@@ -2,6 +2,7 @@ import {
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   RANS_RECOVERY_REMEDIATION_VERSION,
   type DB,
+  enforceSweeperAdmissionFence,
   onResultIngested,
   probeCampaignCompletion,
   recordSolverIncidentInTransaction,
@@ -57,6 +58,16 @@ export type GuardedSubmitOutcome =
 export type LadderSubmitOwner =
   | { uransRequestId: string; verifyQueueId?: never }
   | { verifyQueueId: string; uransRequestId?: never };
+
+/** The global scheduler switch owns locally scheduled work only. Dedicated
+ * remote-solver deployments intentionally keep that switch off and admit
+ * mirrored work through their independently configured remote CPU budget.
+ *
+ * `operator_canary` is the opposite, deliberately narrow maintenance lane:
+ * the exact three-stage canary may submit only while the normal scheduler is
+ * disabled and both durable capacity knobs are exactly zero. It still crosses
+ * the same serialized hazard fence and is never inferred from job payloads. */
+export type SubmissionAdmissionLane = "local" | "remote" | "operator_canary";
 
 const SUBMITTING_ENGINE_STATE = "submitting";
 const ANSWERED_SERVER_RETRY_BACKOFF_MS = 30_000;
@@ -621,6 +632,154 @@ async function withSubmitLifecycleLocks<T>(
   });
 }
 
+type GlobalAdmissionSubmitResult =
+  | { kind: "submitted"; status: JobStatus }
+  | { kind: "denied"; error: string }
+  | { kind: "engine_error"; error: unknown }
+  | { kind: "check_failed"; error: string }
+  | {
+      kind: "accepted_gate_commit_failed";
+      status: JobStatus;
+      error: string;
+    };
+
+/** Last-moment global admission boundary shared by every local, ladder and
+ * remote submit path. The singleton row lock is held until the bounded engine
+ * acceptance call answers. Hazard-transition triggers take that same lock, so
+ * either the engine acceptance is ordered first (and may continue) or the
+ * durable hazard is ordered first (and the engine is never called).
+ *
+ * Engine exceptions are returned untouched for the existing submit-failure
+ * policy. If the engine accepted but the permit transaction itself could not
+ * commit, retain the exact engine id for compensating cancellation. */
+async function submitWithGlobalAdmissionPermit(
+  db: DB,
+  jobId: string,
+  admissionLane: SubmissionAdmissionLane | undefined,
+  submit: () => Promise<JobStatus>,
+): Promise<GlobalAdmissionSubmitResult> {
+  let acceptedStatus: JobStatus | null = null;
+  try {
+    return await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      const [scheduler] = (await tx.execute(sql`
+        SELECT id, enabled, max_concurrent_jobs, cpu_slots
+        FROM sweeper_state
+        WHERE id = 1
+        FOR UPDATE /* submit lifecycle global admission permit */
+      `)) as unknown as Array<{
+        id: number;
+        enabled: boolean;
+        max_concurrent_jobs: number;
+        cpu_slots: number;
+      }>;
+      if (!scheduler) {
+        return {
+          kind: "denied" as const,
+          error: "global scheduler admission state is unavailable",
+        };
+      }
+      let jobLane: { remote_solver: string | null } | undefined;
+      if (!admissionLane) {
+        [jobLane] = (await tx.execute(sql`
+          SELECT request_payload ->> 'remoteSolver' AS remote_solver
+          FROM sim_jobs
+          WHERE id = ${jobId}
+          LIMIT 1
+        `)) as unknown as Array<{ remote_solver: string | null }>;
+      }
+      // Legacy/internal callers are classified from immutable job provenance;
+      // an absent or malformed marker is always local/fail-closed. Explicit
+      // source-lane declarations remain preferable at the primary call sites.
+      const effectiveAdmissionLane =
+        admissionLane ??
+        (jobLane?.remote_solver === "true" ? "remote" : "local");
+      if (effectiveAdmissionLane === "local" && !scheduler.enabled) {
+        return {
+          kind: "denied" as const,
+          error: "global scheduler is paused",
+        };
+      }
+      if (
+        effectiveAdmissionLane === "operator_canary" &&
+        (scheduler.enabled ||
+          Number(scheduler.max_concurrent_jobs) !== 0 ||
+          Number(scheduler.cpu_slots) !== 0)
+      ) {
+        return {
+          kind: "denied" as const,
+          error:
+            "operator canary requires a paused scheduler with zero durable capacity",
+        };
+      }
+      if (effectiveAdmissionLane === "remote" && scheduler.enabled) {
+        const configuredMax = Number(scheduler.max_concurrent_jobs);
+        const cpuSlots = Number(scheduler.cpu_slots);
+        const workerBudget = Number(
+          process.env.AIRFOILFOAM_WORKER_CPU_BUDGET ?? 2,
+        );
+        const sharedCapacity =
+          Number.isInteger(configuredMax) && configuredMax > 0
+            ? configuredMax
+            : Number.isInteger(cpuSlots) && cpuSlots > 0
+              ? cpuSlots
+              : Number.isInteger(workerBudget) && workerBudget > 0
+                ? workerBudget
+                : 2;
+        const [pressure] = (await tx.execute(sql`
+          SELECT count(*)::integer AS count
+          FROM sim_jobs job
+          WHERE job.id <> ${jobId}
+            AND (
+              job.status IN ('submitted', 'running', 'ingesting')
+              OR (
+                job.status = 'pending'
+                AND job.engine_state = ${SUBMITTING_ENGINE_STATE}
+              )
+            )
+        `)) as unknown as Array<{ count: number }>;
+        const reservedSlots = Number(pressure?.count ?? 0);
+        if (reservedSlots >= sharedCapacity) {
+          return {
+            kind: "denied" as const,
+            error: `shared scheduler capacity is full (${reservedSlots}/${sharedCapacity})`,
+          };
+        }
+      }
+      const fence = await enforceSweeperAdmissionFence(tx);
+      if (fence.active || fence.hazardPresent) {
+        return {
+          kind: "denied" as const,
+          error: `global admission safety stop (${fence.trigger?.reason ?? "latched critical solver outcome"})`,
+        };
+      }
+      try {
+        acceptedStatus = await submit();
+        return { kind: "submitted" as const, status: acceptedStatus };
+      } catch (error) {
+        return { kind: "engine_error" as const, error };
+      }
+    });
+  } catch (error) {
+    const message = errorMessage(error);
+    if (acceptedStatus) {
+      return {
+        kind: "accepted_gate_commit_failed",
+        status: acceptedStatus,
+        error: `global admission transaction failed after engine acceptance: ${message}`,
+      };
+    }
+    console.error(
+      "[sweeper] submit-boundary admission check failed; holding engine submission:",
+      error,
+    );
+    return {
+      kind: "check_failed",
+      error: `global admission safety check unavailable: ${message}`,
+    };
+  }
+}
+
 async function stopBeforeEngineSubmit(
   db: DB,
   jobId: string,
@@ -748,6 +907,48 @@ async function recordAcceptedButStopped(
   });
   if (settlement)
     await refreshPrecalcSettlementCampaigns(db, settlement.campaignIds);
+}
+
+/** Persist and execute compensation for an engine task which answered after
+ * its owning lifecycle stopped. The durable engine id is written before the
+ * cancel call so reconciliation can finish compensation after a process
+ * interruption or a failed cancel response. */
+async function compensateAcceptedEngineTask(
+  db: DB,
+  engine: EngineClient,
+  jobId: string,
+  engineJobId: string,
+  reason: string,
+): Promise<GuardedSubmitOutcome> {
+  await recordAcceptedButStopped(db, jobId, engineJobId, reason);
+
+  let engineCancelError: string | null = null;
+  try {
+    await engine.cancelJob(engineJobId);
+  } catch (error) {
+    engineCancelError = errorMessage(error);
+  }
+  await db
+    .update(simJobs)
+    .set({
+      engineState: engineCancelError ? "cancel_pending" : "cancelled",
+      error: engineCancelError
+        ? `${reason}; compensating engine cancellation failed: ${engineCancelError}`
+        : `${reason}; compensating engine cancellation confirmed`,
+    })
+    .where(
+      and(
+        eq(simJobs.id, jobId),
+        eq(simJobs.status, "cancelled"),
+        eq(simJobs.engineJobId, engineJobId),
+      ),
+    );
+  return {
+    kind: "lifecycle_stopped",
+    error: reason,
+    acceptedEngineJobId: engineJobId,
+    engineCancelError,
+  };
 }
 
 function ladderRetryWhere(owner: LadderSubmitOwner) {
@@ -1373,6 +1574,7 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   db: DB;
   engine: EngineClient;
   jobId: string;
+  admissionLane?: SubmissionAdmissionLane;
   campaignId?: string | null;
   request: PolarRequest;
   connectionErrorPrefix: string;
@@ -1470,9 +1672,42 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
     };
   }
 
+  // The tick-level checks keep ordinary scheduling cheap, but a critical
+  // outcome can commit after those checks while a composed job is passing its
+  // lifecycle guards. Every local and remote path converges here. Keep the
+  // singleton lock through the bounded engine acceptance call so a terminal
+  // writer cannot commit inside the former permit→submit gap.
+  const admission = await submitWithGlobalAdmissionPermit(
+    opts.db,
+    opts.jobId,
+    opts.admissionLane,
+    () => opts.engine.submitPolar(opts.request),
+  );
+  if (admission.kind === "denied" || admission.kind === "check_failed") {
+    const reason = `${admission.error} before engine submission`;
+    await stopBeforeEngineSubmit(opts.db, opts.jobId, reason, "submitting");
+    return {
+      kind: "lifecycle_stopped",
+      error: reason,
+      acceptedEngineJobId: null,
+      engineCancelError: null,
+    };
+  }
+  if (admission.kind === "accepted_gate_commit_failed") {
+    const reason = `${admission.error}; accepted engine task ${admission.status.job_id} did not cross the durable admission boundary`;
+    return compensateAcceptedEngineTask(
+      opts.db,
+      opts.engine,
+      opts.jobId,
+      admission.status.job_id,
+      reason,
+    );
+  }
+
   let status: JobStatus;
   try {
-    status = await opts.engine.submitPolar(opts.request);
+    if (admission.kind === "engine_error") throw admission.error;
+    status = admission.status;
     await persistEngineRuntimeForJob(opts.db, opts.jobId, status.engine);
   } catch (error) {
     const message = errorMessage(error);
@@ -1615,33 +1850,11 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   const reason = campaignId
     ? `campaign paused or cancelled before accepted engine task ${status.job_id} crossed the DB submission boundary`
     : `job stopped before accepted engine task ${status.job_id} crossed the DB submission boundary`;
-  await recordAcceptedButStopped(opts.db, opts.jobId, status.job_id, reason);
-
-  let engineCancelError: string | null = null;
-  try {
-    await opts.engine.cancelJob(status.job_id);
-  } catch (error) {
-    engineCancelError = errorMessage(error);
-  }
-  await opts.db
-    .update(simJobs)
-    .set({
-      engineState: engineCancelError ? "cancel_pending" : "cancelled",
-      error: engineCancelError
-        ? `${reason}; compensating engine cancellation failed: ${engineCancelError}`
-        : `${reason}; compensating engine cancellation confirmed`,
-    })
-    .where(
-      and(
-        eq(simJobs.id, opts.jobId),
-        eq(simJobs.status, "cancelled"),
-        eq(simJobs.engineJobId, status.job_id),
-      ),
-    );
-  return {
-    kind: "lifecycle_stopped",
-    error: reason,
-    acceptedEngineJobId: status.job_id,
-    engineCancelError,
-  };
+  return compensateAcceptedEngineTask(
+    opts.db,
+    opts.engine,
+    opts.jobId,
+    status.job_id,
+    reason,
+  );
 }

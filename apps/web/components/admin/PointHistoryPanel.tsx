@@ -140,7 +140,7 @@ const CHIP_TONES: Record<string, StatusChipTone> = {
 const CHIP_LABELS: Record<string, string> = {
   all: "all",
   failed: "failed",
-  awaiting_urans: "awaiting URANS",
+  awaiting_urans: "awaiting FAST URANS",
   needs_review: "unavailable",
   accepted: "accepted",
   needs_urans: "needs URANS",

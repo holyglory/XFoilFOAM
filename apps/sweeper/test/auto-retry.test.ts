@@ -69,7 +69,11 @@ import { resetUransLadderMemory, uransLadderTick } from "../src/urans-ladder";
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-autoretry-${process.pid}-${Date.now().toString(36)}`;
 
-const ANGLES = [3, 4, 5];
+// Keep the crash-only cells outside the low-AoA whole-polar promotion fixtures
+// below. The tests deliberately share one immutable revision, so overlapping
+// angles would let an unrelated promotion claim a crash-chain cell and make
+// this file order-dependent.
+const ANGLES = [31, 32, 33];
 // File-unique chord (F9 rule): reference_geometry_profiles dedupe on canonical
 // physical keys — no other campaign-launching suite may share this chord.
 const CHORD = 0.23;
@@ -85,6 +89,7 @@ let revisionId = "";
 let bcId = "";
 let firstJobId = "";
 let secondJobId = "";
+let crashCellIds: string[] = [];
 const profileIds = { boundary: "", mesh: "", solver: "", output: "" };
 let restoreSweeperEnabled: boolean | null = null;
 
@@ -171,6 +176,22 @@ async function cellRows() {
     .orderBy(asc(results.aoaDeg));
 }
 
+async function crashCellRows() {
+  expect(crashCellIds).toHaveLength(ANGLES.length);
+  return db
+    .select({
+      id: results.id,
+      aoaDeg: results.aoaDeg,
+      status: results.status,
+      simJobId: results.simJobId,
+      autoRetriedAt: results.autoRetriedAt,
+      error: results.error,
+    })
+    .from(results)
+    .where(inArray(results.id, crashCellIds))
+    .orderBy(asc(results.aoaDeg));
+}
+
 beforeAll(async () => {
   const [state] = await db
     .select({ enabled: sweeperState.enabled })
@@ -180,8 +201,8 @@ beforeAll(async () => {
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: false })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: false } });
+    .values({ id: 1, enabled: true })
+    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
 
   const [cat] = await db
     .insert(categories)
@@ -324,6 +345,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
 
     const rows = await cellRows();
     expect(rows.length).toBe(ANGLES.length);
+    crashCellIds = rows.map((row) => row.id);
     for (const row of rows) {
       expect(row.status).toBe("pending"); // re-claimable, NOT failed
       expect(row.autoRetriedAt).not.toBeNull(); // the one-shot marker
@@ -358,348 +380,351 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     expect(again.escalated).toEqual([]);
   }, 240000);
 
-  it("MUST-CATCH: the second crash escalates to unavailable without assigning human review", async () => {
-    // The pending rows are ordinary gaps again: the next tick re-claims them.
-    secondJobId = await composeAndSubmit(`${PREFIX}-engine-2`);
-    expect(secondJobId).not.toBe(firstJobId);
-    await reconcile(db, crashEngine(`${PREFIX}-engine-2`), {
-      jobIds: [secondJobId],
-      skipFailedRecovery: true,
-    });
-
-    const rows = await cellRows();
-    for (const row of rows) {
-      expect(row.status).toBe("failed"); // escalated, no second silent retry
-      expect(row.autoRetriedAt).not.toBeNull();
-    }
-    const points = await db
-      .select({ state: simCampaignPoints.state })
-      .from(simCampaignPoints)
-      .where(eq(simCampaignPoints.campaignId, campaignId));
-    expect(points.every((p) => p.state === "terminal")).toBe(true);
-
-    const totals = await campaignProgressTotals(db, campaignId);
-    expect(totals.failed).toBe(0);
-    expect(totals.blocked).toBe(ANGLES.length);
-    const buckets = await campaignReviewBuckets(db, campaignId);
-    expect(buckets.needsReview).toBe(0);
-    expect(buckets.awaitingUrans).toBe(0);
-
-    const incidents = await db
-      .select()
-      .from(simSolverIncidents)
-      .where(
-        inArray(
-          simSolverIncidents.resultId,
-          rows.map((row) => row.id),
-        ),
-      );
-    expect(incidents).toHaveLength(ANGLES.length);
-    for (const incident of incidents) {
-      expect(incident).toMatchObject({
-        stage: "rans",
-        reason: "solver-execution-failed",
-        severity: "critical",
-        status: "open",
-        remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
-        simJobId: secondJobId,
-        resultAttemptId: null,
+  const registerTerminalSecondCrash = () =>
+    it("MUST-CATCH: the second crash escalates to unavailable without assigning human review", async () => {
+      // The pending rows are ordinary gaps again: the next tick re-claims them.
+      secondJobId = await composeAndSubmit(`${PREFIX}-engine-2`);
+      expect(secondJobId).not.toBe(firstJobId);
+      await reconcile(db, crashEngine(`${PREFIX}-engine-2`), {
+        jobIds: [secondJobId],
+        skipFailedRecovery: true,
       });
-      expect(incident.resultId).not.toBeNull();
-      expect(incident.occurrenceKey).toBe(
-        `rans:${incident.resultId}:${secondJobId}:auto-retry-exhausted`,
-      );
-    }
-    const incidentSummary = await solverIncidentSummary(db, { campaignId });
-    expect(incidentSummary).toMatchObject({
-      occurrenceCount: ANGLES.length,
-      openCount: ANGLES.length,
-      criticalGroupCount: 1,
-    });
-    expect(incidentSummary.groups).toEqual([
-      expect.objectContaining({
-        stage: "rans",
-        reason: "solver-execution-failed",
-        occurrenceCount: ANGLES.length,
-        openCriticalCount: ANGLES.length,
-        requiresInvestigation: true,
-      }),
-    ]);
-  }, 240000);
 
-  it("MUST-CATCH: re-ingesting the same failed job preserves the marker (no second retry from an ingest replay)", async () => {
-    const before = await cellRows();
-    const markerBefore = before[0].autoRetriedAt;
-    expect(markerBefore).not.toBeNull();
+      const rows = await crashCellRows();
+      for (const row of rows) {
+        expect(row.status).toBe("failed"); // escalated, no second silent retry
+        expect(row.autoRetriedAt).not.toBeNull();
+      }
+      const points = await db
+        .select({ state: simCampaignPoints.state })
+        .from(simCampaignPoints)
+        .where(eq(simCampaignPoints.campaignId, campaignId));
+      expect(points.every((p) => p.state === "terminal")).toBe(true);
 
-    // Replay the failed shipment through the REAL ingest upsert (the exact
-    // natural-key SET list production runs) — e.g. a markIngestRetry recovery
-    // re-reading the same result file.
-    const ingested = await ingestResult({
-      db,
-      engine: { baseUrl: "http://engine.test" } as unknown as EngineClient,
-      engineJobId: `${PREFIX}-engine-2`,
-      simJobId: secondJobId,
-      airfoilId,
-      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId }],
-      failedPointErrorFallback: CRASH_MESSAGE,
-      result: {
-        job_id: `${PREFIX}-engine-2`,
-        state: "failed",
-        message: CRASH_MESSAGE,
-        mesh_recovery_version: 3,
-        polars: [
-          {
-            speed: SPEED,
-            chord: CHORD,
-            reynolds: Math.round((SPEED * CHORD) / NU),
-            mach: SPEED / 340.3,
-            points: ANGLES.map((aoa) => ({
-              aoa_deg: aoa,
-              unsteady: false,
-              converged: false,
-              first_order_fallback: false,
-              error: CRASH_MESSAGE,
-              images: {},
-            })),
-          },
-        ],
-      } as JobResult,
-    });
-    expect(ingested.points).toBe(ANGLES.length);
+      const totals = await campaignProgressTotals(db, campaignId);
+      expect(totals.failed).toBe(0);
+      expect(totals.blocked).toBe(ANGLES.length);
+      const buckets = await campaignReviewBuckets(db, campaignId);
+      expect(buckets.needsReview).toBe(0);
+      expect(buckets.awaitingUrans).toBe(0);
 
-    const after = await cellRows();
-    for (const row of after) {
-      expect(row.status).toBe("failed");
-      expect(row.autoRetriedAt).not.toBeNull(); // marker SURVIVED the upsert
-    }
-    const replayAttempts = await db
-      .select({ evidencePayload: resultAttempts.evidencePayload })
-      .from(resultAttempts)
-      .where(eq(resultAttempts.simJobId, secondJobId));
-    expect(replayAttempts).toHaveLength(ANGLES.length);
-    expect(
-      replayAttempts.every(
-        (attempt) =>
-          (
-            attempt.evidencePayload as {
-              mesh_recovery_version?: number;
-            } | null
-          )?.mesh_recovery_version === 3,
-      ),
-    ).toBe(true);
-    // And the auto-retry pass still refuses a second retry: everything
-    // escalates, nothing requeues.
-    const outcome = await autoRetryCrashedResultsForJob(db, secondJobId);
-    expect(outcome.retried).toEqual([]);
-    expect(outcome.escalated.length).toBe(ANGLES.length);
-    expect(
-      await db
-        .select({ id: simSolverIncidents.id })
+      const incidents = await db
+        .select()
         .from(simSolverIncidents)
         .where(
           inArray(
             simSolverIncidents.resultId,
-            after.map((row) => row.id),
+            rows.map((row) => row.id),
           ),
-        ),
-    ).toHaveLength(ANGLES.length);
-  }, 240000);
+        );
+      expect(incidents).toHaveLength(ANGLES.length);
+      for (const incident of incidents) {
+        expect(incident).toMatchObject({
+          stage: "rans",
+          reason: "solver-execution-failed",
+          severity: "critical",
+          status: "open",
+          remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
+          simJobId: secondJobId,
+          resultAttemptId: null,
+        });
+        expect(incident.resultId).not.toBeNull();
+        expect(incident.occurrenceKey).toBe(
+          `rans:${incident.resultId}:${secondJobId}:auto-retry-exhausted`,
+        );
+      }
+      const incidentSummary = await solverIncidentSummary(db, { campaignId });
+      expect(incidentSummary).toMatchObject({
+        occurrenceCount: ANGLES.length,
+        openCount: ANGLES.length,
+        criticalGroupCount: 1,
+      });
+      expect(incidentSummary.groups).toEqual([
+        expect.objectContaining({
+          stage: "rans",
+          reason: "solver-execution-failed",
+          occurrenceCount: ANGLES.length,
+          openCriticalCount: ANGLES.length,
+          requiresInvestigation: true,
+        }),
+      ]);
+    }, 240000);
 
-  it("MUST-CATCH: typed hard-solver stays with promotion, infrastructure gets one retry, and deterministic mesh stays terminal", async () => {
-    const [job] = await db
-      .insert(simJobs)
-      .values({
+  const registerTerminalReingest = () =>
+    it("MUST-CATCH: re-ingesting the same failed job preserves the marker (no second retry from an ingest replay)", async () => {
+      const before = await crashCellRows();
+      const markerBefore = before[0].autoRetriedAt;
+      expect(markerBefore).not.toBeNull();
+
+      // Replay the failed shipment through the REAL ingest upsert (the exact
+      // natural-key SET list production runs) — e.g. a markIngestRetry recovery
+      // re-reading the same result file.
+      const ingested = await ingestResult({
+        db,
+        engine: { baseUrl: "http://engine.test" } as unknown as EngineClient,
+        engineJobId: `${PREFIX}-engine-2`,
+        simJobId: secondJobId,
         airfoilId,
-        bcIds: [bcId],
-        simulationPresetRevisionId: revisionId,
-        campaignId,
-        jobKind: "sweep",
-        referenceChordM: CHORD,
-        wave: 1,
-        status: "running",
-        totalCases: 3,
-        requestPayload: {
-          aoas: [0.25, 0.5, 0.75],
-          ransRetryScope: {
-            origin: "continuous-polar",
-            requestedAoas: [0.25, 0.5, 0.75],
-          },
-        },
-      })
-      .returning();
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId }],
+        failedPointErrorFallback: CRASH_MESSAGE,
+        result: {
+          job_id: `${PREFIX}-engine-2`,
+          state: "failed",
+          message: CRASH_MESSAGE,
+          mesh_recovery_version: 3,
+          polars: [
+            {
+              speed: SPEED,
+              chord: CHORD,
+              reynolds: Math.round((SPEED * CHORD) / NU),
+              mach: SPEED / 340.3,
+              points: ANGLES.map((aoa) => ({
+                aoa_deg: aoa,
+                unsteady: false,
+                converged: false,
+                first_order_fallback: false,
+                error: CRASH_MESSAGE,
+                images: {},
+              })),
+            },
+          ],
+        } as JobResult,
+      });
+      expect(ingested.points).toBe(ANGLES.length);
 
-    const cases = [
-      {
-        aoaDeg: 0.25,
-        disposition: "hard_solver",
-        error: "simpleFoam diverged after residual growth",
-      },
-      {
-        aoaDeg: 0.5,
-        disposition: "infrastructure",
-        error: "OpenMPI reported insufficient slots",
-      },
-      {
-        aoaDeg: 0.75,
-        disposition: "deterministic_mesh",
-        error: "blockMesh rejected deterministic topology",
-      },
-    ] as const;
-    const seeded: Array<{
-      resultId: string;
-      aoaDeg: number;
-      disposition: (typeof cases)[number]["disposition"];
-    }> = [];
-    for (const fixture of cases) {
-      const [result] = await db
-        .insert(results)
+      const after = await crashCellRows();
+      for (const row of after) {
+        expect(row.status).toBe("failed");
+        expect(row.autoRetriedAt).not.toBeNull(); // marker SURVIVED the upsert
+      }
+      const replayAttempts = await db
+        .select({ evidencePayload: resultAttempts.evidencePayload })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.simJobId, secondJobId));
+      expect(replayAttempts).toHaveLength(ANGLES.length);
+      expect(
+        replayAttempts.every(
+          (attempt) =>
+            (
+              attempt.evidencePayload as {
+                mesh_recovery_version?: number;
+              } | null
+            )?.mesh_recovery_version === 3,
+        ),
+      ).toBe(true);
+      // And the auto-retry pass still refuses a second retry: everything
+      // escalates, nothing requeues.
+      const outcome = await autoRetryCrashedResultsForJob(db, secondJobId);
+      expect(outcome.retried).toEqual([]);
+      expect(outcome.escalated.length).toBe(ANGLES.length);
+      expect(
+        await db
+          .select({ id: simSolverIncidents.id })
+          .from(simSolverIncidents)
+          .where(
+            inArray(
+              simSolverIncidents.resultId,
+              after.map((row) => row.id),
+            ),
+          ),
+      ).toHaveLength(ANGLES.length);
+    }, 240000);
+
+  const registerTerminalTypedRecovery = () =>
+    it("MUST-CATCH: typed hard-solver stays with promotion, infrastructure gets one retry, and deterministic mesh stays terminal", async () => {
+      const [job] = await db
+        .insert(simJobs)
         .values({
           airfoilId,
-          bcId,
+          bcIds: [bcId],
           simulationPresetRevisionId: revisionId,
-          aoaDeg: fixture.aoaDeg,
-          status: "failed",
-          source: "queued",
-          regime: "rans",
-          converged: false,
-          error: fixture.error,
-          simJobId: job.id,
-          engineJobId: `${PREFIX}-typed-partial`,
-        })
-        .returning();
-      const [attempt] = await db
-        .insert(resultAttempts)
-        .values({
-          resultId: result.id,
-          airfoilId,
-          bcId,
-          simulationPresetRevisionId: revisionId,
-          aoaDeg: fixture.aoaDeg,
-          simJobId: job.id,
-          engineJobId: `${PREFIX}-typed-partial`,
-          status: "failed",
-          source: "queued",
-          regime: "rans",
-          validForPolar: false,
-          converged: false,
-          error: fixture.error,
-          evidencePayload: {
-            failure_disposition: fixture.disposition,
-            ...(fixture.disposition === "deterministic_mesh"
-              ? { mesh_recovery_version: 7 }
-              : {}),
+          campaignId,
+          jobKind: "sweep",
+          referenceChordM: CHORD,
+          wave: 1,
+          status: "running",
+          totalCases: 3,
+          requestPayload: {
+            aoas: [0.25, 0.5, 0.75],
+            ransRetryScope: {
+              origin: "continuous-polar",
+              requestedAoas: [0.25, 0.5, 0.75],
+            },
           },
-          solvedAt: new Date(),
         })
         .returning();
+
+      const cases = [
+        {
+          aoaDeg: 0.25,
+          disposition: "hard_solver",
+          error: "simpleFoam diverged after residual growth",
+        },
+        {
+          aoaDeg: 0.5,
+          disposition: "infrastructure",
+          error: "OpenMPI reported insufficient slots",
+        },
+        {
+          aoaDeg: 0.75,
+          disposition: "deterministic_mesh",
+          error: "blockMesh rejected deterministic topology",
+        },
+      ] as const;
+      const seeded: Array<{
+        resultId: string;
+        aoaDeg: number;
+        disposition: (typeof cases)[number]["disposition"];
+      }> = [];
+      for (const fixture of cases) {
+        const [result] = await db
+          .insert(results)
+          .values({
+            airfoilId,
+            bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: fixture.aoaDeg,
+            status: "failed",
+            source: "queued",
+            regime: "rans",
+            converged: false,
+            error: fixture.error,
+            simJobId: job.id,
+            engineJobId: `${PREFIX}-typed-partial`,
+          })
+          .returning();
+        const [attempt] = await db
+          .insert(resultAttempts)
+          .values({
+            resultId: result.id,
+            airfoilId,
+            bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: fixture.aoaDeg,
+            simJobId: job.id,
+            engineJobId: `${PREFIX}-typed-partial`,
+            status: "failed",
+            source: "queued",
+            regime: "rans",
+            validForPolar: false,
+            converged: false,
+            error: fixture.error,
+            evidencePayload: {
+              failure_disposition: fixture.disposition,
+              ...(fixture.disposition === "deterministic_mesh"
+                ? { mesh_recovery_version: 7 }
+                : {}),
+            },
+            solvedAt: new Date(),
+          })
+          .returning();
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: attempt.id })
+          .where(eq(results.id, result.id));
+        await db.insert(resultClassifications).values({
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: fixture.aoaDeg,
+          regime: "rans",
+          classifierVersion: "typed-auto-retry-guard:v1",
+          state: "rejected",
+          reasons: [fixture.error],
+        });
+        seeded.push({
+          resultId: result.id,
+          aoaDeg: fixture.aoaDeg,
+          disposition: fixture.disposition,
+        });
+      }
+
+      // Real partial ingestion refreshes classifications before generic retry;
+      // rejected hard evidence is intentionally not a selected public pointer.
+      // The promotion guard must use exact job-local attempt history, not this
+      // mutable projection.
+      const pointerNullHard = seeded.find(
+        (row) => row.disposition === "hard_solver",
+      )!;
       await db
         .update(results)
-        .set({ currentResultAttemptId: attempt.id })
-        .where(eq(results.id, result.id));
-      await db.insert(resultClassifications).values({
-        resultId: result.id,
-        resultAttemptId: attempt.id,
-        airfoilId,
-        simulationPresetRevisionId: revisionId,
-        aoaDeg: fixture.aoaDeg,
-        regime: "rans",
-        classifierVersion: "typed-auto-retry-guard:v1",
-        state: "rejected",
-        reasons: [fixture.error],
-      });
-      seeded.push({
-        resultId: result.id,
-        aoaDeg: fixture.aoaDeg,
-        disposition: fixture.disposition,
-      });
-    }
+        .set({ currentResultAttemptId: null })
+        .where(eq(results.id, pointerNullHard.resultId));
 
-    // Real partial ingestion refreshes classifications before generic retry;
-    // rejected hard evidence is intentionally not a selected public pointer.
-    // The promotion guard must use exact job-local attempt history, not this
-    // mutable projection.
-    const pointerNullHard = seeded.find(
-      (row) => row.disposition === "hard_solver",
-    )!;
-    await db
-      .update(results)
-      .set({ currentResultAttemptId: null })
-      .where(eq(results.id, pointerNullHard.resultId));
-
-    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
-    const after = await db
-      .select({
-        id: results.id,
-        status: results.status,
-        simJobId: results.simJobId,
-        autoRetriedAt: results.autoRetriedAt,
-      })
-      .from(results)
-      .where(
-        inArray(
-          results.id,
-          seeded.map((row) => row.resultId),
-        ),
-      );
-    const byId = new Map(after.map((row) => [row.id, row]));
-    const hard = seeded.find((row) => row.disposition === "hard_solver")!;
-    expect(byId.get(hard.resultId)).toMatchObject({
-      status: "failed",
-      simJobId: job.id,
-      autoRetriedAt: null,
-    });
-    const infrastructure = seeded.find(
-      (row) => row.disposition === "infrastructure",
-    )!;
-    const deterministic = seeded.find(
-      (row) => row.disposition === "deterministic_mesh",
-    )!;
-    expect(outcome.retried.map((row) => row.resultId)).toEqual([
-      infrastructure.resultId,
-    ]);
-    expect(byId.get(infrastructure.resultId)).toMatchObject({
-      status: "pending",
-      simJobId: null,
-    });
-    expect(byId.get(infrastructure.resultId)?.autoRetriedAt).not.toBeNull();
-    expect(outcome.suppressed.map((row) => row.resultId)).toEqual([
-      deterministic.resultId,
-    ]);
-    expect(byId.get(deterministic.resultId)).toMatchObject({
-      status: "failed",
-      simJobId: job.id,
-      autoRetriedAt: null,
-    });
-    const [meshIncident] = await db
-      .select()
-      .from(simSolverIncidents)
-      .where(eq(simSolverIncidents.resultId, deterministic.resultId));
-    expect(meshIncident).toMatchObject({
-      stage: "rans",
-      reason: "mesh-quality-failure",
-      severity: "critical",
-      status: "open",
-      simJobId: job.id,
-      resultAttemptId: expect.any(String),
-      remediationVersion: "rans-mesh-recovery-v7",
-    });
-    expect(meshIncident.occurrenceKey).toBe(
-      `rans:${deterministic.resultId}:${job.id}:deterministic-mesh:v7`,
-    );
-    expect(meshIncident.metadata).toMatchObject({ meshRecoveryVersion: 7 });
-    expect(
-      await db
-        .select({ id: simSolverIncidents.id })
-        .from(simSolverIncidents)
+      const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+      const after = await db
+        .select({
+          id: results.id,
+          status: results.status,
+          simJobId: results.simJobId,
+          autoRetriedAt: results.autoRetriedAt,
+        })
+        .from(results)
         .where(
-          inArray(simSolverIncidents.resultId, [
-            hard.resultId,
-            infrastructure.resultId,
-          ]),
-        ),
-    ).toHaveLength(0);
-  }, 240000);
+          inArray(
+            results.id,
+            seeded.map((row) => row.resultId),
+          ),
+        );
+      const byId = new Map(after.map((row) => [row.id, row]));
+      const hard = seeded.find((row) => row.disposition === "hard_solver")!;
+      expect(byId.get(hard.resultId)).toMatchObject({
+        status: "failed",
+        simJobId: job.id,
+        autoRetriedAt: null,
+      });
+      const infrastructure = seeded.find(
+        (row) => row.disposition === "infrastructure",
+      )!;
+      const deterministic = seeded.find(
+        (row) => row.disposition === "deterministic_mesh",
+      )!;
+      expect(outcome.retried.map((row) => row.resultId)).toEqual([
+        infrastructure.resultId,
+      ]);
+      expect(byId.get(infrastructure.resultId)).toMatchObject({
+        status: "pending",
+        simJobId: null,
+      });
+      expect(byId.get(infrastructure.resultId)?.autoRetriedAt).not.toBeNull();
+      expect(outcome.suppressed.map((row) => row.resultId)).toEqual([
+        deterministic.resultId,
+      ]);
+      expect(byId.get(deterministic.resultId)).toMatchObject({
+        status: "failed",
+        simJobId: job.id,
+        autoRetriedAt: null,
+      });
+      const [meshIncident] = await db
+        .select()
+        .from(simSolverIncidents)
+        .where(eq(simSolverIncidents.resultId, deterministic.resultId));
+      expect(meshIncident).toMatchObject({
+        stage: "rans",
+        reason: "mesh-quality-failure",
+        severity: "critical",
+        status: "open",
+        simJobId: job.id,
+        resultAttemptId: expect.any(String),
+        remediationVersion: "rans-mesh-recovery-v7",
+      });
+      expect(meshIncident.occurrenceKey).toBe(
+        `rans:${deterministic.resultId}:${job.id}:deterministic-mesh:v7`,
+      );
+      expect(meshIncident.metadata).toMatchObject({ meshRecoveryVersion: 7 });
+      expect(
+        await db
+          .select({ id: simSolverIncidents.id })
+          .from(simSolverIncidents)
+          .where(
+            inArray(simSolverIncidents.resultId, [
+              hard.resultId,
+              infrastructure.resultId,
+            ]),
+          ),
+      ).toHaveLength(0);
+    }, 240000);
 
   it("MUST-CATCH: completed physical RANS rejection is normal URANS handoff evidence, never a critical preflight incident", async () => {
     const [job] = await db
@@ -1673,4 +1698,13 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     ).toBe(false);
     expect(submitted).toHaveLength(6);
   }, 240000);
+
+  // These scenarios intentionally leave current-generation critical state.
+  // Register them only after every test which expects another engine
+  // admission. The production-global latch must remain effective throughout
+  // the terminal chain; file cleanup removes its owned campaign before the
+  // exclusive lease restores the pre-file singleton.
+  registerTerminalSecondCrash();
+  registerTerminalReingest();
+  registerTerminalTypedRecovery();
 });

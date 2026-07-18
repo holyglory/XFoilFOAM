@@ -358,7 +358,6 @@ export function CampaignDetail({
   // ---- dashboard hero models (approved design c19fd74a) — every input is a
   // real payload counter; the pure assembly lives in campaign-pipeline.ts ----
   const reviewBuckets = summary.reviewBuckets ?? null;
-  const needsReview = reviewBuckets?.needsReview ?? 0;
   const blocked = totals.blocked ?? 0;
   const remediationCopy = campaignRemediationCopy(summary.remediation);
   const pipeline = assemblePipelineModel({
@@ -710,8 +709,8 @@ export function CampaignDetail({
                   {stage.key === "steady"
                     ? "RANS"
                     : stage.key === "unsteady"
-                      ? "PRELIMINARY URANS"
-                      : "VERIFY"}
+                      ? "FAST URANS"
+                      : "FINAL URANS"}
                 </strong>
                 <span>
                   {stage.settled
@@ -808,30 +807,9 @@ export function CampaignDetail({
                 {fCount(totals.derived)} symmetry-derived
               </span>
             )}
-            {totals.failed > 0 && (
-              <button
-                type="button"
-                data-testid="campaign-failed-link"
-                title="Crash-class failures (after the automatic retry) — open them in the Points explorer"
-                onClick={() => onOpenPoints("failed")}
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 10,
-                  color: C.redText,
-                  background: "transparent",
-                  border: "none",
-                  padding: 0,
-                  cursor: "pointer",
-                  textDecoration: "underline",
-                }}
-              >
-                {fCount(totals.failed)} failed
-              </button>
-            )}
           </div>
           {(barSegments.awaitingCount > 0 ||
-            (barSegments.blockedCount > 0 && remediationCopy) ||
-            needsReview > 0) && (
+            (barSegments.blockedCount > 0 && remediationCopy)) && (
             <div
               data-testid="campaign-exception-actions"
               className="campaign-instrument-exceptions"
@@ -847,7 +825,7 @@ export function CampaignDetail({
                   <CircleDot size={18} strokeWidth={1.6} aria-hidden />
                   <span>
                     <strong>{fCount(barSegments.awaitingCount)}</strong>
-                    <small>awaiting URANS</small>
+                    <small>awaiting FAST URANS</small>
                   </span>
                 </button>
               )}
@@ -863,21 +841,6 @@ export function CampaignDetail({
                     <small>{remediationCopy.label}</small>
                   </span>
                 </div>
-              )}
-              {needsReview > 0 && (
-                <button
-                  type="button"
-                  data-testid="campaign-needs-review-chip"
-                  className="campaign-instrument-exception-action is-red"
-                  title="Open unavailable evidence in the Points explorer"
-                  onClick={() => onOpenPoints("needs_review")}
-                >
-                  <ShieldAlert size={18} strokeWidth={1.6} aria-hidden />
-                  <span>
-                    <strong>{fCount(needsReview)}</strong>
-                    <small>unavailable evidence</small>
-                  </span>
-                </button>
               )}
             </div>
           )}

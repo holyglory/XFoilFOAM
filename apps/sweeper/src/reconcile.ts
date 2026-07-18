@@ -1900,6 +1900,11 @@ export async function submitUransRetryForJob(
      * escalation while unrelated campaign RANS gaps remain. Direct ingest
      * callers omit it and remain route-only. */
     capacityScheduledEscalation?: boolean;
+    /** Exact immutable RANS attempts selected by a shared campaign-owned
+     * obligation whose producing parent may belong to background work or a
+     * different campaign. When present, retry planning is targeted to only
+     * these attempts; it must never widen from the source job's other cells. */
+    sourceResultAttemptIds?: string[];
   } = {},
 ): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
@@ -1972,8 +1977,9 @@ export async function submitUransRetryForJob(
   // Direct ingest never starts a child outside scheduler capacity. The
   // capacity-bounded ladder may, however, admit the exact rejected angle from
   // this terminal parent without waiting for unrelated campaign RANS cells.
-  // Its caller alternates with ordinary RANS admission so neither tier
-  // starves. Conditional whole-polar widening remains ledger-authorized only.
+  // Its caller gives every due targeted handoff priority over unrelated RANS
+  // while admitting at most one physical child per scheduler tick.
+  // Conditional whole-polar widening remains ledger-authorized only.
   const campaignHasRansBacklog = Boolean(
     parent.campaignId && (await campaignHasOpenRansGaps(db, parent.campaignId)),
   );
@@ -2055,10 +2061,16 @@ export async function submitUransRetryForJob(
     parentJobId: parent.id,
     airfoilId: parent.airfoilId,
     revisionId,
-    scope: parseRansRetryScope(
-      (parentPayload as { ransRetryScope?: unknown }).ransRetryScope,
-      anglesForJob(parent),
-    ),
+    scope: opts.sourceResultAttemptIds?.length
+      ? {
+          origin: "explicit-targeted",
+          requestedAoas: anglesForJob(parent),
+        }
+      : parseRansRetryScope(
+          (parentPayload as { ransRetryScope?: unknown }).ransRetryScope,
+          anglesForJob(parent),
+        ),
+    sourceResultAttemptIds: opts.sourceResultAttemptIds,
   });
   const retry =
     plannedRetry?.retryMode === "whole-polar-urans"
@@ -2353,6 +2365,7 @@ async function submitCampaignUransRetries(
     recordRoutesOnly?: boolean;
     meshRecoveryVersion?: number;
     uransRecoveryVersion?: number | null;
+    sourceResultAttemptIds?: string[];
   },
 ): Promise<void> {
   const parentPayload = requestPayload(parent);
@@ -2420,8 +2433,14 @@ async function submitCampaignUransRetries(
       parentJobId: parent.id,
       airfoilId: parent.airfoilId,
       revisionId: entry.revisionId,
-      scope: parseRansRetryScope(entry.ransRetryScope, anglesForJob(parent)),
+      scope: opts.sourceResultAttemptIds?.length
+        ? {
+            origin: "explicit-targeted",
+            requestedAoas: anglesForJob(parent),
+          }
+        : parseRansRetryScope(entry.ransRetryScope, anglesForJob(parent)),
       attemptRevisionId: entry.revisionId,
+      sourceResultAttemptIds: opts.sourceResultAttemptIds,
     });
     const retry =
       plannedRetry?.retryMode === "whole-polar-urans"

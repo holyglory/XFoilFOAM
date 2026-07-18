@@ -26,6 +26,7 @@ export const PROCESS_NOT_RUNNING_DETAIL =
 export type SolverStateName =
   | "unknown"
   | "process_not_running"
+  | "admission_fenced"
   | "paused"
   | "engine_unreachable"
   | "engine_unhealthy"
@@ -68,6 +69,10 @@ export interface SolverStateInput {
   diskFreeBytes?: number | null;
   diskRequiredFreeBytes?: number | null;
   diskCheckedAt?: string | null;
+  admissionFenceActive?: boolean;
+  lastAdmissionFenceAt?: string | null;
+  lastAdmissionFenceReason?: string | null;
+  lastAdmissionFenceDetails?: Record<string, unknown> | null;
 }
 
 export interface DerivedSolverState {
@@ -76,6 +81,33 @@ export interface DerivedSolverState {
   headline: string;
   detail?: string;
   secondary: string[];
+}
+
+function admissionFenceHeadline(input: SolverStateInput): string {
+  const stage = input.lastAdmissionFenceDetails?.stage;
+  const fidelity = input.lastAdmissionFenceDetails?.fidelity;
+  switch (input.lastAdmissionFenceReason) {
+    case "blocked_preliminary_urans":
+      return "Safety stop — fast URANS exhausted.";
+    case "blocked_final_urans":
+      return "Safety stop — final URANS exhausted.";
+    case "blocked_urans_request":
+      if (fidelity === "precalc")
+        return "Safety stop — fast URANS request exhausted.";
+      if (fidelity === "full")
+        return "Safety stop — final URANS request exhausted.";
+      return "Safety stop — URANS recovery exhausted.";
+    case "campaign_progress_blocked":
+      return "Safety stop — campaign recovery exhausted.";
+    case "critical_solver_incident":
+      if (stage === "preliminary")
+        return "Safety stop — fast URANS recovery exhausted.";
+      if (stage === "final")
+        return "Safety stop — final URANS recovery exhausted.";
+      return "Safety stop — solver recovery exhausted.";
+    default:
+      return "Safety stop — critical solver outcome.";
+  }
 }
 
 /** Mirrors the pinned GET /api/admin/campaigns list `solverState` block. */
@@ -93,6 +125,9 @@ export interface SolverStateListPayload {
   diskFreeBytes?: number | null;
   diskRequiredFreeBytes?: number | null;
   diskCheckedAt?: string | null;
+  admissionFenceActive?: boolean;
+  lastAdmissionFenceAt?: string | null;
+  lastAdmissionFenceReason?: string | null;
 }
 
 export function heartbeatAgeMs(
@@ -154,6 +189,8 @@ export function solverStateLabel(state: SolverStateName): string {
       return "STATUS UNKNOWN";
     case "process_not_running":
       return "PROCESS NOT RUNNING";
+    case "admission_fenced":
+      return "SAFETY STOP";
     case "paused":
       return "PAUSED";
     case "engine_unreachable":
@@ -190,6 +227,8 @@ export function solverChipText(
       return "scheduler · paused";
     case "process_not_running":
       return "scheduler · process not running";
+    case "admission_fenced":
+      return "scheduler · safety stop";
     case "engine_unreachable":
       return "scheduler · engine unreachable";
     case "engine_unhealthy":
@@ -206,15 +245,16 @@ export function solverChipText(
 /** GATE PRECEDENCE (approved design, binding):
  *  fetch failed → unknown; heartbeat null/stale → process_not_running (TRUE
  *  process death now that liveness is an independent timer — red regardless
- *  of tick fields); alive+disabled → paused (the pinned paused-first order:
+ *  of tick fields); alive+admission fence → red safety stop; alive+disabled →
+ *  paused (the pinned paused-first order:
  *  while disabled, engine trouble and slow ticks are secondary because
  *  "scheduling continues" copy would be false); alive+enabled+unreachable →
  *  engine_unreachable; reachable but unhealthy/build-mismatch →
  *  engine_unhealthy (advisory); heartbeat fresh but the current tick started
  *  >5 min ago without completing → tick_stalled (AMBER, never red — the
  *  2026-07-06 false "PROCESS NOT RUNNING"); else running / idle. Enabled-path
- *  order matches the locked design: process death > engine unreachable >
- *  engine unhealthy > tick_stalled > healthy. engineQueueError is always
+ *  order matches the locked design: process death > admission fence > engine
+ *  unreachable > engine unhealthy > tick_stalled > healthy. engineQueueError is always
  *  secondary. */
 export function deriveSolverState(
   input: SolverStateInput,
@@ -252,6 +292,17 @@ export function deriveSolverState(
           ? "Solver process is not running — it has never reported a heartbeat."
           : `Solver process is not running — last heartbeat ${formatAge(age)} ago.`,
       detail: PROCESS_NOT_RUNNING_DETAIL,
+      secondary,
+    };
+  }
+
+  if (input.admissionFenceActive) {
+    return {
+      state: "admission_fenced",
+      tone: "red",
+      headline: admissionFenceHeadline(input),
+      detail:
+        "New submissions are fenced. Running jobs continue; engineering investigation is required before Resume.",
       secondary,
     };
   }

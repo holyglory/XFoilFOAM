@@ -19,14 +19,53 @@
   `prod-20260717-22c0d3f08d63-r7`. A fresh-target audit found that the
   one-shot validator still rejected a legitimate no-shedding URANS generation
   because its physical regime is `rans` even though method and fidelity prove
-  preliminary/final URANS execution. Deploy the regression-backed regime
-  correction, restore safe active-solve storage margin, and run the distinct
-  20-32C/Re≈102k/α14° preliminary-plus-final canary on r7. Durable scheduling
-  remains fenced at `enabled=false`, `max_concurrent_jobs=0`, and
-  `cpu_slots=0` until those gates pass. Reopen only bounded campaign capacity
-  and monitor subsequent fast/final work for recurrence. Any exhausted
-  fast/final chain must remain a grouped red system-owned incident with a
-  remediation version, never a review task or an unchanged user retry.
+  preliminary/final URANS execution. The regression-backed no-shedding
+  correction is deployed, and the distinct 20-32C/Re≈102k/α14° target has
+  produced accepted preliminary and final generations. The final attempt is
+  canonical and publishable, its real fast/final deltas correctly settled as a
+  non-critical comparison disagreement, 24 default media artifacts are stored,
+  and its immutable evidence is a verified 1,660,050,186-byte Zstandard object
+  in GCS. The exact closed-world terminal audit returned `completed` with no
+  critical incident. The fresh production backup
+  `app-postgres-1-aerodb-20260717T225517Z-222f9d0f.dump` is 291,330,004 bytes,
+  has SHA-256
+  `7e0db9a28283759d4f22322b2772570068ee5a33f68d141317dff34f9a8ac58f`,
+  passed a strong scratch restore (83 tables, one sequence, 15 functions), and
+  has a matching private off-VPS copy. Durable scheduling remains fenced at
+  `enabled=false`, `max_concurrent_jobs=0`, and `cpu_slots=0` with zero
+  in-flight jobs while the scheduler-priority, automatic-admission-breaker,
+  and per-point UI changes are committed, deployed, and exercised. Do not
+  claim the overall rollout complete until those changes pass production
+  verification and bounded campaign burn-in.
+
+  The old process-local RANS/PRECALC alternation and bounded finished-parent
+  discovery let an already-durable preliminary obligation at rank 53 remain
+  behind unrelated RANS and reconstruct the same starvation after restart. A
+  regression-backed correction now selects due fast-URANS obligations first
+  from their durable ledger. A durable automatic NEW-admission circuit breaker
+  also latches capacity to zero for a current-generation critical/exhausted
+  preliminary or final hazard while reconciliation, ingestion, retention, and
+  accepted jobs continue. Current code also schedules an exact campaign-owned
+  handoff from a shared/background parent, checks the circuit breaker at the
+  actual local/remote engine-submit boundary, serializes explicit Resume
+  against concurrent capacity edits, hides incident provenance from the public
+  sweeper DTO, and holds local NEW admission when mesh capability is unknown.
+  The additive 0075 migration was applied from 0000 to an isolated fresh
+  database seeded with all 1,621 real profiles. Current-code regressions pass:
+  database 118/118, API 285/285, web 352/352, and sweeper 605/605, including
+  URANS ladder 33/33, admission breaker 9/9, predicate-transition ordering
+  5/5, engine capabilities 30/30, the rank-53/background-parent cases, and
+  every package typecheck. The exact operator canary uses an explicit
+  maintenance lane that is admissible only while the ordinary scheduler is
+  disabled with both durable capacity values at zero; it is never inferred
+  from payloads and remains behind the same serialized hazard fence. Operator Resume
+  clears the latch and restores saved capacity, but pre-admission checks
+  immediately re-trip it when the hazard remains; legacy-generation hazards
+  are excluded. Commit, deploy, and prove those scheduler changes before
+  reopening bounded campaign capacity, then monitor subsequent fast/final work
+  for recurrence. Any exhausted fast/final chain must remain a grouped red
+  system-owned incident with a remediation version, never a review task or an
+  unchanged user retry.
 
 - **GCS Zstandard evidence migration:** Implement and deploy content-addressed
   tar.zst finalization, verified GCS upload, temporary render hydration,
@@ -72,16 +111,19 @@
   before deploying the Foundation worker to an arm64 host.
 
 - **Production evidence capacity:** The owner expanded the VPS disk from 300 to
-  500 GiB. The latest 2026-07-17 production measurement is 491.9 GiB usable,
-  about 389 GiB used, and about 99 GiB free (80.0% used); the
-  `/var/lib/docker/volumes/app_results` volume accounts for about 357 GiB.
-  The 78-case successor RANS batch is terminal and durable general admission
-  remains disabled. The active-job admission check currently has only about
-  228 MiB of margin below its 80% ceiling; reclaim and remeasure at least one
-  full active-solve reserve before the fresh r7 canary. The VPS cannot safely
-  retain the immutable artifacts for the complete 631,000-point campaign.
-  Continue the verified migration one complete job at a time, preserve at
-  least 80 GiB free, and remeasure active-case growth before opening sustained
+  500 GiB. The latest 2026-07-18 production measurement is 491.9 GiB usable,
+  76% used with 121 GiB free. A one-shot lock-aware
+  hydration-cache cleanup removed exactly 27,940,933,608 bytes from 550
+  temporary cache entries and left 12,865,912,411 bytes in that cache. It
+  deleted no canonical result, immutable solver evidence, GCS object, raw
+  unarchived case, database row, or provenance. The 78-case successor RANS batch
+  is terminal, the exact α14° fast/final canary passed, and durable general
+  admission remains disabled while the new scheduling and recovery gates are
+  verified and deployed. The restored margin was sufficient for the bounded
+  canary; it does not make the VPS capable of
+  retaining immutable artifacts for the complete 631,000-point campaign.
+  Continue the verified migration one complete job at a time, preserve at least
+  80 GiB free, and remeasure active-case growth before opening sustained
   campaign admission.
 
 - **A18 low-angle alternate-branch correction:** The control-plane classifier,

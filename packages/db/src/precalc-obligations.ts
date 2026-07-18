@@ -813,6 +813,15 @@ export async function requeueDeterministicMeshObligationsForRecoveryVersion(
         )
         AND NOT EXISTS (
           SELECT 1
+          FROM sim_precalc_obligation_attempts immutable_attempt
+          WHERE immutable_attempt.obligation_id = obligation.id
+            AND immutable_attempt.state = 'failed'
+            AND immutable_attempt.outcome = 'deterministic_failure'
+            AND NOT immutable_attempt.consumes_solver_attempt
+            AND immutable_attempt.mesh_recovery_version >= ${meshRecoveryVersion}
+        )
+        AND NOT EXISTS (
+          SELECT 1
           FROM sim_jobs active_job
           CROSS JOIN LATERAL jsonb_array_elements_text(
             CASE
@@ -952,6 +961,15 @@ export async function requeueDeterministicMeshObligationsForRecoveryVersion(
             AND immutable_attempt.outcome = 'deterministic_failure'
             AND NOT immutable_attempt.consumes_solver_attempt
             AND immutable_attempt.mesh_recovery_version < ${meshRecoveryVersion}
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_precalc_obligation_attempts immutable_attempt
+          WHERE immutable_attempt.obligation_id = obligation.id
+            AND immutable_attempt.state = 'failed'
+            AND immutable_attempt.outcome = 'deterministic_failure'
+            AND NOT immutable_attempt.consumes_solver_attempt
+            AND immutable_attempt.mesh_recovery_version >= ${meshRecoveryVersion}
         )
         AND NOT EXISTS (
           SELECT 1
@@ -2200,18 +2218,20 @@ export async function settlePrecalcObligationsForJobInTransaction(
           `precalc obligation ${obligation.id} has no solver implementation for incident attribution`,
         );
       }
-      const reason = continuationNoProgressExhausted
-        ? "continuation-no-progress"
-        : continuationPermanent
-          ? "continuation-source-unavailable"
-          : solverIncidentReason(
-              judged?.reasons,
-              failureDisposition && failureDisposition !== "none"
-                ? failureDisposition
-                : transientFailure
-                  ? "solver-execution-failed"
-                  : "non-publishable-evidence",
-            );
+      const reason = deterministic
+        ? "deterministic-mesh"
+        : continuationNoProgressExhausted
+          ? "continuation-no-progress"
+          : continuationPermanent
+            ? "continuation-source-unavailable"
+            : solverIncidentReason(
+                judged?.reasons,
+                failureDisposition && failureDisposition !== "none"
+                  ? failureDisposition
+                  : transientFailure
+                    ? "solver-execution-failed"
+                    : "non-publishable-evidence",
+              );
       await recordSolverIncidentInTransaction(tx, {
         stage: "preliminary",
         reason,
@@ -2230,6 +2250,12 @@ export async function settlePrecalcObligationsForJobInTransaction(
           progress: currentProgress,
           classificationReasons: judged?.reasons ?? [],
           failureDisposition,
+          ...(deterministic
+            ? {
+                recovery: "deterministic-mesh",
+                meshRecoveryVersion: acknowledgedMeshRecoveryVersion,
+              }
+            : {}),
         },
       });
     }

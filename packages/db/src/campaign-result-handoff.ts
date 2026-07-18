@@ -124,6 +124,10 @@ async function campaignOwnersForCell(
   signal: CampaignResultHandoffSignal,
 ): Promise<string[]> {
   if (!signal.revisionId) return [];
+  // Ownership follows the current campaign's exact natural cell, never the
+  // producing job's scalar campaign_id. A background/shared RANS job may have
+  // started before this campaign and still be the immutable source attempt for
+  // its normal FAST-URANS handoff.
   const rows = await tx
     .selectDistinct({ campaignId: simCampaignPoints.campaignId })
     .from(simCampaignPoints)

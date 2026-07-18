@@ -59,6 +59,7 @@ import {
 } from "./engine-backoff";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { touchHeartbeat } from "./heartbeat";
+import { parsedMeshRecoveryVersion } from "./engine-capabilities";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
@@ -118,6 +119,21 @@ type RemotePromiseSubmitResult =
   | { kind: "submitted" | "busy" | "waiting" }
   | { kind: "terminal"; error: string }
   | { kind: "stopped"; error: string };
+
+export type RemoteEngineAdmissionHoldReason =
+  | "storage_pressure"
+  | "safety_stop"
+  | "mesh_capability_unknown"
+  | "higher_priority_fast_urans"
+  | "shared_capacity_full"
+  | "engine_unavailable";
+
+/** A remote promise is reconciled independently from admitting new local
+ * OpenFOAM work. The allow branch carries the exact live mesh-recovery
+ * capability that the engine request and durable job payload must pin. */
+export type RemoteEngineAdmissionDecision =
+  | { kind: "allow"; meshRecoveryVersion: number }
+  | { kind: "hold"; reason: RemoteEngineAdmissionHoldReason };
 
 function syncBase(settings: Settings): string {
   if (!settings.upstreamBaseUrl)
@@ -1182,6 +1198,7 @@ async function composeRemotePromiseJob(
   db: DB,
   settings: Settings,
   promiseId: string,
+  meshRecoveryVersion: number,
 ): Promise<
   | {
       kind: "composed";
@@ -1280,6 +1297,7 @@ async function composeRemotePromiseJob(
         state.requestedAoas.length > 1 ? "abort_for_precalc" : "continue",
     });
     request.expected_execution_pool = executionPool.routingKey;
+    request.expected_mesh_recovery_version = meshRecoveryVersion;
     request.resources = {
       ...(request.resources ?? {}),
       cpu_budget:
@@ -1299,6 +1317,7 @@ async function composeRemotePromiseJob(
       ],
       aoas: state.dueAoas,
       ransRetryScope: retryScopeForRequestedPolar(state.requestedAoas),
+      meshRecoveryVersion,
       resources: request.resources,
       setupSnapshot: setup,
     };
@@ -1359,13 +1378,19 @@ async function submitMirroredRemotePromise(
   engine: EngineClient,
   settings: Settings,
   promiseId: string,
+  meshRecoveryVersion: number,
 ): Promise<RemotePromiseSubmitResult> {
   if (engineBackoffActive()) {
     const error = `remote engine submit for promise ${promiseId} is waiting for the shared connection backoff`;
     await setStatus(db, "error", error);
     return { kind: "waiting" };
   }
-  const composition = await composeRemotePromiseJob(db, settings, promiseId);
+  const composition = await composeRemotePromiseJob(
+    db,
+    settings,
+    promiseId,
+    meshRecoveryVersion,
+  );
   if (composition.kind === "stopped") {
     return { kind: "stopped", error: "remote promise is no longer active" };
   }
@@ -1393,6 +1418,7 @@ async function submitMirroredRemotePromise(
     db,
     engine,
     jobId: composition.jobId,
+    admissionLane: "remote",
     request: composition.request,
     connectionErrorPrefix: "remote engine unreachable at submit: ",
     submitErrorPrefix: "remote engine submit failed: ",
@@ -1438,7 +1464,8 @@ async function claimRemoteWork(
   db: DB,
   engine: EngineClient,
   settings: Settings,
-): Promise<void> {
+  meshRecoveryVersion: number,
+): Promise<RemotePromiseSubmitResult | null> {
   const solverId =
     settings.remoteSolverRegisteredId ?? (await registerSolver(db, settings));
   await setStatus(db, "claiming", null);
@@ -1454,7 +1481,7 @@ async function claimRemoteWork(
   if (!res.ok) throw new Error(`remote sweep claim failed (${res.status})`);
   if (!payload?.promise) {
     await setStatus(db, "idle", null);
-    return;
+    return null;
   }
   const claim = payload.promise;
   const airfoil = await ensureRemoteAirfoil(db, claim);
@@ -1496,7 +1523,13 @@ async function claimRemoteWork(
       })),
     )
     .onConflictDoNothing();
-  await submitMirroredRemotePromise(db, engine, settings, claim.id);
+  return submitMirroredRemotePromise(
+    db,
+    engine,
+    settings,
+    claim.id,
+    meshRecoveryVersion,
+  );
 }
 
 interface StreamUpload {
@@ -3056,11 +3089,13 @@ async function reopenResolvedConflictDeliveries(
   }
 }
 
-export async function remoteSolverTick(
+/** Reconcile remote authority and evidence without admitting a new engine
+ * job. Returning true means an admission-only pass may be attempted later in
+ * this same scheduler tick, after higher-priority FAST URANS has had the slot. */
+export async function reconcileRemoteSolverTick(
   db: DB,
   engine: EngineClient,
-  allowEngineSubmission = true,
-): Promise<void> {
+): Promise<boolean> {
   const [settings] = await db
     .select()
     .from(syncApiSettings)
@@ -3092,9 +3127,9 @@ export async function remoteSolverTick(
       }
       if (settings?.remoteSolverLastStatus !== "disabled")
         await setStatus(db, "disabled", null);
-      return;
+      return false;
     }
-    if (processedDurableDelivery) return;
+    if (processedDurableDelivery) return false;
     if (!settings.remoteSolverRegisteredId) {
       await registerSolver(db, settings);
     }
@@ -3108,7 +3143,7 @@ export async function remoteSolverTick(
       await setStatus(db, "idle", null, {
         remoteSolverLastPushAt: new Date(),
       });
-      return;
+      return false;
     }
     const active = await activeRemoteJobs(db);
     await heartbeat(
@@ -3117,30 +3152,115 @@ export async function remoteSolverTick(
       active.length,
       active.reduce((sum, job) => sum + job.totalCases, 0),
     );
-    if (await processReusablePromiseEvidence(db, settings)) return;
-    if (active.length === 0) {
-      if (!allowEngineSubmission) {
-        await setStatus(
-          db,
-          "idle",
-          "storage admission is blocked; remote reconciliation continues but no new engine job will be submitted",
-        );
-        return;
-      }
-      const mirrored = await mirroredRemotePromiseIds(db, settings);
-      if (mirrored.length) {
-        await submitMirroredRemotePromise(db, engine, settings, mirrored[0]);
-      } else if (engineBackoffActive()) {
-        await setStatus(
-          db,
-          "error",
-          "remote solver is waiting for the shared engine connection backoff",
-        );
-      } else {
-        await claimRemoteWork(db, engine, settings);
-      }
-    }
+    if (await processReusablePromiseEvidence(db, settings)) return false;
+    return active.length === 0;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
+    return false;
   }
+}
+
+function remoteAdmissionHoldMessage(
+  reason: RemoteEngineAdmissionHoldReason,
+): string {
+  switch (reason) {
+    case "storage_pressure":
+      return "storage admission is blocked; remote reconciliation continues but no new engine job will be submitted";
+    case "safety_stop":
+      return "global admission safety stop is active; remote reconciliation continues but no new engine job will be submitted";
+    case "mesh_capability_unknown":
+      return "engine mesh-recovery capability is unavailable or malformed; remote reconciliation continues but no new engine job will be submitted";
+    case "higher_priority_fast_urans":
+      return "higher-priority FAST URANS owns this scheduler tick; the remote promise remains active for the next admission opportunity";
+    case "shared_capacity_full":
+      return "shared scheduler capacity is full; the remote promise remains active while local or FAST work drains";
+    case "engine_unavailable":
+      return "engine admission is unavailable; remote reconciliation continues but no new engine job will be submitted";
+  }
+}
+
+/** Attempt only the NEW-engine-work part of remote solving. Reconciliation is
+ * deliberately absent: callers run it once, early, then call this boundary
+ * only after the local FAST lane and capability gate have been evaluated. */
+export async function admitRemoteSolverTick(
+  db: DB,
+  engine: EngineClient,
+  decision: RemoteEngineAdmissionDecision,
+): Promise<boolean> {
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  try {
+    if (
+      !settings?.remoteSolverEnabled ||
+      !settings.upstreamBaseUrl ||
+      !settings.upstreamSecret
+    ) {
+      return false;
+    }
+    if (decision.kind === "hold") {
+      await setStatus(db, "idle", remoteAdmissionHoldMessage(decision.reason));
+      return false;
+    }
+    const meshRecoveryVersion = parsedMeshRecoveryVersion(
+      decision.meshRecoveryVersion,
+    );
+    if (meshRecoveryVersion == null) {
+      await setStatus(
+        db,
+        "idle",
+        remoteAdmissionHoldMessage("mesh_capability_unknown"),
+      );
+      return false;
+    }
+    if ((await activeRemoteJobs(db)).length > 0) return false;
+
+    const mirrored = await mirroredRemotePromiseIds(db, settings);
+    let outcome: RemotePromiseSubmitResult | null;
+    if (mirrored.length) {
+      outcome = await submitMirroredRemotePromise(
+        db,
+        engine,
+        settings,
+        mirrored[0],
+        meshRecoveryVersion,
+      );
+    } else if (engineBackoffActive()) {
+      await setStatus(
+        db,
+        "error",
+        "remote solver is waiting for the shared engine connection backoff",
+      );
+      return false;
+    } else {
+      outcome = await claimRemoteWork(
+        db,
+        engine,
+        settings,
+        meshRecoveryVersion,
+      );
+    }
+    // `busy` includes another owner already submitting the exact composed job.
+    // Conservatively consume this tick so no second engine admission races it.
+    return outcome?.kind === "submitted" || outcome?.kind === "busy";
+  } catch (e) {
+    await setStatus(db, "error", e instanceof Error ? e.message : String(e));
+    return false;
+  }
+}
+
+/** Compatibility wrapper for direct callers and focused remote-solver tests.
+ * Production orchestration uses the explicit two-phase functions above. */
+export async function remoteSolverTick(
+  db: DB,
+  engine: EngineClient,
+  decision: RemoteEngineAdmissionDecision = {
+    kind: "allow",
+    meshRecoveryVersion: 0,
+  },
+): Promise<boolean> {
+  if (!(await reconcileRemoteSolverTick(db, engine))) return false;
+  return admitRemoteSolverTick(db, engine, decision);
 }

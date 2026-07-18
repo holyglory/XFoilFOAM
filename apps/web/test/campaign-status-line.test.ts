@@ -7,10 +7,14 @@ import { describe, expect, it } from "vitest";
 
 import type { AdminCampaignSummary } from "../lib/admin";
 import {
+  campaignAutomaticFastCount,
+  campaignHubAdmissionStatusText,
+  campaignHubSchedulerStatusText,
   campaignInstrumentStatus,
   campaignStatusLine,
   gateFromSolverState,
   pausedCampaignStatusText,
+  reviewQueueOperationalState,
 } from "../components/admin/campaigns/campaign-status";
 
 function summary(overrides: {
@@ -26,6 +30,7 @@ function summary(overrides: {
   lastTickCompletedAt?: string | null;
   diskAdmissionBlocked?: boolean;
   diskAdmissionReason?: string | null;
+  admissionFenceActive?: boolean;
   failed?: number;
   rejected?: number;
   blocked?: number;
@@ -68,6 +73,7 @@ function summary(overrides: {
       lastTickCompletedAt: overrides.lastTickCompletedAt ?? null,
       diskAdmissionBlocked: overrides.diskAdmissionBlocked ?? false,
       diskAdmissionReason: overrides.diskAdmissionReason ?? null,
+      admissionFenceActive: overrides.admissionFenceActive ?? false,
     } as AdminCampaignSummary["scheduler"],
   } as AdminCampaignSummary;
 }
@@ -96,6 +102,72 @@ describe("campaignStatusLine — active gate", () => {
     );
     expect(line.tone).toBe("red");
     expect(line.text).toContain("Solver process is not running");
+  });
+});
+
+describe("CampaignsHub — admission-fence precedence", () => {
+  it("shows the critical safety stop before the generic disabled copy", () => {
+    const line = campaignHubAdmissionStatusText("admission_fenced", false);
+    expect(line).toMatch(/Safety stop/i);
+    expect(line).toMatch(/Running jobs continue/i);
+    expect(line).toMatch(
+      /engineering investigation is required before Resume/i,
+    );
+    expect(line).not.toMatch(/Sweeper disabled/i);
+    expect(campaignHubAdmissionStatusText("paused", false)).toMatch(
+      /Sweeper disabled/i,
+    );
+  });
+
+  it("ReviewStep emits one primary state: safety stop outranks engine unreachable", () => {
+    expect(
+      reviewQueueOperationalState({
+        processDead: false,
+        admissionFenceActive: true,
+        sweeperEnabled: false,
+        engineUnreachableSince: new Date().toISOString(),
+      }),
+    ).toBe("safety_stop");
+    expect(
+      reviewQueueOperationalState({
+        processDead: false,
+        admissionFenceActive: false,
+        sweeperEnabled: true,
+        engineUnreachableSince: new Date().toISOString(),
+      }),
+    ).toBe("engine_unreachable");
+    expect(
+      reviewQueueOperationalState({
+        processDead: true,
+        admissionFenceActive: true,
+        sweeperEnabled: false,
+        engineUnreachableSince: new Date().toISOString(),
+      }),
+    ).toBe("process_not_running");
+  });
+
+  it("keeps SAFETY STOP primary when the engine is also unreachable", () => {
+    const text = campaignHubSchedulerStatusText("admission_fenced", {
+      sweeperEnabled: false,
+      engineUnreachableSince: new Date().toISOString(),
+    });
+    expect(text).toMatch(/Safety stop/i);
+    expect(text).toMatch(
+      /engineering investigation is required before Resume/i,
+    );
+    expect(text).not.toMatch(/^Engine unreachable/i);
+    expect(
+      campaignHubSchedulerStatusText("engine_unreachable", {
+        sweeperEnabled: true,
+        engineUnreachableSince: new Date().toISOString(),
+      }),
+    ).toMatch(/^Engine unreachable/i);
+    expect(
+      campaignHubSchedulerStatusText("process_not_running", {
+        sweeperEnabled: false,
+        engineUnreachableSince: new Date().toISOString(),
+      }),
+    ).toMatch(/^Solver process is not running/i);
   });
 });
 
@@ -159,6 +231,35 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       tone: "amber",
     });
     expect(line.text).not.toMatch(/^Active/);
+  });
+
+  it("critical admission fence → red SAFETY STOP, never a misleading pause", () => {
+    const line = campaignStatusLine(
+      summary({
+        sweeperEnabled: false,
+        admissionFenceActive: true,
+        jobs: 2,
+      }),
+    );
+    expect(line.gate).toEqual({
+      text: "SAFETY STOP — critical solver outcome",
+      tone: "red",
+    });
+    expect(line.text).toMatch(/2 active jobs continue/i);
+    expect(line.text).toMatch(/new submissions are fenced/i);
+
+    const hero = campaignInstrumentStatus(
+      summary({
+        sweeperEnabled: false,
+        admissionFenceActive: true,
+        jobs: 2,
+      }),
+    );
+    expect(hero).toMatchObject({
+      title: "Solver safety stop",
+      tone: "red",
+      action: null,
+    });
   });
 
   it("engine unhealthy → red gate badge", () => {
@@ -270,6 +371,12 @@ describe("campaignInstrumentStatus — one truthful hero message", () => {
 });
 
 describe("gateFromSolverState — hub/backlog gate from the global derivation", () => {
+  it("maps the admission breaker to a red safety stop", () => {
+    expect(gateFromSolverState("admission_fenced")).toEqual({
+      text: "SAFETY STOP — critical solver outcome",
+      tone: "red",
+    });
+  });
   it("maps the blocking solver states to gate badges", () => {
     expect(gateFromSolverState("process_not_running")).toEqual({
       text: "BLOCKED — solver process not running",
@@ -393,7 +500,7 @@ describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () 
 });
 
 describe("campaignStatusLine — honest close record (completed branch)", () => {
-  it("does not expose internal attempt labels when the close recorded unavailable results", () => {
+  it("keeps legacy close counters in technical logs instead of a red campaign failure count", () => {
     const line = campaignStatusLine(
       summary({
         status: "completed",
@@ -401,11 +508,12 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
         closedWithRejectedCount: 0,
       }),
     );
-    expect(line.text).toBe("Completed — 2 unavailable results.");
-    expect(line.tone).toBe("red");
+    expect(line.text).toBe("Completed · evidence retained in Solver logs.");
+    expect(line.tone).toBe("amber");
+    expect(line.text).not.toMatch(/failed|rejected|unavailable/i);
   });
 
-  it("names both buckets when the close recorded failed AND rejected points", () => {
+  it("does not aggregate legacy failed and rejected counters into primary UI", () => {
     const line = campaignStatusLine(
       summary({
         status: "completed",
@@ -413,8 +521,8 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
         closedWithRejectedCount: 3,
       }),
     );
-    expect(line.text).toBe("Completed — 4 unavailable results.");
-    expect(line.text).not.toContain("rejected");
+    expect(line.text).toBe("Completed · evidence retained in Solver logs.");
+    expect(line.text).not.toMatch(/failed|rejected|4 unavailable/i);
   });
 
   it("never renders 'closed with 0 failed points' for a rejected-only close", () => {
@@ -425,7 +533,7 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
         closedWithRejectedCount: 3,
       }),
     );
-    expect(line.text).toBe("Completed — 3 unavailable results.");
+    expect(line.text).toBe("Completed · evidence retained in Solver logs.");
     expect(line.text).not.toContain("0 failed");
     expect(line.text).not.toContain("rejected");
   });
@@ -442,20 +550,23 @@ describe("campaignStatusLine — honest close record (completed branch)", () => 
   });
 });
 
-describe("campaignStatusLine — attention covers rejected points (legacy payloads without the split)", () => {
-  it("treats rejected points as unavailable, not a human-review obligation", () => {
+describe("campaignStatusLine — legacy result evidence stays technical", () => {
+  it("does not turn retained rejected RANS evidence into a red campaign failure", () => {
     const line = campaignStatusLine(
       summary({ status: "attention", rejected: 3, failed: 0 }),
     );
-    expect(line.tone).toBe("red");
-    expect(line.text).toBe("3 unavailable results; system recovery required.");
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe("Evidence retained · details in Solver logs.");
+    expect(line.text).not.toMatch(/failed|rejected|unavailable/i);
   });
 
-  it("conserves the combined unavailable count when both kinds exist", () => {
+  it("does not synthesize a primary failure count from mixed legacy statuses", () => {
     const line = campaignStatusLine(
       summary({ status: "attention", rejected: 2, failed: 1 }),
     );
-    expect(line.text).toBe("3 unavailable results; system recovery required.");
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe("Evidence retained · details in Solver logs.");
+    expect(line.text).not.toContain("3");
   });
 });
 
@@ -469,30 +580,46 @@ describe("campaignStatusLine — exhausted automatic recovery", () => {
       }),
     );
     expect(line.tone).toBe("red");
-    expect(line.text).toContain("3 critical result failures");
-    expect(line.text).toContain("system recovery required");
+    expect(line.text).toContain("3 critical recoveries exhausted");
+    expect(line.text).toContain("system investigation required");
     expect(line.text).not.toContain("machine-blocked");
   });
 });
 
-// Amendment-A split (approved design c19fd74a): red strictly for
-// needs-review evidence; an awaiting-URANS-only attention state is the calm
-// violet stage-2 queue — never a false red.
-describe("campaignStatusLine — attention with the reviewBuckets split", () => {
-  it("shows open preliminary URANS work as machine-owned, not human review", () => {
+// One-fidelity journey: only typed recovery exhaustion is red. Ordinary RANS
+// evidence with pending/running FAST URANS is the calm violet automatic stage.
+describe("campaignStatusLine — one automatic FAST-URANS handoff", () => {
+  it("uses one authoritative FAST count instead of adding compatibility views", () => {
+    expect(
+      campaignAutomaticFastCount({
+        automaticPrecalcOpen: 2,
+        reviewBuckets: { awaitingUrans: 3 },
+      }),
+    ).toBe(2);
+    expect(
+      campaignAutomaticFastCount({
+        automaticPrecalcOpen: 0,
+        reviewBuckets: { awaitingUrans: 3 },
+      }),
+    ).toBe(3);
+  });
+
+  it("MUST-CATCH: normal rejected/failed RANS evidence with pending FAST work is violet, never a red failure", () => {
     const line = campaignStatusLine(
       summary({
         status: "attention",
         rejected: 1,
+        failed: 1,
         reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
         tierCounts: { ransOpen: 0, precalcOpen: 1, verifyOpen: 0 },
       }),
     );
     expect(line.tone).toBe("violet");
-    expect(line.text).toBe("Fast URANS · 1 queued or running.");
+    expect(line.text).toBe("Awaiting FAST URANS · 1 point");
+    expect(line.text).not.toMatch(/failed|rejected|unavailable|review/i);
   });
 
-  it("legacy nonzero needsReview payload is unavailable, never human work", () => {
+  it("FAST URANS remains primary when a rolling payload also carries legacy evidence counters", () => {
     const line = campaignStatusLine(
       summary({
         status: "attention",
@@ -501,10 +628,9 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
         reviewBuckets: { awaitingUrans: 3, needsReview: 2 },
       }),
     );
-    expect(line.tone).toBe("red");
-    expect(line.text).toBe(
-      "2 unavailable results · 3 awaiting URANS; system investigation required.",
-    );
+    expect(line.tone).toBe("violet");
+    expect(line.text).toBe("Awaiting FAST URANS · 3 points");
+    expect(line.text).not.toMatch(/failed|unavailable|review/i);
   });
 
   it("MUST-CATCH: awaiting-URANS-only attention is VIOLET, never red, no 'review' wording", () => {
@@ -517,11 +643,11 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
       }),
     );
     expect(line.tone).toBe("violet");
-    expect(line.text).toBe("Fast URANS · 3 queued.");
+    expect(line.text).toBe("Awaiting FAST URANS · 3 points");
     expect(line.text).not.toContain("review");
   });
 
-  it("singular legacy wire count is unavailable", () => {
+  it("legacy wire evidence alone stays a compact non-critical technical state", () => {
     const line = campaignStatusLine(
       summary({
         status: "attention",
@@ -529,12 +655,11 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
         reviewBuckets: { awaitingUrans: 0, needsReview: 1 },
       }),
     );
-    expect(line.text).toBe(
-      "1 unavailable result; system investigation required.",
-    );
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe("Evidence retained · details in Solver logs.");
   });
 
-  it("empty split buckets describe unavailable evidence without assigning human review", () => {
+  it("empty split buckets never promote raw result.failed into red UI", () => {
     const line = campaignStatusLine(
       summary({
         status: "attention",
@@ -542,7 +667,8 @@ describe("campaignStatusLine — attention with the reviewBuckets split", () => 
         reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
       }),
     );
-    expect(line.tone).toBe("red");
-    expect(line.text).toBe("2 unavailable results; system recovery required.");
+    expect(line.tone).toBe("amber");
+    expect(line.text).toBe("Evidence retained · details in Solver logs.");
+    expect(line.text).not.toMatch(/failed|critical/i);
   });
 });

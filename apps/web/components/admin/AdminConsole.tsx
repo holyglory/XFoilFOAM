@@ -842,7 +842,6 @@ export function AdminConsole() {
               }
               onOpenCampaign={openCampaign}
               onOpenSimulations={() => navigate({}, "push")}
-              onOpenPoints={openCampaignPoints}
             />
           )}
           {section === "health" && <HealthPanel />}
@@ -4749,13 +4748,11 @@ function QueueDashboard({
   onTabChange,
   onOpenCampaign,
   onOpenSimulations,
-  onOpenPoints,
 }: {
   tab: SolverTab;
   onTabChange: (t: SolverTab) => void;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
-  onOpenPoints: (campaignId: string, status: CampaignPointsBucket) => void;
 }) {
   const [queue, setQueue] = useState<AdminQueue | null>(null);
   const [engineSetup, setEngineSetup] = useState<AdminSimulationSetup | null>(
@@ -4875,7 +4872,6 @@ function QueueDashboard({
   const externalPromises = queue?.externalPromises ?? [];
   const activeJobs = queue?.activeJobs ?? [];
   const finishedJobs = queue?.finishedJobs ?? [];
-  const failed = queue?.results?.failed ?? 0;
   const staleCount = activeJobs.filter((job) => job.stale).length;
   const engineQueue = queue?.engineQueue;
   const duplicateCount = Object.keys(engineQueue?.duplicates ?? {}).length;
@@ -4930,6 +4926,10 @@ function QueueDashboard({
     diskFreeBytes: sw?.diskFreeBytes ?? null,
     diskRequiredFreeBytes: sw?.diskRequiredFreeBytes ?? null,
     diskCheckedAt: sw?.diskCheckedAt ?? null,
+    admissionFenceActive: sw?.admissionFenceActive ?? false,
+    lastAdmissionFenceAt: sw?.lastAdmissionFenceAt ?? null,
+    lastAdmissionFenceReason: sw?.lastAdmissionFenceReason ?? null,
+    lastAdmissionFenceDetails: sw?.lastAdmissionFenceDetails ?? null,
   });
   const processDead = solver.state === "process_not_running";
   const toneColor =
@@ -5190,41 +5190,21 @@ function QueueDashboard({
             </div>
           )}
 
-          {/* ---- at most two attention chips ---- */}
-          {(failed > 0 || pendingSweepsTotal > 0) && (
+          {/* Generic result.status=failed includes retained screening evidence.
+              It remains available in technical job history, never promoted as
+              a red user-facing point failure. Typed campaign recovery hazards
+              surface through the safety fence and critical counters instead. */}
+          {pendingSweepsTotal > 0 && (
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {failed > 0 && (
-                <button
-                  type="button"
-                  data-testid="attention-inspect-failed"
-                  onClick={() => onTabChange("points")}
-                  style={{
-                    ...ghostBtn,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 7,
-                    color: C.amber,
-                    borderColor: "rgba(245, 165, 36, 0.45)",
-                    padding: "6px 11px",
-                    fontSize: 11,
-                  }}
-                >
-                  {failed.toLocaleString()} failed result
-                  {failed === 1 ? "" : "s"} · inspect evidence
-                </button>
-              )}
-              {pendingSweepsTotal > 0 && (
-                <button
-                  type="button"
-                  data-testid="attention-background-pending"
-                  onClick={() => onTabChange("background")}
-                  style={{ ...ghostBtn, padding: "6px 11px", fontSize: 11 }}
-                >
-                  {pendingSweepsTotal.toLocaleString()} background sweep
-                  {pendingSweepsTotal === 1 ? "" : "s"} pending · view
-                  Background
-                </button>
-              )}
+              <button
+                type="button"
+                data-testid="attention-background-pending"
+                onClick={() => onTabChange("background")}
+                style={{ ...ghostBtn, padding: "6px 11px", fontSize: 11 }}
+              >
+                {pendingSweepsTotal.toLocaleString()} background sweep
+                {pendingSweepsTotal === 1 ? "" : "s"} pending · view Background
+              </button>
             </div>
           )}
 
@@ -5234,7 +5214,6 @@ function QueueDashboard({
               gate={gateFromSolverState(solver.state)}
               onOpenCampaign={onOpenCampaign}
               onOpenSimulations={onOpenSimulations}
-              onOpenPoints={onOpenPoints}
             />
           )}
 
@@ -5883,7 +5862,6 @@ function CampaignBacklogStrip({
   gate,
   onOpenCampaign,
   onOpenSimulations,
-  onOpenPoints,
 }: {
   strip: AdminQueueBacklogStrip;
   /** Scheduler gate from the SAME deriveSolverState the banner uses — the
@@ -5891,7 +5869,6 @@ function CampaignBacklogStrip({
   gate: CampaignGate | null;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
-  onOpenPoints: (campaignId: string, status: CampaignPointsBucket) => void;
 }) {
   const gap = strip.backgroundGapFill;
   return (
@@ -5992,35 +5969,14 @@ function CampaignBacklogStrip({
                   {c.runningPoints.toLocaleString()} points solving
                 </span>
               )}
-              {/* Non-zero failed counts link to the Points explorer filtered
-                  to this campaign; zero counts never render. */}
-              {c.failedPoints > 0 && (
-                <button
-                  type="button"
-                  data-testid={`backlog-failed-link-${c.slug}`}
-                  title="Open these solver failures in the Points explorer"
-                  onClick={() => onOpenPoints(c.id, "failed")}
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 11,
-                    color: C.redText,
-                    background: "transparent",
-                    border: "none",
-                    padding: 0,
-                    cursor: "pointer",
-                    textDecoration: "underline",
-                  }}
-                >
-                  {c.failedPoints.toLocaleString()} failed
-                </button>
-              )}
               {(c.blockedPoints ?? 0) > 0 && (
                 <span
                   data-testid={`backlog-blocked-${c.slug}`}
-                  title="Automatic URANS recovery exhausted; this is a critical system incident requiring investigation"
+                  title="Automatic recovery exhausted; this is a critical system incident requiring investigation"
                   style={{ color: C.redText }}
                 >
-                  {(c.blockedPoints ?? 0).toLocaleString()} critical
+                  {(c.blockedPoints ?? 0).toLocaleString()} critical recover
+                  {(c.blockedPoints ?? 0) === 1 ? "y" : "ies"} exhausted
                 </span>
               )}
               {c.status !== "active" && (

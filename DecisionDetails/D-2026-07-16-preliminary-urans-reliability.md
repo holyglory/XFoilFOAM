@@ -28,9 +28,12 @@ truthful critical terminal incident. Continuing an already-started exact final
 attempt may resume that exact saved state; it does not create a new path around
 the preliminary result.
 
-Once one angle's RANS parent is terminal, its preliminary handoff is eligible
-for the next free solver slot ahead of unrelated new RANS backlog. It does not
-wait for every RANS gap in a large campaign to close.
+Once one angle's RANS parent is terminal, every due preliminary handoff takes
+the next free solver slot ahead of unrelated new RANS backlog. The durable
+preliminary-obligation ledger is the scheduling authority; the controller does
+not depend on process-local alternation or rediscover the route only through a
+bounded finished-parent window. It therefore remains first after a scheduler
+restart and does not wait for every RANS gap in a large campaign to close.
 
 An accepted preliminary point also owes final verification while the campaign
 continues. Final URANS remains lower priority than conditional whole-polar
@@ -148,12 +151,118 @@ re-estimated cadence from the deliberately cropped three-period
 even though the full merged evidence was healthy.
 
 Preliminary early-stop certification now keeps the existing half-cycle margin
-*after* the four-period independent-half floor, for 4.5 monitor periods.
+_after_ the four-period independent-half floor, for 4.5 monitor periods.
 Continuation cadence and its diagnostics use the same merged, post-startup
 coefficient window as live grading, with compact `ForceHistory` only as an
 in-flight fallback. Regression evidence covers a two-percent monitor-period
 undercut and multi-segment merged history; neither change relaxes the stable
 period, density, trend, amplitude, or final-verification gates.
+
+## Durable priority and automatic NEW-admission fence
+
+The old recovery pass combined process-local RANS/PRECALC alternation with a
+bounded finished-parent scan. In production, a due preliminary obligation whose
+source parent ranked 53 in that legacy scan could remain behind unrelated RANS;
+restarting the scheduler cleared only the in-memory turn and reconstructed the
+same starvation. Due campaign-owned preliminary obligations are now selected
+first from their durable obligation and ownership rows, ordered by their saved
+due time, before legacy discovery. At most one physical child is still admitted
+per tick, but every due fast-URANS handoff strictly outranks unrelated new RANS
+and the rule survives a process restart.
+
+A physical RANS parent may be shared background work with no campaign id, or
+may have been launched for a different owner before the current campaign
+requested the same immutable cell. That does not strand the new campaign's
+handoff. Scheduling pins the exact source result-attempt ids from the
+obligation, retains the physical parent as provenance, and carries the active
+beneficiary campaign separately for pause, cancellation, release, and
+generation gates. The resulting child therefore solves only the owed angle and
+cannot widen its scope from unrelated rejected attempts on the same parent.
+
+Mesh-recovery capability is also an admission prerequisite. A successful
+legacy health response that truthfully omits the version maps to supported
+version 0, but an unavailable or malformed probe is unknown. Unknown does not
+coerce to version 0: it holds all local NEW admission, including unrelated
+RANS, until capability can be established. Reconciliation, ingestion,
+retention, and already-running jobs remain live.
+
+The same priority applies when this instance is solving a mirrored remote
+promise. Remote reconciliation and delivery remain active, but a new mirrored
+RANS claim cannot jump ahead of a due local FAST obligation. Once admitted, the
+remote request pins the exact advertised mesh-recovery version in both its
+engine request and durable payload; malformed or unavailable capability holds
+that new request instead of guessing a legacy version.
+
+A rare current-generation solver hazard also owns a durable global circuit
+breaker for NEW admission. An open critical incident, blocked/exhausted
+preliminary obligation, blocked final-verification item, blocked URANS request,
+or blocked current-generation campaign progress atomically latches the sweeper
+off, saves the prior capacity, and sets physical admission to zero. The detector
+joins the active campaign's exact current condition generation and unreleased
+physical points, so a legacy-generation incident or blocked ledger cannot trip
+the current release. A detector error fails closed for new submissions only.
+
+The breaker is not a campaign cancellation and does not stop already-accepted
+OpenFOAM work. Reconciliation, partial and terminal ingestion, retention,
+remote-state processing, storage measurement, and heartbeats continue while it
+is latched. An operator Resume restores the saved capacity and clears the latch,
+but the scheduler checks the durable hazard before reconciliation and again
+after reconciliation, before either local or remote admission. If the hazard
+still exists, the same tick immediately re-trips the latch without admitting
+one job past it. This makes Resume an investigation acknowledgement, not a way
+to bypass an unresolved critical outcome.
+
+A newer deterministic mesh strategy is part of that live reconciliation path,
+not a bypass around the admission stop. While the latch remains closed, one
+maintenance pass may reopen only obligations whose newest immutable
+deterministic failure was produced by an older acknowledged strategy. It
+atomically resolves only the matching deterministic-mesh incident occurrence;
+another controller/runtime incident attached to the same job or attempt stays
+open. A same or malformed capability is a no-op, an older attempt cannot make a
+newer failed strategy eligible again, and the maintenance tick submits no
+solver work. The operator still performs an explicit Resume after the repaired
+ledger no longer contains a current hazard.
+
+The tick-level checks are not the final admission boundary. Every local,
+ladder, and remote path converges on one submit lifecycle guard. Immediately
+before the external engine submission, that guard locks the singleton sweeper
+state row, reruns the exact current-generation hazard detector, and retains the
+lock through the bounded engine acceptance call. Transition-only database
+triggers on the five durable hazard owners take that same lock before their
+transactions may commit. If the hazard owns the lock first, the waiting
+submitter observes it and never calls the engine. If the submitter owns it
+first, that already-accepted job is ordered before the hazard and every later
+submission is fenced. If engine acceptance succeeds but the admission
+transaction cannot commit, the exact accepted engine id is cancelled
+compensatingly rather than becoming an unowned job.
+
+Operator state writes use the same singleton lock: capacity-only edits update
+the saved post-investigation configuration while the physical gate remains
+zero, and only an explicitly supplied `enabled=true` Resume clears the latch.
+The public sweeper status exposes that a safety stop is active but omits
+campaign, incident, request, obligation, and error provenance; the
+authenticated admin read model retains those exact diagnostics.
+
+The owner row is not the only way a hazard becomes current. Campaign resume,
+condition-generation cutover, condition or point activation, and attaching
+campaign ownership or incident attribution can activate an already-blocked
+owner without changing that owner. Those predicate-enabling transitions take
+the same singleton lock as terminal owner transitions and the final submit
+permit. Campaign-point materialization uses one statement-level lock rather
+than one lock per point, preserving set-based launch behavior while keeping the
+commit/submit order unambiguous. A local submission also rechecks the global
+enabled state at that final boundary, so Pause cannot lose a race after the
+tick's earlier state read. Shared local/remote deployments reserve real shared
+capacity for due FAST work before admitting mirrored RANS; a deliberately
+remote-only deployment retains its separate admission policy.
+
+The exact one-shot recovery canary is an explicit third admission lane rather
+than a test-only exception or remote-work disguise. It may cross the final
+permit only while the ordinary scheduler is disabled and both durable capacity
+values are exactly zero. The lane is never inferred from a job payload, still
+holds the singleton lock through engine acceptance, and still reruns the same
+hazard detector. Enabling the scheduler or opening either capacity value makes
+the canary fail closed; ordinary local work remains forbidden while paused.
 
 ## Mixed-version release gate
 
@@ -205,6 +314,9 @@ does not stop or recreate the Python gateway or OpenFOAM worker. Keep the
 pinned campaign generation administratively frozen until the final receipt is
 terminal; if it changes, the next invocation refuses instead of retargeting.
 No other one-shot command or direct database writer may run in that window.
+The CLI's physical submit uses only the explicit `operator_canary` admission
+lane described above; it cannot silently reopen or borrow ordinary scheduler
+capacity.
 
 The canary's closed-world incident fence is deliberately target-scoped.
 Pre-existing legacy incidents and obligations that do not own the pinned
@@ -304,6 +416,32 @@ terminal attempt, canonical result, and classification regimes to agree, and
 still rejects any other regime. Unit must-catch variants cover accepted
 no-shedding preliminary and final generations, impossible regimes, and
 attempt/result/classification disagreement.
+
+The no-shedding audit correction is deployed on the r7 production control
+plane. The distinct 20-32C/Re≈102k/α14° target then published accepted
+preliminary and final generations. Final attempt
+`4ddfced4-bc75-477b-b238-83419f7a1737` is the canonical accepted
+`openfoam.urans`/`urans_full` generation of result
+`6be88006-5c03-46cb-b93e-7f868eb416c3`. Its real coefficient difference from
+the fast estimate correctly settled verification queue item
+`e2c74733-606b-4bc6-8f26-c6ea7610fe67` as the non-critical `disagreed` state.
+The attempt owns 24 stored default-media artifacts and a verified
+1,660,050,186-byte GCS Zstandard archive. The exact closed-world terminal
+receipt
+`/opt/airfoils-pro/audits/three-stage-urans-22c0d3f-r7-aoa14/20260717T224614Z-terminal.json`
+returned `action=completed`, `stage=complete`, and no critical incident.
+Durable scheduling remains fenced at `enabled=false`,
+`max_concurrent_jobs=0`, and `cpu_slots=0` with zero in-flight jobs while the
+restart-safe scheduling, automatic-admission-breaker, and per-point UI changes
+are verified and deployed. The α14° solver canary is complete; the overall
+rollout is not complete until bounded campaign burn-in passes.
+
+Before that continuation, the lock-aware render-hydration cleanup removed
+27,940,933,608 bytes across 550 temporary cache entries and left
+12,865,912,411 bytes. The 2026-07-18 measured VPS state is 76% used with
+121 GiB free. The cleanup used the evidence-store locks and removed no
+canonical result, solver evidence, GCS object, raw unarchived case, database
+row, or immutable provenance.
 
 Invoke once to admit or observe preliminary work. After that exact job is
 terminal and reconciled, repeat the same exclusive one-shot invocation to
@@ -440,8 +578,27 @@ Regression coverage must prove:
 - source-proven non-stationarity adds a three-period corrective tail only after
   K is satisfied, with a false-positive guard for ordinary shortfall;
 - blocked restartable attempts remain protected from destructive retention;
+- an already-durable due preliminary obligation is selected ahead of unrelated
+  new RANS even when its parent would rank 53 beyond the legacy scan window,
+  and the same ordering holds after a sweeper restart;
+- a campaign-owned obligation sourced from a background/null-campaign parent
+  honors the beneficiary lifecycle, pins only its exact source attempt and
+  angle, and does not rewrite the physical parent's provenance;
+- unavailable or malformed mesh capability holds every local NEW submission
+  without stopping reconciliation or coercing the engine to legacy version 0;
 - a pending final-verification point is admitted after no more than eight new
   wave-1 RANS admissions, and the fairness proof survives a sweeper restart;
+- a current-generation critical or exhausted preliminary/final ledger
+  atomically latches NEW admission closed while reconciliation, ingestion, and
+  retention continue; an operator resume restores saved capacity but re-trips
+  before submission when the hazard remains, while an otherwise identical
+  legacy-generation hazard does not trip the latch;
+- the same hazard is caught at the actual local and remote engine-submit
+  boundary even when it commits after the tick-level check; a concurrent
+  capacity edit cannot clear the row-locked latch, and only explicit Resume
+  can do so;
+- public sweeper status reports the safety-stop state without internal
+  campaign/incident provenance, while the authenticated admin DTO retains it;
 - exact and whole-polar admin final requests own the ordinary PRECALC plus
   verification children, never submit a direct full bypass, and settle only
   after every owned child settles;

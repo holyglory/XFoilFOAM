@@ -80,14 +80,9 @@ function SolverStageNode({
 
 function FastStageIcon({
   state,
-  recoveredByFinal,
 }: {
   state: AdminCampaignPreliminaryFastState;
-  recoveredByFinal: boolean;
 }) {
-  if (recoveredByFinal) {
-    return <Info size={16} strokeWidth={1.9} aria-hidden />;
-  }
   if (state === "critical") {
     return <ShieldAlert size={16} strokeWidth={1.9} aria-hidden />;
   }
@@ -269,6 +264,7 @@ export function PreliminaryOutcomePanel({
           letter-spacing: 0.04em;
           line-height: 1.25;
           color: ${C.text};
+          white-space: nowrap;
         }
         .shared-stage small {
           display: block;
@@ -361,13 +357,14 @@ export function PreliminaryOutcomePanel({
           min-width: 0;
           display: grid;
           grid-template-columns:
-            20px minmax(20px, 1fr) 20px minmax(20px, 1fr)
-            20px;
+            44px minmax(12px, 1fr) 44px minmax(12px, 1fr)
+            44px;
           align-items: center;
         }
         .stage-node {
-          width: 20px;
-          height: 20px;
+          position: relative;
+          width: 44px;
+          height: 44px;
           display: inline-grid;
           place-items: center;
           border-radius: 999px;
@@ -381,7 +378,21 @@ export function PreliminaryOutcomePanel({
           cursor: pointer;
         }
         button.stage-node:hover {
+          background: transparent;
+        }
+        button.stage-node:hover::before {
+          content: "";
+          position: absolute;
+          inset: 9px;
+          z-index: 0;
+          border-radius: 999px;
           background: ${C.panel3};
+        }
+        .stage-node > svg,
+        .stage-node > .final-icon-stack,
+        .stage-node > .sr-only {
+          position: relative;
+          z-index: 1;
         }
         button.stage-node:focus-visible {
           outline: 2px solid ${C.teal};
@@ -468,13 +479,36 @@ export function PreliminaryOutcomePanel({
           background: transparent;
           border-top: 1px dashed ${C.dimmer};
         }
+        .row-result {
+          min-width: 0;
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 6px;
+          text-align: right;
+        }
         .row-status {
           min-width: 0;
           font-family: ${MONO};
           font-size: 10px;
           font-weight: 700;
-          text-align: right;
           white-space: normal;
+        }
+        .system-incident-marker {
+          flex: 0 0 auto;
+          display: inline-flex;
+          align-items: center;
+          gap: 3px;
+          padding: 2px 4px;
+          border: 1px solid color-mix(in srgb, ${C.red} 55%, ${C.border});
+          border-radius: 999px;
+          font-family: ${MONO};
+          font-size: 7.5px;
+          font-weight: 800;
+          letter-spacing: 0.055em;
+          line-height: 1;
+          color: ${C.red};
+          white-space: nowrap;
         }
         .row-status.teal {
           color: ${C.teal};
@@ -494,6 +528,7 @@ export function PreliminaryOutcomePanel({
         }
         .diagnostics {
           min-width: 0;
+          justify-self: end;
           font-family: ${MONO};
           font-size: 9.5px;
           color: ${C.dim};
@@ -523,7 +558,12 @@ export function PreliminaryOutcomePanel({
         }
         .diagnostics[open] {
           grid-column: 1 / -1;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr);
           width: 100%;
+        }
+        .diagnostics[open] > summary {
+          justify-self: end;
         }
         .diagnostics[open] > summary svg:last-child {
           transform: rotate(180deg);
@@ -768,7 +808,7 @@ export function PreliminaryOutcomePanel({
                scrollable. */
             padding-right: 4px;
           }
-          .row-status {
+          .row-result {
             grid-column: 2;
             grid-row: 2;
             justify-self: end;
@@ -796,10 +836,10 @@ export function PreliminaryOutcomePanel({
             className="handoff-counts"
             data-testid="cell-preliminary-current-counts"
             aria-live="polite"
-            aria-label={`Current states: ${currentCounts?.active ?? 0} active, ${currentCounts?.ransAccepted ?? 0} RANS accepted, ${currentCounts?.fastReady ?? 0} fast ready, ${currentCounts?.verified ?? 0} verified, ${currentCounts?.critical ?? 0} critical`}
-            title="Mutually exclusive current-state totals"
+            aria-label={`Result and incident facets: ${currentCounts?.active ?? 0} active, ${currentCounts?.ransAccepted ?? 0} RANS accepted, ${currentCounts?.fastReady ?? 0} fast ready, ${currentCounts?.verified ?? 0} verified, ${currentCounts?.critical ?? 0} critical`}
+            title="Result availability and active-work totals; critical incidents can overlap"
           >
-            <span className="label">CURRENT</span>
+            <span className="label">STATUS</span>
             {(currentCounts?.active ?? 0) > 0 && (
               <span className="active">
                 {fCount(currentCounts?.active ?? 0)} active
@@ -834,7 +874,7 @@ export function PreliminaryOutcomePanel({
         <div
           className="shared-rail"
           data-testid="cell-preliminary-handoff-rail"
-          aria-label="RANS screen: an accepted RANS result stops here; RANS non-convergence is a normal handoff, fast preliminary URANS starts automatically, then final verified URANS"
+          aria-label="RANS screen, normal handoff to fast preliminary URANS, then final verified URANS"
         >
           <div className="shared-stage" data-flow-stage="rans">
             <CircleDot size={15} strokeWidth={1.8} aria-hidden />
@@ -850,7 +890,7 @@ export function PreliminaryOutcomePanel({
               title="accepted RANS stops here"
             >
               <CheckCircle2 size={11} strokeWidth={2} />
-              <small>result</small>
+              <small>accepted</small>
             </span>
             <span
               className="flow-exit handoff"
@@ -858,14 +898,14 @@ export function PreliminaryOutcomePanel({
               title="RANS non-convergence is a normal handoff; fast URANS starts automatically"
             >
               <ArrowRight size={11} strokeWidth={2} />
-              <small>if needed</small>
+              <small>normal handoff</small>
             </span>
           </div>
           <div className="shared-stage" data-flow-stage="fast">
             <CircleDot size={15} strokeWidth={1.8} aria-hidden />
             <span>
-              <strong>URANS</strong>
-              <small>fast</small>
+              <strong>FAST URANS</strong>
+              <small>preliminary</small>
             </span>
           </div>
           <span className="shared-arrow">
@@ -874,8 +914,8 @@ export function PreliminaryOutcomePanel({
           <div className="shared-stage" data-flow-stage="final">
             <ShieldCheck size={15} strokeWidth={1.8} aria-hidden />
             <span>
-              <strong>URANS</strong>
-              <small>final</small>
+              <strong>FINAL URANS</strong>
+              <small>verify</small>
             </span>
           </div>
         </div>
@@ -959,6 +999,8 @@ export function PreliminaryOutcomePanel({
                 className={`outcome-row ${rowClass}`}
                 data-testid={`cell-preliminary-outcome-${item.aoaDeg}`}
                 data-current-stage={currentStage}
+                data-rans-stage={view.ransStage}
+                data-critical-stage={view.incidentStage ?? undefined}
               >
                 <span className="angle">
                   {label}
@@ -971,7 +1013,7 @@ export function PreliminaryOutcomePanel({
                   className="row-track"
                   role="group"
                   data-testid={`cell-preliminary-track-${item.aoaDeg}`}
-                  aria-label={`${label}: RANS ${view.ransLabel.toLowerCase()}, fast URANS ${view.fastLabel.toLowerCase()}, final URANS ${view.finalLabel.toLowerCase()}`}
+                  aria-label={`${label}: RANS ${view.ransLabel.toLowerCase()}, ${view.ransProvenanceLabel}; fast URANS ${view.fastLabel.toLowerCase()}, ${view.fastProvenanceLabel}; final URANS ${view.finalLabel.toLowerCase()}, ${view.finalProvenanceLabel}`}
                 >
                   <SolverStageNode
                     className={`stage-node ${
@@ -1013,11 +1055,7 @@ export function PreliminaryOutcomePanel({
                     aria-hidden
                   />
                   <SolverStageNode
-                    className={`stage-node ${
-                      view.fastRecoveredByFinal
-                        ? "comparison-warning"
-                        : view.fastState
-                    }`}
+                    className={`stage-node ${view.fastState}`}
                     testId={`cell-preliminary-fast-${item.aoaDeg}`}
                     current={currentStage === "fast"}
                     title={
@@ -1042,10 +1080,7 @@ export function PreliminaryOutcomePanel({
                         : undefined
                     }
                   >
-                    <FastStageIcon
-                      state={view.fastState}
-                      recoveredByFinal={view.fastRecoveredByFinal}
-                    />
+                    <FastStageIcon state={view.fastState} />
                     <span className="sr-only">{view.fastLabel}</span>
                   </SolverStageNode>
                   <span
@@ -1112,29 +1147,37 @@ export function PreliminaryOutcomePanel({
                   </SolverStageNode>
                 </div>
 
-                <span
-                  className={`row-status ${view.statusTone}`}
+                <div
+                  className="row-result"
+                  role="group"
                   aria-label={
                     view.critical
-                      ? `${view.statusLabel}; system investigation required`
+                      ? `${view.statusLabel}; ${view.incidentLabel}; system-owned incident; engineering investigation required`
                       : view.statusLabel
                   }
-                  title={
-                    view.critical
-                      ? "System-owned incident; automatic investigation required"
-                      : undefined
-                  }
                 >
-                  {view.statusLabel}
-                </span>
+                  <span className={`row-status ${view.statusTone}`}>
+                    {view.statusLabel}
+                  </span>
+                  {view.incidentLabel && (
+                    <span
+                      className="system-incident-marker"
+                      data-testid={`cell-preliminary-incident-${item.aoaDeg}`}
+                      title={`${view.incidentLabel}; system-owned incident; engineering investigation required`}
+                    >
+                      <ShieldAlert size={10} strokeWidth={2.2} aria-hidden />
+                      SYSTEM
+                    </span>
+                  )}
+                </div>
 
                 <details
                   className="diagnostics"
                   data-testid={`cell-preliminary-diagnostics-${item.aoaDeg}`}
                 >
                   <summary
-                    aria-label={`Technical details for ${label}`}
-                    title={`Technical details for ${label}`}
+                    aria-label={`Stage evidence for ${label}`}
+                    title={`Stage evidence for ${label}`}
                   >
                     <Info size={13} strokeWidth={1.7} aria-hidden />
                     <ChevronDown size={11} strokeWidth={1.7} aria-hidden />
@@ -1175,15 +1218,7 @@ export function PreliminaryOutcomePanel({
                         <span className="detail-stage-copy">
                           <strong>RANS SCREEN</strong>
                           <span>{view.ransLabel}</span>
-                          <small>
-                            {view.ransAcceptedResult
-                              ? "result"
-                              : ransDidHandoff
-                                ? "automatic handoff"
-                                : view.critical
-                                  ? "screening stopped"
-                                  : "screening"}
-                          </small>
+                          <small>{view.ransProvenanceLabel}</small>
                         </span>
                       </div>
                       <div className="stage-evidence" data-detail-stage="fast">
@@ -1199,25 +1234,12 @@ export function PreliminaryOutcomePanel({
                           }`}
                           aria-hidden
                         >
-                          <FastStageIcon
-                            state={view.fastState}
-                            recoveredByFinal={view.fastRecoveredByFinal}
-                          />
+                          <FastStageIcon state={view.fastState} />
                         </span>
                         <span className="detail-stage-copy">
                           <strong>URANS FAST</strong>
                           <span>{view.fastLabel}</span>
-                          <small>
-                            {view.fastState === "accepted"
-                              ? "preliminary result"
-                              : view.fastState === "critical"
-                                ? "result missing"
-                                : view.fastState === "running"
-                                  ? "automatic solve"
-                                  : view.ransAcceptedResult
-                                    ? "not needed"
-                                    : "automatic next"}
-                          </small>
+                          <small>{view.fastProvenanceLabel}</small>
                         </span>
                       </div>
                       <div className="stage-evidence" data-detail-stage="final">
@@ -1242,17 +1264,7 @@ export function PreliminaryOutcomePanel({
                         <span className="detail-stage-copy">
                           <strong>URANS FINAL</strong>
                           <span>{view.finalLabel}</span>
-                          <small>
-                            {view.finalState === "accepted"
-                              ? "verified result"
-                              : view.finalState === "critical"
-                                ? "result missing"
-                                : view.finalState === "running"
-                                  ? "verification"
-                                  : view.ransAcceptedResult
-                                    ? "not needed"
-                                    : "background final"}
-                          </small>
+                          <small>{view.finalProvenanceLabel}</small>
                         </span>
                       </div>
                     </div>
@@ -1260,9 +1272,9 @@ export function PreliminaryOutcomePanel({
                       <div className="incident-banner" role="alert">
                         <ShieldAlert size={15} strokeWidth={1.9} aria-hidden />
                         <strong>
-                          SYSTEM INCIDENT · INVESTIGATION REQUIRED
+                          SYSTEM INCIDENT · ENGINEERING INVESTIGATION REQUIRED
                         </strong>
-                        <span>{view.statusLabel}</span>
+                        <span>{view.incidentLabel ?? view.statusLabel}</span>
                       </div>
                     )}
                     <details className="technical-evidence">

@@ -243,9 +243,9 @@ export function stageEta(input: {
 // ---------------------------------------------------------------------------
 // One-line stats summary (the stats wall collapsed to a single line)
 // ---------------------------------------------------------------------------
-/** "1,240 done · 12 solving · 96 awaiting URANS · 402 open of 1,750" — zero
- *  parts are omitted (never "0 solving" noise); done and the total always
- *  render. */
+/** "1,240 done · 12 solving · 96 awaiting FAST URANS · 402 open of 1,750" —
+ * zero parts are omitted (never "0 solving" noise); done and the total always
+ * render. */
 export function progressSummaryLine(
   seg: ProgressBarSegments,
   requested: number,
@@ -253,7 +253,7 @@ export function progressSummaryLine(
   const parts = [`${fCount(seg.doneCount)} done`];
   if (seg.solvingCount > 0) parts.push(`${fCount(seg.solvingCount)} solving`);
   if (seg.awaitingCount > 0)
-    parts.push(`${fCount(seg.awaitingCount)} awaiting URANS`);
+    parts.push(`${fCount(seg.awaitingCount)} awaiting FAST URANS`);
   if (seg.blockedCount > 0) parts.push(`${fCount(seg.blockedCount)} critical`);
   parts.push(`${fCount(seg.openCount)} open of ${fCount(requested)}`);
   return parts.join(" · ");

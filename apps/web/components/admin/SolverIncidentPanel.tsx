@@ -23,12 +23,22 @@ function IncidentRow({
   index: number;
 }) {
   const view = solverIncidentView(group, threshold);
+  const signalKind =
+    view.tone === "critical"
+      ? "alert"
+      : view.tone === "resolved" && group.stage === "final"
+        ? "resolved-final"
+        : group.stage === "rans"
+          ? "repair"
+          : "activity";
   const SignalIcon =
-    group.stage === "rans"
-      ? Wrench
-      : group.stage === "preliminary"
-        ? Activity
-        : ShieldCheck;
+    signalKind === "alert"
+      ? ShieldAlert
+      : signalKind === "resolved-final"
+        ? ShieldCheck
+        : signalKind === "repair"
+          ? Wrench
+          : Activity;
   return (
     <div
       className={`solver-incident-row is-${view.tone}`}
@@ -38,7 +48,11 @@ function IncidentRow({
       data-status={view.tone}
       aria-label={view.ariaLabel}
     >
-      <span className="solver-incident-signal" aria-hidden="true">
+      <span
+        className="solver-incident-signal"
+        data-signal={signalKind}
+        aria-hidden="true"
+      >
         <SignalIcon size={16} strokeWidth={1.8} />
       </span>
       <span className="solver-incident-stage">

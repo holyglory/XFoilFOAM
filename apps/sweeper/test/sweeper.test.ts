@@ -592,8 +592,8 @@ beforeAll(async () => {
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: false })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: false } });
+    .values({ id: 1, enabled: true })
+    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
   await ensureTestSetup();
 });
 
@@ -1758,9 +1758,8 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(
       enrichedAttempts.map(
         (attempt) =>
-          (
-            attempt.evidencePayload as Record<string, unknown>
-          ).mesh_recovery_version,
+          (attempt.evidencePayload as Record<string, unknown>)
+            .mesh_recovery_version,
       ),
     ).toEqual([1, 1, 1]);
     await ingestResult({
@@ -1810,7 +1809,7 @@ describe("sweeper: gap → claim → ingest", () => {
           eq(results.simulationPresetRevisionId, presetRevisionId),
           eq(results.aoaDeg, aoa),
         ),
-    );
+      );
     const [job] = await db
       .insert(simJobs)
       .values({

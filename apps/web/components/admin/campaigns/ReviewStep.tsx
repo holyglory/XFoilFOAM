@@ -33,6 +33,7 @@ import {
   type NumericsProfileRow,
 } from "./NumericsQuickCreate";
 import { resolveNumericsDefault } from "./numerics-resolution";
+import { reviewQueueOperationalState } from "./campaign-status";
 import {
   formatUransMeshDisclosureValue,
   formatUransMeshReviewSummary,
@@ -324,6 +325,14 @@ export function ReviewStep({
     !needsConfirm ||
     (name.trim().length > 0 && confirmText.trim() === name.trim());
   const allSolved = preview?.status === "ok" && preview.allSolved;
+  const queueOperationalState = queue
+    ? reviewQueueOperationalState({
+        processDead: isProcessDead(queue.sweeper.heartbeatAt),
+        admissionFenceActive: queue.sweeper.admissionFenceActive ?? false,
+        sweeperEnabled: queue.sweeper.enabled,
+        engineUnreachableSince: queue.engineUnreachableSince,
+      })
+    : null;
 
   const launch = async () => {
     if (launchedRef.current) return;
@@ -844,16 +853,20 @@ export function ReviewStep({
               <MetricChip
                 label="Sweeper"
                 value={
-                  isProcessDead(queue.sweeper.heartbeatAt)
+                  queueOperationalState === "process_not_running"
                     ? "process not running"
-                    : queue.sweeper.enabled
-                      ? "enabled"
-                      : "disabled"
+                    : queueOperationalState === "safety_stop"
+                      ? "safety stop"
+                      : queueOperationalState === "engine_unreachable"
+                        ? "engine unreachable"
+                        : queueOperationalState === "sweeper_disabled"
+                          ? "disabled"
+                          : "enabled"
                 }
               />
             </div>
             {/* No measured solve rate in the queue payload — the rate line is omitted rather than invented (spec §12). */}
-            {isProcessDead(queue.sweeper.heartbeatAt) ? (
+            {queueOperationalState === "process_not_running" ? (
               // "enable sweeper now" would be a fake control while the solver
               // process is down — guidance text renders instead (same copy as
               // the Solver banner, via lib/solver-state).
@@ -869,7 +882,21 @@ export function ReviewStep({
                   {PROCESS_NOT_RUNNING_DETAIL}
                 </span>
               </div>
-            ) : !queue.sweeper.enabled ? (
+            ) : queueOperationalState === "safety_stop" ? (
+              <InfoLine
+                tone="red"
+                text="Solver safety stop — critical outcome; new submissions are fenced while running jobs continue."
+              />
+            ) : queueOperationalState === "engine_unreachable" ? (
+              <InfoLine
+                tone="red"
+                text={
+                  queue.engineUnreachableSince
+                    ? `Engine unreachable since ${new Date(queue.engineUnreachableSince).toLocaleTimeString()} — no jobs are being submitted.`
+                    : "Engine unreachable — no jobs are being submitted."
+                }
+              />
+            ) : queueOperationalState === "sweeper_disabled" ? (
               <div
                 style={{
                   display: "flex",
@@ -900,12 +927,6 @@ export function ReviewStep({
               </div>
             ) : null}
             {sweeperError && <ErrorLine text={sweeperError} />}
-            {queue.engineUnreachableSince && (
-              <InfoLine
-                tone="red"
-                text={`Engine unreachable since ${new Date(queue.engineUnreachableSince).toLocaleTimeString()} — no jobs are being submitted.`}
-              />
-            )}
           </div>
         )}
       </div>

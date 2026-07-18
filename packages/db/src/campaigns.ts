@@ -6321,6 +6321,9 @@ export async function campaignPreliminaryOutcomes(
       attempt.source AS attempt_source,
       attempt.regime AS attempt_regime,
       attempt.evidence_payload ->> 'fidelity' AS attempt_fidelity,
+      attempt.evidence_payload ->> 'failure_disposition'
+        AS attempt_failure_disposition,
+      attempt.error AS attempt_error,
       classification.state AS classification_state,
       classification.reasons AS classification_reasons,
       point."updatedAt" AS updated_at
@@ -6355,6 +6358,8 @@ export async function campaignPreliminaryOutcomes(
     attempt_source: string | null;
     attempt_regime: string | null;
     attempt_fidelity: string | null;
+    attempt_failure_disposition: string | null;
+    attempt_error: string | null;
     classification_state: string | null;
     classification_reasons: string[] | null;
     updated_at: Date | string;
@@ -6547,19 +6552,17 @@ export async function campaignPreliminaryOutcomes(
             ? "within_tolerance"
             : null
         : null;
-    // An exact accepted URANS-full attempt is the publishable final result.
-    // A fast/final delta outside the comparison tolerance is useful quality
-    // context, not missing evidence, and a later failed refresh does not
-    // invalidate an already accepted immutable generation. Reserve critical
-    // state for a stage that exhausted without obtaining its required result.
+    // An exact accepted URANS-full attempt remains the publishable final
+    // result. Reliability is a separate facet: an actually exhausted FAST
+    // obligation or a later exhausted final activity must still be surfaced
+    // and counted as critical without erasing that immutable accepted result.
+    // A fast/final comparison disagreement by itself remains non-critical.
     const criticalStage =
-      finalState === "accepted"
-        ? null
-        : finalState === "critical"
-          ? ("final" as const)
-          : fastState === "critical"
-            ? ("fast" as const)
-            : null;
+      finalState === "critical" || finalActivityState === "critical"
+        ? ("final" as const)
+        : fastState === "critical"
+          ? ("fast" as const)
+          : null;
     const selectedFinalReasons =
       finalState === "critical" || finalActivityState === "critical"
         ? finalWork?.source === "verify"
@@ -6677,6 +6680,26 @@ export async function campaignPreliminaryOutcomes(
       const acceptedFinal = accepted && fidelity === "urans_full";
       const requested = row.state === "requested";
       const terminalGap = !requested && !accepted;
+      const failureDisposition = row.attempt_failure_disposition;
+      // Match the automatic execution handoff contract rather than treating
+      // every terminal RANS-shaped row as aerodynamic. Typed mesh and
+      // infrastructure failures, errored shells, and contradictory
+      // classifications are machine incidents. Only needs-URANS evidence or
+      // the narrow legacy completed/solved/error-free rejection may bridge
+      // the short transaction window before its durable PRECALC obligation
+      // appears.
+      const terminalRansHandoff =
+        terminalGap &&
+        fidelity === "rans" &&
+        ((row.classification_state === "needs_urans" &&
+          failureDisposition !== "deterministic_mesh" &&
+          failureDisposition !== "infrastructure") ||
+          (row.classification_state === "rejected" &&
+            (failureDisposition === "hard_solver" ||
+              (failureDisposition === null &&
+                row.attempt_status === "done" &&
+                row.attempt_source === "solved" &&
+                !row.attempt_error?.trim()))));
       const ransStage: CampaignPreliminaryRansStage = requested
         ? "not_started"
         : row.attempt_regime === "rans"
@@ -6685,21 +6708,29 @@ export async function campaignPreliminaryOutcomes(
       const fastState: CampaignPreliminaryFastState =
         requested || acceptedRans
           ? "not_started"
-          : acceptedFast
-            ? "accepted"
-            : acceptedFinal
+          : terminalRansHandoff
+            ? "queued"
+            : terminalGap && fidelity === "rans"
               ? "not_started"
-              : "critical";
+              : acceptedFast
+                ? "accepted"
+                : acceptedFinal
+                  ? "not_started"
+                  : "critical";
       const finalState: CampaignPreliminaryFinalState = acceptedFinal
         ? "accepted"
         : "not_started";
-      const criticalStage = terminalGap
-        ? row.attempt_regime === "urans" && fidelity === "urans_full"
-          ? ("final" as const)
-          : row.attempt_regime === "rans" || row.attempt_regime === "urans"
-            ? ("fast" as const)
-            : ("preflight" as const)
-        : null;
+      const criticalStage = terminalRansHandoff
+        ? null
+        : terminalGap
+          ? row.attempt_regime === "urans" && fidelity === "urans_full"
+            ? ("final" as const)
+            : row.attempt_regime === "urans"
+              ? ("fast" as const)
+              : row.attempt_regime === "rans"
+                ? ("rans" as const)
+                : ("preflight" as const)
+          : null;
 
       return {
         aoaDeg: Number(row.aoa_deg),
@@ -6707,12 +6738,20 @@ export async function campaignPreliminaryOutcomes(
         derivedBySymmetry: Boolean(row.derived_by_symmetry),
         affectedAoaDegs: [Number(row.aoa_deg)],
         affectedPointCount: 1,
-        state: requested ? "pending" : terminalGap ? "blocked" : "satisfied",
-        outcome: requested
-          ? "recovering"
-          : terminalGap
-            ? "recovery_unavailable"
-            : "accepted",
+        state:
+          requested || terminalRansHandoff
+            ? "pending"
+            : terminalGap
+              ? "blocked"
+              : "satisfied",
+        outcome:
+          requested || terminalRansHandoff
+            ? "recovering"
+            : terminalGap
+              ? failureDisposition === "deterministic_mesh"
+                ? "mesh_unavailable"
+                : "recovery_unavailable"
+              : "accepted",
         ransStage,
         fastState,
         finalState,

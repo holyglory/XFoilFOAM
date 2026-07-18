@@ -3,6 +3,7 @@ import {
   type CampaignGapBatch,
   compareScheduleCandidates,
   type DB,
+  enforceSweeperAdmissionFence,
   findCampaignGapBatch,
   results,
   simJobs,
@@ -36,7 +37,10 @@ import {
   engineBackoffActive,
   recordEngineUnreachable,
 } from "./engine-backoff";
-import { engineUransRecoveryVersion } from "./engine-capabilities";
+import {
+  engineMeshRecoveryVersion,
+  engineUransRecoveryVersion,
+} from "./engine-capabilities";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
 import {
@@ -46,7 +50,11 @@ import {
 } from "./heartbeat";
 import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { reconcile, resetOrphans } from "./reconcile";
-import { remoteSolverTick } from "./remote-solver";
+import {
+  admitRemoteSolverTick,
+  reconcileRemoteSolverTick,
+  type RemoteEngineAdmissionDecision,
+} from "./remote-solver";
 import { retentionTick } from "./retention";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
@@ -111,6 +119,70 @@ export async function getState(db: DB): Promise<SweeperConfig> {
   };
 }
 
+interface AdmissionFenceGate {
+  blocked: boolean;
+  guardFailed: boolean;
+  hazardPresent: boolean;
+}
+
+/** Typed NEW-remote admission precedence. Safety provenance must survive even
+ * when disk pressure is also present, and a successful FAST handoff consumes
+ * the only admission opportunity before any mirrored RANS can be considered. */
+export function remoteAdmissionDecisionForTick(input: {
+  admissionFenced: boolean;
+  diskAllowed: boolean;
+  fastUransSubmitted: boolean;
+  sharedCapacityAvailable: boolean;
+  engineHealthy: boolean;
+  meshRecoveryVersion: number | null;
+}): RemoteEngineAdmissionDecision {
+  if (input.admissionFenced) return { kind: "hold", reason: "safety_stop" };
+  if (!input.diskAllowed) return { kind: "hold", reason: "storage_pressure" };
+  if (input.fastUransSubmitted)
+    return { kind: "hold", reason: "higher_priority_fast_urans" };
+  if (!input.sharedCapacityAvailable)
+    return { kind: "hold", reason: "shared_capacity_full" };
+  if (!input.engineHealthy)
+    return { kind: "hold", reason: "engine_unavailable" };
+  if (input.meshRecoveryVersion == null)
+    return { kind: "hold", reason: "mesh_capability_unknown" };
+  return {
+    kind: "allow",
+    meshRecoveryVersion: input.meshRecoveryVersion,
+  };
+}
+
+/**
+ * The breaker is fail-closed for NEW admission only. A detector error must not
+ * stop reconciliation, ingestion, retention, or already-running OpenFOAM
+ * work, but it also must not become a window in which another job is admitted.
+ */
+async function checkAdmissionFence(
+  db: DB,
+  phase: "before_reconcile" | "after_reconcile" | "after_mesh_remediation",
+): Promise<AdmissionFenceGate> {
+  try {
+    const result = await enforceSweeperAdmissionFence(db);
+    if (result.fencedNow) {
+      console.error(
+        `[sweeper] NEW admission fenced after ${result.trigger?.reason ?? "critical solver outcome"}` +
+          ` (${result.trigger?.triggerKey ?? "unknown trigger"}, ${phase}); running jobs continue`,
+      );
+    }
+    return {
+      blocked: result.active || result.hazardPresent,
+      guardFailed: false,
+      hazardPresent: result.hazardPresent,
+    };
+  } catch (error) {
+    console.error(
+      `[sweeper] admission-fence check failed (${phase}); holding new submissions:`,
+      error,
+    );
+    return { blocked: true, guardFailed: true, hazardPresent: false };
+  }
+}
+
 async function inFlight(db: DB): Promise<number> {
   const [r] = await db
     .select({ n: count() })
@@ -135,6 +207,7 @@ async function submitComposedJob(
     db,
     engine,
     jobId,
+    admissionLane: "local",
     campaignId,
     request,
     connectionErrorPrefix: "engine unreachable at submit: ",
@@ -559,8 +632,12 @@ export async function submitOneBatch(
   db: DB,
   engine: EngineClient,
   cpuSlots = 0,
-  meshRecoveryVersion = 0,
+  meshRecoveryVersion: number | null = 0,
 ): Promise<boolean> {
+  // A malformed/unknown capability must never be coerced to legacy v0 at the
+  // physical RANS boundary. Otherwise due FAST URANS is skipped while new
+  // screening work consumes its capacity slot.
+  if (meshRecoveryVersion == null) return false;
   await ensureEnabledSimulationPresetRevisions(db);
   const gaps = await findGaps(db, 500);
   const continuous = firstBatch(gaps);
@@ -626,100 +703,169 @@ export async function tick(
   // (heartbeat fresh, tick >5 min without completing) from this pair —
   // liveness itself is the independent index.ts timer.
   await markTickStarted(db);
+  const preReconcileFence = await checkAdmissionFence(db, "before_reconcile");
   await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
+  // Reconciliation can be the operation which records a blocked obligation or
+  // critical incident. Re-check before any local or remote admission in this
+  // same tick; waiting for the next poll would admit one job past the fence.
+  const postReconcileFence = await checkAdmissionFence(db, "after_reconcile");
   await retentionTick(db, engine);
+  let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;
+  const admissionFenceGuardFailed =
+    preReconcileFence.guardFailed || postReconcileFence.guardFailed;
   let inFlightJobs = await inFlight(db);
   // Disk pressure blocks admission only. Reconciliation, partial ingestion,
   // retention and heartbeat progress above remain live so the system can
   // recover automatically instead of turning storage pressure into fake job
   // failures or a PostgreSQL outage.
   let diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
-  await remoteSolverTick(db, engine, diskAdmission.allowed);
-  const afterRemoteInFlight = await inFlight(db);
-  if (afterRemoteInFlight !== inFlightJobs) {
-    inFlightJobs = afterRemoteInFlight;
-    diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
-  }
-  if (
+  // Remote authority/evidence reconciliation remains early and admission-free.
+  // Its NEW RANS lane is considered only after durable FAST URANS below.
+  const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
+  // Dedicated remote-solver instances intentionally leave the local scheduler
+  // disabled and use their independent remote CPU budget. In mixed mode,
+  // mirrored RANS shares the visible local capacity and must wait rather than
+  // queueing ahead of FAST URANS while every slot is occupied.
+  const sharedRemoteCapacityAvailable =
+    !state.enabled || inFlightJobs < state.maxConcurrentJobs;
+  const localCapacityOpen =
     state.enabled &&
+    !admissionFenced &&
     diskAdmission.allowed &&
-    inFlightJobs < state.maxConcurrentJobs
+    inFlightJobs < state.maxConcurrentJobs;
+  const anyNewAdmissionEligible =
+    !admissionFenced &&
+    diskAdmission.allowed &&
+    (localCapacityOpen || remoteAdmissionReady);
+
+  let engineHealthy = false;
+  let meshRecoveryVersion: number | null = null;
+  let uransRecoveryVersion: number | null = null;
+  let fastUransSubmitted = false;
+
+  // One capability/health decision owns every local-engine NEW lane, including
+  // work mirrored from an upstream hub. Unknown capability is never v0.
+  // A latched safety stop closes only NEW work. Reconciliation above may have
+  // just persisted a deterministic mesh blocker from an older engine
+  // strategy, so capability discovery and the bounded versioned ledger
+  // transition must remain live behind the fence. That transition is not an
+  // admission: this tick remains fenced even when it successfully reopens the
+  // exact blocker, and only a later explicit Resume may submit it.
+  const fencedMeshRemediationDue =
+    !admissionFenceGuardFailed &&
+    (preReconcileFence.hazardPresent || postReconcileFence.hazardPresent);
+  if (
+    (anyNewAdmissionEligible || fencedMeshRemediationDue) &&
+    !engineBackoffActive()
   ) {
-    // Engine-down backoff (§7): check the cached engine probe before composing.
-    if (!engineBackoffActive()) {
-      let healthy = false;
-      try {
-        healthy = await engine.health();
-      } catch {
-        healthy = false;
+    try {
+      engineHealthy = await engine.health();
+    } catch {
+      engineHealthy = false;
+    }
+    if (!engineHealthy) {
+      await recordEngineUnreachable(db);
+    } else {
+      await clearEngineUnreachable(db);
+      meshRecoveryVersion =
+        localCapacityOpen || fencedMeshRemediationDue
+          ? await prepareAutomaticMeshRecovery(db, engine)
+          : await engineMeshRecoveryVersion(engine);
+      if (fencedMeshRemediationDue) {
+        // The latch is deliberately not cleared by remediation. Re-read the
+        // guard after the durable transition so a concurrent or unrelated
+        // critical outcome is retained as current provenance; either way the
+        // pre/post gates above make this entire tick admission-free.
+        const postRemediationFence = await checkAdmissionFence(
+          db,
+          "after_mesh_remediation",
+        );
+        admissionFenced =
+          admissionFenced ||
+          postRemediationFence.blocked ||
+          postRemediationFence.guardFailed;
       }
-      if (!healthy) {
-        await recordEngineUnreachable(db);
-      } else {
-        await clearEngineUnreachable(db);
-        const meshRecoveryVersion = await prepareAutomaticMeshRecovery(
+      if (meshRecoveryVersion == null) {
+        console.error(
+          "[sweeper] NEW admission deferred: engine mesh-recovery capability is unavailable or malformed; FAST URANS, remote RANS, and ordinary RANS remain queued",
+        );
+      } else if (localCapacityOpen) {
+        uransRecoveryVersion = await engineUransRecoveryVersion(engine);
+        // A recorded whole-polar promotion and an exact targeted RANS
+        // rejection are normal automatic escalation work. Both strictly own
+        // the slot before mirrored remote RANS or any other new RANS lane.
+        const promotedSubmitted = await submitRecordedPromotionRecovery(
           db,
           engine,
+          state.cpuSlots,
+          { meshRecoveryVersion, uransRecoveryVersion },
         );
-        const uransRecoveryVersion =
-          await engineUransRecoveryVersion(engine);
-        // A recorded whole-polar promotion and an exact targeted RANS
-        // rejection are both normal automatic escalation work. They receive
-        // the next free slot ahead of a new RANS batch. Once those higher
-        // priorities are quiet, durable DB history gives one pending final
-        // verification the next eligible slot after at most eight newly
-        // admitted wave-1 RANS jobs; a sweeper restart cannot reset the bound.
-        const promotedSubmitted =
-          meshRecoveryVersion == null
-            ? false
-            : await submitRecordedPromotionRecovery(
-                db,
-                engine,
-                state.cpuSlots,
-                { meshRecoveryVersion, uransRecoveryVersion },
-              );
-        const targetedSubmitted =
-          promotedSubmitted || meshRecoveryVersion == null
-            ? false
-            : await submitCampaignPrecalcRecoveries(
-                db,
-                engine,
-                undefined,
-                undefined,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              );
-        const interleavedVerifySubmitted =
-          promotedSubmitted || targetedSubmitted
-            ? false
-            : await submitInterleavedVerifyIfDue(db, engine, state.cpuSlots, {
-                uransRecoveryVersion,
-              });
-        const ransSubmitted =
-          promotedSubmitted || targetedSubmitted || interleavedVerifySubmitted
-            ? false
-            : await submitOneBatch(
-                db,
-                engine,
-                state.cpuSlots,
-                meshRecoveryVersion ?? 0,
-              );
-        // Admin-request PRECALC and the ordinary verify fallback remain below
-        // newly composed RANS work. Exact campaign recovery and the bounded
-        // final-verification share were handled above.
-        if (
-          !promotedSubmitted &&
-          !targetedSubmitted &&
-          !interleavedVerifySubmitted &&
-          !ransSubmitted &&
-          (await inFlight(db)) < state.maxConcurrentJobs
-        ) {
-          await uransLadderTick(db, engine, state.cpuSlots, {
-            meshRecoveryVersion,
-            uransRecoveryVersion,
-          });
-        }
+        const targetedSubmitted = promotedSubmitted
+          ? false
+          : await submitCampaignPrecalcRecoveries(
+              db,
+              engine,
+              undefined,
+              undefined,
+              meshRecoveryVersion,
+              uransRecoveryVersion,
+            );
+        fastUransSubmitted = promotedSubmitted || targetedSubmitted;
       }
+    }
+  }
+
+  let remoteAdmissionConsumed = false;
+  if (remoteAdmissionReady) {
+    const decision = remoteAdmissionDecisionForTick({
+      admissionFenced,
+      diskAllowed: diskAdmission.allowed,
+      fastUransSubmitted,
+      sharedCapacityAvailable: sharedRemoteCapacityAvailable,
+      engineHealthy,
+      meshRecoveryVersion,
+    });
+    remoteAdmissionConsumed = await admitRemoteSolverTick(db, engine, decision);
+    if (remoteAdmissionConsumed) {
+      inFlightJobs = await inFlight(db);
+      diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
+    }
+  }
+
+  // Lower lanes run only when neither FAST nor remote admission consumed this
+  // tick. Recheck the shared backoff because a remote submit attempt may have
+  // discovered a connection failure after the successful health probe.
+  if (
+    localCapacityOpen &&
+    engineHealthy &&
+    meshRecoveryVersion != null &&
+    !fastUransSubmitted &&
+    !remoteAdmissionConsumed &&
+    !engineBackoffActive()
+  ) {
+    // Once higher-priority FAST and remote work are quiet, durable DB history
+    // gives one pending final verification the next eligible slot after at
+    // most eight newly admitted wave-1 RANS jobs; restart cannot reset it.
+    const interleavedVerifySubmitted = await submitInterleavedVerifyIfDue(
+      db,
+      engine,
+      state.cpuSlots,
+      { uransRecoveryVersion },
+    );
+    const ransSubmitted = interleavedVerifySubmitted
+      ? false
+      : await submitOneBatch(db, engine, state.cpuSlots, meshRecoveryVersion);
+    // Admin-request PRECALC and the ordinary verify fallback remain below newly
+    // composed RANS work. Campaign FAST and bounded final verification ran above.
+    if (
+      !interleavedVerifySubmitted &&
+      !ransSubmitted &&
+      (await inFlight(db)) < state.maxConcurrentJobs
+    ) {
+      await uransLadderTick(db, engine, state.cpuSlots, {
+        meshRecoveryVersion,
+        uransRecoveryVersion,
+      });
     }
   }
   await markTickCompleted(db);

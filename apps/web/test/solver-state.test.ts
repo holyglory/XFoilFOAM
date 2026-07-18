@@ -5,7 +5,12 @@
 // pinned here, shaped like the real payloads (ISO heartbeats vs a fixed now),
 // plus false-positive guards for healthy/paused states.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
+
+import type {
+  AdminAdmissionFenceContext,
+  AdminCampaignsSolverState,
+} from "../lib/admin";
 
 import {
   HEARTBEAT_STALE_MS,
@@ -102,6 +107,105 @@ describe("deriveSolverState gate precedence", () => {
       NOW,
     );
     expect(d.state).toBe("process_not_running");
+  });
+
+  it("alive + admission fence -> explicit red SAFETY STOP, not an ordinary pause", () => {
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        enabled: false,
+        admissionFenceActive: true,
+        lastAdmissionFenceReason: "blocked_final_urans",
+      },
+      NOW,
+    );
+    expect(d.state).toBe("admission_fenced");
+    expect(d.tone).toBe("red");
+    expect(solverStateLabel(d.state)).toBe("SAFETY STOP");
+    expect(solverChipText(d.state)).toBe("scheduler · safety stop");
+    expect(d.headline).toMatch(/final URANS exhausted/i);
+    expect(d.detail).toMatch(/running jobs continue/i);
+  });
+
+  it("process death still outranks the admission fence", () => {
+    expect(
+      deriveSolverState(
+        { ...healthy, heartbeatAt: null, admissionFenceActive: true },
+        NOW,
+      ).state,
+    ).toBe("process_not_running");
+  });
+
+  it("maps durable fence reasons to concise product language without raw keys", () => {
+    const cases: Array<
+      [
+        SolverStateInput["lastAdmissionFenceReason"],
+        Record<string, unknown> | null,
+        RegExp,
+      ]
+    > = [
+      ["blocked_preliminary_urans", null, /fast URANS exhausted/i],
+      ["blocked_final_urans", null, /final URANS exhausted/i],
+      [
+        "critical_solver_incident",
+        { stage: "preliminary" },
+        /fast URANS recovery exhausted/i,
+      ],
+      [
+        "critical_solver_incident",
+        { stage: "final" },
+        /final URANS recovery exhausted/i,
+      ],
+      ["campaign_progress_blocked", null, /campaign recovery exhausted/i],
+    ];
+    for (const [reason, details, expected] of cases) {
+      const d = deriveSolverState(
+        {
+          ...healthy,
+          enabled: false,
+          admissionFenceActive: true,
+          lastAdmissionFenceReason: reason,
+          lastAdmissionFenceDetails: details,
+        },
+        NOW,
+      );
+      expect(d.headline).toMatch(expected);
+      expect(d.headline).not.toMatch(/blocked_(preliminary|final)|incident/i);
+      expect(d.detail).toMatch(
+        /running jobs continue; engineering investigation is required before Resume/i,
+      );
+    }
+  });
+
+  it("the protected campaign DTO carries only sanitized stage/fidelity fence context", () => {
+    expectTypeOf<
+      AdminCampaignsSolverState["lastAdmissionFenceDetails"]
+    >().toEqualTypeOf<AdminAdmissionFenceContext | null | undefined>();
+    const campaignSolverState: AdminCampaignsSolverState = {
+      heartbeatAt: healthy.heartbeatAt,
+      enabled: false,
+      engineUnreachableSince: null,
+      engineHealthy: true,
+      activeJobCount: 3,
+      lastTickStartedAt: null,
+      lastTickCompletedAt: null,
+      admissionFenceActive: true,
+      lastAdmissionFenceReason: "critical_solver_incident",
+      lastAdmissionFenceDetails: { stage: "preliminary" },
+    };
+    const derived = deriveSolverState(
+      {
+        ...campaignSolverState,
+        fetchOk: true,
+        backlogOpen: true,
+        lastAdmissionFenceDetails:
+          campaignSolverState.lastAdmissionFenceDetails == null
+            ? campaignSolverState.lastAdmissionFenceDetails
+            : { ...campaignSolverState.lastAdmissionFenceDetails },
+      },
+      NOW,
+    );
+    expect(derived.headline).toMatch(/fast URANS recovery exhausted/i);
   });
 
   it("alive + disabled -> paused (amber), with the honest running-jobs detail", () => {

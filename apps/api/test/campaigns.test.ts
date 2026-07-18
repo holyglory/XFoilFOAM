@@ -51,6 +51,7 @@ import {
   simSolverIncidents,
   solverImplementations,
   solverProfiles,
+  sweeperState,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -521,6 +522,12 @@ describe("campaign launch (§5)", () => {
     expect(body.totals.requested).toBe(20);
     expect(body.scheduler).toHaveProperty("sweeperEnabled");
     expect(body.scheduler).toHaveProperty("campaignJobsRunning");
+    expect(body.scheduler).toHaveProperty("lastAdmissionFenceDetails");
+    expect(
+      Object.keys(body.scheduler.lastAdmissionFenceDetails ?? {}).every(
+        (key) => key === "stage" || key === "fidelity",
+      ),
+    ).toBe(true);
     expect(body.solverIncidents).toMatchObject({
       threshold: 3,
       occurrenceCount: 0,
@@ -711,6 +718,63 @@ describe("campaign launch (§5)", () => {
         .where(and(eq(results.airfoilId, asymId), eq(results.status, "done")));
       expect(solvedStill.length).toBeGreaterThan(0);
     });
+  });
+
+  it("carries only sanitized safety-stop stage/fidelity on the bounded campaign summary", async () => {
+    const [previous] = await db
+      .select({
+        admissionFenceActive: sweeperState.admissionFenceActive,
+        lastAdmissionFenceAt: sweeperState.lastAdmissionFenceAt,
+        lastAdmissionFenceReason: sweeperState.lastAdmissionFenceReason,
+        lastAdmissionFenceTriggerKey: sweeperState.lastAdmissionFenceTriggerKey,
+        lastAdmissionFenceDetails: sweeperState.lastAdmissionFenceDetails,
+      })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    expect(previous).toBeDefined();
+    await db
+      .update(sweeperState)
+      .set({
+        admissionFenceActive: true,
+        lastAdmissionFenceAt: new Date(),
+        lastAdmissionFenceReason: "critical_solver_incident",
+        lastAdmissionFenceTriggerKey: `${PREFIX}:private-trigger`,
+        lastAdmissionFenceDetails: {
+          stage: "preliminary",
+          fidelity: "precalc",
+          incidentId: "00000000-0000-4000-8000-000000000001",
+          solverImplementationId: "00000000-0000-4000-8000-000000000002",
+          error: "private solver error",
+          previousCpuSlots: 12,
+        },
+      })
+      .where(eq(sweeperState.id, 1));
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/admin/campaigns/${campaignId}`,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().scheduler).toMatchObject({
+        admissionFenceActive: true,
+        lastAdmissionFenceReason: "critical_solver_incident",
+        lastAdmissionFenceDetails: {
+          stage: "preliminary",
+          fidelity: "precalc",
+        },
+      });
+      expect(res.json().scheduler.lastAdmissionFenceDetails).toEqual({
+        stage: "preliminary",
+        fidelity: "precalc",
+      });
+      expect(res.json().scheduler).not.toHaveProperty(
+        "lastAdmissionFenceTriggerKey",
+      );
+    } finally {
+      await db.update(sweeperState).set(previous).where(eq(sweeperState.id, 1));
+    }
   });
 
   it("duplicate returns a prefill payload without creating anything", async () => {
@@ -2536,6 +2600,223 @@ describe("machine-blocked campaign counters and symmetry conservation", () => {
 });
 
 describe("cell preliminary outcomes stay separate from ordinary RANS failures", () => {
+  it("MUST-CATCH: a terminal rejected RANS point without an exhausted FAST obligation is a queued handoff, not a critical FAST failure", async () => {
+    const speedMps = 26.75 + FILE_SPEED_OFFSET_MPS;
+    const launched = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} normal RANS handoff`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-normal-rans-handoff-key`,
+        airfoilIds: [asymId],
+        plan: planBody({
+          chordsM: [PRIMARY_CHORD_M],
+          speedsMps: [speedMps],
+          baseSweep: {
+            fromDeg: null,
+            toDeg: null,
+            stepDeg: null,
+            listDeg: [9],
+          },
+          objectives: {
+            ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+            clZero: { enabled: false, toleranceDeg: 0.05, maxRounds: 4 },
+            clMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
+          },
+        }),
+      },
+    });
+    expect(launched.statusCode).toBe(201);
+    const campaignId = launched.json().campaign.id as string;
+    cleanupCampaignIds.push(campaignId);
+
+    const [condition] = (await db.execute(sql`
+      SELECT cc.id, cc.simulation_preset_revision_id AS revision_id,
+             preset.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_conditions cc
+      JOIN simulation_presets preset ON preset.id = cc.preset_id
+      WHERE cc.campaign_id = ${campaignId}
+    `)) as unknown as Array<{
+      id: string;
+      revision_id: string;
+      bc_id: string;
+    }>;
+
+    const [ransResult] = await db
+      .insert(results)
+      .values({
+        airfoilId: asymId,
+        bcId: condition.bc_id,
+        simulationPresetRevisionId: condition.revision_id,
+        aoaDeg: 9,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        error: "steady RANS did not converge; hand off to FAST URANS",
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.push(ransResult.id);
+    const [ransAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: ransResult.id,
+        airfoilId: asymId,
+        bcId: condition.bc_id,
+        simulationPresetRevisionId: condition.revision_id,
+        aoaDeg: 9,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        stalled: true,
+        evidencePayload: { fidelity: "rans" },
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db.insert(resultClassifications).values({
+      resultId: ransResult.id,
+      resultAttemptId: ransAttempt.id,
+      airfoilId: asymId,
+      simulationPresetRevisionId: condition.revision_id,
+      aoaDeg: 9,
+      regime: "rans",
+      classifierVersion: `${PREFIX}-normal-rans-handoff-v1`,
+      state: "rejected",
+      reasons: ["not-converged", "solver-stalled"],
+    });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: ransAttempt.id })
+      .where(eq(results.id, ransResult.id));
+    await db
+      .update(simCampaignPoints)
+      .set({
+        state: "terminal",
+        resultId: ransResult.id,
+        resultAttemptId: ransAttempt.id,
+        claimedByJobId: null,
+        terminalAt: new Date(),
+      })
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.conditionId, condition.id),
+          eq(simCampaignPoints.airfoilId, asymId),
+          eq(simCampaignPoints.aoaDeg, 9),
+        ),
+      );
+    const [obligation] = await db
+      .select({ id: simPrecalcObligations.id })
+      .from(simPrecalcObligations)
+      .where(
+        and(
+          eq(simPrecalcObligations.airfoilId, asymId),
+          eq(simPrecalcObligations.revisionId, condition.revision_id),
+          eq(simPrecalcObligations.aoaDeg, 9),
+        ),
+      )
+      .limit(1);
+    expect(obligation).toBeUndefined();
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      total: 1,
+      recovering: 1,
+      critical: 0,
+      unavailable: 0,
+      verified: 0,
+      items: [
+        {
+          aoaDeg: 9,
+          state: "pending",
+          outcome: "recovering",
+          ransStage: "screened",
+          fastState: "queued",
+          finalState: "not_started",
+          criticalStage: null,
+          ransEvidenceRuns: 1,
+          evidenceReasons: ["not-converged", "solver-stalled"],
+        },
+      ],
+    });
+
+    // MUST-NOT-HANDOFF: the read model must preserve the execution contract
+    // even during the short window before a durable incident row is recorded.
+    // Typed deterministic mesh and infrastructure failures are critical
+    // machine incidents; neither may masquerade as normal aerodynamic RANS
+    // non-convergence merely because the attempt regime is RANS.
+    await db
+      .update(resultAttempts)
+      .set({
+        error: "snappyHexMesh quality limit exceeded",
+        evidencePayload: {
+          fidelity: "rans",
+          failure_disposition: "deterministic_mesh",
+        },
+      })
+      .where(eq(resultAttempts.id, ransAttempt.id));
+    const deterministicResponse = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(deterministicResponse.statusCode).toBe(200);
+    expect(deterministicResponse.json()).toMatchObject({
+      total: 1,
+      recovering: 0,
+      critical: 1,
+      unavailable: 1,
+      items: [
+        {
+          aoaDeg: 9,
+          state: "blocked",
+          outcome: "mesh_unavailable",
+          ransStage: "screened",
+          fastState: "not_started",
+          criticalStage: "rans",
+        },
+      ],
+    });
+
+    await db
+      .update(resultAttempts)
+      .set({
+        error: "worker connection refused",
+        evidencePayload: {
+          fidelity: "rans",
+          failure_disposition: "infrastructure",
+        },
+      })
+      .where(eq(resultAttempts.id, ransAttempt.id));
+    const infrastructureResponse = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/preliminary-outcomes?conditionId=${condition.id}&airfoilId=${asymId}`,
+    });
+    expect(infrastructureResponse.statusCode).toBe(200);
+    expect(infrastructureResponse.json()).toMatchObject({
+      total: 1,
+      recovering: 0,
+      critical: 1,
+      unavailable: 1,
+      items: [
+        {
+          aoaDeg: 9,
+          state: "blocked",
+          outcome: "recovery_unavailable",
+          ransStage: "screened",
+          fastState: "not_started",
+          criticalStage: "rans",
+        },
+      ],
+    });
+  });
+
   it("MUST-CATCH: reports the physical URANS budget, typed evidence, and an evidence-less continuation interruption", async () => {
     const speedMps = 27.25 + FILE_SPEED_OFFSET_MPS;
     const launched = await app.inject({
@@ -3771,10 +4052,10 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       ],
     });
 
-    // MUST-CATCH: an exact accepted final generation is authoritative even
-    // if a legacy/direct path left the earlier fast obligation without a
-    // publishable pointer. Preserve the fast incident as comparison context,
-    // but never count an available final result as critical or unavailable.
+    // MUST-CATCH: an exact accepted final generation stays authoritative even
+    // if the earlier FAST obligation genuinely exhausted. Availability and
+    // reliability are separate facets: preserve the final evidence, count the
+    // FAST incident as critical, and do not call the final result unavailable.
     await db
       .update(simPrecalcObligations)
       .set({
@@ -3785,7 +4066,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       .where(eq(simPrecalcObligations.id, obligation.id));
     expect(await readOutcomes()).toMatchObject({
       recovering: 0,
-      critical: 0,
+      critical: 1,
       unavailable: 0,
       verified: 1,
       items: [
@@ -3794,7 +4075,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
           fastState: "critical",
           finalState: "accepted",
           finalResultAttemptId: verifyAttempt.id,
-          criticalStage: null,
+          criticalStage: "fast",
         },
       ],
     });
@@ -4040,7 +4321,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       .where(eq(simUransVerifyQueue.id, followupVerify.id));
     expect(await readOutcomes()).toMatchObject({
       recovering: 0,
-      critical: 0,
+      critical: 1,
       unavailable: 0,
       verified: 1,
       items: [
@@ -4048,7 +4329,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
           finalState: "accepted",
           finalActivityState: "critical",
           finalResultAttemptId: verifyAttempt.id,
-          criticalStage: null,
+          criticalStage: "final",
         },
       ],
     });

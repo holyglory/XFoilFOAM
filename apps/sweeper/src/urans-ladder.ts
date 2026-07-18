@@ -1,8 +1,8 @@
 // URANS fidelity-ladder tick (pinned contracts 4–6, spec: single existing
 // priority scale — no second scale). Runs inside the submit-capacity branch of
 // the sweeper tick. Exact conditional whole-polar promotions take the next
-// free slot; targeted terminal-parent PRECALC alternates admission with the
-// still-open RANS backlog. Final verification receives one bounded interleave
+// free slot; targeted terminal-parent PRECALC takes the next free slot ahead
+// of unrelated new RANS. Final verification receives one bounded interleave
 // after at most eight newly admitted wave-1 RANS jobs; otherwise new RANS work
 // outranks admin-request PRECALC and verification. At most ONE submission wins
 // each scheduler tick.
@@ -10,7 +10,7 @@
 // Tier 2 (precalc rank):
 //   a) campaign wave-2 URANS retries — a rejected RANS attempt is normal
 //      escalation input and is admitted from its terminal parent without a
-//      campaign-wide gap fence, alternating with ordinary RANS admission;
+//      campaign-wide gap fence, ahead of ordinary RANS admission;
 //   b) admin request-URANS work items (contract 6).
 // Tier 3 (global lowest): verify-queue items (contract 4) — one cell re-solved
 //   at FULL fidelity; deltas recorded at ingest (reconcile settle path).
@@ -19,7 +19,6 @@ import {
   airfoils,
   activeCampaignOwnersForUransRequest,
   blockFinalUransVerificationBeforeSubmit,
-  campaignHasOpenRansGaps,
   claimNextPendingUransRequest,
   claimNextPendingVerifyItem,
   type DB,
@@ -94,25 +93,19 @@ import { touchHeartbeat } from "./heartbeat";
 import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
 import { submitUransRetryForJob } from "./reconcile";
-import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
+import {
+  submitPendingJobWithLifecycleGuard,
+  type SubmissionAdmissionLane,
+} from "./submit-lifecycle";
 
 /** Parents whose recovery was already re-attempted this process lifetime —
  *  a parent whose retry plan is empty must not be re-planned every tick
  *  forever. In-memory on purpose (a restart simply rescans; no payload
  *  mutation, no deadlock). Tests reset via resetUransLadderMemory(). */
 const settledRecoveryParents = new Set<string>();
-/** Fair admission handoff between exact per-point PRECALC escalation and the
- * still-open RANS backlog. A successful targeted escalation while any
- * campaign RANS cell remains yields the next pre-RANS pass to submitOneBatch.
- * If RANS has no composable work, the same tick's ladder fallback may consume
- * PRECALC instead, so capacity never sits idle. Conditional whole-polar
- * promotions remain outside this alternation because their immutable event
- * already replaced the parent request's RANS scope. */
-let campaignRansAdmissionTurnDue = false;
 
 export function resetUransLadderMemory(): void {
   settledRecoveryParents.clear();
-  campaignRansAdmissionTurnDue = false;
 }
 
 function normalizedContinuationImplementationId(
@@ -126,6 +119,260 @@ function normalizedContinuationImplementationId(
 
 const RECOVERY_PARENTS_PER_TICK = 3;
 const PROMOTION_RECOVERIES_PER_TICK = 16;
+
+interface CampaignPrecalcRecoveryParent {
+  /** Immutable physical job which produced the pinned RANS attempt. */
+  sourceParent: typeof simJobs.$inferSelect;
+  /** Active beneficiary which authorizes scheduling and lifecycle checks.
+   * This may intentionally differ from sourceParent.campaignId. */
+  ownerCampaignId: string;
+  /** Exact attempts that authorize this campaign-owned targeted handoff. */
+  sourceResultAttemptIds?: string[];
+}
+
+/** Durable PRECALC obligations are the scheduling authority. Discover their
+ * exact source parents before the legacy finished-parent scan so a newly
+ * terminal escalation cannot sit behind an arbitrary history window (or be
+ * pushed back to that window after a process restart). The source-attempt FK
+ * remains pinned to the original RANS evidence while latest_sim_job_id tracks
+ * any later PRECALC continuation, so this path needs no JSON rediscovery.
+ *
+ * The query is intentionally bounded to the same per-pass parent budget as the
+ * legacy scan. Whole-polar obligations are owned by the earlier recorded-
+ * promotion branch and are excluded here.
+ */
+async function dueCampaignPrecalcRecoveryParents(
+  db: DB,
+  campaignId: string,
+  parentJobIds: string[] | undefined,
+  uransRecoveryVersion: number | null | undefined,
+): Promise<CampaignPrecalcRecoveryParent[]> {
+  const parentScope =
+    parentJobIds === undefined
+      ? sql``
+      : parentJobIds.length
+        ? sql`AND parent.id = ANY(${sql`ARRAY[${sql.join(
+            parentJobIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}]`})`
+        : sql`AND false`;
+  const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
+    ? restartablePrecalcCheckpointSql(sql`obligation.id`)
+    : sql`false`;
+  const rows = (await db.execute(sql`
+    SELECT parent.id,
+           array_agg(DISTINCT source_attempt.id ORDER BY source_attempt.id)
+             AS source_attempt_ids,
+           min(COALESCE(obligation.next_submit_at, obligation."createdAt")) AS due_at
+    FROM sim_precalc_obligations obligation
+    JOIN sim_precalc_obligation_campaigns ownership
+      ON ownership.obligation_id = obligation.id
+     AND ownership.state = 'active'
+    JOIN sim_campaigns owner_campaign
+      ON owner_campaign.id = ownership.campaign_id
+     AND owner_campaign.status IN ('active', 'attention')
+    JOIN result_attempts source_attempt
+      ON source_attempt.id = obligation.source_result_attempt_id
+     AND source_attempt.regime = 'rans'
+     AND source_attempt.airfoil_id = obligation.airfoil_id
+     AND source_attempt.simulation_preset_revision_id = obligation.revision_id
+     AND source_attempt.aoa_deg = obligation.aoa_deg
+    JOIN sim_jobs parent
+      ON parent.id = source_attempt.sim_job_id
+     AND parent.airfoil_id = obligation.airfoil_id
+     AND parent.wave = 1
+    WHERE ownership.campaign_id = ${campaignId}
+      AND obligation.state = 'pending'
+      AND (
+        obligation.next_submit_at IS NULL
+        OR obligation.next_submit_at <= now()
+      )
+      AND (
+        obligation.attempt_count < obligation.max_attempts
+        OR (${restartableScope})
+      )
+      AND (
+        (
+          parent.status IN ('done', 'failed')
+          AND parent."ingestedAt" IS NOT NULL
+        )
+        OR parent.status = 'cancelled'
+      )
+      ${parentScope}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs live_child
+        WHERE live_child.parent_job_id = parent.id
+          AND live_child.wave = 2
+          AND live_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs latest_job
+        WHERE latest_job.id = obligation.latest_sim_job_id
+          AND latest_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points promotion_point
+        WHERE promotion_point.obligation_id = obligation.id
+      )
+    GROUP BY parent.id
+    ORDER BY due_at, parent.id
+    LIMIT ${RECOVERY_PARENTS_PER_TICK}
+  `)) as unknown as Array<{
+    id: string;
+    source_attempt_ids: string[];
+    due_at: Date | string;
+  }>;
+  if (!rows.length) return [];
+  const parents = await db
+    .select()
+    .from(simJobs)
+    .where(
+      inArray(
+        simJobs.id,
+        rows.map((row) => row.id),
+      ),
+    );
+  const byId = new Map(parents.map((parent) => [parent.id, parent]));
+  return rows.flatMap((row) => {
+    const parent = byId.get(row.id);
+    return parent
+      ? [
+          {
+            sourceParent: parent,
+            ownerCampaignId: campaignId,
+            sourceResultAttemptIds: row.source_attempt_ids,
+          },
+        ]
+      : [];
+  });
+}
+
+/** Compatibility for pre-pinning obligations. Drive from the campaign-owner
+ * index into its few open physical cells, then resolve the latest exact source
+ * attempt and parent. Never add an OR branch to the broad sim_jobs history
+ * scan: production has a large global job ledger and this path runs per tick. */
+async function legacySharedCampaignRecoveryParents(
+  db: DB,
+  campaignId: string,
+  parentJobIds: string[] | undefined,
+  excludedParentIds: string[],
+  limit: number,
+  uransRecoveryVersion: number | null | undefined,
+): Promise<CampaignPrecalcRecoveryParent[]> {
+  if (limit <= 0) return [];
+  const parentScope =
+    parentJobIds === undefined
+      ? sql``
+      : parentJobIds.length
+        ? sql`AND parent.id = ANY(${sql`ARRAY[${sql.join(
+            parentJobIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}]`})`
+        : sql`AND false`;
+  const excludedScope = excludedParentIds.length
+    ? sql`AND parent.id <> ALL(${sql`ARRAY[${sql.join(
+        excludedParentIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`})`
+    : sql``;
+  const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
+    ? restartablePrecalcCheckpointSql(sql`owned_obligation.id`)
+    : sql`false`;
+  const rows = (await db.execute(sql`
+    SELECT parent.id AS parent_id,
+           array_agg(DISTINCT owned_attempt.id ORDER BY owned_attempt.id)
+             AS source_attempt_ids
+    FROM sim_precalc_obligations owned_obligation
+    JOIN sim_precalc_obligation_campaigns owned_route
+     ON owned_route.obligation_id = owned_obligation.id
+     AND owned_route.campaign_id = ${campaignId}
+     AND owned_route.state = 'active'
+    JOIN result_attempts owned_attempt
+      ON owned_attempt.regime = 'rans'
+     AND owned_attempt.airfoil_id = owned_obligation.airfoil_id
+     AND owned_attempt.simulation_preset_revision_id = owned_obligation.revision_id
+     AND owned_attempt.aoa_deg = owned_obligation.aoa_deg
+    JOIN sim_jobs parent
+      ON parent.id = owned_attempt.sim_job_id
+     AND parent.airfoil_id = owned_obligation.airfoil_id
+     AND parent.wave = 1
+     AND parent.campaign_id IS DISTINCT FROM ${campaignId}
+    WHERE owned_obligation.source_result_attempt_id IS NULL
+      AND owned_obligation.state = 'pending'
+      AND (
+        owned_obligation.next_submit_at IS NULL
+        OR owned_obligation.next_submit_at <= now()
+      )
+      AND (
+        owned_obligation.attempt_count < owned_obligation.max_attempts
+        OR (${restartableScope})
+      )
+      AND (
+        (
+          parent.status IN ('done', 'failed')
+          AND parent."ingestedAt" IS NOT NULL
+        )
+        OR parent.status = 'cancelled'
+      )
+      ${parentScope}
+      ${excludedScope}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM result_attempts newer_attempt
+        WHERE newer_attempt.sim_job_id = owned_attempt.sim_job_id
+          AND newer_attempt.regime = 'rans'
+          AND newer_attempt.airfoil_id = owned_attempt.airfoil_id
+          AND newer_attempt.simulation_preset_revision_id = owned_attempt.simulation_preset_revision_id
+          AND newer_attempt.aoa_deg = owned_attempt.aoa_deg
+          AND (
+            newer_attempt."createdAt" > owned_attempt."createdAt"
+            OR (
+              newer_attempt."createdAt" = owned_attempt."createdAt"
+              AND newer_attempt.id > owned_attempt.id
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs live_child
+        WHERE live_child.parent_job_id = parent.id
+          AND live_child.wave = 2
+          AND live_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+    GROUP BY parent.id
+    ORDER BY min(COALESCE(owned_obligation.next_submit_at, owned_obligation."createdAt")), parent.id
+    LIMIT ${limit}
+  `)) as unknown as Array<{
+    parent_id: string;
+    source_attempt_ids: string[];
+  }>;
+  if (!rows.length) return [];
+  const parents = await db
+    .select()
+    .from(simJobs)
+    .where(
+      inArray(
+        simJobs.id,
+        rows.map((row) => row.parent_id),
+      ),
+    );
+  const parentById = new Map(parents.map((parent) => [parent.id, parent]));
+  return rows.flatMap((row) => {
+    const sourceParent = parentById.get(row.parent_id);
+    return sourceParent
+      ? [
+          {
+            sourceParent,
+            ownerCampaignId: campaignId,
+            sourceResultAttemptIds: row.source_attempt_ids,
+          },
+        ]
+      : [];
+  });
+}
 
 function jobMeshRecoveryVersionSql(requestPayload: SQLWrapper) {
   return sql`CASE
@@ -790,8 +1037,8 @@ export async function submitRecordedPromotionRecovery(
 
 /** Tier-2a: submit one durable campaign PRECALC recovery. The source wave-1
  * parent must be terminal, so URANS never races it over shared mesh state.
- * When unrelated RANS gaps remain, successful targeted admissions alternate
- * with the ordinary RANS composer. */
+ * Every due durable targeted handoff stays ahead of unrelated ordinary RANS;
+ * one scheduler pass still admits at most one physical child. */
 export async function submitCampaignPrecalcRecoveries(
   db: DB,
   engine: EngineClient,
@@ -803,7 +1050,7 @@ export async function submitCampaignPrecalcRecoveries(
   // An explicitly supplied empty list is a closed-world scope, not the
   // production-wide default. One-shot operators use this fence to prove that
   // they cannot admit ordinary campaign recovery while targeting a single
-  // request/verify chain. Do this before any query or process-local fairness
+  // request/verify chain. Do this before any query or process-local recovery
   // mutation so an empty canary scope is observably inert.
   if (
     (campaignIds !== undefined && campaignIds.length === 0) ||
@@ -819,40 +1066,179 @@ export async function submitCampaignPrecalcRecoveries(
       campaignIds !== undefined
         ? and(statusFilter, inArray(simCampaigns.id, campaignIds))
         : statusFilter,
-    );
-  const ransOpenByCampaign = new Map<string, boolean>();
-  const campaignStillHasRans = async (campaignId: string) => {
-    const known = ransOpenByCampaign.get(campaignId);
-    if (known !== undefined) return known;
-    const open = await campaignHasOpenRansGaps(db, campaignId);
-    ransOpenByCampaign.set(campaignId, open);
-    return open;
-  };
-  if (campaignRansAdmissionTurnDue) {
-    campaignRansAdmissionTurnDue = false;
-    for (const campaign of campaigns) {
-      if (await campaignStillHasRans(campaign.id)) {
-        // Main-loop ordering immediately gives this free slot to RANS. When
-        // RANS cannot compose, uransLadderTick calls this function again in
-        // the same tick and exact PRECALC remains the non-idling fallback.
-        return false;
-      }
-    }
-  }
+    )
+    .orderBy(simCampaigns.id);
   for (const campaign of campaigns) {
-    const campaignHasRansBacklog = await campaignStillHasRans(campaign.id);
-    // STARVATION GUARD (adversarial review 2026-07-07): parents whose retry
-    // plan is empty never grow a wave-2 child, so they never leave the
-    // NOT-EXISTS filter. They MUST also be excluded from the SQL window —
-    // skipping them only in memory left the finishedAt-ordered LIMIT window
-    // permanently occupied by the first N no-retry parents, and parents
-    // ranked past the window (typically the needs_urans ones, which finish
-    // last because the gate stays closed until the final RANS gap) were never
-    // fetched → precalc_open stuck > 0, campaign never completed. With the
-    // exclusion the window slides forward every tick; a restart clears the
-    // set and simply re-settles from the front at 3 parents/tick — bounded
-    // progress, no re-block. MUST-CATCH: urans-ladder.test.ts starvation test.
-    const settledIds = [...settledRecoveryParents];
+    let attempted = 0;
+    const attemptedParentIds = new Set<string>();
+    const attemptParents = async (
+      parents: CampaignPrecalcRecoveryParent[],
+      durablePriority: boolean,
+    ): Promise<boolean> => {
+      for (const candidate of parents) {
+        const parent = candidate.sourceParent;
+        if (!durablePriority && settledRecoveryParents.has(parent.id)) continue;
+        if (attempted >= RECOVERY_PARENTS_PER_TICK) break;
+        attempted += 1;
+        attemptedParentIds.add(parent.id);
+        // A durable obligation may have appeared after this parent was memoized
+        // as legacy no-plan. The ledger is authoritative over process memory.
+        if (durablePriority) settledRecoveryParents.delete(parent.id);
+        await touchHeartbeat(db);
+        const before = await db
+          .select({ id: simJobs.id })
+          .from(simJobs)
+          .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+        // The source job is physical provenance, not execution ownership. A
+        // campaign may legitimately benefit from a RANS attempt produced by
+        // background work (or another campaign), so carry the active owner
+        // into gating/route creation while retaining the exact source id.
+        const ownerScopedParent =
+          parent.campaignId === candidate.ownerCampaignId
+            ? parent
+            : { ...parent, campaignId: candidate.ownerCampaignId };
+        await submitUransRetryForJob(db, engine, ownerScopedParent, {
+          meshRecoveryVersion,
+          uransRecoveryVersion,
+          capacityScheduledEscalation: true,
+          sourceResultAttemptIds: candidate.sourceResultAttemptIds,
+        });
+        const [campaignAfterSubmit] = await db
+          .select({ status: simCampaigns.status })
+          .from(simCampaigns)
+          .where(eq(simCampaigns.id, candidate.ownerCampaignId))
+          .limit(1);
+        if (campaignAfterSubmit?.status === "paused") {
+          // Pause may win after composition but before/while engine submission.
+          // Its cancelled child is deliberately NOT a settled obligation: the
+          // queued/no-owner rows must be reconsidered after explicit resume in
+          // this same process, not only after a restart clears memory.
+          settledRecoveryParents.delete(parent.id);
+          continue;
+        }
+        const beforeIds = new Set(before.map((row) => row.id));
+        const after = await db
+          .select({ id: simJobs.id, status: simJobs.status })
+          .from(simJobs)
+          .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+        const created = after.filter((row) => !beforeIds.has(row.id));
+        if (!created.length) {
+          const [openObligation] = (await db.execute(sql`
+            SELECT 1 AS present
+            WHERE EXISTS (
+              SELECT 1
+              FROM sim_jobs sibling_child
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                CASE
+                  WHEN jsonb_typeof(sibling_child.request_payload -> 'precalcObligationIds') = 'array'
+                  THEN sibling_child.request_payload -> 'precalcObligationIds'
+                  ELSE '[]'::jsonb
+                END
+              ) payload_obligation(id)
+              JOIN sim_precalc_obligations obligation
+                ON obligation.id = payload_obligation.id::uuid
+              WHERE sibling_child.parent_job_id = ${parent.id}
+                AND obligation.state IN ('pending', 'running')
+            ) OR EXISTS (
+              -- Covers a crash/failure after ensure but before the child insert.
+              -- Scope that durable cell back to THIS parent's rejected RANS
+              -- evidence. An unrelated open PRECALC obligation on the same
+              -- campaign/revision must not keep every childless no-plan parent
+              -- in the first scan window forever.
+              SELECT 1
+              FROM sim_precalc_obligations obligation
+              JOIN sim_precalc_obligation_campaigns ownership
+                ON ownership.obligation_id = obligation.id
+               AND ownership.state = 'active'
+              WHERE ownership.campaign_id = ${candidate.ownerCampaignId}
+                AND obligation.airfoil_id = ${parent.airfoilId}
+                AND obligation.revision_id = ${parent.simulationPresetRevisionId}
+                AND obligation.state IN ('pending', 'running')
+                AND (
+                  EXISTS (
+                    SELECT 1
+                    FROM result_attempts parent_attempt
+                    JOIN result_classifications classification
+                      ON classification.result_attempt_id = parent_attempt.id
+                    WHERE parent_attempt.sim_job_id = ${parent.id}
+                      AND parent_attempt.regime = 'rans'
+                      AND parent_attempt.airfoil_id = obligation.airfoil_id
+                      AND parent_attempt.simulation_preset_revision_id = obligation.revision_id
+                      AND parent_attempt.aoa_deg = obligation.aoa_deg
+                      AND classification.state IN ('rejected', 'needs_urans')
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM results parent_result
+                    JOIN result_classifications classification
+                      ON classification.result_id = parent_result.id
+                    WHERE parent_result.sim_job_id = ${parent.id}
+                      AND parent_result.regime = 'rans'
+                      AND parent_result.airfoil_id = obligation.airfoil_id
+                      AND parent_result.simulation_preset_revision_id = obligation.revision_id
+                      AND parent_result.aoa_deg = obligation.aoa_deg
+                      AND classification.state IN ('rejected', 'needs_urans')
+                  )
+                )
+            )
+            LIMIT 1
+          `)) as unknown as Array<{ present: number }>;
+          // A retry-wait obligation intentionally produces no child until its
+          // due time. It is not a no-plan parent and must remain reachable in
+          // this process. Memoize only when all known physical cells settled.
+          if (openObligation) settledRecoveryParents.delete(parent.id);
+          else settledRecoveryParents.add(parent.id);
+          continue;
+        }
+        if (
+          created.some((row) =>
+            ["pending", "submitted", "running", "ingesting"].includes(
+              row.status,
+            ),
+          )
+        ) {
+          // The live child itself is the durable duplicate barrier. Do not memo
+          // the parent: once this child settles, another physical obligation on
+          // the same parent may need a continuation in this same process.
+          settledRecoveryParents.delete(parent.id);
+          return true;
+        }
+        // Even a synchronously-terminal child may have left another cell or its
+        // one continuation pending. Re-scan next tick; memoization is reserved
+        // for the genuine no-plan branch above.
+        settledRecoveryParents.delete(parent.id);
+      }
+      return false;
+    };
+
+    const durableParents = await dueCampaignPrecalcRecoveryParents(
+      db,
+      campaign.id,
+      parentJobIds,
+      uransRecoveryVersion,
+    );
+    if (await attemptParents(durableParents, true)) return true;
+    if (attempted >= RECOVERY_PARENTS_PER_TICK) continue;
+
+    // Legacy discovery remains bounded and process-memoized. It materializes
+    // obligations for old terminal evidence that predates route recording, but
+    // it cannot occupy the admission window ahead of an already-durable route.
+    let excludedIds = [
+      ...new Set([...settledRecoveryParents, ...attemptedParentIds]),
+    ];
+    const sharedLegacyParents = await legacySharedCampaignRecoveryParents(
+      db,
+      campaign.id,
+      parentJobIds,
+      excludedIds,
+      RECOVERY_PARENTS_PER_TICK - attempted,
+      uransRecoveryVersion,
+    );
+    if (await attemptParents(sharedLegacyParents, false)) return true;
+    if (attempted >= RECOVERY_PARENTS_PER_TICK) continue;
+    excludedIds = [
+      ...new Set([...settledRecoveryParents, ...attemptedParentIds]),
+    ];
     const child = alias(simJobs, "settled_wave2_child");
     const parents = await db
       .select()
@@ -883,7 +1269,7 @@ export async function submitCampaignPrecalcRecoveries(
               ),
             ),
           ),
-          ...(settledIds.length ? [notInArray(simJobs.id, settledIds)] : []),
+          ...(excludedIds.length ? [notInArray(simJobs.id, excludedIds)] : []),
           // Only an actually live child blocks this parent. Terminal children
           // are immutable attempt history; a pending sibling obligation must
           // be allowed to drain through the next sequential child.
@@ -907,128 +1293,12 @@ export async function submitCampaignPrecalcRecoveries(
         ),
       )
       .orderBy(simJobs.finishedAt)
-      .limit(RECOVERY_PARENTS_PER_TICK);
-    let attempted = 0;
-    for (const parent of parents) {
-      if (settledRecoveryParents.has(parent.id)) continue;
-      if (attempted >= RECOVERY_PARENTS_PER_TICK) break;
-      attempted += 1;
-      await touchHeartbeat(db);
-      const before = await db
-        .select({ id: simJobs.id })
-        .from(simJobs)
-        .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
-      await submitUransRetryForJob(db, engine, parent, {
-        meshRecoveryVersion,
-        uransRecoveryVersion,
-        capacityScheduledEscalation: true,
-      });
-      const [campaignAfterSubmit] = parent.campaignId
-        ? await db
-            .select({ status: simCampaigns.status })
-            .from(simCampaigns)
-            .where(eq(simCampaigns.id, parent.campaignId))
-            .limit(1)
-        : [];
-      if (campaignAfterSubmit?.status === "paused") {
-        // Pause may win after composition but before/while engine submission.
-        // Its cancelled child is deliberately NOT a settled obligation: the
-        // queued/no-owner rows must be reconsidered after explicit resume in
-        // this same process, not only after a restart clears memory.
-        settledRecoveryParents.delete(parent.id);
-        continue;
-      }
-      const beforeIds = new Set(before.map((row) => row.id));
-      const after = await db
-        .select({ id: simJobs.id, status: simJobs.status })
-        .from(simJobs)
-        .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
-      const created = after.filter((row) => !beforeIds.has(row.id));
-      if (!created.length) {
-        const [openObligation] = (await db.execute(sql`
-          SELECT 1 AS present
-          WHERE EXISTS (
-            SELECT 1
-            FROM sim_jobs sibling_child
-            CROSS JOIN LATERAL jsonb_array_elements_text(
-              CASE
-                WHEN jsonb_typeof(sibling_child.request_payload -> 'precalcObligationIds') = 'array'
-                THEN sibling_child.request_payload -> 'precalcObligationIds'
-                ELSE '[]'::jsonb
-              END
-            ) payload_obligation(id)
-            JOIN sim_precalc_obligations obligation
-              ON obligation.id = payload_obligation.id::uuid
-            WHERE sibling_child.parent_job_id = ${parent.id}
-              AND obligation.state IN ('pending', 'running')
-          ) OR EXISTS (
-            -- Covers a crash/failure after ensure but before the child insert.
-            -- Scope that durable cell back to THIS parent's rejected RANS
-            -- evidence. An unrelated open PRECALC obligation on the same
-            -- campaign/revision must not keep every childless no-plan parent
-            -- in the first scan window forever.
-            SELECT 1
-            FROM sim_precalc_obligations obligation
-            JOIN sim_precalc_obligation_campaigns ownership
-              ON ownership.obligation_id = obligation.id
-             AND ownership.state = 'active'
-            WHERE ownership.campaign_id = ${parent.campaignId}
-              AND obligation.airfoil_id = ${parent.airfoilId}
-              AND obligation.revision_id = ${parent.simulationPresetRevisionId}
-              AND obligation.state IN ('pending', 'running')
-              AND (
-                EXISTS (
-                  SELECT 1
-                  FROM result_attempts parent_attempt
-                  JOIN result_classifications classification
-                    ON classification.result_attempt_id = parent_attempt.id
-                  WHERE parent_attempt.sim_job_id = ${parent.id}
-                    AND parent_attempt.regime = 'rans'
-                    AND parent_attempt.airfoil_id = obligation.airfoil_id
-                    AND parent_attempt.simulation_preset_revision_id = obligation.revision_id
-                    AND parent_attempt.aoa_deg = obligation.aoa_deg
-                    AND classification.state IN ('rejected', 'needs_urans')
-                )
-                OR EXISTS (
-                  SELECT 1
-                  FROM results parent_result
-                  JOIN result_classifications classification
-                    ON classification.result_id = parent_result.id
-                  WHERE parent_result.sim_job_id = ${parent.id}
-                    AND parent_result.regime = 'rans'
-                    AND parent_result.airfoil_id = obligation.airfoil_id
-                    AND parent_result.simulation_preset_revision_id = obligation.revision_id
-                    AND parent_result.aoa_deg = obligation.aoa_deg
-                    AND classification.state IN ('rejected', 'needs_urans')
-                )
-              )
-          )
-          LIMIT 1
-        `)) as unknown as Array<{ present: number }>;
-        // A retry-wait obligation intentionally produces no child until its
-        // due time. It is not a no-plan parent and must remain reachable in
-        // this process. Memoize only when all known physical cells settled.
-        if (openObligation) settledRecoveryParents.delete(parent.id);
-        else settledRecoveryParents.add(parent.id);
-        continue;
-      }
-      if (
-        created.some((row) =>
-          ["pending", "submitted", "running", "ingesting"].includes(row.status),
-        )
-      ) {
-        // The live child itself is the durable duplicate barrier. Do not memo
-        // the parent: once this child settles, another physical obligation on
-        // the same parent may need a continuation in this same process.
-        settledRecoveryParents.delete(parent.id);
-        if (campaignHasRansBacklog) campaignRansAdmissionTurnDue = true;
-        return true;
-      }
-      // Even a synchronously-terminal child may have left another cell or its
-      // one continuation pending. Re-scan next tick; memoization is reserved
-      // for the genuine no-plan branch above.
-      settledRecoveryParents.delete(parent.id);
-    }
+      .limit(RECOVERY_PARENTS_PER_TICK - attempted);
+    const legacyParents = parents.map((parent) => ({
+      sourceParent: parent,
+      ownerCampaignId: campaign.id,
+    }));
+    if (await attemptParents(legacyParents, false)) return true;
   }
   return false;
 }
@@ -1099,6 +1369,9 @@ async function submitLadderJob(
     uransRequestId?: string;
     /** Claimed automatic full-verification item. */
     verifyQueueId?: string;
+    /** Explicit only for the one-shot operator canary. Ordinary ladder work
+     * remains local and therefore requires the scheduler switch to be on. */
+    admissionLane?: SubmissionAdmissionLane;
     /** Crash recovery for one normalized whole-polar event. The exact event
      * and selected obligation ids are revalidated by the child composer in
      * the same transaction as insertion. */
@@ -1396,6 +1669,7 @@ async function submitLadderJob(
     db,
     engine,
     jobId: job.id,
+    admissionLane: opts.admissionLane,
     campaignId: campaignId ?? null,
     request,
     connectionErrorPrefix: "engine unreachable at ladder submit: ",
@@ -1526,6 +1800,7 @@ async function consumeUransRequest(
   meshRecoveryVersion?: number,
   uransRecoveryVersion?: number | null,
   requiredFidelity?: UransFidelity,
+  admissionLane?: SubmissionAdmissionLane,
 ): Promise<boolean> {
   const request = await claimNextPendingUransRequest(db, {
     requestIds,
@@ -1828,6 +2103,7 @@ async function consumeUransRequest(
       ? (uransRecoveryVersion ?? undefined)
       : undefined,
     uransRequestId: request.id,
+    admissionLane,
   });
   if (outcome.submitted) {
     if (obligationIds.length) {
@@ -1889,6 +2165,7 @@ async function consumeVerifyItem(
     campaignIds?: string[];
     verifyIds?: string[];
     uransRecoveryVersion?: number | null;
+    admissionLane?: SubmissionAdmissionLane;
   } = {},
 ): Promise<boolean> {
   const durableRecoveryAvailable = supportsDurableUransRecovery(
@@ -2034,6 +2311,7 @@ async function consumeVerifyItem(
       ? (scope.uransRecoveryVersion ?? undefined)
       : undefined,
     verifyQueueId: item.id,
+    admissionLane: scope.admissionLane,
   });
   if (outcome.submitted) {
     console.log(
@@ -2096,6 +2374,8 @@ export async function submitExactUransCanaryStep(
       [input.requestId],
       input.meshRecoveryVersion,
       input.uransRecoveryVersion,
+      undefined,
+      "operator_canary",
     )
   ) {
     return true;
@@ -2105,6 +2385,7 @@ export async function submitExactUransCanaryStep(
   return consumeVerifyItem(db, engine, input.cpuSlots ?? 0, {
     verifyIds: [input.verifyId],
     uransRecoveryVersion: input.uransRecoveryVersion,
+    admissionLane: "operator_canary",
   });
 }
 

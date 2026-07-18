@@ -2654,56 +2654,90 @@ export const solverCutoverContinuationChecks = pgTable(
 // ---------------------------------------------------------------------------
 // 12. Sweeper state — single control row (id = 1).
 // ---------------------------------------------------------------------------
-export const sweeperState = pgTable("sweeper_state", {
-  id: integer("id").primaryKey().default(1),
-  enabled: boolean("enabled").notNull().default(false),
-  // 0 = auto: derive concurrent polar-job admission from the worker token
-  // budget (or the visible cpuSlots cap). A positive value is an explicit
-  // API-only override; it must never remain an invisible legacy ceiling.
-  maxConcurrentJobs: integer("max_concurrent_jobs").notNull().default(0),
-  // THE single global solver-capacity setting ("OpenFOAM CPU slots").
-  // 0 = auto: submit jobs without a cpu_budget cap so the engine resolves its
-  // own worker budget — exactly the pre-campaign effective behavior (scheduling
-  // profiles defaulted cpuBudget to NULL). Job building passes a positive value
-  // into the engine `resources` block, and auto job admission follows this
-  // same capacity instead of a separate hidden ceiling.
-  cpuSlots: integer("cpu_slots").notNull().default(0),
-  // Engine-down backoff (spec §7): set when a submit-path probe/submit fails
-  // with a connection error, cleared on the first successful probe/submit.
-  // While set, Queue + campaign pages show one truthful "Engine unreachable
-  // since …" banner; job status `failed` stays reserved for jobs the engine
-  // actually rejected/ran.
-  engineUnreachableSince: ts(),
-  pollIntervalMs: integer("poll_interval_ms").notNull().default(5000),
-  submitIntervalMs: integer("submit_interval_ms").notNull().default(15000),
-  heartbeatAt: ts(),
-  // Liveness/progress split (migration 0033): heartbeatAt is written by an
-  // INDEPENDENT 15 s timer in the sweeper process (pure liveness — stale >90 s
-  // now really means process death), while these two are stamped by the loop
-  // at tick begin/end (pure progress). A fresh heartbeat with a started-but-
-  // not-completed tick older than 5 min derives the AMBER tick_stalled state
-  // instead of a false red "PROCESS NOT RUNNING" (2026-07-06 prod incident:
-  // one hung engine HTTP call starved the in-tick heartbeat writes).
-  lastTickStartedAt: ts(),
-  lastTickCompletedAt: ts(),
-  // Storage admission is a scheduler gate, not a campaign lifecycle state.
-  // Persist the last real engine measurement so Queue/campaign surfaces can
-  // explain why an enabled scheduler is intentionally not submitting work.
-  diskAdmissionBlocked: boolean("disk_admission_blocked")
-    .notNull()
-    .default(false),
-  diskAdmissionReason: text("disk_admission_reason"),
-  diskUsedPct: doublePrecision("disk_used_pct"),
-  diskFreeBytes: bigint("disk_free_bytes", { mode: "number" }),
-  diskRequiredFreeBytes: bigint("disk_required_free_bytes", {
-    mode: "number",
+export const sweeperState = pgTable(
+  "sweeper_state",
+  {
+    id: integer("id").primaryKey().default(1),
+    enabled: boolean("enabled").notNull().default(false),
+    // 0 = auto: derive concurrent polar-job admission from the worker token
+    // budget (or the visible cpuSlots cap). A positive value is an explicit
+    // API-only override; it must never remain an invisible legacy ceiling.
+    maxConcurrentJobs: integer("max_concurrent_jobs").notNull().default(0),
+    // THE single global solver-capacity setting ("OpenFOAM CPU slots").
+    // 0 = auto: submit jobs without a cpu_budget cap so the engine resolves its
+    // own worker budget — exactly the pre-campaign effective behavior (scheduling
+    // profiles defaulted cpuBudget to NULL). Job building passes a positive value
+    // into the engine `resources` block, and auto job admission follows this
+    // same capacity instead of a separate hidden ceiling.
+    cpuSlots: integer("cpu_slots").notNull().default(0),
+    // Engine-down backoff (spec §7): set when a submit-path probe/submit fails
+    // with a connection error, cleared on the first successful probe/submit.
+    // While set, Queue + campaign pages show one truthful "Engine unreachable
+    // since …" banner; job status `failed` stays reserved for jobs the engine
+    // actually rejected/ran.
+    engineUnreachableSince: ts(),
+    pollIntervalMs: integer("poll_interval_ms").notNull().default(5000),
+    submitIntervalMs: integer("submit_interval_ms").notNull().default(15000),
+    heartbeatAt: ts(),
+    // Liveness/progress split (migration 0033): heartbeatAt is written by an
+    // INDEPENDENT 15 s timer in the sweeper process (pure liveness — stale >90 s
+    // now really means process death), while these two are stamped by the loop
+    // at tick begin/end (pure progress). A fresh heartbeat with a started-but-
+    // not-completed tick older than 5 min derives the AMBER tick_stalled state
+    // instead of a false red "PROCESS NOT RUNNING" (2026-07-06 prod incident:
+    // one hung engine HTTP call starved the in-tick heartbeat writes).
+    lastTickStartedAt: ts(),
+    lastTickCompletedAt: ts(),
+    // Storage admission is a scheduler gate, not a campaign lifecycle state.
+    // Persist the last real engine measurement so Queue/campaign surfaces can
+    // explain why an enabled scheduler is intentionally not submitting work.
+    diskAdmissionBlocked: boolean("disk_admission_blocked")
+      .notNull()
+      .default(false),
+    diskAdmissionReason: text("disk_admission_reason"),
+    diskUsedPct: doublePrecision("disk_used_pct"),
+    diskFreeBytes: bigint("disk_free_bytes", { mode: "number" }),
+    diskRequiredFreeBytes: bigint("disk_required_free_bytes", {
+      mode: "number",
+    }),
+    diskCheckedAt: timestamp("disk_checked_at", { withTimezone: true }),
+    // A critical current-generation solver outcome closes only NEW admission;
+    // already-submitted work keeps running and reconciliation/ingest remain
+    // live.  `admissionFenceActive` is the current operational latch.  The
+    // last-* fields survive an explicit re-enable so an operator can still see
+    // exactly why the automatic fence fired without conflating that history
+    // with a later ordinary pause.
+    admissionFenceActive: boolean("admission_fence_active")
+      .notNull()
+      .default(false),
+    lastAdmissionFenceAt: timestamp("last_admission_fence_at", {
+      withTimezone: true,
+    }),
+    lastAdmissionFenceReason: text("last_admission_fence_reason"),
+    lastAdmissionFenceTriggerKey: text("last_admission_fence_trigger_key"),
+    lastAdmissionFenceDetails: jsonb("last_admission_fence_details").$type<
+      Record<string, unknown>
+    >(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    admissionFenceShapeCheck: check(
+      "sweeper_state_admission_fence_shape_check",
+      sql`NOT ${t.admissionFenceActive} OR (
+      ${t.enabled} = false
+      AND ${t.maxConcurrentJobs} = 0
+      AND ${t.cpuSlots} = 0
+      AND ${t.lastAdmissionFenceAt} IS NOT NULL
+      AND btrim(COALESCE(${t.lastAdmissionFenceReason}, '')) <> ''
+      AND btrim(COALESCE(${t.lastAdmissionFenceTriggerKey}, '')) <> ''
+      AND ${t.lastAdmissionFenceDetails} IS NOT NULL
+    )`,
+    ),
   }),
-  diskCheckedAt: timestamp("disk_checked_at", { withTimezone: true }),
-  updatedAt: ts()
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
+);
 
 // ---------------------------------------------------------------------------
 // 12b. Simulation campaigns — user-launched batch execution records (spec:
@@ -3158,6 +3192,9 @@ export const simCampaignProgress = pgTable(
     conditionIdx: index("sim_campaign_progress_condition_idx").on(
       t.conditionId,
     ),
+    blockedAdmissionIdx: index("sim_campaign_progress_blocked_admission_idx")
+      .on(t.campaignId, t.conditionId, t.airfoilId)
+      .where(sql`${t.blocked} > 0`),
     remediationNonnegativeCheck: check(
       "sim_campaign_progress_remediation_nonnegative_check",
       sql`${t.precalcMeshRepairing} >= 0

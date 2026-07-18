@@ -15,7 +15,13 @@
   limit; storage pressure blocks only new admission while reconciliation and
   ingestion continue. No-shedding preliminary URANS remains preliminary
   evidence. Each point is one RANS screening → fast preliminary URANS → final
-  verified URANS journey; aerodynamic RANS rejection is a normal handoff.
+  verified URANS journey; aerodynamic RANS rejection is a normal handoff. Due
+  fast-URANS obligations strictly outrank unrelated new RANS from their durable
+  ledger, including after a scheduler restart. A current-generation critical or
+  exhausted preliminary/final hazard durably fences only NEW admission while
+  reconciliation, ingestion, retention, and accepted work continue; operator
+  resume clears the latch, but admission checks re-trip it before submission if
+  the hazard remains, and legacy-generation hazards are inert.
   A mesh/runtime problem is repaired automatically before fast URANS, and only
   exhaustion of that non-aerodynamic recovery or of fast/final URANS is a
   critical system incident. Campaign detail leads with one operational message
@@ -48,14 +54,42 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   Deterministic mesh or runtime failure is not aerodynamic handoff evidence:
   repair it automatically under a versioned strategy and show a red system
   incident only if the current strategy cannot reach fast URANS.
-  Admit its preliminary handoff ahead of unrelated new RANS after the parent is
-  terminal, and guarantee final verification one slot after at most eight new
-  wave-1 RANS admissions. Continue only the exact saved transient from the same
-  immutable solver implementation; restore it from archived evidence when
-  needed, and start successor-engine cells fresh. Recovery requests pin the
-  engine's integer `urans_recovery_version`; absent capability is legacy
-  version 0 and any mismatch fails before solve work, leaving recovery pending
-  while ordinary RANS and first-pass preliminary URANS remain eligible.
+  Admit every due preliminary handoff ahead of unrelated new RANS after the
+  parent is terminal, directly from the durable obligation ledger rather than
+  process memory or a bounded finished-parent rank; a restart must not recreate
+  the old rank-53 starvation defect. A campaign beneficiary may take its exact
+  handoff from a shared/background physical parent without changing that
+  parent's provenance, and its lifecycle owns admission. Guarantee final
+  verification one slot after at most eight new wave-1 RANS admissions.
+  Durably latch all NEW solver admission closed when current-generation ledgers
+  expose a critical or exhausted preliminary/final hazard, without pausing
+  reconciliation, ingestion, retention, or already-accepted engine work.
+  Serialize the last permit at the actual engine-submit boundary by holding
+  the singleton admission lock through the bounded engine acceptance call;
+  every durable transition into a critical state takes the same lock, so a
+  hazard and an accepted job have one unambiguous order. Only the explicit
+  `operator_canary` lane may submit while the ordinary scheduler is disabled,
+  and only behind an exact zero/zero durable-capacity fence; it is never
+  inferred and still crosses the same hazard lock. Only an explicit operator
+  Resume clears the latch and restores its saved capacity, while
+  capacity-only edits cannot clear it. Every surrounding transition that can
+  make an already-stored hazard current—campaign resume or generation change,
+  current condition/point activation, or campaign ownership/attribution—takes
+  that lock too. Re-trip before submission if the hazard remains; legacy
+  generations never trip this breaker. Versioned deterministic-mesh
+  remediation is reconciliation rather than NEW admission: while fenced it may
+  atomically reopen only the exact older-strategy obligation and resolve only
+  its matching old incident, but that maintenance tick submits zero, never
+  clears the latch, and cannot repeat the same recovery version. Due FAST work
+  also outranks new mirrored remote RANS admission within shared capacity, and
+  remote requests pin the exact mesh-recovery capability. Unknown engine mesh
+  capability holds all local NEW admission rather than falling back to version 0. Exact incident provenance is admin-only. Continue only the exact saved
+  transient from the same immutable solver implementation; restore it from
+  archived evidence when needed, and start successor-engine cells fresh.
+  Recovery requests pin the engine's integer `urans_recovery_version`; absent
+  capability is legacy version 0 and any mismatch fails before solve work,
+  leaving recovery pending while ordinary RANS and first-pass preliminary
+  URANS remain eligible.
   An admin `full` request means “ensure final verification” for its exact or
   whole-polar scope: it owns the same preliminary and final per-point
   obligations and never launches a direct one-shot full solve that bypasses
@@ -80,6 +114,19 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   rare failures unmistakable, and lets the control plane deploy safely before
   the recovery-capable engine. Treating an accepted final/fast comparison as a
   red failure would misstate an available authoritative result as missing.
+  Process-local RANS/PRECALC alternation plus a bounded finished-parent scan let
+  an already-durable obligation at rank 53 remain behind unrelated RANS again
+  after restart. A manual campaign pause was also too broad and too late: it did
+  not atomically stop new work at the durable hazard while preserving recovery
+  services. Locking only the row that first became blocked was insufficient
+  because a later resume, generation cutover, point activation, or ownership
+  attachment could make old evidence current after the submitter's snapshot.
+  Likewise, treating mesh remediation as ordinary admission deadlocked the
+  repair behind its own safety fence, while retrying from any older attempt
+  could reopen the same failed strategy forever. Durable priority, complete
+  predicate serialization, version-monotonic reconciliation, and a latched
+  NEW-admission breaker close those gaps without treating legacy evidence as a
+  current release failure.
 
 ## D-2026-07-16-campaign-cell-evidence-dialog — Campaign cells explain automatic recovery without calling it failure
 

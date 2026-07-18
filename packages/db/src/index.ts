@@ -18,6 +18,7 @@ export * from "./rans-polar-promotions";
 export * from "./precalc-cell-lock";
 export * from "./result-evidence-lock";
 export * from "./sync-promise-purge";
+export * from "./sweeper-admission-breaker";
 export { createClient, type DB, type Sql } from "./client";
 export { databaseUrl, DEFAULT_DATABASE_URL } from "./env";
 import * as schema from "./schema";

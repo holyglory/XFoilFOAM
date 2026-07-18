@@ -333,7 +333,7 @@ describe("progressSummaryLine", () => {
       { awaitingUrans: 96, needsReview: 2 },
     );
     expect(progressSummaryLine(seg, 1750)).toBe(
-      "1,240 done · 12 solving · 96 awaiting URANS · 402 open of 1,750",
+      "1,240 done · 12 solving · 96 awaiting FAST URANS · 402 open of 1,750",
     );
     const quiet = progressBarSegments(totals(), null);
     expect(progressSummaryLine(quiet, 1750)).toBe(

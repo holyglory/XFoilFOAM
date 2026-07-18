@@ -26,7 +26,9 @@ import {
   resultClassifications,
   resultAttempts,
   recordPrecalcObligationSubmission,
+  recomputeProgressForPrecalcObligations,
   requeueDeterministicMeshObligationsForRecoveryVersion,
+  resolveSolverIncidentsForOwner,
   results,
   simCampaignPoints,
   simCampaignConditions,
@@ -35,6 +37,7 @@ import {
   simPrecalcObligationAttempts,
   simPrecalcObligationCampaigns,
   simPrecalcObligations,
+  simSolverIncidents,
   solverProfiles,
   settlePrecalcObligationsForJob,
   sweeperState,
@@ -59,9 +62,9 @@ import {
 } from "vitest";
 
 import type { ConditionMapEntry } from "../src/ingest";
-import { submitCampaignBatch } from "../src/loop";
+import { submitCampaignBatch, tick } from "../src/loop";
 import { reconcile } from "../src/reconcile";
-import { resetUransLadderMemory, uransLadderTick } from "../src/urans-ladder";
+import { resetUransLadderMemory } from "../src/urans-ladder";
 import { withExactManifestEvidence } from "./exact-result-fixture";
 
 const { db, sql } = createClient({ max: 2 });
@@ -197,10 +200,10 @@ beforeAll(async () => {
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: false })
+    .values({ id: 1, enabled: true })
     .onConflictDoUpdate({
       target: sweeperState.id,
-      set: { enabled: false },
+      set: { enabled: true },
     });
 
   const [category] = await db
@@ -738,6 +741,46 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
       state: "rejected",
       outcome: "rejected_exhausted",
     });
+    const [meshIncident] = await db
+      .select({
+        solverImplementationId: simSolverIncidents.solverImplementationId,
+        simJobId: simSolverIncidents.simJobId,
+        resultAttemptId: simSolverIncidents.resultAttemptId,
+        reason: simSolverIncidents.reason,
+        metadata: simSolverIncidents.metadata,
+      })
+      .from(simSolverIncidents)
+      .where(eq(simSolverIncidents.precalcObligationId, settled[0].id))
+      .limit(1);
+    if (!meshIncident) throw new Error("missing deterministic mesh incident");
+    expect(meshIncident).toMatchObject({
+      simJobId: childJobId,
+      reason: "deterministic-mesh",
+      metadata: {
+        lastOutcome: "deterministic_failure",
+        recovery: "deterministic-mesh",
+        meshRecoveryVersion: 0,
+      },
+    });
+    // A separate controller/runtime occurrence can share the same owner,
+    // physical job, and attempt. Mesh remediation must close only the exact
+    // deterministic-mesh occurrence, never every incident attached to that
+    // evidence.
+    await db.insert(simSolverIncidents).values({
+      stage: "preliminary",
+      reason: "controller-runtime-failure",
+      severity: "critical",
+      precalcObligationId: settled[0].id,
+      solverImplementationId: meshIncident.solverImplementationId,
+      simJobId: meshIncident.simJobId,
+      resultAttemptId: meshIncident.resultAttemptId,
+      occurrenceKey: `${PREFIX}:same-attempt-controller-runtime`,
+      remediationVersion: `${PREFIX}:controller-runtime-v1`,
+      metadata: {
+        lastOutcome: "deterministic_failure",
+        failureDisposition: "infrastructure",
+      },
+    });
 
     // The canonical failed PRECALC evidence stays on the producing child;
     // retry ownership never masquerades as a queued result row.
@@ -769,29 +812,198 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
     expect(childrenBeforeRestart).toHaveLength(1);
     resetUransLadderMemory();
     const replayedRequests: PolarRequest[] = [];
-    const replayEngine = {
-      healthDetails: async () => ({
-        status: "ok",
-        version: "test",
-        mesh_recovery_version: 1,
-      }),
-      submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
-        replayedRequests.push(request);
-        return {
-          job_id: `${PREFIX}-transient-precalc-retry`,
-          state: "pending",
-          total_cases: request.aoa?.angles?.length ?? 0,
-          completed_cases: 0,
-        };
-      },
-    } as unknown as EngineClient;
+    const replayEngine = (meshRecoveryVersion: number) =>
+      ({
+        baseUrl: "http://mesh-recovery.test",
+        health: async () => true,
+        healthDetails: async () => ({
+          status: "ok",
+          version: "test",
+          mesh_recovery_version: meshRecoveryVersion,
+          urans_recovery_version: 2,
+        }),
+        maintenanceDisk: async () => ({
+          total_bytes: 500 * 1024 ** 3,
+          free_bytes: 400 * 1024 ** 3,
+          used_pct: 20,
+        }),
+        maintenanceJobs: async () => ({ items: [] }),
+        getQueue: async () => ({
+          queue_depth: 0,
+          active: [],
+          reserved: [],
+          scheduled: [],
+          active_count: 0,
+          reserved_count: 0,
+          scheduled_count: 0,
+          job_ids: [],
+          duplicates: {},
+          redelivered: [],
+        }),
+        cacheStats: async () => ({}),
+        getJobRuntimes: async () => ({ jobs: [] }),
+        getJob: async () => {
+          throw new Error("no scoped terminal job should be fetched");
+        },
+        cancelJob: async () => ({ status: "cancelled" }),
+        stripJob: async () => ({
+          bytes_freed: 0,
+          files_removed: 0,
+          kept_case_state: true,
+        }),
+        submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
+          replayedRequests.push(request);
+          return {
+            job_id: `${PREFIX}-transient-precalc-retry`,
+            state: "pending",
+            total_cases: request.aoa?.angles?.length ?? 0,
+            completed_cases: 0,
+          };
+        },
+      }) as unknown as EngineClient;
+    const resumeExplicitly = async () => {
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: true,
+          maxConcurrentJobs: 1,
+          cpuSlots: 1,
+          admissionFenceActive: false,
+        })
+        .where(eq(sweeperState.id, 1));
+    };
+    const readFence = async () => {
+      const [row] = await db
+        .select({
+          enabled: sweeperState.enabled,
+          maxConcurrentJobs: sweeperState.maxConcurrentJobs,
+          cpuSlots: sweeperState.cpuSlots,
+          admissionFenceActive: sweeperState.admissionFenceActive,
+          lastAdmissionFenceReason: sweeperState.lastAdmissionFenceReason,
+        })
+        .from(sweeperState)
+        .where(eq(sweeperState.id, 1));
+      return row;
+    };
+    const scopedTick = (meshRecoveryVersion: number) =>
+      tick(db, replayEngine(meshRecoveryVersion), {
+        jobIds: [parentJobId],
+        skipFailedRecovery: true,
+      });
+
     expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(false);
+
+    // A same-version controller has no new physical remediation and may not
+    // slip a submission through the safety stop.
+    await resumeExplicitly();
+    await scopedTick(0);
+    expect(replayedRequests).toHaveLength(0);
+    expect(await readFence()).toMatchObject({
+      enabled: false,
+      maxConcurrentJobs: 0,
+      cpuSlots: 0,
+      admissionFenceActive: true,
+    });
     expect(
-      await uransLadderTick(db, replayEngine, 0, {
-        campaignIds: [campaignId],
-        requestIds: [],
-      }),
-    ).toBe(true);
+      (
+        await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, settled[0].id))
+      )[0],
+    ).toMatchObject({ state: "blocked", lastOutcome: "deterministic_failure" });
+
+    // A malformed capability is unknown, never an implicit upgrade to v1.
+    await resumeExplicitly();
+    await scopedTick(1.5);
+    expect(replayedRequests).toHaveLength(0);
+    expect(await readFence()).toMatchObject({
+      enabled: false,
+      admissionFenceActive: true,
+    });
+    expect(
+      (
+        await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, settled[0].id))
+      )[0],
+    ).toMatchObject({ state: "blocked", lastOutcome: "deterministic_failure" });
+
+    // A genuinely newer strategy may refresh the exact old mesh blocker while
+    // fenced, but that maintenance tick remains admission-free and preserves
+    // the operator latch. The old incident closes atomically with the ledger.
+    await resumeExplicitly();
+    await scopedTick(1);
+    expect(replayedRequests).toHaveLength(0);
+    expect(await readFence()).toMatchObject({
+      enabled: false,
+      admissionFenceActive: true,
+    });
+    expect(
+      (
+        await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, settled[0].id))
+      )[0],
+    ).toMatchObject({
+      state: "pending",
+      lastOutcome: "mesh_recovery_upgrade_pending",
+      attemptCount: 0,
+    });
+    expect(
+      await db
+        .select({
+          reason: simSolverIncidents.reason,
+          status: simSolverIncidents.status,
+        })
+        .from(simSolverIncidents)
+        .where(eq(simSolverIncidents.precalcObligationId, settled[0].id))
+        .orderBy(asc(simSolverIncidents.reason)),
+    ).toEqual([
+      { reason: "controller-runtime-failure", status: "open" },
+      { reason: "deterministic-mesh", status: "resolved" },
+    ]);
+    await resolveSolverIncidentsForOwner(db, {
+      precalcObligationId: settled[0].id,
+    });
+
+    // The unrelated exhausted preliminary result remains critical. Resume
+    // must re-trip until that owner is actually resolved; mesh remediation
+    // cannot erase it as collateral state.
+    await resumeExplicitly();
+    await scopedTick(1);
+    expect(replayedRequests).toHaveLength(0);
+    expect(await readFence()).toMatchObject({
+      enabled: false,
+      admissionFenceActive: true,
+    });
+    expect(
+      await db
+        .select({ status: simSolverIncidents.status })
+        .from(simSolverIncidents)
+        .where(eq(simSolverIncidents.precalcObligationId, settled[2].id)),
+    ).toEqual([{ status: "open" }]);
+
+    // Close only the unrelated test-owned exhaustion, refresh its campaign
+    // projection, then model the real explicit Resume. The next tick may now
+    // submit the two still-due physical cells.
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "cancelled",
+        lastOutcome: "test_fixture_resolved",
+        lastError: null,
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligations.id, settled[2].id));
+    await resolveSolverIncidentsForOwner(db, {
+      precalcObligationId: settled[2].id,
+    });
+    await recomputeProgressForPrecalcObligations(db, [settled[2].id]);
+    await resumeExplicitly();
+    await scopedTick(1);
     expect(replayedRequests).toHaveLength(1);
     expect(replayedRequests[0].aoa?.angles).toEqual([15, 20]);
     expect(replayedRequests[0].solver).toMatchObject({
@@ -902,12 +1114,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
     // A second process restart sees the active v1 wave-2 child and submits
     // nothing. A capability version is consumable at most once.
     resetUransLadderMemory();
-    expect(
-      await uransLadderTick(db, replayEngine, 0, {
-        campaignIds: [campaignId],
-        requestIds: [],
-      }),
-    ).toBe(false);
+    await scopedTick(1);
     const childrenAfterRestart = await db
       .select({ id: simJobs.id })
       .from(simJobs)
@@ -917,7 +1124,7 @@ describe("deterministic precalc mesh-QA auto-retry suppression", () => {
       childrenAfterRetry.map((child) => child.id),
     );
     expect(replayedRequests).toHaveLength(1);
-  }, 240000);
+  }, 300000);
 
   it("MUST-CATCH + FALSE-POSITIVE GUARDS: structured negative-volume mesh failures reopen, while unchanged, infrastructure, and ownerless blockers do not", async () => {
     const testAoas = [31, 32, 33, 34];

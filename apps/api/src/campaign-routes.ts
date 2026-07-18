@@ -53,6 +53,33 @@ const isoOrNull = (v: Date | string | null | undefined): string | null => {
   return Number.isNaN(parsed.getTime()) ? v : parsed.toISOString();
 };
 
+type AdminAdmissionFenceContext = {
+  stage?: "rans" | "preliminary" | "final";
+  fidelity?: "precalc" | "full";
+};
+
+/** Campaign polling needs enough context to name the stopped solver stage,
+ * not exact incident provenance. Keep ids, errors, capacity snapshots and
+ * arbitrary metadata on the dedicated protected sweeper endpoint; campaign
+ * list/summary DTOs receive only validated stage/fidelity enums. */
+function sanitizeAdmissionFenceContext(
+  details: Record<string, unknown> | null | undefined,
+): AdminAdmissionFenceContext | null {
+  if (!details) return null;
+  const context: AdminAdmissionFenceContext = {};
+  if (
+    details.stage === "rans" ||
+    details.stage === "preliminary" ||
+    details.stage === "final"
+  ) {
+    context.stage = details.stage;
+  }
+  if (details.fidelity === "precalc" || details.fidelity === "full") {
+    context.fidelity = details.fidelity;
+  }
+  return Object.keys(context).length ? context : null;
+}
+
 const objectiveBody = z.object({
   enabled: z.boolean(),
   toleranceDeg: numberLike.default(0.1),
@@ -219,6 +246,12 @@ export async function registerCampaignRoutes(
         diskFreeBytes: sweeper?.diskFreeBytes ?? null,
         diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
         diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
+        admissionFenceActive: Boolean(sweeper?.admissionFenceActive),
+        lastAdmissionFenceAt: isoOrNull(sweeper?.lastAdmissionFenceAt),
+        lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
+        lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
+          sweeper?.lastAdmissionFenceDetails,
+        ),
       },
     };
   });
@@ -292,6 +325,12 @@ export async function registerCampaignRoutes(
             diskFreeBytes: sweeper?.diskFreeBytes ?? null,
             diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
             diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
+            admissionFenceActive: Boolean(sweeper?.admissionFenceActive),
+            lastAdmissionFenceAt: isoOrNull(sweeper?.lastAdmissionFenceAt),
+            lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
+            lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
+              sweeper?.lastAdmissionFenceDetails,
+            ),
           },
           rate,
         };

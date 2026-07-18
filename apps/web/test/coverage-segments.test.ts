@@ -16,14 +16,15 @@ import {
   type CoverageCell,
   MIN_SEGMENT_PX,
   SEGMENT_GAP_PX,
+  completedResultCount,
   groupConditionsByChord,
   needsChordGrouping,
   rowDoneFraction,
   segmentFillHeight,
   segmentTitle,
   segmentView,
+  segmentWorkflowFillHeight,
   syncPromisedCount,
-  terminalCount,
 } from "../components/admin/campaigns/coverage-segments";
 
 function cell(
@@ -72,19 +73,28 @@ function condition(
 
 describe("segmentView state derivation", () => {
   it("missing cell (airfoil added after the condition) -> empty, zero fill", () => {
-    expect(segmentView(null)).toEqual({ state: "empty", fillFraction: 0 });
-    expect(segmentView(undefined)).toEqual({ state: "empty", fillFraction: 0 });
+    expect(segmentView(null)).toEqual({
+      state: "empty",
+      fillFraction: 0,
+      workflowFraction: 0,
+    });
+    expect(segmentView(undefined)).toEqual({
+      state: "empty",
+      fillFraction: 0,
+      workflowFraction: 0,
+    });
   });
 
   it("requested === 0 -> empty (never divides by zero)", () => {
     expect(segmentView(cell({ requested: 0, remaining: 0 }))).toEqual({
       state: "empty",
       fillFraction: 0,
+      workflowFraction: 0,
     });
   });
 
-  it("plain progress: fill = terminal fraction, running/remaining are NOT terminal", () => {
-    // mid-flight condition: 20 solved + 4 derived done, 3 running, 4 pending
+  it("plain progress: fill = accepted result fraction", () => {
+    // mid-flight condition: 20 solved + 4 derived results, 3 running, 4 pending
     const v = segmentView(
       cell({ solved: 20, derived: 4, running: 3, remaining: 4 }),
     );
@@ -98,12 +108,14 @@ describe("segmentView state derivation", () => {
     expect(v.fillFraction).toBe(1);
   });
 
-  it("LEGACY payload (no split counters): rejected points tint the fill amber-state 'rejected'", () => {
+  it("LEGACY payload keeps rejected work as a separate amber overlay", () => {
     const v = segmentView(
       cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }),
     );
     expect(v.state).toBe("rejected");
-    expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
+    expect(v.fillFraction).toBeCloseTo(22 / 31, 10);
+    expect(v.workflowFraction).toBeCloseTo(2 / 31, 10);
+    expect(segmentWorkflowFillHeight(v)).toBeCloseTo(2 / 31, 10);
   });
 
   it("any failed point wins over rejected (failed-first salience)", () => {
@@ -111,7 +123,7 @@ describe("segmentView state derivation", () => {
       cell({ solved: 10, failed: 1, rejected: 2, remaining: 18 }),
     );
     expect(v.state).toBe("failed");
-    expect(v.fillFraction).toBeCloseTo(13 / 31, 10);
+    expect(v.fillFraction).toBeCloseTo(10 / 31, 10);
   });
 
   it("fill fraction clamps to [0,1] even on inconsistent counters", () => {
@@ -140,9 +152,11 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
       }),
     );
     expect(v.state).toBe("awaiting_urans");
-    expect(v.fillFraction).toBeCloseTo(24 / 31, 10);
-    // violet is calm: renders at the terminal fraction, not solid
-    expect(segmentFillHeight(v)).toBeCloseTo(24 / 31, 10);
+    expect(v.fillFraction).toBeCloseTo(22 / 31, 10);
+    expect(v.workflowFraction).toBeCloseTo(2 / 31, 10);
+    // Accepted evidence remains teal; the calm handoff gets its own violet band.
+    expect(segmentFillHeight(v)).toBeCloseTo(22 / 31, 10);
+    expect(segmentWorkflowFillHeight(v)).toBeCloseTo(2 / 31, 10);
   });
 
   it("needs-review cells go RED-state solid, winning over awaiting", () => {
@@ -183,7 +197,7 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
     const blocked = split({ solved: 20, blocked: 2, remaining: 9 });
     const view = segmentView(blocked);
     expect(view.state).toBe("blocked");
-    expect(view.fillFraction).toBeCloseTo(22 / 31, 10);
+    expect(view.fillFraction).toBeCloseTo(20 / 31, 10);
     expect(segmentTitle(condition(), blocked, "active")).toContain(
       "2 critical failures",
     );
@@ -198,40 +212,72 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
   it("keeps cached legacy payload arithmetic finite when blocked is absent", () => {
     const legacy = cell({ solved: 20, derived: 2, remaining: 9 });
     delete (legacy as { blocked?: number }).blocked;
-    expect(terminalCount(legacy)).toBe(22);
+    expect(completedResultCount(legacy)).toBe(22);
     expect(segmentView(legacy).fillFraction).toBeCloseTo(22 / 31, 10);
   });
 });
 
 describe("segmentFillHeight rendering rule", () => {
   it("failed renders SOLID (full height) regardless of progress", () => {
-    expect(segmentFillHeight({ state: "failed", fillFraction: 0.1 })).toBe(1);
-    expect(segmentFillHeight({ state: "failed", fillFraction: 0 })).toBe(1);
+    expect(
+      segmentFillHeight({
+        state: "failed",
+        fillFraction: 0.1,
+        workflowFraction: 0,
+      }),
+    ).toBe(1);
+    expect(
+      segmentFillHeight({
+        state: "failed",
+        fillFraction: 0,
+        workflowFraction: 0,
+      }),
+    ).toBe(1);
   });
 
   it("critical recovery failures render SOLID for immediate salience", () => {
-    expect(segmentFillHeight({ state: "blocked", fillFraction: 0.1 })).toBe(1);
+    expect(
+      segmentFillHeight({
+        state: "blocked",
+        fillFraction: 0.1,
+        workflowFraction: 0,
+      }),
+    ).toBe(1);
   });
 
-  it("progress/rejected render at the terminal fraction; empty at 0", () => {
-    expect(segmentFillHeight({ state: "progress", fillFraction: 0.5 })).toBe(
-      0.5,
-    );
-    expect(segmentFillHeight({ state: "rejected", fillFraction: 0.4 })).toBe(
-      0.4,
-    );
-    expect(segmentFillHeight({ state: "empty", fillFraction: 0 })).toBe(0);
+  it("ordinary cells render accepted result coverage; empty stays at 0", () => {
+    expect(
+      segmentFillHeight({
+        state: "progress",
+        fillFraction: 0.5,
+        workflowFraction: 0,
+      }),
+    ).toBe(0.5);
+    expect(
+      segmentFillHeight({
+        state: "rejected",
+        fillFraction: 0.4,
+        workflowFraction: 0.2,
+      }),
+    ).toBe(0.4);
+    expect(
+      segmentFillHeight({
+        state: "empty",
+        fillFraction: 0,
+        workflowFraction: 0,
+      }),
+    ).toBe(0);
   });
 });
 
 describe("segmentTitle tooltip", () => {
-  it("LEGACY payload keeps the raw rejected wording: 'Re 614k · #13 · 24/31 · 2 rejected'", () => {
+  it("LEGACY payload keeps rejected workflow separate from accepted results", () => {
     const t = segmentTitle(
       condition(),
       cell({ solved: 20, derived: 2, rejected: 2, remaining: 7 }),
       "active",
     );
-    expect(t).toBe("Re 614k · #13 · 24/31 · 2 rejected");
+    expect(t).toBe("Re 614k · #13 · 22/31 · 2 rejected");
   });
 
   it("split payload replaces 'rejected' with its refined buckets", () => {
@@ -241,7 +287,7 @@ describe("segmentTitle tooltip", () => {
       needsReview: 0,
     };
     expect(segmentTitle(condition(), awaiting, "active")).toBe(
-      "Re 614k · #13 · 24/31 · 2 awaiting URANS",
+      "Re 614k · #13 · 22/31 · 2 awaiting FAST URANS",
     );
     // A rolling legacy count is labelled unavailable; failed stays distinct.
     // distinguishable from rejected-urans reviews.
@@ -252,7 +298,7 @@ describe("segmentTitle tooltip", () => {
     };
     expect(
       segmentTitle(condition({ reynolds: 1_500_000, ord: 14 }), review),
-    ).toBe("Re 1.5M · #14 · 14/31 · 2 unavailable · 1 failed");
+    ).toBe("Re 1.5M · #14 · 12/31 · 2 unavailable · 1 failed");
     // rescheduled rejects: neither bucket — no review wording at all
     const rescheduled = {
       ...cell({ solved: 20, rejected: 2, remaining: 9 }),
@@ -260,7 +306,7 @@ describe("segmentTitle tooltip", () => {
       needsReview: 0,
     };
     expect(segmentTitle(condition(), rescheduled, "active")).toBe(
-      "Re 614k · #13 · 22/31",
+      "Re 614k · #13 · 20/31",
     );
   });
 
@@ -269,7 +315,7 @@ describe("segmentTitle tooltip", () => {
       condition({ reynolds: 1_500_000, ord: 14 }),
       cell({ solved: 12, failed: 1, remaining: 18 }),
     );
-    expect(t).toBe("Re 1.5M · #14 · 13/31 · 1 failed");
+    expect(t).toBe("Re 1.5M · #14 · 12/31 · 1 failed");
   });
 
   it("running and sync-promised counts surface when present", () => {
@@ -315,12 +361,12 @@ describe("rowDoneFraction (DONE column)", () => {
     ],
   };
 
-  it("sums terminal/requested over the rendered conditions only", () => {
+  it("sums accepted solved/derived results over rendered conditions only", () => {
     const all = rowDoneFraction(row, new Set(["c1", "c2", "c3"]));
-    expect(all).toEqual({ done: 31 + 24 + 11, total: 93 });
+    expect(all).toEqual({ done: 31 + 22 + 10, total: 93 });
     // grouped view: only one chord's conditions rendered
     expect(rowDoneFraction(row, new Set(["c2"]))).toEqual({
-      done: 24,
+      done: 22,
       total: 31,
     });
   });

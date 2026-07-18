@@ -34,8 +34,10 @@ const dbSchema = await import("@aerodb/db");
 const { ensureSimulationPresetRevision } =
   await import("@aerodb/db/simulation-setup");
 const {
+  admitRemoteSolverTick,
   claimResultDelivery,
   createProgressAwareAbort,
+  reconcileRemoteSolverTick,
   remoteSolverTick,
   renewResultDeliveryClaim,
   settleResultDelivery,
@@ -1149,13 +1151,119 @@ describe("remote solver submit lifecycle", () => {
     await remoteSolverTick(
       db,
       { submitPolar, cancelJob: vi.fn() } as unknown as EngineClient,
-      false,
+      { kind: "hold", reason: "storage_pressure" },
     );
 
     expect(submitPolar).not.toHaveBeenCalled();
     expect(await jobsForPromise(promise.id)).toEqual([]);
     expect((await readPromise(promise.id)).promise.status).toBe("active");
+    const [settings] = await db
+      .select({ error: syncApiSettings.remoteSolverLastError })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(settings?.error).toMatch(/storage admission is blocked/i);
+    expect(settings?.error).not.toMatch(/safety stop/i);
   });
+
+  it("reports a safety hold truthfully and never labels it as storage pressure", async () => {
+    const promise = await seedMirroredPromise("safety-stop", [900.601]);
+    stubFetch();
+    const submitPolar = vi.fn(async () => acceptedStatus("must-not-submit"));
+
+    await remoteSolverTick(
+      db,
+      { submitPolar, cancelJob: vi.fn() } as unknown as EngineClient,
+      { kind: "hold", reason: "safety_stop" },
+    );
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(await jobsForPromise(promise.id)).toEqual([]);
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    const [settings] = await db
+      .select({ error: syncApiSettings.remoteSolverLastError })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(settings?.error).toMatch(/global admission safety stop/i);
+    expect(settings?.error).not.toMatch(/storage/i);
+  });
+
+  it("fails closed before composing remote RANS when the supplied mesh capability is malformed", async () => {
+    const promise = await seedMirroredPromise("unknown-mesh", [900.701]);
+    stubFetch();
+    const submitPolar = vi.fn(async () => acceptedStatus("must-not-submit"));
+
+    await remoteSolverTick(
+      db,
+      { submitPolar, cancelJob: vi.fn() } as unknown as EngineClient,
+      { kind: "allow", meshRecoveryVersion: Number.NaN },
+    );
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(await jobsForPromise(promise.id)).toEqual([]);
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    const [settings] = await db
+      .select({ error: syncApiSettings.remoteSolverLastError })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(settings?.error).toMatch(/mesh-recovery capability.*malformed/i);
+  });
+
+  it("keeps reconciliation early but leaves remote RANS untouched when FAST owns the tick", async () => {
+    const promise = await seedMirroredPromise("fast-priority", [900.801]);
+    stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("must-not-submit"),
+    );
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    expect(await reconcileRemoteSolverTick(db, engine)).toBe(true);
+    expect(
+      await admitRemoteSolverTick(db, engine, {
+        kind: "hold",
+        reason: "higher_priority_fast_urans",
+      }),
+    ).toBe(false);
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(await jobsForPromise(promise.id)).toEqual([]);
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+  });
+
+  it.each([0, 17])(
+    "admits remote RANS with known mesh capability v%s and pins the exact version",
+    async (meshRecoveryVersion) => {
+      const promise = await seedMirroredPromise(
+        `known-mesh-v${meshRecoveryVersion}`,
+        [900.901 + meshRecoveryVersion / 1000],
+      );
+      stubFetch();
+      const submitPolar = vi.fn(async (_request: PolarRequest) =>
+        acceptedStatus("remote-known-mesh"),
+      );
+      const engine = {
+        submitPolar,
+        cancelJob: vi.fn(),
+      } as unknown as EngineClient;
+
+      expect(
+        await remoteSolverTick(db, engine, {
+          kind: "allow",
+          meshRecoveryVersion,
+        }),
+      ).toBe(true);
+      expect(submitPolar).toHaveBeenCalledTimes(1);
+      const request = submitPolar.mock.calls[0]?.[0];
+      expect(request?.expected_mesh_recovery_version).toBe(meshRecoveryVersion);
+      const [job] = await jobsForPromise(promise.id);
+      expect(job?.requestPayload).toMatchObject({
+        meshRecoveryVersion,
+        remoteSolver: true,
+        syncPromiseId: promise.id,
+      });
+    },
+  );
 
   it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
     const aoa = 901.001;
@@ -1555,6 +1663,7 @@ describe("remote solver submit lifecycle", () => {
       db,
       engine: { submitPolar } as unknown as EngineClient,
       jobId: job.id,
+      admissionLane: "remote",
       request: {
         airfoil: { points: contour.map(({ x, y }) => [x, y]) },
         aoa: { angles: [wrongAoa] },
@@ -1611,6 +1720,7 @@ describe("remote solver submit lifecycle", () => {
       db,
       engine: { submitPolar } as unknown as EngineClient,
       jobId: job.id,
+      admissionLane: "remote",
       request: {
         airfoil: { points: contour.map(({ x, y }) => [x, y]) },
         aoa: { angles: [aoa] },

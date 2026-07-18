@@ -18,6 +18,7 @@ import {
   schedulingProfiles,
   simJobs,
   simLadderSubmitRetries,
+  sweeperState,
   simulationPresetRevisions,
   simulationPresets,
   simUransRequests,
@@ -238,6 +239,7 @@ async function submit(
     db,
     engine,
     jobId,
+    admissionLane: "local",
     campaignId: null,
     request: {} as PolarRequest,
     connectionErrorPrefix: "connection: ",
@@ -285,6 +287,10 @@ async function expectNoSolverEvidence(jobIds: string[]): Promise<void> {
 }
 
 beforeAll(async () => {
+  await db
+    .update(sweeperState)
+    .set({ enabled: true })
+    .where(eq(sweeperState.id, 1));
   const [category] = await db
     .insert(categories)
     .values({

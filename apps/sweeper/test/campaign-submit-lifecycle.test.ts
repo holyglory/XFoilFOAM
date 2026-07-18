@@ -85,7 +85,7 @@ import {
   type PolarRequest,
   URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -223,8 +223,8 @@ beforeAll(async () => {
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: false })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: false } });
+    .values({ id: 1, enabled: true })
+    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
 
   const [category] = await db
     .insert(categories)
@@ -418,6 +418,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         },
       } as unknown as EngineClient,
       jobId: staleJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
@@ -1236,6 +1237,14 @@ describe("campaign compose→submit lifecycle boundary", () => {
       ).toHaveLength(0);
       expect((await campaignFailures(db, group.campaignId)).total).toBe(0);
     }
+
+    // The typed deterministic-mesh guard intentionally leaves one current
+    // campaign point machine-blocked. Its assertions are complete here; retire
+    // these fixture campaigns so that state cannot become a global admission
+    // hazard for unrelated lifecycle tests later in this file.
+    for (const group of cases) {
+      await cancelCampaign(db, group.campaignId);
+    }
   }, 120000);
 
   it("keeps same-version deterministic RANS terminal, atomically reopens on v2, and pins the replacement job", async () => {
@@ -1511,6 +1520,13 @@ describe("campaign compose→submit lifecycle boundary", () => {
       }),
     ]);
 
+    // Production recovery settles the owning campaign before another gap is
+    // admitted. This fixture invokes the low-level reopen helper directly, so
+    // perform that same derived-progress refresh before exercising the submit
+    // boundary; otherwise the intentionally asserted v1 blocked snapshot is a
+    // stale global breaker input.
+    await recomputeProgressForCampaign(db, campaignId);
+
     const batch = await findCampaignGapBatch(db, {
       limit: 500,
       campaignIds: [campaignId],
@@ -1625,6 +1641,11 @@ describe("campaign compose→submit lifecycle boundary", () => {
         }),
       ]),
     );
+
+    // The v2 terminal incident is the final assertion of this scenario. Its
+    // campaign must not remain a current owner while later tests exercise new
+    // engine admission; file-level cleanup happens only after all 40 cases.
+    await cancelCampaign(db, campaignId);
   }, 120000);
 
   it("keeps an orphaned hard-solver RANS rejection remaining in both incremental and full progress", async () => {
@@ -1962,6 +1983,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       db,
       engine,
       jobId: job.id,
+      admissionLane: "local",
       campaignId,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
@@ -2036,6 +2058,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         db,
         engine,
         jobId: job.id,
+        admissionLane: "local",
         campaignId,
         request: {} as PolarRequest,
         connectionErrorPrefix: "unreachable: ",
@@ -2133,6 +2156,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       db,
       engine,
       jobId: job.id,
+      admissionLane: "local",
       campaignId,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
@@ -2501,7 +2525,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
     );
   }, 120000);
 
-  it("submits a shared automatic continuation when one owner cancels mid-submit, but compensates when every owner pauses", async () => {
+  it("keeps an accepted shared automatic continuation when owner changes queue behind admission", async () => {
     const survivorA = await launch("shared-request-survivor-a", 22.637);
     const survivorB = await launch("shared-request-survivor-b", 22.637);
     const survivorSetupA = await setupFor(survivorA);
@@ -2548,9 +2572,13 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simUransRequests.id, survivorRequest.id));
     const survivorCancelledEngineIds: string[] = [];
     const survivorEngineId = `${PREFIX}-shared-request-survivor-engine`;
+    let survivorCancellation: ReturnType<typeof cancelCampaign> | null = null;
     const survivorEngine = {
       submitPolar: async (): Promise<JobStatus> => {
-        await cancelCampaign(db, survivorA);
+        // Engine acceptance owns the singleton. Queue the owner transition on
+        // another connection without awaiting it reentrantly; it must commit
+        // after the already-accepted task crosses the admission boundary.
+        survivorCancellation = cancelCampaign(db, survivorA);
         return {
           job_id: survivorEngineId,
           state: "pending",
@@ -2567,11 +2595,15 @@ describe("campaign compose→submit lifecycle boundary", () => {
       db,
       engine: survivorEngine,
       jobId: survivorJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
       submitErrorPrefix: "failed: ",
     });
+    if (!survivorCancellation)
+      throw new Error("survivor cancellation was not queued");
+    await survivorCancellation;
     expect(survivorOutcome.kind).toBe("submitted");
     expect(survivorCancelledEngineIds).toEqual([]);
     const [submittedSharedJob] = await db
@@ -2644,10 +2676,13 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simUransRequests.id, pausedRequest.id));
     const pausedEngineId = `${PREFIX}-shared-request-paused-engine`;
     const pausedCancelledEngineIds: string[] = [];
+    let ownerPauses: Promise<unknown> | null = null;
     const pausedEngine = {
       submitPolar: async (): Promise<JobStatus> => {
-        await pauseCampaign(db, pausedA);
-        await pauseCampaign(db, pausedB);
+        ownerPauses = Promise.all([
+          pauseCampaign(db, pausedA),
+          pauseCampaign(db, pausedB),
+        ]);
         return {
           job_id: pausedEngineId,
           state: "pending",
@@ -2664,11 +2699,14 @@ describe("campaign compose→submit lifecycle boundary", () => {
       db,
       engine: pausedEngine,
       jobId: pausedJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
       submitErrorPrefix: "failed: ",
     });
+    if (!ownerPauses) throw new Error("owner pauses were not queued");
+    await ownerPauses;
     expect(pausedOutcome.kind).toBe("lifecycle_stopped");
     expect(pausedCancelledEngineIds).toEqual([pausedEngineId]);
     await releaseClaimedUransRequest(db, pausedRequest.id);
@@ -2689,7 +2727,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
     });
   }, 120000);
 
-  it("submits a shared verification when one owner cancels mid-submit, but compensates when every owner pauses", async () => {
+  it("keeps an accepted shared verification when owner changes queue behind admission", async () => {
     const survivorA = await launch("shared-verify-survivor-a", 24.637);
     const survivorB = await launch("shared-verify-survivor-b", 24.637);
     const survivorSetupA = await setupFor(survivorA);
@@ -2757,9 +2795,10 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simUransVerifyQueue.id, survivorItem.id));
     const survivorEngineId = `${PREFIX}-shared-verify-survivor-engine`;
     const survivorCancelledEngineIds: string[] = [];
+    let survivorCancellation: ReturnType<typeof cancelCampaign> | null = null;
     const survivorEngine = {
       submitPolar: async (): Promise<JobStatus> => {
-        await cancelCampaign(db, survivorA);
+        survivorCancellation = cancelCampaign(db, survivorA);
         return {
           job_id: survivorEngineId,
           state: "pending",
@@ -2776,11 +2815,15 @@ describe("campaign compose→submit lifecycle boundary", () => {
       db,
       engine: survivorEngine,
       jobId: survivorJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
       submitErrorPrefix: "failed: ",
     });
+    if (!survivorCancellation)
+      throw new Error("verification owner cancellation was not queued");
+    await survivorCancellation;
     expect(survivorOutcome.kind).toBe("submitted");
     expect(survivorCancelledEngineIds).toEqual([]);
     const terminalOwner = await cancelCampaign(db, survivorB);
@@ -2863,10 +2906,13 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simUransVerifyQueue.id, pausedItem.id));
     const pausedEngineId = `${PREFIX}-shared-verify-paused-engine`;
     const pausedCancelledEngineIds: string[] = [];
+    let ownerPauses: Promise<unknown> | null = null;
     const pausedEngine = {
       submitPolar: async (): Promise<JobStatus> => {
-        await pauseCampaign(db, pausedA);
-        await pauseCampaign(db, pausedB);
+        ownerPauses = Promise.all([
+          pauseCampaign(db, pausedA),
+          pauseCampaign(db, pausedB),
+        ]);
         return {
           job_id: pausedEngineId,
           state: "pending",
@@ -2883,11 +2929,15 @@ describe("campaign compose→submit lifecycle boundary", () => {
       db,
       engine: pausedEngine,
       jobId: pausedJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
       submitErrorPrefix: "failed: ",
     });
+    if (!ownerPauses)
+      throw new Error("verification owner pauses were not queued");
+    await ownerPauses;
     expect(pausedOutcome.kind).toBe("lifecycle_stopped");
     expect(pausedCancelledEngineIds).toEqual([pausedEngineId]);
     await releaseClaimedVerifyItem(db, pausedItem.id);
@@ -4210,6 +4260,12 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .from(simCampaigns)
       .where(eq(simCampaigns.id, campaignId));
     expect(campaign.status).toBe("attention");
+
+    // This case intentionally proves the rare terminal crash path. Once its
+    // campaign-facing assertions are complete, remove that fixture from the
+    // current owner set so the global breaker does not suppress later,
+    // unrelated submit-policy scenarios in this same file.
+    await cancelCampaign(db, campaignId);
   }, 120000);
 
   it("promotes manual reuse of an automatic request to an independent owner through cancellation, verification, and media discovery", async () => {
@@ -4312,6 +4368,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         }),
       } as unknown as EngineClient,
       jobId: job.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "unreachable: ",
@@ -5045,6 +5102,8 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .from(simCampaigns)
       .where(eq(simCampaigns.id, campaignId));
     expect(campaign.status).toBe("attention");
+
+    await cancelCampaign(db, campaignId);
   }, 120000);
 
   it("blocks deterministic 422 submit rejection in one pass and exposes no same-cell gap on the next tick", async () => {
@@ -5132,6 +5191,8 @@ describe("campaign compose→submit lifecycle boundary", () => {
         `rans:${incident.resultId}:${incident.simJobId}:engine-submit-blocked`,
       );
     }
+
+    await cancelCampaign(db, campaignId);
   }, 120000);
 
   it("settles precalc 422/503 policy atomically without rewriting canonical RANS evidence", async () => {
@@ -5236,6 +5297,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
           },
         } as unknown as EngineClient,
         jobId: job.id,
+        admissionLane: "local",
         campaignId: null,
         request: {} as PolarRequest,
         connectionErrorPrefix: "connection: ",
@@ -5252,6 +5314,30 @@ describe("campaign compose→submit lifecycle boundary", () => {
       422,
       "request validation rejected",
     );
+
+    // The 422 and bounded-503 branches are independent policy cases. Preserve
+    // the second physical obligation as a real background owner, then retire
+    // the campaign whose first angle is now intentionally terminal. This uses
+    // the production ownership lifecycle and prevents that proven 422 hazard
+    // from globally suppressing the 503 submissions the test still needs to
+    // exercise.
+    await db
+      .update(simPrecalcObligations)
+      .set({ backgroundOwner: true })
+      .where(eq(simPrecalcObligations.id, obligations[1].id));
+    await cancelCampaign(db, campaignId);
+    const [retainedBackgroundObligation] = await db
+      .select({
+        state: simPrecalcObligations.state,
+        backgroundOwner: simPrecalcObligations.backgroundOwner,
+      })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligations[1].id));
+    expect(retainedBackgroundObligation).toEqual({
+      state: "pending",
+      backgroundOwner: true,
+    });
+
     await submitFailure(
       obligations[1].id,
       ANGLES[1],
@@ -5306,15 +5392,18 @@ describe("campaign compose→submit lifecycle boundary", () => {
           results.id,
           canonical.map((result) => result.id),
         ),
-      );
+      )
+      .orderBy(asc(results.aoaDeg));
     expect(retained).toEqual(
-      canonical.map((result, index) => ({
-        id: result.id,
-        status: "done",
-        cl: 0.2 + index,
-        cd: 0.02 + index * 0.01,
-        error: `retained-rans-${result.aoaDeg}`,
-      })),
+      [...canonical]
+        .sort((left, right) => left.aoaDeg - right.aoaDeg)
+        .map((result, index) => ({
+          id: result.id,
+          status: "done",
+          cl: 0.2 + index,
+          cd: 0.02 + index * 0.01,
+          error: `retained-rans-${result.aoaDeg}`,
+        })),
     );
     expect(
       await db
@@ -5376,6 +5465,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         },
       } as unknown as EngineClient,
       jobId: mismatchedJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "connection: ",
@@ -5415,6 +5505,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
           }) as JobStatus,
       } as unknown as EngineClient,
       jobId: replacementJob.id,
+      admissionLane: "local",
       campaignId: null,
       request: {} as PolarRequest,
       connectionErrorPrefix: "connection: ",
@@ -5519,6 +5610,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         },
       } as unknown as EngineClient,
       jobId: job.id,
+      admissionLane: "local",
       campaignId: null,
       request: {
         expected_urans_recovery_version: 1,
@@ -5822,6 +5914,8 @@ describe("campaign compose→submit lifecycle boundary", () => {
         ),
       );
     expect(attempts).toHaveLength(0);
+
+    await cancelCampaign(db, campaignId);
   }, 120000);
 
   it("releases connection failures indefinitely without consuming the answered-submit retry budget", async () => {

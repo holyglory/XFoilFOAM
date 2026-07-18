@@ -1,9 +1,9 @@
 // Pure segment/bar math for the coverage matrix redesign (approved mockup
 // 1ed4374f, recolored per amendment A / design c19fd74a): per-airfoil
-// segmented bars, one flex segment per condition; fill HEIGHT is the fraction
-// of that condition's angles that are terminal. Awaiting-URANS points tint
-// the fill VIOLET (calm stage-2 queue); needs-review/failed render the
-// segment solid RED; the legacy amber 'rejected' tint survives only for
+// segmented bars, one flex segment per condition; teal fill HEIGHT is the
+// fraction backed by accepted solved/derived results. Awaiting-URANS work is a
+// separate VIOLET overlay (calm stage-2 queue); needs-review/failed render the
+// segment solid RED; the legacy amber 'rejected' overlay survives only for
 // payloads without the split counters. Kept React-free with relative imports
 // (not @/ aliases): this module is covered by node vitest, which resolves no
 // tsconfig paths (same pattern as campaign-status.ts).
@@ -59,27 +59,22 @@ export type SegmentState =
 
 export interface SegmentView {
   state: SegmentState;
-  /** 0..1 fraction of this condition's requested angles that are terminal
-   *  (solved + derived + failed + rejected — settled, no longer pending or
-   *  running). Real counters from sim_campaign_progress only. */
+  /** 0..1 fraction backed by an accepted solved or symmetry-derived result. */
   fillFraction: number;
+  /** 0..1 fraction still moving through the automatic FAST-URANS handoff.
+   *  This is rendered as a distinct workflow overlay, never as DONE. */
+  workflowFraction: number;
 }
 
-/** Terminal-done points for one cell: settled either way. `remaining` and
- *  `running` are still open; `superseded` points were replaced and are not
- *  part of the requested denominator's terminal share. */
-export function terminalCount(cell: CampaignProgressTotals): number {
-  return (
-    cell.solved +
-    cell.derived +
-    cell.failed +
-    cell.rejected +
-    (cell.blocked ?? 0)
-  );
+/** Results users can actually inspect: accepted solver evidence plus exact
+ * symmetry derivations. Rejected RANS handoffs and exhausted recovery remain
+ * workflow/incident states and must never inflate DONE. */
+export function completedResultCount(cell: CampaignProgressTotals): number {
+  return cell.solved + cell.derived;
 }
 
 /** Encoding (design c19fd74a): failed wins, then needs-review (both solid
- *  red), then awaiting-URANS (violet), then plain progress. A cell whose
+ *  red), then awaiting-URANS (violet overlay), then plain progress. A cell whose
  *  rejected points ALL have their next solve scheduled (split present, both
  *  buckets 0) renders as plain progress — it is back in the pipeline. The
  *  legacy amber 'rejected' state survives only when the payload has no split
@@ -87,28 +82,39 @@ export function terminalCount(cell: CampaignProgressTotals): number {
 export function segmentView(
   cell: CoverageCell | null | undefined,
 ): SegmentView {
-  if (!cell || cell.requested <= 0) return { state: "empty", fillFraction: 0 };
+  if (!cell || cell.requested <= 0) {
+    return { state: "empty", fillFraction: 0, workflowFraction: 0 };
+  }
+  const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
   const fillFraction = Math.min(
     1,
-    Math.max(0, terminalCount(cell) / cell.requested),
+    Math.max(0, completedResultCount(cell) / cell.requested),
   );
-  const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
-  if (cell.failed > 0) return { state: "failed", fillFraction };
+  const workflowCount = hasSplit
+    ? Math.max(0, cell.awaitingUrans ?? 0)
+    : Math.max(0, cell.rejected);
+  const workflowFraction = Math.min(
+    Math.max(0, 1 - fillFraction),
+    workflowCount / cell.requested,
+  );
+  const view = (state: SegmentState): SegmentView => ({
+    state,
+    fillFraction,
+    workflowFraction,
+  });
+  if (cell.failed > 0) return view("failed");
   if (hasSplit) {
-    if ((cell.needsReview ?? 0) > 0)
-      return { state: "needs_review", fillFraction };
-    if ((cell.blocked ?? 0) > 0) return { state: "blocked", fillFraction };
-    if ((cell.awaitingUrans ?? 0) > 0)
-      return { state: "awaiting_urans", fillFraction };
-    return { state: "progress", fillFraction };
+    if ((cell.needsReview ?? 0) > 0) return view("needs_review");
+    if ((cell.blocked ?? 0) > 0) return view("blocked");
+    if ((cell.awaitingUrans ?? 0) > 0) return view("awaiting_urans");
+    return view("progress");
   }
-  if (cell.rejected > 0) return { state: "rejected", fillFraction };
-  return { state: "progress", fillFraction };
+  if (cell.rejected > 0) return view("rejected");
+  return view("progress");
 }
 
-/** Rendered fill height (0..1). Critical/failed/needs-review segments render
- *  SOLID so recovery incidents stay visible at any progress; every other
- *  state fills to the terminal fraction. */
+/** Accepted-result fill height (0..1). Critical recovery renders solid red for
+ * immediate salience; ordinary cells expose only accepted result coverage. */
 export function segmentFillHeight(view: SegmentView): number {
   return view.state === "failed" ||
     view.state === "needs_review" ||
@@ -117,11 +123,19 @@ export function segmentFillHeight(view: SegmentView): number {
     : view.fillFraction;
 }
 
+/** Separate pending-work overlay. RANS handoffs remain visible in violet (or
+ * legacy amber) without being counted or painted as completed results. */
+export function segmentWorkflowFillHeight(view: SegmentView): number {
+  return view.state === "awaiting_urans" || view.state === "rejected"
+    ? view.workflowFraction
+    : 0;
+}
+
 // ---------------------------------------------------------------------------
 // Tooltip label (identification moved off the removed column headers)
 // ---------------------------------------------------------------------------
 
-/** "Re 614k · #13 · 24/31 · 2 awaiting URANS" — condition label + index +
+/** "Re 614k · #13 · 22/31 · 2 awaiting FAST URANS" — condition label + index +
  *  real counts. Legacy nonzero needsReview payloads are described as
  *  unavailable; payloads without the split keep the rejected wording. `stateLabel`
  *  is the ConditionStrip display state; anything other than "active" is
@@ -136,11 +150,13 @@ export function segmentTitle(
   if (!cell || cell.requested <= 0) {
     parts.push("no points");
   } else {
-    parts.push(`${fCount(terminalCount(cell))}/${fCount(cell.requested)}`);
+    parts.push(
+      `${fCount(completedResultCount(cell))}/${fCount(cell.requested)}`,
+    );
     const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
     if (hasSplit) {
       if ((cell.awaitingUrans ?? 0) > 0)
-        parts.push(`${fCount(cell.awaitingUrans ?? 0)} awaiting URANS`);
+        parts.push(`${fCount(cell.awaitingUrans ?? 0)} awaiting FAST URANS`);
       if ((cell.needsReview ?? 0) > 0)
         parts.push(`${fCount(cell.needsReview ?? 0)} unavailable`);
     } else if (cell.rejected > 0) {
@@ -166,8 +182,8 @@ export function segmentTitle(
 // ---------------------------------------------------------------------------
 
 /** Per-row "n/total" over the conditions currently rendered in the bar
- *  (visible conditions, or the selected chord group when grouped): terminal
- *  points / requested points. Matches the segment fill semantics. */
+ *  (visible conditions, or the selected chord group when grouped): accepted
+ *  solved/derived results / requested points. */
 export function rowDoneFraction(
   row: AdminCampaignAirfoilRow,
   renderedConditionIds: ReadonlySet<string>,
@@ -176,7 +192,7 @@ export function rowDoneFraction(
   let total = 0;
   for (const cell of row.perCondition) {
     if (!renderedConditionIds.has(cell.conditionId)) continue;
-    done += terminalCount(cell);
+    done += completedResultCount(cell);
     total += cell.requested;
   }
   return { done, total };

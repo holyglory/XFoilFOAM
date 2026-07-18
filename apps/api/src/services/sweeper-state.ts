@@ -28,6 +28,12 @@ export interface SweeperStateRow {
   diskFreeBytes: number | null;
   diskRequiredFreeBytes: number | null;
   diskCheckedAt: Date | string | null;
+  /** Durable global NEW-admission latch. Existing engine work continues. */
+  admissionFenceActive: boolean;
+  lastAdmissionFenceAt: Date | string | null;
+  lastAdmissionFenceReason: string | null;
+  lastAdmissionFenceTriggerKey: string | null;
+  lastAdmissionFenceDetails: Record<string, unknown> | null;
 }
 
 export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
@@ -51,6 +57,11 @@ export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
   diskFreeBytes: null,
   diskRequiredFreeBytes: null,
   diskCheckedAt: null,
+  admissionFenceActive: false,
+  lastAdmissionFenceAt: null,
+  lastAdmissionFenceReason: null,
+  lastAdmissionFenceTriggerKey: null,
+  lastAdmissionFenceDetails: null,
 };
 
 let engineUnreachableColumnExists: boolean | null = null;
@@ -94,11 +105,33 @@ async function hasDiskAdmissionColumns(): Promise<boolean> {
   return diskAdmissionColumnsExist;
 }
 
-export async function readSweeperState(): Promise<SweeperStateRow | null> {
+let admissionFenceColumnsExist: boolean | null = null;
+
+async function hasAdmissionFenceColumns(): Promise<boolean> {
+  // Cache only success. During an expand-first rolling deploy this process may
+  // probe immediately before 0075 lands; a sticky false would make Resume use
+  // the legacy writer forever and collide with the new latch constraint.
+  if (admissionFenceColumnsExist === true) return true;
+  const rows = (await db.execute(sql`
+    SELECT 1 AS present FROM information_schema.columns
+    WHERE table_name = 'sweeper_state' AND column_name = 'admission_fence_active'
+    LIMIT 1
+  `)) as unknown as unknown[];
+  const present = rows.length > 0;
+  if (present) admissionFenceColumnsExist = true;
+  return present;
+}
+
+type SweeperStateExecutor = Pick<typeof db, "execute">;
+
+async function readSweeperStateFrom(
+  source: SweeperStateExecutor,
+): Promise<SweeperStateRow | null> {
   const withUnreachable = await hasEngineUnreachableColumn();
   const withTickProgress = await hasTickProgressColumns();
   const withDiskAdmission = await hasDiskAdmissionColumns();
-  const rows = (await db.execute(sql`
+  const withAdmissionFence = await hasAdmissionFenceColumns();
+  const rows = (await source.execute(sql`
     SELECT
       id,
       enabled,
@@ -129,21 +162,50 @@ export async function readSweeperState(): Promise<SweeperStateRow | null> {
                   NULL::bigint AS "diskRequiredFreeBytes",
                   NULL::timestamptz AS "diskCheckedAt"`
       }
+      ${
+        withAdmissionFence
+          ? sql`, admission_fence_active AS "admissionFenceActive",
+                  last_admission_fence_at AS "lastAdmissionFenceAt",
+                  last_admission_fence_reason AS "lastAdmissionFenceReason",
+                  last_admission_fence_trigger_key AS "lastAdmissionFenceTriggerKey",
+                  last_admission_fence_details AS "lastAdmissionFenceDetails"`
+          : sql`, false AS "admissionFenceActive",
+                  NULL::timestamptz AS "lastAdmissionFenceAt",
+                  NULL::text AS "lastAdmissionFenceReason",
+                  NULL::text AS "lastAdmissionFenceTriggerKey",
+                  NULL::jsonb AS "lastAdmissionFenceDetails"`
+      }
     FROM sweeper_state
     WHERE id = 1
     LIMIT 1
   `)) as unknown as Array<SweeperStateRow>;
   const row = rows[0];
   if (!row) return null;
+  const savedCapacity = row.admissionFenceActive
+    ? row.lastAdmissionFenceDetails
+    : null;
+  const savedMaxConcurrentJobs =
+    typeof savedCapacity?.previousMaxConcurrentJobs === "number"
+      ? savedCapacity.previousMaxConcurrentJobs
+      : null;
+  const savedCpuSlots =
+    typeof savedCapacity?.previousCpuSlots === "number"
+      ? savedCapacity.previousCpuSlots
+      : null;
   return {
     ...row,
     id: Number(row.id),
     enabled: Boolean(row.enabled),
-    maxConcurrentJobs: Number(row.maxConcurrentJobs),
-    cpuSlots: Number(row.cpuSlots ?? 0),
+    // While fenced the physical admission columns are deliberately zero, but
+    // these API fields remain the operator's saved capacity configuration.
+    // A plain Resume ({enabled:true}) therefore restores exactly what was in
+    // force before the trip instead of enabling a zero-capacity scheduler.
+    maxConcurrentJobs: Number(savedMaxConcurrentJobs ?? row.maxConcurrentJobs),
+    cpuSlots: Number(savedCpuSlots ?? row.cpuSlots ?? 0),
     pollIntervalMs: Number(row.pollIntervalMs),
     submitIntervalMs: Number(row.submitIntervalMs),
     diskAdmissionBlocked: Boolean(row.diskAdmissionBlocked),
+    admissionFenceActive: Boolean(row.admissionFenceActive),
     diskUsedPct: row.diskUsedPct == null ? null : Number(row.diskUsedPct),
     diskFreeBytes: row.diskFreeBytes == null ? null : Number(row.diskFreeBytes),
     diskRequiredFreeBytes:
@@ -151,6 +213,10 @@ export async function readSweeperState(): Promise<SweeperStateRow | null> {
         ? null
         : Number(row.diskRequiredFreeBytes),
   };
+}
+
+export async function readSweeperState(): Promise<SweeperStateRow | null> {
+  return readSweeperStateFrom(db);
 }
 
 export interface SweeperStatePatch {
@@ -167,6 +233,90 @@ export interface SweeperStatePatch {
 export async function writeSweeperState(
   patch: SweeperStatePatch,
 ): Promise<SweeperStateRow> {
+  if (await hasAdmissionFenceColumns()) {
+    return db.transaction(async (transaction) => {
+      // Ensure the singleton exists before taking the serialization lock. The
+      // row lock is shared with the breaker UPDATE, so a safety trip that wins
+      // the race is re-read below and cannot be cleared by a stale capacity
+      // patch. The comment is also a stable wait target for the race test.
+      await transaction.execute(sql`
+        INSERT INTO sweeper_state (id) VALUES (1)
+        ON CONFLICT (id) DO NOTHING
+      `);
+      await transaction.execute(sql`
+        SELECT id
+        FROM sweeper_state
+        WHERE id = 1
+        FOR UPDATE /* writeSweeperState admission fence serialization */
+      `);
+      const existing = await readSweeperStateFrom(transaction);
+      const next = {
+        enabled:
+          patch.enabled ?? existing?.enabled ?? SWEEPER_STATE_DEFAULTS.enabled,
+        maxConcurrentJobs:
+          patch.maxConcurrentJobs ??
+          existing?.maxConcurrentJobs ??
+          SWEEPER_STATE_DEFAULTS.maxConcurrentJobs,
+        cpuSlots:
+          patch.cpuSlots ??
+          existing?.cpuSlots ??
+          SWEEPER_STATE_DEFAULTS.cpuSlots,
+        pollIntervalMs:
+          patch.pollIntervalMs ??
+          existing?.pollIntervalMs ??
+          SWEEPER_STATE_DEFAULTS.pollIntervalMs,
+        submitIntervalMs:
+          patch.submitIntervalMs ??
+          existing?.submitIntervalMs ??
+          SWEEPER_STATE_DEFAULTS.submitIntervalMs,
+      };
+      const explicitResume = patch.enabled === true;
+
+      if (existing?.admissionFenceActive && !explicitResume) {
+        // Only an explicit {enabled:true} is Resume. Capacity edits and an
+        // explicit false made during a safety stop update the saved resume
+        // configuration while preserving the physical 0/0 fence.
+        await transaction.execute(sql`
+          UPDATE sweeper_state
+          SET enabled = false,
+              max_concurrent_jobs = 0,
+              cpu_slots = 0,
+              poll_interval_ms = ${next.pollIntervalMs},
+              submit_interval_ms = ${next.submitIntervalMs},
+              last_admission_fence_details =
+                COALESCE(last_admission_fence_details, '{}'::jsonb) ||
+                jsonb_build_object(
+                  'previousMaxConcurrentJobs', ${next.maxConcurrentJobs}::int,
+                  'previousCpuSlots', ${next.cpuSlots}::int
+                ),
+              "updatedAt" = now()
+          WHERE id = 1
+        `);
+      } else {
+        await transaction.execute(sql`
+          UPDATE sweeper_state
+          SET enabled = ${next.enabled},
+              max_concurrent_jobs = ${next.maxConcurrentJobs},
+              cpu_slots = ${next.cpuSlots},
+              poll_interval_ms = ${next.pollIntervalMs},
+              submit_interval_ms = ${next.submitIntervalMs},
+              admission_fence_active = CASE
+                WHEN ${explicitResume}::boolean THEN false
+                ELSE admission_fence_active
+              END,
+              "updatedAt" = now()
+          WHERE id = 1
+        `);
+      }
+      return (
+        (await readSweeperStateFrom(transaction)) ?? {
+          ...SWEEPER_STATE_DEFAULTS,
+          ...next,
+        }
+      );
+    });
+  }
+
   const existing = await readSweeperState();
   const next = {
     enabled:
@@ -187,15 +337,15 @@ export async function writeSweeperState(
       SWEEPER_STATE_DEFAULTS.submitIntervalMs,
   };
   await db.execute(sql`
-    INSERT INTO sweeper_state (id, enabled, max_concurrent_jobs, cpu_slots, poll_interval_ms, submit_interval_ms)
-    VALUES (1, ${next.enabled}, ${next.maxConcurrentJobs}, ${next.cpuSlots}, ${next.pollIntervalMs}, ${next.submitIntervalMs})
-    ON CONFLICT (id) DO UPDATE SET
-      enabled = EXCLUDED.enabled,
-      max_concurrent_jobs = EXCLUDED.max_concurrent_jobs,
-      cpu_slots = EXCLUDED.cpu_slots,
-      poll_interval_ms = EXCLUDED.poll_interval_ms,
-      submit_interval_ms = EXCLUDED.submit_interval_ms,
-      "updatedAt" = now()
+      INSERT INTO sweeper_state (id, enabled, max_concurrent_jobs, cpu_slots, poll_interval_ms, submit_interval_ms)
+      VALUES (1, ${next.enabled}, ${next.maxConcurrentJobs}, ${next.cpuSlots}, ${next.pollIntervalMs}, ${next.submitIntervalMs})
+      ON CONFLICT (id) DO UPDATE SET
+        enabled = EXCLUDED.enabled,
+        max_concurrent_jobs = EXCLUDED.max_concurrent_jobs,
+        cpu_slots = EXCLUDED.cpu_slots,
+        poll_interval_ms = EXCLUDED.poll_interval_ms,
+        submit_interval_ms = EXCLUDED.submit_interval_ms,
+        "updatedAt" = now()
   `);
   return (await readSweeperState()) ?? { ...SWEEPER_STATE_DEFAULTS, ...next };
 }

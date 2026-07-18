@@ -16,7 +16,7 @@
 
 import { isAutomaticRansPrecalcHandoffEvidence } from "@aerodb/core";
 import { type DB, resultAttempts, resultClassifications } from "@aerodb/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 
 export type RansFailureDisposition =
@@ -203,6 +203,10 @@ export async function ransRetryPlanForJobScoped(
     revisionId: string;
     scope: RansRetryScope;
     attemptRevisionId?: string;
+    /** Exact immutable RANS attempts which authorized a shared campaign
+     * handoff. This prevents a background/source job's unrelated rejected
+     * cells from inheriting the beneficiary campaign's execution ownership. */
+    sourceResultAttemptIds?: string[];
   },
 ): Promise<RansRetryDecision | null> {
   const attemptFilters = [
@@ -212,6 +216,12 @@ export async function ransRetryPlanForJobScoped(
   if (opts.attemptRevisionId) {
     attemptFilters.push(
       eq(resultAttempts.simulationPresetRevisionId, opts.attemptRevisionId),
+    );
+  }
+  if (opts.sourceResultAttemptIds) {
+    if (!opts.sourceResultAttemptIds.length) return null;
+    attemptFilters.push(
+      inArray(resultAttempts.id, opts.sourceResultAttemptIds),
     );
   }
   const attemptRows = await db

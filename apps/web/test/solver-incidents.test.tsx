@@ -169,6 +169,11 @@ describe("solver incident presentation", () => {
     expect(solverIncidentSummaryLabel(incidents)).toContain("currently clear");
     expect(
       renderToStaticMarkup(
+        <SolverIncidentPanel summary={incidents} surface="health" showClear />,
+      ),
+    ).toContain('data-signal="resolved-final"');
+    expect(
+      renderToStaticMarkup(
         <SolverIncidentPanel summary={incidents} surface="campaign" />,
       ),
     ).toBe("");
@@ -211,6 +216,8 @@ describe("solver incident presentation", () => {
     expect(html).toContain("1 active");
     expect(html).toContain("CRITICAL");
     expect(html).toContain("SYSTEM OWNED");
+    expect(html).toContain('data-signal="alert"');
+    expect(html).not.toContain('data-signal="resolved-final"');
     expect(html).toContain("3+ same cause → critical");
     expect(html).not.toContain("INVESTIGATE");
     expect(html).not.toContain("urans-recovery-2026-07-16-v1");

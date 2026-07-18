@@ -336,8 +336,8 @@ beforeAll(async () => {
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: false })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: false } });
+    .values({ id: 1, enabled: true })
+    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
 
   const [cat] = await db
     .insert(categories)

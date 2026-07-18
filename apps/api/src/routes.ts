@@ -1098,10 +1098,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         .where(
           and(
             eq(solverEvidenceArchives.resultId, resultId),
-            eq(
-              solverEvidenceArchives.resultAttemptId,
-              result.currentAttemptId,
-            ),
+            eq(solverEvidenceArchives.resultAttemptId, result.currentAttemptId),
             eq(solverEvidenceArchives.state, "current"),
           ),
         ),
@@ -1373,7 +1370,8 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       }
       if (error instanceof EngineTimeoutError || error instanceof TypeError) {
         return reply.code(503).send({
-          error: "archived solver evidence rendering is temporarily unavailable",
+          error:
+            "archived solver evidence rendering is temporarily unavailable",
         });
       }
       throw error;
@@ -1920,7 +1918,22 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ---- sweeper control / observability ----
   app.get("/api/sweeper", async () => {
     const s = await readSweeperState();
-    return s ?? { id: 1, enabled: false };
+    if (!s) return { id: 1, enabled: false };
+    // Public health consumers need the current gate, not exact incident
+    // provenance. Trigger ids, timestamps and structured solver evidence stay
+    // on the authenticated admin endpoint.
+    const {
+      lastAdmissionFenceAt,
+      lastAdmissionFenceReason,
+      lastAdmissionFenceTriggerKey,
+      lastAdmissionFenceDetails,
+      ...publicState
+    } = s;
+    void lastAdmissionFenceAt;
+    void lastAdmissionFenceReason;
+    void lastAdmissionFenceTriggerKey;
+    void lastAdmissionFenceDetails;
+    return publicState;
   });
 
   // Admin-only (spec §10 auth hardening): sweeper writes control the solver

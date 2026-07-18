@@ -83,6 +83,7 @@ export function campaignInstrumentStatus(
     campaign.status === "active" &&
     !isProcessDead(scheduler.heartbeatAt) &&
     !scheduler.sweeperEnabled &&
+    !scheduler.admissionFenceActive &&
     !scheduler.engineUnreachableSince
   ) {
     return {
@@ -94,6 +95,17 @@ export function campaignInstrumentStatus(
   }
 
   if (line.gate) {
+    if (line.gate.text.toLowerCase().includes("safety stop")) {
+      return {
+        title: "Solver safety stop",
+        detail:
+          jobs > 0
+            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are fenced`
+            : "New submissions are fenced pending solver investigation",
+        tone: "red",
+        action: null,
+      };
+    }
     if (line.gate.text.includes("solver process not running")) {
       return {
         title: "Solver unavailable",
@@ -179,11 +191,29 @@ export function campaignInstrumentStatus(
         action: null,
       };
     case "attention":
+      if (line.tone === "violet") {
+        const tierFast = s.tierCounts?.precalcOpen ?? 0;
+        const fastCount =
+          tierFast > 0 ? tierFast : (s.reviewBuckets?.awaitingUrans ?? 0);
+        return {
+          title: "Awaiting FAST URANS",
+          detail: `${fCount(fastCount)} point${fastCount === 1 ? "" : "s"} continue automatically`,
+          tone: "violet",
+          action: null,
+        };
+      }
+      if (line.tone === "red") {
+        return {
+          title: "Critical recovery exhausted",
+          detail: `${fCount(totals.blocked ?? 0)} point${(totals.blocked ?? 0) === 1 ? "" : "s"} require system investigation`,
+          tone: "red",
+          action: null,
+        };
+      }
       return {
-        title:
-          line.tone === "violet" ? "Unsteady recovery" : "Automatic recovery",
-        detail: line.text,
-        tone: line.tone,
+        title: "Evidence retained",
+        detail: "Technical details remain available in Solver logs",
+        tone: "amber",
         action: null,
       };
     default:
@@ -232,14 +262,16 @@ export function pausedCampaignStatusText(
 /** Gate badge from the GLOBAL solver derivation (lib/solver-state) — used by
  *  surfaces that only carry the shared list payload (hub cards before their
  *  per-card summary arrives, the Solver page backlog strip). Same precedence
- *  as campaignStatusLine: process dead / engine unreachable / engine
- *  unhealthy / sweeper disabled ("paused" solver state). */
+ *  as campaignStatusLine: process dead / admission fence / engine unreachable /
+ *  engine unhealthy / sweeper disabled ("paused" solver state). */
 export function gateFromSolverState(
   state: SolverStateName,
 ): CampaignGate | null {
   switch (state) {
     case "process_not_running":
       return { text: "BLOCKED — solver process not running", tone: "red" };
+    case "admission_fenced":
+      return { text: "SAFETY STOP — critical solver outcome", tone: "red" };
     case "engine_unreachable":
       return { text: "BLOCKED — engine unreachable", tone: "red" };
     case "engine_unhealthy":
@@ -258,6 +290,96 @@ export function gateFromSolverState(
     default:
       return null;
   }
+}
+
+/** Hub-specific precedence for the two states that both persist
+ * `sweeperEnabled=false`. A critical admission fence is an engineering safety
+ * stop, never an ordinary user pause. */
+export function campaignHubAdmissionStatusText(
+  solverState: SolverStateName,
+  sweeperEnabled: boolean | undefined,
+): string | null {
+  if (solverState === "admission_fenced") {
+    return "Safety stop — new submissions are fenced. Running jobs continue; engineering investigation is required before Resume.";
+  }
+  if (sweeperEnabled === false || solverState === "paused") {
+    return "Sweeper disabled — no new points are being scheduled.";
+  }
+  return null;
+}
+
+export interface CampaignHubSchedulerSnapshot {
+  sweeperEnabled?: boolean;
+  engineUnreachableSince?: string | null;
+}
+
+export interface CampaignAutomaticFastSnapshot {
+  automaticPrecalcOpen?: number;
+  reviewBuckets?: { awaitingUrans: number };
+}
+
+/** Canonical list count first; reviewBuckets is a rolling-deploy fallback for
+ * the same stage. They are never added together. */
+export function campaignAutomaticFastCount(
+  snapshot: CampaignAutomaticFastSnapshot,
+): number {
+  const canonical = snapshot.automaticPrecalcOpen ?? 0;
+  return canonical > 0
+    ? canonical
+    : (snapshot.reviewBuckets?.awaitingUrans ?? 0);
+}
+
+/** Campaign-card gate copy with the same binding precedence as
+ * deriveSolverState. Keep this pure so compound safety/connectivity states are
+ * regression-tested without importing the client component tree. */
+export function campaignHubSchedulerStatusText(
+  solverState: SolverStateName,
+  scheduler: CampaignHubSchedulerSnapshot | undefined,
+): string | null {
+  if (solverState === "process_not_running") {
+    return "Solver process is not running — nothing is being scheduled.";
+  }
+  const admissionStatus = campaignHubAdmissionStatusText(
+    solverState,
+    scheduler?.sweeperEnabled,
+  );
+  if (admissionStatus) return admissionStatus;
+  if (scheduler?.engineUnreachableSince) {
+    return `Engine unreachable since ${new Date(scheduler.engineUnreachableSince).toLocaleTimeString()} — no jobs are being submitted.`;
+  }
+  if (solverState === "engine_unreachable") {
+    return "Engine unreachable — submissions are held with backoff.";
+  }
+  if (solverState === "tick_stalled") {
+    return "Tick running — engine responding slowly; scheduling continues next tick.";
+  }
+  if (solverState === "engine_unhealthy") {
+    return "Engine unhealthy — no jobs are being submitted.";
+  }
+  return null;
+}
+
+export type ReviewQueueOperationalState =
+  | "process_not_running"
+  | "safety_stop"
+  | "engine_unreachable"
+  | "sweeper_disabled"
+  | "ready";
+
+/** One primary queue state for the launch review. Keeping the precedence in a
+ * pure helper prevents the review card from rendering a safety stop and a
+ * second, contradictory connectivity warning at the same time. */
+export function reviewQueueOperationalState(input: {
+  processDead: boolean;
+  admissionFenceActive: boolean;
+  sweeperEnabled: boolean;
+  engineUnreachableSince: string | null;
+}): ReviewQueueOperationalState {
+  if (input.processDead) return "process_not_running";
+  if (input.admissionFenceActive) return "safety_stop";
+  if (input.engineUnreachableSince) return "engine_unreachable";
+  if (!input.sweeperEnabled) return "sweeper_disabled";
+  return "ready";
 }
 
 // ---------------------------------------------------------------------------
@@ -347,47 +469,23 @@ export function campaignStatusLine(
           }
         : { gate: null, lifecycle, text: "Cancelled.", tone: "dim" };
     case "completed": {
-      // Honest close record (F2): a close from attention can be driven by
-      // failed AND/OR rejected points. Omit each clause when 0/null — never
-      // render "closed with 0 failed points" for a rejected-only close.
-      const closedFailed = campaign.closedWithFailedCount ?? 0;
-      const closedRejected = campaign.closedWithRejectedCount ?? 0;
       if (blocked > 0) {
-        const unavailable = [
-          closedFailed > 0 ? `${fCount(closedFailed)} unavailable` : null,
-          closedRejected > 0 ? `${fCount(closedRejected)} unavailable` : null,
-          `${fCount(blocked)} critical`,
-        ].filter((part): part is string => part != null);
         return {
           gate: null,
           lifecycle,
-          text: `Completed — ${unavailable.join(" · ")} result failure${closedFailed + closedRejected + blocked === 1 ? "" : "s"}; system investigation required.`,
+          text: `Completed · ${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted; system investigation required.`,
           tone: "red",
         };
       }
-      if (closedFailed > 0 && closedRejected > 0) {
-        const unavailable = closedFailed + closedRejected;
+      if (
+        (campaign.closedWithFailedCount ?? 0) > 0 ||
+        (campaign.closedWithRejectedCount ?? 0) > 0
+      ) {
         return {
           gate: null,
           lifecycle,
-          text: `Completed — ${fCount(unavailable)} unavailable results.`,
-          tone: "red",
-        };
-      }
-      if (closedFailed > 0) {
-        return {
-          gate: null,
-          lifecycle,
-          text: `Completed — ${fCount(closedFailed)} unavailable result${closedFailed === 1 ? "" : "s"}.`,
-          tone: "red",
-        };
-      }
-      if (closedRejected > 0) {
-        return {
-          gate: null,
-          lifecycle,
-          text: `Completed — ${fCount(closedRejected)} unavailable result${closedRejected === 1 ? "" : "s"}.`,
-          tone: "red",
+          text: "Completed · evidence retained in Solver logs.",
+          tone: "amber",
         };
       }
       return {
@@ -399,75 +497,52 @@ export function campaignStatusLine(
     }
     case "attention": {
       const automaticPrecalc = s.tierCounts?.precalcOpen ?? 0;
-      if (automaticPrecalc > 0) {
-        const blockedSuffix =
-          blocked > 0
-            ? ` · ${fCount(blocked)} critical failure${blocked === 1 ? "" : "s"}`
+      if (blocked > 0) {
+        const fastSuffix =
+          automaticPrecalc > 0
+            ? ` · ${fCount(automaticPrecalc)} awaiting FAST URANS`
             : "";
         return {
           gate: null,
           lifecycle,
-          text: `Fast URANS · ${fCount(automaticPrecalc)} queued or running${blockedSuffix}.`,
-          tone: blocked > 0 ? "red" : "violet",
+          text: `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted${fastSuffix}; system investigation required.`,
+          tone: "red",
         };
       }
-      // Amendment-A split when the payload carries it: red strictly for
-      // needs-review evidence; an awaiting-URANS-only attention state is the
-      // calm violet stage-2 queue, never a false red.
+      if (automaticPrecalc > 0) {
+        return {
+          gate: null,
+          lifecycle,
+          text: `Awaiting FAST URANS · ${fCount(automaticPrecalc)} point${automaticPrecalc === 1 ? "" : "s"}`,
+          tone: "violet",
+        };
+      }
+      // Rolling clients may carry the older review-bucket split. Awaiting
+      // URANS is still the automatic stage-2 queue; the legacy needsReview and
+      // failed/rejected counters are technical evidence, not a typed critical
+      // recovery outcome and therefore never become red primary campaign UI.
       const rb = s.reviewBuckets;
       if (rb) {
-        if (blocked > 0) {
-          const unavailable = totals.failed + totals.rejected;
-          const suffix = [
-            rb.awaitingUrans > 0
-              ? `${fCount(rb.awaitingUrans)} awaiting URANS`
-              : null,
-            unavailable > 0 ? `${fCount(unavailable)} other unavailable` : null,
-          ].filter((part): part is string => part != null);
-          return {
-            gate: null,
-            lifecycle,
-            text: `${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"}${suffix.length ? ` · ${suffix.join(" · ")}` : ""}; system recovery required.`,
-            tone: "red",
-          };
-        }
-        if (rb.needsReview > 0) {
-          const suffix =
-            rb.awaitingUrans > 0
-              ? ` · ${fCount(rb.awaitingUrans)} awaiting URANS`
-              : "";
-          return {
-            gate: null,
-            lifecycle,
-            text: `${fCount(rb.needsReview)} unavailable result${rb.needsReview === 1 ? "" : "s"}${suffix}; system investigation required.`,
-            tone: "red",
-          };
-        }
         if (rb.awaitingUrans > 0) {
           return {
             gate: null,
             lifecycle,
-            text: `Fast URANS · ${fCount(rb.awaitingUrans)} queued.`,
+            text: `Awaiting FAST URANS · ${fCount(rb.awaitingUrans)} point${rb.awaitingUrans === 1 ? "" : "s"}`,
             tone: "violet",
           };
         }
-        const unavailable = totals.failed + totals.rejected + blocked;
         return {
           gate: null,
           lifecycle,
-          text: `${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}; system recovery required.`,
-          tone: "red",
+          text: "Evidence retained · details in Solver logs.",
+          tone: "amber",
         };
       }
-      // Older payloads have no refined machine-owned buckets. Failed and
-      // rejected evidence is unavailable; it must never be relabelled as a
-      // human-review obligation merely because the API predates the split.
-      const unavailable = totals.failed + totals.rejected + blocked;
       return {
         gate: null,
         lifecycle,
-        text: `${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}; system recovery required.`,
-        tone: "red",
+        text: "Evidence retained · details in Solver logs.",
+        tone: "amber",
       };
     }
     case "paused":
@@ -492,6 +567,20 @@ export function campaignStatusLine(
           gate: { text: "BLOCKED — solver process not running", tone: "red" },
           lifecycle,
           text: "Solver process is not running — nothing is being scheduled.",
+          tone: "red",
+        };
+      }
+      if (scheduler.admissionFenceActive) {
+        return {
+          gate: {
+            text: "SAFETY STOP — critical solver outcome",
+            tone: "red",
+          },
+          lifecycle,
+          text:
+            jobs > 0
+              ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are fenced pending investigation.`
+              : "New submissions are fenced pending solver investigation.",
           tone: "red",
         };
       }

@@ -1017,8 +1017,39 @@ describe("campaign remediation summary", () => {
         })
       ).obligationIds,
     ).toEqual([]);
+    // Model the repaired obligation failing again under the same v1 strategy.
+    // Its older v0 evidence remains immutable, but v0 may not make another v1
+    // pass look like a new capability upgrade.
+    await db.insert(simPrecalcObligationAttempts).values({
+      obligationId: obligations[1]!.id,
+      attemptNumber: 2,
+      solverAttemptNumber: null,
+      consumesSolverAttempt: false,
+      state: "failed",
+      outcome: "deterministic_failure",
+      meshRecoveryVersion: 1,
+      error: meshError,
+      completedAt: new Date(),
+    });
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "blocked",
+        lastOutcome: "deterministic_failure",
+        lastError: meshError,
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligations.id, obligations[1]!.id));
+    await db.transaction((tx) => recomputeCampaignProgress(tx, campaignId));
+    expect(
+      (
+        await requeueDeterministicMeshObligationsForRecoveryVersion(db, 1, {
+          campaignIds: [campaignId],
+        })
+      ).obligationIds,
+    ).toEqual([]);
     let summary = await campaignSummary(db, campaignId);
-    expect(summary.remediation).toMatchObject({ repairing: 2, blocked: 1 });
+    expect(summary.remediation).toMatchObject({ repairing: 1, blocked: 2 });
     expectConserved(summary);
 
     reopened = await requeueDeterministicMeshObligationsForRecoveryVersion(
@@ -1026,7 +1057,9 @@ describe("campaign remediation summary", () => {
       2,
       { campaignIds: [campaignId] },
     );
-    expect(reopened.obligationIds).toEqual([obligations[0]!.id]);
+    expect(reopened.obligationIds).toEqual(
+      [obligations[0]!.id, obligations[1]!.id].sort(),
+    );
     expect(
       (
         await requeueDeterministicMeshObligationsForRecoveryVersion(db, 2, {

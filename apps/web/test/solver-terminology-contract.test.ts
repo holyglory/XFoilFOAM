@@ -31,6 +31,31 @@ describe("solver terminology contract", () => {
     expect(solverState).toContain("scheduler · storage blocked");
   });
 
+  it("MUST-CATCH: aggregate surfaces never promote retained RANS evidence as a failed point", () => {
+    const adminConsole = source("components/admin/AdminConsole.tsx");
+    const campaignsHub = source("components/admin/campaigns/CampaignsHub.tsx");
+    const campaignStatus = source(
+      "components/admin/campaigns/campaign-status.ts",
+    );
+    const reviewStep = source("components/admin/campaigns/ReviewStep.tsx");
+
+    expect(adminConsole).not.toContain("attention-inspect-failed");
+    expect(adminConsole).not.toContain("backlog-failed-link");
+    expect(adminConsole).not.toMatch(/failed result(?:s)? · inspect evidence/i);
+    expect(campaignsHub).not.toContain("campaign-failed-link");
+    expect(campaignsHub).not.toContain("campaign-rejected-link");
+    const campaignDetail = source(
+      "components/admin/campaigns/CampaignDetail.tsx",
+    );
+    expect(campaignDetail).not.toContain("campaign-failed-link");
+    expect(campaignDetail).not.toContain("campaign-needs-review-chip");
+    expect(campaignsHub).toContain("awaiting FAST URANS");
+    expect(campaignStatus).toContain("Awaiting FAST URANS");
+    expect(campaignStatus).toContain("critical recover");
+    expect(reviewStep).toContain("reviewQueueOperationalState");
+    expect(reviewStep).not.toContain("{queue.engineUnreachableSince &&");
+  });
+
   it("MUST-CATCH: final verification is presented as the third stage, never as a direct full-tier bypass", () => {
     const solverWork = source("components/detail/SolverWorkPanel.tsx");
     const pointHistory = source("components/admin/PointHistoryPanel.tsx");
@@ -77,8 +102,11 @@ describe("solver terminology contract", () => {
     expect(flowPanel).toContain("RANS non-convergence is a normal handoff");
     expect(flowPanel).toContain('data-flow-stage="fast"');
     expect(flowPanel).toContain('data-flow-stage="final"');
-    expect(flowModel).toContain("CRITICAL · AUTO-REPAIR");
+    expect(flowModel).toContain("CRITICAL · SOLVER COULD NOT START");
+    expect(flowModel).toContain("CRITICAL · SCREENING RECOVERY EXHAUSTED");
     expect(flowModel).not.toMatch(/RANS (?:failed|failure)/i);
+    expect(flowModel).not.toContain("RESULT MISSING");
+    expect(flowModel).not.toContain("UPDATE UNAVAILABLE");
   });
 
   it("MUST-CATCH: incident UI is automatic/system-owned and never exposes recovery implementation labels", () => {
@@ -92,6 +120,10 @@ describe("solver terminology contract", () => {
     expect(incidentModel).not.toContain('"INVESTIGATE"');
     expect(incidentModel).not.toContain('"SCREENING RECOVERY"');
     expect(incidentPanel).toContain("? Wrench");
+    expect(incidentPanel).toContain('view.tone === "critical"');
+    expect(incidentPanel).toContain('? "alert"');
+    expect(incidentPanel).toContain("? ShieldAlert");
+    expect(incidentPanel).toContain("? ShieldCheck");
     expect(incidentPanel).not.toContain("solver-incident-remediation");
     expect(incidentPanel).not.toContain("group.solverImplementationKey");
     expect(incidentPanel).not.toContain("view.remediationLabel");

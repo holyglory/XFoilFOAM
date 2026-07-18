@@ -96,6 +96,14 @@ export interface AdminHealthSample {
 export type AdminSolverIncidentStage = "rans" | "preliminary" | "final";
 export type AdminSolverIncidentSeverity = "warning" | "critical";
 
+/** Sanitized safety-stop context carried by high-frequency campaign polling.
+ * Exact incident ids, errors and capacity snapshots remain on the dedicated
+ * authenticated sweeper endpoint. */
+export interface AdminAdmissionFenceContext {
+  stage?: "rans" | "preliminary" | "final";
+  fidelity?: "precalc" | "full";
+}
+
 export interface AdminSolverIncidentGroup {
   stage: AdminSolverIncidentStage;
   reason: string;
@@ -157,6 +165,11 @@ export interface SweeperState {
   diskFreeBytes?: number | null;
   diskRequiredFreeBytes?: number | null;
   diskCheckedAt?: string | null;
+  admissionFenceActive?: boolean;
+  lastAdmissionFenceAt?: string | null;
+  lastAdmissionFenceReason?: string | null;
+  lastAdmissionFenceTriggerKey?: string | null;
+  lastAdmissionFenceDetails?: Record<string, unknown> | null;
 }
 export interface AdminJob {
   id: string;
@@ -1703,6 +1716,10 @@ export interface AdminCampaignSummary {
     diskFreeBytes?: number | null;
     diskRequiredFreeBytes?: number | null;
     diskCheckedAt?: string | null;
+    admissionFenceActive?: boolean;
+    lastAdmissionFenceAt?: string | null;
+    lastAdmissionFenceReason?: string | null;
+    lastAdmissionFenceDetails?: AdminAdmissionFenceContext | null;
   };
   rate: {
     pointsLast24h: number;
@@ -2058,6 +2075,10 @@ export interface AdminCampaignsSolverState {
   diskFreeBytes?: number | null;
   diskRequiredFreeBytes?: number | null;
   diskCheckedAt?: string | null;
+  admissionFenceActive?: boolean;
+  lastAdmissionFenceAt?: string | null;
+  lastAdmissionFenceReason?: string | null;
+  lastAdmissionFenceDetails?: AdminAdmissionFenceContext | null;
 }
 
 export const listCampaigns = (params?: {

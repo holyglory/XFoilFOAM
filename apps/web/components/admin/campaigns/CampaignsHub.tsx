@@ -24,6 +24,8 @@ import {
 } from "@/lib/solver-state";
 import type { CampaignPointsBucket } from "@/lib/point-history";
 import {
+  campaignAutomaticFastCount,
+  campaignHubSchedulerStatusText,
   gateFromSolverState,
   pausedCampaignStatusText,
 } from "./campaign-status";
@@ -71,13 +73,14 @@ function priorityLabel(priority: number): string {
  *  `solverState` is the SAME derivation the Solver banner uses (list-payload
  *  solverState → deriveSolverState), so an active row can never read as
  *  quietly waiting while the solver process is down or the engine is gone. */
-function statusLine(
+export function campaignHubStatusLine(
   item: AdminCampaignListItem,
   summary: AdminCampaignSummary | undefined,
   solverState: SolverStateName,
 ): string {
   const totals = summary?.totals ?? item.totals;
   const blocked = totals.blocked ?? 0;
+  const automaticFast = campaignAutomaticFastCount(item);
   const scheduler = summary?.scheduler;
   if (item.status === "archived") return "Archived — read-only.";
   if (item.status === "cancelled") {
@@ -88,10 +91,11 @@ function statusLine(
   }
   if (item.status === "completed") {
     if (blocked > 0) {
-      return `Completed with ${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"}; system investigation is required.`;
+      return `Completed · ${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted; system investigation required.`;
     }
-    return item.closedWithFailedCount != null && item.closedWithFailedCount > 0
-      ? `Completed with ${fCount(item.closedWithFailedCount)} unavailable result${item.closedWithFailedCount === 1 ? "" : "s"}${item.completedAt ? ` ${ago(item.completedAt)}` : ""}.`
+    return (item.closedWithFailedCount ?? 0) > 0 ||
+      (item.closedWithRejectedCount ?? 0) > 0
+      ? "Completed · evidence retained in Solver logs."
       : `Completed${item.completedAt ? ` ${ago(item.completedAt)}` : ""}.`;
   }
   if (item.status === "paused") {
@@ -102,71 +106,34 @@ function statusLine(
     );
   }
   if (item.status === "attention") {
-    const automaticPrecalc = item.automaticPrecalcOpen ?? 0;
-    if (automaticPrecalc > 0) {
-      const blockedSuffix =
-        blocked > 0
-          ? ` ${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"} also require system recovery.`
+    if (blocked > 0) {
+      const fastSuffix =
+        automaticFast > 0
+          ? ` · ${fCount(automaticFast)} awaiting FAST URANS`
           : "";
-      return `Automatic precalc continuation queued or running for ${fCount(automaticPrecalc)} point${automaticPrecalc === 1 ? "" : "s"}; no human review is required.${blockedSuffix}`;
+      return `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted${fastSuffix}; system investigation required.`;
     }
-    // Amendment-A copy when the list payload carries the split; the legacy
-    // failed/rejected wording survives only for older payloads.
-    const rb = item.reviewBuckets;
-    if (rb) {
-      if (blocked > 0) {
-        return `All work settled — ${fCount(blocked)} critical result failure${blocked === 1 ? "" : "s"}; system investigation is required.`;
-      }
-      const needs: string[] = [];
-      if (rb.needsReview > 0)
-        needs.push(`${fCount(rb.needsReview)} unavailable`);
-      if (rb.awaitingUrans > 0)
-        needs.push(`${fCount(rb.awaitingUrans)} awaiting URANS`);
-      if (needs.length) return `All work settled — ${needs.join(" · ")}.`;
-      const unavailable = totals.failed + totals.rejected + blocked;
-      return `All work settled — ${fCount(unavailable)} unavailable result${unavailable === 1 ? "" : "s"}; no human review is required.`;
+    if (automaticFast > 0) {
+      return `Awaiting FAST URANS · ${fCount(automaticFast)} point${automaticFast === 1 ? "" : "s"}`;
     }
-    const unavailable = totals.failed + totals.rejected + blocked;
-    return `${fCount(unavailable)} result${unavailable === 1 ? "" : "s"} unavailable; system recovery required.`;
+    // Legacy result counters remain inspectable in Solver job logs, but they
+    // cannot become a red campaign failure without typed exhausted recovery.
+    return "Evidence retained · details in Solver logs.";
   }
   // active — scheduler-dependent clause from the shared solver derivation
   // first: never a bare "Active — waiting" while nothing can run. Gated
   // lines drop the "Active —" prefix entirely (mockup fec7b453 screen 3):
   // the gate badge is the headline and the small lifecycle chip says active.
-  if (solverState === "process_not_running") {
-    return "Solver process is not running — nothing is being scheduled.";
-  }
-  if (scheduler?.engineUnreachableSince) {
-    return `Engine unreachable since ${new Date(scheduler.engineUnreachableSince).toLocaleTimeString()} — no jobs are being submitted.`;
-  }
-  if (solverState === "engine_unreachable") {
-    return "Engine unreachable — submissions are held with backoff.";
-  }
-  if (scheduler && !scheduler.sweeperEnabled) {
-    return "Sweeper disabled — no new points are being scheduled.";
-  }
-  if (solverState === "paused") {
-    return "Sweeper disabled — no new points are being scheduled.";
-  }
-  if (solverState === "tick_stalled") {
-    return "Tick running — engine responding slowly; scheduling continues next tick.";
-  }
-  if (solverState === "engine_unhealthy") {
-    return "Engine unhealthy — no jobs are being submitted.";
-  }
+  const schedulerGate = campaignHubSchedulerStatusText(solverState, scheduler);
+  if (schedulerGate) return schedulerGate;
   const parts = [`${fCount(totals.remaining)} points remaining`];
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
-  const rbActive = item.reviewBuckets;
-  if (rbActive) {
-    if (rbActive.needsReview > 0)
-      parts.push(`${fCount(rbActive.needsReview)} unavailable`);
-    if (rbActive.awaitingUrans > 0)
-      parts.push(`${fCount(rbActive.awaitingUrans)} awaiting URANS`);
-  } else {
-    if (totals.failed > 0) parts.push(`${fCount(totals.failed)} failed`);
-    if (totals.rejected > 0) parts.push(`${fCount(totals.rejected)} rejected`);
-  }
-  if (blocked > 0) parts.push(`${fCount(blocked)} critical`);
+  if (automaticFast > 0)
+    parts.push(`${fCount(automaticFast)} awaiting FAST URANS`);
+  if (blocked > 0)
+    parts.push(
+      `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted`,
+    );
   return `Active — ${parts.join(" · ")}.`;
 }
 
@@ -262,6 +229,9 @@ export function CampaignsHub({
           diskFreeBytes: solverPayload.diskFreeBytes,
           diskRequiredFreeBytes: solverPayload.diskRequiredFreeBytes,
           diskCheckedAt: solverPayload.diskCheckedAt,
+          admissionFenceActive: solverPayload.admissionFenceActive,
+          lastAdmissionFenceAt: solverPayload.lastAdmissionFenceAt,
+          lastAdmissionFenceReason: solverPayload.lastAdmissionFenceReason,
         }
       : {
           fetchOk: false,
@@ -443,6 +413,7 @@ export function CampaignsHub({
             const summary = summaries[item.id];
             const totals = summary?.totals ?? item.totals;
             const blocked = totals.blocked ?? 0;
+            const automaticFast = campaignAutomaticFastCount(item);
             const repairing =
               summary?.remediation.repairing ?? item.remediation.repairing;
             const settled = totals.solved + totals.derived;
@@ -464,18 +435,10 @@ export function CampaignsHub({
                   ),
                 ]
               : [];
-            const reviewBuckets = item.reviewBuckets;
             const attentionColor =
-              blocked > 0 || (reviewBuckets?.needsReview ?? 0) > 0
-                ? C.red
-                : item.automaticPrecalcOpen > 0 ||
-                    (reviewBuckets?.awaitingUrans ?? 0) > 0
-                  ? C.violet
-                  : C.amber;
+              blocked > 0 ? C.red : automaticFast > 0 ? C.violet : C.amber;
             const statusColor =
-              blocked > 0 ||
-              (item.status === "completed" &&
-                (item.closedWithFailedCount ?? 0) > 0)
+              blocked > 0
                 ? C.red
                 : item.status === "attention"
                   ? attentionColor
@@ -675,16 +638,20 @@ export function CampaignsHub({
                     fontFamily: MONO,
                     fontSize: 11,
                     color:
-                      item.status === "attention"
-                        ? attentionColor
-                        : gate
-                          ? gate.tone === "red"
-                            ? C.redText
-                            : C.amber
-                          : C.text2,
+                      blocked > 0
+                        ? C.redText
+                        : automaticFast > 0
+                          ? C.violet
+                          : item.status === "attention"
+                            ? attentionColor
+                            : gate
+                              ? gate.tone === "red"
+                                ? C.redText
+                                : C.amber
+                              : C.text2,
                   }}
                 >
-                  {statusLine(item, summary, solver.state)}
+                  {campaignHubStatusLine(item, summary, solver.state)}
                 </div>
 
                 <div
@@ -696,7 +663,7 @@ export function CampaignsHub({
                   }}
                 >
                   <div
-                    aria-label={`progress ${settled} done and ${blocked} critical failures of ${totals.requested}`}
+                    aria-label={`progress ${settled} done and ${blocked} critical recoveries exhausted of ${totals.requested}`}
                     style={{
                       height: 6,
                       borderRadius: 4,
@@ -733,126 +700,45 @@ export function CampaignsHub({
                     }}
                   >
                     {fCount(settled)} / {fCount(totals.requested)}
-                    {/* Amendment-A links: red strictly for needs-review (the
-                        repair surface), calm violet for the awaiting-URANS
-                        stage-2 queue; zero counts never render (no link to an
-                        empty view). Older payloads without the split fall
-                        back to the legacy failed/rejected links. */}
-                    {item.reviewBuckets ? (
+                    {/* Only typed states belong in the campaign summary:
+                        exhausted automatic recovery is red; queued/running
+                        FAST URANS is calm violet. Raw failed/rejected evidence
+                        stays in technical Solver logs. */}
+                    {blocked > 0 && (
                       <>
-                        {blocked > 0 && (
-                          <>
-                            {" · "}
-                            <span
-                              data-testid={`campaign-blocked-${item.slug}`}
-                              title="Critical: automatic preliminary recovery ended without a publishable result"
-                              style={{ color: C.redText }}
-                            >
-                              {fCount(blocked)} critical
-                            </span>
-                          </>
-                        )}
-                        {item.reviewBuckets.needsReview > 0 && (
-                          <>
-                            {" · "}
-                            <button
-                              type="button"
-                              data-testid={`campaign-needs-review-link-${item.slug}`}
-                              title="Open unavailable evidence in the Points explorer"
-                              onClick={() =>
-                                onOpenPoints(item.id, "needs_review")
-                              }
-                              style={{
-                                fontFamily: MONO,
-                                fontSize: 10,
-                                color: C.red,
-                                background: "transparent",
-                                border: "none",
-                                padding: 0,
-                                cursor: "pointer",
-                                textDecoration: "underline",
-                              }}
-                            >
-                              unavailable ·{" "}
-                              {fCount(item.reviewBuckets.needsReview)}
-                            </button>
-                          </>
-                        )}
-                        {item.reviewBuckets.awaitingUrans > 0 && (
-                          <>
-                            {" · "}
-                            <button
-                              type="button"
-                              data-testid={`campaign-awaiting-urans-link-${item.slug}`}
-                              title="Tier-1 rejects queued for the unsteady re-solve — open them in the Points explorer"
-                              onClick={() =>
-                                onOpenPoints(item.id, "awaiting_urans")
-                              }
-                              style={{
-                                fontFamily: MONO,
-                                fontSize: 10,
-                                color: C.violet,
-                                background: "transparent",
-                                border: "none",
-                                padding: 0,
-                                cursor: "pointer",
-                                textDecoration: "underline",
-                              }}
-                            >
-                              {fCount(item.reviewBuckets.awaitingUrans)}{" "}
-                              awaiting URANS
-                            </button>
-                          </>
-                        )}
+                        {" · "}
+                        <span
+                          data-testid={`campaign-blocked-${item.slug}`}
+                          title="Critical: automatic recovery exhausted without a publishable result"
+                          style={{ color: C.redText }}
+                        >
+                          {fCount(blocked)} critical
+                        </span>
                       </>
-                    ) : (
+                    )}
+                    {automaticFast > 0 && (
                       <>
-                        {totals.failed > 0 && (
-                          <>
-                            {" · "}
-                            <button
-                              type="button"
-                              data-testid={`campaign-failed-link-${item.slug}`}
-                              title="Open these solver failures in the Points explorer"
-                              onClick={() => onOpenPoints(item.id, "failed")}
-                              style={{
-                                fontFamily: MONO,
-                                fontSize: 10,
-                                color: C.red,
-                                background: "transparent",
-                                border: "none",
-                                padding: 0,
-                                cursor: "pointer",
-                                textDecoration: "underline",
-                              }}
-                            >
-                              {fCount(totals.failed)} failed
-                            </button>
-                          </>
-                        )}
-                        {totals.rejected > 0 && (
-                          <>
-                            {" · "}
-                            <button
-                              type="button"
-                              data-testid={`campaign-rejected-link-${item.slug}`}
-                              title="Open these rejected points in the Points explorer"
-                              onClick={() => onOpenPoints(item.id, "rejected")}
-                              style={{
-                                fontFamily: MONO,
-                                fontSize: 10,
-                                color: C.red,
-                                background: "transparent",
-                                border: "none",
-                                padding: 0,
-                                cursor: "pointer",
-                                textDecoration: "underline",
-                              }}
-                            >
-                              {fCount(totals.rejected)} rejected
-                            </button>
-                          </>
-                        )}
+                        {" · "}
+                        <button
+                          type="button"
+                          data-testid={`campaign-awaiting-urans-link-${item.slug}`}
+                          title="Open points moving automatically from RANS screening to FAST URANS"
+                          onClick={() =>
+                            onOpenPoints(item.id, "awaiting_urans")
+                          }
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 10,
+                            color: C.violet,
+                            background: "transparent",
+                            border: "none",
+                            padding: 0,
+                            cursor: "pointer",
+                            textDecoration: "underline",
+                          }}
+                        >
+                          {fCount(automaticFast)} awaiting FAST URANS
+                        </button>
                       </>
                     )}
                   </span>

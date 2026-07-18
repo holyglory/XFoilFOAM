@@ -3,10 +3,10 @@
 // Campaign coverage matrix (spec §11, approved mockup 1ed4374f; recolored per
 // amendment A / design c19fd74a): virtualized airfoil rows over the keyset
 // /airfoils pages with per-airfoil SEGMENTED BARS — one flex segment per
-// condition (2px gap), fill height = fraction of that condition's angles
-// terminal, VIOLET fill = awaiting URANS (calm stage-2 queue), solid RED =
-// unavailable / failed, empty = panel background (legacy payloads without
-// the split keep the amber rejected tint). The per-condition column headers are
+// condition (2px gap), teal fill = accepted result coverage, VIOLET overlay =
+// awaiting FAST URANS (calm stage-2 queue), solid RED = critical unavailable
+// evidence, empty = panel background (legacy payloads without the split keep
+// the amber rejected overlay). The per-condition column headers are
 // gone: a slim AIRFOIL | DONE | CONDITIONS legend row sits above and the
 // hover tooltip + cell side panel carry the identification. Click on a
 // segment opens the existing cell side panel (same onCellClick contract).
@@ -35,6 +35,7 @@ import {
   segmentFillHeight,
   segmentTitle,
   segmentView,
+  segmentWorkflowFillHeight,
 } from "./coverage-segments";
 import { fCount, ghostBtn, inputStyle } from "./ui";
 
@@ -473,9 +474,9 @@ export function CoverageMatrix({
             textOverflow: "ellipsis",
           }}
         >
-          CONDITIONS → fill = completed angles ·{" "}
-          <span style={{ color: C.violet }}>violet</span> = fast URANS ·{" "}
-          <span style={{ color: C.redText }}>red</span> = critical · hover for
+          CONDITIONS → fill = accepted results ·{" "}
+          <span style={{ color: C.violet }}>violet</span> = awaiting fast URANS
+          · <span style={{ color: C.redText }}>red</span> = critical · hover for
           detail · click opens the point flow
         </span>
       </div>
@@ -581,6 +582,7 @@ export function CoverageMatrix({
                     );
                     const hoverKey = `${row.slug}:${c.id}`;
                     const fillH = segmentFillHeight(view);
+                    const workflowFillH = segmentWorkflowFillHeight(view);
                     // Amendment-A recolor: red strictly for needs-review /
                     // failed; violet = calm awaiting-URANS; amber only for
                     // legacy payloads without the split counters.
@@ -588,13 +590,9 @@ export function CoverageMatrix({
                       view.state === "failed" ||
                       view.state === "needs_review" ||
                       view.state === "blocked";
-                    const fillColor = red
-                      ? C.red
-                      : view.state === "awaiting_urans"
-                        ? C.violet
-                        : view.state === "rejected"
-                          ? C.amber
-                          : C.teal;
+                    const fillColor = red ? C.red : C.teal;
+                    const workflowColor =
+                      view.state === "awaiting_urans" ? C.violet : C.amber;
                     return (
                       <button
                         key={c.id}
@@ -637,6 +635,20 @@ export function CoverageMatrix({
                               bottom: 0,
                               height: `${fillH * 100}%`,
                               background: fillColor,
+                              display: "block",
+                            }}
+                          />
+                        )}
+                        {!red && workflowFillH > 0 && (
+                          <span
+                            data-testid={`matrix-workflow-${row.slug}-${c.ord}`}
+                            style={{
+                              position: "absolute",
+                              left: 0,
+                              right: 0,
+                              bottom: `${view.fillFraction * 100}%`,
+                              height: `${workflowFillH * 100}%`,
+                              background: workflowColor,
                               display: "block",
                             }}
                           />

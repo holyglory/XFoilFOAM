@@ -32,6 +32,7 @@ import {
   materializeCampaignLaunch,
   mediums,
   meshProfiles,
+  onResultIngestedWithAutomaticPrecalcHandoff,
   outputProfiles,
   precalcContinuationsForObligations,
   precalcSnapshotForVerifyItem,
@@ -247,8 +248,8 @@ beforeAll(async () => {
   restoreSweeperEnabled = state?.enabled ?? false;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: false })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: false } });
+    .values({ id: 1, enabled: true })
+    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
 
   const [cat] = await db
     .insert(categories)
@@ -724,12 +725,12 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       .where(eq(simCampaigns.id, campaignId));
   }, 60000);
 
-  it("FALSE-POSITIVE GUARD: exact per-point PRECALC yields every next admission turn to the open RANS backlog", async () => {
+  it("STRICT PRIORITY: every due terminal-parent PRECALC admission stays ahead of unrelated open RANS", async () => {
     const parentIds: string[] = [];
     const childIds: string[] = [];
     const resultAttemptIds: string[] = [];
     const obligationIds: string[] = [];
-    const fairnessAngles = [11.375, 12.375];
+    const strictPriorityAngles = [11.375, 12.375];
     try {
       await db
         .update(simCampaigns)
@@ -741,7 +742,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
         .where(eq(simCampaignPoints.campaignId, campaignId));
       expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(true);
 
-      for (const [index, aoaDeg] of fairnessAngles.entries()) {
+      for (const [index, aoaDeg] of strictPriorityAngles.entries()) {
         const [parent] = await db
           .insert(simJobs)
           .values({
@@ -811,21 +812,9 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       ).toBe(true);
       expect(requests).toHaveLength(1);
 
-      // A PRECALC win while RANS remains open reserves the next pre-pass for
-      // submitOneBatch. No second preliminary child is admitted here.
-      expect(
-        await submitCampaignPrecalcRecoveries(
-          db,
-          engine,
-          [campaignId],
-          parentIds,
-          0,
-        ),
-      ).toBe(false);
-      expect(requests).toHaveLength(1);
-
-      // If the RANS branch found no composable batch, the same tick's ladder
-      // fallback may use the slot; capacity is not left idle.
+      // The newer per-point fidelity contract is strict: another due
+      // terminal-parent PRECALC handoff still owns the next free slot even
+      // while unrelated campaign RANS gaps remain open.
       expect(
         await submitCampaignPrecalcRecoveries(
           db,
@@ -836,11 +825,25 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
         ),
       ).toBe(true);
       expect(requests).toHaveLength(2);
+
+      // One scheduler pass still admits at most one physical child. Once both
+      // exact handoffs are live, the targeted tier is quiet and ordinary RANS
+      // may own the subsequent main-loop slot.
+      expect(
+        await submitCampaignPrecalcRecoveries(
+          db,
+          engine,
+          [campaignId],
+          parentIds,
+          0,
+        ),
+      ).toBe(false);
+      expect(requests).toHaveLength(2);
       expect(
         requests
           .map((request) => request.aoa?.angles?.[0])
           .sort((left, right) => Number(left) - Number(right)),
-      ).toEqual(fairnessAngles);
+      ).toEqual(strictPriorityAngles);
 
       const children = await db
         .select()
@@ -862,7 +865,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
             (child) => (child.requestPayload as { aoas?: number[] }).aoas ?? [],
           )
           .sort((left, right) => left - right),
-      ).toEqual(fairnessAngles);
+      ).toEqual(strictPriorityAngles);
     } finally {
       resetUransLadderMemory();
       if (childIds.length) {
@@ -3300,41 +3303,82 @@ describe("final/full URANS automatic recovery", () => {
   }, 120000);
 });
 
-describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-07)", () => {
-  // Production shape: a campaign's batched parents mostly need NO gated retry
-  // (their cells all landed accepted), and the parents that DO need a retry
-  // finish LAST (the gate stays closed until the final RANS gap closes). The
-  // buggy scan fetched a fixed finishedAt-ASC window with no retry-need or
-  // settled-parent exclusion in SQL, so >window no-retry parents permanently
-  // occupied the window and the needy parent was never fetched → its
-  // needs_urans cell never re-solved → phase stuck running_precalc forever.
-  it("reaches a needy parent ranked past the first finishedAt window despite 13 earlier no-retry parents", async () => {
-    // The verify test above ends with every tier terminal and the aoa-8 cell
-    // ACCEPTED at full fidelity, so the completion probe settles the shared
-    // fixture campaign to 'completed'. This scenario needs a LIVE mid-ladder
-    // campaign (the gate just opened, gated retries still owed) — reactivate.
-    await db
-      .update(simCampaigns)
-      .set({ status: "active" })
-      .where(eq(simCampaigns.id, campaignId));
-    const [unrelatedOpenObligation] = await ensurePrecalcObligations(
-      db,
-      [
-        {
-          airfoilId,
-          revisionId,
-          aoaDeg: 3.875,
-        },
-      ],
-      { campaignIds: [campaignId] },
-    );
-    expect(unrelatedOpenObligation).toMatchObject({ state: "pending" });
-    const base = Date.now() - 60 * 60 * 1000;
+describe("tier-2a durable-obligation priority MUST-CATCH", () => {
+  // Production shape: healthy terminal parents dominate the finishedAt scan,
+  // while the newer rejected point already owns an exact durable PRECALC
+  // obligation. Process-local window sliding is insufficient: a restart puts
+  // the target behind the same history again and lets ordinary RANS consume
+  // every intervening free slot. The durable queue must win the first pass.
+  it("admits a due durable recovery ranked 53rd on the first post-restart pass", async () => {
     const scopedParentIds: string[] = [];
-    // 13 completed, ingested, childless wave-1 parents with EMPTY retry plans
-    // (no attempts at all) — one more than the old 12-slot scan window.
-    for (let i = 0; i < 13; i++) {
-      const [filler] = await db
+    const obligationIds: string[] = [];
+    const attemptIds: string[] = [];
+    const childIds: string[] = [];
+    const starvationAoa = 14.375;
+    const unrelatedAoa = 13.875;
+    try {
+      // The verify test above ends with every tier terminal and the aoa-8 cell
+      // ACCEPTED at full fidelity, so the completion probe settles the shared
+      // fixture campaign to 'completed'. This scenario needs a LIVE mid-ladder
+      // campaign (the gate just opened, gated retries still owed) — reactivate.
+      await db
+        .update(simCampaigns)
+        .set({ status: "active" })
+        .where(eq(simCampaigns.id, campaignId));
+      const [unrelatedOpenObligation] = await ensurePrecalcObligations(
+        db,
+        [
+          {
+            airfoilId,
+            revisionId,
+            aoaDeg: unrelatedAoa,
+          },
+        ],
+        { campaignIds: [campaignId] },
+      );
+      if (unrelatedOpenObligation)
+        obligationIds.push(unrelatedOpenObligation.id);
+      expect(unrelatedOpenObligation).toMatchObject({ state: "pending" });
+
+      const base = Date.now() - 60 * 60 * 1000;
+      // 52 completed, ingested, childless wave-1 parents with EMPTY retry plans
+      // place the exact durable source parent at production rank 53.
+      const fillers = await db
+        .insert(simJobs)
+        .values(
+          Array.from({ length: 52 }, (_, i) => ({
+            airfoilId,
+            bcIds: [bcId],
+            simulationPresetRevisionId: revisionId,
+            campaignId,
+            jobKind: "sweep",
+            referenceChordM: CHORD,
+            wave: 1,
+            status: "done" as const,
+            engineJobId: `${PREFIX}-starve-filler-${i}`,
+            totalCases: 1,
+            completedCases: 1,
+            ingestedAt: new Date(base + i * 1000),
+            finishedAt: new Date(base + i * 1000),
+            requestPayload: {
+              speedMap: [
+                {
+                  speed: SPEED,
+                  bcId,
+                  presetRevisionId: revisionId,
+                  mach: SPEED / 340.3,
+                },
+              ],
+              aoas: [4],
+            },
+          })),
+        )
+        .returning({ id: simJobs.id });
+      scopedParentIds.push(...fillers.map((filler) => filler.id));
+
+      // The needy parent finishes LAST and carries a failed RANS attempt at a
+      // file-unique AoA (classifies rejected → non-empty targeted retry plan).
+      const [needy] = await db
         .insert(simJobs)
         .values({
           airfoilId,
@@ -3345,11 +3389,11 @@ describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-
           referenceChordM: CHORD,
           wave: 1,
           status: "done",
-          engineJobId: `${PREFIX}-starve-filler-${i}`,
+          engineJobId: `${PREFIX}-starve-needy`,
           totalCases: 1,
           completedCases: 1,
-          ingestedAt: new Date(base + i * 1000),
-          finishedAt: new Date(base + i * 1000),
+          ingestedAt: new Date(base + 999_000),
+          finishedAt: new Date(base + 999_000),
           requestPayload: {
             speedMap: [
               {
@@ -3359,101 +3403,359 @@ describe("tier-2a scan-window starvation MUST-CATCH (adversarial review 2026-07-
                 mach: SPEED / 340.3,
               },
             ],
-            aoas: [4],
+            aoas: [starvationAoa],
           },
         })
-        .returning({ id: simJobs.id });
-      scopedParentIds.push(filler.id);
-    }
-    // The needy parent finishes LAST and carries a failed RANS attempt at
-    // aoa 4 (classifies rejected at refresh → non-empty targeted retry plan).
-    const [needy] = await db
-      .insert(simJobs)
-      .values({
-        airfoilId,
-        bcIds: [bcId],
-        simulationPresetRevisionId: revisionId,
-        campaignId,
-        jobKind: "sweep",
-        referenceChordM: CHORD,
-        wave: 1,
-        status: "done",
-        engineJobId: `${PREFIX}-starve-needy`,
-        totalCases: 1,
-        completedCases: 1,
-        ingestedAt: new Date(base + 999_000),
-        finishedAt: new Date(base + 999_000),
-        requestPayload: {
-          speedMap: [
-            {
-              speed: SPEED,
-              bcId,
-              presetRevisionId: revisionId,
-              mach: SPEED / 340.3,
-            },
-          ],
-          aoas: [4],
-        },
-      })
-      .returning();
-    scopedParentIds.push(needy.id);
-    await db.insert(resultAttempts).values({
-      airfoilId,
-      bcId,
-      simulationPresetRevisionId: revisionId,
-      aoaDeg: 4,
-      simJobId: needy.id,
-      engineJobId: `${PREFIX}-starve-needy`,
-      status: "failed",
-      source: "queued",
-      regime: "rans",
-      validForPolar: false,
-      converged: false,
-      stalled: true,
-      unsteady: false,
-      error: "RANS did not converge",
-      evidencePayload: { failure_disposition: "hard_solver" },
-      solvedAt: new Date(),
-    });
-    expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(false);
-
-    // Bounded ticks: the scan MUST slide past the settled no-retry parents
-    // and reach the needy parent. The buggy window never advances, so no
-    // number of ticks ever creates the child.
-    let child: typeof simJobs.$inferSelect | undefined;
-    for (let tick = 0; tick < 10 && !child; tick++) {
-      const requests: PolarRequest[] = [];
-      const scope = await ladderScope();
-      await uransLadderTick(
+        .returning();
+      scopedParentIds.push(needy.id);
+      const [needyAttempt] = await db
+        .insert(resultAttempts)
+        .values({
+          airfoilId,
+          bcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: starvationAoa,
+          simJobId: needy.id,
+          engineJobId: `${PREFIX}-starve-needy`,
+          status: "failed",
+          source: "queued",
+          regime: "rans",
+          validForPolar: false,
+          converged: false,
+          stalled: true,
+          unsteady: false,
+          error: "RANS did not converge",
+          evidencePayload: { failure_disposition: "hard_solver" },
+          solvedAt: new Date(),
+        })
+        .returning();
+      attemptIds.push(needyAttempt.id);
+      const [durableObligation] = await ensurePrecalcObligations(
         db,
-        stubEngine(requests, `${PREFIX}-starve-child-${tick}`),
-        0,
-        {
-          ...scope,
-          requestIds: [],
-          verifyIds: [],
-          parentJobIds: scopedParentIds,
-        },
+        [
+          {
+            airfoilId,
+            revisionId,
+            aoaDeg: starvationAoa,
+            sourceResultAttemptId: needyAttempt.id,
+          },
+        ],
+        { campaignIds: [campaignId] },
       );
-      [child] = await db
+      if (durableObligation) obligationIds.push(durableObligation.id);
+      expect(durableObligation).toMatchObject({
+        state: "pending",
+        sourceResultAttemptId: needyAttempt.id,
+      });
+      expect(await campaignHasOpenRansGaps(db, campaignId)).toBe(false);
+
+      // A process restart clears legacy scan memory. Durable priority must still
+      // admit this exact parent in one call rather than spending 18+ passes
+      // re-settling the 52 older parents while unrelated RANS can jump ahead.
+      resetUransLadderMemory();
+      const requests: PolarRequest[] = [];
+      expect(
+        await submitCampaignPrecalcRecoveries(
+          db,
+          stubEngine(requests, `${PREFIX}-starve-child`),
+          [campaignId],
+          scopedParentIds,
+          0,
+          2,
+        ),
+      ).toBe(true);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.solver?.urans_fidelity).toBe("precalc");
+      expect(requests[0]?.solver?.force_transient).toBe(true);
+      expect(requests[0]?.aoa?.angles).toEqual([starvationAoa]);
+      const [child] = await db
         .select()
         .from(simJobs)
         .where(and(eq(simJobs.parentJobId, needy.id), eq(simJobs.wave, 2)));
+      if (child) childIds.push(child.id);
+      expect(child).toBeTruthy();
+      expect(child!.jobKind).toBe("targeted");
+      expect(
+        (child!.requestPayload as { uransFidelity?: string }).uransFidelity,
+      ).toBe("precalc");
+      expect((child!.requestPayload as { aoas?: number[] }).aoas).toEqual([
+        starvationAoa,
+      ]);
+    } finally {
+      resetUransLadderMemory();
+      if (childIds.length) {
+        await db.delete(simJobs).where(inArray(simJobs.id, childIds));
+      }
+      if (obligationIds.length) {
+        await db
+          .delete(simPrecalcObligations)
+          .where(inArray(simPrecalcObligations.id, obligationIds));
+      }
+      if (attemptIds.length) {
+        await db
+          .delete(resultAttempts)
+          .where(inArray(resultAttempts.id, attemptIds));
+      }
+      if (scopedParentIds.length) {
+        await db.delete(simJobs).where(inArray(simJobs.id, scopedParentIds));
+      }
     }
-    await db
-      .delete(simPrecalcObligations)
-      .where(eq(simPrecalcObligations.id, unrelatedOpenObligation.id));
-    expect(child).toBeTruthy();
-    expect(child!.jobKind).toBe("targeted");
-    expect(
-      (child!.requestPayload as { uransFidelity?: string }).uransFidelity,
-    ).toBe("precalc");
-    expect((child!.requestPayload as { aoas?: number[] }).aoas).toEqual([4]);
-    // Free the slot so nothing lingers in-flight for other suites.
-    await db
-      .update(simJobs)
-      .set({ status: "done", ingestedAt: new Date(), finishedAt: new Date() })
-      .where(eq(simJobs.id, child!.id));
+  }, 180000);
+
+  it("schedules a campaign-owned handoff from its exact background RANS attempt and honors the beneficiary lifecycle", async () => {
+    const targetAoa = 17.625;
+    const unrelatedAoa = 18.625;
+    let pointInserted = false;
+    let parentId = "";
+    const resultIds: string[] = [];
+    const obligationIds: string[] = [];
+    const childIds: string[] = [];
+    try {
+      await db
+        .update(simCampaigns)
+        .set({ status: "active", completedAt: null })
+        .where(eq(simCampaigns.id, campaignId));
+      const [pointTemplate] = await db
+        .select({ planRevisionNumber: simCampaignPoints.planRevisionNumber })
+        .from(simCampaignPoints)
+        .where(eq(simCampaignPoints.campaignId, campaignId))
+        .limit(1);
+      await db.insert(simCampaignPoints).values({
+        campaignId,
+        conditionId,
+        airfoilId,
+        aoaDeg: targetAoa,
+        revisionId,
+        planRevisionNumber: pointTemplate!.planRevisionNumber,
+        state: "requested",
+      });
+      pointInserted = true;
+
+      const [parent] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          campaignId: null,
+          jobKind: "sweep",
+          referenceChordM: CHORD,
+          wave: 1,
+          status: "done",
+          engineJobId: `${PREFIX}-background-source-parent`,
+          totalCases: 2,
+          completedCases: 2,
+          ingestedAt: new Date(),
+          finishedAt: new Date(),
+          requestPayload: {
+            speedMap: [
+              {
+                speed: SPEED,
+                bcId,
+                presetRevisionId: revisionId,
+                mach: SPEED / 340.3,
+              },
+            ],
+            aoas: [targetAoa, unrelatedAoa],
+            ransRetryScope: {
+              origin: "continuous-polar",
+              requestedAoas: [targetAoa, unrelatedAoa],
+            },
+          },
+        })
+        .returning();
+      parentId = parent.id;
+
+      const sourceResults = await db
+        .insert(results)
+        .values(
+          [targetAoa, unrelatedAoa].map((aoaDeg) => ({
+            airfoilId,
+            bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg,
+            simJobId: parent.id,
+            status: "failed" as const,
+            source: "queued" as const,
+            regime: "rans" as const,
+            fidelity: "rans" as const,
+            converged: false,
+            stalled: true,
+            error: "RANS did not converge",
+            solvedAt: new Date(),
+          })),
+        )
+        .returning();
+      resultIds.push(...sourceResults.map((result) => result.id));
+      const sourceAttempts = await db
+        .insert(resultAttempts)
+        .values(
+          sourceResults.map((result) => ({
+            resultId: result.id,
+            airfoilId,
+            bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: result.aoaDeg,
+            simJobId: parent.id,
+            engineJobId: parent.engineJobId,
+            status: "failed" as const,
+            source: "queued" as const,
+            regime: "rans" as const,
+            validForPolar: false,
+            converged: false,
+            stalled: true,
+            unsteady: false,
+            error: "RANS did not converge",
+            evidencePayload: { failure_disposition: "hard_solver" },
+            solvedAt: new Date(),
+          })),
+        )
+        .returning();
+      await db.insert(resultClassifications).values(
+        sourceAttempts.map((attempt) => ({
+          resultId: attempt.resultId!,
+          resultAttemptId: attempt.id,
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: attempt.aoaDeg,
+          regime: "rans" as const,
+          classifierVersion: `${PREFIX}-background-owner-handoff`,
+          state: "rejected" as const,
+          reasons: ["not-converged"],
+        })),
+      );
+      const targetResult = sourceResults.find(
+        (result) => result.aoaDeg === targetAoa,
+      )!;
+      const targetAttempt = sourceAttempts.find(
+        (attempt) => attempt.aoaDeg === targetAoa,
+      )!;
+
+      await onResultIngestedWithAutomaticPrecalcHandoff(db, {
+        airfoilId,
+        revisionId,
+        aoaDeg: targetAoa,
+        resultId: targetResult.id,
+        resultAttemptId: targetAttempt.id,
+        simJobId: parent.id,
+        status: "failed",
+        regime: "rans",
+      });
+      const [obligation] = await db
+        .select({
+          id: simPrecalcObligations.id,
+          state: simPrecalcObligations.state,
+          sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+          backgroundOwner: simPrecalcObligations.backgroundOwner,
+        })
+        .from(simPrecalcObligations)
+        .innerJoin(
+          simPrecalcObligationCampaigns,
+          and(
+            eq(
+              simPrecalcObligationCampaigns.obligationId,
+              simPrecalcObligations.id,
+            ),
+            eq(simPrecalcObligationCampaigns.campaignId, campaignId),
+            eq(simPrecalcObligationCampaigns.state, "active"),
+          ),
+        )
+        .where(
+          and(
+            eq(simPrecalcObligations.airfoilId, airfoilId),
+            eq(simPrecalcObligations.revisionId, revisionId),
+            eq(simPrecalcObligations.aoaDeg, targetAoa),
+          ),
+        );
+      obligationIds.push(obligation.id);
+      expect(obligation).toMatchObject({
+        state: "pending",
+        sourceResultAttemptId: targetAttempt.id,
+        backgroundOwner: false,
+      });
+
+      await db
+        .update(simCampaigns)
+        .set({ status: "paused" })
+        .where(eq(simCampaigns.id, campaignId));
+      const captured: PolarRequest[] = [];
+      expect(
+        await submitCampaignPrecalcRecoveries(
+          db,
+          stubEngine(captured, `${PREFIX}-background-source-child`),
+          [campaignId],
+          [parent.id],
+          0,
+          2,
+        ),
+      ).toBe(false);
+      expect(captured).toHaveLength(0);
+
+      await db
+        .update(simCampaigns)
+        .set({ status: "active" })
+        .where(eq(simCampaigns.id, campaignId));
+      expect(
+        await submitCampaignPrecalcRecoveries(
+          db,
+          stubEngine(captured, `${PREFIX}-background-source-child`),
+          [campaignId],
+          [parent.id],
+          0,
+          2,
+        ),
+      ).toBe(true);
+      expect(captured).toHaveLength(1);
+      expect(captured[0].aoa?.angles).toEqual([targetAoa]);
+      expect(captured[0].aoa?.angles).not.toContain(unrelatedAoa);
+      const [child] = await db
+        .select()
+        .from(simJobs)
+        .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+      childIds.push(child.id);
+      expect(child).toMatchObject({
+        campaignId: null,
+        jobKind: "targeted",
+        status: "submitted",
+      });
+      expect(child.requestPayload).toMatchObject({
+        aoas: [targetAoa],
+        precalcObligationIds: [obligation.id],
+        uransFidelity: "precalc",
+      });
+    } finally {
+      resetUransLadderMemory();
+      await db
+        .update(simCampaigns)
+        .set({ status: "active" })
+        .where(eq(simCampaigns.id, campaignId));
+      if (childIds.length) {
+        await db.delete(simJobs).where(inArray(simJobs.id, childIds));
+      }
+      if (obligationIds.length) {
+        await db
+          .delete(simPrecalcObligations)
+          .where(inArray(simPrecalcObligations.id, obligationIds));
+      }
+      if (pointInserted) {
+        await db
+          .delete(simCampaignPoints)
+          .where(
+            and(
+              eq(simCampaignPoints.campaignId, campaignId),
+              eq(simCampaignPoints.conditionId, conditionId),
+              eq(simCampaignPoints.airfoilId, airfoilId),
+              eq(simCampaignPoints.aoaDeg, targetAoa),
+            ),
+          );
+      }
+      if (resultIds.length) {
+        await db.delete(results).where(inArray(results.id, resultIds));
+      }
+      if (parentId) {
+        await db.delete(simJobs).where(eq(simJobs.id, parentId));
+      }
+    }
   }, 180000);
 
   it("recovers a cancelled wave-1 parent's partially-ingested rejected cell instead of losing its URANS obligation", async () => {
@@ -3808,6 +4110,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
             },
           } as unknown as EngineClient,
           jobId: freshAtMaxJob.id,
+          admissionLane: "local",
           campaignId: null,
           request: {} as PolarRequest,
           connectionErrorPrefix: "connection: ",
@@ -4033,7 +4336,15 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
       db,
       stubEngine(captured, `${PREFIX}-continuation-job`),
       0,
-      { ...(await ladderScope()), uransRecoveryVersion: 2 },
+      {
+        ...(await ladderScope()),
+        // This assertion is specifically tier 2b request composition. Strict
+        // durable tier 2a priority is covered above, so close both campaign
+        // recovery scopes instead of letting unrelated fixture work win.
+        parentJobIds: [],
+        promotionIds: [],
+        uransRecoveryVersion: 2,
+      },
     );
     expect(submitted).toBe(true);
     expect(captured.length).toBe(1);
@@ -4122,7 +4433,12 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
       db,
       stubEngine(captured, `${PREFIX}-orphan-continuation`),
       0,
-      { ...(await ladderScope()), uransRecoveryVersion: 2 },
+      {
+        ...(await ladderScope()),
+        parentJobIds: [],
+        promotionIds: [],
+        uransRecoveryVersion: 2,
+      },
     );
     expect(submitted).toBe(false);
     expect(captured.length).toBe(0);
