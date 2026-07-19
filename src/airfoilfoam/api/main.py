@@ -1,6 +1,8 @@
 """FastAPI application exposing airfoil polar CFD jobs."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import io
@@ -39,8 +41,10 @@ from ..evidence_runtime import (
     reclaim_brokered_remote_evidence,
 )
 from ..evidence_store import (
+    MAX_EVIDENCE_MANIFEST_BYTES,
     EvidenceStoreError,
     RemoteEvidencePointer,
+    manifest_bundle_member_set_sha256,
     read_remote_pointer,
 )
 from ..evidence_upload_broker import (
@@ -251,6 +255,72 @@ class BrokeredEvidenceReclaimRequest(BaseModel):
     receipt_hmac: str = Field(
         alias="receiptHmac", pattern=r"^[0-9a-f]{64}$"
     )
+
+
+_MAX_EVIDENCE_MANIFEST_BASE64_BYTES = (
+    4 * ((MAX_EVIDENCE_MANIFEST_BYTES + 2) // 3)
+)
+
+
+class VerifyRemoteEvidenceManifestRequest(BaseModel):
+    """Exact immutable archive and manifest identity to authenticate in GCS."""
+
+    remote: dict[str, object]
+    manifest_base64: str = Field(
+        alias="manifestBase64",
+        min_length=4,
+        max_length=_MAX_EVIDENCE_MANIFEST_BASE64_BYTES,
+    )
+    manifest_sha256: str = Field(
+        alias="manifestSha256", pattern=r"^[0-9a-f]{64}$"
+    )
+    manifest_byte_size: int = Field(
+        alias="manifestByteSize",
+        gt=0,
+        le=MAX_EVIDENCE_MANIFEST_BYTES,
+    )
+    manifest_member_set_sha256: str = Field(
+        alias="manifestMemberSetSha256", pattern=r"^[0-9a-f]{64}$"
+    )
+    manifest_member_count: int = Field(
+        alias="manifestMemberCount",
+        gt=0,
+        le=MAX_EVIDENCE_MANIFEST_BYTES,
+    )
+
+    def decoded_manifest(self) -> bytes:
+        try:
+            manifest = base64.b64decode(self.manifest_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("manifestBase64 must be canonical base64") from exc
+        if base64.b64encode(manifest).decode("ascii") != self.manifest_base64:
+            raise ValueError("manifestBase64 must be canonical base64")
+        if len(manifest) > MAX_EVIDENCE_MANIFEST_BYTES:
+            raise ValueError(
+                "evidence manifest exceeds the "
+                f"{MAX_EVIDENCE_MANIFEST_BYTES}-byte limit"
+            )
+        if len(manifest) != self.manifest_byte_size:
+            raise ValueError(
+                "decoded manifest byte size does not match manifestByteSize"
+            )
+        if hashlib.sha256(manifest).hexdigest() != self.manifest_sha256:
+            raise ValueError(
+                "decoded manifest SHA-256 does not match manifestSha256"
+            )
+        member_count, member_set_sha256 = manifest_bundle_member_set_sha256(
+            manifest
+        )
+        if member_count != self.manifest_member_count:
+            raise ValueError(
+                "manifest member count does not match manifestMemberCount"
+            )
+        if member_set_sha256 != self.manifest_member_set_sha256:
+            raise ValueError(
+                "manifest member-set SHA-256 does not match "
+                "manifestMemberSetSha256"
+            )
+        return manifest
 
 
 def _sha256_file(path: Path) -> str:
@@ -1273,6 +1343,58 @@ def create_app() -> FastAPI:
                 # Node hub must return it only to the exact owning solver.
                 "uploadUrl": session.upload_url,
                 "expiresAt": session.expires_at,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-archives/verify-manifest")
+    def verify_remote_evidence_manifest(
+        request: VerifyRemoteEvidenceManifestRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        """Authenticate every member of one exact generation-pinned archive.
+
+        This endpoint is intentionally read-only and internal.  It exists for
+        control-plane reconciliation when a manifest-declared member no longer
+        has unpacked local bytes, and returns only the immutable identities it
+        proved.  Verification always performs a fresh GCS download rather than
+        trusting the render cache.
+        """
+
+        _require_control_plane_bearer(
+            settings.control_plane_token, authorization
+        )
+        try:
+            manifest = request.decoded_manifest()
+            pointer = RemoteEvidencePointer.from_dict(request.remote)
+            if pointer.to_dict() != request.remote:
+                raise ValueError(
+                    "remote must be the exact canonical complete evidence pointer"
+                )
+            remote_store = evidence_object_store(settings)
+            if remote_store is None:
+                raise EvidenceStoreError("GCS evidence storage is not configured")
+            bundled_file_count = remote_store.verify_all_manifest_members(
+                pointer,
+                expected_manifest=manifest,
+                fresh_download=True,
+            )
+            if bundled_file_count + 1 != request.manifest_member_count:
+                raise EvidenceStoreError(
+                    "verified archive member count does not match the exact "
+                    "manifest member-set identity"
+                )
+            return {
+                "state": "verified",
+                "remote": pointer.to_dict(),
+                "manifestSha256": request.manifest_sha256,
+                "manifestByteSize": request.manifest_byte_size,
+                "manifestMemberSetSha256": (
+                    request.manifest_member_set_sha256
+                ),
+                "manifestMemberCount": request.manifest_member_count,
             }
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

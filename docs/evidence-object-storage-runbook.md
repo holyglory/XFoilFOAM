@@ -2440,6 +2440,16 @@ verify_migration_job "$MIGRATION_JOB" uploaded \
   | tee -a "$AUDIT_DIR/bulk-pass1-verified.jsonl"
 
 compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
+  src/evidence-storage-backfill.ts "${MIGRATION_TARGET_ARGS[@]}" \
+  2>&1 | tee -a "$AUDIT_DIR/bulk-pass2-plan.jsonl"
+
+# If a historical manifest member has no logical artifact row and its unpacked
+# file is absent, both this plan and execute require a fresh generation-pinned
+# verification of the complete canonical GCS archive through the engine's
+# closed-world manifest verifier. A mismatched pointer, manifest/member-set
+# identity, duplicate, special, unsafe, extra, missing, or corrupt member stops
+# before any database write.
+compose exec -T sweeper pnpm --filter @aerodb/sweeper exec tsx \
   src/evidence-storage-backfill.ts --execute "${MIGRATION_TARGET_ARGS[@]}" \
   2>&1 | tee -a "$AUDIT_DIR/bulk-pass2-node.jsonl"
 verify_migration_job "$MIGRATION_JOB" registered \

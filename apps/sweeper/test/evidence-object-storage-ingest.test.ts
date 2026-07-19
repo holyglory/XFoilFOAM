@@ -16,6 +16,8 @@ import type {
   EngineClient,
   EngineEvidenceArtifact,
   PolarPoint,
+  VerifyRemoteEvidenceManifestRequest,
+  VerifyRemoteEvidenceManifestResponse,
 } from "@aerodb/engine-client";
 import { and, eq, like } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
@@ -37,11 +39,13 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from "vitest";
 
 import { registerEvidenceArtifacts } from "../src/ingest";
 import {
   parseEvidenceMigrationReceipt,
+  planEvidenceMigrationReceipt,
   registerEvidenceMigrationReceipt,
 } from "../src/evidence-storage-backfill";
 
@@ -49,7 +53,16 @@ const { db, sql } = createClient({ max: 2 });
 const PREFIX = `evidence-gcs-ingest-${process.pid}-${Date.now().toString(36)}`;
 const BUCKET = "airfoils-pro-storage-bucket";
 const EXACT_GCS_GENERATION = "18446744073709551615";
-const ENGINE = { baseUrl: "http://engine.test" } as EngineClient;
+const verifyRemoteEvidenceManifest =
+  vi.fn<
+    (
+      request: VerifyRemoteEvidenceManifestRequest,
+    ) => Promise<VerifyRemoteEvidenceManifestResponse>
+  >();
+const ENGINE = {
+  baseUrl: "http://engine.test",
+  verifyRemoteEvidenceManifest,
+} as unknown as EngineClient;
 
 const sha256 = (value: string): string =>
   createHash("sha256").update(`${PREFIX}:${value}`).digest("hex");
@@ -328,6 +341,15 @@ async function blobsForSha(digest: string) {
 }
 
 beforeEach(async () => {
+  verifyRemoteEvidenceManifest.mockReset();
+  verifyRemoteEvidenceManifest.mockImplementation(async (request) => ({
+    state: "verified",
+    remote: request.remote,
+    manifestSha256: request.manifestSha256,
+    manifestByteSize: request.manifestByteSize,
+    manifestMemberSetSha256: request.manifestMemberSetSha256,
+    manifestMemberCount: request.manifestMemberCount,
+  }));
   fixture = await createOwnerFixture();
 });
 
@@ -352,6 +374,191 @@ afterAll(async () => {
 });
 
 describe("GCS Zstandard evidence ingestion", () => {
+  it("MUST-CATCH: dry-run and execute authenticate omitted members from the exact canonical GCS generation before any write", async () => {
+    const owner = fixture!;
+    const memberPath = "openfoam/mesh_evidence/logs/log.blockMesh";
+    const memberBytes = Buffer.from("verified retained mesh log\n");
+    const memberSha = createHash("sha256").update(memberBytes).digest("hex");
+    const manifestBytes = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 2,
+        bundleExcludes: [],
+        files: [
+          {
+            path: memberPath,
+            role: "mesh_evidence",
+            sha256: memberSha,
+            byteSize: memberBytes.byteLength,
+          },
+        ],
+      }),
+    );
+    await register({
+      ...logicalArtifact(owner, "manifest", "evidence_manifest.json"),
+      sha256: createHash("sha256").update(manifestBytes).digest("hex"),
+      byte_size: manifestBytes.byteLength,
+    });
+
+    const mediaRoot = await mkdtemp(
+      join(tmpdir(), "evidence-backfill-canonical-archive-"),
+    );
+    const evidencePath = `cases/${owner.caseSlug}/${owner.evidenceBase}`;
+    const receiptDir = join(mediaRoot, "jobs", owner.engineJobId, evidencePath);
+    const receiptPath = join(receiptDir, "storage_migration.json");
+    const migratedSha = sha256("retained-archive-migrated-zstd");
+    const tarSha = sha256("canonical-migrated-tar");
+    const tarSize = 98_765;
+    await mkdir(receiptDir, { recursive: true });
+    await writeFile(join(receiptDir, "evidence_manifest.json"), manifestBytes);
+    const legacyPath = `${owner.evidenceBase}/openfoam_evidence.tar.gz`;
+    await register({
+      kind: "engine_bundle",
+      path: legacyPath,
+      url: artifactUrl(owner, legacyPath),
+      mime_type: "application/gzip",
+      sha256: sha256("legacy-canonical-source"),
+      byte_size: 90_000,
+      role: "evidence",
+      metadata: { evidenceBase: owner.evidenceBase },
+    });
+    const receiptPayload = {
+      schemaVersion: 1,
+      state: "awaiting_database_registration",
+      jobId: owner.engineJobId,
+      evidencePath,
+      archive: {
+        storedSha256: migratedSha,
+        storedByteSize: 54_321,
+        uncompressedTarSha256: tarSha,
+        uncompressedTarByteSize: tarSize,
+        zstdLevel: 10,
+      },
+      remote: {
+        schemaVersion: 1,
+        format: "tar+zstd",
+        bucket: BUCKET,
+        objectKey: `${PREFIX}/sha256/${migratedSha.slice(0, 2)}/${migratedSha}.tar.zst`,
+        generation: EXACT_GCS_GENERATION,
+        storedSha256: migratedSha,
+        storedSize: 54_321,
+        tarSha256: tarSha,
+        tarSize,
+        crc32c: "AAAAAA==",
+        zstdLevel: 10,
+        createdAt: "2026-07-18T22:00:00.000Z",
+      },
+      sourceArchives: [],
+    };
+    await writeFile(receiptPath, JSON.stringify(receiptPayload));
+
+    try {
+      await expect(
+        planEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).resolves.toMatchObject({
+        status: "planned",
+        resultId: owner.resultId,
+        resultAttemptId: owner.resultAttemptId,
+        reconciledManifestMembers: 1,
+      });
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(0);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+      expect(verifyRemoteEvidenceManifest).toHaveBeenCalledTimes(1);
+      expect(verifyRemoteEvidenceManifest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          remote: receiptPayload.remote,
+          manifestBase64: manifestBytes.toString("base64"),
+          manifestSha256: createHash("sha256")
+            .update(manifestBytes)
+            .digest("hex"),
+          manifestByteSize: manifestBytes.byteLength,
+          manifestMemberCount: 2,
+        }),
+      );
+
+      verifyRemoteEvidenceManifest.mockRejectedValueOnce(
+        new Error("wrong generation"),
+      );
+      await expect(
+        planEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/canonical GCS archive: wrong generation/);
+      verifyRemoteEvidenceManifest.mockRejectedValueOnce(
+        new Error("wrong generation"),
+      );
+      await expect(
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ).rejects.toThrow(/canonical GCS archive: wrong generation/);
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(0);
+      expect(await archivesFor(owner)).toHaveLength(0);
+      expect(
+        await readFile(join(receiptDir, "storage_migration.database.json"))
+          .then(() => true)
+          .catch(() => false),
+      ).toBe(false);
+
+      const [ack, concurrentAck] = await Promise.all([
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+        registerEvidenceMigrationReceipt({
+          db,
+          engine: ENGINE,
+          receiptPath,
+          mediaRoot,
+        }),
+      ]);
+      expect(concurrentAck).toEqual(ack);
+      expect(ack).toMatchObject({
+        state: "registered",
+        resultId: owner.resultId,
+        resultAttemptId: owner.resultAttemptId,
+      });
+      expect(await artifactsFor(owner, "mesh")).toEqual([
+        expect.objectContaining({
+          storageKey: `jobs/${owner.engineJobId}/${evidencePath}/${memberPath}`,
+          sha256: memberSha,
+          byteSize: memberBytes.byteLength,
+          role: "mesh_evidence",
+        }),
+      ]);
+      expect(await archivesFor(owner)).toHaveLength(1);
+
+      const replay = await registerEvidenceMigrationReceipt({
+        db,
+        engine: ENGINE,
+        receiptPath,
+        mediaRoot,
+      });
+      expect(replay).toEqual(ack);
+      expect(await artifactsFor(owner, "mesh")).toHaveLength(1);
+      expect(await archivesFor(owner)).toHaveLength(1);
+    } finally {
+      await rm(mediaRoot, { recursive: true, force: true });
+    }
+  });
+
   it("MUST-CATCH: reconciles an omitted mesh-evidence row only from exact local bytes and withholds acknowledgement on mismatch", async () => {
     const owner = fixture!;
     const memberPath = "openfoam/mesh_evidence/logs/log.blockMesh";
@@ -456,9 +663,13 @@ describe("GCS Zstandard evidence ingestion", () => {
       ).toBe(false);
       expect(await artifactsFor(owner, "mesh")).toHaveLength(0);
       expect(await archivesFor(owner)).toHaveLength(0);
+      expect(verifyRemoteEvidenceManifest).not.toHaveBeenCalled();
 
       const memberFile = join(receiptDir, memberPath);
       await rm(memberFile, { force: true });
+      verifyRemoteEvidenceManifest.mockRejectedValueOnce(
+        new Error("canonical archive unavailable"),
+      );
       await expect(
         registerEvidenceMigrationReceipt({
           db,
@@ -466,7 +677,8 @@ describe("GCS Zstandard evidence ingestion", () => {
           receiptPath,
           mediaRoot,
         }),
-      ).rejects.toThrow(/is missing locally/);
+      ).rejects.toThrow(/canonical GCS archive: canonical archive unavailable/);
+      expect(verifyRemoteEvidenceManifest).toHaveBeenCalledTimes(1);
       expect(await archivesFor(owner)).toHaveLength(0);
       expect(
         await readFile(join(receiptDir, "storage_migration.database.json"))
@@ -485,6 +697,7 @@ describe("GCS Zstandard evidence ingestion", () => {
           mediaRoot,
         }),
       ).rejects.toThrow(/without symlink traversal/);
+      expect(verifyRemoteEvidenceManifest).toHaveBeenCalledTimes(1);
       expect(await archivesFor(owner)).toHaveLength(0);
       expect(
         await readFile(join(receiptDir, "storage_migration.database.json"))
@@ -512,6 +725,7 @@ describe("GCS Zstandard evidence ingestion", () => {
           mediaRoot,
         }),
       ).rejects.toThrow(/without symlink traversal/);
+      expect(verifyRemoteEvidenceManifest).toHaveBeenCalledTimes(1);
       expect(await archivesFor(owner)).toHaveLength(0);
       expect(
         await readFile(join(receiptDir, "storage_migration.database.json"))

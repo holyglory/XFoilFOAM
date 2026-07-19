@@ -406,6 +406,24 @@ export interface RemoteEvidencePointerPayload {
   createdAt: string;
 }
 
+export interface VerifyRemoteEvidenceManifestRequest {
+  remote: RemoteEvidencePointerPayload;
+  manifestBase64: string;
+  manifestSha256: string;
+  manifestByteSize: number;
+  manifestMemberSetSha256: string;
+  manifestMemberCount: number;
+}
+
+export interface VerifyRemoteEvidenceManifestResponse {
+  state: "verified";
+  remote: RemoteEvidencePointerPayload;
+  manifestSha256: string;
+  manifestByteSize: number;
+  manifestMemberSetSha256: string;
+  manifestMemberCount: number;
+}
+
 export interface FinalizeRemoteEvidenceRequest {
   case_slug: string;
   evidence_base: string;

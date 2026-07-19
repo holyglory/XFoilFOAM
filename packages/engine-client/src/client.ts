@@ -13,6 +13,8 @@ import type {
   EngineDeleteJobResponse,
   FinalizeRemoteEvidenceRequest,
   FinalizeRemoteEvidenceResponse,
+  VerifyRemoteEvidenceManifestRequest,
+  VerifyRemoteEvidenceManifestResponse,
   JobResult,
   JobRuntimeResponse,
   JobStatus,
@@ -108,6 +110,8 @@ export const ENGINE_POLL_TIMEOUT_MS = 15_000;
 export const ENGINE_SUBMIT_TIMEOUT_MS = 60_000;
 /** Field-extents / render round-trips (the engine rasterizes frames). */
 export const ENGINE_RENDER_TIMEOUT_MS = 120_000;
+/** Fresh generation-pinned download plus complete archive/member verification. */
+export const ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS = 15 * 60_000;
 
 /** Thin typed client for the Python CFD solver API (FastAPI). Every call
  *  carries an AbortSignal timeout so a saturated engine can stall a caller
@@ -535,6 +539,75 @@ export class EngineClient {
         body: JSON.stringify(request),
       },
     );
+  }
+
+  verifyRemoteEvidenceManifest(
+    request: VerifyRemoteEvidenceManifestRequest,
+    opts?: EngineCallOptions,
+  ): Promise<VerifyRemoteEvidenceManifestResponse> {
+    if (!this.controlPlaneToken) {
+      throw new EngineError(
+        "ENGINE_CONTROL_PLANE_TOKEN is required for remote evidence verification",
+        undefined,
+        "evidence_verification_auth_missing",
+      );
+    }
+    return this.json<unknown>(
+      "/internal/evidence-archives/verify-manifest",
+      opts?.timeoutMs ?? ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.controlPlaneToken}` },
+        body: JSON.stringify(request),
+      },
+    ).then((raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new EngineError(
+          "remote evidence verification returned a malformed response",
+          undefined,
+          "evidence_verification_identity_mismatch",
+        );
+      }
+      const response = raw as Record<string, unknown>;
+      const remote = response.remote;
+      const remoteKeys = [
+        "schemaVersion",
+        "format",
+        "bucket",
+        "objectKey",
+        "generation",
+        "storedSha256",
+        "storedSize",
+        "tarSha256",
+        "tarSize",
+        "crc32c",
+        "zstdLevel",
+        "createdAt",
+      ] as const;
+      const remoteMatches =
+        remote != null &&
+        typeof remote === "object" &&
+        !Array.isArray(remote) &&
+        remoteKeys.every(
+          (key) =>
+            (remote as Record<string, unknown>)[key] === request.remote[key],
+        );
+      if (
+        response.state !== "verified" ||
+        !remoteMatches ||
+        response.manifestSha256 !== request.manifestSha256 ||
+        response.manifestByteSize !== request.manifestByteSize ||
+        response.manifestMemberSetSha256 !== request.manifestMemberSetSha256 ||
+        response.manifestMemberCount !== request.manifestMemberCount
+      ) {
+        throw new EngineError(
+          "remote evidence verification did not bind the exact pointer and manifest identities",
+          undefined,
+          "evidence_verification_identity_mismatch",
+        );
+      }
+      return response as unknown as VerifyRemoteEvidenceManifestResponse;
+    });
   }
 
   maintenanceJobs(

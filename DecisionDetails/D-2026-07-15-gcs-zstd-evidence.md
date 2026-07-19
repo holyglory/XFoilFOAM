@@ -161,12 +161,20 @@ migrator stopped before archive registration, database acknowledgement, or
 local deletion.
 
 Registration may repair this narrow historical gap only from the exact retained
-manifest role, SHA-256, byte size, and matching local regular-file bytes under
-the exact result/attempt/job/case/evidence-base owner. It authenticates every
-missing bundled member before the first write, rejects symlinks, missing or
-changing bytes, ambiguous rows, role-less missing entries, excluded frames,
-and ownership conflicts, and commits the reconstructed associations only when
-complete manifest coverage revalidates in the same locked transaction. This is
-recovery of authenticated evidence metadata, not creation of evidence: a
-missing or mismatched byte remains a hard stop, and no GCS archive binding,
-database acknowledgement, or deletion authority is emitted.
+manifest role, SHA-256, and byte size under the exact
+result/attempt/job/case/evidence-base owner. A present unpacked regular file is
+authenticated directly. When that file is absent, the reconciler accepts only
+a fresh, generation-pinned verification of the canonical GCS Zstandard object
+through the engine's hardened closed-world archive verifier. The proof binds
+every remote-pointer field, the exact database-authorized manifest bytes and
+size, and the manifest member-set digest and count; duplicate, non-regular,
+unsafe, excluded, missing, extra, corrupt, or mismatched members fail closed.
+The retained gzip remains immutable forensic/recovery input but does not
+authorize canonical GCS member mappings. Dry-run and execute share this
+preflight and authenticate the complete archive before the first write.
+Execute commits reconstructed associations only when complete manifest
+coverage revalidates in the same locked transaction. This is recovery of
+authenticated evidence metadata, not creation of evidence: a member absent
+from both authenticated sources, or any byte/identity mismatch, remains a hard
+stop, and no GCS archive binding, database acknowledgement, or deletion
+authority is emitted.

@@ -460,6 +460,8 @@ interface ManifestArtifactIdentity {
   originalKind: string;
 }
 
+class LocalManifestMemberMissingError extends Error {}
+
 function manifestArtifactIdentity(role: string): ManifestArtifactIdentity {
   if (role === "mesh_evidence") {
     return { kind: "mesh", originalKind: "mesh_evidence" };
@@ -536,7 +538,7 @@ async function verifyLocalManifestMember(
       const child = await open(descriptorPath, flags).catch(
         (error: unknown) => {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-            throw new Error(
+            throw new LocalManifestMemberMissingError(
               `bundled manifest member ${entry.path} is missing locally`,
             );
           }
@@ -585,6 +587,42 @@ async function verifyLocalManifestMember(
     for (const handle of handles.reverse()) {
       await handle.close().catch(() => undefined);
     }
+  }
+}
+
+async function verifyManifestMembersForReconciliation(opts: {
+  engine: EngineClient;
+  receipt: MigrationReceipt;
+  receiptPath: string;
+  manifestBytes: Buffer;
+  memberSet: ReturnType<typeof parseEvidenceManifest>["memberSet"];
+  missing: Array<{ path: string; sha256: string; byteSize: number }>;
+}): Promise<void> {
+  const archiveBacked: typeof opts.missing = [];
+  for (const entry of opts.missing) {
+    try {
+      await verifyLocalManifestMember(dirname(opts.receiptPath), entry);
+    } catch (error) {
+      if (!(error instanceof LocalManifestMemberMissingError)) throw error;
+      archiveBacked.push(entry);
+    }
+  }
+  if (!archiveBacked.length) return;
+  try {
+    await opts.engine.verifyRemoteEvidenceManifest({
+      remote: opts.receipt.remote,
+      manifestBase64: opts.manifestBytes.toString("base64"),
+      manifestSha256: createHash("sha256")
+        .update(opts.manifestBytes)
+        .digest("hex"),
+      manifestByteSize: opts.manifestBytes.byteLength,
+      manifestMemberSetSha256: manifestMemberSetSha256(opts.memberSet),
+      manifestMemberCount: opts.memberSet.length,
+    });
+  } catch (error) {
+    throw new Error(
+      `${archiveBacked[0]!.path} is missing locally and cannot be authenticated from the exact canonical GCS archive: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -840,23 +878,20 @@ function requireAssociationReplay(
 
 /**
  * Historical 2406 payloads could omit the individual shared-mesh artifacts
- * even though the authenticated manifest, local retained files, and archive
- * all contained those bytes. Reconcile only such exact missing logical rows.
- * Every missing member is authenticated before the first database write, and
- * the transaction revalidates complete exact-owner coverage before commit.
+ * even though the authenticated manifest and canonical GCS generation
+ * contained those bytes. Plan and execute share this exact preflight so
+ * dry-run cannot promise a registration that execute would reject. Every
+ * missing member is authenticated before the first database write.
  */
-async function reconcileVerifiedLegacyManifestArtifacts<T>(opts: {
+async function prepareVerifiedLegacyManifestArtifacts(opts: {
   db: DB;
+  engine: EngineClient;
   receipt: MigrationReceipt;
   receiptPath: string;
   source: typeof solverEvidenceArtifacts.$inferSelect;
-  engineBaseUrl: string;
-  finalize: (
-    tx: DB,
-    source: typeof solverEvidenceArtifacts.$inferSelect,
-    manifest: ManifestValidation,
-  ) => Promise<T>;
-}): Promise<T> {
+}): Promise<{
+  missing: ReturnType<typeof parseEvidenceManifest>["memberSet"];
+}> {
   const manifestBytes = await readFile(
     join(dirname(opts.receiptPath), "evidence_manifest.json"),
   );
@@ -915,12 +950,31 @@ async function reconcileVerifiedLegacyManifestArtifacts<T>(opts: {
     manifestArtifactIdentity(entry.role);
     return true;
   });
-  // Authenticate every missing local file before the first row is inserted.
-  // One absent, unsafe, changing, or mismatched member therefore leaves the
-  // database and acknowledgement state untouched.
-  for (const entry of missing) {
-    await verifyLocalManifestMember(dirname(opts.receiptPath), entry);
-  }
+  await verifyManifestMembersForReconciliation({
+    engine: opts.engine,
+    receipt: opts.receipt,
+    receiptPath: opts.receiptPath,
+    manifestBytes,
+    memberSet: parsed.memberSet,
+    missing,
+  });
+  return { missing };
+}
+
+async function reconcileVerifiedLegacyManifestArtifacts<T>(opts: {
+  db: DB;
+  engine: EngineClient;
+  receipt: MigrationReceipt;
+  receiptPath: string;
+  source: typeof solverEvidenceArtifacts.$inferSelect;
+  engineBaseUrl: string;
+  finalize: (
+    tx: DB,
+    source: typeof solverEvidenceArtifacts.$inferSelect,
+    manifest: ManifestValidation,
+  ) => Promise<T>;
+}): Promise<T> {
+  const { missing } = await prepareVerifiedLegacyManifestArtifacts(opts);
 
   return opts.db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
@@ -948,9 +1002,22 @@ async function reconcileVerifiedLegacyManifestArtifacts<T>(opts: {
     await acquireResultEvidenceLocks(tx, [opts.source.resultId]);
     const selectedSource = await findExactSource(tx, opts.receipt);
     if (selectedSource.id !== opts.source.id) {
-      throw new Error(
-        "exact bundle source changed during manifest reconciliation",
-      );
+      // A concurrent identical registration may have installed the exact
+      // canonical tar.zst after this caller completed its read-only preflight.
+      // Accept only that one immutable transition under the same owner lock;
+      // every other source change remains a conflict.
+      requireExactArtifactOwner(selectedSource, opts.source);
+      if (
+        selectedSource.kind !== "engine_bundle" ||
+        selectedSource.storageKey !== sourceKeys(opts.receipt)[0] ||
+        selectedSource.sha256 !== opts.receipt.remote.storedSha256 ||
+        evidenceBaseOf(selectedSource, opts.receipt) !==
+          evidenceBaseOf(opts.source, opts.receipt)
+      ) {
+        throw new Error(
+          "exact bundle source changed during manifest reconciliation",
+        );
+      }
     }
     const [source] = await tx
       .select()
@@ -1751,7 +1818,7 @@ async function currentArchiveAck(
     resultAttemptId: source.resultAttemptId!,
     sourceArtifactId: row.artifact.id,
     archiveId: row.archive.id,
-    registeredAt: new Date().toISOString(),
+    registeredAt: row.archive.createdAt.toISOString(),
   };
 }
 
@@ -1786,6 +1853,59 @@ async function validateMemberCoverage(
       "archive member registration is incomplete or contains a foreign/mismatched mapping",
     );
   }
+}
+
+export async function planEvidenceMigrationReceipt(opts: {
+  db: DB;
+  engine: EngineClient;
+  receiptPath: string;
+  mediaRoot: string;
+}): Promise<Record<string, unknown>> {
+  const document = await readReceiptDocument(opts.receiptPath, opts.mediaRoot);
+  const { receipt } = document;
+  const sourceRows = await exactSourceRows(opts.db, receipt);
+  const ownerKeys = new Set(
+    sourceRows
+      .filter((row) => row.resultId && row.resultAttemptId && row.simJobId)
+      .map((row) => `${row.resultId}:${row.resultAttemptId}:${row.simJobId}`),
+  );
+  if (ownerKeys.size === 0) {
+    const context = await exactOrphanOwnerContext(opts.db, receipt);
+    const provenance = await orphanManifestProvenance(
+      receipt,
+      opts.receiptPath,
+    );
+    return {
+      status: "planned-quarantine",
+      jobId: receipt.jobId,
+      simJobId: context.simJob.id,
+      engineCaseSlug: context.engineCaseSlug,
+      evidencePath: receipt.evidencePath,
+      manifestSha256: provenance.manifestSha256,
+      archiveMemberCount: provenance.archiveMembers.length,
+    };
+  }
+  if (ownerKeys.size !== 1) {
+    throw new Error(
+      `receipt must resolve to one exact result attempt; found ${ownerKeys.size}`,
+    );
+  }
+  const source = await findExactSource(opts.db, receipt);
+  const { missing } = await prepareVerifiedLegacyManifestArtifacts({
+    db: opts.db,
+    engine: opts.engine,
+    receipt,
+    receiptPath: opts.receiptPath,
+    source,
+  });
+  return {
+    status: "planned",
+    jobId: receipt.jobId,
+    evidencePath: receipt.evidencePath,
+    resultId: source.resultId,
+    resultAttemptId: source.resultAttemptId,
+    reconciledManifestMembers: missing.length,
+  };
 }
 
 export async function registerEvidenceMigrationReceipt(opts: {
@@ -1898,6 +2018,7 @@ export async function registerEvidenceMigrationReceipt(opts: {
   const source = await findExactSource(opts.db, receipt);
   const ack = await reconcileVerifiedLegacyManifestArtifacts({
     db: opts.db,
+    engine: opts.engine,
     receipt,
     receiptPath: opts.receiptPath,
     source,
@@ -2155,53 +2276,16 @@ async function main(): Promise<number> {
     for (const receiptPath of receipts) {
       processed += 1;
       try {
-        const document = await readReceiptDocument(receiptPath, mediaRoot);
-        const { receipt } = document;
         if (!execute) {
-          const sourceRows = await exactSourceRows(db, receipt);
-          const ownerKeys = new Set(
-            sourceRows
-              .filter(
-                (row) => row.resultId && row.resultAttemptId && row.simJobId,
-              )
-              .map(
-                (row) =>
-                  `${row.resultId}:${row.resultAttemptId}:${row.simJobId}`,
-              ),
-          );
-          if (ownerKeys.size === 0) {
-            const context = await exactOrphanOwnerContext(db, receipt);
-            const provenance = await orphanManifestProvenance(
-              receipt,
-              receiptPath,
-            );
-            console.log(
-              JSON.stringify({
-                status: "planned-quarantine",
-                jobId: receipt.jobId,
-                simJobId: context.simJob.id,
-                engineCaseSlug: context.engineCaseSlug,
-                evidencePath: receipt.evidencePath,
-                manifestSha256: provenance.manifestSha256,
-                archiveMemberCount: provenance.archiveMembers.length,
-              }),
-            );
-            continue;
-          }
-          if (ownerKeys.size !== 1) {
-            throw new Error(
-              `receipt must resolve to one exact result attempt; found ${ownerKeys.size}`,
-            );
-          }
-          const source = await findExactSource(db, receipt);
           console.log(
-            JSON.stringify({
-              status: "planned",
-              jobId: receipt.jobId,
-              evidencePath: receipt.evidencePath,
-              resultId: source.resultId,
-              resultAttemptId: source.resultAttemptId,
-            }),
+            JSON.stringify(
+              await planEvidenceMigrationReceipt({
+                db,
+                engine,
+                receiptPath,
+                mediaRoot,
+              }),
+            ),
           );
           continue;
         }
