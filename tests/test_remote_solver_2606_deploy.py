@@ -185,7 +185,10 @@ def _volume_receipt() -> dict[str, object]:
             "distribution": "opencfd",
             "version": "2606",
             "numerics_revision": "1",
-            "adapter_contract_version": "1",
+            # Match the real canary/API EngineIdentity JSON contract.  The
+            # adapter revision is numeric even though numerics_revision is a
+            # string.
+            "adapter_contract_version": 1,
         },
         "engine_handshake_key": "openfoam:opencfd:2606:numerics-1:adapter-1",
         "execution_pool": "openfoam-opencfd-2606",

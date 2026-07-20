@@ -23,7 +23,9 @@ ENGINE = {
     "distribution": "opencfd",
     "version": "2606",
     "numerics_revision": "1",
-    "adapter_contract_version": "1",
+    # EngineIdentity serializes this field as a JSON number.  Keep the
+    # attester byte-shape compatible with the canary/API receipt it protects.
+    "adapter_contract_version": 1,
 }
 ENGINE_HANDSHAKE_KEY = "openfoam:opencfd:2606:numerics-1:adapter-1"
 EXECUTION_POOL = "openfoam-opencfd-2606"
