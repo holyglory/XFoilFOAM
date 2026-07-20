@@ -783,7 +783,12 @@ def create_app() -> FastAPI:
             # different from the durable canary receipt.
             "evidence_storage": {
                 "backend": "gcs" if settings.evidence_bucket else "volume",
-                "bucket": settings.evidence_bucket,
+                # Pydantic preserves an explicitly empty environment value as
+                # ``""`` even though it has the same operational meaning as
+                # an unset bucket.  Keep the public storage identity canonical
+                # so a credentialless volume runtime reports JSON null and can
+                # be compared exactly with its durable canary receipt.
+                "bucket": settings.evidence_bucket or None,
                 "object_prefix": settings.evidence_object_prefix,
                 "archive_format": "tar+zstd",
                 "compression": "zstd",

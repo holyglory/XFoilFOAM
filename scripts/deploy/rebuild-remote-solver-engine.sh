@@ -762,7 +762,8 @@ fail_safe() {
 trap fail_safe EXIT
 
 perform_rollback() {
-  local state live2606 receipt_values api_image worker_image api_ref worker_ref old_build old_expected old_keys old_2406_enabled old_2606_enabled
+  local state live2606 api_image worker_image api_ref worker_ref old_build old_expected old_keys old_2406_enabled old_2606_enabled
+  local -a receipt_values
   state="$(python3 "$DEPLOY_SCRIPT_DIR/remote-solver2606-cutover-state.py" \
     --env-file "$ENV_FILE" --receipt-file "$RECEIPT_FILE" --attestation-file "$ATTESTATION_FILE" \
     --current-source-revision "$DEPLOY_SOURCE_REVISION" --current-source-tree-sha256 "$DEPLOY_SOURCE_TREE_SHA256" \
@@ -787,20 +788,29 @@ perform_rollback() {
   stop_writers
   disable_all_opencfd_pools
   require_recreate_safe "before explicit rollback"
-  receipt_values="$(python3 - "$ROLLBACK_RECEIPT_FILE" <<'PY'
+  mapfile -t receipt_values < <(python3 - "$ROLLBACK_RECEIPT_FILE" <<'PY'
 import json, sys
 p=json.load(open(sys.argv[1], encoding="utf-8"))
 pool=p["poolState"]
-print("\t".join(str(value) for value in (
+for value in (
     p["apiImageId"], p["workerImageId"], p["apiImageReference"],
     p["workerImageReference"], p["previousBuildId"],
     p["previousExpectedBuildId"], p["previousEnabledEngineKeys"],
     str(pool["3f8bc764-09ae-4ff3-8fd2-240600000001"]).lower(),
     str(pool["3f8bc764-09ae-4ff3-8fd2-260600000001"]).lower(),
-)))
+):
+    print(value)
 PY
-)"
-  IFS=$'\t' read -r api_image worker_image api_ref worker_ref old_build old_expected old_keys old_2406_enabled old_2606_enabled <<<"$receipt_values"
+  )
+  [[ "${#receipt_values[@]}" == "9" ]] || {
+    echo "Rollback receipt did not yield the exact nine runtime fields." >&2
+    exit 14
+  }
+  api_image="${receipt_values[0]}"; worker_image="${receipt_values[1]}"
+  api_ref="${receipt_values[2]}"; worker_ref="${receipt_values[3]}"
+  old_build="${receipt_values[4]}"; old_expected="${receipt_values[5]}"
+  old_keys="${receipt_values[6]}"; old_2406_enabled="${receipt_values[7]}"
+  old_2606_enabled="${receipt_values[8]}"
   docker image inspect "$api_image" "$worker_image" >/dev/null
   docker image tag "$api_image" "$api_ref"; docker image tag "$worker_image" "$worker_ref"
   set_env_vars_atomic "AIRFOILFOAM_BUILD_ID=$old_build" "ENGINE_EXPECTED_BUILD_ID=$old_expected" "AIRFOILFOAM_ENABLED_ENGINE_KEYS=$old_keys"

@@ -15,7 +15,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="AIRFOILFOAM_", env_file=".env", extra="ignore")
+    # Compose intentionally exports optional deployment variables as empty
+    # strings.  Treat those as absent so optional typed settings retain their
+    # canonical defaults (notably ``None`` for a volume-backed evidence bucket
+    # and control-plane token in non-production development).
+    model_config = SettingsConfigDict(
+        env_prefix="AIRFOILFOAM_",
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
 
     # --- Storage ---
     data_dir: Path = Field(

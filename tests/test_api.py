@@ -76,10 +76,24 @@ def test_health_and_capabilities(client):
     assert health["status"] == "ok"
     assert health["mesh_recovery_version"] == 2
     assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION
+    assert health["evidence_storage"]["backend"] == "volume"
+    assert health["evidence_storage"]["bucket"] is None
     caps = client.get("/capabilities").json()
     assert "blockmesh-cgrid" in caps["meshers"]
     assert "kOmegaSST" in caps["turbulence_models"]
     assert "kOmegaSSTLM" in caps["turbulence_models"]  # transition model exposed
+
+
+def test_settings_treat_empty_optional_compose_values_as_unset(monkeypatch):
+    from airfoilfoam.config import Settings
+
+    monkeypatch.setenv("AIRFOILFOAM_EVIDENCE_BUCKET", "")
+    monkeypatch.setenv("AIRFOILFOAM_CONTROL_PLANE_TOKEN", "")
+
+    settings = Settings()
+
+    assert settings.evidence_bucket is None
+    assert settings.control_plane_token is None
 
 
 def test_parse_airfoil_endpoint(client, naca0012_selig_text):

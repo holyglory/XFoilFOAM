@@ -76,7 +76,12 @@ def _compose_config() -> dict[str, object]:
     }
 
 
-def _remote_env(state: Path, *, remote_only: str = "false") -> str:
+def _remote_env(
+    state: Path,
+    *,
+    remote_only: str = "false",
+    control_plane_token: str = "remote-solver-control-plane-token-at-least-32-bytes",
+) -> str:
     return "\n".join(
         (
             "AIRFOILFOAM_DEPLOYMENT_ROLE=remote-solver",
@@ -86,6 +91,7 @@ def _remote_env(state: Path, *, remote_only: str = "false") -> str:
             "AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX=solver-evidence/v1",
             "AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL=10",
             f"AIRFOILFOAM_EVIDENCE_REMOTE_ONLY={remote_only}",
+            f"AIRFOILFOAM_CONTROL_PLANE_TOKEN={control_plane_token}",
             "AIRFOILFOAM_WORKER_CPU_BUDGET=40",
             "AIRFOILFOAM_CASE_CONCURRENCY=40",
             "AIRFOILFOAM_CELERY_CONCURRENCY=40",
@@ -255,6 +261,62 @@ def test_remote_environment_preflight_requires_external_override_and_explicit_vo
     rejected = subprocess.run(command, text=True, capture_output=True, check=False)
     assert rejected.returncode == 2
     assert "explicit remote-only=false" in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        "",
+        "too-short",
+        '"quoted-remote-solver-control-plane-token-at-least-32-bytes"',
+        "remote-solver-control-plane-token-with whitespace-at-least-32-bytes",
+    ),
+)
+def test_remote_environment_preflight_rejects_unsafe_control_plane_token(
+    tmp_path: Path, token: str
+) -> None:
+    app = tmp_path / "app"
+    state = tmp_path / "state"
+    app.mkdir()
+    state.mkdir()
+    override = state / "docker-compose.remote-solver.yml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    override.chmod(0o644)
+    env_file = state / ".env.deploy"
+    env_file.write_text(
+        _remote_env(state, control_plane_token=token), encoding="utf-8"
+    )
+    env_file.chmod(0o600)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(DEPLOY / "deployment-env-preflight.py"),
+            "--app-dir",
+            str(app),
+            "--state-dir",
+            str(state),
+            "--env-file",
+            str(env_file),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "remote-solver deployment requires" in completed.stderr
+
+
+def test_remote_rollback_preserves_an_empty_previous_engine_key_list() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+
+    assert "mapfile -t receipt_values" in source
+    assert 'old_keys="${receipt_values[6]}"' in source
+    assert (
+        "IFS=$'\\t' read -r api_image worker_image api_ref worker_ref "
+        "old_build old_expected old_keys"
+    ) not in source
 
 
 def test_remote_cutover_state_is_source_bound_restartable_and_tamper_evident(

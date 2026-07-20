@@ -23,10 +23,20 @@ DEPLOYMENT_PROFILE_KEYS = {
     "AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX",
     "AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL",
     "AIRFOILFOAM_EVIDENCE_REMOTE_ONLY",
+    "AIRFOILFOAM_CONTROL_PLANE_TOKEN",
     "AIRFOILFOAM_WORKER_CPU_BUDGET",
     "AIRFOILFOAM_CASE_CONCURRENCY",
     "AIRFOILFOAM_CELERY_CONCURRENCY",
 }
+
+
+def _valid_control_plane_token(token: str) -> bool:
+    return (
+        len(token) >= 32
+        and token[:1] not in {"'", '"'}
+        and token[-1:] not in {"'", '"'}
+        and not any(character.isspace() for character in token)
+    )
 
 
 def _read_remote_evidence_values(path: Path) -> dict[str, str]:
@@ -78,12 +88,7 @@ def _validate_remote_evidence_auth(path: Path) -> None:
     if not bucket or remote_only not in {"1", "true", "yes", "on"}:
         return
     token = values.get("AIRFOILFOAM_CONTROL_PLANE_TOKEN", "")
-    if (
-        len(token) < 32
-        or token[:1] in {"'", '"'}
-        or token[-1:] in {"'", '"'}
-        or any(character.isspace() for character in token)
-    ):
+    if not _valid_control_plane_token(token):
         raise ValueError(
             "remote-only GCS evidence requires an unquoted, whitespace-free "
             "AIRFOILFOAM_CONTROL_PLANE_TOKEN of at least 32 characters"
@@ -142,6 +147,13 @@ def _validate_deployment_profile(path: Path, state: Path) -> None:
         raise ValueError("remote-solver volume evidence requires explicit remote-only=false")
     if values.get("AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL") != "10":
         raise ValueError("remote-solver volume evidence requires Zstandard level 10")
+    if not _valid_control_plane_token(
+        values.get("AIRFOILFOAM_CONTROL_PLANE_TOKEN", "")
+    ):
+        raise ValueError(
+            "remote-solver deployment requires an unquoted, whitespace-free "
+            "AIRFOILFOAM_CONTROL_PLANE_TOKEN of at least 32 characters"
+        )
     for key in (
         "AIRFOILFOAM_WORKER_CPU_BUDGET",
         "AIRFOILFOAM_CASE_CONCURRENCY",
