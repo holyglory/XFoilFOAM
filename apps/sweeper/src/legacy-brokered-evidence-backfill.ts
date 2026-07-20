@@ -63,7 +63,6 @@ export async function backfillLegacyBrokeredEvidence(opts: {
 }): Promise<LegacyBrokeredEvidenceBackfillReport[]> {
   const [settings] = await opts.db
     .select({
-      enabled: syncApiSettings.enabled,
       remoteSolverEnabled: syncApiSettings.remoteSolverEnabled,
       upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
     })
@@ -71,8 +70,7 @@ export async function backfillLegacyBrokeredEvidence(opts: {
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
   if (
-    !settings?.enabled ||
-    !settings.remoteSolverEnabled ||
+    !settings?.remoteSolverEnabled ||
     !settings.upstreamBaseUrl
   ) {
     throw new Error(
