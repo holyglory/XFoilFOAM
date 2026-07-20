@@ -1688,7 +1688,12 @@ describe("remote solver submit lifecycle", () => {
     const mirror = await readPromise(promise.id);
     expect(mirror.promise.status).toBe("cancelled");
     expect(mirror.points.map((row) => row.status)).toEqual(["cancelled"]);
-    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(1);
+    expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toEqual([
+      {
+        url: `${UPSTREAM}/sweeps/${promise.id}/cancel`,
+        body: {},
+      },
+    ]);
     expect(
       await db
         .select()

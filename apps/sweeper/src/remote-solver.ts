@@ -1572,6 +1572,10 @@ async function processPendingPromiseCancellations(
         method: "POST",
         signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
         headers: headers(settings),
+        // headers() declares JSON for every sync call. Fastify correctly
+        // rejects an empty body with that content type before the cancellation
+        // route runs, so send the route's explicit empty object payload.
+        body: JSON.stringify({}),
       });
       if (!response.ok && response.status !== 404) {
         failure = `remote promise cancellation failed (${response.status})`;
