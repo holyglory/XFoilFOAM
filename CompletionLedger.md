@@ -4,12 +4,13 @@
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical
   incident model, and compact per-point rail are deployed with the guarded
-  OpenCFD 2606 engine. Scheduling remains durably disabled while the
-  remote-worker cutover and exact brokered canary are completed. Preserve
-  immutable 2406 histories. Then recover the exact 20-32C/Re≈102k/α20°
-  continuation, obtain
-  its accepted fast and final generations, resume the active campaign at
-  bounded capacity, and monitor subsequent RANS handoffs plus fast/final
+  OpenCFD 2606 engine. General campaign expansion remains held while the exact
+  remote broker canary finishes; the hub local scheduler remains disabled and
+  the remote solver is limited to the canary promise. Preserve immutable 2406
+  histories. Finish the current preliminary-URANS recovery and exact GCS
+  acknowledgement, recover the exact 20-32C/Re≈102k/α20° continuation and
+  its accepted fast and final generations, then resume the active campaign at
+  bounded capacity and monitor subsequent RANS handoffs plus fast/final
   results. Readiness requires no recurring current-generation blocked/critical
   chain; any new exhaustion remains a red system incident and must be
   investigated before ordinary new admission continues.
@@ -27,13 +28,15 @@
   archive-only render proof, restartable guarded cutover, verified
   backup/rollback artifacts, private attestation, and hub-acknowledgement
   retention fence preserve complete local evidence without giving the remote
-  node a Google credential. The live server still requires an idle maintenance
-  run of `scripts/deploy/rebuild-remote-solver-engine.sh` with one immutable
-  build ID, followed by one exact brokered promise canary. Record the merged
-  40-CPU profile, scratch-restored backup and rollback hashes, three-scenario
-  receipt/attestation hashes, OpenCFD 2606 health, exact GCS generation binding,
-  generation-pinned readback, local reclaim acknowledgement, and resumed
-  bounded capacity before removing this item.
+  node a Google credential. The volume-backed OpenCFD 2606 remote deployment,
+  verified backup/rollback artifacts, and first exact brokered transfer are
+  live. The current full-polar canary has 25 of 26 angles accepted, delivered,
+  generation-bound in GCS, and acknowledged by the hub; the last angle is in
+  its second preliminary-URANS recovery run. Finish that result, prove all 26
+  generation-pinned readbacks and acknowledgement-gated remote reclamation,
+  deploy the tested queue-inspection/nofile safeguard through the guarded idle
+  engine rebuild, prove descriptor stability after repeated queue polling, and
+  resume bounded capacity before removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,26 @@ def test_worker_images_cannot_override_recorded_upstream_package_digests():
     assert 'cmp -s "${binary}" "/tmp/openfoam2606-root${binary}"' in opencfd
     assert "ARG OPENFOAM14_" not in foundation
     assert 'echo "${package_sha}  /tmp/openfoam14.deb" | sha256sum -c -' in foundation
+
+
+def test_worker_compose_raises_nofile_limit_for_both_engine_pools():
+    root = Path(__file__).resolve().parents[1]
+
+    for compose_name in ("docker-compose.yml", "docker-compose.deploy.yml"):
+        compose = (root / compose_name).read_text()
+        for service in ("worker", "worker-foundation14"):
+            service_match = re.search(
+                rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:|\Z)",
+                compose,
+            )
+            assert service_match is not None, f"{service} missing from {compose_name}"
+            assert re.search(
+                r"(?m)^    ulimits:\n"
+                r"      nofile:\n"
+                r"        soft: 65536\n"
+                r"        hard: 524288$",
+                service_match.group("body"),
+            ), f"{service} has no durable nofile limit in {compose_name}"
 
 
 def test_foundation14_case_uses_foundation_dictionary_and_function_object_dialect(
@@ -513,6 +534,74 @@ def test_queue_reports_all_registered_routes_and_live_worker_consumers(
         "reserved": ["worker@foundation", "worker@opencfd"],
         "scheduled": ["worker@foundation", "worker@opencfd"],
     }
+
+
+def test_queue_caches_runtime_inspection_until_worker_queue_binding_changes(
+    tmp_path, monkeypatch
+):
+    import redis as redis_module
+
+    settings = Settings(data_dir=tmp_path / "data")
+
+    class FakeRedis:
+        @classmethod
+        def from_url(cls, *_args, **_kwargs):
+            return cls()
+
+        def llen(self, _queue):
+            return 0
+
+    class FakeInspect:
+        queue_name = OPENCFD_2606.queue_name
+        conf_calls = 0
+
+        def active(self):
+            return {"worker@engine": []}
+
+        def reserved(self):
+            return {"worker@engine": []}
+
+        def scheduled(self):
+            return {"worker@engine": []}
+
+        def active_queues(self):
+            return {"worker@engine": [{"name": self.queue_name}]}
+
+        def conf(self):
+            self.conf_calls += 1
+            return {
+                "worker@engine": {
+                    "airfoilfoam_worker_runtime": {
+                        "execution_pool": self.queue_name,
+                        "engine": settings.engine_runtime_identity().model_dump(mode="json"),
+                    }
+                }
+            }
+
+    inspect = FakeInspect()
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(redis_module, "Redis", FakeRedis)
+    monkeypatch.setattr(
+        celery_app.control,
+        "inspect",
+        lambda timeout=None: inspect,
+    )
+    client = TestClient(api_main.create_app())
+
+    first = client.get("/queue").json()
+    second = client.get("/queue").json()
+
+    assert first["worker_runtime_error"] is None
+    assert second["worker_runtime_error"] is None
+    assert inspect.conf_calls == 1
+    assert second["worker_queues"][0]["execution_pool"] == OPENCFD_2606.queue_name
+
+    inspect.queue_name = FOUNDATION_14.queue_name
+    changed = client.get("/queue").json()
+
+    assert changed["worker_runtime_error"] is None
+    assert inspect.conf_calls == 2
+    assert changed["worker_queues"][0]["execution_pool"] == FOUNDATION_14.queue_name
 
 
 def test_queue_reports_incomplete_task_and_runtime_worker_coverage(

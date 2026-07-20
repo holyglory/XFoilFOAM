@@ -71,9 +71,10 @@ def make_celery() -> Celery:
     settings = get_settings()
     app = Celery("airfoilfoam", broker=settings.broker_url, backend=settings.result_backend)
     # This deliberately public worker record is returned by Celery's live
-    # ``inspect.conf()`` command.  The gateway correlates it with
-    # ``inspect.active_queues()`` before allowing an execution pool to be
-    # enabled; no broker secrets or unrelated worker configuration are exposed.
+    # ``inspect.conf()`` command. The gateway correlates one cached snapshot
+    # with the exact ``inspect.active_queues()`` worker/queue binding and
+    # invalidates it when that binding changes; no broker secrets or unrelated
+    # worker configuration are exposed.
     worker_runtime_advertisement = {
         # Do not name this field ``routing_key``: Celery intentionally censors
         # config keys containing "key" in inspect responses.  The value is an

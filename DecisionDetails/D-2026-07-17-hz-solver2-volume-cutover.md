@@ -105,3 +105,23 @@ activation, backup hashes, receipt hashes, worker utilization, promise flow,
 and hub acknowledgement remain production evidence and must be recorded during
 the actual maintenance window.
 
+## Live activation status
+
+The guarded volume-backed OpenCFD 2606 cutover is installed on `hz-solver2`.
+The production full-polar broker canary has accepted, delivered, and hub-bound
+25 of its 26 exact requested angles. Each accepted transfer has an immutable
+GCS generation and checksum; the only remaining angle is running its second
+targeted preliminary-URANS recovery. The correction that created this run also
+prevents a pending remote preliminary obligation from being downgraded into
+ordinary RANS work when the downstream local scheduler is intentionally
+disabled.
+
+The canary exposed a separate Celery observability resource leak: every live
+`inspect.conf()` queue poll created another worker eventpoll descriptor. The
+running worker was protected without restart by raising its soft nofile limit
+to 65,536 while the active solve continued. The durable correction caches one
+validated runtime identity per exact worker/queue binding, single-flights a
+cold inspection, invalidates on a binding change, and declares the same nofile
+limit for both worker pools. It must be installed only through the guarded
+engine rebuild after the current OpenFOAM child is idle, then verified by
+repeated polling and descriptor-count stability before capacity is widened.

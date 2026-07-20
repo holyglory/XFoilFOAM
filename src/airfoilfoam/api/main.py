@@ -14,6 +14,7 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import ContextManager, Iterator, Literal
 
 import numpy as np
@@ -729,6 +730,16 @@ def create_app() -> FastAPI:
     )
     settings = get_settings()
     store = JobStore(settings)
+    # Worker runtime identity is immutable for the lifetime of one exact
+    # worker/queue binding. Celery's `inspect.conf()` handler creates a Kombu
+    # transport on the worker; polling it on every /queue request leaked
+    # eventpoll descriptors until the worker reached RLIMIT_NOFILE. Cache only
+    # a complete exact-binding snapshot and invalidate as soon as a worker or
+    # queue name changes. The lock is also a single-flight fence for concurrent
+    # queue requests.
+    worker_runtime_cache_lock = Lock()
+    worker_runtime_cache_key: tuple[tuple[str, tuple[str, ...]], ...] | None = None
+    worker_runtime_cache_value: dict[str, dict] | None = None
 
     def registered_dialects():
         return [
@@ -955,6 +966,7 @@ def create_app() -> FastAPI:
 
     @app.get("/queue")
     def queue_state() -> dict:
+        nonlocal worker_runtime_cache_key, worker_runtime_cache_value
         from ..celery_app import celery_app
 
         inspect = celery_app.control.inspect(timeout=1.0)
@@ -994,6 +1006,21 @@ def create_app() -> FastAPI:
                 worker_queues_error = "Celery inspector returned an invalid active-queue snapshot"
             else:
                 expected_workers = {str(worker) for worker in active_queue_replies}
+                binding_key = tuple(
+                    (
+                        str(worker),
+                        tuple(
+                            sorted(
+                                {
+                                    str(queue.get("name"))
+                                    for queue in queues or []
+                                    if isinstance(queue, dict) and queue.get("name")
+                                }
+                            )
+                        ),
+                    )
+                    for worker, queues in sorted(active_queue_replies.items())
+                )
                 for kind in ("active", "reserved", "scheduled"):
                     observed_workers = set(inspection_workers.get(kind, []))
                     if kind not in inspection_errors and observed_workers != expected_workers:
@@ -1002,27 +1029,45 @@ def create_app() -> FastAPI:
                             f"expected={sorted(expected_workers)!r}, "
                             f"observed={sorted(observed_workers)!r}"
                         )
-                try:
-                    config_replies = inspect.conf()
-                    if config_replies is None:
-                        worker_runtime_error = (
-                            "Celery inspector returned no worker-runtime snapshot"
-                        )
-                        config_replies = {}
-                    elif not isinstance(config_replies, dict):
-                        worker_runtime_error = (
-                            "Celery inspector returned an invalid worker-runtime snapshot"
-                        )
-                        config_replies = {}
-                    elif set(str(worker) for worker in config_replies) != expected_workers:
-                        worker_runtime_error = (
-                            "Celery inspector worker-runtime coverage is incomplete: "
-                            f"expected={sorted(expected_workers)!r}, "
-                            f"observed={sorted(str(worker) for worker in config_replies)!r}"
-                        )
-                except Exception as exc:  # noqa: BLE001 - availability must fail closed
-                    worker_runtime_error = f"{type(exc).__name__}: {exc}"
-                    config_replies = {}
+                # Keep the cold inspect, validation, and cache publication in
+                # one critical section. Concurrent queue polls must share one
+                # broker command rather than each leaking its own transport on
+                # the worker before the first response has populated the cache.
+                with worker_runtime_cache_lock:
+                    if (
+                        worker_runtime_cache_key == binding_key
+                        and worker_runtime_cache_value is not None
+                    ):
+                        config_replies = worker_runtime_cache_value
+                    else:
+                        try:
+                            config_replies = inspect.conf()
+                            if config_replies is None:
+                                worker_runtime_error = (
+                                    "Celery inspector returned no worker-runtime snapshot"
+                                )
+                                config_replies = {}
+                            elif not isinstance(config_replies, dict):
+                                worker_runtime_error = (
+                                    "Celery inspector returned an invalid worker-runtime snapshot"
+                                )
+                                config_replies = {}
+                            elif (
+                                set(str(worker) for worker in config_replies)
+                                != expected_workers
+                            ):
+                                worker_runtime_error = (
+                                    "Celery inspector worker-runtime coverage is incomplete: "
+                                    f"expected={sorted(expected_workers)!r}, "
+                                    "observed="
+                                    f"{sorted(str(worker) for worker in config_replies)!r}"
+                                )
+                            else:
+                                worker_runtime_cache_key = binding_key
+                                worker_runtime_cache_value = config_replies
+                        except Exception as exc:  # noqa: BLE001 - fail closed
+                            worker_runtime_error = f"{type(exc).__name__}: {exc}"
+                            config_replies = {}
                 worker_queues = [
                     {
                         "worker": worker,

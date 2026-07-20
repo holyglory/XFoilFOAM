@@ -50,6 +50,10 @@ services:
       dockerfile: docker/Dockerfile.worker
       args:
         AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     environment:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
@@ -107,6 +111,10 @@ services:
       dockerfile: docker/Dockerfile.worker-foundation14
       args:
         AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     environment:
       AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
