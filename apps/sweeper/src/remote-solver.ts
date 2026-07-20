@@ -1340,17 +1340,18 @@ export function startRemoteReclaimClaimLease(
   };
 }
 
-/** Keep the exact upstream promise authoritative while a potentially
- * multi-hour GCS or multipart stream is in flight. The timer runs independently
- * of byte progress, so one slow PUT/read cannot silently outlive a one-hour
- * lease. Authoritative 404/409 responses cancel local ownership; transient
- * failures abort only this delivery attempt and remain retryable. */
+/** Keep a potentially multi-hour GCS or multipart transfer claimed. Normal
+ * deliveries also renew the exact active upstream promise. An exact maintenance
+ * replay for a locally fulfilled promise renews only the delivery claim: it has
+ * no new solver-work lease to extend, and the hub revalidates its immutable
+ * result/attempt identity before accepting the upgraded archive. */
 export async function startRemotePromiseTransferLease(
   db: DB,
   engine: EngineClient,
   settings: Settings,
   promiseId: string,
   onRenew: () => Promise<void>,
+  opts: { renewUpstreamPromise?: boolean } = {},
 ): Promise<RemotePromiseTransferLease> {
   const controller = new AbortController();
   let stopped = false;
@@ -1358,7 +1359,14 @@ export async function startRemotePromiseTransferLease(
   let inFlight: Promise<void> | null = null;
   let failure: Error | null = null;
   const renew = async () => {
-    await renewExactRemotePromiseTransferLease(db, engine, settings, promiseId);
+    if (opts.renewUpstreamPromise !== false) {
+      await renewExactRemotePromiseTransferLease(
+        db,
+        engine,
+        settings,
+        promiseId,
+      );
+    }
     await onRenew();
   };
   const schedule = () => {
@@ -2316,6 +2324,7 @@ export interface DeliveryClaim {
   id: string;
   token: string;
   attemptCount: number;
+  fulfilledReplay: boolean;
 }
 
 export async function claimResultDelivery(
@@ -2405,6 +2414,31 @@ export async function claimResultDelivery(
     ) {
       return null;
     }
+    const [fulfilledReplay] = job.simulationPresetRevisionId
+      ? await tx
+          .select({ id: syncSweepPromisePoints.id })
+          .from(syncSweepPromisePoints)
+          .innerJoin(
+            syncSweepPromises,
+            eq(syncSweepPromises.id, syncSweepPromisePoints.promiseId),
+          )
+          .where(
+            and(
+              eq(syncSweepPromises.id, promiseId),
+              eq(syncSweepPromises.status, "fulfilled"),
+              eq(syncSweepPromisePoints.status, "fulfilled"),
+              eq(syncSweepPromisePoints.airfoilId, job.airfoilId),
+              eq(
+                syncSweepPromisePoints.simulationPresetRevisionId,
+                job.simulationPresetRevisionId,
+              ),
+              eq(syncSweepPromisePoints.aoaDeg, result.aoaDeg),
+              eq(syncSweepPromisePoints.resultId, result.id),
+              eq(syncSweepPromisePoints.resultAttemptId, attempt.id),
+            ),
+          )
+          .limit(1)
+      : [];
     const token = randomUUID();
     const [claimed] = await tx
       .update(syncRemoteResultDeliveries)
@@ -2420,7 +2454,9 @@ export async function claimResultDelivery(
         id: syncRemoteResultDeliveries.id,
         attemptCount: syncRemoteResultDeliveries.attemptCount,
       });
-    return claimed ? { ...claimed, token } : null;
+    return claimed
+      ? { ...claimed, token, fulfilledReplay: Boolean(fulfilledReplay) }
+      : null;
   });
 }
 
@@ -3179,6 +3215,7 @@ async function pushOneRemoteResult(
         await renewResultDeliveryClaim(db, claim);
         await touchHeartbeat(db);
       },
+      { renewUpstreamPromise: !claim.fulfilledReplay },
     );
     let brokerResponse = (await fetch(
       `${syncBase(settings)}/evidence-uploads`,

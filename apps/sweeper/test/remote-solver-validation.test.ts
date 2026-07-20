@@ -3571,6 +3571,31 @@ describe("remote solver push validation regressions", () => {
     }
   });
 
+  it("MUST-CATCH: an exact fulfilled-result evidence replay renews its local claim without reopening the upstream work lease", async () => {
+    const promiseId = randomUUID();
+    const [settings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    const fetchMock = vi.fn(async () => {
+      throw new Error("fulfilled evidence replay must not heartbeat work");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onRenew = vi.fn(async () => undefined);
+    const lease = await startRemotePromiseTransferLease(
+      {} as typeof db,
+      {} as EngineClient,
+      settings,
+      promiseId,
+      onRenew,
+      { renewUpstreamPromise: false },
+    );
+    expect(lease.signal.aborted).toBe(false);
+    expect(onRenew).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await lease.stop()).toBeNull();
+  });
+
   it("keeps transfer-heartbeat failures retryable but authoritatively stops ownership on 404/409 before upload", async () => {
     for (const [status, expectedState] of [
       [503, "retry_wait"],
@@ -3967,6 +3992,7 @@ describe("remote solver push validation regressions", () => {
       attempt,
     );
     expect(claim).not.toBeNull();
+    expect(claim!.fulfilledReplay).toBe(false);
     await db
       .update(syncRemoteResultDeliveries)
       .set({
@@ -3982,6 +4008,19 @@ describe("remote solver push validation regressions", () => {
     expect(renewed.claimedAt!.getTime()).toBeLessThan(Date.now() - 30 * 60_000);
     expect(renewed.claimExpiresAt!.getTime()).toBeGreaterThan(Date.now());
     await settleResultDelivery(db, claim!, { kind: "delivered" });
+
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "fulfilled", fulfilledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "fulfilled",
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+      })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
 
     await db
       .update(syncRemoteResultDeliveries)
@@ -4001,6 +4040,7 @@ describe("remote solver push validation regressions", () => {
       attempt,
     );
     expect(staleClaim).not.toBeNull();
+    expect(staleClaim!.fulfilledReplay).toBe(true);
     const replacementToken = randomUUID();
     await db
       .update(syncRemoteResultDeliveries)
