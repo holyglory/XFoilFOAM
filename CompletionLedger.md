@@ -3,23 +3,20 @@
 - **Three-stage solver rollout and campaign burn-in:** The regression-backed
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical
-  incident model, and compact per-point rail are deployed with the guarded
-  OpenCFD 2606 engine. The exact remote canary now has an accepted fast result,
-  immutable generation-pinned GCS evidence, hub acknowledgement, and remote
-  reclamation proof. Its hub FINAL item is correctly background-owned because
-  the canary revision is not a live campaign revision. The nine legacy accepted
-  PRECALC points are now reconciled in production: their exact generations are
-  pinned, their existing FINAL queues own the live campaign, and an immediate
-  second dry-run found no residual work. The bounded campaign restart exposed a
-  live quality-gate defect at AoA 20: the restored 0.07 s physical tail was
-  non-flat, but a quiet cropped three-period reporting slice was incorrectly
-  allowed to restart slow-period acquisition. The full-tail amplitude verdict
-  fix and must-catch regressions are implemented locally; deploy it through the
-  guarded engine-maintenance path, rerun the exact obligation, and prove an
-  accepted PRECALC generation before ordinary admission resumes. Preserve
-  immutable 2406 histories. Readiness requires no recurring current-generation
-  blocked/critical chain; any new exhaustion remains a red system incident and
-  must be investigated before ordinary new admission continues.
+  incident model, and physical-tail classifier are deployed with the guarded
+  OpenCFD 2606 engine. Exact production and remote remediation results are
+  accepted and GCS-bound, ordinary admission is resumed, and the active
+  generation currently has zero blocked points. A 96-chunk last-resort
+  continuation ceiling is implemented and regression-verified so a healthy
+  trajectory that settles just beyond the old 24-chunk edge remains governed
+  by the real wall budget; it is not yet deployed. Let the current production
+  11-angle job finish without interrupting its eight live OpenFOAM processes,
+  then deploy this hardening through the guarded engine-maintenance path.
+  Readiness still requires incremental result publication, verified GCS
+  generations and local reclamation for the live job, plus a burn-in with no
+  recurring current-generation blocked/critical chain. Preserve immutable
+  2406 histories; any new exhaustion remains a red system incident and must be
+  investigated before ordinary new admission continues.
 
 - **Production evidence capacity:** The completed GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used), with no legacy gzip,
@@ -41,10 +38,13 @@
   and the remote reclaimed only after acknowledgement. The hub registered the
   exact blob/archive/member ledger and one durable background FINAL item;
   idempotent replay returned the same archive and queue. Live-campaign PRECALC
-  ownership reconciliation is complete. After the active full-tail quality
-  defect is deployed and its exact PRECALC obligation accepts, widen remote
-  promises and monitor evidence delivery, FINAL completion, descriptor
-  stability, and absence of new critical chains before removing this item.
+  ownership reconciliation is complete, and the final AoA 18 retry has now
+  been accepted, bound to GCS generation `1784567638818547`, acknowledged by
+  the hub, and reclaimed remotely; all 26 promised angles are fulfilled. Deploy
+  the 96-chunk continuation hardening while the remote worker is idle, then
+  widen remote promises and monitor evidence delivery, FINAL completion,
+  descriptor stability, and absence of new critical chains before removing
+  this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

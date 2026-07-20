@@ -4171,11 +4171,16 @@ def _run_transient_attempt(
     )
 
 
-#: Emergency guard only. Real runs are bounded by one monotonic tier deadline
-#: and the measured wall-rate projection below. The old six-chunk terminal cap
-#: rejected slowly relaxing but healthy trajectories before they had enough
-#: same-case evidence to settle.
-URANS_CONTINUATION_MAX_CHUNKS = 24
+#: Emergency guard only. Real runs are bounded first by one monotonic tier
+#: deadline and the measured wall-rate projection below. The former 24-chunk
+#: guard still preempted healthy slow relaxation in production (A63A108C,
+#: alpha=18): its latest certification tail was stable after chunk 24, while
+#: the longer retained context still needed more same-case time to clear the
+#: intentional monotonic-trend guard and most of the wall budget remained.
+#: Ninety-six three-period chunks leave that budget controller in charge while
+#: retaining a finite last-resort bound for pathological zero-cost test/fake
+#: runners; real no-progress chunks are stopped independently after one call.
+URANS_CONTINUATION_MAX_CHUNKS = 96
 
 #: A nonstationary preliminary window is not remediated by repeatedly adding a
 #: single period. Add a meaningful measured tail so a relaxing signal can

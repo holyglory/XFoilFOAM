@@ -2842,6 +2842,53 @@ def test_persistent_full_strict_drift_stays_restartable_without_copied_rerun(
     assert "restartable saved case state" in result.quality.reason
 
 
+def test_precalc_slow_relaxation_can_settle_after_legacy_24_chunk_cap(
+    tmp_path,
+    monkeypatch,
+):
+    """MUST-CATCH: the emergency guard must not preempt the wall budget.
+
+    The production A63A108C/AoA 18 retry still had a monotonically relaxing
+    retained context after 24 continuation chunks, while its latest certified
+    tail was already locally stable and most of the tier budget remained.  A
+    later same-case chunk can clear that honest stationarity gate; stopping at
+    the legacy cap manufactures a terminal quality failure from healthy CFD.
+    """
+
+    period = 0.5
+    settling_call = 27
+    calls = _install_continuation_fakes(
+        monkeypatch,
+        period=period,
+        spans=[
+            2.0 + i * pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS * period
+            for i in range(settling_call)
+        ],
+        wall_seconds=1.0,
+        quality_ok_at_end=True,
+        failure_reason=(
+            "URANS window not stationary (precalc established-oscillation test): "
+            "cycle means trend downward monotonically"
+        ),
+        failure_frames_per_cycle=30.0,
+    )
+
+    result = _run_transient_for_test(
+        tmp_path / "case",
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.4,
+        ),
+        timeout=14_400,
+    )
+
+    assert len(calls) == settling_call
+    assert result is not None and result.quality.ok
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER not in result.quality.reason
+
+
 def test_same_case_extension_stops_after_one_chunk_without_physical_progress(
     tmp_path,
     monkeypatch,

@@ -38,6 +38,7 @@
   [D-2026-07-16-campaign-cell-evidence-dialog]
   [D-2026-07-16-preliminary-urans-reliability]
   [D-2026-07-19-urans-physical-tail]
+  [D-2026-07-20-urans-continuation-wall-budget]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -56,6 +57,24 @@
   no hub GCS credentials, and uses persistent deployment identity/capacity
   separate from numerical solver identity.
   [D-2026-07-17-hz-solver2-volume-cutover]
+
+## D-2026-07-20-urans-continuation-wall-budget — Wall budget, not a short chunk count, bounds healthy relaxation
+
+Detail: [DecisionDetails/D-2026-07-20-urans-continuation-wall-budget.md](DecisionDetails/D-2026-07-20-urans-continuation-wall-budget.md)
+
+- Decision: keep the URANS same-case continuation loop finite, but raise its
+  last-resort emergency ceiling from 24 to 96 chunks. The existing monotonic
+  tier deadline and measured wall-rate projection remain the primary limits;
+  a chunk with no physical progress still stops immediately. Preserve and
+  extend the same saved transient rather than starting another physical run.
+- Why: the exact remote AoA 18 recovery required all 24 permitted chunks and
+  became acceptable only on the final grade, leaving no margin for a similarly
+  healthy case that settles one chunk later. Keeping 24 can manufacture a
+  critical solver failure while time remains; removing every finite bound can
+  loop forever under a broken zero-cost runner; loosening stationarity would
+  publish startup-biased coefficients. A higher emergency ceiling lets the
+  already-authoritative wall budget govern real CFD while retaining a finite
+  fail-safe and the unchanged physical acceptance gates.
 
 ## D-2026-07-18-operational-canary-evidence-retention — Preserve cutover canaries without inventing aerodynamic ownership
 
