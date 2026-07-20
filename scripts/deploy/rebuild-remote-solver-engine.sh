@@ -36,6 +36,7 @@ OPENCFD_2406_POOL_ID="3f8bc764-09ae-4ff3-8fd2-240600000001"
 OPENCFD_2606_POOL_ID="3f8bc764-09ae-4ff3-8fd2-260600000001"
 OPENCFD_2606_IMPLEMENTATION_ID="2f8bc764-09ae-4ff3-8fd2-260600000001"
 FAIL_SAFE_ARMED=false
+FAIL_SAFE_CONTEXT="cutover"
 PREPARE_RESTORE_WRITERS=false
 PREPARE_SWEEPER_WAS_RUNNING=0
 PREPARE_MEDIA_WAS_RUNNING=0
@@ -225,6 +226,29 @@ if any(row.values()):
 '
 }
 
+maintenance_database_activity() {
+  # An active remote promise is a durable scheduling lease, not executable
+  # work. Once both writers are stopped it remains inert and must survive an
+  # ordinary engine maintenance window unchanged. Live jobs, unsettled
+  # deliveries/cancellations, and active media repair still fail closed.
+  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+WITH activity AS (
+  SELECT
+    (SELECT count(*) FROM sim_jobs WHERE status IN ('pending','submitted','running','ingesting'))::int AS live_jobs,
+    (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded'))::int AS unsettled_deliveries,
+    (SELECT count(*) FROM sync_remote_promise_cancellations WHERE state <> 'delivered')::int AS unsettled_cancellations,
+    (SELECT count(*) FROM result_media_repairs WHERE state = 'running')::int AS running_media_repairs
+)
+SELECT row_to_json(activity)::text FROM activity;" | python3 -c '
+import json, sys
+row = json.loads(sys.stdin.read())
+if any(type(value) is not int for value in row.values()):
+    raise SystemExit(f"invalid maintenance database idle snapshot: {row!r}")
+if any(row.values()):
+    print(json.dumps(row, sort_keys=True))
+'
+}
+
 require_idle() {
   local stage processes queue db
   stage="$1"
@@ -305,6 +329,51 @@ require_recreate_safe() {
     return 12
   fi
   echo "Remote-solver recovery recreate gate passed ($stage)."
+}
+
+require_maintenance_safe() {
+  local stage="$1" processes queue db redis_depths sweeper_state media_state
+  sweeper_state="$(writer_state sweeper)" || return 12
+  media_state="$(writer_state media-repair)" || return 12
+  if [[ "$sweeper_state" != "0" || "$media_state" != "0" ]]; then
+    echo "Refusing remote engine maintenance at $stage; control-plane writers are not stopped." >&2
+    return 12
+  fi
+  if ! processes="$(openfoam_processes 2>&1)"; then
+    echo "OpenFOAM process probe failed at $stage: $processes" >&2
+    return 12
+  fi
+  if [[ -n "$processes" ]]; then
+    echo "Refusing remote engine maintenance at $stage; OpenFOAM processes are active:" >&2
+    echo "$processes" >&2
+    return 12
+  fi
+  if ! queue="$(queue_activity 2>&1)"; then
+    echo "Queue probe failed closed at $stage: $queue" >&2
+    return 12
+  fi
+  if [[ -n "$queue" ]]; then
+    echo "Refusing remote engine maintenance at $stage; engine work exists: $queue" >&2
+    return 12
+  fi
+  if ! db="$(maintenance_database_activity 2>&1)"; then
+    echo "Maintenance database probe failed closed at $stage: $db" >&2
+    return 12
+  fi
+  if [[ -n "$db" ]]; then
+    echo "Refusing remote engine maintenance at $stage; executable database work exists: $db" >&2
+    return 12
+  fi
+  if ! redis_depths="$(redis_queue_activity 2>&1)"; then
+    echo "Redis queue probe failed closed at $stage: $redis_depths" >&2
+    return 12
+  fi
+  if [[ -n "$redis_depths" ]]; then
+    echo "Refusing remote engine maintenance at $stage; engine queues are not empty:" >&2
+    echo "$redis_depths" >&2
+    return 12
+  fi
+  echo "Remote-solver ordinary engine maintenance gate passed ($stage)."
 }
 
 wait_http() {
@@ -754,7 +823,11 @@ fail_safe() {
   fi
   if [[ "$FAIL_SAFE_ARMED" != "true" || $rc -eq 0 ]]; then return; fi
   trap - EXIT
-  echo "Remote-solver cutover stopped before attestation; keeping writers stopped and OpenCFD 2606 admission disabled." >&2
+  if [[ "$FAIL_SAFE_CONTEXT" == "maintenance" ]]; then
+    echo "Remote-solver engine maintenance stopped before live verification; keeping writers stopped and OpenCFD admission disabled." >&2
+  else
+    echo "Remote-solver cutover stopped before attestation; keeping writers stopped and OpenCFD 2606 admission disabled." >&2
+  fi
   compose stop sweeper media-repair >/dev/null 2>&1 || true
   disable_all_opencfd_pools >/dev/null 2>&1 || true
   exit "$rc"
@@ -845,6 +918,82 @@ PY
   echo "Explicit pre-evidence rollback restored the retained OpenCFD 2406 runtime; database and volumes were not reverted or deleted."
 }
 
+perform_complete_runtime_maintenance() {
+  local sweeper_was_running media_was_running old_build old_expected pool_state
+  local old_2406_enabled old_2606_enabled worker_container
+
+  [[ "$(current_engine_version)" == "2606" ]] || {
+    echo "Ordinary remote maintenance requires the already-attested OpenCFD 2606 runtime." >&2
+    return 13
+  }
+  old_build="$(read_env_var AIRFOILFOAM_BUILD_ID)"
+  old_expected="$(read_env_var ENGINE_EXPECTED_BUILD_ID)"
+  if [[ -z "$old_build" || "$old_expected" != "$old_build" ]]; then
+    echo "Remote runtime build-id expectations are inconsistent before maintenance." >&2
+    return 13
+  fi
+  validate_live_2606_volume_runtime "$old_build"
+  pool_state="$(compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+SELECT concat_ws('|',
+  coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$OPENCFD_2406_POOL_ID'),'missing'),
+  coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$OPENCFD_2606_POOL_ID'),'missing')
+);")"
+  IFS='|' read -r old_2406_enabled old_2606_enabled <<<"$pool_state"
+  if [[ ! "$old_2406_enabled" =~ ^(true|false)$ || ! "$old_2606_enabled" =~ ^(true|false)$ ]]; then
+    echo "Could not capture the exact OpenCFD execution-pool state before maintenance." >&2
+    return 13
+  fi
+  sweeper_was_running="$(writer_state sweeper)"
+  media_was_running="$(writer_state media-repair)"
+  echo "Remote writer state before engine maintenance: sweeper=$sweeper_was_running media-repair=$media_was_running"
+
+  # From this point any refusal leaves admission disabled and writers stopped.
+  # The old running containers and env remain untouched until both post-build
+  # idle samples pass.
+  FAIL_SAFE_CONTEXT="maintenance"
+  FAIL_SAFE_ARMED=true
+  stop_writers
+  disable_all_opencfd_pools
+  require_maintenance_safe "before image build"
+
+  AIRFOILFOAM_BUILD_ID="$ACTION" compose build api worker node-api sweeper media-repair
+  require_maintenance_safe "after image build"
+  sleep 2
+  require_maintenance_safe "stabilized before service recreate"
+
+  set_env_vars_atomic \
+    "AIRFOILFOAM_BUILD_ID=$ACTION" \
+    "ENGINE_EXPECTED_BUILD_ID=$ACTION"
+  compose up -d --no-build --no-deps --force-recreate api worker node-api
+  wait_http "maintained engine API" http://127.0.0.1:8000/health
+  wait_http "maintained node API" http://127.0.0.1:4000/health
+  validate_live_2606_volume_runtime "$ACTION"
+
+  worker_container="$(compose ps -q worker)"
+  [[ -n "$worker_container" ]] || {
+    echo "Maintained worker container is missing." >&2
+    return 13
+  }
+  docker inspect "$worker_container" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+limits = {
+    row.get("Name"): (row.get("Soft"), row.get("Hard"))
+    for row in payload[0].get("HostConfig", {}).get("Ulimits", [])
+    if isinstance(row, dict)
+}
+if limits.get("nofile") != (65536, 524288):
+    raise SystemExit(f"live worker nofile limit differs: {limits.get('"'"'nofile'"'"')!r}")
+'
+
+  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
+    "UPDATE solver_execution_pools SET enabled=CASE id WHEN '$OPENCFD_2406_POOL_ID' THEN $old_2406_enabled WHEN '$OPENCFD_2606_POOL_ID' THEN $old_2606_enabled ELSE enabled END, \"updatedAt\"=now() WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID');" >/dev/null
+  restore_writers "$sweeper_was_running" "$media_was_running"
+  FAIL_SAFE_ARMED=false
+  echo "hz-solver2 ordinary engine maintenance installed build $ACTION without consuming or cancelling active promise leases."
+  compose ps
+}
+
 main() {
   exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Another deployment is running." >&2; exit 9; }
   verify_deployment_source
@@ -857,8 +1006,8 @@ main() {
     --current-source-revision "$DEPLOY_SOURCE_REVISION" --current-source-tree-sha256 "$DEPLOY_SOURCE_TREE_SHA256" \
     --require-state any)" || exit $?
   if [[ "$state" == "complete" ]]; then
-    echo "hz-solver2 OpenCFD 2606 cutover is already complete; use an ordinary control-plane deploy for source-only changes." >&2
-    exit 14
+    perform_complete_runtime_maintenance
+    return
   fi
   if [[ "$state" == "pristine" ]]; then
     version="$(current_engine_version)"

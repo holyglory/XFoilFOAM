@@ -54,6 +54,7 @@ def _compose_config() -> dict[str, object]:
                     "AIRFOILFOAM_CELERY_CONCURRENCY": "40",
                 },
                 "deploy": {"resources": {"limits": {"cpus": "40"}}},
+                "ulimits": {"nofile": {"soft": 65_536, "hard": 524_288}},
                 "volumes": [
                     {"type": "volume", "source": "results", "target": "/data"},
                     {
@@ -221,6 +222,11 @@ def test_merged_remote_compose_requires_all_40_cpu_and_volume_contracts() -> Non
     bad_cpu["services"]["worker"]["deploy"]["resources"]["limits"]["cpus"] = "8"
     with pytest.raises(ValueError, match="expected 40"):
         module.validate(bad_cpu)
+
+    bad_nofile = json.loads(json.dumps(value))
+    bad_nofile["services"]["worker"]["ulimits"]["nofile"]["soft"] = 1024
+    with pytest.raises(ValueError, match="nofile limit"):
+        module.validate(bad_nofile)
 
     gcs = json.loads(json.dumps(value))
     gcs["services"]["api"]["environment"]["AIRFOILFOAM_EVIDENCE_BUCKET"] = "hub-bucket"
@@ -514,3 +520,62 @@ def test_remote_deployment_scripts_keep_hub_and_volume_cutovers_disjoint() -> No
     assert "AIRFOILFOAM_EVIDENCE_BUCKET=" not in remote
     assert "COMPOSE_FILE_ARGS" in remote and "require_recreate_safe" in remote
     assert "remote-solver2606-cutover-state.py" in redeploy
+
+
+def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(
+        encoding="utf-8"
+    )
+    maintenance_start = source.index("perform_complete_runtime_maintenance()")
+    maintenance_end = source.index("\nmain() {", maintenance_start)
+    maintenance = source[maintenance_start:maintenance_end]
+
+    stop = maintenance.index("stop_writers")
+    disable = maintenance.index("disable_all_opencfd_pools", stop)
+    first_idle = maintenance.index(
+        'require_maintenance_safe "before image build"', disable
+    )
+    build = maintenance.index(
+        'compose build api worker node-api sweeper media-repair', first_idle
+    )
+    second_idle = maintenance.index(
+        'require_maintenance_safe "after image build"', build
+    )
+    stable_idle = maintenance.index(
+        'require_maintenance_safe "stabilized before service recreate"', second_idle
+    )
+    env_update = maintenance.index("set_env_vars_atomic", stable_idle)
+    recreate = maintenance.index(
+        "compose up -d --no-build --no-deps --force-recreate api worker node-api",
+        env_update,
+    )
+    live_proof = maintenance.index(
+        'validate_live_2606_volume_runtime "$ACTION"', recreate
+    )
+    nofile_proof = maintenance.index('limits.get("nofile")', live_proof)
+    pool_restore = maintenance.index("UPDATE solver_execution_pools", nofile_proof)
+    writer_restore = maintenance.index("restore_writers", pool_restore)
+
+    assert (
+        stop
+        < disable
+        < first_idle
+        < build
+        < second_idle
+        < stable_idle
+        < env_update
+        < recreate
+        < live_proof
+        < nofile_proof
+        < pool_restore
+        < writer_restore
+    )
+    maintenance_db_start = source.index("maintenance_database_activity()")
+    maintenance_db_end = source.index("\nrequire_idle()", maintenance_db_start)
+    maintenance_db = source[maintenance_db_start:maintenance_db_end]
+    assert "active_promises" not in maintenance_db
+    assert "live_jobs" in maintenance_db
+    assert "unsettled_deliveries" in maintenance_db
+    assert "unsettled_cancellations" in maintenance_db
+    assert "running_media_repairs" in maintenance_db
+    assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source

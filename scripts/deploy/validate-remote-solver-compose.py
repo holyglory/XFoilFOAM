@@ -85,6 +85,14 @@ def validate(value: object) -> None:
         raise ValueError("merged worker CPU limit is missing") from exc
     if cpu_limit != 40.0:
         raise ValueError(f"merged worker CPU limit is {cpu_limit:g}, expected 40")
+    nofile = _mapping(
+        _mapping(worker.get("ulimits"), "worker.ulimits").get("nofile"),
+        "worker.ulimits.nofile",
+    )
+    if nofile.get("soft") != 65_536 or nofile.get("hard") != 524_288:
+        raise ValueError(
+            "merged worker nofile limit must retain soft=65536 and hard=524288"
+        )
 
     for name in ("api", "worker"):
         env = _environment(_mapping(services[name], name), name)

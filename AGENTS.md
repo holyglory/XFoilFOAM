@@ -161,6 +161,13 @@
   (zombie jobs). The script edits both env vars first, force-recreates exactly
   the services that read them, verifies the engine `/health` build id, and
   triggers `POST /api/admin/jobs/recover-stale`.
+- On a dedicated `remote-solver` deployment whose OpenCFD 2606 cutover is
+  already complete, post-cutover engine maintenance uses the complete-state
+  path in `scripts/deploy/rebuild-remote-solver-engine.sh`. That path preserves
+  active promise leases while both writers are stopped, but still refuses live
+  jobs, unsettled deliveries/cancellations, Redis work, media repair, or any
+  OpenFOAM child; it must prove the merged nofile limit and restore the exact
+  prior execution-pool/writer state before scheduling resumes.
 
 ## Solver Evidence Versus Valid Polars
 

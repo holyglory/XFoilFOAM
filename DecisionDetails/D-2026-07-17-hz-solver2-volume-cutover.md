@@ -131,3 +131,12 @@ cold inspection, invalidates on a binding change, and declares the same nofile
 limit for both worker pools. It must be installed only through the guarded
 engine rebuild while OpenFOAM is idle, then verified by repeated polling and
 descriptor-count stability before capacity is widened.
+
+Post-cutover remote engine maintenance is a distinct complete-state branch of
+the same guarded remote workflow. An active promise remains an inert durable
+lease while both downstream writers are stopped, so it is preserved across
+maintenance; live jobs, unsettled delivery/cancellation work, Redis queue
+depth, media repair, and OpenFOAM children still fail closed. The branch moves
+both build-id expectations atomically, proves the live container nofile limit,
+and restores the exact prior execution-pool and writer states only after health
+and runtime identity pass.
