@@ -2891,6 +2891,120 @@ describe("remote solver sync validation regressions", () => {
       .update(syncSweepPromises)
       .set({ requestPayload: { remoteSolver: true, solverId } })
       .where(eq(syncSweepPromises.id, promiseId));
+    const evidence = uransEvidencePatch("brokered-precalc-final-handoff");
+    const immutableEvidencePayload = {
+      fixture: "legacy-storage-upgrade",
+      fidelity: "urans_precalc",
+    };
+    const engine = {
+      family: "openfoam",
+      distribution: "opencfd",
+      version: "2406",
+      numericsRevision: "1",
+      adapterContractVersion: 1,
+      buildId: `${PREFIX}-brokered-opencfd-2406`,
+      sourceRevision: null,
+      imageDigest: null,
+      applicationSourceSha256: sha256(
+        Buffer.from(`${PREFIX}:brokered-openfoam-application`),
+      ),
+      packageSha256: null,
+      binarySha256: null,
+      architecture: "x86_64",
+    };
+    const legacyArchiveBytes = Buffer.from(
+      `${PREFIX}:legacy-openfoam-evidence-gzip`,
+    );
+    const legacyMember = manifest.members[0]!;
+    const legacyMemberBytes = Buffer.from(
+      `${PREFIX}:brokered-member:${legacyMember.path}`,
+    );
+    const legacyPoint = makePoint(aoaDeg, {
+      ...evidence,
+      methodKey: "openfoam.urans",
+      engineJobId,
+      engineCaseSlug,
+      remoteResultId,
+      remoteResultAttemptId,
+      engine,
+      evidencePayload: immutableEvidencePayload,
+      evidenceArtifacts: [
+        {
+          kind: "manifest",
+          role: "raw",
+          filename: "evidence_manifest.json",
+          mimeType: "application/json",
+          contentBase64: manifest.bytes.toString("base64"),
+          sha256: manifestSha256,
+          byteSize: manifest.bytes.byteLength,
+        },
+        {
+          kind: "openfoam_bundle",
+          role: "evidence",
+          mimeType: "application/gzip",
+          contentBase64: legacyArchiveBytes.toString("base64"),
+          sha256: sha256(legacyArchiveBytes),
+          byteSize: legacyArchiveBytes.byteLength,
+          metadata: { evidenceBase, compression: "gzip" },
+        },
+        {
+          kind: "dictionary",
+          role: legacyMember.role,
+          mimeType: "application/octet-stream",
+          contentBase64: legacyMemberBytes.toString("base64"),
+          sha256: legacyMember.sha256,
+          byteSize: legacyMember.byteSize,
+          metadata: {
+            evidenceBase,
+            manifestPath: "evidence_manifest.json",
+          },
+        },
+      ],
+    });
+    const initialLegacyPush = await app.inject({
+      method: "POST",
+      url: "/api/sync/v1/polars",
+      headers: {
+        "content-type": "application/json",
+        "x-xfoilfoam-solver-token": solverToken,
+      },
+      payload: JSON.stringify(
+        polarPayload([legacyPoint], { promiseId, bcId: undefined }),
+      ),
+    });
+    expect(initialLegacyPush.statusCode, initialLegacyPush.body).toBe(200);
+    expect(initialLegacyPush.json()).toMatchObject({
+      conflictIds: [],
+      fulfilledAoas: [aoaDeg],
+      bindingReceipts: [],
+    });
+
+    const canonicalBeforeUpgrade = await resultAt(aoaDeg);
+    canonicalResultId = canonicalBeforeUpgrade!.id;
+    const legacyAttemptId = canonicalBeforeUpgrade!.currentResultAttemptId!;
+    const [initialLegacyContainer] = await db
+      .select({ id: solverEvidenceArtifacts.id })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, legacyAttemptId),
+          eq(solverEvidenceArtifacts.kind, "openfoam_bundle"),
+        ),
+      );
+    const [initialLogicalMember] = await db
+      .select({ id: solverEvidenceArtifacts.id })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, legacyAttemptId),
+          eq(solverEvidenceArtifacts.kind, "dictionary"),
+        ),
+      );
+    expect(initialLegacyContainer).toBeTruthy();
+    expect(initialLogicalMember).toBeTruthy();
+
+    // The application and database guards must admit this only after the
+    // exact accepted legacy attempt is the fulfilled point owner.
     await db.insert(syncBrokeredEvidenceUploads).values({
       id: uploadId,
       idempotencyKey: randomUUID(),
@@ -2920,7 +3034,6 @@ describe("remote solver sync validation regressions", () => {
       verifiedAt: new Date(),
     });
 
-    const evidence = uransEvidencePatch("brokered-precalc-final-handoff");
     const point = makePoint(aoaDeg, {
       ...evidence,
       methodKey: "openfoam.urans",
@@ -2928,22 +3041,12 @@ describe("remote solver sync validation regressions", () => {
       engineCaseSlug,
       remoteResultId,
       remoteResultAttemptId,
-      engine: {
-        family: "openfoam",
-        distribution: "opencfd",
-        version: "2406",
-        numericsRevision: "1",
-        adapterContractVersion: 1,
-        buildId: `${PREFIX}-brokered-opencfd-2406`,
-        sourceRevision: null,
-        imageDigest: null,
-        applicationSourceSha256: sha256(
-          Buffer.from(`${PREFIX}:brokered-openfoam-application`),
-        ),
-        packageSha256: null,
-        binarySha256: null,
-        architecture: "x86_64",
-      },
+      engine,
+      evidencePayload: immutableEvidencePayload,
+      // Storage-only replay deliberately omits renderer-dependent media and
+      // extents. The hub must preserve those from the accepted generation.
+      media: [],
+      fieldExtents: [],
       evidenceArtifacts: [
         {
           kind: "manifest",
@@ -3080,6 +3183,18 @@ describe("remote solver sync validation regressions", () => {
           resultAttemptId: attemptId,
         },
       ]);
+      expect(
+        await db
+          .select({ id: solverEvidenceArtifacts.id })
+          .from(solverEvidenceArtifacts)
+          .where(eq(solverEvidenceArtifacts.id, initialLegacyContainer!.id)),
+      ).toHaveLength(0);
+      expect(
+        await db
+          .select({ id: solverEvidenceArtifacts.id })
+          .from(solverEvidenceArtifacts)
+          .where(eq(solverEvidenceArtifacts.id, initialLogicalMember!.id)),
+      ).toHaveLength(1);
 
       // Legacy hubs retained the uploaded gzip container as a second source
       // association. Once the exact brokered Zstandard generation is current,

@@ -3090,28 +3090,30 @@ async function pushOneRemoteResult(
           eq(resultFieldExtents.evidenceSha256, evidenceSha256),
         ),
       );
-    if (!extents.length) {
+    if (!claim.fulfilledReplay && !extents.length) {
       await settleResultDelivery(db, claim, {
         kind: "retry",
         error: `remote result ${result.id} is waiting for verified default-media field extents`,
       });
       return false;
     }
-    const missingDefaultMedia = extents.find(
-      (extent) =>
-        !media.some(
-          (item) =>
-            item.field === extent.field &&
-            item.renderProfileKey === extent.renderProfileKey &&
-            item.evidenceSha256 === extent.evidenceSha256 &&
-            item.kind === "image" &&
-            item.role === "instantaneous" &&
-            item.mimeType.startsWith("image/") &&
-            Boolean(item.sha256 && /^[0-9a-fA-F]{64}$/.test(item.sha256)) &&
-            Number(item.byteSize ?? 0) > 0 &&
-            Boolean(item.storageKey.trim()),
-        ),
-    );
+    const missingDefaultMedia = claim.fulfilledReplay
+      ? undefined
+      : extents.find(
+          (extent) =>
+            !media.some(
+              (item) =>
+                item.field === extent.field &&
+                item.renderProfileKey === extent.renderProfileKey &&
+                item.evidenceSha256 === extent.evidenceSha256 &&
+                item.kind === "image" &&
+                item.role === "instantaneous" &&
+                item.mimeType.startsWith("image/") &&
+                Boolean(item.sha256 && /^[0-9a-fA-F]{64}$/.test(item.sha256)) &&
+                Number(item.byteSize ?? 0) > 0 &&
+                Boolean(item.storageKey.trim()),
+            ),
+        );
     if (missingDefaultMedia) {
       await settleResultDelivery(db, claim, {
         kind: "retry",
@@ -3299,11 +3301,12 @@ async function pushOneRemoteResult(
         "remote evidence broker did not return a verified generation",
       );
     const uploads: StreamUpload[] = [];
-    const pushedArtifacts = artifacts.filter(
-      (artifact) =>
-        artifact.kind === "manifest" ||
-        artifact.kind === "frame_image" ||
-        artifact.kind === "engine_bundle",
+    const pushedArtifacts = artifacts.filter((artifact) =>
+      claim.fulfilledReplay
+        ? artifact.kind === "manifest" || artifact.kind === "engine_bundle"
+        : artifact.kind === "manifest" ||
+          artifact.kind === "frame_image" ||
+          artifact.kind === "engine_bundle",
     );
     const evidenceArtifacts = pushedArtifacts.map((artifact, index) => {
       if (artifact.kind === "engine_bundle") {
@@ -3347,33 +3350,35 @@ async function pushOneRemoteResult(
         uploadField,
       };
     });
-    const mediaPayload = media.map((item, index) => {
-      const uploadField = `media_${index}`;
-      uploads.push({
-        fieldName: uploadField,
-        storageKey: item.storageKey,
-        mimeType: item.mimeType,
-      });
-      return {
-        kind: item.kind,
-        field: item.field,
-        role: item.role,
-        mimeType: item.mimeType,
-        width: item.width,
-        height: item.height,
-        frameCount: item.frameCount,
-        durationS: item.durationS,
-        colorScaleVersion: item.colorScaleVersion,
-        scaleVmin: item.scaleVmin,
-        scaleVmax: item.scaleVmax,
-        scalePolicy: item.scalePolicy,
-        renderProfileKey: item.renderProfileKey,
-        evidenceSha256: item.evidenceSha256,
-        sha256: item.sha256,
-        byteSize: item.byteSize,
-        uploadField,
-      };
-    });
+    const mediaPayload = (claim.fulfilledReplay ? [] : media).map(
+      (item, index) => {
+        const uploadField = `media_${index}`;
+        uploads.push({
+          fieldName: uploadField,
+          storageKey: item.storageKey,
+          mimeType: item.mimeType,
+        });
+        return {
+          kind: item.kind,
+          field: item.field,
+          role: item.role,
+          mimeType: item.mimeType,
+          width: item.width,
+          height: item.height,
+          frameCount: item.frameCount,
+          durationS: item.durationS,
+          colorScaleVersion: item.colorScaleVersion,
+          scaleVmin: item.scaleVmin,
+          scaleVmax: item.scaleVmax,
+          scalePolicy: item.scalePolicy,
+          renderProfileKey: item.renderProfileKey,
+          evidenceSha256: item.evidenceSha256,
+          sha256: item.sha256,
+          byteSize: item.byteSize,
+          uploadField,
+        };
+      },
+    );
     const attemptPayload =
       attempt.evidencePayload && typeof attempt.evidencePayload === "object"
         ? (attempt.evidencePayload as Record<string, unknown>)
@@ -3447,7 +3452,10 @@ async function pushOneRemoteResult(
       remoteResultAttemptId: attempt.id,
       evidencePayload: attempt.evidencePayload,
       forceHistory: attemptForceHistory(attempt),
-      fieldExtents: extents,
+      // A fulfilled replay is a storage-container upgrade, not a second
+      // publication pass. Keep the accepted media/extents immutable on the
+      // hub and send only the exact manifest plus brokered engine archive.
+      fieldExtents: claim.fulfilledReplay ? [] : extents,
       evidenceArtifacts,
       media: mediaPayload,
     };
@@ -4216,6 +4224,112 @@ async function processReusablePromiseEvidence(
   return false;
 }
 
+/**
+ * A fulfilled point can need one final, container-only replay after its exact
+ * legacy gzip evidence has been converted and uploaded through the broker.
+ * This path is intentionally separate from normal result discovery: it may
+ * omit derived media/extents only because the upstream point already owns the
+ * exact accepted result and attempt named by the durable delivery row.
+ */
+async function processFulfilledEvidenceUpgrades(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+): Promise<boolean> {
+  const candidates = (await db.execute(sql`
+    SELECT
+      delivery.promise_id,
+      delivery.sim_job_id,
+      delivery.result_id
+    FROM sync_remote_result_deliveries delivery
+    JOIN sync_sweep_promises remote_promise
+      ON remote_promise.id = delivery.promise_id
+     AND remote_promise.status = 'fulfilled'
+    JOIN sync_sweep_promise_points promise_point
+      ON promise_point.promise_id = delivery.promise_id
+     AND promise_point.status = 'fulfilled'
+    JOIN sim_jobs solved_job
+      ON solved_job.id = delivery.sim_job_id
+     AND solved_job.status IN ('submitted', 'running', 'ingesting', 'done')
+     AND solved_job.request_payload ->> 'remoteSolver' = 'true'
+     AND (solved_job.request_payload ->> 'syncPromiseId')::uuid = delivery.promise_id
+    JOIN results solved_result
+      ON solved_result.id = delivery.result_id
+     AND solved_result.sim_job_id = solved_job.id
+     AND solved_result.current_result_attempt_id = delivery.result_attempt_id
+    JOIN result_attempts solved_attempt
+      ON solved_attempt.id = delivery.result_attempt_id
+     AND solved_attempt.result_id = solved_result.id
+     AND delivery.generation_key = solved_attempt.id::text
+    JOIN result_classifications solved_classification
+      ON solved_classification.result_attempt_id = solved_attempt.id
+     AND solved_classification.state = 'accepted'
+    WHERE remote_promise.source_base_url = ${syncBase(settings)}
+      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND promise_point.airfoil_id = solved_result.airfoil_id
+      AND promise_point.simulation_preset_revision_id = solved_result.simulation_preset_revision_id
+      AND promise_point.aoa_deg = solved_result.aoa_deg
+      AND promise_point.result_id = solved_result.id
+      AND promise_point.result_attempt_id = solved_attempt.id
+      AND (
+        delivery.state = 'pending'
+        OR (delivery.state = 'retry_wait' AND delivery.next_attempt_at <= now())
+        OR (
+          delivery.state = 'pushing'
+          AND delivery.claim_expires_at <= now()
+        )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM solver_evidence_artifacts manifest
+        WHERE manifest.result_id = solved_result.id
+          AND manifest.result_attempt_id = solved_attempt.id
+          AND manifest.kind = 'manifest'
+        GROUP BY manifest.result_id, manifest.result_attempt_id
+        HAVING count(*) = 1
+           AND count(*) FILTER (
+             WHERE manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+               AND manifest.byte_size > 0
+               AND length(trim(manifest.storage_key)) > 0
+               AND length(trim(manifest.mime_type)) > 0
+           ) = 1
+      )
+    ORDER BY delivery.next_attempt_at, delivery."createdAt", delivery.id
+    LIMIT 50
+  `)) as unknown as Array<{
+    promise_id: string;
+    sim_job_id: string;
+    result_id: string;
+  }>;
+  for (const candidate of candidates) {
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, candidate.sim_job_id))
+      .limit(1);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, candidate.result_id))
+      .limit(1);
+    if (
+      job &&
+      result &&
+      (await pushOneRemoteResult(
+        db,
+        engine,
+        settings,
+        candidate.promise_id,
+        job,
+        result,
+      ))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function processRemoteResultDeliveries(
   db: DB,
   engine: EngineClient,
@@ -4645,11 +4759,9 @@ export async function reconcileRemoteSolverTick(
     let processedDurableDelivery = false;
     if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
       await reopenResolvedConflictDeliveries(db, settings);
-      processedDurableDelivery = await processRemoteResultDeliveries(
-        db,
-        engine,
-        settings,
-      );
+      processedDurableDelivery =
+        (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
+        (await processRemoteResultDeliveries(db, engine, settings));
     }
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {

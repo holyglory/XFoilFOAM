@@ -603,6 +603,13 @@
       "when": 1788220800000,
       "tag": "0085_settled_legacy_evidence_upgrade",
       "breakpoints": true
+    },
+    {
+      "idx": 86,
+      "version": "7",
+      "when": 1788307200000,
+      "tag": "0086_settled_legacy_evidence_binding",
+      "breakpoints": true
     }
   ]
 }

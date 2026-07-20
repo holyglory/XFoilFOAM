@@ -214,6 +214,10 @@ describe("0080 brokered evidence / 0079 canary cleanup reciprocal fence", () => 
       resolve(migrations, "0085_settled_legacy_evidence_upgrade.sql"),
       "utf8",
     );
+    const migration0086 = readFileSync(
+      resolve(migrations, "0086_settled_legacy_evidence_binding.sql"),
+      "utf8",
+    );
     expect(migration0080).toMatch(
       /sync_brokered_evidence_uploads_promise_fk[\s\S]*?sync_sweep_promises[\s\S]*?ON DELETE restrict/i,
     );
@@ -238,6 +242,12 @@ describe("0080 brokered evidence / 0079 canary cleanup reciprocal fence", () => 
     );
     expect(migration0085).toMatch(
       /AND NOT settled_legacy_upgrade[\s\S]*?requires an active promise lease[\s\S]*?AND NOT settled_legacy_upgrade[\s\S]*?requires an active promise point/i,
+    );
+    expect(migration0086).toMatch(
+      /candidate\.state = 'bound'[\s\S]*?superseding\.id = candidate\.canonical_artifact_id[\s\S]*?remoteEvidenceUploadId[\s\S]*?candidate\.id::text/i,
+    );
+    expect(migration0086).toMatch(
+      /settled_legacy_upgrade := is_exact_settled_legacy_evidence_upgrade\(NEW\)[\s\S]*?AND NOT settled_legacy_upgrade[\s\S]*?requires the exact active promise lease/i,
     );
   });
 

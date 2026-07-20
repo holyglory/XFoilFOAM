@@ -3596,6 +3596,115 @@ describe("remote solver push validation regressions", () => {
     expect(await lease.stop()).toBeNull();
   });
 
+  it("MUST-CATCH: a fulfilled evidence replay sends only the manifest and brokered archive", async () => {
+    const aoaDeg = 865.901;
+    const job = await seedDoneRemoteJob("fulfilled-storage-only", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("fulfilled-storage-only", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "fulfilled", fulfilledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "fulfilled",
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+      })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId,
+      simJobId: job.id,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      aoaDeg,
+      generationKey: attempt.id,
+    });
+    const { fetchMock } = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    const [polar] = requests(fetchMock, "/polars");
+    const [deliveryAfter] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.promiseId, promiseId));
+    const [settingsAfter] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect(
+      polar,
+      JSON.stringify({
+        deliveryAfter,
+        remoteSolverLastStatus: settingsAfter?.remoteSolverLastStatus,
+        remoteSolverLastError: settingsAfter?.remoteSolverLastError,
+        requests: fetchMock.mock.calls.map(([input]) => String(input)),
+      }),
+    ).toBeTruthy();
+    expect(polar.body.results[0].media).toEqual([]);
+    expect(polar.body.results[0].fieldExtents).toEqual([]);
+    expect(
+      polar.body.results[0].evidenceArtifacts.map(
+        (artifact: { kind: string }) => artifact.kind,
+      ),
+    ).toEqual(["manifest", "engine_bundle"]);
+    expect(requests(fetchMock, `/sweeps/${promiseId}/heartbeat`)).toHaveLength(
+      0,
+    );
+  });
+
+  it("FALSE-POSITIVE-GUARD: a fulfilled point without the exact result-attempt owner cannot enter storage-only replay", async () => {
+    const aoaDeg = 865.902;
+    const job = await seedDoneRemoteJob("fulfilled-owner-mismatch", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("fulfilled-owner-mismatch", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "fulfilled", fulfilledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "fulfilled", resultId: result.id, resultAttemptId: null })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId,
+      simJobId: job.id,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      aoaDeg,
+      generationKey: attempt.id,
+    });
+    const { fetchMock } = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(fetchMock, "/polars")).toHaveLength(0);
+    expect((await deliveriesForJob(job.id))[0]).toMatchObject({
+      state: "pending",
+      attemptCount: 0,
+    });
+  });
+
   it("keeps transfer-heartbeat failures retryable but authoritatively stops ownership on 404/409 before upload", async () => {
     for (const [status, expectedState] of [
       [503, "retry_wait"],

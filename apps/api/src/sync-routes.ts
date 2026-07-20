@@ -2362,6 +2362,7 @@ async function equivalentStoredResultEvidence(
     engineCaseSlug: string | null;
     regime: "rans" | "urans";
     manifestSha256: string | null;
+    storageOnlyMemberSet?: PreparedBrokeredArchive["memberSet"] | null;
   },
 ): Promise<boolean> {
   const [storedAttempt] = await tx
@@ -2416,6 +2417,54 @@ async function equivalentStoredResultEvidence(
           : sql`false`,
       ),
     );
+
+  if (exact.storageOnlyMemberSet) {
+    // A fulfilled result may be replayed solely to replace its obsolete
+    // imported gzip container with the exact manifest-authenticated GCS
+    // archive. Presentation renders are derived artifacts and can differ
+    // byte-for-byte across renderer builds, so this path carries none and
+    // never rewrites the already-published media/extents. Instead, prove that
+    // every retained logical raw-evidence association is present in the
+    // authenticated archive member multiset. The verified/bound broker row is
+    // checked separately under the same transaction before this branch.
+    if (point.media.length > 0 || point.fieldExtents.length > 0) return false;
+    const storedManifests = storedArtifacts.filter(
+      (artifact) => artifact.kind === "manifest",
+    );
+    if (
+      storedManifests.length !== 1 ||
+      !exact.manifestSha256 ||
+      storedManifests[0]!.sha256 !== exact.manifestSha256
+    )
+      return false;
+
+    const availableMembers = new Map<string, number>();
+    for (const member of exact.storageOnlyMemberSet) {
+      const key = `${member.sha256}\u0000${member.byteSize}`;
+      availableMembers.set(key, (availableMembers.get(key) ?? 0) + 1);
+    }
+    for (const artifact of storedArtifacts) {
+      if (
+        nullableText(artifact.metadata?.archiveMemberPath) ||
+        artifact.kind === "manifest" ||
+        artifact.kind === "engine_bundle" ||
+        (artifact.kind === "openfoam_bundle" &&
+          artifact.mimeType === "application/gzip" &&
+          artifact.storageKey.startsWith("sync-imports/") &&
+          artifact.storageKey.endsWith(".gz"))
+      ) {
+        continue;
+      }
+      if (!/^[0-9a-f]{64}$/i.test(artifact.sha256) || artifact.byteSize < 0)
+        return false;
+      const key = `${artifact.sha256}\u0000${artifact.byteSize}`;
+      const remaining = availableMembers.get(key) ?? 0;
+      if (remaining < 1) return false;
+      availableMembers.set(key, remaining - 1);
+    }
+    return true;
+  }
+
   const manifest = (
     rows: Array<{
       kind?: unknown;
@@ -3958,6 +4007,7 @@ async function importPolarPush(
     regime: "rans" | "urans";
     fidelity: string | null;
     brokeredUploadId: string | null;
+    storageOnlyReplay: boolean;
   }> = [];
   for (const point of payload.results) {
     const runtime = await resolveEngineRuntimeBuild(db, point.engine);
@@ -4233,7 +4283,34 @@ async function importPolarPush(
             )
             .limit(1)
         : [];
-
+      let exactStorageOnlyReplay = false;
+      if (
+        existing &&
+        exactReplayAttempt &&
+        preparedBrokeredArchive &&
+        preparedArtifacts.length === 2 &&
+        manifests.length === 1 &&
+        brokeredArtifacts.length === 1 &&
+        point.media.length === 0 &&
+        point.fieldExtents.length === 0
+      ) {
+        const upload = preparedBrokeredArchive.upload;
+        if (
+          upload.state === "bound" &&
+          upload.canonicalResultId === existing.id &&
+          upload.canonicalResultAttemptId === exactReplayAttempt.id &&
+          upload.canonicalArtifactId
+        ) {
+          exactStorageOnlyReplay = true;
+        } else if (upload.state === "verified") {
+          const [eligibility] = (await tx.execute(sql`
+            SELECT is_exact_settled_legacy_evidence_upgrade(candidate) AS eligible
+            FROM sync_brokered_evidence_uploads candidate
+            WHERE candidate.id = ${upload.id}
+          `)) as unknown as Array<{ eligible: boolean }>;
+          exactStorageOnlyReplay = eligibility?.eligible === true;
+        }
+      }
       let kind: "imported" | "equivalent" = "imported";
       let createdResult = false;
       if (!existing) {
@@ -4250,18 +4327,25 @@ async function importPolarPush(
           .returning();
         createdResult = true;
         await acquireResultEvidenceLocks(tx, [existing.id]);
-      } else if (equivalentResult(existing, point)) {
+      } else if (exactStorageOnlyReplay || equivalentResult(existing, point)) {
         if (!ownedContinuation && !exactReplayAttempt) {
           return { kind: "conflict" as const, existing };
         }
-        if (
-          !(await equivalentStoredResultEvidence(tx, existing.id, point, {
+        const storedEvidenceEquivalent = await equivalentStoredResultEvidence(
+          tx,
+          existing.id,
+          point,
+          {
             engineJobId: importedEngineJobId,
             engineCaseSlug: point.engineCaseSlug ?? null,
             regime: attemptRegime,
             manifestSha256,
-          }))
-        ) {
+            storageOnlyMemberSet: exactStorageOnlyReplay
+              ? preparedBrokeredArchive?.memberSet
+              : null,
+          },
+        );
+        if (!storedEvidenceEquivalent) {
           return { kind: "conflict" as const, existing };
         }
         kind = "equivalent";
@@ -4294,7 +4378,12 @@ async function importPolarPush(
 
       const observedCurrentAttemptId = existing.currentResultAttemptId;
 
-      const attemptResolution = await insertAttemptForResult(tx, existing.id);
+      const attemptResolution = exactStorageOnlyReplay
+        ? ({
+            kind: "existing" as const,
+            attempt: { id: exactReplayAttempt!.id },
+          } as const)
+        : await insertAttemptForResult(tx, existing.id);
       if (attemptResolution.kind === "conflict") {
         return { kind: "conflict" as const, existing };
       }
@@ -4590,23 +4679,21 @@ async function importPolarPush(
         // the authenticated current archive, while dropping this obsolete
         // source association lets sync-import GC remove the duplicate gzip
         // bytes. Never retire an archive that owns any canonical generation.
-        await tx
-          .delete(solverEvidenceArtifacts)
-          .where(
-            and(
-              eq(solverEvidenceArtifacts.resultId, existing.id),
-              eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
-              eq(solverEvidenceArtifacts.kind, "openfoam_bundle"),
-              eq(solverEvidenceArtifacts.mimeType, "application/gzip"),
-              sql`${solverEvidenceArtifacts.storageKey} LIKE 'sync-imports/%'`,
-              sql`${solverEvidenceArtifacts.storageKey} LIKE '%.gz'`,
-              sql`NOT EXISTS (
+        await tx.delete(solverEvidenceArtifacts).where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, existing.id),
+            eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+            eq(solverEvidenceArtifacts.kind, "openfoam_bundle"),
+            eq(solverEvidenceArtifacts.mimeType, "application/gzip"),
+            sql`${solverEvidenceArtifacts.storageKey} LIKE 'sync-imports/%'`,
+            sql`${solverEvidenceArtifacts.storageKey} LIKE '%.gz'`,
+            sql`NOT EXISTS (
                 SELECT 1
                 FROM ${solverEvidenceArchives} retained_archive
                 WHERE retained_archive.source_artifact_id = ${solverEvidenceArtifacts.id}
               )`,
-            ),
-          );
+          ),
+        );
       }
       for (const { item, stored } of preparedMedia) {
         const association = {
@@ -4744,6 +4831,7 @@ async function importPolarPush(
         attemptInserted: attemptResolution.kind === "inserted",
         importedExtents,
         brokeredArchiveMemberCount,
+        storageOnlyReplay: exactStorageOnlyReplay,
       };
     });
     if (resolution.kind === "conflict") {
@@ -4788,6 +4876,7 @@ async function importPolarPush(
       brokeredUploadId:
         preparedArtifacts.find(({ stored }) => stored.brokeredUploadId)?.stored
           .brokeredUploadId ?? null,
+      storageOnlyReplay: resolution.storageOnlyReplay,
     });
   }
 
@@ -4810,6 +4899,7 @@ async function importPolarPush(
             ? 20
             : 10);
       for (const committed of committedPoints) {
+        if (committed.storageOnlyReplay) continue;
         const [incomingClass] = await tx
           .select({ state: resultClassifications.state })
           .from(resultClassifications)

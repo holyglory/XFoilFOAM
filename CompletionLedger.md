@@ -25,12 +25,18 @@
   2406 histories; any new exhaustion remains a red system incident and must be
   investigated before ordinary new admission continues.
 
-- **Production evidence capacity:** The completed GCS reconciliation left the
-  500 GB VPS about 393 GiB free (roughly 20% used), with no legacy gzip,
-  canonical local Zstandard, packaged raw, or unprotected terminal raw
-  duplicates. Preserve at least 80 GiB free while the campaign is active,
-  keep the temporary hydration cache bounded, and remeasure active-case growth
-  before increasing solver concurrency.
+- **Production evidence capacity:** The July 19 GCS reconciliation left the
+  500 GB VPS about 393 GiB free (roughly 20% used), but the subsequently
+  restored production evidence set contains 68 imported legacy gzip
+  associations that must be rebound to canonical GCS Zstandard archives. One
+  remote canary archive is generation-verified but not yet hub-bound, so its
+  local source has deliberately not been reclaimed. Finish an exact
+  storage-only binding canary, migrate the remaining eligible accepted
+  generations, and handle the six cancelled/invalid point generations through
+  the separate forensic/rejected-evidence path before again claiming zero
+  legacy duplicates. Preserve at least 80 GiB free while the campaign is
+  active, keep the temporary hydration cache bounded, and remeasure active-case
+  growth before increasing solver concurrency.
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`
@@ -47,11 +53,17 @@
   idempotent replay returned the same archive and queue. Live-campaign PRECALC
   ownership reconciliation is complete, and the final AoA 18 retry has now
   been accepted, bound to GCS generation `1784567638818547`, acknowledged by
-  the hub, and reclaimed remotely; all 26 promised angles are fulfilled. Deploy
-  the 96-chunk continuation hardening while the remote worker is idle, then
-  widen remote promises and monitor evidence delivery, FINAL completion,
-  descriptor stability, and absence of new critical chains before removing
-  this item.
+  the hub, and reclaimed remotely; all 26 promised angles are fulfilled. The
+  restored legacy-evidence migration is now exercising the same transfer
+  boundary: canary upload `472a8929-b170-4867-8757-4d6ec117eb1b` is verified at
+  GCS generation `1784582269952724`, but the hub binding and signed
+  acknowledgement are still pending and the remote sweeper is intentionally
+  stopped between retries. Deploy and prove the exact fulfilled-point
+  storage-only replay, then migrate the remaining eligible generations and
+  reclaim remote bytes only from signed hub receipts. After that, deploy the
+  96-chunk continuation hardening while the remote worker is idle, widen
+  remote promises, and monitor evidence delivery, FINAL completion, descriptor
+  stability, and absence of new critical chains before removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation
