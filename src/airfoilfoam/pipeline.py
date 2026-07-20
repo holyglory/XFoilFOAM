@@ -4461,7 +4461,17 @@ def _extend_transient_until_periods(
             or (not can_continue and not acquiring_period)
         ):
             break
-        span = max(0.0, _latest_time(tcase) - transient_start)
+        # Field-write cadence is intentionally sparse during period
+        # acquisition, while force coefficients are sampled every solver step.
+        # Select the next cumulative horizon from the strongest physical
+        # progress token. Using only the latest restartable time directory can
+        # leave the controller just below an already-observed horizon and
+        # schedule a tiny chunk whose force history cannot advance (production
+        # angle 12: field t=0.0661364, force t=0.0666674, 20-period boundary).
+        span = max(
+            0.0,
+            _transient_physical_progress_time(tcase, result) - transient_start,
+        )
         if span <= 0.0:
             break
         if acquiring_period:

@@ -428,6 +428,125 @@ def test_precalc_true_no_shedding_is_accepted_after_slow_horizon(tmp_path):
     assert quality.measured_period_s is None
 
 
+def test_period_acquisition_skips_exhausted_field_horizon_using_force_progress(
+    tmp_path, monkeypatch
+):
+    """A lagging field write must not schedule a zero-progress continuation.
+
+    Production angle 12 had force evidence at 20.000 guessed periods while the
+    latest restartable field directory was still at 19.84. The controller used
+    only the field directory to select the next 20-period horizon, so the
+    resulting chunk could not advance beyond force evidence already retained.
+    It must select the following physical slow-edge horizon from the strongest
+    same-case progress token instead.
+    """
+    speed = 30.0
+    chord = 0.05
+    guess_period = chord / (pipeline.TRANSIENT_INITIAL_STROUHAL * speed)
+    field_cycles = 19.8409264843968
+    force_cycles = 20.0002196814797
+    field_end = field_cycles * guess_period
+    force_end = force_cycles * guess_period
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    (tcase / f"{field_end:.15g}").mkdir()
+
+    first_history = _flat_history(
+        cl_mean=0.893659,
+        cd_mean=0.156141,
+        t0=force_end - 0.00609854,
+        t1=force_end,
+        n=500,
+    )
+    minimum = pipeline._no_shedding_min_observation_s(speed, chord)
+    first_quality = evaluate_urans_quality(
+        tcase,
+        first_history,
+        speed=speed,
+        chord=chord,
+        min_cycles=3.0,
+        min_no_shedding_observation_s=minimum,
+    )
+    assert not first_quality.ok
+    assert pipeline.URANS_APPARENT_FLAT_OBSERVATION_MARKER in first_quality.reason
+    first = TransientResult(
+        avg=SimpleNamespace(cl=0.893659, cd=0.156141, cm=-0.136212),
+        case_dir=tcase,
+        force_history=first_history,
+        quality=first_quality,
+        start_time=0.0,
+        end_time=force_end,
+        run_time=force_end,
+        wall_seconds=1.0,
+    )
+    calls: list[float] = []
+
+    def fake_attempt(case_dir, *_args, run_time=None, **_kwargs):
+        run_time = float(run_time)
+        calls.append(run_time)
+        # A sub-guess request reproduces the production no-progress boundary:
+        # OpenFOAM retains no newer restart field or force sample.
+        if run_time < guess_period:
+            return first
+        end = pipeline._latest_time(case_dir) + run_time
+        (case_dir / f"{end:.15g}").mkdir()
+        history = _flat_history(
+            cl_mean=0.893659,
+            cd_mean=0.156141,
+            t0=0.0,
+            t1=end,
+            n=1500,
+        )
+        quality = evaluate_urans_quality(
+            case_dir,
+            history,
+            speed=speed,
+            chord=chord,
+            min_cycles=3.0,
+            min_no_shedding_observation_s=minimum,
+        )
+        return TransientResult(
+            avg=SimpleNamespace(cl=0.893659, cd=0.156141, cm=-0.136212),
+            case_dir=case_dir,
+            force_history=history,
+            quality=quality,
+            start_time=field_end,
+            end_time=end,
+            run_time=run_time,
+            wall_seconds=1.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_cycles=10,
+        transient_discard_fraction=0.4,
+    )
+    result = pipeline._extend_transient_until_periods(
+        tcase,
+        first,
+        0.0,
+        None,
+        None,
+        {},
+        CaseSpec(chord=chord, speed=speed, aoa_deg=12.0),
+        None,
+        None,
+        solver,
+        None,
+        1,
+        4 * 3600,
+        guess_period / 5000.0,
+    )
+
+    slow_horizon = pipeline._period_acquisition_horizons(solver)[-1]
+    assert calls == pytest.approx([(slow_horizon - force_cycles) * guess_period])
+    assert result.quality.ok
+    assert result.quality.no_shedding
+
+
 def test_full_true_flat_signal_waits_for_same_physical_horizon(
     tmp_path, monkeypatch
 ):

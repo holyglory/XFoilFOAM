@@ -110,11 +110,17 @@ the actual maintenance window.
 The guarded volume-backed OpenCFD 2606 cutover is installed on `hz-solver2`.
 The production full-polar broker canary has accepted, delivered, and hub-bound
 25 of its 26 exact requested angles. Each accepted transfer has an immutable
-GCS generation and checksum; the only remaining angle is running its second
-targeted preliminary-URANS recovery. The correction that created this run also
-prevents a pending remote preliminary obligation from being downgraded into
-ordinary RANS work when the downstream local scheduler is intentionally
-disabled.
+GCS generation and checksum. The second targeted preliminary-URANS run for the
+remaining angle produced stable force coefficients and complete raw evidence,
+then exposed a continuation-controller boundary defect: sparse field writes
+lagged force sampling at the 20-guessed-period horizon, so the controller
+requested that already-observed horizon again and rejected the zero-progress
+chunk just short of the physical flat-wake observation floor. A
+production-shaped regression now requires horizon selection to use the
+strongest same-case physical progress token and skip directly to the next
+meaningful slow-edge horizon. The earlier scheduling correction also prevents
+a pending remote preliminary obligation from being downgraded into ordinary
+RANS work when the downstream local scheduler is intentionally disabled.
 
 The canary exposed a separate Celery observability resource leak: every live
 `inspect.conf()` queue poll created another worker eventpoll descriptor. The
@@ -123,5 +129,5 @@ to 65,536 while the active solve continued. The durable correction caches one
 validated runtime identity per exact worker/queue binding, single-flights a
 cold inspection, invalidates on a binding change, and declares the same nofile
 limit for both worker pools. It must be installed only through the guarded
-engine rebuild after the current OpenFOAM child is idle, then verified by
-repeated polling and descriptor-count stability before capacity is widened.
+engine rebuild while OpenFOAM is idle, then verified by repeated polling and
+descriptor-count stability before capacity is widened.

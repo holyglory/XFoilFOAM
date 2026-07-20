@@ -31,12 +31,16 @@
   node a Google credential. The volume-backed OpenCFD 2606 remote deployment,
   verified backup/rollback artifacts, and first exact brokered transfer are
   live. The current full-polar canary has 25 of 26 angles accepted, delivered,
-  generation-bound in GCS, and acknowledged by the hub; the last angle is in
-  its second preliminary-URANS recovery run. Finish that result, prove all 26
+  generation-bound in GCS, and acknowledged by the hub. The second run for the
+  last angle produced stable force/raw evidence but exposed a controller
+  boundary defect: sparse field writes lagged force progress, so the engine
+  retried an already-observed period horizon and rejected the zero-progress
+  chunk. Deploy the regression-backed physical-progress correction together
+  with the queue-inspection/nofile safeguard through the guarded idle engine
+  rebuild, reopen only that exact obligation, finish its result, prove all 26
   generation-pinned readbacks and acknowledgement-gated remote reclamation,
-  deploy the tested queue-inspection/nofile safeguard through the guarded idle
-  engine rebuild, prove descriptor stability after repeated queue polling, and
-  resume bounded capacity before removing this item.
+  prove descriptor stability after repeated queue polling, and resume bounded
+  capacity before removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation
