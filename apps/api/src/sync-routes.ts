@@ -2564,8 +2564,9 @@ async function equivalentStoredResultEvidence(
         !(
           incomingBrokeredZstandard &&
           artifact.kind === "openfoam_bundle" &&
+          artifact.mimeType === "application/gzip" &&
           artifact.storageKey.startsWith("sync-imports/") &&
-          artifact.storageKey.endsWith(".tar.gz")
+          artifact.storageKey.endsWith(".gz")
         ),
     ) as unknown as Array<Record<string, unknown>>,
   );
@@ -4511,8 +4512,9 @@ async function importPolarPush(
               eq(solverEvidenceArtifacts.resultId, existing.id),
               eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
               eq(solverEvidenceArtifacts.kind, "openfoam_bundle"),
+              eq(solverEvidenceArtifacts.mimeType, "application/gzip"),
               sql`${solverEvidenceArtifacts.storageKey} LIKE 'sync-imports/%'`,
-              sql`${solverEvidenceArtifacts.storageKey} ~ '\\.tar\\.gz$'`,
+              sql`${solverEvidenceArtifacts.storageKey} LIKE '%.gz'`,
               sql`NOT EXISTS (
                 SELECT 1
                 FROM ${solverEvidenceArchives} retained_archive

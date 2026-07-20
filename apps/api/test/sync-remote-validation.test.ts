@@ -3089,7 +3089,7 @@ describe("remote solver sync validation regressions", () => {
         .select()
         .from(resultAttempts)
         .where(eq(resultAttempts.id, attemptId));
-      const legacyStorageKey = `sync-imports/aa/${"a".repeat(64)}.tar.gz`;
+      const legacyStorageKey = `sync-imports/aa/${"a".repeat(64)}.gz`;
       const [legacyContainer] = await db
         .insert(solverEvidenceArtifacts)
         .values({
