@@ -636,6 +636,11 @@ function restartablePrecalcWarningSql(warnings: SQLWrapper) {
 
 const LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT =
   "period acquisition exhausted the physical slow-shedding horizon";
+const LEGACY_SAME_CASE_NO_PROGRESS_FRAGMENT =
+  "same-case chunk produced no measurable simulated-time or force-history advance";
+const LEGACY_FLAT_SIGNAL_FRAGMENT = "apparently flat signal spans";
+const LEGACY_SLOW_SHEDDING_OBSERVATION_FRAGMENT =
+  "below the physical slow-shedding observation horizon";
 
 /**
  * Before the engine emitted the typed continuation marker, OpenCFD 2606 r7
@@ -684,28 +689,59 @@ function legacyRestartablePrecalcCheckpointSql(input: {
     )) = 'transient'
     AND lower(COALESCE(${input.error}, '')) LIKE
       '%hardsolvererror: urans evidence rejected:%'
-    AND lower(COALESCE(${input.error}, '')) LIKE
-      ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
     AND ${positiveMeasuredProgress}
-    AND EXISTS (
-      SELECT 1
-      FROM result_classifications legacy_classification
-      WHERE legacy_classification.result_attempt_id = ${input.attemptId}
-        AND legacy_classification.state = 'rejected'
-        AND 'non-stationary' = ANY(
-          COALESCE(legacy_classification.reasons, ARRAY[]::text[])
+    AND (
+      (
+        lower(COALESCE(${input.error}, '')) LIKE
+          ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
+        AND EXISTS (
+          SELECT 1
+          FROM result_classifications legacy_classification
+          WHERE legacy_classification.result_attempt_id = ${input.attemptId}
+            AND legacy_classification.state = 'rejected'
+            AND 'non-stationary' = ANY(
+              COALESCE(legacy_classification.reasons, ARRAY[]::text[])
+            )
         )
-    )
-    AND EXISTS (
-      SELECT 1
-      FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
-      WHERE lower(warning) LIKE
-        ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
-    )
-    AND EXISTS (
-      SELECT 1
-      FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
-      WHERE lower(warning) LIKE '%not stationary%'
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
+          WHERE lower(warning) LIKE
+            ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
+          WHERE lower(warning) LIKE '%not stationary%'
+        )
+      )
+      OR (
+        lower(COALESCE(${input.error}, '')) LIKE
+          ${"%" + LEGACY_SAME_CASE_NO_PROGRESS_FRAGMENT + "%"}
+        AND lower(COALESCE(${input.error}, '')) LIKE
+          ${"%" + LEGACY_FLAT_SIGNAL_FRAGMENT + "%"}
+        AND lower(COALESCE(${input.error}, '')) LIKE
+          ${"%" + LEGACY_SLOW_SHEDDING_OBSERVATION_FRAGMENT + "%"}
+        AND EXISTS (
+          SELECT 1
+          FROM result_classifications legacy_classification
+          WHERE legacy_classification.result_attempt_id = ${input.attemptId}
+            AND legacy_classification.state = 'rejected'
+            AND 'incomplete-urans-integration' = ANY(
+              COALESCE(legacy_classification.reasons, ARRAY[]::text[])
+            )
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(${input.warnings}, ARRAY[]::text[])) warning
+          WHERE lower(warning) LIKE
+              ${"%" + LEGACY_SAME_CASE_NO_PROGRESS_FRAGMENT + "%"}
+            AND lower(warning) LIKE
+              ${"%" + LEGACY_FLAT_SIGNAL_FRAGMENT + "%"}
+            AND lower(warning) LIKE
+              ${"%" + LEGACY_SLOW_SHEDDING_OBSERVATION_FRAGMENT + "%"}
+        )
+      )
     )
   )`;
 }
@@ -741,9 +777,10 @@ function restartablePrecalcEvidenceSql(input: {
 
 /** Final exact-generation trust gate for PRECALC continuation consumers.
  * Typed engine evidence must be a solved rejected checkpoint; the only
- * compatibility exception is the fully evidenced OpenCFD 2606 r7
- * slow-shedding shape whose historical ingest source was `queued`. Both paths
- * require one unambiguous manifest and a verified complete GCS restart archive.
+ * compatibility exceptions are the fully evidenced OpenCFD 2606 r7
+ * non-stationary acquisition-horizon and flat-signal observation-horizon
+ * shapes whose historical ingest source was `queued`. Every path requires one
+ * unambiguous manifest and a verified complete GCS restart archive.
  * Target-cell and implementation compatibility remain caller-owned because
  * they depend on the obligation/request being composed. */
 export async function isExactRestartablePrecalcAttempt(

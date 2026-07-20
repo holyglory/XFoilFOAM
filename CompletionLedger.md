@@ -47,10 +47,12 @@
   Zstandard source. The regression-backed attempt/job ownership and exact-byte
   archive-binding corrections are deployed; registration is complete without
   rewriting either the canonical result or local bundle artifact. The first
-  admission correctly created no job because an adjacent selector still
-  treated the mutable stale result projection as invalid despite the exact
-  attempt and archive passing their independent gates. Its regression-backed
-  immutable-attempt selection correction is implemented but not yet deployed.
+  admission correctly created no job because adjacent selectors treated the
+  mutable stale result projection and the checkpoint's later flat-signal
+  incomplete-integration wording as invalid despite the exact attempt and
+  archive passing their independent gates. Their regression-backed,
+  false-positive-guarded immutable-attempt selection corrections are
+  implemented but not yet deployed.
   Preserve all three immutable attempts, deploy that control-plane correction,
   and resume the saved case as a non-consuming continuation rather than
   granting another fresh physical attempt. Then

@@ -185,7 +185,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   or reduce its corrective budget. Marking the mutable canonical result
   projection `stale` for future scheduling must not hide an otherwise exact,
   rejected, archived attempt; pending/running/failed projections still fail
-  closed. Archive registration binds execution
+  closed. Pre-marker OpenCFD 2606 evidence may resume only through one of two
+  exact archived compatibility shapes: the older non-stationary acquisition
+  horizon, or the measured-progress flat-signal observation horizon with an
+  explicit incomplete-integration classification. Archive registration binds execution
   provenance to that immutable attempt and its job; the canonical result must
   share the physical cell and revision but need not rewrite its older accepted
   RANS provenance when a later rejected URANS checkpoint is archived. A native
@@ -227,6 +230,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   becoming durably restartable. Requiring that mutable container to remain
   `done` also lets ordinary campaign rematerialization erase the scheduler's
   view of immutable attempt evidence without deleting the evidence itself.
+  Requiring the older non-stationary wording for a later flat-signal
+  observation-horizon stop likewise hides the exact retained state; accepting
+  generic hard-solver errors would instead turn arbitrary CFD failures into
+  continuation authority.
   Replaying identical native Zstandard bytes as
   if their local artifact metadata had always contained the later GCS pointer
   also violates immutable evidence identity. Trusting an earlier archive decision after storage loss, or

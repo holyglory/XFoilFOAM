@@ -205,7 +205,14 @@ though the attempt deliberately remains restartable. The selector now accepts
 only `done` or `stale` parent projections and continues to reject pending,
 running, or failed parents. A live-shaped regression stales the result after
 creating a complete rejected checkpoint and proves that exact-attempt
-selection remains available.
+selection remains available. The same readback exposed a second legacy
+representation: this engine generation truthfully classified the saved case as
+`incomplete-urans-integration` because an apparently flat signal had not yet
+spanned the required slow-shedding observation horizon; it did not call that
+unmeasured window non-stationary. Compatibility now accepts that exact
+hard-solver + retained-transient + measured-progress + flat-horizon warning and
+classification shape. It still rejects generic hard-solver, infrastructure,
+deterministic-mesh, missing-warning, and missing-classification variants.
 
 ## Durable priority and automatic NEW-admission fence
 

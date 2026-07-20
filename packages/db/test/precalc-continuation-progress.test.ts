@@ -461,6 +461,8 @@ const LEGACY_HORIZON_WARNING =
   "URANS period acquisition exhausted the physical slow-shedding horizon (39.6 initial guesses); URANS quality could not be measured";
 const LEGACY_NON_STATIONARY_WARNING =
   "URANS window not stationary (precalc established-oscillation test): cycle means trend downward monotonically";
+const LEGACY_FLAT_HORIZON_WARNING =
+  "URANS requires further same-case integration: the same-case chunk produced no measurable simulated-time or force-history advance (t=0.0665897969); URANS quality could not be measured: an apparently flat signal spans 0.00607703s, below the physical slow-shedding observation horizon 0.07s.";
 const LEGACY_RESTART_MEMBERS = [
   "openfoam/transient/transient_start.json",
   "openfoam/transient/system/controlDict",
@@ -491,6 +493,8 @@ type LegacyCheckpointVariant = {
   continuationSubdir?: string | null;
   error?: string;
   failureDisposition?: string;
+  qualityWarnings?: string[];
+  classificationReasons?: string[];
   manifest?: "valid" | "wrong-owner" | "missing";
   archive?: "valid" | "missing-member" | "missing";
 };
@@ -656,7 +660,10 @@ async function createLegacyCheckpointVariant(
       converged: false,
       unsteady: true,
       error,
-      qualityWarnings: [LEGACY_HORIZON_WARNING, LEGACY_NON_STATIONARY_WARNING],
+      qualityWarnings: input.qualityWarnings ?? [
+        LEGACY_HORIZON_WARNING,
+        LEGACY_NON_STATIONARY_WARNING,
+      ],
       evidencePayload: {
         fidelity: "urans_precalc",
         failure_disposition: input.failureDisposition ?? "hard_solver",
@@ -692,7 +699,11 @@ async function createLegacyCheckpointVariant(
     state: "rejected",
     region: "post_stall",
     confidence: 1,
-    reasons: ["not-solved", "solver-error", "non-stationary"],
+    reasons: input.classificationReasons ?? [
+      "not-solved",
+      "solver-error",
+      "non-stationary",
+    ],
   });
 
   let manifestId: string | null = null;
@@ -872,6 +883,37 @@ describe("cross-segment preliminary URANS progress", () => {
       }),
     ]);
 
+    const flatHorizon = await createLegacyCheckpointVariant(
+      {
+        suffix: "legacy-flat-horizon-production-shape",
+        manifest: "valid",
+        archive: "valid",
+        error: `HardSolverError: URANS evidence rejected: ${LEGACY_FLAT_HORIZON_WARNING}`,
+        qualityWarnings: [LEGACY_FLAT_HORIZON_WARNING],
+        classificationReasons: [
+          "not-solved",
+          "solver-error",
+          "not-converged",
+          "incomplete-urans-integration",
+          "missing-urans-video",
+        ],
+      },
+      20,
+    );
+    await db
+      .update(results)
+      .set({ status: "stale" })
+      .where(eq(results.id, flatHorizon.result.id));
+    expect(
+      await precalcContinuationsForObligations(db, [flatHorizon.obligation.id]),
+    ).toEqual([
+      expect.objectContaining({
+        obligationId: flatHorizon.obligation.id,
+        resultId: flatHorizon.result.id,
+        resultAttemptId: flatHorizon.precalcAttempt.id,
+      }),
+    ]);
+
     await db
       .update(simPrecalcObligations)
       .set({
@@ -906,6 +948,22 @@ describe("cross-segment preliminary URANS progress", () => {
         suffix: "legacy-generic-hard-solver",
         error:
           "HardSolverError: pimpleFoam diverged after a floating point exception",
+      },
+      {
+        suffix: "legacy-flat-horizon-missing-classification",
+        error: `HardSolverError: URANS evidence rejected: ${LEGACY_FLAT_HORIZON_WARNING}`,
+        qualityWarnings: [LEGACY_FLAT_HORIZON_WARNING],
+        classificationReasons: ["not-solved", "solver-error"],
+      },
+      {
+        suffix: "legacy-flat-horizon-missing-warning",
+        error: `HardSolverError: URANS evidence rejected: ${LEGACY_FLAT_HORIZON_WARNING}`,
+        qualityWarnings: [],
+        classificationReasons: [
+          "not-solved",
+          "solver-error",
+          "incomplete-urans-integration",
+        ],
       },
       {
         suffix: "legacy-deterministic-mesh",
