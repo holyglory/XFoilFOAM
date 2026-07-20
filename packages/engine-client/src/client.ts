@@ -13,6 +13,8 @@ import type {
   EngineDeleteJobResponse,
   FinalizeRemoteEvidenceRequest,
   FinalizeRemoteEvidenceResponse,
+  PrepareBrokeredLegacyEvidenceRequest,
+  PrepareBrokeredLegacyEvidenceResponse,
   VerifyRemoteEvidenceManifestRequest,
   VerifyRemoteEvidenceManifestResponse,
   JobResult,
@@ -608,6 +610,29 @@ export class EngineClient {
       }
       return response as unknown as VerifyRemoteEvidenceManifestResponse;
     });
+  }
+
+  prepareBrokeredLegacyEvidence(
+    jobId: string,
+    request: PrepareBrokeredLegacyEvidenceRequest,
+    opts?: EngineCallOptions,
+  ): Promise<PrepareBrokeredLegacyEvidenceResponse> {
+    if (!this.controlPlaneToken) {
+      throw new EngineError(
+        "ENGINE_CONTROL_PLANE_TOKEN is required for legacy evidence preparation",
+        undefined,
+        "evidence_preparation_auth_missing",
+      );
+    }
+    return this.json<PrepareBrokeredLegacyEvidenceResponse>(
+      `/jobs/${encodeURIComponent(jobId)}/evidence/prepare-brokered-legacy`,
+      opts?.timeoutMs ?? ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.controlPlaneToken}` },
+        body: JSON.stringify(request),
+      },
+    );
   }
 
   maintenanceJobs(

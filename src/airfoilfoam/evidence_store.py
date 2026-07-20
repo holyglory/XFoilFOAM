@@ -62,6 +62,7 @@ __all__ = [
     "manifest_bundle_member_set_sha256",
     "read_remote_pointer",
     "transcode_gzip_tar_to_zst",
+    "verify_local_archive_manifest_members",
 ]
 
 
@@ -440,6 +441,42 @@ def inspect_tar_zst(path: Path, *, level: int = 10) -> ArchiveRecord:
         raise
     except Exception as exc:  # noqa: BLE001
         raise EvidenceArchiveError(f"cannot inspect {path}: {exc}") from exc
+
+
+def verify_local_archive_manifest_members(
+    path: Path,
+    *,
+    expected_manifest: bytes,
+    level: int = 10,
+) -> tuple[ArchiveRecord, int]:
+    """Authenticate a local tar.zst and every manifest-owned member.
+
+    Remote verification already performs this closed-world check through an
+    immutable GCS pointer.  A credentialless remote solver needs the same
+    proof before it may offer a legacy gzip transcode to the hub broker.  The
+    synthetic pointer below is used only to reuse the archive reader's exact
+    tar identity and safety bounds; no remote-storage claim is created.
+    """
+
+    record = inspect_tar_zst(path, level=level)
+    pointer = RemoteEvidencePointer(
+        bucket="local-evidence-verification",
+        object_key=Path(path).name,
+        generation=1,
+        stored_sha256=record.stored_sha256,
+        stored_size=record.stored_size,
+        tar_sha256=record.tar_sha256,
+        tar_size=record.tar_size,
+        crc32c="AAAAAA==",
+        zstd_level=level,
+        created_at="1970-01-01T00:00:00+00:00",
+    )
+    member_count = _verify_archive_manifest_members(
+        Path(path),
+        pointer,
+        expected_manifest=expected_manifest,
+    )
+    return record, member_count
 
 
 def read_remote_pointer(path: Path) -> RemoteEvidencePointer:

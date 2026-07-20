@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -40,6 +41,8 @@ from .evidence_store import (
     inspect_tar_zst,
     manifest_bundle_member_set_sha256,
     read_remote_pointer,
+    transcode_gzip_tar_to_zst,
+    verify_local_archive_manifest_members,
 )
 
 
@@ -67,6 +70,56 @@ CONTINUATION_EVIDENCE_PREFIXES = (
 
 class EvidenceCleanupError(RuntimeError):
     """Authenticated database-backed local evidence cleanup was refused."""
+
+
+@dataclass(frozen=True)
+class BrokeredLegacyEvidenceArchive:
+    """One verified local Zstandard transcode ready for hub brokering."""
+
+    archive: ArchiveRecord
+    evidence_base: str
+    manifest_sha256: str
+    manifest_byte_size: int
+    bundled_file_count: int
+    legacy_archive_name: str
+    legacy_archive_sha256: str
+    legacy_archive_byte_size: int
+
+    def artifact(self, job_id: str, case_slug: str) -> dict[str, Any]:
+        relative = (
+            Path("cases")
+            / case_slug
+            / self.evidence_base
+            / EVIDENCE_ARCHIVE_NAME
+        ).as_posix()
+        url = f"/jobs/{job_id}/files/{relative}"
+        return {
+            "kind": "engine_bundle",
+            "path": url,
+            "url": url,
+            "mime_type": ARCHIVE_MIME_TYPE,
+            "sha256": self.archive.stored_sha256,
+            "byte_size": self.archive.stored_size,
+            "metadata": {
+                "storageBackend": "volume",
+                "archiveFormat": "tar+zstd",
+                "compression": "zstd",
+                "zstdLevel": self.archive.zstd_level,
+                "uncompressedTarSha256": self.archive.tar_sha256,
+                "uncompressedTarByteSize": self.archive.tar_size,
+                "manifestSha256": self.manifest_sha256,
+                "manifestByteSize": self.manifest_byte_size,
+                "bundledFileCount": self.bundled_file_count,
+                "evidenceBase": self.evidence_base,
+                "localEvidenceDisposition": "brokered-upload-pending-hub-binding",
+                "legacySource": {
+                    "path": self.legacy_archive_name,
+                    "sha256": self.legacy_archive_sha256,
+                    "byteSize": self.legacy_archive_byte_size,
+                    "compression": "gzip",
+                },
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -772,6 +825,153 @@ def finalize_remote_evidence_cleanup(
         )
 
 
+def prepare_brokered_legacy_evidence_archive(
+    job_root: Path,
+    evidence_dir: Path,
+    *,
+    evidence_base: str,
+    legacy_archive_name: str,
+    expected_legacy_sha256: str,
+    expected_legacy_byte_size: int,
+    expected_manifest_sha256: str,
+    expected_manifest_byte_size: int,
+    zstd_level: int,
+) -> BrokeredLegacyEvidenceArchive:
+    """Transcode one exact legacy gzip for the credentialless hub broker.
+
+    This operation is additive. The gzip, raw evidence, and resulting local
+    tar.zst remain until a later signed hub binding authorizes brokered reclaim.
+    """
+
+    job_root = Path(job_root)
+    evidence_dir = Path(evidence_dir)
+    if legacy_archive_name not in LEGACY_EVIDENCE_ARCHIVE_NAMES:
+        raise EvidenceCleanupError("unsupported legacy evidence archive name")
+    if not 1 <= zstd_level <= 22:
+        raise EvidenceCleanupError("Zstandard level must be between 1 and 22")
+    if (
+        len(expected_legacy_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_legacy_sha256)
+        or expected_legacy_byte_size <= 0
+        or len(expected_manifest_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_manifest_sha256)
+        or expected_manifest_byte_size <= 0
+    ):
+        raise EvidenceCleanupError("legacy evidence identity is malformed")
+    try:
+        resolved_job = job_root.resolve(strict=True)
+        resolved_evidence = evidence_dir.resolve(strict=True)
+        relative = evidence_dir.relative_to(job_root)
+        resolved_evidence.relative_to(resolved_job)
+    except (OSError, ValueError) as exc:
+        raise EvidenceCleanupError(
+            "legacy evidence path must stay inside its exact job"
+        ) from exc
+    if job_root.is_symlink() or evidence_dir.is_symlink():
+        raise EvidenceCleanupError("legacy evidence path must not be a symlink")
+    expected_suffix = Path(evidence_base)
+    if expected_suffix.is_absolute() or any(
+        part in {"", ".", ".."} for part in expected_suffix.parts
+    ):
+        raise EvidenceCleanupError("legacy evidence base must be relative")
+    if tuple(relative.parts[-len(expected_suffix.parts) :]) != expected_suffix.parts:
+        raise EvidenceCleanupError("legacy evidence base does not match its path")
+
+    def size_and_sha256(path: Path) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        return size, digest.hexdigest()
+
+    def gzip_tar_identity(path: Path) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        with gzip.open(path, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        return size, digest.hexdigest()
+
+    with _cleanup_job_guard(job_root):
+        source = evidence_dir / legacy_archive_name
+        manifest_path = evidence_dir / "evidence_manifest.json"
+        for path, label in ((source, "legacy archive"), (manifest_path, "manifest")):
+            if not path.is_file() or path.is_symlink():
+                raise EvidenceCleanupError(f"{label} is not a regular file")
+        source_size, source_sha256 = size_and_sha256(source)
+        if (
+            source_size != expected_legacy_byte_size
+            or source_sha256 != expected_legacy_sha256
+        ):
+            raise EvidenceCleanupError("legacy archive changed from its database identity")
+        manifest_bytes = manifest_path.read_bytes()
+        if (
+            len(manifest_bytes) != expected_manifest_byte_size
+            or hashlib.sha256(manifest_bytes).hexdigest()
+            != expected_manifest_sha256
+        ):
+            raise EvidenceCleanupError("legacy manifest changed from its database identity")
+        try:
+            declared_member_count, _ = manifest_bundle_member_set_sha256(
+                manifest_bytes
+            )
+        except (ValueError, EvidenceStoreError) as exc:
+            raise EvidenceCleanupError(
+                f"legacy evidence manifest is invalid: {exc}"
+            ) from exc
+
+        destination = evidence_dir / EVIDENCE_ARCHIVE_NAME
+        try:
+            if destination.exists() or destination.is_symlink():
+                if not destination.is_file() or destination.is_symlink():
+                    raise EvidenceCleanupError(
+                        "existing Zstandard evidence archive is not a regular file"
+                    )
+                record = inspect_tar_zst(destination, level=zstd_level)
+                legacy_tar_size, legacy_tar_sha256 = gzip_tar_identity(source)
+                if (
+                    record.tar_size != legacy_tar_size
+                    or record.tar_sha256 != legacy_tar_sha256
+                ):
+                    raise EvidenceCleanupError(
+                        "existing Zstandard archive is not the exact legacy tar stream"
+                    )
+            else:
+                record = transcode_gzip_tar_to_zst(
+                    source,
+                    destination,
+                    level=zstd_level,
+                )
+            record, bundled_file_count = verify_local_archive_manifest_members(
+                destination,
+                expected_manifest=manifest_bytes,
+                level=zstd_level,
+            )
+        except EvidenceCleanupError:
+            raise
+        except (OSError, ValueError, EvidenceStoreError) as exc:
+            raise EvidenceCleanupError(
+                f"legacy evidence transcode could not be verified: {exc}"
+            ) from exc
+        if declared_member_count != bundled_file_count + 1:
+            raise EvidenceCleanupError(
+                "legacy manifest member count does not match the verified archive"
+            )
+        return BrokeredLegacyEvidenceArchive(
+            archive=record,
+            evidence_base=evidence_base,
+            manifest_sha256=expected_manifest_sha256,
+            manifest_byte_size=expected_manifest_byte_size,
+            bundled_file_count=bundled_file_count,
+            legacy_archive_name=legacy_archive_name,
+            legacy_archive_sha256=expected_legacy_sha256,
+            legacy_archive_byte_size=expected_legacy_byte_size,
+        )
+
+
 def reclaim_brokered_remote_evidence(
     job_root: Path,
     evidence_dir: Path,
@@ -902,7 +1102,11 @@ def reclaim_brokered_remote_evidence(
                 },
             )
 
-        allowed_names = (*PACKAGED_RAW_DIRS, EVIDENCE_ARCHIVE_NAME)
+        allowed_names = (
+            *PACKAGED_RAW_DIRS,
+            EVIDENCE_ARCHIVE_NAME,
+            *LEGACY_EVIDENCE_ARCHIVE_NAMES,
+        )
         if existing_intent is None:
             inventories = [
                 _broker_reclaim_path_inventory(evidence_dir / name, name)
@@ -1396,6 +1600,8 @@ __all__ = [
     "EVIDENCE_FINALIZATION_RECEIPT_NAME",
     "EVIDENCE_POINTER_NAME",
     "PACKAGED_RAW_DIRS",
+    "LEGACY_EVIDENCE_ARCHIVE_NAMES",
+    "BrokeredLegacyEvidenceArchive",
     "EvidencePublication",
     "EvidenceCleanupAuthorization",
     "EvidenceCleanupError",
@@ -1412,6 +1618,7 @@ __all__ = [
     "hydrated_volume_render_source",
     "publish_evidence_directory",
     "publish_evidence_archive",
+    "prepare_brokered_legacy_evidence_archive",
     "reclaim_brokered_remote_evidence",
     "remove_verified_local_raw_evidence",
     "remove_verified_local_packaged_evidence",

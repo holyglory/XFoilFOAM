@@ -32,6 +32,7 @@ import {
   simulationPresets,
   solverProfiles,
   solverImplementations,
+  solverEvidenceArchives,
   solverEvidenceArtifacts,
   simCampaignPoints,
   simCampaigns,
@@ -2546,9 +2547,26 @@ async function equivalentStoredResultEvidence(
     true,
   );
   const incomingMediaManifest = manifest(point.media, true);
+  const incomingBrokeredZstandard = point.evidenceArtifacts.some(
+    (artifact) =>
+      nullableText(artifact.kind) === "engine_bundle" &&
+      nullableText(artifact.remoteEvidenceUploadId) != null,
+  );
   const storedArtifactManifest = manifest(
     storedArtifacts.filter(
-      (artifact) => !nullableText(artifact.metadata?.archiveMemberPath),
+      (artifact) =>
+        !nullableText(artifact.metadata?.archiveMemberPath) &&
+        // A legacy remote result may be replayed specifically to replace its
+        // imported gzip container with a broker-verified Zstandard archive.
+        // Ignore only that obsolete container in replay equivalence; every
+        // logical member, manifest, and all presentation evidence must still
+        // match exactly before the transaction can bind and retire it.
+        !(
+          incomingBrokeredZstandard &&
+          artifact.kind === "openfoam_bundle" &&
+          artifact.storageKey.startsWith("sync-imports/") &&
+          artifact.storageKey.endsWith(".tar.gz")
+        ),
     ) as unknown as Array<Record<string, unknown>>,
   );
   const incomingArtifactManifest = manifest(point.evidenceArtifacts);
@@ -4480,6 +4498,28 @@ async function importPolarPush(
           memberSet: preparedBrokeredArchive.memberSet,
         });
         brokeredArchiveMemberCount = registration.memberCount;
+
+        // A successful exact broker replay supersedes only the old imported
+        // gzip *container* association. Logical member rows remain mapped to
+        // the authenticated current archive, while dropping this obsolete
+        // source association lets sync-import GC remove the duplicate gzip
+        // bytes. Never retire an archive that owns any canonical generation.
+        await tx
+          .delete(solverEvidenceArtifacts)
+          .where(
+            and(
+              eq(solverEvidenceArtifacts.resultId, existing.id),
+              eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+              eq(solverEvidenceArtifacts.kind, "openfoam_bundle"),
+              sql`${solverEvidenceArtifacts.storageKey} LIKE 'sync-imports/%'`,
+              sql`${solverEvidenceArtifacts.storageKey} ~ '\\.tar\\.gz$'`,
+              sql`NOT EXISTS (
+                SELECT 1
+                FROM ${solverEvidenceArchives} retained_archive
+                WHERE retained_archive.source_artifact_id = ${solverEvidenceArtifacts.id}
+              )`,
+            ),
+          );
       }
       for (const { item, stored } of preparedMedia) {
         const association = {

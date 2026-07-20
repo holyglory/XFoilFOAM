@@ -42,6 +42,7 @@ from ..evidence_runtime import (
     hydrated_render_source,
     reclaim_brokered_remote_evidence,
     hydrated_volume_render_source,
+    prepare_brokered_legacy_evidence_archive,
 )
 from ..evidence_store import (
     MAX_EVIDENCE_MANIFEST_BYTES,
@@ -264,6 +265,22 @@ class BrokeredEvidenceReclaimRequest(BaseModel):
     receipt_hmac: str = Field(
         alias="receiptHmac", pattern=r"^[0-9a-f]{64}$"
     )
+
+
+class PrepareBrokeredLegacyEvidenceRequest(BaseModel):
+    case_slug: str = Field(alias="caseSlug", min_length=1, max_length=240)
+    evidence_base: str = Field(alias="evidenceBase", min_length=1, max_length=800)
+    legacy_archive_name: Literal[
+        "openfoam_evidence.tar.gz", "engine_evidence.tar.gz"
+    ] = Field(alias="legacyArchiveName")
+    legacy_archive_sha256: str = Field(
+        alias="legacyArchiveSha256", pattern=r"^[0-9a-f]{64}$"
+    )
+    legacy_archive_byte_size: int = Field(alias="legacyArchiveByteSize", gt=0)
+    manifest_sha256: str = Field(
+        alias="manifestSha256", pattern=r"^[0-9a-f]{64}$"
+    )
+    manifest_byte_size: int = Field(alias="manifestByteSize", gt=0)
 
 
 _MAX_EVIDENCE_MANIFEST_BASE64_BYTES = (
@@ -1691,6 +1708,61 @@ def create_app() -> FastAPI:
                 authorization_record,
             ).to_dict()
         except EvidenceCleanupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/jobs/{job_id}/evidence/prepare-brokered-legacy")
+    def prepare_brokered_legacy_evidence(
+        job_id: str,
+        request: PrepareBrokeredLegacyEvidenceRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        """Verify and transcode one retained legacy gzip for hub brokering.
+
+        The operation is deliberately additive: neither the gzip nor unpacked
+        evidence is removed until the hub later returns its signed exact-owner
+        binding receipt through the normal brokered reclaim endpoint.
+        """
+
+        _require_control_plane_bearer(settings.control_plane_token, authorization)
+        job_root = safe_job_root(job_id)
+        if not job_root.is_dir() or job_root.is_symlink():
+            raise HTTPException(status_code=404, detail="Job not found")
+        status = store.read_status(job_id)
+        result = store.read_result(job_id)
+        terminal = {JobState.completed, JobState.failed, JobState.cancelled}
+        if status is None or status.state not in terminal:
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy evidence preparation requires a terminal engine job",
+            )
+        if result is None or result.state not in terminal:
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy evidence preparation requires a terminal result payload",
+            )
+        try:
+            evidence_dir = store.file_path(
+                job_id,
+                f"cases/{request.case_slug}/{request.evidence_base}",
+            )
+            prepared = prepare_brokered_legacy_evidence_archive(
+                job_root,
+                evidence_dir,
+                evidence_base=request.evidence_base,
+                legacy_archive_name=request.legacy_archive_name,
+                expected_legacy_sha256=request.legacy_archive_sha256,
+                expected_legacy_byte_size=request.legacy_archive_byte_size,
+                expected_manifest_sha256=request.manifest_sha256,
+                expected_manifest_byte_size=request.manifest_byte_size,
+                zstd_level=settings.evidence_zstd_level,
+            )
+            return {
+                "state": "prepared",
+                "artifact": prepared.artifact(job_id, request.case_slug),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (EvidenceCleanupError, EvidenceStoreError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.delete("/jobs/{job_id}")

@@ -3081,6 +3081,38 @@ describe("remote solver sync validation regressions", () => {
         },
       ]);
 
+      // Legacy hubs retained the uploaded gzip container as a second source
+      // association. Once the exact brokered Zstandard generation is current,
+      // an exact replay must retire only that obsolete container so sync-import
+      // GC can remove its duplicate bytes; member evidence stays registered.
+      const [attemptRow] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, attemptId));
+      const legacyStorageKey = `sync-imports/aa/${"a".repeat(64)}.tar.gz`;
+      const [legacyContainer] = await db
+        .insert(solverEvidenceArtifacts)
+        .values({
+          resultId: canonicalResultId,
+          resultAttemptId: attemptId,
+          airfoilId: canonical!.airfoilId,
+          simJobId: null,
+          engineJobId: attemptRow!.engineJobId,
+          engineCaseSlug: attemptRow!.engineCaseSlug,
+          methodKey: attemptRow!.methodKey,
+          solverImplementationId: attemptRow!.solverImplementationId,
+          solverRuntimeBuildId: attemptRow!.solverRuntimeBuildId,
+          aoaDeg,
+          kind: "openfoam_bundle",
+          role: "evidence",
+          storageKey: legacyStorageKey,
+          mimeType: "application/gzip",
+          sha256: "a".repeat(64),
+          byteSize: 12_345,
+          metadata: { evidenceBase, compression: "gzip" },
+        })
+        .returning({ id: solverEvidenceArtifacts.id });
+
       const replay = await postRemote();
       expect(replay.statusCode, replay.body).toBe(200);
       expect(replay.json()).toMatchObject({
@@ -3089,6 +3121,12 @@ describe("remote solver sync validation regressions", () => {
         fulfilledAoas: [aoaDeg],
       });
       expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(
+        await db
+          .select({ id: solverEvidenceArtifacts.id })
+          .from(solverEvidenceArtifacts)
+          .where(eq(solverEvidenceArtifacts.id, legacyContainer!.id)),
+      ).toHaveLength(0);
       expect(
         await db
           .select()

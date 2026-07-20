@@ -424,6 +424,23 @@ export interface VerifyRemoteEvidenceManifestResponse {
   manifestMemberCount: number;
 }
 
+export interface PrepareBrokeredLegacyEvidenceRequest {
+  caseSlug: string;
+  evidenceBase: string;
+  legacyArchiveName:
+    | "openfoam_evidence.tar.gz"
+    | "engine_evidence.tar.gz";
+  legacyArchiveSha256: string;
+  legacyArchiveByteSize: number;
+  manifestSha256: string;
+  manifestByteSize: number;
+}
+
+export interface PrepareBrokeredLegacyEvidenceResponse {
+  state: "prepared";
+  artifact: EngineEvidenceArtifact;
+}
+
 export interface FinalizeRemoteEvidenceRequest {
   case_slug: string;
   evidence_base: string;

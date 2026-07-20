@@ -46,6 +46,7 @@ from airfoilfoam.evidence_runtime import (
     EvidencePublication,
     BrokeredRemoteEvidenceReclaim,
     finalize_remote_evidence_cleanup,
+    prepare_brokered_legacy_evidence_archive,
     reclaim_brokered_remote_evidence,
     hydrated_volume_render_source,
     verify_remote_evidence_restore,
@@ -483,6 +484,8 @@ def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
     tmp_path: Path,
 ) -> None:
     job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    legacy_archive = evidence / "openfoam_evidence.tar.gz"
+    legacy_archive.write_bytes(b"retained legacy archive")
     authorization = _brokered_reclaim_authorization(
         job_root, evidence, publication
     )
@@ -511,6 +514,7 @@ def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
     assert completed.state == "complete"
     assert completed.bytes_freed > 0
     assert not (evidence / "engine_evidence.tar.zst").exists()
+    assert not legacy_archive.exists()
     assert not (evidence / "openfoam").exists()
     assert not (evidence / "VTK").exists()
     immutable_receipt = (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).read_bytes()
@@ -727,6 +731,86 @@ def test_gzip_transcode_preserves_exact_uncompressed_tar_bytes(tmp_path: Path) -
     assert record.stored_sha256 == _sha(destination.read_bytes())
     assert record.stored_size == destination.stat().st_size
     assert inspect_tar_zst(destination, level=10) == record
+
+
+def test_brokered_legacy_preparation_authenticates_every_member_and_retains_sources(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "jobs" / "job-legacy"
+    evidence = job_root / "cases" / "case-1" / "a1" / "evidence"
+    evidence.mkdir(parents=True)
+    vtk = {"VTK/value.vtu": b"real field bytes\n"}
+    manifest = _valid_manifest(vtk)
+    (evidence / "evidence_manifest.json").write_bytes(manifest)
+    tar_bytes = _tar_with_members(
+        [
+            (tarfile.TarInfo("VTK/value.vtu"), vtk["VTK/value.vtu"]),
+            (tarfile.TarInfo("evidence_manifest.json"), manifest),
+        ]
+    )
+    legacy = evidence / "openfoam_evidence.tar.gz"
+    with gzip.GzipFile(
+        filename=str(legacy), mode="wb", compresslevel=6, mtime=0
+    ) as output:
+        output.write(tar_bytes)
+
+    prepared = prepare_brokered_legacy_evidence_archive(
+        job_root,
+        evidence,
+        evidence_base="a1/evidence",
+        legacy_archive_name=legacy.name,
+        expected_legacy_sha256=_sha(legacy.read_bytes()),
+        expected_legacy_byte_size=legacy.stat().st_size,
+        expected_manifest_sha256=_sha(manifest),
+        expected_manifest_byte_size=len(manifest),
+        zstd_level=10,
+    )
+
+    assert legacy.is_file()
+    assert prepared.archive.path == evidence / EVIDENCE_ARCHIVE_NAME
+    assert _decompress_zstd(prepared.archive.path) == tar_bytes
+    assert prepared.bundled_file_count == 1
+    artifact = prepared.artifact(job_root.name, "case-1")
+    assert artifact["kind"] == "engine_bundle"
+    assert artifact["sha256"] == prepared.archive.stored_sha256
+    assert artifact["metadata"]["legacySource"]["sha256"] == _sha(
+        legacy.read_bytes()
+    )
+
+
+def test_brokered_legacy_preparation_refuses_manifest_member_mismatch(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "jobs" / "job-legacy"
+    evidence = job_root / "cases" / "case-1" / "evidence"
+    evidence.mkdir(parents=True)
+    manifest = _valid_manifest({"VTK/value.vtu": b"declared"})
+    (evidence / "evidence_manifest.json").write_bytes(manifest)
+    tar_bytes = _tar_with_members(
+        [
+            (tarfile.TarInfo("VTK/value.vtu"), b"changed"),
+            (tarfile.TarInfo("evidence_manifest.json"), manifest),
+        ]
+    )
+    legacy = evidence / "openfoam_evidence.tar.gz"
+    with gzip.GzipFile(
+        filename=str(legacy), mode="wb", compresslevel=6, mtime=0
+    ) as output:
+        output.write(tar_bytes)
+
+    with pytest.raises(EvidenceCleanupError, match="could not be verified"):
+        prepare_brokered_legacy_evidence_archive(
+            job_root,
+            evidence,
+            evidence_base="evidence",
+            legacy_archive_name=legacy.name,
+            expected_legacy_sha256=_sha(legacy.read_bytes()),
+            expected_legacy_byte_size=legacy.stat().st_size,
+            expected_manifest_sha256=_sha(manifest),
+            expected_manifest_byte_size=len(manifest),
+            zstd_level=10,
+        )
+    assert legacy.is_file()
 
 
 @pytest.mark.parametrize("unsafe_name", ["../escaped", "/absolute"])
