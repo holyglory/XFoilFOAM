@@ -22,6 +22,7 @@ import {
   createClient,
   createUransRequest,
   discoverMissingResultMediaRepairs,
+  enqueuePrecalcVerifications,
   ensurePrecalcObligations,
   findCampaignGapBatch,
   forceHistory,
@@ -89,7 +90,7 @@ import {
   type PolarRequest,
   URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql as sqlFragment } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -98,6 +99,7 @@ import {
   resetEngineBackoffForTests,
 } from "../src/engine-backoff";
 import { submitCampaignBatch } from "../src/loop";
+import { reconcileLegacyPrecalcFinalOwners } from "../src/precalc-final-owner-backfill";
 import {
   enqueueVerificationsForJob,
   reconcile,
@@ -1930,6 +1932,217 @@ describe("campaign compose→submit lifecycle boundary", () => {
     // The v2 terminal incident is the final assertion of this scenario. Its
     // campaign must not remain a current owner while later tests exercise new
     // engine admission; file-level cleanup happens only after all 40 cases.
+    await cancelCampaign(db, campaignId);
+  }, 120000);
+
+  it("repairs a legacy accepted PRECALC point and attaches its existing FINAL queue to the campaign", async () => {
+    const campaignId = await launch("legacy-precalc-final-owner", 35.172);
+    const setup = await setupFor(campaignId);
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: setup.bcId,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg: ANGLES[0],
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        cl: 0.12,
+        cd: 0.014,
+        cm: -0.01,
+        converged: true,
+        unsteady: true,
+        solvedAt: new Date(),
+      })
+      .returning();
+    const attemptId = await createAcceptedPrecalcAttemptWithRestartArchive(
+      result.id,
+    );
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attemptId })
+      .where(eq(results.id, result.id));
+    // Remote import classifies both the immutable attempt and the mutable
+    // canonical projection before campaign ownership is repaired. Reproduce
+    // that boundary explicitly: the shared attempt fixture is intentionally
+    // too small to run through the physical classifier.
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: null,
+      airfoilId,
+      simulationPresetRevisionId: setup.revisionId,
+      aoaDeg: ANGLES[0],
+      regime: "urans",
+      classifierVersion: "legacy-precalc-final-owner-projection-v1",
+      state: "accepted",
+      region: "unknown",
+      confidence: 1,
+      reasons: [],
+    });
+
+    // Reproduce the legacy import boundary: the campaign knew the mutable
+    // result but had no exact attempt pin when background FINAL was created.
+    await onResultIngested(db, {
+      airfoilId,
+      revisionId: setup.revisionId,
+      aoaDeg: ANGLES[0],
+      resultId: result.id,
+      status: "done",
+      regime: "urans",
+    });
+    await enqueuePrecalcVerifications(db, {
+      airfoilId,
+      revisionId: setup.revisionId,
+      aoaDeg: ANGLES[0],
+    });
+    const [legacyQueue] = await db
+      .select({ id: simUransVerifyQueue.id })
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.precalcResultAttemptId, attemptId));
+    expect(legacyQueue).toBeTruthy();
+    expect(
+      await db
+        .select()
+        .from(simUransVerifyQueueCampaigns)
+        .where(eq(simUransVerifyQueueCampaigns.queueId, legacyQueue.id)),
+    ).toHaveLength(0);
+    const [legacyPoint] = await db
+      .select({
+        state: simCampaignPoints.state,
+        resultId: simCampaignPoints.resultId,
+        resultAttemptId: simCampaignPoints.resultAttemptId,
+      })
+      .from(simCampaignPoints)
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, ANGLES[0]),
+        ),
+      );
+    expect(legacyPoint).toEqual({
+      state: "terminal",
+      resultId: result.id,
+      resultAttemptId: null,
+    });
+    const [legacyCandidateState] = await db
+      .select({
+        resultStatus: results.status,
+        resultSource: results.source,
+        revisionId: results.simulationPresetRevisionId,
+        currentAttemptId: results.currentResultAttemptId,
+        attemptStatus: resultAttempts.status,
+        attemptSource: resultAttempts.source,
+        attemptValid: resultAttempts.validForPolar,
+        attemptFidelity: sqlFragment<
+          string | null
+        >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
+        classificationState: resultClassifications.state,
+        campaignStatus: simCampaigns.status,
+      })
+      .from(results)
+      .innerJoin(
+        resultAttempts,
+        eq(resultAttempts.id, results.currentResultAttemptId),
+      )
+      .innerJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .innerJoin(simCampaignPoints, eq(simCampaignPoints.resultId, results.id))
+      .innerJoin(
+        simCampaigns,
+        eq(simCampaigns.id, simCampaignPoints.campaignId),
+      )
+      .where(eq(results.id, result.id));
+    expect(legacyCandidateState).toMatchObject({
+      resultStatus: "done",
+      resultSource: "solved",
+      revisionId: setup.revisionId,
+      currentAttemptId: attemptId,
+      attemptStatus: "done",
+      attemptSource: "solved",
+      attemptValid: true,
+      attemptFidelity: "urans_precalc",
+      classificationState: "accepted",
+    });
+    expect(["active", "attention", "paused"]).toContain(
+      legacyCandidateState.campaignStatus,
+    );
+
+    const dryRun = await reconcileLegacyPrecalcFinalOwners({
+      db,
+      execute: false,
+    });
+    expect(dryRun).toEqual([
+      expect.objectContaining({
+        resultId: result.id,
+        resultAttemptId: attemptId,
+        campaignIds: [campaignId],
+        finalQueueId: null,
+        state: "verified",
+      }),
+    ]);
+    const reconciled = await reconcileLegacyPrecalcFinalOwners({
+      db,
+      execute: true,
+    });
+    expect(reconciled).toEqual([
+      expect.objectContaining({
+        resultId: result.id,
+        resultAttemptId: attemptId,
+        campaignIds: [campaignId],
+        finalQueueId: legacyQueue.id,
+        state: "reconciled",
+      }),
+    ]);
+    const [point] = await db
+      .select({ resultAttemptId: simCampaignPoints.resultAttemptId })
+      .from(simCampaignPoints)
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, ANGLES[0]),
+        ),
+      );
+    expect(point.resultAttemptId).toBe(attemptId);
+    const [association] = await db
+      .select()
+      .from(simUransVerifyQueueCampaigns)
+      .where(
+        and(
+          eq(simUransVerifyQueueCampaigns.queueId, legacyQueue.id),
+          eq(simUransVerifyQueueCampaigns.campaignId, campaignId),
+          eq(simUransVerifyQueueCampaigns.state, "active"),
+        ),
+      );
+    expect(association).toBeTruthy();
+    const [progress] = await db
+      .select({
+        solved: simCampaignProgress.solved,
+        blocked: simCampaignProgress.blocked,
+        blockedOther: simCampaignProgress.blockedOther,
+      })
+      .from(simCampaignProgress)
+      .where(
+        and(
+          eq(simCampaignProgress.campaignId, campaignId),
+          eq(simCampaignProgress.conditionId, setup.conditionId),
+          eq(simCampaignProgress.airfoilId, airfoilId),
+        ),
+      );
+    expect(progress).toMatchObject({
+      solved: 1,
+      blocked: 0,
+      blockedOther: 0,
+    });
+    expect(
+      await reconcileLegacyPrecalcFinalOwners({
+        db,
+        execute: true,
+      }),
+    ).toEqual([]);
     await cancelCampaign(db, campaignId);
   }, 120000);
 

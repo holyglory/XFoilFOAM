@@ -6,14 +6,17 @@
   incident model, and compact per-point rail are deployed with the guarded
   OpenCFD 2606 engine. The exact remote canary now has an accepted fast result,
   immutable generation-pinned GCS evidence, hub acknowledgement, and remote
-  reclamation proof. General campaign expansion remains held only until the
-  hub registers that already-verified broker archive, durably creates its
-  campaign-owned FINAL item, and proves one exact checkpoint continuation in
-  production. Preserve immutable 2406 histories. Then resume the active
-  campaign at bounded capacity and monitor subsequent RANS handoffs plus
-  fast/final results. Readiness requires no recurring current-generation
-  blocked/critical chain; any new exhaustion remains a red system incident and
-  must be investigated before ordinary new admission continues.
+  reclamation proof. Its hub FINAL item is correctly background-owned because
+  the canary revision is not a live campaign revision. Nine accepted PRECALC
+  points on the active campaign predate exact attempt ownership; the bounded
+  reconciliation that pins those generations, attaches their existing FINAL
+  queues to the campaign, and refreshes progress is regression-verified but
+  still needs production deployment and execution. Preserve immutable 2406
+  histories. Then resume the active campaign at bounded capacity and monitor
+  subsequent RANS handoffs plus fast/final results. Readiness requires no
+  recurring current-generation blocked/critical chain; any new exhaustion
+  remains a red system incident and must be investigated before ordinary new
+  admission continues.
 
 - **Production evidence capacity:** The completed GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used), with no legacy gzip,
@@ -32,14 +35,12 @@
   requested angles. Its final fast generation is bound on the hub to GCS
   generation `1784546127477342`; all 2,621 archive members (manifest plus
   2,620 declared files) passed fresh verification, the hub acknowledged it,
-  and the remote reclaimed only after acknowledgement. The remaining gap is
-  hub-side operational ownership: deploy the broker import/backfill that
-  registers the verified blob/archive/member ledger, repairs the exact
-  campaign-attempt pin, and creates exactly one durable campaign-owned FINAL
-  item. Prove idempotent replay and exact GCS-checkpoint continuation, then
-  widen remote promises and monitor evidence delivery, FINAL completion,
-  descriptor stability, and absence of new critical chains before removing
-  this item.
+  and the remote reclaimed only after acknowledgement. The hub registered the
+  exact blob/archive/member ledger and one durable background FINAL item;
+  idempotent replay returned the same archive and queue. Deploy and execute the
+  separate live-campaign PRECALC ownership reconciliation, then widen remote
+  promises and monitor evidence delivery, FINAL completion, descriptor
+  stability, and absence of new critical chains before removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

@@ -109,9 +109,9 @@ the actual maintenance window.
 
 The guarded volume-backed OpenCFD 2606 cutover is installed on `hz-solver2`.
 The production full-polar broker canary has accepted, delivered, and hub-bound
-25 of its 26 exact requested angles. Each accepted transfer has an immutable
-GCS generation and checksum. The second targeted preliminary-URANS run for the
-remaining angle produced stable force coefficients and complete raw evidence,
+all 26 exact requested angles. Each accepted transfer has an immutable GCS
+generation and checksum. The second targeted preliminary-URANS run for the
+final angle produced stable force coefficients and complete raw evidence,
 then exposed a continuation-controller boundary defect: sparse field writes
 lagged force sampling at the 20-guessed-period horizon, so the controller
 requested that already-observed horizon again and rejected the zero-progress
@@ -140,12 +140,15 @@ records. That made the bytes durable yet invisible to restart admission.
 Brokered import now asks the authenticated engine to freshly verify the
 declared manifest against the exact GCS generation, registers every
 evidence-derived member under the exact attempt, repairs only a terminal
-campaign row whose current attempt matches, and creates one durable FINAL owner
-before acknowledging the point. A bounded, default-dry-run backfill performs
-the same fail-closed sequence for transfers accepted before this correction.
-The production canary object is generation `1784546127477342`, with 2,620
-declared files plus the exact manifest; no declared member lacks an evidence
-role.
+campaign row whose current attempt matches when one exists, and creates one
+durable FINAL owner before acknowledging the point. A non-campaign canary is
+owned by the background lane instead of inventing a campaign association. A
+bounded, default-dry-run backfill performs the same fail-closed sequence for
+transfers accepted before this correction. The production canary object is
+generation `1784546127477342`, with 2,620 declared files plus the exact
+manifest; no declared member lacks an evidence role. The hub registered all
+2,621 members, created one background FINAL item, and returned the identical
+archive and queue on replay before the remote copy was reclaimed.
 
 Post-cutover remote engine maintenance is a distinct complete-state branch of
 the same guarded remote workflow. An active promise remains an inert durable

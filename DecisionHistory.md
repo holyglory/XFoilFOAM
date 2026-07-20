@@ -119,8 +119,9 @@ Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDeta
   hub acknowledges the job-level delivery. Storage location is deployment and
   transfer policy, not part of numerical solver compatibility identity. The
   hub acknowledges accepted fast evidence only after fresh generation-pinned
-  verification, complete blob/archive/member registration, exact campaign
-  attempt ownership, and one durable FINAL owner.
+  verification, complete blob/archive/member registration, an exact live
+  owner (campaign association when applicable, otherwise background), and one
+  durable FINAL item.
 - Why: copying the hub's GCS credentials would widen secret and canonical-data
   authority; using the base Compose file alone silently restores the 8-slot
   defaults and can switch the Docker project/volumes; using the hub cutover on
