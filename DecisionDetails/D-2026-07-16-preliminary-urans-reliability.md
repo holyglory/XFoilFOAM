@@ -174,6 +174,18 @@ the following grade can advance to the next physical horizon. Regression
 coverage reproduces the 19.5-of-20 boundary case and preserves the bounded
 slow-edge cadence, slow plausible shedding, and genuine no-progress stop.
 
+The generation-pinned migration of that exact failed checkpoint authenticated
+all 1,823 bundled members, then exposed an adjacent ownership error before any
+database row was written. The canonical result still truthfully named its
+older RANS generation, while the failed restartable attempt and bundle named
+the newer URANS job. The registrar incorrectly required both provenance sets
+to be identical. Registration now requires the canonical result and attempt to
+share their exact physical cell and immutable preset revision, while execution
+provenance must match the immutable attempt, evidence bundle, and producing
+job. It never rewrites the canonical result merely to archive a rejected
+checkpoint. A live-shaped regression proves the GCS archive binds to the URANS
+attempt and the result retains its older RANS job and method.
+
 ## Durable priority and automatic NEW-admission fence
 
 The old recovery pass combined process-local RANS/PRECALC alternation with a
@@ -495,6 +507,10 @@ widen its identifiers from an open-work query.
   requested and executing runtime identity. OpenCFD 2406 state may continue
   only on the matching 2406 implementation; an OpenCFD 2606 successor starts
   fresh and never merges predecessor coefficient or field history.
+- GCS archive ownership follows the immutable result attempt and its producing
+  job. The stable canonical result container must match that attempt's physical
+  cell and preset revision, but a rejected continuation never overwrites the
+  canonical result's previously published generation provenance.
 - Runtime capability must also equal the recovery version pinned by the
   request. Implementation identity prevents cross-release evidence mixing;
   `urans_recovery_version` prevents a mixed deployment from invoking recovery

@@ -182,7 +182,11 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   Zstandard restart archive containing the distribution-correct OpenFOAM
   state. A mismatched, one-sided, incomplete, or later-lost generation fails
   closed; ownership reconciliation cannot retarget an operator-pinned source
-  or reduce its corrective budget. Unknown-period acquisition crosses every
+  or reduce its corrective budget. Archive registration binds execution
+  provenance to that immutable attempt and its job; the canonical result must
+  share the physical cell and revision but need not rewrite its older accepted
+  RANS provenance when a later rejected URANS checkpoint is archived.
+  Unknown-period acquisition crosses every
   cumulative horizon with at least one full initial-period guess of forward
   time, because an OpenFOAM end-time undershoot must not turn the next
   continuation into a fractional no-op at the same boundary. Publish each
@@ -211,7 +215,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   cross-version, result-wide, or mutable-live-path continuation falsifies
   provenance. Retrying only the fractional remainder to an acquisition
   boundary can repeatedly stop below that same boundary and consume recovery
-  without adding physical evidence. Trusting an earlier archive decision after storage loss, or
+  without adding physical evidence. Requiring a canonical result container to
+  adopt a rejected continuation's job/method/runtime would falsify which
+  generation it currently publishes and prevent the exact failed attempt from
+  becoming durably restartable. Trusting an earlier archive decision after storage loss, or
   advancing a progress counter before evidence publication, can schedule FINAL
   from bytes that do not exist. The selected sequence keeps the common path
   legible, conserves compatible evidence and mesh work, makes rare failures

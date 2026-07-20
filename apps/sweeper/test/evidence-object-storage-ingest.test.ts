@@ -374,6 +374,155 @@ afterAll(async () => {
 });
 
 describe("GCS Zstandard evidence ingestion", () => {
+  it("MUST-CATCH: registers a rejected URANS checkpoint without rewriting the canonical result's older RANS provenance", async () => {
+    const canonical = fixture!;
+    const engineJobId = `${PREFIX}-continuation-engine`;
+    const caseSlug = `${PREFIX}-continuation-case`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: canonical.airfoilId,
+        bcIds: [canonical.bcId],
+        referenceChordM: 0.2,
+        status: "failed",
+        methodKey: "openfoam.urans",
+        engineJobId,
+        totalCases: 1,
+        completedCases: 1,
+      })
+      .returning({ id: simJobs.id });
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: canonical.resultId,
+        airfoilId: canonical.airfoilId,
+        bcId: canonical.bcId,
+        aoaDeg: 0,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug: caseSlug,
+        methodKey: "openfoam.urans",
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: false,
+        error: "requires further same-case integration",
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    const owner: OwnerFixture = {
+      ...canonical,
+      simJobId: job.id,
+      engineJobId,
+      caseSlug,
+      resultAttemptId: attempt.id,
+      evidenceBase: `evidence/${caseSlug}`,
+      point: {
+        aoa_deg: 0,
+        case_slug: caseSlug,
+        method_key: "openfoam.urans",
+      } as PolarPoint,
+    };
+    const manifestBytes = Buffer.from(
+      JSON.stringify({ schemaVersion: 2, bundleExcludes: [], files: [] }),
+    );
+    await register(
+      {
+        ...logicalArtifact(owner, "manifest", "evidence_manifest.json"),
+        sha256: createHash("sha256").update(manifestBytes).digest("hex"),
+        byte_size: manifestBytes.byteLength,
+      },
+      owner,
+    );
+    const legacyPath = `${owner.evidenceBase}/engine_evidence.tar.zst`;
+    await register(
+      {
+        kind: "engine_bundle",
+        path: legacyPath,
+        url: artifactUrl(owner, legacyPath),
+        mime_type: "application/zstd",
+        sha256: sha256("continuation-local-bundle"),
+        byte_size: 54_321,
+        role: "evidence",
+        metadata: { evidenceBase: owner.evidenceBase },
+      },
+      owner,
+    );
+
+    const mediaRoot = await mkdtemp(
+      join(tmpdir(), "evidence-backfill-continuation-owner-"),
+    );
+    const evidencePath = `cases/${caseSlug}/${owner.evidenceBase}`;
+    const receiptDir = join(mediaRoot, "jobs", engineJobId, evidencePath);
+    const receiptPath = join(receiptDir, "storage_migration.json");
+    const migratedSha = sha256("continuation-migrated-zstd");
+    const tarSha = sha256("continuation-tar");
+    await mkdir(receiptDir, { recursive: true });
+    await writeFile(join(receiptDir, "evidence_manifest.json"), manifestBytes);
+    await writeFile(
+      receiptPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        state: "awaiting_database_registration",
+        jobId: engineJobId,
+        evidencePath,
+        archive: {
+          storedSha256: migratedSha,
+          storedByteSize: 54_321,
+          uncompressedTarSha256: tarSha,
+          uncompressedTarByteSize: 98_765,
+          zstdLevel: 10,
+        },
+        remote: {
+          schemaVersion: 1,
+          format: "tar+zstd",
+          bucket: BUCKET,
+          objectKey: `${PREFIX}/sha256/${migratedSha.slice(0, 2)}/${migratedSha}.tar.zst`,
+          generation: EXACT_GCS_GENERATION,
+          storedSha256: migratedSha,
+          storedSize: 54_321,
+          tarSha256: tarSha,
+          tarSize: 98_765,
+          crc32c: "AAAAAA==",
+          zstdLevel: 10,
+          createdAt: "2026-07-20T09:30:00.000Z",
+        },
+        sourceArchives: [],
+      }),
+    );
+
+    try {
+      const acknowledgement = await registerEvidenceMigrationReceipt({
+        db,
+        engine: ENGINE,
+        receiptPath,
+        mediaRoot,
+      });
+      expect(acknowledgement).toMatchObject({
+        state: "registered",
+        resultId: canonical.resultId,
+        resultAttemptId: attempt.id,
+      });
+      expect(await archivesFor(owner)).toHaveLength(1);
+      const [canonicalResult] = await db
+        .select({
+          simJobId: results.simJobId,
+          engineJobId: results.engineJobId,
+          methodKey: results.methodKey,
+        })
+        .from(results)
+        .where(eq(results.id, canonical.resultId));
+      expect(canonicalResult).toMatchObject({
+        simJobId: canonical.simJobId,
+        engineJobId: canonical.engineJobId,
+      });
+      expect(canonicalResult?.methodKey).not.toBe("openfoam.urans");
+    } finally {
+      await rm(mediaRoot, { recursive: true, force: true });
+    }
+  });
+
   it("MUST-CATCH: dry-run and execute authenticate omitted members from the exact canonical GCS generation before any write", async () => {
     const owner = fixture!;
     const memberPath = "openfoam/mesh_evidence/logs/log.blockMesh";

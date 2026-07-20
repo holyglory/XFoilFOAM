@@ -659,17 +659,15 @@ async function requireSourceMatchesReferencedOwners(
     .select({
       resultId: results.id,
       resultAirfoilId: results.airfoilId,
+      resultBcId: results.bcId,
       resultAoaDeg: results.aoaDeg,
-      resultSimJobId: results.simJobId,
-      resultEngineJobId: results.engineJobId,
-      resultEngineCaseSlug: results.engineCaseSlug,
-      resultMethodKey: results.methodKey,
-      resultSolverImplementationId: results.solverImplementationId,
-      resultSolverRuntimeBuildId: results.solverRuntimeBuildId,
+      resultRevisionId: results.simulationPresetRevisionId,
       attemptId: resultAttempts.id,
       attemptResultId: resultAttempts.resultId,
       attemptAirfoilId: resultAttempts.airfoilId,
+      attemptBcId: resultAttempts.bcId,
       attemptAoaDeg: resultAttempts.aoaDeg,
+      attemptRevisionId: resultAttempts.simulationPresetRevisionId,
       attemptSimJobId: resultAttempts.simJobId,
       attemptEngineJobId: resultAttempts.engineJobId,
       attemptEngineCaseSlug: resultAttempts.engineCaseSlug,
@@ -708,23 +706,19 @@ async function requireSourceMatchesReferencedOwners(
     owner.simJobId !== source.simJobId ||
     owner.resultAirfoilId !== source.airfoilId ||
     owner.attemptAirfoilId !== source.airfoilId ||
+    owner.resultBcId !== owner.attemptBcId ||
     owner.simJobAirfoilId !== source.airfoilId ||
     owner.resultAoaDeg !== source.aoaDeg ||
     owner.attemptAoaDeg !== source.aoaDeg ||
-    owner.resultSimJobId !== source.simJobId ||
+    owner.resultRevisionId !== owner.attemptRevisionId ||
     owner.attemptSimJobId !== source.simJobId ||
-    owner.resultEngineJobId !== source.engineJobId ||
     owner.attemptEngineJobId !== source.engineJobId ||
     owner.simJobEngineJobId !== source.engineJobId ||
-    owner.resultEngineCaseSlug !== source.engineCaseSlug ||
     owner.attemptEngineCaseSlug !== source.engineCaseSlug ||
-    owner.resultMethodKey !== source.methodKey ||
     owner.attemptMethodKey !== source.methodKey ||
     owner.simJobMethodKey !== source.methodKey ||
-    owner.resultSolverImplementationId !== source.solverImplementationId ||
     owner.attemptSolverImplementationId !== source.solverImplementationId ||
     owner.simJobSolverImplementationId !== source.solverImplementationId ||
-    owner.resultSolverRuntimeBuildId !== source.solverRuntimeBuildId ||
     owner.attemptSolverRuntimeBuildId !== source.solverRuntimeBuildId ||
     owner.simJobSolverRuntimeBuildId !== source.solverRuntimeBuildId
   ) {
