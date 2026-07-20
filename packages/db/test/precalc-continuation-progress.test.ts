@@ -5,6 +5,7 @@ import {
   airfoils,
   createClient,
   ensurePrecalcObligations,
+  isExactRestartablePrecalcAttempt,
   precalcContinuationMadeProgress,
   precalcContinuationProgressFromEvidence,
   precalcContinuationsForObligations,
@@ -1038,6 +1039,45 @@ describe("cross-segment preliminary URANS progress", () => {
         repairedSubmissionIds: [],
       });
     }
+  }, 120_000);
+
+  it("MUST-CATCH: a stale mutable result projection does not hide an exact archived checkpoint", async () => {
+    const targetAoaDeg = 84.5;
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [{ airfoilId, revisionId, aoaDeg: targetAoaDeg }],
+      { backgroundOwner: true },
+    );
+    if (!obligation) throw new Error("stale-projection obligation missing");
+    obligationIds.push(obligation.id);
+    const attempt = await completeRejectedSegment({
+      suffix: "typed-stale-result-projection",
+      targetObligationId: obligation.id,
+      targetAoaDeg,
+      archive: "valid",
+    });
+    if (!attempt.resultId)
+      throw new Error("stale-projection fixture has no exact result owner");
+
+    await db
+      .update(results)
+      .set({ status: "stale" })
+      .where(eq(results.id, attempt.resultId));
+
+    expect(
+      await isExactRestartablePrecalcAttempt(db, attempt.resultId, attempt.id),
+    ).toBe(true);
+    expect(
+      await precalcContinuationsForObligations(db, [obligation.id]),
+    ).toEqual([
+      expect.objectContaining({
+        obligationId: obligation.id,
+        resultId: attempt.resultId,
+        resultAttemptId: attempt.id,
+        engineJobId: attempt.engineJobId,
+        engineCaseSlug: attempt.engineCaseSlug,
+      }),
+    ]);
   }, 120_000);
 
   it("requires measured phase/time improvement instead of a heartbeat", () => {

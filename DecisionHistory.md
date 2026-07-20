@@ -182,7 +182,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   Zstandard restart archive containing the distribution-correct OpenFOAM
   state. A mismatched, one-sided, incomplete, or later-lost generation fails
   closed; ownership reconciliation cannot retarget an operator-pinned source
-  or reduce its corrective budget. Archive registration binds execution
+  or reduce its corrective budget. Marking the mutable canonical result
+  projection `stale` for future scheduling must not hide an otherwise exact,
+  rejected, archived attempt; pending/running/failed projections still fail
+  closed. Archive registration binds execution
   provenance to that immutable attempt and its job; the canonical result must
   share the physical cell and revision but need not rewrite its older accepted
   RANS provenance when a later rejected URANS checkpoint is archived. A native
@@ -221,7 +224,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   without adding physical evidence. Requiring a canonical result container to
   adopt a rejected continuation's job/method/runtime would falsify which
   generation it currently publishes and prevent the exact failed attempt from
-  becoming durably restartable. Replaying identical native Zstandard bytes as
+  becoming durably restartable. Requiring that mutable container to remain
+  `done` also lets ordinary campaign rematerialization erase the scheduler's
+  view of immutable attempt evidence without deleting the evidence itself.
+  Replaying identical native Zstandard bytes as
   if their local artifact metadata had always contained the later GCS pointer
   also violates immutable evidence identity. Trusting an earlier archive decision after storage loss, or
   advancing a progress counter before evidence publication, can schedule FINAL

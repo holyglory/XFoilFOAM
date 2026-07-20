@@ -38,18 +38,22 @@
   proved that OpenFOAM adaptive-step undershoot could leave a fractional
   acquisition remainder at the 20-period boundary; repeated requests for that
   remainder never selected the later slow-shedding horizon. The
-  regression-backed minimum-forward-progress correction is implemented but
-  not yet deployed. The exact third-run archive is uploaded to GCS generation
-  `1784540530132992` and all 1,823 manifest members passed a fresh restore. Its
+  regression-backed minimum-forward-progress correction is deployed in the
+  guarded recovery-capable engine. The exact third-run archive is uploaded to
+  GCS generation `1784540530132992`, and all 1,823 manifest members passed a
+  fresh restore. Its
   database registration exposed an over-strict provenance gate for rejected
   URANS attempts and then an immutable-metadata replay on the already-native
   Zstandard source. The regression-backed attempt/job ownership and exact-byte
-  archive-binding corrections are implemented but not yet deployed. Preserve
-  all three immutable attempts, deploy the control-plane registrar and guarded
-  engine corrections, register the checkpoint without rewriting either the
-  canonical result or the local bundle artifact, and resume that saved
-  case as a non-consuming continuation rather than granting another fresh
-  physical attempt. Then
+  archive-binding corrections are deployed; registration is complete without
+  rewriting either the canonical result or local bundle artifact. The first
+  admission correctly created no job because an adjacent selector still
+  treated the mutable stale result projection as invalid despite the exact
+  attempt and archive passing their independent gates. Its regression-backed
+  immutable-attempt selection correction is implemented but not yet deployed.
+  Preserve all three immutable attempts, deploy that control-plane correction,
+  and resume the saved case as a non-consuming continuation rather than
+  granting another fresh physical attempt. Then
   finish its result, prove all 26 generation-pinned readbacks and
   acknowledgement-gated remote reclamation, prove descriptor stability after
   repeated queue polling, and resume bounded capacity before removing this

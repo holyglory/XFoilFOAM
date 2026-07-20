@@ -196,6 +196,17 @@ gzip-to-Zstandard transcode still creates a distinct artifact because its bytes
 and checksum really changed. The regression exercises the same-byte path and
 the existing migration suite retains the transcode and conflict guards.
 
+The first post-deploy continuation admission then failed closed without
+creating a job. The exact attempt, manifest, and verified GCS archive all
+passed their independent checks, but campaign rematerialization had marked the
+mutable canonical `results` projection `stale`. Continuation discovery still
+required that container to be `done`, so it hid the immutable checkpoint even
+though the attempt deliberately remains restartable. The selector now accepts
+only `done` or `stale` parent projections and continues to reject pending,
+running, or failed parents. A live-shaped regression stales the result after
+creating a complete rejected checkpoint and proves that exact-attempt
+selection remains available.
+
 ## Durable priority and automatic NEW-admission fence
 
 The old recovery pass combined process-local RANS/PRECALC alternation with a

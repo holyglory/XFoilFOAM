@@ -764,7 +764,12 @@ export async function isExactRestartablePrecalcAttempt(
        AND exact_result.aoa_deg IS NOT DISTINCT FROM exact_attempt.aoa_deg
       WHERE exact_result.id = ${resultId}
         AND exact_attempt.id = ${resultAttemptId}
-        AND exact_result.status = 'done'
+        -- results.status is a mutable scheduling projection. Campaign
+        -- rematerialization may mark the row stale while this exact rejected
+        -- attempt, manifest, and restart archive remain immutable and valid.
+        -- Pending/running/failed parents are still excluded; stale is the one
+        -- terminal projection that deliberately preserves prior evidence.
+        AND exact_result.status IN ('done', 'stale')
         AND exact_attempt.engine_job_id IS NOT NULL
         AND exact_attempt.engine_case_slug IS NOT NULL
         AND ${restartablePrecalcEvidenceSql({
@@ -3006,7 +3011,10 @@ export async function precalcContinuationsForObligations(
           snapshot: sql`target_revision.snapshot`,
           fallbackBoundaryConditionId: sql`target_preset.legacy_boundary_condition_id`,
         })}
-        AND owner_result.status = 'done'
+        -- The canonical result row may be staled for a future solve without
+        -- invalidating an immutable archived attempt. Continue from that exact
+        -- generation, never from the mutable current-result projection.
+        AND owner_result.status IN ('done', 'stale')
         AND result_attempt.status IN ('done', 'failed')
         AND result_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
         AND result_attempt.engine_job_id IS NOT NULL
