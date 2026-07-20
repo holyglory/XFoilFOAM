@@ -37,6 +37,7 @@
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
   [D-2026-07-16-preliminary-urans-reliability]
+  [D-2026-07-19-urans-physical-tail]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -4964,3 +4965,10 @@ Detail: [DecisionDetails/D-2026-07-14-campaign-capacity.md](DecisionDetails/D-20
 
 - Decision: local sweeper submissions omit controller backlog from engine resource requests; completed-job ingest stages immutable evidence and then terminalizes, while a separate fenced media-repair control-plane service owns expensive default-media rendering and retries. Shared `mesh_evidence` artifacts are retained as `mesh` with their original engine kind preserved in provenance.
 - Why: keeping logical campaign backlog as engine pressure serialized independent speed branches despite an idle worker; forcing parallel OpenFOAM processes or changing continuous AoA marching would broaden numerical risk. Engine queue/token observation provides the real capacity signal, while bounded post-terminal repair preserves fail-closed media truth without holding scheduler slots indefinitely.
+
+## D-2026-07-19-urans-physical-tail — Separate the physical amplitude horizon from the publication window
+
+Detail: [DecisionDetails/D-2026-07-19-urans-physical-tail.md](DecisionDetails/D-2026-07-19-urans-physical-tail.md)
+
+- Decision: preliminary URANS decides steady versus shedding from the complete trailing 2.1-slow-period physical horizon, while its compact trailing integer-period window remains responsible only for periodic coefficients, frame density, and publication. A non-flat physical tail must continue through the existing stationarity controller even when its final compact slice is locally quiet.
+- Why: using one period-cropped history for both decisions repeatedly rejected a real AoA 20 continuation after restoring its complete GCS trajectory. Treating the quiet slice as steady discards physical evidence; accepting it immediately bypasses stationarity; extending every case blindly wastes solver capacity. Independent byte-backed windows preserve the real solver sequence and route the still-relaxing case to bounded same-case continuation.

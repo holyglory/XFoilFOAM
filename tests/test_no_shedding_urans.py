@@ -1076,6 +1076,56 @@ def test_trailing_physical_horizon_does_not_hide_real_slow_shedding(tmp_path):
     assert not is_no_shedding(history)
 
 
+def test_physical_horizon_preserves_full_relaxing_tail_before_flat_slice(tmp_path):
+    """MUST-CATCH: the amplitude verdict must retain the full physical tail.
+
+    The production AoA 20 continuation restored a long, still-relaxing force
+    trace whose final three FFT periods happened to be quiet.  Period-windowing
+    the physical decision history reduced 0.07 s of real evidence to roughly
+    0.011 s; that local slice then looked steady and falsely exhausted the
+    no-shedding acquisition path.  The helper used for the steady/shedding
+    decision must return the complete slow-wake horizon even when its spectrum
+    contains a credible in-band period.
+    """
+    speed, chord = 30.0, 0.05
+    required = pipeline._no_shedding_min_observation_s(speed, chord)
+    end_time = 0.15624685
+    period = 0.00365176
+    quiet_start = end_time - 3.0 * period
+    cutoff = end_time - required
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    coeff.parent.mkdir(parents=True)
+    rows = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+        "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    for i in range(7801):
+        t = end_time * i / 7800
+        progress = min(max((t - cutoff) / max(quiet_start - cutoff, 1e-12), 0.0), 1.0)
+        amplitude = 0.018 if t < quiet_start else 0.0002
+        phase = 2.0 * math.pi * t / period
+        cl = 1.15 - 0.15 * progress + amplitude * math.sin(phase)
+        cd = 0.36 - 0.03 * progress + 0.15 * amplitude * math.cos(phase)
+        rows.append(
+            f"{t:.12g} {cd:.12g} 0 0 {cl:.12g} 0 0 -0.17 0 0 0 0 0"
+        )
+    coeff.write_text("\n".join(rows) + "\n")
+
+    history = pipeline._force_history_for_no_shedding_horizon(
+        [coeff],
+        CaseSpec(chord=chord, speed=speed, aoa_deg=20.0),
+        target_cycles=3,
+    )
+
+    assert history is not None
+    assert history.window_start == pytest.approx(cutoff, abs=2e-5)
+    assert history.window_end == pytest.approx(end_time, abs=2e-5)
+    assert history.window_end - history.window_start == pytest.approx(
+        required, abs=2e-5
+    )
+    assert not is_no_shedding(history)
+
+
 def test_no_shedding_finalize_recovers_naca0012_alpha0_as_steady(tmp_path, monkeypatch):
     """naca-0012 alpha=0 class: escalated to URANS, no shedding -> recovered as a
     valid CONVERGED STEADY point (unsteady=false), never a crash."""

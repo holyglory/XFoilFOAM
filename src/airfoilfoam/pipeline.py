@@ -1310,6 +1310,7 @@ def _force_history_for_no_shedding_horizon(
             target_cycles=target_cycles,
             alpha_deg=spec.aoa_deg,
             observation_start_time=cutoff,
+            preserve_observation_window=True,
         )
     except Exception:  # noqa: BLE001 - caller retains its primary force history
         return None

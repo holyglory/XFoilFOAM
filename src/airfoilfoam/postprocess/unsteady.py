@@ -1300,6 +1300,7 @@ def force_history(
     target_cycles: int = 7,
     alpha_deg: float | None = None,
     observation_start_time: float | None = None,
+    preserve_observation_window: bool = False,
 ) -> ForceHistory:
     """Extract the windowed Cl/Cd/Cm time series from a transient coefficient.dat,
     plus the measured shedding frequency and Strouhal number.
@@ -1308,7 +1309,11 @@ def force_history(
     ``max_points`` for transport. ``observation_start_time`` may additionally
     pin an exact physical-time boundary; that boundary is interpolated between
     real adjacent coefficient samples so an adaptive timestep cannot shorten a
-    required observation horizon by one sample.
+    required observation horizon by one sample. When
+    ``preserve_observation_window`` is true, period detection is still
+    measured but the returned samples/statistics retain the complete selected
+    observation instead of the trailing integer-period publication window.
+    This is used by the independent steady-vs-shedding amplitude gate.
     """
     t_all, cl_all, cd_all, cm_all = _coefficient_series(path)
     if t_all.size == 0:
@@ -1386,20 +1391,27 @@ def force_history(
             if st > 0 and speed > 0 and chord > 0
             else None
         )
-        window = (
-            integer_period_window(
-                t_a,
-                period,
-                discard_fraction=0.0,
-                target_cycles=target_cycles,
+        if preserve_observation_window:
+            window = None
+            wt, wcl, wcd, wcm = t_a, cl_a, cd_a, cm_a
+            cl_mean, cl_rms = full_cl_mean, full_cl_rms
+            cd_mean, cd_rms = full_cd_mean, full_cd_rms
+            cm_mean, cm_rms = full_cm_mean, full_cm_rms
+        else:
+            window = (
+                integer_period_window(
+                    t_a,
+                    period,
+                    discard_fraction=0.0,
+                    target_cycles=target_cycles,
+                )
+                if period
+                else None
             )
-            if period
-            else None
-        )
-        wt, wcl, wcd, wcm = _window_series(t_a, cl_a, cd_a, cm_a, window)
-        cl_mean, cl_rms = _time_weighted_mean_std(wt, wcl)
-        cd_mean, cd_rms = _time_weighted_mean_std(wt, wcd)
-        cm_mean, cm_rms = _time_weighted_mean_std(wt, wcm)
+            wt, wcl, wcd, wcm = _window_series(t_a, cl_a, cd_a, cm_a, window)
+            cl_mean, cl_rms = _time_weighted_mean_std(wt, wcl)
+            cd_mean, cd_rms = _time_weighted_mean_std(wt, wcd)
+            cm_mean, cm_rms = _time_weighted_mean_std(wt, wcm)
     return ForceHistory(
         t=_downsample(wt.tolist(), max_points),
         cl=_downsample(wcl.tolist(), max_points),
