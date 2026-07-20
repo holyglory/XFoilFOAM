@@ -4172,6 +4172,14 @@ URANS_NONSTATIONARY_EXTENSION_PERIODS = 3.0
 #: shedding band and the request's startup discard.
 URANS_PERIOD_ACQUISITION_GUESSED_CYCLES = (10.0, 20.0)
 
+#: OpenFOAM may stop its final adaptive time step just below a requested
+#: cumulative horizon.  A fractional clean-up chunk can then request the same
+#: boundary repeatedly without producing a new saved step or force sample.
+#: Every acquisition continuation therefore owns at least one whole initial
+#: guess of forward simulated time.  Once that crosses the current boundary,
+#: the next grade can select the later physical slow-shedding horizon.
+URANS_PERIOD_ACQUISITION_MIN_CHUNK_GUESSES = 1.0
+
 
 def _period_acquisition_write_interval(guessed_period_s: float) -> float:
     """Sparse field cadence while no shedding period is measurable yet.
@@ -4496,6 +4504,10 @@ def _extend_transient_until_periods(
                     ),
                 )
                 break
+            next_horizon = max(
+                next_horizon,
+                guessed_cycles + URANS_PERIOD_ACQUISITION_MIN_CHUNK_GUESSES,
+            )
             period = guessed_period
             retained = result.quality.retained_cycles
             chunk_sim = (next_horizon - guessed_cycles) * guessed_period

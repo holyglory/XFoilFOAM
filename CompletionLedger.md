@@ -32,18 +32,21 @@
   verified backup/rollback artifacts, and first exact brokered transfer are
   live. The current full-polar canary has 25 of 26 angles accepted, delivered,
   generation-bound in GCS, and acknowledged by the hub. The second run for the
-  last angle produced stable force/raw evidence but exposed a controller
-  boundary defect: sparse field writes lagged force progress, so the engine
-  retried an already-observed period horizon and rejected the zero-progress
-  chunk. The regression-backed physical-progress correction and the
-  queue-inspection/nofile safeguard are live on the guarded
-  `hz-solver2-79a33da-2606` engine build; the ordinary two-attempt invariant
-  correctly refused an unaudited third run. Deploy the one-time audited
-  engine-remediation grant, apply it only to that exact obligation without
-  changing either failed attempt, finish its result, prove all 26
-  generation-pinned readbacks and acknowledgement-gated remote reclamation,
-  prove descriptor stability after repeated queue polling, and resume bounded
-  capacity before removing this item.
+  last angle produced stable force/raw evidence but exposed two controller
+  boundary defects. The physical-progress correction is live, and an audited
+  exact third run advanced the preserved same case to about 0.0666 s. It then
+  proved that OpenFOAM adaptive-step undershoot could leave a fractional
+  acquisition remainder at the 20-period boundary; repeated requests for that
+  remainder never selected the later slow-shedding horizon. The
+  regression-backed minimum-forward-progress correction is implemented but
+  not yet deployed. Preserve all three immutable attempts, register the exact
+  third-run restart archive as generation-pinned GCS evidence, deploy the
+  guarded engine correction, and resume that saved case as a non-consuming
+  continuation rather than granting another fresh physical attempt. Then
+  finish its result, prove all 26 generation-pinned readbacks and
+  acknowledgement-gated remote reclamation, prove descriptor stability after
+  repeated queue polling, and resume bounded capacity before removing this
+  item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

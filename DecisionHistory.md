@@ -182,9 +182,13 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   Zstandard restart archive containing the distribution-correct OpenFOAM
   state. A mismatched, one-sided, incomplete, or later-lost generation fails
   closed; ownership reconciliation cannot retarget an operator-pinned source
-  or reduce its corrective budget. Publish each accepted FAST generation and
-  its archive before advancing completed-case progress, and create exactly one
-  FINAL item only after that durable gate passes.
+  or reduce its corrective budget. Unknown-period acquisition crosses every
+  cumulative horizon with at least one full initial-period guess of forward
+  time, because an OpenFOAM end-time undershoot must not turn the next
+  continuation into a fractional no-op at the same boundary. Publish each
+  accepted FAST generation and its archive before advancing completed-case
+  progress, and create exactly one FINAL item only after that durable gate
+  passes.
   An admin `full` request means “ensure final verification” for its exact or
   whole-polar scope: it owns the same preliminary and final per-point
   obligations and never launches a direct one-shot full solve that bypasses
@@ -205,7 +209,9 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   starves known escalations; asking users to retry or change setup transfers
   system-owned CFD work; fresh reruns discard transient progress; and
   cross-version, result-wide, or mutable-live-path continuation falsifies
-  provenance. Trusting an earlier archive decision after storage loss, or
+  provenance. Retrying only the fractional remainder to an acquisition
+  boundary can repeatedly stop below that same boundary and consume recovery
+  without adding physical evidence. Trusting an earlier archive decision after storage loss, or
   advancing a progress counter before evidence publication, can schedule FINAL
   from bytes that do not exist. The selected sequence keeps the common path
   legible, conserves compatible evidence and mesh work, makes rare failures

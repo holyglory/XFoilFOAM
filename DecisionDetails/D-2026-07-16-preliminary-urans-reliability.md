@@ -158,6 +158,22 @@ in-flight fallback. Regression evidence covers a two-percent monitor-period
 undercut and multi-segment merged history; neither change relaxes the stable
 period, density, trend, amplitude, or final-verification gates.
 
+The final angle of the remote OpenCFD 2606 polar canary then exposed two
+adjacent controller defects while preserving all immutable attempts and raw
+case state. First, sparse field writes lagged real force-history time, so
+cross-segment progress compared unlike clocks and retried an already-observed
+horizon. After the controller compared the strongest matching physical-time
+measurements, the exact same case advanced to about 0.0666 s. Near the
+20-guessed-period acquisition boundary, OpenFOAM legitimately stopped its
+final adaptive step just below the requested end time. The next grade asked
+only for the fractional remainder, then repeated that same boundary until a
+chunk made no measurable advance; the later 37-period slow-shedding horizon
+was never selected. Unknown-period acquisition now assigns every continuation
+at least one full initial-period guess, so it crosses the current boundary and
+the following grade can advance to the next physical horizon. Regression
+coverage reproduces the 19.5-of-20 boundary case and preserves the bounded
+slow-edge cadence, slow plausible shedding, and genuine no-progress stop.
+
 ## Durable priority and automatic NEW-admission fence
 
 The old recovery pass combined process-local RANS/PRECALC alternation with a
@@ -517,6 +533,10 @@ widen its identifiers from an open-work query.
 - Same-job extension requires monotonic physical progress from saved simulated
   time or force history. A zero-progress chunk stops immediately with
   restartable state instead of spending the emergency chunk allowance.
+- Unknown-period acquisition never sizes a continuation as only the fractional
+  remainder to a cumulative guessed-period boundary. It advances by at least
+  one full initial-period guess so adaptive-step undershoot cannot strand the
+  case below that boundary or prevent selection of the next horizon.
 - The recorded averaging contract is unchanged by version 2: an ordinary full
   run targets seven retained periods, while an early stop may certify only
   after the established five-period stable floor (plus its existing margin).

@@ -1752,6 +1752,97 @@ def test_period_acquisition_cadence_is_bounded_at_slow_edge():
     assert horizon / interval == pytest.approx(111.0)
 
 
+def test_period_acquisition_boundary_undershoot_keeps_one_guess_of_forward_progress(
+    tmp_path,
+    monkeypatch,
+):
+    """MUST-CATCH: an OpenFOAM end-time undershoot must not create a no-op.
+
+    Production angle 12 reached about 19.5 of the 20 guessed-period boundary.
+    Repeatedly asking for only the fractional remainder left the final force
+    sample just below that boundary and eventually produced no measurable
+    same-case advance.  The next acquisition chunk must own at least one full
+    initial guess so it crosses the boundary and can select the later physical
+    slow-edge horizon on the following grade.
+    """
+
+    guess = pipeline.physics.shedding_period(
+        30.0,
+        0.05,
+        strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL,
+    )
+    tcase = tmp_path / "transient"
+    span = 19.5 * guess
+    (tcase / f"{span:.12g}").mkdir(parents=True)
+    first = TransientResult(
+        avg=None,
+        case_dir=tcase,
+        force_history=None,
+        quality=UransQuality(
+            ok=False,
+            can_refine=False,
+            reason=(
+                "URANS quality could not be measured: missing or flat "
+                "shedding history."
+            ),
+        ),
+        start_time=0.0,
+        end_time=span,
+        run_time=span,
+        wall_seconds=1.0,
+    )
+    calls: list[float] = []
+
+    def fake_attempt(tcase, *_args, run_time=None, **_kwargs):
+        chunk = float(run_time or 0.0)
+        calls.append(chunk)
+        end = pipeline._latest_time(tcase) + chunk
+        (tcase / f"{end:.12g}").mkdir()
+        return TransientResult(
+            avg=None,
+            case_dir=tcase,
+            force_history=None,
+            quality=UransQuality(
+                ok=True,
+                can_refine=False,
+                reason="URANS quality target met.",
+                measured_period_s=guess,
+                retained_cycles=3.0,
+                frames_per_cycle=30.0,
+            ),
+            start_time=span,
+            end_time=end,
+            run_time=chunk,
+            wall_seconds=1.0,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
+    result = pipeline._extend_transient_until_periods(
+        tcase,
+        first,
+        0.0,
+        None,
+        None,
+        {},
+        CaseSpec(chord=0.05, speed=30.0, aoa_deg=12.0),
+        None,
+        None,
+        SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.4,
+        ),
+        None,
+        1,
+        4 * 3600,
+        guess / 5000.0,
+    )
+
+    assert result.quality.ok
+    assert calls == pytest.approx([guess])
+
+
 def test_precalc_period_acquisition_respects_budget_without_inventing_period(
     tmp_path, monkeypatch
 ):
