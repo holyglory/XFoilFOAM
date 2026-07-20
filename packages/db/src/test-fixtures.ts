@@ -115,7 +115,10 @@ export async function createVerifiedRestartArchiveFixture(
     .values({
       backend,
       bucket: backend === "gcs" ? "exact-restart-test" : null,
-      objectKey: `test-fixtures/restart/${token}.tar.${compression === "zstd" ? "zst" : "gz"}`,
+      objectKey:
+        backend === "gcs" && compression === "zstd"
+          ? `solver-evidence/v1/sha256/cc/${"c".repeat(64)}.tar.zst`
+          : `test-fixtures/restart/${token}.tar.${compression === "zstd" ? "zst" : "gz"}`,
       generation:
         backend === "gcs"
           ? String(BigInt(`0x${token.slice(0, 12)}`) + 1n)
@@ -129,7 +132,11 @@ export async function createVerifiedRestartArchiveFixture(
       uncompressedTarSha256: "d".repeat(64),
       uncompressedTarByteSize: 8192,
       verifiedAt: new Date(),
-      metadata: { fixture: "verified-restart-archive" },
+      metadata: {
+        fixture: "verified-restart-archive",
+        archiveFormat: "tar+zstd",
+        zstdLevel: 10,
+      },
     })
     .returning({ id: solverEvidenceBlobs.id });
   const [archive] = await db

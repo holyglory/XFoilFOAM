@@ -252,6 +252,103 @@ def test_archive_source_mode_forces_volume_hydration_for_every_render_endpoint(
     assert lease == {"active": False, "enters": 3, "exits": 3}
 
 
+def test_inline_remote_pointer_renders_brokered_evidence_without_local_job(
+    client, tmp_path, monkeypatch
+):
+    """Hub-imported evidence has no matching local engine job directory.
+
+    The exact generation-pinned GCS identity must therefore be sufficient to
+    compute extents and persist default media under the synthetic sync job id.
+    """
+
+    store = JobStore()
+    job_id = f"sync:brokered-test:{uuid.uuid4().hex}"
+    hydrated = tmp_path / "brokered-hydrated"
+    (hydrated / "VTK").mkdir(parents=True)
+    (hydrated / "evidence_manifest.json").write_text(
+        json.dumps({"windowStart": 5.0, "windowEnd": 6.0}), encoding="utf-8"
+    )
+    pointer = {
+        "schemaVersion": 1,
+        "format": "tar+zstd",
+        "bucket": "airfoils-pro-storage-bucket",
+        "objectKey": f"solver-evidence/v1/sha256/{'a' * 2}/{'a' * 64}.tar.zst",
+        "generation": "18446744073709551615",
+        "storedSha256": "a" * 64,
+        "storedSize": 4096,
+        "tarSha256": "b" * 64,
+        "tarSize": 8192,
+        "crc32c": "AAAAAA==",
+        "zstdLevel": 10,
+        "createdAt": "2026-07-20T00:00:00.000Z",
+    }
+    observed = {"pointer": None, "lease": False}
+
+    @contextmanager
+    def exact_remote(actual_pointer, _settings):
+        assert actual_pointer.to_dict() == pointer
+        assert observed["lease"] is False
+        observed["pointer"] = actual_pointer
+        observed["lease"] = True
+        try:
+            yield hydrated
+        finally:
+            observed["lease"] = False
+
+    def fake_extents(source_dir, *_args, **_kwargs):
+        assert observed["lease"] is True
+        assert source_dir == hydrated
+        return {"pressure": {"min": -1.0, "max": 1.0, "finite_count": 4}}
+
+    def fake_contours(source_dir, out_dir, *_args, **_kwargs):
+        assert observed["lease"] is True
+        assert source_dir == hydrated
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "pressure.png").write_bytes(b"brokered-default-image")
+        return {"pressure": "pressure.png"}
+
+    monkeypatch.setattr(api_main, "hydrated_pointer_render_source", exact_remote)
+    monkeypatch.setattr(api_main, "compute_field_extents", fake_extents)
+    monkeypatch.setattr(api_main, "render_contours", fake_contours)
+    common = {
+        "case_slug": "case-1",
+        "evidence_base": "evidence",
+        "airfoil_points": [[0.0, 0.0], [1.0, 0.0]],
+        "chord": 1.0,
+        "speed": 20.0,
+        "source_mode": "archive",
+        "remote": pointer,
+    }
+    try:
+        assert not store.exists(job_id)
+        extents = client.post(
+            f"/jobs/{job_id}/field-extents",
+            json={**common, "fields": ["pressure"]},
+        )
+        assert extents.status_code == 200, extents.text
+        assert extents.json()["window_start"] == 5.0
+        assert extents.json()["window_end"] == 6.0
+
+        defaults = client.post(
+            f"/jobs/{job_id}/render-default-media",
+            json={
+                **common,
+                "fields": ["pressure"],
+                "scales": {"pressure": {"vmin": -1.0, "vmax": 1.0}},
+            },
+        )
+        assert defaults.status_code == 200, defaults.text
+        media_path = store.file_path(
+            job_id,
+            defaults.json()["images"][0]["url"].split("/files/", 1)[1],
+        )
+        assert media_path.read_bytes() == b"brokered-default-image"
+        assert observed["pointer"] is not None
+        assert observed["lease"] is False
+    finally:
+        shutil.rmtree(store.job_dir(job_id), ignore_errors=True)
+
+
 def test_render_prefers_existing_local_finalized_vtk(
     client, remote_case, monkeypatch
 ):

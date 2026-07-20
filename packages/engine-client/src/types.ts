@@ -660,6 +660,8 @@ export interface RenderFieldRequest {
   width_px?: number;
   height_px?: number;
   params_hash?: string | null;
+  source_mode?: "auto" | "archive";
+  remote?: RemoteEvidencePointerPayload;
 }
 
 export interface FieldExtentsRequest {
@@ -672,6 +674,7 @@ export interface FieldExtentsRequest {
   zoom_chords?: number;
   max_frames?: number | null;
   source_mode?: "auto" | "archive";
+  remote?: RemoteEvidencePointerPayload;
 }
 
 export interface FieldExtent {
@@ -704,6 +707,7 @@ export interface RenderDefaultMediaRequest {
   scale_version?: number;
   render_profile_key?: string;
   source_mode?: "auto" | "archive";
+  remote?: RemoteEvidencePointerPayload;
 }
 
 export interface RenderedDefaultMedia {

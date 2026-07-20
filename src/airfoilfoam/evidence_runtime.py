@@ -1123,6 +1123,26 @@ def hydrated_render_source(evidence_dir: Path, settings: Settings) -> Iterator[P
 
 
 @contextmanager
+def hydrated_pointer_render_source(
+    pointer: RemoteEvidencePointer, settings: Settings
+) -> Iterator[Path]:
+    """Yield verified VTK for an exact pointer supplied by the control plane.
+
+    Brokered remote-solver evidence is canonically registered on the hub after
+    the source node uploads it directly to GCS.  Such an import deliberately
+    has no matching local engine job directory or pointer sidecar.  The
+    control plane can nevertheless render it by supplying the immutable blob
+    identity read from the exact result-attempt archive row.
+    """
+
+    store = evidence_object_store(settings)
+    if store is None:
+        raise FileNotFoundError("remote evidence storage is not configured")
+    with store.render_source(pointer) as source:
+        yield source
+
+
+@contextmanager
 def hydrated_volume_render_source(
     evidence_dir: Path, settings: Settings
 ) -> Iterator[Path]:
@@ -1388,6 +1408,7 @@ __all__ = [
     "evidence_pointer_path",
     "finalize_remote_evidence_cleanup",
     "hydrated_render_source",
+    "hydrated_pointer_render_source",
     "hydrated_volume_render_source",
     "publish_evidence_directory",
     "publish_evidence_archive",

@@ -42,6 +42,7 @@ import {
   type PointFidelity,
   type PolarPoint,
   type RansPrecalcPromotion,
+  type RemoteEvidencePointerPayload,
   type RenderedDefaultMedia,
   type UransFidelity,
 } from "@aerodb/engine-client";
@@ -1713,6 +1714,94 @@ async function currentArchiveWithEvidenceBase(
   return { archive, evidenceBase };
 }
 
+async function currentRemoteRenderPointer(
+  db: DB,
+  resultId: string,
+  resultAttemptId: string,
+): Promise<RemoteEvidencePointerPayload | null> {
+  const [row] = await db
+    .select({ blob: solverEvidenceBlobs })
+    .from(solverEvidenceArchives)
+    .innerJoin(
+      solverEvidenceBlobs,
+      eq(solverEvidenceBlobs.id, solverEvidenceArchives.blobId),
+    )
+    .where(
+      and(
+        eq(solverEvidenceArchives.resultId, resultId),
+        eq(solverEvidenceArchives.resultAttemptId, resultAttemptId),
+        eq(solverEvidenceArchives.state, "current"),
+      ),
+    )
+    .limit(1);
+  if (!row) return null;
+  const { blob } = row;
+  if (blob.backend === "volume") return null;
+  if (
+    blob.backend !== "gcs" ||
+    blob.compression !== "zstd" ||
+    blob.mimeType !== "application/zstd"
+  ) {
+    throw new Error(
+      `current archive blob ${blob.id} is not renderable GCS Zstandard evidence`,
+    );
+  }
+  const metadata = blob.metadata ?? {};
+  if (metadata.archiveFormat != null && metadata.archiveFormat !== "tar+zstd") {
+    throw new Error(`current archive blob ${blob.id} has an invalid format`);
+  }
+  const zstdLevel = requirePositiveSafeInteger(
+    metadata.zstdLevel,
+    "archive zstdLevel",
+  );
+  if (zstdLevel > 22) {
+    throw new Error(`current archive blob ${blob.id} has an invalid zstdLevel`);
+  }
+  const bucket = requireExactNonEmptyString(blob.bucket, "archive bucket");
+  const objectKey = safeRelativePathParts(
+    blob.objectKey,
+    "archive objectKey",
+  ).join("/");
+  const storedSha256 = requirePattern(
+    blob.sha256,
+    "archive stored sha256",
+    SHA256_PATTERN,
+  );
+  requireContentAddressedObjectKey(
+    objectKey,
+    storedSha256,
+    "archive objectKey",
+  );
+  return {
+    schemaVersion: 1,
+    format: "tar+zstd",
+    bucket,
+    objectKey,
+    generation: requirePattern(
+      blob.generation,
+      "archive generation",
+      GCS_GENERATION_PATTERN,
+    ),
+    storedSha256,
+    storedSize: requirePositiveSafeInteger(
+      blob.byteSize,
+      "archive stored byte size",
+    ),
+    tarSha256: requirePattern(
+      blob.uncompressedTarSha256,
+      "archive tar sha256",
+      SHA256_PATTERN,
+    ),
+    tarSize: requirePositiveSafeInteger(
+      blob.uncompressedTarByteSize,
+      "archive tar byte size",
+    ),
+    crc32c: requirePattern(blob.crc32c, "archive crc32c", GCS_CRC32C_PATTERN),
+    zstdLevel,
+    createdAt: blob.verifiedAt.toISOString(),
+  };
+}
+
 export async function registerEvidenceArtifacts(opts: {
   db: DB;
   engine: EngineClient;
@@ -2609,6 +2698,7 @@ async function renderScaledMediaRows(opts: {
   airfoilPoints: [number, number][];
   heartbeat: () => Promise<void>;
   sourceMode?: "auto" | "archive";
+  remote?: RemoteEvidencePointerPayload;
 }): Promise<
   {
     resultId: string;
@@ -2676,6 +2766,7 @@ async function renderScaledMediaRows(opts: {
       scale_version: opts.scale.version,
       render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
       source_mode: opts.sourceMode ?? "auto",
+      remote: opts.remote,
     });
     rendered.push({
       resultId: result.id,
@@ -2761,6 +2852,9 @@ async function rebalanceFieldScales(opts: {
   /** Deferred repair must render from the immutable retained archive because
    * normal post-ingest cleanup may already have removed the raw VTK tree. */
   sourceMode?: "auto" | "archive";
+  /** Exact GCS generation for a brokered result whose engine job is not
+   * present on this node. Only durable single-result archive repairs set it. */
+  remote?: RemoteEvidencePointerPayload;
 }): Promise<number> {
   let mediaCount = 0;
   for (const group of opts.groups.values()) {
@@ -2871,6 +2965,7 @@ async function rebalanceFieldScales(opts: {
         airfoilPoints: opts.airfoilPoints,
         heartbeat: opts.heartbeat,
         sourceMode: opts.sourceMode,
+        remote: opts.remote,
       });
       mediaCount += await registerRenderedMediaSet(
         opts.db,
@@ -2967,6 +3062,7 @@ async function rebalanceFieldScales(opts: {
         airfoilPoints: opts.airfoilPoints,
         heartbeat: opts.heartbeat,
         sourceMode: opts.sourceMode,
+        remote: opts.remote,
       });
       await opts.db.transaction(async (tx) => {
         if (opts.repairFence) {
@@ -3142,6 +3238,11 @@ export async function repairDefaultMediaForStoredResult(opts: {
       `media-repair result ${opts.resultId} has no usable stored evidence manifest`,
     );
   }
+  const remote = await currentRemoteRenderPointer(
+    opts.db,
+    result.id,
+    currentAttemptId,
+  );
 
   const priorExtents = await opts.db
     .select({ field: resultFieldExtents.field })
@@ -3165,6 +3266,7 @@ export async function repairDefaultMediaForStoredResult(opts: {
     zoom_chords: 2,
     max_frames: 220,
     source_mode: "archive",
+    remote: remote ?? undefined,
   });
   // The engine round-trip may be slow. Revalidate ownership immediately
   // before any destructive presentation write; a stale renderer may inspect
@@ -3332,6 +3434,7 @@ export async function repairDefaultMediaForStoredResult(opts: {
     repairFence: opts.repairFence,
     repairSource,
     sourceMode: "archive",
+    remote: remote ?? undefined,
   });
 
   const mediaRows = await opts.db

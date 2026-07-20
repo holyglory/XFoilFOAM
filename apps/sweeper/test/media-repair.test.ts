@@ -54,6 +54,7 @@ import type {
   FieldExtentsRequest,
   FieldExtentsResponse,
   ImageFieldName,
+  RemoteEvidencePointerPayload,
   RenderDefaultMediaRequest,
   RenderDefaultMediaResponse,
 } from "@aerodb/engine-client";
@@ -1478,6 +1479,52 @@ describe("durable result media repair", () => {
         ),
       );
     expect(custom).toHaveLength(3);
+  });
+
+  it("MUST-CATCH: renders a brokered result from its exact GCS generation", async () => {
+    const fixture = await createSolvedResult("brokered-gcs-render");
+    const pointers: Array<RemoteEvidencePointerPayload | undefined> = [];
+    const outcome = await resultMediaRepairTick(
+      db,
+      engineWith({
+        extents: async (_jobId, request) => {
+          pointers.push(request.remote);
+          return {
+            fields: {
+              pressure: { min: -3, max: 2, finite_count: 500 },
+            },
+            window_start: 1,
+            window_end: 2,
+          };
+        },
+        render: async (jobId, request) => {
+          pointers.push(request.remote);
+          return completeMediaResponse(jobId, request);
+        },
+      }),
+      { resultId: fixture.resultId },
+    );
+
+    expect(outcome.finalized).toBe(1);
+    expect(pointers.length).toBeGreaterThan(1);
+    expect(pointers.every(Boolean)).toBe(true);
+    expect(
+      new Set(pointers.map((pointer) => JSON.stringify(pointer))).size,
+    ).toBe(1);
+    expect(pointers[0]).toMatchObject({
+      schemaVersion: 1,
+      format: "tar+zstd",
+      bucket: "exact-restart-test",
+      objectKey: `solver-evidence/v1/sha256/cc/${"c".repeat(64)}.tar.zst`,
+      storedSha256: "c".repeat(64),
+      storedSize: 4096,
+      tarSha256: "d".repeat(64),
+      tarSize: 8192,
+      crc32c: "AAAAAA==",
+      zstdLevel: 10,
+    });
+    expect(pointers[0]?.generation).toMatch(/^[1-9][0-9]{0,19}$/);
+    expect(Number.isNaN(Date.parse(pointers[0]?.createdAt ?? ""))).toBe(false);
   });
 
   it("self-heals a crash after media commit and enqueues exactly one verification", async () => {

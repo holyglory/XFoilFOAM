@@ -38,6 +38,7 @@ from ..evidence_runtime import (
     evidence_object_store,
     evidence_pointer_path,
     finalize_remote_evidence_cleanup,
+    hydrated_pointer_render_source,
     hydrated_render_source,
     reclaim_brokered_remote_evidence,
     hydrated_volume_render_source,
@@ -102,6 +103,7 @@ class RenderFieldRequest(BaseModel):
     height_px: int = Field(default=660, ge=240, le=1800)
     params_hash: str | None = None
     source_mode: Literal["auto", "archive"] = "auto"
+    remote: dict[str, object] | None = None
 
 
 class FieldScaleRequest(BaseModel):
@@ -119,6 +121,7 @@ class FieldExtentsRequest(BaseModel):
     zoom_chords: float = Field(default=2.0, gt=0)
     max_frames: int | None = Field(default=220, ge=1, le=500)
     source_mode: Literal["auto", "archive"] = "auto"
+    remote: dict[str, object] | None = None
 
 
 class RenderDefaultMediaRequest(BaseModel):
@@ -134,6 +137,7 @@ class RenderDefaultMediaRequest(BaseModel):
     scale_version: int = Field(default=1, ge=1)
     render_profile_key: str = Field(default="default:v1:zoom2")
     source_mode: Literal["auto", "archive"] = "auto"
+    remote: dict[str, object] | None = None
 
 
 class StripJobRequest(BaseModel):
@@ -508,6 +512,7 @@ def _render_source(
     settings,
     *,
     source_mode: Literal["auto", "archive"] = "auto",
+    remote_pointer: RemoteEvidencePointer | None = None,
 ) -> Iterator[Path]:
     """Yield the best real VTK source, holding remote cache protection in use.
 
@@ -516,6 +521,31 @@ def _render_source(
     Keeping this context open around the renderer prevents the bounded cache
     cleanup pass from evicting that evidence mid-render.
     """
+
+    if remote_pointer is not None:
+        if source_mode != "archive":
+            raise HTTPException(
+                status_code=400,
+                detail="An inline remote evidence pointer requires archive source mode",
+            )
+        try:
+            with hydrated_pointer_render_source(remote_pointer, settings) as source_dir:
+                if not (source_dir / "VTK").is_dir():
+                    raise EvidenceStoreError(
+                        "verified remote evidence has no VTK directory"
+                    )
+                yield source_dir
+            return
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Retained remote evidence is unavailable: {exc}",
+            ) from exc
+        except (EvidenceStoreError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Retained remote evidence could not be verified: {exc}",
+            ) from exc
 
     if source_mode == "archive":
         pointer_path = evidence_pointer_path(evidence_dir)
@@ -570,10 +600,25 @@ def _render_source(
     if (case_dir / "VTK").is_dir():
         yield case_dir
         return
+
     raise HTTPException(
         status_code=404,
         detail="Stored VTK evidence not found",
     )
+
+
+def _inline_remote_pointer(
+    remote: dict[str, object] | None,
+) -> RemoteEvidencePointer | None:
+    if remote is None:
+        return None
+    try:
+        return RemoteEvidencePointer.from_dict(remote)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid remote evidence pointer: {exc}",
+        ) from exc
 
 
 def _manifest_lists_member(evidence_dir: Path, member_path: str) -> bool:
@@ -1780,14 +1825,15 @@ def create_app() -> FastAPI:
 
     @app.post("/jobs/{job_id}/render-field")
     def render_field(job_id: str, request: RenderFieldRequest) -> dict:
-        if not store.exists(job_id):
+        remote_pointer = _inline_remote_pointer(request.remote)
+        if remote_pointer is None and not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         try:
             case_dir = store.file_path(job_id, f"cases/{request.case_slug}")
             evidence_dir = store.file_path(job_id, f"cases/{request.case_slug}/{request.evidence_base}")
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid case or evidence path")
-        if not case_dir.is_dir():
+        if remote_pointer is None and not case_dir.is_dir():
             raise HTTPException(status_code=404, detail="Case directory not found")
         params_hash = request.params_hash or _render_hash(request)
         out_dir = evidence_dir / "custom_renders" / params_hash
@@ -1798,6 +1844,7 @@ def create_app() -> FastAPI:
                 evidence_dir,
                 settings,
                 source_mode=request.source_mode,
+                remote_pointer=remote_pointer,
             ) as source_dir:
                 filename = render_custom_field(
                     source_dir,
@@ -1837,14 +1884,15 @@ def create_app() -> FastAPI:
 
     @app.post("/jobs/{job_id}/field-extents")
     def field_extents(job_id: str, request: FieldExtentsRequest) -> dict:
-        if not store.exists(job_id):
+        remote_pointer = _inline_remote_pointer(request.remote)
+        if remote_pointer is None and not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         try:
             case_dir = store.file_path(job_id, f"cases/{request.case_slug}")
             evidence_dir = store.file_path(job_id, f"cases/{request.case_slug}/{request.evidence_base}")
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid case or evidence path")
-        if not case_dir.is_dir():
+        if remote_pointer is None and not case_dir.is_dir():
             raise HTTPException(status_code=404, detail="Case directory not found")
         contour = np.asarray(request.airfoil_points, dtype=float)
         fields = request.fields or list(ImageField)
@@ -1854,6 +1902,7 @@ def create_app() -> FastAPI:
                 evidence_dir,
                 settings,
                 source_mode=request.source_mode,
+                remote_pointer=remote_pointer,
             ) as source_dir:
                 start_time, end_time = _evidence_window(evidence_dir)
                 if start_time is None and end_time is None:
@@ -1881,14 +1930,15 @@ def create_app() -> FastAPI:
 
     @app.post("/jobs/{job_id}/render-default-media")
     def render_default_media(job_id: str, request: RenderDefaultMediaRequest) -> dict:
-        if not store.exists(job_id):
+        remote_pointer = _inline_remote_pointer(request.remote)
+        if remote_pointer is None and not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         try:
             case_dir = store.file_path(job_id, f"cases/{request.case_slug}")
             evidence_dir = store.file_path(job_id, f"cases/{request.case_slug}/{request.evidence_base}")
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid case or evidence path")
-        if not case_dir.is_dir():
+        if remote_pointer is None and not case_dir.is_dir():
             raise HTTPException(status_code=404, detail="Case directory not found")
         fields = request.fields or list(request.scales.keys())
         missing_scale = [field.value for field in fields if field not in request.scales]
@@ -1905,6 +1955,7 @@ def create_app() -> FastAPI:
                 evidence_dir,
                 settings,
                 source_mode=request.source_mode,
+                remote_pointer=remote_pointer,
             ) as source_dir:
                 start_time, end_time = _evidence_window(evidence_dir)
                 if start_time is None and end_time is None:
