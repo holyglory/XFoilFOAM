@@ -186,6 +186,16 @@ job. It never rewrites the canonical result merely to archive a rejected
 checkpoint. A live-shaped regression proves the GCS archive binds to the URANS
 attempt and the result retains its older RANS job and method.
 
+That live retry exposed the same migration's second representation edge: the
+source was already the exact canonical Zstandard byte stream, so uploading it
+changed storage ownership but not artifact bytes. The ordinary ingest replay
+correctly refused to pretend the immutable local artifact had always carried
+the new GCS metadata. Native Zstandard migration now reuses that exact source
+artifact and adds only the verified GCS blob/archive relationship. A legacy
+gzip-to-Zstandard transcode still creates a distinct artifact because its bytes
+and checksum really changed. The regression exercises the same-byte path and
+the existing migration suite retains the transcode and conflict guards.
+
 ## Durable priority and automatic NEW-admission fence
 
 The old recovery pass combined process-local RANS/PRECALC alternation with a
@@ -511,6 +521,9 @@ widen its identifiers from an open-work query.
   job. The stable canonical result container must match that attempt's physical
   cell and preset revision, but a rejected continuation never overwrites the
   canonical result's previously published generation provenance.
+- A native tar.zst migration attaches the generation-pinned blob/archive to the
+  exact existing bundle artifact; it does not mutate the artifact to add GCS
+  metadata. A transcode remains a new artifact with its own byte identity.
 - Runtime capability must also equal the recovery version pinned by the
   request. Implementation identity prevents cross-release evidence mixing;
   `urans_recovery_version` prevents a mixed deployment from invoking recovery

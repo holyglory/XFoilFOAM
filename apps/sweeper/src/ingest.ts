@@ -1630,6 +1630,45 @@ async function registerVerifiedGcsArchive(opts: {
   return archive;
 }
 
+/** Bind a verified remote generation to an already-registered local tar.zst
+ * source without rewriting that immutable artifact's metadata. Migration of a
+ * native Zstandard bundle keeps exactly the same bytes and storage key; only
+ * the archive/blob ownership is new. A transcoded legacy bundle must continue
+ * through the ordinary artifact registration path because its bytes differ. */
+export async function registerVerifiedGcsArchiveForExistingSource(opts: {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  sourceArtifact: StoredEvidenceArtifact;
+  artifact: EngineEvidenceArtifact;
+}): Promise<StoredEvidenceArchive> {
+  const { sourceArtifact, artifact } = opts;
+  const urlPath = artifact.url ?? artifact.path;
+  const bundle = parseVerifiedGcsEvidenceBundle("engine_bundle", artifact);
+  if (!urlPath || !bundle) {
+    throw new Error(
+      "existing evidence source requires one verified GCS engine_bundle",
+    );
+  }
+  if (
+    sourceArtifact.kind !== "engine_bundle" ||
+    sourceArtifact.field !== (artifact.field ?? null) ||
+    sourceArtifact.role !== (artifact.role ?? null) ||
+    sourceArtifact.storageKey !== storageKeyOf(urlPath) ||
+    sourceArtifact.mimeType !== artifact.mime_type ||
+    sourceArtifact.sha256 !== artifact.sha256 ||
+    sourceArtifact.byteSize !== artifact.byte_size
+  ) {
+    throw new Error(
+      "existing evidence source does not exactly match the migrated GCS bundle bytes",
+    );
+  }
+  return registerVerifiedGcsArchive({
+    ...opts,
+    bundle,
+  });
+}
+
 async function currentArchiveWithEvidenceBase(
   db: DB,
   resultId: string,

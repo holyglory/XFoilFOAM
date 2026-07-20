@@ -42,10 +42,12 @@
   not yet deployed. The exact third-run archive is uploaded to GCS generation
   `1784540530132992` and all 1,823 manifest members passed a fresh restore. Its
   database registration exposed an over-strict provenance gate for rejected
-  URANS attempts; the regression-backed attempt/job ownership correction is
-  implemented but not yet deployed. Preserve all three immutable attempts,
-  deploy the control-plane registrar and guarded engine corrections, register
-  the checkpoint without rewriting the canonical result, and resume that saved
+  URANS attempts and then an immutable-metadata replay on the already-native
+  Zstandard source. The regression-backed attempt/job ownership and exact-byte
+  archive-binding corrections are implemented but not yet deployed. Preserve
+  all three immutable attempts, deploy the control-plane registrar and guarded
+  engine corrections, register the checkpoint without rewriting either the
+  canonical result or the local bundle artifact, and resume that saved
   case as a non-consuming continuation rather than granting another fresh
   physical attempt. Then
   finish its result, prove all 26 generation-pinned readbacks and

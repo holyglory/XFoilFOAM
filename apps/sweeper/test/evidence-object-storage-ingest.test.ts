@@ -427,6 +427,7 @@ describe("GCS Zstandard evidence ingestion", () => {
     const manifestBytes = Buffer.from(
       JSON.stringify({ schemaVersion: 2, bundleExcludes: [], files: [] }),
     );
+    const migratedSha = sha256("continuation-migrated-zstd");
     await register(
       {
         ...logicalArtifact(owner, "manifest", "evidence_manifest.json"),
@@ -442,7 +443,7 @@ describe("GCS Zstandard evidence ingestion", () => {
         path: legacyPath,
         url: artifactUrl(owner, legacyPath),
         mime_type: "application/zstd",
-        sha256: sha256("continuation-local-bundle"),
+        sha256: migratedSha,
         byte_size: 54_321,
         role: "evidence",
         metadata: { evidenceBase: owner.evidenceBase },
@@ -456,7 +457,6 @@ describe("GCS Zstandard evidence ingestion", () => {
     const evidencePath = `cases/${caseSlug}/${owner.evidenceBase}`;
     const receiptDir = join(mediaRoot, "jobs", engineJobId, evidencePath);
     const receiptPath = join(receiptDir, "storage_migration.json");
-    const migratedSha = sha256("continuation-migrated-zstd");
     const tarSha = sha256("continuation-tar");
     await mkdir(receiptDir, { recursive: true });
     await writeFile(join(receiptDir, "evidence_manifest.json"), manifestBytes);

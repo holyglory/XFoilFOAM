@@ -185,7 +185,10 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   or reduce its corrective budget. Archive registration binds execution
   provenance to that immutable attempt and its job; the canonical result must
   share the physical cell and revision but need not rewrite its older accepted
-  RANS provenance when a later rejected URANS checkpoint is archived.
+  RANS provenance when a later rejected URANS checkpoint is archived. A native
+  Zstandard upload binds the new GCS blob/archive to the existing exact bundle
+  artifact without changing that artifact's immutable local metadata; only a
+  real transcode with different bytes creates a new bundle artifact.
   Unknown-period acquisition crosses every
   cumulative horizon with at least one full initial-period guess of forward
   time, because an OpenFOAM end-time undershoot must not turn the next
@@ -218,7 +221,9 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   without adding physical evidence. Requiring a canonical result container to
   adopt a rejected continuation's job/method/runtime would falsify which
   generation it currently publishes and prevent the exact failed attempt from
-  becoming durably restartable. Trusting an earlier archive decision after storage loss, or
+  becoming durably restartable. Replaying identical native Zstandard bytes as
+  if their local artifact metadata had always contained the later GCS pointer
+  also violates immutable evidence identity. Trusting an earlier archive decision after storage loss, or
   advancing a progress counter before evidence publication, can schedule FINAL
   from bytes that do not exist. The selected sequence keeps the common path
   legible, conserves compatible evidence and mesh work, makes rare failures

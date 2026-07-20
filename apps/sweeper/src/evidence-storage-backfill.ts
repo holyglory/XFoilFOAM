@@ -45,7 +45,10 @@ import {
   manifestMemberSetSha256,
   parseEvidenceManifest,
 } from "./evidence-manifest";
-import { registerEvidenceArtifacts } from "./ingest";
+import {
+  registerEvidenceArtifacts,
+  registerVerifiedGcsArchiveForExistingSource,
+} from "./ingest";
 
 export const MIGRATION_RECEIPT_NAME = "storage_migration.json";
 export const DATABASE_ACK_NAME = "storage_migration.database.json";
@@ -2022,29 +2025,46 @@ export async function registerEvidenceMigrationReceipt(opts: {
       const registrationEngine = {
         baseUrl: engineOriginForSource(lockedSource, opts.engine.baseUrl),
       } as EngineClient;
-      await registerEvidenceArtifacts({
-        db: tx,
-        engine: registrationEngine,
-        resultId: lockedSource.resultId!,
-        resultAttemptId: lockedSource.resultAttemptId!,
-        airfoilId: lockedSource.airfoilId,
-        simJobId: lockedSource.simJobId!,
-        engineJobId: receipt.jobId,
-        point: {
-          aoa_deg: lockedSource.aoaDeg!,
-          case_slug: lockedSource.engineCaseSlug!,
-          method_key: lockedSource.methodKey ?? undefined,
-        } as PolarPoint,
-        artifact,
-        runtime:
-          lockedSource.solverImplementationId &&
-          lockedSource.solverRuntimeBuildId
-            ? {
-                solverImplementationId: lockedSource.solverImplementationId,
-                solverRuntimeBuildId: lockedSource.solverRuntimeBuildId,
-              }
-            : undefined,
-      });
+      const exactPackagedSource =
+        lockedSource.kind === "engine_bundle" &&
+        lockedSource.storageKey ===
+          `jobs/${receipt.jobId}/${receipt.evidencePath}/engine_evidence.tar.zst` &&
+        lockedSource.mimeType === artifact.mime_type &&
+        lockedSource.sha256 === artifact.sha256 &&
+        lockedSource.byteSize === artifact.byte_size;
+      if (exactPackagedSource) {
+        await registerVerifiedGcsArchiveForExistingSource({
+          db: tx,
+          resultId: lockedSource.resultId!,
+          resultAttemptId: lockedSource.resultAttemptId!,
+          sourceArtifact: lockedSource,
+          artifact,
+        });
+      } else {
+        await registerEvidenceArtifacts({
+          db: tx,
+          engine: registrationEngine,
+          resultId: lockedSource.resultId!,
+          resultAttemptId: lockedSource.resultAttemptId!,
+          airfoilId: lockedSource.airfoilId,
+          simJobId: lockedSource.simJobId!,
+          engineJobId: receipt.jobId,
+          point: {
+            aoa_deg: lockedSource.aoaDeg!,
+            case_slug: lockedSource.engineCaseSlug!,
+            method_key: lockedSource.methodKey ?? undefined,
+          } as PolarPoint,
+          artifact,
+          runtime:
+            lockedSource.solverImplementationId &&
+            lockedSource.solverRuntimeBuildId
+              ? {
+                  solverImplementationId: lockedSource.solverImplementationId,
+                  solverRuntimeBuildId: lockedSource.solverRuntimeBuildId,
+                }
+              : undefined,
+        });
+      }
       const current = await currentArchiveAck(tx, receipt, lockedSource);
       await validateMemberCoverage(tx, current, manifest);
       return current;
