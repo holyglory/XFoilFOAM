@@ -121,6 +121,24 @@ const REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS = Math.min(
 );
 const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
   "xfoilfoam-hub-canonical-evidence-binding-v1\n";
+const BROKER_UPLOAD_IDEMPOTENCY_DOMAIN = "xfoilfoam:broker-upload:v1\0";
+
+export function brokeredEvidenceIdempotencyKey(
+  promiseId: string,
+  resultAttemptId: string,
+): string {
+  const bytes = createHash("sha256")
+    .update(BROKER_UPLOAD_IDEMPOTENCY_DOMAIN)
+    .update(promiseId)
+    .update("\0")
+    .update(resultAttemptId)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x80;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 type Settings = typeof syncApiSettings.$inferSelect;
 
@@ -3081,10 +3099,10 @@ async function pushOneRemoteResult(
       await touchHeartbeat(db);
     };
     const brokerRequest = {
-      // A delivery row is intentionally reused when generationKey advances.
-      // The immutable result-attempt UUID is the per-generation broker key;
-      // using claim.id would alias later generations to the first archive.
-      idempotencyKey: attempt.id,
+      // Retries for one promise+attempt must reuse the broker row, while a new
+      // upstream promise reusing the same immutable evidence needs a distinct
+      // broker request. The deterministic UUID preserves both properties.
+      idempotencyKey: brokeredEvidenceIdempotencyKey(promiseId, attempt.id),
       promiseId,
       remoteResultId: result.id,
       remoteResultAttemptId: attempt.id,

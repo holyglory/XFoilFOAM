@@ -39,6 +39,7 @@ const { ensureSimulationPresetRevision } =
   await import("@aerodb/db/simulation-setup");
 const {
   admitRemoteSolverTick,
+  brokeredEvidenceIdempotencyKey,
   claimResultDelivery,
   createProgressAwareAbort,
   processBrokeredRemoteEvidenceReclaims,
@@ -757,6 +758,7 @@ async function brokerFixtureResponse(
       uploadType: "resumable",
       name: objectKey,
       upload_id: id,
+      ifGenerationMatch: "0",
     });
     return new Response(
       JSON.stringify({
@@ -2732,6 +2734,25 @@ describe("remote-owned derived PRECALC lifecycle", () => {
 });
 
 describe("remote solver push validation regressions", () => {
+  it("scopes broker upload idempotency to the promise and immutable attempt", () => {
+    const attemptId = randomUUID();
+    const firstPromiseId = randomUUID();
+    const secondPromiseId = randomUUID();
+
+    const first = brokeredEvidenceIdempotencyKey(firstPromiseId, attemptId);
+    const retry = brokeredEvidenceIdempotencyKey(firstPromiseId, attemptId);
+    const reusedEvidence = brokeredEvidenceIdempotencyKey(
+      secondPromiseId,
+      attemptId,
+    );
+
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(retry).toBe(first);
+    expect(reusedEvidence).not.toBe(first);
+  });
+
   it("preserves the application-source fingerprint in the pushed runtime identity", async () => {
     const aoaDeg = 809.501;
     const job = await seedDoneRemoteJob("runtime-provenance", [aoaDeg]);
@@ -3897,7 +3918,7 @@ describe("remote solver push validation regressions", () => {
     expect((await readPromise(promiseId)).points[0]?.status).toBe("cancelled");
   });
 
-  it("uses the immutable result-attempt UUID when one delivery advances generations", async () => {
+  it("uses deterministic promise-scoped keys when one delivery advances generations", async () => {
     const aoas = [855.201, 855.202];
     const job = await seedDoneRemoteJob("delivery-generation-advance", aoas);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
@@ -4033,7 +4054,10 @@ describe("remote solver push validation regressions", () => {
     );
     expect(
       brokerRequests.map((request) => request.body.idempotencyKey),
-    ).toEqual([attemptA, attemptB.id]);
+    ).toEqual([
+      brokeredEvidenceIdempotencyKey(promiseId, attemptA),
+      brokeredEvidenceIdempotencyKey(promiseId, attemptB.id),
+    ]);
     const [deliveryB] = await db
       .select()
       .from(syncRemoteResultDeliveries)
