@@ -817,6 +817,19 @@ PY
   rollback_compose up -d --no-build --no-deps --force-recreate api worker node-api
   wait_http "rolled-back engine" http://127.0.0.1:8000/health
   [[ "$(current_engine_version)" == "2406" ]] || { echo "Rollback image did not restore OpenCFD 2406." >&2; exit 13; }
+  # The private override is only a recovery bootstrap. Leaving containers
+  # permanently named against the rollback tags makes the next fresh cutover
+  # unable to prove that the normal Compose references own those exact 2406
+  # images. The receipt already retagged both immutable IDs to their original
+  # references, so recreate once through the normal profile while the writers
+  # and execution pools remain stopped, then re-prove 2406 health.
+  require_recreate_safe "before normalized 2406 rollback reference recreate"
+  compose up -d --no-build --no-deps --force-recreate api worker node-api
+  wait_http "normalized rolled-back engine" http://127.0.0.1:8000/health
+  [[ "$(current_engine_version)" == "2406" ]] || {
+    echo "Normalized rollback references did not retain OpenCFD 2406." >&2
+    exit 13
+  }
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
     "UPDATE solver_execution_pools SET enabled=CASE id WHEN '$OPENCFD_2406_POOL_ID' THEN $old_2406_enabled WHEN '$OPENCFD_2606_POOL_ID' THEN $old_2606_enabled ELSE enabled END, \"updatedAt\"=now() WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID');" >/dev/null
   restore_writers "$(read_env_var REMOTE_SOLVER2606_SWEEPER_WAS_RUNNING)" "$(read_env_var REMOTE_SOLVER2606_MEDIA_REPAIR_WAS_RUNNING)"

@@ -319,6 +319,22 @@ def test_remote_rollback_preserves_an_empty_previous_engine_key_list() -> None:
     ) not in source
 
 
+def test_remote_rollback_returns_containers_to_normal_compose_references() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+
+    bootstrap = source.index("rollback_compose up -d --no-build")
+    normalization = source.index(
+        'require_recreate_safe "before normalized 2406 rollback reference recreate"'
+    )
+    normal_recreate = source.index(
+        "compose up -d --no-build --no-deps --force-recreate api worker node-api",
+        normalization,
+    )
+    restored_pools = source.index("UPDATE solver_execution_pools", normal_recreate)
+
+    assert bootstrap < normalization < normal_recreate < restored_pools
+
+
 def test_remote_cutover_state_is_source_bound_restartable_and_tamper_evident(
     tmp_path: Path,
 ) -> None:
