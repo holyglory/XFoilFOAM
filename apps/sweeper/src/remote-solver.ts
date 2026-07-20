@@ -2081,7 +2081,11 @@ export async function uploadBrokeredEvidenceFile(
       await onProgress();
       const response = await fetch(uploadUrl, {
         method: "PUT",
-        redirect: "error",
+        // GCS uses 308 as the resumable protocol's normal "committed so far"
+        // response. Native fetch classifies 308 as an HTTP redirect before the
+        // caller can inspect it when redirect="error". Keep the response
+        // observable and reject every non-protocol 3xx below.
+        redirect: "manual",
         signal: AbortSignal.any([
           absolute,
           AbortSignal.timeout(REMOTE_PUSH_STALL_TIMEOUT_MS),
@@ -2136,7 +2140,7 @@ export async function uploadBrokeredEvidenceFile(
       try {
         query = await fetch(uploadUrl, {
           method: "PUT",
-          redirect: "error",
+          redirect: "manual",
           signal: AbortSignal.any([
             absolute,
             AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),

@@ -37,7 +37,7 @@ it("uploads exact tar.zst bytes through an opaque capability without credentials
         headers: new Headers(init.headers),
         body: Buffer.concat(chunks),
       });
-      expect(init.redirect).toBe("error");
+      expect(init.redirect).toBe("manual");
       return new Response(
         JSON.stringify({ generation: "9007199254740993123" }),
         {
@@ -81,11 +81,19 @@ it("resumes at the exact committed byte and rejects local size drift", async () 
       for await (const _chunk of init.body as unknown as AsyncIterable<Buffer>) {
         // Consume the exact file range before returning the committed offset.
       }
-      if (ranges.length === 1)
+      if (ranges.length === 1) {
+        // Node's native fetch interprets 308 as a redirect before callers can
+        // inspect the resumable-protocol response when redirect="error".
+        // The production regression only appears once a bundle exceeds the
+        // 8 MiB chunk size, so model that behavior explicitly here.
+        if (init.redirect === "error") throw new TypeError("fetch failed");
+        expect(init.redirect).toBe("manual");
         return new Response(null, {
           status: 308,
           headers: { range: `bytes=0-${chunkSize - 1}` },
         });
+      }
+      expect(init.redirect).toBe("manual");
       return new Response(null, {
         status: 200,
         headers: { "x-goog-generation": "18446744073709551615" },
@@ -123,7 +131,7 @@ it("rejects redirects and never follows the capability to another host", async (
   const bytes = Buffer.from("redirect-evidence");
   writeFileSync(join(mediaDir, "redirect.tar.zst"), bytes);
   const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
     for await (const _chunk of init.body as unknown as AsyncIterable<Buffer>) {
       // A real fetch consumes the request stream before returning a response.
     }
