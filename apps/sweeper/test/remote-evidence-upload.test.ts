@@ -17,7 +17,7 @@ const expectedCapability = {
   objectKey: "solver-evidence/v1/sha256/aa/abc.tar.zst",
 };
 const validCapability =
-  "https://storage.googleapis.com/upload/storage/v1/b/evidence-bucket/o?uploadType=resumable&name=solver-evidence%2Fv1%2Fsha256%2Faa%2Fabc.tar.zst&upload_id=opaque";
+  "https://storage.googleapis.com/upload/storage/v1/b/evidence-bucket/o?uploadType=resumable&upload_id=opaque&ifGenerationMatch=0";
 
 afterEach(() => vi.unstubAllGlobals());
 afterAll(() => rmSync(mediaDir, { recursive: true, force: true }));
