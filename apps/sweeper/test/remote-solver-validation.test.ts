@@ -64,6 +64,7 @@ const {
   boundaryProfiles,
   categories,
   createClient,
+  discoverMissingResultMediaRepairs,
   flowConditions,
   forceHistory,
   mediums,
@@ -77,6 +78,7 @@ const {
   resultClassifications,
   resultFieldExtents,
   resultMedia,
+  resultMediaRepairs,
   results,
   schedulingProfiles,
   simJobs,
@@ -3284,6 +3286,82 @@ describe("remote solver push validation regressions", () => {
     ).toSatisfy((rows: Array<{ state: string }>) =>
       rows.every((row) => row.state === "delivered"),
     );
+  });
+
+  it("MUST-CATCH: does not deliver or reclaim a result before default-media extents exist", async () => {
+    const aoa = 822.101;
+    const job = await seedDoneRemoteJob("media-before-delivery", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("media-before-delivery", [aoa], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    await db
+      .delete(resultFieldExtents)
+      .where(eq(resultFieldExtents.resultId, result.id));
+    const waitingFetch = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(waitingFetch.fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => row.resultId),
+    ).toHaveLength(0);
+  });
+
+  it("retires local media work after the authoritative hub accepted that exact generation", async () => {
+    const aoa = 822.102;
+    const job = await seedDoneRemoteJob("hub-owns-media-repair", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("hub-owns-media-repair", [aoa], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.id, result.currentResultAttemptId!));
+    const [manifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, result.id),
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId,
+      simJobId: job.id,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      aoaDeg: aoa,
+      generationKey: attempt.id,
+      state: "delivered",
+      deliveredAt: new Date(),
+    });
+    await db.insert(resultMediaRepairs).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      state: "retry_wait",
+      evidenceSignature: `${attempt.engineJobId}:${attempt.engineCaseSlug}:${manifest.sha256}`,
+      nextAttemptAt: new Date(),
+      lastError: "local archive was reclaimed after signed hub acknowledgement",
+    });
+
+    await discoverMissingResultMediaRepairs(db, { resultId: result.id });
+
+    expect(
+      await db
+        .select()
+        .from(resultMediaRepairs)
+        .where(eq(resultMediaRepairs.resultId, result.id)),
+    ).toHaveLength(0);
   });
 
   it("MUST-CATCH: terminal wave-2 children unblock a wave-1 parent push, while running children still delay it", async () => {

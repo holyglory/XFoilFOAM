@@ -3054,6 +3054,13 @@ async function pushOneRemoteResult(
           eq(resultFieldExtents.evidenceSha256, evidenceSha256),
         ),
       );
+    if (!extents.length) {
+      await settleResultDelivery(db, claim, {
+        kind: "retry",
+        error: `remote result ${result.id} is waiting for verified default-media field extents`,
+      });
+      return false;
+    }
     const missingDefaultMedia = extents.find(
       (extent) =>
         !media.some(
@@ -4099,6 +4106,12 @@ async function processReusablePromiseEvidence(
                AND length(trim(manifest.mime_type)) > 0
            ) = 1
       )
+      AND EXISTS (
+        SELECT 1
+        FROM result_field_extents extent
+        WHERE extent.result_id = solved_result.id
+          AND extent.result_attempt_id = solved_attempt.id
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM result_field_extents extent
@@ -4237,6 +4250,12 @@ async function processRemoteResultDeliveries(
                        AND length(trim(ready_manifest.mime_type)) > 0
                    ) = 1
               )
+              AND EXISTS (
+                SELECT 1
+                FROM result_field_extents ready_extent
+                WHERE ready_extent.result_id = ready_result.id
+                  AND ready_extent.result_attempt_id = ready_attempt.id
+              )
               AND NOT EXISTS (
                 SELECT 1
                 FROM result_field_extents ready_extent
@@ -4313,6 +4332,12 @@ async function processRemoteResultDeliveries(
                  AND length(trim(manifest.storage_key)) > 0
                  AND length(trim(manifest.mime_type)) > 0
              ) = 1
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM result_field_extents extent
+          WHERE extent.result_id = ready_result.id
+            AND extent.result_attempt_id = ready_attempt.id
         )
         AND NOT EXISTS (
           SELECT 1

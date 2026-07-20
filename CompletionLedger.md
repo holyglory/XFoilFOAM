@@ -12,7 +12,11 @@
   by the real wall budget; it is not yet deployed. Deferred default-media
   recovery now explicitly hydrates immutable retained archives, and the API
   image owns the ffmpeg encoder used by that endpoint; both fixes are
-  regression-verified but not yet deployed. Let the current production
+  regression-verified and deployed on the remote solver, but not yet on
+  production. Remote delivery is also regression-gated on a real
+  evidence-backed field inventory before hub acknowledgement/reclaim, and
+  exact generations already accepted by the hub retire obsolete local repair
+  work; this control-plane correction is not yet deployed. Let the current production
   11-angle job finish without interrupting its eight live OpenFOAM processes,
   then deploy this hardening through the guarded engine-maintenance path.
   Readiness still requires incremental result publication, verified GCS

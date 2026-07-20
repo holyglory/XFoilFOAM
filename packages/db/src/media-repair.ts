@@ -300,6 +300,20 @@ export async function discoverMissingResultMediaRepairs(
   const limit = Math.max(1, Math.min(opts.limit ?? 100, 1_000));
   const now = opts.now ?? new Date();
   const nowIso = now.toISOString();
+  // Once an exact remote generation has been accepted by the authoritative
+  // hub, output recovery belongs to that hub's generation-pinned GCS archive.
+  // The remote node may already have reclaimed its local archive after the
+  // signed acknowledgement, so retaining or retrying a local repair would be
+  // both impossible and misleading. Running claims are left token-fenced; a
+  // later pass retires them after they settle or their lease is healed.
+  await db.execute(sql`
+    DELETE FROM result_media_repairs repair
+    USING sync_remote_result_deliveries delivery
+    WHERE delivery.result_id = repair.result_id
+      AND delivery.result_attempt_id = repair.result_attempt_id
+      AND delivery.state IN ('delivered', 'superseded')
+      AND repair.state <> 'running'
+  `);
   const rows = (await db.execute(sql`
     WITH repair_source AS (
       SELECT
@@ -400,6 +414,13 @@ export async function discoverMissingResultMediaRepairs(
       ) manifest ON true
       LEFT JOIN sim_jobs producing_job ON producing_job.id = candidate.sim_job_id
       WHERE r.simulation_preset_revision_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sync_remote_result_deliveries delivered_generation
+          WHERE delivered_generation.result_id = r.id
+            AND delivered_generation.result_attempt_id = candidate.id
+            AND delivered_generation.state IN ('delivered', 'superseded')
+        )
         -- Default-media rendering is output work, not part of the active
         -- solver march. Hold it until the producing job is terminal so one
         -- expensive render cannot stall partial-evidence scheduling.
@@ -607,6 +628,13 @@ export async function claimNextResultMediaRepair(
         )
         AND repair.next_attempt_at <= ${nowIso}::timestamptz
         AND repair.attempt_count < repair.max_attempts
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sync_remote_result_deliveries delivered_generation
+          WHERE delivered_generation.result_id = repair.result_id
+            AND delivered_generation.result_attempt_id = repair.result_attempt_id
+            AND delivered_generation.state IN ('delivered', 'superseded')
+        )
       ORDER BY repair.next_attempt_at, repair."createdAt", repair.id
       FOR UPDATE OF repair SKIP LOCKED
       LIMIT 1
