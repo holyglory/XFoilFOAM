@@ -19,6 +19,11 @@ import sys
 from typing import Any
 
 
+# The deployment release is manifest-verified and immutable.  Loading the
+# canonical canary by file path must not add __pycache__ beneath that release,
+# otherwise a fail-closed recovery replay rejects its own source tree.
+sys.dont_write_bytecode = True
+
 _BASE_PATH = Path(__file__).with_name("openfoam_2606_canary.py")
 _SPEC = importlib.util.spec_from_file_location(
     "_airfoilfoam_openfoam_2606_gcs_canary", _BASE_PATH

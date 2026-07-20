@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import threading
 from typing import Any, Iterator
@@ -38,6 +40,24 @@ VOLUME_SPEC.loader.exec_module(volume_canary)
 VOLUME_CANARY_MODES = frozenset(
     {"volume-ok", "volume-gcs-leak", "volume-missing-member-count"}
 )
+
+
+def test_volume_canary_import_keeps_immutable_release_clean(tmp_path: Path) -> None:
+    deploy = tmp_path / "scripts" / "deploy"
+    deploy.mkdir(parents=True)
+    for source in (CANARY_PATH, VOLUME_CANARY_PATH):
+        shutil.copy2(source, deploy / source.name)
+
+    result = subprocess.run(
+        [sys.executable, str(deploy / VOLUME_CANARY_PATH.name), "--help"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (deploy / "__pycache__").exists()
 
 
 def _sha(payload: bytes) -> str:
