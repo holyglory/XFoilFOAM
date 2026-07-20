@@ -3946,6 +3946,15 @@ function classificationRank(value: unknown): number {
   return value === "accepted" ? 2 : value === "needs_urans" ? 1 : 0;
 }
 
+/** A stale canonical cell may still retain the exact parent RANS generation
+ * that caused a durable PRECALC obligation. The obligation is the correction
+ * authority for its URANS child, so stale must remain publishable alongside
+ * terminal done/failed cells. Running/queued/pending cells still require
+ * exact scheduling ownership and cannot be bypassed by this correction path. */
+function correctionEligibleCellStatus(status: string): boolean {
+  return status === "done" || status === "failed" || status === "stale";
+}
+
 /** Public for the exact-generation precedence regression: classification
  * improvement always wins (accepted evidence is stronger than provisional),
  * while equal-state corrections may only move fidelity forward. */
@@ -4252,7 +4261,7 @@ async function ensureIngestCell(opts: {
   }
   const authorizedCorrection =
     differentOwner &&
-    (row.status === "done" || row.status === "failed") &&
+    correctionEligibleCellStatus(row.status) &&
     publicationAuthority?.correctionAuthority === true;
   return {
     ...row,
@@ -4394,7 +4403,7 @@ async function publishStagedPoints(
         }
         const ownsCurrentCell =
           cell.simJobId === candidate.simJobId ||
-          ((cell.status === "done" || cell.status === "failed") &&
+          (correctionEligibleCellStatus(cell.status) &&
             authority.correctionAuthority);
         if (!ownsCurrentCell) {
           console.error(
