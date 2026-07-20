@@ -7,5 +7,6 @@ import { env } from "./env";
 export function makeEngineClient(): EngineClient {
   return new EngineClient(env.engineUrl, {
     expectedEngine: env.engineIdentity,
+    controlPlaneToken: env.engineControlPlaneToken ?? undefined,
   });
 }

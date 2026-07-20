@@ -31,6 +31,8 @@ const MEDIA_DIR = join(
 );
 mkdirSync(MEDIA_DIR, { recursive: true });
 process.env.MEDIA_DIR = MEDIA_DIR;
+const savedEngineControlPlaneToken = process.env.ENGINE_CONTROL_PLANE_TOKEN;
+process.env.ENGINE_CONTROL_PLANE_TOKEN = "sync-remote-validation-engine-token";
 const TEST_MULTIPART_UPLOAD_LIMIT_BYTES = 2 * 1024 * 1024;
 const TEST_MULTIPART_MANIFEST_LIMIT_BYTES = 2 * 1024 * 1024;
 const savedMultipartUploadLimit =
@@ -75,14 +77,19 @@ const {
   simJobs,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverEvidenceArchives,
+  solverEvidenceArtifactMembers,
+  solverEvidenceBlobs,
   solverProfiles,
   solverRuntimeBuilds,
   syncApiPermissions,
   syncApiSettings,
+  syncBrokeredEvidenceUploads,
   syncImportConflicts,
   syncRemotePromiseCancellations,
   syncSweepPromisePoints,
   syncSweepPromises,
+  simUransVerifyQueue,
   sweepDefinitions,
 } = dbSchema;
 
@@ -160,6 +167,10 @@ async function configureSync() {
       enabled: true,
       secret: SECRET,
       defaultPromiseTtlHours: 24,
+      upstreamBaseUrl: null,
+      upstreamSecret: "",
+      remoteSolverAuthToken: "",
+      remoteSolverEnabled: false,
       updatedAt: new Date(),
     })
     .where(eq(syncApiSettings.id, 1));
@@ -400,6 +411,44 @@ function artifactItem(label: string) {
     metadata: { label, retained: true },
     ...bytesItem(`artifact:${label}`, "application/json"),
   };
+}
+
+function brokeredRestartManifest() {
+  const members = [
+    ["openfoam/transient/transient_start.json", "continuation_state"],
+    ["openfoam/transient/system/controlDict", "dictionary"],
+    ["openfoam/transient/system/fvSchemes", "dictionary"],
+    ["openfoam/transient/system/fvSolution", "dictionary"],
+    ["openfoam/transient/constant/polyMesh/points", "mesh"],
+    ["openfoam/transient/constant/polyMesh/faces", "mesh"],
+    ["openfoam/transient/constant/polyMesh/owner", "mesh"],
+    ["openfoam/transient/constant/polyMesh/neighbour", "mesh"],
+    ["openfoam/transient/constant/polyMesh/boundary", "mesh"],
+    ["openfoam/transient/constant/transportProperties", "dictionary"],
+    ["openfoam/transient/constant/turbulenceProperties", "dictionary"],
+    ["time_directories/0.1/U", "time_directory"],
+    ["time_directories/0.1/p", "time_directory"],
+    ["time_directories/0.1/k", "time_directory"],
+    ["time_directories/0.1/omega", "time_directory"],
+    ["time_directories/0.1/nut", "time_directory"],
+    ["time_directories/0.1/phi", "time_directory"],
+    [
+      "openfoam/postProcessing/forceCoeffs/0/coefficient.dat",
+      "force_coefficients",
+    ],
+  ].map(([path, role]) => {
+    const bytes = Buffer.from(`${PREFIX}:brokered-member:${path}`);
+    return {
+      path,
+      role,
+      sha256: sha256(bytes),
+      byteSize: bytes.byteLength,
+    };
+  });
+  const bytes = Buffer.from(
+    JSON.stringify({ schemaVersion: 1, bundleExcludes: [], files: members }),
+  );
+  return { bytes, members };
 }
 
 function makePoint(aoaDeg: number, patch: Record<string, unknown> = {}) {
@@ -947,6 +996,9 @@ afterAll(async () => {
   else
     process.env.SYNC_POLAR_MULTIPART_MAX_MANIFEST_BYTES =
       savedMultipartManifestLimit;
+  if (savedEngineControlPlaneToken == null)
+    delete process.env.ENGINE_CONTROL_PLANE_TOKEN;
+  else process.env.ENGINE_CONTROL_PLANE_TOKEN = savedEngineControlPlaneToken;
 });
 
 describe("remote solver sync validation regressions", () => {
@@ -993,7 +1045,9 @@ describe("remote solver sync validation regressions", () => {
           payload: JSON.stringify(body),
         }),
       ]);
-      const winners = attempts.filter((response) => response.statusCode === 200);
+      const winners = attempts.filter(
+        (response) => response.statusCode === 200,
+      );
       const losers = attempts.filter((response) => response.statusCode !== 200);
       expect(winners).toHaveLength(1);
       expect(losers).toHaveLength(1);
@@ -2789,6 +2843,288 @@ describe("remote solver sync validation regressions", () => {
         })
       ).statusCode,
     ).toBe(200);
+  });
+
+  it("registers one generation-pinned brokered PRECALC archive and durably owns FINAL before acknowledging the point", async () => {
+    const aoaDeg = 712.101;
+    const promiseId = await createPromise("active", aoaDeg);
+    const [{ id: promisePointId }] = await db
+      .select({ id: syncSweepPromisePoints.id })
+      .from(syncSweepPromisePoints)
+      .where(
+        and(
+          eq(syncSweepPromisePoints.promiseId, promiseId),
+          eq(syncSweepPromisePoints.aoaDeg, aoaDeg),
+        ),
+      );
+    const solverId = randomUUID();
+    const solverToken = `${PREFIX}:brokered-token`;
+    const uploadId = randomUUID();
+    const remoteResultId = randomUUID();
+    const remoteResultAttemptId = randomUUID();
+    const manifest = brokeredRestartManifest();
+    const manifestSha256 = sha256(manifest.bytes);
+    const storedSha256 = sha256(
+      Buffer.from(`${PREFIX}:brokered-restart-archive`),
+    );
+    const tarSha256 = sha256(Buffer.from(`${PREFIX}:brokered-restart-tar`));
+    const bucket = `${PREFIX}-bucket`;
+    const objectKey = `solver-evidence/v1/sha256/${storedSha256.slice(0, 2)}/${storedSha256}.tar.zst`;
+    const generation = "9007199254740993123";
+    const crc32c = "ImIEBA==";
+    const storedByteSize = 4096;
+    const tarByteSize = 8192;
+    const engineJobId = `${PREFIX}-brokered-precalc-engine`;
+    const engineCaseSlug = "aoa_712_101";
+    const evidenceBase = `cases/${engineCaseSlug}/evidence`;
+    let canonicalResultId: string | null = null;
+    let blobId: string | null = null;
+
+    await db.insert(registeredRemoteSolvers).values({
+      id: solverId,
+      instanceId: `${PREFIX}-source`,
+      instanceName: `${PREFIX} brokered solver`,
+      authTokenHash: sha256(Buffer.from(solverToken)),
+      credentialVersion: 1,
+    });
+    await db
+      .update(syncSweepPromises)
+      .set({ requestPayload: { remoteSolver: true, solverId } })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db.insert(syncBrokeredEvidenceUploads).values({
+      id: uploadId,
+      idempotencyKey: randomUUID(),
+      promiseId,
+      promisePointId,
+      solverId,
+      sourceInstanceId: `${PREFIX}-source`,
+      remoteResultId,
+      remoteResultAttemptId,
+      aoaDeg,
+      engineJobId,
+      engineCaseSlug,
+      bucket,
+      objectKey,
+      storedSha256,
+      storedByteSize,
+      tarSha256,
+      tarByteSize,
+      manifestSha256,
+      manifestByteSize: manifest.bytes.byteLength,
+      zstdLevel: 10,
+      bundledFileCount: manifest.members.length,
+      state: "verified",
+      attemptCount: 1,
+      generation,
+      crc32c,
+      verifiedAt: new Date(),
+    });
+
+    const evidence = uransEvidencePatch("brokered-precalc-final-handoff");
+    const point = makePoint(aoaDeg, {
+      ...evidence,
+      methodKey: "openfoam.urans",
+      engineJobId,
+      engineCaseSlug,
+      remoteResultId,
+      remoteResultAttemptId,
+      engine: {
+        family: "openfoam",
+        distribution: "opencfd",
+        version: "2406",
+        numericsRevision: "1",
+        adapterContractVersion: 1,
+        buildId: `${PREFIX}-brokered-opencfd-2406`,
+        sourceRevision: null,
+        imageDigest: null,
+        applicationSourceSha256: sha256(
+          Buffer.from(`${PREFIX}:brokered-openfoam-application`),
+        ),
+        packageSha256: null,
+        binarySha256: null,
+        architecture: "x86_64",
+      },
+      evidenceArtifacts: [
+        {
+          kind: "manifest",
+          role: "raw",
+          filename: "evidence_manifest.json",
+          mimeType: "application/json",
+          contentBase64: manifest.bytes.toString("base64"),
+          sha256: manifestSha256,
+          byteSize: manifest.bytes.byteLength,
+        },
+        {
+          kind: "engine_bundle",
+          role: "evidence",
+          mimeType: "application/zstd",
+          remoteEvidenceUploadId: uploadId,
+          sha256: storedSha256,
+          byteSize: storedByteSize,
+          metadata: {
+            evidenceBase,
+            storageBackend: "gcs",
+            bucket,
+            objectKey,
+            generation,
+            crc32c,
+            tarSha256,
+            tarByteSize: String(tarByteSize),
+            manifestSha256,
+            manifestByteSize: String(manifest.bytes.byteLength),
+          },
+        },
+      ],
+    });
+    const payload = polarPayload([point], {
+      promiseId,
+      bcId: undefined,
+    });
+    const postRemote = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/sync/v1/polars",
+        headers: {
+          "content-type": "application/json",
+          "x-xfoilfoam-solver-token": solverToken,
+        },
+        payload: JSON.stringify(payload),
+      });
+    const fetchMock = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        expect(new URL(String(input)).pathname).toBe(
+          "/internal/evidence-archives/verify-manifest",
+        );
+        expect(new Headers(init?.headers).get("authorization")).toBe(
+          `Bearer ${process.env.ENGINE_CONTROL_PLANE_TOKEN}`,
+        );
+        const request = JSON.parse(String(init?.body));
+        return Response.json({
+          state: "verified",
+          remote: request.remote,
+          manifestSha256: request.manifestSha256,
+          manifestByteSize: request.manifestByteSize,
+          manifestMemberSetSha256: request.manifestMemberSetSha256,
+          manifestMemberCount: request.manifestMemberCount,
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const pushed = await postRemote();
+      expect(pushed.statusCode, pushed.body).toBe(200);
+      expect(pushed.json()).toMatchObject({
+        conflictIds: [],
+        fulfilledAoas: [aoaDeg],
+        unfulfilledAoas: [],
+        bindingReceipts: [
+          {
+            receipt: {
+              brokeredUploadId: uploadId,
+              bindingState: "bound",
+              promisePointState: "fulfilled",
+            },
+            receiptHmac: expect.stringMatching(/^[0-9a-f]{64}$/),
+          },
+        ],
+      });
+      const canonical = await resultAt(aoaDeg);
+      canonicalResultId = canonical!.id;
+      const attemptId = canonical!.currentResultAttemptId!;
+      const [archive] = await db
+        .select({
+          id: solverEvidenceArchives.id,
+          blobId: solverEvidenceArchives.blobId,
+        })
+        .from(solverEvidenceArchives)
+        .where(eq(solverEvidenceArchives.resultAttemptId, attemptId));
+      expect(archive).toBeTruthy();
+      blobId = archive!.blobId;
+      expect(
+        await db
+          .select({ path: solverEvidenceArtifactMembers.memberPath })
+          .from(solverEvidenceArtifactMembers)
+          .where(eq(solverEvidenceArtifactMembers.archiveId, archive!.id)),
+      ).toHaveLength(manifest.members.length + 1);
+      expect(
+        await db
+          .select()
+          .from(solverEvidenceBlobs)
+          .where(eq(solverEvidenceBlobs.id, blobId)),
+      ).toMatchObject([
+        {
+          backend: "gcs",
+          bucket,
+          objectKey,
+          generation,
+          sha256: storedSha256,
+          crc32c,
+        },
+      ]);
+      expect(
+        await db
+          .select()
+          .from(simUransVerifyQueue)
+          .where(eq(simUransVerifyQueue.precalcResultAttemptId, attemptId)),
+      ).toMatchObject([
+        {
+          state: "pending",
+          backgroundOwner: true,
+          precalcResultId: canonicalResultId,
+        },
+      ]);
+      expect((await readPromise(promiseId)).points).toMatchObject([
+        {
+          status: "fulfilled",
+          resultId: canonicalResultId,
+          resultAttemptId: attemptId,
+        },
+      ]);
+
+      const replay = await postRemote();
+      expect(replay.statusCode, replay.body).toBe(200);
+      expect(replay.json()).toMatchObject({
+        attempts: 0,
+        conflictIds: [],
+        fulfilledAoas: [aoaDeg],
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(
+        await db
+          .select()
+          .from(solverEvidenceArchives)
+          .where(eq(solverEvidenceArchives.resultAttemptId, attemptId)),
+      ).toHaveLength(1);
+      expect(
+        await db
+          .select()
+          .from(simUransVerifyQueue)
+          .where(eq(simUransVerifyQueue.precalcResultAttemptId, attemptId)),
+      ).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+      // Bound broker rows are deliberately immutable in runtime. This test's
+      // isolated fixture cleanup bypasses only those audit triggers so it
+      // cannot leak a RESTRICT owner into the shared test database.
+      await sql.begin(async (tx) => {
+        await tx.unsafe("SET LOCAL session_replication_role = replica");
+        await tx`
+          DELETE FROM sync_brokered_evidence_uploads
+          WHERE id = ${uploadId}::uuid
+        `;
+      });
+      if (canonicalResultId) {
+        await db.delete(results).where(eq(results.id, canonicalResultId));
+      }
+      if (blobId) {
+        await db
+          .delete(solverEvidenceBlobs)
+          .where(eq(solverEvidenceBlobs.id, blobId));
+      }
+      await db
+        .delete(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, solverId));
+    }
   });
 
   it("retains a rejected URANS timeout on its attempt without publishing it", async () => {

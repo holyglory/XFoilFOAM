@@ -132,6 +132,21 @@ limit for both worker pools. It must be installed only through the guarded
 engine rebuild while OpenFOAM is idle, then verified by repeated polling and
 descriptor-count stability before capacity is widened.
 
+The completed 26th-angle transfer exposed the last hub ownership gap after the
+broker had already authenticated and acknowledged the exact object. The import
+stored the canonical result, attempt, bundle, and manifest, but did not create
+the hub's blob, archive, archive-member, exact campaign-attempt, or FINAL-owner
+records. That made the bytes durable yet invisible to restart admission.
+Brokered import now asks the authenticated engine to freshly verify the
+declared manifest against the exact GCS generation, registers every
+evidence-derived member under the exact attempt, repairs only a terminal
+campaign row whose current attempt matches, and creates one durable FINAL owner
+before acknowledging the point. A bounded, default-dry-run backfill performs
+the same fail-closed sequence for transfers accepted before this correction.
+The production canary object is generation `1784546127477342`, with 2,620
+declared files plus the exact manifest; no declared member lacks an evidence
+role.
+
 Post-cutover remote engine maintenance is a distinct complete-state branch of
 the same guarded remote workflow. An active promise remains an inert durable
 lease while both downstream writers are stopped, so it is preserved across

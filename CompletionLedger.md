@@ -4,16 +4,16 @@
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical
   incident model, and compact per-point rail are deployed with the guarded
-  OpenCFD 2606 engine. General campaign expansion remains held while the exact
-  remote broker canary finishes; the hub local scheduler remains disabled and
-  the remote solver is limited to the canary promise. Preserve immutable 2406
-  histories. Finish the current preliminary-URANS recovery and exact GCS
-  acknowledgement, recover the exact 20-32C/Re≈102k/α20° continuation and
-  its accepted fast and final generations, then resume the active campaign at
-  bounded capacity and monitor subsequent RANS handoffs plus fast/final
-  results. Readiness requires no recurring current-generation blocked/critical
-  chain; any new exhaustion remains a red system incident and must be
-  investigated before ordinary new admission continues.
+  OpenCFD 2606 engine. The exact remote canary now has an accepted fast result,
+  immutable generation-pinned GCS evidence, hub acknowledgement, and remote
+  reclamation proof. General campaign expansion remains held only until the
+  hub registers that already-verified broker archive, durably creates its
+  campaign-owned FINAL item, and proves one exact checkpoint continuation in
+  production. Preserve immutable 2406 histories. Then resume the active
+  campaign at bounded capacity and monitor subsequent RANS handoffs plus
+  fast/final results. Readiness requires no recurring current-generation
+  blocked/critical chain; any new exhaustion remains a red system incident and
+  must be investigated before ordinary new admission continues.
 
 - **Production evidence capacity:** The completed GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used), with no legacy gzip,
@@ -24,42 +24,22 @@
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`
-  cutover are implemented in the repository. The strict volume canary,
-  archive-only render proof, restartable guarded cutover, verified
+  cutover are live. The strict volume canary, archive-only render proof,
+  restartable guarded cutover, verified
   backup/rollback artifacts, private attestation, and hub-acknowledgement
   retention fence preserve complete local evidence without giving the remote
-  node a Google credential. The volume-backed OpenCFD 2606 remote deployment,
-  verified backup/rollback artifacts, and first exact brokered transfer are
-  live. The current full-polar canary has 25 of 26 angles accepted, delivered,
-  generation-bound in GCS, and acknowledged by the hub. The second run for the
-  last angle produced stable force/raw evidence but exposed two controller
-  boundary defects. The physical-progress correction is live, and an audited
-  exact third run advanced the preserved same case to about 0.0666 s. It then
-  proved that OpenFOAM adaptive-step undershoot could leave a fractional
-  acquisition remainder at the 20-period boundary; repeated requests for that
-  remainder never selected the later slow-shedding horizon. The
-  regression-backed minimum-forward-progress correction is deployed in the
-  guarded recovery-capable engine. The exact third-run archive is uploaded to
-  GCS generation `1784540530132992`, and all 1,823 manifest members passed a
-  fresh restore. Its
-  database registration exposed an over-strict provenance gate for rejected
-  URANS attempts and then an immutable-metadata replay on the already-native
-  Zstandard source. The regression-backed attempt/job ownership and exact-byte
-  archive-binding corrections are deployed; registration is complete without
-  rewriting either the canonical result or local bundle artifact. The first
-  admission correctly created no job because adjacent selectors treated the
-  mutable stale result projection and the checkpoint's later flat-signal
-  incomplete-integration wording as invalid despite the exact attempt and
-  archive passing their independent gates. Their regression-backed,
-  false-positive-guarded immutable-attempt selection corrections are
-  implemented but not yet deployed.
-  Preserve all three immutable attempts, deploy that control-plane correction,
-  and resume the saved case as a non-consuming continuation rather than
-  granting another fresh physical attempt. Then
-  finish its result, prove all 26 generation-pinned readbacks and
-  acknowledgement-gated remote reclamation, prove descriptor stability after
-  repeated queue polling, and resume bounded capacity before removing this
-  item.
+  node a Google credential. The full-polar canary has delivered all 26
+  requested angles. Its final fast generation is bound on the hub to GCS
+  generation `1784546127477342`; all 2,621 archive members (manifest plus
+  2,620 declared files) passed fresh verification, the hub acknowledged it,
+  and the remote reclaimed only after acknowledgement. The remaining gap is
+  hub-side operational ownership: deploy the broker import/backfill that
+  registers the verified blob/archive/member ledger, repairs the exact
+  campaign-attempt pin, and creates exactly one durable campaign-owned FINAL
+  item. Prove idempotent replay and exact GCS-checkpoint continuation, then
+  widen remote promises and monitor evidence delivery, FINAL completion,
+  descriptor stability, and absence of new critical chains before removing
+  this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

@@ -13,8 +13,12 @@ import {
   mediumViscosityTablePoints,
   mediums,
   meshProfiles,
+  onResultIngested,
   outputProfiles,
+  parseEvidenceManifest,
+  manifestMemberSetSha256,
   referenceGeometryProfiles,
+  registerVerifiedBrokeredEvidenceArchive,
   registeredRemoteSolvers,
   remoteAssetReferences,
   resultAttempts,
@@ -29,6 +33,10 @@ import {
   solverProfiles,
   solverImplementations,
   solverEvidenceArtifacts,
+  simCampaignPoints,
+  simCampaigns,
+  simUransVerifyQueue,
+  simUransVerifyQueueCampaigns,
   SYNC_BLOB_LOCK_NAMESPACE,
   syncBlobLockStripe,
   syncApiPermissions,
@@ -45,6 +53,8 @@ import {
   withEvidenceArtifactWriteLocks,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   METHOD_COMPATIBILITY_HASH_VERSION,
+  enqueuePrecalcVerifications,
+  hasExactVerifiedRestartableEvidenceArchive,
 } from "@aerodb/db";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
@@ -77,7 +87,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { link, mkdir, statfs, unlink } from "node:fs/promises";
+import { link, mkdir, readFile, statfs, unlink } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { once } from "node:events";
 import { Readable } from "node:stream";
@@ -91,6 +101,7 @@ import {
   type ResolvedEngineRuntime,
 } from "./engine-provenance";
 import { env } from "./env";
+import { makeEngineClient } from "./engine-client";
 import { mediaStore } from "./media-store";
 import {
   fetchBoundBrokeredEvidenceArchive,
@@ -2036,6 +2047,104 @@ async function resolveUploadedArtifact(
   return ref;
 }
 
+async function uploadedFileBytes(ref: UploadedFileRef): Promise<Buffer> {
+  return readFile(ref.tempFullPath ?? join(env.mediaDir, ref.storageKey));
+}
+
+interface PreparedBrokeredArchive {
+  upload: typeof syncBrokeredEvidenceUploads.$inferSelect;
+  evidenceBase: string;
+  memberSet: ReturnType<typeof parseEvidenceManifest>["memberSet"];
+}
+
+/** Freshly authenticate every manifest member from the exact GCS generation
+ * before the import transaction is allowed to advertise restartable evidence.
+ * A compressed-object checksum alone proves the container, not the restart
+ * contents needed by FINAL URANS. */
+async function prepareBrokeredArchiveRegistration(
+  preparedArtifacts: Array<{
+    artifact: Record<string, unknown>;
+    stored: UploadedFileRef;
+  }>,
+): Promise<PreparedBrokeredArchive | null> {
+  const brokered = preparedArtifacts.filter(
+    ({ stored }) => stored.brokeredUploadId,
+  );
+  if (!brokered.length) return null;
+  if (brokered.length !== 1) {
+    throw new PolarEvidenceBindingError(
+      "one result attempt may carry only one brokered engine archive",
+    );
+  }
+  const [manifest] = preparedArtifacts.filter(
+    ({ artifact }) => nullableText(artifact.kind) === "manifest",
+  );
+  if (!manifest) {
+    throw new PolarEvidenceBindingError(
+      "brokered engine archive requires its exact manifest bytes",
+    );
+  }
+  const uploadId = brokered[0]!.stored.brokeredUploadId!;
+  const [upload] = await db
+    .select()
+    .from(syncBrokeredEvidenceUploads)
+    .where(eq(syncBrokeredEvidenceUploads.id, uploadId))
+    .limit(1);
+  if (
+    !upload ||
+    !["verified", "bound"].includes(upload.state) ||
+    !upload.generation ||
+    !upload.crc32c ||
+    !upload.verifiedAt
+  ) {
+    throw new PolarEvidenceBindingError(
+      "brokered engine archive is not one verified GCS generation",
+    );
+  }
+  const manifestBytes = await uploadedFileBytes(manifest.stored);
+  const parsed = parseEvidenceManifest(manifestBytes);
+  if (
+    manifest.stored.sha256 !== upload.manifestSha256 ||
+    manifest.stored.byteSize !== upload.manifestByteSize ||
+    parsed.bundled.length !== upload.bundledFileCount ||
+    parsed.memberSet.length !== upload.bundledFileCount + 1
+  ) {
+    throw new PolarEvidenceBindingError(
+      "brokered archive manifest does not match its verified upload claim",
+    );
+  }
+  const evidenceBase = nullableText(
+    jsonObject(brokered[0]!.artifact.metadata).evidenceBase,
+  );
+  if (!evidenceBase) {
+    throw new PolarEvidenceBindingError(
+      "brokered engine archive lacks an exact evidenceBase",
+    );
+  }
+  await makeEngineClient().verifyRemoteEvidenceManifest({
+    remote: {
+      schemaVersion: 1,
+      format: "tar+zstd",
+      bucket: upload.bucket,
+      objectKey: upload.objectKey,
+      generation: upload.generation,
+      storedSha256: upload.storedSha256,
+      storedSize: upload.storedByteSize,
+      tarSha256: upload.tarSha256,
+      tarSize: upload.tarByteSize,
+      crc32c: upload.crc32c,
+      zstdLevel: upload.zstdLevel,
+      createdAt: upload.verifiedAt.toISOString(),
+    },
+    manifestBase64: manifestBytes.toString("base64"),
+    manifestSha256: upload.manifestSha256,
+    manifestByteSize: upload.manifestByteSize,
+    manifestMemberSetSha256: manifestMemberSetSha256(parsed.memberSet),
+    manifestMemberCount: parsed.memberSet.length,
+  });
+  return { upload, evidenceBase, memberSet: parsed.memberSet };
+}
+
 function equivalentResult(
   row: typeof results.$inferSelect,
   point: z.infer<typeof polarPointSchema>,
@@ -2438,7 +2547,9 @@ async function equivalentStoredResultEvidence(
   );
   const incomingMediaManifest = manifest(point.media, true);
   const storedArtifactManifest = manifest(
-    storedArtifacts as unknown as Array<Record<string, unknown>>,
+    storedArtifacts.filter(
+      (artifact) => !nullableText(artifact.metadata?.archiveMemberPath),
+    ) as unknown as Array<Record<string, unknown>>,
   );
   const incomingArtifactManifest = manifest(point.evidenceArtifacts);
   const storedExtentManifest = extentManifest(
@@ -3876,6 +3987,8 @@ async function importPolarPush(
         );
       }
     }
+    const preparedBrokeredArchive =
+      await prepareBrokeredArchiveRegistration(preparedArtifacts);
     const resolution = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       const orderedArtifactKeys = [...preparedArtifacts].sort((a, b) =>
@@ -3959,6 +4072,9 @@ async function importPolarPush(
               .select({
                 id: syncSweepPromisePoints.id,
                 regime: resultAttempts.regime,
+                fidelity: sql<
+                  string | null
+                >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
               })
               .from(syncSweepPromisePoints)
               .innerJoin(
@@ -3988,8 +4104,15 @@ async function importPolarPush(
               )
               .limit(1)
           : [];
+      const priorFidelity =
+        ownedGeneration?.fidelity ??
+        (ownedGeneration?.regime === "rans" ? "rans" : null);
+      const incomingFidelity =
+        point.fidelity ?? (attemptRegime === "rans" ? "rans" : null);
       const ownedContinuation =
-        ownedGeneration?.regime === "rans" && attemptRegime === "urans";
+        (priorFidelity === "rans" && incomingFidelity === "urans_precalc") ||
+        (priorFidelity === "urans_precalc" &&
+          incomingFidelity === "urans_full");
       const [exactReplayAttempt] = existing
         ? await tx
             .select({ id: resultAttempts.id })
@@ -4049,11 +4172,11 @@ async function importPolarPush(
           existing.cmStd,
         ].every((value) => value == null);
         if (ownedContinuation) {
-          // The same authoritative promise may legitimately continue from an
-          // already-delivered RANS generation to changed-value URANS/full
-          // evidence. Once a URANS generation owns the point, a different
-          // generation is not another continuation; exact replay is handled
-          // separately above. Unrelated/direct imports still conflict below.
+          // The same authoritative promise may advance only along the exact
+          // three-stage fidelity rail: RANS -> PRECALC -> FULL. Physical
+          // `regime` can remain RANS for a no-shedding URANS solve, so fidelity
+          // is the generation authority. Exact replay is handled separately;
+          // skipped stages and competing generations still conflict below.
           kind = "equivalent";
         }
         const scheduledPlaceholder =
@@ -4096,9 +4219,13 @@ async function importPolarPush(
         metadata: {
           ...jsonObject(artifact.metadata),
           sourceInstanceId,
+          ...(stored.brokeredUploadId
+            ? { remoteEvidenceUploadId: stored.brokeredUploadId }
+            : {}),
         },
       });
       let replayedExistingManifest = false;
+      let replayedExistingManifestArtifactId: string | null = null;
       if (attemptResolution.kind === "existing") {
         const storedManifests = await tx
           .select()
@@ -4147,6 +4274,7 @@ async function importPolarPush(
             return { kind: "conflict" as const, existing };
           }
           replayedExistingManifest = true;
+          replayedExistingManifestArtifactId = storedManifest.id;
         }
       }
       const importedExtents = await importFieldExtentsForResult({
@@ -4157,10 +4285,69 @@ async function importPolarPush(
         simulationPresetRevisionId: revisionId,
         extents: point.fieldExtents,
       });
+      let canonicalManifestArtifactId = replayedExistingManifestArtifactId;
+      let canonicalBrokeredSourceArtifactId: string | null = null;
       for (const preparedArtifact of preparedArtifacts) {
         const association = artifactAssociationFor(preparedArtifact);
         if (replayedExistingManifest && association.kind === "manifest") {
           continue;
+        }
+        if (preparedArtifact.stored.brokeredUploadId) {
+          const [boundUpload] = await tx
+            .select()
+            .from(syncBrokeredEvidenceUploads)
+            .where(
+              eq(
+                syncBrokeredEvidenceUploads.id,
+                preparedArtifact.stored.brokeredUploadId,
+              ),
+            )
+            .for("update")
+            .limit(1);
+          if (boundUpload?.state === "bound") {
+            const [replayed] = boundUpload.canonicalArtifactId
+              ? await tx
+                  .select()
+                  .from(solverEvidenceArtifacts)
+                  .where(
+                    eq(
+                      solverEvidenceArtifacts.id,
+                      boundUpload.canonicalArtifactId,
+                    ),
+                  )
+                  .limit(1)
+              : [];
+            if (
+              !replayed ||
+              replayed.resultId !== association.resultId ||
+              replayed.resultAttemptId !== association.resultAttemptId ||
+              replayed.airfoilId !== association.airfoilId ||
+              replayed.simJobId !== association.simJobId ||
+              replayed.engineJobId !== association.engineJobId ||
+              replayed.engineCaseSlug !== association.engineCaseSlug ||
+              replayed.methodKey !== association.methodKey ||
+              replayed.solverImplementationId !==
+                association.solverImplementationId ||
+              replayed.solverRuntimeBuildId !==
+                association.solverRuntimeBuildId ||
+              replayed.aoaDeg !== association.aoaDeg ||
+              replayed.kind !== association.kind ||
+              replayed.field !== association.field ||
+              replayed.role !== association.role ||
+              replayed.storageKey !== association.storageKey ||
+              replayed.mimeType !== association.mimeType ||
+              replayed.sha256 !== association.sha256 ||
+              replayed.byteSize !== association.byteSize ||
+              stableHash(replayed.metadata ?? {}) !==
+                stableHash(association.metadata)
+            ) {
+              throw new PolarEvidenceBindingError(
+                "bound brokered evidence generation changed its canonical artifact",
+              );
+            }
+            canonicalBrokeredSourceArtifactId = replayed.id;
+            continue;
+          }
         }
         const [insertedAssociation] = await tx
           .insert(solverEvidenceArtifacts)
@@ -4205,6 +4392,9 @@ async function importPolarPush(
             );
           }
           canonicalArtifactId = replayed.id;
+        }
+        if (association.kind === "manifest") {
+          canonicalManifestArtifactId = canonicalArtifactId;
         }
         if (preparedArtifact.stored.brokeredUploadId) {
           const [upload] = await tx
@@ -4253,7 +4443,43 @@ async function importPolarPush(
               "brokered evidence generation is already bound to different canonical evidence",
             );
           }
+          canonicalBrokeredSourceArtifactId = canonicalArtifactId;
         }
+      }
+      let brokeredArchiveMemberCount = 0;
+      if (preparedBrokeredArchive) {
+        if (
+          !canonicalBrokeredSourceArtifactId ||
+          !canonicalManifestArtifactId
+        ) {
+          throw new PolarEvidenceBindingError(
+            "brokered evidence lost its exact source or manifest association",
+          );
+        }
+        const registration = await registerVerifiedBrokeredEvidenceArchive(tx, {
+          resultId: existing.id,
+          resultAttemptId: attempt.id,
+          sourceArtifactId: canonicalBrokeredSourceArtifactId,
+          manifestArtifactId: canonicalManifestArtifactId,
+          evidenceBase: preparedBrokeredArchive.evidenceBase,
+          identity: {
+            bucket: preparedBrokeredArchive.upload.bucket,
+            objectKey: preparedBrokeredArchive.upload.objectKey,
+            generation: preparedBrokeredArchive.upload.generation!,
+            crc32c: preparedBrokeredArchive.upload.crc32c!,
+            storedSha256: preparedBrokeredArchive.upload.storedSha256,
+            storedByteSize: preparedBrokeredArchive.upload.storedByteSize,
+            tarSha256: preparedBrokeredArchive.upload.tarSha256,
+            tarByteSize: preparedBrokeredArchive.upload.tarByteSize,
+            manifestSha256: preparedBrokeredArchive.upload.manifestSha256,
+            manifestByteSize: preparedBrokeredArchive.upload.manifestByteSize,
+            zstdLevel: preparedBrokeredArchive.upload.zstdLevel,
+            bundledFileCount: preparedBrokeredArchive.upload.bundledFileCount,
+            verifiedAt: preparedBrokeredArchive.upload.verifiedAt!,
+          },
+          memberSet: preparedBrokeredArchive.memberSet,
+        });
+        brokeredArchiveMemberCount = registration.memberCount;
       }
       for (const { item, stored } of preparedMedia) {
         const association = {
@@ -4390,6 +4616,7 @@ async function importPolarPush(
         createdResult,
         attemptInserted: attemptResolution.kind === "inserted",
         importedExtents,
+        brokeredArchiveMemberCount,
       };
     });
     if (resolution.kind === "conflict") {
@@ -4418,7 +4645,9 @@ async function importPolarPush(
     const attempt = resolution.attempt;
     if (resolution.attemptInserted) attempts++;
     fieldExtents += resolution.importedExtents;
-    artifacts += preparedArtifacts.length;
+    artifacts +=
+      preparedArtifacts.length +
+      Math.max(0, resolution.brokeredArchiveMemberCount - 1);
     media += preparedMedia.length;
 
     committedPoints.push({
@@ -4566,6 +4795,120 @@ async function importPolarPush(
     },
   });
 
+  // Imported solver evidence must cross the same campaign/fidelity boundary
+  // as locally ingested evidence. In particular, a brokered accepted FAST
+  // generation is acknowledged only after its exact GCS archive is
+  // restartable and one durable FINAL owner exists.
+  for (const committed of committedPoints) {
+    const [selected] = await db
+      .select({
+        status: results.status,
+        regime: results.regime,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(eq(results.id, committed.resultId))
+      .limit(1);
+    if (!selected || selected.currentResultAttemptId !== committed.attemptId) {
+      continue;
+    }
+    await onResultIngested(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg: committed.aoaDeg,
+      resultId: committed.resultId,
+      resultAttemptId: committed.attemptId,
+      status: selected.status,
+      regime: selected.regime,
+    });
+    if (committed.fidelity !== "urans_precalc" || !committed.brokeredUploadId) {
+      continue;
+    }
+    if (
+      !(await hasExactVerifiedRestartableEvidenceArchive(
+        db,
+        committed.resultId,
+        committed.attemptId,
+      ))
+    ) {
+      throw new PolarEvidenceBindingError(
+        `point ${committed.aoaDeg} brokered preliminary evidence is not restartable`,
+      );
+    }
+    const [campaignOwner] = await db
+      .select({ campaignId: simCampaignPoints.campaignId })
+      .from(simCampaignPoints)
+      .innerJoin(
+        simCampaigns,
+        eq(simCampaigns.id, simCampaignPoints.campaignId),
+      )
+      .where(
+        and(
+          eq(simCampaignPoints.resultId, committed.resultId),
+          eq(simCampaignPoints.resultAttemptId, committed.attemptId),
+          eq(simCampaignPoints.derivedBySymmetry, false),
+          inArray(simCampaigns.status, ["active", "attention", "paused"]),
+        ),
+      )
+      .orderBy(simCampaignPoints.campaignId)
+      .limit(1);
+    await enqueuePrecalcVerifications(db, {
+      airfoilId,
+      revisionId,
+      campaignId: campaignOwner?.campaignId ?? null,
+      aoaDeg: committed.aoaDeg,
+    });
+    const [finalOwner] = await db
+      .select({
+        queueId: simUransVerifyQueue.id,
+        backgroundOwner: simUransVerifyQueue.backgroundOwner,
+      })
+      .from(simUransVerifyQueue)
+      .where(
+        and(
+          eq(simUransVerifyQueue.precalcResultAttemptId, committed.attemptId),
+          inArray(simUransVerifyQueue.state, [
+            "pending",
+            "running",
+            "done",
+            "disagreed",
+          ]),
+        ),
+      )
+      .orderBy(simUransVerifyQueue.createdAt)
+      .limit(1);
+    if (!finalOwner) {
+      throw new PolarEvidenceBindingError(
+        `point ${committed.aoaDeg} accepted preliminary evidence without FINAL ownership`,
+      );
+    }
+    if (campaignOwner) {
+      const [owned] = await db
+        .select({ queueId: simUransVerifyQueueCampaigns.queueId })
+        .from(simUransVerifyQueueCampaigns)
+        .where(
+          and(
+            eq(simUransVerifyQueueCampaigns.queueId, finalOwner.queueId),
+            eq(
+              simUransVerifyQueueCampaigns.campaignId,
+              campaignOwner.campaignId,
+            ),
+            eq(simUransVerifyQueueCampaigns.state, "active"),
+          ),
+        )
+        .limit(1);
+      if (!owned) {
+        throw new PolarEvidenceBindingError(
+          `point ${committed.aoaDeg} FINAL verification lost campaign ownership`,
+        );
+      }
+    } else if (!finalOwner.backgroundOwner) {
+      throw new PolarEvidenceBindingError(
+        `point ${committed.aoaDeg} FINAL verification has no live owner`,
+      );
+    }
+  }
+
   if (payload.promiseId) {
     for (const committed of committedPoints) {
       const pointSettlement = await db.transaction(async (rawTx) => {
@@ -4647,22 +4990,31 @@ async function importPolarPush(
         ) {
           return { settled: false, receipt: null };
         }
-        // A marched remote RANS job can publish early siblings before a typed
-        // low-angle hard failure promotes its exact polar to preliminary
-        // URANS. The point remains owned by this promise, and the immutable
-        // RANS generation remains stored, but the fulfilled pointer must be
-        // allowed to advance to the newly accepted canonical URANS attempt.
-        // Arbitrary changed RANS replays still fail the exact-attempt guard.
-        const acceptedUransUpgrade =
-          committed.regime === "urans"
+        // Promise ownership advances by numerical fidelity, not the physical
+        // regime flag: a no-shedding PRECALC or FULL URANS generation is
+        // deliberately stored with physical regime RANS. Preserve every
+        // immutable generation while allowing only RANS -> PRECALC -> FULL.
+        const acceptedFidelityUpgrade =
+          committed.fidelity === "urans_precalc"
             ? sql`EXISTS (
                 SELECT 1
                 FROM result_attempts prior_attempt
                 WHERE prior_attempt.id = ${syncSweepPromisePoints.resultAttemptId}
                   AND prior_attempt.result_id = ${committed.resultId}
-                  AND prior_attempt.regime = 'rans'
+                  AND COALESCE(
+                    prior_attempt.evidence_payload ->> 'fidelity',
+                    CASE WHEN prior_attempt.regime = 'rans' THEN 'rans' END
+                  ) = 'rans'
               )`
-            : sql`false`;
+            : committed.fidelity === "urans_full"
+              ? sql`EXISTS (
+                  SELECT 1
+                  FROM result_attempts prior_attempt
+                  WHERE prior_attempt.id = ${syncSweepPromisePoints.resultAttemptId}
+                    AND prior_attempt.result_id = ${committed.resultId}
+                    AND prior_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+                )`
+              : sql`false`;
         const fulfilledAt = new Date();
         const settled = await tx
           .update(syncSweepPromisePoints)
@@ -4688,7 +5040,7 @@ async function importPolarPush(
                       syncSweepPromisePoints.resultAttemptId,
                       committed.attemptId,
                     ),
-                    acceptedUransUpgrade,
+                    acceptedFidelityUpgrade,
                   ),
                 ),
               ),

@@ -117,7 +117,10 @@ Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDeta
   campaign-successor transition. Retain complete local tar.zst evidence with
   no GCS credential and do not permit generic retention before the production
   hub acknowledges the job-level delivery. Storage location is deployment and
-  transfer policy, not part of numerical solver compatibility identity.
+  transfer policy, not part of numerical solver compatibility identity. The
+  hub acknowledges accepted fast evidence only after fresh generation-pinned
+  verification, complete blob/archive/member registration, exact campaign
+  attempt ownership, and one durable FINAL owner.
 - Why: copying the hub's GCS credentials would widen secret and canonical-data
   authority; using the base Compose file alone silently restores the 8-slot
   defaults and can switch the Docker project/volumes; using the hub cutover on
@@ -127,6 +130,9 @@ Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDeta
   production hub. The selected role-specific profile preserves the existing
   database and volumes, uses all 40 authorized CPU slots, makes rollback and
   recovery durable, and transfers exact evidence before local reclamation.
+  A result/attempt row plus broker receipt alone leaves restartable bytes and
+  required FINAL work outside the scheduling ledger; making those owners part
+  of acknowledgement closes that unsafe intermediate state.
 
 ## D-2026-07-16-preliminary-urans-reliability — Every point follows one automatic fidelity sequence
 

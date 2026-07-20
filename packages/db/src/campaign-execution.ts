@@ -599,6 +599,10 @@ export interface ResultIngestSignal {
   revisionId: string | null;
   aoaDeg: number;
   resultId: string;
+  /** Exact immutable generation selected for this terminal point. Campaign
+   * ownership of later FINAL verification must never be reconstructed from
+   * the mutable result container alone. */
+  resultAttemptId?: string | null;
   status: string;
   regime?: string | null;
 }
@@ -1448,7 +1452,9 @@ export async function onResultIngested(
     // condition's "gained evidence" state is derived at read time.
     const direct = (await db.execute(sql`
       UPDATE sim_campaign_points
-      SET state = 'terminal', result_id = ${signal.resultId}, "updatedAt" = now()
+      SET state = 'terminal', result_id = ${signal.resultId},
+          result_attempt_id = ${signal.resultAttemptId ?? null},
+          "updatedAt" = now()
       WHERE airfoil_id = ${signal.airfoilId} AND revision_id = ${signal.revisionId}
         AND aoa_deg = ${aoa} AND derived_by_symmetry = false AND state = 'requested'
       RETURNING campaign_id, condition_id, airfoil_id
@@ -1459,8 +1465,10 @@ export async function onResultIngested(
     // source, resultId pointing at the +α results row (spec §9.2).
     if (aoa > 0) {
       const mirrored = (await db.execute(sql`
-        UPDATE sim_campaign_points p
-        SET state = 'terminal', result_id = ${signal.resultId}, "updatedAt" = now()
+      UPDATE sim_campaign_points p
+        SET state = 'terminal', result_id = ${signal.resultId},
+            result_attempt_id = ${signal.resultAttemptId ?? null},
+            "updatedAt" = now()
         FROM airfoils a
         WHERE a.id = p.airfoil_id AND a.is_symmetric = true
           AND p.airfoil_id = ${signal.airfoilId} AND p.revision_id = ${signal.revisionId}
@@ -1468,6 +1476,25 @@ export async function onResultIngested(
         RETURNING p.campaign_id, p.condition_id, p.airfoil_id
       `)) as unknown as ProgressKeyRow[];
       affected.push(...mirrored);
+    }
+
+    // Crash/replay repair for terminal rows linked before exact attempt
+    // ownership was persisted. Advance only to the result's currently
+    // selected immutable generation; a later rejected/non-canonical attempt
+    // must never retarget an already terminal campaign point.
+    if (signal.resultAttemptId) {
+      const repaired = (await db.execute(sql`
+        UPDATE sim_campaign_points point
+        SET result_attempt_id = ${signal.resultAttemptId}, "updatedAt" = now()
+        FROM results canonical
+        WHERE point.result_id = ${signal.resultId}
+          AND point.state = 'terminal'
+          AND point.result_attempt_id IS DISTINCT FROM ${signal.resultAttemptId}
+          AND canonical.id = point.result_id
+          AND canonical.current_result_attempt_id = ${signal.resultAttemptId}
+        RETURNING point.campaign_id, point.condition_id, point.airfoil_id
+      `)) as unknown as ProgressKeyRow[];
+      affected.push(...repaired);
     }
 
     // Idempotent re-ingest: rows already linked to this result still need

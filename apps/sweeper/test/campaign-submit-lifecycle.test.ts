@@ -2029,6 +2029,39 @@ describe("campaign compose→submit lifecycle boundary", () => {
       status: "failed",
       regime: "rans",
     });
+    const [initiallyLinkedPoint] = await db
+      .select({ resultAttemptId: simCampaignPoints.resultAttemptId })
+      .from(simCampaignPoints)
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, ANGLES[1]),
+        ),
+      );
+    expect(initiallyLinkedPoint.resultAttemptId).toBeNull();
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, failed.id));
+    await onResultIngested(db, {
+      airfoilId,
+      revisionId: setup.revisionId,
+      aoaDeg: ANGLES[1],
+      resultId: failed.id,
+      resultAttemptId: attempt.id,
+      status: "failed",
+      regime: "rans",
+    });
+    const [linkedFailedPoint] = await db
+      .select({ resultAttemptId: simCampaignPoints.resultAttemptId })
+      .from(simCampaignPoints)
+      .where(
+        and(
+          eq(simCampaignPoints.campaignId, campaignId),
+          eq(simCampaignPoints.aoaDeg, ANGLES[1]),
+        ),
+      );
+    expect(linkedFailedPoint.resultAttemptId).toBe(attempt.id);
 
     const readProgress = async () => {
       const [row] = await db

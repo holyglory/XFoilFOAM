@@ -18,6 +18,8 @@ export * from "./rans-polar-promotions";
 export * from "./precalc-cell-lock";
 export * from "./result-evidence-lock";
 export * from "./evidence-manifest";
+export * from "./evidence-archive-manifest";
+export * from "./brokered-evidence-archive";
 export * from "./sync-promise-purge";
 export * from "./sweeper-admission-breaker";
 export { createClient, type DB, type Sql } from "./client";
