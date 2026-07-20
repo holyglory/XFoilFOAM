@@ -81,7 +81,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8"
+          cpus: "${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}"
 
   # Optional production Foundation 14 pool. It is excluded from ordinary
   # deploys and must be enabled through the guarded engine-maintenance path
@@ -131,7 +131,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8"
+          cpus: "${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}"
 
   postgres:
     image: postgres:16-alpine

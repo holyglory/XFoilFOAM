@@ -92,6 +92,25 @@ describe("remote-only evidence cleanup deployment wiring", () => {
   });
 });
 
+describe("production worker capacity wiring", () => {
+  const production = readFileSync(
+    resolve(repoRoot, "docker-compose.deploy.yml"),
+    "utf8",
+  );
+
+  it.each(["worker", "worker-foundation14"])(
+    "uses one authoritative CPU budget for %s admission and Docker enforcement",
+    (service) => {
+      const block = serviceBlock(production, service);
+      expect(block).toContain(
+        "AIRFOILFOAM_WORKER_CPU_BUDGET: ${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}",
+      );
+      expect(block).toContain('cpus: "${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}"');
+      expect(block).not.toContain('cpus: "8"');
+    },
+  );
+});
+
 describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
   "%s solver engine isolation",
   (filename) => {
@@ -99,9 +118,7 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
       const source = readFileSync(resolve(repoRoot, filename), "utf8");
       const api = serviceBlock(source, "api");
 
-      expect(api).toContain(
-        "openfoam:opencfd:2606:numerics-1:adapter-1",
-      );
+      expect(api).toContain("openfoam:opencfd:2606:numerics-1:adapter-1");
       expect(api).not.toMatch(
         /AIRFOILFOAM_ENABLED_ENGINE_KEYS:[^\n]*foundation/,
       );
@@ -139,9 +156,7 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
 
       for (const worker of [openCfd, foundation]) {
         expect(worker).toContain("results:/data/airfoilfoam");
-        expect(worker).toContain(
-          "engine_runtime:/data/airfoilfoam-runtime",
-        );
+        expect(worker).toContain("engine_runtime:/data/airfoilfoam-runtime");
         expect(worker).toContain(
           "AIRFOILFOAM_CPU_TOKEN_STATE_PATH: /data/airfoilfoam-runtime/cpu-tokens.json",
         );
