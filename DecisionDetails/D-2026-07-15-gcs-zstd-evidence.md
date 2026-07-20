@@ -178,3 +178,27 @@ authenticated evidence metadata, not creation of evidence: a member absent
 from both authenticated sources, or any byte/identity mismatch, remains a hard
 stop, and no GCS archive binding, database acknowledgement, or deletion
 authority is emitted.
+
+## Production completion reconciliation
+
+The migration completed on 2026-07-19 with 3,666 canonical GCS objects totaling
+159,957,991,885 stored bytes. The database independently reconciled all 3,666
+current archives to the target bucket, with zero non-target archives and zero
+bundle attempts lacking an archive association. A separate complete
+partial/incomplete quarantine receipt remains forensic evidence and is not
+counted as a canonical solver archive.
+
+The local terminal corpus reconciled to zero legacy gzip bundles, zero
+canonical local Zstandard duplicates, zero packaged raw duplicates, and zero
+unprotected terminal raw directories or bytes. A separate audit of 92 newer
+live-finalization records reproduced 92/92 GCS pointers, manifests, retention
+receipts, and database associations with zero failures. The bounded hydration
+cache occupied 49,304,076,965 bytes; the VPS had approximately 393 GiB free
+after reclamation. The retained production audit records are:
+
+- `/opt/airfoils-pro/audit/gcs-evidence-20260719T-continuation/final-local-reconciliation.json`;
+- `/opt/airfoils-pro/audit/gcs-evidence-20260719T-continuation/final-database-reconciliation.json`.
+
+The strongly verified post-migration database dump was also copied off the VPS:
+315,362,580 bytes with SHA-256
+`1085e8b6e8aebb3e8ab02d01a79f8f5039c8f06f6dbbefabb0d6930e592e4956`.

@@ -4,49 +4,22 @@
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical
   incident model, and compact per-point rail are deployed with the guarded
-  OpenCFD 2606 engine. Scheduling remains durably disabled while the GCS
-  migration and remote-worker cutover are completed. Preserve immutable 2406
-  histories. Then recover the exact 20-32C/Re≈102k/α20° continuation, obtain
+  OpenCFD 2606 engine. Scheduling remains durably disabled while the
+  remote-worker cutover and exact brokered canary are completed. Preserve
+  immutable 2406 histories. Then recover the exact 20-32C/Re≈102k/α20°
+  continuation, obtain
   its accepted fast and final generations, resume the active campaign at
   bounded capacity, and monitor subsequent RANS handoffs plus fast/final
   results. Readiness requires no recurring current-generation blocked/critical
   chain; any new exhaustion remains a red system incident and must be
   investigated before ordinary new admission continues.
 
-- **GCS Zstandard evidence migration:** Remote-only Zstandard finalization and
-  verified restore are live, but the legacy corpus migration and local
-  reclamation are incomplete. The one AG26 a19 target (manifest/DB AoA 14°)
-  is now conserved in a generation-pinned forensic-quarantine object with an
-  exact database acknowledgement and fresh pinned restore; its local raw and
-  archive duplicates were removed only after that proof. Of the original
-  2,987 normal targets, 2,051 are finalized and 936 remain. Cycle 26 uploaded
-  63 of those remaining targets but stopped before database acknowledgement or
-  local deletion when an authenticated historical `mesh_evidence` member had
-  no logical artifact row. Deploy and verify the exact-owner, byte-authenticated
-  legacy-member reconciliation, finish those 63 registrations/finalizations,
-  and continue the remaining targets one protected terminal job at a time. The
-  migration-0081 operational ownership path for
-  16 cutover-canary generations totaling 216,240,757 bytes across 11 completed
-  zero-`sim_jobs` engine-job directories is implemented and locally verified:
-  four generations are attested r5 evidence and twelve are protected
-  unattested r2/r3/r4 cutover evidence. Deploy it, reproduce every exact
-  protected claim, register all 16 immutable operational owners, freshly
-  restore every pinned GCS generation and manifest member, reclaim only the
-  allowlisted local archive/raw copies, and persist all 16 retention receipts.
-  Do not run the migration-0079 delete path for these generations: GCS remains
-  immutable and present. Then reconcile database ownership, GCS generations,
-  local legacy files, and reclaimed bytes. Never invent an acknowledgement or
-  member, repair a partial package into canonical evidence, or register
-  canary/quarantine bytes as campaign data.
-
-- **Production evidence capacity:** The 500 GB VPS had 271,509,491,712 bytes
-  (about 253 GiB) free at the final pre-deploy check after the safe cycle-26
-  checkpoint and the strongly
-  verified pre-deploy database backup. Preserve at least 80
-  GiB free while the campaign is
-  active, continue bounded hydration-cache cleanup and verified legacy
-  migration, and remeasure active-case growth before increasing solver
-  concurrency.
+- **Production evidence capacity:** The completed GCS reconciliation left the
+  500 GB VPS about 393 GiB free (roughly 20% used), with no legacy gzip,
+  canonical local Zstandard, packaged raw, or unprotected terminal raw
+  duplicates. Preserve at least 80 GiB free while the campaign is active,
+  keep the temporary hydration cache bounded, and remeasure active-case growth
+  before increasing solver concurrency.
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`

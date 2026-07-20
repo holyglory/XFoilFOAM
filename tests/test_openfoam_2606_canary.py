@@ -35,7 +35,9 @@ volume_canary = importlib.util.module_from_spec(VOLUME_SPEC)
 sys.modules[VOLUME_SPEC.name] = volume_canary
 VOLUME_SPEC.loader.exec_module(volume_canary)
 
-VOLUME_CANARY_MODES = frozenset({"volume-ok", "volume-gcs-leak"})
+VOLUME_CANARY_MODES = frozenset(
+    {"volume-ok", "volume-gcs-leak", "volume-missing-member-count"}
+)
 
 
 def _sha(payload: bytes) -> str:
@@ -420,6 +422,7 @@ class FakeGatewayState:
                 "uncompressedTarSha256": _sha(b"fake-uncompressed-tar"),
                 "uncompressedTarByteSize": 4096,
                 "zstdLevel": 10,
+                "bundledFileCount": 42,
                 "localEvidenceDisposition": "volume",
                 "evidenceBase": "evidence",
             }
@@ -427,6 +430,8 @@ class FakeGatewayState:
                 bundle_artifact["metadata"]["bucket"] = (
                     "airfoils-pro-storage-bucket"
                 )
+            elif self.mode == "volume-missing-member-count":
+                bundle_artifact["metadata"].pop("bundledFileCount")
         elif self.mode == "volume-bundle":
             bundle_artifact["metadata"]["storageBackend"] = "volume"
         elif self.mode == "local-retained":
@@ -934,6 +939,38 @@ def test_volume_canary_rejects_gcs_metadata_leaking_into_volume_receipt():
 
     assert state.cancelled == []
     assert state.stripped == []
+
+
+def test_volume_canary_requires_exact_archive_member_count_before_strip():
+    with fake_gateway(mode="volume-missing-member-count") as (state, url):
+        with pytest.raises(
+            volume_canary._base.CanaryFailure,
+            match="bundled file count is invalid",
+        ):
+            volume_canary.OpenCfd2606VolumeCanary(
+                _volume_config(state, url)
+            ).run()
+
+    assert state.stripped == []
+
+
+def test_volume_retained_receipt_rejects_remote_storage_binding_before_reads():
+    with fake_gateway(mode="volume-ok") as (state, url):
+        config = _volume_config(state, url)
+        receipt = volume_canary.OpenCfd2606VolumeCanary(config).run()
+        prior_render_calls = len(state.remote_render_calls)
+        storage = receipt["jobs"][0]["points"][0]["artifacts"][0]["storage"]
+        storage["backend"] = "gcs"
+
+        with pytest.raises(
+            volume_canary._base.CanaryFailure,
+            match="complete local archive contract",
+        ):
+            volume_canary.OpenCfd2606VolumeCanary(
+                config
+            ).verify_retained_receipt(receipt)
+
+    assert len(state.remote_render_calls) == prior_render_calls
 
 
 def test_volume_canary_refuses_an_evidence_bucket_before_contacting_gateway():

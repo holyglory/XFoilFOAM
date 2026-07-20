@@ -136,6 +136,13 @@ class OpenCfd2606VolumeCanary(_base.OpenCfd2606Canary):
             metadata.get("localEvidenceDisposition") == "volume",
             f"{label} does not retain its complete local archive",
         )
+        bundled_file_count = metadata.get("bundledFileCount")
+        _base._require(
+            isinstance(bundled_file_count, int)
+            and not isinstance(bundled_file_count, bool)
+            and bundled_file_count > 0,
+            f"{label} bundled file count is invalid",
+        )
         return {
             "backend": "volume",
             "stored_sha256": artifact["sha256"],
@@ -146,7 +153,72 @@ class OpenCfd2606VolumeCanary(_base.OpenCfd2606Canary):
             "uncompressed_tar_byte_size": tar_size,
             "zstd_level": metadata["zstdLevel"],
             "local_disposition": metadata["localEvidenceDisposition"],
+            # The shared canary validates this against the exact manifest.
+            # It is removed from the role-specific persisted receipt below;
+            # the remote attestation schema retains its established strict
+            # storage shape while the check cannot be bypassed.
+            "bundled_file_count": bundled_file_count,
         }
+
+    def _validate_evidence(
+        self,
+        point: dict[str, Any],
+        scenario: Any,
+        expected_aoa_deg: float,
+    ) -> list[dict[str, object | None]]:
+        artifacts = super()._validate_evidence(
+            point, scenario, expected_aoa_deg
+        )
+        for artifact in artifacts:
+            storage = _base._mapping(
+                artifact.get("storage"),
+                f"{scenario.name} volume receipt storage",
+            )
+            storage.pop("bundled_file_count", None)
+        return artifacts
+
+    @staticmethod
+    def _validate_retained_receipt_bindings(raw_jobs: list[Any]) -> None:
+        expected_keys = {
+            "backend",
+            "stored_sha256",
+            "stored_byte_size",
+            "archive_format",
+            "compression",
+            "uncompressed_tar_sha256",
+            "uncompressed_tar_byte_size",
+            "zstd_level",
+            "local_disposition",
+        }
+        for job_index, job_value in enumerate(raw_jobs):
+            job = _base._mapping(job_value, f"retained volume job {job_index}")
+            points = _base._list(
+                job.get("points"), f"retained volume job {job_index} points"
+            )
+            for point_index, point_value in enumerate(points):
+                point = _base._mapping(
+                    point_value,
+                    f"retained volume job {job_index} point {point_index}",
+                )
+                artifacts = _base._list(
+                    point.get("artifacts"),
+                    f"retained volume job {job_index} point {point_index} artifacts",
+                )
+                for artifact_index, artifact_value in enumerate(artifacts):
+                    artifact = _base._mapping(
+                        artifact_value,
+                        f"retained volume artifact {job_index}/{point_index}/{artifact_index}",
+                    )
+                    storage = _base._mapping(
+                        artifact.get("storage"),
+                        f"retained volume artifact {job_index}/{point_index}/{artifact_index} storage",
+                    )
+                    _base._require(
+                        set(storage) == expected_keys
+                        and storage.get("backend") == "volume"
+                        and storage.get("local_disposition") == "volume",
+                        "retained volume artifact does not bind the complete local archive contract",
+                    )
 
     @staticmethod
     def _to_volume_receipt(base_receipt: dict[str, Any]) -> dict[str, Any]:
