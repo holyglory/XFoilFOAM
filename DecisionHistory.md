@@ -24,7 +24,10 @@
   the hazard remains, and legacy-generation hazards are inert.
   A mesh/runtime problem is repaired automatically before fast URANS, and only
   exhaustion of that non-aerodynamic recovery or of fast/final URANS is a
-  critical system incident. Campaign detail leads with one operational message
+  critical system incident. A reproduced and fixed engine/controller defect
+  may grant one exact obligation one audited, source-pinned remediation run;
+  ordinary preliminary work remains bounded to two physical runs. Campaign
+  detail leads with one operational message
   and a live instrument, progressively discloses secondary detail, separates
   physical attempts from non-physical submissions, and shows pinned real
   geometry in a true modal that owns focus and scroll.
@@ -100,6 +103,7 @@ Detail: [DecisionDetails/D-2026-07-18-incomplete-evidence-quarantine.md](Decisio
   prevent recurrence. Fail-closed retention plus byte-exact quarantine and no
   invented members preserve both solver truth and incident evidence without
   inventing a result.
+
 ## D-2026-07-17-hz-solver2-volume-cutover — hz-solver2 uses a separate 40-slot volume-backed cutover
 
 Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md)
@@ -341,18 +345,27 @@ Detail: [DecisionDetails/D-2026-07-15-precalc-physical-attempt-budget.md](Decisi
   newer recovery capability exists, while infrastructure loss returns to
   automatic scheduling after a bounded backoff. A real accepted, rejected, or
   failed CFD window still consumes its physical attempt even if its containing
-  job later disappears.
+  job later disappears. One exact obligation may receive one audited third
+  physical attempt only after a reproduced engine/controller defect is fixed;
+  the grant records the reason, fixing source revision, and timestamp without
+  changing either prior attempt. Ordinary obligations remain hard-bounded to
+  two physical attempts.
 - Why: the production disk incident left 21 A20-32C cells falsely exhausted by
   lost worker tasks, while seven other cells had spent the old submission
   allowance on mesh setup before their first real preliminary-URANS window
-  requested same-case continuation. Raising the attempt limit would remain
-  exhaustible by infrastructure and permit extra physical solves; deleting or
-  resetting attempt rows would destroy audit evidence; manual requeue would
-  turn recoverable machine work into a user task. Separating submission audit
-  order from physical CFD budget preserves evidence, the two-solve bound, and
+  requested same-case continuation. A blanket higher default would remain
+  exhaustible by infrastructure and permit unexplained extra physical solves;
+  deleting or resetting attempt rows would destroy audit evidence; manual
+  user requeue would turn recoverable machine work into a user task. The later
+  angle-12 broker canary added materially different evidence: both runs
+  completed useful CFD, but the same fixed controller boundary bug rejected
+  them after choosing an already-observed horizon. A one-time, source-pinned
+  remediation grant recovers that exact machine-owned incident without
+  weakening the ordinary two-run bound. Separating submission audit order,
+  physical budget, and the exceptional grant preserves all evidence and
   automatic recovery. This supersedes the 2026-07-11 wording that bounded
-  `engine-accepted submissions`; the durable limit remains two physical CFD
-  attempts.
+  `engine-accepted submissions`; the normal durable limit remains two physical
+  CFD attempts.
 
 ## D-2026-07-15-disk-admission — Storage reserves gate new solver jobs
 

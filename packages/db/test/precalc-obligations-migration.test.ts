@@ -771,3 +771,98 @@ describe("0043→0047 PRECALC upgrade data", () => {
     }
   }, 180_000);
 });
+
+describe("0084 PRECALC engine-remediation grant", () => {
+  const obligationId = "90000000-0000-0000-0000-000000000084";
+
+  it("MUST-CATCH: permits one audited third physical run without resetting prior evidence", async () => {
+    await client!.unsafe(`
+      INSERT INTO sim_precalc_obligations
+        (id, airfoil_id, revision_id, aoa_deg, state, attempt_count, max_attempts)
+      VALUES
+        ('${obligationId}', '${ID.airfoil}', '${ID.revision}', 84, 'pending', 2, 2)
+    `);
+    try {
+      await expect(
+        client!.unsafe(`
+          UPDATE sim_precalc_obligations
+          SET max_attempts = 3
+          WHERE id = '${obligationId}'
+        `),
+      ).rejects.toThrow(/sim_precalc_obligations_attempt_bounds_check/);
+
+      await client!.unsafe(`
+        UPDATE sim_precalc_obligations
+        SET remediation_attempts_granted = 1,
+            max_attempts = 3,
+            remediation_reason = 'period-horizon controller fixed after exact production reproduction',
+            remediation_source_revision = '79a33dab5f5a770f428d3827550676a70c1ac141',
+            remediation_granted_at = now(),
+            last_outcome = 'corrective_engine_fix_retry_pending'
+        WHERE id = '${obligationId}'
+      `);
+      await client!.unsafe(`
+        UPDATE sim_precalc_obligations
+        SET attempt_count = 3
+        WHERE id = '${obligationId}'
+      `);
+
+      const [row] = await client!.unsafe<
+        Array<{
+          attempt_count: number;
+          max_attempts: number;
+          remediation_attempts_granted: number;
+          remediation_reason: string;
+          remediation_source_revision: string;
+          remediation_granted_at: string;
+        }>
+      >(`
+        SELECT attempt_count, max_attempts, remediation_attempts_granted,
+               remediation_reason, remediation_source_revision,
+               remediation_granted_at
+        FROM sim_precalc_obligations
+        WHERE id = '${obligationId}'
+      `);
+      expect(row).toMatchObject({
+        attempt_count: 3,
+        max_attempts: 3,
+        remediation_attempts_granted: 1,
+        remediation_source_revision: "79a33dab5f5a770f428d3827550676a70c1ac141",
+      });
+      expect(row?.remediation_reason).toContain("controller fixed");
+      expect(Date.parse(row?.remediation_granted_at ?? "")).not.toBeNaN();
+
+      await expect(
+        client!.unsafe(`
+          UPDATE sim_precalc_obligations
+          SET remediation_attempts_granted = 2,
+              max_attempts = 4
+          WHERE id = '${obligationId}'
+        `),
+      ).rejects.toThrow(/sim_precalc_obligations_attempt_bounds_check/);
+    } finally {
+      await client!.unsafe(`
+        DELETE FROM sim_precalc_obligations WHERE id = '${obligationId}'
+      `);
+    }
+  });
+
+  it("FALSE-POSITIVE GUARD: ordinary obligations remain hard-bounded to two runs", async () => {
+    const rows = await client!.unsafe<
+      Array<{
+        invalid: number;
+      }>
+    >(`
+      SELECT count(*)::int AS invalid
+      FROM sim_precalc_obligations
+      WHERE remediation_attempts_granted = 0
+        AND (
+          max_attempts <> 2
+          OR remediation_reason IS NOT NULL
+          OR remediation_source_revision IS NOT NULL
+          OR remediation_granted_at IS NOT NULL
+        )
+    `);
+    expect(rows[0]?.invalid).toBe(0);
+  });
+});

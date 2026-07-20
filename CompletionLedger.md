@@ -35,9 +35,12 @@
   last angle produced stable force/raw evidence but exposed a controller
   boundary defect: sparse field writes lagged force progress, so the engine
   retried an already-observed period horizon and rejected the zero-progress
-  chunk. Deploy the regression-backed physical-progress correction together
-  with the queue-inspection/nofile safeguard through the guarded idle engine
-  rebuild, reopen only that exact obligation, finish its result, prove all 26
+  chunk. The regression-backed physical-progress correction and the
+  queue-inspection/nofile safeguard are live on the guarded
+  `hz-solver2-79a33da-2606` engine build; the ordinary two-attempt invariant
+  correctly refused an unaudited third run. Deploy the one-time audited
+  engine-remediation grant, apply it only to that exact obligation without
+  changing either failed attempt, finish its result, prove all 26
   generation-pinned readbacks and acknowledgement-gated remote reclamation,
   prove descriptor stability after repeated queue polling, and resume bounded
   capacity before removing this item.
