@@ -3651,6 +3651,83 @@ interface HubBindingReceipt {
   fulfilledAt: string;
 }
 
+async function isCancelledPromiseSettledEvidenceUpgrade(
+  promise: typeof syncSweepPromises.$inferSelect,
+  payload: PolarPushPayload,
+): Promise<boolean> {
+  if (
+    promise.status !== "cancelled" ||
+    !payload.promiseId ||
+    payload.promiseId !== promise.id ||
+    !promise.sourceInstanceId ||
+    !payload.sourceInstanceId ||
+    promise.sourceInstanceId !== payload.sourceInstanceId
+  )
+    return false;
+
+  for (const point of payload.results) {
+    const brokeredBundles = point.evidenceArtifacts.filter(
+      (artifact) =>
+        nullableText(artifact.kind) === "engine_bundle" &&
+        nullableText(artifact.remoteEvidenceUploadId) != null,
+    );
+    if (
+      brokeredBundles.length !== 1 ||
+      !point.remoteResultId ||
+      !point.remoteResultAttemptId ||
+      !point.engineJobId
+    )
+      return false;
+    const uploadId = nullableText(brokeredBundles[0]!.remoteEvidenceUploadId);
+    if (!uploadId) return false;
+    const [owned] = await db
+      .select({
+        uploadId: syncBrokeredEvidenceUploads.id,
+        state: syncBrokeredEvidenceUploads.state,
+        promiseId: syncBrokeredEvidenceUploads.promiseId,
+        promisePointId: syncBrokeredEvidenceUploads.promisePointId,
+        sourceInstanceId: syncBrokeredEvidenceUploads.sourceInstanceId,
+        remoteResultId: syncBrokeredEvidenceUploads.remoteResultId,
+        remoteResultAttemptId:
+          syncBrokeredEvidenceUploads.remoteResultAttemptId,
+        aoaDeg: syncBrokeredEvidenceUploads.aoaDeg,
+        engineJobId: syncBrokeredEvidenceUploads.engineJobId,
+        engineCaseSlug: syncBrokeredEvidenceUploads.engineCaseSlug,
+        pointId: syncSweepPromisePoints.id,
+        pointStatus: syncSweepPromisePoints.status,
+        pointResultId: syncSweepPromisePoints.resultId,
+        pointResultAttemptId: syncSweepPromisePoints.resultAttemptId,
+      })
+      .from(syncBrokeredEvidenceUploads)
+      .innerJoin(
+        syncSweepPromisePoints,
+        eq(
+          syncSweepPromisePoints.id,
+          syncBrokeredEvidenceUploads.promisePointId,
+        ),
+      )
+      .where(eq(syncBrokeredEvidenceUploads.id, uploadId))
+      .limit(1);
+    if (
+      !owned ||
+      !["verified", "bound"].includes(owned.state) ||
+      owned.promiseId !== promise.id ||
+      owned.promisePointId !== owned.pointId ||
+      owned.sourceInstanceId !== promise.sourceInstanceId ||
+      owned.remoteResultId !== point.remoteResultId ||
+      owned.remoteResultAttemptId !== point.remoteResultAttemptId ||
+      owned.aoaDeg !== point.aoaDeg ||
+      owned.engineJobId !== point.engineJobId ||
+      owned.engineCaseSlug !== (point.engineCaseSlug ?? null) ||
+      owned.pointStatus !== "fulfilled" ||
+      !owned.pointResultId ||
+      !owned.pointResultAttemptId
+    )
+      return false;
+  }
+  return true;
+}
+
 async function importPolarPush(
   payload: PolarPushPayload,
   files: Map<string, UploadedFileRef>,
@@ -3695,8 +3772,16 @@ async function importPolarPush(
     // ladder child's /complete fulfilled the promise after shipping 1 of 3
     // alphas; the parent's remaining chunks were then rejected forever and
     // the hub re-promised work the solver had already finished). Only a
-    // cancelled or unknown promise rejects.
-    if (!promise || promise.status === "cancelled") {
+    // cancelled or unknown promise rejects new evidence. One already-
+    // fulfilled point may still replay its exact brokered generation solely
+    // to replace the accepted attempt's obsolete legacy gzip container.
+    const cancelledEvidenceUpgrade =
+      promise?.status === "cancelled" &&
+      (await isCancelledPromiseSettledEvidenceUpgrade(promise, payload));
+    if (
+      !promise ||
+      (promise.status === "cancelled" && !cancelledEvidenceUpgrade)
+    ) {
       throw new PolarPromiseScopeError("promise is not active");
     }
     if (

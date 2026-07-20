@@ -596,6 +596,13 @@
       "when": 1788134400000,
       "tag": "0084_precalc_engine_remediation_grant",
       "breakpoints": true
+    },
+    {
+      "idx": 85,
+      "version": "7",
+      "when": 1788220800000,
+      "tag": "0085_settled_legacy_evidence_upgrade",
+      "breakpoints": true
     }
   ]
 }

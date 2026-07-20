@@ -67,6 +67,7 @@ function resumableUrl(objectKey: string, uploadId: string): string {
     uploadType: "resumable",
     name: objectKey,
     upload_id: uploadId,
+    ifGenerationMatch: "0",
   });
   return `https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?${query.toString()}`;
 }
@@ -209,6 +210,10 @@ describe("0080 brokered evidence / 0079 canary cleanup reciprocal fence", () => 
       resolve(migrations, "0082_remote_hub_binding_receipts.sql"),
       "utf8",
     );
+    const migration0085 = readFileSync(
+      resolve(migrations, "0085_settled_legacy_evidence_upgrade.sql"),
+      "utf8",
+    );
     expect(migration0080).toMatch(
       /sync_brokered_evidence_uploads_promise_fk[\s\S]*?sync_sweep_promises[\s\S]*?ON DELETE restrict/i,
     );
@@ -225,6 +230,15 @@ describe("0080 brokered evidence / 0079 canary cleanup reciprocal fence", () => 
     expect(migration0082).toMatch(
       /expired_retry[\s\S]*?OLD\.session_cancellation_acknowledged_at IS NOT NULL[\s\S]*?NEW\.attempt_count = OLD\.attempt_count \+ 1/i,
     );
+    expect(migration0085).toMatch(
+      /result\.current_result_attempt_id = point\.result_attempt_id[\s\S]*?point\.status = 'fulfilled'[\s\S]*?attempt\.valid_for_polar/i,
+    );
+    expect(migration0085).toMatch(
+      /manifest\.sha256 = candidate\.manifest_sha256[\s\S]*?legacy\.mime_type = 'application\/gzip'[\s\S]*?superseding\.kind::text = 'engine_bundle'/i,
+    );
+    expect(migration0085).toMatch(
+      /AND NOT settled_legacy_upgrade[\s\S]*?requires an active promise lease[\s\S]*?AND NOT settled_legacy_upgrade[\s\S]*?requires an active promise point/i,
+    );
   });
 
   it("keeps remote delivery promise ownership RESTRICT after the full migration chain", async () => {
@@ -240,6 +254,144 @@ describe("0080 brokered evidence / 0079 canary cleanup reciprocal fence", () => 
     `;
 
     expect(constraints).toEqual([{ confdeltype: "r" }]);
+  });
+
+  it("upgrades one exact fulfilled legacy gzip generation after its parent lease closes", async () => {
+    if (!setup || !database)
+      throw new Error("isolated broker database is unavailable");
+    const solverId = "81000000-0000-4000-8000-000000000001";
+    const promiseId = "81000000-0000-4000-8000-000000000002";
+    const pointId = "81000000-0000-4000-8000-000000000003";
+    const resultId = "81000000-0000-4000-8000-000000000004";
+    const attemptId = "81000000-0000-4000-8000-000000000005";
+    const manifestId = "81000000-0000-4000-8000-000000000006";
+    const gzipId = "81000000-0000-4000-8000-000000000007";
+    const sourceInstanceId = "settled-legacy-instance";
+    const engineJobId = "job-settled-legacy";
+    const engineCaseSlug = "case-settled-legacy";
+    const request = {
+      idempotencyKey: "81000000-0000-4000-8000-000000000008",
+      promiseId,
+      remoteResultId: "81000000-0000-4000-8000-000000000009",
+      remoteResultAttemptId: "81000000-0000-4000-8000-00000000000a",
+      aoaDeg: 18,
+      engineJobId,
+      engineCaseSlug,
+      storedSha256: "d".repeat(64),
+      storedByteSize: 4096,
+      tarSha256: "e".repeat(64),
+      tarByteSize: 8192,
+      manifestSha256: "c".repeat(64),
+      manifestByteSize: 1024,
+      zstdLevel: 10,
+      bundledFileCount: 3,
+    };
+    await setup.unsafe("SET session_replication_role = replica");
+    await setup.unsafe(`
+      INSERT INTO registered_remote_solvers
+        (id, instance_id, instance_name, auth_token_hash, credential_version)
+      VALUES ('${solverId}', '${sourceInstanceId}', 'Settled legacy solver',
+              '${"7".repeat(64)}', 1);
+      INSERT INTO sync_sweep_promises
+        (id, source_instance_id, airfoil_id, simulation_preset_revision_id,
+         aoa_count, status, "expiresAt", "cancelledAt", request_payload)
+      VALUES ('${promiseId}', '${sourceInstanceId}', '${id.airfoil}', '${id.revision}',
+              1, 'cancelled', now() - interval '1 day', now(),
+              '{"solverId":"${solverId}"}'::jsonb);
+      INSERT INTO results
+        (id, current_result_attempt_id, airfoil_id, bc_id,
+         simulation_preset_revision_id, aoa_deg, status, source, regime)
+      VALUES ('${resultId}', '${attemptId}', '${id.airfoil}', '${id.airfoil}',
+              '${id.revision}', 18, 'done', 'solved', 'rans');
+      INSERT INTO result_attempts
+        (id, result_id, airfoil_id, bc_id, simulation_preset_revision_id,
+         aoa_deg, engine_job_id, engine_case_slug, status, source,
+         valid_for_polar, regime)
+      VALUES ('${attemptId}', '${resultId}', '${id.airfoil}', '${id.airfoil}',
+              '${id.revision}', 18,
+              'sync:${sourceInstanceId}:${engineJobId}', '${engineCaseSlug}',
+              'done', 'solved', true, 'rans');
+      INSERT INTO sync_sweep_promise_points
+        (id, promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg,
+         status, result_id, result_attempt_id)
+      VALUES ('${pointId}', '${promiseId}', '${id.airfoil}', '${id.revision}',
+              18, 'fulfilled', '${resultId}', '${attemptId}');
+      INSERT INTO solver_evidence_artifacts
+        (id, result_id, result_attempt_id, airfoil_id, engine_job_id,
+         engine_case_slug, aoa_deg, kind, storage_key, mime_type, sha256,
+         byte_size)
+      VALUES
+        ('${manifestId}', '${resultId}', '${attemptId}', '${id.airfoil}',
+         'sync:${sourceInstanceId}:${engineJobId}', '${engineCaseSlug}', 18,
+         'manifest', 'sync-imports/cc/${request.manifestSha256}.json',
+         'application/json', '${request.manifestSha256}',
+         ${request.manifestByteSize}),
+        ('${gzipId}', '${resultId}', '${attemptId}', '${id.airfoil}',
+         'sync:${sourceInstanceId}:${engineJobId}', '${engineCaseSlug}', 18,
+         'openfoam_bundle', 'sync-imports/aa/${"a".repeat(64)}.gz',
+         'application/gzip', '${"a".repeat(64)}', 12288);
+    `);
+    await setup.unsafe("SET session_replication_role = origin");
+    const [solver] = await database
+      .select()
+      .from(schema.registeredRemoteSolvers)
+      .where(eq(schema.registeredRemoteSolvers.id, solverId));
+    if (!solver) throw new Error("settled legacy solver fixture disappeared");
+
+    const fetchMock = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const path = enginePath(input);
+        if (path.endsWith("/session")) {
+          const body = parsedJsonBody(init);
+          return Response.json({
+            state: "issued",
+            uploadUrl: resumableUrl(
+              String(body.objectKey),
+              "settled-legacy-upgrade",
+            ),
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          });
+        }
+        if (path.endsWith("/session-settled"))
+          return Response.json({ state: "registered" });
+        if (path.endsWith("/cancel-identity"))
+          return Response.json({ state: "cancelled", statusCode: 499 });
+        return Response.json({ detail: "unexpected route" }, { status: 404 });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const issued = await requestBrokeredEvidenceUpload(
+      database,
+      solver,
+      request,
+    );
+    expect(issued.state).toBe("issued");
+    await expireBrokeredEvidenceUploads(database);
+    const [retained] = await setup<{ state: string }[]>`
+      SELECT state FROM sync_brokered_evidence_uploads
+      WHERE id=${issued.id}::uuid
+    `;
+    expect(retained.state).toBe("issued");
+
+    const callsBeforeMismatch = fetchMock.mock.calls.length;
+    await expect(
+      requestBrokeredEvidenceUpload(database, solver, {
+        ...request,
+        idempotencyKey: "81000000-0000-4000-8000-00000000000b",
+        remoteResultAttemptId: "81000000-0000-4000-8000-00000000000c",
+        manifestSha256: "b".repeat(64),
+      }),
+    ).rejects.toThrow(/neither active work nor an eligible settled legacy/);
+    await expect(
+      requestBrokeredEvidenceUpload(database, solver, {
+        ...request,
+        idempotencyKey: "81000000-0000-4000-8000-00000000000d",
+        remoteResultAttemptId: "81000000-0000-4000-8000-00000000000e",
+        engineJobId: "different-job",
+      }),
+    ).rejects.toThrow(/neither active work nor an eligible settled legacy/);
+    expect(fetchMock.mock.calls).toHaveLength(callsBeforeMismatch);
   });
 
   it("serializes both owners on the same advisory identity and rejects the loser", async () => {

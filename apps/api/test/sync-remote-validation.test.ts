@@ -3113,6 +3113,14 @@ describe("remote solver sync validation regressions", () => {
         })
         .returning({ id: solverEvidenceArtifacts.id });
 
+      // Cancelling a completed batch releases every unfinished angle, but it
+      // must not strand an already-fulfilled point on its obsolete gzip
+      // container. The exact brokered generation may replay only that point's
+      // immutable accepted attempt and retire the duplicate container.
+      await db
+        .update(syncSweepPromises)
+        .set({ status: "cancelled", cancelledAt: new Date() })
+        .where(eq(syncSweepPromises.id, promiseId));
       const replay = await postRemote();
       expect(replay.statusCode, replay.body).toBe(200);
       expect(replay.json()).toMatchObject({

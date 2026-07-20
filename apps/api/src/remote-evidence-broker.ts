@@ -1,5 +1,8 @@
 import {
   registeredRemoteSolvers,
+  resultAttempts,
+  results,
+  solverEvidenceArtifacts,
   syncBrokeredEvidenceUploads,
   syncSweepPromisePoints,
   syncSweepPromises,
@@ -194,6 +197,116 @@ function sameRequest(row: UploadRow, input: BrokeredEvidenceRequest): boolean {
   );
 }
 
+async function isExactSettledLegacyEvidenceUpgrade(
+  database: DB,
+  solver: SolverRow,
+  promise: typeof syncSweepPromises.$inferSelect,
+  point: typeof syncSweepPromisePoints.$inferSelect,
+  input: BrokeredEvidenceRequest,
+): Promise<boolean> {
+  if (
+    point.status !== "fulfilled" ||
+    !point.resultId ||
+    !point.resultAttemptId ||
+    promise.sourceInstanceId !== solver.instanceId ||
+    String(
+      (promise.requestPayload as Record<string, unknown> | null)?.solverId ??
+        "",
+    ) !== solver.id
+  )
+    return false;
+
+  const [owner] = await database
+    .select({
+      resultId: results.id,
+      resultAttemptId: resultAttempts.id,
+      currentResultAttemptId: results.currentResultAttemptId,
+      resultAoaDeg: results.aoaDeg,
+      resultStatus: results.status,
+      resultSource: results.source,
+      attemptResultId: resultAttempts.resultId,
+      attemptAoaDeg: resultAttempts.aoaDeg,
+      attemptEngineJobId: resultAttempts.engineJobId,
+      attemptEngineCaseSlug: resultAttempts.engineCaseSlug,
+      attemptStatus: resultAttempts.status,
+      attemptSource: resultAttempts.source,
+      attemptValidForPolar: resultAttempts.validForPolar,
+    })
+    .from(results)
+    .innerJoin(resultAttempts, eq(resultAttempts.id, point.resultAttemptId))
+    .where(eq(results.id, point.resultId))
+    .limit(1);
+  if (
+    !owner ||
+    owner.resultId !== point.resultId ||
+    owner.resultAttemptId !== point.resultAttemptId ||
+    owner.currentResultAttemptId !== point.resultAttemptId ||
+    owner.attemptResultId !== point.resultId ||
+    owner.resultAoaDeg !== input.aoaDeg ||
+    owner.attemptAoaDeg !== input.aoaDeg ||
+    owner.resultStatus !== "done" ||
+    owner.resultSource !== "solved" ||
+    owner.attemptStatus !== "done" ||
+    owner.attemptSource !== "solved" ||
+    !owner.attemptValidForPolar ||
+    owner.attemptEngineJobId !==
+      `sync:${solver.instanceId}:${input.engineJobId}` ||
+    owner.attemptEngineCaseSlug !== input.engineCaseSlug
+  )
+    return false;
+
+  const artifacts = await database
+    .select({
+      kind: solverEvidenceArtifacts.kind,
+      mimeType: solverEvidenceArtifacts.mimeType,
+      storageKey: solverEvidenceArtifacts.storageKey,
+      sha256: solverEvidenceArtifacts.sha256,
+      byteSize: solverEvidenceArtifacts.byteSize,
+      engineJobId: solverEvidenceArtifacts.engineJobId,
+      engineCaseSlug: solverEvidenceArtifacts.engineCaseSlug,
+      aoaDeg: solverEvidenceArtifacts.aoaDeg,
+    })
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultId, point.resultId),
+        eq(solverEvidenceArtifacts.resultAttemptId, point.resultAttemptId),
+        inArray(solverEvidenceArtifacts.kind, [
+          "manifest",
+          "openfoam_bundle",
+          "engine_bundle",
+        ]),
+      ),
+    );
+  const exactOwner = (artifact: (typeof artifacts)[number]) =>
+    artifact.engineJobId === owner.attemptEngineJobId &&
+    artifact.engineCaseSlug === owner.attemptEngineCaseSlug &&
+    artifact.aoaDeg === input.aoaDeg;
+  const manifests = artifacts.filter(
+    (artifact) => artifact.kind === "manifest",
+  );
+  const legacyGzip = artifacts.filter(
+    (artifact) =>
+      artifact.kind === "openfoam_bundle" &&
+      artifact.mimeType === "application/gzip" &&
+      artifact.storageKey.startsWith("sync-imports/") &&
+      artifact.storageKey.endsWith(".gz"),
+  );
+  return (
+    manifests.length === 1 &&
+    exactOwner(manifests[0]!) &&
+    manifests[0]!.sha256 === input.manifestSha256 &&
+    manifests[0]!.byteSize === input.manifestByteSize &&
+    legacyGzip.length === 1 &&
+    exactOwner(legacyGzip[0]!) &&
+    artifacts.every(
+      (artifact) =>
+        artifact.kind !== "openfoam_bundle" || legacyGzip.includes(artifact),
+    ) &&
+    artifacts.every((artifact) => artifact.kind !== "engine_bundle")
+  );
+}
+
 async function engineRequest(
   path: string,
   body: unknown,
@@ -377,7 +490,13 @@ export async function expireBrokeredEvidenceUploads(
     FROM sync_sweep_promises promise, registered_remote_solvers solver
     WHERE upload.promise_id = promise.id AND upload.solver_id = solver.id
       AND upload.state IN ('requested', 'issuing', 'issued', 'verifying', 'failed', 'verified')
-      AND (promise.status IN ('cancelled', 'expired') OR promise."expiresAt" <= now() OR solver.revoked_at IS NOT NULL)
+      AND (
+        solver.revoked_at IS NOT NULL
+        OR (
+          (promise.status IN ('cancelled', 'expired') OR promise."expiresAt" <= now())
+          AND NOT is_exact_settled_legacy_evidence_upgrade(upload)
+        )
+      )
   `);
   await cancelBrokeredEvidenceSessions(database);
 }
@@ -527,8 +646,6 @@ export async function requestBrokeredEvidenceUpload(
       .limit(1);
     if (
       !promise ||
-      promise.status !== "active" ||
-      promise.expiresAt <= new Date() ||
       promise.sourceInstanceId !== solver.instanceId ||
       String(
         (promise.requestPayload as Record<string, unknown> | null)?.solverId ??
@@ -547,8 +664,24 @@ export async function requestBrokeredEvidenceUpload(
       )
       .for("update")
       .limit(1);
-    if (!point || point.status !== "active")
-      throw new Error("exact active promise point is unavailable");
+    if (!point) throw new Error("exact active promise point is unavailable");
+    const activeLease =
+      promise.status === "active" &&
+      promise.expiresAt > new Date() &&
+      point.status === "active";
+    const settledLegacyUpgrade =
+      !activeLease &&
+      (await isExactSettledLegacyEvidenceUpgrade(
+        tx,
+        solver,
+        promise,
+        point,
+        input,
+      ));
+    if (!activeLease && !settledLegacyUpgrade)
+      throw new Error(
+        "exact promise point is neither active work nor an eligible settled legacy evidence upgrade",
+      );
 
     const [quota] = await tx
       .select({
