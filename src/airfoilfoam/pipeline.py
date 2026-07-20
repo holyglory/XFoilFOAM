@@ -2831,6 +2831,7 @@ def evaluate_urans_quality(
     min_cycles: float = URANS_MIN_RETAINED_CYCLES,
     min_frames_per_cycle: float = URANS_MIN_FRAMES_PER_CYCLE,
     min_no_shedding_observation_s: Optional[float] = None,
+    no_shedding_history: Optional[ForceHistory] = None,
 ) -> UransQuality:
     # No-shedding first: a symmetric airfoil at alpha~0 (or any weakly-loaded
     # point) escalated to URANS runs a physically steady transient. Its force
@@ -2839,9 +2840,22 @@ def evaluate_urans_quality(
     # case is pointless and copies a degenerate retained window). This must be
     # decided from the fluctuation amplitude, not from the presence of a
     # (possibly spurious) FFT peak on numerical noise.
-    if history is not None and len(history.t) >= 2 and is_no_shedding(history):
-        retained_start = float(history.t[0])
-        retained_end = float(history.t[-1])
+    # ``history`` may be the compact trailing integer-period publication
+    # window.  A locally quiet phase of a real, slowly modulated wake can look
+    # amplitude-flat there even though the complete physical slow-period tail
+    # is not.  When the caller supplies that byte-backed tail, it exclusively
+    # owns the steady-vs-shedding decision; the compact history continues to
+    # own periodic coefficient/period grading.
+    steady_decision_history = (
+        no_shedding_history if no_shedding_history is not None else history
+    )
+    if (
+        steady_decision_history is not None
+        and len(steady_decision_history.t) >= 2
+        and is_no_shedding(steady_decision_history)
+    ):
+        retained_start = float(steady_decision_history.t[0])
+        retained_end = float(steady_decision_history.t[-1])
         retained_span = max(0.0, retained_end - retained_start)
         if min_no_shedding_observation_s is None:
             required_span = _no_shedding_min_observation_s(speed, chord)
@@ -4075,6 +4089,7 @@ def _run_transient_attempt(
         min_no_shedding_observation_s=_no_shedding_min_observation_s(
             spec.speed, spec.chord
         ),
+        no_shedding_history=no_shedding_tail,
     )
     quality = _grade_precalc_established_oscillation(
         tcase,

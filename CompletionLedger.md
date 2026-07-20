@@ -7,16 +7,19 @@
   OpenCFD 2606 engine. The exact remote canary now has an accepted fast result,
   immutable generation-pinned GCS evidence, hub acknowledgement, and remote
   reclamation proof. Its hub FINAL item is correctly background-owned because
-  the canary revision is not a live campaign revision. Nine accepted PRECALC
-  points on the active campaign predate exact attempt ownership; the bounded
-  reconciliation that pins those generations, attaches their existing FINAL
-  queues to the campaign, and refreshes progress is regression-verified but
-  still needs production deployment and execution. Preserve immutable 2406
-  histories. Then resume the active campaign at bounded capacity and monitor
-  subsequent RANS handoffs plus fast/final results. Readiness requires no
-  recurring current-generation blocked/critical chain; any new exhaustion
-  remains a red system incident and must be investigated before ordinary new
-  admission continues.
+  the canary revision is not a live campaign revision. The nine legacy accepted
+  PRECALC points are now reconciled in production: their exact generations are
+  pinned, their existing FINAL queues own the live campaign, and an immediate
+  second dry-run found no residual work. The bounded campaign restart exposed a
+  live quality-gate defect at AoA 20: the restored 0.07 s physical tail was
+  non-flat, but a quiet cropped three-period reporting slice was incorrectly
+  allowed to restart slow-period acquisition. The full-tail amplitude verdict
+  fix and must-catch regressions are implemented locally; deploy it through the
+  guarded engine-maintenance path, rerun the exact obligation, and prove an
+  accepted PRECALC generation before ordinary admission resumes. Preserve
+  immutable 2406 histories. Readiness requires no recurring current-generation
+  blocked/critical chain; any new exhaustion remains a red system incident and
+  must be investigated before ordinary new admission continues.
 
 - **Production evidence capacity:** The completed GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used), with no legacy gzip,
@@ -37,8 +40,9 @@
   2,620 declared files) passed fresh verification, the hub acknowledged it,
   and the remote reclaimed only after acknowledgement. The hub registered the
   exact blob/archive/member ledger and one durable background FINAL item;
-  idempotent replay returned the same archive and queue. Deploy and execute the
-  separate live-campaign PRECALC ownership reconciliation, then widen remote
+  idempotent replay returned the same archive and queue. Live-campaign PRECALC
+  ownership reconciliation is complete. After the active full-tail quality
+  defect is deployed and its exact PRECALC obligation accepts, widen remote
   promises and monitor evidence delivery, FINAL completion, descriptor
   stability, and absence of new critical chains before removing this item.
 

@@ -276,6 +276,152 @@ def test_precalc_short_apparent_flat_signal_is_not_yet_no_shedding(tmp_path):
     assert "slow-shedding observation horizon" in quality.reason
 
 
+def test_physical_tail_overrides_locally_flat_period_window(tmp_path):
+    """MUST-CATCH: a quiet cropped phase cannot restart period acquisition.
+
+    Production AoA 20 restored 0.148 s of one same-case trajectory.  Its final
+    three-period publication slice spanned only about 0.011 s and looked flat,
+    while the byte-backed 0.07 s slow-period tail was measurably non-flat.  The
+    old quality gate ignored the long-tail verdict and exhausted acquisition
+    repeatedly.  The physical tail owns the steady-vs-shedding decision; the
+    compact window still owns periodic grading.
+    """
+    compact = _shedding_history(
+        cl_mean=1.0,
+        cd_mean=0.33,
+        cl_rms=1e-4,
+        cd_rms=1e-4,
+        st=0.45,
+        t0=0.137,
+        t1=0.1482,
+    )
+    physical_tail = _shedding_history(
+        cl_mean=1.0,
+        cd_mean=0.33,
+        cl_rms=0.02,
+        cd_rms=0.004,
+        st=0.45,
+        t0=0.0782,
+        t1=0.1482,
+    )
+
+    assert is_no_shedding(compact)
+    assert not is_no_shedding(physical_tail)
+
+    quality = evaluate_urans_quality(
+        tmp_path,
+        compact,
+        speed=30.0,
+        chord=0.05,
+        min_cycles=3.0,
+        min_no_shedding_observation_s=0.07,
+        no_shedding_history=physical_tail,
+    )
+
+    assert quality.measured_period_s == pytest.approx(0.05 / (0.45 * 30.0))
+    assert "apparently flat signal" not in quality.reason
+    assert "period acquisition" not in quality.reason
+
+
+def test_transient_attempt_routes_physical_tail_to_quality_gate(
+    tmp_path, monkeypatch
+):
+    """The live solver path must not drop the long-tail amplitude verdict."""
+    compact = _shedding_history(
+        cl_mean=1.0,
+        cd_mean=0.33,
+        cl_rms=1e-4,
+        cd_rms=1e-4,
+        st=0.45,
+        t0=0.137,
+        t1=0.1482,
+    )
+    physical_tail = _shedding_history(
+        cl_mean=1.0,
+        cd_mean=0.33,
+        cl_rms=0.02,
+        cd_rms=0.004,
+        st=0.45,
+        t0=0.0782,
+        t1=0.1482,
+    )
+    histories = iter((compact, physical_tail))
+    monkeypatch.setattr(
+        pipeline,
+        "compute_force_history",
+        lambda *_args, **_kwargs: next(histories),
+    )
+
+    class FakeRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            coeff = (
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
+            coeff.parent.mkdir(parents=True, exist_ok=True)
+            coeff.write_text(
+                "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+                "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)\n"
+                "0 0.33 0 0 1 0 0 -0.17 0 0 0 0 0\n"
+                "0.08 0.331 0 0 1.02 0 0 -0.17 0 0 0 0 0\n"
+            )
+            return SimpleNamespace(ok=True, stdout="pimple ok")
+
+    captured = {}
+
+    def fake_evaluate(*_args, no_shedding_history=None, **_kwargs):
+        captured["no_shedding_history"] = no_shedding_history
+        return pipeline.UransQuality(
+            ok=False,
+            can_refine=True,
+            reason="frames/cycle 0 < 20",
+            measured_period_s=compact.period_s,
+            retained_cycles=3.0,
+        )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", _FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "evaluate_urans_quality", fake_evaluate)
+    monkeypatch.setattr(
+        pipeline,
+        "_grade_precalc_established_oscillation",
+        lambda _case, _paths, _spec, _params, quality, **_kwargs: quality,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_grade_full_strict_stationarity",
+        lambda _case, _paths, _spec, _params, quality, **_kwargs: quality,
+    )
+
+    transient_dir = tmp_path / "transient"
+    (transient_dir / "0").mkdir(parents=True)
+    result = _run_transient_attempt(
+        transient_dir,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=0.05, speed=30.0, aoa_deg=20.0),
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_min_periods=3,
+            transient_discard_fraction=0.4,
+        ),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=120,
+        run_time=0.08,
+        delta_t=1e-5,
+    )
+
+    assert result is not None
+    assert captured["no_shedding_history"] is physical_tail
+
+
 def test_precalc_apparent_flat_signal_acquires_slow_period_in_same_case(
     tmp_path, monkeypatch
 ):
