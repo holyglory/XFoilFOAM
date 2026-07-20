@@ -2608,6 +2608,7 @@ async function renderScaledMediaRows(opts: {
   };
   airfoilPoints: [number, number][];
   heartbeat: () => Promise<void>;
+  sourceMode?: "auto" | "archive";
 }): Promise<
   {
     resultId: string;
@@ -2674,6 +2675,7 @@ async function renderScaledMediaRows(opts: {
       zoom_chords: 2,
       scale_version: opts.scale.version,
       render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
+      source_mode: opts.sourceMode ?? "auto",
     });
     rendered.push({
       resultId: result.id,
@@ -2756,6 +2758,9 @@ async function rebalanceFieldScales(opts: {
   /** Exact attempt projection for a durable repair. It may intentionally be
    * pointer-null until repaired evidence classifies publishable. */
   repairSource?: typeof results.$inferSelect;
+  /** Deferred repair must render from the immutable retained archive because
+   * normal post-ingest cleanup may already have removed the raw VTK tree. */
+  sourceMode?: "auto" | "archive";
 }): Promise<number> {
   let mediaCount = 0;
   for (const group of opts.groups.values()) {
@@ -2865,6 +2870,7 @@ async function rebalanceFieldScales(opts: {
         },
         airfoilPoints: opts.airfoilPoints,
         heartbeat: opts.heartbeat,
+        sourceMode: opts.sourceMode,
       });
       mediaCount += await registerRenderedMediaSet(
         opts.db,
@@ -2960,6 +2966,7 @@ async function rebalanceFieldScales(opts: {
         },
         airfoilPoints: opts.airfoilPoints,
         heartbeat: opts.heartbeat,
+        sourceMode: opts.sourceMode,
       });
       await opts.db.transaction(async (tx) => {
         if (opts.repairFence) {
@@ -3157,6 +3164,7 @@ export async function repairDefaultMediaForStoredResult(opts: {
     fields: ALL_IMAGE_FIELDS,
     zoom_chords: 2,
     max_frames: 220,
+    source_mode: "archive",
   });
   // The engine round-trip may be slow. Revalidate ownership immediately
   // before any destructive presentation write; a stale renderer may inspect
@@ -3323,6 +3331,7 @@ export async function repairDefaultMediaForStoredResult(opts: {
     strict: true,
     repairFence: opts.repairFence,
     repairSource,
+    sourceMode: "archive",
   });
 
   const mediaRows = await opts.db

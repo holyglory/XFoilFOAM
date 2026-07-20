@@ -51,6 +51,7 @@ import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import type {
   EngineClient,
+  FieldExtentsRequest,
   FieldExtentsResponse,
   ImageFieldName,
   RenderDefaultMediaRequest,
@@ -512,7 +513,10 @@ function completeMediaResponse(
 
 function engineWith(
   opts: {
-    extents?: () => Promise<FieldExtentsResponse>;
+    extents?: (
+      jobId: string,
+      request: FieldExtentsRequest,
+    ) => Promise<FieldExtentsResponse>;
     render?: (
       jobId: string,
       request: RenderDefaultMediaRequest,
@@ -1416,11 +1420,24 @@ describe("durable result media repair", () => {
     ]);
 
     let renderCalls = 0;
+    const sourceModes: Array<"auto" | "archive" | undefined> = [];
     const outcome = await resultMediaRepairTick(
       db,
       engineWith({
+        extents: async (_jobId, request) => {
+          sourceModes.push(request.source_mode);
+          return {
+            fields: {
+              velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+              pressure: { min: -3, max: 2, finite_count: 500 },
+            },
+            window_start: 1,
+            window_end: 2,
+          };
+        },
         render: async (jobId, request) => {
           renderCalls++;
+          sourceModes.push(request.source_mode);
           return completeMediaResponse(jobId, request);
         },
       }),
@@ -1428,6 +1445,8 @@ describe("durable result media repair", () => {
     );
     expect(outcome.finalized).toBe(1);
     expect(renderCalls).toBeGreaterThan(0);
+    expect(sourceModes.length).toBeGreaterThan(1);
+    expect(sourceModes.every((mode) => mode === "archive")).toBe(true);
     const [repair] = await db
       .select()
       .from(resultMediaRepairs)

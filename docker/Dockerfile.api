@@ -7,6 +7,9 @@ ENV AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 COPY docker/build-requirements.lock docker/requirements.lock /tmp/
 COPY pyproject.toml README.md ./
 COPY src ./src

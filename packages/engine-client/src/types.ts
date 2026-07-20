@@ -671,6 +671,7 @@ export interface FieldExtentsRequest {
   fields?: ImageFieldName[];
   zoom_chords?: number;
   max_frames?: number | null;
+  source_mode?: "auto" | "archive";
 }
 
 export interface FieldExtent {
@@ -702,6 +703,7 @@ export interface RenderDefaultMediaRequest {
   zoom_chords?: number;
   scale_version?: number;
   render_profile_key?: string;
+  source_mode?: "auto" | "archive";
 }
 
 export interface RenderedDefaultMedia {

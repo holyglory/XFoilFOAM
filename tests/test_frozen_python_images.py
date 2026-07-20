@@ -109,6 +109,14 @@ def test_solver_images_isolate_locked_packages_from_os_python():
         assert contents.index(create_venv) < contents.index(locked_install), dockerfile
 
 
+def test_api_image_includes_ffmpeg_for_deferred_default_media_repairs():
+    api = (ROOT / "docker" / "Dockerfile.api").read_text()
+
+    # Default-media repair is served by the API container, not the OpenFOAM
+    # worker. The renderer must therefore own its encoder dependency too.
+    assert "apt-get install -y --no-install-recommends ffmpeg" in api
+
+
 def test_emergency_rollback_image_keeps_its_historical_lock_path():
     rollback = (
         ROOT / "docker" / "Dockerfile.worker-opencfd2406-rollback"

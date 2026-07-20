@@ -9,7 +9,10 @@
   generation currently has zero blocked points. A 96-chunk last-resort
   continuation ceiling is implemented and regression-verified so a healthy
   trajectory that settles just beyond the old 24-chunk edge remains governed
-  by the real wall budget; it is not yet deployed. Let the current production
+  by the real wall budget; it is not yet deployed. Deferred default-media
+  recovery now explicitly hydrates immutable retained archives, and the API
+  image owns the ffmpeg encoder used by that endpoint; both fixes are
+  regression-verified but not yet deployed. Let the current production
   11-angle job finish without interrupting its eight live OpenFOAM processes,
   then deploy this hardening through the guarded engine-maintenance path.
   Readiness still requires incremental result publication, verified GCS
