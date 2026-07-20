@@ -1985,6 +1985,10 @@ export async function submitUransRetryForJob(
      * different campaign. When present, retry planning is targeted to only
      * these attempts; it must never widen from the source job's other cells. */
     sourceResultAttemptIds?: string[];
+    /** Explicit scheduler-owned CPU envelope. Remote-promise recovery uses
+     * its independent configured budget even when the local scheduler is
+     * intentionally disabled. */
+    cpuSlots?: number;
   } = {},
 ): Promise<void> {
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
@@ -2306,7 +2310,7 @@ export async function submitUransRetryForJob(
     aoaList: aoas,
     wave: 2,
     uransFidelity: "precalc",
-    cpuSlots: capacity?.cpuSlots ?? 0,
+    cpuSlots: opts.cpuSlots ?? capacity?.cpuSlots ?? 0,
   });
   request.expected_execution_pool = executionPool.routingKey;
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;

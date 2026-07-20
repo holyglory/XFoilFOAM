@@ -55,6 +55,8 @@ const { resetEngineBackoffForTests } = await import("../src/engine-backoff");
 const { submitPendingJobWithLifecycleGuard } =
   await import("../src/submit-lifecycle");
 const { submitUransRetryForJob } = await import("../src/reconcile");
+const { submitRemotePromisePrecalcRecoveries } =
+  await import("../src/urans-ladder");
 
 const {
   airfoils,
@@ -2536,6 +2538,169 @@ describe("remote-owned whole-polar promotion scope", () => {
 });
 
 describe("remote-owned derived PRECALC lifecycle", () => {
+  it("MUST-CATCH: a pending attempt-2 PRECALC owns the remote point before any replacement RANS shell", async () => {
+    const aoa = 919.001;
+    const { promise, parent, result } = await seedRemoteRejectedParent(
+      "pending-precalc-attempt-2",
+      aoa,
+    );
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: 1 })
+      .where(eq(syncApiSettings.id, 1));
+    const firstSubmit = vi.fn(async () =>
+      acceptedStatus("pending-precalc-attempt-1"),
+    );
+    await submitUransRetryForJob(
+      db,
+      { submitPolar: firstSubmit } as unknown as EngineClient,
+      parent,
+      {
+        meshRecoveryVersion: 4,
+        uransRecoveryVersion: 1,
+        cpuSlots: 1,
+      },
+    );
+    const [firstChild] = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.latestSimJobId, firstChild.id));
+    expect(obligation).toMatchObject({ state: "running", attemptCount: 1 });
+
+    await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        engineState: "completed",
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+      })
+      .where(eq(simJobs.id, firstChild.id));
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "rejected",
+        outcome: "quality_rejected",
+        error: "preliminary observation horizon was too short",
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligationAttempts.simJobId, firstChild.id));
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        attemptCount: 1,
+        nextSubmitAt: new Date(Date.now() - 1_000),
+        lastOutcome: "quality_rejected",
+        lastError: "preliminary observation horizon was too short",
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await db
+      .update(results)
+      .set({ status: "stale" })
+      .where(eq(results.id, result.id));
+
+    const forbiddenRansSubmit = vi.fn(async () =>
+      acceptedStatus("forbidden-replacement-rans"),
+    );
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          and(
+            inArray(simJobs.status, [
+              "pending",
+              "submitted",
+              "running",
+              "ingesting",
+            ]),
+            dsql`${simJobs.requestPayload} ? 'syncPromiseId'`,
+          ),
+        ),
+    ).toHaveLength(0);
+    const remoteAdmissionConsumed = await admitRemoteSolverTick(
+      db,
+      { submitPolar: forbiddenRansSubmit } as unknown as EngineClient,
+      { kind: "allow", meshRecoveryVersion: 4 },
+    );
+    const [admissionStatus] = await db
+      .select({
+        status: syncApiSettings.remoteSolverLastStatus,
+        error: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect({ remoteAdmissionConsumed, admissionStatus }).toMatchObject({
+      remoteAdmissionConsumed: true,
+      admissionStatus: { status: "solving", error: null },
+    });
+    expect(forbiddenRansSubmit).not.toHaveBeenCalled();
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          and(
+            eq(simJobs.wave, 1),
+            dsql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${promise.id}`,
+            dsql`${simJobs.id} <> ${parent.id}`,
+          ),
+        ),
+    ).toHaveLength(0);
+
+    const correctiveSubmit = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("pending-precalc-attempt-2"),
+    );
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar: correctiveSubmit } as unknown as EngineClient,
+        4,
+        1,
+      ),
+    ).resolves.toBe(true);
+    expect(correctiveSubmit).toHaveBeenCalledTimes(1);
+    expect(correctiveSubmit.mock.calls[0]![0]).toMatchObject({
+      aoa: { angles: [aoa] },
+      resources: { cpu_budget: 1 },
+      solver: { urans_fidelity: "precalc" },
+    });
+    const children = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)))
+      .orderBy(simJobs.createdAt);
+    expect(children).toHaveLength(2);
+    expect(children[1]).toMatchObject({
+      status: "submitted",
+      methodKey: "openfoam.urans",
+    });
+    expect(children[1]!.requestPayload).toMatchObject({
+      syncPromiseId: promise.id,
+      remoteSolver: true,
+      uransFidelity: "precalc",
+      aoas: [aoa],
+      resources: { cpu_budget: 1 },
+    });
+    expect(
+      await db
+        .select()
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligation.id)),
+    ).toMatchObject([
+      {
+        state: "running",
+        attemptCount: 2,
+        latestSimJobId: children[1]!.id,
+      },
+    ]);
+  });
+
   it("submits an exact promised wave-2 child with conjunctive remote provenance and no background owner", async () => {
     const aoa = 920.001;
     const { promise, parent } = await seedRemoteRejectedParent(

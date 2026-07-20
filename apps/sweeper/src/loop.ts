@@ -29,6 +29,7 @@ import { refreshDiskAdmission } from "./disk-admission";
 import {
   submitCampaignPrecalcRecoveries,
   submitInterleavedVerifyIfDue,
+  submitRemotePromisePrecalcRecoveries,
   submitRecordedPromotionRecovery,
   uransLadderTick,
 } from "./urans-ladder";
@@ -733,6 +734,11 @@ export async function tick(
     !admissionFenced &&
     diskAdmission.allowed &&
     inFlightJobs < state.maxConcurrentJobs;
+  const remoteFastCapacityOpen =
+    remoteAdmissionReady &&
+    sharedRemoteCapacityAvailable &&
+    !admissionFenced &&
+    diskAdmission.allowed;
   const anyNewAdmissionEligible =
     !admissionFenced &&
     diskAdmission.allowed &&
@@ -789,7 +795,7 @@ export async function tick(
         console.error(
           "[sweeper] NEW admission deferred: engine mesh-recovery capability is unavailable or malformed; FAST URANS, remote RANS, and ordinary RANS remain queued",
         );
-      } else if (localCapacityOpen) {
+      } else if (localCapacityOpen || remoteFastCapacityOpen) {
         uransRecoveryVersion = await engineUransRecoveryVersion(engine);
         // A recorded whole-polar promotion and an exact targeted RANS
         // rejection are normal automatic escalation work. Both strictly own
@@ -798,19 +804,38 @@ export async function tick(
           db,
           engine,
           state.cpuSlots,
-          { meshRecoveryVersion, uransRecoveryVersion },
+          {
+            meshRecoveryVersion,
+            uransRecoveryVersion,
+            ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
+          },
         );
-        const targetedSubmitted = promotedSubmitted
-          ? false
-          : await submitCampaignPrecalcRecoveries(
-              db,
-              engine,
-              undefined,
-              undefined,
-              meshRecoveryVersion,
-              uransRecoveryVersion,
-            );
-        fastUransSubmitted = promotedSubmitted || targetedSubmitted;
+        const campaignTargetedSubmitted =
+          promotedSubmitted || !localCapacityOpen
+            ? false
+            : await submitCampaignPrecalcRecoveries(
+                db,
+                engine,
+                undefined,
+                undefined,
+                meshRecoveryVersion,
+                uransRecoveryVersion,
+              );
+        const remoteTargetedSubmitted =
+          promotedSubmitted ||
+          campaignTargetedSubmitted ||
+          !remoteFastCapacityOpen
+            ? false
+            : await submitRemotePromisePrecalcRecoveries(
+                db,
+                engine,
+                meshRecoveryVersion,
+                uransRecoveryVersion,
+              );
+        fastUransSubmitted =
+          promotedSubmitted ||
+          campaignTargetedSubmitted ||
+          remoteTargetedSubmitted;
       }
     }
   }

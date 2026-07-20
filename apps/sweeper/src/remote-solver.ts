@@ -17,6 +17,7 @@ import {
   results,
   schedulingProfiles,
   simJobs,
+  simPrecalcObligations,
   simRansPolarPromotions,
   simResultSubmitRetries,
   simulationPresetRevisions,
@@ -934,6 +935,8 @@ async function remotePromiseWorkState(
       resultStatus: results.status,
       retryState: simResultSubmitRetries.state,
       retryAt: simResultSubmitRetries.nextAttemptAt,
+      precalcState: simPrecalcObligations.state,
+      precalcNextSubmitAt: simPrecalcObligations.nextSubmitAt,
     })
     .from(syncSweepPromisePoints)
     .leftJoin(
@@ -951,6 +954,17 @@ async function remotePromiseWorkState(
       simResultSubmitRetries,
       eq(simResultSubmitRetries.resultId, results.id),
     )
+    .leftJoin(
+      simPrecalcObligations,
+      and(
+        eq(simPrecalcObligations.airfoilId, syncSweepPromisePoints.airfoilId),
+        eq(
+          simPrecalcObligations.revisionId,
+          syncSweepPromisePoints.simulationPresetRevisionId,
+        ),
+        eq(simPrecalcObligations.aoaDeg, syncSweepPromisePoints.aoaDeg),
+      ),
+    )
     .where(eq(syncSweepPromisePoints.promiseId, promiseId));
 
   const now = Date.now();
@@ -961,6 +975,33 @@ async function remotePromiseWorkState(
   let completed = false;
   let terminal = false;
   for (const row of activeRows) {
+    // A physical preliminary obligation is the scheduling authority for this
+    // natural cell. Never downgrade it back into a mirrored wave-1 RANS shell;
+    // the FAST lane either submits it now or keeps the promise waiting.
+    if (row.precalcState === "pending") {
+      if (row.precalcNextSubmitAt && row.precalcNextSubmitAt.getTime() > now) {
+        if (
+          !waitingUntil ||
+          row.precalcNextSubmitAt.getTime() < waitingUntil.getTime()
+        )
+          waitingUntil = row.precalcNextSubmitAt;
+      } else {
+        busy = true;
+      }
+      continue;
+    }
+    if (row.precalcState === "running") {
+      busy = true;
+      continue;
+    }
+    if (row.precalcState === "blocked") {
+      terminal = true;
+      continue;
+    }
+    if (row.precalcState === "satisfied") {
+      completed = true;
+      continue;
+    }
     if (!row.resultId) {
       dueAoas.push(Number(row.aoaDeg));
       continue;

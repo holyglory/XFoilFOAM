@@ -51,6 +51,7 @@ import {
   simLadderSubmitRetries,
   simulationPresetRevisions,
   simulationPresets,
+  syncApiSettings,
   simUransRequests,
   simUransVerifyQueue,
   type VerifyInterleaveScope,
@@ -456,6 +457,7 @@ function promotionRecoveryScopeSql(opts: {
   campaignIds?: string[];
   parentJobIds?: string[];
   promotionIds?: string[];
+  syncPromiseOnly?: boolean;
 }) {
   // An exact promotion scope is the strongest test/recovery fence. Otherwise
   // reuse the existing parent/campaign closed-world scopes. Production passes
@@ -483,6 +485,9 @@ function promotionRecoveryScopeSql(opts: {
           sql`, `,
         )}]`})`
       : sql`false`;
+  }
+  if (opts.syncPromiseOnly) {
+    return sql`promotion.owner_kind = 'sync_promise'`;
   }
   return sql`true`;
 }
@@ -716,6 +721,10 @@ export async function submitRecordedPromotionRecovery(
     campaignIds?: string[];
     parentJobIds?: string[];
     promotionIds?: string[];
+    /** Dedicated remote-solver instances keep their local scheduler disabled.
+     * This fence admits only immutable promotions owned by a live remote
+     * promise, never background or local-campaign work. */
+    syncPromiseOnly?: boolean;
     meshRecoveryVersion?: number;
     uransRecoveryVersion?: number | null;
   } = {},
@@ -985,6 +994,15 @@ export async function submitRecordedPromotionRecovery(
       event,
     );
     if (remote.required && "unavailable" in remote) continue;
+    let executionCpuSlots = cpuSlots;
+    if (remote.required) {
+      const [settings] = await db
+        .select({ cpuBudget: syncApiSettings.remoteSolverCpuBudget })
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1))
+        .limit(1);
+      executionCpuSlots = settings?.cpuBudget || 1;
+    }
     const target = await resolveTarget(db, event.airfoilId, event.revisionId);
     if (!target) continue;
     const aoas = schedulable.map((point) => point.aoaDeg);
@@ -1016,7 +1034,7 @@ export async function submitRecordedPromotionRecovery(
             }
           : {}),
       },
-      cpuSlots,
+      cpuSlots: executionCpuSlots,
       continueFrom,
       budgetOverrideS,
       meshRecoveryVersion,
@@ -1304,6 +1322,169 @@ export async function submitCampaignPrecalcRecoveries(
       ownerCampaignId: campaign.id,
     }));
     if (await attemptParents(legacyParents, false)) return true;
+  }
+  return false;
+}
+
+interface RemotePromisePrecalcRecoveryParent {
+  sourceParent: typeof simJobs.$inferSelect;
+  sourceResultAttemptIds: string[];
+}
+
+/** Discover exact targeted PRECALC work owned by an active remote promise.
+ * Remote-only solver instances deliberately keep sweeper_state.enabled=false,
+ * so campaign-owned recovery cannot be their scheduling authority. The
+ * immutable source RANS attempt and the exact active promise point together
+ * authorize this path; ordinary mirrored RANS must never be recomposed while
+ * this higher-fidelity obligation is pending. */
+async function dueRemotePromisePrecalcRecoveryParents(
+  db: DB,
+  uransRecoveryVersion: number | null | undefined,
+): Promise<RemotePromisePrecalcRecoveryParent[]> {
+  const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
+    ? restartablePrecalcCheckpointSql(sql`obligation.id`)
+    : sql`false`;
+  const rows = (await db.execute(sql`
+    SELECT parent.id AS parent_job_id,
+           array_agg(DISTINCT source_attempt.id ORDER BY source_attempt.id)
+             AS source_attempt_ids,
+           min(COALESCE(obligation.next_submit_at, obligation."createdAt")) AS due_at
+    FROM sim_precalc_obligations obligation
+    JOIN result_attempts source_attempt
+      ON source_attempt.id = obligation.source_result_attempt_id
+     AND source_attempt.regime = 'rans'
+     AND source_attempt.airfoil_id = obligation.airfoil_id
+     AND source_attempt.simulation_preset_revision_id = obligation.revision_id
+     AND source_attempt.aoa_deg = obligation.aoa_deg
+    JOIN sim_jobs parent
+      ON parent.id = source_attempt.sim_job_id
+     AND parent.airfoil_id = obligation.airfoil_id
+     AND parent.wave = 1
+     AND parent.request_payload ->> 'remoteSolver' = 'true'
+    JOIN sync_sweep_promises remote_promise
+      ON remote_promise.id::text = parent.request_payload ->> 'syncPromiseId'
+     AND remote_promise.status = 'active'
+     AND remote_promise."expiresAt" > now()
+     AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+    JOIN sync_sweep_promise_points promise_point
+      ON promise_point.promise_id = remote_promise.id
+     AND promise_point.status = 'active'
+     AND promise_point.airfoil_id = obligation.airfoil_id
+     AND promise_point.simulation_preset_revision_id = obligation.revision_id
+     AND promise_point.aoa_deg = obligation.aoa_deg
+    WHERE obligation.state = 'pending'
+      AND (
+        obligation.next_submit_at IS NULL
+        OR obligation.next_submit_at <= now()
+      )
+      AND (
+        obligation.attempt_count < obligation.max_attempts
+        OR (${restartableScope})
+      )
+      AND (
+        (
+          parent.status IN ('done', 'failed')
+          AND parent."ingestedAt" IS NOT NULL
+        )
+        OR parent.status = 'cancelled'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs live_child
+        WHERE live_child.parent_job_id = parent.id
+          AND live_child.wave = 2
+          AND live_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs latest_job
+        WHERE latest_job.id = obligation.latest_sim_job_id
+          AND latest_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points promotion_point
+        WHERE promotion_point.obligation_id = obligation.id
+      )
+    GROUP BY parent.id
+    ORDER BY due_at, parent.id
+    LIMIT ${RECOVERY_PARENTS_PER_TICK}
+  `)) as unknown as Array<{
+    parent_job_id: string;
+    source_attempt_ids: string[];
+    due_at: Date | string;
+  }>;
+  if (!rows.length) return [];
+  const parents = await db
+    .select()
+    .from(simJobs)
+    .where(
+      inArray(
+        simJobs.id,
+        rows.map((row) => row.parent_job_id),
+      ),
+    );
+  const parentById = new Map(parents.map((parent) => [parent.id, parent]));
+  return rows.flatMap((row) => {
+    const sourceParent = parentById.get(row.parent_job_id);
+    return sourceParent
+      ? [
+          {
+            sourceParent,
+            sourceResultAttemptIds: row.source_attempt_ids,
+          },
+        ]
+      : [];
+  });
+}
+
+/** Submit at most one targeted PRECALC child for active remote-promise work.
+ * The configured remote CPU budget owns this child exactly like it owns the
+ * mirrored RANS parent; a disabled local scheduler must not silently widen
+ * the canary's resource envelope. */
+export async function submitRemotePromisePrecalcRecoveries(
+  db: DB,
+  engine: EngineClient,
+  meshRecoveryVersion: number,
+  uransRecoveryVersion: number | null | undefined,
+): Promise<boolean> {
+  const [settings] = await db
+    .select({ cpuBudget: syncApiSettings.remoteSolverCpuBudget })
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  const candidates = await dueRemotePromisePrecalcRecoveryParents(
+    db,
+    uransRecoveryVersion,
+  );
+  for (const candidate of candidates) {
+    await touchHeartbeat(db);
+    await submitUransRetryForJob(db, engine, candidate.sourceParent, {
+      meshRecoveryVersion,
+      uransRecoveryVersion,
+      capacityScheduledEscalation: true,
+      sourceResultAttemptIds: candidate.sourceResultAttemptIds,
+      cpuSlots: settings?.cpuBudget ?? 1,
+    });
+    const [activeChild] = await db
+      .select({ id: simJobs.id })
+      .from(simJobs)
+      .where(
+        and(
+          eq(simJobs.parentJobId, candidate.sourceParent.id),
+          eq(simJobs.wave, 2),
+          inArray(simJobs.status, [
+            "pending",
+            "submitted",
+            "running",
+            "ingesting",
+          ]),
+          sql`${simJobs.requestPayload} ->> 'uransFidelity' = 'precalc'`,
+          sql`${simJobs.requestPayload} ->> 'remoteSolver' = 'true'`,
+        ),
+      )
+      .limit(1);
+    if (activeChild) return true;
   }
   return false;
 }
