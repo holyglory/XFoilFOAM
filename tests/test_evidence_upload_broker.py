@@ -70,7 +70,7 @@ class Blob:
         self.client.session_metadata = dict(self.metadata or {})
         return (
             "https://storage.googleapis.com/upload/storage/v1/b/evidence-bucket/o"
-            f"?uploadType=resumable&name={self.key}&upload_id=session-secret"
+            "?uploadType=resumable&upload_id=session-secret&ifGenerationMatch=0"
         )
 
     def download_to_filename(
@@ -190,7 +190,7 @@ def test_session_is_create_only_and_pins_content_length(tmp_path: Path) -> None:
 
     assert session.upload_url == (
         "https://storage.googleapis.com/upload/storage/v1/b/evidence-bucket/o"
-        f"?uploadType=resumable&name={identity.object_key}&upload_id=session-secret"
+        "?uploadType=resumable&upload_id=session-secret&ifGenerationMatch=0"
     )
     lifetime_hours = (
         datetime.fromisoformat(session.expires_at) - datetime.now(timezone.utc)
@@ -204,6 +204,39 @@ def test_session_is_create_only_and_pins_content_length(tmp_path: Path) -> None:
         "timeout": store.timeout_seconds,
     }
     assert client.session_metadata == identity.metadata
+
+
+def test_session_accepts_the_real_gcs_location_shape_with_create_only_precondition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GCS 3.13 omits ``name`` from Location and retains ifGenerationMatch.
+
+    This is the exact redacted query shape observed from a live create-only
+    session against the production bucket.  The upload id below is synthetic;
+    no provider bearer is stored in the fixture.
+    """
+
+    store, _client, _archive, identity = fixture(tmp_path)
+    session_url = (
+        "https://storage.googleapis.com/upload/storage/v1/b/evidence-bucket/o"
+        "?uploadType=resumable&upload_id=session-secret&ifGenerationMatch=0"
+    )
+
+    monkeypatch.setattr(
+        Blob,
+        "create_resumable_upload_session",
+        lambda _self, **_kwargs: session_url,
+    )
+
+    session = create_brokered_upload_session(
+        store,
+        identity,
+        owner=owner(),
+        ledger_dir=tmp_path / "broker-ledger",
+    )
+
+    assert session.upload_url == session_url
 
 
 def test_existing_object_is_fully_verified_without_issuing_a_bearer_url(tmp_path: Path) -> None:
@@ -484,7 +517,7 @@ def test_resumable_session_cancellation_is_bounded_and_redacted() -> None:
 
     result = cancel_brokered_upload_session(
         "https://storage.googleapis.com/upload/storage/v1/b/evidence/o"
-        f"?uploadType=resumable&name={identity_key}&upload_id=opaque-secret",
+        "?uploadType=resumable&upload_id=opaque-secret&ifGenerationMatch=0",
         "evidence",
         identity_key,
         timeout_seconds=600,
@@ -512,6 +545,9 @@ def test_resumable_session_cancellation_is_bounded_and_redacted() -> None:
         "https://evil.example/upload/storage/v1/b/b/o?upload_id=x",
         "https://storage.googleapis.com/upload/storage/v1/b/b/o",
         "https://storage.googleapis.com/upload/storage/v1/b/b/o?upload_id=x&upload_id=y",
+        "https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=x&ifGenerationMatch=1",
+        "https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=x&ifGenerationMatch=0&unexpected=y",
+        "https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=x&ifGenerationMatch=0&name=wrong",
     ],
 )
 def test_resumable_session_cancellation_rejects_ambiguous_targets(
@@ -539,7 +575,7 @@ def test_resumable_session_cancellation_does_not_follow_redirects() -> None:
     with pytest.raises(Exception, match=r"cancellation failed \(302\)"):
         cancel_brokered_upload_session(
             "https://storage.googleapis.com/upload/storage/v1/b/evidence/o"
-            f"?uploadType=resumable&name={identity_key}&upload_id=opaque-secret",
+            "?uploadType=resumable&upload_id=opaque-secret&ifGenerationMatch=0",
             "evidence",
             identity_key,
             opener=redirect,

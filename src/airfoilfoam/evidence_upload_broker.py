@@ -192,11 +192,21 @@ def _valid_gcs_resumable_url(
     except (TypeError, ValueError):
         return False
     query = parse_qs(parsed.query, keep_blank_values=True)
-    if set(query) != {"uploadType", "name", "upload_id"}:
+    # google-cloud-storage 3.13 returns the provider Location with the exact
+    # create-only precondition but without repeating the object ``name`` that
+    # was supplied by the authenticated initiation request.  Older examples
+    # may retain ``name``.  Accept both shapes, but require the visible
+    # ifGenerationMatch=0 fence and reject every other query parameter.
+    required_query = {"uploadType", "upload_id", "ifGenerationMatch"}
+    allowed_query = required_query | {"name"}
+    if not required_query.issubset(query) or not set(query).issubset(
+        allowed_query
+    ):
         return False
     upload_types = query.get("uploadType", [])
     names = query.get("name", [])
     upload_ids = query.get("upload_id", [])
+    generation_matches = query.get("ifGenerationMatch", [])
     path_match = re.fullmatch(r"/upload/storage/v1/b/([^/]+)/o", parsed.path)
     if path_match is None:
         return False
@@ -213,10 +223,10 @@ def _valid_gcs_resumable_url(
         and path_bucket == expected_bucket
         and len(upload_types) == 1
         and upload_types[0] == "resumable"
-        and len(names) == 1
-        and names[0] == expected_object_key
+        and (not names or (len(names) == 1 and names[0] == expected_object_key))
         and len(upload_ids) == 1
         and upload_ids[0]
+        and generation_matches == ["0"]
     )
 
 
