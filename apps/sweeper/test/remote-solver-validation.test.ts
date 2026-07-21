@@ -3718,7 +3718,7 @@ describe("remote solver push validation regressions", () => {
     );
   });
 
-  it("MUST-CATCH: legacy migration selects a cancelled promise only through its exact fulfilled point", async () => {
+  it("MUST-CATCH: legacy migration selects only an exact unbound fulfilled point", async () => {
     const aoaDeg = 865.904;
     const job = await seedDoneRemoteJob("cancelled-legacy-backfill", [aoaDeg]);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
@@ -3801,6 +3801,38 @@ describe("remote solver push validation regressions", () => {
         state: "planned",
       }),
     ]);
+    const brokeredUploadId = randomUUID();
+    const receipt = {
+      schemaVersion: 1,
+      kind: "hub-canonical-evidence-binding",
+      promiseId,
+      remoteResultId: result.id,
+      remoteResultAttemptId: attempt.id,
+      brokeredUploadId,
+      aoaDeg,
+      bindingState: "bound",
+      promisePointState: "fulfilled",
+    };
+    await db.insert(syncRemoteHubBindingReceipts).values({
+      deliveryId: delivery.id,
+      promiseId,
+      simJobId: job.id,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      aoaDeg,
+      brokeredUploadId,
+      receiptCanonical: canonicalJson(receipt),
+      receipt,
+      receiptHmac: "a".repeat(64),
+    });
+    await expect(
+      backfillLegacyBrokeredEvidence({
+        db,
+        engine: {} as EngineClient,
+        execute: false,
+        deliveryIds: [delivery.id],
+      }),
+    ).rejects.toThrow("eligible settled remote result not found");
   });
 
   it("FALSE-POSITIVE-GUARD: a closed promise without the exact result-attempt owner cannot enter storage-only replay", async () => {

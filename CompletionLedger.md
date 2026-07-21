@@ -31,9 +31,12 @@
   associations to migrate. A first historical batch was stopped before any
   source reclaim when it exposed a selector defect: it treated a cancelled
   whole-promise lease as solver work even though the point itself had already
-  been fulfilled. Deploy the exact settled-point storage-only fence, prove a
-  small requeued batch binds without a lease renewal, then migrate the remaining
-  eligible accepted generations. Handle the six cancelled/invalid point
+  been fulfilled. A dry run also showed that reclaimed canary artifacts remain
+  as immutable provenance rows, so the migration must exclude every exact
+  delivery that already has a signed hub-binding receipt. Deploy both fences,
+  prove a small requeued batch binds without a lease renewal or duplicate
+  canary replay, then migrate the remaining eligible accepted generations.
+  Handle the six cancelled/invalid point
   generations through the separate forensic/rejected-evidence path before again
   claiming zero legacy duplicates. Preserve at least 80 GiB free while the
   campaign is active, keep the temporary hydration cache bounded, and remeasure
@@ -58,12 +61,14 @@
   restored legacy-evidence migration uses the same transfer boundary: canary
   upload `472a8929-b170-4867-8757-4d6ec117eb1b` bound to GCS generation
   `1784582269952724` and was reclaimed after a signed acknowledgement. Remote
-  scheduling is paused while the exact settled-point replay fence is deployed:
-  only a point already fulfilled with the exact result/attempt may perform an
-  archive-only replay under a fulfilled, cancelled, or expired promise, and it
-  must not renew the closed solver-work lease. Prove that small batch before
-  migrating the remaining eligible generations and reclaim remote bytes only
-  from signed hub receipts. After that, deploy the 96-chunk continuation
+  scheduling is paused while the exact settled-point replay and signed-receipt
+  fences are deployed: only a point already fulfilled with the exact
+  result/attempt may perform an archive-only replay under a fulfilled,
+  cancelled, or expired promise; a receipt-backed exact delivery is already
+  bound and must never be replayed. The replay must not renew the closed
+  solver-work lease. Prove that small batch before migrating the remaining
+  eligible generations and reclaim remote bytes only from signed hub receipts.
+  After that, deploy the 96-chunk continuation
   hardening while the remote worker is idle, widen remote promises, and monitor
   evidence delivery, FINAL completion, descriptor stability, and absence of
   new critical chains before removing this item.

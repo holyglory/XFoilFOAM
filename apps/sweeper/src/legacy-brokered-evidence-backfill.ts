@@ -5,6 +5,7 @@ import {
   simJobs,
   solverEvidenceArtifacts,
   syncApiSettings,
+  syncRemoteHubBindingReceipts,
   syncRemoteResultDeliveries,
   syncSweepPromisePoints,
   syncSweepPromises,
@@ -168,6 +169,14 @@ export async function backfillLegacyBrokeredEvidence(opts: {
         eq(resultAttempts.status, "done"),
         eq(resultAttempts.source, "solved"),
         eq(simJobs.status, "done"),
+        sql`NOT EXISTS (
+          SELECT 1
+          FROM sync_remote_hub_binding_receipts bound_receipt
+          WHERE bound_receipt.delivery_id = ${syncRemoteResultDeliveries.id}
+            AND bound_receipt.promise_id = ${syncRemoteResultDeliveries.promiseId}
+            AND bound_receipt.result_id = ${results.id}
+            AND bound_receipt.result_attempt_id = ${resultAttempts.id}
+        )`,
         opts.deliveryIds?.length
           ? inArray(syncRemoteResultDeliveries.id, opts.deliveryIds)
           : undefined,
@@ -367,6 +376,14 @@ export async function backfillLegacyBrokeredEvidence(opts: {
             ]),
             eq(syncRemoteResultDeliveries.generationKey, attempt.id),
             eq(syncRemoteResultDeliveries.resultAttemptId, attempt.id),
+            sql`NOT EXISTS (
+              SELECT 1
+              FROM sync_remote_hub_binding_receipts bound_receipt
+              WHERE bound_receipt.delivery_id = ${delivery.id}
+                AND bound_receipt.promise_id = ${delivery.promiseId}
+                AND bound_receipt.result_id = ${result.id}
+                AND bound_receipt.result_attempt_id = ${attempt.id}
+            )`,
             sql`EXISTS (
               SELECT 1
               FROM sync_sweep_promises remote_promise
