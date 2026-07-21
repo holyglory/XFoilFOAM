@@ -27,20 +27,22 @@
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is
-  now GCS-bound and signed-reclaimed, leaving 67 imported legacy gzip
-  associations to migrate. A first historical batch was stopped before any
-  source reclaim when it exposed a selector defect: it treated a cancelled
-  whole-promise lease as solver work even though the point itself had already
-  been fulfilled. A dry run also showed that reclaimed canary artifacts remain
-  as immutable provenance rows, so the migration must exclude every exact
-  delivery that already has a signed hub-binding receipt. Deploy both fences,
-  prove a small requeued batch binds without a lease renewal or duplicate
-  canary replay, then migrate the remaining eligible accepted generations.
-  Handle the six cancelled/invalid point
-  generations through the separate forensic/rejected-evidence path before again
-  claiming zero legacy duplicates. Preserve at least 80 GiB free while the
-  campaign is active, keep the temporary hydration cache bounded, and remeasure
-  active-case growth before increasing solver concurrency.
+  now GCS-bound and signed-reclaimed. A first historical batch was stopped
+  before any source reclaim when it exposed a selector defect: it treated a
+  cancelled whole-promise lease as solver work even though the point itself had
+  already been fulfilled. The exact settled-point and signed-receipt fences are
+  deployed and regression-covered. Of 39 unbound, accepted legacy generations,
+  38 are now GCS-bound and signed-reclaimed. One remaining complete remote
+  generation has reached a verified immutable GCS object but conflicts with a
+  different hub result generation for the same physical cell; its local source
+  remains intact, and it must enter a durable alternate-result/conflict
+  preservation path rather than be rebound or reclaimed. Six
+  cancelled/invalid point generations still require the separate
+  forensic/rejected-evidence path. Do not claim migration complete or remove
+  any of those seven local sources until their exact durable acknowledgement
+  exists. Preserve at least 80 GiB free while the campaign is active, keep the
+  temporary hydration cache bounded, and remeasure active-case growth before
+  increasing solver concurrency.
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`
@@ -61,14 +63,17 @@
   restored legacy-evidence migration uses the same transfer boundary: canary
   upload `472a8929-b170-4867-8757-4d6ec117eb1b` bound to GCS generation
   `1784582269952724` and was reclaimed after a signed acknowledgement. Remote
-  scheduling is paused while the exact settled-point replay and signed-receipt
-  fences are deployed: only a point already fulfilled with the exact
-  result/attempt may perform an archive-only replay under a fulfilled,
-  cancelled, or expired promise; a receipt-backed exact delivery is already
-  bound and must never be replayed. The replay must not renew the closed
-  solver-work lease. Prove that small batch before migrating the remaining
-  eligible generations and reclaim remote bytes only from signed hub receipts.
-  After that, deploy the 96-chunk continuation
+  scheduler's local admission switch remains deliberately disabled on this
+  dedicated remote node: it prevents an independent local campaign queue while
+  the running sweeper reconciles and admits only hub-issued promises through
+  the remote lane. Its attested OpenCFD 2606 pool is enabled and a 26-point hub
+  promise is running; 2406 remains disabled. Only a point already fulfilled
+  with the exact result/attempt may perform an archive-only replay under a
+  fulfilled, cancelled, or expired promise; a receipt-backed exact delivery is
+  already bound and must never be replayed. The replay must not renew the
+  closed solver-work lease, and remote bytes may be reclaimed only from signed
+  hub receipts. After the remaining alternate/forensic evidence is durably
+  preserved, deploy the 96-chunk continuation
   hardening while the remote worker is idle, widen remote promises, and monitor
   evidence delivery, FINAL completion, descriptor stability, and absence of
   new critical chains before removing this item.
