@@ -2324,6 +2324,11 @@ export interface DeliveryClaim {
   id: string;
   token: string;
   attemptCount: number;
+  /**
+   * The exact upstream point already owns this immutable result generation.
+   * A replay may refresh only its storage container; it must never renew or
+   * otherwise reopen the original solver-work lease.
+   */
   fulfilledReplay: boolean;
 }
 
@@ -2425,7 +2430,15 @@ export async function claimResultDelivery(
           .where(
             and(
               eq(syncSweepPromises.id, promiseId),
-              eq(syncSweepPromises.status, "fulfilled"),
+              // A closed whole-promise lease can still contain an exact
+              // fulfilled point. That point is safe for a storage-only
+              // evidence upgrade, but the surrounding cancelled/expired
+              // lease must never be renewed as solver work.
+              inArray(syncSweepPromises.status, [
+                "fulfilled",
+                "cancelled",
+                "expired",
+              ]),
               eq(syncSweepPromisePoints.status, "fulfilled"),
               eq(syncSweepPromisePoints.airfoilId, job.airfoilId),
               eq(
@@ -4225,11 +4238,13 @@ async function processReusablePromiseEvidence(
 }
 
 /**
- * A fulfilled point can need one final, container-only replay after its exact
+ * A settled exact point can need one final, container-only replay after its
  * legacy gzip evidence has been converted and uploaded through the broker.
  * This path is intentionally separate from normal result discovery: it may
  * omit derived media/extents only because the upstream point already owns the
- * exact accepted result and attempt named by the durable delivery row.
+ * exact accepted result and attempt named by the durable delivery row. The
+ * enclosing promise may be fulfilled, cancelled, or expired; that does not
+ * permit this archive-only flow to renew its solver-work lease.
  */
 async function processFulfilledEvidenceUpgrades(
   db: DB,
@@ -4244,7 +4259,7 @@ async function processFulfilledEvidenceUpgrades(
     FROM sync_remote_result_deliveries delivery
     JOIN sync_sweep_promises remote_promise
       ON remote_promise.id = delivery.promise_id
-     AND remote_promise.status = 'fulfilled'
+     AND remote_promise.status IN ('fulfilled', 'cancelled', 'expired')
     JOIN sync_sweep_promise_points promise_point
       ON promise_point.promise_id = delivery.promise_id
      AND promise_point.status = 'fulfilled'
@@ -4343,6 +4358,18 @@ async function processRemoteResultDeliveries(
         inArray(simJobs.status, ["submitted", "running", "ingesting", "done"]),
         sql`${simJobs.requestPayload} ? 'syncPromiseId'`,
         sql`${simJobs.requestPayload} ->> 'remoteSolver' = 'true'`,
+        // Ordinary result publication is allowed only while the mirrored work
+        // lease remains active/expired. Closed exact points are handled above
+        // by the storage-only path, which deliberately never heartbeats the
+        // original lease.
+        sql`EXISTS (
+          SELECT 1
+          FROM sync_sweep_promises remote_promise
+          WHERE remote_promise.id = (${simJobs.requestPayload} ->> 'syncPromiseId')::uuid
+            AND remote_promise.source_base_url = ${syncBase(settings)}
+            AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+            AND remote_promise.status IN ('active', 'expired')
+        )`,
         sql`NOT (
           ${simJobs.wave} = 1
           AND EXISTS (

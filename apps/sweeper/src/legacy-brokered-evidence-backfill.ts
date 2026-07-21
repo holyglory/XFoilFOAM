@@ -6,6 +6,8 @@ import {
   solverEvidenceArtifacts,
   syncApiSettings,
   syncRemoteResultDeliveries,
+  syncSweepPromisePoints,
+  syncSweepPromises,
 } from "@aerodb/db";
 import type { EngineClient, PolarPoint } from "@aerodb/engine-client";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -54,6 +56,44 @@ function exactRelativeEvidenceBase(value: unknown): string {
   return parts.join("/");
 }
 
+/** A previously prepared local bundle is reusable only when it still proves
+ * the exact retained gzip and manifest which this replay is allowed to move. */
+function preparedLegacyBundleMatches(
+  bundle: typeof solverEvidenceArtifacts.$inferSelect,
+  legacy: typeof solverEvidenceArtifacts.$inferSelect,
+  manifest: typeof solverEvidenceArtifacts.$inferSelect,
+  evidenceBase: string,
+): boolean {
+  const metadata = exactObject(bundle.metadata);
+  const legacySource = exactObject(metadata.legacySource);
+  return (
+    bundle.mimeType === "application/zstd" &&
+    /^[0-9a-f]{64}$/i.test(bundle.sha256) &&
+    Number.isSafeInteger(bundle.byteSize) &&
+    bundle.byteSize > 0 &&
+    bundle.storageKey.trim().length > 0 &&
+    metadata.storageBackend === "volume" &&
+    metadata.archiveFormat === "tar+zstd" &&
+    metadata.compression === "zstd" &&
+    metadata.evidenceBase === evidenceBase &&
+    metadata.manifestSha256 === manifest.sha256 &&
+    metadata.manifestByteSize === manifest.byteSize &&
+    typeof metadata.uncompressedTarSha256 === "string" &&
+    /^[0-9a-f]{64}$/i.test(metadata.uncompressedTarSha256) &&
+    Number.isSafeInteger(metadata.uncompressedTarByteSize) &&
+    Number(metadata.uncompressedTarByteSize) > 0 &&
+    Number.isInteger(metadata.zstdLevel) &&
+    Number(metadata.zstdLevel) >= 1 &&
+    Number(metadata.zstdLevel) <= 22 &&
+    Number.isSafeInteger(metadata.bundledFileCount) &&
+    Number(metadata.bundledFileCount) > 0 &&
+    legacySource.path === basename(legacy.storageKey) &&
+    legacySource.sha256 === legacy.sha256 &&
+    legacySource.byteSize === legacy.byteSize &&
+    legacySource.compression === "gzip"
+  );
+}
+
 export async function backfillLegacyBrokeredEvidence(opts: {
   db: DB;
   engine: EngineClient;
@@ -69,10 +109,7 @@ export async function backfillLegacyBrokeredEvidence(opts: {
     .from(syncApiSettings)
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
-  if (
-    !settings?.remoteSolverEnabled ||
-    !settings.upstreamBaseUrl
-  ) {
+  if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
     throw new Error(
       "legacy brokered evidence backfill is restricted to an enabled remote-solver instance",
     );
@@ -86,15 +123,44 @@ export async function backfillLegacyBrokeredEvidence(opts: {
       job: simJobs,
     })
     .from(syncRemoteResultDeliveries)
+    .innerJoin(
+      syncSweepPromises,
+      eq(syncSweepPromises.id, syncRemoteResultDeliveries.promiseId),
+    )
     .innerJoin(results, eq(results.id, syncRemoteResultDeliveries.resultId))
     .innerJoin(
       resultAttempts,
       eq(resultAttempts.id, syncRemoteResultDeliveries.resultAttemptId),
     )
     .innerJoin(simJobs, eq(simJobs.id, syncRemoteResultDeliveries.simJobId))
+    .innerJoin(
+      syncSweepPromisePoints,
+      and(
+        eq(
+          syncSweepPromisePoints.promiseId,
+          syncRemoteResultDeliveries.promiseId,
+        ),
+        eq(syncSweepPromisePoints.status, "fulfilled"),
+        eq(syncSweepPromisePoints.airfoilId, results.airfoilId),
+        eq(
+          syncSweepPromisePoints.simulationPresetRevisionId,
+          results.simulationPresetRevisionId,
+        ),
+        eq(syncSweepPromisePoints.aoaDeg, results.aoaDeg),
+        eq(syncSweepPromisePoints.resultId, results.id),
+        eq(syncSweepPromisePoints.resultAttemptId, resultAttempts.id),
+      ),
+    )
     .where(
       and(
-        eq(syncRemoteResultDeliveries.state, "delivered"),
+        inArray(syncRemoteResultDeliveries.state, ["delivered", "superseded"]),
+        inArray(syncSweepPromises.status, [
+          "fulfilled",
+          "cancelled",
+          "expired",
+        ]),
+        eq(syncSweepPromises.sourceBaseUrl, settings.upstreamBaseUrl),
+        sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
         eq(results.currentResultAttemptId, resultAttempts.id),
         eq(resultAttempts.resultId, results.id),
         eq(resultAttempts.simJobId, simJobs.id),
@@ -113,7 +179,7 @@ export async function backfillLegacyBrokeredEvidence(opts: {
     const found = new Set(selected.map(({ delivery }) => delivery.id));
     const missing = opts.deliveryIds.filter((id) => !found.has(id));
     throw new Error(
-      `eligible delivered remote result not found: ${missing.join(", ")}`,
+      `eligible settled remote result not found: ${missing.join(", ")}`,
     );
   }
 
@@ -129,7 +195,9 @@ export async function backfillLegacyBrokeredEvidence(opts: {
       attempt.airfoilId !== result.airfoilId ||
       attempt.aoaDeg !== result.aoaDeg
     ) {
-      throw new Error(`delivery ${delivery.id} changed exact attempt ownership`);
+      throw new Error(
+        `delivery ${delivery.id} changed exact attempt ownership`,
+      );
     }
     const artifacts = await opts.db
       .select()
@@ -152,7 +220,7 @@ export async function backfillLegacyBrokeredEvidence(opts: {
     if (
       manifests.length !== 1 ||
       legacyBundles.length !== 1 ||
-      engineBundles.length !== 0
+      engineBundles.length > 1
     ) {
       continue;
     }
@@ -165,6 +233,19 @@ export async function backfillLegacyBrokeredEvidence(opts: {
     if (!LEGACY_ARCHIVE_NAMES.has(legacyArchiveName)) {
       throw new Error(
         `delivery ${delivery.id} legacy archive name is unsupported`,
+      );
+    }
+    if (
+      engineBundles.length === 1 &&
+      !preparedLegacyBundleMatches(
+        engineBundles[0]!,
+        legacy,
+        manifest,
+        evidenceBase,
+      )
+    ) {
+      throw new Error(
+        `delivery ${delivery.id} has a non-matching prepared Zstandard bundle`,
       );
     }
     const report: LegacyBrokeredEvidenceBackfillReport = {
@@ -182,52 +263,61 @@ export async function backfillLegacyBrokeredEvidence(opts: {
       continue;
     }
 
-    const prepared = await opts.engine.prepareBrokeredLegacyEvidence(
-      attempt.engineJobId,
-      {
-        caseSlug: attempt.engineCaseSlug,
-        evidenceBase,
-        legacyArchiveName: legacyArchiveName as
-          | "openfoam_evidence.tar.gz"
-          | "engine_evidence.tar.gz",
-        legacyArchiveSha256: legacy.sha256,
-        legacyArchiveByteSize: legacy.byteSize,
-        manifestSha256: manifest.sha256,
-        manifestByteSize: manifest.byteSize,
-      },
-    );
-    if (prepared.state !== "prepared") {
-      throw new Error(`delivery ${delivery.id} engine preparation was not acknowledged`);
+    if (!engineBundles.length) {
+      const prepared = await opts.engine.prepareBrokeredLegacyEvidence(
+        attempt.engineJobId,
+        {
+          caseSlug: attempt.engineCaseSlug,
+          evidenceBase,
+          legacyArchiveName: legacyArchiveName as
+            | "openfoam_evidence.tar.gz"
+            | "engine_evidence.tar.gz",
+          legacyArchiveSha256: legacy.sha256,
+          legacyArchiveByteSize: legacy.byteSize,
+          manifestSha256: manifest.sha256,
+          manifestByteSize: manifest.byteSize,
+        },
+      );
+      if (prepared.state !== "prepared") {
+        throw new Error(
+          `delivery ${delivery.id} engine preparation was not acknowledged`,
+        );
+      }
+      const point = {
+        aoa_deg: attempt.aoaDeg,
+        case_slug: attempt.engineCaseSlug,
+        method_key: attempt.methodKey,
+      } as PolarPoint;
+      const runtime =
+        attempt.solverImplementationId && attempt.solverRuntimeBuildId
+          ? ({
+              solverImplementationId: attempt.solverImplementationId,
+              solverRuntimeBuildId: attempt.solverRuntimeBuildId,
+            } satisfies ResolvedEngineRuntime)
+          : null;
+      await opts.db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as DB;
+        const cleanup = await registerEvidenceArtifacts({
+          db: tx,
+          engine: opts.engine,
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+          airfoilId: attempt.airfoilId,
+          simJobId: job.id,
+          engineJobId: attempt.engineJobId!,
+          point,
+          artifact: prepared.artifact,
+          runtime,
+        });
+        if (cleanup !== null) {
+          throw new Error(
+            "local legacy transcode unexpectedly requested GCS cleanup",
+          );
+        }
+      });
     }
-    const point = {
-      aoa_deg: attempt.aoaDeg,
-      case_slug: attempt.engineCaseSlug,
-      method_key: attempt.methodKey,
-    } as PolarPoint;
-    const runtime =
-      attempt.solverImplementationId && attempt.solverRuntimeBuildId
-        ? ({
-            solverImplementationId: attempt.solverImplementationId,
-            solverRuntimeBuildId: attempt.solverRuntimeBuildId,
-          } satisfies ResolvedEngineRuntime)
-        : null;
     await opts.db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
-      const cleanup = await registerEvidenceArtifacts({
-        db: tx,
-        engine: opts.engine,
-        resultId: result.id,
-        resultAttemptId: attempt.id,
-        airfoilId: attempt.airfoilId,
-        simJobId: job.id,
-        engineJobId: attempt.engineJobId!,
-        point,
-        artifact: prepared.artifact,
-        runtime,
-      });
-      if (cleanup !== null) {
-        throw new Error("local legacy transcode unexpectedly requested GCS cleanup");
-      }
       const bundles = await tx
         .select()
         .from(solverEvidenceArtifacts)
@@ -236,12 +326,18 @@ export async function backfillLegacyBrokeredEvidence(opts: {
             eq(solverEvidenceArtifacts.resultId, result.id),
             eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
             eq(solverEvidenceArtifacts.kind, "engine_bundle"),
+            sql`${solverEvidenceArtifacts.engineJobId} IS NOT DISTINCT FROM ${attempt.engineJobId}`,
+            sql`${solverEvidenceArtifacts.engineCaseSlug} IS NOT DISTINCT FROM ${attempt.engineCaseSlug}`,
           ),
         );
       if (
         bundles.length !== 1 ||
-        bundles[0]!.sha256 !== prepared.artifact.sha256 ||
-        bundles[0]!.byteSize !== prepared.artifact.byte_size
+        !preparedLegacyBundleMatches(
+          bundles[0]!,
+          legacy,
+          manifest,
+          evidenceBase,
+        )
       ) {
         throw new Error(
           `delivery ${delivery.id} did not register one exact Zstandard bundle`,
@@ -265,9 +361,28 @@ export async function backfillLegacyBrokeredEvidence(opts: {
         .where(
           and(
             eq(syncRemoteResultDeliveries.id, delivery.id),
-            eq(syncRemoteResultDeliveries.state, "delivered"),
+            inArray(syncRemoteResultDeliveries.state, [
+              "delivered",
+              "superseded",
+            ]),
             eq(syncRemoteResultDeliveries.generationKey, attempt.id),
             eq(syncRemoteResultDeliveries.resultAttemptId, attempt.id),
+            sql`EXISTS (
+              SELECT 1
+              FROM sync_sweep_promises remote_promise
+              JOIN sync_sweep_promise_points promise_point
+                ON promise_point.promise_id = remote_promise.id
+               AND promise_point.status = 'fulfilled'
+              WHERE remote_promise.id = ${delivery.promiseId}
+                AND remote_promise.status IN ('fulfilled', 'cancelled', 'expired')
+                AND remote_promise.source_base_url = ${settings.upstreamBaseUrl}
+                AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+                AND promise_point.airfoil_id = ${result.airfoilId}
+                AND promise_point.simulation_preset_revision_id = ${result.simulationPresetRevisionId}
+                AND promise_point.aoa_deg = ${result.aoaDeg}
+                AND promise_point.result_id = ${result.id}
+                AND promise_point.result_attempt_id = ${attempt.id}
+            )`,
           ),
         )
         .returning({ id: syncRemoteResultDeliveries.id });

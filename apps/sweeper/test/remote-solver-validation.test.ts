@@ -51,6 +51,8 @@ const {
   startRemotePromiseTransferLease,
 } = await import("../src/remote-solver");
 const { registerEvidenceArtifacts } = await import("../src/ingest");
+const { backfillLegacyBrokeredEvidence } =
+  await import("../src/legacy-brokered-evidence-backfill");
 const { resetEngineBackoffForTests } = await import("../src/engine-backoff");
 const { submitPendingJobWithLifecycleGuard } =
   await import("../src/submit-lifecycle");
@@ -3664,7 +3666,144 @@ describe("remote solver push validation regressions", () => {
     );
   });
 
-  it("FALSE-POSITIVE-GUARD: a fulfilled point without the exact result-attempt owner cannot enter storage-only replay", async () => {
+  it("MUST-CATCH: a cancelled lease with an exact fulfilled point replays only evidence storage", async () => {
+    const aoaDeg = 865.903;
+    const job = await seedDoneRemoteJob("cancelled-storage-only", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("cancelled-storage-only", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "fulfilled",
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+      })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId,
+      simJobId: job.id,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      aoaDeg,
+      generationKey: attempt.id,
+    });
+    const { fetchMock } = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    const [polar] = requests(fetchMock, "/polars");
+    expect(polar).toBeTruthy();
+    expect(polar.body.results[0].media).toEqual([]);
+    expect(polar.body.results[0].fieldExtents).toEqual([]);
+    expect(
+      polar.body.results[0].evidenceArtifacts.map(
+        (artifact: { kind: string }) => artifact.kind,
+      ),
+    ).toEqual(["manifest", "engine_bundle"]);
+    expect(requests(fetchMock, `/sweeps/${promiseId}/heartbeat`)).toHaveLength(
+      0,
+    );
+  });
+
+  it("MUST-CATCH: legacy migration selects a cancelled promise only through its exact fulfilled point", async () => {
+    const aoaDeg = 865.904;
+    const job = await seedDoneRemoteJob("cancelled-legacy-backfill", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("cancelled-legacy-backfill", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    await db
+      .delete(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, result.id),
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.kind, "engine_bundle"),
+        ),
+      );
+    const legacy = writeMedia(
+      `jobs/${job.engineJobId}/cases/${attempt.engineCaseSlug}/evidence/openfoam_evidence.tar.gz`,
+      "cancelled-legacy-backfill:gzip",
+    );
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simJobId: job.id,
+      engineJobId: job.engineJobId,
+      engineCaseSlug: attempt.engineCaseSlug,
+      aoaDeg,
+      kind: "openfoam_bundle",
+      role: "raw",
+      storageKey: legacy.storageKey,
+      mimeType: "application/gzip",
+      sha256: legacy.sha256,
+      byteSize: legacy.byteSize,
+      metadata: { evidenceBase: "evidence" },
+    });
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        status: "fulfilled",
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+      })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    const [delivery] = await db
+      .insert(syncRemoteResultDeliveries)
+      .values({
+        promiseId,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg,
+        generationKey: attempt.id,
+        state: "superseded",
+      })
+      .returning();
+
+    await expect(
+      backfillLegacyBrokeredEvidence({
+        db,
+        engine: {} as EngineClient,
+        execute: false,
+        deliveryIds: [delivery.id],
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        deliveryId: delivery.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        state: "planned",
+      }),
+    ]);
+  });
+
+  it("FALSE-POSITIVE-GUARD: a closed promise without the exact result-attempt owner cannot enter storage-only replay", async () => {
     const aoaDeg = 865.902;
     const job = await seedDoneRemoteJob("fulfilled-owner-mismatch", [aoaDeg]);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
@@ -3680,7 +3819,7 @@ describe("remote solver push validation regressions", () => {
       .where(eq(resultAttempts.resultId, result.id));
     await db
       .update(syncSweepPromises)
-      .set({ status: "fulfilled", fulfilledAt: new Date() })
+      .set({ status: "cancelled", cancelledAt: new Date() })
       .where(eq(syncSweepPromises.id, promiseId));
     await db
       .update(syncSweepPromisePoints)
