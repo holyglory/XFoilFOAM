@@ -45,12 +45,18 @@ The alternatives were rejected as follows:
 
 ## Verification evidence
 
-- `apps/sweeper/src/remote-solver.ts` contains the singleton active-job gate and
-  the per-job CPU-budget stamping.
-- `apps/api/src/sync-routes.ts` creates promises without a solver-cap check.
-- `apps/sweeper/src/ingest.ts` deliberately postpones extents until the
-  producing job is terminal.
-- `apps/sweeper/src/loop.ts` admits one remote/local batch per scheduler tick.
+- Migration `0087_remote_capacity_and_field_inventory` owns the durable CPU
+  weights, registered-solver promise ownership, promise-cap policy, and exact
+  manifest field inventory.
+- `apps/api/src/sync-routes.ts` enforces the authoritative per-solver promise
+  cap under the registered-solver row lock.
+- `apps/sweeper/src/remote-solver.ts` counts local CPU reservations separately
+  from hub leases, walks independent mirrored polars, claims further hub work
+  while CPU slots remain, and keeps artifact transfer outside admission.
+- `apps/sweeper/src/reconcile.ts` rotates a bounded foreground active-job batch
+  and ingests one running partial snapshot only once per pass.
+- `apps/sweeper/src/loop.ts` admits higher-priority FAST work, fills remote and
+  local CPU slots, then starts one background transfer drain.
 
 ## Implemented
 
@@ -68,17 +74,58 @@ The alternatives were rejected as follows:
   accepted. Remote delivery no longer waits for terminal numeric extents; it
   still requires the exact manifest, accepted attempt, shipped field media,
   and normal broker/evidence checks.
+- Hub-lease reconciliation, CPU admission, and artifact transfer are separate
+  phases. Slow generation-pinned GCS restore/upload is process-local
+  single-flight background work and cannot hold the next admission tick.
+- Foreground reconciliation is limited to eight oldest active jobs per
+  unscoped pass. Status updates rotate each visited job to the back, preserving
+  eventual partial publication while giving CPU refill a bounded opportunity.
+- A newly claimed serial polar no longer becomes a node-wide busy stop. The
+  same admission pass continues claiming independent polars until the 40-slot
+  CPU cap or the authoritative promise cap is reached.
 
 ## Checkout verification
 
-- `apps/sweeper/test/remote-solver-validation.test.ts` and
-  `apps/sweeper/test/build-request-transient-pin.test.ts`: 67/67 passed,
-  including incremental running-result delivery, ownership isolation, weighted
-  admission, retry/recovery, and serial promise lifecycle.
-- `apps/api/test/catalog.test.ts`: 6/6 passed, including the authoritative
-  one-polar promise cap (`at_cap`) claim response.
-- DB/API/sweeper/web type checks, migration application, Prettier, and
-  `git diff --check` passed. Formal UI verification of `/admin` at 390×844 and
-  1440×900 found zero critical geometry/media findings; live API-backed admin
-  controls remain unverified locally because the coordinator's API lease is
-  stale and OpenFOAM dependencies are unavailable.
+- The earlier migration/API baseline passed 67/67 focused sweeper tests and 6/6
+  catalog tests, including weighted admission and the authoritative `at_cap`
+  response.
+- New MUST-CATCH regressions cover transfer I/O versus admission, duplicate
+  running-partial ingestion, the bounded reconciliation budget, and multiple
+  newly claimed promises filling one tick.
+- Sweeper TypeScript checking, Prettier, `git diff --check`, and isolated
+  runtime contracts passed for the deployed changes. The focused Vitest files
+  were discovered but could not execute in this checkout because their global
+  setup requires PostgreSQL on localhost:5432 and that service is offline;
+  this is an environmental test limitation, not a reported green run.
+
+## Live deployment and operating proof
+
+- Production and `hz-solver2` run exact source
+  `7f1595669fc1fcd20aa2cb66c863c72491f10554`. Production deployment
+  [30008340084](https://github.com/holyglory/XFoilFOAM/actions/runs/30008340084)
+  completed successfully. Both deployments recreated only Node control-plane
+  services; the OpenFOAM API and worker containers remained two days old and
+  their active CFD children were preserved.
+- The production OpenCFD 2606 pool is enabled at 8 CPU slots. OpenCFD 2406 and
+  Foundation 14 remain disabled. The remote CPU budget is 40; its hub promise
+  cap is 48 so transient ingest/delivery ownership cannot strand executable
+  CPU slots while the execution cap remains hard at 40.
+- The post-deployment burn-in reached all 40 remote execution reservations
+  (34 running plus 6 engine-submitted jobs) and the worker consumed 38.3 of its
+  Docker-limited 40 CPU cores while the last submissions entered OpenFOAM.
+  Subsequent samples retained 40 owned work items while completed jobs moved
+  through ingest and refill. Production independently reported eight active
+  engine jobs. Remote delivery advanced from 794 to 796 delivered generations
+  with 21 superseded and zero blocked deliveries.
+- An authenticated browser-equivalent request rendered the live campaign as
+  running with eight active production jobs, and the public AG24 detail route
+  rendered its stored profile and 86-point polar. Both routes had zero browser
+  errors and zero console errors. The loaded campaign API returned HTTP 200,
+  although its cold under-load response took about 18 seconds.
+- Before the promise-cap policy update, a fresh production dump was copied
+  off-host and restored into an isolated scratch database:
+  `aerodb-pre-remote-promise-headroom-20260723T125240Z.dump`, 525,581,420
+  bytes, SHA-256
+  `eb90183bd3347a5b7f7a5039d3a72b98d51a7a2817d65b6d803cfde47b4dd555`.
+  Primary and restored inventories matched at 91 public tables, 44 public
+  functions, and 0 public sequences before the scratch database was dropped.

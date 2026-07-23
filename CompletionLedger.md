@@ -13,14 +13,14 @@
   recovery now explicitly hydrates immutable retained archives, and the API
   image owns the ffmpeg encoder used by that endpoint; both fixes are
   regression-verified and deployed on the remote solver, but not yet on
-  production. Remote delivery now has a local manifest-backed field-inventory
-  gate and weighted remote/local admission in this checkout; the migration,
-  admin controls, and incremental-delivery regression coverage are implemented
-  and checkout-verified, while deployment and production verification remain.
-  Exact generations already accepted
-  by the hub retire obsolete local repair work. Let the current production
-  11-angle job finish without interrupting its eight live OpenFOAM processes,
-  then deploy this hardening through the guarded engine-maintenance path.
+  production. Remote delivery now has a deployed local manifest-backed
+  field-inventory gate, independent weighted remote/local admission, bounded
+  rotating reconciliation, single-flight background artifact transfer, and
+  same-tick multi-promise refill. Production is capped at eight OpenCFD 2606
+  CPU slots; the dedicated remote node is capped at 40 CPU slots with 48 hub
+  promises so ingest/delivery ownership cannot strand executable capacity.
+  Exact generations already accepted by the hub retire obsolete local repair
+  work.
   Readiness still requires incremental result publication, verified GCS
   generations and local reclamation for the live job, plus a burn-in with no
   recurring current-generation blocked/critical chain. Preserve immutable
@@ -34,14 +34,13 @@
   cancelled whole-promise lease as solver work even though the point itself had
   already been fulfilled. The exact settled-point and signed-receipt fences are
   deployed and regression-covered. Of 39 unbound, accepted legacy generations,
-  38 are now GCS-bound and signed-reclaimed. One remaining complete remote
-  generation has reached a verified immutable GCS object but conflicts with a
-  different hub result generation for the same physical cell; its local source
-  remains intact, and it must enter a durable alternate-result/conflict
-  preservation path rather than be rebound or reclaimed. Six
+  38 are now GCS-bound and signed-reclaimed. The one complete remote generation
+  that conflicted with a different hub result generation for the same physical
+  cell is preserved as an immutable archived conflict; its obsolete delivery
+  was automatically superseded and no remote delivery remains blocked. Six
   cancelled/invalid point generations still require the separate
   forensic/rejected-evidence path. Do not claim migration complete or remove
-  any of those seven local sources until their exact durable acknowledgement
+  any of those six local sources until their exact durable acknowledgement
   exists. Preserve at least 80 GiB free while the campaign is active, keep the
   temporary hydration cache bounded, and remeasure active-case growth before
   increasing solver concurrency.
@@ -68,17 +67,18 @@
   scheduler's local admission switch remains deliberately disabled on this
   dedicated remote node: it prevents an independent local campaign queue while
   the running sweeper reconciles and admits only hub-issued promises through
-  the remote lane. Its attested OpenCFD 2606 pool is enabled and a 26-point hub
-  promise is running; 2406 remains disabled. Only a point already fulfilled
+  the remote lane. Its attested OpenCFD 2606 pool is enabled with a 40-slot CPU
+  budget and 48-promise hub headroom; production independently retains its
+  eight-slot pool, and OpenCFD 2406 remains disabled. Only a point already fulfilled
   with the exact result/attempt may perform an archive-only replay under a
   fulfilled, cancelled, or expired promise; a receipt-backed exact delivery is
   already bound and must never be replayed. The replay must not renew the
   closed solver-work lease, and remote bytes may be reclaimed only from signed
-  hub receipts. After the remaining alternate/forensic evidence is durably
-  preserved, deploy the 96-chunk continuation
-  hardening while the remote worker is idle, widen remote promises, and monitor
-  evidence delivery, FINAL completion, descriptor stability, and absence of
-  new critical chains before removing this item.
+  hub receipts. After the remaining forensic evidence is durably preserved,
+  deploy the 96-chunk continuation hardening while the remote worker is idle
+  and continue monitoring evidence delivery, FINAL completion, descriptor
+  stability, full CPU refill, and absence of new critical chains before
+  removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation
