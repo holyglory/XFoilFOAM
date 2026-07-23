@@ -76,6 +76,7 @@ import {
 } from "@aerodb/engine-client";
 import {
   and,
+  asc,
   desc,
   eq,
   inArray,
@@ -159,6 +160,25 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
   "running",
   "ingesting",
 ];
+
+export const DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT = 8;
+const MAX_ACTIVE_RECONCILE_JOB_LIMIT = 64;
+
+/** Bound one foreground scheduler pass so partial-result ingestion at high
+ * concurrency cannot postpone CPU refill until every active polar has been
+ * polled. `updatedAt` ordering below rotates the batch: every status/partial
+ * update moves a visited job behind older siblings. Explicit test/operator
+ * scopes remain exact and are never truncated. */
+export function activeReconcileJobLimit(
+  raw = process.env.SWEEPER_ACTIVE_RECONCILE_JOB_LIMIT,
+): number {
+  if (raw == null || raw.trim() === "")
+    return DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0)
+    return DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT;
+  return Math.min(parsed, MAX_ACTIVE_RECONCILE_JOB_LIMIT);
+}
 
 function deterministicMeshEvidenceSql(
   failureDisposition: SQLWrapper,
@@ -3936,10 +3956,14 @@ export async function reconcile(
   if (options.jobIds?.length)
     activeFilters.push(inArray(simJobs.id, options.jobIds));
 
-  const jobs = await db
+  const activeJobQuery = db
     .select()
     .from(simJobs)
-    .where(and(...activeFilters));
+    .where(and(...activeFilters))
+    .orderBy(asc(simJobs.updatedAt), asc(simJobs.id));
+  const jobs = options.jobIds?.length
+    ? await activeJobQuery
+    : await activeJobQuery.limit(activeReconcileJobLimit());
 
   let queue: EngineQueueState | null = null;
   try {
@@ -3979,6 +4003,7 @@ export async function reconcile(
     // 10+-job reconcile pass must not leave the heartbeat silent meanwhile.
     await touchHeartbeat(db);
     const runtime = runtimeByJobId.get(job.engineJobId) ?? null;
+    let handledRuntimePartial = false;
     if (runtime?.has_result && runtime.result_readable) {
       if (runtime.result_state === "completed") {
         try {
@@ -4014,6 +4039,10 @@ export async function reconcile(
         runtime.status_completed_cases > job.completedCases
       ) {
         await ingestRunningPartialJob(db, engine, job);
+        // The subsequent exact status poll still refreshes engine lifecycle
+        // metadata, but must not fetch and ingest the same running snapshot a
+        // second time using this function's stale in-memory completedCases.
+        handledRuntimePartial = true;
       }
     }
     let status;
@@ -4059,7 +4088,8 @@ export async function reconcile(
     }
     if (
       status.state === "running" &&
-      status.completed_cases > job.completedCases
+      status.completed_cases > job.completedCases &&
+      !handledRuntimePartial
     ) {
       await ingestRunningPartialJob(db, engine, job);
     }

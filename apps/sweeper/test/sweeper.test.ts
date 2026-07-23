@@ -4328,6 +4328,7 @@ describe("sweeper: gap → claim → ingest", () => {
         },
       ],
     };
+    let getResultCalls = 0;
     const partialEngine = {
       getQueue: async () => emptyQueue(["running-partial-result"]),
       getJobRuntimes: async () => ({
@@ -4355,7 +4356,10 @@ describe("sweeper: gap → claim → ingest", () => {
         total_cases: 3,
         completed_cases: 1,
       }),
-      getResult: async () => withExactManifestEvidence(partialResult),
+      getResult: async () => {
+        getResultCalls += 1;
+        return withExactManifestEvidence(partialResult);
+      },
       fileUrl: (jobId: string, relPath: string) =>
         `http://engine.test/jobs/${jobId}/files/${relPath}`,
     } as unknown as EngineClient;
@@ -4389,6 +4393,10 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(gotResult.status).toBe("done");
     expect(gotResult.source).toBe("solved");
     expect(gotResult.cl).toBeCloseTo(0.67, 6);
+    // MUST-CATCH: the bulk runtime snapshot and the exact status poll see the
+    // same new partial. Reconciliation ingests it once, not twice from the
+    // stale in-memory completedCases value.
+    expect(getResultCalls).toBe(1);
     const attempts = await db
       .select({ id: resultAttempts.id })
       .from(resultAttempts)
