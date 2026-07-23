@@ -5317,13 +5317,22 @@ export async function admitRemoteSolverTick(
       // real admission and prematurely stop the multi-slot refill loop.
       outcome =
         outcome?.kind === "submitted" ? outcome : (occupiedOutcome ?? outcome);
-      if (!mirrored.length) {
-        outcome = await claimRemoteWork(
+      if (
+        outcome?.kind !== "submitted" &&
+        (await remoteReservedCpuSlots(db, settings)) < remoteCap
+      ) {
+        // Busy mirrored polars are serial only within their own promise. They
+        // must not stop a node-wide refill while the hub can lease another
+        // independent polar. The authoritative per-solver promise cap still
+        // decides whether another lease is available.
+        const claimed = await claimRemoteWork(
           db,
           engine,
           settings,
           meshRecoveryVersion,
         );
+        if (claimed && (claimed.kind === "submitted" || !outcome))
+          outcome = claimed;
       }
       if (outcome?.kind === "submitted") {
         admitted = true;

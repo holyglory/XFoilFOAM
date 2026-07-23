@@ -545,9 +545,7 @@ async function cleanupRemoteRows() {
     .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
   await db
     .delete(registeredRemoteSolvers)
-    .where(
-      dsql`${registeredRemoteSolvers.instanceName} LIKE ${`${PREFIX}%`}`,
-    );
+    .where(dsql`${registeredRemoteSolvers.instanceName} LIKE ${`${PREFIX}%`}`);
 }
 
 async function seedDoneRemoteJob(
@@ -859,10 +857,12 @@ function stubFetch(
     failCancelCount?: number;
     unfulfilledPolarIndex?: number;
     observeJobId?: string;
+    claimPromises?: Array<Record<string, unknown>>;
   } = {},
 ) {
   let polarIndex = 0;
   let cancelIndex = 0;
+  let claimIndex = 0;
   const pushedAtDuringPosts: (string | undefined)[] = [];
   const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
@@ -974,10 +974,15 @@ function stubFetch(
         },
       );
     if (url.endsWith("/sweeps/claim"))
-      return new Response(JSON.stringify({ promise: null }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          promise: opts.claimPromises?.[claimIndex++] ?? null,
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -1633,9 +1638,10 @@ describe("remote solver submit lifecycle", () => {
   );
 
   it("MUST-CATCH: a running serial polar does not block the next mirrored polar from using free CPU capacity", async () => {
-    const runningPromise = await seedMirroredPromise("capacity-running", [
-      900.951,
-    ]);
+    const runningPromise = await seedMirroredPromise(
+      "capacity-running",
+      [900.951],
+    );
     const readyPromise = await seedMirroredPromise("capacity-ready", [900.952]);
     await db.insert(simJobs).values({
       airfoilId,
@@ -1657,9 +1663,7 @@ describe("remote solver submit lifecycle", () => {
         aoas: [900.951],
       },
     });
-    const submitPolar = vi.fn(async () =>
-      acceptedStatus("capacity-ready", 1),
-    );
+    const submitPolar = vi.fn(async () => acceptedStatus("capacity-ready", 1));
 
     const admitted = await admitRemoteSolverTick(
       db,
@@ -1689,6 +1693,71 @@ describe("remote solver submit lifecycle", () => {
         },
       },
     ]);
+  });
+
+  it("MUST-CATCH: a newly claimed busy polar does not stop the same tick from filling another CPU slot", async () => {
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("setup revision fixture required");
+    const claimedAoas = [900.955, 900.956];
+    const claimPromises = claimedAoas.map((aoaDeg, index) => ({
+      id: randomUUID(),
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      airfoil: {
+        slug: airfoilSlug,
+        name: `${PREFIX} claimed ${index + 1}`,
+        source: null,
+        pointFormat: "normalized",
+        points: contour,
+      },
+      setupRevision: {
+        signatureHash: revision.signatureHash,
+        snapshot: revision.snapshot,
+      },
+      aoas: [aoaDeg],
+    }));
+    const { fetchMock } = stubFetch({ claimPromises });
+    let submission = 0;
+    const submitPolar = vi.fn(async () => {
+      submission += 1;
+      return acceptedStatus(`same-tick-claim-${submission}`, 1);
+    });
+
+    expect(
+      await admitRemoteSolverTick(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 17 },
+      ),
+    ).toBe(true);
+
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(2);
+    expect(
+      (
+        await db
+          .select({
+            status: simJobs.status,
+            requestPayload: simJobs.requestPayload,
+          })
+          .from(simJobs)
+          .where(eq(simJobs.simulationPresetRevisionId, revisionId))
+      ).filter(
+        (job) =>
+          job.status === "submitted" &&
+          claimPromises.some(
+            (promise) =>
+              (job.requestPayload as { syncPromiseId?: string })
+                .syncPromiseId === promise.id,
+          ),
+      ),
+    ).toHaveLength(2);
   });
 
   it("MUST-CATCH: a newly claimed promise persists its registered owner before composition", async () => {
@@ -4997,9 +5066,7 @@ describe("remote solver push validation regressions", () => {
     await remoteSolverTick(db, { submitPolar } as unknown as EngineClient);
 
     expect(submitPolar).toHaveBeenCalledTimes(1);
-    expect(submitPolar.mock.calls[0]?.[0].aoa.angles).toEqual([
-      independentAoa,
-    ]);
+    expect(submitPolar.mock.calls[0]?.[0].aoa.angles).toEqual([independentAoa]);
     expect(
       (await deliveriesForJob(acceptedJob.id)).find((row) => row.resultId)
         ?.state,
@@ -5069,9 +5136,7 @@ describe("remote solver push validation regressions", () => {
     await remoteSolverTick(db, { submitPolar } as unknown as EngineClient);
 
     expect(submitPolar).toHaveBeenCalledTimes(1);
-    expect(submitPolar.mock.calls[0]?.[0].aoa.angles).toEqual([
-      independentAoa,
-    ]);
+    expect(submitPolar.mock.calls[0]?.[0].aoa.angles).toEqual([independentAoa]);
     expect(requests(deliveryFetch.fetchMock, "/polars")).toHaveLength(1);
     expect(
       (await deliveriesForJob(deliveredJob.id)).find((row) => row.resultId)
