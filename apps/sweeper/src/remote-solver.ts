@@ -81,6 +81,7 @@ import {
 } from "./engine-backoff";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { touchHeartbeat } from "./heartbeat";
+import { createSingleFlightBackgroundRunner } from "./single-flight";
 import { parsedMeshRecoveryVersion } from "./engine-capabilities";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
@@ -2205,8 +2206,7 @@ export async function persistClaimedRemotePromise(
       );
     if (
       existingOwners.some(
-        (row) =>
-          row.id !== solverId || row.instanceId !== settings.instanceId,
+        (row) => row.id !== solverId || row.instanceId !== settings.instanceId,
       )
     ) {
       throw new Error(
@@ -5168,11 +5168,36 @@ export async function transferRemoteSolverTick(
       engine,
       settings,
     );
-    return processedDurableDelivery || Boolean(readyPromiseId) || reusedEvidence;
+    return (
+      processedDurableDelivery || Boolean(readyPromiseId) || reusedEvidence
+    );
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
     return false;
   }
+}
+
+const scheduleRemoteTransferOnce = createSingleFlightBackgroundRunner(
+  (error) => {
+    console.error(
+      "[sweeper] remote transfer pass failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  },
+);
+
+/**
+ * Start at most one durable transfer pass without holding the scheduler's
+ * admission loop open. A large archive restore/upload may legitimately take
+ * minutes; CPU refill and authority heartbeats must continue every poll
+ * interval during that I/O. The durable row claims provide restart safety,
+ * while this process-local single-flight guard prevents overlapping drains.
+ */
+export function scheduleRemoteSolverTransfer(
+  db: DB,
+  engine: EngineClient,
+): void {
+  scheduleRemoteTransferOnce(() => transferRemoteSolverTick(db, engine));
 }
 
 function remoteAdmissionHoldMessage(

@@ -55,7 +55,7 @@ import { reconcile, resetOrphans } from "./reconcile";
 import {
   admitRemoteSolverTick,
   reconcileRemoteSolverTick,
-  transferRemoteSolverTick,
+  scheduleRemoteSolverTransfer,
   type RemoteEngineAdmissionDecision,
 } from "./remote-solver";
 import { retentionTick } from "./retention";
@@ -924,9 +924,10 @@ export async function tick(
     }
   }
   // Artifact publication, cancellation delivery, and brokered evidence
-  // reclaim can involve slow upstream I/O. Drain those durable outboxes only
-  // after all NEW-work lanes had a chance to occupy free CPU capacity.
-  await transferRemoteSolverTick(db, engine);
+  // reclaim can involve minutes of upstream I/O. Start one single-flight
+  // background drain only after all NEW-work lanes had a chance to occupy free
+  // CPU capacity; never hold the next admission tick behind that transfer.
+  scheduleRemoteSolverTransfer(db, engine);
   await markTickCompleted(db);
 }
 
