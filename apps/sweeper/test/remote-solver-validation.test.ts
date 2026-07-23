@@ -1621,6 +1621,56 @@ describe("remote solver submit lifecycle", () => {
     },
   );
 
+  it("MUST-CATCH: a running serial polar does not block the next mirrored polar from using free CPU capacity", async () => {
+    const runningPromise = await seedMirroredPromise("capacity-running", [
+      900.951,
+    ]);
+    const readyPromise = await seedMirroredPromise("capacity-ready", [900.952]);
+    await db.insert(simJobs).values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 1,
+      jobKind: "sweep",
+      status: "running",
+      engineState: "running",
+      engineJobId: `${PREFIX}-capacity-running`,
+      admissionCpuSlots: 1,
+      totalCases: 1,
+      completedCases: 0,
+      requestPayload: {
+        remoteSolver: true,
+        syncPromiseId: runningPromise.id,
+        upstreamBaseUrl: UPSTREAM,
+        aoas: [900.951],
+      },
+    });
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("capacity-ready", 1),
+    );
+
+    expect(
+      await admitRemoteSolverTick(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 17 },
+      ),
+    ).toBe(true);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(await jobsForPromise(runningPromise.id)).toHaveLength(1);
+    expect(await jobsForPromise(readyPromise.id)).toMatchObject([
+      {
+        status: "submitted",
+        admissionCpuSlots: 1,
+        requestPayload: {
+          syncPromiseId: readyPromise.id,
+        },
+      },
+    ]);
+  });
+
   it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
     const aoa = 901.001;
     const promise = await seedMirroredPromise("connection", [aoa]);

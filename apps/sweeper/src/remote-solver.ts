@@ -5087,16 +5087,39 @@ export async function admitRemoteSolverTick(
         break;
       }
       const mirrored = await mirroredRemotePromiseIds(db, settings);
-      let outcome: RemotePromiseSubmitResult | null;
-      if (mirrored.length) {
-        outcome = await submitMirroredRemotePromise(
+      let outcome: RemotePromiseSubmitResult | null = null;
+      let occupiedOutcome: RemotePromiseSubmitResult | null = null;
+      // A running polar is intentionally serial, but it must not become a
+      // node-wide head-of-line block. Walk every already-mirrored promise and
+      // admit the first independently runnable polar before asking the hub for
+      // another lease. Busy/waiting work still owns this admission cycle when
+      // no sibling is runnable; it must not cause an unnecessary upstream
+      // claim or bypass a pending corrective PRECALC owner.
+      for (const promiseId of mirrored) {
+        const candidate = await submitMirroredRemotePromise(
           db,
           engine,
           settings,
-          mirrored[0]!,
+          promiseId,
           meshRecoveryVersion,
         );
-      } else {
+        if (candidate.kind === "submitted") {
+          outcome = candidate;
+          break;
+        }
+        if (candidate.kind === "busy") {
+          occupiedOutcome = candidate;
+        } else if (
+          candidate.kind === "waiting" &&
+          occupiedOutcome?.kind !== "busy"
+        ) {
+          occupiedOutcome = candidate;
+        } else if (!occupiedOutcome) {
+          outcome = candidate;
+        }
+      }
+      outcome = occupiedOutcome ?? outcome;
+      if (!mirrored.length) {
         outcome = await claimRemoteWork(
           db,
           engine,
