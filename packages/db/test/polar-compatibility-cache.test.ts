@@ -61,7 +61,7 @@ function candidate(
 
 describe("public polar compatibility evidence resolution", () => {
   it("invalidates caches built before incomplete-URANS quality gating", () => {
-    expect(POLAR_COMPATIBILITY_VERSION).toBe("polar-compat-v5");
+    expect(POLAR_COMPATIBILITY_VERSION).toBe("polar-compat-v6");
   });
 
   it.each([URANS_BUDGET_STOP_MARKER, URANS_CONTINUATION_REQUIRED_MARKER])(
@@ -122,13 +122,40 @@ describe("public polar compatibility evidence resolution", () => {
     );
   });
 
-  it("audits equal-ranked coefficient disagreement and excludes the angle", () => {
+  it("keeps numerically repeatable equal-ranked solves as one selected angle", () => {
+    const older = candidate("older", {
+      regime: "urans",
+      fidelity: "urans_full",
+      solvedAt: new Date("2026-07-10T00:00:00Z"),
+    });
+    const newer = candidate("newer", {
+      regime: "urans",
+      fidelity: "urans_full",
+      cl: 0.405,
+      cd: 0.0124,
+      cm: -0.0205,
+      clCd: 0.405 / 0.0124,
+      solvedAt: new Date("2026-07-11T00:00:00Z"),
+    });
+    const resolved = resolvePolarCompatibilityMembers([older, newer]);
+    expect(resolved.conflictAoas).toEqual([]);
+    expect(resolved.selected.map((row) => row.resultId)).toEqual(["newer"]);
+    expect(
+      resolved.members.find((row) => row.resultId === "older"),
+    ).toMatchObject({
+      role: "shadowed",
+      selectionReason:
+        "repeat measurement agrees with selected top-ranked evidence",
+    });
+  });
+
+  it("audits material equal-ranked coefficient disagreement and excludes the angle", () => {
     const a = candidate("a", { regime: "urans", fidelity: "urans_full" });
     const b = candidate("b", {
       regime: "urans",
       fidelity: "urans_full",
-      cl: 0.41,
-      clCd: 0.41 / 0.012,
+      cl: 0.48,
+      clCd: 0.48 / 0.012,
     });
     const resolved = resolvePolarCompatibilityMembers([a, b]);
     expect(resolved.conflictAoas).toEqual([2]);

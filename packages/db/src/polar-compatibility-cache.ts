@@ -34,10 +34,11 @@ import {
   METHOD_COMPATIBILITY_HASH_VERSION,
 } from "./solver-implementations";
 
-// v5 adds versioned solver-method identity. Older v4 rows grouped only by the
-// physical/numerical payload and could coalesce different OpenFOAM
-// distributions/releases; they are therefore never read as current v5 data.
-export const POLAR_COMPATIBILITY_VERSION = "polar-compat-v5";
+// v6 treats repeat runs within bounded solver repeatability as one selectable
+// measurement while retaining the other immutable result as shadow evidence.
+// v5 required bit-exact coefficients, so harmless floating-point / convergence
+// noise could turn an otherwise complete polar into conflict-only gaps.
+export const POLAR_COMPATIBILITY_VERSION = "polar-compat-v6";
 export const POLAR_COMPATIBILITY_MEMBER_ROLES = [
   "selected",
   "shadowed",
@@ -223,11 +224,41 @@ function deterministicCandidateOrder(
   return a.resultId.localeCompare(b.resultId);
 }
 
-function exactSameCoefficients(
-  a: CompatibilityCandidate,
-  b: CompatibilityCandidate,
+function withinRepeatability(
+  a: number,
+  b: number,
+  absoluteTolerance: number,
+  relativeTolerance: number,
 ): boolean {
-  return a.cl === b.cl && a.cd === b.cd && a.cm === b.cm;
+  return (
+    Math.abs(a - b) <=
+    Math.max(
+      absoluteTolerance,
+      relativeTolerance * Math.max(Math.abs(a), Math.abs(b)),
+    )
+  );
+}
+
+/**
+ * Equal-ranked repetitions are not expected to be bit-identical: iterative
+ * convergence and URANS averaging leave small numerical differences even for
+ * the same immutable method-compatible setup. Those repetitions may share one
+ * public primary point only inside conservative coefficient-level bounds.
+ *
+ * A missing Cm never invalidates an otherwise usable Cl/Cd point. When both Cm
+ * values exist, they must also agree within the moment bound.
+ */
+export function repeatMeasurementsAgree(
+  a: Pick<CompatibilityCandidate, "cl" | "cd" | "cm">,
+  b: Pick<CompatibilityCandidate, "cl" | "cd" | "cm">,
+): boolean {
+  const cmAgrees =
+    a.cm == null || b.cm == null || withinRepeatability(a.cm, b.cm, 0.01, 0.05);
+  return (
+    withinRepeatability(a.cl, b.cl, 0.02, 0.03) &&
+    withinRepeatability(a.cd, b.cd, 0.002, 0.05) &&
+    cmAgrees
+  );
 }
 
 export function resolvePolarCompatibilityMembers(
@@ -258,11 +289,11 @@ export function resolvePolarCompatibilityMembers(
     const lower = bucket.filter(
       (candidate) => candidate.selectionRank !== maxRank,
     );
-    const exactTie = top.every((candidate) =>
-      exactSameCoefficients(top[0], candidate),
+    const repeatableTie = top.every((candidate) =>
+      repeatMeasurementsAgree(top[0], candidate),
     );
 
-    if (top.length > 1 && !exactTie) {
+    if (top.length > 1 && !repeatableTie) {
       conflictAoas.push(aoa);
       for (const candidate of top) {
         members.push({
@@ -289,7 +320,7 @@ export function resolvePolarCompatibilityMembers(
       role: "selected",
       selectionReason:
         top.length > 1
-          ? "deterministic winner among exact-equal top-ranked evidence"
+          ? "deterministic winner among repeatable top-ranked evidence"
           : "highest-ranked compatible evidence",
     });
     for (const candidate of top.slice(1)) {
@@ -297,7 +328,7 @@ export function resolvePolarCompatibilityMembers(
         ...candidate,
         role: "shadowed",
         selectionReason:
-          "exact-equal duplicate of selected top-ranked evidence",
+          "repeat measurement agrees with selected top-ranked evidence",
       });
     }
     for (const candidate of lower) {

@@ -74,6 +74,30 @@
   current running-result delivery deadlock without inventing field extents or
   forcing expensive rendering into the solver march.
 
+- Confirmed intent: a public polar must not collapse into artificial gaps
+  because repeat runs from one method-compatible setup differ only by bounded
+  numerical solver noise. Keep every immutable result reachable, choose one
+  deterministic primary inside conservative Cl/Cd/Cm repeatability bounds, and
+  reserve conflict-only gaps for material disagreement.
+  [D-2026-07-23-public-polar-repeatability](DecisionDetails/D-2026-07-23-public-polar-repeatability.md)
+
+## D-2026-07-23-public-polar-repeatability — Bounded repeat noise does not erase a public polar
+
+Detail: [DecisionDetails/D-2026-07-23-public-polar-repeatability.md](DecisionDetails/D-2026-07-23-public-polar-repeatability.md)
+
+- Decision: for equal-ranked results in one exact method-compatibility series
+  and AoA, select the deterministic newest result when Cl differs by at most
+  max(0.02, 3%), Cd by max(0.002, 5%), and available Cm by max(0.01, 5%).
+  Retain agreeing repetitions as alternates. Material disagreement remains
+  conflict evidence and stays out of the fitted curve. Invalidate v5
+  compatibility caches with `polar-compat-v6`.
+- Why: bit-exact comparison erased 24 of 26 angles from the 20-32C Re 102k
+  curve even though most pairs differed only by iterative convergence noise.
+  Always choosing a winner would hide materially different aerodynamic
+  branches; retaining exact equality would keep producing false gaps; averaging
+  would invent a coefficient row that no solver produced. Bounded selection
+  preserves one real result, all provenance, and conservative conflict gaps.
+
 ## D-2026-07-20-urans-continuation-wall-budget — Wall budget, not a short chunk count, bounds healthy relaxation
 
 Detail: [DecisionDetails/D-2026-07-20-urans-continuation-wall-budget.md](DecisionDetails/D-2026-07-20-urans-continuation-wall-budget.md)

@@ -34,6 +34,7 @@ import {
 import {
   POLAR_COMPATIBILITY_VERSION,
   polarCompatibilitySeriesId,
+  repeatMeasurementsAgree,
 } from "@aerodb/db/polar-cache";
 import {
   methodCompatibilityHashForSnapshot,
@@ -150,17 +151,9 @@ function fidelityRank(row: SolvedRow): number {
   return row.result.regime === "urans" ? 2 : 1;
 }
 
-function sameCoefficients(a: SolvedRow, b: SolvedRow): boolean {
-  return (
-    a.result.cl === b.result.cl &&
-    a.result.cd === b.result.cd &&
-    a.result.cm === b.result.cm
-  );
-}
-
 /** Rollout fallback used only while a compatibility cache is absent. It
  * mirrors the cache's conservative selector: accepted before provisional,
- * full URANS before precalc before RANS, exact-equal ties shadow
+ * full URANS before precalc before RANS, repeatable ties shadow
  * deterministically, and contradictory equal-rank evidence remains visible
  * as point-only conflict evidence. */
 function resolveFallbackCompatibilityRows(
@@ -192,7 +185,23 @@ function resolveFallbackCompatibilityRows(
         return updated || x.result.id.localeCompare(y.result.id);
       });
     const lower = candidates.filter((row) => !top.includes(row));
-    if (top.length === 1 || top.every((row) => sameCoefficients(row, top[0]))) {
+    if (
+      top.length === 1 ||
+      top.every((row) =>
+        repeatMeasurementsAgree(
+          {
+            cl: row.result.cl ?? Number.NaN,
+            cd: row.result.cd ?? Number.NaN,
+            cm: row.result.cm,
+          },
+          {
+            cl: top[0].result.cl ?? Number.NaN,
+            cd: top[0].result.cd ?? Number.NaN,
+            cm: top[0].result.cm,
+          },
+        ),
+      )
+    ) {
       resolved.push({ row: top[0], role: "primary" });
       for (const row of top.slice(1)) resolved.push({ row, role: "alternate" });
     } else {

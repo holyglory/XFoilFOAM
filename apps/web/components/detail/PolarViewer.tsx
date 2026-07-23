@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  CHART_VIEW,
   type ChartDomain,
   type ChartPointVM,
   type ChartProjection,
@@ -13,14 +14,24 @@ import {
   readoutAtX,
   zoomChartDomain,
 } from "@aerodb/core";
+import { Maximize2, Minimize2 } from "lucide-react";
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
 } from "react";
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { C, MONO, VIZ } from "@/lib/tokens";
+import { containedBadgePosition, POLAR_BADGE_EDGE } from "@/lib/polar-badge";
 import {
   formatPolarAoa,
   polarLegendItems,
@@ -82,6 +93,15 @@ export function PolarViewer(props: {
   } = props;
   const [cursor, setCursor] = useState<ChartCursor | null>(null);
   const [resultChoice, setResultChoice] = useState<ChartPointVM | null>(null);
+  const [maximized, setMaximized] = useState(false);
+  const [badgePosition, setBadgePosition] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
+  const viewerRef = useRef<HTMLDivElement | null>(null);
+  const chartSurfaceRef = useRef<HTMLDivElement | null>(null);
+  const badgeRef = useRef<HTMLDivElement | null>(null);
+  const maximizeButtonRef = useRef<HTMLButtonElement | null>(null);
   const viewerId = useId();
   const panelId = `${viewerId}-panel`;
 
@@ -89,6 +109,22 @@ export function PolarViewer(props: {
     () => setResultChoice(null),
     [chartType, polars, profileView?.active],
   );
+
+  useEffect(() => {
+    if (!maximized) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMaximized(false);
+      requestAnimationFrame(() => maximizeButtonRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [maximized]);
 
   const activateTab = (id: ChartType | "profile") => {
     if (id === "profile") {
@@ -186,6 +222,47 @@ export function PolarViewer(props: {
   );
   const readoutValue = (y: number) =>
     chartType === "lda" ? f1(y) : chartType === "cma" ? f4(y) : f2(y);
+  const badgeAnchor = hover
+    ? { px: hover.px, py: hover.py }
+    : cursor && readoutRows.length > 0
+      ? { px: cursor.px, py: cursor.py }
+      : null;
+
+  useLayoutEffect(() => {
+    const surface = chartSurfaceRef.current;
+    const badge = badgeRef.current;
+    if (!surface || !badge || !badgeAnchor) {
+      setBadgePosition(null);
+      return;
+    }
+    const place = () => {
+      const containerWidth = surface.clientWidth;
+      const containerHeight = surface.clientHeight;
+      const anchorX = (badgeAnchor.px / CHART_VIEW.w) * containerWidth;
+      const anchorY = (badgeAnchor.py / CHART_VIEW.h) * containerHeight;
+      setBadgePosition(
+        containedBadgePosition({
+          anchorX,
+          anchorY,
+          badgeWidth: badge.offsetWidth,
+          badgeHeight: badge.offsetHeight,
+          containerWidth,
+          containerHeight,
+        }),
+      );
+    };
+    place();
+    const observer = new ResizeObserver(place);
+    observer.observe(surface);
+    observer.observe(badge);
+    return () => observer.disconnect();
+  }, [
+    badgeAnchor?.px,
+    badgeAnchor?.py,
+    hover?.head,
+    readoutRows.length,
+    maximized,
+  ]);
 
   const zoomBy = (factor: number) => {
     const dom = projection.domain;
@@ -229,14 +306,16 @@ export function PolarViewer(props: {
     [onPointClick],
   );
 
-  const badgeStyle = (
-    px: number,
-    py: number,
-    accent: string,
-  ): CSSProperties => ({
+  const badgeStyle = (accent: string): CSSProperties => ({
     position: "absolute",
-    left: Math.min(500, Math.max(0, px + 14)),
-    top: Math.max(0, py - 60),
+    left: badgePosition?.left ?? POLAR_BADGE_EDGE,
+    top: badgePosition?.top ?? POLAR_BADGE_EDGE,
+    visibility: badgePosition ? "visible" : "hidden",
+    width: "min(238px, calc(100% - 16px))",
+    maxHeight: "calc(100% - 16px)",
+    boxSizing: "border-box",
+    overflowY: "auto",
+    overflowWrap: "anywhere",
     background: C.popover,
     border: `1px solid ${accent}`,
     borderRadius: 9,
@@ -246,16 +325,28 @@ export function PolarViewer(props: {
     boxShadow: `0 10px 26px ${C.shadow}`,
   });
   const hoverStyle: CSSProperties = hover
-    ? badgeStyle(hover.px, hover.py, C.teal)
+    ? badgeStyle(C.teal)
     : { display: "none" };
 
   return (
     <div
+      ref={viewerRef}
+      data-testid="polar-viewer"
+      data-maximized={maximized ? "true" : "false"}
       style={{
         background: C.panel,
-        border: `1px solid ${C.border}`,
-        borderRadius: 12,
-        overflow: "hidden",
+        border: maximized ? "none" : `1px solid ${C.border}`,
+        borderRadius: maximized ? 0 : 12,
+        overflow: maximized ? "auto" : "hidden",
+        ...(maximized
+          ? {
+              position: "fixed",
+              inset: 0,
+              zIndex: 2000,
+              width: "100vw",
+              height: "100dvh",
+            }
+          : null),
       }}
     >
       {/* toolbar */}
@@ -455,6 +546,33 @@ export function PolarViewer(props: {
               >
                 fit
               </button>
+              <button
+                ref={maximizeButtonRef}
+                type="button"
+                data-testid="polar-maximize"
+                aria-label={
+                  maximized ? "Exit fullscreen chart" : "Maximize chart"
+                }
+                aria-pressed={maximized}
+                onClick={() => setMaximized((value) => !value)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  border: "none",
+                  borderRadius: 6,
+                  padding: "5px 8px",
+                  cursor: "pointer",
+                  background: maximized ? C.tabActive : "transparent",
+                  color: maximized ? C.teal : C.muted,
+                }}
+              >
+                {maximized ? (
+                  <Minimize2 size={14} aria-hidden="true" />
+                ) : (
+                  <Maximize2 size={14} aria-hidden="true" />
+                )}
+              </button>
             </div>
           </div>
         )}
@@ -487,10 +605,13 @@ export function PolarViewer(props: {
             style={{ padding: "16px 16px 6px", position: "relative" }}
           >
             <div
+              ref={chartSurfaceRef}
+              data-testid="polar-chart-surface"
               style={{
                 position: "relative",
-                width: 684,
+                width: maximized ? 1200 : 684,
                 maxWidth: "100%",
+                boxSizing: "border-box",
                 margin: "0 auto",
                 background: VIZ.bg,
                 borderRadius: 10,
@@ -549,7 +670,11 @@ export function PolarViewer(props: {
                 </div>
               )}
               {hover && (
-                <div style={hoverStyle} data-testid="polar-hover-badge">
+                <div
+                  ref={badgeRef}
+                  style={hoverStyle}
+                  data-testid="polar-hover-badge"
+                >
                   <div
                     style={{
                       fontFamily: MONO,
@@ -586,7 +711,8 @@ export function PolarViewer(props: {
               )}
               {!hover && cursor && readoutRows.length > 0 && (
                 <div
-                  style={badgeStyle(cursor.px, cursor.py, C.stroke2)}
+                  ref={badgeRef}
+                  style={badgeStyle(C.stroke2)}
                   data-testid="polar-readout-badge"
                 >
                   <div
