@@ -5,6 +5,7 @@ import {
   activeReconcileJobLimit,
   DEFAULT_ACTIVE_RECONCILE_CONCURRENCY,
   DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT,
+  prioritizeActiveReconcileJobs,
   runWithConcurrency,
 } from "../src/reconcile";
 
@@ -57,5 +58,34 @@ describe("foreground reconciliation budget", () => {
     expect(activeReconcileConcurrency("not-a-number")).toBe(
       DEFAULT_ACTIVE_RECONCILE_CONCURRENCY,
     );
+  });
+
+  it("MUST-CATCH: prioritizes terminal-looking rows so completion bursts release CPU reservations first", () => {
+    const selected = prioritizeActiveReconcileJobs(
+      [
+        { id: "live-oldest", engineJobId: "engine-live-a" },
+        { id: "terminal-oldest", engineJobId: "engine-finished-a" },
+        { id: "live-newer", engineJobId: "engine-live-b" },
+        { id: "terminal-newer", engineJobId: "engine-finished-b" },
+      ],
+      {
+        queue_depth: 0,
+        active: [],
+        reserved: [],
+        scheduled: [],
+        active_count: 2,
+        reserved_count: 0,
+        scheduled_count: 0,
+        job_ids: ["engine-live-a", "engine-live-b"],
+        duplicates: {},
+        redelivered: [],
+      },
+      2,
+    );
+
+    expect(selected.map((job) => job.id)).toEqual([
+      "terminal-oldest",
+      "terminal-newer",
+    ]);
   });
 });

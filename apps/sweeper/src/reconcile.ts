@@ -218,6 +218,31 @@ export async function runWithConcurrency<T>(
   await Promise.all(Array.from({ length: workerCount }, worker));
 }
 
+/** Prefer jobs no longer present in the live engine queue: those rows are most
+ * likely terminal and releasing them immediately is what opens replacement
+ * CPU slots. Preserve the existing oldest-first order inside both groups. */
+export function prioritizeActiveReconcileJobs<
+  T extends { engineJobId: string | null },
+>(
+  candidates: readonly T[],
+  queue: EngineQueueState | null,
+  limit: number,
+): T[] {
+  if (!queue) return candidates.slice(0, limit);
+  return candidates
+    .map((job, index) => ({
+      job,
+      index,
+      live: engineQueueListsJob(queue, job.engineJobId),
+    }))
+    .sort((left, right) => {
+      if (left.live !== right.live) return left.live ? 1 : -1;
+      return left.index - right.index;
+    })
+    .slice(0, limit)
+    .map(({ job }) => job);
+}
+
 function deterministicMeshEvidenceSql(
   failureDisposition: SQLWrapper,
   error: SQLWrapper,
@@ -3999,9 +4024,9 @@ export async function reconcile(
     .from(simJobs)
     .where(and(...activeFilters))
     .orderBy(asc(simJobs.updatedAt), asc(simJobs.id));
-  const jobs = options.jobIds?.length
+  const candidates = options.jobIds?.length
     ? await activeJobQuery
-    : await activeJobQuery.limit(activeReconcileJobLimit());
+    : await activeJobQuery.limit(MAX_ACTIVE_RECONCILE_JOB_LIMIT);
 
   let queue: EngineQueueState | null = null;
   try {
@@ -4009,6 +4034,13 @@ export async function reconcile(
   } catch {
     queue = null;
   }
+  const jobs = options.jobIds?.length
+    ? candidates
+    : prioritizeActiveReconcileJobs(
+        candidates,
+        queue,
+        activeReconcileJobLimit(),
+      );
   const runtimeByJobId = await engineRuntimeMap(
     engine,
     jobs
