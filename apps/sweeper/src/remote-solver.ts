@@ -5134,8 +5134,11 @@ export async function reconcileRemoteSolverTick(
       active.length,
       active.reduce((sum, job) => sum + job.totalCases, 0),
     );
-    if (await processReusablePromiseEvidence(db, engine, settings))
-      return false;
+    // Reusing and delivering one already-accepted point avoids duplicate CFD,
+    // but it does not consume a solver CPU slot. Continue into admission so a
+    // large reusable-evidence backlog cannot leave the engine idle for one
+    // scheduler interval per reused point.
+    await processReusablePromiseEvidence(db, engine, settings);
     const remoteCap = configuredRemoteCpuCap(settings);
     return (
       remoteCap > 0 && (await remoteReservedCpuSlots(db, settings)) < remoteCap

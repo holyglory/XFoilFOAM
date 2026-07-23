@@ -4925,7 +4925,7 @@ describe("remote solver push validation regressions", () => {
     ).toBe("delivered");
   }, 120_000);
 
-  it("reuses accepted cached evidence for a new promise but releases rejected cached evidence for continuation", async () => {
+  it("reuses accepted cached evidence without idling independent work and releases rejected evidence for continuation", async () => {
     const acceptedAoa = 854.101;
     const acceptedJob = await seedDoneRemoteJob("reuse-accepted", [
       acceptedAoa,
@@ -4937,8 +4937,12 @@ describe("remote solver push validation regressions", () => {
     const acceptedPromise = await seedMirroredPromise("reuse-accepted", [
       acceptedAoa,
     ]);
+    const independentAoa = 854.102;
+    await seedMirroredPromise("reuse-independent", [independentAoa]);
     const acceptedFetch = stubFetch();
-    const submitPolar = vi.fn();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("reuse-independent"),
+    );
 
     const [reusableReadiness] = (await db.execute(dsql`
       SELECT
@@ -4992,7 +4996,10 @@ describe("remote solver push validation regressions", () => {
 
     await remoteSolverTick(db, { submitPolar } as unknown as EngineClient);
 
-    expect(submitPolar).not.toHaveBeenCalled();
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(submitPolar.mock.calls[0]?.[0].aoa.angles).toEqual([
+      independentAoa,
+    ]);
     expect(
       (await deliveriesForJob(acceptedJob.id)).find((row) => row.resultId)
         ?.state,
