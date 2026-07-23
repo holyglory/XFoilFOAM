@@ -1,3 +1,101 @@
+# 20-32C public polar chart — Release QA
+
+- Reported visual:
+  `/home/holyglory/.codex/attachments/977b5d4e-cfff-498a-8c0b-edeeb8504cc3/codex-clipboard-7b7e40af-d095-4738-b7c0-bc981cebe16c.png`
+  (878×1290).
+- Deployed implementation:
+  `/home/holyglory/XFoilFOAM/.codex-artifacts/design-qa/20-32c/implemented-878x1290.png`
+  (878×1290).
+- Deployed maximized state:
+  `/home/holyglory/XFoilFOAM/.codex-artifacts/design-qa/20-32c/maximized-878x1290.png`
+  (878×1290).
+- Same-input comparison:
+  `/home/holyglory/XFoilFOAM/.codex-artifacts/design-qa/20-32c/reported-vs-implemented-1756x1290.png`
+  (1756×1290).
+- Live route:
+  `https://airfoils.pro/airfoils/2032c`.
+- Compared state: dark theme, L/D–α tab, right-edge point hover, 878×1290.
+
+## Correction and prevention
+
+The reported hover badge used a fixed rightward offset. Its content width was
+not measured, so a point near the chart's right edge placed the badge outside
+the plot and card. The same report exposed a separate evidence-selection defect:
+numerically harmless repeated OpenFOAM measurements were treated as material
+conflicts by bit-exact comparison, leaving the nominal Re 102k series with only
+two connected primary points.
+
+The prevention layer now combines a pure measured badge-placement helper,
+browser containment/fullscreen/data-shape assertions, and shared conservative
+repeatability tolerances in the cache and detail fallback. Materially different
+measurements are still retained as alternates and excluded from the best-fit
+curve; no coefficient is invented or averaged.
+
+## Same-input comparison result
+
+The supplied 878×1290 report and the deployed 878×1290 capture were opened
+together in one visual comparison input.
+
+- The hover badge now flips to the point's left when its measured width would
+  cross the chart's right edge, then clamps on both axes with an 8 px plot
+  inset. In the production capture it measured
+  `x=565.34, y=472, w=238, h=103.19`; the chart surface measured
+  `x=403, y=336, w=436, h=246.59`. Every badge edge is inside the surface.
+- The badge keeps the established slate panel, teal outline, mono hierarchy,
+  point metrics, and simulation affordance. Long status copy wraps and the
+  badge gains an internal vertical bound instead of growing beyond the plot.
+- The chart toolbar now has a compact maximize icon in the established control
+  group. Maximized mode occupies the exact 878×1290 viewport, locks background
+  scroll, exposes a modal boundary to assistive technology, exits on Escape,
+  and restores focus and prior body state.
+- Re 102k condition 1 now draws 22 accepted primary angles across the requested
+  range instead of only the 14°–15° segment. Four genuinely incompatible
+  repeats at −2°, −1°, 10°, and 20° remain visible as stored alternates and are
+  not falsely connected into the best-fit polar.
+
+## Fidelity and interaction passes
+
+- Typography and color: the existing IBM Plex Mono hierarchy and established
+  teal/slate status tokens are unchanged.
+- Geometry: production browser measurement proves badge containment at the
+  reported right-edge hover. Fullscreen measurement proves exact viewport
+  bounds at 878×1290.
+- Responsiveness: the same component remains contained in regular and maximized
+  states; the maximized state was also formally checked at 1440×900 without a
+  critical finding.
+- Accessibility: maximize/minimize controls have explicit labels; maximized
+  mode is an `aria-modal` dialog; Escape and focus restoration are covered.
+- Data truthfulness: all displayed points remain stored solver evidence.
+  Tolerance only selects a deterministic representative when repeat deltas are
+  inside explicit Cl/Cd/Cm limits; material conflicts remain separate.
+
+## Findings
+
+- No open P0, P1, or P2 finding for the reported badge, fullscreen journey, or
+  Re 102k series.
+- Accepted unrelated finding: at the 1440×900 base and scripted L/D state, the
+  formal verifier sees two pre-existing polar-selector pills auto-scrolled
+  beneath the sticky site header. It does not occur at the reported viewport
+  and does not occur in either maximized viewport. It was not suppressed or
+  attributed to this correction.
+
+## Verification evidence
+
+- Exact production Playwright regression: 3/3 passed (badge containment,
+  fullscreen scroll/focus/modal restoration, and at least 20 primary Re 102k
+  angles).
+- Web unit suite: 359/359 passed.
+- Polar cache regression: 10/10 passed.
+- Web, API, and database typechecks passed; the web production build passed.
+- Formal report at the reported 878×1290 route/state:
+  `/tmp/formal-2032c-final.{json,md}`.
+- The guarded production deployment completed without restarting the OpenFOAM
+  engine worker.
+
+final result: passed
+
+---
+
 # Campaign Instrument Overview — Design QA
 
 - Approved visual truth:
