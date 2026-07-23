@@ -15,12 +15,13 @@
   regression-verified and deployed on the remote solver, but not yet on
   production. Remote delivery now has a deployed local manifest-backed
   field-inventory gate, independent weighted remote/local admission, bounded
-  rotating reconciliation, single-flight background artifact transfer, and
-  same-tick multi-promise refill. Production is capped at eight OpenCFD 2606
-  CPU slots; the dedicated remote node is capped at 40 CPU slots with 48 hub
-  promises so ingest/delivery ownership cannot strand executable capacity.
-  Exact generations already accepted by the hub retire obsolete local repair
-  work.
+  rotating reconciliation, concurrent queue-aware terminal priority,
+  single-flight background artifact transfer, and same-tick multi-promise
+  refill. Production is capped at eight OpenCFD 2606 CPU slots; the dedicated
+  remote node is capped at 40 CPU slots with 48 hub promises so ingest/delivery
+  ownership cannot strand executable capacity. Live burn-in restored 40 active
+  engine jobs at 4006% worker CPU after a terminal burst. Exact generations
+  already accepted by the hub retire obsolete local repair work.
   Readiness still requires incremental result publication, verified GCS
   generations and local reclamation for the live job, plus a burn-in with no
   recurring current-generation blocked/critical chain. Preserve immutable
@@ -77,8 +78,7 @@
   hub receipts. After the remaining forensic evidence is durably preserved,
   deploy the 96-chunk continuation hardening while the remote worker is idle
   and continue monitoring evidence delivery, FINAL completion, descriptor
-  stability, full CPU refill, and absence of new critical chains before
-  removing this item.
+  stability, and absence of new critical chains before removing this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation

@@ -91,7 +91,9 @@ The alternatives were rejected as follows:
   response.
 - New MUST-CATCH regressions cover transfer I/O versus admission, duplicate
   running-partial ingestion, the bounded reconciliation budget, and multiple
-  newly claimed promises filling one tick.
+  newly claimed promises filling one tick. A terminal-burst regression also
+  proves four bounded reconciliation workers run concurrently and that jobs
+  absent from the live engine queue are retired before still-active rows.
 - Sweeper TypeScript checking, Prettier, `git diff --check`, and isolated
   runtime contracts passed for the deployed changes. The focused Vitest files
   were discovered but could not execute in this checkout because their global
@@ -101,8 +103,8 @@ The alternatives were rejected as follows:
 ## Live deployment and operating proof
 
 - Production and `hz-solver2` run exact source
-  `7f1595669fc1fcd20aa2cb66c863c72491f10554`. Production deployment
-  [30008340084](https://github.com/holyglory/XFoilFOAM/actions/runs/30008340084)
+  `1f6a7cf7144e5c7aa1a2a52b95b0d8ecad9da609`. Production deployment
+  [30010786769](https://github.com/holyglory/XFoilFOAM/actions/runs/30010786769)
   completed successfully. Both deployments recreated only Node control-plane
   services; the OpenFOAM API and worker containers remained two days old and
   their active CFD children were preserved.
@@ -110,13 +112,14 @@ The alternatives were rejected as follows:
   Foundation 14 remain disabled. The remote CPU budget is 40; its hub promise
   cap is 48 so transient ingest/delivery ownership cannot strand executable
   CPU slots while the execution cap remains hard at 40.
-- The post-deployment burn-in reached all 40 remote execution reservations
-  (34 running plus 6 engine-submitted jobs) and the worker consumed 38.3 of its
-  Docker-limited 40 CPU cores while the last submissions entered OpenFOAM.
-  Subsequent samples retained 40 owned work items while completed jobs moved
-  through ingest and refill. Production independently reported eight active
-  engine jobs. Remote delivery advanced from 794 to 796 delivered generations
-  with 21 superseded and zero blocked deliveries.
+- A terminal burst first exposed 13 stale reservations and dropped the remote
+  engine to 26 active jobs. Concurrent bounded reconciliation reduced a pass
+  from more than four minutes to about 69 seconds; queue-aware terminal
+  priority then restored 40 active jobs plus one engine-reserved task. Docker
+  measured 4006% worker CPU against its 40-core quota. Production independently
+  reported eight active engine jobs. Remote delivery advanced from 794 to 815
+  delivered generations with 21 superseded, zero blocked deliveries, and one
+  ordinary automatic retry wait.
 - An authenticated browser-equivalent request rendered the live campaign as
   running with eight active production jobs, and the public AG24 detail route
   rendered its stored profile and 86-point polar. Both routes had zero browser
