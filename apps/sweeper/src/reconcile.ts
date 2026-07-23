@@ -163,6 +163,8 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
 
 export const DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT = 8;
 const MAX_ACTIVE_RECONCILE_JOB_LIMIT = 64;
+export const DEFAULT_ACTIVE_RECONCILE_CONCURRENCY = 4;
+const MAX_ACTIVE_RECONCILE_CONCURRENCY = 8;
 
 /** Bound one foreground scheduler pass so partial-result ingestion at high
  * concurrency cannot postpone CPU refill until every active polar has been
@@ -178,6 +180,42 @@ export function activeReconcileJobLimit(
   if (!Number.isInteger(parsed) || parsed <= 0)
     return DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT;
   return Math.min(parsed, MAX_ACTIVE_RECONCILE_JOB_LIMIT);
+}
+
+/** Poll/ingest independent jobs concurrently. A sequential eight-job batch
+ * took more than four minutes during a terminal-result burst, leaving engine
+ * slots idle behind stale DB reservations. Four workers keep the engine API
+ * and database bounded while letting terminal transitions release CPU
+ * reservations in time for the same tick's admission phase. */
+export function activeReconcileConcurrency(
+  raw = process.env.SWEEPER_ACTIVE_RECONCILE_CONCURRENCY,
+): number {
+  if (raw == null || raw.trim() === "")
+    return DEFAULT_ACTIVE_RECONCILE_CONCURRENCY;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0)
+    return DEFAULT_ACTIVE_RECONCILE_CONCURRENCY;
+  return Math.min(parsed, MAX_ACTIVE_RECONCILE_CONCURRENCY);
+}
+
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  operation: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  const workerCount = Math.min(
+    items.length,
+    Math.max(1, Math.floor(concurrency)),
+  );
+  let nextIndex = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      await operation(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
 }
 
 function deterministicMeshEvidenceSql(
@@ -3996,9 +4034,9 @@ export async function reconcile(
     );
   }
 
-  for (const job of jobs) {
+  await runWithConcurrency(jobs, activeReconcileConcurrency(), async (job) => {
     await reconcileRunningPrecalcHandoff(db, job);
-    if (!job.engineJobId) continue;
+    if (!job.engineJobId) return;
     // Engine API calls take seconds when the worker saturates every core; a
     // 10+-job reconcile pass must not leave the heartbeat silent meanwhile.
     await touchHeartbeat(db);
@@ -4011,7 +4049,7 @@ export async function reconcile(
         } catch (e) {
           await markIngestRetry(db, job.id, e);
         }
-        continue;
+        return;
       } else if (runtime.result_state === "failed") {
         // Same result → status → generic message fallthrough as handlePollMiss
         // (the runtime dispatch is where "All cases failed" got lost to the
@@ -4031,7 +4069,7 @@ export async function reconcile(
             runtime.status_continuation_failure_kind ??
             null,
         );
-        continue;
+        return;
       } else if (
         runtime.result_state === "running" &&
         runtime.status_completed_cases !== null &&
@@ -4061,14 +4099,14 @@ export async function reconcile(
             "engine poll failed but result file is ready",
           )
         ) {
-          continue;
+          return;
         }
       } catch (ingestError) {
         await markIngestRetry(db, job.id, ingestError);
-        continue;
+        return;
       }
       await handlePollMiss(db, engine, job, e, queue, runtime);
-      continue;
+      return;
     }
     const lostReason = classifyLostRunning(job, status, runtime, queue);
     if (lostReason) {
@@ -4084,7 +4122,7 @@ export async function reconcile(
         );
       }
       await cancelJobAndReleaseClaims(db, job, lostReason);
-      continue;
+      return;
     }
     if (
       status.state === "running" &&
@@ -4112,7 +4150,7 @@ export async function reconcile(
         status.continuation_failure_kind,
       );
     }
-  }
+  });
 
   await drainCampaignMaintenance(db);
 }
