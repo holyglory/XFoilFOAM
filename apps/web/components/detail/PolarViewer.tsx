@@ -333,6 +333,14 @@ export function PolarViewer(props: {
       ref={viewerRef}
       data-testid="polar-viewer"
       data-maximized={maximized ? "true" : "false"}
+      data-ui-allow-overlap={
+        maximized
+          ? "fullscreen chart intentionally covers page context"
+          : undefined
+      }
+      role={maximized ? "dialog" : undefined}
+      aria-modal={maximized ? "true" : undefined}
+      aria-label={maximized ? "Maximized polar chart" : undefined}
       style={{
         background: C.panel,
         border: maximized ? "none" : `1px solid ${C.border}`,
