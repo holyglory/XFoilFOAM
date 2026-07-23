@@ -11,6 +11,7 @@ import {
   type JobStatus,
   type PolarRequest,
 } from "@aerodb/engine-client";
+import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, eq, inArray, sql as dsql } from "drizzle-orm";
 import {
   afterAll,
@@ -42,6 +43,7 @@ const {
   brokeredEvidenceIdempotencyKey,
   claimResultDelivery,
   createProgressAwareAbort,
+  persistClaimedRemotePromise,
   processBrokeredRemoteEvidenceReclaims,
   reconcileRemoteSolverTick,
   remoteSolverTick,
@@ -75,6 +77,7 @@ const {
   polarFitSets,
   recordRansPolarPromotion,
   referenceGeometryProfiles,
+  registeredRemoteSolvers,
   remoteAssetReferences,
   resultAttempts,
   resultClassifications,
@@ -90,6 +93,7 @@ const {
   simRansPolarPromotionPoints,
   simRansPolarPromotions,
   simResultSubmitRetries,
+  simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
   solverProfiles,
@@ -537,6 +541,11 @@ async function cleanupRemoteRows() {
   await db
     .delete(syncSweepPromises)
     .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
+  await db
+    .delete(registeredRemoteSolvers)
+    .where(
+      dsql`${registeredRemoteSolvers.instanceId} LIKE ${`${PREFIX}-owner-%`}`,
+    );
 }
 
 async function seedDoneRemoteJob(
@@ -1650,13 +1659,22 @@ describe("remote solver submit lifecycle", () => {
       acceptedStatus("capacity-ready", 1),
     );
 
-    expect(
-      await admitRemoteSolverTick(
-        db,
-        { submitPolar } as unknown as EngineClient,
-        { kind: "allow", meshRecoveryVersion: 17 },
-      ),
-    ).toBe(true);
+    const admitted = await admitRemoteSolverTick(
+      db,
+      { submitPolar } as unknown as EngineClient,
+      { kind: "allow", meshRecoveryVersion: 17 },
+    );
+    const [admissionStatus] = await db
+      .select({
+        status: syncApiSettings.remoteSolverLastStatus,
+        error: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect({ admitted, admissionStatus }).toMatchObject({
+      admitted: true,
+      admissionStatus: { status: "solving", error: null },
+    });
 
     expect(submitPolar).toHaveBeenCalledTimes(1);
     expect(await jobsForPromise(runningPromise.id)).toHaveLength(1);
@@ -1667,6 +1685,102 @@ describe("remote solver submit lifecycle", () => {
         requestPayload: {
           syncPromiseId: readyPromise.id,
         },
+      },
+    ]);
+  });
+
+  it("MUST-CATCH: a newly claimed promise persists its registered owner before composition", async () => {
+    const claimId = randomUUID();
+    const aoa = 900.961;
+    const [settings] = await db
+      .select({
+        registeredSolverId: syncApiSettings.remoteSolverRegisteredId,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!settings?.registeredSolverId || !revision)
+      throw new Error("registered remote fixture and setup revision required");
+    await db.insert(registeredRemoteSolvers).values({
+      id: settings.registeredSolverId,
+      instanceId: `${PREFIX}-owner-${claimId}`,
+      instanceName: `${PREFIX} owner fixture`,
+      cpuCapacity: 2,
+      cpuBudget: 2,
+      maxActivePolarPromises: 2,
+    });
+
+    stubFetch();
+    await persistClaimedRemotePromise(db, {
+      claim: {
+        id: claimId,
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        airfoil: {
+          slug: airfoilSlug,
+          name: `${PREFIX} foil`,
+          source: null,
+          pointFormat: "normalized",
+          points: contour,
+        },
+        setupRevision: {
+          signatureHash: revision.signatureHash,
+          snapshot: revision.snapshot as unknown as SimulationSetupSnapshot,
+        },
+        aoas: [aoa],
+      },
+      solverId: settings.registeredSolverId,
+      sourceBaseUrl: UPSTREAM,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+    });
+    const submitPolar = vi.fn(async () => acceptedStatus("owner-bound-claim"));
+
+    const admitted = await admitRemoteSolverTick(
+      db,
+      { submitPolar } as unknown as EngineClient,
+      { kind: "allow", meshRecoveryVersion: 17 },
+    );
+    const [admissionStatus] = await db
+      .select({
+        status: syncApiSettings.remoteSolverLastStatus,
+        error: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    expect({ admitted, admissionStatus }).toMatchObject({
+      admitted: true,
+      admissionStatus: { status: "solving", error: null },
+    });
+
+    const [promise] = await db
+      .select({
+        registeredSolverId: syncSweepPromises.registeredSolverId,
+        requestPayload: syncSweepPromises.requestPayload,
+      })
+      .from(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, claimId))
+      .limit(1);
+    expect(promise).toMatchObject({
+      registeredSolverId: settings.registeredSolverId,
+      requestPayload: {
+        remoteSolver: true,
+        solverId: settings.registeredSolverId,
+        upstreamBaseUrl: UPSTREAM,
+      },
+    });
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(await jobsForPromise(claimId)).toMatchObject([
+      {
+        status: "submitted",
+        requestPayload: { syncPromiseId: claimId },
       },
     ]);
   });

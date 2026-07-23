@@ -220,6 +220,8 @@ interface RemoteClaimResponse {
   };
 }
 
+type RemoteClaim = NonNullable<RemoteClaimResponse["promise"]>;
+
 interface RemotePromiseWorkState {
   dueAoas: number[];
   requestedAoas: number[];
@@ -2108,22 +2110,55 @@ async function claimRemoteWork(
   const claim = payload.promise;
   const airfoil = await ensureRemoteAirfoil(db, claim);
   const setup = await ensureRemoteRevision(db, claim, settings);
+  await persistClaimedRemotePromise(db, {
+    claim,
+    solverId,
+    sourceBaseUrl: syncBase(settings),
+    airfoilId: airfoil.id,
+    simulationPresetRevisionId: setup.revision.id,
+  });
+  return submitMirroredRemotePromise(
+    db,
+    engine,
+    settings,
+    claim.id,
+    meshRecoveryVersion,
+  );
+}
+
+/** Persist the authenticated ownership edge before composing engine work.
+ * Keeping this boundary explicit prevents a registered node from creating an
+ * ownerless mirror which its own lifecycle queries must then reject. */
+export async function persistClaimedRemotePromise(
+  db: DB,
+  input: {
+    claim: RemoteClaim;
+    solverId: string;
+    sourceBaseUrl: string;
+    airfoilId: string;
+    simulationPresetRevisionId: string;
+  },
+): Promise<void> {
+  const { claim, solverId } = input;
+  const ownershipPayload = {
+    remoteSolver: true,
+    solverId,
+    upstreamBaseUrl: input.sourceBaseUrl,
+  };
   await db
     .insert(syncSweepPromises)
     .values({
       id: claim.id,
       sourceInstanceId: "upstream",
       sourceInstanceName: "Up-tier",
-      sourceBaseUrl: syncBase(settings),
-      airfoilId: airfoil.id,
-      simulationPresetRevisionId: setup.revision.id,
+      sourceBaseUrl: input.sourceBaseUrl,
+      airfoilId: input.airfoilId,
+      simulationPresetRevisionId: input.simulationPresetRevisionId,
       aoaCount: claim.aoas.length,
       expiresAt: new Date(claim.expiresAt),
       lastHeartbeatAt: new Date(),
-      requestPayload: {
-        remoteSolver: true,
-        upstreamBaseUrl: syncBase(settings),
-      },
+      registeredSolverId: solverId,
+      requestPayload: ownershipPayload,
     })
     .onConflictDoUpdate({
       target: syncSweepPromises.id,
@@ -2131,6 +2166,8 @@ async function claimRemoteWork(
         expiresAt: new Date(claim.expiresAt),
         aoaCount: claim.aoas.length,
         lastHeartbeatAt: new Date(),
+        registeredSolverId: solverId,
+        requestPayload: ownershipPayload,
         updatedAt: new Date(),
       },
     });
@@ -2139,19 +2176,12 @@ async function claimRemoteWork(
     .values(
       claim.aoas.map((aoaDeg) => ({
         promiseId: claim.id,
-        airfoilId: airfoil.id,
-        simulationPresetRevisionId: setup.revision.id,
+        airfoilId: input.airfoilId,
+        simulationPresetRevisionId: input.simulationPresetRevisionId,
         aoaDeg,
       })),
     )
     .onConflictDoNothing();
-  return submitMirroredRemotePromise(
-    db,
-    engine,
-    settings,
-    claim.id,
-    meshRecoveryVersion,
-  );
 }
 
 interface StreamUpload {
