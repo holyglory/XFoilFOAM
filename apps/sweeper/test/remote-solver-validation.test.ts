@@ -5049,6 +5049,36 @@ describe("remote solver push validation regressions", () => {
     );
   });
 
+  it("MUST-CATCH: a ready evidence delivery cannot suppress independent CPU admission", async () => {
+    const deliveredAoa = 854.301;
+    const deliveredJob = await seedDoneRemoteJob("delivery-before-admission", [
+      deliveredAoa,
+    ]);
+    await seedMirroredPromise(
+      "delivery-before-admission",
+      [deliveredAoa],
+      (deliveredJob.requestPayload as { syncPromiseId: string }).syncPromiseId,
+    );
+    const independentAoa = 854.302;
+    await seedMirroredPromise("delivery-independent", [independentAoa]);
+    const deliveryFetch = stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("delivery-independent"),
+    );
+
+    await remoteSolverTick(db, { submitPolar } as unknown as EngineClient);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(submitPolar.mock.calls[0]?.[0].aoa.angles).toEqual([
+      independentAoa,
+    ]);
+    expect(requests(deliveryFetch.fetchMock, "/polars")).toHaveLength(1);
+    expect(
+      (await deliveriesForJob(deliveredJob.id)).find((row) => row.resultId)
+        ?.state,
+    ).toBe("delivered");
+  });
+
   it("ships only the exact child attempt generation and ignores stale parent artifact, media, and extent rows", async () => {
     const aoa = 855.001;
     const child = await seedDoneRemoteJob("exact-child", [aoa]);

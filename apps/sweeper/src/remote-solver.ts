@@ -5063,10 +5063,63 @@ async function reopenResolvedConflictDeliveries(
   }
 }
 
-/** Reconcile remote authority and evidence without admitting a new engine
- * job. Returning true means an admission-only pass may be attempted later in
- * this same scheduler tick, after higher-priority FAST URANS has had the slot. */
+/** Reconcile remote authority without admitting a new engine job or waiting
+ * on artifact transfer. Returning true means an admission-only pass may be
+ * attempted later in this same scheduler tick, after higher-priority FAST
+ * URANS has had the slot. */
 export async function reconcileRemoteSolverTick(
+  db: DB,
+  engine: EngineClient,
+): Promise<boolean> {
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  try {
+    assertRemoteSolverHubUrlContract(settings?.upstreamBaseUrl);
+    assertRemoteSolverNodeEvidenceContract(
+      settings?.remoteSolverEnabled ?? false,
+    );
+    if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
+      if (settings?.remoteSolverLastStatus !== "disabled")
+        await setStatus(db, "disabled", null);
+      return false;
+    }
+    if (!settings.remoteSolverRegisteredId || !settings.remoteSolverAuthToken) {
+      if (!settings.upstreamSecret)
+        throw new Error(
+          "remote solver has no credential; an admin must install a rotated solver token or temporarily configure the bootstrap secret for first registration",
+        );
+      await registerSolver(db, settings);
+    }
+    await renewMirroredPromiseLeases(db, engine, settings);
+    await expireMirroredRemotePromises(db, settings);
+    await releaseUnacceptedPromiseResults(db, settings);
+    const active = await activeRemoteJobs(db, settings);
+    await heartbeat(
+      settings,
+      active.length ? "solving" : "idle",
+      active.length,
+      active.reduce((sum, job) => sum + job.totalCases, 0),
+    );
+    const remoteCap = configuredRemoteCpuCap(settings);
+    return (
+      remoteCap > 0 && (await remoteReservedCpuSlots(db, settings)) < remoteCap
+    );
+  } catch (e) {
+    await setStatus(db, "error", e instanceof Error ? e.message : String(e));
+    return false;
+  }
+}
+
+/**
+ * Drain remote evidence/cancellation/reclaim outboxes after NEW-work
+ * admission. These operations may stream archives or wait on the hub, so they
+ * must never stand in front of free CPU capacity. The outboxes remain durable
+ * and bounded to one publish/reuse operation per tick.
+ */
+export async function transferRemoteSolverTick(
   db: DB,
   engine: EngineClient,
 ): Promise<boolean> {
@@ -5086,38 +5139,22 @@ export async function reconcileRemoteSolverTick(
     // local bytes intact instead of turning an old receipt into delete power.
     if (settings) await processBrokeredRemoteEvidenceReclaims(db, settings);
     // Cancellation is an authority-release outbox, not solver work. Drain it
-    // before registration/claim gates and even while solving is disabled; a
-    // local pause must never strand an upstream lease. Each row supplies its
-    // stored hub URL, while the current same-authority credential is used.
+    // even while solving is disabled; a local pause must never strand an
+    // upstream lease.
     if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
       await processPendingPromiseCancellations(db, settings);
-    }
-    let processedDurableDelivery = false;
-    if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
       await reopenResolvedConflictDeliveries(db, settings);
-      processedDurableDelivery =
-        (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
-        (await processRemoteResultDeliveries(db, engine, settings));
     }
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
         await cancelMirroredPromisesForDisabledSolver(db, engine, settings);
       }
-      if (settings?.remoteSolverLastStatus !== "disabled")
-        await setStatus(db, "disabled", null);
       return false;
     }
-    if (processedDurableDelivery) return false;
-    if (!settings.remoteSolverRegisteredId || !settings.remoteSolverAuthToken) {
-      if (!settings.upstreamSecret)
-        throw new Error(
-          "remote solver has no credential; an admin must install a rotated solver token or temporarily configure the bootstrap secret for first registration",
-        );
-      await registerSolver(db, settings);
-    }
-    await renewMirroredPromiseLeases(db, engine, settings);
-    await expireMirroredRemotePromises(db, settings);
-    await releaseUnacceptedPromiseResults(db, settings);
+    if (!settings.remoteSolverAuthToken) return false;
+    const processedDurableDelivery =
+      (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
+      (await processRemoteResultDeliveries(db, engine, settings));
     const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
     if (readyPromiseId) {
       await setStatus(db, "pushing", null);
@@ -5125,24 +5162,13 @@ export async function reconcileRemoteSolverTick(
       await setStatus(db, "idle", null, {
         remoteSolverLastPushAt: new Date(),
       });
-      return false;
     }
-    const active = await activeRemoteJobs(db, settings);
-    await heartbeat(
+    const reusedEvidence = await processReusablePromiseEvidence(
+      db,
+      engine,
       settings,
-      active.length ? "solving" : "idle",
-      active.length,
-      active.reduce((sum, job) => sum + job.totalCases, 0),
     );
-    // Reusing and delivering one already-accepted point avoids duplicate CFD,
-    // but it does not consume a solver CPU slot. Continue into admission so a
-    // large reusable-evidence backlog cannot leave the engine idle for one
-    // scheduler interval per reused point.
-    await processReusablePromiseEvidence(db, engine, settings);
-    const remoteCap = configuredRemoteCpuCap(settings);
-    return (
-      remoteCap > 0 && (await remoteReservedCpuSlots(db, settings)) < remoteCap
-    );
+    return processedDurableDelivery || Boolean(readyPromiseId) || reusedEvidence;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
     return false;
@@ -5261,7 +5287,11 @@ export async function admitRemoteSolverTick(
           outcome = candidate;
         }
       }
-      outcome = occupiedOutcome ?? outcome;
+      // A previously busy serial polar is useful only when no independent
+      // promise was submitted. Never let that stale observation overwrite a
+      // real admission and prematurely stop the multi-slot refill loop.
+      outcome =
+        outcome?.kind === "submitted" ? outcome : (occupiedOutcome ?? outcome);
       if (!mirrored.length) {
         outcome = await claimRemoteWork(
           db,
@@ -5300,6 +5330,10 @@ export async function remoteSolverTick(
     meshRecoveryVersion: 0,
   },
 ): Promise<boolean> {
-  if (!(await reconcileRemoteSolverTick(db, engine))) return false;
-  return admitRemoteSolverTick(db, engine, decision);
+  const ready = await reconcileRemoteSolverTick(db, engine);
+  const admitted = ready
+    ? await admitRemoteSolverTick(db, engine, decision)
+    : false;
+  await transferRemoteSolverTick(db, engine);
+  return admitted;
 }
