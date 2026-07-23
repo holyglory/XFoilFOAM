@@ -1,6 +1,11 @@
 .git/
 .github/
 .ssh/
+.codex/
+.pytest_cache/
+.venv/
+venv/
+__pycache__/
 .env
 .env.deploy
 .env.local

@@ -239,6 +239,10 @@ def test_manifest_binds_deployed_files_and_ignores_runtime_paths(tmp_path: Path)
     (source / ".env.deploy").write_text("SECRET=one\n")
     (source / ".github").mkdir()
     (source / ".github" / "workflow.yml").write_text("ignored\n")
+    for runtime_dir in (".codex", ".pytest_cache", ".venv", "venv", "__pycache__"):
+        directory = source / runtime_dir
+        directory.mkdir()
+        (directory / "local-only.txt").write_text("ignored\n")
 
     created = _run_manifest(source, "--create", revision=REVISION)
     assert created.returncode == 0, created.stderr
@@ -249,6 +253,8 @@ def test_manifest_binds_deployed_files_and_ignores_runtime_paths(tmp_path: Path)
 
     (source / ".env.deploy").write_text("SECRET=rotated\n")
     (source / ".github" / "workflow.yml").write_text("still ignored\n")
+    for runtime_dir in (".codex", ".pytest_cache", ".venv", "venv", "__pycache__"):
+        (source / runtime_dir / "local-only.txt").write_text("still ignored\n")
     verified = _run_manifest(source, "--verify")
     assert verified.returncode == 0, verified.stderr
 
