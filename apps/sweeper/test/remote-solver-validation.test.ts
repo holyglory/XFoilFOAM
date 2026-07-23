@@ -257,6 +257,8 @@ async function configureRemoteSolver() {
     .update(syncApiSettings)
     .set({
       enabled: true,
+      instanceId: randomUUID(),
+      instanceName: `${PREFIX} remote node`,
       secret: SECRET,
       upstreamBaseUrl: UPSTREAM,
       // The shared secret is bootstrap-only. Every normal lifecycle assertion
@@ -544,7 +546,7 @@ async function cleanupRemoteRows() {
   await db
     .delete(registeredRemoteSolvers)
     .where(
-      dsql`${registeredRemoteSolvers.instanceId} LIKE ${`${PREFIX}-owner-%`}`,
+      dsql`${registeredRemoteSolvers.instanceName} LIKE ${`${PREFIX}%`}`,
     );
 }
 
@@ -1709,14 +1711,12 @@ describe("remote solver submit lifecycle", () => {
       .limit(1);
     if (!settings?.registeredSolverId || !revision)
       throw new Error("registered remote fixture and setup revision required");
-    await db.insert(registeredRemoteSolvers).values({
-      id: settings.registeredSolverId,
-      instanceId: `${PREFIX}-owner-${claimId}`,
-      instanceName: `${PREFIX} owner fixture`,
-      cpuCapacity: 2,
-      cpuBudget: 2,
-      maxActivePolarPromises: 2,
-    });
+    expect(
+      await db
+        .select({ id: registeredRemoteSolvers.id })
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, settings.registeredSolverId)),
+    ).toEqual([]);
 
     stubFetch();
     await persistClaimedRemotePromise(db, {
@@ -1776,6 +1776,27 @@ describe("remote solver submit lifecycle", () => {
         upstreamBaseUrl: UPSTREAM,
       },
     });
+    expect(
+      await db
+        .select({
+          id: registeredRemoteSolvers.id,
+          instanceName: registeredRemoteSolvers.instanceName,
+          authTokenHash: registeredRemoteSolvers.authTokenHash,
+          credentialVersion: registeredRemoteSolvers.credentialVersion,
+          maxActivePolarPromises:
+            registeredRemoteSolvers.maxActivePolarPromises,
+        })
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, settings.registeredSolverId)),
+    ).toMatchObject([
+      {
+        id: settings.registeredSolverId,
+        instanceName: `${PREFIX} remote node`,
+        authTokenHash: null,
+        credentialVersion: 0,
+        maxActivePolarPromises: 2,
+      },
+    ]);
     expect(submitPolar).toHaveBeenCalledTimes(1);
     expect(await jobsForPromise(claimId)).toMatchObject([
       {

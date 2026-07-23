@@ -16,6 +16,7 @@ import {
   resultFieldExtents,
   resultMedia,
   results,
+  registeredRemoteSolvers,
   schedulingProfiles,
   simJobs,
   simPrecalcObligations,
@@ -2145,43 +2146,152 @@ export async function persistClaimedRemotePromise(
     solverId,
     upstreamBaseUrl: input.sourceBaseUrl,
   };
-  await db
-    .insert(syncSweepPromises)
-    .values({
-      id: claim.id,
-      sourceInstanceId: "upstream",
-      sourceInstanceName: "Up-tier",
-      sourceBaseUrl: input.sourceBaseUrl,
-      airfoilId: input.airfoilId,
-      simulationPresetRevisionId: input.simulationPresetRevisionId,
-      aoaCount: claim.aoas.length,
-      expiresAt: new Date(claim.expiresAt),
+  await db.transaction(async (tx) => {
+    const [settings] = await tx
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settings || settings.remoteSolverRegisteredId !== solverId) {
+      throw new Error(
+        "claimed remote promise owner does not match the registered local solver identity",
+      );
+    }
+
+    // The hub owns the credential-bearing registry row. The remote node keeps
+    // only a non-secret mirror of its own identity so its local promise FK and
+    // lifecycle ownership queries remain enforceable. Never copy or hash the
+    // hub credential into this mirror.
+    const localOwner = {
+      id: solverId,
+      instanceId: settings.instanceId,
+      instanceName: settings.instanceName,
+      publicEndpoint: settings.publicEndpointOverride,
+      cpuCapacity: remoteWorkerCpuCapacity(settings),
+      cpuBudget: settings.remoteSolverCpuBudget,
+      buildVersion:
+        process.env.AIRFOILFOAM_BUILD_ID ??
+        process.env.npm_package_version ??
+        null,
+      authTokenHash: null,
+      credentialVersion: 0,
+      revokedAt: null,
+      status: settings.remoteSolverLastStatus,
       lastHeartbeatAt: new Date(),
-      registeredSolverId: solverId,
-      requestPayload: ownershipPayload,
-    })
-    .onConflictDoUpdate({
-      target: syncSweepPromises.id,
-      set: {
-        expiresAt: new Date(claim.expiresAt),
+      maxActivePolarPromises: Math.max(
+        1,
+        Number(settings.remoteSolverCpuBudget) || 1,
+      ),
+      recentError: settings.remoteSolverLastError,
+      metadata: {
+        source: "local-remote-solver-owner-mirror",
+        upstreamBaseUrl: input.sourceBaseUrl,
+      },
+      updatedAt: new Date(),
+    } satisfies typeof registeredRemoteSolvers.$inferInsert;
+    const existingOwners = await tx
+      .select({
+        id: registeredRemoteSolvers.id,
+        instanceId: registeredRemoteSolvers.instanceId,
+        authTokenHash: registeredRemoteSolvers.authTokenHash,
+        credentialVersion: registeredRemoteSolvers.credentialVersion,
+      })
+      .from(registeredRemoteSolvers)
+      .where(
+        or(
+          eq(registeredRemoteSolvers.id, solverId),
+          eq(registeredRemoteSolvers.instanceId, settings.instanceId),
+        ),
+      );
+    if (
+      existingOwners.some(
+        (row) =>
+          row.id !== solverId || row.instanceId !== settings.instanceId,
+      )
+    ) {
+      throw new Error(
+        "local remote-solver identity conflicts with the hub registration",
+      );
+    }
+    const existingOwner = existingOwners.find((row) => row.id === solverId);
+    if (!existingOwner) {
+      await tx
+        .insert(registeredRemoteSolvers)
+        .values(localOwner)
+        .onConflictDoNothing();
+    } else if (
+      existingOwner.authTokenHash === null &&
+      existingOwner.credentialVersion === 0
+    ) {
+      await tx
+        .update(registeredRemoteSolvers)
+        .set({
+          instanceName: localOwner.instanceName,
+          publicEndpoint: localOwner.publicEndpoint,
+          cpuCapacity: localOwner.cpuCapacity,
+          cpuBudget: localOwner.cpuBudget,
+          buildVersion: localOwner.buildVersion,
+          status: localOwner.status,
+          lastHeartbeatAt: localOwner.lastHeartbeatAt,
+          maxActivePolarPromises: localOwner.maxActivePolarPromises,
+          recentError: localOwner.recentError,
+          metadata: localOwner.metadata,
+          updatedAt: localOwner.updatedAt,
+        })
+        .where(eq(registeredRemoteSolvers.id, solverId));
+    }
+    const [boundOwner] = await tx
+      .select({
+        id: registeredRemoteSolvers.id,
+        instanceId: registeredRemoteSolvers.instanceId,
+      })
+      .from(registeredRemoteSolvers)
+      .where(eq(registeredRemoteSolvers.id, solverId))
+      .limit(1);
+    if (!boundOwner || boundOwner.instanceId !== settings.instanceId) {
+      throw new Error(
+        "failed to establish the local remote-solver ownership mirror",
+      );
+    }
+
+    await tx
+      .insert(syncSweepPromises)
+      .values({
+        id: claim.id,
+        sourceInstanceId: "upstream",
+        sourceInstanceName: "Up-tier",
+        sourceBaseUrl: input.sourceBaseUrl,
+        airfoilId: input.airfoilId,
+        simulationPresetRevisionId: input.simulationPresetRevisionId,
         aoaCount: claim.aoas.length,
+        expiresAt: new Date(claim.expiresAt),
         lastHeartbeatAt: new Date(),
         registeredSolverId: solverId,
         requestPayload: ownershipPayload,
-        updatedAt: new Date(),
-      },
-    });
-  await db
-    .insert(syncSweepPromisePoints)
-    .values(
-      claim.aoas.map((aoaDeg) => ({
-        promiseId: claim.id,
-        airfoilId: input.airfoilId,
-        simulationPresetRevisionId: input.simulationPresetRevisionId,
-        aoaDeg,
-      })),
-    )
-    .onConflictDoNothing();
+      })
+      .onConflictDoUpdate({
+        target: syncSweepPromises.id,
+        set: {
+          expiresAt: new Date(claim.expiresAt),
+          aoaCount: claim.aoas.length,
+          lastHeartbeatAt: new Date(),
+          registeredSolverId: solverId,
+          requestPayload: ownershipPayload,
+          updatedAt: new Date(),
+        },
+      });
+    await tx
+      .insert(syncSweepPromisePoints)
+      .values(
+        claim.aoas.map((aoaDeg) => ({
+          promiseId: claim.id,
+          airfoilId: input.airfoilId,
+          simulationPresetRevisionId: input.simulationPresetRevisionId,
+          aoaDeg,
+        })),
+      )
+      .onConflictDoNothing();
+  });
 }
 
 interface StreamUpload {
