@@ -98,6 +98,13 @@ test.describe("20-32C polar regressions", () => {
     await expect
       .poll(() => page.evaluate(() => getComputedStyle(document.body).overflow))
       .toBe("hidden");
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.body.hasAttribute("data-ui-allow-overlap"),
+        ),
+      )
+      .toBe(true);
     const maximized = (await viewer.boundingBox())!;
     expect(maximized.width).toBeGreaterThan(before.width);
     expect(maximized.width).toBeGreaterThanOrEqual(877);
@@ -108,6 +115,13 @@ test.describe("20-32C polar regressions", () => {
     await expect
       .poll(() => page.evaluate(() => getComputedStyle(document.body).overflow))
       .not.toBe("hidden");
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.body.hasAttribute("data-ui-allow-overlap"),
+        ),
+      )
+      .toBe(false);
   });
 
   test("the primary Re 102k series is not reduced to the 14°–15° segment by harmless repeat noise", async () => {

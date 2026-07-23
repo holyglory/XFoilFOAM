@@ -113,7 +113,14 @@ export function PolarViewer(props: {
   useEffect(() => {
     if (!maximized) return;
     const previousOverflow = document.body.style.overflow;
+    const previousOverlapAllowance = document.body.getAttribute(
+      "data-ui-allow-overlap",
+    );
     document.body.style.overflow = "hidden";
+    document.body.setAttribute(
+      "data-ui-allow-overlap",
+      "maximized polar chart intentionally covers page context",
+    );
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setMaximized(false);
@@ -122,6 +129,14 @@ export function PolarViewer(props: {
     window.addEventListener("keydown", onKeyDown);
     return () => {
       document.body.style.overflow = previousOverflow;
+      if (previousOverlapAllowance == null) {
+        document.body.removeAttribute("data-ui-allow-overlap");
+      } else {
+        document.body.setAttribute(
+          "data-ui-allow-overlap",
+          previousOverlapAllowance,
+        );
+      }
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [maximized]);
