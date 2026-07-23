@@ -15,6 +15,7 @@ import {
   resultClassifications,
   solverEvidenceArchives,
   solverEvidenceArtifactMembers,
+  resultEvidenceFieldInventory,
   resultFieldExtents,
   resultMediaRepairs,
   refreshPolarCacheForRevision,
@@ -906,6 +907,67 @@ async function registerShippedMedia(
     }
   }
   return count;
+}
+
+/** Persist the fields that the engine actually shipped for this exact
+ * attempt.  This is deliberately independent of result_field_extents: the
+ * latter is a terminal presentation calculation and may legitimately lag a
+ * running continuous polar.  Inventory rows are immutable evidence metadata
+ * keyed by the manifest checksum; media-repair may add scaled artifacts later
+ * without changing what the solver really produced. */
+async function registerEvidenceFieldInventory(
+  db: DB,
+  resultId: string,
+  resultAttemptId: string,
+  airfoilId: string,
+  simulationPresetRevisionId: string | null,
+  point: PolarPoint,
+): Promise<number> {
+  if (!simulationPresetRevisionId) return 0;
+  const manifest = point.evidence_artifacts?.find(
+    (artifact) => artifact.kind === "manifest",
+  );
+  const evidenceSha256 = manifest?.sha256 ?? "";
+  if (!SHA256_PATTERN.test(evidenceSha256)) return 0;
+  const inventory = new Map<string, Set<string>>();
+  const add = (entries: Record<string, string> | undefined, role: string) => {
+    for (const [field, urlPath] of Object.entries(entries ?? {})) {
+      if (!field.trim() || !urlPath?.trim()) continue;
+      const roles = inventory.get(field) ?? new Set<string>();
+      roles.add(role);
+      inventory.set(field, roles);
+    }
+  };
+  add(point.images, "instantaneous");
+  add(point.mean_images, "mean");
+  add(point.video, "video");
+  if (!inventory.size) return 0;
+  for (const [field, roles] of inventory) {
+    await db
+      .insert(resultEvidenceFieldInventory)
+      .values({
+        resultId,
+        resultAttemptId,
+        airfoilId,
+        simulationPresetRevisionId,
+        field,
+        roles: [...roles].sort(),
+        evidenceSha256,
+        source: "engine_manifest",
+      })
+      .onConflictDoUpdate({
+        target: [
+          resultEvidenceFieldInventory.resultAttemptId,
+          resultEvidenceFieldInventory.field,
+        ],
+        set: {
+          roles: [...roles].sort(),
+          evidenceSha256,
+          source: "engine_manifest",
+        },
+      });
+  }
+  return inventory.size;
 }
 
 function stalledForPoint(p: PolarPoint): boolean {
@@ -5311,6 +5373,14 @@ export async function ingestResult(opts: {
         engine,
         cell.id,
         resultAttemptId,
+        p,
+      );
+      await registerEvidenceFieldInventory(
+        db,
+        cell.id,
+        resultAttemptId,
+        airfoilId,
+        input.presetRevisionId,
         p,
       );
     }

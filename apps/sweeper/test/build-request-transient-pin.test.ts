@@ -16,7 +16,10 @@ import type { Airfoil } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { describe, expect, it } from "vitest";
 
-import { buildPolarRequest } from "../src/build-request";
+import {
+  admissionCpuSlotsForRequest,
+  buildPolarRequest,
+} from "../src/build-request";
 
 const airfoil = {
   id: "a",
@@ -165,5 +168,24 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
     expect(request.solver?.force_transient).toBe(true);
     expect(request.solver?.rans_failure_policy).toBe("continue");
     expect(request.solver?.urans_fidelity).toBe("precalc");
+  });
+});
+
+describe("weighted scheduler admission", () => {
+  it("reserves the product of solver processes and concurrent cases", () => {
+    expect(
+      admissionCpuSlotsForRequest({
+        resources: { solver_processes: 2, case_concurrency: 3 },
+      }),
+    ).toBe(6);
+  });
+
+  it("uses one conservative slot when the engine will resolve resources", () => {
+    expect(admissionCpuSlotsForRequest({ resources: undefined })).toBe(1);
+    expect(
+      admissionCpuSlotsForRequest({
+        resources: { solver_processes: 0, case_concurrency: null },
+      }),
+    ).toBe(1);
   });
 });

@@ -173,6 +173,10 @@ const remoteSolverCredentialInstallSchema = z.object({
   authToken: z.string().min(32).max(512),
 });
 
+const remoteSolverPolicyPatchSchema = z.object({
+  maxActivePolarPromises: z.coerce.number().int().min(0).max(1024),
+});
+
 const claimBodySchema = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(36),
   ttlHours: z.coerce
@@ -769,6 +773,7 @@ function remoteSolverStatusPayload(
     status: solver.status,
     lastHeartbeatAt: iso(solver.lastHeartbeatAt),
     activePromiseCount: solver.activePromiseCount,
+    maxActivePolarPromises: solver.maxActivePolarPromises,
     activeAoaCount: solver.activeAoaCount,
     solvedCount: solver.solvedCount,
     pushedCount: solver.pushedCount,
@@ -806,13 +811,16 @@ async function requirePromiseSyncAccess(
     .from(syncSweepPromises)
     .where(eq(syncSweepPromises.id, promiseId))
     .limit(1);
+  const payloadSolverId = String(
+    (promise?.requestPayload as Record<string, unknown> | null)?.solverId ?? "",
+  );
+  const ownsPromise = promise?.registeredSolverId
+    ? promise.registeredSolverId === solver.id
+    : payloadSolverId === solver.id;
   if (
     !promise ||
     promise.sourceInstanceId !== solver.instanceId ||
-    String(
-      (promise.requestPayload as Record<string, unknown> | null)?.solverId ??
-        "",
-    ) !== solver.id
+    !ownsPromise
   ) {
     reply.code(403).send({ error: "remote solver does not own this promise" });
     return null;
@@ -1158,6 +1166,29 @@ async function syncAdminPayload(req: FastifyRequest) {
     .from(registeredRemoteSolvers)
     .orderBy(desc(registeredRemoteSolvers.updatedAt))
     .limit(100);
+  const activePromiseRows = await db
+    .select({
+      solverId: syncSweepPromises.registeredSolverId,
+      promises: count(),
+      aoas: sql<number>`COALESCE(SUM(${syncSweepPromises.aoaCount}), 0)::int`,
+    })
+    .from(syncSweepPromises)
+    .where(
+      and(
+        eq(syncSweepPromises.status, "active"),
+        sql`${syncSweepPromises.expiresAt} > now()`,
+        isNotNull(syncSweepPromises.registeredSolverId),
+      ),
+    )
+    .groupBy(syncSweepPromises.registeredSolverId);
+  const activePromiseBySolver = new Map(
+    activePromiseRows
+      .filter((row) => row.solverId)
+      .map((row) => [
+        row.solverId!,
+        { promises: Number(row.promises), aoas: Number(row.aoas ?? 0) },
+      ]),
+  );
   const remoteAssetRows = await db
     .select({ availability: remoteAssetReferences.availability, n: count() })
     .from(remoteAssetReferences)
@@ -1209,8 +1240,9 @@ async function syncAdminPayload(req: FastifyRequest) {
       revokedAt: iso(row.revokedAt),
       status: row.status,
       lastHeartbeatAt: iso(row.lastHeartbeatAt),
-      activePromiseCount: row.activePromiseCount,
-      activeAoaCount: row.activeAoaCount,
+      activePromiseCount: activePromiseBySolver.get(row.id)?.promises ?? 0,
+      activeAoaCount: activePromiseBySolver.get(row.id)?.aoas ?? 0,
+      maxActivePolarPromises: row.maxActivePolarPromises,
       solvedCount: row.solvedCount,
       pushedCount: row.pushedCount,
       recentError: row.recentError,
@@ -6326,6 +6358,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             instanceId: bootstrapped.instanceId,
             instanceName: bootstrapped.instanceName,
             cpuBudget: bootstrapped.cpuBudget,
+            maxActivePolarPromises: bootstrapped.maxActivePolarPromises,
             status: bootstrapped.status,
           },
         };
@@ -6366,6 +6399,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           instanceId: refreshed.instanceId,
           instanceName: refreshed.instanceName,
           cpuBudget: refreshed.cpuBudget,
+          maxActivePolarPromises: refreshed.maxActivePolarPromises,
           status: refreshed.status,
         },
       };
@@ -6414,6 +6448,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         instanceId: solver.instanceId,
         instanceName: solver.instanceName,
         cpuBudget: solver.cpuBudget,
+        maxActivePolarPromises: solver.maxActivePolarPromises,
         status: solver.status,
       },
     };
@@ -6431,8 +6466,6 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     const update: Partial<typeof registeredRemoteSolvers.$inferInsert> = {
       status: body.status,
       lastHeartbeatAt: new Date(),
-      activePromiseCount: body.activePromiseCount,
-      activeAoaCount: body.activeAoaCount,
       recentError: body.recentError ?? null,
       updatedAt: new Date(),
     };
@@ -6443,6 +6476,13 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       update.localEndpoint = body.localEndpoint ?? null;
     if (body.cpuCapacity !== undefined) update.cpuCapacity = body.cpuCapacity;
     if (body.cpuBudget !== undefined) update.cpuBudget = body.cpuBudget;
+    // Keep the last node-reported telemetry for the solver's direct response.
+    // The admin aggregate intentionally recomputes active leases from the
+    // promise ledger, so a heartbeat cannot inflate capacity admission.
+    if (body.activePromiseCount !== undefined)
+      update.activePromiseCount = body.activePromiseCount;
+    if (body.activeAoaCount !== undefined)
+      update.activeAoaCount = body.activeAoaCount;
     if (body.buildVersion !== undefined)
       update.buildVersion = body.buildVersion ?? null;
     if (body.solvedCount !== undefined) update.solvedCount = body.solvedCount;
@@ -6698,104 +6738,167 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       .slice(0, body.limit)
       .map((row) => Number(row.aoa_deg))
       .sort((a, b) => a - b);
-    const [promise] = await db
-      .insert(syncSweepPromises)
-      .values({
-        sourceInstanceId:
-          registeredSolver?.instanceId ?? body.sourceInstanceId ?? null,
-        sourceInstanceName:
-          registeredSolver?.instanceName ?? body.sourceInstanceName ?? null,
-        sourceBaseUrl:
-          registeredSolver?.publicEndpoint ?? body.sourceBaseUrl ?? null,
-        airfoilId: first.airfoil_id,
-        simulationPresetRevisionId: first.revision_id,
-        aoaCount: aoas.length,
-        expiresAt,
-        requestPayload: {
-          limit: body.limit,
-          ttlHours,
-          solverId: registeredSolver?.id ?? null,
-          sourceBaseUrl:
-            registeredSolver?.publicEndpoint ?? body.sourceBaseUrl ?? null,
-        },
-      })
-      .returning();
-    const pointRows = await db
-      .insert(syncSweepPromisePoints)
-      .values(
-        aoas.map((aoaDeg) => ({
-          promiseId: promise.id,
+    const claimResult = await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      let owner = registeredSolver;
+      if (body.solverId) {
+        const [locked] = await tx
+          .select()
+          .from(registeredRemoteSolvers)
+          .where(eq(registeredRemoteSolvers.id, body.solverId))
+          .for("update")
+          .limit(1);
+        if (!locked) throw new Error("registered solver not found");
+        owner = locked;
+
+        const expired = await tx
+          .update(syncSweepPromises)
+          .set({
+            status: "expired",
+            expiredAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(syncSweepPromises.registeredSolverId, owner.id),
+              eq(syncSweepPromises.status, "active"),
+              sql`${syncSweepPromises.expiresAt} <= now()`,
+            ),
+          )
+          .returning({ id: syncSweepPromises.id });
+        if (expired.length) {
+          await tx
+            .update(syncSweepPromisePoints)
+            .set({ status: "expired", updatedAt: new Date() })
+            .where(
+              inArray(
+                syncSweepPromisePoints.promiseId,
+                expired.map((row) => row.id),
+              ),
+            );
+        }
+        const [active] = await tx
+          .select({ promises: count() })
+          .from(syncSweepPromises)
+          .where(
+            and(
+              eq(syncSweepPromises.registeredSolverId, owner.id),
+              eq(syncSweepPromises.status, "active"),
+              sql`${syncSweepPromises.expiresAt} > now()`,
+            ),
+          );
+        const activeCount = Number(active?.promises ?? 0);
+        if (activeCount >= owner.maxActivePolarPromises) {
+          return {
+            promise: null,
+            admission: {
+              state: "at_cap" as const,
+              active: activeCount,
+              cap: owner.maxActivePolarPromises,
+            },
+          };
+        }
+      }
+
+      const [promise] = await tx
+        .insert(syncSweepPromises)
+        .values({
+          sourceInstanceId: owner?.instanceId ?? body.sourceInstanceId ?? null,
+          sourceInstanceName:
+            owner?.instanceName ?? body.sourceInstanceName ?? null,
+          sourceBaseUrl: owner?.publicEndpoint ?? body.sourceBaseUrl ?? null,
+          registeredSolverId: owner?.id ?? null,
           airfoilId: first.airfoil_id,
           simulationPresetRevisionId: first.revision_id,
-          aoaDeg,
-        })),
-      )
-      .onConflictDoNothing()
-      .returning({ aoaDeg: syncSweepPromisePoints.aoaDeg });
-    if (!pointRows.length) {
-      await db
+          aoaCount: aoas.length,
+          expiresAt,
+          requestPayload: {
+            limit: body.limit,
+            ttlHours,
+            solverId: owner?.id ?? null,
+            sourceBaseUrl: owner?.publicEndpoint ?? body.sourceBaseUrl ?? null,
+          },
+        })
+        .returning();
+      const pointRows = await tx
+        .insert(syncSweepPromisePoints)
+        .values(
+          aoas.map((aoaDeg) => ({
+            promiseId: promise.id,
+            airfoilId: first.airfoil_id,
+            simulationPresetRevisionId: first.revision_id,
+            aoaDeg,
+          })),
+        )
+        .onConflictDoNothing()
+        .returning({ aoaDeg: syncSweepPromisePoints.aoaDeg });
+      if (!pointRows.length) {
+        await tx
+          .update(syncSweepPromises)
+          .set({ status: "cancelled", cancelledAt: new Date() })
+          .where(eq(syncSweepPromises.id, promise.id));
+        return { promise: null };
+      }
+      const promisedAoas = pointRows
+        .map((row) => Number(row.aoaDeg))
+        .sort((a, b) => a - b);
+      await tx
         .update(syncSweepPromises)
-        .set({ status: "cancelled", cancelledAt: new Date() })
+        .set({ aoaCount: promisedAoas.length })
         .where(eq(syncSweepPromises.id, promise.id));
-      return { promise: null };
-    }
-    const promisedAoas = pointRows
-      .map((row) => Number(row.aoaDeg))
-      .sort((a, b) => a - b);
-    await db
-      .update(syncSweepPromises)
-      .set({ aoaCount: promisedAoas.length })
-      .where(eq(syncSweepPromises.id, promise.id));
-    if (registeredSolver) {
-      const [active] = await db
-        .select({
-          promises: count(),
-          aoas: sql<number>`COALESCE(SUM(${syncSweepPromises.aoaCount}), 0)::int`,
-        })
-        .from(syncSweepPromises)
-        .where(
-          and(
-            eq(syncSweepPromises.sourceInstanceId, registeredSolver.instanceId),
-            eq(syncSweepPromises.status, "active"),
-          ),
-        );
-      await db
-        .update(registeredRemoteSolvers)
-        .set({
-          status: "claiming",
-          lastHeartbeatAt: new Date(),
-          activePromiseCount: Number(active?.promises ?? 1),
-          activeAoaCount: Number(active?.aoas ?? promisedAoas.length),
-          updatedAt: new Date(),
-        })
-        .where(eq(registeredRemoteSolvers.id, registeredSolver.id));
-    }
-    return {
-      promise: {
-        id: promise.id,
-        expiresAt: expiresAt.toISOString(),
-        ttlHours,
-        airfoil: {
-          id: first.airfoil_id,
-          slug: first.airfoil_slug,
-          name: first.airfoil_name,
-          source: first.airfoil_source,
-          pointFormat: first.point_format,
-          points: first.points,
+      if (owner) {
+        const [active] = await tx
+          .select({
+            promises: count(),
+            aoas: sql<number>`COALESCE(SUM(${syncSweepPromises.aoaCount}), 0)::int`,
+          })
+          .from(syncSweepPromises)
+          .where(
+            and(
+              eq(syncSweepPromises.registeredSolverId, owner.id),
+              eq(syncSweepPromises.status, "active"),
+              sql`${syncSweepPromises.expiresAt} > now()`,
+            ),
+          );
+        await tx
+          .update(registeredRemoteSolvers)
+          .set({
+            status: "claiming",
+            lastHeartbeatAt: new Date(),
+            activePromiseCount: Number(active?.promises ?? 1),
+            activeAoaCount: Number(active?.aoas ?? promisedAoas.length),
+            updatedAt: new Date(),
+          })
+          .where(eq(registeredRemoteSolvers.id, owner.id));
+      }
+      return {
+        promise: {
+          id: promise.id,
+          expiresAt: expiresAt.toISOString(),
+          ttlHours,
+          airfoil: {
+            id: first.airfoil_id,
+            slug: first.airfoil_slug,
+            name: first.airfoil_name,
+            source: first.airfoil_source,
+            pointFormat: first.point_format,
+            points: first.points,
+          },
+          setupRevision: {
+            id: first.revision_id,
+            presetId: first.preset_id,
+            legacyBoundaryConditionId: first.bc_id,
+            signatureHash: first.signature_hash,
+            reynolds: Number(first.reynolds),
+            mach: first.mach == null ? null : Number(first.mach),
+            referenceLengthM: Number(first.reference_length_m),
+            snapshot: first.snapshot,
+          },
+          aoas: promisedAoas,
         },
-        setupRevision: {
-          id: first.revision_id,
-          presetId: first.preset_id,
-          legacyBoundaryConditionId: first.bc_id,
-          signatureHash: first.signature_hash,
-          reynolds: Number(first.reynolds),
-          mach: first.mach == null ? null : Number(first.mach),
-          referenceLengthM: Number(first.reference_length_m),
-          snapshot: first.snapshot,
-        },
-        aoas: promisedAoas,
-      },
-    };
+      };
+    });
+    return claimResult;
   });
 
   app.post("/api/sync/v1/sweeps/:promiseId/heartbeat", async (req, reply) => {
@@ -7623,6 +7726,26 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       if (!solver)
         return reply.code(404).send({ error: "registered solver not found" });
       await revokeSolverEvidenceUploads(db, solver.id);
+      return syncAdminPayload(req);
+    },
+  );
+
+  app.patch(
+    "/api/admin/sync/solvers/:id/policy",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().uuid() }).parse(req.params);
+      const body = remoteSolverPolicyPatchSchema.parse(req.body ?? {});
+      const [solver] = await db
+        .update(registeredRemoteSolvers)
+        .set({
+          maxActivePolarPromises: body.maxActivePolarPromises,
+          updatedAt: new Date(),
+        })
+        .where(eq(registeredRemoteSolvers.id, params.id))
+        .returning({ id: registeredRemoteSolvers.id });
+      if (!solver)
+        return reply.code(404).send({ error: "registered solver not found" });
       return syncAdminPayload(req);
     },
   );

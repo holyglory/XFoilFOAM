@@ -18,9 +18,10 @@ import {
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
-import { count, eq, inArray, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 
 import {
+  admissionCpuSlotsForRequest,
   buildPolarRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
@@ -83,10 +84,10 @@ export function effectiveMaxConcurrentJobs(
   cpuSlots: number | null | undefined,
   workerBudget = Number(process.env.AIRFOILFOAM_WORKER_CPU_BUDGET ?? 2),
 ): number {
-  if (Number.isInteger(configuredMax) && (configuredMax ?? 0) > 0)
-    return configuredMax as number;
   if (Number.isInteger(cpuSlots) && (cpuSlots ?? 0) > 0)
     return cpuSlots as number;
+  if (Number.isInteger(configuredMax) && (configuredMax ?? 0) > 0)
+    return configuredMax as number;
   return Number.isInteger(workerBudget) && workerBudget > 0 ? workerBudget : 2;
 }
 
@@ -107,8 +108,8 @@ export async function getState(db: DB): Promise<SweeperConfig> {
   return {
     enabled: s?.enabled ?? false,
     // 0 = auto: admit up to the same CPU-token capacity the engine owns.
-    // A positive value remains an explicit API-only override for installations
-    // that deliberately want fewer concurrent polar jobs.
+    // The legacy max-concurrent value is used only when no CPU-token value is
+    // configured, so an invisible default cannot strand worker capacity.
     maxConcurrentJobs: effectiveMaxConcurrentJobs(
       s?.maxConcurrentJobs,
       s?.cpuSlots,
@@ -186,10 +187,21 @@ async function checkAdmissionFence(
 
 async function inFlight(db: DB): Promise<number> {
   const [r] = await db
-    .select({ n: count() })
+    .select({
+      n: sql<number>`coalesce(sum(${simJobs.admissionCpuSlots}), 0)`,
+    })
     .from(simJobs)
-    .where(inArray(simJobs.status, ["submitted", "running", "ingesting"]));
-  return r?.n ?? 0;
+    .where(
+      sql`(
+        ${simJobs.status} IN ('submitted', 'running')
+        OR (${simJobs.status} = 'pending' AND ${simJobs.engineState} = 'submitting')
+        OR (
+          ${simJobs.status} = 'cancelled'
+          AND ${simJobs.engineState} IN ('cancelling', 'cancel_pending')
+        )
+      )`,
+    );
+  return Number(r?.n ?? 0);
 }
 
 async function submitComposedJob(
@@ -300,6 +312,7 @@ async function submitContinuousBatch(
         referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
         wave: 1,
         status: "pending",
+        admissionCpuSlots: admissionCpuSlotsForRequest(request),
         totalCases: batch.aoas.length,
         requestPayload: {
           speedMap: [
@@ -528,6 +541,7 @@ export async function submitCampaignBatch(
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
         wave: 1,
         status: "pending",
+        admissionCpuSlots: admissionCpuSlotsForRequest(request),
         totalCases,
         requestPayload: campaignJobPayload(
           batch,
@@ -729,7 +743,7 @@ export async function tick(
   // queueing ahead of FAST URANS while every slot is occupied.
   const sharedRemoteCapacityAvailable =
     !state.enabled || inFlightJobs < state.maxConcurrentJobs;
-  const localCapacityOpen =
+  let localCapacityOpen =
     state.enabled &&
     !admissionFenced &&
     diskAdmission.allowed &&
@@ -854,43 +868,58 @@ export async function tick(
     if (remoteAdmissionConsumed) {
       inFlightJobs = await inFlight(db);
       diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
+      localCapacityOpen =
+        state.enabled &&
+        !admissionFenced &&
+        diskAdmission.allowed &&
+        inFlightJobs < state.maxConcurrentJobs;
     }
   }
 
-  // Lower lanes run only when neither FAST nor remote admission consumed this
-  // tick. Recheck the shared backoff because a remote submit attempt may have
-  // discovered a connection failure after the successful health probe.
+  // Local work can use any capacity left after the remote refill. Recheck the
+  // shared backoff because a remote submit attempt may have discovered a
+  // connection failure after the successful health probe.
   if (
     localCapacityOpen &&
     engineHealthy &&
     meshRecoveryVersion != null &&
     !fastUransSubmitted &&
-    !remoteAdmissionConsumed &&
     !engineBackoffActive()
   ) {
-    // Once higher-priority FAST and remote work are quiet, durable DB history
-    // gives one pending final verification the next eligible slot after at
-    // most eight newly admitted wave-1 RANS jobs; restart cannot reset it.
-    const interleavedVerifySubmitted = await submitInterleavedVerifyIfDue(
-      db,
-      engine,
-      state.cpuSlots,
-      { uransRecoveryVersion },
-    );
-    const ransSubmitted = interleavedVerifySubmitted
-      ? false
-      : await submitOneBatch(db, engine, state.cpuSlots, meshRecoveryVersion);
-    // Admin-request PRECALC and the ordinary verify fallback remain below newly
-    // composed RANS work. Campaign FAST and bounded final verification ran above.
-    if (
-      !interleavedVerifySubmitted &&
-      !ransSubmitted &&
-      (await inFlight(db)) < state.maxConcurrentJobs
-    ) {
-      await uransLadderTick(db, engine, state.cpuSlots, {
+    // Fill every remaining weighted slot in this tick. Each composer still
+    // claims one independent polar and the submit lifecycle fence serializes
+    // the final admission, so concurrent ticks cannot over-admit. Persistent
+    // priority logic decides what each successive slot receives.
+    const MAX_LOCAL_ADMISSIONS_PER_TICK = 16;
+    for (let i = 0; i < MAX_LOCAL_ADMISSIONS_PER_TICK; i++) {
+      if ((await inFlight(db)) >= state.maxConcurrentJobs) break;
+      if (engineBackoffActive()) break;
+      const interleavedVerifySubmitted = await submitInterleavedVerifyIfDue(
+        db,
+        engine,
+        state.cpuSlots,
+        {
+          uransRecoveryVersion,
+        },
+      );
+      if (interleavedVerifySubmitted) continue;
+      const ransSubmitted = await submitOneBatch(
+        db,
+        engine,
+        state.cpuSlots,
         meshRecoveryVersion,
-        uransRecoveryVersion,
-      });
+      );
+      if (ransSubmitted) continue;
+      const ladderSubmitted = await uransLadderTick(
+        db,
+        engine,
+        state.cpuSlots,
+        {
+          meshRecoveryVersion,
+          uransRecoveryVersion,
+        },
+      );
+      if (!ladderSubmitted) break;
     }
   }
   await markTickCompleted(db);

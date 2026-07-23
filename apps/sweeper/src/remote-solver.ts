@@ -12,6 +12,7 @@ import {
   remoteAssetReferences,
   resultAttempts,
   resultClassifications,
+  resultEvidenceFieldInventory,
   resultFieldExtents,
   resultMedia,
   results,
@@ -61,6 +62,7 @@ import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 
 import {
+  admissionCpuSlotsForRequest,
   buildPolarRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
@@ -195,6 +197,11 @@ function canonicalJson(value: unknown): string {
 }
 
 interface RemoteClaimResponse {
+  admission?: {
+    state: "at_cap";
+    active: number;
+    cap: number;
+  };
   promise: null | {
     id: string;
     expiresAt: string;
@@ -247,6 +254,42 @@ function syncBase(settings: Settings): string {
   if (!settings.upstreamBaseUrl)
     throw new Error("up-tier endpoint is not configured");
   return canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl);
+}
+
+/** Scope mirrored work to the registered solver that owns it. The JSON
+ * solverId fallback keeps pre-0087 promises readable during the migration;
+ * once a hub has assigned a durable owner, another remote node must not
+ * renew, cancel, deliver, or execute that promise merely because it shares the
+ * same hub URL. Shared-secret compatibility mode has no registered identity
+ * and intentionally remains unscoped. */
+function remotePromiseOwnerSql(
+  settings: Settings,
+  tableAlias = "sync_sweep_promises",
+) {
+  if (!settings.remoteSolverRegisteredId) return sql`TRUE`;
+  const alias = sql.raw(tableAlias);
+  return sql`(
+    ${alias}.registered_solver_id = ${settings.remoteSolverRegisteredId}::uuid
+    OR (
+      ${alias}.registered_solver_id IS NULL
+      AND ${alias}.request_payload ->> 'solverId' = ${settings.remoteSolverRegisteredId}
+    )
+  )`;
+}
+
+function remotePromiseOwnedBySettings(
+  settings: Settings,
+  promise: {
+    registeredSolverId?: string | null;
+    requestPayload?: Record<string, unknown> | null;
+  },
+): boolean {
+  if (!settings.remoteSolverRegisteredId) return true;
+  return (
+    promise.registeredSolverId === settings.remoteSolverRegisteredId ||
+    (!promise.registeredSolverId &&
+      promise.requestPayload?.solverId === settings.remoteSolverRegisteredId)
+  );
 }
 
 function headers(settings: Settings) {
@@ -642,8 +685,7 @@ async function ensureRemoteRevision(
       schedulingPolicy: snapshot.scheduling.schedulingPolicy,
       caseConcurrency: snapshot.scheduling.caseConcurrency,
       solverProcesses: snapshot.scheduling.solverProcesses,
-      cpuBudget:
-        settings.remoteSolverCpuBudget || snapshot.scheduling.cpuBudget,
+      cpuBudget: snapshot.scheduling.cpuBudget,
     })
     .onConflictDoUpdate({
       target: schedulingProfiles.slug,
@@ -715,8 +757,7 @@ async function ensureRemoteRevision(
       writeImages: snapshot.output.writeImages,
       imageZoomChords: snapshot.output.imageZoomChords,
       schedulingPolicy: snapshot.scheduling.schedulingPolicy,
-      cpuBudget:
-        settings.remoteSolverCpuBudget || snapshot.scheduling.cpuBudget,
+      cpuBudget: snapshot.scheduling.cpuBudget,
       caseConcurrency: snapshot.scheduling.caseConcurrency,
       solverProcesses: snapshot.scheduling.solverProcesses,
       aoaStart: snapshot.sweep.aoaStart,
@@ -765,8 +806,7 @@ async function ensureRemoteRevision(
     flowState: { ...snapshot.flowState, mediumId: medium.id },
     scheduling: {
       ...snapshot.scheduling,
-      cpuBudget:
-        settings.remoteSolverCpuBudget || snapshot.scheduling.cpuBudget,
+      cpuBudget: snapshot.scheduling.cpuBudget,
     },
   };
   const physicsHash = physicsHashForSnapshot(localSnapshot);
@@ -844,7 +884,7 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
       instanceId: settings.instanceId,
       instanceName: settings.instanceName,
       publicEndpoint: settings.publicEndpointOverride,
-      cpuCapacity: settings.remoteSolverCpuBudget,
+      cpuCapacity: remoteWorkerCpuCapacity(settings),
       cpuBudget: settings.remoteSolverCpuBudget,
       buildVersion:
         process.env.AIRFOILFOAM_BUILD_ID ??
@@ -891,36 +931,97 @@ async function heartbeat(
         status,
         activePromiseCount,
         activeAoaCount,
-        cpuCapacity: settings.remoteSolverCpuBudget,
+        cpuCapacity: remoteWorkerCpuCapacity(settings),
         cpuBudget: settings.remoteSolverCpuBudget,
       }),
     },
   ).catch(() => undefined);
 }
 
-async function activeRemoteJobs(db: DB) {
+function remoteJobOwnerSql(settings: Settings, tableAlias = "job") {
+  const alias = sql.raw(tableAlias);
+  const upstream = syncBase(settings);
+  if (!settings.remoteSolverRegisteredId) {
+    return sql`(
+      ${alias}.request_payload ->> 'remoteSolver' = 'true'
+      AND ${alias}.request_payload ->> 'upstreamBaseUrl' = ${upstream}
+    )`;
+  }
+  return sql`(
+    ${alias}.request_payload ->> 'remoteSolver' = 'true'
+    AND ${alias}.request_payload ->> 'upstreamBaseUrl' = ${upstream}
+    AND (
+      (
+        ${alias}.request_payload ->> 'syncPromiseId' IS NULL
+        AND ${alias}.request_payload ->> 'solverId' = ${settings.remoteSolverRegisteredId}
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM sync_sweep_promises remote_owner_promise
+        WHERE remote_owner_promise.id::text = ${alias}.request_payload ->> 'syncPromiseId'
+          AND remote_owner_promise.source_base_url = ${upstream}
+          AND ${remotePromiseOwnerSql(settings, "remote_owner_promise")}
+      )
+    )
+  )`;
+}
+
+async function activeRemoteJobs(db: DB, settings: Settings) {
   const jobs = await db
     .select()
     .from(simJobs)
     .where(
-      or(
-        inArray(simJobs.status, [
-          "pending",
-          "submitted",
-          "running",
-          "ingesting",
-        ]),
-        and(
-          eq(simJobs.status, "cancelled"),
-          inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+      and(
+        remoteJobOwnerSql(settings, "sim_jobs"),
+        or(
+          inArray(simJobs.status, [
+            "pending",
+            "submitted",
+            "running",
+            "ingesting",
+          ]),
+          and(
+            eq(simJobs.status, "cancelled"),
+            inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+          ),
         ),
       ),
     );
-  return jobs.filter((job) =>
-    Boolean(
-      (job.requestPayload as { syncPromiseId?: string } | null)?.syncPromiseId,
-    ),
-  );
+  return jobs;
+}
+
+async function remoteReservedCpuSlots(
+  db: DB,
+  settings: Settings,
+): Promise<number> {
+  const [row] = (await db.execute(sql`
+    SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
+    FROM sim_jobs job
+    WHERE ${remoteJobOwnerSql(settings, "job")}
+      AND (
+        job.status IN ('submitted', 'running')
+        OR (
+          job.status = 'pending'
+          AND job.engine_state = 'submitting'
+        )
+        OR (
+          job.status = 'cancelled'
+          AND job.engine_state IN ('cancelling', 'cancel_pending')
+        )
+      )
+  `)) as unknown as Array<{ slots: number }>;
+  return Number(row?.slots ?? 0);
+}
+
+function configuredRemoteCpuCap(settings: Settings): number {
+  const cap = Number(settings.remoteSolverCpuBudget);
+  return Number.isInteger(cap) && cap > 0 ? cap : 0;
+}
+
+function remoteWorkerCpuCapacity(settings: Settings): number {
+  const detected = Number(process.env.AIRFOILFOAM_WORKER_CPU_BUDGET);
+  if (Number.isInteger(detected) && detected > 0) return detected;
+  return Math.max(1, Number(settings.remoteSolverCpuBudget) || 1);
 }
 
 async function remotePromiseWorkState(
@@ -1065,6 +1166,7 @@ async function expireMirroredRemotePromises(
           eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
           sql`${syncSweepPromises.expiresAt} <= now()`,
           sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+          remotePromiseOwnerSql(settings),
         ),
       )
       .returning({ id: syncSweepPromises.id });
@@ -1097,6 +1199,7 @@ async function mirroredRemotePromiseIds(
         eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
         sql`${syncSweepPromises.expiresAt} > now()`,
         sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+        remotePromiseOwnerSql(settings),
       ),
     )
     .orderBy(syncSweepPromises.createdAt, syncSweepPromises.id);
@@ -1421,6 +1524,7 @@ async function renewMirroredPromiseLeases(
         eq(syncSweepPromises.status, "active"),
         eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
         sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+        remotePromiseOwnerSql(settings),
         sql`(
           ${syncSweepPromises.lastHeartbeatAt} IS NULL
           OR ${syncSweepPromises.lastHeartbeatAt} <= now() - (${intervalMs}::double precision * interval '1 millisecond')
@@ -1576,6 +1680,7 @@ async function cancelMirroredPromisesForDisabledSolver(
       and(
         inArray(syncSweepPromises.status, ["active", "expired"]),
         sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+        remotePromiseOwnerSql(settings),
       ),
     )
     .orderBy(syncSweepPromises.createdAt, syncSweepPromises.id);
@@ -1613,6 +1718,7 @@ async function processPendingPromiseCancellations(
         onlyPromiseId
           ? eq(syncRemotePromiseCancellations.promiseId, onlyPromiseId)
           : undefined,
+        remotePromiseOwnerSql(settings),
       ),
     )
     .orderBy(
@@ -1724,6 +1830,7 @@ async function composeRemotePromiseJob(
     promise.status !== "active" ||
     promise.expiresAt.getTime() <= Date.now() ||
     promise.sourceBaseUrl !== syncBase(settings) ||
+    !remotePromiseOwnedBySettings(settings, promise) ||
     (promise.requestPayload as { remoteSolver?: boolean } | null)
       ?.remoteSolver !== true
   )
@@ -1758,6 +1865,7 @@ async function composeRemotePromiseJob(
         AND remote_promise."expiresAt" > now()
         AND remote_promise.source_base_url = ${syncBase(settings)}
         AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+        AND ${remotePromiseOwnerSql(settings, "remote_promise")}
       FOR UPDATE OF remote_promise
     `)) as unknown as Array<{ id: string }>;
     if (!locked[0]) return { kind: "stopped" as const };
@@ -1802,10 +1910,13 @@ async function composeRemotePromiseJob(
     });
     request.expected_execution_pool = executionPool.routingKey;
     request.expected_mesh_recovery_version = meshRecoveryVersion;
+    const admissionCpuSlots = admissionCpuSlotsForRequest(request);
     request.resources = {
       ...(request.resources ?? {}),
-      cpu_budget:
-        settings.remoteSolverCpuBudget || request.resources?.cpu_budget,
+      // remoteSolverCpuBudget is a node-wide admission cap, never a per-job
+      // budget. Give each polar its real process/concurrency weight so the
+      // engine cannot reserve the entire node for every admitted job.
+      cpu_budget: admissionCpuSlots,
     };
     const payload = {
       remoteSolver: true,
@@ -1838,6 +1949,7 @@ async function composeRemotePromiseJob(
         wave: 1,
         jobKind: state.dueAoas.length <= 3 ? "targeted" : "sweep",
         status: "pending",
+        admissionCpuSlots,
         totalCases: state.dueAoas.length,
         requestPayload: payload,
       })
@@ -1984,7 +2096,13 @@ async function claimRemoteWork(
     .catch(() => null)) as RemoteClaimResponse | null;
   if (!res.ok) throw new Error(`remote sweep claim failed (${res.status})`);
   if (!payload?.promise) {
-    await setStatus(db, "idle", null);
+    await setStatus(
+      db,
+      "idle",
+      payload?.admission?.state === "at_cap"
+        ? `hub promise cap reached (${payload.admission.active}/${payload.admission.cap})`
+        : null,
+    );
     return null;
   }
   const claim = payload.promise;
@@ -2902,6 +3020,7 @@ async function completeMirroredPromiseIfReady(
       AND remote_promise.status IN ('active', 'expired', 'fulfilled')
       AND remote_promise.source_base_url = ${syncBase(settings)}
       AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND ${remotePromiseOwnerSql(settings, "remote_promise")}
     GROUP BY remote_promise.id, remote_promise.status, remote_promise.aoa_count
   `)) as unknown as Array<{
     id: string;
@@ -2992,6 +3111,7 @@ async function firstReadyMirroredPromiseId(
     WHERE remote_promise.status IN ('active', 'expired')
       AND remote_promise.source_base_url = ${syncBase(settings)}
       AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND ${remotePromiseOwnerSql(settings, "remote_promise")}
       AND remote_promise.aoa_count > 0
       AND (
         SELECT count(*)::int
@@ -3093,6 +3213,16 @@ async function pushOneRemoteResult(
           sql`length(trim(${resultMedia.mimeType})) > 0`,
         ),
       );
+    const inventory = await db
+      .select()
+      .from(resultEvidenceFieldInventory)
+      .where(
+        and(
+          eq(resultEvidenceFieldInventory.resultId, result.id),
+          eq(resultEvidenceFieldInventory.resultAttemptId, attempt.id),
+          eq(resultEvidenceFieldInventory.evidenceSha256, evidenceSha256),
+        ),
+      );
     const extents = await db
       .select()
       .from(resultFieldExtents)
@@ -3103,22 +3233,24 @@ async function pushOneRemoteResult(
           eq(resultFieldExtents.evidenceSha256, evidenceSha256),
         ),
       );
-    if (!claim.fulfilledReplay && !extents.length) {
+    const shippedFields = inventory.filter((field) =>
+      field.roles.includes("instantaneous"),
+    );
+    if (!claim.fulfilledReplay && !shippedFields.length) {
       await settleResultDelivery(db, claim, {
         kind: "retry",
-        error: `remote result ${result.id} is waiting for verified default-media field extents`,
+        error: `remote result ${result.id} is waiting for engine-shipped field inventory`,
       });
       return false;
     }
     const missingDefaultMedia = claim.fulfilledReplay
       ? undefined
-      : extents.find(
-          (extent) =>
+      : shippedFields.find(
+          (field) =>
             !media.some(
               (item) =>
-                item.field === extent.field &&
-                item.renderProfileKey === extent.renderProfileKey &&
-                item.evidenceSha256 === extent.evidenceSha256 &&
+                item.field === field.field &&
+                item.evidenceSha256 === field.evidenceSha256 &&
                 item.kind === "image" &&
                 item.role === "instantaneous" &&
                 item.mimeType.startsWith("image/") &&
@@ -3130,7 +3262,7 @@ async function pushOneRemoteResult(
     if (missingDefaultMedia) {
       await settleResultDelivery(db, claim, {
         kind: "retry",
-        error: `remote result ${result.id} is waiting for verified default ${missingDefaultMedia.field} media`,
+        error: `remote result ${result.id} is waiting for shipped ${missingDefaultMedia.field} media`,
       });
       return false;
     }
@@ -3468,6 +3600,9 @@ async function pushOneRemoteResult(
       // A fulfilled replay is a storage-container upgrade, not a second
       // publication pass. Keep the accepted media/extents immutable on the
       // hub and send only the exact manifest plus brokered engine archive.
+      // Extents are terminal presentation metadata. A running polar is
+      // deliverable as soon as its exact manifest and shipped media exist;
+      // send extents only when the repair worker has produced them.
       fieldExtents: claim.fulfilledReplay ? [] : extents,
       evidenceArtifacts,
       media: mediaPayload,
@@ -3684,6 +3819,7 @@ async function releaseUnacceptedPromiseResults(
           AND remote_promise.status = 'active'
           AND remote_promise.source_base_url = ${syncBase(settings)}
           AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+          AND ${remotePromiseOwnerSql(settings, "remote_promise")}
       )
       AND NOT EXISTS (
         SELECT 1
@@ -4134,6 +4270,7 @@ async function processReusablePromiseEvidence(
     WHERE remote_promise.status = 'active'
       AND remote_promise.source_base_url = ${syncBase(settings)}
       AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND ${remotePromiseOwnerSql(settings, "remote_promise")}
       AND NOT (
         solved_job.wave = 1
         AND EXISTS (
@@ -4166,22 +4303,32 @@ async function processReusablePromiseEvidence(
       )
       AND EXISTS (
         SELECT 1
-        FROM result_field_extents extent
-        WHERE extent.result_id = solved_result.id
-          AND extent.result_attempt_id = solved_attempt.id
+        FROM result_evidence_field_inventory inventory
+        WHERE inventory.result_id = solved_result.id
+          AND inventory.result_attempt_id = solved_attempt.id
+          AND inventory.evidence_sha256 = (
+            SELECT manifest.sha256
+            FROM solver_evidence_artifacts manifest
+            WHERE manifest.result_id = solved_result.id
+              AND manifest.result_attempt_id = solved_attempt.id
+              AND manifest.kind = 'manifest'
+              AND manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+            LIMIT 1
+          )
+          AND inventory.roles @> '["instantaneous"]'::jsonb
       )
       AND NOT EXISTS (
         SELECT 1
-        FROM result_field_extents extent
-        WHERE extent.result_id = solved_result.id
-          AND extent.result_attempt_id = solved_attempt.id
+        FROM result_evidence_field_inventory inventory
+        WHERE inventory.result_id = solved_result.id
+          AND inventory.result_attempt_id = solved_attempt.id
+          AND inventory.roles @> '["instantaneous"]'::jsonb
           AND NOT EXISTS (
             SELECT 1 FROM result_media media
             WHERE media.result_id = solved_result.id
               AND media.result_attempt_id = solved_attempt.id
-              AND media.field = extent.field
-              AND media.render_profile_key = extent.render_profile_key
-              AND media.evidence_sha256 = extent.evidence_sha256
+              AND media.field = inventory.field
+              AND media.evidence_sha256 = inventory.evidence_sha256
               AND media.kind = 'image'
               AND media.role = 'instantaneous'
               AND media.mime_type LIKE 'image/%'
@@ -4281,6 +4428,7 @@ async function processFulfilledEvidenceUpgrades(
      AND solved_classification.state = 'accepted'
     WHERE remote_promise.source_base_url = ${syncBase(settings)}
       AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND ${remotePromiseOwnerSql(settings, "remote_promise")}
       AND promise_point.airfoil_id = solved_result.airfoil_id
       AND promise_point.simulation_preset_revision_id = solved_result.simulation_preset_revision_id
       AND promise_point.aoa_deg = solved_result.aoa_deg
@@ -4368,6 +4516,7 @@ async function processRemoteResultDeliveries(
           WHERE remote_promise.id = (${simJobs.requestPayload} ->> 'syncPromiseId')::uuid
             AND remote_promise.source_base_url = ${syncBase(settings)}
             AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+            AND ${remotePromiseOwnerSql(settings, "remote_promise")}
             AND remote_promise.status IN ('active', 'expired')
         )`,
         sql`NOT (
@@ -4430,22 +4579,32 @@ async function processRemoteResultDeliveries(
               )
               AND EXISTS (
                 SELECT 1
-                FROM result_field_extents ready_extent
-                WHERE ready_extent.result_id = ready_result.id
-                  AND ready_extent.result_attempt_id = ready_attempt.id
+                FROM result_evidence_field_inventory ready_inventory
+                WHERE ready_inventory.result_id = ready_result.id
+                  AND ready_inventory.result_attempt_id = ready_attempt.id
+                  AND ready_inventory.evidence_sha256 = (
+                    SELECT ready_manifest.sha256
+                    FROM solver_evidence_artifacts ready_manifest
+                    WHERE ready_manifest.result_id = ready_result.id
+                      AND ready_manifest.result_attempt_id = ready_attempt.id
+                      AND ready_manifest.kind = 'manifest'
+                      AND ready_manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+                    LIMIT 1
+                  )
+                  AND ready_inventory.roles @> '["instantaneous"]'::jsonb
               )
               AND NOT EXISTS (
                 SELECT 1
-                FROM result_field_extents ready_extent
-                WHERE ready_extent.result_id = ready_result.id
-                  AND ready_extent.result_attempt_id = ready_attempt.id
+                FROM result_evidence_field_inventory ready_inventory
+                WHERE ready_inventory.result_id = ready_result.id
+                  AND ready_inventory.result_attempt_id = ready_attempt.id
+                  AND ready_inventory.roles @> '["instantaneous"]'::jsonb
                   AND NOT EXISTS (
                     SELECT 1 FROM result_media ready_media
                     WHERE ready_media.result_id = ready_result.id
                       AND ready_media.result_attempt_id = ready_attempt.id
-                      AND ready_media.field = ready_extent.field
-                      AND ready_media.render_profile_key = ready_extent.render_profile_key
-                      AND ready_media.evidence_sha256 = ready_extent.evidence_sha256
+                      AND ready_media.field = ready_inventory.field
+                      AND ready_media.evidence_sha256 = ready_inventory.evidence_sha256
                       AND ready_media.kind = 'image'
                       AND ready_media.role = 'instantaneous'
                       AND ready_media.mime_type LIKE 'image/%'
@@ -4513,22 +4672,32 @@ async function processRemoteResultDeliveries(
         )
         AND EXISTS (
           SELECT 1
-          FROM result_field_extents extent
-          WHERE extent.result_id = ready_result.id
-            AND extent.result_attempt_id = ready_attempt.id
+          FROM result_evidence_field_inventory inventory
+          WHERE inventory.result_id = ready_result.id
+            AND inventory.result_attempt_id = ready_attempt.id
+            AND inventory.evidence_sha256 = (
+              SELECT manifest.sha256
+              FROM solver_evidence_artifacts manifest
+              WHERE manifest.result_id = ready_result.id
+                AND manifest.result_attempt_id = ready_attempt.id
+                AND manifest.kind = 'manifest'
+                AND manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+              LIMIT 1
+            )
+            AND inventory.roles @> '["instantaneous"]'::jsonb
         )
         AND NOT EXISTS (
           SELECT 1
-          FROM result_field_extents extent
-          WHERE extent.result_id = ready_result.id
-            AND extent.result_attempt_id = ready_attempt.id
+          FROM result_evidence_field_inventory inventory
+          WHERE inventory.result_id = ready_result.id
+            AND inventory.result_attempt_id = ready_attempt.id
+            AND inventory.roles @> '["instantaneous"]'::jsonb
             AND NOT EXISTS (
               SELECT 1 FROM result_media media
               WHERE media.result_id = ready_result.id
                 AND media.result_attempt_id = ready_attempt.id
-                AND media.field = extent.field
-                AND media.render_profile_key = extent.render_profile_key
-                AND media.evidence_sha256 = extent.evidence_sha256
+                AND media.field = inventory.field
+                AND media.evidence_sha256 = inventory.evidence_sha256
                 AND media.kind = 'image'
                 AND media.role = 'instantaneous'
                 AND media.mime_type LIKE 'image/%'
@@ -4818,7 +4987,7 @@ export async function reconcileRemoteSolverTick(
       });
       return false;
     }
-    const active = await activeRemoteJobs(db);
+    const active = await activeRemoteJobs(db, settings);
     await heartbeat(
       settings,
       active.length ? "solving" : "idle",
@@ -4827,7 +4996,10 @@ export async function reconcileRemoteSolverTick(
     );
     if (await processReusablePromiseEvidence(db, engine, settings))
       return false;
-    return active.length === 0;
+    const remoteCap = configuredRemoteCpuCap(settings);
+    return (
+      remoteCap > 0 && (await remoteReservedCpuSlots(db, settings)) < remoteCap
+    );
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
     return false;
@@ -4893,36 +5065,59 @@ export async function admitRemoteSolverTick(
       );
       return false;
     }
-    if ((await activeRemoteJobs(db)).length > 0) return false;
-
-    const mirrored = await mirroredRemotePromiseIds(db, settings);
-    let outcome: RemotePromiseSubmitResult | null;
-    if (mirrored.length) {
-      outcome = await submitMirroredRemotePromise(
-        db,
-        engine,
-        settings,
-        mirrored[0],
-        meshRecoveryVersion,
-      );
-    } else if (engineBackoffActive()) {
-      await setStatus(
-        db,
-        "error",
-        "remote solver is waiting for the shared engine connection backoff",
-      );
+    const remoteCap = configuredRemoteCpuCap(settings);
+    if (!remoteCap) {
+      await setStatus(db, "idle", "remote solver CPU cap is zero");
       return false;
-    } else {
-      outcome = await claimRemoteWork(
-        db,
-        engine,
-        settings,
-        meshRecoveryVersion,
-      );
     }
-    // `busy` includes another owner already submitting the exact composed job.
-    // Conservatively consume this tick so no second engine admission races it.
-    return outcome?.kind === "submitted" || outcome?.kind === "busy";
+
+    // A node cap is a weighted token budget, not a singleton-job switch. One
+    // polar remains serial internally (the promise composer guards that
+    // promise), while independent promises fill every available token.
+    const MAX_ADMISSIONS_PER_TICK = 16;
+    let admitted = false;
+    for (let attempt = 0; attempt < MAX_ADMISSIONS_PER_TICK; attempt++) {
+      if ((await remoteReservedCpuSlots(db, settings)) >= remoteCap) break;
+      if (engineBackoffActive()) {
+        await setStatus(
+          db,
+          "error",
+          "remote solver is waiting for the shared engine connection backoff",
+        );
+        break;
+      }
+      const mirrored = await mirroredRemotePromiseIds(db, settings);
+      let outcome: RemotePromiseSubmitResult | null;
+      if (mirrored.length) {
+        outcome = await submitMirroredRemotePromise(
+          db,
+          engine,
+          settings,
+          mirrored[0]!,
+          meshRecoveryVersion,
+        );
+      } else {
+        outcome = await claimRemoteWork(
+          db,
+          engine,
+          settings,
+          meshRecoveryVersion,
+        );
+      }
+      if (outcome?.kind === "submitted") {
+        admitted = true;
+        continue;
+      }
+      // `busy` is an idempotent race on an already-composed promise. It does
+      // not justify admitting a second job for that same promise, but another
+      // tick can safely retry it once the owner advances.
+      if (outcome?.kind === "busy") {
+        admitted = true;
+        break;
+      }
+      break;
+    }
+    return admitted;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
     return false;

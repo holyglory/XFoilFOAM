@@ -78,6 +78,7 @@ const {
   remoteAssetReferences,
   resultAttempts,
   resultClassifications,
+  resultEvidenceFieldInventory,
   resultFieldExtents,
   resultMedia,
   resultMediaRepairs,
@@ -687,6 +688,16 @@ async function seedDoneRemoteJob(
       sha256: stored.sha256,
       byteSize: stored.byteSize,
     });
+    await db.insert(resultEvidenceFieldInventory).values({
+      resultId: row.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      field: `pressure_${idx}`,
+      roles: ["instantaneous"],
+      evidenceSha256: manifest.sha256,
+      source: "engine_manifest",
+    });
   }
 
   return job;
@@ -978,6 +989,13 @@ function requests(fetchMock: ReturnType<typeof vi.fn>, suffix: string) {
 }
 
 async function seedMirroredPromise(label: string, aoas: number[], id?: string) {
+  const [settings] = await db
+    .select({
+      remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+    })
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
   const [promise] = await db
     .insert(syncSweepPromises)
     .values({
@@ -992,6 +1010,7 @@ async function seedMirroredPromise(label: string, aoas: number[], id?: string) {
       lastHeartbeatAt: new Date(),
       requestPayload: {
         remoteSolver: true,
+        solverId: settings?.remoteSolverRegisteredId ?? null,
         upstreamBaseUrl: UPSTREAM,
         fixture: label,
       },
@@ -1211,6 +1230,34 @@ async function seedRemoteWholePolarParent(label: string) {
     },
     `${label}:accepted-rans`,
   );
+  const acceptedPressure = writeMedia(
+    `jobs/${engineJobId}/cases/aoa_0/pressure.png`,
+    `${label}:accepted-rans-pressure`,
+  );
+  await db.insert(resultMedia).values({
+    resultId: acceptedResult.id,
+    resultAttemptId: acceptedAttempt.id,
+    kind: "image",
+    field: "pressure",
+    role: "instantaneous",
+    storageKey: acceptedPressure.storageKey,
+    mimeType: "image/png",
+    width: 4,
+    height: 4,
+    evidenceSha256: acceptedManifest.sha256,
+    sha256: acceptedPressure.sha256,
+    byteSize: acceptedPressure.byteSize,
+  });
+  await db.insert(resultEvidenceFieldInventory).values({
+    resultId: acceptedResult.id,
+    resultAttemptId: acceptedAttempt.id,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    field: "pressure",
+    roles: ["instantaneous"],
+    evidenceSha256: acceptedManifest.sha256,
+    source: "engine_manifest",
+  });
 
   const [triggerResult] = await db
     .insert(results)
@@ -3290,7 +3337,7 @@ describe("remote solver push validation regressions", () => {
     );
   });
 
-  it("MUST-CATCH: does not deliver or reclaim a result before default-media extents exist", async () => {
+  it("delivers running evidence before terminal default-media extents exist", async () => {
     const aoa = 822.101;
     const job = await seedDoneRemoteJob("media-before-delivery", [aoa]);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
@@ -3307,10 +3354,12 @@ describe("remote solver push validation regressions", () => {
 
     await remoteSolverTick(db, {} as never);
 
-    expect(requests(waitingFetch.fetchMock, "/polars")).toHaveLength(0);
+    expect(requests(waitingFetch.fetchMock, "/polars")).toHaveLength(1);
     expect(
       (await deliveriesForJob(job.id)).filter((row) => row.resultId),
-    ).toHaveLength(0);
+    ).toSatisfy((rows: Array<{ state: string }>) =>
+      rows.every((row) => row.state === "delivered"),
+    );
   });
 
   it("retires local media work after the authoritative hub accepted that exact generation", async () => {
@@ -4607,6 +4656,16 @@ describe("remote solver push validation regressions", () => {
       evidenceSha256: manifest.sha256,
       sha256: image.sha256,
       byteSize: image.byteSize,
+    });
+    await db.insert(resultEvidenceFieldInventory).values({
+      resultId: result.id,
+      resultAttemptId: attemptB.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      field: "pressure_generation_b",
+      roles: ["instantaneous"],
+      evidenceSha256: manifest.sha256,
+      source: "engine_manifest",
     });
 
     await remoteSolverTick(db, {} as never);

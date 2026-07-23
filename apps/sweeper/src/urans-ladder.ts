@@ -79,6 +79,7 @@ import {
 import { alias } from "drizzle-orm/pg-core";
 
 import {
+  admissionCpuSlotsForRequest,
   buildPolarRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
@@ -1693,6 +1694,7 @@ async function submitLadderJob(
     referenceChordM: target.snapshot.referenceGeometry.referenceLengthM,
     wave: 2,
     status: "pending",
+    admissionCpuSlots: admissionCpuSlotsForRequest(request),
     totalCases: aoas.length,
     requestPayload: {
       ...payloadExtras,

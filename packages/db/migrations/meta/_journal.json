@@ -610,6 +610,13 @@
       "when": 1788307200000,
       "tag": "0086_settled_legacy_evidence_binding",
       "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1788393600000,
+      "tag": "0087_remote_capacity_and_field_inventory",
+      "breakpoints": true
     }
   ]
 }

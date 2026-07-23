@@ -175,3 +175,25 @@ export function buildPolarRequest(opts: {
   };
   return { request, speed, nu };
 }
+
+/** Durable scheduler weight for one engine job. OpenCFD runs one or more
+ * solver processes per concurrently executed case; the control plane reserves
+ * that product so a node cap represents real CPU pressure rather than merely
+ * a count of database rows. Unknown/auto policies reserve one slot and let
+ * the engine resolve its own internal defaults. */
+export function admissionCpuSlotsForRequest(
+  request: Pick<PolarRequest, "resources">,
+): number {
+  const resources = request.resources;
+  const solverProcesses =
+    Number.isInteger(resources?.solver_processes) &&
+    (resources?.solver_processes ?? 0) > 0
+      ? (resources?.solver_processes as number)
+      : 1;
+  const caseConcurrency =
+    Number.isInteger(resources?.case_concurrency) &&
+    (resources?.case_concurrency ?? 0) > 0
+      ? (resources?.case_concurrency as number)
+      : 1;
+  return Math.max(1, solverProcesses * caseConcurrency);
+}

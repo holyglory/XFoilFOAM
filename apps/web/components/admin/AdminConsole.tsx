@@ -85,6 +85,7 @@ import {
   getAdminSimulationSetup,
   patchSweeper,
   patchAdminSync,
+  patchAdminRemoteSolverPolicy,
   promoteSyncConflict,
   purgeTestArtifacts,
   recoverStaleJobs,
@@ -3934,6 +3935,9 @@ function SyncApiPanel() {
   const [state, setState] = useState<AdminSyncState | null>(null);
   const [draft, setDraft] = useState<SyncDraft | null>(null);
   const [busy, setBusy] = useState(false);
+  const [solverCapDrafts, setSolverCapDrafts] = useState<
+    Record<string, number>
+  >({});
   const [err, setErr] = useState<string | null>(null);
   const [validationIssues, setValidationIssues] = useState<ValidationIssue[]>(
     [],
@@ -3943,7 +3947,43 @@ function SyncApiPanel() {
     const next = await getAdminSync();
     setState(next);
     setDraft(syncDraftFromState(next));
+    setSolverCapDrafts(
+      Object.fromEntries(
+        next.registeredSolvers.map((solver) => [
+          solver.id,
+          solver.maxActivePolarPromises,
+        ]),
+      ),
+    );
   }, []);
+
+  const saveSolverPolicy = async (solverId: string) => {
+    const maxActivePolarPromises = Math.max(
+      0,
+      Math.min(1024, Math.trunc(solverCapDrafts[solverId] ?? 0)),
+    );
+    setBusy(true);
+    setErr(null);
+    try {
+      const next = await patchAdminRemoteSolverPolicy(solverId, {
+        maxActivePolarPromises,
+      });
+      setState(next);
+      setDraft(syncDraftFromState(next));
+      setSolverCapDrafts(
+        Object.fromEntries(
+          next.registeredSolvers.map((solver) => [
+            solver.id,
+            solver.maxActivePolarPromises,
+          ]),
+        ),
+      );
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     refresh().catch((e) => setErr((e as Error).message));
@@ -4261,7 +4301,7 @@ function SyncApiPanel() {
                   }
                 />
                 <NumberField
-                  label="Remote solver CPUs"
+                  label="Remote CPU cap (0 pauses)"
                   value={draft.remoteSolverCpuBudget}
                   onChange={(remoteSolverCpuBudget) =>
                     setDraft(
@@ -4271,7 +4311,7 @@ function SyncApiPanel() {
                   }
                 />
                 <NumberField
-                  label="Claim size"
+                  label="Angles per polar promise"
                   value={draft.remoteSolverClaimSize}
                   onChange={(remoteSolverClaimSize) =>
                     setDraft(
@@ -4637,12 +4677,69 @@ function SyncApiPanel() {
                           {solver.cpuBudget}/{solver.cpuCapacity} CPU
                         </div>
                         <div>
-                          {solver.activePromiseCount} promises ·{" "}
+                          {solver.activePromiseCount}/
+                          {solver.maxActivePolarPromises} polar promises ·{" "}
                           {solver.activeAoaCount} AoAs
                         </div>
                         <div>
                           {solver.solvedCount} solved · {solver.pushedCount}{" "}
                           pushed
+                        </div>
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 5,
+                            alignItems: "center",
+                            justifyContent: "flex-end",
+                            marginTop: 6,
+                          }}
+                        >
+                          <label
+                            htmlFor={`remote-promise-cap-${solver.id}`}
+                            style={{ color: C.dim, fontSize: 10 }}
+                          >
+                            cap
+                          </label>
+                          <input
+                            id={`remote-promise-cap-${solver.id}`}
+                            type="number"
+                            min={0}
+                            max={1024}
+                            step={1}
+                            value={
+                              solverCapDrafts[solver.id] ??
+                              solver.maxActivePolarPromises
+                            }
+                            onChange={(event) =>
+                              setSolverCapDrafts((current) => ({
+                                ...current,
+                                [solver.id]: Number(event.target.value),
+                              }))
+                            }
+                            style={{
+                              width: 58,
+                              padding: "3px 5px",
+                              border: `1px solid ${C.border}`,
+                              borderRadius: 4,
+                              background: C.panel,
+                              color: C.text,
+                              fontFamily: MONO,
+                              fontSize: 11,
+                            }}
+                          />
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => saveSolverPolicy(solver.id)}
+                            style={{
+                              ...ghostBtn,
+                              padding: "3px 6px",
+                              fontSize: 10,
+                              opacity: busy ? 0.6 : 1,
+                            }}
+                          >
+                            save
+                          </button>
                         </div>
                       </div>
                     </div>

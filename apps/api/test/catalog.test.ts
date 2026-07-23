@@ -426,6 +426,7 @@ describe("catalog solved-metric evidence", () => {
           id: string;
           instanceId: string;
           cpuBudget: number;
+          maxActivePolarPromises: number;
           status: string;
         };
       };
@@ -433,6 +434,7 @@ describe("catalog solved-metric evidence", () => {
       expect(registered.solver).toMatchObject({
         instanceId: `${sourceInstanceId}-solver`,
         cpuBudget: 2,
+        maxActivePolarPromises: 1,
         status: "idle",
       });
       expect(registered.authToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
@@ -515,6 +517,25 @@ describe("catalog solved-metric evidence", () => {
         expect(body.promise.aoas.length).toBe(1);
         cleanupSyncPromiseIds.add(body.promise.id);
       }
+
+      // A lease cap is authoritative hub state, not heartbeat telemetry: a
+      // second claim is rejected while the first polar promise remains active.
+      const cappedClaim = await app.inject({
+        method: "POST",
+        url: "/api/sync/v1/sweeps/claim",
+        headers: { "x-xfoilfoam-solver-token": registered.authToken },
+        payload: {
+          limit: 1,
+          solverId: registered.solver.id,
+          sourceInstanceId,
+          sourceInstanceName: "sync api test",
+        },
+      });
+      expect(cappedClaim.statusCode).toBe(200);
+      expect(cappedClaim.json()).toMatchObject({
+        promise: null,
+        admission: { state: "at_cap", active: 1, cap: 1 },
+      });
     } finally {
       await db
         .delete(syncSweepPromises)

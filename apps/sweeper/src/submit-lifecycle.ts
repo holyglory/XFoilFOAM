@@ -18,6 +18,7 @@ import {
   simResultSubmitRetries,
   simUransRequests,
   simUransVerifyQueue,
+  syncApiSettings,
   settlePrecalcObligationsForJobInTransaction,
 } from "@aerodb/db";
 import { releasedResultStatusSql } from "@aerodb/db/result-claim-lifecycle";
@@ -30,7 +31,7 @@ import {
   type PolarRequest,
   URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
-import { and, count, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import { isEngineConnectionFailure } from "./engine-backoff";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
@@ -84,11 +85,20 @@ export async function solverQueuePressure(
   opts: { jobIds?: string[] } = {},
 ): Promise<number> {
   const filters = [
-    inArray(simJobs.status, ["pending", "submitted", "running", "ingesting"]),
+    sql`(
+      ${simJobs.status} IN ('submitted', 'running')
+      OR (${simJobs.status} = 'pending' AND ${simJobs.engineState} = 'submitting')
+      OR (
+        ${simJobs.status} = 'cancelled'
+        AND ${simJobs.engineState} IN ('cancelling', 'cancel_pending')
+      )
+    )`,
   ];
   if (opts.jobIds?.length) filters.push(inArray(simJobs.id, opts.jobIds));
   const [row] = await db
-    .select({ n: count() })
+    .select({
+      n: sql<number>`coalesce(sum(${simJobs.admissionCpuSlots}), 0)`,
+    })
     .from(simJobs)
     .where(and(...filters));
   return Number(row?.n ?? 0);
@@ -719,37 +729,119 @@ async function submitWithGlobalAdmissionPermit(
             "operator canary requires a paused scheduler with zero durable capacity",
         };
       }
-      if (effectiveAdmissionLane === "remote" && scheduler.enabled) {
+      const [jobCapacity] = (await tx.execute(sql`
+        SELECT COALESCE(admission_cpu_slots, 1)::integer AS admission_cpu_slots
+        FROM sim_jobs
+        WHERE id = ${jobId}
+        LIMIT 1
+      `)) as unknown as Array<{ admission_cpu_slots: number }>;
+      const requestedSlots = Math.max(
+        1,
+        Number(jobCapacity?.admission_cpu_slots ?? 1),
+      );
+      const activeReservationPredicate = sql`(
+        job.status IN ('submitted', 'running')
+        OR (
+          job.status = 'pending'
+          AND job.engine_state = ${SUBMITTING_ENGINE_STATE}
+        )
+        OR (
+          job.status = 'cancelled'
+          AND job.engine_state IN ('cancelling', 'cancel_pending')
+        )
+      )`;
+      if (effectiveAdmissionLane === "remote") {
+        const [remotePolicy] = (await tx.execute(sql`
+          SELECT remote_solver_cpu_budget::integer AS cap,
+                 remote_solver_registered_id::text AS registered_solver_id,
+                 upstream_base_url
+          FROM sync_api_settings
+          WHERE id = 1
+          LIMIT 1
+        `)) as unknown as Array<{
+          cap: number | null;
+          registered_solver_id: string | null;
+          upstream_base_url: string | null;
+        }>;
+        const remoteCap = Number(remotePolicy?.cap ?? 0);
+        if (!Number.isInteger(remoteCap) || remoteCap <= 0) {
+          return {
+            kind: "denied" as const,
+            error: "remote solver CPU cap is zero or unavailable",
+          };
+        }
+        const remoteOwnerPredicate = remotePolicy?.registered_solver_id
+          ? sql`(
+              job.request_payload ->> 'upstreamBaseUrl' = ${remotePolicy.upstream_base_url ?? ""}
+              AND
+              (
+                job.request_payload ->> 'syncPromiseId' IS NULL
+                AND job.request_payload ->> 'solverId' = ${remotePolicy.registered_solver_id}
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sync_sweep_promises remote_owner_promise
+                WHERE remote_owner_promise.id::text = job.request_payload ->> 'syncPromiseId'
+                  AND remote_owner_promise.source_base_url = ${remotePolicy.upstream_base_url ?? ""}
+                  AND remote_owner_promise.registered_solver_id::text = ${remotePolicy.registered_solver_id}
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sync_sweep_promises remote_owner_promise
+                WHERE remote_owner_promise.id::text = job.request_payload ->> 'syncPromiseId'
+                  AND remote_owner_promise.source_base_url = ${remotePolicy.upstream_base_url ?? ""}
+                  AND remote_owner_promise.registered_solver_id IS NULL
+                  AND remote_owner_promise.request_payload ->> 'solverId' = ${remotePolicy.registered_solver_id}
+              )
+            )`
+          : sql`job.request_payload ->> 'upstreamBaseUrl' = ${remotePolicy?.upstream_base_url ?? ""}`;
+        const [remotePressure] = (await tx.execute(sql`
+          SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
+          FROM sim_jobs job
+          WHERE job.id <> ${jobId}
+            AND job.request_payload ->> 'remoteSolver' = 'true'
+            AND ${remoteOwnerPredicate}
+            AND ${activeReservationPredicate}
+        `)) as unknown as Array<{ slots: number }>;
+        const remoteReservedSlots = Number(remotePressure?.slots ?? 0);
+        if (remoteReservedSlots + requestedSlots > remoteCap) {
+          return {
+            kind: "denied" as const,
+            error: `remote solver CPU cap is full (${remoteReservedSlots}+${requestedSlots}/${remoteCap})`,
+          };
+        }
+      }
+      if (
+        (effectiveAdmissionLane === "remote" ||
+          effectiveAdmissionLane === "local") &&
+        scheduler.enabled
+      ) {
         const configuredMax = Number(scheduler.max_concurrent_jobs);
         const cpuSlots = Number(scheduler.cpu_slots);
         const workerBudget = Number(
           process.env.AIRFOILFOAM_WORKER_CPU_BUDGET ?? 2,
         );
         const sharedCapacity =
-          Number.isInteger(configuredMax) && configuredMax > 0
-            ? configuredMax
-            : Number.isInteger(cpuSlots) && cpuSlots > 0
-              ? cpuSlots
+          Number.isInteger(cpuSlots) && cpuSlots > 0
+            ? cpuSlots
+            : Number.isInteger(configuredMax) && configuredMax > 0
+              ? configuredMax
               : Number.isInteger(workerBudget) && workerBudget > 0
                 ? workerBudget
                 : 2;
         const [pressure] = (await tx.execute(sql`
-          SELECT count(*)::integer AS count
+          SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
           FROM sim_jobs job
           WHERE job.id <> ${jobId}
-            AND (
-              job.status IN ('submitted', 'running', 'ingesting')
-              OR (
-                job.status = 'pending'
-                AND job.engine_state = ${SUBMITTING_ENGINE_STATE}
-              )
-            )
-        `)) as unknown as Array<{ count: number }>;
-        const reservedSlots = Number(pressure?.count ?? 0);
-        if (reservedSlots >= sharedCapacity) {
+            AND ${activeReservationPredicate}
+      `)) as unknown as Array<{ slots: number }>;
+        const reservedSlots = Number(
+          (pressure as unknown as { slots: number } | undefined)?.slots ?? 0,
+        );
+        if (reservedSlots + requestedSlots > sharedCapacity) {
           return {
             kind: "denied" as const,
-            error: `shared scheduler capacity is full (${reservedSlots}/${sharedCapacity})`,
+            error: `shared scheduler capacity is full (${reservedSlots}+${requestedSlots}/${sharedCapacity})`,
           };
         }
       }

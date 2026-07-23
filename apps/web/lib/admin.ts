@@ -530,6 +530,7 @@ export interface AdminRegisteredSolver {
   status: string;
   lastHeartbeatAt: string | null;
   activePromiseCount: number;
+  maxActivePolarPromises: number;
   activeAoaCount: number;
   solvedCount: number;
   pushedCount: number;
@@ -820,6 +821,14 @@ export const patchAdminSync = (
   },
 ) =>
   aj<AdminSyncState>("/api/admin/sync", {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+export const patchAdminRemoteSolverPolicy = (
+  solverId: string,
+  body: { maxActivePolarPromises: number },
+) =>
+  aj<AdminSyncState>(`/api/admin/sync/solvers/${solverId}/policy`, {
     method: "PATCH",
     body: JSON.stringify(body),
   });

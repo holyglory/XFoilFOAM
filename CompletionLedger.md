@@ -13,10 +13,12 @@
   recovery now explicitly hydrates immutable retained archives, and the API
   image owns the ffmpeg encoder used by that endpoint; both fixes are
   regression-verified and deployed on the remote solver, but not yet on
-  production. Remote delivery is also regression-gated on a real
-  evidence-backed field inventory before hub acknowledgement/reclaim, and
-  exact generations already accepted by the hub retire obsolete local repair
-  work; this control-plane correction is not yet deployed. Let the current production
+  production. Remote delivery now has a local manifest-backed field-inventory
+  gate and weighted remote/local admission in this checkout; the migration,
+  admin controls, and incremental-delivery regression coverage are implemented
+  and checkout-verified, while deployment and production verification remain.
+  Exact generations already accepted
+  by the hub retire obsolete local repair work. Let the current production
   11-angle job finish without interrupting its eight live OpenFOAM processes,
   then deploy this hardening through the guarded engine-maintenance path.
   Readiness still requires incremental result publication, verified GCS

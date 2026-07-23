@@ -1495,6 +1495,49 @@ export const resultFieldExtents = pgTable(
   }),
 );
 
+/** Immutable field availability derived from an exact solver manifest and the
+ * engine-shipped media for that same attempt. This is intentionally separate
+ * from numeric result_field_extents: delivery may use this cheap inventory
+ * while a terminal media-repair worker computes presentation ranges. */
+export const resultEvidenceFieldInventory = pgTable(
+  "result_evidence_field_inventory",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    simulationPresetRevisionId: uuid("simulation_preset_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    field: text("field").notNull(),
+    roles: jsonb("roles").$type<string[]>().notNull().default([]),
+    evidenceSha256: text("evidence_sha256").notNull(),
+    source: text("source").notNull().default("engine_manifest"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_evidence_field_inventory_attempt_owner_fk",
+    }).onDelete("cascade"),
+    resultIdx: index("result_evidence_field_inventory_result_idx").on(
+      t.resultId,
+    ),
+    attemptIdx: index("result_evidence_field_inventory_attempt_idx").on(
+      t.resultAttemptId,
+    ),
+    fieldUq: uniqueIndex("result_evidence_field_inventory_attempt_field_uq").on(
+      t.resultAttemptId,
+      t.field,
+    ),
+  }),
+);
+
 export const resultMedia = pgTable(
   "result_media",
   {
@@ -2929,6 +2972,9 @@ export const simJobs = pgTable(
     status: simJobStatusEnum("status").notNull().default("pending"),
     totalCases: integer("total_cases").notNull().default(0),
     completedCases: integer("completed_cases").notNull().default(0),
+    /** Durable scheduler admission weight. This is execution policy metadata,
+     * not part of the immutable physical/numerical setup revision. */
+    admissionCpuSlots: integer("admission_cpu_slots").notNull().default(1),
     requestPayload: jsonb("request_payload"),
     engineState: text("engine_state"),
     error: text("error"),
@@ -2983,6 +3029,10 @@ export const simJobs = pgTable(
     methodKeyCheck: check(
       "sim_jobs_method_key_check",
       sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
+    ),
+    admissionCpuSlotsCheck: check(
+      "sim_jobs_admission_cpu_slots_check",
+      sql`${t.admissionCpuSlots} >= 1`,
     ),
     noDirectFullRequestCheck: check(
       "sim_jobs_no_direct_full_request_check",
@@ -4740,6 +4790,10 @@ export const syncSweepPromises = pgTable(
     sourceInstanceId: text("source_instance_id"),
     sourceInstanceName: text("source_instance_name"),
     sourceBaseUrl: text("source_base_url"),
+    registeredSolverId: uuid("registered_solver_id").references(
+      (): AnyPgColumn => registeredRemoteSolvers.id,
+      { onDelete: "restrict" },
+    ),
     status: syncPromiseStatusEnum("status").notNull().default("active"),
     airfoilId: uuid("airfoil_id")
       .notNull()
@@ -4767,6 +4821,11 @@ export const syncSweepPromises = pgTable(
     scopeIdx: index("sync_sweep_promises_scope_idx").on(
       t.airfoilId,
       t.simulationPresetRevisionId,
+    ),
+    solverStatusIdx: index("sync_sweep_promises_solver_status_idx").on(
+      t.registeredSolverId,
+      t.status,
+      t.expiresAt,
     ),
   }),
 );
@@ -5151,6 +5210,11 @@ export const registeredRemoteSolvers = pgTable(
     status: remoteSolverStatusEnum("status").notNull().default("idle"),
     lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true }),
     activePromiseCount: integer("active_promise_count").notNull().default(0),
+    /** Admin-owned lease cap. Heartbeats may report telemetry but never edit
+     * this policy value. */
+    maxActivePolarPromises: integer("max_active_polar_promises")
+      .notNull()
+      .default(1),
     activeAoaCount: integer("active_aoa_count").notNull().default(0),
     solvedCount: integer("solved_count").notNull().default(0),
     pushedCount: integer("pushed_count").notNull().default(0),
@@ -5180,6 +5244,10 @@ export const registeredRemoteSolvers = pgTable(
     credentialVersionCheck: check(
       "registered_remote_solvers_credential_version_check",
       sql`${t.credentialVersion} >= 0`,
+    ),
+    maxActivePolarPromisesCheck: check(
+      "registered_remote_solvers_max_active_polar_promises_check",
+      sql`${t.maxActivePolarPromises} BETWEEN 0 AND 1024`,
     ),
   }),
 );
@@ -5450,6 +5518,8 @@ export type ResultInsert = typeof results.$inferInsert;
 export type ResultAttempt = typeof resultAttempts.$inferSelect;
 export type ResultAttemptInsert = typeof resultAttempts.$inferInsert;
 export type ResultMedia = typeof resultMedia.$inferSelect;
+export type ResultEvidenceFieldInventory =
+  typeof resultEvidenceFieldInventory.$inferSelect;
 export type SolverEvidenceArtifact =
   typeof solverEvidenceArtifacts.$inferSelect;
 export type SolverEvidenceBlob = typeof solverEvidenceBlobs.$inferSelect;

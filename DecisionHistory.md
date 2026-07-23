@@ -58,6 +58,22 @@
   separate from numerical solver identity.
   [D-2026-07-17-hz-solver2-volume-cutover]
 
+- Decision: treat remote CPU capacity and hub-issued polar promises as separate
+  execution controls. A remote node admits independent serial polars until its
+  configured CPU-slot cap is reserved; the authoritative hub limits each
+  registered solver's active, unexpired polar leases. Running AoAs remain
+  serial within one promise so mesh reuse and warm marching are preserved.
+  Incremental delivery is allowed from authenticated manifest-backed field
+  inventory while numeric extents and scaled presentation media remain
+  asynchronous.
+  [D-2026-07-22-remote-capacity-and-promise-caps](DecisionDetails/D-2026-07-22-remote-capacity-and-promise-caps.md)
+- Why: one active remote job wastes the dedicated node; copying the node budget
+  into every job does not provide total-cap admission; and AoA claim size is
+  not a concurrency limit. A per-solver lease cap avoids global suppression of
+  independent remote capacity, while exact manifest inventory resolves the
+  current running-result delivery deadlock without inventing field extents or
+  forcing expensive rendering into the solver march.
+
 ## D-2026-07-20-urans-continuation-wall-budget — Wall budget, not a short chunk count, bounds healthy relaxation
 
 Detail: [DecisionDetails/D-2026-07-20-urans-continuation-wall-budget.md](DecisionDetails/D-2026-07-20-urans-continuation-wall-budget.md)
