@@ -30,11 +30,19 @@
   burn-in additionally exposed false watchdog SIGKILLs from copied/non-live
   coefficient histories and an untyped terminal-promise reclaim loop. Exact
   live-process monitoring, isolated-but-retained initialization evidence, and
-  build-scoped terminal cancellation are regression-verified but not yet
-  deployed. The guarded remote maintenance path now correctly treats durable
-  `blocked` delivery conflicts as terminal, inert review records while still
-  refusing retryable/claimed deliveries. Readiness requires deploying both
-  control-plane and remote-engine changes, then proving remote CPU refill,
+  build-scoped terminal cancellation are regression-verified. The guarded
+  remote maintenance path correctly treats durable `blocked` delivery
+  conflicts as terminal, inert review records while still refusing
+  retryable/claimed deliveries. The remote control plane and OpenCFD 2606
+  engine are deployed as `hz-solver2-2800bba-urans-watchdog`; runtime source
+  inspection proves the exact live-process watcher and isolated steady
+  initialization evidence are installed. Its 40-CPU cap is restored, but the
+  production hub currently accepts TCP without emitting SSH or HTTP protocol
+  responses. Eight leases containing 87 active angles remain durable on the
+  remote node and no engine job is admitted while the authoritative hub is
+  unreachable. Production control-plane deployment and the remote burn-in
+  remain incomplete. Readiness requires production VPS recovery, deployment of
+  the typed cancellation API, then proof of remote CPU refill,
   accepted-result delivery, and no recurrence of the false kill/reclaim chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the

@@ -142,6 +142,24 @@ The alternatives were rejected as follows:
   records as executable delivery work. The gate now continues to fail closed
   for retryable/claimed deliveries while allowing terminal blocked conflicts
   to remain immutable and reviewable during maintenance.
+- Remote commit `2800bba80c171997ca4579774667e387f895a1a0` was sealed and
+  deployed as OpenCFD 2606 build
+  `hz-solver2-2800bba-urans-watchdog`. The guarded rebuild passed empty engine,
+  Redis, database-work, and OpenFOAM-process gates; recreated the API, worker,
+  and Node API; restored its writers; and reported the expected 2606 runtime.
+  Direct inspection inside the running worker proved the watcher reads only
+  exact live process working directories, and the running pipeline exposes the
+  retained `steady_initialization` evidence namespace.
+- Production deployment runs
+  [#153](https://github.com/holyglory/XFoilFOAM/actions/runs/30088884598)
+  and [#154](https://github.com/holyglory/XFoilFOAM/actions/runs/30090026675)
+  could not reach the control plane. Ports 22, 80, and 443 accepted TCP from
+  the remote node, but SSH emitted no protocol banner and HTTPS emitted no
+  response; the first workflow failed before staging and the second remained
+  in its pre-deploy SSH check. No production service or data was mutated.
+  Remote admission is configured at 40 CPUs and will reconnect automatically;
+  eight preserved leases contain 87 active angles, but admission correctly
+  remains empty while the authoritative hub is unavailable.
 - An authenticated browser-equivalent request rendered the live campaign as
   running with eight active production jobs, and the public AG24 detail route
   rendered its stored profile and 86-point polar. Both routes had zero browser
