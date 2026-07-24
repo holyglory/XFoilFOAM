@@ -213,7 +213,8 @@ def test_polar_submit_rejects_urans_recovery_cutover_before_queueing(
         "actual_version": URANS_RECOVERY_VERSION,
         "message": (
             "Engine URANS-recovery capability changed before submission: "
-            "requested v1, API is v2. Refresh capability and retry."
+            f"requested v1, API is v{URANS_RECOVERY_VERSION}. "
+            "Refresh capability and retry."
         ),
     }
 
@@ -227,7 +228,10 @@ def test_worker_rejects_urans_recovery_mismatch_before_geometry_or_solver(tmp_pa
         }
     )
 
-    with pytest.raises(RuntimeError, match="requested v1, worker is v2"):
+    with pytest.raises(
+        RuntimeError,
+        match=f"requested v1, worker is v{URANS_RECOVERY_VERSION}",
+    ):
         jobs.execute_job(
             "urans-recovery-capability-mismatch",
             request,

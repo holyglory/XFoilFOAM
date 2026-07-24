@@ -518,6 +518,53 @@ def _coefficient_series_one(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndar
     return _normalise_series(t, cl, cd, cm)
 
 
+# Search the most recent evidence first.  Fractions are deliberately dense near
+# the tail: a violent transient may occupy most of a long same-case trajectory,
+# while only the final few periods are the physical settled wake.  Candidates
+# are still byte-backed suffixes of the immutable merged history; this selector
+# never deletes or rewrites raw solver evidence.
+_CLEAN_TAIL_FRACTIONS = (
+    0.025,
+    0.05,
+    0.075,
+    0.10,
+    0.15,
+    0.20,
+    0.30,
+    0.40,
+    0.50,
+    0.65,
+    0.80,
+    1.0,
+)
+
+
+def _tail_candidate_series(
+    t: np.ndarray,
+    cl: np.ndarray,
+    cd: np.ndarray,
+    cm: np.ndarray,
+    *,
+    min_samples: int,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Return distinct trailing evidence suffixes, shortest/latest first."""
+    if t.size < min_samples or float(t[-1]) <= float(t[0]):
+        return []
+    span = float(t[-1] - t[0])
+    out: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    starts: set[int] = set()
+    for fraction in _CLEAN_TAIL_FRACTIONS:
+        start_time = float(t[-1]) - fraction * span
+        index = max(0, int(np.searchsorted(t, start_time, side="left")))
+        if index in starts or t.size - index < min_samples:
+            continue
+        starts.add(index)
+        out.append((t[index:], cl[index:], cd[index:], cm[index:]))
+    if 0 not in starts:
+        out.append((t, cl, cd, cm))
+    return out
+
+
 def stable_two_period_window(
     path: "Path | Sequence[Path]",
     speed: float,
@@ -554,70 +601,120 @@ def stable_two_period_window(
     if t.size < max(16, min_samples_per_cycle * 2):
         return StablePeriodResult(ok=False, reason="not enough retained coefficient samples")
 
-    freq = dominant_frequency(
-        t, cl, freq_band=shedding_frequency_band(speed, chord, alpha_deg=alpha_deg)
-    )
-    st = strouhal(freq, chord, speed)
-    period = chord / (st * speed) if st > 0 else None
-    if period is None or not math.isfinite(period) or period <= 0:
-        return StablePeriodResult(ok=False, reason="no measurable shedding period")
-    window = integer_period_window(t, period, discard_fraction=0.0, target_cycles=2)
-    if window is None or window.cycles < 2:
-        return StablePeriodResult(ok=False, reason="fewer than two measured periods", period_s=period)
+    frames = np.asarray(frame_times, dtype=float)
+    frames = frames[np.isfinite(frames)]
+    best: StablePeriodResult | None = None
+    for candidate in _tail_candidate_series(
+        t,
+        cl,
+        cd,
+        cm,
+        min_samples=max(16, min_samples_per_cycle * 2),
+    ):
+        tc, clc, cdc, _cmc = candidate
+        freq = dominant_frequency(
+            tc,
+            clc,
+            freq_band=shedding_frequency_band(
+                speed, chord, alpha_deg=alpha_deg
+            ),
+        )
+        st = strouhal(freq, chord, speed)
+        period = chord / (st * speed) if st > 0 else None
+        if period is None or not math.isfinite(period) or period <= 0:
+            continue
+        window = integer_period_window(
+            tc, period, discard_fraction=0.0, target_cycles=2
+        )
+        if window is None or window.cycles < 2:
+            continue
 
-    mid = window.start + period
-    first_mask = (t >= window.start) & (t <= mid)
-    second_mask = (t >= mid) & (t <= window.end)
-    if int(first_mask.sum()) < min_samples_per_cycle or int(second_mask.sum()) < min_samples_per_cycle:
-        return StablePeriodResult(
+        mid = window.start + period
+        first_mask = (tc >= window.start) & (tc <= mid)
+        second_mask = (tc >= mid) & (tc <= window.end)
+        if (
+            int(first_mask.sum()) < min_samples_per_cycle
+            or int(second_mask.sum()) < min_samples_per_cycle
+        ):
+            best = best or StablePeriodResult(
+                ok=False,
+                reason="not enough samples per period",
+                period_s=period,
+                window_start=window.start,
+                window_end=window.end,
+                cycles=2,
+            )
+            continue
+
+        phase = np.linspace(0.0, period, max(8, phase_samples), endpoint=False)
+
+        def compare(values: np.ndarray) -> tuple[float, float]:
+            p1 = np.interp(window.start + phase, tc, values)
+            p2 = np.interp(mid + phase, tc, values)
+            combined = np.concatenate((p1, p2))
+            amplitude = float(np.nanmax(combined) - np.nanmin(combined))
+            scale = max(
+                amplitude,
+                abs(float(np.nanmean(combined))) * 0.05,
+                1e-9,
+            )
+            nrms = float(np.sqrt(np.nanmean((p1 - p2) ** 2)) / scale)
+            mean_drift = float(
+                abs(np.nanmean(p1) - np.nanmean(p2)) / scale
+            )
+            return nrms, mean_drift
+
+        cl_similarity, cl_drift = compare(clc)
+        cd_similarity, cd_drift = compare(cdc)
+        similarity = max(cl_similarity, cd_similarity)
+        mean_drift = max(cl_drift, cd_drift)
+        stable = (
+            similarity <= similarity_tolerance
+            and mean_drift <= mean_drift_tolerance
+        )
+        frame_count = int(
+            ((frames >= window.start) & (frames <= window.end)).sum()
+        )
+        frames_per_cycle = frame_count / 2.0
+        base = StablePeriodResult(
             ok=False,
-            reason="not enough samples per period",
+            reason="",
+            stable=stable,
             period_s=period,
             window_start=window.start,
             window_end=window.end,
             cycles=2,
+            frame_count=frame_count,
+            frames_per_cycle=frames_per_cycle,
+            similarity=similarity,
+            mean_drift=mean_drift,
         )
-
-    phase = np.linspace(0.0, period, max(8, phase_samples), endpoint=False)
-
-    def compare(values: np.ndarray) -> tuple[float, float]:
-        p1 = np.interp(window.start + phase, t, values)
-        p2 = np.interp(mid + phase, t, values)
-        combined = np.concatenate((p1, p2))
-        amplitude = float(np.nanmax(combined) - np.nanmin(combined))
-        scale = max(amplitude, abs(float(np.nanmean(combined))) * 0.05, 1e-9)
-        nrms = float(np.sqrt(np.nanmean((p1 - p2) ** 2)) / scale)
-        mean_drift = float(abs(np.nanmean(p1) - np.nanmean(p2)) / scale)
-        return nrms, mean_drift
-
-    cl_similarity, cl_drift = compare(cl)
-    cd_similarity, cd_drift = compare(cd)
-    similarity = max(cl_similarity, cd_similarity)
-    mean_drift = max(cl_drift, cd_drift)
-    stable = similarity <= similarity_tolerance and mean_drift <= mean_drift_tolerance
-
-    frames = np.asarray(frame_times, dtype=float)
-    frames = frames[np.isfinite(frames)]
-    frame_count = int(((frames >= window.start) & (frames <= window.end)).sum())
-    frames_per_cycle = frame_count / 2.0
-    base = StablePeriodResult(
-        ok=False,
-        reason="",
-        stable=stable,
-        period_s=period,
-        window_start=window.start,
-        window_end=window.end,
-        cycles=2,
-        frame_count=frame_count,
-        frames_per_cycle=frames_per_cycle,
-        similarity=similarity,
-        mean_drift=mean_drift,
+        if not stable:
+            best = best or replace(
+                base,
+                reason=(
+                    f"periods differ: similarity {similarity:.3f}, "
+                    f"mean drift {mean_drift:.3f}"
+                ),
+            )
+            continue
+        if frames_per_cycle + 1e-9 < min_frames_per_cycle:
+            best = best or replace(
+                base,
+                reason=(
+                    f"frames/cycle {frames_per_cycle:.2f} "
+                    f"< {min_frames_per_cycle:.2f}"
+                ),
+            )
+            continue
+        return replace(
+            base,
+            ok=True,
+            reason="two stable periods with sufficient frames",
+        )
+    return best or StablePeriodResult(
+        ok=False, reason="no measurable shedding period"
     )
-    if not stable:
-        return replace(base, reason=f"periods differ: similarity {similarity:.3f}, mean drift {mean_drift:.3f}")
-    if frames_per_cycle + 1e-9 < min_frames_per_cycle:
-        return replace(base, reason=f"frames/cycle {frames_per_cycle:.2f} < {min_frames_per_cycle:.2f}")
-    return replace(base, ok=True, reason="two stable periods with sufficient frames")
 
 
 # --------------------------------------------------------------------------- #
@@ -922,6 +1019,147 @@ def discard_startup(
     cut = float(t[0]) + min(max(float(fraction), 0.0), 0.999999) * float(t[-1] - t[0])
     mask = t >= cut
     return (t[mask], *(a[mask] for a in arrays))
+
+
+@dataclass(frozen=True)
+class CleanPeriodicTail:
+    """A byte-backed settled suffix whose independent halves agree on period."""
+
+    series: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    estimate: PeriodEstimate
+
+
+def _has_impulsive_discontinuity(
+    t: np.ndarray,
+    *channels: np.ndarray,
+) -> bool:
+    """Detect an isolated solver-step jump that is not a resolved waveform.
+
+    The derivative comparison accounts for adaptive timesteps.  Both a large
+    robust-amplitude jump and a 20x slope outlier are required, so ordinary
+    sharp but repeatedly resolved post-stall cycles do not trip this guard.
+    """
+    if t.size < 32:
+        return False
+    dt = np.diff(t)
+    valid_dt = np.isfinite(dt) & (dt > 0)
+    if int(valid_dt.sum()) < 16:
+        return True
+    for values in channels:
+        finite = np.isfinite(values)
+        if int(finite.sum()) != values.size:
+            return True
+        jumps = np.abs(np.diff(values))
+        slopes = jumps[valid_dt] / dt[valid_dt]
+        if slopes.size < 16:
+            continue
+        slope_reference = float(np.nanpercentile(slopes, 95))
+        robust_span = float(
+            np.nanpercentile(values, 95) - np.nanpercentile(values, 5)
+        )
+        if (
+            float(np.nanmax(slopes))
+            > max(20.0 * slope_reference, 1e-12)
+            and float(np.nanmax(jumps))
+            > max(0.25 * robust_span, 1e-9)
+        ):
+            return True
+    return False
+
+
+def clean_periodic_tail(
+    times: "np.ndarray | list[float]",
+    cl: "np.ndarray | list[float]",
+    cd: "np.ndarray | list[float]",
+    cm: "np.ndarray | list[float]",
+    *,
+    speed: float,
+    chord: float,
+    required_cycles: float,
+    alpha_deg: "float | None" = None,
+) -> "CleanPeriodicTail | None":
+    """Find the latest clean, corroborated periodic suffix.
+
+    A fixed elapsed-time discard is only a lower-level startup hint: numerical
+    settling can outlive it.  Search trailing immutable evidence suffixes,
+    require the period to agree across both halves, then retain an exact final
+    ``required_cycles`` horizon with the same independently corroborated
+    cadence and no isolated timestep discontinuity.
+    """
+    t, vcl, vcd, vcm = _normalise_series(times, cl, cd, cm)
+    cycles = max(
+        float(required_cycles),
+        2.0 * PERIOD_ESTIMATE_MIN_CYCLES + 0.5,
+    )
+    minimum_samples = max(64, int(math.ceil(cycles * 20.0)))
+    for candidate in _tail_candidate_series(
+        t,
+        vcl,
+        vcd,
+        vcm,
+        min_samples=minimum_samples,
+    ):
+        tc, clc, cdc, cmc = candidate
+        estimate = estimate_period(
+            tc,
+            clc,
+            speed=speed,
+            chord=chord,
+            alpha_deg=alpha_deg,
+        )
+        if estimate is None or estimate.ambiguous:
+            continue
+        period = float(estimate.period_s)
+        if (
+            not math.isfinite(period)
+            or period <= 0
+            or float(tc[-1] - tc[0]) + 1e-12 < cycles * period
+        ):
+            continue
+        exact = trailing_period_series(
+            tc,
+            clc,
+            cdc,
+            cmc,
+            period,
+            cycles,
+        )
+        confirmed = estimate_period(
+            exact[0],
+            exact[1],
+            speed=speed,
+            chord=chord,
+            alpha_deg=alpha_deg,
+        )
+        if confirmed is None or confirmed.ambiguous:
+            continue
+        confirmed_period = float(confirmed.period_s)
+        if (
+            not math.isfinite(confirmed_period)
+            or confirmed_period <= 0
+            or abs(confirmed_period - period) / max(confirmed_period, period)
+            > PERIOD_AMBIGUITY_TOLERANCE
+            or float(tc[-1] - tc[0]) + 1e-12
+            < cycles * confirmed_period
+        ):
+            continue
+        exact = trailing_period_series(
+            tc,
+            clc,
+            cdc,
+            cmc,
+            confirmed_period,
+            cycles,
+        )
+        if _has_impulsive_discontinuity(*exact):
+            continue
+        # Publish only the exact corroborated horizon.  The candidate may be
+        # wider than this window and still contain an old startup burst whose
+        # energy is too small to change its dominant trailing period.  Returning
+        # that wider suffix would reintroduce precisely the corrupt prefix this
+        # selector exists to remove.
+        return CleanPeriodicTail(series=exact, estimate=confirmed)
+    return None
 
 
 @dataclass(frozen=True)
@@ -1362,6 +1600,31 @@ def force_history(
         full_cd_mean,
         full_cd_rms,
     )
+    # The configured discard is not evidence that an oscillating wake has
+    # settled.  A high-Courant startup burst can extend beyond that elapsed-time
+    # boundary and poison period detection even when the final wake owns many
+    # clean cycles.  Preserve the complete observation for genuinely flat
+    # wakes: their physical no-shedding horizon must never be shortened by a
+    # tiny, spectrally credible numerical ripple.
+    if not amplitude_flat and not preserve_observation_window:
+        clean_tail = clean_periodic_tail(
+            t_a,
+            cl_a,
+            cd_a,
+            cm_a,
+            speed=speed,
+            chord=chord,
+            required_cycles=max(
+                float(target_cycles),
+                2.0 * PERIOD_ESTIMATE_MIN_CYCLES + 0.5,
+            ),
+            alpha_deg=alpha_deg,
+        )
+        if clean_tail is not None:
+            t_a, cl_a, cd_a, cm_a = clean_tail.series
+            full_cl_mean, full_cl_rms = _time_weighted_mean_std(t_a, cl_a)
+            full_cd_mean, full_cd_rms = _time_weighted_mean_std(t_a, cd_a)
+            full_cm_mean, full_cm_rms = _time_weighted_mean_std(t_a, cm_a)
     if amplitude_flat:
         freq = 0.0
         st = 0.0

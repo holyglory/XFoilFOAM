@@ -39,6 +39,7 @@
   [D-2026-07-16-preliminary-urans-reliability]
   [D-2026-07-19-urans-physical-tail]
   [D-2026-07-20-urans-continuation-wall-budget]
+  [D-2026-07-24-urans-clean-tail]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -91,6 +92,26 @@
   reachable without horizontal scrolling; narrow layouts use accessible burger
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-07-24-urans-clean-tail — Prevent startup bursts and publish only clean whole periods
+
+Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-2026-07-24-urans-clean-tail.md)
+
+- Decision: every URANS physical chunk starts at `Co <= 1` and may restore the
+  configured Courant ceiling only after the live force monitor measures two
+  repeatable periods. Raw trajectories remain immutable, but preliminary
+  certification searches the latest clean physical suffix when a fixed startup
+  discard leaves the period missing or ambiguous. Accepted preliminary force
+  histories and media expose exactly the last three clean whole periods; the
+  existing 4.5-period independent-half/stationarity certificate remains the
+  acceptance floor.
+- Why: keeping only the fixed 40% discard let a late numerical startup burst
+  poison period detection and display despite a clean wake tail. Permanently
+  reducing the whole run to `Co <= 1` was safe but needlessly expensive, and
+  accepting arbitrary visually periodic tails could promote out-of-band
+  numerical oscillations. Conservative startup plus measured release prevents
+  the burst, while a physically banded suffix selector reuses valid stored
+  evidence without deleting raw history or weakening stationarity.
 
 ## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
 

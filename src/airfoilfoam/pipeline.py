@@ -118,6 +118,7 @@ from .postprocess.unsteady import (
     PeriodEstimate,
     PeriodWindowStats,
     StablePeriodResult,
+    clean_periodic_tail,
     coefficient_series,
     discard_startup,
     estimate_period,
@@ -298,6 +299,10 @@ URANS_RECOVERY_CHECKPOINT_DIR = "_urans_recovery_checkpoint_v2"
 STEADY_INITIALIZATION_EVIDENCE_DIR = "steady_initialization"
 URANS_NUMERICAL_RECOVERY_MAX_COURANT = 1.0
 URANS_NUMERICAL_RECOVERY_DELTA_T_FACTOR = 0.25
+# A normal URANS chunk also starts at Co<=1 until the live force monitor proves
+# that the latest two physical periods repeat.  Unlike numerical recovery, the
+# configured ceiling is then restored in-place for production throughput.
+URANS_STARTUP_MAX_COURANT = 1.0
 
 
 def write_divergence_condemnation(case_dir: Path, reason: str) -> None:
@@ -2752,6 +2757,7 @@ def _make_urans_monitor(
     coeff_start_time: Optional[float] = None,
     *,
     solver_params: Optional[SolverParams] = None,
+    settled_max_courant: Optional[float] = None,
 ) -> Callable[[], None]:
     state: dict[str, object] = {"cadence_period": None, "target_period": None, "stop_requested": False}
 
@@ -2783,6 +2789,25 @@ def _make_urans_monitor(
                 )
                 state["cadence_period"] = period
         if result.stable and period is not None and period > 0:
+            # Every physical chunk starts conservatively.  Only a measured,
+            # repeatable tail may release the configured production Courant
+            # ceiling; startup bursts therefore cannot be amplified by a
+            # large adaptive timestep, while an already-settled continuation
+            # returns to normal throughput at its first monitor poll.
+            if (
+                settled_max_courant is not None
+                and math.isfinite(float(settled_max_courant))
+                and float(settled_max_courant) > 0
+                and not state.get("courant_released")
+            ):
+                _set_control_dict_entries(
+                    tcase / "system" / "controlDict",
+                    {
+                        "maxCo": float(settled_max_courant),
+                        "runTimeModifiable": True,
+                    },
+                )
+                state["courant_released"] = True
             # Certification clock: retention is measured from the START of the
             # first stable two-period window. The stop only fires once both the
             # tier target (+ margin) and the period estimator's independent-half
@@ -3084,6 +3109,32 @@ def _precalc_certified_window(
         chord=spec.chord,
         alpha_deg=spec.aoa_deg,
     )
+    if (
+        not early_stopped
+        and (source_estimate is None or source_estimate.ambiguous)
+    ):
+        clean_tail = clean_periodic_tail(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            speed=spec.speed,
+            chord=spec.chord,
+            required_cycles=_early_stop_certification_cycles(solver_params),
+            alpha_deg=spec.aoa_deg,
+        )
+        if clean_tail is not None:
+            selected = clean_tail.series
+            t_c, cl_c, cd_c, cm_c = selected
+            # Re-run through the pipeline-owned estimator so live grading,
+            # monkeypatched failure guards, and finalization share one verdict.
+            source_estimate = estimate_period(
+                t_c,
+                cl_c,
+                speed=spec.speed,
+                chord=spec.chord,
+                alpha_deg=spec.aoa_deg,
+            )
     if source_estimate is None:
         raise _PrecalcCertifiedWindowUnavailable(
             "no corroborated shedding period"
@@ -3106,7 +3157,26 @@ def _precalc_certified_window(
     if not early_stopped:
         certification_cycles = _early_stop_certification_cycles(solver_params)
         available_span = float(t_c[-1]) - float(t_c[0])
-        span_epsilon = max(1e-9, abs(float(t_c[-1])) * 1e-9)
+        positive_steps = sorted(
+            step
+            for left, right in zip(t_c, t_c[1:])
+            if math.isfinite(step := float(right) - float(left)) and step > 0
+        )
+        # The clean-tail selector and the finalizer independently corroborate
+        # period length.  Their sub-sample estimates may differ by less than
+        # one stored coefficient interval even though the interpolated window
+        # contains the requested physical horizon.  Treat one median sample as
+        # boundary resolution, never as an extra physical period.
+        sample_resolution = (
+            positive_steps[len(positive_steps) // 2]
+            if positive_steps
+            else 0.0
+        )
+        span_epsilon = max(
+            1e-9,
+            abs(float(t_c[-1])) * 1e-9,
+            sample_resolution,
+        )
         required_span = certification_cycles * float(source_period)
         if available_span + span_epsilon < required_span:
             raise _PrecalcCertifiedWindowUnavailable(
@@ -3824,6 +3894,7 @@ def _run_transient_attempt(
         *,
         pass_delta_t: float,
         pass_max_delta_t: float | None,
+        settled_max_courant: float | None,
     ) -> tuple[object, float, str | None, bool, OpenFOAMError | None]:
         nonlocal wall_seconds
         remaining = float(timeout)
@@ -3874,7 +3945,8 @@ def _run_transient_attempt(
                 tcase,
                 spec,
                 coeff_start_time,
-                solver_params=pass_params,
+                solver_params=solver_params,
+                settled_max_courant=settled_max_courant,
             ),
         )
         wall_seconds += max(0.0, time.monotonic() - solve_started)
@@ -3902,11 +3974,20 @@ def _run_transient_attempt(
             pass_failure,
         )
 
+    startup_params = solver_params.model_copy(
+        update={
+            "transient_max_courant": min(
+                float(solver_params.transient_max_courant),
+                URANS_STARTUP_MAX_COURANT,
+            )
+        }
+    )
     try:
         res, remaining_timeout, march_stop, timed_out, failure = run_solver_pass(
-            solver_params,
+            startup_params,
             pass_delta_t=delta_t,
             pass_max_delta_t=max_delta_t,
+            settled_max_courant=float(solver_params.transient_max_courant),
         )
     except BaseException:
         _remove_transient_recovery_checkpoint(checkpoint)
@@ -3967,6 +4048,7 @@ def _run_transient_attempt(
                 recovery_params,
                 pass_delta_t=recovery_delta_t,
                 pass_max_delta_t=recovery_max_delta_t,
+                settled_max_courant=None,
             )
         except BaseException:
             _remove_transient_recovery_checkpoint(checkpoint)
@@ -4421,6 +4503,31 @@ def _continuation_period_estimate(
                 chord=spec.chord,
                 alpha_deg=spec.aoa_deg,
             )
+            if (
+                not result.early_stopped
+                and (estimate is None or estimate.ambiguous)
+            ):
+                clean_tail = clean_periodic_tail(
+                    t_c,
+                    cl_c,
+                    _cd_c,
+                    _cm_c,
+                    speed=spec.speed,
+                    chord=spec.chord,
+                    required_cycles=_early_stop_certification_cycles(
+                        solver_params
+                    ),
+                    alpha_deg=spec.aoa_deg,
+                )
+                if clean_tail is not None:
+                    t_c, cl_c, _cd_c, _cm_c = clean_tail.series
+                    estimate = estimate_period(
+                        t_c,
+                        cl_c,
+                        speed=spec.speed,
+                        chord=spec.chord,
+                        alpha_deg=spec.aoa_deg,
+                    )
             if estimate is not None:
                 return estimate
         except Exception:  # noqa: BLE001 - in-flight evidence may be partial

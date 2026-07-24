@@ -1,6 +1,7 @@
 import {
   OPENCFD_2606_EXECUTION_POOL_ID,
   OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+  URANS_RECOVERY_REMEDIATION_VERSION,
   type DB,
 } from "@aerodb/db";
 import {
@@ -62,7 +63,7 @@ function markCritical(
     id: incidentId,
     stage,
     reason: "recovery-budget-exhausted",
-    remediationVersion: "urans-recovery-2026-07-16-v2",
+    remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
     solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
     resultId: null,
     precalcObligationId:
@@ -675,7 +676,7 @@ describe("three-stage URANS one-shot canary", () => {
       criticalIncidentId: incidentId,
       criticalIncidentStage: "final",
       criticalIncidentReason: "recovery-budget-exhausted",
-      criticalRemediationVersion: "urans-recovery-2026-07-16-v2",
+      criticalRemediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
     });
     expect(criticalDeps.submitExactStep).not.toHaveBeenCalled();
 

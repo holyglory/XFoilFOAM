@@ -41,8 +41,13 @@
   responses. Eight leases containing 87 active angles remain durable on the
   remote node and no engine job is admitted while the authoritative hub is
   unreachable. Production control-plane deployment and the remote burn-in
-  remain incomplete. Readiness requires production VPS recovery, deployment of
-  the typed cancellation API, then proof of remote CPU refill,
+  remain incomplete. URANS recovery v3 regression-proves conservative
+  `Co <= 1` chunk startup, measured Courant release, and physically banded clean
+  trailing-period selection; it is not yet deployed. Exact pre-v3 corrupted
+  attempts must receive only the audited source-pinned remediation allowance,
+  then publish three clean whole periods and retire their obsolete generations.
+  Readiness requires production VPS recovery, deployment of the typed
+  cancellation API and URANS recovery v3, then proof of remote CPU refill,
   accepted-result delivery, and no recurrence of the false kill/reclaim chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the

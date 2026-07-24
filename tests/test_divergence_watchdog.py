@@ -557,7 +557,12 @@ def test_condemned_transient_raises_truthful_error_not_graded(tmp_path, monkeypa
 
     # Both physical passes are retained; the second condemnation proves the
     # bounded recovery was exhausted rather than silently repeating forever.
-    event = tcase / "numerical_recovery" / "v2" / "event_001"
+    event = (
+        tcase
+        / "numerical_recovery"
+        / f"v{pipeline.URANS_RECOVERY_VERSION}"
+        / "event_001"
+    )
     assert (event / "pass_1_numerical" / "failure.json").is_file()
     assert (event / "pass_2_numerical" / "failure.json").is_file()
 
@@ -651,13 +656,13 @@ def test_condemned_transient_restores_checkpoint_and_recovers_conservatively(
     failed = (
         tcase
         / "numerical_recovery"
-        / "v2"
+        / f"v{pipeline.URANS_RECOVERY_VERSION}"
         / "event_001"
         / "pass_1_numerical"
     )
     assert (failed / "last_time" / "0.1" / "U").read_text() == "diverged U"
     metadata = json.loads((failed / "failure.json").read_text())
-    assert metadata["uransRecoveryVersion"] == 2
+    assert metadata["uransRecoveryVersion"] == pipeline.URANS_RECOVERY_VERSION
     assert metadata["classification"] == "numerical"
 
 
@@ -693,11 +698,11 @@ def test_generic_transient_exit_is_infrastructure_and_does_not_retry(
 
     assert calls == 1
     assert (
-        tcase
-        / "numerical_recovery"
-        / "v2"
-        / "event_001"
-        / "pass_1_infrastructure"
+            tcase
+            / "numerical_recovery"
+            / f"v{pipeline.URANS_RECOVERY_VERSION}"
+            / "event_001"
+            / "pass_1_infrastructure"
         / "failure.json"
     ).is_file()
     assert not (tcase / pipeline.URANS_RECOVERY_CHECKPOINT_DIR).exists()

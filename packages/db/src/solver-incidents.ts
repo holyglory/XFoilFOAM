@@ -10,7 +10,7 @@ import {
 /** Bump when the recovery decision itself changes. Incident summaries keep
  * versions separate so recurrence before and after a correction is visible. */
 export const URANS_RECOVERY_REMEDIATION_VERSION =
-  "urans-recovery-2026-07-16-v2";
+  "urans-recovery-2026-07-24-v3";
 export const RANS_RECOVERY_REMEDIATION_VERSION = "rans-recovery-2026-07-16-v1";
 
 export function ransMeshRecoveryRemediationVersion(version: number): string {

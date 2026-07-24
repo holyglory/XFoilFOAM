@@ -1932,6 +1932,69 @@ def test_fresh_chunk_monitor_switches_to_frame_write_cadence(tmp_path, monkeypat
     assert f"maxDeltaT {period / pipeline.URANS_FRAME_WRITE_PER_CYCLE:.12g};" in control
 
 
+def test_live_monitor_releases_startup_courant_only_after_repeatable_periods(
+    tmp_path,
+    monkeypatch,
+):
+    """The startup Co cap stays until the physical tail repeats, then restores
+    the configured throughput ceiling without restarting the same case."""
+    tcase = tmp_path / "transient"
+    (tcase / "system").mkdir(parents=True)
+    (tcase / "system" / "controlDict").write_text(
+        "maxCo 1;\nwriteInterval 0.1;\nmaxDeltaT 0.1;\n"
+        "runTimeModifiable true;\n"
+    )
+    (tcase / "1").mkdir()
+    verdicts = iter(
+        [
+            pipeline.StablePeriodResult(
+                ok=False,
+                reason="startup still settling",
+                stable=False,
+                period_s=0.2,
+            ),
+            pipeline.StablePeriodResult(
+                ok=True,
+                reason="two stable periods with sufficient frames",
+                stable=True,
+                period_s=0.2,
+                window_start=0.6,
+                window_end=1.0,
+                cycles=2,
+                frame_count=60,
+                frames_per_cycle=30.0,
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_transient_coeff_selection",
+        lambda *_args, **_kwargs: [tmp_path / "coefficient.dat"],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "stable_two_period_window",
+        lambda *_args, **_kwargs: next(verdicts),
+    )
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        transient_max_courant=4.0,
+    )
+    monitor = pipeline._make_urans_monitor(
+        tcase,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=8.0),
+        solver_params=solver,
+        settled_max_courant=solver.transient_max_courant,
+    )
+
+    monitor()
+    assert "maxCo 1;" in (tcase / "system" / "controlDict").read_text()
+
+    monitor()
+    assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
+
+
 def test_live_control_dict_update_is_atomic_and_preserves_force_function(
     tmp_path, monkeypatch
 ):

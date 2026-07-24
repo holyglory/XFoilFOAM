@@ -72,6 +72,33 @@ def _write_coeff(path, f, n=600, dt=0.01, cl0=0.75, cd0=0.30):
     path.write_text("\n".join(lines) + "\n")
 
 
+def _write_coeff_with_late_startup_burst(path: Path) -> None:
+    """Prod-shaped URANS history: a clean wake follows a late startup burst.
+
+    The burst deliberately extends beyond the legacy 40% discard boundary.
+    It is not part of the converged wake and must remain only in immutable raw
+    evidence, never in the published/certified force window.
+    """
+    lines = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+        "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    samples = 10_001
+    for i in range(samples):
+        t = 2.0 * i / (samples - 1)
+        cl = 0.4 + 0.05 * math.sin(2 * math.pi * 10.0 * t)
+        cd = 0.03 + 0.006 * math.sin(2 * math.pi * 10.0 * t + 0.5)
+        cm = -0.05 + 0.003 * math.sin(2 * math.pi * 10.0 * t + 0.9)
+        if 0.8 <= t <= 1.16:
+            envelope = math.sin(math.pi * (t - 0.8) / 0.36) ** 2
+            cl += 2.0 * envelope * math.sin(2 * math.pi * 211.0 * t)
+            cd += 1.0 * envelope * math.sin(2 * math.pi * 162.47 * t)
+            cm += 0.6 * envelope * math.sin(2 * math.pi * 253.2 * t)
+        row = [t, cd, 0.0, 0.0, cl, 0.0, 0.0, cm, 0.0, 0.0, 0.0, 0.0, 0.0]
+        lines.append(" ".join(f"{value:.12g}" for value in row))
+    path.write_text("\n".join(lines) + "\n")
+
+
 def test_force_history_from_coefficient_dat(tmp_path):
     f = 2.0
     coeff = tmp_path / "coefficient.dat"
@@ -93,6 +120,28 @@ def test_force_history_from_coefficient_dat(tmp_path):
     # measured Strouhal: f c / U = 2 * 1 / 20 = 0.1
     assert abs(hist.strouhal - 0.1) < 0.03
     assert hist.shedding_freq_hz > 0
+
+
+def test_force_history_publishes_only_clean_periods_after_late_startup_burst(
+    tmp_path: Path,
+):
+    """MUST-CATCH: startup corruption after 40% cannot poison a clean tail."""
+    coeff = tmp_path / "coefficient.dat"
+    _write_coeff_with_late_startup_burst(coeff)
+
+    hist = force_history(
+        coeff,
+        speed=20.0,
+        chord=1.0,
+        discard_fraction=0.4,
+        target_cycles=3,
+    )
+
+    assert hist.period_s == pytest.approx(0.1, rel=0.03)
+    assert hist.retained_cycles == 3
+    assert hist.window_start is not None and hist.window_start >= 1.69
+    assert max(hist.cl) < 0.46
+    assert min(hist.cl) > 0.34
 
 
 def test_integer_period_window_uses_final_whole_periods():
@@ -139,6 +188,30 @@ def test_stable_two_period_window_requires_animation_frames(tmp_path: Path):
     assert not result.ok
     assert result.stable
     assert "frames/cycle" in result.reason
+
+
+def test_stable_two_period_window_uses_clean_tail_after_late_startup_burst(
+    tmp_path: Path,
+):
+    """The live early-stop monitor must not be poisoned by discarded startup."""
+    coeff = tmp_path / "coefficient.dat"
+    _write_coeff_with_late_startup_burst(coeff)
+    frame_times = [1.8 + i * (0.2 / 60) for i in range(61)]
+
+    result = stable_two_period_window(
+        coeff,
+        speed=20.0,
+        chord=1.0,
+        frame_times=frame_times,
+        discard_fraction=0.4,
+        min_frames_per_cycle=20,
+    )
+
+    assert result.ok
+    assert result.stable
+    assert result.period_s == pytest.approx(0.1, rel=0.03)
+    assert result.window_start is not None and result.window_start >= 1.79
+    assert result.frames_per_cycle >= 20
 
 
 def _history(t0, t1, st=0.6634408650015379, n=400, cl_rms=0.05, cd_rms=0.01):
@@ -660,12 +733,14 @@ def test_transient_attempt_accepts_force_coefficients_under_zero_folder(tmp_path
     from airfoilfoam import pipeline
     from airfoilfoam.models import FluidProperties, RoughnessParams, SolverParams
 
+    written_solver_params = []
+
     class FakeCaseBuilder:
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, *args, **_kwargs):
+            self.solver_params = args[6]
 
         def write_transient(self, *_args, **_kwargs):
-            pass
+            written_solver_params.append(self.solver_params)
 
     class FakeRunner:
         def solver(self, case_dir, *_args, **_kwargs):
@@ -701,6 +776,10 @@ def test_transient_attempt_accepts_force_coefficients_under_zero_folder(tmp_path
     assert result is not None
     assert result.avg.cl == pytest.approx(0.5)
     assert result.avg.cd == pytest.approx(0.02)
+    assert written_solver_params
+    assert written_solver_params[0].transient_max_courant == pytest.approx(
+        pipeline.URANS_STARTUP_MAX_COURANT
+    )
 
 
 def test_finalizer_archives_first_pass_failure_before_propagating(
