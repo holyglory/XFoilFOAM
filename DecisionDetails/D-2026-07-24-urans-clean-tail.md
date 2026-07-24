@@ -1,5 +1,25 @@
 # D-2026-07-24-urans-clean-tail
 
+## Repeated proven-controller remediation
+
+Ordinary preliminary URANS remains bounded to two physical runs. The July 24
+incident required several successive controller corrections on the same six
+physical cells; each failed/cancelled generation remains immutable evidence,
+so resetting `attempt_count` or relabelling those attempts would destroy the
+audit trail. Conversely, retaining the original one-remediation-ever ceiling
+would prevent the corrected v8 controller from producing the requested clean
+periods.
+
+Each distinct, proven fixed source revision may therefore add exactly one
+immutable remediation-grant row to an exhausted blocked obligation. The grant
+records the 40-character source revision, reason, and time, advances
+`max_attempts` by one, and returns the obligation to pending without changing
+any prior attempt. A unique obligation/source-revision key forbids an unchanged
+retry, and deferred database guards require the mutable summary to equal the
+immutable grant history. This keeps the normal two-run bound while allowing
+evidence-preserving recovery from more than one independently reproduced
+controller defect.
+
 ## Production evidence
 
 Remote OpenCFD 2606 job `b43323ceef034f498731fe10c5871e64`

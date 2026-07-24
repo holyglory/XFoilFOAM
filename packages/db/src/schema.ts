@@ -4187,9 +4187,10 @@ export const simPrecalcObligations = pgTable(
     state: text("state").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
     maxAttempts: integer("max_attempts").notNull().default(2),
-    /** One audited extra physical solve may be granted only after a proven
-     * engine/controller defect has been remediated. Ordinary PRECALC remains
-     * bounded to the initial solve plus one corrective solve. */
+    /** One audited extra physical solve may be granted per distinct proven
+     * engine/controller correction. Ordinary PRECALC remains bounded to the
+     * initial solve plus one corrective solve. Immutable grant history lives
+     * in sim_precalc_obligation_remediations. */
     remediationAttemptsGranted: integer("remediation_attempts_granted")
       .notNull()
       .default(0),
@@ -4237,7 +4238,7 @@ export const simPrecalcObligations = pgTable(
     ),
     attemptBoundsCheck: check(
       "sim_precalc_obligations_attempt_bounds_check",
-      sql`${t.attemptCount} >= 0 AND ${t.remediationAttemptsGranted} IN (0, 1) AND ${t.maxAttempts} = 2 + ${t.remediationAttemptsGranted} AND ${t.attemptCount} <= ${t.maxAttempts}`,
+      sql`${t.attemptCount} >= 0 AND ${t.remediationAttemptsGranted} >= 0 AND ${t.maxAttempts} = 2 + ${t.remediationAttemptsGranted} AND ${t.attemptCount} <= ${t.maxAttempts}`,
     ),
     remediationShapeCheck: check(
       "sim_precalc_obligations_remediation_shape_check",
@@ -4247,7 +4248,7 @@ export const simPrecalcObligations = pgTable(
         AND ${t.remediationSourceRevision} IS NULL
         AND ${t.remediationGrantedAt} IS NULL
       ) OR (
-        ${t.remediationAttemptsGranted} = 1
+        ${t.remediationAttemptsGranted} > 0
         AND btrim(COALESCE(${t.remediationReason}, '')) <> ''
         AND COALESCE(${t.remediationSourceRevision}, '') ~ '^[0-9a-f]{40}$'
         AND ${t.remediationGrantedAt} IS NOT NULL
@@ -4290,10 +4291,47 @@ export const simPrecalcObligations = pgTable(
   }),
 );
 
+/** Immutable evidence that a distinct, source-pinned engine/controller fix
+ * granted one additional physical PRECALC attempt. A database trigger accepts
+ * a grant only for an exhausted blocked obligation, advances its bound by one,
+ * and returns it to pending without rewriting prior attempt evidence. */
+export const simPrecalcObligationRemediations = pgTable(
+  "sim_precalc_obligation_remediations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    obligationId: uuid("obligation_id")
+      .notNull()
+      .references(() => simPrecalcObligations.id, { onDelete: "cascade" }),
+    sourceRevision: text("source_revision").notNull(),
+    reason: text("reason").notNull(),
+    grantedAt: timestamp("granted_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    sourceRevisionCheck: check(
+      "sim_precalc_obligation_remediations_source_revision_check",
+      sql`${t.sourceRevision} ~ '^[0-9a-f]{40}$'`,
+    ),
+    reasonCheck: check(
+      "sim_precalc_obligation_remediations_reason_check",
+      sql`btrim(${t.reason}) <> ''`,
+    ),
+    obligationSourceUq: unique(
+      "sim_precalc_obligation_remediations_obligation_source_uq",
+    ).on(t.obligationId, t.sourceRevision),
+    obligationIdx: index(
+      "sim_precalc_obligation_remediations_obligation_idx",
+    ).on(t.obligationId, t.grantedAt),
+  }),
+);
+
 /** Immutable per-engine-submission audit rows for a bounded precalc
- * obligation. Solver-attempt numbers remain limited to the initial solve and
- * one correction; non-CFD infrastructure/setup submissions retain a monotonic
- * audit sequence without consuming that physical budget. */
+ * obligation. Solver-attempt numbers begin with the ordinary initial solve and
+ * one correction, then advance only when an immutable, source-pinned engine
+ * remediation grant expands that physical budget. Non-CFD
+ * infrastructure/setup submissions retain a monotonic audit sequence without
+ * consuming that physical budget. */
 export const simPrecalcObligationAttempts = pgTable(
   "sim_precalc_obligation_attempts",
   {
@@ -4307,7 +4345,7 @@ export const simPrecalcObligationAttempts = pgTable(
     /** Monotonic engine-submission sequence. Infrastructure/setup failures
      * remain immutable audit rows and therefore still need their own sequence
      * even though they do not consume the ordinary two-attempt physical CFD
-     * budget or its single audited remediation allowance. */
+     * budget or its source-pinned audited remediation allowances. */
     attemptNumber: integer("attempt_number").notNull(),
     /** Physical CFD-attempt ordinal. Null means the submission ended in
      * infrastructure or deterministic setup/mesh work before usable CFD
@@ -4360,7 +4398,7 @@ export const simPrecalcObligationAttempts = pgTable(
     ),
     solverNumberCheck: check(
       "sim_precalc_obligation_attempts_solver_number_check",
-      sql`${t.solverAttemptNumber} IS NULL OR ${t.solverAttemptNumber} IN (1, 2, 3)`,
+      sql`${t.solverAttemptNumber} IS NULL OR ${t.solverAttemptNumber} > 0`,
     ),
     meshRecoveryVersionCheck: check(
       "sim_precalc_obligation_attempts_mesh_recovery_version_check",

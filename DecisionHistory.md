@@ -40,6 +40,10 @@
   [D-2026-07-19-urans-physical-tail]
   [D-2026-07-20-urans-continuation-wall-budget]
   [D-2026-07-24-urans-clean-tail]
+  A proven controller correction may grant one immutable, source-pinned
+  remediation attempt per distinct fixed source revision. Ordinary work still
+  has two physical attempts; grants never reset or relabel prior evidence, and
+  an unchanged revision cannot grant another run.
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver

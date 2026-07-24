@@ -772,15 +772,15 @@ describe("0043→0047 PRECALC upgrade data", () => {
   }, 180_000);
 });
 
-describe("0084 PRECALC engine-remediation grant", () => {
+describe("0084/0089 PRECALC engine-remediation grants", () => {
   const obligationId = "90000000-0000-0000-0000-000000000084";
 
-  it("MUST-CATCH: permits one audited third physical run without resetting prior evidence", async () => {
+  it("MUST-CATCH: permits one immutable grant per distinct fixed source without resetting prior evidence", async () => {
     await client!.unsafe(`
       INSERT INTO sim_precalc_obligations
         (id, airfoil_id, revision_id, aoa_deg, state, attempt_count, max_attempts)
       VALUES
-        ('${obligationId}', '${ID.airfoil}', '${ID.revision}', 84, 'pending', 2, 2)
+        ('${obligationId}', '${ID.airfoil}', '${ID.revision}', 84, 'blocked', 2, 2)
     `);
     try {
       await expect(
@@ -792,19 +792,27 @@ describe("0084 PRECALC engine-remediation grant", () => {
       ).rejects.toThrow(/sim_precalc_obligations_attempt_bounds_check/);
 
       await client!.unsafe(`
-        UPDATE sim_precalc_obligations
-        SET remediation_attempts_granted = 1,
-            max_attempts = 3,
-            remediation_reason = 'period-horizon controller fixed after exact production reproduction',
-            remediation_source_revision = '79a33dab5f5a770f428d3827550676a70c1ac141',
-            remediation_granted_at = now(),
-            last_outcome = 'corrective_engine_fix_retry_pending'
-        WHERE id = '${obligationId}'
+        INSERT INTO sim_precalc_obligation_remediations
+          (obligation_id, source_revision, reason)
+        VALUES (
+          '${obligationId}',
+          '79a33dab5f5a770f428d3827550676a70c1ac141',
+          'period-horizon controller fixed after exact production reproduction'
+        )
       `);
       await client!.unsafe(`
         UPDATE sim_precalc_obligations
-        SET attempt_count = 3
+        SET attempt_count = 3, state = 'blocked'
         WHERE id = '${obligationId}'
+      `);
+      await client!.unsafe(`
+        INSERT INTO sim_precalc_obligation_remediations
+          (obligation_id, source_revision, reason)
+        VALUES (
+          '${obligationId}',
+          '15872f4cb7fd204917a38606f87e78ee4de04f3f',
+          'restart-seam classifier fixed after exact remote reproduction'
+        )
       `);
 
       const [row] = await client!.unsafe<
@@ -825,21 +833,47 @@ describe("0084 PRECALC engine-remediation grant", () => {
       `);
       expect(row).toMatchObject({
         attempt_count: 3,
-        max_attempts: 3,
-        remediation_attempts_granted: 1,
-        remediation_source_revision: "79a33dab5f5a770f428d3827550676a70c1ac141",
+        max_attempts: 4,
+        remediation_attempts_granted: 2,
+        remediation_source_revision: "15872f4cb7fd204917a38606f87e78ee4de04f3f",
       });
-      expect(row?.remediation_reason).toContain("controller fixed");
+      expect(row?.remediation_reason).toContain("restart-seam");
       expect(Date.parse(row?.remediation_granted_at ?? "")).not.toBeNaN();
+
+      const grants = await client!.unsafe<
+        Array<{ source_revision: string; reason: string }>
+      >(`
+        SELECT source_revision, reason
+        FROM sim_precalc_obligation_remediations
+        WHERE obligation_id = '${obligationId}'
+        ORDER BY granted_at, id
+      `);
+      expect(grants).toHaveLength(2);
+      expect(grants.map((grant) => grant.source_revision)).toEqual([
+        "79a33dab5f5a770f428d3827550676a70c1ac141",
+        "15872f4cb7fd204917a38606f87e78ee4de04f3f",
+      ]);
 
       await expect(
         client!.unsafe(`
           UPDATE sim_precalc_obligations
-          SET remediation_attempts_granted = 2,
-              max_attempts = 4
+          SET remediation_attempts_granted = 3,
+              max_attempts = 5
           WHERE id = '${obligationId}'
         `),
-      ).rejects.toThrow(/sim_precalc_obligations_attempt_bounds_check/);
+      ).rejects.toThrow(/remediation summary differs/);
+
+      await expect(
+        client!.unsafe(`
+          INSERT INTO sim_precalc_obligation_remediations
+            (obligation_id, source_revision, reason)
+          VALUES (
+            '${obligationId}',
+            'dbe0eb143064176868348f292de11bde4db8fc47',
+            'must not grant an unchanged non-exhausted retry'
+          )
+        `),
+      ).rejects.toThrow(/requires an exhausted blocked obligation/);
     } finally {
       await client!.unsafe(`
         DELETE FROM sim_precalc_obligations WHERE id = '${obligationId}'

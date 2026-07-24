@@ -624,6 +624,13 @@
       "when": 1788480000000,
       "tag": "0088_remote_transfer_maintenance_fence",
       "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1788566400000,
+      "tag": "0089_repeatable_engine_remediation_grants",
+      "breakpoints": true
     }
   ]
 }

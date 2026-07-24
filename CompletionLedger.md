@@ -72,15 +72,19 @@
   and final clean-tail publication remain strict. Its
   failing-before/fixed-after seam regression, 95-test frame-track file,
   TypeScript incident checks/typecheck, and the full 1,287-test non-integration
-  engine suite pass; guarded deployment remains active. An operator-side
+  engine suite pass. Both guarded engines now report recovery v8. The original
+  single-remediation ceiling was exhausted by the successive v4–v7 controller
+  corrections, so an immutable one-grant-per-distinct-fixed-source ledger is
+  implemented and awaits migration/deployment before the six exact v8
+  corrective obligations can resume. An operator-side
   live-dictionary edit
   during diagnosis caused four v6 cases to stop with immutable rejected
   evidence; all four canonical archives authenticated every manifest member,
   their unpacked duplicates were restored exactly, and the runbook now forbids
-  direct live dictionary edits. The v7 engines are deployed at restored
-  8/40-slot admission while the exact six-angle corrective run remains
-  evidence-bearing but not publishable.
-  Readiness still requires a guarded v8 deployment, restored 8/40-slot
+  direct live dictionary edits. The v8 engines are deployed while both
+  execution pools remain fenced for the remediation migration; the exact
+  six-angle corrective run remains evidence-bearing but not publishable.
+  Readiness still requires the remediation-grant migration, restored 8/40-slot
   admission, evidence-preserving v8 reruns for the still-unresolved angles,
   three clean whole periods for all six exact obligations, GCS binding and
   obsolete-generation retirement, and no recurring current-generation
