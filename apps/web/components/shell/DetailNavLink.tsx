@@ -1,11 +1,19 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { type MouseEventHandler, useEffect, useState } from "react";
 
 import { C } from "@/lib/tokens";
 
-export function DetailNavLink({ active }: { active: boolean }) {
+export function DetailNavLink({
+  active,
+  mobile = false,
+  onNavigate,
+}: {
+  active: boolean;
+  mobile?: boolean;
+  onNavigate?: MouseEventHandler<HTMLAnchorElement>;
+}) {
   const [href, setHref] = useState("/?chooseDetail=1");
 
   useEffect(() => {
@@ -16,12 +24,15 @@ export function DetailNavLink({ active }: { active: boolean }) {
   return (
     <Link
       href={href}
+      onClick={onNavigate}
       style={{
         padding: "6px 13px",
         borderRadius: 7,
         color: active ? C.text : C.muted,
         background: active ? C.navActive : "transparent",
         fontWeight: active ? 600 : 400,
+        display: mobile ? "block" : undefined,
+        width: mobile ? "100%" : undefined,
       }}
     >
       Detail

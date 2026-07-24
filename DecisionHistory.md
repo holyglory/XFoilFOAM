@@ -86,6 +86,28 @@
   deterministic primary inside conservative Cl/Cd/Cm repeatability bounds, and
   reserve conflict-only gaps for material disagreement.
   [D-2026-07-23-public-polar-repeatability](DecisionDetails/D-2026-07-23-public-polar-repeatability.md)
+- Confirmed interface direction: public and admin pages are distinct surfaces
+  with one route-owned navigation system. Primary navigation must remain fully
+  reachable without horizontal scrolling; narrow layouts use accessible burger
+  menus while desktop keeps the established public tabs and admin sidebar.
+  [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
+
+Detail: [DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+- Decision: public routes keep the public Browse/Search/Detail/Compare
+  navigation and collapse it into an accessible burger below 860 px. Admin
+  routes render an admin-branded top bar with no public navigation; their
+  Simulations/Solver/Health/Setup/Catalog/Sync navigation stays a sidebar on
+  desktop and becomes a burger menu below 940 px. Neither primary navigation
+  may use horizontal scrolling.
+- Why: the prior alternatives—two stacked navigation systems on `/admin`,
+  horizontally scrolling tabs, or hiding destinations without a replacement—
+  made the surface ambiguous and visibly produced scrollbars at 653 px. One
+  route-owned menu preserves every destination, removes duplicated hierarchy,
+  and keeps the narrow-screen page within the viewport without changing
+  desktop information architecture.
 
 ## D-2026-07-23-public-polar-repeatability — Bounded repeat noise does not erase a public polar
 

@@ -14,11 +14,13 @@ import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import {
   ExternalLink,
+  Menu,
   Pause,
   Play,
   RotateCcw,
   ShieldAlert,
   Trash2,
+  X,
 } from "lucide-react";
 
 import {
@@ -313,6 +315,7 @@ export function AdminConsole() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loginErr, setLoginErr] = useState<string | null>(null);
+  const [adminNavOpen, setAdminNavOpen] = useState(false);
 
   // ---- routing (spec §11): URL search params are the single source of truth
   // for section / campaign / wizard / step / tab — no mirrored useState.
@@ -325,6 +328,8 @@ export function AdminConsole() {
   const section: Section = SECTION_KEYS.has(rawSection)
     ? (rawSection as Section)
     : "simulations";
+  const activeSection =
+    SECTIONS.find((item) => item.k === section) ?? SECTIONS[0];
   const campaignParam =
     section === "simulations" ? searchParams.get("campaign") : null;
   const wizardParam =
@@ -338,6 +343,33 @@ export function AdminConsole() {
     ? Math.min(4, Math.max(1, stepRaw))
     : 1;
   const tabParam = searchParams.get("tab");
+
+  useEffect(() => {
+    setAdminNavOpen(false);
+  }, [section, campaignParam, wizardParam]);
+
+  useEffect(() => {
+    if (!adminNavOpen) return;
+
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAdminNavOpen(false);
+    };
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (
+        event.target instanceof Element &&
+        !event.target.closest("[data-admin-nav-root]")
+      ) {
+        setAdminNavOpen(false);
+      }
+    };
+
+    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+    };
+  }, [adminNavOpen]);
 
   // Dirty flag reported by the wizard (drafts persist to sessionStorage; the
   // guard is about accidental navigation, not data loss — copy stays honest).
@@ -561,12 +593,19 @@ export function AdminConsole() {
           gap: 22px;
           align-items: start;
         }
+        .admin-nav-column {
+          position: sticky;
+          top: 70px;
+          z-index: 20;
+          min-width: 0;
+        }
+        .admin-mobile-nav-button {
+          display: none;
+        }
         .admin-section-nav {
           display: flex;
           flex-direction: column;
           gap: 4px;
-          position: sticky;
-          top: 70px;
         }
         .admin-editor-grid {
           display: grid;
@@ -631,14 +670,54 @@ export function AdminConsole() {
           .admin-shell-grid {
             grid-template-columns: minmax(0, 1fr);
           }
-          .admin-section-nav {
-            position: static !important;
-            flex-direction: row !important;
-            overflow-x: auto;
-            padding-bottom: 4px;
+          .admin-nav-column {
+            position: relative;
+            top: auto;
           }
-          .admin-section-nav button {
-            flex: 0 0 auto;
+          .admin-mobile-nav-button {
+            display: flex;
+            width: min(100%, 320px);
+            min-width: 0;
+            align-items: center;
+            gap: 9px;
+            padding: 9px 11px;
+            color: ${C.teal};
+            background: ${C.panel2};
+            border: 1px solid ${C.tealBorder};
+            border-radius: 8px;
+            font-family: ${MONO};
+            font-size: 12px;
+            font-weight: 600;
+            text-align: left;
+            cursor: pointer;
+          }
+          .admin-mobile-nav-button:hover,
+          .admin-mobile-nav-button:focus-visible {
+            color: ${C.text};
+            border-color: ${C.teal};
+            outline: none;
+          }
+          .admin-mobile-nav-label {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+          .admin-section-nav {
+            display: none;
+            position: absolute;
+            top: calc(100% + 6px);
+            left: 0;
+            z-index: 30;
+            width: min(320px, 100%);
+            padding: 7px;
+            background: ${C.popover};
+            border: 1px solid ${C.stroke};
+            border-radius: 10px;
+            box-shadow: 0 16px 38px ${C.shadow};
+          }
+          .admin-section-nav[data-open="true"] {
+            display: flex;
           }
           .admin-editor-grid {
             grid-template-columns: minmax(0, 1fr);
@@ -741,55 +820,80 @@ export function AdminConsole() {
       )}
 
       <div className="admin-shell-grid">
-        <nav className="admin-section-nav">
-          {SECTIONS.map((s) => {
-            const on = section === s.k;
-            return (
-              <button
-                key={s.k}
-                type="button"
-                data-testid={`admin-nav-${s.k}`}
-                onClick={() => {
-                  // Clicking the active section with no sub-state is a no-op
-                  // (no duplicate history entries).
-                  if (on && !campaignParam && !wizardKind && !tabParam) return;
-                  if (!confirmLeaveWizard()) return;
-                  wizardDirtyRef.current = false;
-                  navigate(
-                    s.k === "simulations" ? {} : { section: s.k },
-                    "push",
-                  );
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 9,
-                  textAlign: "left",
-                  fontFamily: MONO,
-                  fontSize: 12,
-                  color: on ? C.teal : C.muted,
-                  background: on ? C.navActive : "transparent",
-                  border: `1px solid ${on ? C.tealBorder : "transparent"}`,
-                  borderRadius: 8,
-                  padding: "9px 11px",
-                  cursor: "pointer",
-                  fontWeight: on ? 600 : 400,
-                }}
-              >
-                <span
+        <div className="admin-nav-column" data-admin-nav-root>
+          <button
+            type="button"
+            className="admin-mobile-nav-button"
+            data-testid="admin-nav-menu-button"
+            aria-label={
+              adminNavOpen ? "Close admin navigation" : "Open admin navigation"
+            }
+            aria-expanded={adminNavOpen}
+            aria-controls="admin-section-navigation"
+            onClick={() => setAdminNavOpen((open) => !open)}
+          >
+            {adminNavOpen ? <X size={17} /> : <Menu size={17} />}
+            <span className="admin-mobile-nav-label">
+              {activeSection.label}
+            </span>
+          </button>
+          <nav
+            id="admin-section-navigation"
+            className="admin-section-nav"
+            data-open={adminNavOpen ? "true" : "false"}
+            aria-label="Admin navigation"
+          >
+            {SECTIONS.map((s) => {
+              const on = section === s.k;
+              return (
+                <button
+                  key={s.k}
+                  type="button"
+                  data-testid={`admin-nav-${s.k}`}
+                  onClick={() => {
+                    setAdminNavOpen(false);
+                    // Clicking the active section with no sub-state is a no-op
+                    // (no duplicate history entries).
+                    if (on && !campaignParam && !wizardKind && !tabParam)
+                      return;
+                    if (!confirmLeaveWizard()) return;
+                    wizardDirtyRef.current = false;
+                    navigate(
+                      s.k === "simulations" ? {} : { section: s.k },
+                      "push",
+                    );
+                  }}
                   style={{
-                    width: 14,
-                    textAlign: "center",
-                    opacity: on ? 1 : 0.7,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 9,
+                    textAlign: "left",
+                    fontFamily: MONO,
+                    fontSize: 12,
+                    color: on ? C.teal : C.muted,
+                    background: on ? C.navActive : "transparent",
+                    border: `1px solid ${on ? C.tealBorder : "transparent"}`,
+                    borderRadius: 8,
+                    padding: "9px 11px",
+                    cursor: "pointer",
+                    fontWeight: on ? 600 : 400,
                   }}
                 >
-                  {s.icon}
-                </span>
-                {s.label}
-              </button>
-            );
-          })}
-        </nav>
+                  <span
+                    style={{
+                      width: 14,
+                      textAlign: "center",
+                      opacity: on ? 1 : 0.7,
+                    }}
+                  >
+                    {s.icon}
+                  </span>
+                  {s.label}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
 
         <div style={{ minWidth: 0 }}>
           {section === "simulations" && campaignParam && (
