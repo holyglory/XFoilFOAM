@@ -611,7 +611,7 @@ def stable_two_period_window(
         cm,
         min_samples=max(16, min_samples_per_cycle * 2),
     ):
-        tc, clc, cdc, _cmc = candidate
+        tc, clc, cdc, cmc = candidate
         freq = dominant_frequency(
             tc,
             clc,
@@ -639,6 +639,24 @@ def stable_two_period_window(
             best = best or StablePeriodResult(
                 ok=False,
                 reason="not enough samples per period",
+                period_s=period,
+                window_start=window.start,
+                window_end=window.end,
+                cycles=2,
+            )
+            continue
+
+        retained_mask = (tc >= window.start) & (tc <= window.end)
+        if _has_impulsive_discontinuity(
+            tc[retained_mask],
+            clc[retained_mask],
+            cdc[retained_mask],
+            cmc[retained_mask],
+        ):
+            best = best or StablePeriodResult(
+                ok=False,
+                reason="candidate periods contain an impulsive discontinuity",
+                stable=False,
                 period_s=period,
                 window_start=window.start,
                 window_end=window.end,

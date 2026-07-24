@@ -98,20 +98,25 @@
 Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-2026-07-24-urans-clean-tail.md)
 
 - Decision: every URANS physical chunk starts at `Co <= 1` and may restore the
-  configured Courant ceiling only after the live force monitor measures two
-  repeatable periods. Raw trajectories remain immutable, but preliminary
-  certification searches the latest clean physical suffix when a fixed startup
-  discard leaves the period missing or ambiguous. Accepted preliminary force
-  histories and media expose exactly the last three clean whole periods; the
-  existing 4.5-period independent-half/stationarity certificate remains the
-  acceptance floor.
+  configured Courant ceiling only after the live monitor measures two
+  repeatable, discontinuity-free periods with at least 20 stored field frames
+  per period. A tentative force cadence may densify future field writes but
+  cannot relax `maxCo` or `maxDeltaT`. Raw trajectories remain immutable, but
+  preliminary certification searches the latest clean physical suffix when a
+  fixed startup discard leaves the period missing or ambiguous. Accepted
+  preliminary force histories and media expose exactly the last three clean
+  whole periods; the existing 4.5-period independent-half/stationarity
+  certificate remains the acceptance floor.
 - Why: keeping only the fixed 40% discard let a late numerical startup burst
-  poison period detection and display despite a clean wake tail. Permanently
-  reducing the whole run to `Co <= 1` was safe but needlessly expensive, and
-  accepting arbitrary visually periodic tails could promote out-of-band
-  numerical oscillations. Conservative startup plus measured release prevents
-  the burst, while a physically banded suffix selector reuses valid stored
-  evidence without deleting raw history or weakening stationarity.
+  poison period detection and display despite a clean wake tail; a first live
+  rollout also proved that force-only phase similarity could release the
+  timestep while its newest slice still contained an impulse and only three
+  field frames per period. Permanently reducing the whole run to `Co <= 1` was
+  safe but needlessly expensive, and accepting arbitrary visually periodic
+  tails could promote out-of-band numerical oscillations. Conservative startup
+  plus the complete publishable-period gate prevents both bursts, while a
+  physically banded suffix selector reuses valid stored evidence without
+  deleting raw history or weakening stationarity.
 
 ## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
 

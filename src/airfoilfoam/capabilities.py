@@ -21,4 +21,4 @@ MESH_RECOVERY_VERSION = 2
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 3
+URANS_RECOVERY_VERSION = 4

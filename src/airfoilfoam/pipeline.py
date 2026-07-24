@@ -2779,16 +2779,22 @@ def _make_urans_monitor(
             previous = state.get("cadence_period")
             if previous is None or abs(float(previous) - period) / max(period, 1e-12) > 0.15:
                 write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
+                cadence_entries: dict[str, object] = {
+                    "writeInterval": write_interval,
+                    "runTimeModifiable": True,
+                }
+                # A tentative force cadence is enough to request denser field
+                # writes, but not enough to relax the conservative physical
+                # timestep.  Keep the startup maxDeltaT until the same two
+                # periods also carry the required publishable field frames.
+                if result.ok:
+                    cadence_entries["maxDeltaT"] = write_interval
                 _set_control_dict_entries(
                     tcase / "system" / "controlDict",
-                    {
-                        "writeInterval": write_interval,
-                        "maxDeltaT": write_interval,
-                        "runTimeModifiable": True,
-                    },
+                    cadence_entries,
                 )
                 state["cadence_period"] = period
-        if result.stable and period is not None and period > 0:
+        if result.ok and result.stable and period is not None and period > 0:
             # Every physical chunk starts conservatively.  Only a measured,
             # repeatable tail may release the configured production Courant
             # ceiling; startup bursts therefore cannot be amplified by a

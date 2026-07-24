@@ -33,22 +33,20 @@
   build-scoped terminal cancellation are regression-verified. The guarded
   remote maintenance path correctly treats durable `blocked` delivery
   conflicts as terminal, inert review records while still refusing
-  retryable/claimed deliveries. The remote control plane and OpenCFD 2606
-  engine are deployed as `hz-solver2-2800bba-urans-watchdog`; runtime source
-  inspection proves the exact live-process watcher and isolated steady
-  initialization evidence are installed. Its 40-CPU cap is restored, but the
-  production hub currently accepts TCP without emitting SSH or HTTP protocol
-  responses. Eight leases containing 87 active angles remain durable on the
-  remote node and no engine job is admitted while the authoritative hub is
-  unreachable. Production control-plane deployment and the remote burn-in
-  remain incomplete. URANS recovery v3 regression-proves conservative
-  `Co <= 1` chunk startup, measured Courant release, and physically banded clean
-  trailing-period selection; it is not yet deployed. Exact pre-v3 corrupted
-  attempts must receive only the audited source-pinned remediation allowance,
-  then publish three clean whole periods and retire their obsolete generations.
-  Readiness requires production VPS recovery, deployment of the typed
-  cancellation API and URANS recovery v3, then proof of remote CPU refill,
-  accepted-result delivery, and no recurrence of the false kill/reclaim chain.
+  retryable/claimed deliveries. The production hub is reachable and both
+  engines received URANS recovery v3, but its first corrective run proved that
+  force-only phase similarity could release the conservative timestep with
+  only three field frames per period while an impulse remained in the newest
+  suffix. Both OpenCFD 2606 pools and remote new-work admission are now closed,
+  and all in-flight v3 tasks were cancelled through the normal
+  evidence-preserving API before publication. Recovery v4 adds the
+  discontinuity and 20-frames-per-period release gate and is
+  regression-verified but not yet deployed. The exact pre-v3 corrupted
+  attempts must retain their audited source-pinned remediation allowance,
+  restart under v4, publish three clean whole periods, bind their evidence to
+  GCS, and retire their obsolete generations. Readiness requires guarded v4
+  deployment, restored 8/40-slot admission, accepted corrective-result
+  delivery, and no recurring current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

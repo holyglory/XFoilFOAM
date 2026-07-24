@@ -1916,9 +1916,15 @@ def test_fresh_chunk_monitor_switches_to_frame_write_cadence(tmp_path, monkeypat
         pipeline,
         "stable_two_period_window",
         lambda *_args, **_kwargs: pipeline.StablePeriodResult(
-            ok=False,
-            reason="period locked",
+            ok=True,
+            reason="two stable periods with sufficient frames",
+            stable=True,
             period_s=period,
+            window_start=0.6,
+            window_end=1.0,
+            cycles=2,
+            frame_count=60,
+            frames_per_cycle=30.0,
         ),
     )
 
@@ -1993,6 +1999,64 @@ def test_live_monitor_releases_startup_courant_only_after_repeatable_periods(
 
     monitor()
     assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
+
+
+def test_live_monitor_keeps_startup_courant_until_period_frames_are_publishable(
+    tmp_path,
+    monkeypatch,
+):
+    """A force-only cadence match must not release the startup timestep.
+
+    Production can momentarily repeat an impulsive startup shape before enough
+    field states exist to prove two usable periods.  ``stable=True`` without
+    the complete frame-density verdict is therefore only a cadence hint, not
+    permission to raise maxCo.
+    """
+    tcase = tmp_path / "transient"
+    (tcase / "system").mkdir(parents=True)
+    (tcase / "system" / "controlDict").write_text(
+        "maxCo 1;\nwriteInterval 0.1;\nmaxDeltaT 0.1;\n"
+        "runTimeModifiable true;\n"
+    )
+    (tcase / "1").mkdir()
+    monkeypatch.setattr(
+        pipeline,
+        "_transient_coeff_selection",
+        lambda *_args, **_kwargs: [tmp_path / "coefficient.dat"],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "stable_two_period_window",
+        lambda *_args, **_kwargs: pipeline.StablePeriodResult(
+            ok=False,
+            reason="frames/cycle 3.00 < 20.00",
+            stable=True,
+            period_s=0.2,
+            window_start=0.6,
+            window_end=1.0,
+            cycles=2,
+            frame_count=6,
+            frames_per_cycle=3.0,
+        ),
+    )
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        transient_max_courant=4.0,
+    )
+    monitor = pipeline._make_urans_monitor(
+        tcase,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=8.0),
+        solver_params=solver,
+        settled_max_courant=solver.transient_max_courant,
+    )
+
+    monitor()
+
+    control = (tcase / "system" / "controlDict").read_text()
+    assert "maxCo 1;" in control
+    assert "maxCo 4;" not in control
+    assert "maxDeltaT 0.1;" in control
 
 
 def test_live_control_dict_update_is_atomic_and_preserves_force_function(
@@ -2072,8 +2136,8 @@ def test_early_stop_retention_is_fidelity_aware(
         pipeline,
         "stable_two_period_window",
         lambda *_args, **_kwargs: pipeline.StablePeriodResult(
-            ok=False,
-            reason="stable, retention pending",
+            ok=True,
+            reason="two stable periods with sufficient frames",
             stable=True,
             period_s=period,
             window_start=0.0,

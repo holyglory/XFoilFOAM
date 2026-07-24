@@ -4,6 +4,7 @@ import signal
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from airfoilfoam import pipeline
@@ -212,6 +213,57 @@ def test_stable_two_period_window_uses_clean_tail_after_late_startup_burst(
     assert result.period_s == pytest.approx(0.1, rel=0.03)
     assert result.window_start is not None and result.window_start >= 1.79
     assert result.frames_per_cycle >= 20
+
+
+def test_stable_two_period_window_rejects_impulsive_candidate(tmp_path: Path):
+    """A one-step jump can look phase-similar after amplitude normalization.
+
+    It is corrupt numerical evidence, not a repeatable physical period, and
+    must not release the conservative startup timestep or certify early stop.
+    """
+    coeff = tmp_path / "coefficient.dat"
+    times = np.arange(0.0, 1.002, 0.002)
+    period = 0.2
+
+    def cl_at(t: float) -> float:
+        wave = 0.7 + 0.08 * math.sin(2.0 * math.pi * t / period)
+        return 3.7 if abs(t - 0.7) < 1e-12 else wave
+
+    lines = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+        "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    for t in times:
+        row = [
+            t,
+            0.03,
+            0.0,
+            0.0,
+            cl_at(float(t)),
+            0.0,
+            0.0,
+            -0.05,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+        lines.append(" ".join(f"{value:.12g}" for value in row))
+    coeff.write_text("\n".join(lines) + "\n")
+    frame_times = [0.6 + i * (0.4 / 60) for i in range(61)]
+
+    result = stable_two_period_window(
+        coeff,
+        speed=25.0,
+        chord=1.0,
+        frame_times=frame_times,
+        min_frames_per_cycle=20,
+    )
+
+    assert not result.ok
+    assert not result.stable
+    assert "impulsive discontinuity" in result.reason
 
 
 def _history(t0, t1, st=0.6634408650015379, n=400, cl_rms=0.05, cd_rms=0.01):
