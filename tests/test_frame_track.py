@@ -2001,6 +2001,149 @@ def test_live_monitor_releases_startup_courant_only_after_repeatable_periods(
     assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
 
 
+def test_live_monitor_recovers_impulsive_tail_with_tight_numerics(
+    tmp_path,
+    monkeypatch,
+):
+    """MUST-CATCH: a transient impulse train must trigger a clean-tail retry.
+
+    A live OpenCFD 2606 canary at 20-32C/Re~102k/alpha=13 retained recurring
+    one/two-step Cl/Cd/Cm discontinuities at the ordinary startup settings.
+    Tighter pressure/transport solves with a 4x3 PIMPLE loop removed the
+    recurrence.  Once that recovery is armed, the monitor must restore the
+    conservative Courant/timestep ceiling and must not release it again merely
+    because the later clean tail becomes repeatable.
+    """
+    tcase = tmp_path / "transient"
+    (tcase / "system").mkdir(parents=True)
+    (tcase / "system" / "controlDict").write_text(
+        "maxCo 1;\nwriteInterval 0.1;\nmaxDeltaT 0.01;\n"
+        "runTimeModifiable true;\n"
+    )
+    (tcase / "system" / "fvSolution").write_text(
+        """
+solvers
+{
+    p
+    {
+        tolerance 1e-07;
+        relTol 0.05;
+    }
+    pFinal
+    {
+        tolerance 1e-06;
+        relTol 0;
+    }
+    "(k|omega|U).*"
+    {
+        tolerance 1e-08;
+        relTol 0.1;
+    }
+}
+PIMPLE
+{
+    nOuterCorrectors 3;
+    nCorrectors 2;
+}
+"""
+    )
+    (tcase / "1").mkdir()
+    stable = pipeline.StablePeriodResult(
+        ok=True,
+        reason="two stable periods with sufficient frames",
+        stable=True,
+        period_s=0.2,
+        window_start=0.6,
+        window_end=1.0,
+        cycles=2,
+        frame_count=60,
+        frames_per_cycle=30.0,
+    )
+    verdicts = iter(
+        [
+            stable,
+            pipeline.StablePeriodResult(
+                ok=False,
+                reason="candidate periods contain an impulsive discontinuity",
+                stable=False,
+                period_s=0.2,
+                window_start=0.6,
+                window_end=1.0,
+                cycles=2,
+            ),
+            stable,
+        ]
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_transient_coeff_selection",
+        lambda *_args, **_kwargs: [tmp_path / "coefficient.dat"],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "stable_two_period_window",
+        lambda *_args, **_kwargs: next(verdicts),
+    )
+    solver = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        transient_max_courant=4.0,
+    )
+    monitor = pipeline._make_urans_monitor(
+        tcase,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=13.0),
+        solver_params=solver,
+        settled_max_courant=solver.transient_max_courant,
+        startup_max_delta_t=0.01,
+    )
+
+    monitor()
+    assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
+
+    monitor()
+    control = (tcase / "system" / "controlDict").read_text()
+    assert "maxCo 1;" in control
+    assert "maxDeltaT 0.01;" in control
+    solution = (tcase / "system" / "fvSolution").read_text()
+    assert "nOuterCorrectors 4;" in solution
+    assert "nCorrectors 3;" in solution
+    assert "tolerance 1e-08;" in solution
+    assert "relTol 0.01;" in solution
+    marker = json.loads(
+        (tcase / pipeline.URANS_IMPULSE_RECOVERY_MARKER).read_text()
+    )
+    assert marker["trigger_reason"] == (
+        "candidate periods contain an impulsive discontinuity"
+    )
+    assert marker["trigger_time"] == pytest.approx(1.0)
+
+    monitor()
+    control = (tcase / "system" / "controlDict").read_text()
+    assert "maxCo 1;" in control
+    assert "maxCo 4;" not in control
+
+    # A same-case continuation owns a fresh monitor closure. The immutable
+    # recovery marker must carry the conservative-Courant decision across that
+    # boundary instead of releasing back to the setting that caused the
+    # condemned prefix.
+    monkeypatch.setattr(
+        pipeline,
+        "stable_two_period_window",
+        lambda *_args, **_kwargs: stable,
+    )
+    restarted_monitor = pipeline._make_urans_monitor(
+        tcase,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=13.0),
+        solver_params=solver,
+        settled_max_courant=solver.transient_max_courant,
+        startup_max_delta_t=0.01,
+    )
+    restarted_monitor()
+    control = (tcase / "system" / "controlDict").read_text()
+    assert "maxCo 1;" in control
+    assert "maxCo 4;" not in control
+
+
 def test_live_monitor_keeps_startup_courant_until_period_frames_are_publishable(
     tmp_path,
     monkeypatch,

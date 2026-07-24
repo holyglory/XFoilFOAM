@@ -100,7 +100,11 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
 - Decision: every URANS physical chunk starts at `Co <= 1` and may restore the
   configured Courant ceiling only after the live monitor measures two
   repeatable, discontinuity-free periods with at least 20 stored field frames
-  per period. A tentative force cadence may densify future field writes but
+  per period. If a later candidate contains an impulsive Cl/Cd/Cm
+  discontinuity, the live case automatically tightens pressure/transport
+  convergence, deepens the PIMPLE correction loop, restores `Co <= 1`, and
+  restarts certification; that physical chunk may not release the conservative
+  cap again. A tentative force cadence may densify future field writes but
   cannot relax `maxCo` or `maxDeltaT`. Field output uses `runTime`, so matching
   a write boundary never shortens or otherwise reschedules the physical
   Courant-controlled timestep. Raw trajectories remain immutable, but
@@ -119,9 +123,13 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
   `adjustableRunTime` and trimming every output-alignment spike could never
   yield a continuously clean suffix; `runTime` preserves the physical march
   and only relaxes exact frame timestamps. Conservative startup plus the
-  complete publishable-period gate prevents both bursts, while a physically
-  banded suffix selector reuses valid stored evidence without deleting raw
-  history or weakening stationarity.
+  complete publishable-period gate prevents both bursts. A subsequent live
+  canary proved that timestep reduction alone did not clear a recurring
+  high-angle pressure impulse, while tighter linear-solver tolerances and a
+  4×3 PIMPLE loop did. The automatic recovery rung applies that measured cure
+  only after the discontinuity detector fires, preserving ordinary throughput;
+  the physically banded suffix selector then reuses only valid stored evidence
+  without deleting raw history or weakening stationarity.
 
 ## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
 

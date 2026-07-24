@@ -94,6 +94,10 @@ _TRANSIENT_START_FILENAME = "transient_start.json"
 _TRANSIENT_START_ARCHIVE_MEMBER = "openfoam/transient/transient_start.json"
 _URANS_EARLY_STOP_FILENAME = "urans_early_stop.json"
 _URANS_EARLY_STOP_ARCHIVE_MEMBER = "openfoam/transient/urans_early_stop.json"
+_URANS_IMPULSE_RECOVERY_FILENAME = "urans_impulse_recovery.json"
+_URANS_IMPULSE_RECOVERY_ARCHIVE_MEMBER = (
+    "openfoam/transient/urans_impulse_recovery.json"
+)
 _MARCH_BUDGET_FILENAME = "march_budget.json"
 _MAX_TRANSIENT_MARKER_BYTES = 64 * 1024
 _IMMUTABLE_TRANSIENT_MARKERS = {
@@ -103,6 +107,10 @@ _IMMUTABLE_TRANSIENT_MARKERS = {
     ),
     _URANS_EARLY_STOP_FILENAME: (
         _URANS_EARLY_STOP_ARCHIVE_MEMBER,
+        "quality_evidence",
+    ),
+    _URANS_IMPULSE_RECOVERY_FILENAME: (
+        _URANS_IMPULSE_RECOVERY_ARCHIVE_MEMBER,
         "quality_evidence",
     ),
 }

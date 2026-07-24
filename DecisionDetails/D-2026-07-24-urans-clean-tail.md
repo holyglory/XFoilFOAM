@@ -32,10 +32,12 @@ timesteps are not promoted into aerodynamic evidence.
    stored field frames per period, and search physically banded trailing
    suffixes only when the ordinary retained history cannot corroborate a
    period. A tentative cadence may change only the field-write interval; it
-   cannot relax `maxCo` or `maxDeltaT`. Selected: it prevents large adaptive
-   timesteps during the vulnerable restart/startup interval, restores normal
-   throughput on fully evidenced settled cases, and salvages only evidence
-   that passes the unchanged physical and stationarity gates.
+   cannot relax `maxCo` or `maxDeltaT`. If the discontinuity gate later fires,
+   tighten the linear solves and PIMPLE loop in place, restore the conservative
+   ceiling, and restart certification after the contaminated prefix. Selected:
+   it prevents large adaptive timesteps during the vulnerable restart/startup
+   interval, restores normal throughput on ordinary settled cases, and pays
+   for the stronger numerics only when real evidence requires them.
 
 ## Evidence and retention contract
 
@@ -92,10 +94,31 @@ exactly. Field times remain real solver states and the existing
 must-catch regression covers both OpenCFD 2606 and Foundation 14 dictionaries
 and forbids `adjustableRunTime` on transient field output.
 
+The first v5 corrective burn-in passed the decisive dense-output test: twelve
+successive AoA 9 field writes kept the physical timestep near 1.13 microseconds
+and coefficient changes at roughly `1e-7` to `1e-6`, rather than the v4
+simultaneous Cl/Cd/Cm spikes. It also exposed a separate AoA 13 numerical
+pressure mode that began before cadence densification. Reducing `maxCo` from 1
+to 0.25 changed that mode's frequency but did not remove it. Tightening `p` to
+`1e-8/0.01`, final pressure to `1e-8/0`, transport to `1e-9/0.01`, and the
+PIMPLE loop from 3×2 to 4×3 removed the recurrence; after the two samples at
+the live dictionary-reload boundary, the normal Courant-1 trace remained
+clean. The manually altered diagnostic generation was cancelled before
+publication and its exact obligations returned to pending without consuming a
+physical attempt.
+
+Version 6 makes that measured cure automatic. The first impulsive candidate
+arms the stronger live numerics once, restores the startup Courant/timestep
+ceiling, clears the certification clock, and permanently forbids a Courant
+release for that physical chunk. Its marker and final dictionaries are
+immutable quality evidence and survive same-case/cross-job continuation.
+Publication still requires a fresh clean trailing certificate; raw condemned
+samples remain preserved as attempt evidence.
+
 Adjacent regressions preserve period-band/subharmonic behavior, ambiguous and
 non-stationary rejection, no-shedding observation length, dense-field gates,
 restart-seam ownership, finalization/live-window identity, and conservative
-startup Courant release. The recovery capability is version 5 and solver
-incident grouping uses `urans-recovery-2026-07-24-v5` so exact pre-fix
+startup Courant release. The recovery capability is version 6 and solver
+incident grouping uses `urans-recovery-2026-07-24-v6` so exact pre-fix
 exhaustions remain auditable and may receive only the existing one
 source-pinned remediation allowance.

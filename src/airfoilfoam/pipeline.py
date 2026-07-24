@@ -1150,6 +1150,19 @@ URANS_FRAME_WRITE_PER_CYCLE = 30.0
 URANS_ANIMATION_FRAMES = 141
 URANS_MAX_ANIMATION_FRAMES = 220
 URANS_EARLY_STOP_MARKER = "urans_early_stop.json"
+URANS_IMPULSE_RECOVERY_MARKER = "urans_impulse_recovery.json"
+# A discontinuity-free tail is mandatory evidence, but an isolated numerical
+# impulse is recoverable in-place.  The live OpenCFD 2606 canary that exposed
+# this path cleared only after pressure/transport solves were tightened and the
+# PIMPLE correction loop was deepened; changing the timestep alone did not
+# help.  Keep these values explicit so the recovery is reproducible from the
+# archived fvSolution and monotonic engine capability version.
+URANS_IMPULSE_PRESSURE_TOLERANCE = 1e-8
+URANS_IMPULSE_PRESSURE_REL_TOL = 0.01
+URANS_IMPULSE_TRANSPORT_TOLERANCE = 1e-9
+URANS_IMPULSE_TRANSPORT_REL_TOL = 0.01
+URANS_IMPULSE_OUTER_CORRECTORS = 4
+URANS_IMPULSE_CORRECTORS = 3
 #: A flat URANS signal is not enough evidence of physically steady flow until
 #: the retained force history spans the slow edge of the plausible shedding
 #: band.  Two periods are the minimum needed to distinguish a weak, slowly
@@ -1444,6 +1457,134 @@ def _set_foam_dict_entries(dict_path: Path, entries: dict[str, object]) -> None:
 
 def _set_control_dict_entries(control_dict: Path, entries: dict[str, object]) -> None:
     _set_foam_dict_entries(control_dict, entries)
+
+
+def _set_foam_block_entries(
+    dict_path: Path,
+    block_entries: dict[str, dict[str, object]],
+) -> None:
+    """Atomically update entries inside simple generated dictionary blocks.
+
+    The generated transient fvSolution blocks used here contain no nested
+    dictionaries.  Match the complete named block first, then replace only its
+    direct scalar entries.  Missing blocks/entries fail closed: silently
+    appending a similarly named top-level key would not change OpenFOAM
+    numerics and would make the recovery provenance dishonest.
+    """
+    if not dict_path.exists():
+        raise InfrastructureError(
+            f"URANS numerical recovery dictionary is missing: {dict_path}"
+        )
+    original = dict_path.read_text()
+    text = original
+    for block_name, entries in block_entries.items():
+        block_pattern = re.compile(
+            rf"(^\s*{re.escape(block_name)}\s*\{{)(.*?)(^\s*\}})",
+            re.MULTILINE | re.DOTALL,
+        )
+        block_match = block_pattern.search(text)
+        if block_match is None:
+            raise InfrastructureError(
+                f"URANS numerical recovery block {block_name!r} is missing "
+                f"from {dict_path}"
+            )
+        body = block_match.group(2)
+        for key, value in entries.items():
+            entry_pattern = re.compile(
+                rf"(^\s*{re.escape(key)}\s+)([^;]*)(;)",
+                re.MULTILINE,
+            )
+            if entry_pattern.search(body) is None:
+                raise InfrastructureError(
+                    f"URANS numerical recovery entry {block_name}.{key} is "
+                    f"missing from {dict_path}"
+                )
+            body = entry_pattern.sub(
+                rf"\g<1>{_foam_value(value)}\3",
+                body,
+                count=1,
+            )
+        text = (
+            text[: block_match.start(2)]
+            + body
+            + text[block_match.end(2) :]
+        )
+    if text == original:
+        return
+    tmp = dict_path.with_name(f".{dict_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, dict_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _apply_urans_impulse_solution_entries(tcase: Path) -> None:
+    """Install the pressure/PIMPLE side of the impulse-recovery rung."""
+    _set_foam_block_entries(
+        tcase / "system" / "fvSolution",
+        {
+            "p": {
+                "tolerance": URANS_IMPULSE_PRESSURE_TOLERANCE,
+                "relTol": URANS_IMPULSE_PRESSURE_REL_TOL,
+            },
+            "pFinal": {
+                "tolerance": URANS_IMPULSE_PRESSURE_TOLERANCE,
+                "relTol": 0,
+            },
+            '"(k|omega|U).*"': {
+                "tolerance": URANS_IMPULSE_TRANSPORT_TOLERANCE,
+                "relTol": URANS_IMPULSE_TRANSPORT_REL_TOL,
+            },
+            "PIMPLE": {
+                "nOuterCorrectors": URANS_IMPULSE_OUTER_CORRECTORS,
+                "nCorrectors": URANS_IMPULSE_CORRECTORS,
+            },
+        },
+    )
+
+
+def _arm_urans_impulse_recovery(
+    tcase: Path,
+    result: StablePeriodResult,
+    *,
+    startup_max_delta_t: float | None,
+) -> None:
+    """Tighten live PIMPLE numerics after an impulsive candidate is observed."""
+    _apply_urans_impulse_solution_entries(tcase)
+    control_entries: dict[str, object] = {
+        "maxCo": URANS_STARTUP_MAX_COURANT,
+        "runTimeModifiable": True,
+    }
+    if (
+        startup_max_delta_t is not None
+        and math.isfinite(float(startup_max_delta_t))
+        and float(startup_max_delta_t) > 0
+    ):
+        control_entries["maxDeltaT"] = float(startup_max_delta_t)
+    _set_control_dict_entries(
+        tcase / "system" / "controlDict",
+        control_entries,
+    )
+    marker = {
+        "trigger_reason": result.reason,
+        "trigger_time": _latest_time(tcase),
+        "period_s": result.period_s,
+        "window_start": result.window_start,
+        "window_end": result.window_end,
+        "max_courant": URANS_STARTUP_MAX_COURANT,
+        "max_delta_t": startup_max_delta_t,
+        "pressure_tolerance": URANS_IMPULSE_PRESSURE_TOLERANCE,
+        "pressure_rel_tolerance": URANS_IMPULSE_PRESSURE_REL_TOL,
+        "transport_tolerance": URANS_IMPULSE_TRANSPORT_TOLERANCE,
+        "transport_rel_tolerance": URANS_IMPULSE_TRANSPORT_REL_TOL,
+        "outer_correctors": URANS_IMPULSE_OUTER_CORRECTORS,
+        "correctors": URANS_IMPULSE_CORRECTORS,
+    }
+    (tcase / URANS_IMPULSE_RECOVERY_MARKER).write_text(
+        json.dumps(marker, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _sanitize_freestream_init_time_state(case_dir: Path, initial_delta_t: float) -> bool:
@@ -2351,7 +2492,11 @@ def _materialize_archived_continuation_case(
         copy_tree(openfoam / "system", staged_transient / "system")
     if not copy_tree(archived_transient / "constant", staged_transient / "constant"):
         copy_tree(openfoam / "constant", staged_transient / "constant")
-    for marker_name in (TRANSIENT_START_MARKER, URANS_EARLY_STOP_MARKER):
+    for marker_name in (
+        TRANSIENT_START_MARKER,
+        URANS_EARLY_STOP_MARKER,
+        URANS_IMPULSE_RECOVERY_MARKER,
+    ):
         archived_marker = archived_transient / marker_name
         if archived_marker.is_file():
             staged_transient.mkdir(parents=True, exist_ok=True)
@@ -2758,8 +2903,16 @@ def _make_urans_monitor(
     *,
     solver_params: Optional[SolverParams] = None,
     settled_max_courant: Optional[float] = None,
+    startup_max_delta_t: Optional[float] = None,
 ) -> Callable[[], None]:
-    state: dict[str, object] = {"cadence_period": None, "target_period": None, "stop_requested": False}
+    state: dict[str, object] = {
+        "cadence_period": None,
+        "target_period": None,
+        "stop_requested": False,
+        "impulse_recovery_armed": (
+            tcase / URANS_IMPULSE_RECOVERY_MARKER
+        ).is_file(),
+    }
 
     def monitor() -> None:
         coeff_files = _transient_coeff_selection(tcase, coeff_start_time)
@@ -2794,6 +2947,23 @@ def _make_urans_monitor(
                     cadence_entries,
                 )
                 state["cadence_period"] = period
+        impulse_candidate = (
+            "impulsive discontinuity" in result.reason.lower()
+        )
+        if impulse_candidate and not state.get("impulse_recovery_armed"):
+            _arm_urans_impulse_recovery(
+                tcase,
+                result,
+                startup_max_delta_t=startup_max_delta_t,
+            )
+            # Changing live dictionaries can itself contaminate a few boundary
+            # samples.  Forget all earlier certification and require a fresh,
+            # clean suffix under the tighter numerics.  Once this rung is
+            # armed, never release the conservative Courant ceiling again in
+            # the same physical chunk.
+            state["impulse_recovery_armed"] = True
+            state["courant_released"] = False
+            state["stable_since"] = None
         if result.ok and result.stable and period is not None and period > 0:
             # Every physical chunk starts conservatively.  Only a measured,
             # repeatable tail may release the configured production Courant
@@ -2805,6 +2975,7 @@ def _make_urans_monitor(
                 and math.isfinite(float(settled_max_courant))
                 and float(settled_max_courant) > 0
                 and not state.get("courant_released")
+                and not state.get("impulse_recovery_armed")
             ):
                 _set_control_dict_entries(
                     tcase / "system" / "controlDict",
@@ -3932,6 +4103,12 @@ def _run_transient_attempt(
             write_interval=write_interval,
             max_delta_t=pass_max_delta_t,
         )
+        # write_transient refreshes generated dictionaries for every same-case
+        # continuation chunk.  Reapply a previously armed recovery rung before
+        # the solver starts so a clean suffix cannot silently fall back to the
+        # looser numerics that produced its condemned prefix.
+        if (tcase / URANS_IMPULSE_RECOVERY_MARKER).is_file():
+            _apply_urans_impulse_solution_entries(tcase)
         # Arm the heartbeat march-rate watchdog for this chunk: it projects
         # trailing simulated-time progress against the bounded tier budget.
         write_march_budget_marker(
@@ -3953,6 +4130,7 @@ def _run_transient_attempt(
                 coeff_start_time,
                 solver_params=solver_params,
                 settled_max_courant=settled_max_courant,
+                startup_max_delta_t=pass_max_delta_t,
             ),
         )
         wall_seconds += max(0.0, time.monotonic() - solve_started)
@@ -5507,6 +5685,16 @@ def _archive_case_evidence(
             _copy_file_preserving_rel(
                 post_dir,
                 early_stop_marker,
+                raw_dir / "transient",
+                entries,
+                "quality_evidence",
+                manifest_base=evidence_dir,
+            )
+        impulse_recovery_marker = post_dir / URANS_IMPULSE_RECOVERY_MARKER
+        if impulse_recovery_marker.is_file():
+            _copy_file_preserving_rel(
+                post_dir,
+                impulse_recovery_marker,
                 raw_dir / "transient",
                 entries,
                 "quality_evidence",

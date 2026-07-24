@@ -50,13 +50,21 @@
   simultaneous Cl/Cd/Cm impulses, but also identified their remaining source:
   `adjustableRunTime` shortened a physical timestep at every dense field-write
   boundary and repeatedly injected a new impulse. Both 2606 pools are fenced
-  and the v4 generations were cancelled before publication. Recovery v5 uses
-  non-rescheduling `runTime` field output while preserving adaptive Courant
-  control and the 20-frames-per-period evidence gate; the full 1,285-test
-  non-integration engine suite and focused TypeScript incident checks pass.
-  Readiness still requires guarded v5 deployment, restored 8/40-slot
-  admission, exact corrective reruns that publish three clean whole periods,
-  GCS binding and obsolete-generation retirement, and no recurring
+  and the v4 generations were cancelled before publication. Recovery v5 was
+  deployed on both engines and proved that non-rescheduling `runTime` output
+  eliminates the dense-write timestep collapse. Its corrective burn-in exposed
+  a separate high-angle pressure/PIMPLE impulse: reducing timestep alone did
+  not cure it, while tighter pressure/transport convergence and a 4×3 PIMPLE
+  loop did. The manually altered canary was cancelled before publication and
+  all six exact obligations returned to pending without consuming attempts.
+  Recovery v6 now arms that stronger numerical rung automatically, restores
+  the conservative Courant cap, restarts certification, persists the recovery
+  through continuation/evidence retention, and forbids later release within
+  the recovered physical chunk. The focused 243-test solver/evidence suite,
+  TypeScript incident checks/typecheck, and full 1,286-test non-integration
+  engine suite pass. Readiness still requires guarded v6 deployment, restored
+  8/40-slot admission, exact corrective reruns that publish three clean whole
+  periods, GCS binding and obsolete-generation retirement, and no recurring
   current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
