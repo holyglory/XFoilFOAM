@@ -64,16 +64,24 @@
   `controlDict` and fresh monitor closure could replace the marker-owned
   `maxDeltaT` with a cadence-sized value. Recovery v7 atomically reapplies the
   persisted numerical and timestep controls before both boundaries and
-  prevents cadence refinement from changing them while recovery is armed. A
-  failing-before/fixed-after continuation regression, the 95-test frame-track
-  file, TypeScript incident checks/typecheck, and the full 1,286-test
-  non-integration engine suite pass. An operator-side live-dictionary edit
+  prevents cadence refinement from changing them while recovery is armed. Its
+  corrective burn-in exposed a throughput-only classification defect: the
+  immutable numeric continuation seam itself armed the strong recovery rung on
+  flat cases. Recovery v8 excludes only the derivative crossing a known
+  OpenFOAM segment boundary from the live trigger; ordinary period similarity
+  and final clean-tail publication remain strict. Its
+  failing-before/fixed-after seam regression, 95-test frame-track file,
+  TypeScript incident checks/typecheck, and the full 1,287-test non-integration
+  engine suite pass; guarded deployment remains active. An operator-side
+  live-dictionary edit
   during diagnosis caused four v6 cases to stop with immutable rejected
   evidence; all four canonical archives authenticated every manifest member,
   their unpacked duplicates were restored exactly, and the runbook now forbids
-  direct live dictionary edits. Two unaffected cases continue solving.
-  Readiness still requires a guarded v7 deployment, restored 8/40-slot
-  admission, evidence-preserving v7 reruns for the four interrupted angles,
+  direct live dictionary edits. The v7 engines are deployed at restored
+  8/40-slot admission while the exact six-angle corrective run remains
+  evidence-bearing but not publishable.
+  Readiness still requires a guarded v8 deployment, restored 8/40-slot
+  admission, evidence-preserving v8 reruns for the still-unresolved angles,
   three clean whole periods for all six exact obligations, GCS binding and
   obsolete-generation retirement, and no recurring current-generation
   critical chain.

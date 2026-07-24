@@ -127,6 +127,20 @@ must-catch regression first reproduced the old continuation increase, then
 proves both the initial and restarted monitor retain the exact conservative
 ceiling.
 
+The first v7 corrective burn-in then showed that the coefficient discontinuity
+detector also treated the immutable numeric continuation boundary itself as a
+new within-run solver impulse. Flat low-angle cases consequently armed the
+strong pressure/PIMPLE recovery rung exactly at their normal same-case restart
+and became unnecessarily slow. Version 8 derives authoritative restart times
+only from numeric OpenFOAM coefficient-segment directories and excludes the
+single derivative crossing each known boundary from the live recovery trigger.
+It does not discard samples or waive period similarity. The independent final
+clean-tail selector receives no exclusions, so a shifted or contaminated
+restart still cannot be published until a later byte-backed suffix contains
+the required clean whole periods. The must-catch test proves the old path
+reports an impulse, while v8 leaves the deliberately unsettled trajectory to
+the ordinary period-difference gate.
+
 During that burn-in, an emergency operator command attempted to change a live
 `controlDict` with `foamDictionary`. OpenFOAM observed the transient empty
 value and stopped four cases with `attempt to read beyond EOF`. Their original
@@ -139,7 +153,7 @@ evidence-preserving retries are the only supported correction path.
 Adjacent regressions preserve period-band/subharmonic behavior, ambiguous and
 non-stationary rejection, no-shedding observation length, dense-field gates,
 restart-seam ownership, finalization/live-window identity, and conservative
-startup Courant release. The recovery capability is version 7 and solver
-incident grouping uses `urans-recovery-2026-07-24-v7` so exact pre-fix
+startup Courant release. The recovery capability is version 8 and solver
+incident grouping uses `urans-recovery-2026-07-24-v8` so exact pre-fix
 exhaustions remain auditable and may receive only the existing one
 source-pinned remediation allowance.

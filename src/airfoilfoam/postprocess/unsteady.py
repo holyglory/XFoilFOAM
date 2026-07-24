@@ -588,6 +588,18 @@ def stable_two_period_window(
     """
     if speed <= 0 or chord <= 0:
         return StablePeriodResult(ok=False, reason="invalid speed/chord")
+    restart_boundaries: tuple[float, ...] = ()
+    if isinstance(path, (list, tuple)):
+        starts: set[float] = set()
+        for item in path:
+            try:
+                start = float(Path(item).parent.name)
+            except ValueError:
+                continue
+            if math.isfinite(start):
+                starts.add(start)
+        # The first segment is the trajectory origin, not a continuation seam.
+        restart_boundaries = tuple(sorted(starts)[1:])
     try:
         t, cl, cd, cm = _coefficient_series(path)
     except Exception as exc:  # noqa: BLE001 - in-flight coefficient file may be incomplete
@@ -652,6 +664,7 @@ def stable_two_period_window(
             clc[retained_mask],
             cdc[retained_mask],
             cmc[retained_mask],
+            ignored_jump_times=restart_boundaries,
         ):
             best = best or StablePeriodResult(
                 ok=False,
@@ -1050,6 +1063,7 @@ class CleanPeriodicTail:
 def _has_impulsive_discontinuity(
     t: np.ndarray,
     *channels: np.ndarray,
+    ignored_jump_times: Sequence[float] = (),
 ) -> bool:
     """Detect an isolated solver-step jump that is not a resolved waveform.
 
@@ -1061,6 +1075,20 @@ def _has_impulsive_discontinuity(
         return False
     dt = np.diff(t)
     valid_dt = np.isfinite(dt) & (dt > 0)
+    # An OpenFOAM continuation may restart from a byte-backed checkpoint with
+    # a different initial residual state. The single transition crossing its
+    # authoritative numeric segment boundary is not a new within-run impulse.
+    # Keep all samples and all ordinary period-similarity checks; exclude only
+    # that derivative from the live recovery trigger. Final clean-tail
+    # certification supplies no exclusions and therefore remains strict.
+    for raw_boundary in ignored_jump_times:
+        try:
+            boundary = float(raw_boundary)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(boundary):
+            continue
+        valid_dt &= ~((t[:-1] < boundary) & (t[1:] >= boundary))
     if int(valid_dt.sum()) < 16:
         return True
     for values in channels:

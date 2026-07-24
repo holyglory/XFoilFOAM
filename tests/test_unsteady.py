@@ -266,6 +266,85 @@ def test_stable_two_period_window_rejects_impulsive_candidate(tmp_path: Path):
     assert "impulsive discontinuity" in result.reason
 
 
+def test_stable_two_period_window_does_not_classify_restart_seam_as_impulse(
+    tmp_path: Path,
+):
+    """A known OpenFOAM restart boundary is not a new physical solver impulse.
+
+    The live monitor must keep the ordinary period-similarity gate in charge at
+    a continuation seam instead of arming expensive numerical recovery. The
+    final clean-tail selector remains strict and will not publish this
+    deliberately unsettled two-period window.
+    """
+    header = (
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+        "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    )
+    period = 0.2
+
+    def rows(start: float, end: float, mean_shift: float) -> list[str]:
+        output = [header]
+        for t in np.arange(start, end + 0.0005, 0.001):
+            cl = 0.7 + mean_shift + 0.08 * math.sin(2.0 * math.pi * t / period)
+            cd = 0.03 + 0.4 * mean_shift + 0.01 * math.sin(
+                2.0 * math.pi * t / period + 0.7
+            )
+            row = [
+                t,
+                cd,
+                0.0,
+                0.0,
+                cl,
+                0.0,
+                0.0,
+                -0.05,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]
+            output.append(" ".join(f"{value:.12g}" for value in row))
+        return output
+
+    first = tmp_path / "forceCoeffs1" / "0" / "coefficient.dat"
+    second = tmp_path / "forceCoeffs1" / "0.6" / "coefficient.dat"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first_rows = rows(0.0, 0.599, 0.0)
+    second_rows = rows(0.6, 0.8, 0.08)
+    first.write_text("\n".join(first_rows) + "\n")
+    second.write_text("\n".join(second_rows) + "\n")
+
+    # A flattened history has no restart provenance and therefore correctly
+    # treats the same mean jump as an unexplained impulse.
+    flattened = tmp_path / "flattened.dat"
+    flattened.write_text(
+        "\n".join(first_rows + second_rows[1:]) + "\n"
+    )
+    frame_times = [0.4 + i * (0.4 / 80) for i in range(81)]
+    strict = stable_two_period_window(
+        flattened,
+        speed=25.0,
+        chord=1.0,
+        frame_times=frame_times,
+        min_frames_per_cycle=20,
+    )
+    segmented = stable_two_period_window(
+        [first, second],
+        speed=25.0,
+        chord=1.0,
+        frame_times=frame_times,
+        min_frames_per_cycle=20,
+    )
+
+    assert not strict.ok
+    assert "impulsive discontinuity" in strict.reason
+    assert not segmented.ok
+    assert "impulsive discontinuity" not in segmented.reason
+    assert "periods differ" in segmented.reason
+
+
 def _history(t0, t1, st=0.6634408650015379, n=400, cl_rms=0.05, cd_rms=0.01):
     ts = [t0 + (t1 - t0) * i / (n - 1) for i in range(n)]
     return ForceHistory(
