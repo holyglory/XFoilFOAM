@@ -31,9 +31,11 @@
   coefficient histories and an untyped terminal-promise reclaim loop. Exact
   live-process monitoring, isolated-but-retained initialization evidence, and
   build-scoped terminal cancellation are regression-verified but not yet
-  deployed. Readiness requires deploying both control-plane and remote-engine
-  changes, then proving remote CPU refill, accepted-result delivery, and no
-  recurrence of the false kill/reclaim chain.
+  deployed. The guarded remote maintenance path now correctly treats durable
+  `blocked` delivery conflicts as terminal, inert review records while still
+  refusing retryable/claimed deliveries. Readiness requires deploying both
+  control-plane and remote-engine changes, then proving remote CPU refill,
+  accepted-result delivery, and no recurrence of the false kill/reclaim chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

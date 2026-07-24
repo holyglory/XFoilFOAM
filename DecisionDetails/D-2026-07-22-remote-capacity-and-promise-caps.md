@@ -136,6 +136,12 @@ The alternatives were rejected as follows:
   reported eight active engine jobs. Remote delivery advanced from 794 to 815
   delivered generations with 21 superseded, zero blocked deliveries, and one
   ordinary automatic retry wait.
+- The July 24 watchdog rollout found three later delivery conflicts already in
+  the writer's terminal `blocked` state, each with a durable hub conflict id.
+  The ordinary engine-maintenance gate incorrectly counted those inert review
+  records as executable delivery work. The gate now continues to fail closed
+  for retryable/claimed deliveries while allowing terminal blocked conflicts
+  to remain immutable and reviewable during maintenance.
 - An authenticated browser-equivalent request rendered the live campaign as
   running with eight active production jobs, and the public AG24 detail route
   rendered its stored profile and 86-point polar. Both routes had zero browser

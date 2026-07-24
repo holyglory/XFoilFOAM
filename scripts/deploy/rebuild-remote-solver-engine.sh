@@ -229,13 +229,15 @@ if any(row.values()):
 maintenance_database_activity() {
   # An active remote promise is a durable scheduling lease, not executable
   # work. Once both writers are stopped it remains inert and must survive an
-  # ordinary engine maintenance window unchanged. Live jobs, unsettled
-  # deliveries/cancellations, and active media repair still fail closed.
+  # ordinary engine maintenance window unchanged. Live jobs, retryable or
+  # claimed deliveries, unsettled cancellations, and active media repair still
+  # fail closed. A blocked delivery is already terminal in the remote writer
+  # state machine; its reviewable hub conflict ids remain durable and inert.
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
 WITH activity AS (
   SELECT
     (SELECT count(*) FROM sim_jobs WHERE status IN ('pending','submitted','running','ingesting'))::int AS live_jobs,
-    (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded'))::int AS unsettled_deliveries,
+    (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations WHERE state <> 'delivered')::int AS unsettled_cancellations,
     (SELECT count(*) FROM result_media_repairs WHERE state = 'running')::int AS running_media_repairs
 )

@@ -576,6 +576,10 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     assert "active_promises" not in maintenance_db
     assert "live_jobs" in maintenance_db
     assert "unsettled_deliveries" in maintenance_db
+    assert (
+        "state NOT IN ('delivered','superseded','blocked')"
+        in maintenance_db
+    )
     assert "unsettled_cancellations" in maintenance_db
     assert "running_media_repairs" in maintenance_db
     assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
