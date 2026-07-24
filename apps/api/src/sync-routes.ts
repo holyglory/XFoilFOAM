@@ -200,6 +200,18 @@ const heartbeatBodySchema = z.object({
     .optional(),
 });
 
+const promiseCancellationBodySchema = z.object({
+  disposition: z
+    .enum(["terminal_local_state", "operator_release", "authority_rejected"])
+    .default("operator_release"),
+  reason: z
+    .string()
+    .trim()
+    .min(1)
+    .max(2_000)
+    .default("remote solver released the promise"),
+});
+
 const exportQuerySchema = z.object({
   types: z.string().optional(),
   since: z.string().datetime().optional(),
@@ -6647,6 +6659,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     await expirePromises();
     const ttlHours = body.ttlHours ?? ctx.settings.defaultPromiseTtlHours;
     const expiresAt = new Date(Date.now() + ttlHours * 3600_000);
+    const terminalExclusionSolverId = registeredSolver?.id ?? null;
+    const terminalExclusionBuildVersion =
+      registeredSolver?.buildVersion ?? null;
     const rows = (await db.execute(sql`
       WITH latest_revision AS (
         SELECT DISTINCT ON (preset_id) preset_id, id, signature_hash, reynolds, mach, reference_length_m, snapshot
@@ -6704,6 +6719,28 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
               AND pp.status = 'active'
               AND pr.status = 'active'
               AND pr."expiresAt" > now()
+          )
+          AND (
+            ${terminalExclusionSolverId}::uuid IS NULL
+            OR NOT EXISTS (
+              SELECT 1
+              FROM sync_sweep_promise_points terminal_point
+              JOIN sync_sweep_promises terminal_promise
+                ON terminal_promise.id = terminal_point.promise_id
+              WHERE terminal_point.airfoil_id = a.id
+                AND terminal_point.simulation_preset_revision_id = rev.id
+                AND terminal_point.aoa_deg = g.aoa
+                AND terminal_promise.registered_solver_id =
+                  ${terminalExclusionSolverId}::uuid
+                AND terminal_promise.status = 'cancelled'
+                AND terminal_promise.response_payload
+                  #>> '{remoteCancellation,disposition}' =
+                    'terminal_local_state'
+                AND terminal_promise.response_payload
+                  #>> '{remoteCancellation,buildVersion}'
+                    IS NOT DISTINCT FROM
+                      ${terminalExclusionBuildVersion}::text
+            )
           )
       )
       SELECT *
@@ -6940,22 +6977,50 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     const params = z.object({ promiseId: z.string().uuid() }).parse(req.params);
     const ctx = await requirePromiseSyncAccess(req, reply, params.promiseId);
     if (!ctx) return;
+    const body = promiseCancellationBodySchema.parse(req.body ?? {});
     const outcome = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       const [promise] = (await tx.execute(sql`
-        SELECT id, status
-        FROM sync_sweep_promises
-        WHERE id = ${params.promiseId}
-        FOR UPDATE
-      `)) as unknown as Array<{ id: string; status: string }>;
+        SELECT
+          promise.id,
+          promise.status,
+          promise.response_payload,
+          solver.build_version AS solver_build_version
+        FROM sync_sweep_promises promise
+        LEFT JOIN registered_remote_solvers solver
+          ON solver.id = promise.registered_solver_id
+        WHERE promise.id = ${params.promiseId}
+        FOR UPDATE OF promise
+      `)) as unknown as Array<{
+        id: string;
+        status: string;
+        response_payload: Record<string, unknown> | null;
+        solver_build_version: string | null;
+      }>;
       if (!promise) return "missing" as const;
-      if (promise.status === "fulfilled" || promise.status === "cancelled")
+      if (promise.status === "fulfilled") return "terminal" as const;
+      const responsePayload = {
+        ...(promise.response_payload ?? {}),
+        remoteCancellation: {
+          disposition: body.disposition,
+          reason: body.reason,
+          buildVersion: promise.solver_build_version,
+          receivedAt: new Date().toISOString(),
+        },
+      };
+      if (promise.status === "cancelled") {
+        await tx
+          .update(syncSweepPromises)
+          .set({ responsePayload, updatedAt: new Date() })
+          .where(eq(syncSweepPromises.id, params.promiseId));
         return "terminal" as const;
+      }
       const cancelled = await tx
         .update(syncSweepPromises)
         .set({
           status: "cancelled",
           cancelledAt: new Date(),
+          responsePayload,
           updatedAt: new Date(),
         })
         .where(

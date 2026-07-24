@@ -995,6 +995,16 @@ def test_archived_continuation_preserves_exact_transient_start_marker(tmp_path):
         '{"uransRecoveryVersion":2,"latestTime":"0"}\n'
     )
     (recovery_checkpoint / "latest_time" / "U").write_text("safe U")
+    init_coeff = (
+        tcase
+        / pipeline.STEADY_INITIALIZATION_EVIDENCE_DIR
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    )
+    init_coeff.parent.mkdir(parents=True)
+    init_coeff.write_text(_coeff_rows(1.0, 20.0))
     outcome = CaseOutcome(spec=SPEC, reynolds=166_666, unsteady=True)
     pipeline._archive_case_evidence(src, tcase, outcome)
     manifest = json.loads(
@@ -1023,6 +1033,10 @@ def test_archived_continuation_preserves_exact_transient_start_marker(tmp_path):
     assert entries[
         "openfoam/transient/recovery_checkpoint/latest_time/U"
     ] == "time_directory"
+    assert entries[
+        "openfoam/transient/steady_initialization/postProcessing/"
+        "forceCoeffs1/0/coefficient.dat"
+    ] == "force_coefficients"
     marker_artifact = next(
         artifact
         for artifact in outcome.evidence_artifacts

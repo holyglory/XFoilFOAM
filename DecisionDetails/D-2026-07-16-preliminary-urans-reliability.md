@@ -214,6 +214,23 @@ hard-solver + retained-transient + measured-progress + flat-horizon warning and
 classification shape. It still rejects generic hard-solver, infrastructure,
 deterministic-mesh, missing-warning, and missing-classification variants.
 
+The July 24 remote burn-in exposed a different false failure loop: the live
+divergence watchdog scanned every recently touched coefficient history under a
+job, including outer RANS cases, copied numerical-recovery checkpoints, and
+the short SIMPLE initialization inside the transient case. It condemned those
+stale pseudo-time rows, wrote the marker outside the live pimpleFoam directory,
+and killed the healthy transient. The markerless `-9` exit then correctly
+looked like infrastructure to the controller, so it consumed no physical
+attempt and retried forever.
+
+The divergence and march-rate monitors now observe only `postProcessing`
+directly below each live solver process's exact working directory. Before
+pimpleFoam starts, short SIMPLE initialization output moves to
+`steady_initialization/`: it remains immutable archived force evidence but
+cannot be read as physical transient time. Disabling the watchdog was rejected
+because genuine coefficient blow-ups still require a bounded safety stop;
+accepting copied histories would retain the false-kill path.
+
 ## Durable priority and automatic NEW-admission fence
 
 The old recovery pass combined process-local RANS/PRECALC alternation with a

@@ -2000,7 +2000,10 @@ describe("remote solver submit lifecycle", () => {
     expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toEqual([
       {
         url: `${UPSTREAM}/sweeps/${promise.id}/cancel`,
-        body: {},
+        body: {
+          disposition: "terminal_local_state",
+          reason: expect.stringContaining("remote engine submit blocked"),
+        },
       },
     ]);
     expect(

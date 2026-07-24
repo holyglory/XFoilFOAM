@@ -264,6 +264,81 @@ def test_check_and_condemn_kills_case_and_writes_truthful_marker(tmp_path, monke
     assert (bad_case / DIVERGENCE_MARKER_FILENAME).stat().st_mtime == marker_mtime
 
 
+def test_watchdog_ignores_non_live_parent_and_checkpoint_histories(
+    tmp_path, monkeypatch
+):
+    """Regression: only a live solver cwd may own a watchdog verdict.
+
+    OpenCFD 2606 production jobs retain outer-case RANS histories and copy
+    transient histories into the numerical-recovery checkpoint.  Those files
+    can be recently touched while pimpleFoam is running in ``transient/``.
+    A broad job-directory glob used to read the copied/parent rows, write the
+    marker to the wrong directory, SIGKILL the healthy live pimpleFoam, and
+    misclassify the missing live marker as an infrastructure failure.
+    """
+
+    store = JobStore(Settings(data_dir=tmp_path / "data"))
+    job_id = "j-live-cwd-only"
+    store.write_status(_running(job_id, JobPhase.solving_urans))
+    case = store.job_dir(job_id) / "cases" / "c0p05_u30_a0"
+    live_transient = case / "transient"
+    checkpoint = live_transient / "_urans_recovery_checkpoint_v2"
+    _write_coeff(
+        live_transient
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat",
+        _post_stall_rows(),
+    )
+    _write_coeff(
+        case / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat",
+        _diverged_rows(),
+    )
+    _write_coeff(
+        checkpoint
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat",
+        _diverged_rows(t0=0.071),
+    )
+
+    monkeypatch.setattr(
+        JobStore,
+        "job_process_details",
+        lambda self, jid: [
+            {
+                "pid": 4321,
+                "cwd": str(live_transient),
+                "command": "pimpleFoam",
+                "solver_mode": "urans",
+            }
+        ],
+    )
+    kills: list[tuple[list[int], int]] = []
+    monkeypatch.setattr(
+        tasks,
+        "_kill_pids",
+        lambda pids, sig: kills.append((list(pids), sig)),
+    )
+
+    watchdog = _watchdog()
+    now = time_mod.time()
+    for i in range(20):
+        tasks._check_and_condemn_divergence(
+            store,
+            job_id,
+            watchdog,
+            now=now + 10.0 * i,
+        )
+
+    assert kills == []
+    assert read_divergence_condemnation(live_transient) is None
+    assert read_divergence_condemnation(case) is None
+    assert read_divergence_condemnation(checkpoint) is None
+
+
 def test_check_and_condemn_only_monitors_solving_phases(tmp_path, monkeypatch):
     store = JobStore(Settings(data_dir=tmp_path / "data"))
     job_id = "j-phase"
@@ -289,13 +364,23 @@ def test_check_and_condemn_only_monitors_solving_phases(tmp_path, monkeypatch):
 
 
 def test_stale_coefficient_segments_are_ignored(tmp_path):
-    """A finished steady-init segment (old mtime) must not be observed at all."""
-    job_dir = tmp_path / "job"
-    coeff = job_dir / "cases" / "c1" / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    """A live process's stale coefficient segment must not be observed."""
+    case = tmp_path / "job" / "cases" / "c1"
+    coeff = case / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
     _write_coeff(coeff, _diverged_rows())
+    processes = [
+        {
+            "pid": 4321,
+            "cwd": str(case),
+            "command": "simpleFoam",
+            "solver_mode": "rans",
+        }
+    ]
     now = time_mod.time()
-    assert tasks._live_coefficient_segments(job_dir, now) == [coeff]
-    assert tasks._live_coefficient_segments(job_dir, now + 3600.0) == []
+    assert tasks._live_coefficient_segments(processes, now) == [
+        (case.resolve(), coeff)
+    ]
+    assert tasks._live_coefficient_segments(processes, now + 3600.0) == []
 
 
 # --------------------------------------------------------------------------- #

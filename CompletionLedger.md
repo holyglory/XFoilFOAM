@@ -26,7 +26,14 @@
   generations and local reclamation for the live job, plus a burn-in with no
   recurring current-generation blocked/critical chain. Preserve immutable
   2406 histories; any new exhaustion remains a red system incident and must be
-  investigated before ordinary new admission continues.
+  investigated before ordinary new admission continues. The July 24 remote
+  burn-in additionally exposed false watchdog SIGKILLs from copied/non-live
+  coefficient histories and an untyped terminal-promise reclaim loop. Exact
+  live-process monitoring, isolated-but-retained initialization evidence, and
+  build-scoped terminal cancellation are regression-verified but not yet
+  deployed. Readiness requires deploying both control-plane and remote-engine
+  changes, then proving remote CPU refill, accepted-result delivery, and no
+  recurrence of the false kill/reclaim chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

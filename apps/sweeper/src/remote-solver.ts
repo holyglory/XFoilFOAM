@@ -146,6 +146,40 @@ export function brokeredEvidenceIdempotencyKey(
 }
 
 type Settings = typeof syncApiSettings.$inferSelect;
+type RemotePromiseCancellationDisposition =
+  | "terminal_local_state"
+  | "operator_release"
+  | "authority_rejected";
+
+interface RemotePromiseCancellation {
+  disposition: RemotePromiseCancellationDisposition;
+  reason: string;
+}
+
+function remotePromiseCancellationFromPayload(
+  payload: Record<string, unknown> | null,
+): RemotePromiseCancellation {
+  const cancellation =
+    payload?.remoteCancellation &&
+    typeof payload.remoteCancellation === "object"
+      ? (payload.remoteCancellation as Record<string, unknown>)
+      : null;
+  const disposition = cancellation?.disposition;
+  const reason = cancellation?.reason;
+  if (
+    (disposition === "terminal_local_state" ||
+      disposition === "operator_release" ||
+      disposition === "authority_rejected") &&
+    typeof reason === "string" &&
+    reason.trim()
+  ) {
+    return { disposition, reason: reason.trim() };
+  }
+  return {
+    disposition: "operator_release",
+    reason: "remote solver released the promise",
+  };
+}
 
 interface HubBindingReceipt {
   schemaVersion: 1;
@@ -1600,6 +1634,7 @@ async function cancelMirroredRemotePromise(
   settings: Settings,
   promiseId: string,
   error: string,
+  disposition: RemotePromiseCancellationDisposition,
 ): Promise<void> {
   // Stop local ownership first, then durably enqueue the upstream release.
   // A failed HTTP attempt remains retryable in the outbox; the local heartbeat
@@ -1611,7 +1646,11 @@ async function cancelMirroredRemotePromise(
       .set({
         status: "cancelled",
         cancelledAt: new Date(),
-        responsePayload: { submitBlocked: true, error },
+        responsePayload: {
+          submitBlocked: true,
+          error,
+          remoteCancellation: { disposition, reason: error },
+        },
         updatedAt: new Date(),
       })
       .where(
@@ -1690,7 +1729,13 @@ async function cancelMirroredPromisesForDisabledSolver(
     .orderBy(syncSweepPromises.createdAt, syncSweepPromises.id);
   for (const promise of promises) {
     const reason = "remote solver disabled before the mirrored promise settled";
-    await cancelMirroredRemotePromise(db, settings, promise.id, reason);
+    await cancelMirroredRemotePromise(
+      db,
+      settings,
+      promise.id,
+      reason,
+      "operator_release",
+    );
     await cancelAuthoritativelyExpiredPromise(db, engine, promise.id, reason);
   }
 }
@@ -1706,6 +1751,7 @@ async function processPendingPromiseCancellations(
       state: syncRemotePromiseCancellations.state,
       attemptCount: syncRemotePromiseCancellations.attemptCount,
       sourceBaseUrl: syncSweepPromises.sourceBaseUrl,
+      responsePayload: syncSweepPromises.responsePayload,
     })
     .from(syncRemotePromiseCancellations)
     .innerJoin(
@@ -1749,10 +1795,9 @@ async function processPendingPromiseCancellations(
         method: "POST",
         signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
         headers: headers(settings),
-        // headers() declares JSON for every sync call. Fastify correctly
-        // rejects an empty body with that content type before the cancellation
-        // route runs, so send the route's explicit empty object payload.
-        body: JSON.stringify({}),
+        body: JSON.stringify(
+          remotePromiseCancellationFromPayload(row.responsePayload),
+        ),
       });
       if (!response.ok && response.status !== 404) {
         failure = `remote promise cancellation failed (${response.status})`;
@@ -2029,7 +2074,13 @@ async function submitMirroredRemotePromise(
   }
   if (composition.kind === "terminal") {
     const error = `remote promise ${promiseId} has no retryable claimed cells`;
-    await cancelMirroredRemotePromise(db, settings, promiseId, error);
+    await cancelMirroredRemotePromise(
+      db,
+      settings,
+      promiseId,
+      error,
+      "terminal_local_state",
+    );
     await setStatus(db, "error", error);
     return { kind: "terminal", error };
   }
@@ -2075,7 +2126,13 @@ async function submitMirroredRemotePromise(
     return { kind: "waiting" };
   }
   const error = `remote engine submit blocked: ${outcome.error}`;
-  await cancelMirroredRemotePromise(db, settings, promiseId, error);
+  await cancelMirroredRemotePromise(
+    db,
+    settings,
+    promiseId,
+    error,
+    "terminal_local_state",
+  );
   await setStatus(db, "error", error);
   return { kind: "terminal", error };
 }
@@ -3823,7 +3880,13 @@ async function pushOneRemoteResult(
           error,
           httpStatus: response.status,
         });
-        await cancelMirroredRemotePromise(db, settings, promiseId, error);
+        await cancelMirroredRemotePromise(
+          db,
+          settings,
+          promiseId,
+          error,
+          "authority_rejected",
+        );
       }
       throw new Error(error);
     }
@@ -3858,7 +3921,13 @@ async function pushOneRemoteResult(
         httpStatus: response.status,
       });
       if (exactUnfulfilled) {
-        await cancelMirroredRemotePromise(db, settings, promiseId, error);
+        await cancelMirroredRemotePromise(
+          db,
+          settings,
+          promiseId,
+          error,
+          "authority_rejected",
+        );
       }
       throw new Error(error);
     }
@@ -4876,6 +4945,7 @@ async function processRemoteResultDeliveries(
           settings,
           promiseId,
           "remote job completed without canonical result evidence",
+          "terminal_local_state",
         );
       }
       continue;

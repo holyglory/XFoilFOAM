@@ -549,8 +549,15 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
             calls.append(cmd.split()[0])
             return SimpleNamespace(ok=True, stdout="", check=lambda: None)
 
-        def solver(self, _case_dir, app, *_args, **_kwargs):
+        def solver(self, case_dir, app, *_args, **_kwargs):
             calls.append(app)
+            _write_drifting_steady_coeff(
+                Path(case_dir)
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
             return SimpleNamespace(ok=True, stdout="init ok")
 
     monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
@@ -575,6 +582,15 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
     assert "potentialFoam" in calls
     assert "simpleFoam" in calls  # RANS-first fallback is unconditional
     assert (tcase / "log.simpleFoam.init").read_text() == "init ok"
+    assert not (tcase / "postProcessing").exists()
+    assert (
+        tcase
+        / pipeline.STEADY_INITIALIZATION_EVIDENCE_DIR
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    ).is_file()
 
 
 def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_path, monkeypatch):

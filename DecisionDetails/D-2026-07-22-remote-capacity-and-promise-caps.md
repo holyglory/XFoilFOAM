@@ -23,6 +23,13 @@ are complete. Numeric field extents and scaled default media remain deferred
 presentation work and are repaired from generation-pinned evidence after hub
 binding.
 
+A remote promise release is also typed. `terminal_local_state` means the exact
+unchanged physical cell has no authorized local attempt left;
+`operator_release` and `authority_rejected` relinquish scheduling ownership
+without claiming physical exhaustion. The hub suppresses a terminal cell only
+for the same registered solver and build version. Another solver or a later
+build remains eligible.
+
 ## Why
 
 The existing remote admission path rejects any new job while one remote job is
@@ -33,6 +40,11 @@ not safe admission state. Finally, partial ingest defers extents until a job is
 terminal while remote delivery requires extents, so running accepted points
 cannot be returned incrementally.
 
+The live July 24 burn-in also produced more than 1,400 cancelled promises for
+one exact cell already exhausted on the remote node. The untyped cancellation
+gave the hub no durable reason to avoid immediately leasing it back to the same
+build, starving eligible work behind it.
+
 The alternatives were rejected as follows:
 
 - Parallel AoAs inside one polar would discard the continuous march and mesh
@@ -42,6 +54,10 @@ The alternatives were rejected as follows:
 - Relaxing delivery to accept invented or unverified extents would violate the
   evidence contract. Manifest inventory is lossless and cheap, while derived
   extents can be repaired asynchronously.
+- Retrying terminal work unchanged preserves the starvation loop. Excluding a
+  terminal cell globally or forever prevents recovery by another solver or a
+  corrected build. A same-solver, same-build exclusion is the narrow durable
+  boundary.
 
 ## Verification evidence
 

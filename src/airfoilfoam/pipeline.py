@@ -295,6 +295,7 @@ DIVERGENCE_MARKER_FILENAME = "divergence_condemned.json"
 #: convection and a Co<=1 cap.  Both failed passes remain immutable evidence.
 URANS_NUMERICAL_RECOVERY_DIR = "numerical_recovery"
 URANS_RECOVERY_CHECKPOINT_DIR = "_urans_recovery_checkpoint_v2"
+STEADY_INITIALIZATION_EVIDENCE_DIR = "steady_initialization"
 URANS_NUMERICAL_RECOVERY_MAX_COURANT = 1.0
 URANS_NUMERICAL_RECOVERY_DELTA_T_FACTOR = 0.25
 
@@ -3743,10 +3744,36 @@ def _prepare_transient_case(
     init = runner.solver(tcase, dialect.steady_solver_command, n_proc, timeout=timeout)
     _check_cancel(cancel_check)
     (tcase / "log.simpleFoam.init").write_text(init.stdout)
+    _isolate_steady_initialization_postprocessing(tcase)
     # The steady initialisation is only a convenience seed for pimpleFoam. When
     # the whole polar has already been promoted because RANS is fragile, failing
     # here with the same SIMPLE problem should not prevent the transient attempt.
     return tmesh, patches
+
+
+def _isolate_steady_initialization_postprocessing(tcase: Path) -> None:
+    """Retain SIMPLE seed output without exposing it as live URANS history.
+
+    The short in-case steady initialization writes pseudo-time force
+    coefficients below ``postProcessing``.  pimpleFoam subsequently uses the
+    same case directory, so a live watchdog or an unbounded coefficient scan
+    cannot distinguish those iteration rows from physical transient time.
+    Move the complete initialization tree out of the live function-object path
+    before pimpleFoam starts.  The immutable evidence archiver copies this
+    retained tree separately.
+    """
+
+    source = tcase / "postProcessing"
+    if not source.is_dir():
+        return
+    destination = tcase / STEADY_INITIALIZATION_EVIDENCE_DIR / "postProcessing"
+    if destination.exists():
+        raise InfrastructureError(
+            "steady initialization evidence destination already exists; "
+            "refusing to overwrite retained solver evidence"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
 
 
 def _run_transient_attempt(
@@ -5382,6 +5409,13 @@ def _archive_case_evidence(
         _copy_tree_files_classified(
             post_dir / URANS_RECOVERY_CHECKPOINT_DIR,
             raw_dir / "transient" / "recovery_checkpoint",
+            entries,
+            _numerical_recovery_evidence_role,
+            manifest_base=evidence_dir,
+        )
+        _copy_tree_files_classified(
+            post_dir / STEADY_INITIALIZATION_EVIDENCE_DIR,
+            raw_dir / "transient" / STEADY_INITIALIZATION_EVIDENCE_DIR,
             entries,
             _numerical_recovery_evidence_role,
             manifest_base=evidence_dir,

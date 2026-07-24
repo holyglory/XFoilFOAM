@@ -511,7 +511,13 @@ describe("catalog solved-metric evidence", () => {
       });
       expect(claim.statusCode).toBe(200);
       const body = claim.json() as {
-        promise: null | { id: string; aoas: number[]; expiresAt: string };
+        promise: null | {
+          id: string;
+          aoas: number[];
+          expiresAt: string;
+          airfoil: { id: string };
+          setupRevision: { id: string };
+        };
       };
       if (body.promise) {
         expect(body.promise.aoas.length).toBe(1);
@@ -536,6 +542,58 @@ describe("catalog solved-metric evidence", () => {
         promise: null,
         admission: { state: "at_cap", active: 1, cap: 1 },
       });
+
+      if (body.promise) {
+        const terminalCancel = await app.inject({
+          method: "POST",
+          url: `/api/sync/v1/sweeps/${body.promise.id}/cancel`,
+          headers: { "x-xfoilfoam-solver-token": registered.authToken },
+          payload: {
+            disposition: "terminal_local_state",
+            reason:
+              "the exact claimed cell exhausted its bounded physical solver attempts",
+          },
+        });
+        expect(terminalCancel.statusCode).toBe(200);
+
+        const [cancelledPromise] = await db
+          .select({ responsePayload: syncSweepPromises.responsePayload })
+          .from(syncSweepPromises)
+          .where(eq(syncSweepPromises.id, body.promise.id))
+          .limit(1);
+        expect(cancelledPromise?.responsePayload).toMatchObject({
+          remoteCancellation: {
+            disposition: "terminal_local_state",
+            reason:
+              "the exact claimed cell exhausted its bounded physical solver attempts",
+          },
+        });
+
+        const nextClaim = await app.inject({
+          method: "POST",
+          url: "/api/sync/v1/sweeps/claim",
+          headers: { "x-xfoilfoam-solver-token": registered.authToken },
+          payload: {
+            limit: 1,
+            solverId: registered.solver.id,
+            sourceInstanceId,
+            sourceInstanceName: "sync api test",
+          },
+        });
+        expect(nextClaim.statusCode).toBe(200);
+        const nextBody = nextClaim.json() as typeof body;
+        expect(nextBody.promise).not.toBeNull();
+        cleanupSyncPromiseIds.add(nextBody.promise!.id);
+        expect({
+          airfoilId: nextBody.promise!.airfoil.id,
+          revisionId: nextBody.promise!.setupRevision.id,
+          aoaDeg: nextBody.promise!.aoas[0],
+        }).not.toEqual({
+          airfoilId: body.promise.airfoil.id,
+          revisionId: body.promise.setupRevision.id,
+          aoaDeg: body.promise.aoas[0],
+        });
+      }
     } finally {
       await db
         .delete(syncSweepPromises)

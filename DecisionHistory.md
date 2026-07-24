@@ -57,6 +57,12 @@
   no hub GCS credentials, and uses persistent deployment identity/capacity
   separate from numerical solver identity.
   [D-2026-07-17-hz-solver2-volume-cutover]
+  A solver watchdog may judge only coefficient history directly owned by the
+  live OpenFOAM process directory. Remote terminal-cell releases suppress only
+  the same solver build from reclaiming the unchanged cell; another solver or
+  a newer build remains eligible.
+  [D-2026-07-16-preliminary-urans-reliability]
+  [D-2026-07-22-remote-capacity-and-promise-caps]
 
 - Decision: treat remote CPU capacity and hub-issued polar promises as separate
   execution controls. A remote node admits independent serial polars until its

@@ -395,34 +395,51 @@ class DivergenceWatchdog:
         return state.condemned_reason
 
 
-def _case_root_for_coefficient(coeff_path: Path) -> Path:
-    """…/<case>/postProcessing/forceCoeffs1/<t>/coefficient.dat -> <case>."""
-    return coeff_path.parents[3]
+def _live_coefficient_segments(
+    processes: list[dict],
+    now: float,
+    *,
+    solver_modes: frozenset[str] = frozenset({"rans", "urans"}),
+) -> list[tuple[Path, Path]]:
+    """Newest live coefficient file for each exact solver working directory.
 
+    A job directory may contain recently copied outer-case RANS histories,
+    continuation sources, numerical-recovery checkpoints, and immutable
+    failure evidence.  Their mtimes do not prove that the current OpenFOAM
+    process owns those rows.  Process ``cwd`` is the authoritative case root:
+    observe only a force history directly below that exact directory and carry
+    the same root into marker placement and PID selection.
+    """
 
-def _live_coefficient_segments(job_dir: Path, now: float) -> list[Path]:
-    """The newest recently-written coefficient.dat per case dir. Targeted
-    globs (cases can nest as <slug>/, <polar>/transient_aN/ or
-    <polar>/urans_aN/transient/) so no walk over time/VTK dirs happens."""
-    patterns = tuple(
-        f"cases/{depth}/postProcessing/forceCoeffs1/*/{filename}"
-        for depth in ("*", "*/*", "*/*/*")
-        for filename in FORCE_COEFFICIENT_FILENAMES
-    )
     newest_per_case: dict[Path, tuple[float, Path]] = {}
-    for pattern in patterns:
-        for coeff in job_dir.glob(pattern):
-            try:
-                mtime = coeff.stat().st_mtime
-            except OSError:
-                continue
-            if now - mtime > DIVERGENCE_ACTIVE_WINDOW_S:
-                continue
-            case_root = _case_root_for_coefficient(coeff)
-            best = newest_per_case.get(case_root)
-            if best is None or mtime > best[0]:
-                newest_per_case[case_root] = (mtime, coeff)
-    return [coeff for _mtime, coeff in newest_per_case.values()]
+    for process in processes:
+        mode = process.get("solver_mode")
+        if mode not in solver_modes:
+            continue
+        raw_cwd = process.get("cwd")
+        if not raw_cwd:
+            continue
+        try:
+            case_root = Path(str(raw_cwd)).resolve()
+        except (OSError, RuntimeError):
+            continue
+        for filename in FORCE_COEFFICIENT_FILENAMES:
+            for coeff in case_root.glob(
+                f"postProcessing/forceCoeffs1/*/{filename}"
+            ):
+                try:
+                    mtime = coeff.stat().st_mtime
+                except OSError:
+                    continue
+                if now - mtime > DIVERGENCE_ACTIVE_WINDOW_S:
+                    continue
+                best = newest_per_case.get(case_root)
+                if best is None or mtime > best[0]:
+                    newest_per_case[case_root] = (mtime, coeff)
+    return [
+        (case_root, coeff)
+        for case_root, (_mtime, coeff) in newest_per_case.items()
+    ]
 
 
 def _condemn_diverged_case(store: JobStore, job_id: str, case_root: Path, reason: str) -> None:
@@ -466,8 +483,8 @@ def _check_and_condemn_divergence(
     if status.phase not in DIVERGENCE_MONITORED_PHASES:
         return
     now = time.time() if now is None else now
-    for coeff in _live_coefficient_segments(store.job_dir(job_id), now):
-        case_root = _case_root_for_coefficient(coeff)
+    processes = store.job_process_details(job_id)
+    for case_root, coeff in _live_coefficient_segments(processes, now):
         # The pipeline clears the case marker before every fresh attempt; the
         # watchdog uses its presence to distinguish "escalate on the condemned
         # solver" from "a retry owns this path now — fresh verdict".
@@ -658,8 +675,12 @@ def _check_and_stop_hopeless_march(
     if status.phase not in DIVERGENCE_MONITORED_PHASES:
         return
     now = time.time() if now is None else now
-    for coeff in _live_coefficient_segments(store.job_dir(job_id), now):
-        case_root = _case_root_for_coefficient(coeff)
+    processes = store.job_process_details(job_id)
+    for case_root, coeff in _live_coefficient_segments(
+        processes,
+        now,
+        solver_modes=frozenset({"urans"}),
+    ):
         budget = read_march_budget_marker(case_root)
         if budget is None:
             continue  # not an armed transient chunk (e.g. a steady solve)
