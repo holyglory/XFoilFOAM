@@ -71,6 +71,9 @@ export function TopBar({ active }: { active: string }) {
         .topbar-shell {
           isolation: isolate;
         }
+        .topbar-tabs {
+          display: flex;
+        }
         .topbar-public-menu-button,
         .topbar-mobile-menu {
           display: none;
@@ -165,7 +168,7 @@ export function TopBar({ active }: { active: string }) {
         <nav
           className="topbar-tabs"
           aria-label="Public navigation"
-          style={{ display: "flex", gap: 2, fontSize: 13 }}
+          style={{ gap: 2, fontSize: 13 }}
         >
           {TABS.map((t) => {
             const on = t.k === active;
