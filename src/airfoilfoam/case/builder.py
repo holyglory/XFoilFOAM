@@ -257,7 +257,15 @@ class CaseBuilder:
                 "stopAt": "endTime",
                 "endTime": end_time,
                 "deltaT": delta_t,
-                "writeControl": "adjustableRunTime",
+                # ``adjustableRunTime`` makes OpenFOAM shorten a physical
+                # timestep to land exactly on every field-write boundary.
+                # Once the live URANS monitor densifies writes to ~24/period,
+                # those repeated step-ratio collapses can create simultaneous
+                # Cl/Cd/Cm impulses that masquerade as a broken shedding
+                # prefix. ``runTime`` writes on the first completed physical
+                # step after the boundary and therefore never perturbs the
+                # adaptive Courant-controlled march merely to align output.
+                "writeControl": "runTime",
                 # ~48 field snapshots, all retained (purgeWrite 0), so the URANS
                 # animation has frames; the time-averaged forces use coefficient.dat
                 # (accumulated separately, unaffected by these field writes).

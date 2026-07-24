@@ -101,7 +101,9 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
   configured Courant ceiling only after the live monitor measures two
   repeatable, discontinuity-free periods with at least 20 stored field frames
   per period. A tentative force cadence may densify future field writes but
-  cannot relax `maxCo` or `maxDeltaT`. Raw trajectories remain immutable, but
+  cannot relax `maxCo` or `maxDeltaT`. Field output uses `runTime`, so matching
+  a write boundary never shortens or otherwise reschedules the physical
+  Courant-controlled timestep. Raw trajectories remain immutable, but
   preliminary certification searches the latest clean physical suffix when a
   fixed startup discard leaves the period missing or ambiguous. Accepted
   preliminary force histories and media expose exactly the last three clean
@@ -113,10 +115,13 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
   timestep while its newest slice still contained an impulse and only three
   field frames per period. Permanently reducing the whole run to `Co <= 1` was
   safe but needlessly expensive, and accepting arbitrary visually periodic
-  tails could promote out-of-band numerical oscillations. Conservative startup
-  plus the complete publishable-period gate prevents both bursts, while a
-  physically banded suffix selector reuses valid stored evidence without
-  deleting raw history or weakening stationarity.
+  tails could promote out-of-band numerical oscillations. Keeping
+  `adjustableRunTime` and trimming every output-alignment spike could never
+  yield a continuously clean suffix; `runTime` preserves the physical march
+  and only relaxes exact frame timestamps. Conservative startup plus the
+  complete publishable-period gate prevents both bursts, while a physically
+  banded suffix selector reuses valid stored evidence without deleting raw
+  history or weakening stationarity.
 
 ## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
 

@@ -72,10 +72,30 @@ The new regression proves that this force-only verdict keeps both `maxCo` and
 `maxDeltaT` conservative, while a genuinely complete two-period window still
 releases throughput.
 
+The first v4 burn-in then exposed the remaining source of those impulses.
+After the live monitor densified field writes, OpenFOAM's
+`adjustableRunTime` write control shortened one physical timestep to land
+exactly on each output boundary. In the live AoA 9 trace, a step contracted
+from about 1.15 microseconds to 0.23 microseconds while Cl jumped from about
+`-0.056` to `+0.292`; Cd and Cm jumped on the same step. The pattern repeated
+at later write boundaries even though `maxCo` remained 1. The v4
+discontinuity guard correctly prevented publication, but waiting or trimming
+could not create a permanently clean suffix while output alignment kept
+injecting new impulses. Both v4 pools were fenced and the affected generation
+was cancelled before publication.
+
+Version 5 keeps adaptive Courant control but changes transient field output to
+`runTime`. OpenFOAM now writes the first completed physical state after a
+requested boundary instead of changing the timestep to hit the boundary
+exactly. Field times remain real solver states and the existing
+20-frames-per-period gate still measures their actual density. A structural
+must-catch regression covers both OpenCFD 2606 and Foundation 14 dictionaries
+and forbids `adjustableRunTime` on transient field output.
+
 Adjacent regressions preserve period-band/subharmonic behavior, ambiguous and
 non-stationary rejection, no-shedding observation length, dense-field gates,
 restart-seam ownership, finalization/live-window identity, and conservative
-startup Courant release. The recovery capability is version 4 and solver
-incident grouping uses `urans-recovery-2026-07-24-v4` so exact pre-fix
+startup Courant release. The recovery capability is version 5 and solver
+incident grouping uses `urans-recovery-2026-07-24-v5` so exact pre-fix
 exhaustions remain auditable and may receive only the existing one
 source-pinned remediation allowance.

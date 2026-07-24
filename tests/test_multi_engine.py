@@ -211,6 +211,34 @@ def test_foundation14_case_uses_foundation_dictionary_and_function_object_dialec
     assert FOUNDATION_14.vtk_all_times_command == "foamToVTK -useTimeName"
 
 
+@pytest.mark.parametrize("dialect", [OPENCFD_2606, FOUNDATION_14])
+def test_transient_field_writes_never_reschedule_physical_timesteps(
+    tmp_path, naca0012_selig_text, dialect
+):
+    """MUST-CATCH: output alignment must not inject Cl/Cd/Cm impulses.
+
+    With ``adjustableRunTime``, densifying ``writeInterval`` to 24 field
+    frames per measured period forced a very short step at every output
+    boundary. The live OpenCFD 2606 trace jumped in all three coefficients at
+    those boundaries. ``runTime`` preserves the Courant-owned physical march
+    and writes the first completed state after each requested boundary.
+    """
+    builder, case = _builder(tmp_path, naca0012_selig_text, dialect)
+    builder.write_transient(
+        case,
+        start_time=0.0,
+        end_time=0.02,
+        delta_t=1e-6,
+        write_interval=2e-5,
+        max_delta_t=2e-6,
+    )
+
+    transient_control = _words((case / "system" / "controlDict").read_text())
+    assert "writeControl runTime;" in transient_control
+    assert "writeControl adjustableRunTime;" not in transient_control
+    assert "adjustTimeStep yes;" in transient_control
+
+
 def test_opencfd_2606_case_uses_verified_opencfd_dictionary_and_command_dialect(
     tmp_path, naca0012_selig_text
 ):

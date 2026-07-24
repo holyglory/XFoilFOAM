@@ -33,27 +33,31 @@
   build-scoped terminal cancellation are regression-verified. The guarded
   remote maintenance path correctly treats durable `blocked` delivery
   conflicts as terminal, inert review records while still refusing
-  retryable/claimed deliveries. The production hub is reachable and both
-  engines received URANS recovery v3, but its first corrective run proved that
-  force-only phase similarity could release the conservative timestep with
-  only three field frames per period while an impulse remained in the newest
-  suffix. Both OpenCFD 2606 pools and remote new-work admission are now closed,
-  and all in-flight v3 tasks were cancelled through the normal
-  evidence-preserving API before publication. Recovery v4 adds the
-  discontinuity and 20-frames-per-period release gate and is
-  regression-verified but not yet deployed. The exact pre-v3 corrupted
-  attempts must retain their audited source-pinned remediation allowance,
-  restart under v4, publish three clean whole periods, bind their evidence to
-  GCS, and retire their obsolete generations. Readiness requires guarded v4
-  deployment, restored 8/40-slot admission, accepted corrective-result
-  delivery, and no recurring current-generation critical chain. The first v4
-  maintenance attempt also exposed a transfer-quiescence race: the remote
-  background writer could claim and verify another exact GCS upload between
-  the maintenance read and process stop, leaving its otherwise safe delivery
-  behind a fresh lease. A durable transfer-only pause, live-writer drain, exact
-  pause-state restoration, deployment-order regression, and real
-  no-network/no-claim test are implemented and verified locally but not yet
-  deployed. Promote that guard before retrying remote engine maintenance.
+  retryable/claimed deliveries. The production hub is reachable. Recovery v3's
+  first corrective run proved that force-only phase similarity could release
+  the conservative timestep with only three field frames per period while an
+  impulse remained in the newest suffix; every in-flight v3 task was cancelled
+  through the normal evidence-preserving API before publication. Recovery v4
+  adds the discontinuity and 20-frames-per-period release gate and is deployed
+  on both OpenCFD 2606 engines. The durable transfer-only maintenance pause,
+  live-writer drain, exact pause-state restoration, deployment-order
+  regression, and real no-network/no-claim test are also deployed; the guarded
+  remote rebuild caught and drained a delivery that arrived between its two
+  quiescence checks. Production and remote admission are restored at 8 and 40
+  CPU slots. Six exact pre-v3 corrupted attempts retained their audited
+  source-pinned remediation allowance and began together under v4 from the
+  shared mesh. Live burn-in proved the v4 discontinuity gate refused real
+  simultaneous Cl/Cd/Cm impulses, but also identified their remaining source:
+  `adjustableRunTime` shortened a physical timestep at every dense field-write
+  boundary and repeatedly injected a new impulse. Both 2606 pools are fenced
+  and the v4 generations were cancelled before publication. Recovery v5 uses
+  non-rescheduling `runTime` field output while preserving adaptive Courant
+  control and the 20-frames-per-period evidence gate; the full 1,285-test
+  non-integration engine suite and focused TypeScript incident checks pass.
+  Readiness still requires guarded v5 deployment, restored 8/40-slot
+  admission, exact corrective reruns that publish three clean whole periods,
+  GCS binding and obsolete-generation retirement, and no recurring
+  current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

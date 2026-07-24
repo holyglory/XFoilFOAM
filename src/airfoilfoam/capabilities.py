@@ -18,7 +18,12 @@ MESH_RECOVERY_VERSION = 2
 # recovery: immutable evidence archives could hydrate a saved case after local
 # retention, continuations used the adaptive extension budget, and requests
 # were rejected before CFD when controller and worker disagreed.
+# Version 5 prevents dense field-output cadence from altering the physical
+# timestep: transient dictionaries use ``runTime`` instead of
+# ``adjustableRunTime``, so a write boundary cannot inject a one-step
+# coefficient impulse. Version 4 kept startup Co<=1 until two repeatable,
+# discontinuity-free periods also carried >=20 real field frames per period.
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 4
+URANS_RECOVERY_VERSION = 5
