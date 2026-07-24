@@ -5203,6 +5203,12 @@ export async function transferRemoteSolverTick(
     assertRemoteSolverNodeEvidenceContract(
       settings?.remoteSolverEnabled ?? false,
     );
+    // Engine maintenance raises this durable fence while the writer is still
+    // alive, then waits for the one already-running single-flight transfer to
+    // settle before stopping the process. Re-read on every pass: an in-flight
+    // pass keeps its exact claim and completes normally, while no later pass
+    // may claim another delivery, cancellation, or reclaim row.
+    if (settings?.remoteSolverTransferPaused) return false;
     // Reclaim is its own durable outbox, but deletion still requires the
     // current owning solver token to read back and authenticate the exact bound
     // hub archive first. Missing/rotated credentials therefore back off with

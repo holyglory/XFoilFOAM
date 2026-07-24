@@ -37,10 +37,13 @@ OPENCFD_2606_POOL_ID="3f8bc764-09ae-4ff3-8fd2-260600000001"
 OPENCFD_2606_IMPLEMENTATION_ID="2f8bc764-09ae-4ff3-8fd2-260600000001"
 FAIL_SAFE_ARMED=false
 FAIL_SAFE_CONTEXT="cutover"
+MAINTENANCE_QUIESCE_ARMED=false
+MAINTENANCE_TRANSFER_PAUSE_WAS=""
 PREPARE_RESTORE_WRITERS=false
 PREPARE_SWEEPER_WAS_RUNNING=0
 PREPARE_MEDIA_WAS_RUNNING=0
 CANARY_TEMP_FILE=""
+REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS="${REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS:-21900}"
 
 cd "$APP_DIR"
 python3 "$DEPLOY_SCRIPT_DIR/deployment-env-preflight.py" \
@@ -249,6 +252,78 @@ if any(type(value) is not int for value in row.values()):
 if any(row.values()):
     print(json.dumps(row, sort_keys=True))
 '
+}
+
+remote_transfer_paused() {
+  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+SELECT remote_solver_transfer_paused::text
+FROM sync_api_settings
+WHERE id = 1;" | python3 -c '
+import sys
+value = sys.stdin.read().strip()
+if value not in {"true", "false"}:
+    raise SystemExit(f"invalid remote transfer pause state: {value!r}")
+print(value)
+'
+}
+
+set_remote_transfer_paused() {
+  local value="$1" observed
+  [[ "$value" == "true" || "$value" == "false" ]] || {
+    echo "Invalid remote transfer pause value: $value" >&2
+    return 12
+  }
+  observed="$(compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+UPDATE sync_api_settings
+SET remote_solver_transfer_paused = $value,
+    \"updatedAt\" = now()
+WHERE id = 1
+RETURNING remote_solver_transfer_paused::text;")" || return 12
+  [[ "$observed" == "$value" ]] || {
+    echo "Remote transfer pause update did not persist the requested state." >&2
+    return 12
+  }
+}
+
+remote_transfer_activity() {
+  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+WITH activity AS (
+  SELECT
+    (SELECT count(*) FROM sync_remote_result_deliveries
+      WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
+    (SELECT count(*) FROM sync_remote_promise_cancellations
+      WHERE state <> 'delivered')::int AS unsettled_cancellations
+)
+SELECT row_to_json(activity)::text FROM activity;" | python3 -c '
+import json, sys
+row = json.loads(sys.stdin.read())
+if any(type(value) is not int for value in row.values()):
+    raise SystemExit(f"invalid remote transfer snapshot: {row!r}")
+if any(row.values()):
+    print(json.dumps(row, sort_keys=True))
+'
+}
+
+wait_remote_transfer_quiescence() {
+  local stage="$1" started now activity
+  started="$(date +%s)"
+  while true; do
+    if ! activity="$(remote_transfer_activity 2>&1)"; then
+      echo "Remote transfer probe failed closed at $stage: $activity" >&2
+      return 12
+    fi
+    if [[ -z "$activity" ]]; then
+      echo "Remote transfer outboxes are quiescent ($stage)."
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - started >= REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS )); then
+      echo "Remote transfer quiescence timed out at $stage: $activity" >&2
+      return 12
+    fi
+    echo "Waiting for the already-claimed remote transfer to settle: $activity"
+    sleep 2
+  done
 }
 
 require_idle() {
@@ -823,6 +898,12 @@ fail_safe() {
     restore_writers "$PREPARE_SWEEPER_WAS_RUNNING" "$PREPARE_MEDIA_WAS_RUNNING" || true
     exit "$rc"
   fi
+  if [[ "$MAINTENANCE_QUIESCE_ARMED" == "true" && $rc -ne 0 ]]; then
+    trap - EXIT
+    echo "Remote transfer quiescence failed before writer stop; restoring the prior transfer-pause state." >&2
+    set_remote_transfer_paused "$MAINTENANCE_TRANSFER_PAUSE_WAS" || true
+    exit "$rc"
+  fi
   if [[ "$FAIL_SAFE_ARMED" != "true" || $rc -eq 0 ]]; then return; fi
   trap - EXIT
   if [[ "$FAIL_SAFE_CONTEXT" == "maintenance" ]]; then
@@ -922,6 +1003,7 @@ PY
 
 perform_complete_runtime_maintenance() {
   local sweeper_was_running media_was_running old_build old_expected pool_state
+  local transfer_pause_was
   local old_2406_enabled old_2606_enabled worker_container
 
   [[ "$(current_engine_version)" == "2606" ]] || {
@@ -948,6 +1030,22 @@ SELECT concat_ws('|',
   sweeper_was_running="$(writer_state sweeper)"
   media_was_running="$(writer_state media-repair)"
   echo "Remote writer state before engine maintenance: sweeper=$sweeper_was_running media-repair=$media_was_running"
+
+  # Raise a durable transfer fence while the writer is still alive. The one
+  # single-flight pass that already owns a delivery may finish normally; every
+  # later pass observes the fence and declines to claim another row. Only then
+  # stop the process. This closes the claim-after-probe race that otherwise
+  # strands a valid GCS upload behind a fresh 30-minute lease on every rebuild.
+  transfer_pause_was="$(remote_transfer_paused)"
+  MAINTENANCE_TRANSFER_PAUSE_WAS="$transfer_pause_was"
+  MAINTENANCE_QUIESCE_ARMED=true
+  set_remote_transfer_paused "true"
+  if ! wait_remote_transfer_quiescence "before writer stop"; then
+    set_remote_transfer_paused "$transfer_pause_was" || true
+    MAINTENANCE_QUIESCE_ARMED=false
+    return 12
+  fi
+  MAINTENANCE_QUIESCE_ARMED=false
 
   # From this point any refusal leaves admission disabled and writers stopped.
   # The old running containers and env remain untouched until both post-build
@@ -991,6 +1089,7 @@ if limits.get("nofile") != (65536, 524288):
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
     "UPDATE solver_execution_pools SET enabled=CASE id WHEN '$OPENCFD_2406_POOL_ID' THEN $old_2406_enabled WHEN '$OPENCFD_2606_POOL_ID' THEN $old_2606_enabled ELSE enabled END, \"updatedAt\"=now() WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID');" >/dev/null
   restore_writers "$sweeper_was_running" "$media_was_running"
+  set_remote_transfer_paused "$transfer_pause_was"
   FAIL_SAFE_ARMED=false
   echo "hz-solver2 ordinary engine maintenance installed build $ACTION without consuming or cancelling active promise leases."
   compose ps

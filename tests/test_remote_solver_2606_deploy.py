@@ -530,7 +530,11 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     maintenance_end = source.index("\nmain() {", maintenance_start)
     maintenance = source[maintenance_start:maintenance_end]
 
-    stop = maintenance.index("stop_writers")
+    pause_transfers = maintenance.index('set_remote_transfer_paused "true"')
+    drain_transfers = maintenance.index(
+        'wait_remote_transfer_quiescence "before writer stop"', pause_transfers
+    )
+    stop = maintenance.index("stop_writers", drain_transfers)
     disable = maintenance.index("disable_all_opencfd_pools", stop)
     first_idle = maintenance.index(
         'require_maintenance_safe "before image build"', disable
@@ -557,7 +561,9 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     writer_restore = maintenance.index("restore_writers", pool_restore)
 
     assert (
-        stop
+        pause_transfers
+        < drain_transfers
+        < stop
         < disable
         < first_idle
         < build
@@ -583,3 +589,28 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     assert "unsettled_cancellations" in maintenance_db
     assert "running_media_repairs" in maintenance_db
     assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
+
+
+def test_remote_maintenance_pause_is_a_real_transfer_admission_gate() -> None:
+    deploy = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(
+        encoding="utf-8"
+    )
+    schema = (ROOT / "packages/db/src/schema.ts").read_text(encoding="utf-8")
+    transfer = (ROOT / "apps/sweeper/src/remote-solver.ts").read_text(
+        encoding="utf-8"
+    )
+    migration = (
+        ROOT
+        / "packages/db/migrations/0088_remote_transfer_maintenance_fence.sql"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'remoteSolverTransferPaused: boolean("remote_solver_transfer_paused")'
+        in schema
+    )
+    assert (
+        'ADD COLUMN IF NOT EXISTS "remote_solver_transfer_paused"' in migration
+    )
+    assert "settings?.remoteSolverTransferPaused" in transfer
+    assert "set_remote_transfer_paused()" in deploy
+    assert "wait_remote_transfer_quiescence()" in deploy

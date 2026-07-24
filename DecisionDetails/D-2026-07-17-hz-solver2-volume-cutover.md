@@ -158,3 +158,25 @@ depth, media repair, and OpenFOAM children still fail closed. The branch moves
 both build-id expectations atomically, proves the live container nofile limit,
 and restores the exact prior execution-pool and writer states only after health
 and runtime identity pass.
+
+Maintenance must not infer transfer quiescence from one read followed by
+`docker stop`. A July 24 v4 maintenance attempt proved that the background
+single-flight transfer can claim a new result in that interval, verify its GCS
+object, and then lose the process before the final polar-binding receipt is
+stored locally. The evidence remains safe, but its exact delivery lease
+correctly blocks the engine rebuild until normal expiry and replay.
+
+The complete-state path therefore uses the database-backed
+`remote_solver_transfer_paused` fence. It records the prior value, raises the
+fence while the sweeper is still running, and waits for the pass that already
+owns a claim to settle normally. Each later transfer pass rereads the setting
+and performs no reclaim, cancellation, delivery, reuse, or hub call while it is
+raised. Only after both delivery and cancellation outboxes are quiescent may
+the workflow stop the writer and enter the existing engine/Redis/OpenFOAM
+guards. A pre-stop timeout or interruption restores the prior fence and leaves
+the running engine and writers alone; a post-stop failure remains fail-closed
+with writers stopped and OpenCFD admission disabled. Successful maintenance
+restores the exact prior fence value after the prior writer state is restored.
+This control is deliberately separate from the user CPU cap and solver-enabled
+state: maintenance must not cancel hub promises or change compute policy merely
+to stop new transfer claims.

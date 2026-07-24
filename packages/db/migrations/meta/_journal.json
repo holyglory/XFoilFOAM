@@ -617,6 +617,13 @@
       "when": 1788393600000,
       "tag": "0087_remote_capacity_and_field_inventory",
       "breakpoints": true
+    },
+    {
+      "idx": 88,
+      "version": "7",
+      "when": 1788480000000,
+      "tag": "0088_remote_transfer_maintenance_fence",
+      "breakpoints": true
     }
   ]
 }

@@ -46,7 +46,14 @@
   restart under v4, publish three clean whole periods, bind their evidence to
   GCS, and retire their obsolete generations. Readiness requires guarded v4
   deployment, restored 8/40-slot admission, accepted corrective-result
-  delivery, and no recurring current-generation critical chain.
+  delivery, and no recurring current-generation critical chain. The first v4
+  maintenance attempt also exposed a transfer-quiescence race: the remote
+  background writer could claim and verify another exact GCS upload between
+  the maintenance read and process stop, leaving its otherwise safe delivery
+  behind a fresh lease. A durable transfer-only pause, live-writer drain, exact
+  pause-state restoration, deployment-order regression, and real
+  no-network/no-claim test are implemented and verified locally but not yet
+  deployed. Promote that guard before retrying remote engine maintenance.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

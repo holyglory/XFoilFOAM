@@ -51,6 +51,7 @@ const {
   settleResultDelivery,
   startRemoteReclaimClaimLease,
   startRemotePromiseTransferLease,
+  transferRemoteSolverTick,
 } = await import("../src/remote-solver");
 const { registerEvidenceArtifacts } = await import("../src/ingest");
 const { backfillLegacyBrokeredEvidence } =
@@ -266,6 +267,7 @@ async function configureRemoteSolver() {
       upstreamSecret: "",
       remoteSolverEnabled: true,
       remoteSolverCpuBudget: 2,
+      remoteSolverTransferPaused: false,
       remoteSolverClaimSize: 3,
       remoteSolverRegisteredId: randomUUID(),
       remoteSolverAuthToken: `${PREFIX}-solver-token`,
@@ -1490,6 +1492,23 @@ afterAll(async () => {
 });
 
 describe("remote solver submit lifecycle", () => {
+  it("does not claim or contact the hub while maintenance pauses transfers", async () => {
+    await db
+      .update(syncApiSettings)
+      .set({
+        remoteSolverTransferPaused: true,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncApiSettings.id, 1));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(
+      await transferRemoteSolverTick(db, {} as unknown as EngineClient),
+    ).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("fails a tick before any claim or upload network call for an unsafe stored hub", async () => {
     await db
       .update(syncApiSettings)

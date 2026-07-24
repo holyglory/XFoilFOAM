@@ -4740,6 +4740,14 @@ export const syncApiSettings = pgTable("sync_api_settings", {
   remoteSolverCpuBudget: integer("remote_solver_cpu_budget")
     .notNull()
     .default(1),
+  /** Internal maintenance fence. This pauses new remote transfer/outbox passes
+   * without disabling the solver, cancelling promises, or changing CPU
+   * admission. An already-running transfer finishes under its existing exact
+   * claim; the maintenance workflow waits for that claim before stopping the
+   * writer. */
+  remoteSolverTransferPaused: boolean("remote_solver_transfer_paused")
+    .notNull()
+    .default(false),
   remoteSolverClaimSize: integer("remote_solver_claim_size")
     .notNull()
     .default(36),

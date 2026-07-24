@@ -228,7 +228,11 @@ Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDeta
   budget, case concurrency, Celery concurrency, and container CPU limit at 40.
   Upgrade its executable OpenCFD pool from 2406 to 2606 through a dedicated
   drain/backup/rollback/canary/attestation workflow that never runs the hub's
-  campaign-successor transition. Retain complete local tar.zst evidence with
+  campaign-successor transition. For later engine maintenance, raise a durable
+  transfer-only fence while the writer is still alive, wait for its already
+  claimed exact delivery to settle, and only then stop the writer; restore the
+  prior fence value after verified runtime activation. Retain complete local
+  tar.zst evidence with
   no GCS credential and do not permit generic retention before the production
   hub acknowledges the job-level delivery. Storage location is deployment and
   transfer policy, not part of numerical solver compatibility identity. The
@@ -245,6 +249,11 @@ Detail: [DecisionDetails/D-2026-07-17-hz-solver2-volume-cutover.md](DecisionDeta
   production hub. The selected role-specific profile preserves the existing
   database and volumes, uses all 40 authorized CPU slots, makes rollback and
   recovery durable, and transfers exact evidence before local reclamation.
+  Stopping the writer immediately after an idle read was also rejected after a
+  real maintenance race: the background single-flight could claim a verified
+  GCS upload between that read and process stop, stranding its acknowledgement
+  behind a fresh lease. A transfer-specific fence closes that race without
+  disabling the solver or cancelling promise ownership.
   A result/attempt row plus broker receipt alone leaves restartable bytes and
   required FINAL work outside the scheduling ledger; making those owners part
   of acknowledgement closes that unsafe intermediate state.
