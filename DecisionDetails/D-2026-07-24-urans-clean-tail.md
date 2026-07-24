@@ -115,10 +115,31 @@ immutable quality evidence and survive same-case/cross-job continuation.
 Publication still requires a fresh clean trailing certificate; raw condemned
 samples remain preserved as attempt evidence.
 
+The first v6 corrective burn-in exposed a continuation-boundary gap in that
+contract. A regenerated continuation dictionary could restore a larger
+`maxDeltaT`, and the new monitor closure could later replace it with the
+cadence-sized field-write interval even though the recovery marker and
+`maxCo=1` remained. Version 7 reads the marker before every monitor closure and
+same-case continuation, atomically reapplies both the stronger `fvSolution`
+blocks and the original conservative `maxCo`/`maxDeltaT`, and prevents cadence
+refinement from changing `maxDeltaT` while the marker is armed. The
+must-catch regression first reproduced the old continuation increase, then
+proves both the initial and restarted monitor retain the exact conservative
+ceiling.
+
+During that burn-in, an emergency operator command attempted to change a live
+`controlDict` with `foamDictionary`. OpenFOAM observed the transient empty
+value and stopped four cases with `attempt to read beyond EOF`. Their original
+failed blobs, manifests, and canonical archives remain immutable; the unpacked
+duplicates were restored byte-for-byte from archives that authenticated every
+manifest member. The production runbook now forbids direct edits of a live
+OpenFOAM dictionary: versioned atomic generator changes plus normal
+evidence-preserving retries are the only supported correction path.
+
 Adjacent regressions preserve period-band/subharmonic behavior, ambiguous and
 non-stationary rejection, no-shedding observation length, dense-field gates,
 restart-seam ownership, finalization/live-window identity, and conservative
-startup Courant release. The recovery capability is version 6 and solver
-incident grouping uses `urans-recovery-2026-07-24-v6` so exact pre-fix
+startup Courant release. The recovery capability is version 7 and solver
+incident grouping uses `urans-recovery-2026-07-24-v7` so exact pre-fix
 exhaustions remain auditable and may receive only the existing one
 source-pinned remediation allowance.

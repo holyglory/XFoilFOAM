@@ -168,6 +168,15 @@
   jobs, unsettled deliveries/cancellations, Redis work, media repair, or any
   OpenFOAM child; it must prove the merged nofile limit and restore the exact
   prior execution-pool/writer state before scheduling resumes.
+- Never edit a live OpenFOAM case dictionary with `foamDictionary`, `sed`, or
+  another in-place command. OpenFOAM hot-reloads `controlDict`; even a
+  momentarily empty or partial value can terminate the physical run and turn
+  the operator edit into immutable failure evidence. Fix the versioned
+  generator/continuation path, let a guarded deployment establish the new
+  behavior, and retry through the normal evidence-preserving controller. If a
+  future typed runtime-control API is introduced, it must publish an atomic
+  complete dictionary replacement and carry a regression that proves a reader
+  can never observe a partial file.
 
 ## Solver Evidence Versus Valid Polars
 

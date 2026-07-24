@@ -1587,6 +1587,47 @@ def _arm_urans_impulse_recovery(
     )
 
 
+def _restore_urans_impulse_recovery(
+    tcase: Path,
+    *,
+    fallback_max_delta_t: float | None,
+) -> None:
+    """Reapply a persisted impulse rung before a continuation starts.
+
+    The marker owns the original conservative timestep ceiling.  A later
+    continuation can otherwise inherit a cadence-sized ``maxDeltaT`` from its
+    regenerated controlDict even though ``maxCo`` remains conservative.
+    """
+    marker_path = tcase / URANS_IMPULSE_RECOVERY_MARKER
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        marker = {}
+    stored_max_delta_t = marker.get("max_delta_t")
+    max_delta_t = (
+        float(stored_max_delta_t)
+        if isinstance(stored_max_delta_t, (int, float))
+        and math.isfinite(float(stored_max_delta_t))
+        and float(stored_max_delta_t) > 0
+        else fallback_max_delta_t
+    )
+    control_entries: dict[str, object] = {
+        "maxCo": URANS_STARTUP_MAX_COURANT,
+        "runTimeModifiable": True,
+    }
+    if (
+        isinstance(max_delta_t, (int, float))
+        and math.isfinite(float(max_delta_t))
+        and float(max_delta_t) > 0
+    ):
+        control_entries["maxDeltaT"] = float(max_delta_t)
+    _apply_urans_impulse_solution_entries(tcase)
+    _set_control_dict_entries(
+        tcase / "system" / "controlDict",
+        control_entries,
+    )
+
+
 def _sanitize_freestream_init_time_state(case_dir: Path, initial_delta_t: float) -> bool:
     """Reset a SIMPLE-init pseudo-time restart to the intended transient dt.
 
@@ -2905,13 +2946,19 @@ def _make_urans_monitor(
     settled_max_courant: Optional[float] = None,
     startup_max_delta_t: Optional[float] = None,
 ) -> Callable[[], None]:
+    impulse_recovery_armed = (
+        tcase / URANS_IMPULSE_RECOVERY_MARKER
+    ).is_file()
+    if impulse_recovery_armed:
+        _restore_urans_impulse_recovery(
+            tcase,
+            fallback_max_delta_t=startup_max_delta_t,
+        )
     state: dict[str, object] = {
         "cadence_period": None,
         "target_period": None,
         "stop_requested": False,
-        "impulse_recovery_armed": (
-            tcase / URANS_IMPULSE_RECOVERY_MARKER
-        ).is_file(),
+        "impulse_recovery_armed": impulse_recovery_armed,
     }
 
     def monitor() -> None:
@@ -2940,7 +2987,7 @@ def _make_urans_monitor(
                 # writes, but not enough to relax the conservative physical
                 # timestep.  Keep the startup maxDeltaT until the same two
                 # periods also carry the required publishable field frames.
-                if result.ok:
+                if result.ok and not state.get("impulse_recovery_armed"):
                     cadence_entries["maxDeltaT"] = write_interval
                 _set_control_dict_entries(
                     tcase / "system" / "controlDict",
@@ -4108,7 +4155,10 @@ def _run_transient_attempt(
         # the solver starts so a clean suffix cannot silently fall back to the
         # looser numerics that produced its condemned prefix.
         if (tcase / URANS_IMPULSE_RECOVERY_MARKER).is_file():
-            _apply_urans_impulse_solution_entries(tcase)
+            _restore_urans_impulse_recovery(
+                tcase,
+                fallback_max_delta_t=pass_max_delta_t,
+            )
         # Arm the heartbeat march-rate watchdog for this chunk: it projects
         # trailing simulated-time progress against the bounded tier budget.
         write_march_budget_marker(

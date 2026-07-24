@@ -57,15 +57,26 @@
   not cure it, while tighter pressure/transport convergence and a 4×3 PIMPLE
   loop did. The manually altered canary was cancelled before publication and
   all six exact obligations returned to pending without consuming attempts.
-  Recovery v6 now arms that stronger numerical rung automatically, restores
-  the conservative Courant cap, restarts certification, persists the recovery
-  through continuation/evidence retention, and forbids later release within
-  the recovered physical chunk. The focused 243-test solver/evidence suite,
-  TypeScript incident checks/typecheck, and full 1,286-test non-integration
-  engine suite pass. Readiness still requires guarded v6 deployment, restored
-  8/40-slot admission, exact corrective reruns that publish three clean whole
-  periods, GCS binding and obsolete-generation retirement, and no recurring
-  current-generation critical chain.
+  Recovery v6 is deployed on both engines; it automatically arms the stronger
+  numerical rung, restores the conservative Courant cap, restarts
+  certification, and forbids later release within that physical chunk. Its
+  corrective burn-in found one remaining continuation defect: a regenerated
+  `controlDict` and fresh monitor closure could replace the marker-owned
+  `maxDeltaT` with a cadence-sized value. Recovery v7 atomically reapplies the
+  persisted numerical and timestep controls before both boundaries and
+  prevents cadence refinement from changing them while recovery is armed. A
+  failing-before/fixed-after continuation regression, the 95-test frame-track
+  file, TypeScript incident checks/typecheck, and the full 1,286-test
+  non-integration engine suite pass. An operator-side live-dictionary edit
+  during diagnosis caused four v6 cases to stop with immutable rejected
+  evidence; all four canonical archives authenticated every manifest member,
+  their unpacked duplicates were restored exactly, and the runbook now forbids
+  direct live dictionary edits. Two unaffected cases continue solving.
+  Readiness still requires a guarded v7 deployment, restored 8/40-slot
+  admission, evidence-preserving v7 reruns for the four interrupted angles,
+  three clean whole periods for all six exact obligations, GCS binding and
+  obsolete-generation retirement, and no recurring current-generation
+  critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

@@ -2121,6 +2121,8 @@ PIMPLE
     control = (tcase / "system" / "controlDict").read_text()
     assert "maxCo 1;" in control
     assert "maxCo 4;" not in control
+    assert "maxDeltaT 0.01;" in control
+    assert "maxDeltaT 0.2;" not in control
 
     # A same-case continuation owns a fresh monitor closure. The immutable
     # recovery marker must carry the conservative-Courant decision across that
@@ -2142,6 +2144,8 @@ PIMPLE
     control = (tcase / "system" / "controlDict").read_text()
     assert "maxCo 1;" in control
     assert "maxCo 4;" not in control
+    assert "maxDeltaT 0.01;" in control
+    assert "maxDeltaT 0.2;" not in control
 
 
 def test_live_monitor_keeps_startup_courant_until_period_frames_are_publishable(
