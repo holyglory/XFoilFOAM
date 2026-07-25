@@ -17,6 +17,7 @@ import pytest
 from airfoilfoam import pipeline, tasks
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.cache import EngineCache
+from airfoilfoam.cancellation import JobCancelled
 from airfoilfoam.config import Settings
 from airfoilfoam.meshing.base import BoundaryPatch, Mesher, MeshResult, list_meshers
 from airfoilfoam.models import (
@@ -25,7 +26,11 @@ from airfoilfoam.models import (
     CaseSpec,
     FailureDisposition,
     FluidProperties,
+    JobResult,
+    JobState,
     MeshParams,
+    Polar,
+    PolarPoint,
     PolarRequest,
     RoughnessParams,
     SolverParams,
@@ -616,6 +621,66 @@ def test_terminal_pre_angle_failure_serializes_typed_job_disposition_without_poi
     )
     assert status_payload["failure_disposition"] == expected_wire_value
     assert result_payload["failure_disposition"] == expected_wire_value
+
+
+def test_worker_cancellation_preserves_incrementally_published_cases(
+    tmp_path, monkeypatch
+):
+    settings = Settings(data_dir=tmp_path / "data")
+    store = JobStore(settings)
+    request = PolarRequest(
+        airfoil={
+            "name": "cancelled-partial",
+            "points": [[1, 0], [0.5, 0.1], [0, 0], [0.5, -0.1], [1, 0]],
+        },
+        aoa=AoASpec(angles=[9.0, 10.0]),
+    )
+    job_id = "cancelled-partial-worker"
+    store.create(job_id, request)
+    monkeypatch.setattr(tasks, "get_settings", lambda: settings)
+    monkeypatch.setattr(tasks, "install_subprocess_signal_handlers", lambda: None)
+
+    completed_case = PolarPoint(
+        case_slug="c1_u30_a9",
+        aoa_deg=9.0,
+        cl=0.9,
+        cd=0.03,
+        cm=-0.02,
+        cl_cd=30.0,
+        converged=True,
+        unsteady=True,
+        fidelity="urans_precalc",
+    )
+
+    def publish_then_cancel(*_args, **_kwargs):
+        store.write_result(
+            JobResult(
+                job_id=job_id,
+                state=JobState.running,
+                polars=[
+                    Polar(
+                        speed=30.0,
+                        chord=1.0,
+                        reynolds=2_000_000.0,
+                        points=[completed_case],
+                    )
+                ],
+            )
+        )
+        raise JobCancelled("cancelled after partial publication")
+
+    monkeypatch.setattr(tasks, "execute_job", publish_then_cancel)
+
+    assert tasks.run_polar(job_id, request.model_dump_json()) == {
+        "job_id": job_id,
+        "state": "cancelled",
+    }
+
+    result = store.read_result(job_id)
+    assert result is not None
+    assert result.state is JobState.cancelled
+    assert result.message == "cancelled"
+    assert [point.case_slug for point in result.polars[0].points] == ["c1_u30_a9"]
 
 
 def test_non_default_mesher_deterministic_failure_does_not_change_user_strategy(

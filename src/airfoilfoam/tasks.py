@@ -1055,13 +1055,27 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
         try:
             result = execute_job(job_id, request, store=store, settings=settings)
         except JobCancelled:
-            result = JobResult(
-                job_id=job_id,
-                state=JobState.cancelled,
-                message="cancelled",
-                engine=runtime_engine,
-                execution_pool=settings.celery_queue,
-            )
+            terminalized_partial = store.terminalize_cancelled_result(job_id)
+            result = store.read_result(job_id)
+            if result is None:
+                result = JobResult(
+                    job_id=job_id,
+                    state=JobState.cancelled,
+                    message="cancelled",
+                    engine=runtime_engine,
+                    execution_pool=settings.celery_queue,
+                )
+            elif not terminalized_partial:
+                # A late cancellation signal must never overwrite a result
+                # that another terminal path already committed.
+                return {"job_id": job_id, "state": result.state.value}
+            else:
+                # Keep every incrementally published polar/case while filling
+                # legacy partials that predate top-level runtime provenance.
+                result.engine = result.engine or runtime_engine
+                result.execution_pool = (
+                    result.execution_pool or settings.celery_queue
+                )
             status = store.read_status(job_id) or JobStatus(job_id=job_id, state=JobState.cancelled)
             status.state = JobState.cancelled
             status.phase = JobPhase.cancelled
