@@ -18,6 +18,11 @@ MESH_RECOVERY_VERSION = 2
 # recovery: immutable evidence archives could hydrate a saved case after local
 # retention, continuations used the adaptive extension budget, and requests
 # were rejected before CFD when controller and worker disagreed.
+# Version 9 derives the high-frequency wake bound from the larger of projected
+# AoA height and measured section thickness. Thick/cambered sections therefore
+# retain a physically plausible thickness-scale limit cycle while the legacy
+# chord-only bound remains unchanged for thin/ordinary sections; clean-tail,
+# independent-half, discontinuity, and field-density gates remain mandatory.
 # Version 8 keeps a known immutable OpenFOAM continuation boundary out of the
 # live within-run impulse trigger. Period similarity and final clean-tail
 # publication remain strict, so an unsettled restart cannot be accepted; it
@@ -37,4 +42,4 @@ MESH_RECOVERY_VERSION = 2
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 8
+URANS_RECOVERY_VERSION = 9

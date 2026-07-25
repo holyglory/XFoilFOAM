@@ -106,9 +106,19 @@
   artifact rows for minutes. The corrected discovery is lightweight while the
   exact bounded second phase remains the sole continuation authorization gate;
   isolated promotion and exhausted-checkpoint regressions plus sweeper
-  typecheck pass. Readiness still requires deploying that scheduler correction,
-  obtaining accepted clean-period evidence for the four unresolved angles,
-  GCS binding and obsolete-generation retirement, and no recurring
+  typecheck pass. That scheduler correction is deployed on both nodes and
+  production-scale admission no longer scans the complete artifact ledger.
+  The first exact AoA 0 continuation then advanced the retained case by
+  `0.051606 s` without rebuilding its mesh, but exposed a physics-context
+  defect: its 1,076 Hz tail is stable across both halves and has
+  thickness-scale `St_t=0.394` on the measured `t/c=0.22` section, while the
+  chord-only 30–300 Hz band rejected it. Recovery v9 derives only the
+  high-frequency wake edge from immutable projected section height; actual
+  production bytes select a stationary clean 4.5-period certificate and exact
+  three-period publication window after the corrupt prefix. The implementation
+  and regressions are complete but v9 is not yet deployed. Readiness still
+  requires guarded v9 deployment, accepted clean-period evidence for AoA 0, 1,
+  7, and 9, GCS binding and obsolete-generation retirement, and no recurring
   current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the

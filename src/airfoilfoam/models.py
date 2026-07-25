@@ -783,6 +783,17 @@ class CaseSpec(BaseModel):
     chord: float
     speed: float
     aoa_deg: float
+    section_thickness_ratio: Optional[float] = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description=(
+            "Derived maximum airfoil thickness divided by chord. Internal "
+            "geometry context for wake-period measurement; not a user-owned "
+            "physical setup input."
+        ),
+        exclude=True,
+    )
 
     @property
     def slug(self) -> str:

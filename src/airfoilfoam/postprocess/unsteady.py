@@ -134,16 +134,33 @@ IN_BAND_CREDIBILITY_FRACTION = 0.05
 AC_FFT_UNDERCUT_TOLERANCE = 0.25
 
 
-def _shedding_reference_length(chord: float, alpha_deg: "float | None") -> float:
-    if alpha_deg is None:
-        return chord
+def _shedding_reference_length(
+    chord: float,
+    alpha_deg: "float | None",
+    section_thickness_ratio: "float | None" = None,
+) -> float:
+    projected_ratio = 0.0
     try:
-        sin_alpha = abs(math.sin(math.radians(float(alpha_deg))))
+        if alpha_deg is not None:
+            projected_ratio = abs(math.sin(math.radians(float(alpha_deg))))
     except (TypeError, ValueError):
+        projected_ratio = 0.0
+    try:
+        thickness_ratio = (
+            float(section_thickness_ratio)
+            if section_thickness_ratio is not None
+            else 0.0
+        )
+    except (TypeError, ValueError):
+        thickness_ratio = 0.0
+    if math.isfinite(thickness_ratio) and 0 < thickness_ratio <= 1:
+        projected_ratio = max(projected_ratio, thickness_ratio)
+    if (
+        not math.isfinite(projected_ratio)
+        or projected_ratio <= SHEDDING_PROJECTED_HEIGHT_FLOOR
+    ):
         return chord
-    if not math.isfinite(sin_alpha) or sin_alpha <= SHEDDING_PROJECTED_HEIGHT_FLOOR:
-        return chord
-    return chord * sin_alpha
+    return chord * projected_ratio
 
 
 def shedding_period_band(
@@ -152,6 +169,7 @@ def shedding_period_band(
     st_band: tuple[float, float] = SHEDDING_STROUHAL_BAND,
     *,
     alpha_deg: "float | None" = None,
+    section_thickness_ratio: "float | None" = None,
 ) -> "tuple[float, float] | None":
     """Physically plausible shedding-period window [s] for the flow context:
     St in ``st_band`` => period in [H/(St_max U), c/(St_min U)] where ``H`` is
@@ -173,7 +191,11 @@ def shedding_period_band(
     lo, hi = float(st_band[0]), float(st_band[1])
     if not (0 < lo < hi):
         return None
-    length = _shedding_reference_length(c, alpha_deg)
+    length = _shedding_reference_length(
+        c,
+        alpha_deg,
+        section_thickness_ratio,
+    )
     return (length / (hi * u), c / (lo * u))
 
 
@@ -183,10 +205,17 @@ def shedding_frequency_band(
     st_band: tuple[float, float] = SHEDDING_STROUHAL_BAND,
     *,
     alpha_deg: "float | None" = None,
+    section_thickness_ratio: "float | None" = None,
 ) -> "tuple[float, float] | None":
     """Frequency-domain twin of :func:`shedding_period_band`: [St_min U / c,
     St_max U / H] in Hz, or None without flow context."""
-    band = shedding_period_band(speed, chord, st_band, alpha_deg=alpha_deg)
+    band = shedding_period_band(
+        speed,
+        chord,
+        st_band,
+        alpha_deg=alpha_deg,
+        section_thickness_ratio=section_thickness_ratio,
+    )
     if band is None:
         return None
     p_lo, p_hi = band
@@ -577,6 +606,7 @@ def stable_two_period_window(
     similarity_tolerance: float = 0.12,
     mean_drift_tolerance: float = 0.12,
     alpha_deg: float | None = None,
+    section_thickness_ratio: float | None = None,
 ) -> StablePeriodResult:
     """Return an early-stop candidate when the final two periods are repeatable.
 
@@ -628,7 +658,10 @@ def stable_two_period_window(
             tc,
             clc,
             freq_band=shedding_frequency_band(
-                speed, chord, alpha_deg=alpha_deg
+                speed,
+                chord,
+                alpha_deg=alpha_deg,
+                section_thickness_ratio=section_thickness_ratio,
             ),
         )
         st = strouhal(freq, chord, speed)
@@ -985,6 +1018,7 @@ def estimate_period(
     corr_threshold: float = 0.2,
     ambiguity_tolerance: float = PERIOD_AMBIGUITY_TOLERANCE,
     alpha_deg: "float | None" = None,
+    section_thickness_ratio: "float | None" = None,
 ) -> "PeriodEstimate | None":
     """Flow-context-aware shedding period with a stability check.
 
@@ -996,7 +1030,12 @@ def estimate_period(
     AMBIGUOUS.  The full-window estimate remains usable for continuation sizing,
     but an ambiguous estimate must never certify established oscillation.
     """
-    band = shedding_period_band(speed, chord, alpha_deg=alpha_deg)
+    band = shedding_period_band(
+        speed,
+        chord,
+        alpha_deg=alpha_deg,
+        section_thickness_ratio=section_thickness_ratio,
+    )
     t, v = _normalise_series(times, values)
     if t.size == 0:
         return None
@@ -1123,6 +1162,7 @@ def clean_periodic_tail(
     chord: float,
     required_cycles: float,
     alpha_deg: "float | None" = None,
+    section_thickness_ratio: "float | None" = None,
 ) -> "CleanPeriodicTail | None":
     """Find the latest clean, corroborated periodic suffix.
 
@@ -1152,6 +1192,7 @@ def clean_periodic_tail(
             speed=speed,
             chord=chord,
             alpha_deg=alpha_deg,
+            section_thickness_ratio=section_thickness_ratio,
         )
         if estimate is None or estimate.ambiguous:
             continue
@@ -1176,6 +1217,7 @@ def clean_periodic_tail(
             speed=speed,
             chord=chord,
             alpha_deg=alpha_deg,
+            section_thickness_ratio=section_thickness_ratio,
         )
         if confirmed is None or confirmed.ambiguous:
             continue
@@ -1583,6 +1625,7 @@ def force_history(
     max_points: int = 400,
     target_cycles: int = 7,
     alpha_deg: float | None = None,
+    section_thickness_ratio: float | None = None,
     observation_start_time: float | None = None,
     preserve_observation_window: bool = False,
 ) -> ForceHistory:
@@ -1665,6 +1708,7 @@ def force_history(
                 2.0 * PERIOD_ESTIMATE_MIN_CYCLES + 0.5,
             ),
             alpha_deg=alpha_deg,
+            section_thickness_ratio=section_thickness_ratio,
         )
         if clean_tail is not None:
             t_a, cl_a, cd_a, cm_a = clean_tail.series
@@ -1691,7 +1735,10 @@ def force_history(
             t_a,
             cl_a,
             freq_band=shedding_frequency_band(
-                speed, chord, alpha_deg=alpha_deg
+                speed,
+                chord,
+                alpha_deg=alpha_deg,
+                section_thickness_ratio=section_thickness_ratio,
             ),
         )
         st = strouhal(freq, chord, speed)

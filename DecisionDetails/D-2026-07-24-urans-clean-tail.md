@@ -32,9 +32,14 @@ broken prefix. Later segments were materially calmer, proving that elapsed
 fraction alone was not a truthful settling boundary.
 
 The late signal in this exact case oscillated near 970 Hz, outside the
-flow-owned 30–300 Hz shedding band. It therefore remains rejected and requires
-one corrected physical continuation/rerun; visually repeated numerical
-timesteps are not promoted into aerodynamic evidence.
+then flow-owned 30–300 Hz chord band. It therefore remained rejected pending a
+corrected physical continuation; visually repeated timesteps were not promoted
+without further evidence. The subsequent exact v8 continuation reproduced a
+stable 1,076 Hz tail under conservative timestep and tightened PIMPLE controls,
+and measured geometry showed `t/c=0.22` (`St_t=0.394`). The chord-only
+classification is superseded by
+[D-2026-07-25-geometry-scale-wake](D-2026-07-25-geometry-scale-wake.md);
+the clean-tail and stationarity requirements remain unchanged.
 
 ## Options considered
 

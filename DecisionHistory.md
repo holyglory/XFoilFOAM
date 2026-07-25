@@ -40,6 +40,7 @@
   [D-2026-07-19-urans-physical-tail]
   [D-2026-07-20-urans-continuation-wall-budget]
   [D-2026-07-24-urans-clean-tail]
+  [D-2026-07-25-geometry-scale-wake]
   A proven controller correction may grant one immutable, source-pinned
   remediation attempt per distinct fixed source revision. Ordinary work still
   has two physical attempts; grants never reset or relabel prior evidence, and
@@ -166,6 +167,27 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
   weakening the acceptance gate. The physically banded
   suffix selector then reuses only valid stored evidence without deleting raw
   history or weakening stationarity.
+
+## D-2026-07-25-geometry-scale-wake — Measure thick-section wakes on real projected height
+
+Detail: [DecisionDetails/D-2026-07-25-geometry-scale-wake.md](DecisionDetails/D-2026-07-25-geometry-scale-wake.md)
+
+- Decision: derive the URANS high-frequency wake bound from the larger of
+  `c·sin(|α|)` and the immutable airfoil section's measured maximum thickness
+  whenever that projected-height ratio exceeds 0.15. Keep the low-frequency
+  edge chord-based and preserve independent-half agreement, clean-tail,
+  discontinuity, frame-density, stationarity, and exact three-period
+  publication gates. Thin/default/missing-geometry cases retain the existing
+  chord-only band.
+- Why: AH81K144WFKLAPPE at 0° retained a 1,076 Hz tail that was outside the
+  chord-only 30–300 Hz window, but both independent halves agreed within 0.2%
+  and its measured `t/c=0.22` gives the physically plausible thickness-scale
+  `St_t=0.394`. Repeating the same v8 continuation reproduced that clean
+  cadence and wasted 87 minutes while the chord-only classifier still called
+  it unavailable. Globally widening the band could accept numerical modes on
+  ordinary thin sections, and manual acceptance would bypass evidence gates.
+  Geometry-owned projected height admits only the physically supported wake
+  while the unchanged clean-tail certificate removes the corrupt prefix.
 
 ## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
 

@@ -221,6 +221,33 @@ class Airfoil:
         lower = self.contour[i:]  # LE->TE
         return upper, lower
 
+    @property
+    def max_thickness_fraction(self) -> float:
+        """Maximum section thickness divided by chord.
+
+        The contour is already chord-aligned and normalised.  Interpolate both
+        surfaces on their combined real x stations so asymmetric/cambered
+        sections do not depend on matching source point indices.
+        """
+        upper, lower = self.split_surfaces()
+        if len(upper) < 2 or len(lower) < 2:
+            return 0.0
+        stations = np.unique(
+            np.concatenate((upper[:, 0], lower[:, 0]))
+        )
+        stations = stations[
+            np.isfinite(stations)
+            & (stations >= max(float(upper[0, 0]), float(lower[0, 0])))
+            & (stations <= min(float(upper[-1, 0]), float(lower[-1, 0])))
+        ]
+        if stations.size == 0:
+            return 0.0
+        upper_y = np.interp(stations, upper[:, 0], upper[:, 1])
+        lower_y = np.interp(stations, lower[:, 0], lower[:, 1])
+        thickness = upper_y - lower_y
+        finite = thickness[np.isfinite(thickness)]
+        return max(0.0, float(np.max(finite))) if finite.size else 0.0
+
     @staticmethod
     def _resample_surface(surface: np.ndarray, n: int) -> np.ndarray:
         """Cosine-cluster a single surface (LE->TE) to n+1 points, x in [0, 1]."""

@@ -5,7 +5,12 @@ import numpy as np
 import pytest
 
 from airfoilfoam.airfoil import Airfoil, load_airfoil, max_concave_curvature, parse_airfoil
-from airfoilfoam.models import AirfoilFormat, PRECALC_WALLFN_MAX_CONCAVE_CURVATURE
+from airfoilfoam.models import (
+    AirfoilFormat,
+    CaseSpec,
+    PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
+)
+from airfoilfoam.pipeline import _spec_with_airfoil_geometry
 
 
 SELIG_SEED_DIR = Path(__file__).resolve().parents[1] / "packages/db/seed/selig-database"
@@ -45,6 +50,47 @@ def test_naca0012_thickness(naca0012_selig_text):
     # NACA0012 max thickness ~12% chord
     thickness = upper[:, 1] - lower[:, 1]
     assert thickness.max() == pytest.approx(0.12, abs=0.01)
+    assert af.max_thickness_fraction == pytest.approx(0.12, abs=0.01)
+
+
+def test_max_thickness_interpolates_mismatched_surface_stations():
+    contour = np.array(
+        [
+            [1.0, 0.0],
+            [0.75, 0.08],
+            [0.30, 0.14],
+            [0.0, 0.0],
+            [0.20, -0.07],
+            [0.55, -0.09],
+            [0.90, -0.025],
+            [1.0, 0.0],
+        ],
+        dtype=float,
+    )
+    af = Airfoil.from_contour("asymmetric-thick", contour)
+
+    assert af.max_thickness_fraction == pytest.approx(0.22, abs=0.015)
+
+
+def test_case_spec_receives_immutable_airfoil_thickness_context():
+    contour = np.array(
+        [
+            [1.0, 0.0],
+            [0.50, 0.11],
+            [0.0, 0.0],
+            [0.50, -0.11],
+            [1.0, 0.0],
+        ],
+        dtype=float,
+    )
+    af = Airfoil.from_contour("thick-section", contour)
+    original = CaseSpec(chord=0.05, speed=30.0, aoa_deg=0.0)
+
+    resolved = _spec_with_airfoil_geometry(original, af)
+
+    assert original.section_thickness_ratio is None
+    assert resolved.section_thickness_ratio == pytest.approx(0.22)
+    assert "section_thickness_ratio" not in resolved.model_dump()
 
 
 def test_resample_endpoints_and_count(naca0012_selig_text):

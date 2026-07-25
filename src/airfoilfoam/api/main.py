@@ -905,15 +905,12 @@ def create_app() -> FastAPI:
             af = load_airfoil(airfoil.name, airfoil.coordinates, airfoil.points, airfoil.format)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=422, detail=f"Could not parse airfoil: {exc}")
-        upper, lower = af.split_surfaces()
-        thickness = float(np.max(np.interp(lower[:, 0], upper[:, 0], upper[:, 1]) - lower[:, 1])) \
-            if len(upper) and len(lower) else None
         return {
             "name": af.name,
             "n_points": int(af.contour.shape[0]),
             "leading_edge_index": af.le_index,
             "trailing_edge_gap_original": af.te_gap_original,
-            "max_thickness_fraction": thickness,
+            "max_thickness_fraction": af.max_thickness_fraction,
         }
 
     @app.post("/polars", response_model=JobStatus, status_code=202)

@@ -12,8 +12,10 @@ from airfoilfoam.cancellation import JobCancelled
 from airfoilfoam.postprocess.unsteady import (
     ForceHistory,
     dominant_frequency,
+    estimate_period,
     force_history,
     integer_period_window,
+    shedding_frequency_band,
     stable_two_period_window,
     strouhal,
 )
@@ -59,6 +61,101 @@ def test_strouhal_formula():
     assert strouhal(2.0, 1.0, 20.0) == 0.1
     assert strouhal(5.0, 0.5, 10.0) == 0.25
     assert strouhal(2.0, 1.0, 0.0) == 0.0  # guard against zero speed
+
+
+def test_thick_section_wake_scale_corroborates_high_frequency_period():
+    """MUST-CATCH: the AH81K144WFKLAPPE 0° production class.
+
+    Its clean tail repeats at about 1,076 Hz.  That is outside the legacy
+    chord-only 30–300 Hz band, but its measured t/c=0.22 makes St_t=0.394:
+    a physically plausible thickness-scale wake.  Both independent halves
+    agree to much better than 1%, so it must not be called numerical merely
+    because the section is thick.
+    """
+    speed = 30.0
+    chord = 0.05
+    thickness_ratio = 0.22
+    frequency = 1075.7
+    times = np.linspace(0.0, 0.02, 10_001)
+    lift = -0.448 + 0.0042 * np.sin(2.0 * math.pi * frequency * times)
+
+    legacy = estimate_period(
+        times,
+        lift,
+        speed=speed,
+        chord=chord,
+        alpha_deg=0.0,
+    )
+    geometry_aware = estimate_period(
+        times,
+        lift,
+        speed=speed,
+        chord=chord,
+        alpha_deg=0.0,
+        section_thickness_ratio=thickness_ratio,
+    )
+    band = shedding_frequency_band(
+        speed,
+        chord,
+        alpha_deg=0.0,
+        section_thickness_ratio=thickness_ratio,
+    )
+
+    assert legacy is None
+    assert band is not None
+    assert band[0] == pytest.approx(30.0)
+    assert band[1] == pytest.approx(1363.636, rel=1e-4)
+    assert geometry_aware is not None
+    assert not geometry_aware.ambiguous
+    assert geometry_aware.period_s == pytest.approx(1.0 / frequency, rel=0.01)
+    assert geometry_aware.first_half_s == pytest.approx(
+        geometry_aware.second_half_s, rel=0.01
+    )
+
+
+def test_thick_section_clean_tail_excludes_late_corrupt_prefix(tmp_path):
+    """A geometry-scale wake still uses the strict clean-suffix contract."""
+    speed = 30.0
+    chord = 0.05
+    frequency = 1075.7
+    path = tmp_path / "coefficient.dat"
+    lines = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
+        "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    times = np.linspace(0.0, 0.05, 25_001)
+    for t in times:
+        if t < 0.03:
+            # Corruption extends beyond the legacy 40% discard boundary.
+            cl = -0.25 + 0.18 * math.sin(2.0 * math.pi * 71.0 * t)
+            cd = 0.06 + 0.025 * math.cos(2.0 * math.pi * 47.0 * t)
+        else:
+            cl = -0.448 + 0.0042 * math.sin(2.0 * math.pi * frequency * t)
+            cd = 0.0327 + 0.00018 * math.cos(
+                2.0 * math.pi * frequency * t + 0.2
+            )
+        lines.append(
+            f"{t:.12g} {cd:.12g} 0 0 {cl:.12g} 0 0 "
+            "0.099 0 0 0 0 0"
+        )
+    path.write_text("\n".join(lines) + "\n")
+
+    history = force_history(
+        path,
+        speed,
+        chord,
+        discard_fraction=0.4,
+        target_cycles=3,
+        alpha_deg=0.0,
+        section_thickness_ratio=0.22,
+    )
+
+    assert history.period_s == pytest.approx(1.0 / frequency, rel=0.01)
+    assert history.retained_cycles == 3
+    assert history.window_start is not None
+    assert history.window_start > 0.045
+    assert min(history.cl) > -0.46
+    assert max(history.cl) < -0.43
 
 
 def _write_coeff(path, f, n=600, dt=0.01, cl0=0.75, cd0=0.30):

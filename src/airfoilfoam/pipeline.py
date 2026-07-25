@@ -208,6 +208,21 @@ class PolarMarchResult:
     precalc_promotion: Optional[RansPrecalcPromotion] = None
 
 
+def _spec_with_airfoil_geometry(
+    spec: CaseSpec,
+    airfoil: Optional[Airfoil],
+) -> CaseSpec:
+    """Attach immutable derived geometry needed by wake-period measurement."""
+    if spec.section_thickness_ratio is not None or airfoil is None:
+        return spec
+    thickness_ratio = getattr(airfoil, "max_thickness_fraction", 0.0)
+    if not math.isfinite(thickness_ratio) or thickness_ratio <= 0:
+        return spec
+    return spec.model_copy(
+        update={"section_thickness_ratio": thickness_ratio}
+    )
+
+
 def _time_of(coeff_path) -> float:
     try:
         return float(coeff_path.parent.name)
@@ -1328,6 +1343,7 @@ def _force_history_for_no_shedding_horizon(
             0.0,
             target_cycles=target_cycles,
             alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
             observation_start_time=cutoff,
             preserve_observation_window=True,
         )
@@ -2970,6 +2986,7 @@ def _make_urans_monitor(
             speed=spec.speed,
             chord=spec.chord,
             alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
             frame_times=_numeric_time_dirs(tcase),
             discard_fraction=0.0,
             min_frames_per_cycle=URANS_MIN_FRAMES_PER_CYCLE,
@@ -3332,6 +3349,7 @@ def _precalc_certified_window(
         speed=spec.speed,
         chord=spec.chord,
         alpha_deg=spec.aoa_deg,
+        section_thickness_ratio=spec.section_thickness_ratio,
     )
     if (
         not early_stopped
@@ -3346,6 +3364,7 @@ def _precalc_certified_window(
             chord=spec.chord,
             required_cycles=_early_stop_certification_cycles(solver_params),
             alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
         )
         if clean_tail is not None:
             selected = clean_tail.series
@@ -3358,6 +3377,7 @@ def _precalc_certified_window(
                 speed=spec.speed,
                 chord=spec.chord,
                 alpha_deg=spec.aoa_deg,
+                section_thickness_ratio=spec.section_thickness_ratio,
             )
     if source_estimate is None:
         raise _PrecalcCertifiedWindowUnavailable(
@@ -3425,6 +3445,7 @@ def _precalc_certified_window(
             speed=spec.speed,
             chord=spec.chord,
             alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
         )
         if trailing_estimate is None:
             raise _PrecalcCertifiedWindowUnavailable(
@@ -3626,6 +3647,7 @@ def _grade_precalc_established_oscillation(
                         else solver_params.urans_min_periods
                     ),
                     alpha_deg=spec.aoa_deg,
+                    section_thickness_ratio=spec.section_thickness_ratio,
                 )
             except Exception:  # noqa: BLE001
                 # In-flight restart evidence may be partial; keep acquisition.
@@ -3771,6 +3793,7 @@ def _grade_full_strict_stationarity(
             speed=spec.speed,
             chord=spec.chord,
             alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
         )
         if estimate is not None:
             period = estimate.period_s
@@ -4394,6 +4417,7 @@ def _run_transient_attempt(
             history_discard,
             target_cycles=target_cycles,
             alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
         )
         no_shedding_tail = _force_history_for_no_shedding_horizon(
             list(coeff_paths),
@@ -4736,6 +4760,7 @@ def _continuation_period_estimate(
                 speed=spec.speed,
                 chord=spec.chord,
                 alpha_deg=spec.aoa_deg,
+                section_thickness_ratio=spec.section_thickness_ratio,
             )
             if (
                 not result.early_stopped
@@ -4752,6 +4777,7 @@ def _continuation_period_estimate(
                         solver_params
                     ),
                     alpha_deg=spec.aoa_deg,
+                    section_thickness_ratio=spec.section_thickness_ratio,
                 )
                 if clean_tail is not None:
                     t_c, cl_c, _cd_c, _cm_c = clean_tail.series
@@ -4761,6 +4787,7 @@ def _continuation_period_estimate(
                         speed=spec.speed,
                         chord=spec.chord,
                         alpha_deg=spec.aoa_deg,
+                        section_thickness_ratio=spec.section_thickness_ratio,
                     )
             if estimate is not None:
                 return estimate
@@ -4776,6 +4803,7 @@ def _continuation_period_estimate(
         speed=spec.speed,
         chord=spec.chord,
         alpha_deg=spec.aoa_deg,
+        section_thickness_ratio=spec.section_thickness_ratio,
     )
 
 
@@ -5206,7 +5234,12 @@ def _run_transient(
             if saved_paths:
                 t_all, cl_all, _cd_all, _cm_all = coefficient_series(saved_paths)
                 estimate = estimate_period(
-                    t_all, cl_all, speed=spec.speed, chord=spec.chord, alpha_deg=spec.aoa_deg
+                    t_all,
+                    cl_all,
+                    speed=spec.speed,
+                    chord=spec.chord,
+                    alpha_deg=spec.aoa_deg,
+                    section_thickness_ratio=spec.section_thickness_ratio,
                 )
                 if estimate is not None:
                     period = estimate.period_s
@@ -6287,6 +6320,7 @@ def _finalize_outcome(
                             speed=spec.speed,
                             chord=spec.chord,
                             alpha_deg=spec.aoa_deg,
+                            section_thickness_ratio=spec.section_thickness_ratio,
                         )
                         frame_period = (
                             frame_estimate.period_s
@@ -6659,6 +6693,7 @@ def run_case(
     (see ``stage_continuation_case``): meshing and the steady stage are
     skipped entirely and the URANS transient restarts from latestTime with
     ``urans_budget_s`` (when given) replacing the tier wall budget."""
+    spec = _spec_with_airfoil_geometry(spec, airfoil)
     case_dir.mkdir(parents=True, exist_ok=True)
     re = physics.reynolds(spec.speed, spec.chord, fluid.nu)
     runtime = (
@@ -8029,7 +8064,10 @@ def _run_full_urans_replacement(
     points: list[StoredCaseOutcome] = []
     for j, aoa in enumerate(sorted(aoas)):
         _check_cancel(cancel_check)
-        spec = CaseSpec(chord=chord, speed=speed, aoa_deg=aoa)
+        spec = _spec_with_airfoil_geometry(
+            CaseSpec(chord=chord, speed=speed, aoa_deg=aoa),
+            airfoil,
+        )
         case_slug = f"{polar_dir.name}/urans_a{j}"
         case_dir = polar_dir / f"urans_a{j}"
         if phase_progress:
@@ -8121,7 +8159,10 @@ def solve_polar_marched(
     try:
         for execution_index, (case_index, aoa) in enumerate(execution_plan):
             _check_cancel(cancel_check)
-            spec = CaseSpec(chord=chord, speed=speed, aoa_deg=aoa)
+            spec = _spec_with_airfoil_geometry(
+                CaseSpec(chord=chord, speed=speed, aoa_deg=aoa),
+                airfoil,
+            )
             if phase_progress:
                 phase_progress(
                     JobPhase.solving_urans if solver_params.force_transient else JobPhase.solving_rans,
