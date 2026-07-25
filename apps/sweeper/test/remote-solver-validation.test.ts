@@ -2920,6 +2920,153 @@ describe("remote-owned whole-polar promotion scope", () => {
 });
 
 describe("remote-owned derived PRECALC lifecycle", () => {
+  it("MUST-CATCH: a stale promotion owner cannot strand a point owned by a newer active promise", async () => {
+    const aoa = 3.125;
+    const stalePromise = await seedMirroredPromise(
+      "stale-promotion-owner",
+      [aoa],
+    );
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled" })
+      .where(eq(syncSweepPromisePoints.promiseId, stalePromise.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, stalePromise.id));
+    const current = await seedRemoteRejectedParent(
+      "replacement-owner-after-stale-promotion",
+      aoa,
+    );
+    const firstSubmit = vi.fn(async () =>
+      acceptedStatus("replacement-owner-precalc-first"),
+    );
+    await submitUransRetryForJob(
+      db,
+      { submitPolar: firstSubmit } as unknown as EngineClient,
+      current.parent,
+      {
+        meshRecoveryVersion: 4,
+        uransRecoveryVersion: 1,
+        cpuSlots: 1,
+      },
+    );
+    const [firstChild] = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, current.parent.id), eq(simJobs.wave, 2)));
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.latestSimJobId, firstChild.id));
+    await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        engineState: "completed",
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+      })
+      .where(eq(simJobs.id, firstChild.id));
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "rejected",
+        outcome: "quality_rejected",
+        error: "preliminary observation horizon was too short",
+        completedAt: new Date(),
+      })
+      .where(eq(simPrecalcObligationAttempts.simJobId, firstChild.id));
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        attemptCount: 1,
+        nextSubmitAt: new Date(Date.now() - 1_000),
+        lastOutcome: "quality_rejected",
+        lastError: "preliminary observation horizon was too short",
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await db
+      .update(results)
+      .set({ status: "stale" })
+      .where(eq(results.id, current.result.id));
+    const [historicalParent] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 1,
+        jobKind: "sweep",
+        status: "cancelled",
+        engineJobId: `${PREFIX}-stale-promotion-owner-rans`,
+        totalCases: 1,
+        completedCases: 0,
+        finishedAt: new Date(),
+        requestPayload: {
+          syncPromiseId: stalePromise.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          aoas: [aoa],
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: [aoa],
+          },
+        },
+      })
+      .returning();
+    const [promotion] = await db
+      .insert(simRansPolarPromotions)
+      .values({
+        parentJobId: historicalParent.id,
+        airfoilId,
+        revisionId,
+        ownerKind: "sync_promise",
+        syncPromiseId: stalePromise.id,
+        triggerResultAttemptId: current.attempt.id,
+        triggerAoaDeg: aoa,
+        failureDisposition: "hard_solver",
+        requestOrigin: "continuous-polar",
+      })
+      .returning();
+    await db.insert(simRansPolarPromotionPoints).values({
+      promotionId: promotion.id,
+      aoaDeg: aoa,
+      obligationId: obligation.id,
+    });
+
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("replacement-owner-precalc"),
+    );
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+      ),
+    ).resolves.toBe(true);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(submitPolar.mock.calls[0]![0]).toMatchObject({
+      aoa: { angles: [aoa] },
+      solver: { urans_fidelity: "precalc" },
+    });
+    const children = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, current.parent.id), eq(simJobs.wave, 2)))
+      .orderBy(simJobs.createdAt);
+    expect(children).toHaveLength(2);
+    expect(children[1]?.requestPayload).toMatchObject({
+      syncPromiseId: current.promise.id,
+      remoteSolver: true,
+      precalcObligationIds: [obligation.id],
+    });
+  });
+
   it("MUST-CATCH: a pending attempt-2 PRECALC owns the remote point before any replacement RANS shell", async () => {
     const aoa = 919.001;
     const { promise, parent, result } = await seedRemoteRejectedParent(

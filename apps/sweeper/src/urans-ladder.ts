@@ -1403,8 +1403,27 @@ async function dueRemotePromisePrecalcRecoveryParents(
           AND latest_job.status IN ('pending', 'submitted', 'running', 'ingesting')
       )
       AND NOT EXISTS (
+        -- A recorded promotion excludes this targeted lane only while its own
+        -- exact remote promise still owns the cell. Historical promotion
+        -- provenance remains immutable after that lease closes; a replacement
+        -- active promise must still be able to continue the shared obligation.
         SELECT 1
         FROM sim_rans_polar_promotion_points promotion_point
+        JOIN sim_rans_polar_promotions promotion
+          ON promotion.id = promotion_point.promotion_id
+         AND promotion.owner_kind = 'sync_promise'
+        JOIN sync_sweep_promises promotion_promise
+          ON promotion_promise.id = promotion.sync_promise_id
+         AND promotion_promise.status = 'active'
+         AND promotion_promise."expiresAt" > now()
+         AND promotion_promise.request_payload ->> 'remoteSolver' = 'true'
+        JOIN sync_sweep_promise_points promotion_promise_point
+          ON promotion_promise_point.promise_id = promotion_promise.id
+         AND promotion_promise_point.status = 'active'
+         AND promotion_promise_point.airfoil_id = obligation.airfoil_id
+         AND promotion_promise_point.simulation_preset_revision_id =
+           obligation.revision_id
+         AND promotion_promise_point.aoa_deg = obligation.aoa_deg
         WHERE promotion_point.obligation_id = obligation.id
       )
     GROUP BY parent.id
