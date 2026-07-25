@@ -136,3 +136,48 @@ final result: passed
 Passed. The routine Health state is compact; chronology and debug evidence are
 available on demand; wide and narrow layouts remain inside their component;
 and the same authenticated read model is available to operators and AI agents.
+
+---
+
+# Design QA — registered remote solver card
+
+## Source visual target
+
+- User-visible source: the browser annotation attached to this task for
+  `https://airfoils.pro/admin?section=sync`; the app did not expose a local
+  filesystem path for that attachment.
+- Source viewport: 517 × 917 CSS pixels.
+- Targeted problem: the solver name, CPU capacity, promise counts, heartbeat,
+  endpoint, cap control, and save action competed for the same narrow row and
+  overlapped.
+
+## Implementation screenshots
+
+- Reported width, 517 × 917:
+  `/tmp/remote-solver-layout-screens-final/https_airfoils.pro_admin_section_sync-reported.png`
+- Narrow mobile, 390 × 844:
+  `/tmp/remote-solver-layout-screens-final/https_airfoils.pro_admin_section_sync-mobile.png`
+- Desktop, 1260 × 1280:
+  `/tmp/remote-solver-layout-screens-final/https_airfoils.pro_admin_section_sync-desktop.png`
+- Formal verification report:
+  `/tmp/remote-solver-layout-formal-final.md`
+
+## Comparison history
+
+1. The source compressed identity and metrics into a two-column row whose
+   fixed-width content could not fit at 517 px.
+2. A regression test was written first and failed against that structure.
+3. The card was reorganized into stable identity, heartbeat, capacity, endpoint,
+   metric, and control regions. Metric tiles use two columns below 460 px.
+4. The first production pass exposed the same fixed-column cause in adjacent
+   connection, permissions, and asset card pairs. Those pairs now stack below
+   760 px as part of the same prevention scope.
+5. Production was rechecked at 517, 390, and 1260 px. The formal verifier found
+   zero critical geometry findings and no horizontal overflow.
+
+## Final result
+
+The selected card and adjacent Sync API panels now remain readable without
+overlap or clipped text at the reported and narrower widths.
+
+final result: passed
