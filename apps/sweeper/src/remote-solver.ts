@@ -4336,7 +4336,13 @@ async function pushOneRemoteResult(
     transferLease = null;
     if (transferFailure) throw transferFailure;
     if (!response.ok) {
-      const error = `remote polar push failed (${response.status})`;
+      const remoteDetail =
+        typeof responsePayload?.error === "string"
+          ? responsePayload.error.trim().slice(0, 700)
+          : "";
+      const error = `remote polar push failed (${response.status})${
+        remoteDetail ? `: ${remoteDetail}` : ""
+      }`;
       if (
         response.status >= 500 ||
         response.status === 408 ||

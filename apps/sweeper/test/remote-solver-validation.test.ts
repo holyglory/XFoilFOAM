@@ -3926,7 +3926,7 @@ describe("remote solver push validation regressions", () => {
       .limit(1);
     expect(settingsAfterFailure.remoteSolverLastStatus).toBe("error");
     expect(settingsAfterFailure.remoteSolverLastError).toContain(
-      "remote polar push failed (500)",
+      "remote polar push failed (500): chunk failed",
     );
 
     await db
