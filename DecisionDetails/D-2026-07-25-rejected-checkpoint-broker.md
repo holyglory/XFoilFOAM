@@ -21,8 +21,13 @@ not reach the gate.
 - Keep the remote promise point active. Checkpoint transfer is evidence
   preservation, not an accepted result or promise fulfillment.
 - Permit the mutable result projection to be `failed` when the immutable
-  attempt is solved/rejected PRECALC evidence with the continuation marker,
-  exact manifest, and verified complete restart archive.
+  attempt is rejected PRECALC evidence with the continuation marker, exact
+  manifest, and verified complete restart archive. A campaign-ingested
+  `source=queued` attempt is eligible only when it also carries the exact
+  OpenCFD 2606 identity, hard-solver disposition, retained transient
+  directory, measured physical progress, and typed budget-stop marker;
+  ordinary queued failures and pre-typed continuation wording remain
+  ineligible.
 - Submit continuation against the same engine job/case. It does not consume a
   new physical solver attempt; its progress and outcome remain separate
   immutable continuation evidence.
@@ -44,7 +49,9 @@ not reach the gate.
 
 - Database regression: a `failed` result projection remains ineligible without
   the archive, becomes eligible after exact archive registration, and a
-  same-case continuation submission is non-consuming.
+  same-case continuation submission is non-consuming. A generic queued
+  projection stays ineligible, while the fully typed OpenCFD 2606
+  campaign-ingest projection is covered by the remote transfer regression.
 - Remote transfer regression: a rejected checkpoint is broker-uploaded and
   registered, no `/polars` publication occurs, the promise point stays active,
   and idempotent replay performs no second transfer.

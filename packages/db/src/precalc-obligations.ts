@@ -631,6 +631,14 @@ function restartablePrecalcWarningSql(warnings: SQLWrapper) {
   )`;
 }
 
+function restartablePrecalcBudgetWarningSql(warnings: SQLWrapper) {
+  return sql`EXISTS (
+    SELECT 1
+    FROM unnest(COALESCE(${warnings}, ARRAY[]::text[])) warning
+    WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+  )`;
+}
+
 const LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT =
   "period acquisition exhausted the physical slow-shedding horizon";
 const LEGACY_SAME_CASE_NO_PROGRESS_FRAGMENT =
@@ -640,16 +648,17 @@ const LEGACY_SLOW_SHEDDING_OBSERVATION_FRAGMENT =
   "below the physical slow-shedding observation horizon";
 
 /**
- * Before the engine emitted the typed continuation marker, OpenCFD 2606 r7
- * could preserve a perfectly restartable PRECALC case while reporting its
- * physical slow-shedding horizon as a failed/rejected point. Recognize only
- * that production semantic shape: a rejected physical window with measured
- * forward progress and an exact retained transient directory. The shared
- * checkpoint gate below independently requires one exact manifest and one
- * verified complete restart archive. Generic solver failures and mesh/setup
+ * Campaign ingestion stores rejected physical attempts with `source=queued`
+ * because `source` describes their scheduling projection, not whether the
+ * engine ran. Recognize that projection only for an exact OpenCFD 2606
+ * preliminary checkpoint with hard-solver disposition, measured physical
+ * progress, retained transient state, and either the unambiguous typed
+ * budget-stop marker or one of the fully evidenced r7 compatibility shapes.
+ * The shared checkpoint gate independently requires one exact manifest and
+ * one verified complete restart archive. Generic queue failures and mesh/setup
  * failures deliberately cannot match.
  */
-function legacyRestartablePrecalcCheckpointSql(input: {
+function queuedRestartablePrecalcCheckpointSql(input: {
   attemptId: SQLWrapper;
   resultId: SQLWrapper;
   status: SQLWrapper;
@@ -688,6 +697,17 @@ function legacyRestartablePrecalcCheckpointSql(input: {
       '%hardsolvererror: urans evidence rejected:%'
     AND ${positiveMeasuredProgress}
     AND (
+      (
+        ${restartablePrecalcBudgetWarningSql(input.warnings)}
+        AND EXISTS (
+          SELECT 1
+          FROM result_classifications typed_queued_classification
+          WHERE typed_queued_classification.result_attempt_id =
+            ${input.attemptId}
+            AND typed_queued_classification.state = 'rejected'
+        )
+      )
+      OR
       (
         lower(COALESCE(${input.error}, '')) LIKE
           ${"%" + LEGACY_SLOW_SHEDDING_HORIZON_FRAGMENT + "%"}
@@ -768,16 +788,17 @@ function restartablePrecalcEvidenceSql(input: {
           AND typed_classification.state = 'rejected'
       )
     )
-    OR ${legacyRestartablePrecalcCheckpointSql(input)}
+    OR ${queuedRestartablePrecalcCheckpointSql(input)}
   )`;
 }
 
 /** Final exact-generation trust gate for PRECALC continuation consumers.
- * Typed engine evidence must be a solved rejected checkpoint; the only
- * compatibility exceptions are the fully evidenced OpenCFD 2606 r7
+ * Typed direct-engine evidence may be a solved rejected checkpoint. The
+ * campaign-ingested `queued` projection is accepted only with the exact
+ * OpenCFD 2606 hard-solver/transient/progress identity above; historical r7
  * non-stationary acquisition-horizon and flat-signal observation-horizon
- * shapes whose historical ingest source was `queued`. Every path requires one
- * unambiguous manifest and a verified complete GCS restart archive.
+ * shapes retain the same structural gate. Every path requires one unambiguous
+ * manifest and a verified complete GCS restart archive.
  * Target-cell and implementation compatibility remain caller-owned because
  * they depend on the obligation/request being composed. */
 export async function isExactRestartablePrecalcAttempt(
@@ -2314,7 +2335,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
         failureDisposition: sql<
           string | null
         >`${resultAttempts.evidencePayload} ->> 'failure_disposition'`,
-        legacyRestartable: legacyRestartablePrecalcCheckpointSql({
+        queuedRestartable: queuedRestartablePrecalcCheckpointSql({
           attemptId: resultAttempts.id,
           resultId: resultAttempts.resultId,
           status: resultAttempts.status,
@@ -2369,7 +2390,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
       (row) =>
         row.classification === "accepted" &&
         !hasPrecalcContinuationWarning(row.qualityWarnings) &&
-        !row.legacyRestartable,
+        !row.queuedRestartable,
     );
     const judged =
       accepted ??
@@ -2397,7 +2418,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
       judged?.engineJobId &&
       judged.engineCaseSlug &&
       (hasPrecalcContinuationWarning(judged.qualityWarnings) ||
-        judged.legacyRestartable),
+        judged.queuedRestartable),
     );
     // Cache refresh classifies every stored attempt, including execution
     // failures such as a divergence watchdog trip. Classification presence

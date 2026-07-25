@@ -11,7 +11,10 @@ import {
   type JobStatus,
   type PolarRequest,
 } from "@aerodb/engine-client";
-import { URANS_CONTINUATION_REQUIRED_MARKER } from "@aerodb/core";
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, eq, inArray, sql as dsql } from "drizzle-orm";
 import {
@@ -3379,23 +3382,30 @@ describe("remote solver push validation regressions", () => {
         engineCaseSlug,
         methodKey: "openfoam.urans",
         status: "failed",
-        source: "solved",
+        source: "queued",
         regime: "urans",
         validForPolar: false,
         converged: false,
         unsteady: true,
-        error: "clean period acquisition is incomplete",
+        error:
+          "HardSolverError: URANS evidence rejected: clean period acquisition stopped by the wall-clock budget guard",
         qualityWarnings: [
-          `URANS ${URANS_CONTINUATION_REQUIRED_MARKER}: retained restartable state`,
+          `URANS ${URANS_BUDGET_STOP_MARKER}: retained restartable state`,
         ],
         evidencePayload: {
           fidelity: "urans_precalc",
+          failure_disposition: "hard_solver",
+          continuation_transient_subdir: "transient",
           frame_track: {
             period_s: 0.02,
             periods_retained: 1.4,
             stationary: false,
             drift_frac: 0.08,
             window: { t_start: 0.04, t_end: 0.068 },
+          },
+          force_history: {
+            window_start: 0.04,
+            window_end: 0.068,
           },
         },
         solvedAt: new Date(),

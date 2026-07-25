@@ -89,9 +89,14 @@
   archives unregistered and the controller correctly refused an unsafe
   continuation. The transfer/controller fix now brokers such checkpoints
   without fulfilling the point, preserves the exact verified GCS archive, and
-  makes the same-case continuation non-consuming; focused database and remote
-  transfer regressions pass, but it is not yet deployed. Readiness still
-  requires deploying that fix, observing all five checkpoints become
+  makes the same-case continuation non-consuming. Its first deployment exposed
+  that campaign ingest truthfully projects physical attempts as
+  `source=queued`; a second narrow predicate accepts only typed OpenCFD 2606
+  hard-solver checkpoints with retained transient state and measured progress,
+  plus the unambiguous budget-stop marker, while generic queued failures and
+  legacy lookalikes remain excluded. Focused database and remote transfer
+  regressions cover the trust boundary. Readiness still requires
+  deploying that predicate, observing all five checkpoints become
   generation-pinned and continue rather than restart, obtaining accepted clean
   whole-period evidence for the five unresolved angles, GCS binding and
   obsolete-generation retirement, and no recurring current-generation
