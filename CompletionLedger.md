@@ -95,12 +95,21 @@
   hard-solver checkpoints with retained transient state and measured progress,
   plus the unambiguous budget-stop marker, while generic queued failures and
   legacy lookalikes remain excluded. Focused database and remote transfer
-  regressions cover the trust boundary. Readiness still requires
-  deploying that predicate, observing all five checkpoints become
-  generation-pinned and continue rather than restart, obtaining accepted clean
-  whole-period evidence for the five unresolved angles, GCS binding and
-  obsolete-generation retirement, and no recurring current-generation
-  critical chain.
+  regressions cover the trust boundary. That predicate is deployed and all five
+  checkpoints are now exact, hub-verified GCS generations. AoA -1 continued the
+  same engine case from `t=0.154775 s` with `mesh_build_count=0`, consumed no
+  new physical attempt, and produced accepted evidence whose published window
+  begins after the corrupt prefix. AoA 0, 1, 7, and 9 remain pending exact
+  same-case continuation. Their first automatic admission exposed a separate
+  scheduler-query defect: broad promotion discovery embedded the complete
+  archive-member trust proof twice and scanned the remote node's 3.9 million
+  artifact rows for minutes. The corrected discovery is lightweight while the
+  exact bounded second phase remains the sole continuation authorization gate;
+  isolated promotion and exhausted-checkpoint regressions plus sweeper
+  typecheck pass. Readiness still requires deploying that scheduler correction,
+  obtaining accepted clean-period evidence for the four unresolved angles,
+  GCS binding and obsolete-generation retirement, and no recurring
+  current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
   500 GB VPS about 393 GiB free (roughly 20% used). The storage-only canary is

@@ -815,10 +815,6 @@ export async function submitRecordedPromotionRecovery(
         WHERE point.promotion_id = promotion.id
           AND obligation.state = 'pending'
           AND (
-            obligation.attempt_count < obligation.max_attempts
-            OR ${restartablePrecalcCheckpointSql(sql`obligation.id`)}
-          )
-          AND (
             obligation.next_submit_at IS NULL
             OR obligation.next_submit_at <= now()
           )
@@ -866,10 +862,6 @@ export async function submitRecordedPromotionRecovery(
           ON unowned_obligation.id = unowned_point.obligation_id
         WHERE unowned_point.promotion_id = promotion.id
           AND unowned_obligation.state = 'pending'
-          AND (
-            unowned_obligation.attempt_count < unowned_obligation.max_attempts
-            OR ${restartablePrecalcCheckpointSql(sql`unowned_obligation.id`)}
-          )
           AND (
             unowned_obligation.next_submit_at IS NULL
             OR unowned_obligation.next_submit_at <= now()
@@ -953,6 +945,14 @@ export async function submitRecordedPromotionRecovery(
         point.state === "pending" &&
         (!point.nextSubmitAt || new Date(point.nextSubmitAt).getTime() <= now),
     );
+    // Keep the broad promotion-discovery query independent of the complete
+    // archive trust predicate. Production can hold millions of artifact rows;
+    // embedding the manifest/member proof in both correlated ownership scans
+    // made one 26-angle promotion consume minutes of database CPU before this
+    // exact, bounded phase was reached. This second phase remains the sole
+    // schedulability decision: exhausted points require a fully verified
+    // continuation below, while ordinary points still require fresh-attempt
+    // budget. Widening discovery therefore cannot authorize a solve.
     const continuations = await precalcContinuationsForObligations(
       db,
       duePending.map((point) => point.obligationId),

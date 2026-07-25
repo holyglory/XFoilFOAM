@@ -58,3 +58,31 @@ not reach the gate.
 - Production proof requires all five retained v8 checkpoints to receive exact
   GCS generations, schedule continuations rather than fresh solves, and produce
   accepted clean-period evidence without recomputing already accepted AoA 13.
+
+## Production progress
+
+The hub has verified and registered all five exact restart archives:
+
+- AoA -1: generation `1784941179744806`, 171,422,501 bytes;
+- AoA 0: generation `1784941381258033`, 123,135,403 bytes;
+- AoA 1: generation `1784942338014018`, 72,519,548 bytes;
+- AoA 7: generation `1784942356463529`, 118,910,639 bytes;
+- AoA 9: generation `1784942372870034`, 104,881,113 bytes.
+
+AoA -1 then resumed engine job `73a9a2c2530044a39c7401e091375b45`
+from `t=0.154775 s`, built no mesh, retained its four-of-four physical-attempt
+count, advanced to `t=0.1614419904740217 s`, and produced accepted no-shedding
+evidence. Its accepted force-history window begins at
+`t=0.09144199047402168 s`, after the corrupt startup prefix.
+
+That first continuation exposed an admission-scale defect rather than an
+evidence-trust defect. Broad promotion discovery embedded the complete archive
+and manifest-member trust predicate in two correlated scans; with 3.9 million
+remote artifact rows, a single 26-angle promotion query consumed minutes before
+reaching the already bounded per-obligation verification phase. Discovery now
+finds only due, correctly owned pending points. The exact bounded second phase
+still requires an authenticated restart archive for an exhausted obligation or
+fresh-attempt budget for an ordinary obligation, so widening discovery cannot
+authorize a solve. The complete six-case promotion regression, the
+exhausted-checkpoint same-case continuation regression, and sweeper typecheck
+pass against a fresh isolated database.
