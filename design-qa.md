@@ -81,3 +81,58 @@ The formal report contains warning-only contrast coverage gaps caused by translu
 No request-related P3 follow-up is required.
 
 final result: passed
+
+---
+
+# Design QA — compact solver incident log
+
+## Source visual target
+
+- User-visible source:
+  `/home/holyglory/.codex/attachments/19511c2c-dac9-4863-9ca4-cf958bb68868/codex-clipboard-61aa7ddb-064c-47e3-b32c-9945f1d2f2a2.png`
+- Source viewport: 1260 × 1280 CSS pixels, desktop density.
+- Targeted problem: the permanently expanded `SOLVER RELIABILITY` block used
+  the first Health viewport for grouped system diagnostics, told the user that
+  investigation was required despite providing no user action, and hid event
+  chronology and exact evidence.
+
+## Implementation screenshots
+
+- Collapsed desktop, 1260 × 1280:
+  `/tmp/solver-log-formal-screens/file_tmp_solver-log.html-desktop.png`
+- Collapsed mobile, 390 × 844:
+  `/tmp/solver-log-formal-screens/file_tmp_solver-log.html-mobile.png`
+- Expanded desktop with one event open, 1260 × 1280:
+  `/tmp/solver-log-formal-expanded-screens/file_tmp_solver-log-expanded.html-desktop.png`
+- Expanded mobile with one event open, 390 × 844:
+  `/tmp/solver-log-formal-expanded-screens/file_tmp_solver-log-expanded.html-mobile.png`
+- Same-canvas source/implementation comparison:
+  `/tmp/solver-log-design-comparison.png`
+
+## Comparison history
+
+1. The source kept four grouped rows plus a headline visible at all times.
+   The first implementation pass replaced them with a 46 px status bar that
+   reports only solver-owned/retrying counts and the latest event time.
+2. The first broader test pass found an obsolete source-contract test that
+   required the old expanded implementation. The contract was corrected to
+   require progressive disclosure, explicit system ownership, authenticated
+   agent JSON, and absence of the misleading investigation copy.
+3. Collapsed and expanded states were rendered from the real component at
+   desktop and narrow constraints. The expanded state keeps events newest
+   first; every row has an independent disclosure for owner, job/attempt,
+   recovery version, occurrence key, resolution state, and raw metadata.
+4. The formal geometry verifier checked all four component/state combinations:
+   no critical findings, no warnings, no active horizontal scrollbar, and full
+   target coverage.
+5. Production control-plane deployment preserved all live OpenFOAM workers.
+   The authenticated production endpoint returned 46 chronological events,
+   28 open events, `userActionRequired=false`, and raw metadata; the deployed
+   web bundle contains `Solver recovery` and contains no
+   `System investigation required`.
+
+## Final result
+
+Passed. The routine Health state is compact; chronology and debug evidence are
+available on demand; wide and narrow layouts remain inside their component;
+and the same authenticated read model is available to operators and AI agents.

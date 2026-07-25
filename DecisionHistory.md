@@ -2,6 +2,14 @@
 
 ## Direction
 
+- Confirmed intent: solver reliability is system-owned and progressively
+  disclosed. Routine Health inspection shows only one compact status bar;
+  chronology lives in its expandable event log, exact technical/debug evidence
+  lives inside each expandable event, and authenticated structured JSON gives
+  AI agents the same runtime source for reconciling active implementation work
+  with `CompletionLedger.md`. The UI never asks an administrator to
+  “investigate” when no user action exists.
+  [D-2026-07-25-solver-incident-log]
 - Confirmed intent: solver setup and evidence support independently versioned
   engine implementations. OpenCFD 2606 replaces 2406 after a guarded drain and
   reruns the active campaign through a linked successor generation; 2406 stays
@@ -119,6 +127,23 @@
   reachable without horizontal scrolling; narrow layouts use accessible burger
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-07-25-solver-incident-log — Solver incidents are a compact, system-owned event log
+
+- Decision: replace the permanently expanded solver-reliability panel with one
+  compact status bar that expands into a newest-first immutable event log.
+  Each event independently expands to exact technical/debug evidence. Expose
+  the same log through an authenticated structured admin endpoint for AI-agent
+  diagnosis and `CompletionLedger.md` reconciliation, while explicitly marking
+  that no user action is required.
+  [detail](DecisionDetails/D-2026-07-25-solver-incident-log.md)
+- Why: changing only “System investigation required” would still let grouped
+  recurrence dominate Health, conceal chronology, and leave operators without
+  exact evidence. Automatically copying every runtime occurrence into the
+  source-controlled ledger would conflate immutable history with the active
+  implementation queue. Progressive disclosure plus one shared authenticated
+  read model preserves both compact routine inspection and full forensic
+  depth.
 
 ## D-2026-07-24-urans-clean-tail — Prevent startup bursts and publish only clean whole periods
 
