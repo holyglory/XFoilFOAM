@@ -2922,10 +2922,9 @@ describe("remote-owned whole-polar promotion scope", () => {
 describe("remote-owned derived PRECALC lifecycle", () => {
   it("MUST-CATCH: a stale promotion owner cannot strand a point owned by a newer active promise", async () => {
     const aoa = 3.125;
-    const stalePromise = await seedMirroredPromise(
-      "stale-promotion-owner",
-      [aoa],
-    );
+    const stalePromise = await seedMirroredPromise("stale-promotion-owner", [
+      aoa,
+    ]);
     await db
       .update(syncSweepPromisePoints)
       .set({ status: "cancelled" })
@@ -2954,7 +2953,9 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     const [firstChild] = await db
       .select()
       .from(simJobs)
-      .where(and(eq(simJobs.parentJobId, current.parent.id), eq(simJobs.wave, 2)));
+      .where(
+        and(eq(simJobs.parentJobId, current.parent.id), eq(simJobs.wave, 2)),
+      );
     const [obligation] = await db
       .select()
       .from(simPrecalcObligations)
@@ -2982,6 +2983,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       .set({
         state: "pending",
         attemptCount: 1,
+        sourceResultAttemptId: null,
         nextSubmitAt: new Date(Date.now() - 1_000),
         lastOutcome: "quality_rejected",
         lastError: "preliminary observation horizon was too short",
@@ -3054,16 +3056,25 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       aoa: { angles: [aoa] },
       solver: { urans_fidelity: "precalc" },
     });
-    const children = await db
+    const [recovered] = await db
       .select()
       .from(simJobs)
-      .where(and(eq(simJobs.parentJobId, current.parent.id), eq(simJobs.wave, 2)))
-      .orderBy(simJobs.createdAt);
-    expect(children).toHaveLength(2);
-    expect(children[1]?.requestPayload).toMatchObject({
+      .where(
+        dsql`${simJobs.requestPayload} -> 'precalcObligationIds' @> ${JSON.stringify([obligation.id])}::jsonb`,
+      )
+      .orderBy(dsql`${simJobs.createdAt} DESC`)
+      .limit(1);
+    expect(recovered).toMatchObject({
+      parentJobId: null,
+      wave: 2,
+    });
+    expect(recovered?.requestPayload).toMatchObject({
       syncPromiseId: current.promise.id,
       remoteSolver: true,
       precalcObligationIds: [obligation.id],
+      retryMode: "replacement-promise-urans",
+      historicalConditionalPromotionId: promotion.id,
+      historicalPromotionParentJobId: historicalParent.id,
     });
   });
 

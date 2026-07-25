@@ -1332,6 +1332,147 @@ interface RemotePromisePrecalcRecoveryParent {
   sourceResultAttemptIds: string[];
 }
 
+interface ReplacementPromisePromotionPoint {
+  obligationId: string;
+  airfoilId: string;
+  revisionId: string;
+  aoaDeg: number;
+  attemptCount: number;
+  maxAttempts: number;
+  promotionId: string;
+  promotionParentJobId: string;
+  conditionId: string | null;
+  syncPromiseId: string;
+  upstreamBaseUrl: string;
+}
+
+/** A conditional-promotion event is immutable evidence of why URANS became
+ * necessary, but its remote promise is only a lease. When that lease closes,
+ * a newer exact promise may continue one shared physical obligation without
+ * adopting the old whole-polar authority.
+ *
+ * This discovery deliberately does not require source_result_attempt_id:
+ * historical normalized promotions already pin their exact obligation, and
+ * some pre-pinning production rows have no source-attempt FK. The current
+ * active promise point is the sole scheduling scope and is revalidated again
+ * by composePhysicalPrecalcJob and the guarded submit boundary.
+ */
+async function dueReplacementPromisePromotionPoints(
+  db: DB,
+  meshRecoveryVersion: number,
+  uransRecoveryVersion: number | null | undefined,
+): Promise<ReplacementPromisePromotionPoint[]> {
+  const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
+    ? restartablePrecalcCheckpointSql(sql`obligation.id`)
+    : sql`false`;
+  const rows = (await db.execute(sql`
+    SELECT obligation.id AS obligation_id,
+           obligation.airfoil_id,
+           obligation.revision_id,
+           obligation.aoa_deg,
+           obligation.attempt_count,
+           obligation.max_attempts,
+           promotion.id AS promotion_id,
+           promotion.parent_job_id AS promotion_parent_job_id,
+           promotion.condition_id,
+           current_owner.promise_id AS sync_promise_id,
+           current_owner.source_base_url
+    FROM sim_precalc_obligations obligation
+    JOIN sim_rans_polar_promotion_points promotion_point
+      ON promotion_point.obligation_id = obligation.id
+     AND promotion_point.aoa_deg = obligation.aoa_deg
+    JOIN sim_rans_polar_promotions promotion
+      ON promotion.id = promotion_point.promotion_id
+     AND promotion.owner_kind = 'sync_promise'
+     AND promotion.airfoil_id = obligation.airfoil_id
+     AND promotion.revision_id = obligation.revision_id
+    JOIN LATERAL (
+      SELECT current_promise.id AS promise_id,
+             current_promise.source_base_url
+      FROM sync_sweep_promises current_promise
+      JOIN sync_sweep_promise_points current_point
+        ON current_point.promise_id = current_promise.id
+       AND current_point.status = 'active'
+       AND current_point.airfoil_id = obligation.airfoil_id
+       AND current_point.simulation_preset_revision_id = obligation.revision_id
+       AND current_point.aoa_deg = obligation.aoa_deg
+      WHERE current_promise.status = 'active'
+        AND current_promise."expiresAt" > now()
+        AND current_promise.request_payload ->> 'remoteSolver' = 'true'
+        AND current_promise.source_base_url IS NOT NULL
+        AND current_promise.id IS DISTINCT FROM promotion.sync_promise_id
+      ORDER BY current_promise."createdAt", current_promise.id
+      LIMIT 1
+    ) current_owner ON true
+    WHERE obligation.state = 'pending'
+      AND (
+        obligation.next_submit_at IS NULL
+        OR obligation.next_submit_at <= now()
+      )
+      AND (
+        obligation.attempt_count < obligation.max_attempts
+        OR (${restartableScope})
+      )
+      AND NOT (
+        obligation.last_outcome = 'deterministic_failure'
+        AND ${obligationMeshRecoveryVersionSql(
+          sql`obligation.id`,
+          sql`obligation.latest_sim_job_id`,
+        )} >= ${meshRecoveryVersion}
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_sweep_promises original_promise
+        JOIN sync_sweep_promise_points original_point
+          ON original_point.promise_id = original_promise.id
+         AND original_point.status = 'active'
+         AND original_point.airfoil_id = obligation.airfoil_id
+         AND original_point.simulation_preset_revision_id = obligation.revision_id
+         AND original_point.aoa_deg = obligation.aoa_deg
+        WHERE original_promise.id = promotion.sync_promise_id
+          AND original_promise.status = 'active'
+          AND original_promise."expiresAt" > now()
+          AND original_promise.request_payload ->> 'remoteSolver' = 'true'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs latest_job
+        WHERE latest_job.id = obligation.latest_sim_job_id
+          AND latest_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+    ORDER BY COALESCE(obligation.next_submit_at, obligation."createdAt"),
+             obligation.id,
+             promotion."createdAt",
+             promotion.id
+    LIMIT ${RECOVERY_PARENTS_PER_TICK}
+  `)) as unknown as Array<{
+    obligation_id: string;
+    airfoil_id: string;
+    revision_id: string;
+    aoa_deg: number | string;
+    attempt_count: number | string;
+    max_attempts: number | string;
+    promotion_id: string;
+    promotion_parent_job_id: string;
+    condition_id: string | null;
+    sync_promise_id: string;
+    source_base_url: string;
+  }>;
+  return rows.map((row) => ({
+    obligationId: row.obligation_id,
+    airfoilId: row.airfoil_id,
+    revisionId: row.revision_id,
+    aoaDeg: Number(row.aoa_deg),
+    attemptCount: Number(row.attempt_count),
+    maxAttempts: Number(row.max_attempts),
+    promotionId: row.promotion_id,
+    promotionParentJobId: row.promotion_parent_job_id,
+    conditionId: row.condition_id,
+    syncPromiseId: row.sync_promise_id,
+    upstreamBaseUrl: row.source_base_url,
+  }));
+}
+
 /** Discover exact targeted PRECALC work owned by an active remote promise.
  * Remote-only solver instances deliberately keep sweeper_state.enabled=false,
  * so campaign-owned recovery cannot be their scheduling authority. The
@@ -1473,6 +1614,65 @@ export async function submitRemotePromisePrecalcRecoveries(
     .from(syncApiSettings)
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
+  const replacementPoints = await dueReplacementPromisePromotionPoints(
+    db,
+    meshRecoveryVersion,
+    uransRecoveryVersion,
+  );
+  for (const point of replacementPoints) {
+    await touchHeartbeat(db);
+    const [continuation] = supportsDurableUransRecovery(uransRecoveryVersion)
+      ? await precalcContinuationsForObligations(db, [point.obligationId])
+      : [];
+    if (!continuation && point.attemptCount >= point.maxAttempts) continue;
+    const target = await resolveTarget(db, point.airfoilId, point.revisionId);
+    if (!target) continue;
+    const outcome = await submitLadderJob(db, engine, {
+      target,
+      aoas: [point.aoaDeg],
+      fidelity: "precalc",
+      jobKind: "targeted",
+      campaignId: null,
+      payloadExtras: {
+        syncPromiseId: point.syncPromiseId,
+        remoteSolver: true,
+        upstreamBaseUrl: point.upstreamBaseUrl,
+        precalcObligationIds: [point.obligationId],
+        retryMode: "replacement-promise-urans",
+        historicalConditionalPromotionId: point.promotionId,
+        historicalPromotionParentJobId: point.promotionParentJobId,
+        historicalPromotionConditionId: point.conditionId,
+        ...(continuation
+          ? {
+              continueFromResultId: continuation.resultId,
+              continueFromResultAttemptId: continuation.resultAttemptId,
+              budgetOverrideS: continuation.budgetOverrideS,
+            }
+          : {}),
+      },
+      cpuSlots: settings?.cpuBudget || 1,
+      continueFrom: continuation
+        ? {
+            engineJobId: continuation.engineJobId,
+            caseSlug: continuation.engineCaseSlug,
+          }
+        : null,
+      budgetOverrideS: continuation?.budgetOverrideS ?? null,
+      meshRecoveryVersion,
+      uransRecoveryVersion: continuation ? uransRecoveryVersion! : undefined,
+      admissionLane: "remote",
+    });
+    if (outcome.submitted) {
+      await recordPrecalcObligationSubmission(db, outcome.jobId, [
+        point.obligationId,
+      ]);
+      console.log(
+        `[sweeper] current remote promise ${point.syncPromiseId} resumed exact historical promotion point ${point.promotionId}/${point.obligationId} at α ${point.aoaDeg}° through PRECALC job ${outcome.jobId}`,
+      );
+      return true;
+    }
+    if (outcome.submissionInProgress) return true;
+  }
   const candidates = await dueRemotePromisePrecalcRecoveryParents(
     db,
     uransRecoveryVersion,
