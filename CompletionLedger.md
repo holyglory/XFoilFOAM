@@ -115,10 +115,18 @@
   chord-only 30–300 Hz band rejected it. Recovery v9 derives only the
   high-frequency wake edge from immutable projected section height; actual
   production bytes select a stationary clean 4.5-period certificate and exact
-  three-period publication window after the corrupt prefix. The implementation
-  and regressions are complete but v9 is not yet deployed. Readiness still
-  requires guarded v9 deployment, accepted clean-period evidence for AoA 0, 1,
-  7, and 9, GCS binding and obsolete-generation retirement, and no recurring
+  three-period publication window after the corrupt prefix. Recovery v9 is
+  deployed on the remote OpenCFD 2606 engine. AoA 1 now has accepted exact
+  clean-tail evidence and a verified GCS archive without another CFD solve.
+  Hub import exposed one separate association defect: pressure frames 25 and 84
+  are different real time steps with byte-identical PNGs, and blob-only
+  identity rejected the second frame. Migration 0090 preserves logical
+  `frameIndex` while sharing the physical content-addressed bytes; its
+  failing-before/fixed-after API regression, full 51-test remote-sync file,
+  seven-test migration suite, and DB/API/sweeper typechecks pass. Readiness
+  still requires deploying that hub fix, replaying and binding AoA 1, accepted
+  clean-period evidence for AoA 0, 7, and 9, guarded v9 production-engine
+  deployment, obsolete-generation retirement, and no recurring
   current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the

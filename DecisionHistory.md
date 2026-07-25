@@ -62,6 +62,9 @@
   [D-2026-07-15-gcs-zstd-evidence]
   [D-2026-07-18-incomplete-evidence-quarantine]
   [D-2026-07-18-operational-canary-evidence-retention]
+  Byte-identical rendered frames share one physical content-addressed object
+  but retain one logical association per real frame index.
+  [D-2026-07-25-logical-frame-associations]
   A dedicated remote solver is a transfer boundary: it keeps complete local
   Zstandard evidence until the hub acknowledges the exact delivery, receives
   no hub GCS credentials, and uses persistent deployment identity/capacity
@@ -188,6 +191,23 @@ Detail: [DecisionDetails/D-2026-07-25-geometry-scale-wake.md](DecisionDetails/D-
   ordinary thin sections, and manual acceptance would bypass evidence gates.
   Geometry-owned projected height admits only the physically supported wake
   while the unchanged clean-tail certificate removes the corrupt prefix.
+
+## D-2026-07-25-logical-frame-associations — Preserve time-step identity across content deduplication
+
+Detail: [DecisionDetails/D-2026-07-25-logical-frame-associations.md](DecisionDetails/D-2026-07-25-logical-frame-associations.md)
+
+- Decision: keep physical evidence bytes content-addressed, but include the
+  immutable `frameIndex` in a frame artifact's exact owner/content identity.
+  Byte-identical frames for different real time steps therefore share one
+  stored object while retaining distinct logical artifact associations and
+  deterministic exact replay.
+- Why: a clean OpenCFD 2606 URANS generation contained two legitimate pressure
+  frames with identical PNG bytes at indices 25 and 84. Blob-only association
+  identity collapsed them and rejected the second frame as changed metadata.
+  Copying identical bytes into artificial storage objects would waste capacity,
+  dropping one association would corrupt the time track, and making arbitrary
+  metadata part of uniqueness would weaken the narrow immutable contract.
+  Frame-index identity preserves both evidence truth and deduplication.
 
 ## D-2026-07-24-route-owned-responsive-navigation — Public and admin surfaces own separate responsive menus
 

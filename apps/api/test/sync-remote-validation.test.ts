@@ -3787,6 +3787,85 @@ describe("remote solver sync validation regressions", () => {
     ).toHaveLength(uploadCount);
   }, 120_000);
 
+  it("preserves distinct URANS frame indices when two frames have identical bytes", async () => {
+    const aoaDeg = 720.051;
+    const frameBytes = Buffer.from(
+      `${PREFIX}:identical-pressure-frame-content`,
+    );
+    const manifest = artifactItem("identical-frame-manifest");
+    const frames = [25, 84].map((frameIndex) => ({
+      kind: "frame_image",
+      field: "pressure",
+      role: "frame_image",
+      filename: `f${String(frameIndex).padStart(4, "0")}.png`,
+      mimeType: "image/png",
+      uploadField: `pressure_frame_${frameIndex}`,
+      sha256: sha256(frameBytes),
+      byteSize: frameBytes.byteLength,
+      metadata: { frameIndex },
+    }));
+    const payload = polarPayload([
+      makePoint(aoaDeg, {
+        evidenceArtifacts: [manifest, ...frames],
+      }),
+    ]);
+    const parts: MultipartTestPart[] = [
+      multipartManifestPart(payload),
+      ...frames.map((frame) =>
+        multipartFilePart(
+          String(frame.uploadField),
+          frameBytes,
+          "image/png",
+        ),
+      ),
+    ];
+
+    const accepted = await postMultipartPolars(parts);
+    expect(accepted.statusCode, accepted.body).toBe(200);
+    expect(accepted.json()).toMatchObject({
+      imported: 1,
+      attempts: 1,
+      artifacts: 3,
+      conflictIds: [],
+    });
+    const canonical = await resultAt(aoaDeg);
+    const storedFrames = await db
+      .select({
+        storageKey: solverEvidenceArtifacts.storageKey,
+        metadata: solverEvidenceArtifacts.metadata,
+      })
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, canonical!.id),
+          eq(solverEvidenceArtifacts.kind, "frame_image"),
+          eq(solverEvidenceArtifacts.field, "pressure"),
+        ),
+      );
+    expect(storedFrames).toHaveLength(2);
+    expect(
+      storedFrames
+        .map((frame) => Number(frame.metadata.frameIndex))
+        .sort((a, b) => a - b),
+    ).toEqual([25, 84]);
+    expect(new Set(storedFrames.map((frame) => frame.storageKey)).size).toBe(1);
+
+    const replayed = await postMultipartPolars(parts);
+    expect(replayed.statusCode, replayed.body).toBe(200);
+    expect(replayed.json()).toMatchObject({
+      imported: 0,
+      attempts: 0,
+      artifacts: 3,
+      conflictIds: [],
+    });
+    expect(
+      await db
+        .select({ id: solverEvidenceArtifacts.id })
+        .from(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.resultId, canonical!.id)),
+    ).toHaveLength(3);
+  });
+
   it("rejects changed API artifact association metadata while allowing identical bytes for another owner", async () => {
     const firstAoa = 720.101;
     const secondAoa = 720.102;

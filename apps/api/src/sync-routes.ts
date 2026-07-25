@@ -4593,6 +4593,9 @@ async function importPolarPush(
           .returning({ id: solverEvidenceArtifacts.id });
         let canonicalArtifactId = insertedAssociation?.id ?? null;
         if (!insertedAssociation) {
+          const associationFrameIndex = String(
+            (association.metadata as Record<string, unknown>).frameIndex ?? "",
+          );
           const [replayed] = await tx
             .select()
             .from(solverEvidenceArtifacts)
@@ -4604,6 +4607,7 @@ async function importPolarPush(
                 sql`${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM ${association.role}`,
                 eq(solverEvidenceArtifacts.storageKey, association.storageKey),
                 eq(solverEvidenceArtifacts.sha256, association.sha256),
+                sql`COALESCE(${solverEvidenceArtifacts.metadata} ->> 'frameIndex', '') = ${associationFrameIndex}`,
               ),
             )
             .limit(1);

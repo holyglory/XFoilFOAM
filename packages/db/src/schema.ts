@@ -1775,6 +1775,7 @@ export const solverEvidenceArtifacts = pgTable(
         sql`COALESCE(${t.role}, '')`,
         t.storageKey,
         t.sha256,
+        sql`COALESCE(${t.metadata} ->> 'frameIndex', '')`,
       )
       .where(sql`${t.resultAttemptId} IS NOT NULL`),
     resultContentUq: uniqueIndex("solver_evidence_artifacts_result_content_uq")
@@ -1785,6 +1786,7 @@ export const solverEvidenceArtifacts = pgTable(
         sql`COALESCE(${t.role}, '')`,
         t.storageKey,
         t.sha256,
+        sql`COALESCE(${t.metadata} ->> 'frameIndex', '')`,
       )
       .where(sql`${t.resultAttemptId} IS NULL AND ${t.resultId} IS NOT NULL`),
   }),
