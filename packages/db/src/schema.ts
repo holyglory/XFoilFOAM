@@ -4770,7 +4770,7 @@ export const syncApiSettings = pgTable("sync_api_settings", {
   secret: text("secret").notNull().default(""),
   defaultPromiseTtlHours: integer("default_promise_ttl_hours")
     .notNull()
-    .default(24),
+    .default(72),
   upstreamBaseUrl: text("upstream_base_url"),
   upstreamSecret: text("upstream_secret").notNull().default(""),
   syncMode: syncModeEnum("sync_mode").notNull().default("full"),

@@ -111,7 +111,13 @@ const DELIVERY_CLAIM_RENEW_INTERVAL_MS = Number(
   process.env.REMOTE_DELIVERY_CLAIM_RENEW_INTERVAL_MS ??
     Math.min(5 * 60_000, Math.max(1_000, DELIVERY_CLAIM_MS / 3)),
 );
-const REMOTE_TRANSFER_PROMISE_TTL_HOURS = 1;
+const REMOTE_PROMISE_TTL_HOURS = Math.min(
+  24 * 30,
+  Math.max(
+    24,
+    Math.round(Number(process.env.REMOTE_PROMISE_TTL_HOURS ?? 72) || 72),
+  ),
+);
 const REMOTE_TRANSFER_PROMISE_RENEW_INTERVAL_MS = Math.min(
   20 * 60_000,
   Math.max(
@@ -1357,7 +1363,7 @@ async function renewExactRemotePromiseTransferLease(
         method: "POST",
         signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
         headers: headers(settings),
-        body: JSON.stringify({ ttlHours: REMOTE_TRANSFER_PROMISE_TTL_HOURS }),
+        body: JSON.stringify({ ttlHours: REMOTE_PROMISE_TTL_HOURS }),
       },
     );
   } catch (error) {
@@ -1586,7 +1592,7 @@ async function renewMirroredPromiseLeases(
           method: "POST",
           signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
           headers: headers(settings),
-          body: JSON.stringify({}),
+          body: JSON.stringify({ ttlHours: REMOTE_PROMISE_TTL_HOURS }),
         },
       );
     } catch (error) {
@@ -2155,7 +2161,11 @@ async function claimRemoteWork(
     method: "POST",
     signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
     headers: headers(settings),
-    body: JSON.stringify({ solverId, limit: settings.remoteSolverClaimSize }),
+    body: JSON.stringify({
+      solverId,
+      limit: settings.remoteSolverClaimSize,
+      ttlHours: REMOTE_PROMISE_TTL_HOURS,
+    }),
   });
   const payload = (await res
     .json()

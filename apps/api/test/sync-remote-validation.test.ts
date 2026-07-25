@@ -51,7 +51,10 @@ const { ensureSimulationPresetRevision } =
   await import("@aerodb/db/simulation-setup");
 const { advisoryLockSql, db, sql } = await import("../src/db");
 const { buildServer } = await import("../src/server");
-const { assertMultipartDiskReserveAvailableBytes } =
+const {
+  assertMultipartDiskReserveAvailableBytes,
+  lockAndFilterRemoteClaimAoas,
+} =
   await import("../src/sync-routes");
 
 const {
@@ -1002,6 +1005,61 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("rechecks remote claim candidates under the shared cell lock", async () => {
+    const aoaDeg = 699.951;
+    const promiseId = await createPromise("active", aoaDeg);
+    const blockedByPromise = await db.transaction((rawTx) =>
+      lockAndFilterRemoteClaimAoas(
+        rawTx as unknown as typeof db,
+        airfoilId,
+        revisionId,
+        [aoaDeg],
+      ),
+    );
+    expect(blockedByPromise).toEqual([]);
+
+    await db
+      .update(syncSweepPromises)
+      .set({
+        status: "expired",
+        expiredAt: new Date(),
+        expiresAt: new Date(Date.now() - 1000),
+        updatedAt: new Date(),
+      })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "expired", updatedAt: new Date() })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    const released = await db.transaction((rawTx) =>
+      lockAndFilterRemoteClaimAoas(
+        rawTx as unknown as typeof db,
+        airfoilId,
+        revisionId,
+        [aoaDeg],
+      ),
+    );
+    expect(released).toEqual([aoaDeg]);
+
+    await db.insert(results).values({
+      airfoilId,
+      bcId: legacyBcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      status: "queued",
+      source: "queued",
+    });
+    const blockedByLocalClaim = await db.transaction((rawTx) =>
+      lockAndFilterRemoteClaimAoas(
+        rawTx as unknown as typeof db,
+        airfoilId,
+        revisionId,
+        [aoaDeg],
+      ),
+    );
+    expect(blockedByLocalClaim).toEqual([]);
+  });
+
   it("exchanges the bootstrap secret exactly once for a legacy solver credential", async () => {
     const instanceId = randomUUID();
     const [legacy] = await db
@@ -2146,6 +2204,211 @@ describe("remote solver sync validation regressions", () => {
       expect(archivedConflict?.status).toBe("archived");
     },
   );
+
+  it("automatically clears an obsolete exact-generation replay while retaining a genuinely different generation for review", async () => {
+    const aoaDeg = 703.951;
+    const remoteEngineJobId = `${PREFIX}-accepted-remote-generation`;
+    const canonicalEngineJobId = `sync:${PREFIX}-source:${remoteEngineJobId}`;
+    const [canonical] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: legacyBcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        reynolds,
+        speed,
+        chord: CHORD,
+        mach,
+        cl: 0.64,
+        cd: 0.041,
+        cm: -0.08,
+        converged: true,
+        engineJobId: canonicalEngineJobId,
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: canonical.id,
+        airfoilId,
+        bcId: legacyBcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        cl: 0.64,
+        cd: 0.041,
+        cm: -0.08,
+        converged: true,
+        engineJobId: canonicalEngineJobId,
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, canonical.id));
+    await db.insert(resultClassifications).values({
+      resultId: canonical.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "urans",
+      classifierVersion: `${PREFIX}-accepted-replay`,
+      state: "accepted",
+      region: "post_stall",
+    });
+
+    const promiseId = await createPromise("fulfilled", aoaDeg);
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        resultId: canonical.id,
+        resultAttemptId: attempt.id,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    const inserted = await db
+      .insert(syncImportConflicts)
+      .values([
+        {
+          dataType: "polars" as const,
+          naturalKey: `${airfoilId}:${revisionId}:${aoaDeg}`,
+          sourceInstanceId: `${PREFIX}-source`,
+          sourceInstanceName: "remote validation test",
+          incomingPayload: {
+            aoaDeg,
+            engineJobId: remoteEngineJobId,
+            cl: 0.64,
+            cd: 0.041,
+            cm: -0.08,
+            fidelity: "urans_precalc",
+          },
+          localSnapshot: {
+            id: canonical.id,
+            currentResultAttemptId: attempt.id,
+            cl: 0.64,
+            cd: 0.041,
+            cm: -0.08,
+            reynolds,
+            speed,
+            chord: CHORD,
+          },
+          artifactManifest: { promiseId },
+        },
+        {
+          dataType: "polars" as const,
+          naturalKey: `${airfoilId}:${revisionId}:${aoaDeg}`,
+          sourceInstanceId: `${PREFIX}-source`,
+          sourceInstanceName: "remote validation test",
+          incomingPayload: {
+            aoaDeg,
+            engineJobId: `${remoteEngineJobId}-different`,
+            cl: 0.71,
+            cd: 0.052,
+            cm: -0.09,
+            fidelity: "urans_precalc",
+          },
+          localSnapshot: {
+            id: canonical.id,
+            currentResultAttemptId: attempt.id,
+            cl: 0.64,
+            cd: 0.041,
+            cm: -0.08,
+            reynolds,
+            speed,
+            chord: CHORD,
+          },
+          artifactManifest: { promiseId },
+        },
+        {
+          dataType: "polars" as const,
+          naturalKey: `${airfoilId}:${revisionId}:${aoaDeg}`,
+          sourceInstanceId: `${PREFIX}-source`,
+          sourceInstanceName: "remote validation test",
+          incomingPayload: {
+            aoaDeg,
+            engineJobId: remoteEngineJobId,
+            cl: 0.91,
+            cd: 0.041,
+            cm: -0.08,
+            fidelity: "urans_precalc",
+          },
+          localSnapshot: {
+            id: canonical.id,
+            currentResultAttemptId: attempt.id,
+            cl: 0.64,
+            cd: 0.041,
+            cm: -0.08,
+            reynolds,
+            speed,
+            chord: CHORD,
+          },
+          artifactManifest: { promiseId },
+        },
+      ])
+      .returning({ id: syncImportConflicts.id });
+    inserted.forEach((row) => cleanupConflictIds.add(row.id));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/sync",
+      headers: { "x-xfoilfoam-sync-secret": SECRET },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const body = response.json() as {
+      conflicts: Array<{
+        id: string;
+        canPromote: boolean;
+        review: { title: string; context: string };
+      }>;
+    };
+    expect(body.conflicts.map((conflict) => conflict.id)).not.toContain(
+      inserted[0]!.id,
+    );
+    expect(body.conflicts).toContainEqual(
+      expect.objectContaining({
+        id: inserted[1]!.id,
+        canPromote: false,
+        review: expect.objectContaining({
+          title: expect.stringContaining("α 703.951°"),
+          context: expect.stringContaining("Re "),
+        }),
+      }),
+    );
+    const conflictStates = await db
+      .select({
+        id: syncImportConflicts.id,
+        status: syncImportConflicts.status,
+        resolutionNote: syncImportConflicts.resolutionNote,
+      })
+      .from(syncImportConflicts)
+      .where(
+        inArray(
+          syncImportConflicts.id,
+          inserted.map((row) => row.id),
+        ),
+      )
+      .orderBy(syncImportConflicts.id);
+    const byId = new Map(
+      conflictStates.map((row) => [row.id, row] as const),
+    );
+    expect(byId.get(inserted[0]!.id)).toMatchObject({
+      status: "archived",
+      resolutionNote: expect.stringContaining("exact promised generation"),
+    });
+    expect(byId.get(inserted[1]!.id)).toMatchObject({ status: "pending" });
+    expect(byId.get(inserted[2]!.id)).toMatchObject({ status: "pending" });
+  });
 
   it("strips base64 from sync conflict incoming_payload for non-equivalent existing polar rows", async () => {
     const aoaDeg = 704.001;

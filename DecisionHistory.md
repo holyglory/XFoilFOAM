@@ -2,6 +2,13 @@
 
 ## Direction
 
+- Confirmed intent: hub-issued remote solver promises exclusively own their
+  exact cells while alive, use one refreshed 72-hour failover horizon across
+  claim/solve/transfer, and serialize against local claims at the mutation
+  boundary. Exact accepted delivery replays clear automatically; genuinely
+  distinct solver generations remain reviewable through compact aerodynamic
+  context with technical identities progressively disclosed.
+  [D-2026-07-25-remote-promise-ownership-review]
 - Confirmed intent: solver reliability is system-owned and progressively
   disclosed. Routine Health inspection shows only one compact status bar;
   chronology lives in its expandable event log, exact technical/debug evidence
@@ -127,6 +134,20 @@
   reachable without horizontal scrolling; narrow layouts use accessible burger
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
+
+- Decision: give every hub-issued remote polar one refreshed 72-hour failover
+  lease, serialize local and remote claims with the same cell locks and
+  mutation-boundary ownership recheck, automatically archive only exact
+  accepted-generation replays, and present remaining conflicts as compact
+  aerodynamic comparisons with technical ids behind disclosure.
+  [detail](DecisionDetails/D-2026-07-25-remote-promise-ownership-review.md)
+- Why: the former 24-hour default plus one-hour transfer renewal and
+  scan-before-write race could duplicate expensive CFD, while permanent leases
+  would strand dead work. Raw UUID cards exposed no decision context and
+  offered a polar promotion action that could never succeed; hiding every
+  conflict would instead conceal genuinely distinct immutable evidence.
 
 ## D-2026-07-25-solver-incident-log — Solver incidents are a compact, system-owned event log
 

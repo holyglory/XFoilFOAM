@@ -13,6 +13,7 @@ import {
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import {
+  CheckCircle2,
   ExternalLink,
   Menu,
   Pause,
@@ -176,6 +177,11 @@ function agoFromSeconds(seconds: number): string {
   if (s < 3600) return `${Math.round(s / 60)}m`;
   if (s < 86400) return `${Math.round(s / 3600)}h`;
   return `${Math.round(s / 86400)}d`;
+}
+
+function conflictCoefficient(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return Math.abs(value) >= 10 ? value.toFixed(3) : value.toFixed(5);
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -752,6 +758,128 @@ export function AdminConsole() {
           gap: 6px;
           min-width: 0;
         }
+        .sync-review-panel {
+          display: grid;
+          gap: 0;
+        }
+        .sync-review-heading,
+        .sync-review-empty {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          min-width: 0;
+        }
+        .sync-review-heading {
+          justify-content: space-between;
+          padding-bottom: 9px;
+        }
+        .sync-review-count {
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 10px;
+        }
+        .sync-review-empty {
+          color: ${C.muted};
+          font-family: ${MONO};
+          font-size: 11px;
+          line-height: 1.4;
+        }
+        .sync-review-empty svg {
+          flex: 0 0 auto;
+          color: ${C.teal};
+        }
+        .sync-conflict-review {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 8px 16px;
+          min-width: 0;
+          padding: 12px 0;
+          border-top: 1px solid ${C.borderSoft};
+          font-family: ${MONO};
+        }
+        .sync-conflict-copy {
+          display: grid;
+          gap: 4px;
+          min-width: 0;
+        }
+        .sync-conflict-title {
+          overflow-wrap: anywhere;
+          color: ${C.text};
+          font-size: 12px;
+          font-weight: 700;
+          line-height: 1.35;
+        }
+        .sync-conflict-context {
+          overflow-wrap: anywhere;
+          color: ${C.teal};
+          font-size: 10px;
+          line-height: 1.35;
+        }
+        .sync-conflict-summary {
+          max-width: 72ch;
+          color: ${C.muted};
+          font-size: 10px;
+          line-height: 1.45;
+        }
+        .sync-conflict-actions {
+          display: flex;
+          align-items: start;
+          justify-content: flex-end;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .sync-conflict-actions button {
+          min-height: 34px;
+        }
+        .sync-conflict-details {
+          grid-column: 1 / -1;
+          min-width: 0;
+          color: ${C.dim};
+          font-size: 10px;
+        }
+        .sync-conflict-details summary {
+          width: fit-content;
+          min-height: 28px;
+          cursor: pointer;
+          color: ${C.dim};
+          line-height: 28px;
+        }
+        .sync-conflict-details[open] summary {
+          color: ${C.text};
+        }
+        .sync-conflict-comparison {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 8px;
+          margin-top: 7px;
+        }
+        .sync-conflict-generation {
+          min-width: 0;
+          padding: 9px;
+          border-radius: 7px;
+          background: ${C.panel2};
+        }
+        .sync-conflict-generation-title {
+          margin-bottom: 5px;
+          color: ${C.muted};
+          font-size: 9px;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+        .sync-conflict-coefficients {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 6px;
+          color: ${C.text};
+          font-size: 10px;
+        }
+        .sync-conflict-technical {
+          margin-top: 7px;
+          overflow-wrap: anywhere;
+          color: ${C.dimmest};
+          font-size: 9px;
+          line-height: 1.4;
+        }
         @media (max-width: 940px) {
           .admin-shell-grid {
             grid-template-columns: minmax(0, 1fr);
@@ -850,6 +978,15 @@ export function AdminConsole() {
           }
           .registered-remote-solver-controls {
             justify-content: flex-start;
+          }
+          .sync-conflict-review {
+            grid-template-columns: minmax(0, 1fr);
+          }
+          .sync-conflict-actions {
+            justify-content: flex-start;
+          }
+          .sync-conflict-comparison {
+            grid-template-columns: minmax(0, 1fr);
           }
         }
       `}</style>
@@ -4984,90 +5121,120 @@ function SyncApiPanel() {
             </div>
           </div>
 
-          <div style={card}>
-            <div style={label}>IMPORT CONFLICTS</div>
+          <div style={card} className="sync-review-panel">
+            <div className="sync-review-heading">
+              <div style={label}>REMOTE REVIEW</div>
+              {state.conflicts.length > 0 && (
+                <span className="sync-review-count">
+                  {state.conflicts.length}{" "}
+                  {state.conflicts.length === 1 ? "decision" : "decisions"}
+                </span>
+              )}
+            </div>
             {state.conflicts.length === 0 ? (
-              <div style={{ fontFamily: MONO, fontSize: 12, color: C.dim }}>
-                No pending remote-import conflicts.
+              <div className="sync-review-empty">
+                <CheckCircle2 aria-hidden="true" size={16} />
+                <span>Remote imports agree with current results.</span>
               </div>
             ) : (
-              <div style={{ display: "grid", gap: 8 }}>
+              <div>
                 {state.conflicts.map((conflict) => (
                   <div
                     key={conflict.id}
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "minmax(0, 1fr) auto",
-                      gap: 10,
-                      alignItems: "start",
-                      border: `1px solid ${C.borderSoft}`,
-                      borderRadius: 8,
-                      padding: 10,
-                    }}
+                    className="sync-conflict-review"
                   >
-                    <div style={{ minWidth: 0, fontFamily: MONO }}>
-                      <div
-                        style={{ color: C.text, fontSize: 12, fontWeight: 700 }}
-                      >
-                        {SYNC_DATA_TYPE_LABELS[conflict.dataType]} ·{" "}
-                        {conflict.naturalKey}
+                    <div className="sync-conflict-copy">
+                      <div className="sync-conflict-title">
+                        {conflict.review.title}
                       </div>
-                      <div style={{ marginTop: 4, color: C.dim, fontSize: 10 }}>
+                      <div className="sync-conflict-context">
+                        {conflict.review.context}
+                      </div>
+                      <div className="sync-conflict-summary">
+                        {conflict.review.summary}{" "}
                         {conflict.sourceInstanceName ??
                           conflict.sourceInstanceId ??
-                          "remote instance"}{" "}
-                        · {ago(conflict.createdAt)}
-                      </div>
-                      <div
-                        style={{
-                          marginTop: 7,
-                          color: C.dimmest,
-                          fontSize: 10,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        incoming{" "}
-                        {Object.keys(conflict.incomingPayload ?? {})
-                          .slice(0, 8)
-                          .join(", ") || "payload"}
+                          "Remote solver"}{" "}
+                        sent it {ago(conflict.createdAt)}.
                       </div>
                     </div>
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: 6,
-                        flexWrap: "wrap",
-                        justifyContent: "flex-end",
-                      }}
-                    >
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => resolveConflict(conflict.id, "promote")}
-                        style={{
-                          ...ghostBtn,
-                          color: C.amber,
-                          padding: "6px 9px",
-                          fontSize: 10,
-                        }}
-                      >
-                        promote
-                      </button>
+                    <div className="sync-conflict-actions">
+                      {conflict.canPromote && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            resolveConflict(conflict.id, "promote")
+                          }
+                          style={{
+                            ...ghostBtn,
+                            color: C.amber,
+                            padding: "7px 10px",
+                            fontSize: 10,
+                          }}
+                        >
+                          Use incoming
+                        </button>
+                      )}
                       <button
                         type="button"
                         disabled={busy}
                         onClick={() => resolveConflict(conflict.id, "archive")}
                         style={{
                           ...ghostBtn,
-                          padding: "6px 9px",
+                          padding: "7px 10px",
                           fontSize: 10,
                         }}
                       >
-                        archive
+                        Keep current
                       </button>
                     </div>
+                    <details className="sync-conflict-details">
+                      <summary>Compare evidence</summary>
+                      <div className="sync-conflict-comparison">
+                        {[
+                          {
+                            label: "Current",
+                            evidence: conflict.review.current,
+                          },
+                          {
+                            label: "Incoming",
+                            evidence: conflict.review.incoming,
+                          },
+                        ].map(({ label: generationLabel, evidence }) => {
+                          return (
+                            <div
+                              key={String(generationLabel)}
+                              className="sync-conflict-generation"
+                            >
+                              <div className="sync-conflict-generation-title">
+                                {generationLabel}{" "}
+                                {evidence.solver
+                                  ? `· ${evidence.solver}`
+                                  : ""}
+                              </div>
+                              <div className="sync-conflict-coefficients">
+                                <span>
+                                  Cl {conflictCoefficient(evidence.cl)}
+                                </span>
+                                <span>
+                                  Cd {conflictCoefficient(evidence.cd)}
+                                </span>
+                                <span>
+                                  Cm {conflictCoefficient(evidence.cm)}
+                                </span>
+                              </div>
+                              <div className="sync-conflict-technical">
+                                generation {evidence.engineJobId ?? "—"}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div className="sync-conflict-technical">
+                        record {conflict.naturalKey} · conflict {conflict.id}
+                      </div>
+                    </details>
                   </div>
                 ))}
               </div>

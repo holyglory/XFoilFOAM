@@ -16,7 +16,7 @@ import {
   URANS_CONTINUATION_REQUIRED_MARKER,
 } from "@aerodb/core";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
-import { and, eq, inArray, sql as dsql } from "drizzle-orm";
+import { and, eq, inArray, or, sql as dsql } from "drizzle-orm";
 import {
   afterAll,
   afterEach,
@@ -493,28 +493,45 @@ async function seedEngineBundle(
 
 async function cleanupRemoteRows() {
   if (!revisionId) return;
-  const promiseIds = await db
-    .select({ id: syncSweepPromises.id })
+  const ownerIds = await db
+    .select({ id: registeredRemoteSolvers.id })
+    .from(registeredRemoteSolvers)
+    .where(dsql`${registeredRemoteSolvers.instanceName} LIKE ${`${PREFIX}%`}`);
+  const promiseRows = await db
+    .select({
+      id: syncSweepPromises.id,
+      revisionId: syncSweepPromises.simulationPresetRevisionId,
+    })
     .from(syncSweepPromises)
-    .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
+    .where(
+      ownerIds.length
+        ? or(
+            eq(syncSweepPromises.simulationPresetRevisionId, revisionId),
+            inArray(
+              syncSweepPromises.registeredSolverId,
+              ownerIds.map((row) => row.id),
+            ),
+          )
+        : eq(syncSweepPromises.simulationPresetRevisionId, revisionId),
+    );
+  const promiseIds = promiseRows.map((row) => row.id);
+  const fixtureRevisionIds = Array.from(
+    new Set([revisionId, ...promiseRows.map((row) => row.revisionId)]),
+  );
   if (promiseIds.length) {
     await db.delete(syncRemoteHubBindingReceipts).where(
-      inArray(
-        syncRemoteHubBindingReceipts.promiseId,
-        promiseIds.map((row) => row.id),
-      ),
+      inArray(syncRemoteHubBindingReceipts.promiseId, promiseIds),
     );
     await db.delete(syncRemotePromiseCancellations).where(
-      inArray(
-        syncRemotePromiseCancellations.promiseId,
-        promiseIds.map((row) => row.id),
-      ),
+      inArray(syncRemotePromiseCancellations.promiseId, promiseIds),
     );
   }
   const resultIds = await db
     .select({ id: results.id })
     .from(results)
-    .where(eq(results.simulationPresetRevisionId, revisionId));
+    .where(
+      inArray(results.simulationPresetRevisionId, fixtureRevisionIds),
+    );
   const evidenceBlobIds = resultIds.length
     ? await db
         .select({ id: solverEvidenceBlobs.id })
@@ -551,22 +568,33 @@ async function cleanupRemoteRows() {
   }
   await db
     .delete(resultClassifications)
-    .where(eq(resultClassifications.simulationPresetRevisionId, revisionId));
+    .where(
+      inArray(
+        resultClassifications.simulationPresetRevisionId,
+        fixtureRevisionIds,
+      ),
+    );
   await db
     .delete(simPrecalcObligations)
-    .where(eq(simPrecalcObligations.revisionId, revisionId));
+    .where(inArray(simPrecalcObligations.revisionId, fixtureRevisionIds));
   await db
     .delete(polarFitSets)
-    .where(eq(polarFitSets.simulationPresetRevisionId, revisionId));
+    .where(
+      inArray(polarFitSets.simulationPresetRevisionId, fixtureRevisionIds),
+    );
   await db
     .delete(results)
-    .where(eq(results.simulationPresetRevisionId, revisionId));
+    .where(inArray(results.simulationPresetRevisionId, fixtureRevisionIds));
   await db
     .delete(resultAttempts)
-    .where(eq(resultAttempts.simulationPresetRevisionId, revisionId));
+    .where(
+      inArray(resultAttempts.simulationPresetRevisionId, fixtureRevisionIds),
+    );
   await db
     .delete(simJobs)
-    .where(eq(simJobs.simulationPresetRevisionId, revisionId));
+    .where(
+      inArray(simJobs.simulationPresetRevisionId, fixtureRevisionIds),
+    );
   if (cleanupRuntimeBuildIds.size) {
     await db
       .delete(solverRuntimeBuilds)
@@ -575,9 +603,11 @@ async function cleanupRemoteRows() {
       );
     cleanupRuntimeBuildIds.clear();
   }
-  await db
-    .delete(syncSweepPromises)
-    .where(eq(syncSweepPromises.simulationPresetRevisionId, revisionId));
+  if (promiseIds.length) {
+    await db
+      .delete(syncSweepPromises)
+      .where(inArray(syncSweepPromises.id, promiseIds));
+  }
   await db
     .delete(registeredRemoteSolvers)
     .where(dsql`${registeredRemoteSolvers.instanceName} LIKE ${`${PREFIX}%`}`);
@@ -1814,6 +1844,11 @@ describe("remote solver submit lifecycle", () => {
     expect(submitPolar).toHaveBeenCalledTimes(2);
     expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(2);
     expect(
+      requests(fetchMock, "/sweeps/claim").every(
+        (request) => request.body.ttlHours === 72,
+      ),
+    ).toBe(true);
+    expect(
       (
         await db
           .select({
@@ -1821,7 +1856,12 @@ describe("remote solver submit lifecycle", () => {
             requestPayload: simJobs.requestPayload,
           })
           .from(simJobs)
-          .where(eq(simJobs.simulationPresetRevisionId, revisionId))
+          .where(
+            inArray(
+              dsql<string>`${simJobs.requestPayload} ->> 'syncPromiseId'`,
+              claimPromises.map((promise) => promise.id),
+            ),
+          )
       ).filter(
         (job) =>
           job.status === "submitted" &&
@@ -4346,7 +4386,7 @@ describe("remote solver push validation regressions", () => {
     stalled.dispose();
   });
 
-  it("MUST-CATCH: a transfer lasting beyond one hour renews the exact upstream promise with a one-hour TTL throughout", async () => {
+  it("MUST-CATCH: a long transfer keeps the exact upstream promise on the shared 72-hour failover lease", async () => {
     const promiseId = randomUUID();
     const [settings] = await db
       .select()
@@ -4369,7 +4409,9 @@ describe("remote solver push validation regressions", () => {
           heartbeatBodies.push(JSON.parse(String(init?.body ?? "{}")));
           return Response.json({
             ok: true,
-            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+            expiresAt: new Date(
+              Date.now() + 72 * 3_600_000,
+            ).toISOString(),
           });
         }),
       );
@@ -4386,7 +4428,7 @@ describe("remote solver push validation regressions", () => {
       expect(heartbeatBodies).toHaveLength(5);
       expect(heartbeatBodies).toSatisfy(
         (rows: Array<Record<string, unknown>>) =>
-          rows.every((row) => row.ttlHours === 1),
+          rows.every((row) => row.ttlHours === 72),
       );
       expect(onRenew).toHaveBeenCalledTimes(5);
       expect(returning).toHaveBeenCalledTimes(5);

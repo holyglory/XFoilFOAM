@@ -563,9 +563,26 @@ export interface AdminSyncConflict {
   naturalKey: string;
   sourceInstanceId: string | null;
   sourceInstanceName: string | null;
-  incomingPayload: Record<string, unknown>;
-  localSnapshot: Record<string, unknown> | null;
-  artifactManifest: Record<string, unknown> | null;
+  canPromote: boolean;
+  review: {
+    title: string;
+    context: string;
+    summary: string;
+    incoming: {
+      cl: number | null;
+      cd: number | null;
+      cm: number | null;
+      engineJobId: string | null;
+      solver: string | null;
+    };
+    current: {
+      cl: number | null;
+      cd: number | null;
+      cm: number | null;
+      engineJobId: string | null;
+      solver: string | null;
+    };
+  };
   createdAt: string | null;
 }
 export interface AdminRegisteredSolver {

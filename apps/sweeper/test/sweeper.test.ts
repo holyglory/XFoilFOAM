@@ -977,6 +977,100 @@ describe("sweeper: gap → claim → ingest", () => {
     }
   }, 60000);
 
+  it("refuses a local claim after a remote promise owns the cell but allows that promise's mirrored job", async () => {
+    const aoaDeg = 96.001;
+    const claimAirfoilId = airfoilId;
+    const claimBcId = testBcId();
+    const claimRevisionId = testPresetRevisionId;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, claimAirfoilId),
+          eq(results.simulationPresetRevisionId, claimRevisionId),
+          eq(results.aoaDeg, aoaDeg),
+        ),
+      );
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: "remote-claim-owner-test",
+        sourceInstanceName: "remote claim owner test",
+        airfoilId: claimAirfoilId,
+        simulationPresetRevisionId: claimRevisionId,
+        aoaCount: 1,
+        expiresAt: new Date(Date.now() + 3600_000),
+      })
+      .returning({ id: syncSweepPromises.id });
+    cleanupSyncPromiseIds.add(promise.id);
+    await db.insert(syncSweepPromisePoints).values({
+      promiseId: promise.id,
+      airfoilId: claimAirfoilId,
+      simulationPresetRevisionId: claimRevisionId,
+      aoaDeg,
+    });
+    const jobs = await db
+      .insert(simJobs)
+      .values([
+        {
+          airfoilId: claimAirfoilId,
+          bcIds: [claimBcId],
+          simulationPresetRevisionId: claimRevisionId,
+          referenceChordM: 1,
+          wave: 1,
+          status: "pending",
+        },
+        {
+          airfoilId: claimAirfoilId,
+          bcIds: [claimBcId],
+          simulationPresetRevisionId: claimRevisionId,
+          referenceChordM: 1,
+          wave: 1,
+          status: "pending",
+          requestPayload: {
+            remoteSolver: true,
+            syncPromiseId: promise.id,
+          },
+        },
+      ])
+      .returning({ id: simJobs.id });
+    jobs.forEach((job) => cleanupJobIds.add(job.id));
+
+    expect(
+      await claimAoas(
+        db,
+        claimAirfoilId,
+        claimBcId,
+        claimRevisionId,
+        [aoaDeg],
+        jobs[0]!.id,
+      ),
+    ).toEqual([]);
+    expect(
+      await db
+        .select({ id: results.id })
+        .from(results)
+        .where(
+          and(
+            eq(results.airfoilId, claimAirfoilId),
+            eq(results.simulationPresetRevisionId, claimRevisionId),
+            eq(results.aoaDeg, aoaDeg),
+          ),
+        ),
+    ).toHaveLength(0);
+
+    expect(
+      await claimAoas(
+        db,
+        claimAirfoilId,
+        claimBcId,
+        claimRevisionId,
+        [aoaDeg],
+        jobs[1]!.id,
+      ),
+    ).toEqual([aoaDeg]);
+  }, 60000);
+
   it("claims a batch, then refuses to re-claim queued rows", async () => {
     const batch = await testBatch(500);
     expect(batch).not.toBeNull();

@@ -39,6 +39,24 @@ async function claimAoasInTransaction(
           AND obligation.revision_id = ${presetRevisionId}
           AND obligation.aoa_deg = ${aoa}
       )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sync_sweep_promise_points promised_point
+          JOIN sync_sweep_promises promise
+            ON promise.id = promised_point.promise_id
+          WHERE promised_point.airfoil_id = ${airfoilId}::uuid
+            AND promised_point.simulation_preset_revision_id =
+              ${presetRevisionId}::uuid
+            AND promised_point.aoa_deg = ${aoa}
+            AND promised_point.status = 'active'
+            AND promise.status = 'active'
+            AND promise."expiresAt" > now()
+            AND promised_point.promise_id::text IS DISTINCT FROM (
+              SELECT job.request_payload ->> 'syncPromiseId'
+              FROM sim_jobs job
+              WHERE job.id = ${simJobId}::uuid
+            )
+        )
       ON CONFLICT (airfoil_id, simulation_preset_revision_id, aoa_deg)
       DO UPDATE SET
         status = 'queued', source = 'queued', sim_job_id = ${simJobId}::uuid,
@@ -51,6 +69,24 @@ async function claimAoasInTransaction(
           WHERE obligation.airfoil_id = results.airfoil_id
             AND obligation.revision_id = results.simulation_preset_revision_id
             AND obligation.aoa_deg = results.aoa_deg
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sync_sweep_promise_points promised_point
+          JOIN sync_sweep_promises promise
+            ON promise.id = promised_point.promise_id
+          WHERE promised_point.airfoil_id = results.airfoil_id
+            AND promised_point.simulation_preset_revision_id =
+              results.simulation_preset_revision_id
+            AND promised_point.aoa_deg = results.aoa_deg
+            AND promised_point.status = 'active'
+            AND promise.status = 'active'
+            AND promise."expiresAt" > now()
+            AND promised_point.promise_id::text IS DISTINCT FROM (
+              SELECT job.request_payload ->> 'syncPromiseId'
+              FROM sim_jobs job
+              WHERE job.id = ${simJobId}::uuid
+            )
         )
         AND NOT EXISTS (
           SELECT 1 FROM sim_result_submit_retries submit_retry

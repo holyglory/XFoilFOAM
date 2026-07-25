@@ -17,6 +17,7 @@ import {
   outputProfiles,
   parseEvidenceManifest,
   manifestMemberSetSha256,
+  lockPrecalcCells,
   referenceGeometryProfiles,
   registerVerifiedBrokeredEvidenceArchive,
   registeredRemoteSolvers,
@@ -1151,7 +1152,223 @@ function permissionRowsForAdmin(
   });
 }
 
+/**
+ * Close the scheduler/remote-claim race at the mutation boundary.
+ *
+ * The broad gap query is intentionally outside the transaction so it can scan
+ * cheaply. A local scheduler can claim one of those rows before the remote
+ * promise is inserted, so the transaction takes the same per-cell advisory
+ * locks as the local scheduler and rechecks ownership before writing a lease.
+ */
+export async function lockAndFilterRemoteClaimAoas(
+  tx: DB,
+  airfoilId: string,
+  revisionId: string,
+  aoas: number[],
+): Promise<number[]> {
+  const candidates = Array.from(
+    new Set(aoas.filter((aoa) => Number.isFinite(aoa))),
+  ).sort((a, b) => a - b);
+  if (!candidates.length) return [];
+  await lockPrecalcCells(
+    tx,
+    candidates.map((aoaDeg) => ({
+      airfoilId,
+      revisionId,
+      aoaDeg,
+    })),
+  );
+  const values = sql.join(
+    candidates.map((aoaDeg) => sql`(${aoaDeg}::float8)`),
+    sql`, `,
+  );
+  const rows = (await tx.execute(sql`
+    WITH candidate(aoa_deg) AS (VALUES ${values})
+    SELECT candidate.aoa_deg
+    FROM candidate
+    LEFT JOIN results result
+      ON result.airfoil_id = ${airfoilId}::uuid
+      AND result.simulation_preset_revision_id = ${revisionId}::uuid
+      AND result.aoa_deg = candidate.aoa_deg
+    WHERE (result.id IS NULL OR result.status IN ('pending', 'stale'))
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_sweep_promise_points promised_point
+        JOIN sync_sweep_promises promise
+          ON promise.id = promised_point.promise_id
+        WHERE promised_point.airfoil_id = ${airfoilId}::uuid
+          AND promised_point.simulation_preset_revision_id =
+            ${revisionId}::uuid
+          AND promised_point.aoa_deg = candidate.aoa_deg
+          AND promised_point.status = 'active'
+          AND promise.status = 'active'
+          AND promise."expiresAt" > now()
+      )
+    ORDER BY candidate.aoa_deg
+  `)) as unknown as Array<{ aoa_deg: number }>;
+  return rows.map((row) => Number(row.aoa_deg));
+}
+
+export async function reconcileObsoleteExactPolarConflicts(
+  database: DB = db,
+): Promise<number> {
+  const rows = (await database.execute(sql`
+    UPDATE sync_import_conflicts conflict
+    SET
+      status = 'archived',
+      resolution_note =
+        'automatically cleared: exact promised generation was subsequently accepted',
+      "resolvedAt" = now(),
+      "updatedAt" = now()
+    FROM sync_sweep_promises promise,
+         sync_sweep_promise_points promised_point,
+         results result,
+         result_attempts attempt
+    WHERE conflict.status = 'pending'
+      AND conflict.data_type = 'polars'
+      AND conflict.artifact_manifest ->> 'promiseId' = promise.id::text
+      AND promised_point.promise_id = promise.id
+      AND promised_point.status = 'fulfilled'
+      AND promised_point.result_id = result.id
+      AND promised_point.result_attempt_id = attempt.id
+      AND result.current_result_attempt_id = attempt.id
+      AND attempt.result_id = result.id
+      AND attempt.status = 'done'
+      AND conflict.incoming_payload ->> 'engineJobId' IS NOT NULL
+      AND promised_point.aoa_deg = CASE
+        WHEN conflict.incoming_payload ->> 'aoaDeg'
+          ~ '^-?[0-9]+([.][0-9]+)?$'
+        THEN (conflict.incoming_payload ->> 'aoaDeg')::float8
+        ELSE NULL
+      END
+      AND attempt.engine_job_id = concat(
+        'sync:',
+        COALESCE(conflict.source_instance_id, promise.source_instance_id),
+        ':',
+        conflict.incoming_payload ->> 'engineJobId'
+      )
+      AND attempt.engine_case_slug IS NOT DISTINCT FROM
+        NULLIF(conflict.incoming_payload ->> 'engineCaseSlug', '')
+      AND result.fidelity::text IS NOT DISTINCT FROM
+        (conflict.incoming_payload ->> 'fidelity')
+      AND attempt.cl IS NOT DISTINCT FROM CASE
+        WHEN jsonb_typeof(conflict.incoming_payload -> 'cl') = 'number'
+        THEN (conflict.incoming_payload ->> 'cl')::float8
+        ELSE NULL
+      END
+      AND attempt.cd IS NOT DISTINCT FROM CASE
+        WHEN jsonb_typeof(conflict.incoming_payload -> 'cd') = 'number'
+        THEN (conflict.incoming_payload ->> 'cd')::float8
+        ELSE NULL
+      END
+      AND attempt.cm IS NOT DISTINCT FROM CASE
+        WHEN jsonb_typeof(conflict.incoming_payload -> 'cm') = 'number'
+        THEN (conflict.incoming_payload ->> 'cm')::float8
+        ELSE NULL
+      END
+      AND EXISTS (
+        SELECT 1
+        FROM result_classifications classification
+        WHERE classification.result_attempt_id = attempt.id
+          AND classification.state = 'accepted'
+      )
+    RETURNING conflict.id
+  `)) as unknown as Array<{ id: string }>;
+  return rows.length;
+}
+
+function conflictReviewNumber(
+  source: Record<string, unknown> | null,
+  key: string,
+): number | null {
+  return nullableNumber(source?.[key]);
+}
+
+function conflictAoALabel(value: number | null): string {
+  if (value == null) return "unknown angle";
+  const rounded = Math.round(value * 1000) / 1000;
+  return `α ${rounded.toFixed(Number.isInteger(rounded) ? 1 : 3).replace(/0+$/, "").replace(/[.]$/, "")}°`;
+}
+
+function conflictReynoldsLabel(value: number): string {
+  if (value >= 1_000_000)
+    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 2).replace(/0+$/, "").replace(/[.]$/, "")}M`;
+  if (value >= 1_000)
+    return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1).replace(/0$/, "").replace(/[.]$/, "")}k`;
+  return String(Math.round(value));
+}
+
+function conflictSolverLabel(payload: Record<string, unknown>): string | null {
+  const fidelity = nullableText(payload.fidelity);
+  if (fidelity === "urans_precalc") return "Fast URANS";
+  if (fidelity === "urans_full") return "Final URANS";
+  const regime = nullableText(payload.regime);
+  if (regime === "urans") return "URANS";
+  if (regime === "rans") return "RANS";
+  return nullableText(payload.methodKey);
+}
+
+function conflictCoefficientReview(payload: Record<string, unknown> | null) {
+  return {
+    cl: conflictReviewNumber(payload, "cl"),
+    cd: conflictReviewNumber(payload, "cd"),
+    cm: conflictReviewNumber(payload, "cm"),
+    engineJobId: nullableText(payload?.engineJobId),
+    solver: payload ? conflictSolverLabel(payload) : null,
+  };
+}
+
+function conflictReview(
+  row: typeof syncImportConflicts.$inferSelect,
+  airfoilName: string | null,
+) {
+  const incoming = jsonObject(row.incomingPayload);
+  const current = row.localSnapshot ? jsonObject(row.localSnapshot) : null;
+  const aoa =
+    conflictReviewNumber(incoming, "aoaDeg") ??
+    conflictReviewNumber(current, "aoaDeg");
+  const titleSubject =
+    airfoilName ??
+    nullableText(incoming.name) ??
+    nullableText(incoming.slug) ??
+    (row.dataType === "polars" ? "Polar point" : "Imported record");
+  const contextParts: string[] = [];
+  const reynolds =
+    conflictReviewNumber(incoming, "reynolds") ??
+    conflictReviewNumber(current, "reynolds");
+  if (reynolds != null)
+    contextParts.push(`Re ${conflictReynoldsLabel(reynolds)}`);
+  const speed =
+    conflictReviewNumber(incoming, "speed") ??
+    conflictReviewNumber(current, "speed");
+  if (speed != null) contextParts.push(`${speed} m/s`);
+  const chord =
+    conflictReviewNumber(incoming, "chord") ??
+    conflictReviewNumber(current, "chord");
+  if (chord != null) contextParts.push(`${chord} m chord`);
+  const solver = conflictSolverLabel(incoming);
+  if (solver) contextParts.push(solver);
+  if (!contextParts.length)
+    contextParts.push(
+      row.sourceInstanceName ?? row.sourceInstanceId ?? "Remote source",
+    );
+  return {
+    title:
+      row.dataType === "polars"
+        ? `${titleSubject} · ${conflictAoALabel(aoa)}`
+        : titleSubject,
+    context: contextParts.join(" · "),
+    summary:
+      row.dataType === "polars"
+        ? "A different solver generation arrived for an accepted point. The current result stays active."
+        : "The incoming record differs from the current canonical record.",
+    incoming: conflictCoefficientReview(incoming),
+    current: conflictCoefficientReview(current),
+  };
+}
+
 async function syncAdminPayload(req: FastifyRequest) {
+  await reconcileObsoleteExactPolarConflicts();
   const { settings, permissions } = await getSettings();
   const promiseRows = await db
     .select({
@@ -1173,6 +1390,27 @@ async function syncAdminPayload(req: FastifyRequest) {
     .where(eq(syncImportConflicts.status, "pending"))
     .orderBy(desc(syncImportConflicts.createdAt))
     .limit(50);
+  const polarAirfoilIds = Array.from(
+    new Set(
+      conflicts
+        .filter((row) => row.dataType === "polars")
+        .map((row) => row.naturalKey.split(":")[0] ?? "")
+        .filter((id) =>
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            id,
+          ),
+        ),
+    ),
+  );
+  const conflictAirfoils = polarAirfoilIds.length
+    ? await db
+        .select({ id: airfoils.id, name: airfoils.name })
+        .from(airfoils)
+        .where(inArray(airfoils.id, polarAirfoilIds))
+    : [];
+  const conflictAirfoilNames = new Map(
+    conflictAirfoils.map((row) => [row.id, row.name]),
+  );
   const solvers = await db
     .select()
     .from(registeredRemoteSolvers)
@@ -1271,9 +1509,15 @@ async function syncAdminPayload(req: FastifyRequest) {
       naturalKey: row.naturalKey,
       sourceInstanceId: row.sourceInstanceId,
       sourceInstanceName: row.sourceInstanceName,
-      incomingPayload: row.incomingPayload,
-      localSnapshot: row.localSnapshot,
-      artifactManifest: row.artifactManifest,
+      canPromote:
+        row.dataType === "airfoils" || row.dataType === "mediums",
+      review: conflictReview(
+        row,
+        row.dataType === "polars"
+          ? (conflictAirfoilNames.get(row.naturalKey.split(":")[0] ?? "") ??
+              null)
+          : null,
+      ),
       createdAt: iso(row.createdAt),
     })),
   };
@@ -6770,7 +7014,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     }[];
     const first = rows[0];
     if (!first) return { promise: null };
-    const aoas = rows
+    const candidateAoas = rows
       .filter(
         (row) =>
           row.airfoil_id === first.airfoil_id &&
@@ -6840,6 +7084,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           };
         }
       }
+
+      const aoas = await lockAndFilterRemoteClaimAoas(
+        tx,
+        first.airfoil_id,
+        first.revision_id,
+        candidateAoas,
+      );
+      if (!aoas.length) return { promise: null };
 
       const [promise] = await tx
         .insert(syncSweepPromises)
@@ -7548,6 +7800,10 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       if (permissionError)
         return reply.code(403).send({ error: permissionError });
       if (response) {
+        // A later exact delivery can make an earlier replay conflict obsolete.
+        // Reconcile on the successful ingest boundary so the admin review
+        // queue never waits for someone to open the page to become truthful.
+        await reconcileObsoleteExactPolarConflicts();
         if (!authenticatedSolver) {
           return { ...response, bindingReceipts: [] };
         }
