@@ -74,19 +74,26 @@
   TypeScript incident checks/typecheck, and the full 1,287-test non-integration
   engine suite pass. Both guarded engines now report recovery v8. The original
   single-remediation ceiling was exhausted by the successive v4–v7 controller
-  corrections, so an immutable one-grant-per-distinct-fixed-source ledger is
-  implemented and awaits migration/deployment before the six exact v8
-  corrective obligations can resume. An operator-side
+  corrections, so an immutable one-grant-per-distinct-fixed-source ledger was
+  deployed before the six exact v8 corrective obligations resumed. An
+  operator-side
   live-dictionary edit
   during diagnosis caused four v6 cases to stop with immutable rejected
   evidence; all four canonical archives authenticated every manifest member,
   their unpacked duplicates were restored exactly, and the runbook now forbids
-  direct live dictionary edits. The v8 engines are deployed while both
-  execution pools remain fenced for the remediation migration; the exact
-  six-angle corrective run remains evidence-bearing but not publishable.
-  Readiness still requires the remediation-grant migration, restored 8/40-slot
-  admission, evidence-preserving v8 reruns for the still-unresolved angles,
-  three clean whole periods for all six exact obligations, GCS binding and
+  direct live dictionary edits. Both 8/40-slot execution pools are restored.
+  The exact six-angle v8 corrective run reused one mesh and recomputed no
+  already accepted point. AoA 13 produced accepted clean-period evidence and is
+  GCS-bound. AoA -1, 0, 1, 7, and 9 retained complete restartable rejected
+  checkpoints, but the accepted-result-only remote broker left those five
+  archives unregistered and the controller correctly refused an unsafe
+  continuation. The transfer/controller fix now brokers such checkpoints
+  without fulfilling the point, preserves the exact verified GCS archive, and
+  makes the same-case continuation non-consuming; focused database and remote
+  transfer regressions pass, but it is not yet deployed. Readiness still
+  requires deploying that fix, observing all five checkpoints become
+  generation-pinned and continue rather than restart, obtaining accepted clean
+  whole-period evidence for the five unresolved angles, GCS binding and
   obsolete-generation retirement, and no recurring current-generation
   critical chain.
 

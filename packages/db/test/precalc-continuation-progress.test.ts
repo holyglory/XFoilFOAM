@@ -6,6 +6,7 @@ import {
   createClient,
   ensurePrecalcObligations,
   isExactRestartablePrecalcAttempt,
+  precalcCheckpointCandidatesForObligations,
   precalcContinuationMadeProgress,
   precalcContinuationProgressFromEvidence,
   precalcContinuationsForObligations,
@@ -1076,6 +1077,17 @@ describe("cross-segment preliminary URANS progress", () => {
       expect(
         await precalcContinuationsForObligations(db, [obligation.id]),
       ).toEqual([]);
+      if (variant === "missing-archive") {
+        expect(
+          await precalcCheckpointCandidatesForObligations(db, [obligation.id]),
+        ).toEqual([
+          expect.objectContaining({
+            obligationId: obligation.id,
+            resultId: attempt.resultId,
+            resultAttemptId: attempt.id,
+          }),
+        ]);
+      }
 
       await db
         .update(simPrecalcObligations)
@@ -1136,6 +1148,65 @@ describe("cross-segment preliminary URANS progress", () => {
         engineCaseSlug: attempt.engineCaseSlug,
       }),
     ]);
+  }, 120_000);
+
+  it("MUST-CATCH: a failed mutable result projection retains its exact rejected checkpoint and continuation budget", async () => {
+    const targetAoaDeg = 84.51;
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [{ airfoilId, revisionId, aoaDeg: targetAoaDeg }],
+      { backgroundOwner: true },
+    );
+    if (!obligation) throw new Error("failed-projection obligation missing");
+    obligationIds.push(obligation.id);
+    const attempt = await completeRejectedSegment({
+      suffix: "typed-failed-result-projection",
+      targetObligationId: obligation.id,
+      targetAoaDeg,
+      archive: "valid",
+    });
+    if (!attempt.resultId)
+      throw new Error("failed-projection fixture has no exact result owner");
+
+    await db
+      .update(results)
+      .set({ status: "failed" })
+      .where(eq(results.id, attempt.resultId));
+
+    expect(
+      await isExactRestartablePrecalcAttempt(db, attempt.resultId, attempt.id),
+    ).toBe(true);
+    expect(
+      await precalcContinuationsForObligations(db, [obligation.id]),
+    ).toEqual([
+      expect.objectContaining({
+        obligationId: obligation.id,
+        resultId: attempt.resultId,
+        resultAttemptId: attempt.id,
+      }),
+    ]);
+
+    const continuation = await completeRejectedSegment({
+      suffix: "typed-failed-result-continuation",
+      continueFromResultAttemptId: attempt.id,
+      targetObligationId: obligation.id,
+      targetAoaDeg,
+      archive: "valid",
+    });
+    const [submission] = await db
+      .select()
+      .from(simPrecalcObligationAttempts)
+      .where(
+        and(
+          eq(simPrecalcObligationAttempts.obligationId, obligation.id),
+          eq(simPrecalcObligationAttempts.resultAttemptId, continuation.id),
+        ),
+      )
+      .limit(1);
+    expect(submission).toMatchObject({
+      consumesSolverAttempt: false,
+      continuationSegmentNumber: 1,
+    });
   }, 120_000);
 
   it("requires measured phase/time improvement instead of a heartbeat", () => {

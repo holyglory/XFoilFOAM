@@ -11,6 +11,7 @@ import {
   type JobStatus,
   type PolarRequest,
 } from "@aerodb/engine-client";
+import { URANS_CONTINUATION_REQUIRED_MARKER } from "@aerodb/core";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, eq, inArray, sql as dsql } from "drizzle-orm";
 import {
@@ -45,6 +46,7 @@ const {
   createProgressAwareAbort,
   persistClaimedRemotePromise,
   processBrokeredRemoteEvidenceReclaims,
+  processRestartableRemotePrecalcCheckpoint,
   reconcileRemoteSolverTick,
   remoteSolverTick,
   renewResultDeliveryClaim,
@@ -70,12 +72,15 @@ const {
   categories,
   createClient,
   discoverMissingResultMediaRepairs,
+  ensurePrecalcObligations,
   flowConditions,
   forceHistory,
   mediums,
   meshProfiles,
   outputProfiles,
   polarFitSets,
+  precalcContinuationsForObligations,
+  recordPrecalcObligationSubmission,
   recordRansPolarPromotion,
   referenceGeometryProfiles,
   registeredRemoteSolvers,
@@ -97,6 +102,8 @@ const {
   simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverEvidenceArchives,
+  solverEvidenceBlobs,
   solverProfiles,
   solverRuntimeBuilds,
   solverRuntimeProvenanceKey,
@@ -505,6 +512,21 @@ async function cleanupRemoteRows() {
     .select({ id: results.id })
     .from(results)
     .where(eq(results.simulationPresetRevisionId, revisionId));
+  const evidenceBlobIds = resultIds.length
+    ? await db
+        .select({ id: solverEvidenceBlobs.id })
+        .from(solverEvidenceArchives)
+        .innerJoin(
+          solverEvidenceBlobs,
+          eq(solverEvidenceBlobs.id, solverEvidenceArchives.blobId),
+        )
+        .where(
+          inArray(
+            solverEvidenceArchives.resultId,
+            resultIds.map((row) => row.id),
+          ),
+        )
+    : [];
   if (resultIds.length) {
     await db.delete(remoteAssetReferences).where(
       inArray(
@@ -516,6 +538,14 @@ async function cleanupRemoteRows() {
   await db
     .delete(solverEvidenceArtifacts)
     .where(eq(solverEvidenceArtifacts.airfoilId, airfoilId));
+  if (evidenceBlobIds.length) {
+    await db.delete(solverEvidenceBlobs).where(
+      inArray(
+        solverEvidenceBlobs.id,
+        evidenceBlobIds.map((row) => row.id),
+      ),
+    );
+  }
   await db
     .delete(resultClassifications)
     .where(eq(resultClassifications.simulationPresetRevisionId, revisionId));
@@ -759,7 +789,14 @@ async function parsedRequestBody(init?: RequestInit): Promise<unknown> {
 const brokerObjects = new Map<string, string>();
 const brokerArchives = new Map<
   string,
-  { bytes: Buffer; sha256: string; byteSize: number }
+  {
+    bytes: Buffer;
+    sha256: string;
+    byteSize: number;
+    tarSha256: string;
+    tarByteSize: number;
+    zstdLevel: number;
+  }
 >();
 
 async function brokerFixtureResponse(
@@ -772,6 +809,9 @@ async function brokerFixtureResponse(
       idempotencyKey?: string;
       storedSha256?: string;
       storedByteSize?: number;
+      tarSha256?: string;
+      tarByteSize?: number;
+      zstdLevel?: number;
     };
     const id = body.idempotencyKey ?? randomUUID();
     const storedSha256 = body.storedSha256 ?? "0".repeat(64);
@@ -781,6 +821,9 @@ async function brokerFixtureResponse(
       bytes: Buffer.alloc(0),
       sha256: storedSha256,
       byteSize: body.storedByteSize ?? 0,
+      tarSha256: body.tarSha256 ?? "1".repeat(64),
+      tarByteSize: body.tarByteSize ?? 1,
+      zstdLevel: body.zstdLevel ?? 19,
     });
     const query = new URLSearchParams({
       uploadType: "resumable",
@@ -820,6 +863,7 @@ async function brokerFixtureResponse(
   }
   const verify = /\/evidence-uploads\/([^/]+)\/verify$/.exec(url);
   if (verify) {
+    const archive = brokerArchives.get(verify[1]!);
     return new Response(
       JSON.stringify({
         id: verify[1],
@@ -829,6 +873,14 @@ async function brokerFixtureResponse(
           objectKey: brokerObjects.get(verify[1]!) ?? "missing",
           generation: "9007199254740993123",
           crc32c: "AAAAAA==",
+          schemaVersion: 1,
+          format: "tar+zstd",
+          storedSha256: archive?.sha256,
+          storedSize: archive?.byteSize,
+          tarSha256: archive?.tarSha256,
+          tarSize: archive?.tarByteSize,
+          zstdLevel: archive?.zstdLevel,
+          createdAt: new Date().toISOString(),
         },
       }),
       { status: 200, headers: { "content-type": "application/json" } },
@@ -3244,6 +3296,285 @@ describe("remote solver push validation regressions", () => {
     expect(retry).toBe(first);
     expect(reusedEvidence).not.toBe(first);
   });
+
+  it("MUST-CATCH: brokers a rejected restartable PRECALC checkpoint without fulfilling the remote point", async () => {
+    const aoaDeg = 89.499;
+    const label = "restartable-precalc-checkpoint";
+    const promise = await seedMirroredPromise(label, [aoaDeg]);
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [{ airfoilId, revisionId, aoaDeg }],
+      { backgroundOwner: false, syncPromiseIds: [promise.id] },
+    );
+    if (!obligation) throw new Error("PRECALC obligation was not created");
+    const [revision] = await db
+      .select()
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    const engineJobId = `${PREFIX}-${label}`;
+    const engineCaseSlug = "a89p499";
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        solverImplementationId: revision?.solverImplementationId ?? null,
+        referenceChordM: CHORD,
+        wave: 2,
+        jobKind: "targeted",
+        status: "done",
+        engineJobId,
+        totalCases: 1,
+        completedCases: 1,
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+        requestPayload: {
+          syncPromiseId: promise.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          aoas: [aoaDeg],
+          uransFidelity: "precalc",
+          precalcObligationIds: [obligation.id],
+        },
+      })
+      .returning();
+    await db
+      .update(simPrecalcObligations)
+      .set({ latestSimJobId: job.id })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await recordPrecalcObligationSubmission(db, job.id, [obligation.id]);
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        solverImplementationId: revision?.solverImplementationId ?? null,
+        aoaDeg,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        methodKey: "openfoam.urans",
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug,
+        error: "clean period acquisition is incomplete",
+        solvedAt: new Date(),
+      })
+      .returning();
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        solverImplementationId: revision?.solverImplementationId ?? null,
+        aoaDeg,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug,
+        methodKey: "openfoam.urans",
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: false,
+        unsteady: true,
+        error: "clean period acquisition is incomplete",
+        qualityWarnings: [
+          `URANS ${URANS_CONTINUATION_REQUIRED_MARKER}: retained restartable state`,
+        ],
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          frame_track: {
+            period_s: 0.02,
+            periods_retained: 1.4,
+            stationary: false,
+            drift_frac: 0.08,
+            window: { t_start: 0.04, t_end: 0.068 },
+          },
+        },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "urans",
+      classifierVersion: "remote-checkpoint-test-v1",
+      state: "rejected",
+      reasons: ["clean period acquisition is incomplete"],
+    });
+    await db
+      .update(simPrecalcObligationAttempts)
+      .set({
+        state: "rejected",
+        outcome: "rejected",
+        resultAttemptId: attempt.id,
+        completedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(simPrecalcObligationAttempts.obligationId, obligation.id),
+          eq(simPrecalcObligationAttempts.simJobId, job.id),
+        ),
+      );
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        lastOutcome: "rejected",
+        latestSimJobId: job.id,
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+
+    const restartMembers = [
+      "openfoam/transient/transient_start.json",
+      "openfoam/transient/system/controlDict",
+      "openfoam/transient/system/fvSchemes",
+      "openfoam/transient/system/fvSolution",
+      "openfoam/transient/constant/polyMesh/points",
+      "openfoam/transient/constant/polyMesh/faces",
+      "openfoam/transient/constant/polyMesh/owner",
+      "openfoam/transient/constant/polyMesh/neighbour",
+      "openfoam/transient/constant/polyMesh/boundary",
+      "openfoam/transient/constant/transportProperties",
+      "openfoam/transient/constant/turbulenceProperties",
+      "openfoam/transient/constant/physicalProperties",
+      "openfoam/transient/constant/momentumTransport",
+      "time_directories/0.068/U",
+      "time_directories/0.068/p",
+      "time_directories/0.068/k",
+      "time_directories/0.068/omega",
+      "time_directories/0.068/nut",
+      "time_directories/0.068/phi",
+      "openfoam/postProcessing/forceCoeffs1/0/coefficient.dat",
+    ].map((path, index) => ({
+      path,
+      sha256: (index % 16).toString(16).repeat(64),
+      byteSize: 64 + index,
+      role: path.includes("polyMesh")
+        ? "mesh_evidence"
+        : path.startsWith("time_directories/")
+          ? "time_directory"
+          : path.includes("coefficient.dat")
+            ? "force_coefficients"
+            : "continuation_state",
+    }));
+    const manifestBytes = Buffer.from(
+      JSON.stringify({ files: restartMembers, bundleExcludes: [] }),
+    );
+    const manifestStorageKey = `jobs/${engineJobId}/cases/${engineCaseSlug}/evidence_manifest.json`;
+    mkdirSync(dirname(join(MEDIA_DIR, manifestStorageKey)), {
+      recursive: true,
+    });
+    writeFileSync(join(MEDIA_DIR, manifestStorageKey), manifestBytes);
+    const [manifest] = await db
+      .insert(solverEvidenceArtifacts)
+      .values({
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simJobId: job.id,
+        engineJobId,
+        engineCaseSlug,
+        methodKey: "openfoam.urans",
+        solverImplementationId: revision?.solverImplementationId ?? null,
+        aoaDeg,
+        kind: "manifest",
+        storageKey: manifestStorageKey,
+        mimeType: "application/json",
+        sha256: sha256(manifestBytes),
+        byteSize: manifestBytes.byteLength,
+      })
+      .returning();
+    const tarBytes = Buffer.from(`${PREFIX}:${label}:tar`);
+    const bundle = writeMedia(
+      `jobs/${engineJobId}/cases/${engineCaseSlug}/engine_evidence.tar.zst`,
+      `${label}:zstd`,
+    );
+    await db.insert(solverEvidenceArtifacts).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simJobId: job.id,
+      engineJobId,
+      engineCaseSlug,
+      methodKey: "openfoam.urans",
+      solverImplementationId: revision?.solverImplementationId ?? null,
+      aoaDeg,
+      kind: "engine_bundle",
+      storageKey: bundle.storageKey,
+      mimeType: "application/zstd",
+      sha256: bundle.sha256,
+      byteSize: bundle.byteSize,
+      metadata: {
+        evidenceBase: "evidence",
+        archiveFormat: "tar+zstd",
+        uncompressedTarSha256: sha256(tarBytes),
+        uncompressedTarByteSize: tarBytes.byteLength,
+        zstdLevel: 19,
+        bundledFileCount: restartMembers.length,
+      },
+    });
+    const { fetchMock } = stubFetch();
+    const [settings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+
+    expect(
+      await processRestartableRemotePrecalcCheckpoint(
+        db,
+        {} as unknown as EngineClient,
+        settings,
+      ),
+    ).toBe(true);
+    expect(requests(fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      await db
+        .select()
+        .from(syncSweepPromisePoints)
+        .where(eq(syncSweepPromisePoints.promiseId, promise.id)),
+    ).toEqual([
+      expect.objectContaining({
+        status: "active",
+        resultId: null,
+        resultAttemptId: null,
+      }),
+    ]);
+    expect(
+      await db
+        .select()
+        .from(solverEvidenceArchives)
+        .where(eq(solverEvidenceArchives.resultAttemptId, attempt.id)),
+    ).toHaveLength(1);
+    expect(
+      await precalcContinuationsForObligations(db, [obligation.id]),
+    ).toEqual([
+      expect.objectContaining({
+        obligationId: obligation.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+      }),
+    ]);
+    expect(manifest.id).toBeTruthy();
+    expect(
+      await processRestartableRemotePrecalcCheckpoint(
+        db,
+        {} as unknown as EngineClient,
+        settings,
+      ),
+    ).toBe(false);
+  }, 120_000);
 
   it("preserves the application-source fingerprint in the pushed runtime identity", async () => {
     const aoaDeg = 809.501;

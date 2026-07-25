@@ -382,10 +382,7 @@ function precalcContinuationPayload(
   resultId: string | null;
   resultAttemptId: string | null;
 } {
-  if (
-    requestPayload == null ||
-    typeof requestPayload !== "object"
-  ) {
+  if (requestPayload == null || typeof requestPayload !== "object") {
     return {
       mentioned: false,
       exactPair: false,
@@ -802,11 +799,12 @@ export async function isExactRestartablePrecalcAttempt(
       WHERE exact_result.id = ${resultId}
         AND exact_attempt.id = ${resultAttemptId}
         -- results.status is a mutable scheduling projection. Campaign
-        -- rematerialization may mark the row stale while this exact rejected
-        -- attempt, manifest, and restart archive remain immutable and valid.
-        -- Pending/running/failed parents are still excluded; stale is the one
-        -- terminal projection that deliberately preserves prior evidence.
-        AND exact_result.status IN ('done', 'stale')
+        -- rematerialization may mark the row stale, while a rejected physical
+        -- PRECALC checkpoint is normally projected as failed. Neither mutable
+        -- projection invalidates the exact rejected attempt, manifest, or
+        -- authenticated restart archive. Pending/running parents remain
+        -- excluded.
+        AND exact_result.status IN ('done', 'stale', 'failed')
         AND exact_attempt.engine_job_id IS NOT NULL
         AND exact_attempt.engine_case_slug IS NOT NULL
         AND ${restartablePrecalcEvidenceSql({
@@ -2217,22 +2215,22 @@ export async function settlePrecalcObligationsForJobInTransaction(
   const continuationObligation = obligations[0];
   const sameCaseContinuation = Boolean(
     continuation.exactPair &&
-      continuation.resultId &&
-      continuation.resultAttemptId &&
-      continuationObligation &&
-      obligations.length === 1 &&
-      targetBoundaryConditionIds.length === 1 &&
-      job.solverImplementationId &&
-      job.simulationPresetRevisionId &&
-      (await isExactPrecalcContinuationForTarget(tx, {
-        resultId: continuation.resultId!,
-        resultAttemptId: continuation.resultAttemptId!,
-        airfoilId: job.airfoilId,
-        revisionId: job.simulationPresetRevisionId!,
-        aoaDeg: continuationObligation.aoaDeg,
-        boundaryConditionId: targetBoundaryConditionIds[0]!,
-        solverImplementationId: job.solverImplementationId!,
-      })),
+    continuation.resultId &&
+    continuation.resultAttemptId &&
+    continuationObligation &&
+    obligations.length === 1 &&
+    targetBoundaryConditionIds.length === 1 &&
+    job.solverImplementationId &&
+    job.simulationPresetRevisionId &&
+    (await isExactPrecalcContinuationForTarget(tx, {
+      resultId: continuation.resultId!,
+      resultAttemptId: continuation.resultAttemptId!,
+      airfoilId: job.airfoilId,
+      revisionId: job.simulationPresetRevisionId!,
+      aoaDeg: continuationObligation.aoaDeg,
+      boundaryConditionId: targetBoundaryConditionIds[0]!,
+      solverImplementationId: job.solverImplementationId!,
+    })),
   );
   const exactContinuationSourceAttemptId = sameCaseContinuation
     ? continuation.resultAttemptId
@@ -2984,7 +2982,13 @@ export interface PrecalcContinuationAddress {
  * a later physical/rejected attempt deliberately prevents an unchanged resume
  * loop. The canonical result may still be protected RANS evidence and is never
  * consulted. */
-export async function precalcContinuationsForObligations(
+/**
+ * Return the exact newest checkpoint candidates before the final archive
+ * trust gate. Remote solvers use this bounded view to broker a locally
+ * packaged rejected checkpoint into object storage; callers must never submit
+ * a continuation directly from this function.
+ */
+export async function precalcCheckpointCandidatesForObligations(
   db: DB,
   obligationIds: string[],
 ): Promise<PrecalcContinuationAddress[]> {
@@ -3048,10 +3052,11 @@ export async function precalcContinuationsForObligations(
           snapshot: sql`target_revision.snapshot`,
           fallbackBoundaryConditionId: sql`target_preset.legacy_boundary_condition_id`,
         })}
-        -- The canonical result row may be staled for a future solve without
-        -- invalidating an immutable archived attempt. Continue from that exact
-        -- generation, never from the mutable current-result projection.
-        AND owner_result.status IN ('done', 'stale')
+        -- The canonical result row may be staled for a future solve or marked
+        -- failed for a rejected PRECALC checkpoint without invalidating the
+        -- immutable attempt. Continue from that exact generation, never from
+        -- the mutable current-result projection.
+        AND owner_result.status IN ('done', 'stale', 'failed')
         AND result_attempt.status IN ('done', 'failed')
         AND result_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
         AND result_attempt.engine_job_id IS NOT NULL
@@ -3116,34 +3121,45 @@ export async function precalcContinuationsForObligations(
     engine_case_slug: string;
     budget_override_s: number;
   }>;
+  return rows.map((row) => ({
+    obligationId: row.obligation_id,
+    aoaDeg: Number(row.aoa_deg),
+    resultId: row.result_id,
+    resultAttemptId: row.result_attempt_id,
+    engineJobId: row.engine_job_id,
+    engineCaseSlug: row.engine_case_slug,
+    // The campaign recovery lane intentionally runs before the admin-request
+    // lane. An exact operator continuation can therefore exist before its
+    // request-coverage link is materialized. Preserve that exact immutable
+    // pair's larger budget here, while never retargeting a different attempt
+    // and never shrinking below the automatic continuation floor.
+    budgetOverrideS: Number(row.budget_override_s),
+  }));
+}
+
+export async function precalcContinuationsForObligations(
+  db: DB,
+  obligationIds: string[],
+): Promise<PrecalcContinuationAddress[]> {
+  const candidates = await precalcCheckpointCandidatesForObligations(
+    db,
+    obligationIds,
+  );
   const continuations: PrecalcContinuationAddress[] = [];
-  for (const row of rows) {
+  for (const candidate of candidates) {
     // Engine-local job/case strings are mutable addressing, not proof that the
     // immutable generation can still be resumed. Fail closed unless the exact
     // pair owns one valid manifest and one verified complete restart archive.
     if (
       !(await isExactRestartablePrecalcAttempt(
         db,
-        row.result_id,
-        row.result_attempt_id,
+        candidate.resultId,
+        candidate.resultAttemptId,
       ))
     ) {
       continue;
     }
-    continuations.push({
-      obligationId: row.obligation_id,
-      aoaDeg: Number(row.aoa_deg),
-      resultId: row.result_id,
-      resultAttemptId: row.result_attempt_id,
-      engineJobId: row.engine_job_id,
-      engineCaseSlug: row.engine_case_slug,
-      // The campaign recovery lane intentionally runs before the admin-request
-      // lane. An exact operator continuation can therefore exist before its
-      // request-coverage link is materialized. Preserve that exact immutable
-      // pair's larger budget here, while never retargeting a different attempt
-      // and never shrinking below the automatic continuation floor.
-      budgetOverrideS: Number(row.budget_override_s),
-    });
+    continuations.push(candidate);
   }
   return continuations;
 }

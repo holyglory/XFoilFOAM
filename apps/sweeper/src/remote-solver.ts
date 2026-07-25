@@ -5,10 +5,14 @@ import {
   categories,
   type DB,
   flowConditions,
+  hasPrecalcContinuationWarning,
+  isExactRestartablePrecalcAttempt,
   mediums,
   meshProfiles,
   outputProfiles,
+  precalcCheckpointCandidatesForObligations,
   referenceGeometryProfiles,
+  registerVerifiedBrokeredEvidenceArchive,
   remoteAssetReferences,
   resultAttempts,
   resultClassifications,
@@ -58,7 +62,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 
@@ -85,6 +89,7 @@ import { createSingleFlightBackgroundRunner } from "./single-flight";
 import { parsedMeshRecoveryVersion } from "./engine-capabilities";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
+import { parseEvidenceManifest } from "./evidence-manifest";
 
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
 
@@ -3327,6 +3332,474 @@ async function firstReadyMirroredPromiseId(
   return row?.id ?? null;
 }
 
+interface VerifiedCheckpointPointer {
+  schemaVersion: 1;
+  format: "tar+zstd";
+  bucket: string;
+  objectKey: string;
+  generation: string;
+  storedSha256: string;
+  storedSize: number;
+  tarSha256: string;
+  tarSize: number;
+  crc32c: string;
+  zstdLevel: number;
+  createdAt: string;
+}
+
+function exactVerifiedCheckpointPointer(
+  response: Record<string, unknown>,
+  request: {
+    storedSha256: string;
+    storedByteSize: number;
+    tarSha256: string;
+    tarByteSize: number;
+    zstdLevel: number;
+  },
+): { uploadId: string; remote: VerifiedCheckpointPointer } {
+  const remote =
+    response.remote &&
+    typeof response.remote === "object" &&
+    !Array.isArray(response.remote)
+      ? (response.remote as Record<string, unknown>)
+      : null;
+  if (
+    typeof response.id !== "string" ||
+    !["verified", "bound"].includes(String(response.state)) ||
+    !remote ||
+    remote.schemaVersion !== 1 ||
+    remote.format !== "tar+zstd" ||
+    typeof remote.bucket !== "string" ||
+    !remote.bucket ||
+    typeof remote.objectKey !== "string" ||
+    remote.objectKey !==
+      `solver-evidence/v1/sha256/${request.storedSha256.slice(0, 2)}/${request.storedSha256}.tar.zst` ||
+    remote.storedSha256 !== request.storedSha256 ||
+    remote.storedSize !== request.storedByteSize ||
+    remote.tarSha256 !== request.tarSha256 ||
+    remote.tarSize !== request.tarByteSize ||
+    remote.zstdLevel !== request.zstdLevel ||
+    typeof remote.generation !== "string" ||
+    !/^[1-9][0-9]{0,19}$/.test(remote.generation) ||
+    BigInt(remote.generation) > 18_446_744_073_709_551_615n ||
+    typeof remote.crc32c !== "string" ||
+    !/^[A-Za-z0-9+/]{6}==$/.test(remote.crc32c) ||
+    typeof remote.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(remote.createdAt))
+  ) {
+    throw new Error(
+      "remote checkpoint broker did not return one exact verified generation",
+    );
+  }
+  return {
+    uploadId: response.id,
+    remote: remote as unknown as VerifiedCheckpointPointer,
+  };
+}
+
+async function activeRemotePrecalcObligationIds(
+  db: DB,
+  settings: Settings,
+): Promise<Array<{ obligationId: string; promiseId: string }>> {
+  const rows = (await db.execute(sql`
+    SELECT obligation.id AS obligation_id,
+           remote_promise.id AS promise_id
+    FROM sync_sweep_promises remote_promise
+    JOIN sync_sweep_promise_points promise_point
+      ON promise_point.promise_id = remote_promise.id
+    JOIN sim_precalc_obligations obligation
+      ON obligation.airfoil_id = promise_point.airfoil_id
+     AND obligation.revision_id =
+       promise_point.simulation_preset_revision_id
+     AND obligation.aoa_deg = promise_point.aoa_deg
+    WHERE remote_promise.status = 'active'
+      AND remote_promise."expiresAt" > now()
+      AND promise_point.status = 'active'
+      AND obligation.state = 'pending'
+      AND remote_promise.source_base_url = ${syncBase(settings)}
+      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND ${remotePromiseOwnerSql(settings, "remote_promise")}
+    ORDER BY obligation.id, remote_promise.id
+    LIMIT 100
+  `)) as unknown as Array<{
+    obligation_id: string;
+    promise_id: string;
+  }>;
+  return rows.map((row) => ({
+    obligationId: row.obligation_id,
+    promiseId: row.promise_id,
+  }));
+}
+
+/**
+ * Broker one rejected-but-restartable PRECALC checkpoint without publishing a
+ * polar point or fulfilling its remote promise. The hub authenticates every
+ * manifest member from the exact GCS generation before returning `verified`;
+ * only then may the local immutable archive ledger make the same-case
+ * continuation eligible.
+ */
+export async function processRestartableRemotePrecalcCheckpoint(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+): Promise<boolean> {
+  const ownership = await activeRemotePrecalcObligationIds(db, settings);
+  if (!ownership.length) return false;
+  const promisesByObligation = new Map(
+    ownership.map((row) => [row.obligationId, row.promiseId]),
+  );
+  const candidates = await precalcCheckpointCandidatesForObligations(
+    db,
+    ownership.map((row) => row.obligationId),
+  );
+  let firstError: unknown = null;
+  for (const candidate of candidates) {
+    const promiseId = promisesByObligation.get(candidate.obligationId);
+    if (!promiseId) continue;
+    if (
+      await isExactRestartablePrecalcAttempt(
+        db,
+        candidate.resultId,
+        candidate.resultAttemptId,
+      )
+    ) {
+      continue;
+    }
+    let transferLease: RemotePromiseTransferLease | null = null;
+    try {
+      const [attempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.id, candidate.resultAttemptId),
+            eq(resultAttempts.resultId, candidate.resultId),
+          ),
+        )
+        .limit(1);
+      const attemptEvidence =
+        attempt?.evidencePayload &&
+        typeof attempt.evidencePayload === "object" &&
+        !Array.isArray(attempt.evidencePayload)
+          ? (attempt.evidencePayload as Record<string, unknown>)
+          : {};
+      if (
+        !attempt ||
+        !attempt.engineJobId ||
+        !attempt.engineCaseSlug ||
+        !hasPrecalcContinuationWarning(attempt.qualityWarnings) ||
+        attemptEvidence.fidelity !== "urans_precalc"
+      ) {
+        throw new Error(
+          `restartable checkpoint ${candidate.resultAttemptId} changed immutable PRECALC identity`,
+        );
+      }
+      const artifacts = await db
+        .select()
+        .from(solverEvidenceArtifacts)
+        .where(
+          and(
+            eq(solverEvidenceArtifacts.resultId, candidate.resultId),
+            eq(
+              solverEvidenceArtifacts.resultAttemptId,
+              candidate.resultAttemptId,
+            ),
+          ),
+        )
+        .orderBy(solverEvidenceArtifacts.createdAt, solverEvidenceArtifacts.id);
+      const manifests = artifacts.filter(
+        (artifact) => artifact.kind === "manifest",
+      );
+      const localBundles = artifacts.filter(
+        (artifact) =>
+          artifact.kind === "engine_bundle" &&
+          (artifact.metadata as Record<string, unknown> | null)
+            ?.storageBackend !== "gcs",
+      );
+      if (manifests.length !== 1 || localBundles.length !== 1) {
+        throw new Error(
+          `restartable checkpoint ${candidate.resultAttemptId} requires one manifest and one local engine bundle`,
+        );
+      }
+      const manifest = manifests[0]!;
+      const bundle = localBundles[0]!;
+      const bundleMetadata =
+        bundle.metadata &&
+        typeof bundle.metadata === "object" &&
+        !Array.isArray(bundle.metadata)
+          ? (bundle.metadata as Record<string, unknown>)
+          : {};
+      const tarSha256 =
+        typeof bundleMetadata.uncompressedTarSha256 === "string"
+          ? bundleMetadata.uncompressedTarSha256.toLowerCase()
+          : "";
+      const tarByteSize = Number(bundleMetadata.uncompressedTarByteSize ?? 0);
+      const zstdLevel = Number(bundleMetadata.zstdLevel ?? 0);
+      const bundledFileCount = Number(bundleMetadata.bundledFileCount ?? 0);
+      if (
+        !/^[0-9a-f]{64}$/i.test(bundle.sha256) ||
+        !/^[0-9a-f]{64}$/.test(tarSha256) ||
+        bundle.byteSize <= 0 ||
+        !Number.isSafeInteger(tarByteSize) ||
+        tarByteSize <= 0 ||
+        !Number.isInteger(zstdLevel) ||
+        zstdLevel < 1 ||
+        zstdLevel > 22 ||
+        !Number.isSafeInteger(bundledFileCount) ||
+        bundledFileCount <= 0 ||
+        !/^[0-9a-f]{64}$/i.test(manifest.sha256) ||
+        manifest.byteSize <= 0
+      ) {
+        throw new Error(
+          `restartable checkpoint ${candidate.resultAttemptId} lacks exact archive identity`,
+        );
+      }
+      const manifestBytes = await readFile(
+        join(MEDIA_DIR, manifest.storageKey),
+      );
+      if (
+        manifestBytes.byteLength !== manifest.byteSize ||
+        createHash("sha256").update(manifestBytes).digest("hex") !==
+          manifest.sha256.toLowerCase()
+      ) {
+        throw new Error(
+          `restartable checkpoint ${candidate.resultAttemptId} manifest bytes changed`,
+        );
+      }
+      const parsed = parseEvidenceManifest(manifestBytes);
+      if (
+        parsed.bundled.length !== bundledFileCount ||
+        parsed.memberSet.length !== bundledFileCount + 1
+      ) {
+        throw new Error(
+          `restartable checkpoint ${candidate.resultAttemptId} manifest member count changed`,
+        );
+      }
+      const evidenceBase = exactEvidenceBase(bundleMetadata.evidenceBase);
+      const brokerRequest = {
+        idempotencyKey: brokeredEvidenceIdempotencyKey(promiseId, attempt.id),
+        promiseId,
+        remoteResultId: candidate.resultId,
+        remoteResultAttemptId: attempt.id,
+        aoaDeg: candidate.aoaDeg,
+        engineJobId: attempt.engineJobId,
+        engineCaseSlug: attempt.engineCaseSlug,
+        storedSha256: bundle.sha256.toLowerCase(),
+        storedByteSize: bundle.byteSize,
+        tarSha256,
+        tarByteSize,
+        manifestSha256: manifest.sha256.toLowerCase(),
+        manifestByteSize: manifest.byteSize,
+        zstdLevel,
+        bundledFileCount,
+      };
+      transferLease = await startRemotePromiseTransferLease(
+        db,
+        engine,
+        settings,
+        promiseId,
+        () => touchHeartbeat(db),
+      );
+      await setStatus(db, "pushing", null);
+      let brokerResponse = (await fetch(
+        `${syncBase(settings)}/evidence-uploads`,
+        {
+          method: "POST",
+          signal: AbortSignal.any([
+            AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+            transferLease.signal,
+          ]),
+          headers: headers(settings),
+          body: JSON.stringify(brokerRequest),
+        },
+      ).then(async (response) => {
+        const payload = (await response.json().catch(() => null)) as Record<
+          string,
+          unknown
+        > | null;
+        if (!response.ok || !payload)
+          throw new Error(
+            `remote checkpoint broker request failed (${response.status})`,
+          );
+        return payload;
+      })) as Record<string, unknown>;
+      if (brokerResponse.state === "issued") {
+        if (
+          typeof brokerResponse.id !== "string" ||
+          typeof brokerResponse.uploadUrl !== "string" ||
+          typeof brokerResponse.bucket !== "string" ||
+          typeof brokerResponse.objectKey !== "string"
+        ) {
+          throw new Error(
+            "remote checkpoint broker omitted its upload capability",
+          );
+        }
+        const generation = await uploadBrokeredEvidenceFile(
+          brokerResponse.uploadUrl,
+          {
+            bucket: brokerResponse.bucket,
+            objectKey: brokerResponse.objectKey,
+          },
+          bundle.storageKey,
+          bundle.byteSize,
+          async () => {
+            transferLease?.throwIfFailed();
+            await touchHeartbeat(db);
+          },
+          transferLease.signal,
+        );
+        brokerResponse = await fetch(
+          `${syncBase(settings)}/evidence-uploads/${brokerResponse.id}/verify`,
+          {
+            method: "POST",
+            signal: AbortSignal.any([
+              AbortSignal.timeout(REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS),
+              transferLease.signal,
+            ]),
+            headers: headers(settings),
+            body: JSON.stringify({ generation }),
+          },
+        ).then(async (response) => {
+          const payload = (await response.json().catch(() => null)) as Record<
+            string,
+            unknown
+          > | null;
+          if (!response.ok || !payload)
+            throw new Error(
+              `remote checkpoint verification failed (${response.status})`,
+            );
+          return payload;
+        });
+      }
+      const verified = exactVerifiedCheckpointPointer(
+        brokerResponse,
+        brokerRequest,
+      );
+      transferLease.throwIfFailed();
+
+      await db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as DB;
+        const gcsMetadata = {
+          ...bundleMetadata,
+          storageBackend: "gcs",
+          bucket: verified.remote.bucket,
+          objectKey: verified.remote.objectKey,
+          generation: verified.remote.generation,
+          crc32c: verified.remote.crc32c,
+          tarSha256: brokerRequest.tarSha256,
+          tarByteSize: String(brokerRequest.tarByteSize),
+          manifestSha256: brokerRequest.manifestSha256,
+          manifestByteSize: String(brokerRequest.manifestByteSize),
+          brokeredCheckpointUploadId: verified.uploadId,
+        };
+        const gcsBundleValues = {
+          resultId: bundle.resultId,
+          resultAttemptId: bundle.resultAttemptId,
+          airfoilId: bundle.airfoilId,
+          simJobId: bundle.simJobId,
+          engineJobId: bundle.engineJobId,
+          engineCaseSlug: bundle.engineCaseSlug,
+          methodKey: bundle.methodKey,
+          solverImplementationId: bundle.solverImplementationId,
+          solverRuntimeBuildId: bundle.solverRuntimeBuildId,
+          aoaDeg: bundle.aoaDeg,
+          kind: "engine_bundle" as const,
+          field: bundle.field,
+          role: bundle.role,
+          storageKey: verified.remote.objectKey,
+          mimeType: "application/zstd",
+          sha256: brokerRequest.storedSha256,
+          byteSize: brokerRequest.storedByteSize,
+          engineUrl: bundle.engineUrl,
+          metadata: gcsMetadata,
+        };
+        const [inserted] = await tx
+          .insert(solverEvidenceArtifacts)
+          .values(gcsBundleValues)
+          .onConflictDoNothing()
+          .returning();
+        let gcsBundle = inserted;
+        if (!gcsBundle) {
+          [gcsBundle] = await tx
+            .select()
+            .from(solverEvidenceArtifacts)
+            .where(
+              and(
+                eq(
+                  solverEvidenceArtifacts.resultAttemptId,
+                  candidate.resultAttemptId,
+                ),
+                eq(solverEvidenceArtifacts.kind, "engine_bundle"),
+                eq(
+                  solverEvidenceArtifacts.storageKey,
+                  verified.remote.objectKey,
+                ),
+                eq(solverEvidenceArtifacts.sha256, brokerRequest.storedSha256),
+              ),
+            )
+            .limit(1);
+        }
+        if (
+          !gcsBundle ||
+          gcsBundle.resultId !== candidate.resultId ||
+          canonicalJson(gcsBundle.metadata) !== canonicalJson(gcsMetadata)
+        ) {
+          throw new Error(
+            `restartable checkpoint ${candidate.resultAttemptId} GCS artifact identity changed`,
+          );
+        }
+        await registerVerifiedBrokeredEvidenceArchive(tx, {
+          resultId: candidate.resultId,
+          resultAttemptId: candidate.resultAttemptId,
+          sourceArtifactId: gcsBundle.id,
+          manifestArtifactId: manifest.id,
+          evidenceBase,
+          identity: {
+            bucket: verified.remote.bucket,
+            objectKey: verified.remote.objectKey,
+            generation: verified.remote.generation,
+            crc32c: verified.remote.crc32c,
+            storedSha256: brokerRequest.storedSha256,
+            storedByteSize: brokerRequest.storedByteSize,
+            tarSha256: brokerRequest.tarSha256,
+            tarByteSize: brokerRequest.tarByteSize,
+            manifestSha256: brokerRequest.manifestSha256,
+            manifestByteSize: brokerRequest.manifestByteSize,
+            zstdLevel: brokerRequest.zstdLevel,
+            bundledFileCount: brokerRequest.bundledFileCount,
+            verifiedAt: new Date(verified.remote.createdAt),
+          },
+          memberSet: parsed.memberSet,
+        });
+      });
+      const leaseFailure = await transferLease.stop();
+      transferLease = null;
+      if (leaseFailure) throw leaseFailure;
+      if (
+        !(await isExactRestartablePrecalcAttempt(
+          db,
+          candidate.resultId,
+          candidate.resultAttemptId,
+        ))
+      ) {
+        throw new Error(
+          `restartable checkpoint ${candidate.resultAttemptId} failed its post-registration trust gate`,
+        );
+      }
+      await setStatus(db, "idle", null, {
+        remoteSolverLastPushAt: new Date(),
+      });
+      return true;
+    } catch (error) {
+      if (!firstError) firstError = error;
+    } finally {
+      if (transferLease) await transferLease.stop();
+    }
+  }
+  if (firstError) throw firstError;
+  return false;
+}
+
 async function pushOneRemoteResult(
   db: DB,
   engine: EngineClient,
@@ -5229,6 +5702,7 @@ export async function transferRemoteSolverTick(
     }
     if (!settings.remoteSolverAuthToken) return false;
     const processedDurableDelivery =
+      (await processRestartableRemotePrecalcCheckpoint(db, engine, settings)) ||
       (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
       (await processRemoteResultDeliveries(db, engine, settings));
     const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);

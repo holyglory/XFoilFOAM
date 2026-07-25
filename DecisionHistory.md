@@ -44,6 +44,10 @@
   remediation attempt per distinct fixed source revision. Ordinary work still
   has two physical attempts; grants never reset or relabel prior evidence, and
   an unchanged revision cannot grant another run.
+  A rejected preliminary-URANS checkpoint is brokered to the same
+  generation-pinned GCS archive before same-case continuation, without
+  fulfilling its remote point or consuming a fresh physical-solver attempt.
+  [D-2026-07-25-rejected-checkpoint-broker]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -84,6 +88,21 @@
   independent remote capacity, while exact manifest inventory resolves the
   current running-result delivery deadlock without inventing field extents or
   forcing expensive rendering into the solver march.
+
+- Decision: broker an exact rejected-but-restartable preliminary-URANS
+  checkpoint through the credentialless remote evidence upload path, verify
+  every manifest member at the authoritative hub, register that immutable GCS
+  generation on the producing attempt, and only then expose the same engine
+  job/case to continuation. Keep the promise point active until a later
+  accepted generation is delivered.
+  [D-2026-07-25-rejected-checkpoint-broker](DecisionDetails/D-2026-07-25-rejected-checkpoint-broker.md)
+- Why: the accepted-result-only broker preserved final evidence but stranded
+  valid rejected checkpoints at the trust gate. Granting the remote node GCS
+  credentials, relaxing complete-archive verification, or starting another
+  fresh run would weaken evidence isolation, delete the resumable trajectory,
+  or waste the audited physical budget. Transfer-only checkpoint registration
+  preserves all immutable attempts and lets the solver extend the existing
+  physical trajectory safely.
 
 - Confirmed intent: a public polar must not collapse into artificial gaps
   because repeat runs from one method-compatible setup differ only by bounded
