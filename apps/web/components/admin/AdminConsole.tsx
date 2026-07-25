@@ -666,6 +666,92 @@ export function AdminConsole() {
           gap: 8px;
           margin-bottom: 12px;
         }
+        .sync-remote-overview-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(260px, 0.5fr);
+          gap: 14px;
+        }
+        .sync-connection-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(300px, 0.85fr);
+          gap: 14px;
+        }
+        .sync-permissions-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) minmax(280px, 0.7fr);
+          gap: 14px;
+        }
+        .registered-remote-solver {
+          display: grid;
+          gap: 9px;
+          min-width: 0;
+          padding-top: 10px;
+          border-top: 1px solid ${C.borderSoft};
+          font-family: ${MONO};
+        }
+        .registered-remote-solver-heading {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 14px;
+          min-width: 0;
+        }
+        .registered-remote-solver-identity {
+          display: grid;
+          gap: 3px;
+          min-width: 0;
+        }
+        .registered-remote-solver-name-row {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 6px 9px;
+          min-width: 0;
+        }
+        .registered-remote-solver-endpoint {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .registered-remote-solver-capacity {
+          flex: 0 0 auto;
+          display: grid;
+          justify-items: end;
+          white-space: nowrap;
+        }
+        .registered-remote-solver-stats {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .registered-remote-solver-stat {
+          display: grid;
+          gap: 2px;
+          min-width: 0;
+          padding: 7px 8px;
+          border-radius: 7px;
+          background: ${C.panel2};
+        }
+        .registered-remote-solver-stat-value {
+          overflow-wrap: anywhere;
+          color: ${C.text};
+          font-size: 11px;
+          font-weight: 700;
+        }
+        .registered-remote-solver-stat-label {
+          color: ${C.dim};
+          font-size: 9px;
+          line-height: 1.25;
+        }
+        .registered-remote-solver-controls {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          flex-wrap: wrap;
+          gap: 6px;
+          min-width: 0;
+        }
         @media (max-width: 940px) {
           .admin-shell-grid {
             grid-template-columns: minmax(0, 1fr);
@@ -743,9 +829,27 @@ export function AdminConsole() {
             flex: 0 0 auto;
           }
         }
+        @media (max-width: 760px) {
+          .sync-connection-grid,
+          .sync-permissions-grid,
+          .sync-remote-overview-grid {
+            grid-template-columns: minmax(0, 1fr);
+          }
+        }
         @media (max-width: 620px) {
           .admin-form-grid {
             grid-template-columns: minmax(0, 1fr);
+          }
+        }
+        @media (max-width: 460px) {
+          .registered-remote-solver-heading {
+            gap: 9px;
+          }
+          .registered-remote-solver-stats {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+          .registered-remote-solver-controls {
+            justify-content: flex-start;
           }
         }
       `}</style>
@@ -4339,13 +4443,7 @@ function SyncApiPanel() {
             </button>
           </div>
 
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "minmax(0, 1fr) minmax(300px, 0.85fr)",
-              gap: 14,
-            }}
-          >
+          <div className="sync-connection-grid">
             <div style={card}>
               <div style={label}>UP-TIER CONNECTION</div>
               <div className="admin-form-grid">
@@ -4559,13 +4657,7 @@ function SyncApiPanel() {
             </div>
           </div>
 
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "minmax(0, 1fr) minmax(280px, 0.7fr)",
-              gap: 14,
-            }}
-          >
+          <div className="sync-permissions-grid">
             <div style={card}>
               <div style={label}>PERMISSIONS</div>
               <div style={{ display: "grid", gap: 6 }}>
@@ -4683,14 +4775,8 @@ function SyncApiPanel() {
             </div>
           </div>
 
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "minmax(0, 1fr) minmax(260px, 0.5fr)",
-              gap: 14,
-            }}
-          >
-            <div style={card}>
+          <div className="sync-remote-overview-grid">
+            <div style={card} data-testid="registered-remote-solvers">
               <div style={label}>REGISTERED REMOTE SOLVERS</div>
               {state.registeredSolvers.length === 0 ? (
                 <div style={{ fontFamily: MONO, fontSize: 12, color: C.dim }}>
@@ -4701,150 +4787,153 @@ function SyncApiPanel() {
                   {state.registeredSolvers.map((solver) => (
                     <div
                       key={solver.id}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "minmax(0, 1fr) auto",
-                        gap: 10,
-                        alignItems: "center",
-                        borderTop: `1px solid ${C.borderSoft}`,
-                        paddingTop: 8,
-                      }}
+                      className="registered-remote-solver"
+                      data-testid={`registered-remote-solver-${solver.id}`}
                     >
-                      <div style={{ minWidth: 0 }}>
-                        <div
-                          style={{
-                            display: "flex",
-                            gap: 8,
-                            alignItems: "center",
-                            flexWrap: "wrap",
-                            fontFamily: MONO,
-                          }}
-                        >
-                          <strong style={{ color: C.text, fontSize: 12 }}>
-                            {solver.instanceName}
-                          </strong>
+                      <div className="registered-remote-solver-heading">
+                        <div className="registered-remote-solver-identity">
+                          <div className="registered-remote-solver-name-row">
+                            <strong
+                              style={{
+                                color: C.text,
+                                fontSize: 12,
+                                overflowWrap: "anywhere",
+                              }}
+                            >
+                              {solver.instanceName}
+                            </strong>
+                            <span
+                              style={{
+                                color:
+                                  solver.status === "error"
+                                    ? C.redText
+                                    : solver.status === "solving" ||
+                                        solver.status === "pushing"
+                                      ? C.amber
+                                      : C.teal,
+                                fontSize: 10,
+                              }}
+                            >
+                              {solver.status}
+                            </span>
+                          </div>
                           <span
                             style={{
-                              color:
-                                solver.status === "error"
-                                  ? C.redText
-                                  : solver.status === "solving" ||
-                                      solver.status === "pushing"
-                                    ? C.amber
-                                    : C.teal,
-                              fontSize: 11,
+                              color: C.dim,
+                              fontSize: 10,
+                              lineHeight: 1.35,
                             }}
                           >
-                            {solver.status}
-                          </span>
-                          <span style={{ color: C.dim, fontSize: 10 }}>
                             heartbeat {ago(solver.lastHeartbeatAt)}
                           </span>
                         </div>
-                        <div
-                          style={{
-                            marginTop: 4,
-                            fontFamily: MONO,
-                            fontSize: 10,
-                            color: C.dim,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {solver.publicEndpoint ??
-                            solver.localEndpoint ??
-                            solver.instanceId}
+                        <div className="registered-remote-solver-capacity">
+                          <strong style={{ color: C.text, fontSize: 12 }}>
+                            {solver.cpuBudget}/{solver.cpuCapacity}
+                          </strong>
+                          <span style={{ color: C.dim, fontSize: 9 }}>CPU</span>
                         </div>
-                        {solver.recentError && (
-                          <div
-                            style={{
-                              marginTop: 4,
-                              fontFamily: MONO,
-                              fontSize: 10,
-                              color: C.redText,
-                            }}
-                          >
-                            {solver.recentError}
-                          </div>
-                        )}
                       </div>
                       <div
-                        style={{
-                          fontFamily: MONO,
-                          fontSize: 11,
-                          color: C.muted,
-                          textAlign: "right",
-                        }}
+                        className="registered-remote-solver-endpoint"
+                        title={
+                          solver.publicEndpoint ??
+                          solver.localEndpoint ??
+                          solver.instanceId
+                        }
+                        style={{ color: C.dim, fontSize: 10 }}
                       >
-                        <div>
-                          {solver.cpuBudget}/{solver.cpuCapacity} CPU
-                        </div>
-                        <div>
-                          {solver.activePromiseCount}/
-                          {solver.maxActivePolarPromises} polar promises ·{" "}
-                          {solver.activeAoaCount} AoAs
-                        </div>
-                        <div>
-                          {solver.solvedCount} solved · {solver.pushedCount}{" "}
-                          pushed
-                        </div>
+                        {solver.publicEndpoint ??
+                          solver.localEndpoint ??
+                          solver.instanceId}
+                      </div>
+                      {solver.recentError && (
                         <div
                           style={{
-                            display: "flex",
-                            gap: 5,
-                            alignItems: "center",
-                            justifyContent: "flex-end",
-                            marginTop: 6,
+                            fontSize: 10,
+                            lineHeight: 1.4,
+                            color: C.redText,
+                            overflowWrap: "anywhere",
                           }}
                         >
-                          <label
-                            htmlFor={`remote-promise-cap-${solver.id}`}
-                            style={{ color: C.dim, fontSize: 10 }}
-                          >
-                            cap
-                          </label>
-                          <input
-                            id={`remote-promise-cap-${solver.id}`}
-                            type="number"
-                            min={0}
-                            max={1024}
-                            step={1}
-                            value={
-                              solverCapDrafts[solver.id] ??
-                              solver.maxActivePolarPromises
-                            }
-                            onChange={(event) =>
-                              setSolverCapDrafts((current) => ({
-                                ...current,
-                                [solver.id]: Number(event.target.value),
-                              }))
-                            }
-                            style={{
-                              width: 58,
-                              padding: "3px 5px",
-                              border: `1px solid ${C.border}`,
-                              borderRadius: 4,
-                              background: C.panel,
-                              color: C.text,
-                              fontFamily: MONO,
-                              fontSize: 11,
-                            }}
-                          />
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => saveSolverPolicy(solver.id)}
-                            style={{
-                              ...ghostBtn,
-                              padding: "3px 6px",
-                              fontSize: 10,
-                              opacity: busy ? 0.6 : 1,
-                            }}
-                          >
-                            save
-                          </button>
+                          {solver.recentError}
                         </div>
+                      )}
+                      <div className="registered-remote-solver-stats">
+                        <div className="registered-remote-solver-stat">
+                          <span className="registered-remote-solver-stat-value">
+                            {solver.activePromiseCount}/
+                            {solver.maxActivePolarPromises}
+                          </span>
+                          <span className="registered-remote-solver-stat-label">
+                            polar promises
+                          </span>
+                        </div>
+                        <div className="registered-remote-solver-stat">
+                          <span className="registered-remote-solver-stat-value">
+                            {solver.activeAoaCount}
+                          </span>
+                          <span className="registered-remote-solver-stat-label">
+                            active AoAs
+                          </span>
+                        </div>
+                        <div className="registered-remote-solver-stat">
+                          <span className="registered-remote-solver-stat-value">
+                            {solver.solvedCount} / {solver.pushedCount}
+                          </span>
+                          <span className="registered-remote-solver-stat-label">
+                            solved / pushed
+                          </span>
+                        </div>
+                      </div>
+                      <div className="registered-remote-solver-controls">
+                        <label
+                          htmlFor={`remote-promise-cap-${solver.id}`}
+                          style={{ color: C.dim, fontSize: 10 }}
+                        >
+                          promise cap
+                        </label>
+                        <input
+                          id={`remote-promise-cap-${solver.id}`}
+                          type="number"
+                          min={0}
+                          max={1024}
+                          step={1}
+                          value={
+                            solverCapDrafts[solver.id] ??
+                            solver.maxActivePolarPromises
+                          }
+                          onChange={(event) =>
+                            setSolverCapDrafts((current) => ({
+                              ...current,
+                              [solver.id]: Number(event.target.value),
+                            }))
+                          }
+                          style={{
+                            width: 62,
+                            boxSizing: "border-box",
+                            padding: "4px 6px",
+                            border: `1px solid ${C.border}`,
+                            borderRadius: 4,
+                            background: C.panel,
+                            color: C.text,
+                            fontFamily: MONO,
+                            fontSize: 11,
+                          }}
+                        />
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => saveSolverPolicy(solver.id)}
+                          style={{
+                            ...ghostBtn,
+                            padding: "4px 7px",
+                            fontSize: 10,
+                            opacity: busy ? 0.6 : 1,
+                          }}
+                        >
+                          save
+                        </button>
                       </div>
                     </div>
                   ))}
