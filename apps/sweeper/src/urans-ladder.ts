@@ -1359,12 +1359,7 @@ interface ReplacementPromisePromotionPoint {
  */
 async function dueReplacementPromisePromotionPoints(
   db: DB,
-  meshRecoveryVersion: number,
-  uransRecoveryVersion: number | null | undefined,
 ): Promise<ReplacementPromisePromotionPoint[]> {
-  const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
-    ? restartablePrecalcCheckpointSql(sql`obligation.id`)
-    : sql`false`;
   const rows = (await db.execute(sql`
     SELECT obligation.id AS obligation_id,
            obligation.airfoil_id,
@@ -1409,17 +1404,12 @@ async function dueReplacementPromisePromotionPoints(
         obligation.next_submit_at IS NULL
         OR obligation.next_submit_at <= now()
       )
-      AND (
-        obligation.attempt_count < obligation.max_attempts
-        OR (${restartableScope})
-      )
-      AND NOT (
-        obligation.last_outcome = 'deterministic_failure'
-        AND ${obligationMeshRecoveryVersionSql(
-          sql`obligation.id`,
-          sql`obligation.latest_sim_job_id`,
-        )} >= ${meshRecoveryVersion}
-      )
+      -- A deterministic mesh failure belongs to automatic mesh repair, never
+      -- this solver-continuation lane. Exact restartability is intentionally
+      -- evaluated only after this small candidate query: embedding the full
+      -- authenticated-archive predicate here made the scheduler scan artifact
+      -- storage for every historical point before LIMIT.
+      AND obligation.last_outcome IS DISTINCT FROM 'deterministic_failure'
       AND NOT EXISTS (
         SELECT 1
         FROM sync_sweep_promises original_promise
@@ -1614,11 +1604,7 @@ export async function submitRemotePromisePrecalcRecoveries(
     .from(syncApiSettings)
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
-  const replacementPoints = await dueReplacementPromisePromotionPoints(
-    db,
-    meshRecoveryVersion,
-    uransRecoveryVersion,
-  );
+  const replacementPoints = await dueReplacementPromisePromotionPoints(db);
   for (const point of replacementPoints) {
     await touchHeartbeat(db);
     const [continuation] = supportsDurableUransRecovery(uransRecoveryVersion)
