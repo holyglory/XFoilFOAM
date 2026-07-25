@@ -67,3 +67,25 @@ The exact production coefficient files were also graded offline by the v9
 code. The focused 201-test geometry/URANS/API suite and the complete 1,290-test
 non-integration engine suite pass; 22 Docker/OpenFOAM integration tests remain
 separately selected by their existing marker.
+
+## Corrective rollout
+
+Recovery v9 is deployed on both guarded OpenCFD 2606 engines. The first exact
+remote generation accepted AoA 1 from retained bytes and bound its complete
+archive to GCS without another CFD solve. A historical promotion then exposed
+two scheduling defects outside the physical classifier: its original remote
+promise was cancelled, its replacement promise owned only selected angles, and
+some normalized obligations had no source-attempt FK. The recovery scheduler
+now uses the current exact promise point as its sole authority, retains the old
+promotion only as immutable provenance, and cannot widen the replacement into
+the old whole-polar scope.
+
+The production-scale candidate query initially embedded the complete
+authenticated-archive predicate and spent minutes scanning millions of
+artifact associations. The corrected query selects only small due ownership
+candidates; the existing bounded per-point phase remains the sole authority
+for restartability. AoA 7 and 9 subsequently resumed their exact retained
+engine cases, with AoA 7 reporting `mesh_build_count=0` and continuation from
+`t=0.12888 s`. Their raw prefixes remain immutable, and neither result is
+publishable until v9 selects a later clean 4.5-period certificate and exact
+three-period output window.

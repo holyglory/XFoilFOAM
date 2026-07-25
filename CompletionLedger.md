@@ -99,15 +99,20 @@
   checkpoints are now exact, hub-verified GCS generations. AoA -1 continued the
   same engine case from `t=0.154775 s` with `mesh_build_count=0`, consumed no
   new physical attempt, and produced accepted evidence whose published window
-  begins after the corrupt prefix. AoA 0, 1, 7, and 9 remain pending exact
-  same-case continuation. Their first automatic admission exposed a separate
+  begins after the corrupt prefix. Their first automatic admission exposed a
   scheduler-query defect: broad promotion discovery embedded the complete
   archive-member trust proof twice and scanned the remote node's 3.9 million
   artifact rows for minutes. The corrected discovery is lightweight while the
   exact bounded second phase remains the sole continuation authorization gate;
   isolated promotion and exhausted-checkpoint regressions plus sweeper
-  typecheck pass. That scheduler correction is deployed on both nodes and
-  production-scale admission no longer scans the complete artifact ledger.
+  typecheck pass. A second historical-row defect left exact obligations without
+  a source-attempt FK under a cancelled original promise. The current active
+  replacement promise may now continue only its explicitly owned point while
+  the old whole-polar promotion remains immutable provenance; it cannot adopt
+  or widen the old scope. The candidate query excludes deterministic mesh
+  failures and defers authenticated-archive proof to the bounded per-point
+  phase. Both corrections are deployed on the remote solver and production
+  control planes.
   The first exact AoA 0 continuation then advanced the retained case by
   `0.051606 s` without rebuilding its mesh, but exposed a physics-context
   defect: its 1,076 Hz tail is stable across both halves and has
@@ -116,17 +121,23 @@
   high-frequency wake edge from immutable projected section height; actual
   production bytes select a stationary clean 4.5-period certificate and exact
   three-period publication window after the corrupt prefix. Recovery v9 is
-  deployed on the remote OpenCFD 2606 engine. AoA 1 now has accepted exact
+  deployed on both OpenCFD 2606 engines. AoA 1 now has accepted exact
   clean-tail evidence and a verified GCS archive without another CFD solve.
   Hub import exposed one separate association defect: pressure frames 25 and 84
   are different real time steps with byte-identical PNGs, and blob-only
   identity rejected the second frame. Migration 0090 preserves logical
   `frameIndex` while sharing the physical content-addressed bytes; its
   failing-before/fixed-after API regression, full 51-test remote-sync file,
-  seven-test migration suite, and DB/API/sweeper typechecks pass. Readiness
-  still requires deploying that hub fix, replaying and binding AoA 1, accepted
-  clean-period evidence for AoA 0, 7, and 9, guarded v9 production-engine
-  deployment, obsolete-generation retirement, and no recurring
+  seven-test migration suite, and DB/API/sweeper typechecks pass; it is deployed
+  and AoA 1 is bound on the hub. AoA 7 and 9 are now live non-consuming
+  continuations from their exact GCS-verified checkpoints; AoA 7 reports
+  `mesh_build_count=0` and resumed at `t=0.12888 s`. AoA 0 had no authenticated
+  restartable archive and is one explicit replacement solve. The remote pool is
+  saturated at its 40-slot cap; AoA -2 remains pending until capacity returns.
+  Readiness still requires accepted clean-period evidence plus verified
+  hub/GCS binding for AoA -2, 0, 7, and 9, retirement of obsolete generations,
+  the already-committed cancellation-preservation worker code to be installed
+  by guarded engine maintenance after both pools drain, and no recurring
   current-generation critical chain.
 
 - **Production evidence capacity:** The July 19 GCS reconciliation left the
