@@ -50,6 +50,7 @@ import {
   simUransVerifyQueue,
   simUransVerifyQueueCampaigns,
   simUransVerifyQueueRequests,
+  solverIncidentEventLog,
   solverIncidentSummary,
   syncLegacyBoundaryConditionForPreset as syncLegacyBoundaryConditionForPresetDb,
 } from "@aerodb/db";
@@ -2256,14 +2257,47 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/api/admin/health", { preHandler: requireAdmin }, async () => {
-    const [system, solverIncidents] = await Promise.all([
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [system, solverIncidents, solverIncidentEvents] = await Promise.all([
       systemHealthSnapshot(),
-      solverIncidentSummary(db, {
-        since: new Date(Date.now() - 24 * 60 * 60 * 1000),
-      }),
+      solverIncidentSummary(db, { since }),
+      solverIncidentEventLog(db, { since }),
     ]);
-    return { ...system, solverIncidents };
+    return { ...system, solverIncidents, solverIncidentEvents };
   });
+
+  app.get(
+    "/api/admin/solver-incidents",
+    { preHandler: requireAdmin },
+    async (req) => {
+      const query = z
+        .object({
+          sinceHours: z.coerce.number().int().min(1).max(24 * 90).default(24),
+          limit: z.coerce.number().int().min(1).max(500).default(100),
+        })
+        .parse(req.query);
+      const since = new Date(
+        Date.now() - query.sinceHours * 60 * 60 * 1000,
+      );
+      const [summary, events] = await Promise.all([
+        solverIncidentSummary(db, { since, limit: query.limit }),
+        solverIncidentEventLog(db, { since, limit: query.limit }),
+      ]);
+      return {
+        asOf: new Date().toISOString(),
+        summary,
+        events,
+        agentContext: {
+          schemaVersion: 1,
+          source: "sim_solver_incidents",
+          ordering: "occurredAt_desc",
+          userActionRequired: false,
+          completionLedgerRole:
+            "Runtime evidence supplement; reconcile unresolved system-owned patterns with CompletionLedger.md without deleting immutable event history.",
+        },
+      };
+    },
+  );
 
   // Genuine solver archives whose exact job/case never produced an ingested
   // result remain operator-discoverable without being exposed as aerodynamic

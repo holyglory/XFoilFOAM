@@ -450,6 +450,7 @@ export function HealthPanel() {
         <div className="health-incidents">
           <SolverIncidentPanel
             summary={health.solverIncidents}
+            events={health.solverIncidentEvents}
             surface="health"
             showClear
           />

@@ -322,6 +322,172 @@ export interface SolverIncidentSummary {
   groups: SolverIncidentAggregate[];
 }
 
+export type SolverIncidentOperationalState =
+  | "automatic_recovery"
+  | "system_attention"
+  | "resolved";
+
+export interface SolverIncidentEvent {
+  id: string;
+  stage: SolverIncidentStage;
+  reason: string;
+  severity: SolverIncidentSeverity;
+  status: "open" | "resolved";
+  operationalState: SolverIncidentOperationalState;
+  userActionRequired: false;
+  solverImplementationId: string;
+  solverImplementationKey: string;
+  remediationVersion: string;
+  occurrenceKey: string;
+  owner: {
+    type:
+      | "result"
+      | "precalc_obligation"
+      | "verify_queue"
+      | "urans_request";
+    id: string;
+  };
+  simJobId: string | null;
+  resultAttemptId: string | null;
+  campaignIds: string[];
+  metadata: Record<string, unknown>;
+  occurredAt: string;
+  resolvedAt: string | null;
+  patternOccurrenceCount: number;
+  patternOpenCount: number;
+}
+
+/** Individual, immutable incident occurrences for the operator/agent log.
+ * Open incidents remain visible regardless of age; resolved history is bounded
+ * by `since`. The endpoint intentionally states that these machine incidents
+ * require no end-user action—the recovery controller or solver owner owns
+ * them. */
+export async function solverIncidentEventLog(
+  db: DB,
+  opts: {
+    since?: Date;
+    limit?: number;
+  } = {},
+): Promise<SolverIncidentEvent[]> {
+  const sinceSql = opts.since
+    ? sql`AND (
+        incident.status = 'open'
+        OR incident.occurred_at >= ${opts.since.toISOString()}::timestamptz
+      )`
+    : sql``;
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+  const rows = (await db.execute(sql`
+    WITH visible AS (
+      SELECT
+        incident.*,
+        implementation.key AS solver_implementation_key,
+        count(*) OVER (
+          PARTITION BY
+            incident.stage,
+            incident.reason,
+            incident.solver_implementation_id,
+            incident.remediation_version
+        )::int AS pattern_occurrence_count,
+        count(*) FILTER (WHERE incident.status = 'open') OVER (
+          PARTITION BY
+            incident.stage,
+            incident.reason,
+            incident.solver_implementation_id,
+            incident.remediation_version
+        )::int AS pattern_open_count
+      FROM sim_solver_incidents incident
+      JOIN solver_implementations implementation
+        ON implementation.id = incident.solver_implementation_id
+      WHERE true
+        ${sinceSql}
+    )
+    SELECT
+      visible.*,
+      COALESCE(
+        (
+          SELECT array_agg(
+            DISTINCT ownership.campaign_id::text
+            ORDER BY ownership.campaign_id::text
+          )
+          FROM sim_solver_incident_campaigns ownership
+          WHERE ownership.incident_id = visible.id
+        ),
+        ARRAY[]::text[]
+      ) AS campaign_ids
+    FROM visible
+    ORDER BY visible.occurred_at DESC, visible.id DESC
+    LIMIT ${limit}
+  `)) as unknown as Array<{
+    id: string;
+    stage: SolverIncidentStage;
+    reason: string;
+    severity: SolverIncidentSeverity;
+    status: "open" | "resolved";
+    result_id: string | null;
+    precalc_obligation_id: string | null;
+    verify_queue_id: string | null;
+    urans_request_id: string | null;
+    solver_implementation_id: string;
+    solver_implementation_key: string;
+    sim_job_id: string | null;
+    result_attempt_id: string | null;
+    occurrence_key: string;
+    remediation_version: string;
+    metadata: Record<string, unknown>;
+    occurred_at: Date | string;
+    resolved_at: Date | string | null;
+    pattern_occurrence_count: number;
+    pattern_open_count: number;
+    campaign_ids: string[];
+  }>;
+
+  return rows.map((row): SolverIncidentEvent => {
+    const owner =
+      row.result_id != null
+        ? ({ type: "result", id: row.result_id } as const)
+        : row.precalc_obligation_id != null
+          ? ({
+              type: "precalc_obligation",
+              id: row.precalc_obligation_id,
+            } as const)
+          : row.verify_queue_id != null
+            ? ({ type: "verify_queue", id: row.verify_queue_id } as const)
+            : ({ type: "urans_request", id: row.urans_request_id! } as const);
+    return {
+      id: row.id,
+      stage: row.stage,
+      reason: row.reason,
+      severity: row.severity,
+      status: row.status,
+      operationalState:
+        row.status === "resolved"
+          ? "resolved"
+          : row.severity === "critical" ||
+              Number(row.pattern_occurrence_count) >=
+                REPEATED_SOLVER_INCIDENT_THRESHOLD
+            ? "system_attention"
+            : "automatic_recovery",
+      userActionRequired: false,
+      solverImplementationId: row.solver_implementation_id,
+      solverImplementationKey: row.solver_implementation_key,
+      remediationVersion: row.remediation_version,
+      occurrenceKey: row.occurrence_key,
+      owner,
+      simJobId: row.sim_job_id,
+      resultAttemptId: row.result_attempt_id,
+      campaignIds: row.campaign_ids,
+      metadata: row.metadata,
+      occurredAt: new Date(row.occurred_at).toISOString(),
+      resolvedAt:
+        row.resolved_at == null
+          ? null
+          : new Date(row.resolved_at).toISOString(),
+      patternOccurrenceCount: Number(row.pattern_occurrence_count),
+      patternOpenCount: Number(row.pattern_open_count),
+    };
+  });
+}
+
 /** Durable recurrence read model for campaign and health surfaces. The time
  * window limits resolved history only; unresolved incidents are always shown. */
 export async function solverIncidentSummary(

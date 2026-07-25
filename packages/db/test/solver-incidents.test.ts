@@ -21,6 +21,7 @@ import {
   simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverIncidentEventLog,
   solverIncidentSummary,
 } from "@aerodb/db";
 import { eq, inArray } from "drizzle-orm";
@@ -110,6 +111,42 @@ afterAll(async () => {
 });
 
 describe("durable solver incident recurrence", () => {
+  it("MUST-CATCH: exposes immutable events newest-first with machine ownership and debug evidence", async () => {
+    const events = await solverIncidentEventLog(db, { limit: 500 });
+    const ours = events.filter((event) =>
+      event.occurrenceKey.startsWith(`${PREFIX}:repeat:`),
+    );
+
+    expect(ours).toHaveLength(REPEATED_SOLVER_INCIDENT_THRESHOLD);
+    expect(
+      ours.every(
+        (event, index) =>
+          index === 0 ||
+          Date.parse(ours[index - 1]!.occurredAt) >=
+            Date.parse(event.occurredAt),
+      ),
+    ).toBe(true);
+    expect(ours[0]).toMatchObject({
+      stage: "final",
+      reason: "non-stationary",
+      status: "open",
+      operationalState: "system_attention",
+      userActionRequired: false,
+      solverImplementationKey: expect.any(String),
+      owner: { type: "urans_request" },
+      metadata: { index: expect.any(Number) },
+      patternOccurrenceCount: expect.any(Number),
+      patternOpenCount: expect.any(Number),
+    });
+    expect(ours[0]!.patternOccurrenceCount).toBeGreaterThanOrEqual(
+      REPEATED_SOLVER_INCIDENT_THRESHOLD,
+    );
+    expect(ours[0]!.patternOpenCount).toBeGreaterThanOrEqual(
+      REPEATED_SOLVER_INCIDENT_THRESHOLD,
+    );
+    expect(ours[0]!.campaignIds).toContain(campaignId);
+  });
+
   it("separates current-generation campaign alerts from immutable incident history", async () => {
     const [scopedCampaign] = await db
       .insert(simCampaigns)

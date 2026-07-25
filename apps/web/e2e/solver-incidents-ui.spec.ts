@@ -83,6 +83,58 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
             },
           ],
         },
+        solverIncidentEvents: [
+          {
+            id: "incident-current",
+            stage: "preliminary",
+            reason: "continuation-no-progress",
+            severity: "critical",
+            status: "open",
+            operationalState: "system_attention",
+            userActionRequired: false,
+            solverImplementationId: "solver-2606",
+            solverImplementationKey: "openfoam-2606",
+            remediationVersion: "urans-recovery-2026-07-16-v1",
+            occurrenceKey: "preliminary:current",
+            owner: {
+              type: "precalc_obligation",
+              id: "obligation-current",
+            },
+            simJobId: "job-current",
+            resultAttemptId: "attempt-current",
+            campaignIds: ["campaign-current"],
+            metadata: {
+              lastOutcome: "rejected_exhausted",
+              diagnostic: "current-debug",
+            },
+            occurredAt: "2026-07-16T02:00:00.000Z",
+            resolvedAt: null,
+            patternOccurrenceCount: 3,
+            patternOpenCount: 1,
+          },
+          {
+            id: "incident-history",
+            stage: "final",
+            reason: "media-repair-exhausted",
+            severity: "critical",
+            status: "resolved",
+            operationalState: "resolved",
+            userActionRequired: false,
+            solverImplementationId: "solver-2606",
+            solverImplementationKey: "openfoam-2606",
+            remediationVersion: "urans-recovery-2026-07-16-v1",
+            occurrenceKey: "final:history",
+            owner: { type: "verify_queue", id: "verify-history" },
+            simJobId: "job-history",
+            resultAttemptId: "attempt-history",
+            campaignIds: ["campaign-current"],
+            metadata: { diagnostic: "history-debug" },
+            occurredAt: "2026-07-15T04:00:00.000Z",
+            resolvedAt: "2026-07-15T05:00:00.000Z",
+            patternOccurrenceCount: 4,
+            patternOpenCount: 0,
+          },
+        ],
       },
     });
   });
@@ -95,27 +147,33 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
   await expect(panel).toHaveAccessibleName(
     /Solver reliability, 1 active recovery event, 1 critical system-owned pattern, 7 occurrences/i,
   );
-  await expect(panel).toContainText("System investigation required");
-  await expect(panel).toContainText("3+ same cause → critical");
+  await expect(panel).toContainText("Solver recovery");
+  await expect(panel).toContainText("1 solver-owned");
+  await expect(panel).not.toContainText("System investigation required");
 
-  const current = panel.getByTestId("solver-incident-group-0");
+  const current = panel.getByTestId("solver-incident-event-0");
+  await expect(current).not.toBeVisible();
+  await panel.locator(":scope > summary").click();
+  await expect(current).toBeVisible();
   await expect(current).toHaveAttribute("data-stage", "preliminary");
-  await expect(current).toHaveAttribute("data-status", "critical");
+  await expect(current).toHaveAttribute(
+    "data-operational-state",
+    "system_attention",
+  );
   await expect(current).toContainText("FAST URANS");
   await expect(current).toContainText("continuation made no progress");
-  await expect(current).toContainText("CRITICAL");
-  await expect(current).toContainText("SYSTEM OWNED");
+  await expect(current).toContainText("solver fix");
+  await expect(current).not.toContainText("current-debug");
+  await current.locator(":scope > summary").click();
+  await expect(current).toContainText("current-debug");
+  await expect(current).toContainText("solver system · no user action");
 
-  const history = panel.getByTestId("solver-incident-group-1");
-  await expect(history).toHaveAttribute("data-stage", "final");
+  const history = panel.getByTestId("solver-incident-event-1");
   await expect(history).toHaveAttribute("data-status", "resolved");
   await expect(history).toContainText("FINAL URANS");
-  await expect(history).toContainText("RESOLVED");
-  await expect(history).toContainText("HISTORY");
-  await expect(panel).not.toContainText("urans-recovery-2026-07-16-v1");
-  await expect(panel).not.toContainText("openfoam-2606");
-  await expect(panel).not.toContainText("INVESTIGATE");
-  await expect(panel).not.toContainText("solver evidence rejected");
+  await expect(history).toContainText("resolved");
+
+  await expect(panel.getByText("agent JSON ↗")).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(panel).toBeVisible();

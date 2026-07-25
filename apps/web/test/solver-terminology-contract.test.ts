@@ -196,7 +196,7 @@ describe("solver terminology contract", () => {
     );
   });
 
-  it("MUST-CATCH: incident UI is automatic/system-owned and never exposes recovery implementation labels", () => {
+  it("MUST-CATCH: incident UI keeps system-owned recovery compact and progressively discloses diagnostics", () => {
     const incidentPanel = source("components/admin/SolverIncidentPanel.tsx");
     const incidentModel = source("lib/solver-incidents.ts");
 
@@ -206,13 +206,14 @@ describe("solver terminology contract", () => {
     expect(incidentModel).toContain('"SYSTEM OWNED"');
     expect(incidentModel).not.toContain('"INVESTIGATE"');
     expect(incidentModel).not.toContain('"SCREENING RECOVERY"');
-    expect(incidentPanel).toContain("? Wrench");
-    expect(incidentPanel).toContain('view.tone === "critical"');
-    expect(incidentPanel).toContain('? "alert"');
-    expect(incidentPanel).toContain("? ShieldAlert");
-    expect(incidentPanel).toContain("? ShieldCheck");
-    expect(incidentPanel).not.toContain("solver-incident-remediation");
-    expect(incidentPanel).not.toContain("group.solverImplementationKey");
+    expect(incidentPanel).toContain('const title = hasOpen ? "Solver recovery"');
+    expect(incidentPanel).toContain("<details");
+    expect(incidentPanel).toContain("newest first · system");
+    expect(incidentPanel).toContain("solver system · no user action");
+    expect(incidentPanel).toContain("agent JSON ↗");
+    expect(incidentPanel).toContain("DEBUG EVIDENCE");
+    expect(incidentPanel).not.toContain("System investigation required");
+    expect(incidentPanel).not.toContain("same cause → critical");
     expect(incidentPanel).not.toContain("view.remediationLabel");
   });
 });

@@ -120,12 +120,59 @@ export interface AdminSolverIncidentGroup {
 }
 
 export interface AdminSolverIncidentSummary {
-  /** Repeated physical incidents at or above this count require investigation. */
+  /** Repeated physical incidents at or above this count become a solver-owned
+   * reliability pattern. This never implies an end-user action. */
   threshold: number;
   occurrenceCount: number;
   openCount: number;
   criticalGroupCount: number;
   groups: AdminSolverIncidentGroup[];
+}
+
+export interface AdminSolverIncidentEvent {
+  id: string;
+  stage: AdminSolverIncidentStage;
+  reason: string;
+  severity: AdminSolverIncidentSeverity;
+  status: "open" | "resolved";
+  operationalState:
+    | "automatic_recovery"
+    | "system_attention"
+    | "resolved";
+  userActionRequired: false;
+  solverImplementationId: string;
+  solverImplementationKey: string;
+  remediationVersion: string;
+  occurrenceKey: string;
+  owner: {
+    type:
+      | "result"
+      | "precalc_obligation"
+      | "verify_queue"
+      | "urans_request";
+    id: string;
+  };
+  simJobId: string | null;
+  resultAttemptId: string | null;
+  campaignIds: string[];
+  metadata: Record<string, unknown>;
+  occurredAt: string;
+  resolvedAt: string | null;
+  patternOccurrenceCount: number;
+  patternOpenCount: number;
+}
+
+export interface AdminSolverIncidentLog {
+  asOf: string;
+  summary: AdminSolverIncidentSummary;
+  events: AdminSolverIncidentEvent[];
+  agentContext: {
+    schemaVersion: number;
+    source: string;
+    ordering: string;
+    userActionRequired: false;
+    completionLedgerRole: string;
+  };
 }
 
 export interface AdminHealth {
@@ -145,6 +192,9 @@ export interface AdminHealth {
   /** Durable screening/preliminary/final solver reliability incidents.
    * Normal aerodynamic RANS handoff is deliberately absent from this model. */
   solverIncidents: AdminSolverIncidentSummary;
+  /** Newest-first immutable recovery events. Open incidents remain visible
+   * beyond the 24-hour health window; resolved history is time-bounded. */
+  solverIncidentEvents: AdminSolverIncidentEvent[];
 }
 export interface SweeperState {
   enabled: boolean;
@@ -583,6 +633,10 @@ export const adminGoogleLoginUrl = (returnTo = "/admin") =>
 export const adminLogout = () =>
   aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
 export const getAdminHealth = () => aj<AdminHealth>("/api/admin/health");
+export const getAdminSolverIncidentLog = (sinceHours = 24, limit = 100) =>
+  aj<AdminSolverIncidentLog>(
+    `/api/admin/solver-incidents?sinceHours=${encodeURIComponent(String(sinceHours))}&limit=${encodeURIComponent(String(limit))}`,
+  );
 export const getAdminQueue = (scope: AdminQueueScope = "all") =>
   aj<AdminQueue>(`/api/admin/queue${scope === "all" ? "" : `?scope=${scope}`}`);
 

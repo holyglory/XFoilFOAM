@@ -720,12 +720,17 @@ test.describe
     await expect(page.getByTestId("campaign-detail")).toBeVisible();
     const incidentRail = page.getByTestId("solver-incidents-campaign");
     await expect(incidentRail).toBeVisible();
+    await expect(incidentRail).toContainText("Solver recovery");
+    await expect(incidentRail).toContainText("2 solver-owned");
+    await expect(incidentRail).not.toContainText("FAST URANS");
+    await expect(incidentRail).not.toContainText(
+      "System investigation required",
+    );
+    await incidentRail.locator(":scope > summary").click();
     await expect(incidentRail).toContainText("FAST URANS");
     await expect(incidentRail).toContainText("continuation made no progress");
-    await expect(incidentRail).toContainText("×3 · 2 active");
-    await expect(incidentRail).toContainText("CRITICAL");
-    await expect(incidentRail).toContainText("SYSTEM OWNED");
-    await expect(incidentRail).toContainText("System investigation required");
+    await expect(incidentRail).toContainText("solver fix");
+    await expect(incidentRail).toContainText("no user action");
     await expect(incidentRail).not.toContainText(
       "urans-recovery-2026-07-16-v1",
     );
@@ -734,6 +739,13 @@ test.describe
     await expect(
       incidentRail.getByTestId("solver-incident-group-0"),
     ).toHaveAttribute("data-status", "critical");
+    await incidentRail
+      .getByTestId("solver-incident-group-0")
+      .locator("summary")
+      .click();
+    await expect(incidentRail).toContainText(
+      "urans-recovery-2026-07-16-v1",
+    );
 
     const trigger = page.getByTestId(
       `matrix-cell-${state.camAirfoil.slug}-${condition.ord}`,
