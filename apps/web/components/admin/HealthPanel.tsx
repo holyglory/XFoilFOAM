@@ -531,7 +531,7 @@ export function HealthPanel() {
 
   return (
     <div data-testid="admin-health-page">
-      <style jsx>{`
+      <style jsx global>{`
         .health-header {
           display: flex;
           align-items: center;
