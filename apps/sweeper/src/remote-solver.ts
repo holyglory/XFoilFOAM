@@ -32,6 +32,7 @@ import {
   solverImplementations,
   solverProfiles,
   solverRuntimeBuilds,
+  sweeperState,
   syncApiSettings,
   syncRemoteHubBindingReceipts,
   syncRemotePromiseCancellations,
@@ -63,6 +64,7 @@ import {
 } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import os from "node:os";
 import { basename, join } from "node:path";
 import { Readable } from "node:stream";
 
@@ -968,6 +970,39 @@ async function heartbeat(
   status: Settings["remoteSolverLastStatus"],
   activePromiseCount: number,
   activeAoaCount: number,
+  telemetry: {
+    schemaVersion: 1;
+    sampledAt: string;
+    cpu: {
+      load1: number;
+      load5: number;
+      load15: number;
+      availableCpus: number;
+      loadPct: number;
+    };
+    memory: {
+      totalBytes: number;
+      freeBytes: number;
+      usedBytes: number;
+      usedPct: number;
+    };
+    storage: {
+      usedPct: number | null;
+      freeBytes: number | null;
+      requiredFreeBytes: number | null;
+      admissionBlocked: boolean;
+      reason: string | null;
+      checkedAt: string | null;
+    } | null;
+    execution: {
+      activeJobs: number;
+      reservedCpuSlots: number;
+      capacityCpuSlots: number;
+      activeAoaCount: number;
+    };
+  },
+  solvedCount: number,
+  pushedCount: number,
 ) {
   if (!settings.remoteSolverRegisteredId) return;
   await fetch(
@@ -982,9 +1017,86 @@ async function heartbeat(
         activeAoaCount,
         cpuCapacity: remoteWorkerCpuCapacity(settings),
         cpuBudget: settings.remoteSolverCpuBudget,
+        solvedCount,
+        pushedCount,
+        health: telemetry,
       }),
     },
   ).catch(() => undefined);
+}
+
+function percent(used: number, total: number): number {
+  if (!Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return 0;
+  return (used / total) * 100;
+}
+
+async function remoteNodeHealth(
+  db: DB,
+  activeJobs: Awaited<ReturnType<typeof activeRemoteJobs>>,
+  reservedCpuSlots: number,
+  capacityCpuSlots: number,
+  activeAoaCount: number,
+) {
+  const [state] = await db.select().from(sweeperState).limit(1);
+  const availableCpus =
+    typeof os.availableParallelism === "function"
+      ? os.availableParallelism()
+      : os.cpus().length;
+  const [load1, load5, load15] = os.loadavg();
+  const totalBytes = os.totalmem();
+  const freeBytes = os.freemem();
+  const usedBytes = Math.max(0, totalBytes - freeBytes);
+  return {
+    schemaVersion: 1 as const,
+    sampledAt: new Date().toISOString(),
+    cpu: {
+      load1,
+      load5,
+      load15,
+      availableCpus: Math.max(1, availableCpus),
+      loadPct: percent(load1, Math.max(1, availableCpus)),
+    },
+    memory: {
+      totalBytes,
+      freeBytes,
+      usedBytes,
+      usedPct: percent(usedBytes, totalBytes),
+    },
+    storage: state
+      ? {
+          usedPct: state.diskUsedPct,
+          freeBytes: state.diskFreeBytes,
+          requiredFreeBytes: state.diskRequiredFreeBytes,
+          admissionBlocked: state.diskAdmissionBlocked,
+          reason: state.diskAdmissionReason,
+          checkedAt: state.diskCheckedAt?.toISOString() ?? null,
+        }
+      : null,
+    execution: {
+      activeJobs: activeJobs.length,
+      reservedCpuSlots,
+      capacityCpuSlots,
+      activeAoaCount,
+    },
+  };
+}
+
+async function remoteOutcomeCounters(db: DB, settings: Settings) {
+  const [solved] = (await db.execute(sql`
+    SELECT count(*)::integer AS count
+    FROM results result
+    JOIN sim_jobs job ON job.id = result.sim_job_id
+    WHERE ${remoteJobOwnerSql(settings, "job")}
+      AND result.status = 'done'
+      AND result.source = 'solved'
+  `)) as unknown as Array<{ count: number }>;
+  const [pushed] = await db
+    .select({ count: sql<number>`count(*)::integer` })
+    .from(syncRemoteHubBindingReceipts);
+  return {
+    solvedCount: Number(solved?.count ?? 0),
+    pushedCount: Number(pushed?.count ?? 0),
+  };
 }
 
 function remoteJobOwnerSql(settings: Settings, tableAlias = "job") {
@@ -5656,16 +5768,23 @@ export async function reconcileRemoteSolverTick(
     await expireMirroredRemotePromises(db, settings);
     await releaseUnacceptedPromiseResults(db, settings);
     const active = await activeRemoteJobs(db, settings);
+    const activeAoaCount = active.reduce((sum, job) => sum + job.totalCases, 0);
+    const remoteCap = configuredRemoteCpuCap(settings);
+    const reservedCpuSlots = await remoteReservedCpuSlots(db, settings);
+    const [telemetry, counters] = await Promise.all([
+      remoteNodeHealth(db, active, reservedCpuSlots, remoteCap, activeAoaCount),
+      remoteOutcomeCounters(db, settings),
+    ]);
     await heartbeat(
       settings,
       active.length ? "solving" : "idle",
       active.length,
-      active.reduce((sum, job) => sum + job.totalCases, 0),
+      activeAoaCount,
+      telemetry,
+      counters.solvedCount,
+      counters.pushedCount,
     );
-    const remoteCap = configuredRemoteCpuCap(settings);
-    return (
-      remoteCap > 0 && (await remoteReservedCpuSlots(db, settings)) < remoteCap
-    );
+    return remoteCap > 0 && reservedCpuSlots < remoteCap;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
     return false;

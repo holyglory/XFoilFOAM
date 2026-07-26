@@ -17,6 +17,14 @@
   with `CompletionLedger.md`. The UI never asks an administrator to
   “investigate” when no user action exists.
   [D-2026-07-25-solver-incident-log]
+- Confirmed intent: Health is the fleet-wide operational source of truth.
+  Every solver reports bounded host/execution/storage telemetry through its
+  heartbeat; the hub shows actual reserved slots and CFD jobs separately from
+  configured capacity, derives accepted RANS/fast-URANS/final-URANS throughput
+  by producing node, and labels storage admission safeguards as the cause of
+  idle capacity. Sync shows brokered GCS evidence delivery rather than empty
+  legacy remote-reference counters.
+  [D-2026-07-26-fleet-health-telemetry]
 - Confirmed intent: solver setup and evidence support independently versioned
   engine implementations. OpenCFD 2606 replaces 2406 after a guarded drain and
   reruns the active campaign through a linked successor generation; 2406 stays
@@ -148,6 +156,25 @@
   would strand dead work. Raw UUID cards exposed no decision context and
   offered a polar promotion action that could never succeed; hiding every
   conflict would instead conceal genuinely distinct immutable evidence.
+
+## D-2026-07-26-fleet-health-telemetry — Reported fleet health and attributable throughput
+
+- Decision: extend authenticated remote-solver heartbeats with versioned,
+  bounded host, execution, and storage-admission telemetry; retain the latest
+  report in existing solver metadata; and make Admin Health the combined local
+  and remote fleet view. Show actual reserved CPU slots, active CFD jobs,
+  capacity, CPU/memory/storage pressure, seven daily accepted-point totals,
+  24-hour totals, and per-node averages split into RANS, fast URANS, and final
+  URANS. Replace Sync’s empty remote-reference card with real brokered GCS
+  evidence-transfer counts and bytes.
+  [detail](DecisionDetails/D-2026-07-26-fleet-health-telemetry.md)
+- Why: configured CPU caps and promise counts are scheduling limits, not proof
+  of active compute, while legacy `remote_asset_references` does not represent
+  the brokered GCS path used by the solver. Live hub probes would couple a
+  frequently polled admin page to remote availability; un-attributed aggregate
+  counts would conceal a slow node. Authenticated push telemetry plus
+  hub-derived immutable result attribution remains truthful during outages,
+  preserves secrets, and exposes capacity safeguards without inventing data.
 
 ## D-2026-07-25-solver-incident-log — Solver incidents are a compact, system-owned event log
 

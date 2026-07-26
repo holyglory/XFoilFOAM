@@ -4966,9 +4966,13 @@ function SyncApiPanel() {
                         </div>
                         <div className="registered-remote-solver-capacity">
                           <strong style={{ color: C.text, fontSize: 12 }}>
-                            {solver.cpuBudget}/{solver.cpuCapacity}
+                            {solver.health?.execution.reservedCpuSlots ?? 0}/
+                            {solver.health?.execution.capacityCpuSlots ??
+                              solver.cpuBudget}
                           </strong>
-                          <span style={{ color: C.dim, fontSize: 9 }}>CPU</span>
+                          <span style={{ color: C.dim, fontSize: 9 }}>
+                            active slots
+                          </span>
                         </div>
                       </div>
                       <div
@@ -4999,6 +5003,14 @@ function SyncApiPanel() {
                       <div className="registered-remote-solver-stats">
                         <div className="registered-remote-solver-stat">
                           <span className="registered-remote-solver-stat-value">
+                            {solver.health?.execution.activeJobs ?? "—"}
+                          </span>
+                          <span className="registered-remote-solver-stat-label">
+                            CFD jobs running
+                          </span>
+                        </div>
+                        <div className="registered-remote-solver-stat">
+                          <span className="registered-remote-solver-stat-value">
                             {solver.activePromiseCount}/
                             {solver.maxActivePolarPromises}
                           </span>
@@ -5008,21 +5020,34 @@ function SyncApiPanel() {
                         </div>
                         <div className="registered-remote-solver-stat">
                           <span className="registered-remote-solver-stat-value">
-                            {solver.activeAoaCount}
+                            {solver.health
+                              ? `${solver.health.cpu.loadPct.toFixed(0)}%`
+                              : "—"}
                           </span>
                           <span className="registered-remote-solver-stat-label">
-                            active AoAs
-                          </span>
-                        </div>
-                        <div className="registered-remote-solver-stat">
-                          <span className="registered-remote-solver-stat-value">
-                            {solver.solvedCount} / {solver.pushedCount}
-                          </span>
-                          <span className="registered-remote-solver-stat-label">
-                            solved / pushed
+                            host CPU load
                           </span>
                         </div>
                       </div>
+                      {solver.health?.storage?.admissionBlocked && (
+                        <div
+                          style={{
+                            padding: "7px 8px",
+                            borderRadius: 7,
+                            background: "rgba(245, 165, 36, 0.08)",
+                            color: C.amber,
+                            fontSize: 10,
+                            lineHeight: 1.4,
+                          }}
+                        >
+                          New work paused by storage safeguard ·{" "}
+                          {solver.health.execution.activeJobs} running job
+                          {solver.health.execution.activeJobs === 1
+                            ? ""
+                            : "s"}{" "}
+                          continue
+                        </div>
+                      )}
                       <div className="registered-remote-solver-controls">
                         <label
                           htmlFor={`remote-promise-cap-${solver.id}`}
@@ -5078,7 +5103,7 @@ function SyncApiPanel() {
               )}
             </div>
             <div style={card}>
-              <div style={label}>REMOTE ASSETS</div>
+              <div style={label}>GCS EVIDENCE DELIVERY</div>
               <div
                 style={{
                   display: "grid",
@@ -5087,10 +5112,47 @@ function SyncApiPanel() {
                   fontSize: 12,
                 }}
               >
-                {["remote_only", "cached", "missing", "failed"].map(
-                  (status) => (
+                {[
+                  {
+                    key: "bound",
+                    label: "bound to results",
+                    states: ["bound"],
+                  },
+                  {
+                    key: "verified",
+                    label: "verified, binding",
+                    states: ["verified"],
+                  },
+                  {
+                    key: "transferring",
+                    label: "transferring",
+                    states: ["requested", "issuing", "issued", "verifying"],
+                  },
+                  {
+                    key: "retry",
+                    label: "failed / expired",
+                    states: ["failed", "expired"],
+                  },
+                  {
+                    key: "revoked",
+                    label: "revoked history",
+                    states: ["revoked"],
+                  },
+                ].map((item) => {
+                  const count = item.states.reduce(
+                    (sum, status) =>
+                      sum + (state.evidenceTransfers.byState[status] ?? 0),
+                    0,
+                  );
+                  const bytes = item.states.reduce(
+                    (sum, status) =>
+                      sum +
+                      (state.evidenceTransfers.bytesByState[status] ?? 0),
+                    0,
+                  );
+                  return (
                     <div
-                      key={status}
+                      key={item.key}
                       style={{
                         display: "flex",
                         justifyContent: "space-between",
@@ -5099,24 +5161,34 @@ function SyncApiPanel() {
                         paddingBottom: 7,
                       }}
                     >
-                      <span style={{ color: C.dim }}>
-                        {status.replace(/_/g, " ")}
-                      </span>
+                      <span style={{ color: C.dim }}>{item.label}</span>
                       <span
                         style={{
                           color:
-                            status === "failed" || status === "missing"
+                            item.key === "retry"
                               ? C.redText
-                              : status === "cached"
+                              : item.key === "bound"
                                 ? C.teal
                                 : C.text,
                         }}
                       >
-                        {state.remoteAssets.byAvailability[status] ?? 0}
+                        {count.toLocaleString()}
+                        {bytes ? ` · ${formatBytes(bytes)}` : ""}
                       </span>
                     </div>
-                  ),
-                )}
+                  );
+                })}
+              </div>
+              <div
+                style={{
+                  marginTop: 9,
+                  color: C.dim,
+                  fontFamily: MONO,
+                  fontSize: 9,
+                  lineHeight: 1.4,
+                }}
+              >
+                Canonical Zstandard evidence stored through the hub GCS broker.
               </div>
             </div>
           </div>

@@ -106,6 +106,10 @@ import { env } from "./env";
 import { makeEngineClient } from "./engine-client";
 import { mediaStore } from "./media-store";
 import {
+  parseRemoteSolverHealth,
+  remoteSolverHealthSchema,
+} from "./services/remote-solver-health";
+import {
   fetchBoundBrokeredEvidenceArchive,
   requestBrokeredEvidenceUpload,
   revokeSolverEvidenceUploads,
@@ -250,6 +254,7 @@ const solverHeartbeatSchema = solverRegisterSchema.partial().extend({
   solvedCount: z.coerce.number().int().min(0).optional(),
   pushedCount: z.coerce.number().int().min(0).optional(),
   recentError: z.string().nullable().optional(),
+  health: remoteSolverHealthSchema.optional(),
 });
 
 const brokeredEvidenceRequestSchema = z.object({
@@ -1443,6 +1448,14 @@ async function syncAdminPayload(req: FastifyRequest) {
     .select({ availability: remoteAssetReferences.availability, n: count() })
     .from(remoteAssetReferences)
     .groupBy(remoteAssetReferences.availability);
+  const evidenceTransferRows = await db
+    .select({
+      state: syncBrokeredEvidenceUploads.state,
+      n: count(),
+      bytes: sql<number>`COALESCE(SUM(${syncBrokeredEvidenceUploads.storedByteSize}), 0)`,
+    })
+    .from(syncBrokeredEvidenceUploads)
+    .groupBy(syncBrokeredEvidenceUploads.state);
   return {
     settings: {
       enabled: settings.enabled,
@@ -1496,11 +1509,20 @@ async function syncAdminPayload(req: FastifyRequest) {
       solvedCount: row.solvedCount,
       pushedCount: row.pushedCount,
       recentError: row.recentError,
+      health: parseRemoteSolverHealth(row.metadata),
       updatedAt: iso(row.updatedAt),
     })),
     remoteAssets: {
       byAvailability: Object.fromEntries(
         remoteAssetRows.map((row) => [row.availability, Number(row.n)]),
+      ),
+    },
+    evidenceTransfers: {
+      byState: Object.fromEntries(
+        evidenceTransferRows.map((row) => [row.state, Number(row.n)]),
+      ),
+      bytesByState: Object.fromEntries(
+        evidenceTransferRows.map((row) => [row.state, Number(row.bytes)]),
       ),
     },
     conflicts: conflicts.map((row) => ({
@@ -6747,10 +6769,21 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       update.buildVersion = body.buildVersion ?? null;
     if (body.solvedCount !== undefined) update.solvedCount = body.solvedCount;
     if (body.pushedCount !== undefined) update.pushedCount = body.pushedCount;
-    if (body.metadata !== undefined) update.metadata = body.metadata;
+    const metadataPatch = {
+      ...(body.metadata ?? {}),
+      ...(body.health ? { health: body.health } : {}),
+    };
+    const metadataUpdate =
+      Object.keys(metadataPatch).length > 0
+        ? {
+            metadata: sql`${registeredRemoteSolvers.metadata} || ${JSON.stringify(
+              metadataPatch,
+            )}::jsonb`,
+          }
+        : {};
     const [solver] = await db
       .update(registeredRemoteSolvers)
-      .set(update)
+      .set({ ...update, ...metadataUpdate })
       .where(eq(registeredRemoteSolvers.id, params.id))
       .returning();
     if (!solver)
@@ -6786,10 +6819,17 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       update.activePromiseCount = body.activePromiseCount;
     if (body.activeAoaCount !== undefined)
       update.activeAoaCount = body.activeAoaCount;
-    if (body.metadata !== undefined) update.metadata = body.metadata;
+    const metadataUpdate =
+      body.metadata !== undefined
+        ? {
+            metadata: sql`${registeredRemoteSolvers.metadata} || ${JSON.stringify(
+              body.metadata,
+            )}::jsonb`,
+          }
+        : {};
     const [solver] = await db
       .update(registeredRemoteSolvers)
-      .set(update)
+      .set({ ...update, ...metadataUpdate })
       .where(eq(registeredRemoteSolvers.id, params.id))
       .returning();
     return { ok: true, solver: remoteSolverStatusPayload(solver) };

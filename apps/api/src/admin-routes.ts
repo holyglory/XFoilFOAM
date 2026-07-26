@@ -132,6 +132,7 @@ import {
   startSystemHealthSampler,
   systemHealthSnapshot,
 } from "./services/system-health";
+import { solverFleetHealth } from "./services/solver-fleet-health";
 import {
   readSweeperState,
   SWEEPER_STATE_DEFAULTS,
@@ -2258,12 +2259,19 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/admin/health", { preHandler: requireAdmin }, async () => {
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const [system, solverIncidents, solverIncidentEvents] = await Promise.all([
-      systemHealthSnapshot(),
-      solverIncidentSummary(db, { since }),
-      solverIncidentEventLog(db, { since }),
-    ]);
-    return { ...system, solverIncidents, solverIncidentEvents };
+    const system = await systemHealthSnapshot();
+    const [solverIncidents, solverIncidentEvents, fleetHealth] =
+      await Promise.all([
+        solverIncidentSummary(db, { since }),
+        solverIncidentEventLog(db, { since }),
+        solverFleetHealth(db, system.current),
+      ]);
+    return {
+      ...system,
+      solverIncidents,
+      solverIncidentEvents,
+      ...fleetHealth,
+    };
   });
 
   app.get(

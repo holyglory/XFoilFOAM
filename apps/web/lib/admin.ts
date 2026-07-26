@@ -93,6 +93,62 @@ export interface AdminHealthSample {
   storageError: string | null;
 }
 
+export interface AdminSolverNodeHealth {
+  schemaVersion: 1;
+  sampledAt: string;
+  cpu: AdminHealthSample["cpu"];
+  memory: AdminHealthSample["memory"];
+  storage: {
+    usedPct: number | null;
+    freeBytes: number | null;
+    requiredFreeBytes: number | null;
+    admissionBlocked: boolean;
+    reason: string | null;
+    checkedAt: string | null;
+  } | null;
+  execution: {
+    activeJobs: number;
+    reservedCpuSlots: number;
+    capacityCpuSlots: number;
+    activeAoaCount: number;
+  };
+}
+
+export interface AdminSolverFleetNode {
+  id: string;
+  instanceName: string;
+  connectivity: "online" | "stale" | "offline";
+  status: string;
+  lastHeartbeatAt: string | null;
+  activeJobs: number;
+  reservedCpuSlots: number;
+  capacityCpuSlots: number;
+  activePromiseCount?: number;
+  activeAoaCount?: number;
+  solvedCount?: number;
+  pushedCount?: number;
+  recentError?: string | null;
+  buildVersion?: string | null;
+  health: AdminSolverNodeHealth | null;
+}
+
+export interface AdminSolverPerformanceCounts {
+  day: string;
+  rans: number;
+  preliminary: number;
+  final: number;
+  total: number;
+}
+
+export interface AdminSolverPerformanceSource {
+  id: string;
+  name: string;
+  kind: "local" | "remote";
+  totals24h: AdminSolverPerformanceCounts;
+  averagePerDay: number;
+  daily: AdminSolverPerformanceCounts[];
+}
+
 export type AdminSolverIncidentStage = "rans" | "preliminary" | "final";
 export type AdminSolverIncidentSeverity = "warning" | "critical";
 
@@ -189,6 +245,16 @@ export interface AdminHealth {
     memoryUsedPct: number | null;
   };
   history: AdminHealthSample[];
+  fleet: {
+    local: AdminSolverFleetNode;
+    remotes: AdminSolverFleetNode[];
+  };
+  performance: {
+    windowDays: number;
+    daily: AdminSolverPerformanceCounts[];
+    totals24h: AdminSolverPerformanceCounts;
+    sources: AdminSolverPerformanceSource[];
+  };
   /** Durable screening/preliminary/final solver reliability incidents.
    * Normal aerodynamic RANS handoff is deliberately absent from this model. */
   solverIncidents: AdminSolverIncidentSummary;
@@ -602,6 +668,7 @@ export interface AdminRegisteredSolver {
   solvedCount: number;
   pushedCount: number;
   recentError: string | null;
+  health: AdminSolverNodeHealth | null;
   updatedAt: string | null;
 }
 export interface AdminSyncState {
@@ -635,6 +702,10 @@ export interface AdminSyncState {
   registeredSolvers: AdminRegisteredSolver[];
   remoteAssets: {
     byAvailability: Record<string, number>;
+  };
+  evidenceTransfers: {
+    byState: Record<string, number>;
+    bytesByState: Record<string, number>;
   };
   conflicts: AdminSyncConflict[];
 }

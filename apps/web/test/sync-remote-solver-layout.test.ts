@@ -38,4 +38,13 @@ describe("registered remote solver responsive layout", () => {
       /@media \(max-width: 460px\)[\s\S]*?\.registered-remote-solver-stats\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/,
     );
   });
+
+  it("shows canonical GCS delivery instead of irrelevant zero remote-reference counts", () => {
+    expect(source).toContain("GCS EVIDENCE DELIVERY");
+    expect(source).toContain("evidenceTransfers.byState");
+    expect(source).not.toContain(">REMOTE ASSETS<");
+    expect(source).not.toContain(
+      '["remote_only", "cached", "missing", "failed"]',
+    );
+  });
 });
