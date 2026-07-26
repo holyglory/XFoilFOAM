@@ -8,6 +8,13 @@ const source = readFileSync(
 );
 
 describe("admin health compute fleet", () => {
+  it("applies the health layout styles to extracted child components", () => {
+    expect(source).toContain("<style jsx global>");
+    expect(source).toContain('className="fleet-node"');
+    expect(source).toContain('className="throughput-bars"');
+    expect(source).toContain('className="health-card"');
+  });
+
   it("distinguishes configured capacity from real active execution", () => {
     expect(source).toContain('data-testid="health-compute-fleet"');
     expect(source).toContain("reservedCpuSlots");
