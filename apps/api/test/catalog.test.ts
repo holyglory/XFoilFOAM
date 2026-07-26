@@ -417,6 +417,9 @@ describe("catalog solved-metric evidence", () => {
           cpuCapacity: 4,
           cpuBudget: 2,
           buildVersion: "test-build",
+          metadata: {
+            engine: { family: "openfoam", version: "2606" },
+          },
         },
       });
       expect(register.statusCode).toBe(200);
@@ -469,6 +472,39 @@ describe("catalog solved-metric evidence", () => {
           activePromiseCount: 1,
           activeAoaCount: 36,
           cpuBudget: 2,
+          solvedCount: 17,
+          pushedCount: 12,
+          health: {
+            schemaVersion: 1,
+            sampledAt: new Date().toISOString(),
+            cpu: {
+              load1: 1.5,
+              load5: 1.25,
+              load15: 1,
+              availableCpus: 4,
+              loadPct: 37.5,
+            },
+            memory: {
+              totalBytes: 8_000,
+              freeBytes: 3_000,
+              usedBytes: 5_000,
+              usedPct: 62.5,
+            },
+            storage: {
+              usedPct: 81,
+              freeBytes: 2_000,
+              requiredFreeBytes: 1_000,
+              admissionBlocked: true,
+              reason: "capacity safeguard",
+              checkedAt: new Date().toISOString(),
+            },
+            execution: {
+              activeJobs: 1,
+              reservedCpuSlots: 1,
+              capacityCpuSlots: 2,
+              activeAoaCount: 36,
+            },
+          },
         },
       });
       expect(heartbeat.statusCode).toBe(200);
@@ -478,9 +514,37 @@ describe("catalog solved-metric evidence", () => {
           status: "solving",
           activePromiseCount: 1,
           activeAoaCount: 36,
+          solvedCount: 17,
+          pushedCount: 12,
         },
       });
       expect(JSON.stringify(heartbeat.json())).not.toContain("authTokenHash");
+      const [heartbeatRow] = await db
+        .select({ metadata: registeredRemoteSolvers.metadata })
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, registered.solver.id))
+        .limit(1);
+      expect(heartbeatRow?.metadata).toMatchObject({
+        engine: { family: "openfoam", version: "2606" },
+        health: {
+          schemaVersion: 1,
+          cpu: { availableCpus: 4, loadPct: 37.5 },
+          storage: { admissionBlocked: true },
+          execution: { activeJobs: 1, reservedCpuSlots: 1 },
+        },
+      });
+
+      const adminSync = await app.inject({
+        method: "GET",
+        url: "/api/admin/sync",
+      });
+      expect(adminSync.statusCode).toBe(200);
+      expect(adminSync.json()).toMatchObject({
+        evidenceTransfers: {
+          byState: expect.any(Object),
+          bytesByState: expect.any(Object),
+        },
+      });
 
       const progress = await app.inject({
         method: "POST",
@@ -495,7 +559,7 @@ describe("catalog solved-metric evidence", () => {
       expect(progress.statusCode).toBe(200);
       expect(progress.json()).toMatchObject({
         ok: true,
-        solver: { status: "pushing", solvedCount: 2, pushedCount: 1 },
+        solver: { status: "pushing", solvedCount: 19, pushedCount: 13 },
       });
 
       const claim = await app.inject({

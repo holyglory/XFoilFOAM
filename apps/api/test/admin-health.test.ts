@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { registeredRemoteSolvers } from "@aerodb/db";
+import { eq } from "drizzle-orm";
 
+import { db } from "../src/db";
 import { buildServer } from "../src/server";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -28,6 +31,22 @@ describe("GET /api/admin/health", () => {
       expect(body.averages24h.memoryUsedPct).toEqual(expect.any(Number));
       expect(Array.isArray(body.history)).toBe(true);
       expect(body.current.storage || body.current.storageError).toBeTruthy();
+      expect(body.fleet).toMatchObject({
+        local: {
+          id: "local",
+          instanceName: expect.any(String),
+          activeJobs: expect.any(Number),
+          reservedCpuSlots: expect.any(Number),
+          capacityCpuSlots: expect.any(Number),
+        },
+        remotes: expect.any(Array),
+      });
+      expect(body.performance).toMatchObject({
+        windowDays: 7,
+        daily: expect.any(Array),
+        sources: expect.any(Array),
+        totals24h: expect.any(Object),
+      });
       expect(body.solverIncidents).toMatchObject({
         threshold: expect.any(Number),
         occurrenceCount: expect.any(Number),
@@ -38,6 +57,85 @@ describe("GET /api/admin/health", () => {
       expect(body.solverIncidentEvents).toEqual(expect.any(Array));
     } finally {
       await app.close();
+    }
+  });
+
+  it("returns the latest remote-reported host health without a live probe", async () => {
+    process.env.ADMIN_AUTH_DISABLED = "true";
+    const instanceId = `admin-health-remote-${Date.now()}-${Math.random()}`;
+    const sampledAt = new Date().toISOString();
+    const [solver] = await db
+      .insert(registeredRemoteSolvers)
+      .values({
+        instanceId,
+        instanceName: "health test remote",
+        cpuCapacity: 48,
+        cpuBudget: 40,
+        status: "solving",
+        lastHeartbeatAt: new Date(),
+        metadata: {
+          health: {
+            schemaVersion: 1,
+            sampledAt,
+            cpu: {
+              load1: 11,
+              load5: 10,
+              load15: 9,
+              availableCpus: 96,
+              loadPct: 11.458,
+            },
+            memory: {
+              totalBytes: 128_000,
+              freeBytes: 80_000,
+              usedBytes: 48_000,
+              usedPct: 37.5,
+            },
+            storage: {
+              usedPct: 85.7,
+              freeBytes: 482_000,
+              requiredFreeBytes: 330_000,
+              admissionBlocked: true,
+              reason: "Storage admission stopped",
+              checkedAt: sampledAt,
+            },
+            execution: {
+              activeJobs: 11,
+              reservedCpuSlots: 11,
+              capacityCpuSlots: 40,
+              activeAoaCount: 214,
+            },
+          },
+        },
+      })
+      .returning({ id: registeredRemoteSolvers.id });
+    const app = await buildServer();
+    try {
+      const res = await app.inject({ method: "GET", url: "/api/admin/health" });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().fleet.remotes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: solver.id,
+            instanceName: "health test remote",
+            connectivity: "online",
+            activeJobs: 11,
+            reservedCpuSlots: 11,
+            capacityCpuSlots: 40,
+            health: expect.objectContaining({
+              sampledAt,
+              storage: expect.objectContaining({
+                admissionBlocked: true,
+                usedPct: 85.7,
+              }),
+            }),
+          }),
+        ]),
+      );
+    } finally {
+      await app.close();
+      await db
+        .delete(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, solver.id));
     }
   });
 

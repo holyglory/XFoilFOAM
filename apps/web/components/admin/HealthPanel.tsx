@@ -1,11 +1,22 @@
 "use client";
 
-import { Activity, Cpu, HardDrive, MemoryStick, RefreshCw } from "lucide-react";
+import {
+  Activity,
+  Cpu,
+  Gauge,
+  HardDrive,
+  MemoryStick,
+  RefreshCw,
+  Server,
+} from "lucide-react";
 import { type ReactNode, useCallback, useRef, useState } from "react";
 
 import {
   type AdminHealth,
   type AdminHealthSample,
+  type AdminSolverFleetNode,
+  type AdminSolverPerformanceCounts,
+  type AdminSolverPerformanceSource,
   getAdminHealth,
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
@@ -54,6 +65,218 @@ function formatTime(iso: string | null | undefined): string {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(iso));
+}
+
+function formatCount(value: number | null | undefined): string {
+  return isReal(value) ? Math.round(value).toLocaleString() : EMPTY;
+}
+
+function dayLabel(day: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(`${day}T00:00:00Z`));
+}
+
+function slotPct(node: AdminSolverFleetNode): number {
+  if (node.capacityCpuSlots <= 0) return 0;
+  return Math.min(100, (node.reservedCpuSlots / node.capacityCpuSlots) * 100);
+}
+
+function reportedAge(iso: string | null): string {
+  if (!iso) return "no report";
+  const seconds = (Date.now() - Date.parse(iso)) / 1000;
+  return Number.isFinite(seconds) ? `${formatAge(seconds)} ago` : "no report";
+}
+
+function NodeCard({
+  node,
+  local = false,
+}: {
+  node: AdminSolverFleetNode;
+  local?: boolean;
+}) {
+  const storage = node.health?.storage ?? null;
+  const awaitingHealth = !local && !node.health;
+  const tone =
+    node.connectivity === "offline"
+      ? C.redText
+      : awaitingHealth
+        ? C.dim
+        : storage?.admissionBlocked
+          ? C.amber
+          : C.teal;
+  const stateLabel =
+    node.connectivity === "offline"
+      ? "offline"
+      : awaitingHealth
+        ? "awaiting health"
+        : storage?.admissionBlocked
+          ? "capacity safeguard"
+          : node.connectivity === "stale"
+            ? "report delayed"
+            : node.status;
+
+  return (
+    <article
+      className="fleet-node"
+      data-testid={`health-fleet-node-${node.id}`}
+    >
+      <div className="fleet-node-head">
+        <div className="fleet-node-name">
+          <span className="fleet-node-icon">
+            {local ? <Server size={15} /> : <Cpu size={15} />}
+          </span>
+          <div>
+            <strong>{node.instanceName}</strong>
+            <span>
+              {local
+                ? "local solver"
+                : `remote solver · ${reportedAge(node.lastHeartbeatAt)}`}
+            </span>
+          </div>
+        </div>
+        <span className="fleet-state" style={{ color: tone }}>
+          <i style={{ background: tone }} />
+          {stateLabel}
+        </span>
+      </div>
+
+      <div className="slot-reading">
+        <div>
+          <strong>
+            {formatCount(node.reservedCpuSlots)}
+            <small> / {formatCount(node.capacityCpuSlots)}</small>
+          </strong>
+          <span>slots reserved</span>
+        </div>
+        <span>{formatPct(slotPct(node), 0)}</span>
+      </div>
+      <div className="slot-track" aria-hidden="true">
+        <i
+          style={{
+            width: `${slotPct(node)}%`,
+            background: tone,
+          }}
+        />
+      </div>
+
+      <div className="fleet-stat-grid">
+        <div>
+          <strong>{formatCount(node.activeJobs)}</strong>
+          <span>CFD jobs</span>
+        </div>
+        <div>
+          <strong>{formatPct(node.health?.cpu.loadPct, 0)}</strong>
+          <span>host load</span>
+        </div>
+        <div>
+          <strong>{formatPct(node.health?.memory.usedPct, 0)}</strong>
+          <span>memory</span>
+        </div>
+      </div>
+
+      <div className="fleet-storage">
+        <span>storage</span>
+        <strong style={{ color: storage?.admissionBlocked ? C.amber : C.text }}>
+          {formatPct(storage?.usedPct, 0)}
+        </strong>
+        <span>{formatBytes(storage?.freeBytes)} free</span>
+      </div>
+      {storage?.admissionBlocked && (
+        <div className="fleet-capacity-note">
+          <HardDrive size={13} />
+          <span>
+            New jobs paused · {formatCount(node.activeJobs)} running continue
+          </span>
+        </div>
+      )}
+      {!node.health && !local && (
+        <div className="fleet-awaiting">Awaiting node health report</div>
+      )}
+    </article>
+  );
+}
+
+function ThroughputBars({ daily }: { daily: AdminSolverPerformanceCounts[] }) {
+  const max = Math.max(1, ...daily.map((item) => item.total));
+  return (
+    <div
+      className="throughput-bars"
+      role="img"
+      aria-label="Daily solver points"
+    >
+      {daily.map((item) => {
+        const totalHeight = (item.total / max) * 100;
+        const ransShare = item.total ? (item.rans / item.total) * 100 : 0;
+        const preliminaryShare = item.total
+          ? (item.preliminary / item.total) * 100
+          : 0;
+        const finalShare = item.total ? (item.final / item.total) * 100 : 0;
+        return (
+          <div className="throughput-day" key={item.day}>
+            <span className="throughput-value">{formatCount(item.total)}</span>
+            <div className="throughput-column">
+              <div style={{ height: `${totalHeight}%` }}>
+                <i
+                  className="throughput-rans"
+                  style={{ height: `${ransShare}%` }}
+                />
+                <i
+                  className="throughput-preliminary"
+                  style={{ height: `${preliminaryShare}%` }}
+                />
+                <i
+                  className="throughput-final"
+                  style={{ height: `${finalShare}%` }}
+                />
+              </div>
+            </div>
+            <span className="throughput-day-label">{dayLabel(item.day)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SourcePerformance({
+  source,
+}: {
+  source: AdminSolverPerformanceSource;
+}) {
+  const max = Math.max(1, ...source.daily.map((item) => item.total));
+  return (
+    <article className="performance-source">
+      <div className="performance-source-head">
+        <div>
+          <strong>{source.name}</strong>
+          <span>{source.kind === "local" ? "local" : "remote"}</span>
+        </div>
+        <div>
+          <strong>{formatCount(source.totals24h.total)}</strong>
+          <span>last 24h</span>
+        </div>
+      </div>
+      <div className="source-spark" aria-hidden="true">
+        {source.daily.map((item) => (
+          <i
+            key={item.day}
+            style={{ height: `${Math.max(3, (item.total / max) * 100)}%` }}
+            title={`${dayLabel(item.day)}: ${item.total}`}
+          />
+        ))}
+      </div>
+      <div className="performance-source-foot">
+        <span>{source.averagePerDay.toFixed(1)} pts/day avg</span>
+        <span>
+          {source.totals24h.rans} R · {source.totals24h.preliminary} P ·{" "}
+          {source.totals24h.final} F
+        </span>
+      </div>
+    </article>
+  );
 }
 
 function chartSeries(
@@ -416,9 +639,369 @@ export function HealthPanel() {
         .health-incidents {
           margin-bottom: 12px;
         }
+        .health-section {
+          margin-bottom: 12px;
+          padding: 14px;
+          border: 1px solid ${C.border};
+          border-radius: 9px;
+          background: ${C.panel};
+        }
+        .health-section-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 12px;
+        }
+        .health-section-title {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+          color: ${C.text};
+          font-family: ${MONO};
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+        .health-section-meta {
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 10px;
+        }
+        .fleet-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+          gap: 10px;
+        }
+        .fleet-node {
+          min-width: 0;
+          padding: 12px;
+          border: 1px solid ${C.borderSoft};
+          border-radius: 8px;
+          background: ${C.panel2};
+          font-family: ${MONO};
+        }
+        .fleet-node-head,
+        .fleet-node-name,
+        .slot-reading,
+        .fleet-storage,
+        .performance-source-head,
+        .performance-source-head > div,
+        .performance-source-foot {
+          display: flex;
+          align-items: center;
+        }
+        .fleet-node-head,
+        .slot-reading,
+        .performance-source-head,
+        .performance-source-foot {
+          justify-content: space-between;
+          gap: 10px;
+        }
+        .fleet-node-name {
+          min-width: 0;
+          gap: 8px;
+        }
+        .fleet-node-name > div,
+        .performance-source-head > div {
+          min-width: 0;
+          display: grid;
+          gap: 2px;
+        }
+        .fleet-node-name strong,
+        .performance-source-head strong {
+          overflow: hidden;
+          color: ${C.text};
+          font-size: 11px;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .fleet-node-name span,
+        .performance-source-head span,
+        .slot-reading span,
+        .fleet-stat-grid span,
+        .fleet-storage,
+        .performance-source-foot {
+          color: ${C.dim};
+          font-size: 9px;
+        }
+        .fleet-node-icon {
+          width: 28px;
+          height: 28px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          flex: 0 0 auto;
+          border: 1px solid ${C.tealBorder};
+          border-radius: 7px;
+          color: ${C.teal};
+          background: ${C.tealFill};
+        }
+        .fleet-state {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          flex: 0 0 auto;
+          font-family: ${MONO};
+          font-size: 9px;
+          text-transform: uppercase;
+        }
+        .fleet-state i {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+        }
+        .slot-reading {
+          margin-top: 13px;
+        }
+        .slot-reading > div {
+          display: grid;
+          gap: 2px;
+        }
+        .slot-reading strong {
+          color: ${C.text};
+          font-size: 22px;
+          line-height: 1;
+        }
+        .slot-reading small {
+          color: ${C.dim};
+          font-size: 13px;
+        }
+        .slot-reading > span {
+          color: ${C.muted};
+          font-size: 11px;
+        }
+        .slot-track {
+          height: 5px;
+          margin-top: 8px;
+          overflow: hidden;
+          border-radius: 999px;
+          background: ${C.grid};
+        }
+        .slot-track i {
+          height: 100%;
+          display: block;
+          border-radius: inherit;
+          transition: width 220ms ease;
+        }
+        .fleet-stat-grid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 6px;
+          margin-top: 11px;
+        }
+        .fleet-stat-grid > div {
+          min-width: 0;
+          display: grid;
+          gap: 2px;
+          padding: 7px;
+          border-radius: 6px;
+          background: ${C.panel3};
+        }
+        .fleet-stat-grid strong {
+          color: ${C.text};
+          font-size: 11px;
+        }
+        .fleet-storage {
+          gap: 7px;
+          margin-top: 10px;
+        }
+        .fleet-storage strong {
+          font-size: 10px;
+        }
+        .fleet-storage span:last-child {
+          margin-left: auto;
+        }
+        .fleet-capacity-note,
+        .fleet-awaiting {
+          min-height: 30px;
+          box-sizing: border-box;
+          margin-top: 9px;
+          padding: 7px 8px;
+          border-radius: 6px;
+          font-family: ${MONO};
+          font-size: 9px;
+          line-height: 1.35;
+        }
+        .fleet-capacity-note {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          color: ${C.amber};
+          background: rgba(245, 165, 36, 0.08);
+        }
+        .fleet-awaiting {
+          color: ${C.dim};
+          background: ${C.panel3};
+        }
+        .performance-summary {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 7px;
+          margin-bottom: 12px;
+        }
+        .performance-summary > div {
+          min-width: 0;
+          display: grid;
+          gap: 3px;
+          padding: 9px 10px;
+          border-radius: 7px;
+          background: ${C.panel2};
+          font-family: ${MONO};
+        }
+        .performance-summary strong {
+          color: ${C.text};
+          font-size: 18px;
+        }
+        .performance-summary span {
+          color: ${C.dim};
+          font-size: 9px;
+          text-transform: uppercase;
+        }
+        .throughput-legend {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-bottom: 7px;
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 9px;
+        }
+        .throughput-legend span {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+        }
+        .throughput-legend i {
+          width: 8px;
+          height: 8px;
+          border-radius: 2px;
+        }
+        .throughput-bars {
+          height: 185px;
+          display: grid;
+          grid-template-columns: repeat(7, minmax(0, 1fr));
+          align-items: stretch;
+          gap: 8px;
+          padding: 10px 10px 0;
+          border-radius: 8px;
+          background: ${C.panel2};
+        }
+        .throughput-day {
+          min-width: 0;
+          display: grid;
+          grid-template-rows: 18px minmax(0, 1fr) 24px;
+          gap: 4px;
+          text-align: center;
+        }
+        .throughput-value,
+        .throughput-day-label {
+          overflow: hidden;
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 9px;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .throughput-column {
+          min-height: 0;
+          display: flex;
+          align-items: end;
+          justify-content: center;
+          border-bottom: 1px solid ${C.axis};
+          background-image: linear-gradient(
+            to bottom,
+            transparent 49%,
+            ${C.grid} 50%,
+            transparent 51%
+          );
+        }
+        .throughput-column > div {
+          width: min(34px, 70%);
+          min-height: 2px;
+          display: flex;
+          flex-direction: column-reverse;
+          overflow: hidden;
+          border-radius: 4px 4px 0 0;
+          transition: height 220ms ease;
+        }
+        .throughput-column i {
+          width: 100%;
+          display: block;
+        }
+        .throughput-rans {
+          background: ${C.teal};
+        }
+        .throughput-preliminary {
+          background: ${C.violet};
+        }
+        .throughput-final {
+          background: ${C.amber};
+        }
+        .performance-source-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+          gap: 8px;
+          margin-top: 10px;
+        }
+        .performance-source {
+          min-width: 0;
+          padding: 10px;
+          border: 1px solid ${C.borderSoft};
+          border-radius: 7px;
+          background: ${C.panel2};
+          font-family: ${MONO};
+        }
+        .performance-source-head > div:last-child {
+          justify-items: end;
+        }
+        .source-spark {
+          height: 42px;
+          display: grid;
+          grid-template-columns: repeat(7, minmax(0, 1fr));
+          align-items: end;
+          gap: 4px;
+          margin: 9px 0 6px;
+          border-bottom: 1px solid ${C.axis};
+        }
+        .source-spark i {
+          min-height: 2px;
+          border-radius: 2px 2px 0 0;
+          background: ${C.teal};
+        }
         @media (max-width: 980px) {
           .health-grid {
             grid-template-columns: minmax(0, 1fr);
+          }
+        }
+        @media (max-width: 760px) {
+          .fleet-grid,
+          .performance-source-grid {
+            grid-template-columns: minmax(0, 1fr);
+          }
+          .performance-summary {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+        }
+        @media (max-width: 460px) {
+          .health-section {
+            padding: 11px;
+          }
+          .health-section-head {
+            align-items: flex-start;
+            flex-direction: column;
+            gap: 4px;
+          }
+          .throughput-bars {
+            gap: 4px;
+            padding-inline: 5px;
+          }
+          .throughput-day-label {
+            font-size: 8px;
           }
         }
       `}</style>
@@ -455,6 +1038,80 @@ export function HealthPanel() {
             showClear
           />
         </div>
+      )}
+
+      {health && (
+        <section className="health-section" data-testid="health-compute-fleet">
+          <div className="health-section-head">
+            <div className="health-section-title">
+              <Server size={15} />
+              Compute fleet
+            </div>
+            <div className="health-section-meta">
+              {health.fleet.remotes
+                .filter((node) => node.connectivity === "online")
+                .length.toLocaleString()}{" "}
+              remote online
+            </div>
+          </div>
+          <div className="fleet-grid">
+            <NodeCard node={health.fleet.local} local />
+            {health.fleet.remotes.map((node) => (
+              <NodeCard key={node.id} node={node} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {health && (
+        <section className="health-section" data-testid="health-performance">
+          <div className="health-section-head">
+            <div className="health-section-title">
+              <Gauge size={15} />
+              Solver output
+            </div>
+            <div className="health-section-meta">
+              accepted points · UTC · {health.performance.windowDays} days
+            </div>
+          </div>
+          <div className="performance-summary">
+            <div>
+              <strong>{formatCount(health.performance.totals24h.total)}</strong>
+              <span>all · last 24h</span>
+            </div>
+            <div>
+              <strong>{formatCount(health.performance.totals24h.rans)}</strong>
+              <span>RANS</span>
+            </div>
+            <div>
+              <strong>
+                {formatCount(health.performance.totals24h.preliminary)}
+              </strong>
+              <span>Fast URANS</span>
+            </div>
+            <div>
+              <strong>{formatCount(health.performance.totals24h.final)}</strong>
+              <span>Final URANS</span>
+            </div>
+          </div>
+          <div className="throughput-legend" aria-hidden="true">
+            <span>
+              <i style={{ background: C.teal }} /> RANS
+            </span>
+            <span>
+              <i style={{ background: C.violet }} /> Fast URANS
+            </span>
+            <span>
+              <i style={{ background: C.amber }} /> Final URANS
+            </span>
+          </div>
+          <ThroughputBars daily={health.performance.daily} />
+          <div className="performance-source-grid">
+            {health.performance.sources.map((source) => (
+              <SourcePerformance key={source.id} source={source} />
+            ))}
+          </div>
+        </section>
       )}
 
       <div className="health-grid">
