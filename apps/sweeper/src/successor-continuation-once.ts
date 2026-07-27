@@ -674,7 +674,7 @@ export function productionSuccessorAdmissionDependencies(
       };
     },
     async assertDiskAdmission() {
-      const decision = await refreshDiskAdmission(db, engine, 0);
+      const decision = await refreshDiskAdmission(db, engine);
       if (!decision.allowed)
         throw admissionError(decision.reason ?? "disk admission is closed");
     },

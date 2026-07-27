@@ -4,6 +4,8 @@ import {
   DEFAULT_DISK_JOB_RESERVE_BYTES,
   DEFAULT_DISK_MAX_USED_PCT,
   DEFAULT_DISK_MIN_FREE_BYTES,
+  diskAdmissionExposureForJobs,
+  diskMeasurementFromStatfs,
   evaluateDiskAdmission,
 } from "../src/disk-admission";
 
@@ -19,7 +21,10 @@ describe("disk admission", () => {
     expect(
       evaluateDiskAdmission(
         { total_bytes: 300 * GIB, free_bytes: 220 * GIB, used_pct: 26.7 },
-        3,
+        {
+          activeLocalJobCount: 3,
+          activeLocalReservedBytes: 72 * GIB,
+        },
         config,
       ),
     ).toMatchObject({
@@ -31,29 +36,41 @@ describe("disk admission", () => {
 
   it("blocks at the percentage ceiling even when no job is active", () => {
     const decision = evaluateDiskAdmission(
-      { total_bytes: 300 * GIB, free_bytes: 58 * GIB, used_pct: 80.1 },
-      0,
+      { total_bytes: 300 * GIB, free_bytes: 14 * GIB, used_pct: 95.1 },
+      {
+        activeLocalJobCount: 0,
+        activeLocalReservedBytes: 0,
+      },
       config,
     );
     expect(decision.allowed).toBe(false);
-    expect(decision.reason).toContain("80.1% used");
+    expect(decision.reason).toContain("95.1% used");
   });
 
   it("reserves worst-case growth for active jobs and the next admission", () => {
     const decision = evaluateDiskAdmission(
       { total_bytes: 300 * GIB, free_bytes: 110 * GIB, used_pct: 63.3 },
-      3,
+      {
+        activeLocalJobCount: 3,
+        activeLocalReservedBytes: 72 * GIB,
+      },
       config,
     );
     expect(decision.allowed).toBe(false);
-    expect(decision.reason).toContain("116.0 GiB required for 3 active jobs");
+    expect(decision.reason).toContain("116.0 GiB required");
+    expect(decision.reason).toContain(
+      "72.0 GiB remaining local work across 3 jobs",
+    );
   });
 
   it("fails closed on an invalid measurement", () => {
     expect(
       evaluateDiskAdmission(
         { total_bytes: 0, free_bytes: Number.NaN, used_pct: 0 },
-        0,
+        {
+          activeLocalJobCount: 0,
+          activeLocalReservedBytes: 0,
+        },
         config,
       ),
     ).toMatchObject({
@@ -61,6 +78,138 @@ describe("disk admission", () => {
       usedPct: null,
       freeBytes: null,
       requiredFreeBytes: null,
+    });
+  });
+
+  it("reserves measured future growth by solver fidelity and remaining cases", () => {
+    const exposure = diskAdmissionExposureForJobs(
+      [
+        {
+          totalCases: 78,
+          completedCases: 77,
+          requestPayload: null,
+        },
+        {
+          totalCases: 8,
+          completedCases: 6,
+          requestPayload: { uransFidelity: "precalc" },
+        },
+        {
+          totalCases: 1,
+          completedCases: 0,
+          requestPayload: { uransFidelity: "full" },
+        },
+      ],
+      config,
+    );
+
+    expect(exposure).toEqual({
+      activeLocalJobCount: 3,
+      // 0.3125 GiB RANS + 2 × 2 GiB FAST + 1 × 6 GiB FINAL URANS.
+      activeLocalReservedBytes: 10.3125 * GIB,
+    });
+  });
+
+  it("does not turn CPU slots into local disk jobs", () => {
+    const exposure = diskAdmissionExposureForJobs(
+      [
+        {
+          totalCases: 1,
+          completedCases: 0,
+          admissionCpuSlots: 40,
+          requestPayload: null,
+        },
+      ],
+      config,
+    );
+
+    expect(exposure).toEqual({
+      activeLocalJobCount: 1,
+      activeLocalReservedBytes: 0.3125 * GIB,
+    });
+    expect(
+      evaluateDiskAdmission(
+        { total_bytes: 500 * GIB, free_bytes: 50 * GIB, used_pct: 70 },
+        exposure,
+        config,
+      ),
+    ).toMatchObject({
+      allowed: true,
+      requiredFreeBytes: 44.3125 * GIB,
+    });
+  });
+
+  it("keeps a full unknown-job reserve instead of underestimating malformed work", () => {
+    expect(
+      diskAdmissionExposureForJobs(
+        [
+          {
+            totalCases: 0,
+            completedCases: 0,
+            requestPayload: { uransFidelity: "unexpected" },
+          },
+        ],
+        config,
+      ),
+    ).toEqual({
+      activeLocalJobCount: 1,
+      activeLocalReservedBytes: DEFAULT_DISK_JOB_RESERVE_BYTES,
+    });
+  });
+
+  it("allows the observed mixed production workload without weakening a full RANS batch", () => {
+    const exposure = diskAdmissionExposureForJobs(
+      [
+        { totalCases: 78, completedCases: 28, requestPayload: null },
+        { totalCases: 78, completedCases: 43, requestPayload: null },
+        { totalCases: 78, completedCases: 37, requestPayload: null },
+        { totalCases: 78, completedCases: 0, requestPayload: null },
+        {
+          totalCases: 8,
+          completedCases: 1,
+          requestPayload: { uransFidelity: "precalc" },
+        },
+        { totalCases: 2, completedCases: 0, requestPayload: null },
+        { totalCases: 2, completedCases: 0, requestPayload: null },
+        {
+          totalCases: 1,
+          completedCases: 0,
+          requestPayload: { uransFidelity: "full" },
+        },
+      ],
+      config,
+    );
+    const decision = evaluateDiskAdmission(
+      { total_bytes: 500 * GIB, free_bytes: 215.2 * GIB, used_pct: 56.9 },
+      exposure,
+      config,
+    );
+
+    expect(exposure.activeLocalReservedBytes / GIB).toBeCloseTo(85, 5);
+    expect(decision).toMatchObject({
+      allowed: true,
+      requiredFreeBytes: 129 * GIB,
+    });
+    expect(
+      diskAdmissionExposureForJobs(
+        [{ totalCases: 78, completedCases: 0, requestPayload: null }],
+        config,
+      ).activeLocalReservedBytes,
+    ).toBeCloseTo(24.375 * GIB, 4);
+  });
+
+  it("can measure the mounted media volume without waiting for the engine API", () => {
+    expect(
+      diskMeasurementFromStatfs({
+        blocks: 1000,
+        bfree: 400,
+        bavail: 350,
+        bsize: 4096,
+      }),
+    ).toEqual({
+      total_bytes: 4_096_000,
+      free_bytes: 1_433_600,
+      used_pct: 65,
     });
   });
 });

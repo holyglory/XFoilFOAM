@@ -43,6 +43,11 @@ const EXCLUSIVE_FILES = new Set([
   "worker-restart-orphan.test.ts",
 ]);
 
+/** Pure calculation tests neither read nor mutate the shared database. Keeping
+ * them independent lets the storage-admission guard be verified even while a
+ * local database runtime is deliberately offline. */
+const DATABASE_FREE_FILES = new Set(["disk-admission.test.ts"]);
+
 interface VitestWorkerState {
   filepath?: string;
 }
@@ -124,7 +129,9 @@ async function restoreSweeperState(
 }
 
 beforeAll(async () => {
-  exclusive = EXCLUSIVE_FILES.has(currentTestFile());
+  const testFile = currentTestFile();
+  if (DATABASE_FREE_FILES.has(testFile)) return;
+  exclusive = EXCLUSIVE_FILES.has(testFile);
   client = createClient({ max: 2 });
   reserved = await client.sql.reserve();
   await lock(reserved);
