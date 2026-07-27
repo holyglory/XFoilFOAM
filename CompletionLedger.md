@@ -164,10 +164,20 @@
   backs off a settled engine-observability failure for 30 minutes. The Python
   gateway also returns cached or explicitly unavailable worker-runtime data
   instead of waiting behind a stalled Celery `inspect.conf()` lock. Both paths
-  have concurrency regressions. Deploy the Node guard immediately; install the
-  Python guard through guarded engine maintenance only after the active
-  OpenFOAM pool drains, then prove concurrent `/queue` polls cannot delay
-  `/health` and remove this item.
+  have concurrency regressions. The Node guard is deployed. The original
+  production gateway remains preserved and wedged for forensic inspection
+  while active OpenFOAM jobs continue in the unchanged worker. A fresh
+  production-image gateway now carries Node API, sweeper, and media-repair
+  traffic; its restart policy and the live deployment `ENGINE_URL` preserve
+  that route across service/deploy restarts. Authenticated queue verification
+  reports healthy exact build identity, no health/queue error, no build
+  mismatch, and a cleared unreachable timestamp. Twelve concurrent admin
+  polls completed without increasing the recovery gateway's Redis-client
+  count. Install the Python guard through guarded engine maintenance only
+  after the active OpenFOAM pool drains, then prove direct concurrent
+  `/queue` polls cannot delay `/health`, retire the forensic gateway and
+  temporary gateway, restore the canonical Compose service URL, and remove
+  this item.
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`
