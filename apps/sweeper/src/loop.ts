@@ -719,6 +719,14 @@ export async function tick(
   // (heartbeat fresh, tick >5 min without completing) from this pair —
   // liveness itself is the independent index.ts timer.
   await markTickStarted(db);
+  // Publish storage admission before any engine-dependent reconciliation.
+  // Reconcile can legitimately take minutes while the OpenFOAM API is CPU
+  // saturated; leaving the previous disk snapshot in place during that wait
+  // made a recovered filesystem look blocked even though the local statfs
+  // fallback was already available. No NEW work can be admitted before the
+  // rest of this tick reaches the admission lanes below, so this early,
+  // workload-conservative snapshot is safe as well as user-visible.
+  let diskAdmission = await refreshDiskAdmission(db, engine);
   const preReconcileFence = await checkAdmissionFence(db, "before_reconcile");
   await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
   // Reconciliation can be the operation which records a blocked obligation or
@@ -734,7 +742,6 @@ export async function tick(
   // retention and heartbeat progress above remain live so the system can
   // recover automatically instead of turning storage pressure into fake job
   // failures or a PostgreSQL outage.
-  let diskAdmission = await refreshDiskAdmission(db, engine);
   // Remote authority/evidence reconciliation remains early and admission-free.
   // Its NEW RANS lane is considered only after durable FAST URANS below.
   const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
