@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
 
+from airfoilfoam import pipeline, tasks
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.api import main as api_main
 from airfoilfoam.cache import MANIFEST_NAME, EngineCache
@@ -43,7 +46,6 @@ from airfoilfoam.postprocess.forces import parse_force_coefficients
 from airfoilfoam.postprocess.images import find_all_vtus
 from airfoilfoam.provenance import application_source_sha256
 from airfoilfoam.storage import JobStore
-from airfoilfoam import pipeline, tasks
 
 
 def _patches() -> list[BoundaryPatch]:
@@ -630,6 +632,81 @@ def test_queue_caches_runtime_inspection_until_worker_queue_binding_changes(
     assert changed["worker_runtime_error"] is None
     assert inspect.conf_calls == 2
     assert changed["worker_queues"][0]["execution_pool"] == FOUNDATION_14.queue_name
+
+
+def test_queue_does_not_block_concurrent_poll_behind_runtime_inspection(
+    tmp_path, monkeypatch
+):
+    import redis as redis_module
+
+    settings = Settings(data_dir=tmp_path / "data")
+    conf_started = Event()
+    release_conf = Event()
+
+    class FakeRedis:
+        @classmethod
+        def from_url(cls, *_args, **_kwargs):
+            return cls()
+
+        def llen(self, _queue):
+            return 0
+
+    class FakeInspect:
+        def active(self):
+            return {"worker@engine": []}
+
+        def reserved(self):
+            return {"worker@engine": []}
+
+        def scheduled(self):
+            return {"worker@engine": []}
+
+        def active_queues(self):
+            return {"worker@engine": [{"name": OPENCFD_2606.queue_name}]}
+
+        def conf(self):
+            conf_started.set()
+            assert release_conf.wait(timeout=5)
+            return {
+                "worker@engine": {
+                    "airfoilfoam_worker_runtime": {
+                        "execution_pool": OPENCFD_2606.queue_name,
+                        "engine": settings.engine_runtime_identity().model_dump(mode="json"),
+                    }
+                }
+            }
+
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(redis_module, "Redis", FakeRedis)
+    monkeypatch.setattr(
+        celery_app.control,
+        "inspect",
+        lambda timeout=None: FakeInspect(),
+    )
+    app = api_main.create_app()
+    queue_endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/queue"
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(queue_endpoint)
+        assert conf_started.wait(timeout=2)
+        second = executor.submit(queue_endpoint)
+        try:
+            concurrent_body = second.result(timeout=2)
+        except TimeoutError:
+            release_conf.set()
+            raise
+        finally:
+            release_conf.set()
+
+        first_body = first.result(timeout=2)
+
+    assert (
+        concurrent_body["worker_runtime_error"]
+        == "Celery worker-runtime inspection already in progress"
+    )
+    assert first_body["worker_runtime_error"] is None
 
 
 def test_queue_reports_incomplete_task_and_runtime_worker_coverage(

@@ -112,6 +112,10 @@ import { makeEngineClient } from "./engine-client";
 import { db } from "./db";
 import { env } from "./env";
 import { mediaStore, type MediaStore } from "./media-store";
+import {
+  raceCachedProbe,
+  type ProbeCacheStore,
+} from "./probe-cache";
 import { categoriesTree } from "./services/catalog";
 import {
   hashtagsByAirfoilIds,
@@ -368,6 +372,10 @@ async function activeSolverImplementation(id: string) {
 const QUEUE_REVISION_ENSURE_TTL_MS = 10_000;
 const ENGINE_QUEUE_FRESH_TTL_MS = 5_000;
 const ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS = 750;
+// A timed-out fetch aborts the Node request, but it cannot cancel a synchronous
+// FastAPI handler already blocked in Celery inspection. Back off long enough
+// that observability degradation cannot fill the engine's request thread pool.
+const ENGINE_PROBE_FAILURE_TTL_MS = 30 * 60 * 1000;
 // Pool admission is a one-off maintenance handshake, not a polled UI probe.
 // The engine's authoritative Celery queue snapshot may consume its full
 // five-second inspector window, so the caller must leave transport margin.
@@ -434,64 +442,6 @@ interface GapScanResult {
 let gapFillScanPromise: Promise<GapScanResult> | null = null;
 let engineRuntimeUnsupportedUntil = 0;
 
-/** TTL cache + stale-while-refresh + bounded race cap shared by every engine
- *  probe the queue payload depends on (spec §10/§12): the handler must NEVER
- *  await a live engine round-trip — while OpenFOAM solves saturate the CPU
- *  the engine's uvicorn takes seconds to answer, and that is exactly when the
- *  admin queue page must stay usable.
- *  - fresh entry with a known snapshot (stale or fresh) → served immediately;
- *  - fresh entry still resolving (cold path) → raced against the cap;
- *  - expired entry → refresh kicked off; the previous snapshot is served
- *    immediately when one exists, else the new probe races the cap.
- *  `probe` must never reject (each caller catches into an error-carrying
- *  value); `capValue` is the honest "still running" placeholder. */
-type ProbeCacheEntry<T> = {
-  key: string;
-  expiresAt: number;
-  promise: Promise<T>;
-  value: T | null;
-};
-type ProbeCacheStore<T> = { current: ProbeCacheEntry<T> | null };
-function raceCachedProbe<T>(
-  store: ProbeCacheStore<T>,
-  key: string,
-  ttlMs: number,
-  capMs: number,
-  probe: () => Promise<T>,
-  capValue: () => T,
-): Promise<T> {
-  const now = Date.now();
-  const existing = store.current;
-  if (existing && existing.key === key && existing.expiresAt > now) {
-    if (existing.value) return Promise.resolve(existing.value);
-    return Promise.race([
-      existing.promise,
-      new Promise<T>((resolve) => setTimeout(() => resolve(capValue()), capMs)),
-    ]);
-  }
-  // Last-known snapshot (for the runtime probe possibly an older job set —
-  // still served with its own asOf timestamp, never presented as fresh).
-  const previous = existing?.value ?? null;
-  const entry: ProbeCacheEntry<T> = {
-    key,
-    expiresAt: now + ttlMs,
-    promise: probe().then((value) => {
-      if (store.current === entry) entry.value = value;
-      return value;
-    }),
-    value: previous,
-  };
-  store.current = entry;
-  if (previous) {
-    void entry.promise.catch(() => undefined);
-    return Promise.resolve(previous);
-  }
-  return Promise.race([
-    entry.promise,
-    new Promise<T>((resolve) => setTimeout(() => resolve(capValue()), capMs)),
-  ]);
-}
-
 const engineQueueCacheStore: ProbeCacheStore<{
   queue: EngineQueueState | null;
   error: string | null;
@@ -537,8 +487,12 @@ function getCachedEngineQueue(
   return raceCachedProbe(
     engineQueueCacheStore,
     "engine-queue",
-    ENGINE_QUEUE_FRESH_TTL_MS,
-    ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+    {
+      ttlMs: ENGINE_QUEUE_FRESH_TTL_MS,
+      capMs: ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+      failureTtlMs: ENGINE_PROBE_FAILURE_TTL_MS,
+      isFailure: (value) => value.error != null,
+    },
     () =>
       engine
         .getQueue()
@@ -555,8 +509,12 @@ export function getCachedEngineHealth(engine: EngineClient): Promise<{
   return raceCachedProbe(
     engineHealthCacheStore,
     "engine-health",
-    ENGINE_HEALTH_FRESH_TTL_MS,
-    ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+    {
+      ttlMs: ENGINE_HEALTH_FRESH_TTL_MS,
+      capMs: ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+      failureTtlMs: ENGINE_PROBE_FAILURE_TTL_MS,
+      isFailure: (value) => value.error != null,
+    },
     () =>
       engine
         .healthDetails()
@@ -575,8 +533,12 @@ function getCachedEngineCacheStats(
   return raceCachedProbe(
     engineCacheStatsCacheStore,
     "engine-cache-stats",
-    ENGINE_CACHE_STATS_FRESH_TTL_MS,
-    ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+    {
+      ttlMs: ENGINE_CACHE_STATS_FRESH_TTL_MS,
+      capMs: ENGINE_QUEUE_BACKGROUND_TIMEOUT_MS,
+      failureTtlMs: ENGINE_PROBE_FAILURE_TTL_MS,
+      isFailure: (value) => value.error != null,
+    },
     () =>
       engine
         .cacheStats()
@@ -737,8 +699,12 @@ function getCachedEngineRuntimes(
   return raceCachedProbe(
     engineRuntimeCacheStore,
     unique.join(","),
-    ENGINE_RUNTIME_FRESH_TTL_MS,
-    ENGINE_RUNTIME_RACE_CAP_MS,
+    {
+      ttlMs: ENGINE_RUNTIME_FRESH_TTL_MS,
+      capMs: ENGINE_RUNTIME_RACE_CAP_MS,
+      failureTtlMs: ENGINE_PROBE_FAILURE_TTL_MS,
+      isFailure: (value) => value.error != null,
+    },
     () =>
       engine
         .getJobRuntimes(unique)

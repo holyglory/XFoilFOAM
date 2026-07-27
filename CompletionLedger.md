@@ -159,6 +159,16 @@
   active; keep the temporary hydration cache bounded, and remeasure active-case
   growth before increasing solver concurrency.
 
+- **Engine observability single-flight deployment:** The Node control plane now
+  keeps one live owner across probe TTL expiry and changing runtime keys, and
+  backs off a settled engine-observability failure for 30 minutes. The Python
+  gateway also returns cached or explicitly unavailable worker-runtime data
+  instead of waiting behind a stalled Celery `inspect.conf()` lock. Both paths
+  have concurrency regressions. Deploy the Node guard immediately; install the
+  Python guard through guarded engine maintenance only after the active
+  OpenFOAM pool drains, then prove concurrent `/queue` polls cannot delay
+  `/health` and remove this item.
+
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`
   cutover are live. The strict volume canary, archive-only render proof,
