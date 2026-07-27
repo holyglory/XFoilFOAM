@@ -56,6 +56,7 @@
   geometry in a true modal that owns focus and scroll.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
+  [D-2026-07-27-workload-aware-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
@@ -5258,3 +5259,22 @@ Detail: [DecisionDetails/D-2026-07-19-urans-physical-tail.md](DecisionDetails/D-
 
 - Decision: preliminary URANS decides steady versus shedding from the complete trailing 2.1-slow-period physical horizon, while its compact trailing integer-period window remains responsible only for periodic coefficients, frame density, and publication. A non-flat physical tail must continue through the existing stationarity controller even when its final compact slice is locally quiet.
 - Why: using one period-cropped history for both decisions repeatedly rejected a real AoA 20 continuation after restoring its complete GCS trajectory. Treating the quiet slice as steady discards physical evidence; accepting it immediately bypasses stationarity; extending every case blindly wastes solver capacity. Independent byte-backed windows preserve the real solver sequence and route the still-relaxing case to bounded same-case continuation.
+
+## D-2026-07-27-workload-aware-disk-admission — Reserve remaining local work
+
+Detail: [DecisionDetails/D-2026-07-27-workload-aware-disk-admission.md](DecisionDetails/D-2026-07-27-workload-aware-disk-admission.md)
+
+- Decision: replace the fixed `24 GiB × active CPU-slot count` admission
+  estimate with conservative per-remaining-case reserves for local RANS, fast
+  URANS, and final URANS work. Keep a 20 GiB system floor, one 24 GiB unknown
+  next-local-job reserve, a 95% emergency ceiling, and a full fallback for
+  malformed work. Do not charge hub-issued work executing on another solver as
+  production local jobs; use local mounted-volume `statfs` when the engine disk
+  endpoint is temporarily saturated.
+- Why: the old rule reported 236 GiB required for a live mixed workload whose
+  directories occupied about 8.2 GiB because it treated execution slots as
+  full-batch disk exposures. Removing admission would repeat the full-disk
+  outage, while charging remote promises double-counts storage already owned by
+  the remote/GCS path. Measured p95 evidence sizes support conservative
+  fidelity-specific reserves that still allocate 24.375 GiB to a fresh
+  78-angle RANS sweep and fail safe for unknown work.

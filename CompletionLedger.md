@@ -154,9 +154,10 @@
   cancelled/invalid point generations still require the separate
   forensic/rejected-evidence path. Do not claim migration complete or remove
   any of those six local sources until their exact durable acknowledgement
-  exists. Preserve at least 80 GiB free while the campaign is active, keep the
-  temporary hydration cache bounded, and remeasure active-case growth before
-  increasing solver concurrency.
+  exists. Preserve the workload-aware 20 GiB system floor, measured remaining
+  local-work reserve, and 24 GiB next-local-job reserve while the campaign is
+  active; keep the temporary hydration cache bounded, and remeasure active-case
+  growth before increasing solver concurrency.
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`
