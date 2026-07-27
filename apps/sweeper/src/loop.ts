@@ -734,7 +734,7 @@ export async function tick(
   // retention and heartbeat progress above remain live so the system can
   // recover automatically instead of turning storage pressure into fake job
   // failures or a PostgreSQL outage.
-  let diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
+  let diskAdmission = await refreshDiskAdmission(db, engine);
   // Remote authority/evidence reconciliation remains early and admission-free.
   // Its NEW RANS lane is considered only after durable FAST URANS below.
   const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
@@ -868,7 +868,7 @@ export async function tick(
     remoteAdmissionConsumed = await admitRemoteSolverTick(db, engine, decision);
     if (remoteAdmissionConsumed) {
       inFlightJobs = await inFlight(db);
-      diskAdmission = await refreshDiskAdmission(db, engine, inFlightJobs);
+      diskAdmission = await refreshDiskAdmission(db, engine);
       localCapacityOpen =
         state.enabled &&
         !admissionFenced &&

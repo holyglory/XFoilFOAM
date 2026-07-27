@@ -1035,7 +1035,10 @@ export function validateThreeStageUransEnginePreflight(
       "the live evidence store is not the exact remote-only GCS tar+Zstandard contract",
     );
   }
-  const diskAdmission = evaluateDiskAdmission(preflight.disk, 0);
+  const diskAdmission = evaluateDiskAdmission(preflight.disk, {
+    activeLocalJobCount: 0,
+    activeLocalReservedBytes: 0,
+  });
   if (!diskAdmission.allowed)
     throw canaryError(diskAdmission.reason ?? "storage admission is closed");
   const supported = health.supported_engines ?? [];
