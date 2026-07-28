@@ -259,6 +259,12 @@ function SourcePerformance({
   source: AdminSolverPerformanceSource;
 }) {
   const max = Math.max(1, ...source.daily.map((item) => item.total));
+  const dailySummary = source.daily
+    .map(
+      (item) =>
+        `${dayLabel(item.day)}: ${formatCount(item.rans)} RANS, ${formatCount(item.preliminary)} FAST URANS, ${formatCount(item.final)} FINAL URANS`,
+    )
+    .join("; ");
   return (
     <article className="performance-source">
       <div className="performance-source-head">
@@ -271,21 +277,71 @@ function SourcePerformance({
           <span>last 24h</span>
         </div>
       </div>
-      <div className="source-spark" aria-hidden="true">
-        {source.daily.map((item) => (
-          <i
-            key={item.day}
-            style={{ height: `${Math.max(3, (item.total / max) * 100)}%` }}
-            title={`${dayLabel(item.day)}: ${item.total}`}
-          />
-        ))}
+      <div
+        className="source-spark"
+        role="img"
+        aria-label={`${source.name} daily accepted points by solver stage. ${dailySummary}`}
+      >
+        {source.daily.map((item) => {
+          const totalHeight = item.total
+            ? Math.max(3, (item.total / max) * 100)
+            : 0;
+          const ransShare = item.total ? (item.rans / item.total) * 100 : 0;
+          const preliminaryShare = item.total
+            ? (item.preliminary / item.total) * 100
+            : 0;
+          const finalShare = item.total ? (item.final / item.total) * 100 : 0;
+          return (
+            <div
+              className="source-spark-day"
+              key={item.day}
+              title={`${dayLabel(item.day)}: ${formatCount(item.rans)} RANS, ${formatCount(item.preliminary)} FAST URANS, ${formatCount(item.final)} FINAL URANS`}
+            >
+              <div
+                className="source-spark-column"
+                style={{ height: `${totalHeight}%` }}
+              >
+                <i
+                  aria-hidden="true"
+                  className="source-spark-rans"
+                  style={{ height: `${ransShare}%` }}
+                />
+                <i
+                  aria-hidden="true"
+                  className="source-spark-preliminary"
+                  style={{ height: `${preliminaryShare}%` }}
+                />
+                <i
+                  aria-hidden="true"
+                  className="source-spark-final"
+                  style={{ height: `${finalShare}%` }}
+                />
+              </div>
+            </div>
+          );
+        })}
       </div>
       <div className="performance-source-foot">
-        <span>{source.averagePerDay.toFixed(1)} pts/day avg</span>
         <span>
-          {source.totals24h.rans} R · {source.totals24h.preliminary} P ·{" "}
-          {source.totals24h.final} F
+          {source.averagePerDay.toFixed(1)} pts/day · 7-day all-stage avg
         </span>
+        <div
+          className="performance-source-breakdown"
+          aria-label="Last 24 hours by solver stage"
+        >
+          <span>
+            <i aria-hidden="true" className="source-key-rans" />
+            {formatCount(source.totals24h.rans)} RANS
+          </span>
+          <span>
+            <i aria-hidden="true" className="source-key-preliminary" />
+            {formatCount(source.totals24h.preliminary)} FAST URANS
+          </span>
+          <span>
+            <i aria-hidden="true" className="source-key-final" />
+            {formatCount(source.totals24h.final)} FINAL URANS
+          </span>
+        </div>
       </div>
     </article>
   );
@@ -976,15 +1032,65 @@ export function HealthPanel() {
           height: 42px;
           display: grid;
           grid-template-columns: repeat(7, minmax(0, 1fr));
-          align-items: end;
           gap: 4px;
           margin: 9px 0 6px;
           border-bottom: 1px solid ${C.axis};
         }
-        .source-spark i {
-          min-height: 2px;
+        .source-spark-day {
+          min-width: 0;
+          height: 100%;
+          display: flex;
+          align-items: flex-end;
+        }
+        .source-spark-column {
+          width: 100%;
+          display: flex;
+          flex-direction: column-reverse;
+          overflow: hidden;
           border-radius: 2px 2px 0 0;
+          transition: height 220ms ease;
+        }
+        .source-spark-column i {
+          width: 100%;
+          display: block;
+        }
+        .source-spark-rans,
+        .source-key-rans {
           background: ${C.teal};
+        }
+        .source-spark-preliminary,
+        .source-key-preliminary {
+          background: ${C.violet};
+        }
+        .source-spark-final,
+        .source-key-final {
+          background: ${C.amber};
+        }
+        .performance-source-foot {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 6px;
+          line-height: 1.35;
+        }
+        .performance-source-breakdown {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 4px 9px;
+        }
+        .performance-source-breakdown span {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          color: ${C.muted};
+          white-space: nowrap;
+        }
+        .performance-source-breakdown i {
+          width: 7px;
+          height: 7px;
+          display: inline-block;
+          flex: 0 0 auto;
+          border-radius: 2px;
         }
         @media (max-width: 980px) {
           .health-grid {
