@@ -13,7 +13,6 @@ import {
   formatAge,
   isProcessDead,
   type SolverStateName,
-  tickStalledForMs,
 } from "../../../lib/solver-state";
 
 // Local copy of ui.tsx's fCount: importing ui.tsx here would drag the React
@@ -129,14 +128,6 @@ export function campaignInstrumentStatus(
         detail:
           "Campaign scheduling is waiting for the engine health check to recover",
         tone: "red",
-        action: null,
-      };
-    }
-    if (line.gate.text.startsWith("SLOW")) {
-      return {
-        title: "Scheduler responding slowly",
-        detail: "The current tick is still running; no action is required",
-        tone: "amber",
         action: null,
       };
     }
@@ -281,12 +272,9 @@ export function gateFromSolverState(
     case "paused":
       return { text: "BLOCKED — sweeper disabled", tone: "amber" };
     case "tick_stalled":
-      // Not a BLOCKED gate: scheduling continues next tick — the badge is an
-      // honest amber slowness signal, never a false red.
-      return {
-        text: "SLOW — tick running; engine responding slowly",
-        tone: "amber",
-      };
+      // A long scheduler cycle is advisory global telemetry, not a campaign
+      // gate. It neither proves an engine problem nor changes campaign state.
+      return null;
     default:
       return null;
   }
@@ -349,9 +337,6 @@ export function campaignHubSchedulerStatusText(
   }
   if (solverState === "engine_unreachable") {
     return "Engine unreachable — submissions are held with backoff.";
-  }
-  if (solverState === "tick_stalled") {
-    return "Tick running — engine responding slowly; scheduling continues next tick.";
   }
   if (solverState === "engine_unhealthy") {
     return "Engine unhealthy — no jobs are being submitted.";
@@ -619,26 +604,6 @@ export function campaignStatusLine(
           lifecycle,
           text: `Engine unhealthy${scheduler.engineError ? ` (${scheduler.engineError})` : ""} — no jobs are being submitted.`,
           tone: "red",
-        };
-      }
-      // tick_stalled (liveness/progress split): heartbeat fresh but the
-      // current tick started >5 min ago without completing — a slow engine
-      // call is holding the tick. AMBER and non-blocking: scheduling
-      // continues next tick, so this ranks below every BLOCKED gate above.
-      const stalledForMs = tickStalledForMs(
-        scheduler.lastTickStartedAt ?? null,
-        scheduler.lastTickCompletedAt ?? null,
-        nowMs,
-      );
-      if (stalledForMs != null) {
-        return {
-          gate: {
-            text: "SLOW — tick running; engine responding slowly",
-            tone: "amber",
-          },
-          lifecycle,
-          text: `Tick running ${formatAge(stalledForMs)} — engine responding slowly; scheduling continues next tick.`,
-          tone: "amber",
         };
       }
       // Point counters update on INGEST, so between job submission and the

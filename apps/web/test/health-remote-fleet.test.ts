@@ -23,6 +23,16 @@ describe("admin health compute fleet", () => {
     expect(source).toContain("admissionBlocked");
   });
 
+  it("labels whole-host load with its CPU scope so it cannot masquerade as solver-slot utilization", () => {
+    expect(source).toContain("1m whole-host load · not solver CPU");
+    expect(source).toContain("load1.toFixed(1)");
+    expect(source).toContain("availableCpus");
+    expect(source).not.toContain("<span>host load</span>");
+    expect(source).not.toContain(
+      "formatPct(node.health?.cpu.loadPct, 0)",
+    );
+  });
+
   it("shows per-solver and overall daily point throughput", () => {
     expect(source).toContain('data-testid="health-performance"');
     expect(source).toContain("performance.daily");

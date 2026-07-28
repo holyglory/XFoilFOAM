@@ -38,6 +38,7 @@ import {
   segmentWorkflowFillHeight,
 } from "./coverage-segments";
 import { fCount, ghostBtn, inputStyle } from "./ui";
+import { createLatestOnlyTaskController } from "./usePoll";
 
 const PAGE_LIMIT = 50;
 const ROW_H = 30; // 16px bar + 7px breathing top/bottom (mockup .cov)
@@ -101,6 +102,10 @@ export function CoverageMatrix({
   const [hover, setHover] = useState<HoverTip | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const loadingRef = useRef(false);
+  const pagesRef = useRef<PageState[]>([]);
+  const campaignIdRef = useRef(campaignId);
+  pagesRef.current = pages;
+  campaignIdRef.current = campaignId;
 
   // Measured root width drives the fixed name column (170–220px) and the
   // chord-grouping threshold — no matchMedia, no horizontal overflow. The
@@ -162,39 +167,58 @@ export function CoverageMatrix({
   }, [campaignId, nextCursor]);
 
   // Poll refresh (spec §10): refetch only the pages intersecting the current
-  // viewport, using their original keyset cursors.
+  // viewport, using their original keyset cursors. Slow refreshes are
+  // serialized and one newer poll is coalesced: obsolete Promise.all calls
+  // must not pile up or make the matrix churn while the summary endpoint is
+  // already under load.
   const visiblePagesRef = useRef<Set<number>>(new Set([0]));
+  const refreshControllerRef = useRef<ReturnType<
+    typeof createLatestOnlyTaskController
+  > | null>(null);
   useEffect(() => {
-    if (pollKey === 0 || pages.length === 0) return;
-    const targets = [...visiblePagesRef.current].filter(
-      (i) => i < pages.length,
-    );
-    if (targets.length === 0) targets.push(0);
-    let cancelled = false;
-    void Promise.all(
-      targets.map(async (i) => {
-        const refreshed = await getCampaignAirfoils(
-          campaignId,
-          pages[i].cursor,
-          PAGE_LIMIT,
-        ).catch(() => null);
-        return { i, refreshed };
-      }),
-    ).then((updates) => {
-      if (cancelled) return;
+    let mounted = true;
+    const controller = createLatestOnlyTaskController(async (signal) => {
+      const targetCampaignId = campaignIdRef.current;
+      const pageSnapshot = pagesRef.current;
+      const targets = [...visiblePagesRef.current].filter(
+        (i) => i < pageSnapshot.length,
+      );
+      if (targets.length === 0 && pageSnapshot.length > 0) targets.push(0);
+      if (targets.length === 0) return;
+      const updates = await Promise.all(
+        targets.map(async (i) => {
+          const refreshed = await getCampaignAirfoils(
+            targetCampaignId,
+            pageSnapshot[i].cursor,
+            PAGE_LIMIT,
+            signal,
+          ).catch(() => null);
+          return { i, refreshed };
+        }),
+      );
+      if (!mounted || campaignIdRef.current !== targetCampaignId) return;
       setPages((prev) => {
         const next = [...prev];
         for (const { i, refreshed } of updates) {
           if (refreshed && next[i])
             next[i] = { cursor: next[i].cursor, rows: refreshed.items };
         }
+        pagesRef.current = next;
         return next;
       });
     });
+    refreshControllerRef.current = controller;
     return () => {
-      cancelled = true;
+      mounted = false;
+      controller.stop();
+      if (refreshControllerRef.current === controller)
+        refreshControllerRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (pollKey === 0 || pagesRef.current.length === 0) return;
+    refreshControllerRef.current?.request();
   }, [pollKey]);
 
   const pageOfSlug = useMemo(() => {

@@ -7105,6 +7105,18 @@ export interface CampaignListItem {
    *  reported by failed/rejected/blocked totals instead. */
   reviewBuckets: CampaignReviewBuckets;
   automaticPrecalcOpen: number;
+  /** Everything the campaign card needs beyond the progress counters. This is
+   * populated by the bounded list read model so the browser never fans out to
+   * one full campaign-summary request per visible card. */
+  card: {
+    objectives: {
+      ldMax: boolean;
+      clZero: boolean;
+      clMax: boolean;
+    };
+    reynolds: number[];
+    campaignJobsRunning: number;
+  };
   latestLifecycleEvent: {
     action: string;
     actor: string | null;
@@ -7130,6 +7142,26 @@ export async function listCampaigns(
     SELECT
       c.id, c.slug, c.name, c.status, c.priority, c.notes,
       c.closed_with_failed_count, c.closed_with_rejected_count, c."completedAt" AS completed_at, c."createdAt" AS created_at, c."updatedAt" AS updated_at,
+      COALESCE((current_plan.plan #>> '{objectives,ldMax,enabled}')::boolean, false) AS objective_ld_max_enabled,
+      COALESCE((current_plan.plan #>> '{objectives,clZero,enabled}')::boolean, false) AS objective_cl_zero_enabled,
+      COALESCE((current_plan.plan #>> '{objectives,clMax,enabled}')::boolean, false) AS objective_cl_max_enabled,
+      ARRAY(
+        SELECT distinct_condition.reynolds
+        FROM (
+          SELECT DISTINCT current_condition.reynolds::float8 AS reynolds
+          FROM sim_campaign_conditions current_condition
+          WHERE current_condition.campaign_id = c.id
+            AND current_condition.generation = c.current_condition_generation
+            AND current_condition.status <> 'released'
+        ) distinct_condition
+        ORDER BY distinct_condition.reynolds
+      ) AS reynolds_values,
+      (
+        SELECT count(*)::int
+        FROM sim_jobs campaign_job
+        WHERE campaign_job.campaign_id = c.id
+          AND campaign_job.status IN ('submitted', 'running', 'ingesting')
+      ) AS campaign_jobs_running,
       lifecycle.action AS lifecycle_action,
       lifecycle.actor AS lifecycle_actor,
       lifecycle.reason AS lifecycle_reason,
@@ -7191,6 +7223,8 @@ export async function listCampaigns(
       ) AS automatic_precalc_open,
       count(*) OVER ()::int AS total
     FROM sim_campaigns c
+    LEFT JOIN sim_campaign_plan_revisions current_plan
+      ON current_plan.id = c.current_plan_revision_id
     LEFT JOIN (
       SELECT progress.campaign_id AS campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
              sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
@@ -7243,6 +7277,17 @@ export async function listCampaigns(
       createdAt: isoOf(r.created_at as Date | string | null)!,
       updatedAt: isoOf(r.updated_at as Date | string | null)!,
       automaticPrecalcOpen: Number(r.automatic_precalc_open ?? 0),
+      card: {
+        objectives: {
+          ldMax: Boolean(r.objective_ld_max_enabled),
+          clZero: Boolean(r.objective_cl_zero_enabled),
+          clMax: Boolean(r.objective_cl_max_enabled),
+        },
+        reynolds: Array.isArray(r.reynolds_values)
+          ? r.reynolds_values.map(Number).filter(Number.isFinite)
+          : [],
+        campaignJobsRunning: Number(r.campaign_jobs_running ?? 0),
+      },
       latestLifecycleEvent:
         r.lifecycle_action == null || r.lifecycle_created_at == null
           ? null
@@ -7353,7 +7398,9 @@ export interface CampaignSummary {
   lanesSummary: Record<string, Record<string, number>>;
 }
 
-/** Bounded summary for the 10 s poll: O(conditions), counters only. */
+/** Bounded summary for the 10 s poll. Independent read models execute
+ * concurrently; sparse source-first ladder queries avoid campaign-wide point
+ * scans for the few exceptional URANS/review cells. */
 export async function campaignSummary(
   db: DB,
   campaignId: string,
@@ -7362,53 +7409,29 @@ export async function campaignSummary(
     db,
     campaignId,
   );
-  const progress = await campaignProgressSnapshot(db, campaignId);
-  const totals = progress.totals;
-  const tierCounts = await campaignOpenTierCounts(db, campaignId);
-  const solverIncidents = await solverIncidentSummary(db, {
-    campaignId,
-    currentGenerationOnly: true,
-  });
-  const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
-  const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
-    (acc, row) => ({
-      awaitingUrans: acc.awaitingUrans + row.awaitingUrans,
-      needsReview: acc.needsReview + row.needsReview,
-    }),
-    { awaitingUrans: 0, needsReview: 0 },
-  );
-  const reviewByCondition = new Map<string, CampaignReviewBuckets>();
-  for (const row of reviewBucketRows) {
-    const prev = reviewByCondition.get(row.conditionId) ?? {
-      awaitingUrans: 0,
-      needsReview: 0,
-    };
-    reviewByCondition.set(row.conditionId, {
-      awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
-      needsReview: prev.needsReview + row.needsReview,
-    });
-  }
-  const [scopeRow] = (await db.execute(sql`
+  const scopeRowsPromise = db.execute(sql`
     SELECT
       count(*) FILTER (WHERE airfoil."archivedAt" IS NULL AND airfoil."deletedAt" IS NULL)::int AS active,
       count(*) FILTER (WHERE airfoil."archivedAt" IS NOT NULL OR airfoil."deletedAt" IS NOT NULL)::int AS excluded
     FROM sim_campaign_airfoils scope
     JOIN airfoils airfoil ON airfoil.id = scope.airfoil_id
     WHERE scope.campaign_id = ${campaignId}
-  `)) as unknown as Array<{ active: number; excluded: number }>;
-  const [lifecycleRow] = (await db.execute(sql`
+  `) as unknown as Promise<Array<{ active: number; excluded: number }>>;
+  const lifecycleRowsPromise = db.execute(sql`
     SELECT action, actor, reason, "createdAt" AS created_at
     FROM sim_campaign_lifecycle_events
     WHERE campaign_id = ${campaignId}
     ORDER BY "createdAt" DESC, id DESC
     LIMIT 1
-  `)) as unknown as Array<{
-    action: string;
-    actor: string | null;
-    reason: string | null;
-    created_at: Date | string;
-  }>;
-  const conditionRows = (await db.execute(sql`
+  `) as unknown as Promise<
+    Array<{
+      action: string;
+      actor: string | null;
+      reason: string | null;
+      created_at: Date | string;
+    }>
+  >;
+  const conditionRowsPromise = db.execute(sql`
     SELECT
       cc.id, cc.ord, cc.status,
       cc.flow_condition_id, cc.reference_geometry_profile_id, cc.preset_id, cc.simulation_preset_revision_id,
@@ -7449,15 +7472,60 @@ export async function campaignSummary(
     WHERE cc.campaign_id = ${campaignId}
       AND cc.generation = ${campaign.currentConditionGeneration}
     ORDER BY cc.ord ASC
-  `)) as unknown as Array<Record<string, unknown>>;
-  const laneRows = (await db.execute(sql`
+  `) as unknown as Promise<Array<Record<string, unknown>>>;
+  const laneRowsPromise = db.execute(sql`
     SELECT lane.objective, lane.state, count(*)::int AS n
     FROM sim_campaign_lanes lane
     JOIN sim_campaign_conditions condition ON condition.id = lane.condition_id
     WHERE lane.campaign_id = ${campaignId}
       AND condition.generation = ${campaign.currentConditionGeneration}
     GROUP BY lane.objective, lane.state
-  `)) as unknown as Array<{ objective: string; state: string; n: number }>;
+  `) as unknown as Promise<
+    Array<{ objective: string; state: string; n: number }>
+  >;
+  const [
+    progress,
+    tierCounts,
+    solverIncidents,
+    reviewBucketRows,
+    scopeRows,
+    lifecycleRows,
+    conditionRows,
+    laneRows,
+  ] = await Promise.all([
+    campaignProgressSnapshot(db, campaignId),
+    campaignOpenTierCounts(db, campaignId),
+    solverIncidentSummary(db, {
+      campaignId,
+      currentGenerationOnly: true,
+    }),
+    campaignReviewBucketRows(db, campaignId),
+    scopeRowsPromise,
+    lifecycleRowsPromise,
+    conditionRowsPromise,
+    laneRowsPromise,
+  ]);
+  const totals = progress.totals;
+  const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
+    (acc, row) => ({
+      awaitingUrans: acc.awaitingUrans + row.awaitingUrans,
+      needsReview: acc.needsReview + row.needsReview,
+    }),
+    { awaitingUrans: 0, needsReview: 0 },
+  );
+  const reviewByCondition = new Map<string, CampaignReviewBuckets>();
+  for (const row of reviewBucketRows) {
+    const prev = reviewByCondition.get(row.conditionId) ?? {
+      awaitingUrans: 0,
+      needsReview: 0,
+    };
+    reviewByCondition.set(row.conditionId, {
+      awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
+      needsReview: prev.needsReview + row.needsReview,
+    });
+  }
+  const [scopeRow] = scopeRows;
+  const [lifecycleRow] = lifecycleRows;
   const lanesSummary: Record<string, Record<string, number>> = {};
   for (const row of laneRows) {
     lanesSummary[row.objective] = {

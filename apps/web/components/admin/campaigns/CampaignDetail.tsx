@@ -133,13 +133,14 @@ export function CampaignDetail({
 
   const stripRef = useRef<HTMLDivElement>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
-      const next = await getCampaign(campaignId);
+      const next = await getCampaign(campaignId, signal);
       setSummary(next);
       setLoadError(null);
       setPollKey((k) => k + 1);
     } catch (e) {
+      if (signal?.aborted) return;
       setLoadError((e as Error).message);
     }
   }, [campaignId]);

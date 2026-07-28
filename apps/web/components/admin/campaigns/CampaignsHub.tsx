@@ -12,7 +12,6 @@ import {
   type AdminCampaignsSolverState,
   type AdminCampaignSummary,
   campaignVerb,
-  getCampaign,
   getCampaignDuplicatePrefill,
   listCampaigns,
 } from "@/lib/admin";
@@ -77,14 +76,20 @@ export function campaignHubStatusLine(
   item: AdminCampaignListItem,
   summary: AdminCampaignSummary | undefined,
   solverState: SolverStateName,
+  listScheduler?: {
+    sweeperEnabled: boolean;
+    engineUnreachableSince: string | null;
+  },
 ): string {
   const totals = summary?.totals ?? item.totals;
   const blocked = totals.blocked ?? 0;
   const automaticFast = campaignAutomaticFastCount(item);
   const scheduler = summary?.scheduler;
+  const campaignJobsRunning =
+    scheduler?.campaignJobsRunning ?? item.card?.campaignJobsRunning ?? 0;
   if (item.status === "archived") return "Archived — read-only.";
   if (item.status === "cancelled") {
-    const finishing = scheduler?.campaignJobsRunning ?? 0;
+    const finishing = campaignJobsRunning;
     return finishing > 0
       ? `Cancelled — ${finishing} job${finishing === 1 ? "" : "s"} finishing.`
       : "Cancelled — evidence kept.";
@@ -99,7 +104,7 @@ export function campaignHubStatusLine(
       : `Completed${item.completedAt ? ` ${ago(item.completedAt)}` : ""}.`;
   }
   if (item.status === "paused") {
-    const running = scheduler?.campaignJobsRunning ?? 0;
+    const running = campaignJobsRunning;
     return pausedCampaignStatusText(
       summary?.latestLifecycleEvent ?? item.latestLifecycleEvent,
       running,
@@ -124,7 +129,10 @@ export function campaignHubStatusLine(
   // first: never a bare "Active — waiting" while nothing can run. Gated
   // lines drop the "Active —" prefix entirely (mockup fec7b453 screen 3):
   // the gate badge is the headline and the small lifecycle chip says active.
-  const schedulerGate = campaignHubSchedulerStatusText(solverState, scheduler);
+  const schedulerGate = campaignHubSchedulerStatusText(
+    solverState,
+    scheduler ?? listScheduler,
+  );
   if (schedulerGate) return schedulerGate;
   const parts = [`${fCount(totals.remaining)} points remaining`];
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
@@ -137,14 +145,13 @@ export function campaignHubStatusLine(
   return `Active — ${parts.join(" · ")}.`;
 }
 
-function kindChip(summary: AdminCampaignSummary | undefined): string | null {
-  if (!summary) return null;
-  const { ldMax, clZero, clMax } = summary.campaign.plan.objectives;
-  // clMax is optional on pre-clMax plan revisions — absence means disabled.
+function kindChip(item: AdminCampaignListItem): string | null {
+  if (!item.card) return null;
+  const { ldMax, clZero, clMax } = item.card.objectives;
   const enabled = [
-    ldMax.enabled ? "max L/D" : null,
-    clZero.enabled ? "zero-lift" : null,
-    clMax?.enabled ? "Cl_max" : null,
+    ldMax ? "max L/D" : null,
+    clZero ? "zero-lift" : null,
+    clMax ? "Cl_max" : null,
   ].filter((x): x is string => x != null);
   if (enabled.length === 0) return "polar sweep";
   if (enabled.length === 1)
@@ -161,9 +168,6 @@ export function CampaignsHub({
   const [segment, setSegment] = useState<"active" | "all">("active");
   const [items, setItems] = useState<AdminCampaignListItem[] | null>(null);
   const [total, setTotal] = useState(0);
-  const [summaries, setSummaries] = useState<
-    Record<string, AdminCampaignSummary>
-  >({});
   const [solverPayload, setSolverPayload] =
     useState<AdminCampaignsSolverState | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -174,36 +178,22 @@ export function CampaignsHub({
   const segmentRef = useRef(segment);
   segmentRef.current = segment;
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
       const seg = segmentRef.current;
-      const result = await listCampaigns({
-        statuses: seg === "active" ? ACTIVE_STATUSES : undefined,
-        limit: 50,
-      });
+      const result = await listCampaigns(
+        {
+          statuses: seg === "active" ? ACTIVE_STATUSES : undefined,
+          limit: 50,
+        },
+        signal,
+      );
       setErr(null);
       setItems(result.items);
       setTotal(result.total);
       setSolverPayload(result.solverState ?? null);
-      // Bounded per-card summaries (limit 50, O(conditions) each) give the
-      // real kind/objective chips, Re chips and scheduler truth fields.
-      const detail = await Promise.all(
-        result.items.map(async (item) => {
-          try {
-            return [item.id, await getCampaign(item.id)] as const;
-          } catch {
-            return null;
-          }
-        }),
-      );
-      setSummaries(
-        Object.fromEntries(
-          detail.filter(
-            (d): d is readonly [string, AdminCampaignSummary] => d != null,
-          ),
-        ),
-      );
     } catch (e) {
+      if (signal?.aborted) return;
       setErr((e as Error).message);
     }
   }, []);
@@ -315,7 +305,11 @@ export function CampaignsHub({
         <button
           type="button"
           data-testid="hub-solver-chip"
-          title="Open the Solver page"
+          title={
+            solver.state === "tick_stalled"
+              ? "Scheduler online; the current cycle is taking longer than usual. Existing solves continue; open Solver if the delay persists."
+              : "Open the Solver page"
+          }
           onClick={onOpenSolver}
           style={{
             fontFamily: MONO,
@@ -410,12 +404,10 @@ export function CampaignsHub({
       ) : (
         <div style={{ display: "grid", gap: 10 }}>
           {sorted.map((item) => {
-            const summary = summaries[item.id];
-            const totals = summary?.totals ?? item.totals;
+            const totals = item.totals;
             const blocked = totals.blocked ?? 0;
             const automaticFast = campaignAutomaticFastCount(item);
-            const repairing =
-              summary?.remediation.repairing ?? item.remediation.repairing;
+            const repairing = item.remediation.repairing;
             const settled = totals.solved + totals.derived;
             const progress =
               totals.requested > 0
@@ -425,16 +417,8 @@ export function CampaignsHub({
               totals.requested > 0
                 ? Math.min(1 - progress, blocked / totals.requested)
                 : 0;
-            const chip = kindChip(summary);
-            const reValues = summary
-              ? [
-                  ...new Set(
-                    summary.conditions
-                      .filter((c) => c.status !== "released")
-                      .map((c) => formatRe(c.reynolds)),
-                  ),
-                ]
-              : [];
+            const chip = kindChip(item);
+            const reValues = (item.card?.reynolds ?? []).map(formatRe);
             const attentionColor =
               blocked > 0 ? C.red : automaticFast > 0 ? C.violet : C.amber;
             const statusColor =
@@ -651,7 +635,18 @@ export function CampaignsHub({
                               : C.text2,
                   }}
                 >
-                  {campaignHubStatusLine(item, summary, solver.state)}
+                  {campaignHubStatusLine(
+                    item,
+                    undefined,
+                    solver.state,
+                    solverPayload
+                      ? {
+                          sweeperEnabled: solverPayload.enabled,
+                          engineUnreachableSince:
+                            solverPayload.engineUnreachableSince,
+                        }
+                      : undefined,
+                  )}
                 </div>
 
                 <div

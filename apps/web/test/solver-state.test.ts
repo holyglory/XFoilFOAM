@@ -466,8 +466,12 @@ describe("tick_stalled (liveness/progress split)", () => {
     expect(d.tone).toBe("amber");
     expect(d.tone).not.toBe("red");
     expect(d.headline).toBe(
-      "Tick running 6m — engine responding slowly; scheduling continues next tick.",
+      "Scheduler cycle delayed for 6m.",
     );
+    expect(d.detail).toBe(
+      "Existing solves continue; new scheduling waits for this cycle. Open Solver if the delay persists.",
+    );
+    expect(`${d.headline} ${d.detail}`).not.toContain("engine");
   });
 
   it("MUST-CATCH: stale heartbeat -> red process_not_running regardless of tick fields", () => {
@@ -583,7 +587,7 @@ describe("tick_stalled (liveness/progress split)", () => {
   });
 
   it("label + chip copy for the new state", () => {
-    expect(solverStateLabel("tick_stalled")).toBe("TICK STALLED");
-    expect(solverChipText("tick_stalled")).toBe("scheduler · tick stalled");
+    expect(solverStateLabel("tick_stalled")).toBe("SCHEDULER DELAYED");
+    expect(solverChipText("tick_stalled")).toBe("scheduler · delayed");
   });
 });

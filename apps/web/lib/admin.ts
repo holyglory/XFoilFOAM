@@ -191,21 +191,14 @@ export interface AdminSolverIncidentEvent {
   reason: string;
   severity: AdminSolverIncidentSeverity;
   status: "open" | "resolved";
-  operationalState:
-    | "automatic_recovery"
-    | "system_attention"
-    | "resolved";
+  operationalState: "automatic_recovery" | "system_attention" | "resolved";
   userActionRequired: false;
   solverImplementationId: string;
   solverImplementationKey: string;
   remediationVersion: string;
   occurrenceKey: string;
   owner: {
-    type:
-      | "result"
-      | "precalc_obligation"
-      | "verify_queue"
-      | "urans_request";
+    type: "result" | "precalc_obligation" | "verify_queue" | "urans_request";
     id: string;
   };
   simJobId: string | null;
@@ -720,13 +713,20 @@ export const adminGoogleLoginUrl = (returnTo = "/admin") =>
   `${BASE}/api/admin/oauth/google?returnTo=${encodeURIComponent(returnTo)}`;
 export const adminLogout = () =>
   aj<{ ok: boolean }>("/api/admin/logout", { method: "POST" });
-export const getAdminHealth = () => aj<AdminHealth>("/api/admin/health");
+export const getAdminHealth = (signal?: AbortSignal) =>
+  aj<AdminHealth>("/api/admin/health", { signal });
 export const getAdminSolverIncidentLog = (sinceHours = 24, limit = 100) =>
   aj<AdminSolverIncidentLog>(
     `/api/admin/solver-incidents?sinceHours=${encodeURIComponent(String(sinceHours))}&limit=${encodeURIComponent(String(limit))}`,
   );
-export const getAdminQueue = (scope: AdminQueueScope = "all") =>
-  aj<AdminQueue>(`/api/admin/queue${scope === "all" ? "" : `?scope=${scope}`}`);
+export const getAdminQueue = (
+  scope: AdminQueueScope = "all",
+  signal?: AbortSignal,
+) =>
+  aj<AdminQueue>(
+    `/api/admin/queue${scope === "all" ? "" : `?scope=${scope}`}`,
+    { signal },
+  );
 
 /** One REAL solved result row (results: status=done, source=solved, solvedAt
  *  set) — derived/mirrored display points are never listed here. */
@@ -1791,6 +1791,18 @@ export interface AdminCampaignListItem {
   remediation: CampaignRemediationSummary;
   reviewBuckets?: CampaignReviewBuckets;
   automaticPrecalcOpen: number;
+  /** Bounded campaign-card read model returned by the list endpoint. Optional
+   * at the browser boundary so a new web container remains compatible with
+   * the previous API during a normal rolling control-plane deployment. */
+  card?: {
+    objectives: {
+      ldMax: boolean;
+      clZero: boolean;
+      clMax: boolean;
+    };
+    reynolds: number[];
+    campaignJobsRunning: number;
+  };
 }
 
 export interface AdminCampaignConditionSummary {
@@ -2241,11 +2253,14 @@ export interface AdminCampaignsSolverState {
   lastAdmissionFenceDetails?: AdminAdmissionFenceContext | null;
 }
 
-export const listCampaigns = (params?: {
-  statuses?: string[];
-  limit?: number;
-  offset?: number;
-}) => {
+export const listCampaigns = (
+  params?: {
+    statuses?: string[];
+    limit?: number;
+    offset?: number;
+  },
+  signal?: AbortSignal,
+) => {
   const qs = new URLSearchParams();
   if (params?.statuses?.length) qs.set("status", params.statuses.join(","));
   if (params?.limit != null) qs.set("limit", String(params.limit));
@@ -2255,21 +2270,25 @@ export const listCampaigns = (params?: {
     items: AdminCampaignListItem[];
     total: number;
     solverState: AdminCampaignsSolverState;
-  }>(`/api/admin/campaigns${suffix}`);
+  }>(`/api/admin/campaigns${suffix}`, { signal });
 };
 
-export const getCampaign = (id: string) =>
-  aj<AdminCampaignSummary>(`/api/admin/campaigns/${encodeURIComponent(id)}`);
+export const getCampaign = (id: string, signal?: AbortSignal) =>
+  aj<AdminCampaignSummary>(`/api/admin/campaigns/${encodeURIComponent(id)}`, {
+    signal,
+  });
 
 export const getCampaignAirfoils = (
   id: string,
   cursor?: string | null,
   limit = 25,
+  signal?: AbortSignal,
 ) => {
   const qs = new URLSearchParams({ limit: String(limit) });
   if (cursor) qs.set("cursor", cursor);
   return aj<{ items: AdminCampaignAirfoilRow[]; nextCursor: string | null }>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/airfoils?${qs.toString()}`,
+    { signal },
   );
 };
 

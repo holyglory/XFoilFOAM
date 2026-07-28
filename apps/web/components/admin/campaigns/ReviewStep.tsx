@@ -311,11 +311,12 @@ export function ReviewStep({
   // Queue context poll (10 s, hidden-tab aware). The review context needs
   // backlog counters + sweeper + engine reachability only — the cheap
   // activity scope, never the full gap-scan payload (spec §10/§12).
-  usePoll(async () => {
+  usePoll(async (signal) => {
     try {
-      setQueue(await getAdminQueue("activity"));
+      setQueue(await getAdminQueue("activity", signal));
       setQueueError(null);
     } catch (e) {
+      if (signal?.aborted) return;
       setQueueError((e as Error).message);
     }
   }, 10_000);

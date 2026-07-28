@@ -5387,7 +5387,7 @@ function QueueDashboard({
   const tabRef = useRef(tab);
   tabRef.current = tab;
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
     try {
@@ -5399,7 +5399,7 @@ function QueueDashboard({
       // traffic at all while it is open.
       while (scope) {
         const next = await (consumeQueuePrefetch(scope) ??
-          getAdminQueue(scope));
+          getAdminQueue(scope, signal));
         setQueue((prev) => mergeAdminQueue(prev, next));
         setErr(null);
         const active = solverScopeForTab(tabRef.current);
@@ -5407,6 +5407,7 @@ function QueueDashboard({
         scope = active;
       }
     } catch (e) {
+      if (signal?.aborted) return;
       setErr((e as Error).message);
     } finally {
       refreshingRef.current = false;
@@ -5491,8 +5492,8 @@ function QueueDashboard({
     campaignPointsSolving,
     backlogOpen,
     // Tick-progress pair (liveness/progress split): a fresh heartbeat with a
-    // >5 min unfinished tick derives the amber TICK STALLED banner instead of
-    // a false red PROCESS NOT RUNNING (2026-07-06 prod incident).
+    // >5 min unfinished tick derives the amber SCHEDULER DELAYED banner
+    // instead of a false red PROCESS NOT RUNNING (2026-07-06 prod incident).
     lastTickStartedAt: sw?.lastTickStartedAt ?? null,
     lastTickCompletedAt: sw?.lastTickCompletedAt ?? null,
     diskAdmissionBlocked: sw?.diskAdmissionBlocked ?? false,

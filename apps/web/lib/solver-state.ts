@@ -200,7 +200,7 @@ export function solverStateLabel(state: SolverStateName): string {
     case "storage_blocked":
       return "STORAGE BLOCKED";
     case "tick_stalled":
-      return "TICK STALLED";
+      return "SCHEDULER DELAYED";
     case "idle":
       return "IDLE";
     case "running":
@@ -236,7 +236,7 @@ export function solverChipText(
     case "storage_blocked":
       return "scheduler · storage blocked";
     case "tick_stalled":
-      return "scheduler · tick stalled";
+      return "scheduler · delayed";
     case "unknown":
       return "scheduler · status unknown";
   }
@@ -370,9 +370,9 @@ export function deriveSolverState(
     return {
       state: "tick_stalled",
       tone: "amber",
-      headline: `Tick running ${formatAge(stalledForMs)} — engine responding slowly; scheduling continues next tick.`,
+      headline: `Scheduler cycle delayed for ${formatAge(stalledForMs)}.`,
       detail:
-        "Process heartbeat is fresh — the sweeper is alive; a slow engine call is holding the current scheduler tick.",
+        "Existing solves continue; new scheduling waits for this cycle. Open Solver if the delay persists.",
       secondary,
     };
   }

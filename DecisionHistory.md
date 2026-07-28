@@ -2,6 +2,12 @@
 
 ## Direction
 
+- Confirmed intent: internal scheduler latency is one global advisory, not a
+  campaign failure or an inferred engine diagnosis. Campaign progress reads
+  begin from sparse owning work records, independent counters execute
+  concurrently, and browser polling is completion-relative with no overlapping
+  request or matrix-refresh generations.
+  [D-2026-07-28-scheduler-delay-and-campaign-polling]
 - Confirmed intent: immutable per-frame solver evidence stays exact and
   unsmoothed. Instantaneous Cl/Cd is derived from the stored Cl and Cd samples,
   chart domains must not visually amplify sub-percent algebraic movement into
@@ -150,6 +156,22 @@
   reachable without horizontal scrolling; narrow layouts use accessible burger
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-07-28-scheduler-delay-and-campaign-polling — Honest advisory and bounded live reads
+
+- Decision: render an unfinished scheduler cycle once as a global
+  `Scheduler delayed` advisory with no campaign gate or invented engine cause;
+  existing solves continue while new scheduling waits, and an administrator
+  opens Solver details only if the delay persists. Derive sparse campaign
+  ladder counts source-first, run independent summary reads concurrently, and
+  serialize/coalesce browser polling and coverage refreshes.
+  [detail](DecisionDetails/D-2026-07-28-scheduler-delay-and-campaign-polling.md)
+- Why: repeated campaign warnings turned non-actionable internal progress
+  telemetry into a false user task, while whole-campaign scans and overlapping
+  fixed-interval requests made the ten-second live view amplify its own load.
+  Hiding the signal would discard useful operations evidence, and merely
+  polling less often or caching stale campaign state would not fix first-load
+  cost or truthful live progress.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

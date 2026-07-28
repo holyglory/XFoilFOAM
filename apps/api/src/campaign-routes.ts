@@ -213,20 +213,24 @@ export async function registerCampaignRoutes(
         offset: z.coerce.number().int().min(0).default(0),
       })
       .parse(req.query);
-    const listing = await listCampaigns(db, {
-      statuses: q.status,
-      limit: q.limit,
-      offset: q.offset,
-    });
     // Cheap solver-state block (pinned contract): sweeper_state row + active
     // sim_jobs count + the SAME cached engine-health probe the queue endpoint
     // uses — no new probe paths.
-    const sweeper = await readSweeperState();
-    const { health, error: engineError } =
-      await getCachedEngineHealth(makeEngineClient());
-    const [jobsRow] = (await db.execute(sql`
+    const jobsRowsPromise = db.execute(sql`
       SELECT count(*)::int AS n FROM sim_jobs WHERE status IN ('submitted', 'running', 'ingesting')
-    `)) as unknown as Array<{ n: number }>;
+    `) as unknown as Promise<Array<{ n: number }>>;
+    const [listing, sweeper, engineHealth, jobsRows] = await Promise.all([
+      listCampaigns(db, {
+        statuses: q.status,
+        limit: q.limit,
+        offset: q.offset,
+      }),
+      readSweeperState(),
+      getCachedEngineHealth(makeEngineClient()),
+      jobsRowsPromise,
+    ]);
+    const { health, error: engineError } = engineHealth;
+    const [jobsRow] = jobsRows;
     return {
       ...listing,
       solverState: {
@@ -286,25 +290,31 @@ export async function registerCampaignRoutes(
       const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
       try {
         const summary = await campaignSummary(db, id);
-        const sweeper = await readSweeperState();
         const engine = makeEngineClient();
-        const { health, error: engineError } =
-          await getCachedEngineHealth(engine);
-        const [jobsRow] = (await db.execute(sql`
-        SELECT count(*)::int AS n FROM sim_jobs WHERE campaign_id = ${id} AND status IN ('submitted', 'running', 'ingesting')
-      `)) as unknown as Array<{ n: number }>;
-        // engineUnreachableSince lands with the sweeper phase (migration 0026);
-        // readSweeperState() reads it defensively while the column may be absent.
-        const engineUnreachableSince = sweeper?.engineUnreachableSince ?? null;
-        const rate =
+        const jobsRowsPromise = db.execute(sql`
+          SELECT count(*)::int AS n
+          FROM sim_jobs
+          WHERE campaign_id = ${id}
+            AND status IN ('submitted', 'running', 'ingesting')
+        `) as unknown as Promise<Array<{ n: number }>>;
+        const [sweeper, engineHealth, jobsRows, rate] = await Promise.all([
+          readSweeperState(),
+          getCachedEngineHealth(engine),
+          jobsRowsPromise,
           summary.campaign.status === "active"
-            ? await campaignRate(
+            ? campaignRate(
                 db,
                 id,
                 summary.campaign.rateBaselineAt,
                 summary.totals.remaining,
               )
-            : null;
+            : Promise.resolve(null),
+        ]);
+        const { health, error: engineError } = engineHealth;
+        const [jobsRow] = jobsRows;
+        // engineUnreachableSince lands with the sweeper phase (migration 0026);
+        // readSweeperState() reads it defensively while the column may be absent.
+        const engineUnreachableSince = sweeper?.engineUnreachableSince ?? null;
         return {
           ...summary,
           scheduler: {

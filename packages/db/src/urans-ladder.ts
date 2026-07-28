@@ -2921,7 +2921,15 @@ export async function campaignOpenTierCounts(
   db: DB,
   campaignId: string,
 ): Promise<CampaignTierCounts> {
-  const [row] = (await db.execute(sql`
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    // This exact counter is expression-heavy enough to cross PostgreSQL's JIT
+    // threshold on production. Compilation alone consumed ~0.5 s per 10 s
+    // admin poll, while the query is short-lived after the source-first
+    // rewrite. Keep the override transaction-local; never change the server
+    // or pool default.
+    await tx.execute(sql`SET LOCAL jit = off`);
+    const [row] = (await tx.execute(sql`
     SELECT
       (
         -- RANS tier: requested non-derived cells still on the wave-1 path —
@@ -2929,13 +2937,23 @@ export async function campaignOpenTierCounts(
         -- in-flight wave-1 job (same shape as campaignHasOpenRansGaps).
         SELECT count(*) FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id AND c.status IN ('active', 'kept')
-        JOIN airfoils a ON a.id = p.airfoil_id
         LEFT JOIN results r
           ON r.airfoil_id = p.airfoil_id AND r.simulation_preset_revision_id = p.revision_id AND r.aoa_deg = p.aoa_deg
         LEFT JOIN sim_jobs j ON j.id = r.sim_job_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'requested'
           AND p.derived_by_symmetry = false
-          AND NOT (a.is_symmetric AND p.aoa_deg < 0)
+          -- Keep the symmetry lookup as one hashed subplan. A direct join made
+          -- PostgreSQL perform one airfoils PK lookup per open point when
+          -- campaign-point statistics lagged a live sweep (hundreds of
+          -- thousands of repeated probes on production).
+          AND (
+            p.aoa_deg >= 0
+            OR p.airfoil_id NOT IN (
+              SELECT symmetric_airfoil.id
+              FROM airfoils symmetric_airfoil
+              WHERE symmetric_airfoil.is_symmetric
+            )
+          )
           AND (
             (
               (r.id IS NULL OR r.status IN ('pending', 'stale'))
@@ -2951,52 +2969,65 @@ export async function campaignOpenTierCounts(
         -- inflate one point into two or three obligations.
         SELECT count(*)::int
         FROM (
+          -- Terminal hand-offs start at the rare classification source and
+          -- reach the owning campaign point by result_id. Do not invert this
+          -- into a campaign-wide point scan: live campaigns commonly contain
+          -- more than a million point generations but only a few thousand
+          -- classifications.
           SELECT p.airfoil_id, p.revision_id, p.aoa_deg
-          FROM sim_campaign_points p
+          FROM result_classifications rc
+          JOIN sim_campaign_points p ON p.result_id = rc.result_id
           JOIN sim_campaign_conditions c ON c.id = p.condition_id AND c.status IN ('active', 'kept')
-          LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
           LEFT JOIN results live
             ON live.airfoil_id = p.airfoil_id
            AND live.simulation_preset_revision_id = p.revision_id
            AND live.aoa_deg = p.aoa_deg
-          LEFT JOIN sim_jobs lj ON lj.id = live.sim_job_id
+          LEFT JOIN sim_precalc_obligations obligation
+            ON obligation.airfoil_id = p.airfoil_id
+           AND obligation.revision_id = p.revision_id
+           AND obligation.aoa_deg = p.aoa_deg
           WHERE p.campaign_id = ${campaignId}
             AND p.derived_by_symmetry = false
+            AND (obligation.id IS NULL OR obligation.state IN ('pending', 'running'))
+            AND p.state = 'terminal'
             AND (
-              NOT EXISTS (
-                SELECT 1 FROM sim_precalc_obligations known_obligation
-                WHERE known_obligation.airfoil_id = p.airfoil_id
-                  AND known_obligation.revision_id = p.revision_id
-                  AND known_obligation.aoa_deg = p.aoa_deg
-              )
-              OR EXISTS (
-                SELECT 1 FROM sim_precalc_obligations open_obligation
-                WHERE open_obligation.airfoil_id = p.airfoil_id
-                  AND open_obligation.revision_id = p.revision_id
-                  AND open_obligation.aoa_deg = p.aoa_deg
-                  AND open_obligation.state IN ('pending', 'running')
-              )
-            )
-            AND (
-              (
-                p.state = 'terminal'
+              rc.state = 'needs_urans'
+              OR (
+                rc.state = 'rejected'
+                AND live.status = 'done'
                 AND (
-                  rc.state = 'needs_urans'
-                  OR (
-                    rc.state = 'rejected'
-                    AND live.status = 'done'
-                    AND (
-                      live.fidelity = 'rans'
-                      OR (live.fidelity IS NULL AND live.regime IS DISTINCT FROM 'urans')
-                    )
-                  )
+                  live.fidelity = 'rans'
+                  OR (live.fidelity IS NULL AND live.regime IS DISTINCT FROM 'urans')
                 )
               )
-              OR (
-                live.status IN ('queued', 'running')
-                AND (lj.wave IS NULL OR lj.wave <> 1 OR lj.status IN ('done', 'failed', 'cancelled'))
-              )
             )
+
+          UNION
+
+          -- Live wave-2 claims start at the comparatively small results set,
+          -- map revisions to campaign conditions, then use the campaign-point
+          -- physical-cell key. This avoids scanning every point merely to
+          -- discover the handful of running jobs.
+          SELECT p.airfoil_id, p.revision_id, p.aoa_deg
+          FROM results live
+          JOIN sim_campaign_conditions c
+            ON c.campaign_id = ${campaignId}
+           AND c.simulation_preset_revision_id = live.simulation_preset_revision_id
+           AND c.status IN ('active', 'kept')
+          JOIN sim_campaign_points p
+            ON p.campaign_id = c.campaign_id
+           AND p.condition_id = c.id
+           AND p.airfoil_id = live.airfoil_id
+           AND p.aoa_deg = live.aoa_deg
+          LEFT JOIN sim_jobs lj ON lj.id = live.sim_job_id
+          LEFT JOIN sim_precalc_obligations obligation
+            ON obligation.airfoil_id = p.airfoil_id
+           AND obligation.revision_id = p.revision_id
+           AND obligation.aoa_deg = p.aoa_deg
+          WHERE p.derived_by_symmetry = false
+            AND (obligation.id IS NULL OR obligation.state IN ('pending', 'running'))
+            AND live.status IN ('queued', 'running')
+            AND (lj.wave IS NULL OR lj.wave <> 1 OR lj.status IN ('done', 'failed', 'cancelled'))
 
           UNION
 
@@ -3013,8 +3044,12 @@ export async function campaignOpenTierCounts(
           SELECT request_point.airfoil_id, request_point.revision_id, request_point.aoa_deg
           FROM sim_urans_request_campaigns ownership
           JOIN sim_urans_requests req ON req.id = ownership.request_id
+          JOIN sim_campaign_conditions request_condition
+            ON request_condition.campaign_id = ownership.campaign_id
+           AND request_condition.simulation_preset_revision_id = req.revision_id
           JOIN sim_campaign_points request_point
             ON request_point.campaign_id = ownership.campaign_id
+           AND request_point.condition_id = request_condition.id
            AND request_point.airfoil_id = req.airfoil_id
            AND request_point.revision_id = req.revision_id
            AND (req.aoa_deg IS NULL OR request_point.aoa_deg = req.aoa_deg)
@@ -3042,15 +3077,16 @@ export async function campaignOpenTierCounts(
           AND q.state IN ('pending', 'running')
       )::int AS verify_open
   `)) as unknown as {
-    rans_open: number;
-    precalc_open: number;
-    verify_open: number;
-  }[];
-  return {
-    ransOpen: Number(row?.rans_open ?? 0),
-    precalcOpen: Number(row?.precalc_open ?? 0),
-    verifyOpen: Number(row?.verify_open ?? 0),
-  };
+      rans_open: number;
+      precalc_open: number;
+      verify_open: number;
+    }[];
+    return {
+      ransOpen: Number(row?.rans_open ?? 0),
+      precalcOpen: Number(row?.precalc_open ?? 0),
+      verifyOpen: Number(row?.verify_open ?? 0),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3082,16 +3118,12 @@ export interface CampaignReviewBucketRow extends CampaignReviewBuckets {
   airfoilId: string;
 }
 
-const AWAITING_URANS_POINT_SQL = sql`
+/** Shared non-obligation predicate for both sparse bucket reads. Each query
+ * joins the open obligation first so PostgreSQL can begin at rare sources
+ * rather than evaluating a correlated EXISTS for every campaign point. */
+const AWAITING_URANS_SOURCE_SQL = sql`
   p.state = 'terminal' AND p.derived_by_symmetry = false
   AND r.status = 'done' AND rc.state = 'rejected'
-  AND EXISTS (
-    SELECT 1 FROM sim_precalc_obligations open_obligation
-    WHERE open_obligation.airfoil_id = p.airfoil_id
-      AND open_obligation.revision_id = p.revision_id
-      AND open_obligation.aoa_deg = p.aoa_deg
-      AND open_obligation.state IN ('pending', 'running')
-  )
   AND (
     r.fidelity = 'rans'
     OR (r.fidelity IS NULL AND r.regime IS DISTINCT FROM 'urans')
@@ -3103,8 +3135,6 @@ const AWAITING_URANS_POINT_SQL = sql`
 // needs its own informed product decision; it must not be inferred from an
 // automatic solver failure. Exhausted work stays rejected/failed/blocked: it
 // is never auto-accepted and never becomes a coefficient-review chore.
-const NEEDS_REVIEW_POINT_SQL = sql`FALSE`;
-
 interface ReviewBucketQueryRow {
   condition_id: string;
   airfoil_id: string;
@@ -3127,20 +3157,27 @@ export async function campaignReviewBucketRows(
     : sql``;
   const rows = (await db.execute(sql`
     SELECT p.condition_id, p.airfoil_id,
-      COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
-      COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
-    FROM sim_campaign_points p
+      COUNT(*)::int AS awaiting_urans,
+      0::int AS needs_review
+    -- Rejected classifications and open obligations are the sparse sources.
+    -- Begin there and use result_id to reach campaign points; a point-first
+    -- scan made the 10 s admin poll repeatedly walk every campaign generation.
+    FROM result_classifications rc
+    JOIN results r ON r.id = rc.result_id
+    JOIN sim_campaign_points p ON p.result_id = r.id
     JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
     JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
-    LEFT JOIN results r ON r.id = p.result_id
-    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    JOIN sim_precalc_obligations open_obligation
+      ON open_obligation.airfoil_id = p.airfoil_id
+     AND open_obligation.revision_id = p.revision_id
+     AND open_obligation.aoa_deg = p.aoa_deg
+     AND open_obligation.state IN ('pending', 'running')
     WHERE p.campaign_id = ${campaignId}
       AND condition.generation = campaign.current_condition_generation
       AND condition.status IN ('active', 'kept')
+      AND ${AWAITING_URANS_SOURCE_SQL}
       ${airfoilFilter}
     GROUP BY p.condition_id, p.airfoil_id
-    HAVING COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL}) > 0
-        OR COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL}) > 0
   `)) as unknown as ReviewBucketQueryRow[];
   return rows.map((row) => ({
     conditionId: row.condition_id,
@@ -3155,23 +3192,14 @@ export async function campaignReviewBuckets(
   db: DB,
   campaignId: string,
 ): Promise<CampaignReviewBuckets> {
-  const [row] = (await db.execute(sql`
-    SELECT
-      COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
-      COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
-    FROM sim_campaign_points p
-    JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
-    JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
-    LEFT JOIN results r ON r.id = p.result_id
-    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    WHERE p.campaign_id = ${campaignId}
-      AND condition.generation = campaign.current_condition_generation
-      AND condition.status IN ('active', 'kept')
-  `)) as unknown as Array<{ awaiting_urans: number; needs_review: number }>;
-  return {
-    awaitingUrans: Number(row?.awaiting_urans ?? 0),
-    needsReview: Number(row?.needs_review ?? 0),
-  };
+  const rows = await campaignReviewBucketRows(db, campaignId);
+  return rows.reduce<CampaignReviewBuckets>(
+    (totals, row) => ({
+      awaitingUrans: totals.awaitingUrans + row.awaitingUrans,
+      needsReview: totals.needsReview + row.needsReview,
+    }),
+    { awaitingUrans: 0, needsReview: 0 },
+  );
 }
 
 /** Batched rolling-compatibility buckets for a campaign list payload.
@@ -3183,19 +3211,29 @@ export async function reviewBucketsByCampaign(
   if (!campaignIds.length) return new Map();
   const rows = (await db.execute(sql`
     SELECT p.campaign_id,
-      COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
-      COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
-    FROM sim_campaign_points p
+      COUNT(*)::int AS awaiting_urans,
+      0::int AS needs_review
+    -- The list route is polled every 10 s and can contain 50 campaigns.
+    -- Start at the sparse rejected-classification source, then reach the
+    -- owning campaign cell through the stable result id. A point-first scan
+    -- walked every point generation merely to discover a few hand-offs.
+    FROM result_classifications rc
+    JOIN results r ON r.id = rc.result_id
+    JOIN sim_campaign_points p ON p.result_id = r.id
     JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
     JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
-    LEFT JOIN results r ON r.id = p.result_id
-    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    JOIN sim_precalc_obligations open_obligation
+      ON open_obligation.airfoil_id = p.airfoil_id
+     AND open_obligation.revision_id = p.revision_id
+     AND open_obligation.aoa_deg = p.aoa_deg
+     AND open_obligation.state IN ('pending', 'running')
     WHERE p.campaign_id = ANY(${sql`ARRAY[${sql.join(
       campaignIds.map((id) => sql`${id}::uuid`),
       sql`, `,
     )}]`})
       AND condition.generation = campaign.current_condition_generation
       AND condition.status IN ('active', 'kept')
+      AND ${AWAITING_URANS_SOURCE_SQL}
     GROUP BY p.campaign_id
   `)) as unknown as Array<{
     campaign_id: string;

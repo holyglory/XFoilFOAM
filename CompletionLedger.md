@@ -33,8 +33,11 @@
   rotating reconciliation, concurrent queue-aware terminal priority,
   single-flight background artifact transfer, and same-tick multi-promise
   refill. Production is capped at eight OpenCFD 2606 CPU slots; the dedicated
-  remote node is capped at 40 CPU slots with 48 hub promises so ingest/delivery
-  ownership cannot strand executable capacity. Live burn-in restored 40 active
+  remote node is capped at 40 CPU slots with a 96-promise hub buffer so
+  ingest/delivery ownership cannot strand executable capacity. The
+  workload-aware storage guard is deployed there: it reserves measured
+  unfinished local work instead of the obsolete fixed 24 GiB per active job.
+  Live burn-in restored 40 active
   engine jobs at 4006% worker CPU after a terminal burst. Exact generations
   already accepted by the hub retire obsolete local repair work.
   Readiness still requires incremental result publication, verified GCS

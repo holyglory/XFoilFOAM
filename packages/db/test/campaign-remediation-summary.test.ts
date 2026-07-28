@@ -31,6 +31,7 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  resultClassifications,
   results,
   simCampaignPoints,
   simJobs,
@@ -42,6 +43,7 @@ import {
   syncSweepPromises,
 } from "../src/schema";
 import { cleanupCampaignFixtures } from "../src/test-cleanup";
+import { reviewBucketsByCampaign } from "../src/urans-ladder";
 
 const RUN_STAMP = Date.now();
 const PREFIX = `remediation-${process.pid}-${RUN_STAMP.toString(36)}`;
@@ -350,6 +352,100 @@ describe("campaign remediation summary", () => {
       WHERE campaign_id = ${campaignId}
     `)) as unknown as Array<{ n: number }>;
     expect(Number(count.n)).toBe(2);
+  });
+
+  it("MUST-CATCH + FALSE-POSITIVE GUARD: the batched list counts only rejected RANS cells with open FAST URANS work", async () => {
+    const { campaignId, conditions } = await launchCampaign({
+      label: "batched-review-buckets",
+      airfoilId: asymId,
+      speeds: [17.125],
+      from: 0,
+      to: 1,
+    });
+    const condition = conditions[0]!;
+    const created = await db
+      .insert(results)
+      .values([
+        {
+          airfoilId: asymId,
+          bcId: condition.bcId,
+          simulationPresetRevisionId: condition.revisionId,
+          aoaDeg: 0,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          fidelity: "rans",
+        },
+        {
+          airfoilId: asymId,
+          bcId: condition.bcId,
+          simulationPresetRevisionId: condition.revisionId,
+          aoaDeg: 1,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "urans" as const,
+          fidelity: "urans_precalc",
+        },
+      ])
+      .returning({ id: results.id, aoaDeg: results.aoaDeg });
+    for (const result of created) {
+      await db
+        .update(simCampaignPoints)
+        .set({ state: "terminal", resultId: result.id })
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, campaignId),
+            eq(simCampaignPoints.revisionId, condition.revisionId),
+            eq(simCampaignPoints.aoaDeg, result.aoaDeg),
+          ),
+        );
+      await db.insert(resultClassifications).values({
+        resultId: result.id,
+        airfoilId: asymId,
+        simulationPresetRevisionId: condition.revisionId,
+        aoaDeg: result.aoaDeg,
+        regime: result.aoaDeg === 0 ? "rans" : "urans",
+        classifierVersion: `${PREFIX}-batched-review`,
+        state: "rejected",
+        confidence: 1,
+        reasons: ["test-rejected"],
+      });
+    }
+    await insertObligations(campaignId, asymId, [
+      {
+        revisionId: condition.revisionId,
+        aoaDeg: 0,
+        state: "pending",
+      },
+      {
+        revisionId: condition.revisionId,
+        aoaDeg: 1,
+        state: "pending",
+      },
+    ]);
+
+    const buckets = await reviewBucketsByCampaign(db, [campaignId]);
+    expect(buckets.get(campaignId)).toEqual({
+      awaitingUrans: 1,
+      needsReview: 0,
+    });
+
+    const listing = await listCampaigns(db, {
+      statuses: ["active", "attention"],
+      limit: 100,
+    });
+    const item = listing.items.find((candidate) => candidate.id === campaignId);
+    expect(item?.reviewBuckets).toEqual({
+      awaitingUrans: 1,
+      needsReview: 0,
+    });
+    expect(item?.card.objectives).toEqual({
+      ldMax: false,
+      clZero: false,
+      clMax: false,
+    });
+    expect(item?.card.reynolds).toHaveLength(1);
+    expect(item?.card.campaignJobsRunning).toBe(0);
   });
 
   it("MUST-CATCH: conserves blocked groups and keeps automatic repair separate", () => {

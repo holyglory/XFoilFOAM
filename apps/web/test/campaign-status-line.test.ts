@@ -406,21 +406,21 @@ describe("gateFromSolverState — hub/backlog gate from the global derivation", 
     expect(gateFromSolverState("unknown")).toBeNull();
   });
 
-  it("tick_stalled maps to the amber SLOW badge — honest slowness, never a BLOCKED lie", () => {
-    const gate = gateFromSolverState("tick_stalled");
-    expect(gate).toEqual({
-      text: "SLOW — tick running; engine responding slowly",
-      tone: "amber",
-    });
-    expect(gate?.text).not.toContain("BLOCKED");
-    expect(gate?.tone).not.toBe("red");
+  it("tick_stalled is advisory telemetry, not a per-campaign gate", () => {
+    expect(gateFromSolverState("tick_stalled")).toBeNull();
+    expect(
+      campaignHubSchedulerStatusText("tick_stalled", {
+        sweeperEnabled: true,
+        engineUnreachableSince: null,
+      }),
+    ).toBeNull();
   });
 });
 
 // Liveness/progress split (2026-07-06 prod false "PROCESS NOT RUNNING"): the
-// campaign line must show the amber tick_stalled state while the liveness
-// heartbeat is fresh but a slow engine call holds the current tick, and keep
-// the red process gate ONLY for a genuinely stale heartbeat.
+// A fresh heartbeat plus a delayed scheduler cycle is global telemetry, not a
+// campaign gate and not evidence that any one dependency caused the delay.
+// The red process gate remains ONLY for a genuinely stale heartbeat.
 describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () => {
   const NOW = Date.parse("2026-07-06T12:00:00.000Z");
   const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
@@ -430,16 +430,12 @@ describe("campaignStatusLine — tick_stalled (fresh heartbeat, slow tick)", () 
     lastTickCompletedAt: iso(11 * 60_000),
   };
 
-  it("MUST-CATCH: fresh heartbeat + >5 min unfinished tick → amber SLOW gate with the tick copy, NEVER red", () => {
+  it("MUST-CATCH: a delayed scheduler cycle does not replace useful campaign progress or blame the engine", () => {
     const line = campaignStatusLine(summary(stalledOverrides), NOW);
-    expect(line.gate).toEqual({
-      text: "SLOW — tick running; engine responding slowly",
-      tone: "amber",
-    });
-    expect(line.tone).toBe("amber");
-    expect(line.text).toBe(
-      "Tick running 6m — engine responding slowly; scheduling continues next tick.",
-    );
+    expect(line.gate).toBeNull();
+    expect(line.tone).toBe("teal");
+    expect(line.text).toBe("Active — 0 points running, 32 remaining.");
+    expect(line.text).not.toContain("engine");
     expect(line.lifecycle).toBe("active");
   });
 

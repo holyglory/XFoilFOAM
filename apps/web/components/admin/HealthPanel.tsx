@@ -168,8 +168,20 @@ function NodeCard({
           <span>CFD jobs</span>
         </div>
         <div>
-          <strong>{formatPct(node.health?.cpu.loadPct, 0)}</strong>
-          <span>host load</span>
+          <strong>
+            {node.health
+              ? `${node.health.cpu.load1.toFixed(1)} / ${node.health.cpu.availableCpus.toLocaleString()}`
+              : EMPTY}
+          </strong>
+          <span
+            title={
+              node.health
+                ? `One-minute OS load across the whole ${node.health.cpu.availableCpus}-CPU host; this is not CPU utilization. Solver use is the reserved-slot gauge above.`
+                : "One-minute whole-host load; this is not CPU utilization. Solver use is the reserved-slot gauge above."
+            }
+          >
+            1m whole-host load · not solver CPU
+          </span>
         </div>
         <div>
           <strong>{formatPct(node.health?.memory.usedPct, 0)}</strong>
@@ -499,14 +511,15 @@ export function HealthPanel() {
   const [busy, setBusy] = useState(false);
   const refreshingRef = useRef(false);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
     setBusy(true);
     try {
-      setHealth(await getAdminHealth());
+      setHealth(await getAdminHealth(signal));
       setErr(null);
     } catch (e) {
+      if (signal?.aborted) return;
       setErr((e as Error).message);
     } finally {
       refreshingRef.current = false;
