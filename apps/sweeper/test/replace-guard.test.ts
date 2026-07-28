@@ -35,6 +35,7 @@ import {
   referenceGeometryProfiles,
   recordPrecalcObligationSubmission,
   refreshPolarCacheForRevision,
+  resultAttemptIngestCompletions,
   resultAttempts,
   resultClassifications,
   resultMedia,
@@ -1600,6 +1601,628 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0].resultId).toBe(keptId);
     expect(artifacts[0].resultAttemptId).not.toBeNull();
+  }, 60000);
+
+  it("MUST-CATCH durable ingest projection: a crash-partial child is filled, exact cross-tick replay skips the heavy tail, and payload drift is rejected", async () => {
+    await cleanCell();
+    const engineJobId = `${PREFIX}-projection-crash-replay`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+      })
+      .returning();
+    const point = {
+      ...rejectedPrecalcPoint(),
+      evidence_artifacts: [
+        {
+          kind: "manifest",
+          path: `/jobs/${engineJobId}/files/evidence/a0/evidence_manifest.json`,
+          url: `/jobs/${engineJobId}/files/evidence/a0/evidence_manifest.json`,
+          mime_type: "application/json",
+          sha256: digest(`${engineJobId}-manifest`),
+          byte_size: 128,
+          metadata: { evidenceBase: "evidence/a0" },
+        },
+      ],
+    } as PolarPoint;
+    const result = jobResult(engineJobId, point);
+    let interruptedAttemptId = "";
+    await expect(
+      ingestResult({
+        db,
+        engine: stubEngine(),
+        engineJobId,
+        simJobId: job.id,
+        airfoilId,
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+        uransFidelity: "precalc",
+        result,
+        hooks: {
+          afterPointEvidenceStaged: async ({ resultAttemptId }) => {
+            interruptedAttemptId = resultAttemptId;
+            // Model a process loss before the completion marker with one
+            // committed child absent. The replay must not trust the attempt
+            // row or the other already-committed children as completeness.
+            await db
+              .delete(forceHistory)
+              .where(eq(forceHistory.resultAttemptId, resultAttemptId));
+            throw new Error("injected projection crash");
+          },
+        },
+      }),
+    ).rejects.toThrow("injected projection crash");
+    expect(interruptedAttemptId).toBeTruthy();
+    expect(
+      await db
+        .select()
+        .from(resultAttemptIngestCompletions)
+        .where(
+          eq(
+            resultAttemptIngestCompletions.resultAttemptId,
+            interruptedAttemptId,
+          ),
+        ),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select()
+        .from(forceHistory)
+        .where(eq(forceHistory.resultAttemptId, interruptedAttemptId)),
+    ).toHaveLength(0);
+
+    const replayTail = vi.fn();
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      uransFidelity: "precalc",
+      result,
+      hooks: { afterPointEvidenceStaged: replayTail },
+    });
+    expect(replayTail).toHaveBeenCalledTimes(1);
+    expect(
+      await db
+        .select()
+        .from(forceHistory)
+        .where(eq(forceHistory.resultAttemptId, interruptedAttemptId)),
+    ).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(resultAttemptIngestCompletions)
+        .where(
+          eq(
+            resultAttemptIngestCompletions.resultAttemptId,
+            interruptedAttemptId,
+          ),
+        ),
+    ).toHaveLength(1);
+
+    const skippedTail = vi.fn();
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      uransFidelity: "precalc",
+      result,
+      hooks: { afterPointEvidenceStaged: skippedTail },
+    });
+    expect(skippedTail).not.toHaveBeenCalled();
+
+    const drifted = {
+      ...point,
+      force_history: {
+        ...point.force_history!,
+        samples: (point.force_history?.samples ?? 0) + 1,
+      },
+    } as PolarPoint;
+    await expect(
+      ingestResult({
+        db,
+        engine: stubEngine(),
+        engineJobId,
+        simJobId: job.id,
+        airfoilId,
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+        uransFidelity: "precalc",
+        result: jobResult(engineJobId, drifted),
+      }),
+    ).rejects.toThrow(/changed immutable evidence|completed ingest projection/);
+    const [retainedHistory] = await db
+      .select({ sampleCount: forceHistory.sampleCount })
+      .from(forceHistory)
+      .where(eq(forceHistory.resultAttemptId, interruptedAttemptId));
+    expect(retainedHistory?.sampleCount).toBe(point.force_history?.samples);
+  }, 60000);
+
+  it("FALSE-POSITIVE durable ingest projection: the same AoA in RANS and URANS owns two completion markers", async () => {
+    await cleanCell();
+    const engineJobId = `${PREFIX}-projection-regime-isolation`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        totalCases: 2,
+      })
+      .returning();
+    const rans = {
+      case_slug: "same-aoa-rans",
+      aoa_deg: GATE_AOA,
+      cl: 0.7,
+      cd: 0.08,
+      cm: -0.03,
+      cl_cd: 8.75,
+      unsteady: false,
+      converged: true,
+      first_order_fallback: false,
+      images: {},
+      evidence_artifacts: [
+        {
+          kind: "manifest",
+          path: `evidence/rans/evidence_manifest.json`,
+          url: `/jobs/${engineJobId}/files/evidence/rans/evidence_manifest.json`,
+          mime_type: "application/json",
+          sha256: digest(`${engineJobId}-rans-manifest`),
+          byte_size: 100,
+          metadata: { evidenceBase: "evidence/rans" },
+        },
+      ],
+    } as PolarPoint;
+    const urans = {
+      ...rejectedPrecalcPoint(),
+      case_slug: "same-aoa-urans",
+      images: {},
+      mean_images: {},
+      video: {},
+      evidence_artifacts: [
+        {
+          kind: "manifest",
+          path: `evidence/urans/evidence_manifest.json`,
+          url: `/jobs/${engineJobId}/files/evidence/urans/evidence_manifest.json`,
+          mime_type: "application/json",
+          sha256: digest(`${engineJobId}-urans-manifest`),
+          byte_size: 100,
+          metadata: { evidenceBase: "evidence/urans" },
+        },
+      ],
+    } as PolarPoint;
+    const result: JobResult = {
+      job_id: engineJobId,
+      state: "completed",
+      polars: [
+        {
+          speed: SPEED,
+          chord: CHORD,
+          reynolds,
+          mach,
+          points: [rans],
+          attempts: [urans],
+        },
+      ],
+    };
+    const staged = vi.fn();
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      result,
+      hooks: { afterPointEvidenceStaged: staged },
+    });
+    expect(staged).toHaveBeenCalledTimes(2);
+    const attempts = await db
+      .select({
+        id: resultAttempts.id,
+        regime: resultAttempts.regime,
+      })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id));
+    expect(attempts.map((attempt) => attempt.regime).sort()).toEqual([
+      "rans",
+      "urans",
+    ]);
+    expect(
+      await db
+        .select()
+        .from(resultAttemptIngestCompletions)
+        .where(
+          inArray(
+            resultAttemptIngestCompletions.resultAttemptId,
+            attempts.map((attempt) => attempt.id),
+          ),
+        ),
+    ).toHaveLength(2);
+
+    const replayed = vi.fn();
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      result,
+      hooks: { afterPointEvidenceStaged: replayed },
+    });
+    expect(replayed).not.toHaveBeenCalled();
+  }, 60000);
+
+  it("MUST-CATCH durable ingest projection: identical running and terminal payloads reuse one completion marker", async () => {
+    await cleanCell();
+    const engineJobId = `${PREFIX}-projection-running-terminal`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+      })
+      .returning();
+    const point = {
+      case_slug: "running-terminal",
+      aoa_deg: GATE_AOA,
+      cl: 0.72,
+      cd: 0.08,
+      cm: -0.03,
+      cl_cd: 9,
+      unsteady: false,
+      converged: true,
+      first_order_fallback: false,
+      images: {},
+      evidence_artifacts: [],
+    } as PolarPoint;
+    const terminalResult = jobResult(engineJobId, point);
+    const runningResult: JobResult = {
+      ...terminalResult,
+      state: "running",
+    };
+    const runningTail = vi.fn();
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      result: runningResult,
+      hooks: { afterPointEvidenceStaged: runningTail },
+    });
+    expect(runningTail).toHaveBeenCalledTimes(1);
+    const [attempt] = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id))
+      .limit(1);
+    expect(attempt).toBeTruthy();
+    const [runningCompletion] = await db
+      .select()
+      .from(resultAttemptIngestCompletions)
+      .where(eq(resultAttemptIngestCompletions.resultAttemptId, attempt!.id));
+    expect(runningCompletion).toBeTruthy();
+
+    const terminalTail = vi.fn();
+    const terminalIngest = await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      result: terminalResult,
+      hooks: { afterPointEvidenceStaged: terminalTail },
+    });
+    expect(terminalIngest.points).toBe(1);
+    expect(terminalTail).not.toHaveBeenCalled();
+    const terminalCompletions = await db
+      .select()
+      .from(resultAttemptIngestCompletions)
+      .where(eq(resultAttemptIngestCompletions.resultAttemptId, attempt!.id));
+    expect(terminalCompletions).toHaveLength(1);
+    expect(terminalCompletions[0]).toEqual(runningCompletion);
+  }, 60000);
+
+  it("MUST-CATCH durable ingest projection: concurrent exact writers converge on one completion marker", async () => {
+    await cleanCell();
+    const engineJobId = `${PREFIX}-projection-concurrent-writers`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+      })
+      .returning();
+    const point = {
+      case_slug: "concurrent-writers",
+      aoa_deg: GATE_AOA,
+      cl: 0.72,
+      cd: 0.08,
+      cm: -0.03,
+      cl_cd: 9,
+      unsteady: false,
+      converged: true,
+      first_order_fallback: false,
+      images: {},
+      evidence_artifacts: [],
+    } as PolarPoint;
+    const result = jobResult(engineJobId, point);
+    let arrivals = 0;
+    let releaseWriters!: () => void;
+    const bothWritersStaged = new Promise<void>((resolve) => {
+      releaseWriters = resolve;
+    });
+    const releaseTimer = setTimeout(releaseWriters, 5_000);
+    const stagedTail = vi.fn(async () => {
+      arrivals += 1;
+      if (arrivals === 2) releaseWriters();
+      await bothWritersStaged;
+    });
+    try {
+      await Promise.all([
+        ingestResult({
+          db,
+          engine: stubEngine(),
+          engineJobId,
+          simJobId: job.id,
+          airfoilId,
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          result,
+          hooks: { afterPointEvidenceStaged: stagedTail },
+        }),
+        ingestResult({
+          db,
+          engine: stubEngine(),
+          engineJobId,
+          simJobId: job.id,
+          airfoilId,
+          speedMap: [
+            { speed: SPEED, bcId, presetRevisionId: revisionId, mach },
+          ],
+          result,
+          hooks: { afterPointEvidenceStaged: stagedTail },
+        }),
+      ]);
+    } finally {
+      clearTimeout(releaseTimer);
+      releaseWriters();
+    }
+    expect(stagedTail).toHaveBeenCalledTimes(2);
+    const attempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id));
+    expect(attempts).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(resultAttemptIngestCompletions)
+        .where(
+          eq(resultAttemptIngestCompletions.resultAttemptId, attempts[0]!.id),
+        ),
+    ).toHaveLength(1);
+  }, 60000);
+
+  it("MUST-CATCH durable ingest projection: terminal cleanup failure leaves the marker reusable for exact GCS recovery", async () => {
+    await cleanCell();
+    const engineJobId = `${PREFIX}-projection-gcs-cleanup`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+      })
+      .returning();
+    const evidenceBase = "evidence/gcs-cleanup";
+    const manifestBytes = Buffer.from(
+      JSON.stringify({ schemaVersion: 2, bundleExcludes: [], files: [] }),
+    );
+    const manifestSha = createHash("sha256")
+      .update(manifestBytes)
+      .digest("hex");
+    const bundleSha = digest(`${engineJobId}-bundle`);
+    const tarSha = digest(`${engineJobId}-tar`);
+    const objectKey = `${PREFIX}/sha256/${bundleSha.slice(0, 2)}/${bundleSha}.tar.zst`;
+    const manifestStorageDir = join(
+      mediaRoot,
+      "jobs",
+      engineJobId,
+      evidenceBase,
+    );
+    await mkdir(manifestStorageDir, { recursive: true });
+    await writeFile(
+      join(manifestStorageDir, "evidence_manifest.json"),
+      manifestBytes,
+    );
+    const point = {
+      case_slug: "gcs-cleanup",
+      aoa_deg: GATE_AOA,
+      cl: 0.5,
+      cd: 0.05,
+      cm: -0.01,
+      cl_cd: 10,
+      unsteady: false,
+      converged: true,
+      first_order_fallback: false,
+      images: {},
+      evidence_artifacts: [
+        {
+          kind: "manifest",
+          path: `${evidenceBase}/evidence_manifest.json`,
+          url: `/jobs/${engineJobId}/files/${evidenceBase}/evidence_manifest.json`,
+          mime_type: "application/json",
+          sha256: manifestSha,
+          byte_size: manifestBytes.byteLength,
+          role: "evidence",
+          metadata: { evidenceBase },
+        },
+        {
+          kind: "engine_bundle",
+          path: `${evidenceBase}/engine_evidence.tar.zst`,
+          url: `/jobs/${engineJobId}/files/${evidenceBase}/engine_evidence.tar.zst`,
+          mime_type: "application/zstd",
+          sha256: bundleSha,
+          byte_size: 54_321,
+          role: "evidence",
+          metadata: {
+            evidenceBase,
+            storageBackend: "gcs",
+            bucket: "airfoils-pro-storage-bucket",
+            objectKey,
+            generation: "18446744073709551615",
+            crc32c: "AAAAAA==",
+            compression: "zstd",
+            archiveFormat: "tar+zstd",
+            zstdLevel: 10,
+            uncompressedTarSha256: tarSha,
+            uncompressedTarByteSize: 98_765,
+            verifiedAt: "2026-07-28T00:00:00.000Z",
+            localEvidenceDisposition: "remote-only-pending-cleanup",
+            bundledFileCount: 0,
+          },
+        },
+      ],
+    } as PolarPoint;
+    let finalizeAttempts = 0;
+    const finalizeRemoteEvidence = vi.fn(
+      async (
+        _jobId: string,
+        request: {
+          evidence_base: string;
+          database_associations: unknown[];
+        },
+      ) => {
+        finalizeAttempts += 1;
+        if (finalizeAttempts === 1) {
+          throw new Error("injected terminal cleanup outage");
+        }
+        return {
+          state: "complete" as const,
+          evidence_base: request.evidence_base,
+          bytes_freed: 54_321,
+          verification: "archive+manifest+all-members-restore:test",
+          association_count: request.database_associations.length,
+        };
+      },
+    );
+    const engine = {
+      ...stubEngine(),
+      finalizeRemoteEvidence,
+    } as unknown as EngineClient;
+    const result = jobResult(engineJobId, point);
+    await expect(
+      ingestResult({
+        db,
+        engine,
+        engineJobId,
+        simJobId: job.id,
+        airfoilId,
+        speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+        result,
+      }),
+    ).rejects.toThrow("injected terminal cleanup outage");
+    expect(finalizeRemoteEvidence).toHaveBeenCalledTimes(1);
+    const [attempt] = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id))
+      .limit(1);
+    expect(attempt).toBeTruthy();
+    expect(
+      await db
+        .select()
+        .from(resultAttemptIngestCompletions)
+        .where(eq(resultAttemptIngestCompletions.resultAttemptId, attempt!.id)),
+    ).toHaveLength(1);
+    const [cellAfterCleanupFailure] = await db
+      .select({ currentAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(
+        and(
+          eq(results.simulationPresetRevisionId, revisionId),
+          eq(results.aoaDeg, GATE_AOA),
+        ),
+      )
+      .limit(1);
+    expect(cellAfterCleanupFailure?.currentAttemptId).toBeNull();
+    const [blob] = await db
+      .select({ id: solverEvidenceBlobs.id })
+      .from(solverEvidenceBlobs)
+      .where(eq(solverEvidenceBlobs.sha256, bundleSha))
+      .limit(1);
+    if (blob) continuationEvidenceBlobIds.push(blob.id);
+
+    const skippedTail = vi.fn();
+    await ingestResult({
+      db,
+      engine,
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      result,
+      hooks: { afterPointEvidenceStaged: skippedTail },
+    });
+    expect(skippedTail).not.toHaveBeenCalled();
+    expect(finalizeRemoteEvidence).toHaveBeenCalledTimes(2);
+    expect(finalizeRemoteEvidence.mock.calls[1]?.[1]).toEqual(
+      finalizeRemoteEvidence.mock.calls[0]?.[1],
+    );
+    const [cellAfterReplay] = await db
+      .select({ currentAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(
+        and(
+          eq(results.simulationPresetRevisionId, revisionId),
+          eq(results.aoaDeg, GATE_AOA),
+        ),
+      )
+      .limit(1);
+    expect(cellAfterReplay?.currentAttemptId).toBe(attempt!.id);
   }, 60000);
 
   it("MUST-CATCH: rejected FULL evidence preserves accepted PRECALC and becomes critical only after continuation plus one corrective fresh start", async () => {

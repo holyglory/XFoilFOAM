@@ -3,8 +3,10 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type { DB } from "./client";
 import {
-  onResultIngested,
+  linkResultToCampaigns,
+  probeCampaignCompletions,
   type CampaignLaneKey,
+  type CampaignResultLinkOutcome,
   type ResultIngestSignal,
 } from "./campaign-execution";
 import { ensurePrecalcObligationsInTransaction } from "./precalc-obligations";
@@ -168,6 +170,26 @@ export async function onResultIngestedWithAutomaticPrecalcHandoff(
   signal: CampaignResultHandoffSignal,
   hooks: CampaignResultHandoffHooks = {},
 ): Promise<CampaignLaneKey[]> {
+  const outcome = await linkResultToCampaignsWithAutomaticPrecalcHandoff(
+    db,
+    signal,
+    hooks,
+  );
+  await probeCampaignCompletions(db, outcome.campaignIds);
+  return outcome.laneKeys;
+}
+
+/**
+ * Transactionally attach the exact automatic PRECALC owner and settle the
+ * point/progress projection, while leaving the campaign-wide completion
+ * decision to the caller. Bulk result ingest uses this to make one completion
+ * decision per affected campaign after every point in the payload is linked.
+ */
+export async function linkResultToCampaignsWithAutomaticPrecalcHandoff(
+  db: DB,
+  signal: CampaignResultHandoffSignal,
+  hooks: CampaignResultHandoffHooks = {},
+): Promise<CampaignResultLinkOutcome> {
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const terminal = signal.status === "done" || signal.status === "failed";
@@ -213,6 +235,6 @@ export async function onResultIngestedWithAutomaticPrecalcHandoff(
         await hooks.afterPrecalcAttachedBeforeProgress?.();
       }
     }
-    return onResultIngested(tx, signal);
+    return linkResultToCampaigns(tx, signal);
   });
 }

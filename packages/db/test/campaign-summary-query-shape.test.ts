@@ -3,6 +3,11 @@ import type { SQL } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 
 import type { DB } from "../src/client";
+import {
+  finalizeCampaignResultLinkBatch,
+  probeCampaignCompletion,
+  probeCampaignCompletions,
+} from "../src/campaign-execution";
 import { listCampaigns } from "../src/campaigns";
 import {
   campaignOpenTierCounts,
@@ -31,6 +36,130 @@ function recordingDb(resultRows: unknown[]) {
 }
 
 describe("campaign summary sparse-query guardrails", () => {
+  it("MUST-CATCH: completion probing short-circuits active campaigns before terminal scans", async () => {
+    const { db, queries } = recordingDb([{ open: true }]);
+
+    await probeCampaignCompletion(db, CAMPAIGN_ID);
+
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain("as open");
+    expect(queries[0]).toContain("p.state = 'requested'");
+    expect(queries[0]).not.toContain("as lanes_open");
+    expect(queries[0]).not.toContain("as automatic_recovery_open");
+    expect(queries[0]).not.toContain("as precalc_open");
+    expect(queries[0]).not.toContain("as verify_open");
+  });
+
+  it("coalesces one completion decision per affected campaign", async () => {
+    const { db, queries } = recordingDb([{ open: true }]);
+    const secondCampaign = "00000000-0000-0000-0000-000000000002";
+
+    await probeCampaignCompletions(db, [
+      CAMPAIGN_ID,
+      secondCampaign,
+      CAMPAIGN_ID,
+      secondCampaign,
+    ]);
+
+    expect(queries).toHaveLength(2);
+    expect(queries.every((query) => query.includes("as open"))).toBe(true);
+  });
+
+  it("MUST-CATCH: a multi-point ingest batch probes its campaign once and deduplicates dirty lanes", async () => {
+    const { db, queries } = recordingDb([{ open: true }]);
+    const lane = {
+      campaignId: CAMPAIGN_ID,
+      airfoilId: "airfoil-1",
+      conditionId: "condition-1",
+      objective: "ld_max",
+    };
+
+    const dirty = await finalizeCampaignResultLinkBatch(db, [
+      { laneKeys: [lane], campaignIds: [CAMPAIGN_ID] },
+      { laneKeys: [lane], campaignIds: [CAMPAIGN_ID] },
+      { laneKeys: [], campaignIds: [CAMPAIGN_ID] },
+    ]);
+
+    expect(dirty).toEqual([lane]);
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain("as open");
+  });
+
+  it("rechecks newly-open work in the rare terminal snapshot", async () => {
+    const queries: string[] = [];
+    const dialect = new PgDialect();
+    let call = 0;
+    const db = {
+      execute: async (query: SQL) => {
+        queries.push(compact(dialect.sqlToQuery(query).sql));
+        call += 1;
+        return call === 1
+          ? [{ open: false }]
+          : [
+              {
+                open: true,
+                lanes_open: false,
+                in_flight: false,
+                has_failed: false,
+                automatic_recovery_open: false,
+                has_rejected: false,
+                has_blocked: false,
+                precalc_open: false,
+                verify_open: false,
+              },
+            ];
+      },
+    } as unknown as DB;
+
+    await probeCampaignCompletion(db, CAMPAIGN_ID);
+
+    expect(queries).toHaveLength(2);
+    expect(queries[1]).toContain("as open");
+    expect(queries[1]).toContain("as lanes_open");
+    expect(queries[1]).toContain("as automatic_recovery_open");
+    expect(queries[1]).toContain("as verify_open");
+  });
+
+  it("preserves terminal completion after the split gate", async () => {
+    const updates: Record<string, unknown>[] = [];
+    let call = 0;
+    const db = {
+      execute: async () => {
+        call += 1;
+        return call === 1
+          ? [{ open: false }]
+          : [
+              {
+                open: false,
+                lanes_open: false,
+                in_flight: false,
+                has_failed: false,
+                automatic_recovery_open: false,
+                has_rejected: false,
+                has_blocked: false,
+                precalc_open: false,
+                verify_open: false,
+              },
+            ];
+      },
+      update: () => ({
+        set: (values: Record<string, unknown>) => ({
+          where: async () => {
+            updates.push(values);
+            return [];
+          },
+        }),
+      }),
+    } as unknown as DB;
+
+    await probeCampaignCompletion(db, CAMPAIGN_ID);
+
+    expect(call).toBe(2);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.status).toBe("completed");
+    expect(updates[0]?.completedAt).toBeInstanceOf(Date);
+  });
+
   it("MUST-CATCH: open-tier exceptions start at sparse sources, not the full point ledger", async () => {
     const { db, queries } = recordingDb([
       { rans_open: 11, precalc_open: 7, verify_open: 3 },

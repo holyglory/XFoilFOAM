@@ -25,10 +25,13 @@ describe("0092 result-media storage-key index migration", () => {
     );
   });
 
-  it("is the latest ordered migration", () => {
-    expect(journal.entries.at(-1)).toMatchObject({
+  it("remains ordered before later migrations", () => {
+    expect(journal.entries.find((entry) => entry.idx === 92)).toMatchObject({
       idx: 92,
       tag: "0092_result_media_storage_key_index",
     });
+    expect(journal.entries.findIndex((entry) => entry.idx === 92)).toBeLessThan(
+      journal.entries.findIndex((entry) => entry.idx === 93),
+    );
   });
 });

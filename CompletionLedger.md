@@ -5,12 +5,17 @@
   so later scheduler polls safely replay already-staged attempts and their
   immutable children. Exact point/attempt duplicates inside one payload are now
   collapsed only after the immutable attempt check, and retention no longer
-  owns scheduler liveness. Remaining: add a durable projection-complete
-  signature or bulk exact-association completeness proof so cross-tick replay
-  can skip only fully committed artifact/media/inventory/force-history tails;
-  verify crash recovery still fills every intentionally interrupted child row
-  and that ordinary ticks complete below the scheduler-delay threshold under a
-  live cumulative URANS/RANS workload.
+  owns scheduler liveness. A versioned, exact-attempt projection-complete
+  signature is implemented and regression-verified: it commits only after
+  artifact/media/inventory/force-history children, refuses payload drift,
+  isolates same-AoA solver regimes, fills a crash-partial child when no marker
+  exists, and reconstructs terminal GCS cleanup from the exact stored archive.
+  Exact point-to-campaign settlement remains transactional, while the common
+  completion gate now returns after one indexed open-work probe and cumulative
+  payloads make one terminal decision per affected campaign instead of one per
+  point. Remaining: deploy migration 0093 plus the sweeper, then prove ordinary
+  ticks complete below the scheduler-delay threshold under a live cumulative
+  URANS/RANS workload before removing this item.
 
 - **Frame-evidence integrity and narrow modal navigation:** Exact production
   evidence proves the AG 455CT02R frames 15–17 Cl/Cd values are authentic; the

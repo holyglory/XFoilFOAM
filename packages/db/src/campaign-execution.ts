@@ -607,6 +607,11 @@ export interface ResultIngestSignal {
   regime?: string | null;
 }
 
+export interface CampaignResultLinkOutcome {
+  laneKeys: CampaignLaneKey[];
+  campaignIds: string[];
+}
+
 interface ProgressKeyRow {
   campaign_id: string;
   condition_id: string;
@@ -1175,9 +1180,35 @@ export async function probeCampaignCompletion(
   db: DB,
   campaignId: string,
 ): Promise<void> {
+  // The overwhelming steady-state case is an active campaign with requested
+  // work. Keep that path to the one partial-index EXISTS probe; PostgreSQL
+  // evaluates every expression in a SELECT list before returning the row, so
+  // putting this guard beside the terminal checks made every point ingest pay
+  // for all of them even though the TypeScript branch returned immediately.
+  const [openProbe] = (await db.execute(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM sim_campaign_points p
+      JOIN sim_campaign_conditions c ON c.id = p.condition_id
+      WHERE p.campaign_id = ${campaignId} AND p.state = 'requested' AND c.status IN ('active', 'kept')
+        AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
+        AND NOT EXISTS (
+          SELECT 1 FROM sim_precalc_obligations blocked_obligation
+          WHERE blocked_obligation.airfoil_id = p.airfoil_id
+            AND blocked_obligation.revision_id = p.revision_id
+            AND blocked_obligation.aoa_deg = p.aoa_deg
+            AND blocked_obligation.state = 'blocked'
+        )
+    ) AS open
+  `)) as unknown as { open: boolean }[];
+  if (!openProbe || openProbe.open) return;
+
   const [probe] = (await db.execute(sql`
     SELECT
       EXISTS (
+        -- Recheck inside the terminal snapshot: a plan edit may add requested
+        -- work after the fast gate. The common active path never reaches this
+        -- query, while the rare completion edge keeps the original
+        -- no-premature-completion guarantee.
         SELECT 1 FROM sim_campaign_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'requested' AND c.status IN ('active', 'kept')
@@ -1400,6 +1431,34 @@ export async function probeCampaignCompletion(
   }
 }
 
+/** Run the campaign-wide completion decision once for each affected campaign.
+ * Per-point ingest callers may defer this until the whole engine payload has
+ * linked its exact evidence, avoiding one identical global probe per point. */
+export async function probeCampaignCompletions(
+  db: DB,
+  campaignIds: Iterable<string>,
+): Promise<void> {
+  for (const campaignId of [...new Set(campaignIds)].sort()) {
+    await probeCampaignCompletion(db, campaignId);
+  }
+}
+
+/** Merge a bulk ingest payload's point-link outcomes and run its deferred
+ * campaign-wide completion decisions exactly once per campaign. */
+export async function finalizeCampaignResultLinkBatch(
+  db: DB,
+  outcomes: readonly CampaignResultLinkOutcome[],
+): Promise<CampaignLaneKey[]> {
+  const laneKeys = new Map<string, CampaignLaneKey>();
+  const campaignIds = new Set<string>();
+  for (const outcome of outcomes) {
+    for (const key of outcome.laneKeys) laneKeys.set(laneKeyId(key), key);
+    for (const campaignId of outcome.campaignIds) campaignIds.add(campaignId);
+  }
+  await probeCampaignCompletions(db, campaignIds);
+  return [...laneKeys.values()];
+}
+
 async function lanesForProgressKeys(
   db: DB,
   keys: ProgressKeyRow[],
@@ -1433,15 +1492,15 @@ async function lanesForProgressKeys(
 /**
  * Ingest hook: link the matching campaign points to the just-upserted results
  * row, flip derived-by-symmetry cells when their +α source lands (canonical
- * negation), recompute the affected progress counters, run the completion
- * probe, and return the dirty lane keys the caller should drain via laneTick
- * AFTER refreshing the polar fit cache for the revision.
+ * negation), recompute the affected progress counters, and return the dirty
+ * lane keys plus affected campaign ids. The caller may defer the campaign-wide
+ * completion probe until a whole ingest payload has linked its points.
  */
-export async function onResultIngested(
+export async function linkResultToCampaigns(
   db: DB,
   signal: ResultIngestSignal,
-): Promise<CampaignLaneKey[]> {
-  if (!signal.revisionId) return [];
+): Promise<CampaignResultLinkOutcome> {
+  if (!signal.revisionId) return { laneKeys: [], campaignIds: [] };
   const aoa = canonicalAoa(signal.aoaDeg);
   const terminal = signal.status === "done" || signal.status === "failed";
   const affected: ProgressKeyRow[] = [];
@@ -1539,15 +1598,26 @@ export async function onResultIngested(
   }
 
   const keys = dedupeProgressKeys(affected);
-  if (!keys.length) return [];
+  if (!keys.length) return { laneKeys: [], campaignIds: [] };
   await recomputeProgressForKeys(db, keys);
-  if (!terminal) return [];
+  if (!terminal) return { laneKeys: [], campaignIds: [] };
 
   const laneKeys = await lanesForProgressKeys(db, keys);
-  for (const campaignId of new Set(keys.map((k) => k.campaign_id))) {
-    await probeCampaignCompletion(db, campaignId);
-  }
-  return laneKeys;
+  const campaignIds = [...new Set(keys.map((key) => key.campaign_id))].sort();
+  return { laneKeys, campaignIds };
+}
+
+/**
+ * Immediate compatibility wrapper for single-point callers. Bulk ingest uses
+ * linkResultToCampaigns and coalesces the completion decision per payload.
+ */
+export async function onResultIngested(
+  db: DB,
+  signal: ResultIngestSignal,
+): Promise<CampaignLaneKey[]> {
+  const outcome = await linkResultToCampaigns(db, signal);
+  await probeCampaignCompletions(db, outcome.campaignIds);
+  return outcome.laneKeys;
 }
 
 // ---------------------------------------------------------------------------

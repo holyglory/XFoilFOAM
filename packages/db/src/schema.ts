@@ -1341,6 +1341,45 @@ export const results = pgTable(
   }),
 );
 
+/**
+ * Durable proof that one exact immutable result attempt finished its
+ * point-owned ingest projection (artifacts, shipped media, field inventory,
+ * and force history).
+ *
+ * This is scheduler/projection metadata, not solver evidence. It is written
+ * only after every child write has committed. Absence therefore means
+ * "replay the idempotent projection", including after a crash; presence with
+ * the exact versioned payload signature permits cumulative engine-result
+ * polling to skip that expensive tail.
+ */
+export const resultAttemptIngestCompletions = pgTable(
+  "result_attempt_ingest_completions",
+  {
+    resultAttemptId: uuid("result_attempt_id").primaryKey(),
+    resultId: uuid("result_id").notNull(),
+    projectionVersion: integer("projection_version").notNull(),
+    payloadSignature: text("payload_signature").notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_attempt_ingest_completions_attempt_owner_fk",
+    }).onDelete("cascade"),
+    projectionVersionCheck: check(
+      "result_attempt_ingest_completions_projection_version_check",
+      sql`${t.projectionVersion} > 0`,
+    ),
+    payloadSignatureCheck: check(
+      "result_attempt_ingest_completions_payload_signature_check",
+      sql`${t.payloadSignature} ~ '^[0-9a-f]{64}$'`,
+    ),
+  }),
+);
+
 /** Durable execution policy for answered engine submit failures. Kept
  * separate from canonical solver results: no row here claims that OpenFOAM
  * ran or that coefficient evidence exists. */

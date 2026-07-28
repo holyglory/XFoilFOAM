@@ -4,13 +4,16 @@ import {
   type CampaignLaneKey,
   fieldColorScales,
   enqueuePrecalcVerifications,
+  finalizeCampaignResultLinkBatch,
   forceHistory,
   hasExactValidSolverManifest,
   laneKeyId,
+  linkResultToCampaignsWithAutomaticPrecalcHandoff,
   onResultIngested,
-  onResultIngestedWithAutomaticPrecalcHandoff,
+  type CampaignResultLinkOutcome,
   type DB,
   type ResultInsert,
+  resultAttemptIngestCompletions,
   resultAttempts,
   resultClassifications,
   solverEvidenceArchives,
@@ -84,6 +87,7 @@ const ARCHIVED_EVIDENCE_MEMBER_KINDS = new Set([
   "dictionary",
   "field_data",
 ]);
+const RESULT_ATTEMPT_INGEST_PROJECTION_VERSION = 1;
 
 interface VerifiedGcsEvidenceBundle {
   bucket: string;
@@ -1466,6 +1470,60 @@ async function insertResultAttempt(opts: {
 type StoredEvidenceArtifact = typeof solverEvidenceArtifacts.$inferSelect;
 type StoredEvidenceArchive = typeof solverEvidenceArchives.$inferSelect;
 
+function pendingRemoteEvidenceCleanupForStoredArchive(opts: {
+  point: PolarPoint;
+  artifact: EngineEvidenceArtifact;
+  bundle: VerifiedGcsEvidenceBundle;
+  resultId: string;
+  resultAttemptId: string;
+  sourceArtifactId: string;
+  archiveId: string;
+}): PendingRemoteEvidenceCleanup | null {
+  const metadata = opts.artifact.metadata ?? {};
+  const cleanupDisposition = metadata.localEvidenceDisposition;
+  if (
+    cleanupDisposition !==
+      "remote-copy-plus-local-archive-pending-database-ack" &&
+    cleanupDisposition !== "remote-only-pending-cleanup"
+  ) {
+    return null;
+  }
+  if (!opts.point.case_slug) {
+    throw new Error("GCS evidence cleanup requires an exact case_slug");
+  }
+  const bundledFileCount = requireNonnegativeSafeInteger(
+    metadata.bundledFileCount,
+    "bundledFileCount",
+  );
+  return {
+    caseSlug: opts.point.case_slug,
+    evidenceBase: opts.bundle.evidenceBase,
+    pointer: {
+      schemaVersion: 1,
+      format: "tar+zstd",
+      bucket: opts.bundle.bucket,
+      objectKey: opts.bundle.objectKey,
+      generation: opts.bundle.generation,
+      storedSha256: opts.artifact.sha256,
+      storedSize: opts.artifact.byte_size,
+      tarSha256: opts.bundle.uncompressedTarSha256,
+      tarSize: opts.bundle.uncompressedTarByteSize,
+      crc32c: opts.bundle.crc32c,
+      zstdLevel: opts.bundle.zstdLevel,
+      createdAt: opts.bundle.verifiedAtText,
+    },
+    bundledFileCount,
+    associations: [
+      {
+        resultId: opts.resultId,
+        resultAttemptId: opts.resultAttemptId,
+        sourceArtifactId: opts.sourceArtifactId,
+        archiveId: opts.archiveId,
+      },
+    ],
+  };
+}
+
 function artifactEvidenceBase(
   artifact: Pick<StoredEvidenceArtifact, "metadata">,
   expectedEvidenceBase: string,
@@ -2112,49 +2170,15 @@ export async function registerEvidenceArtifacts(opts: {
         artifact,
         bundle: gcsBundle,
       });
-      const metadata = artifact.metadata ?? {};
-      const cleanupDisposition = metadata.localEvidenceDisposition;
-      if (
-        cleanupDisposition !==
-          "remote-copy-plus-local-archive-pending-database-ack" &&
-        cleanupDisposition !== "remote-only-pending-cleanup"
-      ) {
-        return null;
-      }
-      if (!point.case_slug) {
-        throw new Error("GCS evidence cleanup requires an exact case_slug");
-      }
-      const bundledFileCount = requireNonnegativeSafeInteger(
-        metadata.bundledFileCount,
-        "bundledFileCount",
-      );
-      return {
-        caseSlug: point.case_slug,
-        evidenceBase: gcsBundle.evidenceBase,
-        pointer: {
-          schemaVersion: 1,
-          format: "tar+zstd",
-          bucket: gcsBundle.bucket,
-          objectKey: gcsBundle.objectKey,
-          generation: gcsBundle.generation,
-          storedSha256: artifact.sha256,
-          storedSize: artifact.byte_size,
-          tarSha256: gcsBundle.uncompressedTarSha256,
-          tarSize: gcsBundle.uncompressedTarByteSize,
-          crc32c: gcsBundle.crc32c,
-          zstdLevel: gcsBundle.zstdLevel,
-          createdAt: gcsBundle.verifiedAtText,
-        },
-        bundledFileCount,
-        associations: [
-          {
-            resultId: resultId!,
-            resultAttemptId: resultAttemptId!,
-            sourceArtifactId: storedArtifact.id,
-            archiveId: archive.id,
-          },
-        ],
-      };
+      return pendingRemoteEvidenceCleanupForStoredArchive({
+        point,
+        artifact,
+        bundle: gcsBundle,
+        resultId: resultId!,
+        resultAttemptId: resultAttemptId!,
+        sourceArtifactId: storedArtifact.id,
+        archiveId: archive.id,
+      });
     }
 
     if (
@@ -2188,6 +2212,122 @@ export async function registerEvidenceArtifacts(opts: {
     },
     write,
   );
+}
+
+/**
+ * A completed projection may skip re-registering thousands of immutable
+ * member rows, but terminal GCS reclamation still needs the exact database
+ * association proof. Reconstruct it from the already-committed source
+ * artifact/archive pair and the exact replayed payload; never treat the
+ * projection marker itself as a cleanup acknowledgement.
+ */
+async function restoreCompletedProjectionRemoteEvidenceCleanups(opts: {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  airfoilId: string;
+  simJobId: string;
+  engineJobId: string;
+  point: PolarPoint;
+  runtime: ResolvedEngineRuntime | null;
+}): Promise<PendingRemoteEvidenceCleanup[]> {
+  const restored: PendingRemoteEvidenceCleanup[] = [];
+  for (const artifact of opts.point.evidence_artifacts ?? []) {
+    if (artifact.kind !== "engine_bundle") continue;
+    const bundle = parseVerifiedGcsEvidenceBundle("engine_bundle", artifact);
+    if (!bundle) continue;
+    const cleanupDisposition = artifact.metadata?.localEvidenceDisposition;
+    if (
+      cleanupDisposition !==
+        "remote-copy-plus-local-archive-pending-database-ack" &&
+      cleanupDisposition !== "remote-only-pending-cleanup"
+    ) {
+      continue;
+    }
+    const urlPath = artifact.url ?? artifact.path;
+    if (!urlPath) {
+      throw new Error(
+        `completed ingest projection lost its GCS bundle path for attempt ${opts.resultAttemptId}`,
+      );
+    }
+    const storedArtifacts = await opts.db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, opts.resultId),
+          eq(solverEvidenceArtifacts.resultAttemptId, opts.resultAttemptId),
+          eq(solverEvidenceArtifacts.kind, "engine_bundle"),
+          eq(solverEvidenceArtifacts.storageKey, storageKeyOf(urlPath)),
+          eq(solverEvidenceArtifacts.sha256, artifact.sha256),
+        ),
+      )
+      .limit(2);
+    if (storedArtifacts.length !== 1) {
+      throw new Error(
+        `completed ingest projection has ${storedArtifacts.length} exact GCS bundle associations for attempt ${opts.resultAttemptId}`,
+      );
+    }
+    const [source] = storedArtifacts;
+    const associationMismatches = [
+      source!.airfoilId !== opts.airfoilId && "airfoilId",
+      source!.simJobId !== opts.simJobId && "simJobId",
+      source!.engineJobId !== opts.engineJobId && "engineJobId",
+      source!.engineCaseSlug !== (opts.point.case_slug ?? null) &&
+        "engineCaseSlug",
+      source!.methodKey !== (opts.point.method_key ?? null) && "methodKey",
+      source!.solverImplementationId !==
+        (opts.runtime?.solverImplementationId ?? null) &&
+        "solverImplementationId",
+      source!.solverRuntimeBuildId !==
+        (opts.runtime?.solverRuntimeBuildId ?? null) && "solverRuntimeBuildId",
+      source!.aoaDeg !== opts.point.aoa_deg && "aoaDeg",
+      source!.field !== (artifact.field ?? null) && "field",
+      source!.role !== (artifact.role ?? null) && "role",
+      source!.mimeType !== artifact.mime_type && "mimeType",
+      source!.byteSize !== artifact.byte_size && "byteSize",
+      stableHash(source!.metadata ?? {}) !==
+        stableHash(artifact.metadata ?? {}) && "metadata",
+    ].filter((field): field is string => Boolean(field));
+    if (associationMismatches.length) {
+      throw new Error(
+        `completed ingest projection GCS association changed for attempt ${opts.resultAttemptId}: ${associationMismatches.join(", ")}`,
+      );
+    }
+    const archives = await opts.db
+      .select()
+      .from(solverEvidenceArchives)
+      .where(
+        and(
+          eq(solverEvidenceArchives.resultId, opts.resultId),
+          eq(solverEvidenceArchives.resultAttemptId, opts.resultAttemptId),
+          eq(solverEvidenceArchives.sourceArtifactId, source!.id),
+          eq(solverEvidenceArchives.state, "current"),
+        ),
+      )
+      .limit(2);
+    if (archives.length !== 1) {
+      throw new Error(
+        `completed ingest projection has ${archives.length} current GCS archives for attempt ${opts.resultAttemptId}`,
+      );
+    }
+    const cleanup = pendingRemoteEvidenceCleanupForStoredArchive({
+      point: opts.point,
+      artifact,
+      bundle,
+      resultId: opts.resultId,
+      resultAttemptId: opts.resultAttemptId,
+      sourceArtifactId: source!.id,
+      archiveId: archives[0]!.id,
+    });
+    if (!cleanup) {
+      throw new Error(
+        `completed ingest projection lost its GCS cleanup disposition for attempt ${opts.resultAttemptId}`,
+      );
+    }
+    restored.push(cleanup);
+  }
+  return restored;
 }
 
 type ScaleGroupKey = `${string}:${string}:${ImageFieldName}`;
@@ -2233,7 +2373,7 @@ function nearlyEqual(a: number, b: number): boolean {
   return Math.abs(a - b) <= scale * 1e-9;
 }
 
-function stableHash(value: unknown): string {
+function stableJson(value: unknown): string {
   const stable = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(stable);
     if (v && typeof v === "object") {
@@ -2245,10 +2385,15 @@ function stableHash(value: unknown): string {
     }
     return v;
   };
-  return createHash("sha256")
-    .update(JSON.stringify(stable(value)))
-    .digest("hex")
-    .slice(0, 24);
+  return JSON.stringify(stable(value));
+}
+
+function stableSha256(value: unknown): string {
+  return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+function stableHash(value: unknown): string {
+  return stableSha256(value).slice(0, 24);
 }
 
 function attemptEvidenceRecord(value: unknown): Record<string, unknown> | null {
@@ -2320,6 +2465,142 @@ function mergePendingRemoteEvidenceCleanup(
       (candidate) => stableHash(candidate) === identity,
     );
     if (!duplicate) existing.associations.push(association);
+  }
+}
+
+function resultAttemptIngestProjectionSignature(opts: {
+  point: PolarPoint;
+  presetRevisionId: string | null;
+  runtime: ResolvedEngineRuntime | null;
+}): string {
+  return stableSha256({
+    schemaVersion: RESULT_ATTEMPT_INGEST_PROJECTION_VERSION,
+    point: opts.point,
+    presetRevisionId: opts.presetRevisionId,
+    solverImplementationId: opts.runtime?.solverImplementationId ?? null,
+    solverRuntimeBuildId: opts.runtime?.solverRuntimeBuildId ?? null,
+  });
+}
+
+async function completedResultAttemptIngestProjection(opts: {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  payloadSignature: string;
+}): Promise<boolean> {
+  const [completion] = await opts.db
+    .select()
+    .from(resultAttemptIngestCompletions)
+    .where(
+      and(
+        eq(
+          resultAttemptIngestCompletions.resultAttemptId,
+          opts.resultAttemptId,
+        ),
+        eq(resultAttemptIngestCompletions.resultId, opts.resultId),
+      ),
+    )
+    .limit(1);
+  if (!completion) return false;
+  if (completion.projectionVersion > RESULT_ATTEMPT_INGEST_PROJECTION_VERSION) {
+    throw new Error(
+      `result attempt ${opts.resultAttemptId} was projected by newer ingest version ${completion.projectionVersion}`,
+    );
+  }
+  if (
+    completion.projectionVersion === RESULT_ATTEMPT_INGEST_PROJECTION_VERSION
+  ) {
+    if (completion.payloadSignature !== opts.payloadSignature) {
+      throw new Error(
+        `result attempt ${opts.resultAttemptId} replay changed its completed ingest projection payload`,
+      );
+    }
+    return true;
+  }
+  // A future projection version may add another idempotent child. Older
+  // completion rows deliberately take the full tail once and are upgraded
+  // only after every current-version child write commits.
+  return false;
+}
+
+async function recordResultAttemptIngestProjection(opts: {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  payloadSignature: string;
+}): Promise<void> {
+  const [inserted] = await opts.db
+    .insert(resultAttemptIngestCompletions)
+    .values({
+      resultAttemptId: opts.resultAttemptId,
+      resultId: opts.resultId,
+      projectionVersion: RESULT_ATTEMPT_INGEST_PROJECTION_VERSION,
+      payloadSignature: opts.payloadSignature,
+      completedAt: new Date(),
+    })
+    .onConflictDoNothing()
+    .returning({
+      resultAttemptId: resultAttemptIngestCompletions.resultAttemptId,
+    });
+  if (inserted) return;
+
+  const [existing] = await opts.db
+    .select()
+    .from(resultAttemptIngestCompletions)
+    .where(
+      eq(resultAttemptIngestCompletions.resultAttemptId, opts.resultAttemptId),
+    )
+    .limit(1);
+  if (!existing || existing.resultId !== opts.resultId) {
+    throw new Error(
+      `result attempt ${opts.resultAttemptId} ingest completion lost its exact result owner`,
+    );
+  }
+  if (
+    existing.projectionVersion === RESULT_ATTEMPT_INGEST_PROJECTION_VERSION &&
+    existing.payloadSignature === opts.payloadSignature
+  ) {
+    return;
+  }
+  if (existing.projectionVersion >= RESULT_ATTEMPT_INGEST_PROJECTION_VERSION) {
+    throw new Error(
+      `result attempt ${opts.resultAttemptId} ingest completion conflicts with immutable projection metadata`,
+    );
+  }
+  const [upgraded] = await opts.db
+    .update(resultAttemptIngestCompletions)
+    .set({
+      projectionVersion: RESULT_ATTEMPT_INGEST_PROJECTION_VERSION,
+      payloadSignature: opts.payloadSignature,
+      completedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(
+          resultAttemptIngestCompletions.resultAttemptId,
+          opts.resultAttemptId,
+        ),
+        eq(resultAttemptIngestCompletions.resultId, opts.resultId),
+        eq(
+          resultAttemptIngestCompletions.projectionVersion,
+          existing.projectionVersion,
+        ),
+        eq(
+          resultAttemptIngestCompletions.payloadSignature,
+          existing.payloadSignature,
+        ),
+      ),
+    )
+    .returning({
+      resultAttemptId: resultAttemptIngestCompletions.resultAttemptId,
+    });
+  if (!upgraded) {
+    const completed = await completedResultAttemptIngestProjection(opts);
+    if (!completed) {
+      throw new Error(
+        `result attempt ${opts.resultAttemptId} ingest completion upgrade lost its compare-and-set fence`,
+      );
+    }
   }
 }
 
@@ -5245,8 +5526,10 @@ export async function ingestResult(opts: {
   hooks?: {
     afterEvidenceStaged?: () => Promise<void>;
     /** Test-only observation after one point's expensive child evidence has
-     * been staged. Exact point/attempt duplicates intentionally do not fire
-     * this hook twice. */
+     * been staged but before its durable projection-complete marker commits.
+     * Exact point/attempt duplicates intentionally do not fire this hook
+     * twice. Throwing here models a crash whose next replay must re-prove and
+     * fill every idempotent child. */
     afterPointEvidenceStaged?: (point: {
       resultId: string;
       resultAttemptId: string;
@@ -5372,11 +5655,62 @@ export async function ingestResult(opts: {
     if (!resultAttemptId) {
       throw new Error(`failed to stage exact attempt (${pointContext})`);
     }
+    const staged: StagedPoint = {
+      airfoilId,
+      bcId: input.bcId,
+      presetRevisionId: input.presetRevisionId,
+      resultId: cell.id,
+      resultAttemptId,
+      point: p,
+      derived,
+      reynolds: Math.round(input.reynolds),
+      speed: input.speed,
+      chord: input.chord,
+      mach: input.mappedMach,
+      simJobId,
+      engineJobId,
+      ingestLeaseToken: opts.ingestLeaseToken ?? null,
+      observedCurrentAttemptId: cell.currentAttemptId,
+      observedStatus: cell.status,
+      observedSimJobId: cell.simJobId,
+      quarantined: cell.quarantined,
+    };
     if (
       input.reuseCandidate?.resultId === cell.id &&
       input.reuseCandidate.resultAttemptId === resultAttemptId
     ) {
       return input.reuseCandidate;
+    }
+    const projectionSignature = resultAttemptIngestProjectionSignature({
+      point: p,
+      presetRevisionId: input.presetRevisionId,
+      runtime,
+    });
+    if (
+      await completedResultAttemptIngestProjection({
+        db,
+        resultId: cell.id,
+        resultAttemptId,
+        payloadSignature: projectionSignature,
+      })
+    ) {
+      if (["completed", "failed", "cancelled"].includes(result.state)) {
+        for (const cleanup of await restoreCompletedProjectionRemoteEvidenceCleanups(
+          {
+            db,
+            resultId: cell.id,
+            resultAttemptId,
+            airfoilId,
+            simJobId,
+            engineJobId,
+            point: p,
+            runtime,
+          },
+        )) {
+          mergePendingRemoteEvidenceCleanup(remoteEvidenceCleanups, cleanup);
+        }
+      }
+      return staged;
     }
 
     // Exact immutable evidence is complete before any canonical projection or
@@ -5423,32 +5757,19 @@ export async function ingestResult(opts: {
       aoaDeg: p.aoa_deg,
       regime: p.unsteady ? "urans" : "rans",
     });
+    await recordResultAttemptIngestProjection({
+      db,
+      resultId: cell.id,
+      resultAttemptId,
+      payloadSignature: projectionSignature,
+    });
     // Field extents and scaled default media belong to the separate, durable
     // media-repair worker. Calling the renderer while a continuous sweep is
     // publishing partial evidence makes the scheduler wait on I/O instead of
     // submitting the next independent polar. Shipped media and immutable raw
     // evidence above remain immediately available; the repair worker derives
     // extents only after the producing engine job is terminal.
-    return {
-      airfoilId,
-      bcId: input.bcId,
-      presetRevisionId: input.presetRevisionId,
-      resultId: cell.id,
-      resultAttemptId,
-      point: p,
-      derived,
-      reynolds: Math.round(input.reynolds),
-      speed: input.speed,
-      chord: input.chord,
-      mach: input.mappedMach,
-      simJobId,
-      engineJobId,
-      ingestLeaseToken: opts.ingestLeaseToken ?? null,
-      observedCurrentAttemptId: cell.currentAttemptId,
-      observedStatus: cell.status,
-      observedSimJobId: cell.simJobId,
-      quarantined: cell.quarantined,
-    };
+    return staged;
   };
 
   for (const polar of result.polars) {
@@ -5629,11 +5950,12 @@ export async function ingestResult(opts: {
   // Campaign and obligation state observe only committed selected evidence (or
   // a pointer-null machine failure). A rejected child of an existing public
   // generation settles against the kept current row returned above.
+  const campaignLinkOutcomes: CampaignResultLinkOutcome[] = [];
   for (const finalized of finalizedByResult.values()) {
     const candidate = [...candidatesByRevision.values(), legacyCandidates]
       .flat()
       .find((item) => item.resultId === finalized.resultId);
-    const laneKeys = await onResultIngestedWithAutomaticPrecalcHandoff(db, {
+    const outcome = await linkResultToCampaignsWithAutomaticPrecalcHandoff(db, {
       airfoilId,
       revisionId: candidate?.presetRevisionId ?? null,
       aoaDeg: finalized.aoaDeg,
@@ -5643,7 +5965,13 @@ export async function ingestResult(opts: {
       resultAttemptId: finalized.resultAttemptId,
       simJobId: finalized.simJobId,
     });
-    for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
+    campaignLinkOutcomes.push(outcome);
+  }
+  for (const key of await finalizeCampaignResultLinkBatch(
+    db,
+    campaignLinkOutcomes,
+  )) {
+    dirtyLanes.set(laneKeyId(key), key);
   }
   return {
     points,

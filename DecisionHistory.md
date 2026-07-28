@@ -169,8 +169,13 @@
   maintenance loop so it cannot hold tick progress open; index exact artifact
   reference lookups and limit cleanup to one database connection at a time.
   Reuse exact canonical point/attempt duplicates within one payload only after
-  immutable replay validation; retain a durable completeness gate as required
-  follow-up before skipping evidence across separate partial-result polls.
+  immutable replay validation. Across separate partial-result polls, skip the
+  expensive evidence tail only after an exact-attempt, versioned full-payload
+  completion marker commits after every child; marker absence replays safely,
+  and terminal GCS cleanup is reconstructed and revalidated independently.
+  Keep exact per-point handoff/progress transactional, but short-circuit the
+  campaign completion gate on indexed open work and coalesce its terminal
+  decision once per affected campaign and engine payload.
   [detail](DecisionDetails/D-2026-07-28-scheduler-delay-and-campaign-polling.md)
 - Why: repeated campaign warnings turned non-actionable internal progress
   telemetry into a false user task, while whole-campaign scans and overlapping
@@ -180,7 +185,10 @@
   cost or truthful live progress. Awaiting an hourly cache scan inside the
   admission tick made maintenance latency look like scheduler failure; an
   independent serial loop preserves cleanup without delaying work or outliving
-  its database pool.
+  its database pool. Attempt existence or child-row counts cannot prove a
+  crash-complete projection; the separate commit-after-children signature is
+  conservative, drift-detecting, and keeps storage reclamation obligations
+  intact.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

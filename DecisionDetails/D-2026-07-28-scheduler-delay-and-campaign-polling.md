@@ -30,8 +30,8 @@ minute fifty seconds while `sweepSyncImportOrphans` checked large batches of
 storage keys. Subsequent ticks remained slow because cumulative engine result
 payloads replayed already-staged points and artifacts. This decision removes
 retention from scheduler liveness and eliminates the duplicate canonical
-point/attempt evidence tail inside one payload; durable cross-tick replay
-short-circuiting remains separate active work.
+point/attempt evidence tail inside one payload. The same correction now gives
+cross-tick cumulative replay its own durable exact-attempt completion proof.
 
 ## Decision
 
@@ -68,6 +68,36 @@ connection at a time. Within one engine payload, reuse a canonical point only
 after the duplicate attempt passes the existing exact immutable-evidence check;
 do not repeat artifact, media, inventory, or force-history staging for the same
 exact attempt.
+
+For separate partial-result polls, keep projection completion outside immutable
+solver evidence in `result_attempt_ingest_completions`. One row binds the exact
+`(result_attempt_id, result_id)` owner to a projection version and full SHA-256
+signature of the point payload, setup revision, and resolved solver runtime.
+Always run immutable attempt replay validation first. Skip the expensive child
+tail only when the current version and signature match. Write the completion
+row only after artifacts, shipped media, field inventory, and force history
+have all committed; do not backfill historical attempts. A missing marker
+therefore takes the idempotent full path and fills crash-partial children.
+Terminal GCS replays reconstruct their cleanup obligation from the exact stored
+bundle/archive association and still pass full manifest/member validation
+before asking the engine to reclaim local bytes.
+
+Keep the point-to-campaign link, automatic RANS-to-PRECALC ownership, and
+progress recomputation exact and transactional for every finalized point. Do
+not run the campaign-wide completion decision after every point in a cumulative
+engine payload. Accumulate affected campaign ids and run that decision once per
+campaign after the payload has linked all of its committed points. Existing
+single-point callers retain immediate completion semantics. If the process
+stops between point settlement and the deferred decision, the campaign remains
+conservatively active; the low-frequency campaign reconciler recomputes
+progress and runs the same completion decision.
+
+Split the completion decision into a fast open-work gate and a terminal-only
+snapshot. The ordinary active-campaign path runs only the partial-index-backed
+requested-point `EXISTS`. Only a campaign with no open point evaluates lanes,
+in-flight replacements, recovery obligations, rejected/blocked evidence,
+preliminary work, and final verification. Recheck open work in the terminal
+snapshot so a concurrent plan edit cannot cause premature completion.
 
 This supersedes only the causal wording and campaign-level presentation in the
 2026-07-07 liveness/progress decision. Its independent heartbeat, tick
@@ -113,8 +143,24 @@ provides an explicit shutdown join.
 Treating an existing attempt row as sufficient proof of complete cross-tick
 ingest was rejected. Attempt insertion precedes child artifacts, projection,
 and remote cleanup acknowledgement, so a crash may leave an honest partial
-stage that must be resumed. A future cross-tick shortcut needs its own durable
-projection-complete signature or exact bulk completeness proof.
+stage that must be resumed. Counting expected rows was also rejected: artifact
+kinds can evolve, media may legitimately be absent, and a count cannot prove
+the exact immutable payload or GCS archive identity. The separate completion
+row is a commit-after-children fence. It makes absence conservative, detects
+payload/runtime drift, keeps RANS and URANS attempts isolated even at the same
+AoA, and preserves remote cleanup rather than confusing projection completion
+with local-byte reclamation.
+
+Running the full completion snapshot once per finalized point was also
+rejected. A 256-point cumulative payload could repeat the same campaign-wide
+terminal scans 256 times per poll, and repeated partial polls compounded that
+work. Skipping per-point campaign linking was not acceptable because a campaign
+may begin owning a cell after its evidence was first ingested. The selected
+boundary therefore preserves per-point ownership and counters but batches only
+the global decision. Adding another point-ledger index was not selected:
+production `EXPLAIN ANALYZE` measured the fast open predicate at 0.249 ms with
+the existing partial index, so another write-amplifying index would not address
+the repeated terminal scans.
 
 ## Evidence
 
@@ -132,4 +178,15 @@ Regression coverage pins non-overlapping polls, coalesced follow-ups,
 latest-only matrix refreshes, hidden-tab behavior, sparse-query source shape,
 the absence of campaign-level scheduler-delay gates, a deferred retention pass
 that cannot overlap or hold scheduler progress open, graceful shutdown drain,
-and the indexed storage-key lookup used by cache reference checks.
+and the indexed storage-key lookup used by cache reference checks. Exact ingest
+regressions additionally prove crash-partial force history is filled before a
+marker appears, exact cross-tick replay bypasses the child tail, changed
+payloads fail immutable validation, same-AoA RANS and URANS attempts retain
+separate markers, and terminal replay restores the identical GCS cleanup
+association.
+
+Completion-probe regressions additionally pin that an open campaign executes
+only the fast query, the rare terminal snapshot rechecks newly-open work, and a
+multi-point result-link batch deduplicates both dirty lanes and completion
+decisions. The existing transaction regression proves automatic PRECALC
+ownership and point/progress settlement remain one visibility boundary.
