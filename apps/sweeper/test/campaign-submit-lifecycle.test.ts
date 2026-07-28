@@ -28,6 +28,7 @@ import {
   forceHistory,
   healOrphanedUransRequests,
   listCampaigns,
+  linkResultsToCampaignsWithAutomaticPrecalcHandoff,
   materializeCampaignLaunch,
   mediums,
   meshProfiles,
@@ -974,6 +975,232 @@ describe("campaign compose→submit lifecycle boundary", () => {
       blocked: 0,
     });
     expect((await campaignFailures(db, campaignId)).total).toBe(0);
+  }, 120000);
+
+  it("batches cumulative RANS handoffs in one rollback-safe point, PRECALC and progress visibility boundary", async () => {
+    const campaignId = await launch(
+      "atomic-batch-rans-precalc-handoff",
+      35.147,
+    );
+    const setup = await setupFor(campaignId);
+    const [parent] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [setup.bcId],
+        simulationPresetRevisionId: setup.revisionId,
+        campaignId,
+        jobKind: "sweep",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "running",
+        engineJobId: `${PREFIX}-atomic-batch-handoff-parent`,
+        totalCases: ANGLES.length,
+        completedCases: ANGLES.length,
+        requestPayload: {
+          aoas: ANGLES,
+          ransRetryScope: {
+            origin: "continuous-polar",
+            requestedAoas: ANGLES,
+          },
+        },
+      })
+      .returning();
+    const sourceResults = await db
+      .insert(results)
+      .values(
+        ANGLES.map((aoaDeg) => ({
+          airfoilId,
+          bcId: setup.bcId,
+          simulationPresetRevisionId: setup.revisionId,
+          aoaDeg,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          fidelity: "rans",
+          simJobId: parent.id,
+          error: null,
+          converged: true,
+          stalled: false,
+          solvedAt: new Date(),
+        })),
+      )
+      .returning();
+    const sourceAttempts = await db
+      .insert(resultAttempts)
+      .values(
+        sourceResults.map((result) => ({
+          resultId: result.id,
+          airfoilId,
+          bcId: setup.bcId,
+          simulationPresetRevisionId: setup.revisionId,
+          aoaDeg: result.aoaDeg,
+          simJobId: parent.id,
+          engineJobId: parent.engineJobId,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          validForPolar: false,
+          converged: true,
+          stalled: false,
+          unsteady: false,
+          error: null,
+          evidencePayload: {},
+          solvedAt: new Date(),
+        })),
+      )
+      .returning();
+    await db.insert(resultClassifications).values(
+      sourceAttempts.map((attempt) => ({
+        resultId: attempt.resultId!,
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: setup.revisionId,
+        aoaDeg: attempt.aoaDeg,
+        regime: "rans" as const,
+        classifierVersion: `${PREFIX}-atomic-batch-rans-precalc-handoff`,
+        state: "rejected" as const,
+        reasons: ["missing-coefficients"],
+      })),
+    );
+    const signals = sourceResults.map((result) => {
+      const attempt = sourceAttempts.find(
+        (candidate) => candidate.resultId === result.id,
+      )!;
+      return {
+        airfoilId,
+        revisionId: setup.revisionId,
+        aoaDeg: result.aoaDeg,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        simJobId: parent.id,
+        status: "done",
+        regime: "rans",
+      };
+    });
+
+    let crashHookCalls = 0;
+    await expect(
+      linkResultsToCampaignsWithAutomaticPrecalcHandoff(db, signals, {
+        afterPrecalcAttachedBeforeProgress: async () => {
+          crashHookCalls += 1;
+          if (crashHookCalls === ANGLES.length) {
+            throw new Error("injected batch handoff crash");
+          }
+        },
+      }),
+    ).rejects.toThrow("injected batch handoff crash");
+    expect(crashHookCalls).toBe(ANGLES.length);
+    expect(
+      await db
+        .select({ id: simPrecalcObligations.id })
+        .from(simPrecalcObligations)
+        .where(
+          and(
+            eq(simPrecalcObligations.airfoilId, airfoilId),
+            eq(simPrecalcObligations.revisionId, setup.revisionId),
+            inArray(simPrecalcObligations.aoaDeg, ANGLES),
+          ),
+        ),
+    ).toHaveLength(0);
+    expect(
+      await db
+        .select({ state: simCampaignPoints.state })
+        .from(simCampaignPoints)
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, campaignId),
+            eq(simCampaignPoints.conditionId, setup.conditionId),
+            inArray(simCampaignPoints.aoaDeg, ANGLES),
+          ),
+        ),
+    ).toEqual(ANGLES.map(() => ({ state: "requested" })));
+
+    const observerSnapshots: Array<{
+      terminalPoints: number;
+      obligations: number;
+    }> = [];
+    const outcome = await linkResultsToCampaignsWithAutomaticPrecalcHandoff(
+      db,
+      signals,
+      {
+        afterPrecalcAttachedBeforeProgress: async () => {
+          const points = await observerDb
+            .select({ state: simCampaignPoints.state })
+            .from(simCampaignPoints)
+            .where(
+              and(
+                eq(simCampaignPoints.campaignId, campaignId),
+                eq(simCampaignPoints.conditionId, setup.conditionId),
+                inArray(simCampaignPoints.aoaDeg, ANGLES),
+              ),
+            );
+          const obligations = await observerDb
+            .select({ id: simPrecalcObligations.id })
+            .from(simPrecalcObligations)
+            .where(
+              and(
+                eq(simPrecalcObligations.airfoilId, airfoilId),
+                eq(simPrecalcObligations.revisionId, setup.revisionId),
+                inArray(simPrecalcObligations.aoaDeg, ANGLES),
+              ),
+            );
+          observerSnapshots.push({
+            terminalPoints: points.filter((point) => point.state === "terminal")
+              .length,
+            obligations: obligations.length,
+          });
+        },
+      },
+    );
+
+    expect(observerSnapshots).toHaveLength(ANGLES.length);
+    expect(
+      observerSnapshots.every(
+        (snapshot) =>
+          snapshot.terminalPoints === 0 && snapshot.obligations === 0,
+      ),
+    ).toBe(true);
+    expect(outcome.campaignIds).toEqual([campaignId]);
+    expect(
+      await db
+        .select({ state: simCampaignPoints.state })
+        .from(simCampaignPoints)
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, campaignId),
+            eq(simCampaignPoints.conditionId, setup.conditionId),
+            inArray(simCampaignPoints.aoaDeg, ANGLES),
+          ),
+        ),
+    ).toEqual(ANGLES.map(() => ({ state: "terminal" })));
+    expect(
+      await db
+        .select({ id: simPrecalcObligations.id })
+        .from(simPrecalcObligations)
+        .where(
+          and(
+            eq(simPrecalcObligations.airfoilId, airfoilId),
+            eq(simPrecalcObligations.revisionId, setup.revisionId),
+            inArray(simPrecalcObligations.aoaDeg, ANGLES),
+          ),
+        ),
+    ).toHaveLength(ANGLES.length);
+    const [progress] = await db
+      .select({
+        failed: simCampaignProgress.failed,
+        rejected: simCampaignProgress.rejected,
+        blocked: simCampaignProgress.blocked,
+      })
+      .from(simCampaignProgress)
+      .where(
+        and(
+          eq(simCampaignProgress.campaignId, campaignId),
+          eq(simCampaignProgress.conditionId, setup.conditionId),
+          eq(simCampaignProgress.airfoilId, airfoilId),
+        ),
+      );
+    expect(progress).toEqual({ failed: 0, rejected: 0, blocked: 0 });
   }, 120000);
 
   it("reads the canonical accepted RANS attempt when a legacy campaign point has no attempt pin", async () => {

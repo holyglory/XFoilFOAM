@@ -173,9 +173,12 @@
   expensive evidence tail only after an exact-attempt, versioned full-payload
   completion marker commits after every child; marker absence replays safely,
   and terminal GCS cleanup is reconstructed and revalidated independently.
-  Keep exact per-point handoff/progress transactional, but short-circuit the
-  campaign completion gate on indexed open work and coalesce its terminal
-  decision once per affected campaign and engine payload.
+  Settle every finalized point in one engine payload through one transaction:
+  attach all automatic RANS-to-PRECALC owners first, then project points and
+  materialize deduplicated incident, progress, lane, and completion work once.
+  Acquire campaign-owner and canonical natural-cell locks in the shared order.
+  Short-circuit the campaign completion gate on indexed open work and coalesce
+  its terminal decision once per affected campaign and engine payload.
   [detail](DecisionDetails/D-2026-07-28-scheduler-delay-and-campaign-polling.md)
 - Why: repeated campaign warnings turned non-actionable internal progress
   telemetry into a false user task, while whole-campaign scans and overlapping
@@ -188,7 +191,9 @@
   its database pool. Attempt existence or child-row counts cannot prove a
   crash-complete projection; the separate commit-after-children signature is
   conservative, drift-detecting, and keeps storage reclamation obligations
-  intact.
+  intact. Per-point transactions repeated the same campaign aggregates and
+  exposed partial payload visibility; one bounded payload transaction preserves
+  exact ownership while eliminating that amplification.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

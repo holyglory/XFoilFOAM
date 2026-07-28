@@ -3,12 +3,14 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import type { DB } from "./client";
 import {
-  linkResultToCampaigns,
+  materializeCampaignResultLinkProjections,
   probeCampaignCompletions,
+  projectResultToCampaigns,
   type CampaignLaneKey,
   type CampaignResultLinkOutcome,
   type ResultIngestSignal,
 } from "./campaign-execution";
+import { lockPrecalcCells } from "./precalc-cell-lock";
 import { ensurePrecalcObligationsInTransaction } from "./precalc-obligations";
 import {
   resultAttempts,
@@ -190,13 +192,85 @@ export async function linkResultToCampaignsWithAutomaticPrecalcHandoff(
   signal: CampaignResultHandoffSignal,
   hooks: CampaignResultHandoffHooks = {},
 ): Promise<CampaignResultLinkOutcome> {
+  return linkResultsToCampaignsWithAutomaticPrecalcHandoff(db, [signal], hooks);
+}
+
+function compareHandoffSignals(
+  left: CampaignResultHandoffSignal,
+  right: CampaignResultHandoffSignal,
+): number {
+  return (
+    left.airfoilId.localeCompare(right.airfoilId) ||
+    (left.revisionId ?? "").localeCompare(right.revisionId ?? "") ||
+    left.aoaDeg - right.aoaDeg ||
+    left.resultId.localeCompare(right.resultId) ||
+    (left.resultAttemptId ?? "").localeCompare(right.resultAttemptId ?? "")
+  );
+}
+
+interface PreparedAutomaticHandoff {
+  signal: CampaignResultHandoffSignal;
+  attempt: RansHandoffAttempt;
+  campaignIds: string[];
+}
+
+/**
+ * Bulk visibility boundary for one engine payload. All campaign owners are
+ * locked before the sorted natural-cell locks, every automatic PRECALC owner
+ * is attached before its point turns terminal, and the deduplicated incident,
+ * progress and lane projections materialize before commit.
+ */
+export async function linkResultsToCampaignsWithAutomaticPrecalcHandoff(
+  db: DB,
+  signals: readonly CampaignResultHandoffSignal[],
+  hooks: CampaignResultHandoffHooks = {},
+): Promise<CampaignResultLinkOutcome> {
+  if (!signals.length) return { laneKeys: [], campaignIds: [] };
+  const orderedSignals = [...signals].sort(compareHandoffSignals);
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
-    const terminal = signal.status === "done" || signal.status === "failed";
-    const attempt = terminal ? await exactRansHandoffAttempt(tx, signal) : null;
-    if (attempt && signal.revisionId) {
+    const prepared: PreparedAutomaticHandoff[] = [];
+    for (const signal of orderedSignals) {
+      const terminal = signal.status === "done" || signal.status === "failed";
+      if (!terminal) continue;
+
+      // Replayed cumulative points are already terminal and therefore have no
+      // requested campaign owner. Check that sparse owner set before the exact
+      // RANS-attempt classifier so ordinary replay avoids another attempt scan.
       const campaignIds = await campaignOwnersForCell(tx, signal);
-      if (campaignIds.length) {
+      if (!campaignIds.length) continue;
+      const attempt = await exactRansHandoffAttempt(tx, signal);
+      if (attempt && signal.revisionId) {
+        prepared.push({ signal, attempt, campaignIds });
+      }
+    }
+
+    // Global owner -> natural-cell lock order must still hold when one
+    // transaction owns several points. Pre-lock the complete owner union
+    // before ensurePrecalcObligationsInTransaction takes its first cell lock.
+    const campaignIds = [
+      ...new Set(prepared.flatMap((handoff) => handoff.campaignIds)),
+    ].sort();
+    if (campaignIds.length) {
+      await tx
+        .select({ id: simCampaigns.id })
+        .from(simCampaigns)
+        .where(inArray(simCampaigns.id, campaignIds))
+        .orderBy(simCampaigns.id)
+        .for("share");
+    }
+    await lockPrecalcCells(
+      tx,
+      prepared.map(({ signal }) => ({
+        airfoilId: signal.airfoilId,
+        revisionId: signal.revisionId!,
+        aoaDeg: signal.aoaDeg,
+      })),
+    );
+
+    for (const handoff of prepared) {
+      const { signal, attempt, campaignIds: ownerIds } = handoff;
+      if (signal.revisionId) {
         const obligations = await ensurePrecalcObligationsInTransaction(
           tx,
           [
@@ -208,11 +282,11 @@ export async function linkResultToCampaignsWithAutomaticPrecalcHandoff(
               sourceResultAttemptId: attempt.id,
             },
           ],
-          { campaignIds },
+          { campaignIds: ownerIds },
         );
         if (obligations.length !== 1) {
           throw new Error(
-            `failed to attach automatic PRECALC handoff for ${signal.resultId}: ${campaignIds.length} live campaign owner(s), ${obligations.length} obligation(s)`,
+            `failed to attach automatic PRECALC handoff for ${signal.resultId}: ${ownerIds.length} live campaign owner(s), ${obligations.length} obligation(s)`,
           );
         }
         const attachedOwners = await tx
@@ -223,18 +297,23 @@ export async function linkResultToCampaignsWithAutomaticPrecalcHandoff(
           .where(
             and(
               eq(simPrecalcObligationCampaigns.obligationId, obligations[0].id),
-              inArray(simPrecalcObligationCampaigns.campaignId, campaignIds),
+              inArray(simPrecalcObligationCampaigns.campaignId, ownerIds),
               eq(simPrecalcObligationCampaigns.state, "active"),
             ),
           );
-        if (attachedOwners.length !== campaignIds.length) {
+        if (attachedOwners.length !== ownerIds.length) {
           throw new Error(
-            `failed to attach every automatic PRECALC owner for ${signal.resultId}: expected ${campaignIds.length}, attached ${attachedOwners.length}`,
+            `failed to attach every automatic PRECALC owner for ${signal.resultId}: expected ${ownerIds.length}, attached ${attachedOwners.length}`,
           );
         }
         await hooks.afterPrecalcAttachedBeforeProgress?.();
       }
     }
-    return linkResultToCampaigns(tx, signal);
+
+    const projections = [];
+    for (const signal of orderedSignals) {
+      projections.push(await projectResultToCampaigns(tx, signal));
+    }
+    return materializeCampaignResultLinkProjections(tx, projections);
   });
 }

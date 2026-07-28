@@ -82,13 +82,22 @@ Terminal GCS replays reconstruct their cleanup obligation from the exact stored
 bundle/archive association and still pass full manifest/member validation
 before asking the engine to reclaim local bytes.
 
-Keep the point-to-campaign link, automatic RANS-to-PRECALC ownership, and
-progress recomputation exact and transactional for every finalized point. Do
-not run the campaign-wide completion decision after every point in a cumulative
-engine payload. Accumulate affected campaign ids and run that decision once per
-campaign after the payload has linked all of its committed points. Existing
-single-point callers retain immediate completion semantics. If the process
-stops between point settlement and the deferred decision, the campaign remains
+Treat one engine result payload as one campaign visibility boundary. Discover
+all exact automatic RANS-to-PRECALC handoffs first, lock the complete campaign
+owner set, acquire all natural-cell advisory locks through the shared canonical
+bulk-lock helper, and attach every PRECALC owner before any matching campaign
+point turns terminal. Then project every finalized point and materialize the
+deduplicated accepted-result incident resolution, progress aggregates, dirty
+lanes, and affected campaign ids once before the transaction commits. Existing
+single-point callers delegate to this same path and retain immediate completion
+semantics.
+
+Do not run the campaign-wide completion decision after every point in a
+cumulative engine payload. Accumulate affected campaign ids and run that
+decision once per campaign after the payload transaction commits. If the
+process stops before commit, neither PRECALC ownership nor point settlement is
+visible; a replay repeats the idempotent transaction. If it stops after commit
+but before the deferred completion decision, the campaign remains
 conservatively active; the low-frequency campaign reconciler recomputes
 progress and runs the same completion decision.
 
@@ -154,10 +163,14 @@ with local-byte reclamation.
 Running the full completion snapshot once per finalized point was also
 rejected. A 256-point cumulative payload could repeat the same campaign-wide
 terminal scans 256 times per poll, and repeated partial polls compounded that
-work. Skipping per-point campaign linking was not acceptable because a campaign
-may begin owning a cell after its evidence was first ingested. The selected
-boundary therefore preserves per-point ownership and counters but batches only
-the global decision. Adding another point-ledger index was not selected:
+work. Keeping separate transactions while merely batching their later
+completion probes was also insufficient: every point still recomputed the same
+campaign progress and lane projections, and readers could observe only part of
+one cumulative payload. Skipping exact point linking was not acceptable because
+a campaign may begin owning a cell after its evidence was first ingested. The
+selected boundary preserves exact per-point ownership while batching
+materialization and makes the payload all-or-nothing. Adding another
+point-ledger index was not selected:
 production `EXPLAIN ANALYZE` measured the fast open predicate at 0.249 ms with
 the existing partial index, so another write-amplifying index would not address
 the repeated terminal scans.
@@ -188,5 +201,10 @@ association.
 Completion-probe regressions additionally pin that an open campaign executes
 only the fast query, the rare terminal snapshot rechecks newly-open work, and a
 multi-point result-link batch deduplicates both dirty lanes and completion
-decisions. The existing transaction regression proves automatic PRECALC
-ownership and point/progress settlement remain one visibility boundary.
+decisions. A real-PostgreSQL cumulative-payload regression injects a failure at
+the last handoff and proves that no PRECALC obligation or terminal campaign
+point escapes the rollback. A second database connection observes neither
+state during every pre-commit hook, then sees all points and owners together
+after success. Query-shape coverage proves one progress aggregate, one lane
+discovery, and one accepted-result incident batch per payload; the shared
+natural-cell lock helper fixes the cross-path acquisition order.

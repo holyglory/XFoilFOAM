@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { DB } from "../src/client";
 import {
   finalizeCampaignResultLinkBatch,
+  materializeCampaignResultLinkProjections,
   probeCampaignCompletion,
   probeCampaignCompletions,
 } from "../src/campaign-execution";
@@ -83,6 +84,110 @@ describe("campaign summary sparse-query guardrails", () => {
     expect(dirty).toEqual([lane]);
     expect(queries).toHaveLength(1);
     expect(queries[0]).toContain("as open");
+  });
+
+  it("MUST-CATCH: a cumulative point payload recomputes progress and discovers lanes once per deduplicated key", async () => {
+    const queries: string[] = [];
+    const dialect = new PgDialect();
+    const progressKey = {
+      campaign_id: CAMPAIGN_ID,
+      condition_id: "00000000-0000-0000-0000-000000000003",
+      airfoil_id: "00000000-0000-0000-0000-000000000004",
+    };
+    const db = {
+      execute: async (query: SQL) => {
+        const text = compact(dialect.sqlToQuery(query).sql);
+        queries.push(text);
+        return text.includes("from sim_campaign_lanes")
+          ? [
+              {
+                ...progressKey,
+                objective: "ld_max",
+              },
+            ]
+          : [];
+      },
+    } as unknown as DB;
+
+    const outcome = await materializeCampaignResultLinkProjections(db, [
+      {
+        progressKeys: [progressKey],
+        terminalProgressKeys: [progressKey],
+        doneResultIds: [],
+      },
+      {
+        progressKeys: [progressKey, progressKey],
+        terminalProgressKeys: [progressKey],
+        doneResultIds: [],
+      },
+    ]);
+
+    expect(
+      queries.filter((query) =>
+        query.startsWith("insert into sim_campaign_progress"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      queries.filter((query) => query.includes("from sim_campaign_lanes")),
+    ).toHaveLength(1);
+    expect(outcome).toEqual({
+      campaignIds: [CAMPAIGN_ID],
+      laneKeys: [
+        {
+          campaignId: CAMPAIGN_ID,
+          airfoilId: progressKey.airfoil_id,
+          conditionId: progressKey.condition_id,
+          objective: "ld_max",
+        },
+      ],
+    });
+  });
+
+  it("coalesces accepted-result incident resolution across a cumulative payload", async () => {
+    const firstResult = "00000000-0000-0000-0000-000000000005";
+    const secondResult = "00000000-0000-0000-0000-000000000006";
+    const queries: string[] = [];
+    const dialect = new PgDialect();
+    let incidentUpdates = 0;
+    const db = {
+      execute: async (query: SQL) => {
+        const text = compact(dialect.sqlToQuery(query).sql);
+        queries.push(text);
+        return text.includes("select distinct accepted_result.id")
+          ? [{ result_id: firstResult }, { result_id: secondResult }]
+          : [];
+      },
+      update: () => ({
+        set: () => ({
+          where: () => ({
+            returning: async () => {
+              incidentUpdates += 1;
+              return [{ id: "incident-1" }, { id: "incident-2" }];
+            },
+          }),
+        }),
+      }),
+    } as unknown as DB;
+
+    await materializeCampaignResultLinkProjections(db, [
+      {
+        progressKeys: [],
+        terminalProgressKeys: [],
+        doneResultIds: [firstResult, firstResult],
+      },
+      {
+        progressKeys: [],
+        terminalProgressKeys: [],
+        doneResultIds: [secondResult, firstResult],
+      },
+    ]);
+
+    expect(
+      queries.filter((query) =>
+        query.includes("select distinct accepted_result.id"),
+      ),
+    ).toHaveLength(1);
+    expect(incidentUpdates).toBe(1);
   });
 
   it("rechecks newly-open work in the rare terminal snapshot", async () => {

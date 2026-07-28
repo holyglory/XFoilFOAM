@@ -8,9 +8,8 @@ import {
   forceHistory,
   hasExactValidSolverManifest,
   laneKeyId,
-  linkResultToCampaignsWithAutomaticPrecalcHandoff,
+  linkResultsToCampaignsWithAutomaticPrecalcHandoff,
   onResultIngested,
-  type CampaignResultLinkOutcome,
   type DB,
   type ResultInsert,
   resultAttemptIngestCompletions,
@@ -5950,27 +5949,31 @@ export async function ingestResult(opts: {
   // Campaign and obligation state observe only committed selected evidence (or
   // a pointer-null machine failure). A rejected child of an existing public
   // generation settles against the kept current row returned above.
-  const campaignLinkOutcomes: CampaignResultLinkOutcome[] = [];
-  for (const finalized of finalizedByResult.values()) {
-    const candidate = [...candidatesByRevision.values(), legacyCandidates]
+  const candidateByResultId = new Map(
+    [...candidatesByRevision.values(), legacyCandidates]
       .flat()
-      .find((item) => item.resultId === finalized.resultId);
-    const outcome = await linkResultToCampaignsWithAutomaticPrecalcHandoff(db, {
-      airfoilId,
-      revisionId: candidate?.presetRevisionId ?? null,
-      aoaDeg: finalized.aoaDeg,
-      resultId: finalized.resultId,
-      status: finalized.status,
-      regime: finalized.regime,
-      resultAttemptId: finalized.resultAttemptId,
-      simJobId: finalized.simJobId,
-    });
-    campaignLinkOutcomes.push(outcome);
-  }
-  for (const key of await finalizeCampaignResultLinkBatch(
-    db,
-    campaignLinkOutcomes,
-  )) {
+      .map((candidate) => [candidate.resultId, candidate] as const),
+  );
+  const campaignLinkOutcome =
+    await linkResultsToCampaignsWithAutomaticPrecalcHandoff(
+      db,
+      [...finalizedByResult.values()].map((finalized) => {
+        const candidate = candidateByResultId.get(finalized.resultId);
+        return {
+          airfoilId,
+          revisionId: candidate?.presetRevisionId ?? null,
+          aoaDeg: finalized.aoaDeg,
+          resultId: finalized.resultId,
+          status: finalized.status,
+          regime: finalized.regime,
+          resultAttemptId: finalized.resultAttemptId,
+          simJobId: finalized.simJobId,
+        };
+      }),
+    );
+  for (const key of await finalizeCampaignResultLinkBatch(db, [
+    campaignLinkOutcome,
+  ])) {
     dirtyLanes.set(laneKeyId(key), key);
   }
   return {

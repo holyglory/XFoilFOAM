@@ -612,14 +612,22 @@ export interface CampaignResultLinkOutcome {
   campaignIds: string[];
 }
 
-interface ProgressKeyRow {
+export interface CampaignProgressKeyRow {
   campaign_id: string;
   condition_id: string;
   airfoil_id: string;
 }
 
-function dedupeProgressKeys(rows: ProgressKeyRow[]): ProgressKeyRow[] {
-  const seen = new Map<string, ProgressKeyRow>();
+export interface CampaignResultLinkProjection {
+  progressKeys: CampaignProgressKeyRow[];
+  terminalProgressKeys: CampaignProgressKeyRow[];
+  doneResultIds: string[];
+}
+
+function dedupeProgressKeys(
+  rows: CampaignProgressKeyRow[],
+): CampaignProgressKeyRow[] {
+  const seen = new Map<string, CampaignProgressKeyRow>();
   for (const row of rows)
     seen.set(`${row.campaign_id}:${row.condition_id}:${row.airfoil_id}`, row);
   return [...seen.values()];
@@ -1003,7 +1011,7 @@ const PRECALC_BLOCKED_OTHER_SQL = sql`(
 
 async function recomputeProgressForKeys(
   db: DB,
-  keys: ProgressKeyRow[],
+  keys: CampaignProgressKeyRow[],
 ): Promise<void> {
   if (!keys.length) return;
   if (keys.length > PROGRESS_KEY_CHUNK) {
@@ -1079,7 +1087,7 @@ export async function recomputeProgressForPrecalcObligations(
   obligationIds: string[],
 ): Promise<string[]> {
   if (!obligationIds.length) return [];
-  const keys: ProgressKeyRow[] = [];
+  const keys: CampaignProgressKeyRow[] = [];
   for (let i = 0; i < obligationIds.length; i += PROGRESS_KEY_CHUNK) {
     const chunk = obligationIds.slice(i, i + PROGRESS_KEY_CHUNK);
     const idArray = sql`ARRAY[${sql.join(
@@ -1098,7 +1106,7 @@ export async function recomputeProgressForPrecalcObligations(
          ELSE p.aoa_deg
        END
       WHERE obligation.id = ANY(${idArray})
-    `)) as unknown as ProgressKeyRow[];
+    `)) as unknown as CampaignProgressKeyRow[];
     keys.push(...rows);
   }
   const deduped = dedupeProgressKeys(keys);
@@ -1461,7 +1469,7 @@ export async function finalizeCampaignResultLinkBatch(
 
 async function lanesForProgressKeys(
   db: DB,
-  keys: ProgressKeyRow[],
+  keys: CampaignProgressKeyRow[],
 ): Promise<CampaignLaneKey[]> {
   if (!keys.length) return [];
   const tuples = sql.join(
@@ -1490,20 +1498,20 @@ async function lanesForProgressKeys(
 }
 
 /**
- * Ingest hook: link the matching campaign points to the just-upserted results
- * row, flip derived-by-symmetry cells when their +α source lands (canonical
- * negation), recompute the affected progress counters, and return the dirty
- * lane keys plus affected campaign ids. The caller may defer the campaign-wide
- * completion probe until a whole ingest payload has linked its points.
+ * Project one exact result into matching campaign point rows. Expensive
+ * aggregate maintenance is deliberately deferred so bulk ingest can
+ * materialize one deduplicated progress/incident/lane batch in the same
+ * transaction that owns every point transition.
  */
-export async function linkResultToCampaigns(
+export async function projectResultToCampaigns(
   db: DB,
   signal: ResultIngestSignal,
-): Promise<CampaignResultLinkOutcome> {
-  if (!signal.revisionId) return { laneKeys: [], campaignIds: [] };
+): Promise<CampaignResultLinkProjection> {
+  if (!signal.revisionId)
+    return { progressKeys: [], terminalProgressKeys: [], doneResultIds: [] };
   const aoa = canonicalAoa(signal.aoaDeg);
   const terminal = signal.status === "done" || signal.status === "failed";
-  const affected: ProgressKeyRow[] = [];
+  const affected: CampaignProgressKeyRow[] = [];
 
   if (terminal) {
     // Direct point terminal-linking. Released points are NEVER resurrected
@@ -1517,7 +1525,7 @@ export async function linkResultToCampaigns(
       WHERE airfoil_id = ${signal.airfoilId} AND revision_id = ${signal.revisionId}
         AND aoa_deg = ${aoa} AND derived_by_symmetry = false AND state = 'requested'
       RETURNING campaign_id, condition_id, airfoil_id
-    `)) as unknown as ProgressKeyRow[];
+    `)) as unknown as CampaignProgressKeyRow[];
     affected.push(...direct);
 
     // Symmetric airfoils: the −α derived cell goes terminal alongside its +α
@@ -1533,7 +1541,7 @@ export async function linkResultToCampaigns(
           AND p.airfoil_id = ${signal.airfoilId} AND p.revision_id = ${signal.revisionId}
           AND p.aoa_deg = ${canonicalAoa(-aoa)} AND p.derived_by_symmetry = true AND p.state = 'requested'
         RETURNING p.campaign_id, p.condition_id, p.airfoil_id
-      `)) as unknown as ProgressKeyRow[];
+      `)) as unknown as CampaignProgressKeyRow[];
       affected.push(...mirrored);
     }
 
@@ -1552,7 +1560,7 @@ export async function linkResultToCampaigns(
           AND canonical.id = point.result_id
           AND canonical.current_result_attempt_id = ${signal.resultAttemptId}
         RETURNING point.campaign_id, point.condition_id, point.airfoil_id
-      `)) as unknown as ProgressKeyRow[];
+      `)) as unknown as CampaignProgressKeyRow[];
       affected.push(...repaired);
     }
 
@@ -1562,7 +1570,7 @@ export async function linkResultToCampaigns(
       SELECT campaign_id, condition_id, airfoil_id
       FROM sim_campaign_points
       WHERE result_id = ${signal.resultId}
-    `)) as unknown as ProgressKeyRow[];
+    `)) as unknown as CampaignProgressKeyRow[];
     affected.push(...linked);
   } else {
     // queued/running transitions only move the `running` counter.
@@ -1571,40 +1579,80 @@ export async function linkResultToCampaigns(
       FROM sim_campaign_points
       WHERE airfoil_id = ${signal.airfoilId} AND revision_id = ${signal.revisionId}
         AND aoa_deg = ${aoa} AND state = 'requested'
-    `)) as unknown as ProgressKeyRow[];
+    `)) as unknown as CampaignProgressKeyRow[];
     affected.push(...runningKeys);
   }
 
+  const keys = dedupeProgressKeys(affected);
+  return {
+    progressKeys: keys,
+    terminalProgressKeys: terminal ? keys : [],
+    doneResultIds:
+      terminal && signal.status === "done" ? [signal.resultId] : [],
+  };
+}
+
+/**
+ * Materialize all expensive campaign projections once for a result payload.
+ * Callers that also attach PRECALC owners run this before their transaction
+ * commits so point, owner, incident and progress visibility stays atomic.
+ */
+export async function materializeCampaignResultLinkProjections(
+  db: DB,
+  projections: readonly CampaignResultLinkProjection[],
+): Promise<CampaignResultLinkOutcome> {
+  const keys = dedupeProgressKeys(
+    projections.flatMap((projection) => projection.progressKeys),
+  );
+  const terminalKeys = dedupeProgressKeys(
+    projections.flatMap((projection) => projection.terminalProgressKeys),
+  );
+  const doneResultIds = [
+    ...new Set(projections.flatMap((projection) => projection.doneResultIds)),
+  ].sort();
+
   // Result-owned RANS incidents close only when the canonical classifier has
-  // selected real accepted evidence for this exact result. Merely requeueing,
-  // receiving another failed attempt, or handing RANS to PRECALC must not make
-  // a critical incident disappear.
-  if (terminal && signal.status === "done") {
+  // selected real accepted evidence for the exact result. Resolve the entire
+  // payload in one statement; rejected/needs-URANS rows remain absent.
+  if (doneResultIds.length) {
+    const idArray = sql`ARRAY[${sql.join(
+      doneResultIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    )}]`;
     const accepted = (await db.execute(sql`
-      SELECT 1
+      SELECT DISTINCT accepted_result.id AS result_id
       FROM results accepted_result
       JOIN result_classifications accepted_classification
         ON accepted_classification.result_id = accepted_result.id
        AND accepted_classification.state = 'accepted'
-      WHERE accepted_result.id = ${signal.resultId}
+      WHERE accepted_result.id = ANY(${idArray})
         AND accepted_result.status = 'done'
-      LIMIT 1
-    `)) as unknown as unknown[];
-    if (accepted.length) {
-      await resolveSolverIncidentsForAcceptedResultsInTransaction(db, [
-        signal.resultId,
-      ]);
-    }
+    `)) as unknown as Array<{ result_id: string }>;
+    await resolveSolverIncidentsForAcceptedResultsInTransaction(
+      db,
+      accepted.map((row) => row.result_id),
+    );
   }
 
-  const keys = dedupeProgressKeys(affected);
-  if (!keys.length) return { laneKeys: [], campaignIds: [] };
   await recomputeProgressForKeys(db, keys);
-  if (!terminal) return { laneKeys: [], campaignIds: [] };
-
-  const laneKeys = await lanesForProgressKeys(db, keys);
-  const campaignIds = [...new Set(keys.map((key) => key.campaign_id))].sort();
+  const laneKeys = await lanesForProgressKeys(db, terminalKeys);
+  const campaignIds = [
+    ...new Set(terminalKeys.map((key) => key.campaign_id)),
+  ].sort();
   return { laneKeys, campaignIds };
+}
+
+/**
+ * Immediate compatibility API for single-point callers. It retains the
+ * established semantics while bulk handoff callers use the raw projection
+ * plus one payload materialization.
+ */
+export async function linkResultToCampaigns(
+  db: DB,
+  signal: ResultIngestSignal,
+): Promise<CampaignResultLinkOutcome> {
+  const projection = await projectResultToCampaigns(db, signal);
+  return materializeCampaignResultLinkProjections(db, [projection]);
 }
 
 /**
@@ -2418,7 +2466,7 @@ export async function autoRetryCrashedResultsForJob(
             AND campaign.status IN ('active', 'attention', 'paused', 'completed')
         )
       RETURNING p.campaign_id, p.condition_id, p.airfoil_id
-    `)) as unknown as ProgressKeyRow[];
+    `)) as unknown as CampaignProgressKeyRow[];
       await recomputeProgressForKeys(tx, dedupeProgressKeys(keys));
       // The completion probe may have flipped the campaign to 'attention' the
       // instant its last point terminal-failed — BEFORE this retry reopened it.
@@ -2717,7 +2765,7 @@ export async function requeueDeterministicRansMeshFailuresForRecoveryVersion(
         AND condition.generation = campaign.current_condition_generation
         AND condition.status IN ('active', 'kept')
       RETURNING point.campaign_id, point.condition_id, point.airfoil_id
-    `)) as unknown as ProgressKeyRow[];
+    `)) as unknown as CampaignProgressKeyRow[];
 
     await resolveOlderRansMeshIncidentsInTransaction(
       tx,
