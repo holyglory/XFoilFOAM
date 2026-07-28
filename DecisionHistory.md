@@ -2,6 +2,13 @@
 
 ## Direction
 
+- Confirmed intent: immutable per-frame solver evidence stays exact and
+  unsmoothed. Instantaneous Cl/Cd is derived from the stored Cl and Cd samples,
+  chart domains must not visually amplify sub-percent algebraic movement into
+  a full-height discontinuity, and any non-positive-drag or numerically
+  diverged frame disqualifies the averaged result from a published polar while
+  preserving the original attempt for audit and targeted recomputation.
+  [D-2026-07-27-frame-evidence-integrity]
 - Confirmed intent: hub-issued remote solver promises exclusively own their
   exact cells while alive, use one refreshed 72-hour failover horizon across
   claim/solve/transfer, and serialize against local claims at the mutation

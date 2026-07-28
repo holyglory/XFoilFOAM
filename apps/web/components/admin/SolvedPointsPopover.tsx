@@ -14,7 +14,13 @@
 
 import type { FieldId, FieldTrackPoint } from "@aerodb/core";
 import type { Point, SimulationDetail } from "@aerodb/core";
-import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import { type AdminSolvedPoint, getSolvedPoints } from "@/lib/admin";
 import { getSim } from "@/lib/api";
@@ -49,9 +55,15 @@ const chipStyle = (tone: "teal" | "amber" | "muted"): CSSProperties => ({
 function classificationChip(state: string | null) {
   // Same language as everywhere else in the portal (spec §9): accepted teal,
   // needs-URANS amber; anything else (superseded/rejected/unclassified) muted.
-  if (state === "accepted") return <span style={chipStyle("teal")}>accepted</span>;
-  if (state === "needs_urans") return <span style={chipStyle("amber")}>needs URANS</span>;
-  return <span style={chipStyle("muted")}>{state ? state.replaceAll("_", " ") : "unclassified"}</span>;
+  if (state === "accepted")
+    return <span style={chipStyle("teal")}>accepted</span>;
+  if (state === "needs_urans")
+    return <span style={chipStyle("amber")}>needs URANS</span>;
+  return (
+    <span style={chipStyle("muted")}>
+      {state ? state.replaceAll("_", " ") : "unclassified"}
+    </span>
+  );
 }
 
 const smallBtn: CSSProperties = {
@@ -119,7 +131,11 @@ export function SolvedPointsPopover({
     setLoadingMore(true);
     setError(null);
     try {
-      const page = await getSolvedPoints({ jobId, cursor: nextCursor, limit: PAGE_LIMIT });
+      const page = await getSolvedPoints({
+        jobId,
+        cursor: nextCursor,
+        limit: PAGE_LIMIT,
+      });
       let merged: AdminSolvedPoint[] = [];
       setItems((prev) => {
         merged = mergeSolvedPointsPages(prev, page.items);
@@ -142,7 +158,8 @@ export function SolvedPointsPopover({
     const onMouseDown = (e: MouseEvent) => {
       if (openRowRef.current) return;
       const panel = panelRef.current;
-      if (panel && e.target instanceof Node && !panel.contains(e.target)) onClose();
+      if (panel && e.target instanceof Node && !panel.contains(e.target))
+        onClose();
     };
     document.addEventListener("mousedown", onMouseDown);
     return () => document.removeEventListener("mousedown", onMouseDown);
@@ -172,26 +189,40 @@ export function SolvedPointsPopover({
     let cancelled = false;
     setSim(null);
     setSimMessage(null);
-    getSim(openRow.airfoilSlug, openRow.reynolds ?? 0, openRow.aoaDeg, openRow.resultId)
+    getSim(
+      openRow.airfoilSlug,
+      openRow.reynolds ?? 0,
+      openRow.aoaDeg,
+      openRow.resultId,
+    )
       .then((d) => {
         if (cancelled) return;
         setSim(d);
         setSimField((current) => {
-          if (d.status !== "solved" || d.availableFields.length === 0 || d.availableFields.includes(current)) return current;
+          if (
+            d.status !== "solved" ||
+            d.availableFields.length === 0 ||
+            d.availableFields.includes(current)
+          )
+            return current;
           return d.availableFields[0];
         });
       })
       .catch((e) => {
         if (cancelled) return;
         setSim(null);
-        setSimMessage(`Could not load the stored OpenFOAM result (${(e as Error).message}). The API or its media backend may be unreachable.`);
+        setSimMessage(
+          `Could not load the stored OpenFOAM result (${(e as Error).message}). The API or its media backend may be unreachable.`,
+        );
       });
     return () => {
       cancelled = true;
     };
   }, [openRow]);
 
-  const openIndex = openRow ? items.findIndex((row) => row.resultId === openRow.resultId) : -1;
+  const openIndex = openRow
+    ? items.findIndex((row) => row.resultId === openRow.resultId)
+    : -1;
 
   const openRowAt = useCallback((row: AdminSolvedPoint) => {
     setOpenRow(row);
@@ -200,8 +231,17 @@ export function SolvedPointsPopover({
 
   const step = useCallback(
     async (direction: -1 | 1) => {
-      const idx = openRowRef.current ? items.findIndex((row) => row.resultId === openRowRef.current!.resultId) : -1;
-      const decision = stepSolvedPoint(items.length, idx, direction, nextCursor);
+      const idx = openRowRef.current
+        ? items.findIndex(
+            (row) => row.resultId === openRowRef.current!.resultId,
+          )
+        : -1;
+      const decision = stepSolvedPoint(
+        items.length,
+        idx,
+        direction,
+        nextCursor,
+      );
       if (decision.kind === "move") {
         openRowAt(items[decision.index]);
       } else if (decision.kind === "load-more") {
@@ -241,7 +281,10 @@ export function SolvedPointsPopover({
   const maxHeight = Math.max(220, Math.min(540, vh - top - 16));
 
   const prevDisabled = openIndex <= 0;
-  const nextDisabled = openIndex < 0 || (openIndex >= items.length - 1 && !nextCursor) || loadingMore;
+  const nextDisabled =
+    openIndex < 0 ||
+    (openIndex >= items.length - 1 && !nextCursor) ||
+    loadingMore;
 
   return (
     <>
@@ -266,32 +309,104 @@ export function SolvedPointsPopover({
           overflow: "hidden",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderBottom: `1px solid ${C.borderSoft}` }}>
-          <span style={{ fontFamily: MONO, fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", color: C.text }}>SOLVED POINTS</span>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "10px 12px",
+            borderBottom: `1px solid ${C.borderSoft}`,
+          }}
+        >
+          <span
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: "0.1em",
+              color: C.text,
+            }}
+          >
+            SOLVED POINTS
+          </span>
+          <span
+            style={{
+              fontFamily: MONO,
+              fontSize: 10,
+              color: C.dim,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
             {scopeLabel ?? "all jobs"}
           </span>
-          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 7 }}>
+          <div
+            style={{
+              marginLeft: "auto",
+              display: "flex",
+              alignItems: "center",
+              gap: 7,
+            }}
+          >
             {solvedToday != null && (
-              <span data-testid="solved-popover-today" style={{ fontFamily: MONO, fontSize: 10, color: solvedToday > 0 ? C.teal : C.dim }}>
+              <span
+                data-testid="solved-popover-today"
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  color: solvedToday > 0 ? C.teal : C.dim,
+                }}
+              >
                 {solvedToday} solved today
               </span>
             )}
-            <button type="button" data-testid="solved-popover-refresh" disabled={loading} onClick={() => void fetchFirstPage()} style={{ ...smallBtn, opacity: loading ? 0.6 : 1 }}>
+            <button
+              type="button"
+              data-testid="solved-popover-refresh"
+              disabled={loading}
+              onClick={() => void fetchFirstPage()}
+              style={{ ...smallBtn, opacity: loading ? 0.6 : 1 }}
+            >
               {loading ? "loading…" : "refresh"}
             </button>
-            <button type="button" aria-label="Close solved points" onClick={onClose} style={smallBtn}>
+            <button
+              type="button"
+              aria-label="Close solved points"
+              onClick={onClose}
+              style={smallBtn}
+            >
               ×
             </button>
           </div>
         </div>
 
         {compact ? (
-          <div style={{ padding: "6px 12px", borderBottom: `1px solid ${C.borderSoft}`, fontFamily: MONO, fontSize: 9, color: C.dim }}>
+          <div
+            style={{
+              padding: "6px 12px",
+              borderBottom: `1px solid ${C.borderSoft}`,
+              fontFamily: MONO,
+              fontSize: 9,
+              color: C.dim,
+            }}
+          >
             newest first · α · speed · Re · Cl · Cd · L/D
           </div>
         ) : (
-          <div style={{ display: "grid", gridTemplateColumns: ROW_COLUMNS, gap: 8, padding: "7px 12px", borderBottom: `1px solid ${C.borderSoft}`, fontFamily: MONO, fontSize: 9, color: C.dim }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: ROW_COLUMNS,
+              gap: 8,
+              padding: "7px 12px",
+              borderBottom: `1px solid ${C.borderSoft}`,
+              fontFamily: MONO,
+              fontSize: 9,
+              color: C.dim,
+            }}
+          >
             <span>Airfoil</span>
             <span style={{ textAlign: "right" }}>α</span>
             <span>Speed · Re</span>
@@ -304,19 +419,50 @@ export function SolvedPointsPopover({
 
         <div style={{ overflowY: "auto", minHeight: 0 }}>
           {error && (
-            <div style={{ fontFamily: MONO, fontSize: 11, color: C.redText, padding: "12px", lineHeight: 1.5 }}>
+            <div
+              style={{
+                fontFamily: MONO,
+                fontSize: 11,
+                color: C.redText,
+                padding: "12px",
+                lineHeight: 1.5,
+              }}
+            >
               {error}
-              <button type="button" onClick={() => void fetchFirstPage()} style={{ ...smallBtn, marginLeft: 8 }}>
+              <button
+                type="button"
+                onClick={() => void fetchFirstPage()}
+                style={{ ...smallBtn, marginLeft: 8 }}
+              >
                 retry
               </button>
             </div>
           )}
           {!error && loading && items.length === 0 && (
-            <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, padding: "14px 12px" }}>Loading solved points…</div>
+            <div
+              style={{
+                fontFamily: MONO,
+                fontSize: 11,
+                color: C.muted,
+                padding: "14px 12px",
+              }}
+            >
+              Loading solved points…
+            </div>
           )}
           {!error && !loading && items.length === 0 && (
-            <div style={{ fontFamily: MONO, fontSize: 11, color: C.muted, padding: "14px 12px", lineHeight: 1.5 }}>
-              {jobId ? "No solved points recorded for this job yet." : "No solved points recorded yet."}
+            <div
+              style={{
+                fontFamily: MONO,
+                fontSize: 11,
+                color: C.muted,
+                padding: "14px 12px",
+                lineHeight: 1.5,
+              }}
+            >
+              {jobId
+                ? "No solved points recorded for this job yet."
+                : "No solved points recorded yet."}
             </div>
           )}
           {items.map((row) => {
@@ -326,7 +472,10 @@ export function SolvedPointsPopover({
               fontFamily: MONO,
               fontSize: 10.5,
               padding: "8px 12px",
-              background: openRow?.resultId === row.resultId ? C.rowActive : "transparent",
+              background:
+                openRow?.resultId === row.resultId
+                  ? C.rowActive
+                  : "transparent",
               border: "none",
               borderBottom: `1px solid ${C.borderRow}`,
               cursor: "pointer",
@@ -341,12 +490,34 @@ export function SolvedPointsPopover({
                 onClick={() => openRowAt(row)}
                 style={{ ...rowBase, display: "grid", gap: 4 }}
               >
-                <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600, flex: 1 }}>{row.airfoilName}</span>
+                <span
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    minWidth: 0,
+                  }}
+                >
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      fontWeight: 600,
+                      flex: 1,
+                    }}
+                  >
+                    {row.airfoilName}
+                  </span>
                   {classificationChip(row.classificationState)}
                 </span>
                 <span style={{ color: C.muted, fontSize: 10 }}>
-                  α {f(row.aoaDeg, 1)}° · {fSpeed(row.speed)} · {row.reynolds != null ? `Re ${formatRe(row.reynolds)}` : "Re —"} · Cl {f(row.cl, 2)} · Cd {f(row.cd, 4)} · L/D {f(row.clCd, 1)}
+                  α {f(row.aoaDeg, 1)}° · {fSpeed(row.speed)} ·{" "}
+                  {row.reynolds != null
+                    ? `Re ${formatRe(row.reynolds)}`
+                    : "Re —"}{" "}
+                  · Cl {f(row.cl, 2)} · Cd {f(row.cd, 4)} · L/D {f(row.clCd, 1)}
                 </span>
               </button>
             ) : (
@@ -356,23 +527,68 @@ export function SolvedPointsPopover({
                 data-testid="solved-point-row"
                 title={`solved ${ago(row.solvedAt)} — open the stored OpenFOAM result`}
                 onClick={() => openRowAt(row)}
-                style={{ ...rowBase, display: "grid", gridTemplateColumns: ROW_COLUMNS, gap: 8, alignItems: "center" }}
+                style={{
+                  ...rowBase,
+                  display: "grid",
+                  gridTemplateColumns: ROW_COLUMNS,
+                  gap: 8,
+                  alignItems: "center",
+                }}
               >
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>{row.airfoilName}</span>
-                <span style={{ textAlign: "right", color: C.text }}>{f(row.aoaDeg, 1)}°</span>
-                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.muted }}>
-                  {fSpeed(row.speed)} · {row.reynolds != null ? `Re ${formatRe(row.reynolds)}` : "Re —"}
+                <span
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    fontWeight: 600,
+                  }}
+                >
+                  {row.airfoilName}
                 </span>
-                <span style={{ textAlign: "right", color: C.muted }}>{f(row.cl, 2)}</span>
-                <span style={{ textAlign: "right", color: C.muted }}>{f(row.cd, 4)}</span>
-                <span style={{ textAlign: "right", color: C.muted }}>{f(row.clCd, 1)}</span>
+                <span style={{ textAlign: "right", color: C.text }}>
+                  {f(row.aoaDeg, 1)}°
+                </span>
+                <span
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    color: C.muted,
+                  }}
+                >
+                  {fSpeed(row.speed)} ·{" "}
+                  {row.reynolds != null
+                    ? `Re ${formatRe(row.reynolds)}`
+                    : "Re —"}
+                </span>
+                <span style={{ textAlign: "right", color: C.muted }}>
+                  {f(row.cl, 2)}
+                </span>
+                <span style={{ textAlign: "right", color: C.muted }}>
+                  {f(row.cd, 4)}
+                </span>
+                <span style={{ textAlign: "right", color: C.muted }}>
+                  {f(row.clCd, 1)}
+                </span>
                 {classificationChip(row.classificationState)}
               </button>
             );
           })}
           {nextCursor && !error && (
             <div style={{ padding: "9px 12px" }}>
-              <button type="button" data-testid="solved-load-more" disabled={loadingMore} onClick={() => void loadMore()} style={{ ...smallBtn, width: "100%", opacity: loadingMore ? 0.6 : 1 }}>
+              <button
+                type="button"
+                data-testid="solved-load-more"
+                disabled={loadingMore}
+                onClick={() => void loadMore()}
+                style={{
+                  ...smallBtn,
+                  width: "100%",
+                  opacity: loadingMore ? 0.6 : 1,
+                }}
+              >
                 {loadingMore ? "loading…" : "load more"}
               </button>
             </div>
@@ -384,7 +600,12 @@ export function SolvedPointsPopover({
         <>
           <SimModal
             open
-            ctx={{ re: openRow.reynolds ?? 0, aoa: openRow.aoaDeg, resultId: openRow.resultId, mirrored: false }}
+            ctx={{
+              re: openRow.reynolds ?? 0,
+              aoa: openRow.aoaDeg,
+              resultId: openRow.resultId,
+              mirrored: false,
+            }}
             sim={sim}
             name={openRow.airfoilName}
             machStr="—"
@@ -401,57 +622,14 @@ export function SolvedPointsPopover({
               setSimMessage(null);
             }}
             unavailableMessage={simMessage}
+            pointNavigation={{
+              previousDisabled: prevDisabled,
+              nextDisabled,
+              nextLoading: loadingMore,
+              onPrevious: () => void step(-1),
+              onNext: () => void step(1),
+            }}
           />
-          {/* Lightweight α prev/next stepping over the popover's row list —
-              wraps the modal (zIndex above its overlay) without forking it. */}
-          <button
-            type="button"
-            data-testid="solved-step-prev"
-            disabled={prevDisabled}
-            onClick={() => void step(-1)}
-            style={{
-              position: "fixed",
-              left: 14,
-              top: "50%",
-              transform: "translateY(-50%)",
-              zIndex: 51,
-              fontFamily: MONO,
-              fontSize: 11,
-              color: prevDisabled ? C.dimmest : C.teal,
-              background: C.panel2,
-              border: `1px solid ${prevDisabled ? C.stroke : C.tealBorder}`,
-              borderRadius: 9,
-              padding: "10px 11px",
-              cursor: prevDisabled ? "not-allowed" : "pointer",
-              opacity: prevDisabled ? 0.55 : 1,
-            }}
-          >
-            ‹ α prev
-          </button>
-          <button
-            type="button"
-            data-testid="solved-step-next"
-            disabled={nextDisabled}
-            onClick={() => void step(1)}
-            style={{
-              position: "fixed",
-              right: 14,
-              top: "50%",
-              transform: "translateY(-50%)",
-              zIndex: 51,
-              fontFamily: MONO,
-              fontSize: 11,
-              color: nextDisabled ? C.dimmest : C.teal,
-              background: C.panel2,
-              border: `1px solid ${nextDisabled ? C.stroke : C.tealBorder}`,
-              borderRadius: 9,
-              padding: "10px 11px",
-              cursor: nextDisabled ? "not-allowed" : "pointer",
-              opacity: nextDisabled ? 0.55 : 1,
-            }}
-          >
-            {loadingMore ? "loading…" : "α next ›"}
-          </button>
         </>
       )}
     </>

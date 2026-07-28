@@ -11,6 +11,8 @@ import {
   chartXForTime,
   clampFrameIndex,
   defaultFrameField,
+  frameSeriesChartDomain,
+  frameSeriesValue,
   frameForChartX,
   frameForScrubFrac,
   frameImageUrl,
@@ -27,7 +29,9 @@ import {
   type FramePlayerModel,
 } from "../lib/frame-player";
 
-type FrameTrackDetail = NonNullable<Parameters<typeof buildFramePlayerModel>[0]>;
+type FrameTrackDetail = NonNullable<
+  Parameters<typeof buildFramePlayerModel>[0]
+>;
 
 const STATS = {
   cl: { mean: 0.912, std: 0.148, min: 0.61, max: 1.19 },
@@ -37,11 +41,16 @@ const STATS = {
 
 /** Real-shaped track: 48 frames over 2 periods of 0.5 s (24/period), both
  *  contract fields, one frame missing its velocity PNG (evidence gap). */
-function realTrack(overrides: Partial<FrameTrackDetail> = {}): FrameTrackDetail {
+function realTrack(
+  overrides: Partial<FrameTrackDetail> = {},
+): FrameTrackDetail {
   const frames = Array.from({ length: 48 }, (_, k) => {
     const stamp = `f${String(72 + k).padStart(4, "0")}.png`;
-    const imageUrls: Record<string, string> = { vorticity: `/api/media/results/r1/frames/vorticity/${stamp}` };
-    if (k !== 5) imageUrls.velocity_magnitude = `/api/media/results/r1/frames/velocity_magnitude/${stamp}`;
+    const imageUrls: Record<string, string> = {
+      vorticity: `/api/media/results/r1/frames/vorticity/${stamp}`,
+    };
+    if (k !== 5)
+      imageUrls.velocity_magnitude = `/api/media/results/r1/frames/velocity_magnitude/${stamp}`;
     return {
       i: 72 + k,
       t: 3.0 + (k * 1.0) / 47,
@@ -99,7 +108,8 @@ describe("buildFramePlayerModel — payload → player model incl. legacy fallba
     const shuffled = { ...track, frames: [...track.frames].reverse() };
     const m = buildFramePlayerModel(shuffled);
     expect(m).not.toBeNull();
-    for (let k = 1; k < m!.times.length; k++) expect(m!.times[k]).toBeGreaterThanOrEqual(m!.times[k - 1]);
+    for (let k = 1; k < m!.times.length; k++)
+      expect(m!.times[k]).toBeGreaterThanOrEqual(m!.times[k - 1]);
   });
 
   it("counts registered frame images per field — gaps stay gaps", () => {
@@ -113,7 +123,10 @@ describe("buildFramePlayerModel — payload → player model incl. legacy fallba
     const track = realTrack();
     const stripped = {
       ...track,
-      frames: track.frames.map((f) => ({ ...f, imageUrls: { vorticity: f.imageUrls.vorticity! } })),
+      frames: track.frames.map((f) => ({
+        ...f,
+        imageUrls: { vorticity: f.imageUrls.vorticity! },
+      })),
     };
     const m = buildFramePlayerModel(stripped)!;
     expect(m.fields).toEqual(["vorticity", "velocity_magnitude"]);
@@ -214,7 +227,11 @@ describe("scrub bar mapping", () => {
 
   it("a single-frame track pins the scrub to 0 without dividing by zero", () => {
     const track = realTrack();
-    const single = buildFramePlayerModel({ ...track, frames: [track.frames[0]], window: { tStart: 3, tEnd: 3 } })!;
+    const single = buildFramePlayerModel({
+      ...track,
+      frames: [track.frames[0]],
+      window: { tStart: 3, tEnd: 3 },
+    })!;
     expect(single.durationS).toBe(0);
     expect(scrubFracForFrame(single, 0)).toBe(0);
     expect(frameForScrubFrac(single, 0.7)).toBe(0);
@@ -246,10 +263,54 @@ describe("chart x ↔ frame mapping (shared geometry)", () => {
   });
 });
 
+describe("instantaneous coefficient-series math", () => {
+  it("derives L/D from the exact stored frame Cl and Cd without changing either input", () => {
+    const m = model();
+    const frame = m.frames[15];
+    expect(frameSeriesValue(frame, "cl")).toBe(frame.cl);
+    expect(frameSeriesValue(frame, "cd")).toBe(frame.cd);
+    expect(frameSeriesValue(frame, "ld")).toBeCloseTo(frame.cl / frame.cd, 12);
+  });
+
+  it("keeps a zero-drag ratio unavailable instead of drawing an invented value", () => {
+    const frame = { ...model().frames[0], cd: 0 };
+    expect(frameSeriesValue(frame, "ld")).toBeNaN();
+  });
+
+  it("does not magnify a sub-percent L/D ripple to the full plot height", () => {
+    // Exact production-shaped samples from AG 455CT02R around frames 15–17.
+    // The values are authentic and smooth in Cl/Cd; their instantaneous ratio
+    // moves by only ~0.25%. A min-relative chart span keeps that tiny physical
+    // variation visible without presenting it as a full-height discontinuity.
+    const base = realTrack();
+    const frames = [
+      { ...base.frames[0], t: 0.008923709, cl: 0.816519139, cd: 0.19510041 },
+      { ...base.frames[1], t: 0.008936617, cl: 0.823550538, cd: 0.19703591 },
+      { ...base.frames[2], t: 0.008950458, cl: 0.826339717, cd: 0.19793646 },
+    ];
+    const m = buildFramePlayerModel({
+      ...base,
+      frames,
+      window: { tStart: frames[0].t, tEnd: frames[2].t },
+    })!;
+    const domain = frameSeriesChartDomain(m, "ld");
+    expect(domain).not.toBeNull();
+    expect(domain!.observedLo).toBeCloseTo(4.1747727, 6);
+    expect(domain!.observedHi).toBeCloseTo(4.1851226, 6);
+    expect(domain!.hi - domain!.lo).toBeCloseTo(
+      Math.abs((domain!.observedHi + domain!.observedLo) / 2) * 0.05,
+      12,
+    );
+  });
+});
+
 describe("play cadence math", () => {
   it("1× advances exactly one period of sim time per WALL_SECONDS_PER_PERIOD", () => {
     const m = model();
-    expect(playbackSimRate(m, 1)).toBeCloseTo(0.5 / WALL_SECONDS_PER_PERIOD, 12);
+    expect(playbackSimRate(m, 1)).toBeCloseTo(
+      0.5 / WALL_SECONDS_PER_PERIOD,
+      12,
+    );
     const after = advancePlayback(m.tStart, WALL_SECONDS_PER_PERIOD, 1, m);
     expect(after).toBeCloseTo(m.tStart + 0.5, 9);
   });
@@ -262,7 +323,12 @@ describe("play cadence math", () => {
 
   it("loops back inside the window instead of running off the end", () => {
     const m = model(); // window = 2 periods = 2 wall-seconds at 1×
-    const after = advancePlayback(m.tStart, 2.5 * WALL_SECONDS_PER_PERIOD, 1, m);
+    const after = advancePlayback(
+      m.tStart,
+      2.5 * WALL_SECONDS_PER_PERIOD,
+      1,
+      m,
+    );
     expect(after).toBeCloseTo(m.tStart + 0.25, 9);
     expect(after).toBeGreaterThanOrEqual(m.tStart);
     expect(after).toBeLessThan(m.tEnd);
@@ -286,17 +352,28 @@ describe("play cadence math", () => {
 
   it("degenerate window stays pinned at tStart (no NaN drift)", () => {
     const track = realTrack();
-    const single = buildFramePlayerModel({ ...track, frames: [track.frames[0]], window: { tStart: 3, tEnd: 3 } })!;
+    const single = buildFramePlayerModel({
+      ...track,
+      frames: [track.frames[0]],
+      window: { tStart: 3, tEnd: 3 },
+    })!;
     expect(single.durationS).toBe(0);
     expect(advancePlayback(3, 1, 1, single)).toBe(3);
-    const noPeriod = buildFramePlayerModel({ ...track, periodS: null, frames: [track.frames[0]], window: { tStart: 3, tEnd: 3 } })!;
+    const noPeriod = buildFramePlayerModel({
+      ...track,
+      periodS: null,
+      frames: [track.frames[0]],
+      window: { tStart: 3, tEnd: 3 },
+    })!;
     expect(playbackSimRate(noPeriod, 1)).toBe(0);
     expect(advancePlayback(3, 1, 1, noPeriod)).toBe(3);
   });
 
   it("junk sim time / dt inputs stay inside the window", () => {
     const m = model();
-    expect(advancePlayback(Number.NaN, 0.1, 1, m)).toBeGreaterThanOrEqual(m.tStart);
+    expect(advancePlayback(Number.NaN, 0.1, 1, m)).toBeGreaterThanOrEqual(
+      m.tStart,
+    );
     expect(advancePlayback(m.tStart, Number.NaN, 1, m)).toBe(m.tStart);
     expect(advancePlayback(m.tStart, -5, 1, m)).toBe(m.tStart);
   });
@@ -326,7 +403,11 @@ describe("period tick fractions", () => {
 
   it("returns no visual ticks when no measured period/window exists", () => {
     expect(periodTickFractions(model({ periodS: null }))).toEqual([]);
-    const single = buildFramePlayerModel({ ...realTrack(), frames: [realTrack().frames[0]], window: { tStart: 3, tEnd: 3 } })!;
+    const single = buildFramePlayerModel({
+      ...realTrack(),
+      frames: [realTrack().frames[0]],
+      window: { tStart: 3, tEnd: 3 },
+    })!;
     expect(periodTickFractions(single)).toEqual([]);
   });
 });
@@ -334,7 +415,9 @@ describe("period tick fractions", () => {
 describe("frame image resolution", () => {
   it("returns the registered URL for field+frame and null for gaps", () => {
     const m = model();
-    expect(frameImageUrl(m, 0, "vorticity")).toContain("/frames/vorticity/f0072.png");
+    expect(frameImageUrl(m, 0, "vorticity")).toContain(
+      "/frames/vorticity/f0072.png",
+    );
     expect(frameImageUrl(m, 5, "velocity_magnitude")).toBeNull(); // the unregistered PNG
     expect(frameImageUrl(m, 5, "vorticity")).toContain("f0077.png");
     expect(frameImageUrl(m, 0, "pressure")).toBeNull(); // field not in the track

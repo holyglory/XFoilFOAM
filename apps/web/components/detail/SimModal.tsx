@@ -29,9 +29,12 @@ import {
   chartXForTime,
   clampFrameIndex,
   defaultFrameField,
+  type FrameCoefficientSeries,
   frameForChartX,
   frameImageUrl,
   frameIndexForTime,
+  frameSeriesChartDomain,
+  frameSeriesValue,
   PLAYER_CHART_GEOMETRY,
   periodOrdinal,
   periodTickFractions,
@@ -156,6 +159,15 @@ export function SimModal(props: {
   restoreFocusTo?: HTMLElement | null;
   unavailableMessage?: string | null;
   review?: SimModalReviewContext | null;
+  /** Optional navigation owned by the caller's result list. It is rendered
+   * inside the sticky modal header so controls never float over evidence. */
+  pointNavigation?: {
+    previousDisabled: boolean;
+    nextDisabled: boolean;
+    nextLoading?: boolean;
+    onPrevious: () => void;
+    onNext: () => void;
+  } | null;
 }) {
   const {
     open,
@@ -173,6 +185,7 @@ export function SimModal(props: {
     restoreFocusTo,
     unavailableMessage,
     review,
+    pointNavigation,
   } = props;
 
   useModalLayer(open);
@@ -2045,7 +2058,7 @@ export function SimModal(props: {
       ? ([
           ["Cl(t)", C.teal, clMonRef, "sim-frame-chart", 136],
           ["Cd(t)", C.amber, cdMonRef, "sim-frame-chart-cd", 116],
-          ["L/D(t)", C.text, ldMonRef, "sim-frame-chart-ld", 116],
+          ["Cl/Cd(t)", C.text, ldMonRef, "sim-frame-chart-ld", 116],
         ] as const)
       : ([
           ["Cl history", C.teal, clMonRef, "sim-frame-chart", 136],
@@ -2078,7 +2091,9 @@ export function SimModal(props: {
               <span style={{ fontSize: 10, color }}>{title}</span>
               <span style={{ fontSize: 9, color: C.dim, whiteSpace: "nowrap" }}>
                 {transportActive
-                  ? "click / drag to seek"
+                  ? title === "Cl/Cd(t)"
+                    ? "exact frames · seek"
+                    : "click / drag to seek"
                   : steadyModel
                     ? "recorded iterations"
                     : "no history"}
@@ -2251,6 +2266,24 @@ export function SimModal(props: {
             grid-template-columns: minmax(0, 1fr);
           }
         }
+        .sim-header-actions {
+          margin-left: auto;
+          display: flex;
+          align-items: center;
+          gap: 7px;
+        }
+        .sim-point-navigation {
+          display: flex;
+          align-items: center;
+          gap: 5px;
+        }
+        @media (max-width: 520px) {
+          .sim-header-actions {
+            margin-left: 0;
+            width: 100%;
+            justify-content: flex-end;
+          }
+        }
       `}</style>
       <div
         ref={dialogRef}
@@ -2363,26 +2396,71 @@ export function SimModal(props: {
           >
             {qualityChips()}
           </div>
-          <button
-            ref={closeButtonRef}
-            type="button"
-            aria-label="Close simulation evidence"
-            onClick={onClose}
-            style={{
-              marginLeft: "auto",
-              width: 30,
-              height: 30,
-              borderRadius: 8,
-              background: C.panel3,
-              border: `1px solid ${C.stroke}`,
-              color: C.muted,
-              cursor: "pointer",
-              fontSize: 15,
-              lineHeight: 1,
-            }}
-          >
-            ✕
-          </button>
+          <div className="sim-header-actions" data-testid="sim-header-actions">
+            {pointNavigation && (
+              <div
+                className="sim-point-navigation"
+                data-testid="sim-point-navigation"
+                aria-label="Step through solved points"
+              >
+                <button
+                  type="button"
+                  data-testid="solved-step-prev"
+                  aria-label="Previous solved point"
+                  disabled={pointNavigation.previousDisabled}
+                  onClick={pointNavigation.onPrevious}
+                  style={{
+                    ...dlBtn,
+                    color: pointNavigation.previousDisabled
+                      ? C.dimmest
+                      : C.teal,
+                    cursor: pointNavigation.previousDisabled
+                      ? "not-allowed"
+                      : "pointer",
+                    opacity: pointNavigation.previousDisabled ? 0.55 : 1,
+                  }}
+                >
+                  ‹ α
+                </button>
+                <button
+                  type="button"
+                  data-testid="solved-step-next"
+                  aria-label="Next solved point"
+                  disabled={pointNavigation.nextDisabled}
+                  onClick={pointNavigation.onNext}
+                  style={{
+                    ...dlBtn,
+                    color: pointNavigation.nextDisabled ? C.dimmest : C.teal,
+                    cursor: pointNavigation.nextDisabled
+                      ? "not-allowed"
+                      : "pointer",
+                    opacity: pointNavigation.nextDisabled ? 0.55 : 1,
+                  }}
+                >
+                  {pointNavigation.nextLoading ? "…" : "α ›"}
+                </button>
+              </div>
+            )}
+            <button
+              ref={closeButtonRef}
+              type="button"
+              aria-label="Close simulation evidence"
+              onClick={onClose}
+              style={{
+                width: 30,
+                height: 30,
+                borderRadius: 8,
+                background: C.panel3,
+                border: `1px solid ${C.stroke}`,
+                color: C.muted,
+                cursor: "pointer",
+                fontSize: 15,
+                lineHeight: 1,
+              }}
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
         <div style={{ padding: "16px 18px 20px" }}>
@@ -2505,7 +2583,7 @@ function drawFrameWindowChart(
     height: number;
     model: FramePlayerModel;
     frameIndex: number;
-    series: "cl" | "cd" | "ld";
+    series: FrameCoefficientSeries;
     color: string;
   },
 ) {
@@ -2516,19 +2594,9 @@ function drawFrameWindowChart(
   const plotH = H - padT - padB;
   g.fillStyle = VIZ.panel;
   g.fillRect(0, 0, W, H);
-  const valueOf = (f: FramePlayerModel["frames"][number]) => {
-    if (series === "cl") return f.cl;
-    if (series === "cd") return f.cd;
-    return Math.abs(f.cd) > 1e-9 ? f.cl / f.cd : Number.NaN;
-  };
-  const values = model.frames.map(valueOf).filter(Number.isFinite);
-  if (values.length === 0) return;
-  let lo = Math.min(...values);
-  let hi = Math.max(...values);
-  if (hi - lo < 1e-12) {
-    lo -= 0.5;
-    hi += 0.5;
-  }
+  const domain = frameSeriesChartDomain(model, series);
+  if (!domain) return;
+  const { lo, hi } = domain;
   const span = hi - lo;
   const yv = (v: number) => padT + (1 - (v - lo) / span) * plotH;
   const xv = (t: number) => chartXForTime(t, model, geom);
@@ -2597,11 +2665,18 @@ function drawFrameWindowChart(
   g.strokeStyle = color;
   g.lineWidth = 1.6;
   g.beginPath();
-  model.frames.forEach((f, k) => {
+  let traceStarted = false;
+  model.frames.forEach((f) => {
     const x = xv(f.t);
-    const y = yv(valueOf(f));
-    if (k === 0) g.moveTo(x, y);
+    const value = frameSeriesValue(f, series);
+    if (!Number.isFinite(value)) {
+      traceStarted = false;
+      return;
+    }
+    const y = yv(value);
+    if (!traceStarted) g.moveTo(x, y);
     else g.lineTo(x, y);
+    traceStarted = true;
   });
   g.stroke();
   // cursor at the current frame
@@ -2614,10 +2689,13 @@ function drawFrameWindowChart(
   g.moveTo(cx, padT);
   g.lineTo(cx, H - padB);
   g.stroke();
-  g.fillStyle = "#e6edf3";
-  g.beginPath();
-  g.arc(cx, yv(valueOf(cur)), 3.4, 0, Math.PI * 2);
-  g.fill();
+  const cursorValue = frameSeriesValue(cur, series);
+  if (Number.isFinite(cursorValue)) {
+    g.fillStyle = "#e6edf3";
+    g.beginPath();
+    g.arc(cx, yv(cursorValue), 3.4, 0, Math.PI * 2);
+    g.fill();
+  }
 }
 
 function ConditionGroup({

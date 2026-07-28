@@ -907,6 +907,48 @@ describe("URANS evidence gate (ingest-shaped rows — solver-stalled ≠ post-st
     expect(classified.classifications[0].reasons).toContain("non-stationary");
   });
 
+  it("MUST-CATCH: a positive-mean URANS result with a non-positive drag frame is rejected", () => {
+    // Production-shaped failure: the averaged Cd remained positive and all
+    // existing point-level gates passed, but one immutable force-history
+    // sample crossed into negative drag. Such evidence must stay retained
+    // while being excluded from accepted polars.
+    const classified = classifyPolarEvidence([
+      {
+        ...ingestShapedUrans,
+        frameTrack: {
+          ...contractFrameTrack,
+          frames: [
+            contractFrameTrack.frames[0],
+            { i: 1, t: 10.78, cl: -1.6, cd: -0.015, cm: -0.08 },
+          ],
+        },
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain(
+      "non-positive-frame-drag",
+    );
+  });
+
+  it("MUST-CATCH: a numerically diverged frame cannot hide behind acceptable time-averaged coefficients", () => {
+    const classified = classifyPolarEvidence([
+      {
+        ...ingestShapedUrans,
+        frameTrack: {
+          ...contractFrameTrack,
+          frames: [
+            contractFrameTrack.frames[0],
+            { i: 1, t: 10.78, cl: 8.2, cd: 0.24, cm: -6.1 },
+          ],
+        },
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain(
+      "non-physical-frame-coefficients",
+    );
+  });
+
   it("MUST-CATCH: a diverged STEADY row (converged, positive drag) is equally non-physical", () => {
     const classified = classifyPolarEvidence([
       {

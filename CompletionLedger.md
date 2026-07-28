@@ -1,5 +1,21 @@
 # Completion Ledger
 
+- **Frame-evidence integrity and narrow modal navigation:** Exact production
+  evidence proves the AG 455CT02R frames 15–17 Cl/Cd values are authentic; the
+  apparent L/D corruption is a sub-percent instantaneous ratio ripple
+  misleadingly expanded by an extrema-only chart domain. The UI now derives
+  Cl/Cd from immutable frame samples, uses a minimum relative display span
+  without smoothing or changing evidence, and keeps solved-point navigation
+  inside the modal header instead of floating over charts. A full production
+  audit found no missing numerics or non-monotonic times across 2,300 tracks
+  and 210,797 frames, but found two genuinely non-positive drag samples in AH
+  94-W-301 at 9° and 13° that the mean-only classifier had accepted. The v7
+  frame-sample gate and focused regressions are implemented locally. Remaining:
+  deploy the control plane, rebuild the exact affected revision cache, confirm
+  those two rows become rejected while their evidence remains immutable, queue
+  fresh preliminary URANS for only those cells, and verify the 627 px modal
+  journey has no overlap.
+
 - **Three-stage solver rollout and campaign burn-in:** The regression-backed
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical

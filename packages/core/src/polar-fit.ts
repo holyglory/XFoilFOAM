@@ -45,7 +45,10 @@ import {
 // can still be an alternate numerical branch. A narrowly bounded attached
 // baseline + discontinuity check routes only the incoherent low-angle run to
 // preliminary URANS; it never invents replacement coefficients.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v6";
+// v7 (frame-sample physics, 2026-07-27): accepted URANS means can no longer
+// hide a non-positive-drag or numerically diverged sample inside frame_track.
+// Immutable raw evidence remains stored; only polar eligibility changes.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v7";
 
 /** A derived-media absence, not an aerodynamic verdict. The point remains
  * rejected until real stored video exists, but it belongs to automatic media
@@ -53,7 +56,7 @@ export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v6";
 export const MISSING_URANS_VIDEO_REASON = "missing-urans-video";
 // v6 invalidates fits whose selected RANS evidence may contain an alternate
 // low-angle branch that now requires preliminary URANS confirmation.
-export const POLAR_FIT_VERSION = "evidence-lowess-v6";
+export const POLAR_FIT_VERSION = "evidence-lowess-v7";
 
 /** Canonical classifier reason for restartable but incomplete URANS evidence. */
 export const INCOMPLETE_URANS_INTEGRATION_REASON =
@@ -118,6 +121,7 @@ export const NON_PHYSICAL_COEFFICIENT_LIMIT = 5;
 export interface FrameTrackEvidence {
   stationary?: unknown;
   periods_retained?: unknown;
+  frames?: unknown;
   [key: string]: unknown;
 }
 
@@ -325,6 +329,36 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
         )
       ) {
         reasons.push("insufficient-periods");
+      }
+      if (Array.isArray(p.frameTrack.frames)) {
+        let invalidFrame = false;
+        let nonPositiveFrameDrag = false;
+        let nonPhysicalFrameCoefficients = false;
+        for (const sample of p.frameTrack.frames) {
+          if (typeof sample !== "object" || sample === null) {
+            invalidFrame = true;
+            continue;
+          }
+          const frame = sample as Record<string, unknown>;
+          const cl = frame.cl;
+          const cd = frame.cd;
+          const cm = frame.cm;
+          if (!finite(cl) || !finite(cd) || !finite(cm)) {
+            invalidFrame = true;
+            continue;
+          }
+          if (cd <= 0) nonPositiveFrameDrag = true;
+          if (
+            Math.abs(cl) > NON_PHYSICAL_COEFFICIENT_LIMIT ||
+            Math.abs(cm) > NON_PHYSICAL_COEFFICIENT_LIMIT
+          ) {
+            nonPhysicalFrameCoefficients = true;
+          }
+        }
+        if (invalidFrame) reasons.push("invalid-frame-coefficients");
+        if (nonPositiveFrameDrag) reasons.push("non-positive-frame-drag");
+        if (nonPhysicalFrameCoefficients)
+          reasons.push("non-physical-frame-coefficients");
       }
     }
   }

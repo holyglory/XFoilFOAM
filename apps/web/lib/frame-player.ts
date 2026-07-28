@@ -51,12 +51,71 @@ export interface ChartGeometry {
   padRight: number;
 }
 
-export const PLAYER_CHART_GEOMETRY: Omit<ChartGeometry, "width"> = { padLeft: 44, padRight: 10 };
+export const PLAYER_CHART_GEOMETRY: Omit<ChartGeometry, "width"> = {
+  padLeft: 44,
+  padRight: 10,
+};
+
+export type FrameCoefficientSeries = "cl" | "cd" | "ld";
+
+export interface FrameSeriesChartDomain {
+  /** Exact extrema present in stored frame evidence. */
+  observedLo: number;
+  observedHi: number;
+  /** Display domain. May be wider than the evidence extrema, never narrower. */
+  lo: number;
+  hi: number;
+}
+
+/** Exact coefficient value represented by one recorded frame. L/D is a
+ * derived presentation value, not separate solver evidence: it is always the
+ * stored instantaneous Cl divided by the stored instantaneous Cd. */
+export function frameSeriesValue(
+  frame: FrameTrackFrameDetail,
+  series: FrameCoefficientSeries,
+): number {
+  if (series === "cl") return frame.cl;
+  if (series === "cd") return frame.cd;
+  return Math.abs(frame.cd) > 1e-9 ? frame.cl / frame.cd : Number.NaN;
+}
+
+/** Honest y-domain for a recorded coefficient trace. Cl and Cd retain their
+ * evidence-extrema domain. An instantaneous Cl/Cd ratio gets a minimum 5%
+ * relative span so a sub-percent algebraic ripple is not misleadingly
+ * magnified to the full chart height. The samples themselves are untouched. */
+export function frameSeriesChartDomain(
+  model: FramePlayerModel,
+  series: FrameCoefficientSeries,
+): FrameSeriesChartDomain | null {
+  const values = model.frames
+    .map((frame) => frameSeriesValue(frame, series))
+    .filter(Number.isFinite);
+  if (values.length === 0) return null;
+  const observedLo = Math.min(...values);
+  const observedHi = Math.max(...values);
+  let lo = observedLo;
+  let hi = observedHi;
+  if (series === "ld") {
+    const center = (observedLo + observedHi) / 2;
+    const minSpan = Math.max(Math.abs(center) * 0.05, 1e-6);
+    if (hi - lo < minSpan) {
+      lo = center - minSpan / 2;
+      hi = center + minSpan / 2;
+    }
+  }
+  if (hi - lo < 1e-12) {
+    lo -= 0.5;
+    hi += 0.5;
+  }
+  return { observedLo, observedHi, lo, hi };
+}
 
 /** Assemble the player model from the API payload. Returns null for legacy
  *  evidence (no frame track, or an empty frame list) — the caller must fall
  *  back to the stored mp4 loop, never synthesize frames. */
-export function buildFramePlayerModel(frameTrack: FrameTrackDetail | null | undefined): FramePlayerModel | null {
+export function buildFramePlayerModel(
+  frameTrack: FrameTrackDetail | null | undefined,
+): FramePlayerModel | null {
   if (!frameTrack) return null;
   const frames = frameTrack.frames
     .filter((f) => Number.isFinite(f.t))
@@ -98,8 +157,15 @@ export function buildFramePlayerModel(frameTrack: FrameTrackDetail | null | unde
       frameImageCounts[field] = (frameImageCounts[field] ?? 0) + 1;
     }
   }
-  const imageFields = frameTrack.fields.filter((field) => (frameImageCounts[field] ?? 0) > 0);
-  const periodS = frameTrack.periodS != null && Number.isFinite(frameTrack.periodS) && frameTrack.periodS > 0 ? frameTrack.periodS : null;
+  const imageFields = frameTrack.fields.filter(
+    (field) => (frameImageCounts[field] ?? 0) > 0,
+  );
+  const periodS =
+    frameTrack.periodS != null &&
+    Number.isFinite(frameTrack.periodS) &&
+    frameTrack.periodS > 0
+      ? frameTrack.periodS
+      : null;
   return {
     frames,
     times,
@@ -140,26 +206,39 @@ export function frameIndexForTime(times: number[], t: number): number {
   return t - times[lo] <= times[hi] - t ? lo : hi;
 }
 
-export function timeForFrameIndex(model: FramePlayerModel, index: number): number {
+export function timeForFrameIndex(
+  model: FramePlayerModel,
+  index: number,
+): number {
   const idx = clampFrameIndex(model.frames.length, index);
   return idx < 0 ? model.tStart : model.times[idx];
 }
 
 /** Scrub-bar position (0..1 within the recording window) for a frame. */
-export function scrubFracForFrame(model: FramePlayerModel, index: number): number {
+export function scrubFracForFrame(
+  model: FramePlayerModel,
+  index: number,
+): number {
   if (model.durationS <= 0) return 0;
   const t = timeForFrameIndex(model, index);
   return Math.max(0, Math.min(1, (t - model.tStart) / model.durationS));
 }
 
 /** Nearest frame for a scrub-bar position (0..1). */
-export function frameForScrubFrac(model: FramePlayerModel, frac: number): number {
+export function frameForScrubFrac(
+  model: FramePlayerModel,
+  frac: number,
+): number {
   const f = Number.isFinite(frac) ? Math.max(0, Math.min(1, frac)) : 0;
   return frameIndexForTime(model.times, model.tStart + f * model.durationS);
 }
 
 /** Canvas x (pixel) where a simulation time falls in the window chart. */
-export function chartXForTime(t: number, model: FramePlayerModel, geom: ChartGeometry): number {
+export function chartXForTime(
+  t: number,
+  model: FramePlayerModel,
+  geom: ChartGeometry,
+): number {
   const plotW = Math.max(1, geom.width - geom.padLeft - geom.padRight);
   if (model.durationS <= 0) return geom.padLeft;
   const frac = Math.max(0, Math.min(1, (t - model.tStart) / model.durationS));
@@ -168,7 +247,11 @@ export function chartXForTime(t: number, model: FramePlayerModel, geom: ChartGeo
 
 /** Nearest frame for a canvas x (pixel) — the chart click/drag → frame map.
  *  X outside the plot area clamps to the first/last frame. */
-export function frameForChartX(x: number, model: FramePlayerModel, geom: ChartGeometry): number {
+export function frameForChartX(
+  x: number,
+  model: FramePlayerModel,
+  geom: ChartGeometry,
+): number {
   const plotW = Math.max(1, geom.width - geom.padLeft - geom.padRight);
   const frac = Math.max(0, Math.min(1, (x - geom.padLeft) / plotW));
   return frameForScrubFrac(model, frac);
@@ -178,21 +261,35 @@ export function frameForChartX(x: number, model: FramePlayerModel, geom: ChartGe
  *  one shedding period per WALL_SECONDS_PER_PERIOD at 1×. When the engine
  *  shipped no usable period (period_s null), the window length divided by the
  *  recorded period count stands in so playback still paces per-period. */
-export function playbackSimRate(model: FramePlayerModel, speed: PlaybackSpeed): number {
-  const period = model.periodS ?? (model.durationS > 0 ? model.durationS / Math.max(1, windowPeriodCount(model) ?? 1) : 0);
+export function playbackSimRate(
+  model: FramePlayerModel,
+  speed: PlaybackSpeed,
+): number {
+  const period =
+    model.periodS ??
+    (model.durationS > 0
+      ? model.durationS / Math.max(1, windowPeriodCount(model) ?? 1)
+      : 0);
   if (period <= 0) return 0;
   return (period / WALL_SECONDS_PER_PERIOD) * speed;
 }
 
 /** Advance the playback clock by a wall-clock dt, looping inside the
  *  recording window. Degenerate windows stay pinned at tStart. */
-export function advancePlayback(simTime: number, wallDtSeconds: number, speed: PlaybackSpeed, model: FramePlayerModel): number {
+export function advancePlayback(
+  simTime: number,
+  wallDtSeconds: number,
+  speed: PlaybackSpeed,
+  model: FramePlayerModel,
+): number {
   if (model.durationS <= 0) return model.tStart;
   const rate = playbackSimRate(model, speed);
   const base = Number.isFinite(simTime) ? simTime : model.tStart;
-  const dt = Number.isFinite(wallDtSeconds) && wallDtSeconds > 0 ? wallDtSeconds : 0;
+  const dt =
+    Number.isFinite(wallDtSeconds) && wallDtSeconds > 0 ? wallDtSeconds : 0;
   const advanced = base - model.tStart + dt * rate;
-  const wrapped = ((advanced % model.durationS) + model.durationS) % model.durationS;
+  const wrapped =
+    ((advanced % model.durationS) + model.durationS) % model.durationS;
   return model.tStart + wrapped;
 }
 
@@ -210,7 +307,8 @@ export function periodTickFractions(model: FramePlayerModel): number[] {
   if (total == null || model.periodS == null || model.durationS <= 0) return [];
   const ticks: number[] = [];
   for (let k = 1; k < total; k++) {
-    const frac = (model.tStart + k * model.periodS - model.tStart) / model.durationS;
+    const frac =
+      (model.tStart + k * model.periodS - model.tStart) / model.durationS;
     if (frac > 0 && frac < 1) ticks.push(frac);
   }
   return ticks;
@@ -218,17 +316,27 @@ export function periodTickFractions(model: FramePlayerModel): number[] {
 
 /** 1-based period ordinal of a frame within the recording window, for the
  *  image overlay readout ("period 2/3"). null when no period was measured. */
-export function periodOrdinal(model: FramePlayerModel, index: number): { ordinal: number; total: number } | null {
+export function periodOrdinal(
+  model: FramePlayerModel,
+  index: number,
+): { ordinal: number; total: number } | null {
   const total = windowPeriodCount(model);
   if (total == null || model.periodS == null) return null;
   const t = timeForFrameIndex(model, index);
-  const ordinal = Math.min(total, Math.max(1, Math.floor((t - model.tStart) / model.periodS + 1e-9) + 1));
+  const ordinal = Math.min(
+    total,
+    Math.max(1, Math.floor((t - model.tStart) / model.periodS + 1e-9) + 1),
+  );
   return { ordinal, total };
 }
 
 /** Frame PNG URL for a field at a frame — null when that frame's image
  *  evidence is not registered (absence stays absence; no invented URL). */
-export function frameImageUrl(model: FramePlayerModel, index: number, field: string | null): string | null {
+export function frameImageUrl(
+  model: FramePlayerModel,
+  index: number,
+  field: string | null,
+): string | null {
   if (!field) return null;
   const idx = clampFrameIndex(model.frames.length, index);
   if (idx < 0) return null;
