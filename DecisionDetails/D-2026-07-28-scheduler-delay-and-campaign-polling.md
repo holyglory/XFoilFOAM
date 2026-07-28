@@ -208,3 +208,20 @@ state during every pre-commit hook, then sees all points and owners together
 after success. Query-shape coverage proves one progress aggregate, one lane
 discovery, and one accepted-result incident batch per payload; the shared
 natural-cell lock helper fixes the cross-path acquisition order.
+
+Production release evidence:
+
+- exact source revision
+  `209e9ace9633c8ccacacba0800ea5761c604e685` passed the deployment source
+  manifest and public web/API health gates;
+- the engine gateway, recovery gateway, and worker container identities and
+  start times were identical before and after deployment, while live
+  `pimpleFoam` processes continued;
+- the first two complete post-release scheduler cycles took 5.405 seconds and
+  5.182 seconds, with no tick, deadlock, or campaign-result errors;
+- the exact campaign summary endpoint returned in 983.2, 1,222.2, and
+  1,048.1 ms (1,048.1 ms median); its first 50-airfoil coverage slice returned
+  in 88.3, 98.0, and 79.1 ms (88.3 ms median);
+- durable ingest completions reached 420 with zero orphan marker owners;
+- `hz-solver2` reported 40 active jobs, 40/40 reserved CPU slots, no recent
+  error, and a one-minute whole-host load of 43.04 across 96 logical CPUs.
