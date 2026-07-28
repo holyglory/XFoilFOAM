@@ -1584,6 +1584,7 @@ export const resultMedia = pgTable(
     }).onDelete("cascade"),
     resultIdx: index("result_media_result_idx").on(t.resultId),
     attemptIdx: index("result_media_attempt_idx").on(t.resultAttemptId),
+    storageIdx: index("result_media_storage_key_idx").on(t.storageKey),
     resultProfileEvidenceIdx: index(
       "result_media_result_profile_evidence_idx",
     ).on(t.resultId, t.renderProfileKey, t.evidenceSha256),

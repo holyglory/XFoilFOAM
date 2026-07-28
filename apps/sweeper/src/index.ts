@@ -6,7 +6,9 @@ import {
   makeContext,
 } from "./config";
 import { startHeartbeatTimer } from "./heartbeat";
+import { runSweeperLifecycle } from "./lifecycle";
 import { runLoop } from "./loop";
+import { runRetentionLoop } from "./retention";
 
 const { db, sql, engine } = makeContext();
 try {
@@ -37,10 +39,11 @@ console.log(
 // process as "PROCESS NOT RUNNING"). Tick progress is stamped separately by
 // the loop (lastTickStartedAt/lastTickCompletedAt).
 const stopHeartbeat = startHeartbeatTimer(db);
-try {
-  await runLoop(db, engine, ac.signal);
-} finally {
-  stopHeartbeat();
-}
-await sql.end();
+await runSweeperLifecycle({
+  controller: ac,
+  startScheduler: (signal) => runLoop(db, engine, signal),
+  startRetention: (signal) => runRetentionLoop(db, engine, signal),
+  stopHeartbeat,
+  closeResources: () => sql.end(),
+});
 console.log("[sweeper] stopped");

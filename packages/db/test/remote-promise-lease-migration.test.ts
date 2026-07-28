@@ -21,15 +21,16 @@ describe("0091 remote promise failover lease migration", () => {
     );
     expect(migration).toContain("SET default_promise_ttl_hours = 72");
     expect(migration).toContain("WHERE default_promise_ttl_hours = 24");
-    expect(schema).toMatch(
-      /defaultPromiseTtlHours:[\s\S]*?\.default\(72\)/,
-    );
+    expect(schema).toMatch(/defaultPromiseTtlHours:[\s\S]*?\.default\(72\)/);
   });
 
-  it("is the latest ordered migration", () => {
-    expect(journal.entries.at(-1)).toMatchObject({
+  it("remains ordered before later migrations", () => {
+    expect(journal.entries.find((entry) => entry.idx === 91)).toMatchObject({
       idx: 91,
       tag: "0091_remote_promise_failover_lease",
     });
+    expect(journal.entries.findIndex((entry) => entry.idx === 91)).toBeLessThan(
+      journal.entries.findIndex((entry) => entry.idx === 92),
+    );
   });
 });

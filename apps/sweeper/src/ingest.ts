@@ -5242,7 +5242,18 @@ export async function ingestResult(opts: {
   /** Deterministic crash-boundary hook used by the exact-generation replay
    * regression. It runs after every immutable evidence row is committed but
    * before classification/pointer publication. */
-  hooks?: { afterEvidenceStaged?: () => Promise<void> };
+  hooks?: {
+    afterEvidenceStaged?: () => Promise<void>;
+    /** Test-only observation after one point's expensive child evidence has
+     * been staged. Exact point/attempt duplicates intentionally do not fire
+     * this hook twice. */
+    afterPointEvidenceStaged?: (point: {
+      resultId: string;
+      resultAttemptId: string;
+      aoaDeg: number;
+      regime: "rans" | "urans";
+    }) => void | Promise<void>;
+  };
 }): Promise<{
   points: number;
   media: number;
@@ -5292,6 +5303,10 @@ export async function ingestResult(opts: {
     reynolds: number;
     speed: number;
     chord: number;
+    /** A canonical point from this same payload whose heavy evidence tail has
+     * already completed. We still resolve the cell and run the immutable
+     * attempt replay check before reusing it. */
+    reuseCandidate?: StagedPoint;
   }): Promise<StagedPoint> => {
     const p = input.point;
     const pointRuntime = p.engine
@@ -5357,6 +5372,12 @@ export async function ingestResult(opts: {
     if (!resultAttemptId) {
       throw new Error(`failed to stage exact attempt (${pointContext})`);
     }
+    if (
+      input.reuseCandidate?.resultId === cell.id &&
+      input.reuseCandidate.resultAttemptId === resultAttemptId
+    ) {
+      return input.reuseCandidate;
+    }
 
     // Exact immutable evidence is complete before any canonical projection or
     // current pointer can change. Every row carries both owner ids, enforced
@@ -5396,6 +5417,12 @@ export async function ingestResult(opts: {
       );
     }
     await stageForceHistory(db, cell.id, resultAttemptId, p);
+    await opts.hooks?.afterPointEvidenceStaged?.({
+      resultId: cell.id,
+      resultAttemptId,
+      aoaDeg: p.aoa_deg,
+      regime: p.unsteady ? "urans" : "rans",
+    });
     // Field extents and scaled default media belong to the separate, durable
     // media-repair worker. Calling the renderer while a continuous sweep is
     // publishing partial evidence makes the scheduler wait on I/O instead of
@@ -5458,6 +5485,7 @@ export async function ingestResult(opts: {
     }
     const canonicalAoas = new Set(polar.points.map((point) => point.aoa_deg));
     const pointCandidates: StagedPoint[] = [];
+    const canonicalCandidates = new Map<string, StagedPoint>();
     for (const p of polar.points) {
       await heartbeat();
       const staged = await stagePoint({
@@ -5470,6 +5498,10 @@ export async function ingestResult(opts: {
         chord: polar.chord,
       });
       pointCandidates.push(staged);
+      canonicalCandidates.set(
+        `${p.aoa_deg}\0${p.unsteady ? "urans" : "rans"}`,
+        staged,
+      );
       points++;
     }
     const attemptOnlyByAoa = new Map<number, StagedPoint>();
@@ -5485,6 +5517,9 @@ export async function ingestResult(opts: {
         reynolds: polar.reynolds,
         speed: polar.speed,
         chord: polar.chord,
+        reuseCandidate: canonicalCandidates.get(
+          `${p.aoa_deg}\0${p.unsteady ? "urans" : "rans"}`,
+        ),
       });
       stagedAttemptByAoa.set(p.aoa_deg, staged);
       if (!canonicalAoas.has(p.aoa_deg))

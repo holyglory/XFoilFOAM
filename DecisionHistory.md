@@ -164,14 +164,23 @@
   existing solves continue while new scheduling waits, and an administrator
   opens Solver details only if the delay persists. Derive sparse campaign
   ladder counts source-first, run independent summary reads concurrently, and
-  serialize/coalesce browser polling and coverage refreshes.
+  serialize/coalesce browser polling and coverage refreshes. Run retention and
+  hydration-cache garbage collection in an independent, serial, shutdown-joined
+  maintenance loop so it cannot hold tick progress open; index exact artifact
+  reference lookups and limit cleanup to one database connection at a time.
+  Reuse exact canonical point/attempt duplicates within one payload only after
+  immutable replay validation; retain a durable completeness gate as required
+  follow-up before skipping evidence across separate partial-result polls.
   [detail](DecisionDetails/D-2026-07-28-scheduler-delay-and-campaign-polling.md)
 - Why: repeated campaign warnings turned non-actionable internal progress
   telemetry into a false user task, while whole-campaign scans and overlapping
   fixed-interval requests made the ten-second live view amplify its own load.
   Hiding the signal would discard useful operations evidence, and merely
   polling less often or caching stale campaign state would not fix first-load
-  cost or truthful live progress.
+  cost or truthful live progress. Awaiting an hourly cache scan inside the
+  admission tick made maintenance latency look like scheduler failure; an
+  independent serial loop preserves cleanup without delaying work or outliving
+  its database pool.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

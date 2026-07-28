@@ -10,6 +10,7 @@ import {
   resultMedia,
   simJobs,
   solverEvidenceArtifacts,
+  sweeperState,
 } from "@aerodb/db";
 import { EngineError, type EngineClient } from "@aerodb/engine-client";
 import { eq, inArray, sql } from "drizzle-orm";
@@ -43,6 +44,19 @@ export interface RetentionConfig {
 export interface RetentionTickOptions extends Partial<RetentionConfig> {
   now?: Date;
   forceOrphanSweep?: boolean;
+}
+
+type RetentionPass = (
+  db: DB,
+  engine: EngineClient,
+  options?: RetentionTickOptions,
+) => Promise<void>;
+
+export interface RetentionLoopOptions {
+  /** Test/operations override. Production follows the live sweeper interval. */
+  pollIntervalMs?: number;
+  passOptions?: RetentionTickOptions;
+  runPass?: RetentionPass;
 }
 
 interface StripCandidate {
@@ -515,20 +529,21 @@ export async function sweepSyncImportOrphans(
     if (removed >= maxPerSweep) break;
     const batch = candidates.slice(offset, offset + 1_000);
     const keys = batch.map((candidate) => candidate.storageKey);
-    const [artifacts, media, remote] = await Promise.all([
-      db
-        .select({ storageKey: solverEvidenceArtifacts.storageKey })
-        .from(solverEvidenceArtifacts)
-        .where(inArray(solverEvidenceArtifacts.storageKey, keys)),
-      db
-        .select({ storageKey: resultMedia.storageKey })
-        .from(resultMedia)
-        .where(inArray(resultMedia.storageKey, keys)),
-      db
-        .select({ storageKey: remoteAssetReferences.localStorageKey })
-        .from(remoteAssetReferences)
-        .where(inArray(remoteAssetReferences.localStorageKey, keys)),
-    ]);
+    // Retention is intentionally low-priority background work. Probe the
+    // reference owners serially so one cache batch consumes at most one pool
+    // connection while scheduler admission and evidence ingest stay busy.
+    const artifacts = await db
+      .select({ storageKey: solverEvidenceArtifacts.storageKey })
+      .from(solverEvidenceArtifacts)
+      .where(inArray(solverEvidenceArtifacts.storageKey, keys));
+    const media = await db
+      .select({ storageKey: resultMedia.storageKey })
+      .from(resultMedia)
+      .where(inArray(resultMedia.storageKey, keys));
+    const remote = await db
+      .select({ storageKey: remoteAssetReferences.localStorageKey })
+      .from(remoteAssetReferences)
+      .where(inArray(remoteAssetReferences.localStorageKey, keys));
     const referenced = new Set(
       [...artifacts, ...media, ...remote].map((row) => row.storageKey),
     );
@@ -608,5 +623,75 @@ export async function retentionTick(
         `[sweeper] RETENTION: sync import GC failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, Math.max(0, ms));
+    signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
+async function retentionPollIntervalMs(
+  db: DB,
+  override: number | undefined,
+): Promise<number> {
+  if (override != null) return Math.max(0, Math.floor(override));
+  try {
+    const [state] = await db
+      .select({ pollIntervalMs: sweeperState.pollIntervalMs })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    return Math.max(0, state?.pollIntervalMs ?? 5_000);
+  } catch (error) {
+    console.error(
+      "[sweeper] retention interval lookup failed; retrying in 5s:",
+      error instanceof Error ? error.message : String(error),
+    );
+    return 5_000;
+  }
+}
+
+/**
+ * Run retention independently from the scheduler's admission/progress tick.
+ *
+ * Each pass is awaited before another can start, which makes the loop
+ * intrinsically single-flight. The initial delay gives admission startup
+ * priority. On shutdown, no new pass begins, but the current restart-safe
+ * destructive pass drains before the caller closes PostgreSQL.
+ */
+export async function runRetentionLoop(
+  db: DB,
+  engine: EngineClient,
+  signal: AbortSignal,
+  options: RetentionLoopOptions = {},
+): Promise<void> {
+  await delay(
+    await retentionPollIntervalMs(db, options.pollIntervalMs),
+    signal,
+  );
+  while (!signal.aborted) {
+    try {
+      await (options.runPass ?? retentionTick)(db, engine, options.passOptions);
+    } catch (error) {
+      console.error(
+        "[sweeper] retention pass failed:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    if (signal.aborted) break;
+    await delay(
+      await retentionPollIntervalMs(db, options.pollIntervalMs),
+      signal,
+    );
   }
 }

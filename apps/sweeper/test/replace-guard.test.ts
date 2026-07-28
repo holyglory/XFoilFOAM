@@ -1560,6 +1560,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         },
       ],
     };
+    const stagedEvidence = vi.fn();
     const r = await ingestResult({
       db,
       engine: stubEngine(),
@@ -1569,9 +1570,11 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
       uransFidelity: "precalc",
       result,
+      hooks: { afterPointEvidenceStaged: stagedEvidence },
     });
     expect(r.points).toBe(1);
     expect(r.attempts).toBe(1); // the explicit warm-start duplicate
+    expect(stagedEvidence).toHaveBeenCalledTimes(1);
 
     // Canonical row untouched.
     const [row] = await db

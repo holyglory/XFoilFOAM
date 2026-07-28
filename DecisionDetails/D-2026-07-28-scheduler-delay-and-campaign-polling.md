@@ -23,6 +23,16 @@ seconds. Fixed-interval browser polling could start another request while the
 previous request was still running and could fan that overlap into concurrent
 coverage-matrix refreshes.
 
+Production verification after the first control-plane deploy found two
+independent contributors. The restart-triggered retention pass added about one
+minute fifty seconds while `sweepSyncImportOrphans` checked large batches of
+`solver_evidence_artifacts`, `result_media`, and `remote_asset_references`
+storage keys. Subsequent ticks remained slow because cumulative engine result
+payloads replayed already-staged points and artifacts. This decision removes
+retention from scheduler liveness and eliminates the duplicate canonical
+point/attempt evidence tail inside one payload; durable cross-tick replay
+short-circuiting remains separate active work.
+
 ## Decision
 
 Treat an unfinished scheduler cycle as one global advisory named **Scheduler
@@ -45,6 +55,19 @@ completion-relative and serial: one active request, at most one coalesced
 follow-up, no fixed-interval overlap. Every polled fetch receives a bounded
 abort signal so a connection that never settles cannot freeze future updates.
 Coverage refreshes apply the same latest-only and bounded-abort rules.
+
+Run retention in one independent process-local serial loop beside the scheduler
+loop. Give admission startup priority, await each retention pass before starting
+another, and drain the active pass before closing PostgreSQL on shutdown.
+Retention therefore cannot suppress reconciliation, admission, heartbeat, or
+tick completion. Keep the existing durable strip stamps, exact reference
+rechecks, blob-stripe locks, and process-restart replay as the correctness
+boundary. Add the missing `result_media(storage_key)` lookup index and keep
+batch reference probes serial so maintenance uses at most one pooled database
+connection at a time. Within one engine payload, reuse a canonical point only
+after the duplicate attempt passes the existing exact immutable-evidence check;
+do not repeat artifact, media, inventory, or force-history staging for the same
+exact attempt.
 
 This supersedes only the causal wording and campaign-level presentation in the
 2026-07-07 liveness/progress decision. Its independent heartbeat, tick
@@ -77,6 +100,22 @@ campaign. Sparse source-first queries preserve live truth and scale with the
 exceptional work they count. Serial completion-relative polling additionally
 prevents a slow response from becoming self-amplifying load.
 
+Keeping retention awaited before admission was also rejected. It made an
+hourly, potentially exhaustive cache scan part of scheduler liveness even
+though cleanup has its own durable idempotency and does not own new-work
+admission. Allowing unbounded concurrent retention passes was rejected because
+they could race the same cache and amplify database and filesystem pressure.
+A detached single-flight promise was also rejected: it would let shutdown close
+the shared database pool while destructive cleanup was still in flight. The
+independent serial loop gives cleanup one owner, lets admission continue, and
+provides an explicit shutdown join.
+
+Treating an existing attempt row as sufficient proof of complete cross-tick
+ingest was rejected. Attempt insertion precedes child artifacts, projection,
+and remote cleanup acknowledgement, so a crash may leave an honest partial
+stage that must be resumed. A future cross-tick shortcut needs its own durable
+projection-complete signature or exact bulk completeness proof.
+
 ## Evidence
 
 Production read-only comparison on campaign
@@ -91,4 +130,6 @@ Production read-only comparison on campaign
 
 Regression coverage pins non-overlapping polls, coalesced follow-ups,
 latest-only matrix refreshes, hidden-tab behavior, sparse-query source shape,
-and the absence of campaign-level scheduler-delay gates.
+the absence of campaign-level scheduler-delay gates, a deferred retention pass
+that cannot overlap or hold scheduler progress open, graceful shutdown drain,
+and the indexed storage-key lookup used by cache reference checks.

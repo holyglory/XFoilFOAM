@@ -1,5 +1,17 @@
 # Completion Ledger
 
+- **Cumulative partial-result replay:** Production tracing found that each new
+  `completed_cases` increment returns the engine's cumulative result payload,
+  so later scheduler polls safely replay already-staged attempts and their
+  immutable children. Exact point/attempt duplicates inside one payload are now
+  collapsed only after the immutable attempt check, and retention no longer
+  owns scheduler liveness. Remaining: add a durable projection-complete
+  signature or bulk exact-association completeness proof so cross-tick replay
+  can skip only fully committed artifact/media/inventory/force-history tails;
+  verify crash recovery still fills every intentionally interrupted child row
+  and that ordinary ticks complete below the scheduler-delay threshold under a
+  live cumulative URANS/RANS workload.
+
 - **Frame-evidence integrity and narrow modal navigation:** Exact production
   evidence proves the AG 455CT02R frames 15–17 Cl/Cd values are authentic; the
   apparent L/D corruption is a sub-percent instantaneous ratio ripple

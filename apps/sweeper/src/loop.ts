@@ -58,7 +58,6 @@ import {
   scheduleRemoteSolverTransfer,
   type RemoteEngineAdmissionDecision,
 } from "./remote-solver";
-import { retentionTick } from "./retention";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
@@ -733,7 +732,6 @@ export async function tick(
   // critical incident. Re-check before any local or remote admission in this
   // same tick; waiting for the next poll would admit one job past the fence.
   const postReconcileFence = await checkAdmissionFence(db, "after_reconcile");
-  await retentionTick(db, engine);
   let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;
   const admissionFenceGuardFailed =
     preReconcileFence.guardFailed || postReconcileFence.guardFailed;
@@ -934,6 +932,8 @@ export async function tick(
   // reclaim can involve minutes of upstream I/O. Start one single-flight
   // background drain only after all NEW-work lanes had a chance to occupy free
   // CPU capacity; never hold the next admission tick behind that transfer.
+  // Retention has its own serial process loop and is intentionally absent from
+  // this scheduler progress boundary.
   scheduleRemoteSolverTransfer(db, engine);
   await markTickCompleted(db);
 }
