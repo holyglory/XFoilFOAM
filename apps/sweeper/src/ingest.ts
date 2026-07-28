@@ -1990,6 +1990,11 @@ export async function registerEvidenceArtifacts(opts: {
       }
       const existingManifest = existingManifests[0];
       if (existingManifest) {
+        // The internal engine gateway is an access route, not immutable
+        // evidence identity. A failover may change engineUrl while the exact
+        // owner, storage key, checksum, byte size, and metadata stay fixed.
+        // Keep the first stored provenance URL and accept only that exact
+        // content replay.
         const exactReplay =
           existingManifest.resultId === association.resultId &&
           existingManifest.resultAttemptId === association.resultAttemptId &&
@@ -2009,7 +2014,6 @@ export async function registerEvidenceArtifacts(opts: {
           existingManifest.mimeType === association.mimeType &&
           existingManifest.sha256 === association.sha256 &&
           existingManifest.byteSize === association.byteSize &&
-          existingManifest.engineUrl === association.engineUrl &&
           stableHash(existingManifest.metadata ?? {}) ===
             stableHash(association.metadata);
         if (!exactReplay) {

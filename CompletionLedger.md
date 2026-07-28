@@ -10,11 +10,10 @@
   audit found no missing numerics or non-monotonic times across 2,300 tracks
   and 210,797 frames, but found two genuinely non-positive drag samples in AH
   94-W-301 at 9° and 13° that the mean-only classifier had accepted. The v7
-  frame-sample gate and focused regressions are implemented locally. Remaining:
-  deploy the control plane, rebuild the exact affected revision cache, confirm
-  those two rows become rejected while their evidence remains immutable, queue
-  fresh preliminary URANS for only those cells, and verify the 627 px modal
-  journey has no overlap.
+  frame-sample gate is deployed, both rows are rejected without mutating their
+  attempts, and fresh preliminary URANS is queued for only those cells. The
+  627 px production modal has no overlap. Remaining: accept the two replacement
+  generations and rebuild the affected polar after ingestion.
 
 - **Three-stage solver rollout and campaign burn-in:** The regression-backed
   RANS screening → fast preliminary URANS → final verified URANS controller,
@@ -184,8 +183,11 @@
   production gateway remains preserved and wedged for forensic inspection
   while active OpenFOAM jobs continue in the unchanged worker. A fresh
   production-image gateway now carries Node API, sweeper, and media-repair
-  traffic; its restart policy and the live deployment `ENGINE_URL` preserve
-  that route across service/deploy restarts. Authenticated queue verification
+  traffic. A later control-plane deploy exposed that this endpoint existed only
+  in mutable environment state: the deploy briefly restored the wedged
+  canonical gateway. The environment has been corrected, and a state-owned
+  route marker plus deploy preflight regression now prevents future endpoint
+  drift. Authenticated queue verification
   reports healthy exact build identity, no health/queue error, no build
   mismatch, and a cleared unreachable timestamp. Twelve concurrent admin
   polls completed without increasing the recovery gateway's Redis-client

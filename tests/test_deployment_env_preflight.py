@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import runpy
 import subprocess
 
@@ -66,6 +67,41 @@ def test_rebuild_rejects_compatibility_env_symlink_without_splitting_state(
 def test_env_preflight_enforces_deploying_owner_in_source() -> None:
     source = (ROOT / "scripts" / "deploy" / "deployment-env-preflight.py").read_text()
     assert "metadata.st_uid != os.geteuid()" in source
+
+
+def test_control_plane_deploy_rejects_engine_route_drift_before_compose(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    env_file = Path(env["ENV_FILE"])
+    with env_file.open("a", encoding="utf-8") as stream:
+        stream.write("ENGINE_URL=http://api:8000\n")
+    state = Path(env["AIRFOILS_PRO_STATE_DIR"])
+    state.mkdir()
+    marker = state / "engine-route.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "engine_url": "http://app-api-recovery:8000",
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker.chmod(0o600)
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "does not match the active engine route marker" in completed.stderr
+    call_log = Path(env["CALL_LOG"])
+    assert not call_log.exists() or call_log.read_text().splitlines() == []
 
 
 @pytest.mark.parametrize(

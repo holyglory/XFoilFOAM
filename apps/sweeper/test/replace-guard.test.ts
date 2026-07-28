@@ -393,9 +393,12 @@ afterEach(() => {
 
 /** Engine stub: ingest-capable, scaled-render chain down (the guard paths
  *  never reach it; the replacement paths tolerate the loud extent failure). */
-function stubEngine(result?: JobResult): EngineClient {
+function stubEngine(
+  result?: JobResult,
+  baseUrl = "http://engine.test",
+): EngineClient {
   return {
-    baseUrl: "http://engine.test",
+    baseUrl,
     getQueue: async () => {
       throw new Error("queue unavailable in test");
     },
@@ -420,7 +423,7 @@ function stubEngine(result?: JobResult): EngineClient {
       throw new Error("render backend down");
     },
     fileUrl: (id: string, relPath: string) =>
-      `http://engine.test/jobs/${id}/files/${relPath}`,
+      `${baseUrl}/jobs/${id}/files/${relPath}`,
   } as unknown as EngineClient;
 }
 
@@ -3131,6 +3134,86 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         .from(forceHistory)
         .where(eq(forceHistory.resultId, staged.id)),
     ).toHaveLength(1);
+  }, 60000);
+
+  it("replays an exact manifest through a failover gateway without changing immutable evidence", async () => {
+    await cleanCell();
+    const engineJobId = `${PREFIX}-gateway-failover`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+      })
+      .returning();
+    const result = jobResult(engineJobId, acceptingPrecalcPoint());
+    const request = {
+      db,
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      uransFidelity: "precalc" as const,
+      result,
+    };
+    await expect(
+      ingestResult({
+        ...request,
+        engine: stubEngine(result, "http://primary-engine.test"),
+        hooks: {
+          afterEvidenceStaged: async () => {
+            throw new Error("injected crash before gateway failover");
+          },
+        },
+      }),
+    ).rejects.toThrow("injected crash before gateway failover");
+    const [staged] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simulationPresetRevisionId, revisionId));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, staged.id));
+    const [manifestBefore] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+
+    await ingestResult({
+      ...request,
+      engine: stubEngine(result, "http://recovery-engine.test"),
+    });
+
+    const [published] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, staged.id));
+    const manifestsAfter = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    expect(published.status).toBe("done");
+    expect(published.currentResultAttemptId).toBe(attempt.id);
+    expect(manifestsAfter).toEqual([manifestBefore]);
+    expect(manifestsAfter[0].engineUrl).toContain("primary-engine.test");
   }, 60000);
 
   it("keeps selected exact media and the sole manifest immutable when terminal replay crashes before refresh", async () => {

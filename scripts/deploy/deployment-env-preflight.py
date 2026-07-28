@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import stat
 import sys
+from urllib.parse import urlsplit
 
 
 REMOTE_EVIDENCE_KEYS = {
@@ -27,6 +29,7 @@ DEPLOYMENT_PROFILE_KEYS = {
     "AIRFOILFOAM_WORKER_CPU_BUDGET",
     "AIRFOILFOAM_CASE_CONCURRENCY",
     "AIRFOILFOAM_CELERY_CONCURRENCY",
+    "ENGINE_URL",
 }
 
 
@@ -163,6 +166,29 @@ def _validate_deployment_profile(path: Path, state: Path) -> None:
             raise ValueError(f"remote-solver deployment requires {key}=40")
 
 
+def _validate_engine_route(path: Path, state: Path) -> None:
+    """Fence control-plane deploys to the explicitly active engine gateway."""
+    marker = state / "engine-route.json"
+    if not marker.exists():
+        return
+    _validate_regular_owned_file(marker, "engine route marker")
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("engine route marker must use schema_version 1")
+    expected = payload.get("engine_url")
+    if not isinstance(expected, str) or expected != expected.strip():
+        raise ValueError("engine route marker must contain one exact engine_url")
+    parsed = urlsplit(expected)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("engine route marker engine_url must be an HTTP(S) URL")
+    actual = _read_profile_values(path).get("ENGINE_URL", "")
+    if actual != expected:
+        raise ValueError(
+            "deployment ENGINE_URL does not match the active engine route marker: "
+            f"expected {expected}, found {actual or '<unset>'}"
+        )
+
+
 def _reject_symlink_components(path: Path) -> None:
     current = Path(path.anchor)
     for component in path.parts[1:]:
@@ -207,6 +233,7 @@ def main() -> int:
         raise ValueError("deployment env must be owned by the deploying user")
     _validate_remote_evidence_auth(env)
     _validate_deployment_profile(env, state)
+    _validate_engine_route(env, state)
     print(env.resolve(strict=True))
     return 0
 
