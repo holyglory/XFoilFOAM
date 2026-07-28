@@ -3153,7 +3153,21 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         totalCases: 1,
       })
       .returning();
-    const result = jobResult(engineJobId, acceptingPrecalcPoint());
+    const point = acceptingPrecalcPoint();
+    point.evidence_artifacts = [
+      ...(point.evidence_artifacts ?? []),
+      {
+        kind: "engine_bundle",
+        path: `/jobs/${engineJobId}/files/evidence/a0/evidence.tar.zst`,
+        url: `/jobs/${engineJobId}/files/evidence/a0/evidence.tar.zst`,
+        mime_type: "application/zstd",
+        sha256: digest(`${PREFIX}-gateway-failover-bundle`),
+        byte_size: 256,
+        role: "evidence",
+        metadata: { evidenceBase: "/tmp/evidence/a0" },
+      },
+    ];
+    const result = jobResult(engineJobId, point);
     const request = {
       db,
       engineJobId,
@@ -3182,15 +3196,11 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       .select()
       .from(resultAttempts)
       .where(eq(resultAttempts.resultId, staged.id));
-    const [manifestBefore] = await db
+    const artifactsBefore = await db
       .select()
       .from(solverEvidenceArtifacts)
-      .where(
-        and(
-          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
-          eq(solverEvidenceArtifacts.kind, "manifest"),
-        ),
-      );
+      .where(eq(solverEvidenceArtifacts.resultAttemptId, attempt.id))
+      .orderBy(solverEvidenceArtifacts.kind);
 
     await ingestResult({
       ...request,
@@ -3201,19 +3211,20 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       .select()
       .from(results)
       .where(eq(results.id, staged.id));
-    const manifestsAfter = await db
+    const artifactsAfter = await db
       .select()
       .from(solverEvidenceArtifacts)
-      .where(
-        and(
-          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
-          eq(solverEvidenceArtifacts.kind, "manifest"),
-        ),
-      );
+      .where(eq(solverEvidenceArtifacts.resultAttemptId, attempt.id))
+      .orderBy(solverEvidenceArtifacts.kind);
     expect(published.status).toBe("done");
     expect(published.currentResultAttemptId).toBe(attempt.id);
-    expect(manifestsAfter).toEqual([manifestBefore]);
-    expect(manifestsAfter[0].engineUrl).toContain("primary-engine.test");
+    expect(artifactsAfter).toEqual(artifactsBefore);
+    expect(artifactsAfter).toHaveLength(2);
+    expect(
+      artifactsAfter.every((artifact) =>
+        artifact.engineUrl?.includes("primary-engine.test"),
+      ),
+    ).toBe(true);
   }, 60000);
 
   it("keeps selected exact media and the sole manifest immutable when terminal replay crashes before refresh", async () => {

@@ -2083,7 +2083,9 @@ export async function registerEvidenceArtifacts(opts: {
         storedArtifact.aoaDeg !== association.aoaDeg ||
         storedArtifact.mimeType !== association.mimeType ||
         storedArtifact.byteSize !== association.byteSize ||
-        storedArtifact.engineUrl !== association.engineUrl ||
+        // As with the sole manifest above, engineUrl is a mutable gateway
+        // route. Immutable artifact identity is owned by the exact attempt,
+        // logical role, storage key, checksum, byte size, and metadata.
         stableHash(storedArtifact.metadata ?? {}) !==
           stableHash(association.metadata)
       ) {
