@@ -2068,29 +2068,34 @@ export async function registerEvidenceArtifacts(opts: {
           ),
         )
         .limit(1);
-      if (
-        !storedArtifact ||
-        storedArtifact.resultId !== association.resultId ||
-        storedArtifact.airfoilId !== association.airfoilId ||
-        storedArtifact.simJobId !== association.simJobId ||
-        storedArtifact.engineJobId !== association.engineJobId ||
-        storedArtifact.engineCaseSlug !== association.engineCaseSlug ||
-        storedArtifact.methodKey !== association.methodKey ||
-        storedArtifact.solverImplementationId !==
-          association.solverImplementationId ||
-        storedArtifact.solverRuntimeBuildId !==
-          association.solverRuntimeBuildId ||
-        storedArtifact.aoaDeg !== association.aoaDeg ||
-        storedArtifact.mimeType !== association.mimeType ||
-        storedArtifact.byteSize !== association.byteSize ||
-        // As with the sole manifest above, engineUrl is a mutable gateway
-        // route. Immutable artifact identity is owned by the exact attempt,
-        // logical role, storage key, checksum, byte size, and metadata.
-        stableHash(storedArtifact.metadata ?? {}) !==
-          stableHash(association.metadata)
-      ) {
+      const replayMismatches = storedArtifact
+        ? [
+            storedArtifact.resultId !== association.resultId && "resultId",
+            storedArtifact.airfoilId !== association.airfoilId && "airfoilId",
+            storedArtifact.simJobId !== association.simJobId && "simJobId",
+            storedArtifact.engineJobId !== association.engineJobId &&
+              "engineJobId",
+            storedArtifact.engineCaseSlug !== association.engineCaseSlug &&
+              "engineCaseSlug",
+            storedArtifact.methodKey !== association.methodKey && "methodKey",
+            storedArtifact.solverImplementationId !==
+              association.solverImplementationId && "solverImplementationId",
+            storedArtifact.solverRuntimeBuildId !==
+              association.solverRuntimeBuildId && "solverRuntimeBuildId",
+            storedArtifact.aoaDeg !== association.aoaDeg && "aoaDeg",
+            storedArtifact.mimeType !== association.mimeType && "mimeType",
+            storedArtifact.byteSize !== association.byteSize && "byteSize",
+            // As with the sole manifest above, engineUrl is a mutable gateway
+            // route. Immutable artifact identity is owned by the exact
+            // attempt, logical role, storage key, checksum, byte size, and
+            // metadata.
+            stableHash(storedArtifact.metadata ?? {}) !==
+              stableHash(association.metadata) && "metadata",
+          ].filter((field): field is string => Boolean(field))
+        : ["storedArtifact"];
+      if (replayMismatches.length) {
         throw new Error(
-          `evidence artifact replay changed immutable association metadata for attempt ${resultAttemptId ?? "unbound"} (${kind}/${artifact.field ?? ""}/${artifact.role ?? ""})`,
+          `evidence artifact replay changed immutable association metadata for attempt ${resultAttemptId ?? "unbound"} (${kind}/${artifact.field ?? ""}/${artifact.role ?? ""}; ${replayMismatches.join(", ")})`,
         );
       }
     }
