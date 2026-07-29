@@ -33,7 +33,7 @@ const LEGACY_TIMESTAMP = {
   resultMediaIndex: 1788825600000,
   ingestCompletion: 1788912000000,
 } as const;
-const PUBLICATION_QUEUE_TIMESTAMP = 1789430400000;
+const FINAL_RECONCILIATION_TIMESTAMP = 1789516800000;
 const FIRST_LEDGER_TIMESTAMP = 1788998400000;
 
 let admin: ReturnType<typeof postgres> | null = null;
@@ -123,7 +123,7 @@ afterAll(async () => {
   if (baselineDir) rmSync(baselineDir, { recursive: true, force: true });
 });
 
-describe("0096 result interpretation ledger reconciliation", () => {
+describe("0096–0100 result interpretation ledger reconciliation", () => {
   it("accepts a truly fresh disposable database with no journal or application anchors", async () => {
     if (!admin) throw new Error("migration test admin database is unavailable");
     const freshName = `${dbName}_fresh`;
@@ -242,7 +242,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
 
     await migrateWithResultInterpretationLedgerPreflight(readerDb, migrations);
     await expect(readResultInterpretationLedgerPreflight(readerDb)).resolves.toMatchObject({
-      state: "postledger_0099",
+      state: "postledger_0100",
       issues: [],
     });
 
@@ -380,7 +380,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
         "ri_recovery_active_request_owner_uq",
         "ri_recovery_active_verify_owner_uq",
       ],
-      latestMigration: String(PUBLICATION_QUEUE_TIMESTAMP),
+      latestMigration: String(FINAL_RECONCILIATION_TIMESTAMP),
       historicalIngestTable: true,
       promiseTtlDefault: "72",
       legacyArchiveGapTable: true,
@@ -398,9 +398,52 @@ describe("0096 result interpretation ledger reconciliation", () => {
         "result_interpretations_nonarchive_attempt_reducer_evidence_uq",
       ],
     });
+
+    // Reproduce the exact pre-release 0099 index identity emitted by
+    // PostgreSQL: the original overlong declaration was stored under this
+    // 63-byte truncation. With the 0100 journal row absent, it is a valid
+    // upgrade baseline rather than an incompatible partial schema.
+    await client.unsafe(`
+      DELETE FROM drizzle.__drizzle_migrations
+      WHERE created_at = ${FINAL_RECONCILIATION_TIMESTAMP};
+    `);
+    await client.unsafe(`
+      DROP INDEX "result_interpretations_archive_attempt_reducer_src_evidence_uq";
+      CREATE UNIQUE INDEX "result_interpretations_archive_attempt_reducer_source_evidence_"
+        ON "result_interpretations" (
+          "result_attempt_id", "reducer_version_id", "source_archive_id", "input_evidence_signature"
+        )
+        WHERE "source" = 'archive_backfill';
+    `);
+    await expect(readResultInterpretationLedgerPreflight(readerDb)).resolves.toMatchObject({
+      state: "postledger_0099_upgrade",
+      issues: [],
+    });
+
+    await migrateWithResultInterpretationLedgerPreflight(readerDb, migrations);
+    await expect(readResultInterpretationLedgerPreflight(readerDb)).resolves.toMatchObject({
+      state: "postledger_0100",
+      issues: [],
+    });
+    const [reconciled] = await client<
+      Array<{ legacyAbsent: boolean; canonicalPresent: boolean; latestMigration: string }>
+    >`
+      SELECT
+        to_regclass('public.result_interpretations_archive_attempt_reducer_source_evidence_')
+          IS NULL AS "legacyAbsent",
+        to_regclass('public.result_interpretations_archive_attempt_reducer_src_evidence_uq')
+          IS NOT NULL AS "canonicalPresent",
+        (SELECT max(created_at)::text FROM drizzle.__drizzle_migrations)
+          AS "latestMigration"
+    `;
+    expect(reconciled).toEqual({
+      legacyAbsent: true,
+      canonicalPresent: true,
+      latestMigration: String(FINAL_RECONCILIATION_TIMESTAMP),
+    });
   });
 
-  it("retains the post-0099 source-scoped uniqueness topology", async () => {
+  it("retains the final source-scoped uniqueness topology", async () => {
     if (!client) throw new Error("migration test database is unavailable");
 
     const [counts] = await client<
@@ -410,6 +453,9 @@ describe("0096 result interpretation ledger reconciliation", () => {
         terminalState: boolean;
         archivePredicate: boolean;
         nonarchivePredicate: boolean;
+        archiveSourceIdentity: boolean;
+        nonarchiveSourceIdentity: boolean;
+        legacyArchiveSourceIdentityAbsent: boolean;
       }>
     >`
       SELECT
@@ -456,7 +502,42 @@ describe("0096 result interpretation ledger reconciliation", () => {
           WHERE schemaname = 'public'
             AND indexname = 'result_interpretations_nonarchive_attempt_reducer_evidence_uq'
             AND indexdef LIKE '%WHERE (source <> ''archive_backfill''::text)%'
-        ) AS "nonarchivePredicate";
+        ) AS "nonarchivePredicate",
+        EXISTS (
+          SELECT 1
+          FROM pg_index index_row
+          JOIN pg_class index_class ON index_class.oid = index_row.indexrelid
+          WHERE index_class.relname =
+              'result_interpretations_archive_attempt_reducer_src_evidence_uq'
+            AND index_class.relnamespace = 'public'::regnamespace
+            AND index_row.indrelid = 'public.result_interpretations'::regclass
+            AND index_row.indisunique
+            AND index_row.indnkeyatts = 4
+            AND pg_get_indexdef(index_row.indexrelid, 1, true) = 'result_attempt_id'
+            AND pg_get_indexdef(index_row.indexrelid, 2, true) = 'reducer_version_id'
+            AND pg_get_indexdef(index_row.indexrelid, 3, true) = 'source_archive_id'
+            AND pg_get_indexdef(index_row.indexrelid, 4, true) = 'input_evidence_signature'
+            AND pg_get_expr(index_row.indpred, index_row.indrelid)
+              = '(source = ''archive_backfill''::text)'
+        ) AS "archiveSourceIdentity",
+        EXISTS (
+          SELECT 1
+          FROM pg_index index_row
+          JOIN pg_class index_class ON index_class.oid = index_row.indexrelid
+          WHERE index_class.relname =
+              'result_interpretations_nonarchive_attempt_reducer_evidence_uq'
+            AND index_class.relnamespace = 'public'::regnamespace
+            AND index_row.indrelid = 'public.result_interpretations'::regclass
+            AND index_row.indisunique
+            AND index_row.indnkeyatts = 3
+            AND pg_get_indexdef(index_row.indexrelid, 1, true) = 'result_attempt_id'
+            AND pg_get_indexdef(index_row.indexrelid, 2, true) = 'reducer_version_id'
+            AND pg_get_indexdef(index_row.indexrelid, 3, true) = 'input_evidence_signature'
+            AND pg_get_expr(index_row.indpred, index_row.indrelid)
+              = '(source <> ''archive_backfill''::text)'
+        ) AS "nonarchiveSourceIdentity",
+        to_regclass('public.result_interpretations_archive_attempt_reducer_source_evidence_')
+          IS NULL AS "legacyArchiveSourceIdentityAbsent";
     `;
 
     expect(counts).toEqual({
@@ -465,6 +546,43 @@ describe("0096 result interpretation ledger reconciliation", () => {
       terminalState: true,
       archivePredicate: true,
       nonarchivePredicate: true,
+      archiveSourceIdentity: true,
+      nonarchiveSourceIdentity: true,
+      legacyArchiveSourceIdentityAbsent: true,
     });
+
+    // This is intentionally the final mutation in the disposable database.
+    // A journal alone must not authorize deployment if an ownership fence or
+    // clean-tail constraint has been lost after a prior migration.
+    await client.unsafe(`
+      ALTER TABLE sim_urans_requests
+        DROP CONSTRAINT sim_urans_tail_periods_ck;
+      ALTER TABLE result_interpretation_recovery_actions
+        DROP CONSTRAINT ri_recovery_tail_periods_ck;
+      ALTER TABLE result_interpretation_recovery_actions
+        DROP CONSTRAINT result_interpretation_recovery_actions_target_shape_check;
+      ALTER TABLE result_interpretations
+        DROP CONSTRAINT result_interpretations_source_check;
+      ALTER TABLE result_interpretations
+        DROP CONSTRAINT result_interpretations_archive_owner_fk;
+      DROP INDEX ri_recovery_active_request_owner_uq;
+      DROP INDEX legacy_urans_archive_gap_recovery_active_request_uq;
+      DROP INDEX result_archive_reduction_queue_identity_uq;
+    `);
+    const damaged = await readResultInterpretationLedgerPreflight(
+      drizzle(client) as unknown as DB,
+    );
+    expect(damaged.state).toBe("incompatible");
+    expect(damaged.issues).toEqual(
+      expect.arrayContaining([
+        "0094 URANS corrective-tail constraints are incomplete",
+        "recovery action tail/target-shape constraints are incompatible",
+        "interpretation archive ownership is incompatible",
+        "interpretation source provenance check is incompatible",
+        "recovery action request-owner fence is incompatible",
+        "legacy archive-gap active request fence is incompatible",
+        "archive-reduction queue identity fence is incompatible",
+      ]),
+    );
   });
 });

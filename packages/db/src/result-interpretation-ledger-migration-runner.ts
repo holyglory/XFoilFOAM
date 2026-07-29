@@ -6,7 +6,7 @@ import { assertResultInterpretationLedgerMigrationPreflight } from "./result-int
 /**
  * The one migration path used by the production CLI and the disposable-DB
  * release test.  Keeping the fail-closed gate here prevents a future CLI
- * refactor from applying 0094–0099 before the exact journal/schema baseline
+ * refactor from applying 0094–0100 before the exact journal/schema baseline
  * has been read and accepted.
  */
 export async function migrateWithResultInterpretationLedgerPreflight(

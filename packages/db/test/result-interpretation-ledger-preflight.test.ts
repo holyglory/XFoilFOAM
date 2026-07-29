@@ -17,6 +17,7 @@ function facts(
     preledger0093Issues: [],
     post0093MarkersPresent: false,
     postledger0099Issues: [],
+    postledger0100Issues: [],
     ...overrides,
   };
 }
@@ -76,14 +77,42 @@ describe("result-interpretation ledger migration preflight state partition", () 
     }
   });
 
-  it("accepts only a fully verified 0099 postflight shape", () => {
-    const full = classifyResultInterpretationLedgerPreflight(
+  it("accepts a fully verified 0099 shape only as an upgradeable 0100 baseline", () => {
+    const upgradeable = classifyResultInterpretationLedgerPreflight(
       facts({
         hasApplicationAnchors: true,
         journalState: "postledger_0099",
         footprintPresent: true,
       }),
     );
-    expect(full).toMatchObject({ state: "postledger_0099", issues: [] });
+    expect(upgradeable).toMatchObject({ state: "postledger_0099_upgrade", issues: [] });
+    expect(mayApplyResultInterpretationLedgerMigrations(upgradeable)).toBe(true);
+  });
+
+  it("accepts only the final 0100 archive source-identity topology", () => {
+    const final = classifyResultInterpretationLedgerPreflight(
+      facts({
+        hasApplicationAnchors: true,
+        journalState: "postledger_0100",
+        footprintPresent: true,
+      }),
+    );
+    expect(final).toMatchObject({ state: "postledger_0100", issues: [] });
+
+    const legacyArchiveIdentity = classifyResultInterpretationLedgerPreflight(
+      facts({
+        hasApplicationAnchors: true,
+        journalState: "postledger_0100",
+        footprintPresent: true,
+        postledger0100Issues: [
+          "0100 archive interpretation source identity is incompatible",
+        ],
+      }),
+    );
+    expect(legacyArchiveIdentity.state).toBe("incompatible");
+    expect(legacyArchiveIdentity.issues).toContain(
+      "0100 archive interpretation source identity is incompatible",
+    );
+    expect(mayApplyResultInterpretationLedgerMigrations(legacyArchiveIdentity)).toBe(false);
   });
 });
