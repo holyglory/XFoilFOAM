@@ -303,19 +303,19 @@ export async function readResultInterpretationLedgerPreflight(
             ])
           ) THEN NULL ELSE 'ledger tables are incomplete' END,
           CASE WHEN (
-            SELECT COALESCE(array_agg(enumlabel ORDER BY enumsortorder), ARRAY[]::text[])
+            SELECT COALESCE(array_agg(enumlabel::text ORDER BY enumsortorder), ARRAY[]::text[])
             FROM pg_enum
             WHERE enumtypid = to_regtype('public.result_interpretation_state')
           ) = ARRAY['accepted','continuation_required','terminal_failure','legacy_uncertified']::text[]
           THEN NULL ELSE 'result_interpretation_state enum is incompatible' END,
           CASE WHEN (
-            SELECT COALESCE(array_agg(enumlabel ORDER BY enumsortorder), ARRAY[]::text[])
+            SELECT COALESCE(array_agg(enumlabel::text ORDER BY enumsortorder), ARRAY[]::text[])
             FROM pg_enum
             WHERE enumtypid = to_regtype('public.result_interpretation_regime')
           ) = ARRAY['legacy_engine_reported','rans_hold','steady_equivalent','periodic','broadband_stationary','trending_unresolved']::text[]
           THEN NULL ELSE 'result_interpretation_regime enum is incompatible' END,
           CASE WHEN (
-            SELECT COALESCE(array_agg(enumlabel ORDER BY enumsortorder), ARRAY[]::text[])
+            SELECT COALESCE(array_agg(enumlabel::text ORDER BY enumsortorder), ARRAY[]::text[])
             FROM pg_enum
             WHERE enumtypid = to_regtype('public.result_interpretation_cycle_disposition')
           ) = ARRAY['selected','startup','hard_corrupt','settling_outlier','cadence_unresolved','numerically_noisy','insufficient_frames']::text[]
