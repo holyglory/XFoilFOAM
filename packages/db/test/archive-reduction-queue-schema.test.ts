@@ -1,5 +1,7 @@
+import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 
+import { archiveResultAttemptFrom } from "../src/polar-cache";
 import {
   legacyUransArchiveGapRecoveryActions,
   resultArchiveReductionQueue,
@@ -33,6 +35,19 @@ describe("result interpretation scheduler schema", () => {
     ]) {
       expect(queue.claimExpiresAt.name).toBe("claim_expires_at");
       expect(queue.nextAttemptAt.name).toBe("next_attempt_at");
+    }
+  });
+
+  it("renders physical result_attempts tables inside raw archive joins", () => {
+    const dialect = new PgDialect();
+    for (const aliasName of [
+      "current_archive_selected_attempt",
+      "pending_archive_reduction_attempt",
+    ] as const) {
+      const query = dialect.sqlToQuery(
+        archiveResultAttemptFrom(aliasName),
+      ).sql;
+      expect(query).toBe(`"result_attempts" ${aliasName}`);
     }
   });
 });

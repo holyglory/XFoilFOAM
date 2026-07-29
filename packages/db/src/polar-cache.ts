@@ -85,6 +85,29 @@ const pendingArchiveReductionAttempt = alias(
   "pending_archive_reduction_attempt",
 );
 
+type ArchiveResultAttemptAlias =
+  | "current_archive_selected_attempt"
+  | "pending_archive_reduction_attempt";
+
+/**
+ * A Drizzle `alias()` is valid for column projections and query-builder joins,
+ * but interpolating it directly into a raw SQL `JOIN` renders only the alias
+ * identifier. Keep the physical table and its static alias together so these
+ * archive-pinned predicates always emit `result_attempts <alias>`.
+ */
+export function archiveResultAttemptFrom(
+  aliasName: ArchiveResultAttemptAlias,
+): SQL {
+  return sql`${resultAttempts} ${sql.raw(aliasName)}`;
+}
+
+const currentArchiveSelectedAttemptFrom = archiveResultAttemptFrom(
+  "current_archive_selected_attempt",
+);
+const pendingArchiveReductionAttemptFrom = archiveResultAttemptFrom(
+  "pending_archive_reduction_attempt",
+);
+
 export interface PolarCacheRefreshResult {
   airfoilId: string;
   simulationPresetRevisionId: string;
@@ -872,7 +895,7 @@ async function retireInvalidSelectedAttempts(
       ON selected_interpretation.id = selected_interpretation_selection.result_interpretation_id
      AND selected_interpretation.result_id = ${results.id}
      AND selected_interpretation.result_attempt_id = ${results.currentResultAttemptId}
-    JOIN ${currentArchiveSelectedAttempt}
+    JOIN ${currentArchiveSelectedAttemptFrom}
       ON ${currentArchiveSelectedAttempt.id} = ${results.currentResultAttemptId}
      AND ${currentArchiveSelectedAttempt.resultId} = ${results.id}
     JOIN ${solverEvidenceArchives} selected_archive
@@ -919,7 +942,7 @@ async function retireInvalidSelectedAttempts(
   const pendingCurrentUransArchiveReduction = sql`EXISTS (
     SELECT 1
     FROM ${resultArchiveReductionQueue} publication_queue
-    JOIN ${pendingArchiveReductionAttempt}
+    JOIN ${pendingArchiveReductionAttemptFrom}
       ON ${pendingArchiveReductionAttempt.id} = publication_queue.result_attempt_id
      AND ${pendingArchiveReductionAttempt.resultId} = publication_queue.result_id
     JOIN ${solverEvidenceArchives} pending_archive
