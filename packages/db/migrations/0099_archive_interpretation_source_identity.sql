@@ -7,7 +7,11 @@
 DROP INDEX IF EXISTS "result_interpretations_attempt_reducer_evidence_uq";
 --> statement-breakpoint
 
-CREATE UNIQUE INDEX IF NOT EXISTS "result_interpretations_archive_attempt_reducer_source_evidence_uq"
+-- PostgreSQL silently truncates identifiers longer than 63 bytes. Keep these
+-- two provenance indexes explicitly below that limit so the migration,
+-- schema metadata, preflight, and operational introspection agree on one
+-- stable identity.
+CREATE UNIQUE INDEX IF NOT EXISTS "result_interpretations_archive_attempt_reducer_src_evidence_uq"
   ON "result_interpretations" (
     "result_attempt_id", "reducer_version_id", "source_archive_id", "input_evidence_signature"
   )

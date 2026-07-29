@@ -2211,7 +2211,7 @@ export const resultInterpretations = pgTable(
     // members yet remain distinct immutable inputs; collapsing them here lets
     // an A->B archive replacement return an interpretation bound to A.
     archiveAttemptReducerSourceEvidenceUq: uniqueIndex(
-      "result_interpretations_archive_attempt_reducer_source_evidence_uq",
+      "result_interpretations_archive_attempt_reducer_src_evidence_uq",
     )
       .on(
         t.resultAttemptId,

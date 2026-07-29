@@ -147,7 +147,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
       );
       await admin.unsafe(`DROP DATABASE IF EXISTS "${freshName}"`);
     }
-  });
+  }, 30_000);
 
   it("upgrades a production-shaped timestamp collision through the legacy archive-gap ledger without replaying historical migrations", async () => {
     if (!client) throw new Error("migration test database is unavailable");
@@ -350,7 +350,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
           FROM pg_indexes
           WHERE schemaname = 'public'
             AND indexname IN (
-              'result_interpretations_archive_attempt_reducer_source_evidence_uq',
+              'result_interpretations_archive_attempt_reducer_src_evidence_uq',
               'result_interpretations_nonarchive_attempt_reducer_evidence_uq'
             )
           ORDER BY indexname
@@ -394,7 +394,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
       awaitingArchiveReduction: true,
       legacyGlobalIndexAbsent: true,
       sourceScopedIndexes: [
-        "result_interpretations_archive_attempt_reducer_source_evidence_uq",
+        "result_interpretations_archive_attempt_reducer_src_evidence_uq",
         "result_interpretations_nonarchive_attempt_reducer_evidence_uq",
       ],
     });
@@ -448,7 +448,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
         EXISTS (
           SELECT 1 FROM pg_indexes
           WHERE schemaname = 'public'
-            AND indexname = 'result_interpretations_archive_attempt_reducer_source_evidence_uq'
+            AND indexname = 'result_interpretations_archive_attempt_reducer_src_evidence_uq'
             AND indexdef LIKE '%WHERE (source = ''archive_backfill''::text)%'
         ) AS "archivePredicate",
         EXISTS (

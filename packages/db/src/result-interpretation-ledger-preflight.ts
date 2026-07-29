@@ -249,7 +249,7 @@ export async function readResultInterpretationLedgerPreflight(
           OR to_regclass('public.ri_recovery_active_verify_owner_uq') IS NOT NULL
           OR to_regclass('public.legacy_urans_archive_gap_recovery_source_uq') IS NOT NULL
           OR to_regclass('public.result_archive_reduction_queue_identity_uq') IS NOT NULL
-          OR to_regclass('public.result_interpretations_archive_attempt_reducer_source_evidence_uq') IS NOT NULL
+          OR to_regclass('public.result_interpretations_archive_attempt_reducer_src_evidence_uq') IS NOT NULL
           OR to_regclass('public.result_interpretations_nonarchive_attempt_reducer_evidence_uq') IS NOT NULL
           AS post_0093_markers_present
     ), journal AS (${journalCte}), fingerprint AS (
@@ -364,7 +364,7 @@ export async function readResultInterpretationLedgerPreflight(
           CASE WHEN (
             SELECT count(*) = 2 FROM pg_indexes
             WHERE schemaname = 'public' AND indexname IN (
-              'result_interpretations_archive_attempt_reducer_source_evidence_uq',
+              'result_interpretations_archive_attempt_reducer_src_evidence_uq',
               'result_interpretations_nonarchive_attempt_reducer_evidence_uq'
             )
           ) THEN NULL ELSE 'source-scoped interpretation uniqueness indexes are incomplete' END,
@@ -372,7 +372,7 @@ export async function readResultInterpretationLedgerPreflight(
             SELECT 1
             FROM pg_index index_row
             JOIN pg_class index_class ON index_class.oid = index_row.indexrelid
-            WHERE index_class.relname = 'result_interpretations_archive_attempt_reducer_source_evidence_uq'
+            WHERE index_class.relname = 'result_interpretations_archive_attempt_reducer_src_evidence_uq'
               AND pg_get_expr(index_row.indpred, index_row.indrelid)
                 = '(source = ''archive_backfill''::text)'
           ) THEN NULL ELSE 'archive interpretation uniqueness predicate is incompatible' END,
