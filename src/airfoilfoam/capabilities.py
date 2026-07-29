@@ -43,3 +43,11 @@ MESH_RECOVERY_VERSION = 2
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
 URANS_RECOVERY_VERSION = 10
+
+# Version 1 is the first authenticated, generation-pinned GCS archive
+# clean-cycle reducer.  The control plane treats a missing field as legacy
+# version zero and will not admit fresh RANS or URANS that it could not later
+# interpret from immutable evidence.  Increment only when the reducer's
+# durable output contract changes compatibly and needs a new control-plane
+# admission fence.
+ARCHIVE_REDUCTION_VERSION = 1

@@ -29,7 +29,11 @@ from ..archive_reduction import (
     reduce_remote_archive_clean_cycles,
 )
 from ..cache import EngineCache
-from ..capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
+from ..capabilities import (
+    ARCHIVE_REDUCTION_VERSION,
+    MESH_RECOVERY_VERSION,
+    URANS_RECOVERY_VERSION,
+)
 from ..config import get_settings
 from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
@@ -862,6 +866,7 @@ def create_app() -> FastAPI:
             "build_id": settings.build_id,
             "mesh_recovery_version": MESH_RECOVERY_VERSION,
             "urans_recovery_version": URANS_RECOVERY_VERSION,
+            "archive_reduction_version": ARCHIVE_REDUCTION_VERSION,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
             # provenance appears solely on worker-acknowledged status/results.

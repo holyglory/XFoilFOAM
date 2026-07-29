@@ -3,8 +3,10 @@ import type { EngineClient } from "@aerodb/engine-client";
 import { describe, expect, it } from "vitest";
 
 import {
+  engineArchiveReductionVersion,
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
+  supportsArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "../src/engine-capabilities";
 import { remoteAdmissionDecisionForTick, submitOneBatch } from "../src/loop";
@@ -83,6 +85,57 @@ describe("engine mesh-recovery capability handshake", () => {
     );
     expect(submissions).toBe(0);
   });
+
+  it("holds ordinary RANS admission when immutable archive reduction is not available", async () => {
+    let submissions = 0;
+    const engine = {
+      submitPolar: async () => {
+        submissions += 1;
+        throw new Error("legacy archive reducer must not reach the engine");
+      },
+    } as unknown as EngineClient;
+    await expect(submitOneBatch({} as DB, engine, 0, 0, 0)).resolves.toBe(
+      false,
+    );
+    expect(submissions).toBe(0);
+  });
+});
+
+describe("engine immutable archive-reduction capability handshake", () => {
+  it("accepts the explicit first clean-cycle reducer contract", async () => {
+    const engine = {
+      healthDetails: async () => ({
+        status: "ok",
+        version: "archive-reducer-v1",
+        archive_reduction_version: 1,
+      }),
+    } as unknown as EngineClient;
+    await expect(engineArchiveReductionVersion(engine)).resolves.toBe(1);
+    expect(supportsArchiveCleanCycleReduction(1)).toBe(true);
+  });
+
+  it("treats a health response without an explicit reducer as legacy and closes new work", async () => {
+    const engine = {
+      healthDetails: async () => ({ status: "ok", version: "legacy-2406" }),
+    } as unknown as EngineClient;
+    await expect(engineArchiveReductionVersion(engine)).resolves.toBe(0);
+    expect(supportsArchiveCleanCycleReduction(0)).toBe(false);
+    expect(supportsArchiveCleanCycleReduction(null)).toBe(false);
+  });
+
+  it.each([-1, 1.5, Number.NaN, "1", null, 2_147_483_648])(
+    "fails closed on malformed archive-reducer version %p",
+    async (archiveReductionVersion) => {
+      const engine = {
+        healthDetails: async () => ({
+          status: "ok",
+          version: "malformed",
+          archive_reduction_version: archiveReductionVersion,
+        }),
+      } as unknown as EngineClient;
+      await expect(engineArchiveReductionVersion(engine)).resolves.toBeNull();
+    },
+  );
 });
 
 describe("engine durable URANS-recovery capability handshake", () => {
@@ -147,6 +200,7 @@ describe("remote NEW-admission lane precedence", () => {
     sharedCapacityAvailable: true,
     engineHealthy: true,
     meshRecoveryVersion: 4,
+    archiveReductionVersion: 1,
   };
 
   it("keeps safety-stop provenance ahead of simultaneous storage pressure", () => {
@@ -187,6 +241,27 @@ describe("remote NEW-admission lane precedence", () => {
     expect(remoteAdmissionDecisionForTick(open)).toEqual({
       kind: "allow",
       meshRecoveryVersion: 4,
+    });
+  });
+
+  it("holds remote RANS when the immutable archive reducer is absent or malformed", () => {
+    expect(
+      remoteAdmissionDecisionForTick({
+        ...open,
+        archiveReductionVersion: 0,
+      }),
+    ).toEqual({
+      kind: "hold",
+      reason: "archive_reduction_capability_unavailable",
+    });
+    expect(
+      remoteAdmissionDecisionForTick({
+        ...open,
+        archiveReductionVersion: null,
+      }),
+    ).toEqual({
+      kind: "hold",
+      reason: "archive_reduction_capability_unavailable",
     });
   });
 });

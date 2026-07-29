@@ -342,6 +342,10 @@ export interface EngineHealth {
   /** Durable cross-job URANS recovery contract. Missing means legacy version
    * zero and must not authorize continuation or corrective final recovery. */
   urans_recovery_version?: number;
+  /** Immutable GCS archive clean-cycle reducer contract. Missing means a
+   * pre-reducer engine and must not authorize new RANS/URANS work whose
+   * publishable interpretation depends on this reducer. */
+  archive_reduction_version?: number;
   /** Structured engine/runtime identity. Top-level version/build_id remain for
    * legacy control-plane and operator compatibility during rollout. */
   engine?: EngineRuntimeIdentity | null;

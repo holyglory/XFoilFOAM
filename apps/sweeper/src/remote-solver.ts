@@ -290,6 +290,7 @@ export type RemoteEngineAdmissionHoldReason =
   | "storage_pressure"
   | "safety_stop"
   | "mesh_capability_unknown"
+  | "archive_reduction_capability_unavailable"
   | "higher_priority_fast_urans"
   | "shared_capacity_full"
   | "engine_unavailable";
@@ -5895,6 +5896,8 @@ function remoteAdmissionHoldMessage(
       return "global admission safety stop is active; remote reconciliation continues but no new engine job will be submitted";
     case "mesh_capability_unknown":
       return "engine mesh-recovery capability is unavailable or malformed; remote reconciliation continues but no new engine job will be submitted";
+    case "archive_reduction_capability_unavailable":
+      return "engine archive-reduction capability is absent, unavailable, or malformed; remote reconciliation and transfer continue but no new engine job will be submitted";
     case "higher_priority_fast_urans":
       return "higher-priority FAST URANS owns this scheduler tick; the remote promise remains active for the next admission opportunity";
     case "shared_capacity_full":

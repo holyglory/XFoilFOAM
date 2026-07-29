@@ -94,9 +94,11 @@ import {
   solverImplementationIdForSetup,
 } from "./build-request";
 import {
+  engineArchiveReductionVersion,
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
   parsedMeshRecoveryVersion,
+  supportsArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
@@ -2059,6 +2061,9 @@ export async function submitUransRetryForJob(
     /** Live durable cross-job URANS recovery contract. Legacy engines may
      * still run fresh work, but cannot consume continuation recovery. */
     uransRecoveryVersion?: number | null;
+    /** Live immutable archive clean-cycle reducer contract. Missing/invalid
+     * closes only new physical URANS admission; route recording continues. */
+    archiveReductionVersion?: number | null;
     /** The capacity-bounded scheduler may admit this exact terminal-parent
      * escalation while unrelated campaign RANS gaps remain. Direct ingest
      * callers omit it and remain route-only. */
@@ -2159,6 +2164,7 @@ export async function submitUransRetryForJob(
   }
   let meshRecoveryVersion = opts.meshRecoveryVersion;
   let uransRecoveryVersion = opts.uransRecoveryVersion;
+  let archiveReductionVersion = opts.archiveReductionVersion;
   const maySubmitNow =
     !opts.recordPromotionsOnly && !opts.recordRoutesOnly && !campaignGated;
   if (meshRecoveryVersion === undefined && maySubmitNow) {
@@ -2173,6 +2179,9 @@ export async function submitUransRetryForJob(
   }
   if (uransRecoveryVersion === undefined && maySubmitNow) {
     uransRecoveryVersion = await engineUransRecoveryVersion(engine);
+  }
+  if (archiveReductionVersion === undefined && maySubmitNow) {
+    archiveReductionVersion = await engineArchiveReductionVersion(engine);
   }
   // Record-only/gated passes never cross the engine boundary. Version zero
   // preserves the legacy terminal fence until a capacity-bounded tick probes
@@ -2191,6 +2200,7 @@ export async function submitUransRetryForJob(
         ...opts,
         meshRecoveryVersion: effectiveMeshRecoveryVersion,
         uransRecoveryVersion,
+        archiveReductionVersion,
       },
     );
     return;
@@ -2334,6 +2344,7 @@ export async function submitUransRetryForJob(
   );
   if (opts.recordRoutesOnly) return;
   if (campaignGated) return;
+  if (!supportsArchiveCleanCycleReduction(archiveReductionVersion)) return;
   const continuations = await precalcContinuationsForObligations(
     db,
     obligations
@@ -2533,6 +2544,7 @@ async function submitCampaignUransRetries(
     recordRoutesOnly?: boolean;
     meshRecoveryVersion?: number;
     uransRecoveryVersion?: number | null;
+    archiveReductionVersion?: number | null;
     sourceResultAttemptIds?: string[];
   },
 ): Promise<void> {
@@ -2689,6 +2701,8 @@ async function submitCampaignUransRetries(
     );
     if (opts.recordRoutesOnly) continue;
     if (campaignGated) continue;
+    if (!supportsArchiveCleanCycleReduction(opts.archiveReductionVersion))
+      continue;
     const continuations = await precalcContinuationsForObligations(
       db,
       obligations

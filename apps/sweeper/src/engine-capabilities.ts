@@ -10,6 +10,12 @@ export const MAX_MESH_RECOVERY_VERSION = 2_147_483_647;
  * continuation or corrective-final recovery owned by the version-2 policy. */
 export const MIN_DURABLE_URANS_RECOVERY_VERSION = 2;
 export const MAX_URANS_RECOVERY_VERSION = 2_147_483_647;
+/** Version 1 is the first immutable, generation-pinned archive clean-cycle
+ * reducer. A control plane that has introduced archive interpretations must
+ * not send fresh physical work to an engine which cannot produce that
+ * corresponding publication evidence. */
+export const MIN_ARCHIVE_REDUCTION_VERSION = 1;
+export const MAX_ARCHIVE_REDUCTION_VERSION = 2_147_483_647;
 
 export function parsedMeshRecoveryVersion(value: unknown): number | null {
   return typeof value === "number" &&
@@ -25,6 +31,15 @@ export function parsedUransRecoveryVersion(value: unknown): number | null {
     Number.isSafeInteger(value) &&
     value >= 0 &&
     value <= MAX_URANS_RECOVERY_VERSION
+    ? value
+    : null;
+}
+
+export function parsedArchiveReductionVersion(value: unknown): number | null {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= MAX_ARCHIVE_REDUCTION_VERSION
     ? value
     : null;
 }
@@ -99,8 +114,31 @@ export async function engineUransRecoveryVersion(
   return parsedUransRecoveryVersion(health.urans_recovery_version);
 }
 
+/** Read the live engine's immutable archive clean-cycle reducer contract.
+ *
+ * A successful response without the explicit field is a known legacy v0:
+ * reconciliation, ingestion, retention and remote transfer may continue, but
+ * fresh RANS/URANS work remains queued until an engine that can reduce its
+ * immutable evidence is live. A malformed response or failed health probe is
+ * unknown (`null`) and is also fail-closed for new physical work.
+ */
+export async function engineArchiveReductionVersion(
+  engine: EngineClient,
+): Promise<number | null> {
+  const health = await engineHealthDetails(engine);
+  if (!health) return null;
+  if (!("archive_reduction_version" in health)) return 0;
+  return parsedArchiveReductionVersion(health.archive_reduction_version);
+}
+
 export function supportsDurableUransRecovery(
   version: number | null | undefined,
 ): version is number {
   return version != null && version >= MIN_DURABLE_URANS_RECOVERY_VERSION;
+}
+
+export function supportsArchiveCleanCycleReduction(
+  version: number | null | undefined,
+): version is number {
+  return version != null && version >= MIN_ARCHIVE_REDUCTION_VERSION;
 }

@@ -40,8 +40,10 @@ import {
   recordEngineUnreachable,
 } from "./engine-backoff";
 import {
+  engineArchiveReductionVersion,
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
+  supportsArchiveCleanCycleReduction,
 } from "./engine-capabilities";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
@@ -68,6 +70,30 @@ interface SweeperConfig {
   cpuSlots: number;
   pollIntervalMs: number;
   submitIntervalMs: number;
+}
+
+/** A rolling engine upgrade can leave a healthy old gateway running briefly.
+ * Do not turn that deliberately fail-closed admission state into one error per
+ * scheduler tick: it is an actionable deployment condition, not a new solver
+ * failure. */
+const ARCHIVE_REDUCTION_CAPABILITY_LOG_INTERVAL_MS = 5 * 60_000;
+let lastArchiveReductionCapabilityLogAt = 0;
+
+function reportArchiveReductionCapabilityDeferred(
+  version: number | null | undefined,
+): void {
+  const now = Date.now();
+  if (
+    now - lastArchiveReductionCapabilityLogAt <
+    ARCHIVE_REDUCTION_CAPABILITY_LOG_INTERVAL_MS
+  ) {
+    return;
+  }
+  lastArchiveReductionCapabilityLogAt = now;
+  const observed = version == null ? "unavailable or malformed" : `v${version}`;
+  console.warn(
+    `[sweeper] NEW admission deferred: engine archive-reduction capability is ${observed}; reconciliation, ingestion, and remote transfer continue while RANS/URANS remain queued`,
+  );
 }
 
 /**
@@ -138,6 +164,7 @@ export function remoteAdmissionDecisionForTick(input: {
   sharedCapacityAvailable: boolean;
   engineHealthy: boolean;
   meshRecoveryVersion: number | null;
+  archiveReductionVersion: number | null;
 }): RemoteEngineAdmissionDecision {
   if (input.admissionFenced) return { kind: "hold", reason: "safety_stop" };
   if (!input.diskAllowed) return { kind: "hold", reason: "storage_pressure" };
@@ -149,6 +176,8 @@ export function remoteAdmissionDecisionForTick(input: {
     return { kind: "hold", reason: "engine_unavailable" };
   if (input.meshRecoveryVersion == null)
     return { kind: "hold", reason: "mesh_capability_unknown" };
+  if (!supportsArchiveCleanCycleReduction(input.archiveReductionVersion))
+    return { kind: "hold", reason: "archive_reduction_capability_unavailable" };
   return {
     kind: "allow",
     meshRecoveryVersion: input.meshRecoveryVersion,
@@ -649,11 +678,18 @@ export async function submitOneBatch(
   engine: EngineClient,
   cpuSlots = 0,
   meshRecoveryVersion: number | null = 0,
+  /** Direct callers without a live health probe retain the historical helper
+   * contract. The scheduler always passes its explicit capability result. */
+  archiveReductionVersion: number | null = 1,
 ): Promise<boolean> {
   // A malformed/unknown capability must never be coerced to legacy v0 at the
   // physical RANS boundary. Otherwise due FAST URANS is skipped while new
   // screening work consumes its capacity slot.
-  if (meshRecoveryVersion == null) return false;
+  if (
+    meshRecoveryVersion == null ||
+    !supportsArchiveCleanCycleReduction(archiveReductionVersion)
+  )
+    return false;
   await ensureEnabledSimulationPresetRevisions(db);
   const gaps = await findGaps(db, 500);
   const continuous = firstBatch(gaps);
@@ -768,6 +804,7 @@ export async function tick(
   let engineHealthy = false;
   let meshRecoveryVersion: number | null = null;
   let uransRecoveryVersion: number | null = null;
+  let archiveReductionVersion: number | null = null;
   let fastUransSubmitted = false;
 
   // One capability/health decision owns every local-engine NEW lane, including
@@ -816,47 +853,52 @@ export async function tick(
         console.error(
           "[sweeper] NEW admission deferred: engine mesh-recovery capability is unavailable or malformed; FAST URANS, remote RANS, and ordinary RANS remain queued",
         );
-      } else if (localCapacityOpen || remoteFastCapacityOpen) {
-        uransRecoveryVersion = await engineUransRecoveryVersion(engine);
-        // A recorded whole-polar promotion and an exact targeted RANS
-        // rejection are normal automatic escalation work. Both strictly own
-        // the slot before mirrored remote RANS or any other new RANS lane.
-        const promotedSubmitted = await submitRecordedPromotionRecovery(
-          db,
-          engine,
-          state.cpuSlots,
-          {
-            meshRecoveryVersion,
-            uransRecoveryVersion,
-            ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
-          },
-        );
-        const campaignTargetedSubmitted =
-          promotedSubmitted || !localCapacityOpen
-            ? false
-            : await submitCampaignPrecalcRecoveries(
-                db,
-                engine,
-                undefined,
-                undefined,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              );
-        const remoteTargetedSubmitted =
-          promotedSubmitted ||
-          campaignTargetedSubmitted ||
-          !remoteFastCapacityOpen
-            ? false
-            : await submitRemotePromisePrecalcRecoveries(
-                db,
-                engine,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              );
-        fastUransSubmitted =
-          promotedSubmitted ||
-          campaignTargetedSubmitted ||
-          remoteTargetedSubmitted;
+      } else {
+        archiveReductionVersion = await engineArchiveReductionVersion(engine);
+        if (!supportsArchiveCleanCycleReduction(archiveReductionVersion)) {
+          reportArchiveReductionCapabilityDeferred(archiveReductionVersion);
+        } else if (localCapacityOpen || remoteFastCapacityOpen) {
+          uransRecoveryVersion = await engineUransRecoveryVersion(engine);
+          // A recorded whole-polar promotion and an exact targeted RANS
+          // rejection are normal automatic escalation work. Both strictly own
+          // the slot before mirrored remote RANS or any other new RANS lane.
+          const promotedSubmitted = await submitRecordedPromotionRecovery(
+            db,
+            engine,
+            state.cpuSlots,
+            {
+              meshRecoveryVersion,
+              uransRecoveryVersion,
+              ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
+            },
+          );
+          const campaignTargetedSubmitted =
+            promotedSubmitted || !localCapacityOpen
+              ? false
+              : await submitCampaignPrecalcRecoveries(
+                  db,
+                  engine,
+                  undefined,
+                  undefined,
+                  meshRecoveryVersion,
+                  uransRecoveryVersion,
+                );
+          const remoteTargetedSubmitted =
+            promotedSubmitted ||
+            campaignTargetedSubmitted ||
+            !remoteFastCapacityOpen
+              ? false
+              : await submitRemotePromisePrecalcRecoveries(
+                  db,
+                  engine,
+                  meshRecoveryVersion,
+                  uransRecoveryVersion,
+                );
+          fastUransSubmitted =
+            promotedSubmitted ||
+            campaignTargetedSubmitted ||
+            remoteTargetedSubmitted;
+        }
       }
     }
   }
@@ -870,6 +912,7 @@ export async function tick(
       sharedCapacityAvailable: sharedRemoteCapacityAvailable,
       engineHealthy,
       meshRecoveryVersion,
+      archiveReductionVersion,
     });
     remoteAdmissionConsumed = await admitRemoteSolverTick(db, engine, decision);
     if (remoteAdmissionConsumed) {
@@ -890,6 +933,7 @@ export async function tick(
     localCapacityOpen &&
     engineHealthy &&
     meshRecoveryVersion != null &&
+    supportsArchiveCleanCycleReduction(archiveReductionVersion) &&
     !fastUransSubmitted &&
     !engineBackoffActive()
   ) {
@@ -915,6 +959,7 @@ export async function tick(
         engine,
         state.cpuSlots,
         meshRecoveryVersion,
+        archiveReductionVersion,
       );
       if (ransSubmitted) continue;
       const ladderSubmitted = await uransLadderTick(
@@ -940,7 +985,18 @@ export async function tick(
   // archive reduced before it becomes a polar point.  Keep this nonblocking:
   // the live queue is durable and globally deduplicated, while this tick must
   // remain free to reconcile and admit CFD work.
-  scheduleArchiveReductionQueueDrain(db, engine);
+  // A legacy engine must never receive an endpoint it does not advertise:
+  // rows remain pending, carry no retry/error noise, and resume from their
+  // exact immutable GCS archive once the rolling rebuild advertises v1.
+  // When all capacity is occupied the admission block above intentionally did
+  // not probe health, so make one bounded capability probe solely for this
+  // non-admission background path.
+  if (archiveReductionVersion == null) {
+    archiveReductionVersion = await engineArchiveReductionVersion(engine);
+  }
+  if (supportsArchiveCleanCycleReduction(archiveReductionVersion)) {
+    scheduleArchiveReductionQueueDrain(db, engine);
+  }
   await markTickCompleted(db);
 }
 
