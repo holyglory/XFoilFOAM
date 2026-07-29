@@ -10,7 +10,11 @@ from . import physics
 from .airfoil import load_airfoil
 from .cache import EngineCache
 from .cancellation import JobCancelled
-from .capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
+from .capabilities import (
+    ARCHIVE_REDUCTION_VERSION,
+    MESH_RECOVERY_VERSION,
+    URANS_RECOVERY_VERSION,
+)
 from .config import Settings, get_settings
 from .meshing.base import get_mesher
 from .models import (
@@ -26,7 +30,12 @@ from .models import (
     PolarPoint,
     PolarRequest,
 )
-from .openfoam.runner import EngineIdentityMismatch, OpenFOAMError, get_runner
+from .openfoam.runner import (
+    EngineIdentityMismatch,
+    InfrastructureError,
+    OpenFOAMError,
+    get_runner,
+)
 from .openfoam.dialects import OPENCFD_2606_IDENTITY, get_openfoam_dialect
 from .pipeline import (
     CaseOutcome,
@@ -170,6 +179,16 @@ def execute_job(
             "worker URANS-recovery capability mismatch: "
             f"requested v{request.expected_urans_recovery_version}, "
             f"worker is v{URANS_RECOVERY_VERSION}"
+        )
+    if (
+        request.expected_archive_reduction_version is not None
+        and request.expected_archive_reduction_version
+        != ARCHIVE_REDUCTION_VERSION
+    ):
+        raise InfrastructureError(
+            "worker archive-reduction capability mismatch: "
+            f"requested v{request.expected_archive_reduction_version}, "
+            f"worker is v{ARCHIVE_REDUCTION_VERSION}"
         )
     airfoil = load_airfoil(
         request.airfoil.name, request.airfoil.coordinates, request.airfoil.points,

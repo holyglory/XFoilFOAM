@@ -263,6 +263,11 @@ function engineReturning(
   response: ArchiveCleanCycleReductionResponse,
 ): EngineClient {
   return {
+    healthDetails: async () => ({
+      status: "ok",
+      version: "archive-reducer-v1",
+      archive_reduction_version: 1,
+    }),
     reduceRemoteEvidenceCleanCycles: async () => response,
   } as unknown as EngineClient;
 }
@@ -454,6 +459,11 @@ describe("archive reduction publication queue", () => {
     const gate = deferred<never>();
     const entered = deferred<void>();
     const engine = {
+      healthDetails: async () => ({
+        status: "ok",
+        version: "archive-reducer-v1",
+        archive_reduction_version: 1,
+      }),
       reduceRemoteEvidenceCleanCycles: async () => {
         entered.resolve();
         return gate.promise;
@@ -530,6 +540,11 @@ describe("archive reduction publication queue", () => {
     const firstDrain = drainArchiveReductionQueue(
       db,
       {
+        healthDetails: async () => ({
+          status: "ok",
+          version: "archive-reducer-v1",
+          archive_reduction_version: 1,
+        }),
         reduceRemoteEvidenceCleanCycles: async () => {
           firstEntered.resolve();
           return firstReduction.promise;
@@ -603,6 +618,11 @@ describe("archive reduction publication queue", () => {
     const secondDrain = drainArchiveReductionQueue(
       db,
       {
+        healthDetails: async () => ({
+          status: "ok",
+          version: "archive-reducer-v1",
+          archive_reduction_version: 1,
+        }),
         reduceRemoteEvidenceCleanCycles: async () => {
           secondEntered.resolve();
           return secondReduction.promise;

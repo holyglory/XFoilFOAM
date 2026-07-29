@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
+  REQUIRED_ARCHIVE_REDUCTION_VERSION,
 } from "../src/build-request";
 
 const airfoil = {
@@ -89,6 +90,23 @@ const setup = {
 } as unknown as SimulationSetupSnapshot;
 
 describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)", () => {
+  it("pins the immutable archive reducer on every wave before engine submission", () => {
+    for (const wave of [1, 2]) {
+      const { request } = buildPolarRequest({
+        airfoil,
+        setup,
+        aoaList: [2],
+        wave,
+      });
+      expect(request.expected_archive_reduction_version).toBe(
+        REQUIRED_ARCHIVE_REDUCTION_VERSION,
+      );
+      expect(JSON.parse(JSON.stringify(request))).toMatchObject({
+        expected_archive_reduction_version: REQUIRED_ARCHIVE_REDUCTION_VERSION,
+      });
+    }
+  });
+
   it("batched CAMPAIGN wave-1 job (speeds[] + cpuSlots, the loop.ts submitCampaignBatch shape) ships transient_fallback:false and force_transient:false as present keys", () => {
     const { request } = buildPolarRequest({
       airfoil,

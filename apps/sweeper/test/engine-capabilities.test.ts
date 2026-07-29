@@ -9,7 +9,12 @@ import {
   supportsArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "../src/engine-capabilities";
+import { drainArchiveReductionQueue } from "../src/archive-reduction-queue";
 import { remoteAdmissionDecisionForTick, submitOneBatch } from "../src/loop";
+import {
+  submitExactUransCanaryStep,
+  uransLadderTick,
+} from "../src/urans-ladder";
 
 describe("engine mesh-recovery capability handshake", () => {
   it("accepts a monotonic non-negative integer advertised by live health", async () => {
@@ -136,6 +141,53 @@ describe("engine immutable archive-reduction capability handshake", () => {
       await expect(engineArchiveReductionVersion(engine)).resolves.toBeNull();
     },
   );
+
+  it("leaves direct archive-reduction queue work pending when the engine is legacy", async () => {
+    let reductions = 0;
+    const engine = {
+      healthDetails: async () => ({ status: "ok", version: "legacy-2406" }),
+      reduceRemoteEvidenceCleanCycles: async () => {
+        reductions += 1;
+        throw new Error("a legacy engine must not receive archive reduction");
+      },
+    } as unknown as EngineClient;
+
+    await expect(
+      drainArchiveReductionQueue({} as DB, engine, { enqueue: false }),
+    ).resolves.toMatchObject({
+      scanned: 0,
+      enqueued: 0,
+      processed: 0,
+      archiveReductionVersion: 0,
+      deferredByCapability: true,
+    });
+    expect(reductions).toBe(0);
+  });
+
+  it("holds direct ladder and canary entry points before they touch durable state", async () => {
+    let submissions = 0;
+    const legacyCanaryEngine = {
+      healthDetails: async () => ({ status: "ok", version: "legacy-2406" }),
+      submitPolar: async () => {
+        submissions += 1;
+        throw new Error("a legacy engine must not receive a physical request");
+      },
+    } as unknown as EngineClient;
+
+    await expect(
+      uransLadderTick({} as DB, legacyCanaryEngine, 0, {
+        archiveReductionVersion: 0,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      submitExactUransCanaryStep({} as DB, legacyCanaryEngine, {
+        requestId: "legacy-canary-request",
+        meshRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
+      }),
+    ).resolves.toBe(false);
+    expect(submissions).toBe(0);
+  });
 });
 
 describe("engine durable URANS-recovery capability handshake", () => {

@@ -86,8 +86,10 @@ import {
   solverImplementationIdForSetup,
 } from "./build-request";
 import {
+  engineArchiveReductionVersion,
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
+  supportsArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
@@ -2352,8 +2354,7 @@ async function consumeUransRequest(
     // the exact action/source/archive proof above; otherwise a manual or
     // legacy continuation keeps the established source-derived heuristic.
     if (archiveBackfillContinuation) {
-      effectiveCorrectiveTailPeriods =
-        request.correctiveTailPeriods ?? null;
+      effectiveCorrectiveTailPeriods = request.correctiveTailPeriods ?? null;
     }
     if (
       !source ||
@@ -2363,9 +2364,9 @@ async function consumeUransRequest(
         archiveBackfillContinuation ||
         (!archiveBackfillRequiresActionProof &&
           (await isExactRestartablePrecalcAttempt(
-          db,
-          request.continueFromResultId,
-          request.continueFromResultAttemptId,
+            db,
+            request.continueFromResultId,
+            request.continueFromResultAttemptId,
           )))
       )
     ) {
@@ -2901,9 +2902,7 @@ async function consumeVerifyItem(
             continueFromResultId: recovery.resultId,
             continueFromResultAttemptId: recovery.resultAttemptId,
             budgetOverrideS,
-            ...(correctiveTailPeriods != null
-              ? { correctiveTailPeriods }
-              : {}),
+            ...(correctiveTailPeriods != null ? { correctiveTailPeriods } : {}),
           }
         : {}),
     },
@@ -2959,6 +2958,14 @@ export async function submitExactUransCanaryStep(
     uransRecoveryVersion: number;
   },
 ): Promise<boolean> {
+  // This operator-only bypass is intentionally guarded independently of the
+  // normal scheduler.  A canary must never create a physical generation on a
+  // gateway which cannot reduce that generation's immutable archive back into
+  // a publishable interpretation.
+  const archiveReductionVersion = await engineArchiveReductionVersion(engine);
+  if (!supportsArchiveCleanCycleReduction(archiveReductionVersion))
+    return false;
+
   await healOrphanedUransRequests(db, { requestIds: [input.requestId] });
   if (input.verifyId) {
     await healOrphanedVerifyItems(db, { verifyIds: [input.verifyId] });
@@ -3050,8 +3057,29 @@ export async function uransLadderTick(
     /** Separate rolling-cutover contract for durable URANS continuation and
      * corrective final recovery. Legacy mesh-recovery v1 is insufficient. */
     uransRecoveryVersion?: number | null;
+    /** Immutable archive clean-cycle reduction must be available before this
+     * ladder can create new physical work. The normal tick forwards the
+     * capability it already probed; direct real-engine callers probe below. */
+    archiveReductionVersion?: number | null;
   } = {},
 ): Promise<boolean> {
+  // The normal production scheduler supplies its one live probe. Keep direct
+  // operator/library use safe too: every real EngineClient exposes health.
+  // Structural test doubles that predate the health endpoint intentionally
+  // retain their existing lower-level behavior; their submitted request is
+  // still fenced by expected_archive_reduction_version at the engine boundary.
+  const archiveReductionVersion =
+    opts.archiveReductionVersion !== undefined
+      ? opts.archiveReductionVersion
+      : typeof engine.healthDetails === "function"
+        ? await engineArchiveReductionVersion(engine)
+        : undefined;
+  if (
+    archiveReductionVersion !== undefined &&
+    !supportsArchiveCleanCycleReduction(archiveReductionVersion)
+  )
+    return false;
+
   const healedItems = await healOrphanedVerifyItems(db, {
     campaignIds: opts.campaignIds,
     verifyIds: opts.verifyIds,

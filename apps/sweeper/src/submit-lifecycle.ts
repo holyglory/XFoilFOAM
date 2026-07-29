@@ -23,6 +23,7 @@ import {
 } from "@aerodb/db";
 import { releasedResultStatusSql } from "@aerodb/db/result-claim-lifecycle";
 import {
+  ARCHIVE_REDUCTION_CAPABILITY_MISMATCH_CODE,
   ENGINE_IDENTITY_MISMATCH_CODE,
   EngineError,
   MESH_RECOVERY_CAPABILITY_MISMATCH_CODE,
@@ -1835,6 +1836,21 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
       // ownership without consuming solver/submit retry budgets. Unlike an
       // ordinary answered rejection, wrong-engine execution is never valid
       // failure evidence.
+      return { kind: "capability_mismatch", error: message };
+    }
+    if (
+      error instanceof EngineError &&
+      error.status === 409 &&
+      error.code === ARCHIVE_REDUCTION_CAPABILITY_MISMATCH_CODE &&
+      opts.request.expected_archive_reduction_version != null
+    ) {
+      await recordUnexecutedTransientSubmitFailure(
+        opts.db,
+        opts.jobId,
+        `engine archive-reduction capability changed before execution: ${message}`,
+        campaignId,
+        opts.ladderSubmitOwner,
+      );
       return { kind: "capability_mismatch", error: message };
     }
     if (

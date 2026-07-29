@@ -1017,6 +1017,24 @@ def create_app() -> FastAPI:
                     ),
                 },
             )
+        if (
+            request.expected_archive_reduction_version is not None
+            and request.expected_archive_reduction_version
+            != ARCHIVE_REDUCTION_VERSION
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "archive_reduction_version_mismatch",
+                    "requested_version": request.expected_archive_reduction_version,
+                    "actual_version": ARCHIVE_REDUCTION_VERSION,
+                    "message": (
+                        "Engine archive-reduction capability changed before submission: "
+                        f"requested v{request.expected_archive_reduction_version}, "
+                        f"API is v{ARCHIVE_REDUCTION_VERSION}. Refresh capability and retry."
+                    ),
+                },
+            )
         # validate airfoil up-front so bad geometry fails fast with 422
         try:
             load_airfoil(

@@ -17,6 +17,12 @@ import {
   type UransFidelity,
 } from "@aerodb/engine-client";
 
+/** First immutable GCS archive clean-cycle reducer. This is intentionally
+ * attached to every newly built physical request—not just scheduler-owned
+ * calls—so an engine gateway swap after a health probe fails at the submit
+ * boundary rather than producing evidence the old engine cannot interpret. */
+export const REQUIRED_ARCHIVE_REDUCTION_VERSION = 1;
+
 export function engineIdentityForSetup(
   setup: SimulationSetupSnapshot,
 ): EngineIdentity {
@@ -114,6 +120,7 @@ export function buildPolarRequest(opts: {
     expected_engine: {
       ...(engineIdentity ?? engineIdentityForSetup(setup)),
     },
+    expected_archive_reduction_version: REQUIRED_ARCHIVE_REDUCTION_VERSION,
     airfoil: {
       name: airfoil.name,
       format: airfoil.pointFormat as AirfoilFormat,

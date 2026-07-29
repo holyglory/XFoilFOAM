@@ -240,6 +240,11 @@ export interface PolarRequest {
   /** Required durable URANS recovery contract. Automatic continuation and
    * corrective final recovery callers pin the exact live version. */
   expected_urans_recovery_version?: number | null;
+  /** Required immutable archive clean-cycle reducer contract. Every new
+   * physical request pins this before crossing the engine boundary so a
+   * gateway swap cannot accept CFD work that it cannot later interpret from
+   * immutable evidence. */
+  expected_archive_reduction_version?: number | null;
 }
 
 export type JobState =

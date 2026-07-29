@@ -52,6 +52,10 @@ import {
   reducerVersionIsNewer,
   selectArchiveReductionScanPage,
 } from "./archive-reduction-queue-policy";
+import {
+  engineArchiveReductionVersion,
+  supportsArchiveCleanCycleReduction,
+} from "./engine-capabilities";
 import { createSingleFlightBackgroundRunner } from "./single-flight";
 
 export const ARCHIVE_REDUCTION_QUEUE_LEASE_MS = 30 * 60_000;
@@ -63,6 +67,19 @@ export const ARCHIVE_REDUCTION_QUEUE_LEASE_RENEW_MS = Math.max(
 );
 export const ARCHIVE_REDUCTION_QUEUE_SCAN_LIMIT = 64;
 export const ARCHIVE_REDUCTION_QUEUE_DRAIN_LIMIT = 2;
+
+export type ArchiveReductionQueueDrainReport = {
+  scanned: number;
+  enqueued: number;
+  admittedResultAttemptIds: string[];
+  processed: number;
+  /** The exact gateway contract observed or supplied by the admission owner.
+   * `null` means the bounded health probe was unavailable or malformed. */
+  archiveReductionVersion: number | null;
+  /** A legacy/unavailable reducer must leave immutable queue rows untouched.
+   * This is a controlled deployment hold, not a reduction failure/retry. */
+  deferredByCapability: boolean;
+};
 
 type QueueState =
   | "pending"
@@ -1039,13 +1056,30 @@ export async function drainArchiveReductionQueue(
   opts: ArchiveReductionQueueScope & {
     maxItems?: number;
     enqueue?: boolean;
+    /** A scheduler which already made a live capability decision passes it
+     * through so the nonblocking queue tail does not add another health
+     * round-trip. Direct CLI callers deliberately omit it and probe here. */
+    archiveReductionVersion?: number | null;
   } = {},
-): Promise<{
-  scanned: number;
-  enqueued: number;
-  admittedResultAttemptIds: string[];
-  processed: number;
-}> {
+): Promise<ArchiveReductionQueueDrainReport> {
+  const archiveReductionVersion =
+    opts.archiveReductionVersion === undefined
+      ? await engineArchiveReductionVersion(engine)
+      : opts.archiveReductionVersion;
+  // Do this before discovery or claiming. A legacy gateway does not expose the
+  // immutable archive endpoint; creating a backoff/error receipt in that
+  // expected rolling-upgrade state would misrepresent deployment sequencing as
+  // a data-quality failure. Pending exact-source rows resume after v1 appears.
+  if (!supportsArchiveCleanCycleReduction(archiveReductionVersion)) {
+    return {
+      scanned: 0,
+      enqueued: 0,
+      admittedResultAttemptIds: [],
+      processed: 0,
+      archiveReductionVersion,
+      deferredByCapability: true,
+    };
+  }
   const scan =
     opts.enqueue === false
       ? { scanned: 0, enqueued: 0, admittedResultAttemptIds: [] }
@@ -1069,6 +1103,8 @@ export async function drainArchiveReductionQueue(
     enqueued: scan.enqueued,
     admittedResultAttemptIds: scan.admittedResultAttemptIds,
     processed,
+    archiveReductionVersion,
+    deferredByCapability: false,
   };
 }
 
@@ -1085,10 +1121,12 @@ const scheduleDrainSingleFlight = createSingleFlightBackgroundRunner(
 export function scheduleArchiveReductionQueueDrain(
   db: DB,
   engine: EngineClient,
+  opts: { archiveReductionVersion?: number | null } = {},
 ): boolean {
   return scheduleDrainSingleFlight(() =>
     drainArchiveReductionQueue(db, engine, {
       maxItems: ARCHIVE_REDUCTION_QUEUE_DRAIN_LIMIT,
+      archiveReductionVersion: opts.archiveReductionVersion,
     }),
   );
 }

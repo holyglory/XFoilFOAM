@@ -243,6 +243,56 @@ def test_worker_rejects_urans_recovery_mismatch_before_geometry_or_solver(tmp_pa
         )
 
 
+def test_polar_submit_rejects_archive_reducer_cutover_before_queueing(
+    client, naca0012_selig_text
+):
+    requested_version = ARCHIVE_REDUCTION_VERSION + 1
+    response = client.post(
+        "/polars",
+        json={
+            "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+            "aoa": {"angles": [0]},
+            "expected_archive_reduction_version": requested_version,
+        },
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail == {
+        "code": "archive_reduction_version_mismatch",
+        "requested_version": requested_version,
+        "actual_version": ARCHIVE_REDUCTION_VERSION,
+        "message": (
+            "Engine archive-reduction capability changed before submission: "
+            f"requested v{requested_version}, API is v{ARCHIVE_REDUCTION_VERSION}. "
+            "Refresh capability and retry."
+        ),
+    }
+
+
+def test_worker_rejects_archive_reducer_mismatch_before_geometry_or_solver(tmp_path):
+    requested_version = ARCHIVE_REDUCTION_VERSION + 1
+    request = PolarRequest.model_validate(
+        {
+            "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
+            "aoa": {"angles": [0]},
+            "expected_archive_reduction_version": requested_version,
+        }
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            f"requested v{requested_version}, worker is v{ARCHIVE_REDUCTION_VERSION}"
+        ),
+    ):
+        jobs.execute_job(
+            "archive-reducer-capability-mismatch",
+            request,
+            store=JobStore(),
+        )
+
+
 def test_polar_submit_rejects_continuation_without_recovery_version_pin(
     client, naca0012_selig_text
 ):

@@ -969,6 +969,7 @@ export async function tick(
         {
           meshRecoveryVersion,
           uransRecoveryVersion,
+          archiveReductionVersion,
         },
       );
       if (!ladderSubmitted) break;
@@ -988,15 +989,16 @@ export async function tick(
   // A legacy engine must never receive an endpoint it does not advertise:
   // rows remain pending, carry no retry/error noise, and resume from their
   // exact immutable GCS archive once the rolling rebuild advertises v1.
-  // When all capacity is occupied the admission block above intentionally did
-  // not probe health, so make one bounded capability probe solely for this
-  // non-admission background path.
-  if (archiveReductionVersion == null) {
-    archiveReductionVersion = await engineArchiveReductionVersion(engine);
-  }
-  if (supportsArchiveCleanCycleReduction(archiveReductionVersion)) {
-    scheduleArchiveReductionQueueDrain(db, engine);
-  }
+  // When all capacity is occupied the admission block intentionally did not
+  // probe health. Let the single-flight background drain perform that probe
+  // after this tick returns rather than awaiting live engine I/O here: a slow
+  // gateway must never turn normal reconciliation into a "tick stalled"
+  // condition. A known legacy v0 is forwarded so it remains a quiet no-op.
+  scheduleArchiveReductionQueueDrain(
+    db,
+    engine,
+    archiveReductionVersion == null ? {} : { archiveReductionVersion },
+  );
   await markTickCompleted(db);
 }
 

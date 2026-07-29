@@ -740,6 +740,14 @@ class PolarRequest(BaseModel):
         "API and worker reject a mismatch before CFD so a legacy engine cannot "
         "consume newly reopened recovery work during a rolling deployment.",
     )
+    expected_archive_reduction_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Controller-required immutable archive clean-cycle reducer "
+        "contract. New physical submissions pin this at the API and worker so "
+        "a rolling gateway swap cannot accept CFD work whose immutable evidence "
+        "cannot be reduced under the selected interpretation contract.",
+    )
     expected_engine: Optional[EngineIdentity] = Field(
         default=None,
         description="Exact logical solver implementation required by the controller. "

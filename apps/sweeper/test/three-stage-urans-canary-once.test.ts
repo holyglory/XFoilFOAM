@@ -401,6 +401,7 @@ function enginePreflight(): ThreeStageUransEnginePreflight {
       build_id: target.expectedEngineBuildId,
       mesh_recovery_version: target.expectedMeshRecoveryVersion,
       urans_recovery_version: target.expectedUransRecoveryVersion,
+      archive_reduction_version: 1,
       default_engine: OPENCFD_2606_ENGINE,
       supported_engines: [OPENCFD_2606_ENGINE],
       evidence_storage: {
@@ -1232,6 +1233,11 @@ describe("three-stage URANS engine admission preflight", () => {
         (p.health.urans_recovery_version = 1),
     ],
     [
+      "missing immutable archive reduction",
+      (p: ThreeStageUransEnginePreflight) =>
+        (p.health.archive_reduction_version = 0),
+    ],
+    [
       "missing continuation",
       (p: ThreeStageUransEnginePreflight) =>
         (p.capabilities.supports_continuation = false),
@@ -1300,7 +1306,9 @@ describe("three-stage URANS engine admission preflight", () => {
     [
       "disk percentage safeguard",
       (p: ThreeStageUransEnginePreflight) => {
-        p.disk.used_pct = 90;
+        // 100% exceeds every valid configured admission limit (<100), even
+        // when a developer's environment deliberately raises the default.
+        p.disk.used_pct = 100;
       },
     ],
     [

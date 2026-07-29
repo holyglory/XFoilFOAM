@@ -162,6 +162,11 @@ function stubEngine(
   engineJobId: string,
 ): EngineClient {
   return {
+    healthDetails: async () => ({
+      status: "ok",
+      version: "archive-reducer-v1",
+      archive_reduction_version: 1,
+    }),
     submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
       capture.push(request);
       return {
