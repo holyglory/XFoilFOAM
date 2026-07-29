@@ -2389,8 +2389,8 @@ export const resultInterpretationBackfillRuns = pgTable(
       .notNull()
       .default(sql`'{}'::jsonb`),
     requestedBy: text("requested_by").notNull().default("system"),
-    startedAt: ts(),
-    completedAt: ts(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2438,8 +2438,10 @@ export const resultInterpretationBackfillItems = pgTable(
     state: text("state").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
     claimToken: uuid("claim_token"),
-    claimExpiresAt: ts(),
-    nextAttemptAt: ts().notNull().defaultNow(),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     lastError: text("last_error"),
     resultInterpretationId: uuid("result_interpretation_id"),
     createdAt: ts().notNull().defaultNow(),
@@ -2537,8 +2539,15 @@ export const resultArchiveReductionQueue = pgTable(
     state: text("state").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
     claimToken: uuid("claim_token"),
-    claimExpiresAt: ts(),
-    nextAttemptAt: ts().notNull().defaultNow(),
+    // This queue was introduced through a hand-written migration whose
+    // operational columns are snake_case. `ts()` deliberately uses the
+    // TypeScript property name (for legacy createdAt/updatedAt columns), so
+    // it must not be used for these two fields: Drizzle would otherwise emit
+    // quoted `claimExpiresAt`/`nextAttemptAt` identifiers at runtime.
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     lastError: text("last_error"),
     backfillRunId: uuid("backfill_run_id").references(
       () => resultInterpretationBackfillRuns.id,
@@ -2658,8 +2667,10 @@ export const resultInterpretationRecoveryActions = pgTable(
     state: text("state").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
     claimToken: uuid("claim_token"),
-    claimExpiresAt: ts(),
-    nextAttemptAt: ts().notNull().defaultNow(),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     targetUransRequestId: uuid("target_urans_request_id").references(
       (): AnyPgColumn => simUransRequests.id,
       { onDelete: "restrict" },
@@ -2815,8 +2826,10 @@ export const legacyUransArchiveGapRecoveryActions = pgTable(
     state: text("state").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
     claimToken: uuid("claim_token"),
-    claimExpiresAt: ts(),
-    nextAttemptAt: ts().notNull().defaultNow(),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     /** Immutable ownership receipt for the normal PRECALC request. */
     targetUransRequestId: uuid("target_urans_request_id").references(
       (): AnyPgColumn => simUransRequests.id,
