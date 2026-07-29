@@ -96,6 +96,9 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         mean_images={field: url(rel) for field, rel in outcome.mean_images.items()},
         force_history=history,
         frame_track=outcome.frame_track,
+        urans_cycle_certificate=outcome.urans_cycle_certificate,
+        no_shedding_certificate=outcome.no_shedding_certificate,
+        rans_hold_certificate=outcome.rans_hold_certificate,
         fidelity=outcome.fidelity,
         steady_history=outcome.steady_history,
         quality_warnings=outcome.quality_warnings,
@@ -501,6 +504,7 @@ def execute_job(
                 settings=settings,
                 aoa_deg=spec.aoa_deg,
                 expected_engine=expected_engine,
+                corrective_tail_periods=request.corrective_tail_periods,
             )
         except OpenFOAMError as exc:
             permanent = isinstance(exc, ContinuationPermanentError)

@@ -1,6 +1,7 @@
 import { URANS_CONTINUATION_REQUIRED_MARKER } from "@aerodb/core";
 import {
   MAX_PRECALC_NO_PROGRESS_SEGMENTS,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
   airfoils,
   createClient,
@@ -856,6 +857,151 @@ async function createLegacyCheckpointVariant(
 }
 
 describe("cross-segment preliminary URANS progress", () => {
+  it("MUST-CATCH: terminal PRECALC settlement never accepts a wrong boundary, mixed-boundary job, or solver implementation", async () => {
+    const alternateImplementationId =
+      solverImplementationId === OPENCFD_2606_SOLVER_IMPLEMENTATION_ID
+        ? OPENCFD_2406_SOLVER_IMPLEMENTATION_ID
+        : OPENCFD_2606_SOLVER_IMPLEMENTATION_ID;
+    const variants = [
+      {
+        suffix: "accepted-mixed-boundary",
+        candidateBcId: bcId,
+        jobBcIds: [bcId, legacyFixture.bcId],
+        candidateImplementationId: solverImplementationId,
+      },
+      {
+        suffix: "accepted-wrong-boundary",
+        candidateBcId: legacyFixture.bcId,
+        jobBcIds: [legacyFixture.bcId],
+        candidateImplementationId: solverImplementationId,
+      },
+      {
+        suffix: "accepted-wrong-implementation",
+        candidateBcId: bcId,
+        jobBcIds: [bcId],
+        candidateImplementationId: alternateImplementationId,
+      },
+    ] as const;
+
+    for (let index = 0; index < variants.length; index += 1) {
+      const variant = variants[index]!;
+      const targetAoaDeg = aoaDeg + 0.2 + index / 100;
+      const [obligation] = await ensurePrecalcObligations(
+        db,
+        [{ airfoilId, revisionId, aoaDeg: targetAoaDeg }],
+        { backgroundOwner: true },
+      );
+      if (!obligation) throw new Error(`${variant.suffix} obligation missing`);
+      obligationIds.push(obligation.id);
+
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [...variant.jobBcIds],
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId: variant.candidateImplementationId,
+          jobKind: "targeted",
+          referenceChordM: 1,
+          wave: 2,
+          status: "submitted",
+          engineJobId: `${PREFIX}-${variant.suffix}`,
+          submittedAt: new Date(),
+          totalCases: 1,
+          completedCases: 1,
+          requestPayload: {
+            aoas: [targetAoaDeg],
+            uransFidelity: "precalc",
+            precalcObligationIds: [obligation.id],
+          },
+        })
+        .returning();
+      jobIds.push(job.id);
+      await db
+        .update(simPrecalcObligations)
+        .set({ latestSimJobId: job.id, state: "pending" })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      await recordPrecalcObligationSubmission(db, job.id, [obligation.id]);
+
+      const [result] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId: variant.candidateBcId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: targetAoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          fidelity: "urans_precalc",
+          methodKey: "openfoam.urans",
+          solverImplementationId: variant.candidateImplementationId,
+          converged: true,
+          unsteady: true,
+          solvedAt: new Date(),
+        })
+        .returning();
+      resultIds.push(result.id);
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: result.id,
+          airfoilId,
+          bcId: variant.candidateBcId,
+          simulationPresetRevisionId: revisionId,
+          solverImplementationId: variant.candidateImplementationId,
+          aoaDeg: targetAoaDeg,
+          simJobId: job.id,
+          engineJobId: job.engineJobId,
+          engineCaseSlug: `precalc_${index}`,
+          methodKey: "openfoam.urans",
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          validForPolar: true,
+          converged: true,
+          unsteady: true,
+          evidencePayload: { fidelity: "urans_precalc" },
+          solvedAt: new Date(),
+        })
+        .returning();
+      resultAttemptIds.push(attempt.id);
+      await db.insert(resultClassifications).values({
+        resultAttemptId: attempt.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: targetAoaDeg,
+        regime: "urans",
+        classifierVersion: `${PREFIX}-${variant.suffix}`,
+        state: "accepted",
+        region: "post_stall",
+        confidence: 1,
+        reasons: ["accepted"],
+      });
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attempt.id })
+        .where(eq(results.id, result.id));
+      const [completedJob] = await db
+        .update(simJobs)
+        .set({ status: "done", finishedAt: new Date() })
+        .where(eq(simJobs.id, job.id))
+        .returning();
+
+      const settlement = await settlePrecalcObligationsForJob(db, completedJob);
+      expect(settlement.satisfied).not.toContain(obligation.id);
+      const [settled] = await db
+        .select({
+          state: simPrecalcObligations.state,
+          sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+        })
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      expect(settled?.state).not.toBe("satisfied");
+      expect(settled?.sourceResultAttemptId).toBeNull();
+    }
+  }, 120_000);
+
   it("MUST-CATCH: only the exact archived OpenCFD 2606 legacy slow-shedding checkpoint resumes", async () => {
     const valid = await createLegacyCheckpointVariant(
       { suffix: "legacy-valid", manifest: "valid", archive: "valid" },

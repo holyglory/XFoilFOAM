@@ -65,6 +65,7 @@ export function campaignInstrumentStatus(
   const { campaign, scheduler, totals } = s;
   const jobs = scheduler.campaignJobsRunning;
   const remaining = fCount(totals.remaining);
+  const evidenceProcessing = totals.awaitingArchiveReduction ?? 0;
 
   if (campaign.status === "active" && scheduler.diskAdmissionBlocked) {
     return {
@@ -140,14 +141,28 @@ export function campaignInstrumentStatus(
     };
   }
 
+  if (
+    campaign.status === "active" &&
+    evidenceProcessing > 0 &&
+    jobs === 0 &&
+    totals.remaining <= evidenceProcessing
+  ) {
+    return {
+      title: "Processing verified evidence",
+      detail: `${fCount(evidenceProcessing)} URANS result${evidenceProcessing === 1 ? "" : "s"} will publish automatically`,
+      tone: "dim",
+      action: null,
+    };
+  }
+
   switch (campaign.status) {
     case "active":
       return {
         title: "Campaign running",
         detail:
           jobs > 0
-            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} · ${remaining} points remain`
-            : `${remaining} points remain · ready for the next scheduler tick`,
+            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} · ${remaining} points remain${evidenceProcessing > 0 ? ` · ${fCount(evidenceProcessing)} publishing` : ""}`
+            : `${remaining} points remain · ready for the next scheduler tick${evidenceProcessing > 0 ? ` · ${fCount(evidenceProcessing)} publishing` : ""}`,
         tone: "teal",
         action: null,
       };
@@ -434,6 +449,7 @@ export function campaignStatusLine(
 ): CampaignStatusView {
   const { campaign, totals, scheduler } = s;
   const blocked = totals.blocked ?? 0;
+  const evidenceProcessing = totals.awaitingArchiveReduction ?? 0;
   const jobs = scheduler.campaignJobsRunning;
   const lifecycle = campaign.status;
   switch (campaign.status) {
@@ -460,6 +476,14 @@ export function campaignStatusLine(
           lifecycle,
           text: `Completed · ${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted; system investigation required.`,
           tone: "red",
+        };
+      }
+      if (evidenceProcessing > 0) {
+        return {
+          gate: null,
+          lifecycle,
+          text: `Processing verified evidence · ${fCount(evidenceProcessing)} URANS result${evidenceProcessing === 1 ? "" : "s"} will publish automatically.`,
+          tone: "dim",
         };
       }
       if (
@@ -500,6 +524,14 @@ export function campaignStatusLine(
           lifecycle,
           text: `Awaiting FAST URANS · ${fCount(automaticPrecalc)} point${automaticPrecalc === 1 ? "" : "s"}`,
           tone: "violet",
+        };
+      }
+      if (evidenceProcessing > 0) {
+        return {
+          gate: null,
+          lifecycle,
+          text: `Processing verified evidence · ${fCount(evidenceProcessing)} URANS result${evidenceProcessing === 1 ? "" : "s"} will publish automatically.`,
+          tone: "dim",
         };
       }
       // Rolling clients may carry the older review-bucket split. Awaiting
@@ -606,6 +638,18 @@ export function campaignStatusLine(
           tone: "red",
         };
       }
+      if (
+        evidenceProcessing > 0 &&
+        jobs === 0 &&
+        totals.remaining <= evidenceProcessing
+      ) {
+        return {
+          gate: null,
+          lifecycle,
+          text: `Processing verified evidence · ${fCount(evidenceProcessing)} URANS result${evidenceProcessing === 1 ? "" : "s"} will publish automatically.`,
+          tone: "dim",
+        };
+      }
       // Point counters update on INGEST, so between job submission and the
       // first partial ingest they read 0 while the engine is solving hard
       // (observed on the first prod campaign, 2026-07-05). The scheduler's
@@ -615,8 +659,8 @@ export function campaignStatusLine(
         lifecycle,
         text:
           jobs > 0
-            ? `Active — ${fCount(jobs)} job${jobs === 1 ? "" : "s"} solving · ${fCount(totals.running)} point${totals.running === 1 ? "" : "s"} mid-ingest · ${fCount(totals.remaining)} remaining.`
-            : `Active — ${fCount(totals.running)} point${totals.running === 1 ? "" : "s"} running, ${fCount(totals.remaining)} remaining.`,
+            ? `Active — ${fCount(jobs)} job${jobs === 1 ? "" : "s"} solving · ${fCount(totals.running)} point${totals.running === 1 ? "" : "s"} mid-ingest · ${fCount(totals.remaining)} remaining${evidenceProcessing > 0 ? ` · ${fCount(evidenceProcessing)} processing verified evidence` : ""}.`
+            : `Active — ${fCount(totals.running)} point${totals.running === 1 ? "" : "s"} running, ${fCount(totals.remaining)} remaining${evidenceProcessing > 0 ? ` · ${fCount(evidenceProcessing)} processing verified evidence` : ""}.`,
         tone: "teal",
       };
     }

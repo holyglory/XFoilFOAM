@@ -159,6 +159,25 @@ describe("segmentView — amendment-A split recolor (design c19fd74a)", () => {
     expect(segmentWorkflowFillHeight(v)).toBeCloseTo(2 / 31, 10);
   });
 
+  it("MUST-CATCH: verified URANS archive publication is a neutral processing overlay, never rejected or blocked", () => {
+    const pending = split({
+      solved: 22,
+      rejected: 0,
+      remaining: 0,
+      awaitingArchiveReduction: 1,
+    });
+    const view = segmentView(pending);
+    expect(view.state).toBe("evidence_processing");
+    expect(view.fillFraction).toBeCloseTo(22 / 31, 10);
+    expect(segmentWorkflowFillHeight(view)).toBeCloseTo(1 / 31, 10);
+    expect(segmentTitle(condition(), pending, "active")).toContain(
+      "1 processing verified evidence",
+    );
+    expect(segmentTitle(condition(), pending, "active")).not.toContain(
+      "critical",
+    );
+  });
+
   it("needs-review cells go RED-state solid, winning over awaiting", () => {
     const v = segmentView(
       split({

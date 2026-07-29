@@ -13,6 +13,7 @@ export const POINT_STATUS_CHIPS = [
   "all",
   "failed",
   "awaiting_urans",
+  "evidence_processing",
   "accepted",
   "needs_urans",
   "solving",
@@ -90,6 +91,9 @@ export interface PointHistoryItem {
    *  and is presented as unavailable, never as required human adjudication. */
   reviewBucket: "awaiting_urans" | "needs_review" | null;
   workDisposition: "scheduled" | "blocked" | null;
+  /** Verified URANS archive publication/recovery is automatic and remains
+   *  outstanding until a canonical interpretation is accepted. */
+  archivePublicationPending?: boolean;
   /** Amendment C: the rejected urans solve has restartable saved case state
    *  after a budget stop or bounded same-case continuation (Continue +2h/+6h). */
   continuable: boolean;
@@ -103,6 +107,7 @@ export interface PointHistoryCounts {
    *  links only — the chips render the split counts below instead. */
   rejected: number;
   awaiting_urans: number;
+  evidence_processing?: number;
   needs_review: number;
   accepted: number;
   needs_urans: number;
@@ -197,6 +202,7 @@ export interface PointStoryPayload {
     /** Rolling-compatibility ladder bucket (see PointHistoryItem.reviewBucket). */
     reviewBucket: "awaiting_urans" | "needs_review" | null;
     workDisposition: "scheduled" | "blocked" | null;
+    archivePublicationPending?: boolean;
     /** Amendment C: rejected urans row with restartable saved case state — the
      *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
@@ -311,6 +317,7 @@ export type CampaignPointsBucket =
   | "failed"
   | "rejected"
   | "awaiting_urans"
+  | "evidence_processing"
   | "needs_review";
 
 /** Canonical explorer link target for a campaign's review-bucket counts
@@ -459,7 +466,9 @@ export function fidelityChipView(
 export function bucketOfPoint(
   status: string,
   classificationState: string | null,
+  archivePublicationPending = false,
 ): string {
+  if (archivePublicationPending) return "evidence_processing";
   if (status === "failed") return "failed";
   if (status === "pending" || status === "queued" || status === "running")
     return "solving";
@@ -509,6 +518,8 @@ export function statusChipDisplay(
       return { label: "result unavailable", tone: "red" };
     case "accepted":
       return { label: "accepted", tone: "teal" };
+    case "evidence_processing":
+      return { label: "processing verified evidence", tone: "muted" };
     case "needs_urans":
       return { label: "fast URANS next", tone: "violet" };
     case "solving":
@@ -582,6 +593,9 @@ export function buildStoryDigest(
         ? ` — mirror of ${item.sourceAoaDeg > 0 ? "+" : ""}${item.sourceAoaDeg}°`
         : "";
     return `derived by symmetry${src}`;
+  }
+  if (item.bucket === "evidence_processing") {
+    return "processing verified URANS evidence";
   }
   if (item.attemptDigest.length === 0) {
     if (item.status === "running") return "solving — no attempts recorded yet";
@@ -733,10 +747,22 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
 
   const events = [...timed];
   const cls = story.point.classification;
+  const archivePublicationPending = Boolean(
+    story.point.archivePublicationPending,
+  );
   const uransQueued =
     story.point.reviewBucket === "awaiting_urans" &&
     story.point.workDisposition === "scheduled";
-  if (cls) {
+  if (archivePublicationPending) {
+    events.push({
+      kind: "classification",
+      at: null,
+      tone: "muted",
+      title: "processing verified URANS evidence",
+      detail: "automatic archive reduction is preparing the publishable result",
+      whyLines: [],
+    });
+  } else if (cls) {
     const tone: TimelineTone = uransQueued
       ? "muted"
       : cls.state === "accepted"
@@ -765,7 +791,11 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
   // disagreed = accepted final evidence plus amber comparison context carrying
   // the stored deltas. It is not a failed verification or review task.
   const verify = story.point.verify;
-  if (verify && (verify.state === "pending" || verify.state === "running")) {
+  if (
+    !archivePublicationPending &&
+    verify &&
+    (verify.state === "pending" || verify.state === "running")
+  ) {
     events.push({
       kind: "classification",
       at: null,
@@ -777,7 +807,11 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       detail: "background verification of the accepted URANS fast result",
       whyLines: [],
     });
-  } else if (verify && verify.state === "disagreed") {
+  } else if (
+    !archivePublicationPending &&
+    verify &&
+    verify.state === "disagreed"
+  ) {
     const deltas = disagreedDeltaLabel(verify);
     events.push({
       kind: "classification",
@@ -787,7 +821,11 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
       detail: `${deltas ? `${deltas} — ` : ""}the accepted final URANS result is authoritative; the fast result remains preliminary comparison evidence`,
       whyLines: [],
     });
-  } else if (verify && verify.state === "blocked") {
+  } else if (
+    !archivePublicationPending &&
+    verify &&
+    verify.state === "blocked"
+  ) {
     events.push({
       kind: "classification",
       at: null,
@@ -801,15 +839,17 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     });
   }
 
-  const bucketTone: TimelineTone = uransQueued
+  const bucketTone: TimelineTone = archivePublicationPending
     ? "muted"
-    : story.point.status === "failed"
-      ? "red"
-      : cls?.state === "rejected"
+    : uransQueued
+      ? "muted"
+      : story.point.status === "failed"
         ? "red"
-        : story.point.status === "done"
-          ? "teal"
-          : "amber";
+        : cls?.state === "rejected"
+          ? "red"
+          : story.point.status === "done"
+            ? "teal"
+            : "amber";
   const evidence = `${story.attempts.length} attempt${story.attempts.length === 1 ? "" : "s"}${
     story.interruptions.length
       ? ` · ${story.interruptions.length} interruption${story.interruptions.length === 1 ? "" : "s"}`
@@ -822,11 +862,13 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     kind: "now",
     at: story.point.updatedAt,
     tone: bucketTone,
-    title: uransQueued
-      ? "NOW: URANS fast queued"
-      : `NOW: ${story.point.status}${cls ? ` · ${cls.state.replaceAll("_", " ")}` : ""}`,
+    title: archivePublicationPending
+      ? "NOW: processing verified evidence"
+      : uransQueued
+        ? "NOW: URANS fast queued"
+        : `NOW: ${story.point.status}${cls ? ` · ${cls.state.replaceAll("_", " ")}` : ""}`,
     detail: [evidence, closureLine].filter(Boolean).join(" — "),
-    whyLines: story.point.qualityWarnings,
+    whyLines: archivePublicationPending ? [] : story.point.qualityWarnings,
   });
   return events;
 }

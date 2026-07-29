@@ -34,6 +34,7 @@ describe("bucketOfPoint", () => {
     expect(bucketOfPoint("done", "rejected")).toBe("rejected");
     expect(bucketOfPoint("done", "needs_urans")).toBe("needs_urans");
     expect(bucketOfPoint("done", "accepted")).toBe("accepted");
+    expect(bucketOfPoint("done", "rejected", true)).toBe("evidence_processing");
     expect(bucketOfPoint("done", null)).toBe("other"); // unclassified stays honest
     expect(bucketOfPoint("derived", null)).toBe("other");
   });
@@ -84,6 +85,7 @@ describe("point filter query-param round-trip", () => {
       "failed",
       "rejected",
       "awaiting_urans",
+      "evidence_processing",
       "needs_review",
     ] as const) {
       const search = campaignPointsSearch(id, status);
@@ -104,6 +106,7 @@ describe("point filter query-param round-trip", () => {
 
   it("chip row exposes machine-owned states but not inactive review workflows", () => {
     expect(POINT_STATUS_CHIPS).toContain("awaiting_urans");
+    expect(POINT_STATUS_CHIPS).toContain("evidence_processing");
     expect(POINT_STATUS_CHIPS as readonly string[]).not.toContain(
       "needs_review",
     );
@@ -151,6 +154,13 @@ describe("statusChipDisplay", () => {
     expect(statusChipDisplay("rejected", null, "blocked")).toEqual({
       label: "critical recovery failure",
       tone: "red",
+    });
+  });
+
+  it("renders archive publication as neutral automatic processing", () => {
+    expect(statusChipDisplay("evidence_processing", null)).toEqual({
+      label: "processing verified evidence",
+      tone: "muted",
     });
   });
 
@@ -370,6 +380,34 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
 }
 
 describe("assembleTimeline", () => {
+  it("MUST-CATCH: a verified archive awaiting publication is neutral, automatic, and never rendered as rejected", () => {
+    const events = assembleTimeline(
+      storyPayload({
+        point: {
+          status: "done",
+          archivePublicationPending: true,
+          classification: {
+            state: "rejected",
+            reasons: ["legacy pre-publication classifier verdict"],
+            confidence: 1,
+            classifierVersion: "v3",
+          },
+        } as never,
+      }),
+    );
+    expect(events.at(-2)).toMatchObject({
+      kind: "classification",
+      tone: "muted",
+      title: "processing verified URANS evidence",
+    });
+    expect(events.at(-1)).toMatchObject({
+      kind: "now",
+      tone: "muted",
+      title: "NOW: processing verified evidence",
+      whyLines: [],
+    });
+  });
+
   it("MUST-CATCH: a rejected stalled RANS row with scheduled PRECALC tells the operator the automatic next step", () => {
     const events = assembleTimeline(
       storyPayload({

@@ -133,6 +133,7 @@ const CHIP_TONES: Record<string, StatusChipTone> = {
   all: "muted",
   failed: "red",
   awaiting_urans: "violet",
+  evidence_processing: "muted",
   needs_review: "red",
   accepted: "teal",
   needs_urans: "amber",
@@ -143,6 +144,7 @@ const CHIP_LABELS: Record<string, string> = {
   all: "all",
   failed: "failed",
   awaiting_urans: "awaiting FAST URANS",
+  evidence_processing: "processing verified evidence",
   needs_review: "unavailable",
   accepted: "accepted",
   needs_urans: "needs URANS",
@@ -227,6 +229,23 @@ function classificationChip(item: PointHistoryItem) {
         }}
       >
         {src}
+      </span>
+    );
+  }
+  if (item.archivePublicationPending || item.bucket === "evidence_processing") {
+    return (
+      <span
+        style={{
+          fontFamily: MONO,
+          fontSize: 9,
+          color: C.muted,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 999,
+          padding: "2px 7px",
+          whiteSpace: "nowrap",
+        }}
+      >
+        automatic
       </span>
     );
   }
@@ -586,6 +605,7 @@ export function PointHistoryPanel() {
   // consumed its automatic retry or predates the feature).
   const retryEligible =
     story != null &&
+    !story.point.archivePublicationPending &&
     story.point.status === "failed" &&
     story.point.regime !== "urans" &&
     !(story.point.fidelity ?? "").startsWith("urans") &&
@@ -595,6 +615,7 @@ export function PointHistoryPanel() {
   // (server-derived `continuable` — never guessed client-side).
   const continueEligible =
     story != null &&
+    !story.point.archivePublicationPending &&
     story.point.continuable &&
     story.point.continuationResultAttemptId != null;
   // Legacy requeue stays ONLY for red needs-review rejected rows that cannot
@@ -602,6 +623,7 @@ export function PointHistoryPanel() {
   // rescheduled rejected rows get NO repair verbs — stage 2 handles them.
   const requeueRejectedEligible =
     story != null &&
+    !story.point.archivePublicationPending &&
     !continueEligible &&
     story.point.status === "done" &&
     story.point.classification?.state === "rejected" &&
@@ -789,10 +811,14 @@ export function PointHistoryPanel() {
             bucket: bucketOfPoint(
               story.point.status,
               story.point.classification?.state ?? null,
+              Boolean(story.point.archivePublicationPending),
             ),
             classificationState: story.point.classification?.state ?? null,
             reviewBucket: story.point.reviewBucket,
             workDisposition: story.point.workDisposition,
+            archivePublicationPending: Boolean(
+              story.point.archivePublicationPending,
+            ),
             continuable: story.point.continuable,
           }
         : openItem;
@@ -804,6 +830,12 @@ export function PointHistoryPanel() {
   const openFinalVerificationRequest = openItem
     ? openRequestFor(openItem.aoaDeg, "full")
     : null;
+  const automaticEvidenceProcessing = Boolean(
+    storyMatchesOpen
+      ? story.point.archivePublicationPending
+      : openItem?.archivePublicationPending ||
+          openItem?.bucket === "evidence_processing",
+  );
 
   return (
     <div data-testid="point-history-panel" style={{ display: "grid", gap: 12 }}>
@@ -1122,104 +1154,117 @@ export function PointHistoryPanel() {
                   >
                     {ago(item.lastActivityAt)}
                   </span>
-                  <button
-                    type="button"
-                    data-testid="point-row-overflow"
-                    data-urans-menu
-                    aria-label={`Operator overrides for ${item.airfoilName} α ${f(item.aoaDeg, 1)}°`}
-                    title="Operator overrides"
-                    aria-expanded={rowMenuKey === item.rowKey}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setRowMenuKey((k) =>
-                        k === item.rowKey ? null : item.rowKey,
-                      );
-                    }}
-                    style={{ ...smallBtn, padding: "2px 6px", lineHeight: 1.2 }}
-                  >
-                    ⋯
-                  </button>
-                </div>
-                {rowMenuKey === item.rowKey && (
-                  <div
-                    data-urans-menu
-                    data-testid="point-row-menu"
-                    style={{
-                      position: "absolute",
-                      right: 8,
-                      top: "calc(100% - 4px)",
-                      zIndex: 30,
-                      minWidth: 230,
-                      background: C.popover,
-                      border: `1px solid ${C.stroke}`,
-                      borderRadius: 8,
-                      boxShadow: `0 12px 28px ${C.shadow}`,
-                      padding: 6,
-                      display: "grid",
-                      gap: 4,
-                    }}
-                  >
-                    <div
-                      style={{
-                        padding: "2px 3px 4px",
-                        fontFamily: MONO,
-                        fontSize: 8.5,
-                        color: C.dim,
-                        letterSpacing: "0.08em",
-                      }}
-                    >
-                      OPERATOR OVERRIDE
-                    </div>
+                  {item.archivePublicationPending ||
+                  item.bucket === "evidence_processing" ? (
+                    <span aria-hidden />
+                  ) : (
                     <button
                       type="button"
-                      data-testid="point-row-request-final-verification"
-                      disabled={
-                        item.kind !== "result" ||
-                        item.revisionId == null ||
-                        uransBusy
-                      }
-                      title={
-                        item.kind === "derived"
-                          ? "Derived mirror — request final verification on the +α source point instead"
-                          : item.revisionId == null
-                            ? "No pinned setup revision recorded for this point — cannot request final verification"
-                            : "Request final verification; FAST URANS runs first automatically when needed"
-                      }
-                      onClick={() =>
-                        void doRequestFinalVerification(
-                          {
-                            airfoilId: item.airfoilId,
-                            revisionId: item.revisionId!,
-                            aoaDeg: item.aoaDeg,
-                            label: item.airfoilName,
-                          },
-                          {
-                            refreshStory:
-                              openItemRef.current?.rowKey === item.rowKey
-                                ? item
-                                : undefined,
-                          },
-                        )
-                      }
+                      data-testid="point-row-overflow"
+                      data-urans-menu
+                      aria-label={`Operator overrides for ${item.airfoilName} α ${f(item.aoaDeg, 1)}°`}
+                      title="Operator overrides"
+                      aria-expanded={rowMenuKey === item.rowKey}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRowMenuKey((k) =>
+                          k === item.rowKey ? null : item.rowKey,
+                        );
+                      }}
                       style={{
                         ...smallBtn,
-                        width: "100%",
-                        textAlign: "left",
-                        color:
-                          item.kind === "result" && item.revisionId != null
-                            ? C.teal
-                            : C.dimmest,
-                        borderColor:
-                          item.kind === "result" && item.revisionId != null
-                            ? C.tealBorder
-                            : C.stroke,
-                        opacity: uransBusy ? 0.6 : 1,
+                        padding: "2px 6px",
+                        lineHeight: 1.2,
                       }}
                     >
-                      {uransBusy ? "requesting…" : "request final verification"}
+                      ⋯
                     </button>
-                  </div>
-                )}
+                  )}
+                </div>
+                {rowMenuKey === item.rowKey &&
+                  !item.archivePublicationPending &&
+                  item.bucket !== "evidence_processing" && (
+                    <div
+                      data-urans-menu
+                      data-testid="point-row-menu"
+                      style={{
+                        position: "absolute",
+                        right: 8,
+                        top: "calc(100% - 4px)",
+                        zIndex: 30,
+                        minWidth: 230,
+                        background: C.popover,
+                        border: `1px solid ${C.stroke}`,
+                        borderRadius: 8,
+                        boxShadow: `0 12px 28px ${C.shadow}`,
+                        padding: 6,
+                        display: "grid",
+                        gap: 4,
+                      }}
+                    >
+                      <div
+                        style={{
+                          padding: "2px 3px 4px",
+                          fontFamily: MONO,
+                          fontSize: 8.5,
+                          color: C.dim,
+                          letterSpacing: "0.08em",
+                        }}
+                      >
+                        OPERATOR OVERRIDE
+                      </div>
+                      <button
+                        type="button"
+                        data-testid="point-row-request-final-verification"
+                        disabled={
+                          item.kind !== "result" ||
+                          item.revisionId == null ||
+                          uransBusy
+                        }
+                        title={
+                          item.kind === "derived"
+                            ? "Derived mirror — request final verification on the +α source point instead"
+                            : item.revisionId == null
+                              ? "No pinned setup revision recorded for this point — cannot request final verification"
+                              : "Request final verification; FAST URANS runs first automatically when needed"
+                        }
+                        onClick={() =>
+                          void doRequestFinalVerification(
+                            {
+                              airfoilId: item.airfoilId,
+                              revisionId: item.revisionId!,
+                              aoaDeg: item.aoaDeg,
+                              label: item.airfoilName,
+                            },
+                            {
+                              refreshStory:
+                                openItemRef.current?.rowKey === item.rowKey
+                                  ? item
+                                  : undefined,
+                            },
+                          )
+                        }
+                        style={{
+                          ...smallBtn,
+                          width: "100%",
+                          textAlign: "left",
+                          color:
+                            item.kind === "result" && item.revisionId != null
+                              ? C.teal
+                              : C.dimmest,
+                          borderColor:
+                            item.kind === "result" && item.revisionId != null
+                              ? C.tealBorder
+                              : C.stroke,
+                          opacity: uransBusy ? 0.6 : 1,
+                        }}
+                      >
+                        {uransBusy
+                          ? "requesting…"
+                          : "request final verification"}
+                      </button>
+                    </div>
+                  )}
               </div>
             ))}
           </div>
@@ -1418,144 +1463,147 @@ export function PointHistoryPanel() {
                   detail page ↗
                 </Link>
               </div>
-              {(openItem.kind !== "derived" ||
-                requeueEligible ||
-                continueEligible) && (
-                <details
-                  data-testid="point-operator-overrides"
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 9.5,
-                    color: C.dim,
-                  }}
-                >
-                  <summary
+              {!automaticEvidenceProcessing &&
+                (openItem.kind !== "derived" ||
+                  requeueEligible ||
+                  continueEligible) && (
+                  <details
+                    data-testid="point-operator-overrides"
                     style={{
-                      width: "fit-content",
-                      cursor: "pointer",
-                      letterSpacing: "0.08em",
+                      fontFamily: MONO,
+                      fontSize: 9.5,
+                      color: C.dim,
                     }}
                   >
-                    OPERATOR DIAGNOSTICS &amp; OVERRIDES
-                  </summary>
-                  <div
-                    style={{
-                      display: "grid",
-                      gap: 7,
-                      marginTop: 7,
-                      padding: 8,
-                      border: `1px solid ${C.borderSoft}`,
-                      borderRadius: 7,
-                      background: C.panel2,
-                    }}
-                  >
-                    <span style={{ color: C.muted }}>
-                      Normal recovery and final verification are automatic.
-                    </span>
-                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                      {requeueEligible && (
-                        <button
-                          type="button"
-                          data-testid="point-requeue"
-                          disabled={requeueBusy}
-                          title={
-                            retryEligible
-                              ? "This crash survived its automatic retry — send it back to the solve queue for a fresh attempt"
-                              : "Reset this point's rejected evidence back to the solve queue"
-                          }
-                          onClick={() => void doRequeue()}
-                          style={{
-                            ...smallBtn,
-                            color: C.redText,
-                            borderColor: "rgba(245, 101, 101, 0.4)",
-                            opacity: requeueBusy ? 0.6 : 1,
-                          }}
-                        >
-                          {requeueBusy
-                            ? "requeueing…"
-                            : retryEligible
-                              ? "Retry"
-                              : "requeue point"}
-                        </button>
-                      )}
-                      {continueEligible &&
-                        ([2, 6, 24] as const).map((h) => (
+                    <summary
+                      style={{
+                        width: "fit-content",
+                        cursor: "pointer",
+                        letterSpacing: "0.08em",
+                      }}
+                    >
+                      OPERATOR DIAGNOSTICS &amp; OVERRIDES
+                    </summary>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: 7,
+                        marginTop: 7,
+                        padding: 8,
+                        border: `1px solid ${C.borderSoft}`,
+                        borderRadius: 7,
+                        background: C.panel2,
+                      }}
+                    >
+                      <span style={{ color: C.muted }}>
+                        Normal recovery and final verification are automatic.
+                      </span>
+                      <div
+                        style={{ display: "flex", gap: 6, flexWrap: "wrap" }}
+                      >
+                        {requeueEligible && (
                           <button
-                            key={h}
                             type="button"
-                            data-testid={`point-continue-${h}h`}
-                            disabled={continueBusy}
-                            title={`This URANS solve has restartable saved case state — resume it from the last written time step with +${h} h of budget`}
-                            onClick={() => void doContinue(h)}
+                            data-testid="point-requeue"
+                            disabled={requeueBusy}
+                            title={
+                              retryEligible
+                                ? "This crash survived its automatic retry — send it back to the solve queue for a fresh attempt"
+                                : "Reset this point's rejected evidence back to the solve queue"
+                            }
+                            onClick={() => void doRequeue()}
                             style={{
                               ...smallBtn,
-                              color: C.violet,
-                              borderColor: C.violetBorder,
-                              opacity: continueBusy ? 0.6 : 1,
+                              color: C.redText,
+                              borderColor: "rgba(245, 101, 101, 0.4)",
+                              opacity: requeueBusy ? 0.6 : 1,
                             }}
                           >
-                            {continueBusy ? "queueing…" : `Continue +${h}h`}
+                            {requeueBusy
+                              ? "requeueing…"
+                              : retryEligible
+                                ? "Retry"
+                                : "requeue point"}
                           </button>
-                        ))}
-                      {openItem.kind !== "derived" && (
-                        <button
-                          type="button"
-                          data-testid="point-request-final-verification"
-                          disabled={
-                            openItem.revisionId == null ||
-                            !!openFinalVerificationRequest ||
-                            uransBusy
-                          }
-                          title={
-                            openFinalVerificationRequest
-                              ? `An open final-verification request already covers this ${openFinalVerificationRequest.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
-                              : openItem.revisionId == null
-                                ? "No pinned setup revision recorded for this point — cannot request final verification"
-                                : "Request final verification; FAST URANS runs first automatically when needed"
-                          }
-                          onClick={() =>
-                            void doRequestFinalVerification(
-                              {
-                                airfoilId: openItem.airfoilId,
-                                revisionId: openItem.revisionId!,
-                                aoaDeg: openItem.aoaDeg,
-                                label: openItem.airfoilName,
-                              },
-                              { refreshStory: openItem },
-                            )
-                          }
-                          style={{
-                            ...smallBtn,
-                            color: openFinalVerificationRequest
-                              ? C.dim
-                              : C.teal,
-                            borderColor: openFinalVerificationRequest
-                              ? C.stroke
-                              : C.tealBorder,
-                            opacity: uransBusy ? 0.6 : 1,
-                            cursor:
-                              openItem.revisionId != null &&
-                              !openFinalVerificationRequest &&
-                              !uransBusy
-                                ? "pointer"
-                                : "not-allowed",
-                          }}
-                        >
-                          {openFinalVerificationRequest
-                            ? `final verification requested (${openFinalVerificationRequest.state}${openFinalVerificationRequest.aoaDeg == null ? " · whole polar" : ""})`
-                            : "request final verification"}
-                        </button>
+                        )}
+                        {continueEligible &&
+                          ([2, 6, 24] as const).map((h) => (
+                            <button
+                              key={h}
+                              type="button"
+                              data-testid={`point-continue-${h}h`}
+                              disabled={continueBusy}
+                              title={`This URANS solve has restartable saved case state — resume it from the last written time step with +${h} h of budget`}
+                              onClick={() => void doContinue(h)}
+                              style={{
+                                ...smallBtn,
+                                color: C.violet,
+                                borderColor: C.violetBorder,
+                                opacity: continueBusy ? 0.6 : 1,
+                              }}
+                            >
+                              {continueBusy ? "queueing…" : `Continue +${h}h`}
+                            </button>
+                          ))}
+                        {openItem.kind !== "derived" && (
+                          <button
+                            type="button"
+                            data-testid="point-request-final-verification"
+                            disabled={
+                              openItem.revisionId == null ||
+                              !!openFinalVerificationRequest ||
+                              uransBusy
+                            }
+                            title={
+                              openFinalVerificationRequest
+                                ? `An open final-verification request already covers this ${openFinalVerificationRequest.aoaDeg == null ? "cell (whole polar)" : "angle"} — requests are idempotent`
+                                : openItem.revisionId == null
+                                  ? "No pinned setup revision recorded for this point — cannot request final verification"
+                                  : "Request final verification; FAST URANS runs first automatically when needed"
+                            }
+                            onClick={() =>
+                              void doRequestFinalVerification(
+                                {
+                                  airfoilId: openItem.airfoilId,
+                                  revisionId: openItem.revisionId!,
+                                  aoaDeg: openItem.aoaDeg,
+                                  label: openItem.airfoilName,
+                                },
+                                { refreshStory: openItem },
+                              )
+                            }
+                            style={{
+                              ...smallBtn,
+                              color: openFinalVerificationRequest
+                                ? C.dim
+                                : C.teal,
+                              borderColor: openFinalVerificationRequest
+                                ? C.stroke
+                                : C.tealBorder,
+                              opacity: uransBusy ? 0.6 : 1,
+                              cursor:
+                                openItem.revisionId != null &&
+                                !openFinalVerificationRequest &&
+                                !uransBusy
+                                  ? "pointer"
+                                  : "not-allowed",
+                            }}
+                          >
+                            {openFinalVerificationRequest
+                              ? `final verification requested (${openFinalVerificationRequest.state}${openFinalVerificationRequest.aoaDeg == null ? " · whole polar" : ""})`
+                              : "request final verification"}
+                          </button>
+                        )}
+                      </div>
+                      {requeueNotice && (
+                        <div style={{ color: C.amber }}>{requeueNotice}</div>
+                      )}
+                      {uransNotice && openItem && (
+                        <div style={{ color: C.amber }}>{uransNotice}</div>
                       )}
                     </div>
-                    {requeueNotice && (
-                      <div style={{ color: C.amber }}>{requeueNotice}</div>
-                    )}
-                    {uransNotice && openItem && (
-                      <div style={{ color: C.amber }}>{uransNotice}</div>
-                    )}
-                  </div>
-                </details>
-              )}
+                  </details>
+                )}
             </div>
 
             {/* body */}

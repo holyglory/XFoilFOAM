@@ -10,7 +10,14 @@ import pytest
 from airfoilfoam import pipeline
 from airfoilfoam.cancellation import JobCancelled
 from airfoilfoam.postprocess.unsteady import (
+    FINAL_CLEAN_CYCLE_MINIMUM,
+    FAST_CLEAN_CYCLE_MINIMUM,
     ForceHistory,
+    additional_periods_for_clean_suffix,
+    audit_period_cycles,
+    clean_cycle_recovery_exhausted,
+    clean_periodic_tail,
+    required_clean_cycle_count,
     dominant_frequency,
     estimate_period,
     force_history,
@@ -18,6 +25,7 @@ from airfoilfoam.postprocess.unsteady import (
     shedding_frequency_band,
     stable_two_period_window,
     strouhal,
+    with_clean_cycle_recovery_progress,
 )
 from airfoilfoam.postprocess.images import find_all_vtus, select_vtus
 from airfoilfoam.models import CaseSpec, FailureDisposition
@@ -240,6 +248,497 @@ def test_force_history_publishes_only_clean_periods_after_late_startup_burst(
     assert hist.window_start is not None and hist.window_start >= 1.69
     assert max(hist.cl) < 0.46
     assert min(hist.cl) > 0.34
+
+
+def test_clean_periodic_tail_finds_short_suffix_after_long_corrupt_history():
+    """MUST-CATCH: continuation history length cannot hide a clean final wake.
+
+    The former shortest candidate was 2.5% of the complete trajectory. After
+    many same-case continuations that can still include dozens of corrupt
+    startup cycles even though the final five periods are clean and sufficient
+    for certification.
+    """
+    dt = 0.001
+    end = 40.0
+    period = 0.125
+    clean_start = end - 5.5 * period
+    times = np.arange(0.0, end + dt / 2.0, dt)
+    cl = 0.4 + 0.18 * np.sin(2.0 * math.pi * 1.3 * times) + 0.004 * times
+    cd = 0.04 + 0.08 * np.sin(2.0 * math.pi * 1.7 * times + 0.3) + 0.001 * times
+    cm = -0.03 + 0.06 * np.sin(2.0 * math.pi * 0.9 * times + 0.8) - 0.001 * times
+    clean = times >= clean_start
+    cl[clean] = 0.4 + 0.05 * np.sin(2.0 * math.pi * 8.0 * times[clean])
+    cd[clean] = 0.03 + 0.006 * np.sin(
+        2.0 * math.pi * 8.0 * times[clean] + 0.5
+    )
+    cm[clean] = -0.05 + 0.003 * np.sin(
+        2.0 * math.pi * 8.0 * times[clean] + 0.9
+    )
+
+    tail = clean_periodic_tail(
+        times,
+        cl,
+        cd,
+        cm,
+        speed=20.0,
+        chord=1.0,
+        required_cycles=4.5,
+    )
+
+    assert tail is not None
+    assert tail.estimate.period_s == pytest.approx(period, rel=0.03)
+    assert tail.series[0][0] >= clean_start
+    assert tail.series[0][-1] - tail.series[0][0] == pytest.approx(
+        4.5 * period,
+        rel=0.03,
+    )
+    assert max(tail.series[1]) < 0.46
+    assert min(tail.series[1]) > 0.34
+
+
+def _clean_cycle_series(
+    *,
+    period: float = 0.2,
+    cycles: int = 7,
+    dt: float = 0.001,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A resolved three-channel periodic wake for clean-cycle fixtures."""
+    times = np.arange(0.0, cycles * period + dt / 2.0, dt)
+    phase = 2.0 * math.pi * times / period
+    return (
+        times,
+        0.70 + 0.08 * np.sin(phase),
+        0.030 + 0.010 * np.sin(phase + 0.6),
+        -0.050 + 0.004 * np.sin(phase + 1.1),
+    )
+
+
+def test_clean_cycle_audit_discards_a_broken_early_period_but_certifies_suffix():
+    """MUST-CATCH: an old startup impulse cannot poison a clean final wake."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period)
+    # One isolated early solver step, intentionally much larger than the
+    # waveform so the hard impulse gate—not a changed physical mean—owns it.
+    cl[np.argmin(abs(times - 0.11))] = 4.0
+
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+    )
+
+    assert audit.certified
+    assert audit.required_clean_cycles == FAST_CLEAN_CYCLE_MINIMUM
+    assert audit.cycles[0].disposition == "hard_corrupt"
+    assert "impulsive discontinuity" in audit.cycles[0].hard_reasons
+    assert audit.terminal_clean_cycles >= 3
+
+
+def test_clean_cycle_audit_selects_only_the_fixed_publication_window():
+    """Extra clean tail evidence must not silently widen FAST's mean window."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period, cycles=7)
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+    )
+
+    assert audit.certified
+    assert audit.terminal_clean_cycles >= 5
+    assert audit.terminal_clean_start == pytest.approx(0.0)
+    # The exact published coefficients use only the last three clean cycles;
+    # the older clean tail remains audited provenance, not an implicit average.
+    assert audit.selected_start == pytest.approx(0.8)
+
+
+def test_clean_cycle_audit_requires_a_contiguous_terminal_suffix():
+    """MUST-CATCH: a broken last period requests recovery, not publication."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period)
+    cl[np.argmin(abs(times - 1.31))] = 4.0
+
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+    )
+
+    assert not audit.certified
+    assert audit.terminal_clean_cycles == 0
+    assert audit.cycles[-1].disposition == "hard_corrupt"
+    # This fixture already contains seven measured FAST periods.  A damaged
+    # final period normally earns a three-period repair chunk, but the
+    # physical FAST ceiling is nine, so only two more periods are admissible.
+    assert additional_periods_for_clean_suffix(
+        audit, fidelity="fast", required_cycles=3
+    ) == 2
+
+
+def test_clean_tail_does_not_normalise_away_a_terminal_nonfinite_sample():
+    """MUST-CATCH: a NaN in the final cycle cannot be interpolated away.
+
+    ``clean_periodic_tail`` needs a normalised series for period estimation,
+    but that normalisation must not turn a raw terminal defect into a smooth
+    gap-free waveform.  The raw row stays immutable; the certification view
+    simply rejects its owning period and asks the controller for recovery.
+    """
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period)
+    cl[np.argmin(abs(times - 1.31))] = math.nan
+    frames = np.arange(0.0, times[-1] + 0.0005, 0.005)
+
+    tail = clean_periodic_tail(
+        times,
+        cl,
+        cd,
+        cm,
+        speed=20.0,
+        chord=1.0,
+        required_cycles=3,
+        fidelity="fast",
+        frame_times=frames,
+        min_frames_per_cycle=20,
+    )
+
+    assert tail is None
+
+
+def test_clean_cycle_audit_detects_a_single_step_at_the_20_sample_floor():
+    """The minimum write cadence must not create an impulse blind spot."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period, dt=0.01)
+    cl[np.argmin(abs(times - 1.31))] = 4.0
+
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+    )
+
+    assert audit.cycles[-1].samples >= 20
+    assert "impulsive discontinuity" in audit.cycles[-1].hard_reasons
+
+
+def _period_boundary_sample_series(
+    *,
+    interior_samples: tuple[int, int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Three 1-second cycles with exact shared time boundaries.
+
+    The 58-row variant was the old false-pass shape: inclusive adjacent
+    windows counted each boundary twice and reported 20 samples in all three
+    cycles. The 60-row shape independently owns exactly 20 rows per cycle.
+    """
+    times: list[float] = [0.0]
+    for cycle, count in enumerate(interior_samples):
+        times.extend(
+            cycle + (index + 1) / (count + 1)
+            for index in range(count)
+        )
+        if cycle < 2:
+            times.append(float(cycle + 1))
+    times.append(3.0)
+    raw = np.asarray(sorted(set(times)), dtype=float)
+    phase = 2.0 * math.pi * raw
+    return (
+        raw,
+        0.70 + 0.08 * np.sin(phase),
+        0.030 + 0.010 * np.sin(phase + 0.6),
+        -0.050 + 0.004 * np.sin(phase + 1.1),
+    )
+
+
+def test_clean_cycle_sample_floor_does_not_double_count_shared_period_boundaries():
+    """MUST-CATCH: 58 distinct rows cannot certify three 20-sample cycles."""
+    sparse = _period_boundary_sample_series(interior_samples=(18, 18, 18))
+    sparse_audit = audit_period_cycles(
+        *sparse,
+        1.0,
+        fidelity="fast",
+        required_cycles=3,
+        min_frames_per_cycle=0,
+    )
+    assert [cycle.samples for cycle in sparse_audit.cycles] == [19, 19, 20]
+    assert not sparse_audit.certified
+    assert all(
+        "samples " in reason
+        for cycle in sparse_audit.cycles[:2]
+        for reason in cycle.hard_reasons
+        if reason.startswith("samples ")
+    )
+
+    resolved = _period_boundary_sample_series(interior_samples=(19, 19, 18))
+    resolved_audit = audit_period_cycles(
+        *resolved,
+        1.0,
+        fidelity="fast",
+        required_cycles=3,
+        min_frames_per_cycle=0,
+    )
+    assert [cycle.samples for cycle in resolved_audit.cycles] == [20, 20, 20]
+    assert resolved_audit.certified
+
+
+def test_clean_cycle_audit_catches_cm_only_nonrepeatable_cycle():
+    """Cl/Cd can be smooth while a moment coefficient is still unsettled."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period)
+    final = times >= 1.2
+    # Double only the Cm waveform in the final cycle. It stays continuous at
+    # the endpoints, so it must be a soft repeatability verdict rather than a
+    # manufactured sharp-step false positive.
+    cm[final] = -0.050 + 0.008 * np.sin(
+        2.0 * math.pi * times[final] / period + 1.1
+    )
+
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+    )
+
+    assert not audit.certified
+    assert audit.cycles[-1].disposition == "settling_outlier"
+    assert any(reason.startswith("cm ") for reason in audit.cycles[-1].soft_reasons)
+    assert audit.cycles[-1].cl_shape_error < 0.02
+    assert audit.cycles[-1].cd_shape_error < 0.02
+
+
+def test_clean_cycle_audit_marks_an_isolated_high_frequency_burst_hard():
+    """A smooth high-frequency numerical burst is not a resolved wake shape."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period)
+    middle = (times >= 0.6) & (times <= 0.8)
+    # The burst is continuous at cycle boundaries and has no one-row jump.
+    # It therefore exercises the independent spectral hard-corruption guard.
+    cl[middle] += 0.05 * np.sin(2.0 * math.pi * 18.0 * times[middle] / period)
+
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+    )
+
+    burst = audit.cycles[3]
+    assert burst.disposition == "hard_corrupt"
+    assert "cl high-frequency burst" in burst.hard_reasons
+    # Later clean cycles remain valid; an old burst cannot force a needless
+    # same-case rerun once a contiguous terminal certificate exists.
+    assert audit.certified
+
+
+def test_clean_cycle_audit_requires_frames_in_every_selected_cycle():
+    """Twenty frames in one period cannot subsidize an empty neighbour."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period)
+    # Six well-resolved cycles and a deliberately sparse final one.
+    frames = np.concatenate(
+        (
+            np.arange(0.0, 1.2, 0.005),
+            np.array([1.23, 1.31, 1.39]),
+        )
+    )
+
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+        frame_times=frames,
+        min_frames_per_cycle=20,
+    )
+
+    assert not audit.certified
+    assert audit.cycles[-1].disposition == "hard_corrupt"
+    assert any(reason.startswith("frames ") for reason in audit.cycles[-1].hard_reasons)
+
+
+def test_clean_cycle_floors_and_adaptive_guard_chunk_are_tier_specific():
+    assert required_clean_cycle_count(fidelity="fast", required_cycles=2.0) == 3
+    assert required_clean_cycle_count(fidelity="full", required_cycles=3.0) == 5
+    assert FAST_CLEAN_CYCLE_MINIMUM == 3
+    assert FINAL_CLEAN_CYCLE_MINIMUM == 5
+
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period, cycles=3)
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="full",
+        required_cycles=3,
+    )
+    assert audit.terminal_clean_cycles == 3
+    assert not audit.certified
+    assert additional_periods_for_clean_suffix(
+        audit, fidelity="full", required_cycles=3
+    ) == 2
+    assert additional_periods_for_clean_suffix(
+        audit, fidelity="fast", required_cycles=3, borderline=True
+    ) == 3
+
+
+def test_clean_cycle_recovery_uses_only_the_explicit_tier_caps():
+    """MUST-CATCH: seven clean periods do not prematurely stop recovery."""
+    period = 0.2
+
+    def audit_for(*, cycles: int, fidelity: str):
+        times, cl, cd, cm = _clean_cycle_series(period=period, cycles=cycles)
+        return audit_period_cycles(
+            times,
+            cl,
+            cd,
+            cm,
+            period,
+            fidelity=fidelity,
+            required_cycles=3,
+        )
+
+    # The former generic seven-cycle guard would have abandoned both of these
+    # before their approved FAST/FINAL recovery ceilings.
+    assert not clean_cycle_recovery_exhausted(audit_for(cycles=7, fidelity="fast"), fidelity="fast")
+    assert clean_cycle_recovery_exhausted(audit_for(cycles=9, fidelity="fast"), fidelity="fast")
+    assert not clean_cycle_recovery_exhausted(audit_for(cycles=9, fidelity="full"), fidelity="full")
+    assert clean_cycle_recovery_exhausted(audit_for(cycles=12, fidelity="full"), fidelity="full")
+
+
+def test_clean_cycle_recovery_cap_uses_authenticated_physical_progress_not_tail_length():
+    """A short candidate tail must not reset FINAL's 12-period ceiling."""
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period, cycles=3)
+    tail_audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="full",
+        required_cycles=5,
+    )
+    assert len(tail_audit.cycles) == 3
+    progressed = with_clean_cycle_recovery_progress(
+        tail_audit,
+        origin_time=0.0,
+        latest_time=12.0 * period,
+    )
+    assert progressed is not None
+    assert progressed.physical_periods == 12
+    assert clean_cycle_recovery_exhausted(progressed, fidelity="full")
+    assert (
+        additional_periods_for_clean_suffix(
+            progressed,
+            fidelity="full",
+            required_cycles=5,
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("fidelity", "cycles", "required_cycles", "expected"),
+    [
+        # A newly corrupt terminal period normally earns three periods, but
+        # the cap is physical: FAST 8/9 and FINAL 11/12 have only one period
+        # left to measure before the reducer must emit a critical exhaustion.
+        ("fast", 8, 3, 1),
+        ("full", 11, 5, 1),
+        ("fast", 9, 3, 0),
+        ("full", 12, 5, 0),
+    ],
+)
+def test_clean_cycle_recovery_chunk_never_crosses_remaining_tier_cap(
+    fidelity: str,
+    cycles: int,
+    required_cycles: int,
+    expected: int,
+):
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period, cycles=cycles)
+    # Break a sample well inside the final period so the audit owns an actual
+    # terminal corrupt cycle rather than a fabricated end-point ambiguity.
+    final_midpoint = (cycles - 0.45) * period
+    cl[np.argmin(abs(times - final_midpoint))] = 4.0
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+    )
+
+    assert len(audit.cycles) == cycles
+    assert not audit.cycles[-1].clean
+    assert additional_periods_for_clean_suffix(
+        audit,
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+    ) == expected
+
+
+def test_clean_periodic_tail_promotes_an_alternating_half_cycle_to_its_vector_repeat():
+    """A T/2 harmonic lock must not reject a wake that repeats every 2T."""
+    half_period = 0.2
+    times = np.arange(0.0, 2.0 + 0.0005, 0.001)
+    cycle = np.floor((times + 1e-9) / half_period).astype(int)
+    amplitude = np.where(cycle % 2 == 0, 0.08, 0.12)
+    phase = 2.0 * math.pi * times / half_period
+    cl = 0.70 + amplitude * np.sin(phase)
+    cd = 0.030 + 0.125 * amplitude * np.sin(phase + 0.6)
+    cm = -0.050 + 0.050 * amplitude * np.sin(phase + 1.1)
+
+    # The scalar Cl tracker reasonably sees the strong half-period harmonic.
+    # The vector cycle audit must then test 2T and choose the actual repeat.
+    initial = estimate_period(times, cl, speed=25.0, chord=1.0)
+    assert initial is not None
+    assert initial.period_s == pytest.approx(half_period, rel=0.02)
+
+    tail = clean_periodic_tail(
+        times,
+        cl,
+        cd,
+        cm,
+        speed=25.0,
+        chord=1.0,
+        required_cycles=3,
+        fidelity="fast",
+    )
+
+    assert tail is not None
+    assert tail.cadence_adjusted
+    assert tail.estimate.period_s == pytest.approx(2.0 * half_period, rel=0.02)
+    assert tail.clean_cycles >= 3
 
 
 def test_integer_period_window_uses_final_whole_periods():

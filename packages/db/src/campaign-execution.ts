@@ -14,7 +14,7 @@ import {
   DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
   POLAR_FIT_VERSION,
 } from "@aerodb/core";
-import { and, asc, desc, eq, sql, type SQLWrapper } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql, type SQLWrapper } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
@@ -642,7 +642,10 @@ function dedupeProgressKeys(
  *                 obligated cell count, not just still-open cells)
  *   - solved:     terminal, non-derived, result.status='done' AND an explicit
  *                 usable classification (accepted / needs_urans /
- *                 superseded_by_urans); unclassified evidence fails closed
+ *                 superseded_by_urans), except an exact URANS archive still
+ *                 owned by the durable publication queue; that physical cell
+ *                 belongs only to awaiting_archive_reduction until selection
+ *                 settles. Unclassified evidence otherwise fails closed.
  *   - blocked:    physical cell whose bounded PRECALC obligation is terminal
  *                 blocked, plus terminal unclassified/unrecognized evidence;
  *                 this bucket takes precedence over failed/rejected. While an
@@ -969,6 +972,81 @@ const PRECALC_BLOCKED_ENGINE_SUBMIT_SQL = sql`(
   )
 )`;
 
+/**
+ * A completed URANS physical generation whose verified GCS archive is still
+ * owned by automatic publication/recovery.  The physical result need not be
+ * the result row's current scalar generation yet: a valid RANS polar remains
+ * selected until the archive-derived URANS interpretation is accepted.  This
+ * is intentionally independent
+ * from `result_classifications`: the classifier remains fail-closed for polar
+ * fitting, while campaign/UI state must not turn an ordinary publication wait
+ * into rejected/blocked work or issue another URANS solve.
+ *
+ * Every use below joins `results` as `r` and campaign points as `p`.
+ */
+const AWAITING_ARCHIVE_REDUCTION_SQL = sql`EXISTS (
+  SELECT 1
+  FROM result_archive_reduction_queue publication_queue
+  JOIN result_attempts publication_attempt
+    ON publication_attempt.id = publication_queue.result_attempt_id
+   AND publication_attempt.result_id = publication_queue.result_id
+  JOIN solver_evidence_archives publication_archive
+    ON publication_archive.id = publication_queue.source_archive_id
+   AND publication_archive.result_id = r.id
+   AND publication_archive.result_attempt_id = publication_queue.result_attempt_id
+   AND publication_archive.state = 'current'
+  JOIN solver_evidence_blobs publication_blob
+    ON publication_blob.id = publication_archive.blob_id
+  WHERE publication_queue.result_id = r.id
+    AND publication_queue.source_archive_id = publication_archive.id
+    AND (
+      publication_queue.state IN ('pending', 'hydrating', 'continuation_required', 'rerun_required')
+      -- A missing archive only remains machine-owned when the durable
+      -- recovery ledger has accepted responsibility for the exact attempt.
+      OR (
+        publication_queue.state = 'missing_evidence'
+        AND EXISTS (
+          SELECT 1
+          FROM result_interpretation_recovery_actions publication_recovery
+          WHERE publication_recovery.result_id = publication_queue.result_id
+            AND publication_recovery.result_attempt_id = publication_queue.result_attempt_id
+            AND publication_recovery.source_archive_id = publication_queue.source_archive_id
+            AND publication_recovery.state IN (
+              'pending', 'routing', 'waiting_for_precalc',
+              'continuation_routed', 'fresh_rerun_routed'
+            )
+        )
+      )
+    )
+    AND publication_attempt.status = 'done'
+    AND publication_attempt.source = 'solved'
+    AND publication_attempt.evidence_payload ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+    AND (
+      (publication_attempt.regime = 'urans' AND publication_attempt.unsteady IN (TRUE, FALSE))
+      OR (publication_attempt.regime = 'rans' AND publication_attempt.unsteady = FALSE)
+    )
+    AND publication_blob.backend = 'gcs'
+    AND publication_blob.compression = 'zstd'
+    AND publication_blob.mime_type = 'application/zstd'
+    AND btrim(COALESCE(publication_blob.bucket, '')) <> ''
+    AND publication_blob.generation ~ '^[1-9][0-9]{0,19}$'
+    AND publication_blob."verifiedAt" IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM result_canonical_selections selected_publication
+      JOIN result_interpretations selected_interpretation
+        ON selected_interpretation.id = selected_publication.result_interpretation_id
+      WHERE selected_publication.result_id = r.id
+        AND selected_publication.result_attempt_id = publication_queue.result_attempt_id
+        AND selected_interpretation.result_id = r.id
+        AND selected_interpretation.result_attempt_id = publication_queue.result_attempt_id
+        AND selected_interpretation.source = 'archive_backfill'
+        AND selected_interpretation.state = 'accepted'
+        AND selected_interpretation.source_archive_id = publication_archive.id
+        AND selected_interpretation.reducer_version_id = publication_queue.reducer_version_id
+    )
+)`;
+
 /** The canonical terminal blocked predicate is shared by the headline count
  * and every reason group. The catch-all group below makes those groups exactly
  * exhaustive without turning ordinary pending work into a terminal reason. */
@@ -983,6 +1061,7 @@ const CANONICAL_BLOCKED_SQL = sql`(
           (${TERMINAL_RANS_MACHINE_BLOCKER_SQL})
           OR (
             r.status = 'done'
+            AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL})
             AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
           )
         )
@@ -994,6 +1073,7 @@ const CANONICAL_BLOCKED_SQL = sql`(
           OR (r.status = 'failed' AND (${USER_TERMINAL_URANS_FIDELITY_SQL}))
           OR (
             r.status = 'done'
+            AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL})
             AND (rc.state IS NULL OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected'))
           )
         )
@@ -1031,18 +1111,19 @@ async function recomputeProgressForKeys(
     INSERT INTO sim_campaign_progress (
       campaign_id, condition_id, airfoil_id,
       requested, solved, failed, running, superseded, derived, rejected, blocked,
-      precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
+      awaiting_archive_reduction, precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
       blocked_engine_submit, blocked_other
     )
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}) AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND (${AWAITING_ARCHIVE_REDUCTION_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}))::int,
@@ -1069,6 +1150,7 @@ async function recomputeProgressForKeys(
       derived = excluded.derived,
       rejected = excluded.rejected,
       blocked = excluded.blocked,
+      awaiting_archive_reduction = excluded.awaiting_archive_reduction,
       precalc_mesh_repairing = excluded.precalc_mesh_repairing,
       blocked_mesh_quality = excluded.blocked_mesh_quality,
       blocked_precalc_exhausted = excluded.blocked_precalc_exhausted,
@@ -1076,6 +1158,35 @@ async function recomputeProgressForKeys(
       blocked_other = excluded.blocked_other,
       "updatedAt" = now()
   `);
+}
+
+/**
+ * Reconcile the exact campaign cells that reference a result after a
+ * non-solver publication transition (for example archive reduction selecting
+ * a URANS interpretation).  This avoids a campaign-wide scan for the normal
+ * two-item background reducer drain while ensuring the same read models never
+ * retain an old rejected counter after the durable queue advances.
+ */
+export async function refreshCampaignProgressForResultIds(
+  db: DB,
+  resultIds: Iterable<string>,
+): Promise<void> {
+  const ids = [...new Set(resultIds)].filter(Boolean);
+  if (!ids.length) return;
+  const rows = (await db
+    .select({
+      campaign_id: simCampaignPoints.campaignId,
+      condition_id: simCampaignPoints.conditionId,
+      airfoil_id: simCampaignPoints.airfoilId,
+    })
+    .from(simCampaignPoints)
+    .where(inArray(simCampaignPoints.resultId, ids))) as CampaignProgressKeyRow[];
+  const keys = dedupeProgressKeys(rows);
+  await recomputeProgressForKeys(db, keys);
+  await probeCampaignCompletions(
+    db,
+    keys.map((key) => key.campaign_id),
+  );
 }
 
 /** Recompute only progress rows whose canonical physical cell references one
@@ -1124,18 +1235,19 @@ export async function recomputeProgressForCampaign(
     INSERT INTO sim_campaign_progress (
       campaign_id, condition_id, airfoil_id,
       requested, solved, failed, running, superseded, derived, rejected, blocked,
-      precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
+      awaiting_archive_reduction, precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
       blocked_engine_submit, blocked_other
     )
     SELECT p.campaign_id, p.condition_id, p.airfoil_id,
            COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}) AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
+           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND (${AWAITING_ARCHIVE_REDUCTION_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
            COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}))::int,
@@ -1162,6 +1274,7 @@ export async function recomputeProgressForCampaign(
       derived = excluded.derived,
       rejected = excluded.rejected,
       blocked = excluded.blocked,
+      awaiting_archive_reduction = excluded.awaiting_archive_reduction,
       precalc_mesh_repairing = excluded.precalc_mesh_repairing,
       blocked_mesh_quality = excluded.blocked_mesh_quality,
       blocked_precalc_exhausted = excluded.blocked_precalc_exhausted,
@@ -1303,7 +1416,7 @@ export async function probeCampaignCompletion(
           AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
           AND p.derived_by_symmetry = false
           AND (
-            (p.state = 'terminal' AND r.status = 'done' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}) AND (
+            (p.state = 'terminal' AND r.status = 'done' AND NOT (${AWAITING_ARCHIVE_REDUCTION_SQL}) AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}) AND (
               rc.state = 'rejected'
               OR rc.state IS NULL
               OR rc.state NOT IN ('accepted', 'needs_urans', 'superseded_by_urans', 'rejected')
@@ -1388,6 +1501,23 @@ export async function probeCampaignCompletion(
           AND media_condition.status IN ('active', 'kept')
           AND NOT media_point.derived_by_symmetry
           AND repair.state IN ('pending', 'running', 'retry_wait')
+      ) OR EXISTS (
+        -- Archive reduction/recovery owns a completed physical generation.
+        -- Keep the campaign open until it selects the exact archive result or
+        -- reaches an explicit terminal condition; never turn this ordinary
+        -- machine wait into a user-facing rejection.
+        SELECT 1
+        FROM sim_campaign_points p
+        JOIN sim_campaign_conditions c ON c.id = p.condition_id
+        JOIN results r ON r.id = p.result_id
+        WHERE p.campaign_id = ${campaignId}
+          AND p.state = 'terminal'
+          AND NOT p.derived_by_symmetry
+          AND c.status IN ('active', 'kept')
+          AND c.generation = (
+            SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId}
+          )
+          AND (${AWAITING_ARCHIVE_REDUCTION_SQL})
       )) AS precalc_open,
       EXISTS (
         -- Fidelity ladder tier 3 (contract 7): open verify-queue items block

@@ -462,6 +462,22 @@ describe("solverWorkStateForPoint", () => {
     }
   });
 
+  it("MUST-CATCH: keeps verified archive publication machine-owned and neutral even when the scalar row is rejected or historically reviewed", () => {
+    expect(
+      solverWorkStateForPoint({
+        resultId: "archive-publication",
+        status: "done",
+        classificationState: "rejected",
+        regime: "rans",
+        fidelity: "rans",
+        reviewVerdict: "exclude",
+        mediaRepairState: "blocked",
+        precalcObligationState: "blocked",
+        archivePublicationPending: true,
+      }),
+    ).toBe("evidence_processing");
+  });
+
   it("never lets a legacy human waiver override the machine state", () => {
     expect(
       solverWorkStateForPoint({

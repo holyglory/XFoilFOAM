@@ -1,5 +1,30 @@
 # Completion Ledger
 
+- **Immutable clean-cycle interpretation rollout:** Solver attempts and their
+  generation-pinned GCS archives remain immutable while every RANS/URANS
+  reduction is recorded in an append-only interpretation ledger. FAST accepts
+  exactly the terminal 3 clean cycles and FINAL exactly 5; every selected cycle
+  requires 20 raw coefficient samples and 20 archived field frames. A damaged
+  terminal period can request only one to three additional physical periods,
+  capped at FAST 9 / FINAL 12 periods measured from authenticated transient
+  state. Current RANS without an all-channel 200-iteration hold proof routes to
+  targeted FAST URANS. Production still needs the guarded 0094–0097 migration,
+  matching engine/control-plane rollout after live CFD work drains, GCS-backed
+  interpretation backfill, and verification that raw hashes/attempts remain
+  unchanged while repaired projections select only the exact current archive.
+  Legacy URANS without a current verified archive must create one separately
+  leased fresh-FAST recovery receipt, never a fabricated continuation. Remove
+  this item only after a representative API/cache check and the historical run
+  prove no noisy prefix or capped trajectory publishes.
+  A current no-shedding URANS result is also evidence-gated: it needs a
+  versioned slow-wake certificate, at least 20 raw and transported samples,
+  finite all-channel statistics, and a time-weighted Cl/Cd/Cm witness that
+  recomputes exactly from the bounded force-history payload. It cannot publish
+  directly from an engine summary; only the matching verified GCS archive
+  reduction may select it. Production backfill must route malformed,
+  shortened, or witness-mismatched no-shedding history through the same
+  bounded recovery path before this item can close.
+
 - **Frame-evidence integrity and narrow modal navigation:** Exact production
   evidence proves the AG 455CT02R frames 15–17 Cl/Cd values are authentic; the
   apparent L/D corruption is a sub-percent instantaneous ratio ripple

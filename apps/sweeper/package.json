@@ -10,6 +10,8 @@
     "evidence-storage-backfill": "tsx src/evidence-storage-backfill.ts",
     "brokered-evidence-final-backfill": "tsx src/brokered-evidence-final-backfill.ts",
     "legacy-brokered-evidence-backfill": "tsx src/legacy-brokered-evidence-backfill.ts",
+    "result-interpretation-backfill": "tsx src/result-interpretation-backfill-cli.ts",
+    "legacy-archive-gap-recovery": "tsx src/legacy-urans-archive-gap-recovery-cli.ts",
     "precalc-final-owner-backfill": "tsx src/precalc-final-owner-backfill.ts",
     "canary-evidence-cleanup": "tsx src/canary-evidence-cleanup-cli.ts",
     "canary-evidence-ownership": "tsx src/canary-evidence-ownership-cli.ts",

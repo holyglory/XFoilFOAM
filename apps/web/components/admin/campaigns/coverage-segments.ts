@@ -54,6 +54,7 @@ export type SegmentState =
   | "rejected"
   | "blocked"
   | "awaiting_urans"
+  | "evidence_processing"
   | "needs_review"
   | "failed";
 
@@ -74,11 +75,12 @@ export function completedResultCount(cell: CampaignProgressTotals): number {
 }
 
 /** Encoding (design c19fd74a): failed wins, then needs-review (both solid
- *  red), then awaiting-URANS (violet overlay), then plain progress. A cell whose
- *  rejected points ALL have their next solve scheduled (split present, both
- *  buckets 0) renders as plain progress — it is back in the pipeline. The
- *  legacy amber 'rejected' state survives only when the payload has no split
- *  counters. A missing cell or requested === 0 renders empty. */
+ *  red), then automatic evidence processing (neutral overlay), then
+ *  awaiting-URANS (violet overlay), then plain progress. A cell whose rejected
+ *  points ALL have their next solve scheduled (split present, both buckets 0)
+ *  renders as plain progress — it is back in the pipeline. The legacy amber
+ *  'rejected' state survives only when the payload has no split counters. A
+ *  missing cell or requested === 0 renders empty. */
 export function segmentView(
   cell: CoverageCell | null | undefined,
 ): SegmentView {
@@ -90,9 +92,16 @@ export function segmentView(
     1,
     Math.max(0, completedResultCount(cell) / cell.requested),
   );
-  const workflowCount = hasSplit
-    ? Math.max(0, cell.awaitingUrans ?? 0)
-    : Math.max(0, cell.rejected);
+  const evidenceProcessingCount = Math.max(
+    0,
+    cell.awaitingArchiveReduction ?? 0,
+  );
+  const workflowCount =
+    evidenceProcessingCount > 0
+      ? evidenceProcessingCount
+      : hasSplit
+        ? Math.max(0, cell.awaitingUrans ?? 0)
+        : Math.max(0, cell.rejected);
   const workflowFraction = Math.min(
     Math.max(0, 1 - fillFraction),
     workflowCount / cell.requested,
@@ -106,9 +115,11 @@ export function segmentView(
   if (hasSplit) {
     if ((cell.needsReview ?? 0) > 0) return view("needs_review");
     if ((cell.blocked ?? 0) > 0) return view("blocked");
+    if (evidenceProcessingCount > 0) return view("evidence_processing");
     if ((cell.awaitingUrans ?? 0) > 0) return view("awaiting_urans");
     return view("progress");
   }
+  if (evidenceProcessingCount > 0) return view("evidence_processing");
   if (cell.rejected > 0) return view("rejected");
   return view("progress");
 }
@@ -126,7 +137,9 @@ export function segmentFillHeight(view: SegmentView): number {
 /** Separate pending-work overlay. RANS handoffs remain visible in violet (or
  * legacy amber) without being counted or painted as completed results. */
 export function segmentWorkflowFillHeight(view: SegmentView): number {
-  return view.state === "awaiting_urans" || view.state === "rejected"
+  return view.state === "awaiting_urans" ||
+    view.state === "evidence_processing" ||
+    view.state === "rejected"
     ? view.workflowFraction
     : 0;
 }
@@ -154,6 +167,10 @@ export function segmentTitle(
       `${fCount(completedResultCount(cell))}/${fCount(cell.requested)}`,
     );
     const hasSplit = cell.awaitingUrans != null || cell.needsReview != null;
+    const evidenceProcessing = Math.max(0, cell.awaitingArchiveReduction ?? 0);
+    if (evidenceProcessing > 0) {
+      parts.push(`${fCount(evidenceProcessing)} processing verified evidence`);
+    }
     if (hasSplit) {
       if ((cell.awaitingUrans ?? 0) > 0)
         parts.push(`${fCount(cell.awaitingUrans ?? 0)} awaiting FAST URANS`);

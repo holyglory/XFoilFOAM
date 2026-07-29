@@ -11,6 +11,7 @@ import {
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
 } from "./urans-quality";
+import { selectedCleanCycleQualityReasons } from "./urans-cycle-policy";
 
 // v2: solver-stalled applies only to non-converged STEADY points; unsteady
 // rows are judged on the URANS evidence gate (converged + force history +
@@ -125,6 +126,83 @@ export interface FrameTrackEvidence {
   [key: string]: unknown;
 }
 
+/**
+ * Per-cycle clean-tail certificate carried beside (never inside) the strict
+ * frame_track contract.  Kept structurally loose here because raw evidence
+ * must be retained even if a new engine drifts; the classifier reads a small
+ * fail-closed subset while the engine-client parser records exact drift.
+ */
+export interface UransCycleCertificateEvidence {
+  reducer_version?: unknown;
+  required_clean_cycles?: unknown;
+  terminal_clean_cycles?: unknown;
+  selected_cycle_start_index?: unknown;
+  certified?: unknown;
+  cycles?: unknown;
+  [key: string]: unknown;
+}
+
+export const URANS_CLEAN_CYCLE_CERTIFICATE_VERSION = "clean-cycle-v3";
+
+/**
+ * Proof-only steady RANS final-window contract.  The engine-client performs
+ * the full transport parser; core deliberately repeats the small, fail-closed
+ * acceptance subset because historical JSON can reach a cache rebuild without
+ * passing through a live engine client.
+ */
+export interface RansHoldChannelEvidence {
+  mean?: unknown;
+  min_value?: unknown;
+  max_value?: unknown;
+  peak_to_peak?: unknown;
+  relative_spread?: unknown;
+  [key: string]: unknown;
+}
+
+export interface RansHoldCertificateEvidence {
+  reducer_version?: unknown;
+  sample_count?: unknown;
+  required_sample_count?: unknown;
+  start_iteration?: unknown;
+  end_iteration?: unknown;
+  relative_tolerance?: unknown;
+  absolute_floor?: unknown;
+  certified?: unknown;
+  cl?: RansHoldChannelEvidence;
+  cd?: RansHoldChannelEvidence;
+  cm?: RansHoldChannelEvidence;
+  [key: string]: unknown;
+}
+
+export const RANS_HOLD_CERTIFICATE_VERSION = "rans-hold-v1";
+export const RANS_HOLD_REQUIRED_SAMPLES = 200;
+
+/**
+ * A read-model proof that an accepted coefficient interpretation was reduced
+ * from the *current*, generation-pinned evidence archive of this exact
+ * attempt.  This is deliberately smaller than the interpretation row: the
+ * database join proves selection ownership/current-archive identity while the
+ * core classifier merely decides whether it may use the selected coefficients
+ * instead of the original engine summary.
+ *
+ * It is not a client-supplied override.  The only producer is the canonical
+ * result read model, after the append-only selection and archive ownership
+ * checks have both succeeded.
+ */
+export interface SelectedArchiveInterpretationEvidence {
+  id?: unknown;
+  source?: unknown;
+  state?: unknown;
+  regime?: unknown;
+  /** Immutable selector semantics, not a display label.  A periodic clean
+   * tail and a steady-equivalent no-shedding observation have different
+   * scientific proof obligations and cannot share a selector namespace. */
+  selectionNamespace?: unknown;
+  sourceArchiveId?: unknown;
+  inputEvidenceSignature?: unknown;
+  [key: string]: unknown;
+}
+
 /** Raw steady_history jsonb as persisted at ingest (snake_case engine
  *  contract shape, ladder contract 2). Typed loosely on purpose: the gate
  *  reads only mean_stable and FAILS CLOSED — anything but a literal `true`
@@ -138,6 +216,10 @@ export interface SteadyHistoryEvidence {
 export interface PolarEvidencePoint {
   id?: string | null;
   attemptId?: string | null;
+  /** True only for the canonical `results` projection. Attempt-history
+   * classifications intentionally remain diagnostic: they never have a
+   * canonical-selection pointer to prove against. */
+  canonicalResultProjection?: boolean;
   a: number;
   cl: number | null;
   cd: number | null;
@@ -168,6 +250,14 @@ export interface PolarEvidencePoint {
    *  payload). null/undefined = legacy pre-contract evidence or steady point
    *  → frame-track gate not applied. */
   frameTrack?: FrameTrackEvidence | null;
+  /** Undefined = pre-clean-cycle legacy attempt; null = a current engine
+   * explicitly failed to ship a certificate for a shedding point and must
+   * fail closed. */
+  uransCycleCertificate?: UransCycleCertificateEvidence | null;
+  /** Undefined is pre-hold legacy evidence.  Explicit null is a current
+   * steady-RANS producer that could not prove its exact raw final window;
+   * that is an ordinary targeted URANS handoff, not a terminal result. */
+  ransHoldCertificate?: RansHoldCertificateEvidence | null;
   /** Fidelity ladder tier ('rans' | 'urans_precalc' | 'urans_full';
    *  results.fidelity / attempt evidence payload). null/undefined = legacy
    *  pre-ladder evidence → strict full-fidelity period bar. */
@@ -180,6 +270,13 @@ export interface PolarEvidencePoint {
   /** Engine non-fatal quality diagnostics.  Restartable integration markers
    * are classification evidence, not display-only metadata. */
   qualityWarnings?: string[] | null;
+  /**
+   * Present only when the result's current canonical selection points at an
+   * accepted, generation-pinned archive reduction for the exact current
+   * attempt.  In that case the selected interpretation—not a stale engine
+   * summary—is the coefficient evidence for this result-level projection.
+   */
+  selectedArchiveInterpretation?: SelectedArchiveInterpretationEvidence | null;
 }
 
 export interface PolarEvidenceClassification {
@@ -199,6 +296,77 @@ export interface ClassifiedPolar {
 
 function finite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const UUID_TEXT =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * This is intentionally a narrow, fail-closed proof.  A selected archive
+ * interpretation is allowed to supersede stale point payload gates only for
+ * one of two exact current-archive semantics:
+ *
+ * - periodic URANS: raw `urans` regime plus preliminary/final URANS fidelity;
+ * - no-shedding URANS: raw `urans` regime with `unsteady=false` plus
+ *   preliminary/final URANS fidelity, selected by the dedicated
+ *   steady-equivalent namespace.  A narrow legacy `rans` representation is
+ *   retained only for old rows written before regime meant numerical method.
+ *
+ * The raw regime is deliberately part of the proof.  It prevents a normal
+ * RANS result from borrowing no-shedding coefficients and prevents a
+ * steady-equivalent interpretation from standing in for a periodic tail.
+ */
+export function hasCertifiedSelectedArchiveInterpretation(
+  p: PolarEvidencePoint,
+): boolean {
+  const interpretation = p.selectedArchiveInterpretation;
+  const commonProof =
+    isRecord(interpretation) &&
+    interpretation.source === "archive_backfill" &&
+    interpretation.state === "accepted" &&
+    typeof interpretation.id === "string" &&
+    UUID_TEXT.test(interpretation.id) &&
+    typeof interpretation.sourceArchiveId === "string" &&
+    UUID_TEXT.test(interpretation.sourceArchiveId) &&
+    typeof interpretation.inputEvidenceSignature === "string" &&
+    SHA256_HEX.test(interpretation.inputEvidenceSignature);
+  if (!commonProof || !isCurrentUransFidelity(p.fidelity)) return false;
+  return (
+    (p.regime === "urans" &&
+      p.unsteady === true &&
+      interpretation.regime === "periodic" &&
+      interpretation.selectionNamespace === "archive-clean-cycle-v3") ||
+    ((p.regime === "urans" || p.regime === "rans") &&
+      p.unsteady === false &&
+      interpretation.regime === "steady_equivalent" &&
+      interpretation.selectionNamespace === "archive-no-shedding-v1")
+  );
+}
+
+/** URANS fidelity is immutable numerical provenance even when a no-shedding
+ * wake is presented with a physical `rans` regime. */
+export function isCurrentUransFidelity(
+  fidelity: string | null | undefined,
+): boolean {
+  return fidelity === "urans_precalc" || fidelity === "urans_full";
+}
+
+/** A current URANS result is not a public polar point until a reducer selects
+ * the exact, verified GCS archive.  This gate applies only to the canonical
+ * results projection; immutable attempt history remains classified for audit
+ * and recovery routing, where no result-level selection can exist. */
+export function requiresSelectedArchiveInterpretation(
+  p: PolarEvidencePoint,
+): boolean {
+  return (
+    p.canonicalResultProjection === true &&
+    isCurrentUransFidelity(p.fidelity) &&
+    ((p.regime === "urans" && typeof p.unsteady === "boolean") ||
+      // Backward-compatible only: old ingest represented a physically steady
+      // URANS observation as `rans`; current ingest records solver method.
+      (p.regime === "rans" && p.unsteady === false))
+  );
 }
 
 function ldOf(p: PolarEvidencePoint): number | null {
@@ -274,6 +442,12 @@ export function isOscillatingSteadyStable(p: PolarEvidencePoint): boolean {
  *  drift-prone re-implementation. */
 export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   const reasons: string[] = [];
+  // A selected archive interpretation is the current, authenticated
+  // coefficient reduction for this exact periodic or steady-equivalent URANS
+  // attempt.  It may
+  // supersede stale engine-summary *quality* gates, but never basic result
+  // identity, coefficients, source/status, or stored-media obligations.
+  const archiveBacked = hasCertifiedSelectedArchiveInterpretation(p);
   if (p.status !== "done" || p.source !== "solved") reasons.push("not-solved");
   if (!finite(p.cl) || !finite(p.cd) || !finite(p.cm))
     reasons.push("missing-coefficients");
@@ -296,19 +470,48 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   // applies, and the honest note is surfaced via the ingest quality-warning
   // marker, never via reasons (reasons are rejection-only).
   const oscillatingSteady = isOscillatingSteadyStable(p);
-  if (p.converged !== true && !oscillatingSteady) reasons.push("not-converged");
+  // URANS periodic acceptance is based on the authenticated clean-cycle
+  // window, not the old steady-style summary bit.  A re-reduction may prove
+  // a usable periodic result despite `converged: false` in the historical
+  // attempt payload; only the narrow selected-archive proof can waive it.
+  if (p.converged !== true && !oscillatingSteady && !archiveBacked)
+    reasons.push("not-converged");
   // `stalled` is the AERODYNAMIC post-stall marker (ingest sets it true for
   // every unsteady point by construction). Solver-stalled is a SOLVER defect:
   // only a non-converged steady point earns it. Unsteady evidence is judged on
   // its own gate below — converged + force history + video (evidence-first
   // honesty; without this split no URANS row could ever classify accepted).
-  if (p.stalled && !p.unsteady && !oscillatingSteady)
+  if (p.stalled && !p.unsteady && !oscillatingSteady && !archiveBacked)
     reasons.push("solver-stalled");
+  // A current steady RANS producer must either provide an exact raw
+  // all-channel hold proof or be handed to FAST URANS.  Keep this alongside
+  // the pointwise gates rather than inferring proof from display averages.
+  reasons.push(...ransHoldCertificateReasons(p));
+  // A current URANS summary is never a polar coefficient until the exact,
+  // verified archive has an accepted reduction selected.  This keeps fitting
+  // fail-closed.  The database read model deliberately translates this one
+  // internal reason into the nonterminal `awaiting_archive_reduction`
+  // publication state; it must never present it to a user as a physical
+  // solver failure or route another URANS solve while the reducer is running.
+  if (requiresSelectedArchiveInterpretation(p) && !archiveBacked) {
+    reasons.push("archive-reduction-pending");
+  }
   if (p.regime === "urans") {
-    if (hasIncompleteUransIntegrationWarning(p.qualityWarnings)) {
+    // A current accepted archive interpretation is a fresh raw-evidence
+    // reduction, not a reinterpretation of the attempt's old summary
+    // metadata.  Its exact raw force history has already been authenticated
+    // at archive-reduction time, so a stale `quality_warnings`, frame_track,
+    // or cycle-certificate payload must not re-reject the selected result.
+    // Video remains an independent stored-media obligation: selection never
+    // invents a preview artifact and therefore cannot waive that gate.
+    if (
+      !archiveBacked &&
+      hasIncompleteUransIntegrationWarning(p.qualityWarnings)
+    ) {
       reasons.push(INCOMPLETE_URANS_INTEGRATION_REASON);
     }
-    if (!p.hasForceHistory) reasons.push("missing-force-history");
+    if (!archiveBacked && !p.hasForceHistory)
+      reasons.push("missing-force-history");
     if (!p.hasVideo) reasons.push(MISSING_URANS_VIDEO_REASON);
     // Frame-track stationarity gate (v3): applies ONLY to evidence whose
     // engine version shipped frame_track (non-null). Reads fail closed — a
@@ -317,7 +520,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     // v4: the period bar is fidelity-aware — precalc rows (half-resolution
     // pre-calculation tier) accept at >= 3 retained periods, full/legacy rows
     // keep the strict >= 5 bar.
-    if (p.frameTrack !== null && p.frameTrack !== undefined) {
+    if (!archiveBacked && p.frameTrack !== null && p.frameTrack !== undefined) {
       if (p.frameTrack.stationary !== true) reasons.push("non-stationary");
       const periods = p.frameTrack.periods_retained;
       const minPeriods = frameTrackMinPeriodsFor(p.fidelity);
@@ -361,6 +564,142 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
           reasons.push("non-physical-frame-coefficients");
       }
     }
+    // Clean-cycle v2 gate: a new shedding URANS producer must prove a
+    // contiguous terminal clean suffix. `undefined` is preserved as an
+    // honest legacy absence so deployment does not silently mass-reject
+    // historical attempts; explicit null is a current-contract omission and
+    // fails closed. Strict payload-shape validation happens during ingestion,
+    // while these checks keep an invalid/uncertified current point out of the
+    // legacy canonical projection before a reducer can select it.
+    if (!archiveBacked && p.uransCycleCertificate !== undefined) {
+      const certificate = p.uransCycleCertificate;
+      if (certificate === null) {
+        reasons.push("missing-clean-cycle-certificate");
+      } else {
+        const required = frameTrackMinPeriodsFor(p.fidelity);
+        if (
+          certificate.reducer_version !== URANS_CLEAN_CYCLE_CERTIFICATE_VERSION
+        ) {
+          reasons.push("invalid-clean-cycle-certificate");
+        }
+        if (certificate.certified !== true) {
+          reasons.push("uncertified-urans-cycles");
+        }
+        if (
+          certificate.certified === true &&
+          certificate.reducer_version === URANS_CLEAN_CYCLE_CERTIFICATE_VERSION
+        ) {
+          if (
+            !(
+              typeof certificate.required_clean_cycles === "number" &&
+              Number.isInteger(certificate.required_clean_cycles) &&
+              certificate.required_clean_cycles === required
+            ) ||
+            !(
+              typeof certificate.terminal_clean_cycles === "number" &&
+              Number.isInteger(certificate.terminal_clean_cycles) &&
+              certificate.terminal_clean_cycles >= required
+            )
+          ) {
+            reasons.push("insufficient-clean-cycles");
+          }
+          const cycles = Array.isArray(certificate.cycles)
+            ? certificate.cycles
+            : [];
+          const selected = cycles.filter(
+            (cycle) =>
+              cycle != null &&
+              typeof cycle === "object" &&
+              (cycle as { disposition?: unknown }).disposition === "selected",
+          );
+          const selectedQualityIssues = selected.flatMap((cycle) => {
+            const record = cycle as Record<string, unknown>;
+            return selectedCleanCycleQualityReasons({
+              coefficientSamples: record.coefficient_samples,
+              fieldFrames: record.field_frames,
+              phaseMaxGap: record.phase_max_gap,
+              phaseShiftBins: record.phase_shift_bins,
+              cl: {
+                shapeError: record.cl_shape_error,
+                amplitudeDeviation: record.cl_amplitude_deviation,
+                highFrequency: record.cl_high_frequency,
+              },
+              cd: {
+                shapeError: record.cd_shape_error,
+                amplitudeDeviation: record.cd_amplitude_deviation,
+                highFrequency: record.cd_high_frequency,
+              },
+              cm: {
+                shapeError: record.cm_shape_error,
+                amplitudeDeviation: record.cm_amplitude_deviation,
+                highFrequency: record.cm_high_frequency,
+              },
+              reasons: record.reasons,
+            });
+          });
+          if (
+            selected.length < required ||
+            selectedQualityIssues.some(
+              (issue) => issue === "coefficient-samples" || issue === "field-frames",
+            )
+          ) {
+            reasons.push("insufficient-clean-cycle-evidence");
+          }
+          if (
+            selectedQualityIssues.some(
+              (issue) => issue !== "coefficient-samples" && issue !== "field-frames",
+            )
+          ) {
+            reasons.push("invalid-clean-cycle-quality");
+          }
+          // A trustworthy certificate selects exactly one *terminal contiguous
+          // suffix*.  Counting isolated "selected" cycles would permit a
+          // producer to stitch around a corrupt middle period, defeating the
+          // purpose of the clean-tail reducer.  Validate this here as well as
+          // at engine-client ingestion: raw historical JSON can bypass the
+          // parser, but it must never re-enter a canonical polar projection.
+          const selectedStart = certificate.selected_cycle_start_index;
+          const normalizedCycles = cycles.map((cycle) => {
+            const record =
+              cycle != null && typeof cycle === "object"
+                ? (cycle as Record<string, unknown>)
+                : null;
+            return {
+              index: record?.index,
+              selected: record?.disposition === "selected",
+            };
+          });
+          const startPosition =
+            typeof selectedStart === "number" &&
+            Number.isInteger(selectedStart) &&
+            selectedStart >= 0
+              ? normalizedCycles.findIndex(
+                  (cycle) => cycle.index === selectedStart,
+                )
+              : -1;
+          const suffixIsValid =
+            startPosition >= 0 &&
+            normalizedCycles
+              .slice(startPosition)
+              .every((cycle) => cycle.selected) &&
+            normalizedCycles
+              .slice(0, startPosition)
+              .every((cycle) => !cycle.selected) &&
+            normalizedCycles.every(
+              (cycle, index) =>
+                typeof cycle.index === "number" &&
+                Number.isInteger(cycle.index) &&
+                (index === 0 ||
+                  cycle.index ===
+                    (normalizedCycles[index - 1].index as number) + 1),
+            ) &&
+            selected.length === required;
+          if (!suffixIsValid) {
+            reasons.push("invalid-clean-cycle-certificate");
+          }
+        }
+      }
+    }
   }
   return reasons;
 }
@@ -386,6 +725,144 @@ function isSteadyRansEvidence(evidence: PolarEvidencePoint): boolean {
     evidence.fidelity !== "urans_precalc" &&
     evidence.fidelity !== "urans_full"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  return (
+    Object.keys(value).length === expected.length &&
+    expected.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function approximatelyEqual(left: number, right: number): boolean {
+  return (
+    Math.abs(left - right) <=
+    1e-12 * Math.max(1, Math.abs(left), Math.abs(right))
+  );
+}
+
+function validRansHoldChannel(
+  value: unknown,
+  absoluteFloor: number,
+  relativeTolerance: number,
+): boolean {
+  if (!isRecord(value)) return false;
+  const keys = [
+    "mean",
+    "min_value",
+    "max_value",
+    "peak_to_peak",
+    "relative_spread",
+  ] as const;
+  if (!hasExactKeys(value, keys)) return false;
+  const mean = value.mean;
+  const minimum = value.min_value;
+  const maximum = value.max_value;
+  const peakToPeak = value.peak_to_peak;
+  const relativeSpread = value.relative_spread;
+  if (
+    !finite(mean) ||
+    !finite(minimum) ||
+    !finite(maximum) ||
+    !finite(peakToPeak) ||
+    !finite(relativeSpread) ||
+    minimum > mean ||
+    mean > maximum ||
+    maximum < minimum ||
+    peakToPeak < 0 ||
+    relativeSpread < 0
+  ) {
+    return false;
+  }
+  const expectedPeakToPeak = maximum - minimum;
+  const expectedRelativeSpread = peakToPeak / (Math.abs(mean) + absoluteFloor);
+  return (
+    approximatelyEqual(peakToPeak, expectedPeakToPeak) &&
+    approximatelyEqual(relativeSpread, expectedRelativeSpread) &&
+    relativeSpread <= relativeTolerance
+  );
+}
+
+/**
+ * `undefined` is deliberately compatible legacy evidence.  A current engine
+ * sends either a complete proof object or explicit `null`; that distinction
+ * lets us keep historical results visible while routing current unproven RANS
+ * to the normal, targeted FAST-URANS ladder.
+ */
+function ransHoldCertificateReasons(p: PolarEvidencePoint): string[] {
+  if (!isSteadyRansEvidence(p) || p.ransHoldCertificate === undefined)
+    return [];
+  if (p.ransHoldCertificate === null) return ["missing-rans-hold-certificate"];
+
+  const certificate = p.ransHoldCertificate;
+  if (!isRecord(certificate)) return ["invalid-rans-hold-certificate"];
+  const keys = [
+    "reducer_version",
+    "sample_count",
+    "required_sample_count",
+    "start_iteration",
+    "end_iteration",
+    "relative_tolerance",
+    "absolute_floor",
+    "certified",
+    "cl",
+    "cd",
+    "cm",
+  ] as const;
+  if (!hasExactKeys(certificate, keys))
+    return ["invalid-rans-hold-certificate"];
+  const sampleCount = certificate.sample_count;
+  const requiredSampleCount = certificate.required_sample_count;
+  const startIteration = certificate.start_iteration;
+  const endIteration = certificate.end_iteration;
+  const relativeTolerance = certificate.relative_tolerance;
+  const absoluteFloor = certificate.absolute_floor;
+  const integer = (value: unknown): value is number =>
+    finite(value) && Number.isInteger(value);
+  if (
+    certificate.reducer_version !== RANS_HOLD_CERTIFICATE_VERSION ||
+    certificate.certified !== true ||
+    !integer(sampleCount) ||
+    !integer(requiredSampleCount) ||
+    sampleCount !== RANS_HOLD_REQUIRED_SAMPLES ||
+    requiredSampleCount !== RANS_HOLD_REQUIRED_SAMPLES ||
+    !integer(startIteration) ||
+    startIteration < 0 ||
+    !integer(endIteration) ||
+    endIteration < startIteration ||
+    endIteration - startIteration + 1 !== sampleCount ||
+    !finite(relativeTolerance) ||
+    relativeTolerance <= 0 ||
+    !finite(absoluteFloor) ||
+    absoluteFloor <= 0 ||
+    !validRansHoldChannel(certificate.cl, absoluteFloor, relativeTolerance) ||
+    !validRansHoldChannel(certificate.cd, absoluteFloor, relativeTolerance) ||
+    !validRansHoldChannel(certificate.cm, absoluteFloor, relativeTolerance)
+  ) {
+    return ["invalid-rans-hold-certificate"];
+  }
+  // The certificate is evidence for this exact result, not merely a stable
+  // shape that another set of displayed coefficients may borrow.  Bind every
+  // projected RANS coefficient to the raw 200-sample window mean before the
+  // classifier permits it into a polar.
+  if (
+    !finite(p.cl) ||
+    !finite(p.cd) ||
+    !finite(p.cm) ||
+    !approximatelyEqual(p.cl, certificate.cl!.mean as number) ||
+    !approximatelyEqual(p.cd, certificate.cd!.mean as number) ||
+    !approximatelyEqual(p.cm, certificate.cm!.mean as number)
+  ) {
+    return ["rans-hold-coefficient-mismatch"];
+  }
+  return [];
 }
 
 export interface AutomaticRansPrecalcHandoffEvidence {
@@ -553,14 +1030,26 @@ export function classifyPolarEvidence(
   const classifications: PolarEvidenceClassification[] = ordered.map(
     (evidence) => {
       const reasons = baseRejectionReasons(evidence);
-      const state: ResultClassificationState = reasons.length
-        ? "rejected"
-        : "accepted";
+      const ransHoldReasons = ransHoldCertificateReasons(evidence);
+      // An unavailable or malformed proof on an otherwise solved current RANS
+      // point is a normal fidelity handoff, not a terminal solver failure.
+      // Keeping it targeted prevents a proof-policy change from falsely
+      // triggering whole-polar low-AoA promotion.
+      const onlyRansHoldProofIsMissing =
+        ransHoldReasons.length > 0 &&
+        reasons.length === ransHoldReasons.length &&
+        reasons.every((reason) => ransHoldReasons.includes(reason));
+      const state: ResultClassificationState = onlyRansHoldProofIsMissing
+        ? "needs_urans"
+        : reasons.length
+          ? "rejected"
+          : "accepted";
       return {
         evidence,
         state,
         region: state === "accepted" ? "attached" : "unknown",
-        confidence: state === "accepted" ? 0.9 : 1,
+        confidence:
+          state === "accepted" ? 0.9 : onlyRansHoldProofIsMissing ? 0.98 : 1,
         reasons,
       };
     },

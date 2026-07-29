@@ -34,6 +34,7 @@ from airfoilfoam.openfoam.runner import (
     OpenFOAMError,
     _run_subprocess,
 )
+from airfoilfoam.postprocess.unsteady import ForceHistory
 from airfoilfoam.pipeline import (
     CaseOutcome,
     TransientResult,
@@ -142,8 +143,38 @@ class FakeCaseBuilder:
 
 
 def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
+    """Return the smallest *publishable* steady-equivalent URANS witness.
+
+    The warm-start cases deliberately stub the transient runner because they
+    exercise only the hand-off from steady RANS to pimpleFoam.  That stub must
+    nevertheless satisfy the production no-shedding contract: a no-shedding
+    verdict cannot be finalized from coefficient summaries alone.  Keep a
+    dense, finite terminal force history across the real slow-wake horizon so
+    these tests continue to prove warm-start behavior without bypassing the
+    evidence gate.
+    """
     tcase.mkdir(parents=True, exist_ok=True)
     (tcase / "0.1").mkdir(exist_ok=True)
+    observation_end = pipeline._no_shedding_min_observation_s(50.0, 0.5)
+    sample_count = 64
+    times = [observation_end * index / (sample_count - 1) for index in range(sample_count)]
+    history = ForceHistory(
+        t=times,
+        cl=[0.3] * sample_count,
+        cd=[0.03] * sample_count,
+        cm=[-0.02] * sample_count,
+        cl_mean=0.3,
+        cd_mean=0.03,
+        cm_mean=-0.02,
+        cl_rms=0.0,
+        cd_rms=0.0,
+        cm_rms=0.0,
+        shedding_freq_hz=0.0,
+        strouhal=0.0,
+        samples=sample_count,
+        window_start=0.0,
+        window_end=observation_end,
+    )
     return TransientResult(
         avg=SimpleNamespace(
             cl=0.3,
@@ -155,7 +186,7 @@ def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
             cm_std=0.0,
         ),
         case_dir=tcase,
-        force_history=None,
+        force_history=history,
         quality=UransQuality(
             ok=True,
             can_refine=False,
@@ -163,8 +194,8 @@ def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
             no_shedding=True,
         ),
         start_time=0.0,
-        end_time=0.1,
-        run_time=0.1,
+        end_time=observation_end,
+        run_time=observation_end,
     )
 
 

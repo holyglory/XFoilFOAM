@@ -21,6 +21,7 @@ import {
   resultFieldExtents,
   resultMediaRepairs,
   refreshPolarCacheForRevision,
+  refreshCampaignProgressForResultIds,
   results,
   resultMedia,
   solverEvidenceArtifacts,
@@ -68,6 +69,11 @@ import {
   resolveEngineRuntimeBuild,
   type ResolvedEngineRuntime,
 } from "./engine-provenance";
+import {
+  selectEngineInterpretation,
+  stageEngineResultInterpretation,
+} from "./result-interpretations";
+import { enqueueVerifiedArchiveReductions } from "./archive-reduction-queue";
 import type { RansRetryScope } from "./retry-plan";
 
 const execFileAsync = promisify(execFile);
@@ -1035,8 +1041,8 @@ export function frameTrackForPoint(p: PolarPoint, context: string): unknown {
 
 /** Fidelity tier to persist on the results row (ladder contract 1/3).
  *  Precedence: the engine's strict-parsed echo; else the tier the JOB
- *  requested (for URANS points of fidelity-requesting wave-2 jobs — with a
- *  loud drift log, because a post-ladder engine must echo); else the honest
+ *  requested (including physically no-shedding URANS points — with a loud
+ *  drift log, because a post-ladder engine must echo); else the honest
  *  regime-derived tier matching the 0034 backfill semantics (pre-ladder
  *  engines: urans = full behavior, steady = rans). Exported for the pin test. */
 export function fidelityForPoint(
@@ -1046,15 +1052,38 @@ export function fidelityForPoint(
 ): PointFidelity {
   const echoed = parsePointFidelity(p.fidelity);
   if (echoed) return echoed;
-  if (p.unsteady && requestedUransFidelity) {
+  if (requestedUransFidelity) {
     console.error(
-      `[sweeper] fidelity echo MISSING on URANS point of a '${requestedUransFidelity}'-fidelity job (${context}); persisting the requested tier — engine contract drift`,
+      `[sweeper] fidelity echo MISSING on a '${requestedUransFidelity}'-fidelity job (${context}); persisting the requested tier — engine contract drift`,
     );
     return requestedUransFidelity === "precalc"
       ? "urans_precalc"
       : "urans_full";
   }
   return p.unsteady ? "urans_full" : "rans";
+}
+
+/**
+ * Solver regime describes the numerical method that produced an attempt; it
+ * is not synonymous with whether the final physical wake sheds. A successful
+ * URANS no-shedding observation is deliberately `unsteady=false`, but it must
+ * remain attributable to URANS for provenance, comparison and the immutable
+ * attempt identity. Conversely an unsteady payload claiming RANS fidelity is
+ * a producer-contract contradiction and must never be silently reclassified.
+ */
+export function solverRegimeForPoint(
+  p: PolarPoint,
+  fidelity: PointFidelity,
+  context: string,
+): "rans" | "urans" {
+  const urans =
+    fidelity === "urans_precalc" || fidelity === "urans_full";
+  if (p.unsteady && !urans) {
+    throw new Error(
+      `solver regime contract drift (${context}): shedding point carries non-URANS fidelity '${fidelity}'`,
+    );
+  }
+  return urans ? "urans" : "rans";
 }
 
 /** steady_history value to persist verbatim (ladder contract 2). Like
@@ -1151,7 +1180,11 @@ export function incomingPointEvidence(
     ld: p.cl_cd ?? null,
     status: failed ? "failed" : "done",
     source: failed ? "queued" : "solved",
-    regime: p.unsteady ? "urans" : "rans",
+    regime: solverRegimeForPoint(
+      p,
+      derived.fidelity,
+      `incoming evidence a=${p.aoa_deg}`,
+    ),
     converged: p.converged,
     stalled: stalledForPoint(p),
     unsteady: p.unsteady,
@@ -1165,6 +1198,13 @@ export function incomingPointEvidence(
     hasVideo: Object.values(p.video ?? {}).some(Boolean),
     frameTrack: (derived.frameTrack ??
       null) as PolarEvidencePoint["frameTrack"],
+    // Preserve optional-key semantics: a legacy engine omits this field,
+    // while a current shedding engine explicitly sends a certificate (or a
+    // fail-closed null if it could not certify one).
+    uransCycleCertificate:
+      p.urans_cycle_certificate === undefined
+        ? undefined
+        : (p.urans_cycle_certificate as PolarEvidencePoint["uransCycleCertificate"]),
     fidelity: derived.fidelity,
     steadyHistory: (derived.steadyHistory ??
       null) as PolarEvidencePoint["steadyHistory"],
@@ -1307,6 +1347,18 @@ async function insertResultAttempt(opts: {
     point: p,
     derived,
   } = opts;
+  const fidelity =
+    derived?.fidelity ??
+    fidelityForPoint(
+      p,
+      undefined,
+      `attempt ${simJobId}/${engineJobId}/a=${p.aoa_deg}`,
+    );
+  const regime = solverRegimeForPoint(
+    p,
+    fidelity,
+    `attempt ${simJobId}/${engineJobId}/a=${p.aoa_deg}`,
+  );
   const stalled = stalledForPoint(p);
   const warnings = [...(qualityWarningsForPoint(p) ?? [])];
   for (const extra of opts.extraQualityWarnings ?? []) {
@@ -1318,7 +1370,7 @@ async function insertResultAttempt(opts: {
     // local quarantine/replace annotations are scheduler context; a running
     // partial and terminal replay of the same engine case must compare equal.
     error: p.error ?? null,
-    fidelity: derived?.fidelity ?? p.fidelity ?? null,
+    fidelity,
     frame_track: derived?.frameTrack ?? p.frame_track ?? null,
     steady_history: derived?.steadyHistory ?? p.steady_history ?? null,
     quality_warnings: qualityWarningsForPoint(p) ?? [],
@@ -1340,7 +1392,7 @@ async function insertResultAttempt(opts: {
       aoaDeg: p.aoa_deg,
       status: failedForPoint(p) ? "failed" : "done",
       source: failedForPoint(p) ? "queued" : "solved",
-      regime: p.unsteady ? "urans" : "rans",
+      regime,
       validForPolar: validForPolarPoint(p),
       simJobId,
       engineJobId,
@@ -1399,7 +1451,7 @@ async function insertResultAttempt(opts: {
         eq(resultAttempts.engineJobId, engineJobId),
         eq(resultAttempts.resultId, resultId),
         eq(resultAttempts.aoaDeg, p.aoa_deg),
-        eq(resultAttempts.regime, p.unsteady ? "urans" : "rans"),
+        eq(resultAttempts.regime, regime),
       ),
     )
     .limit(1);
@@ -1426,7 +1478,7 @@ async function insertResultAttempt(opts: {
       !enrichLegacyMeshRecoveryVersion)
   ) {
     throw new Error(
-      `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
+      `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${regime}`,
     );
   }
   if (enrichLegacyMeshRecoveryVersion) {
@@ -1458,7 +1510,7 @@ async function insertResultAttempt(opts: {
           stableHash(evidencePayload)
       ) {
         throw new Error(
-          `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${p.unsteady ? "urans" : "rans"}`,
+          `result attempt replay changed immutable evidence for ${simJobId}/${engineJobId}/a=${p.aoa_deg}/${regime}`,
         );
       }
     }
@@ -4425,6 +4477,10 @@ type StagedPoint = {
   observedStatus: string;
   observedSimJobId: string | null;
   quarantined: boolean;
+  /** Immutable scientific reduction staged alongside the attempt. It becomes
+   * canonical only after the existing evidence/classifier CAS publishes this
+   * exact attempt. */
+  resultInterpretationId: string | null;
 };
 
 type FinalizedPoint = {
@@ -4842,6 +4898,28 @@ async function currentTerminalState(
     : null;
 }
 
+/**
+ * Admit the exact immutable URANS archive before publishing its raw attempt
+ * pointer. The queue owns the full authenticated-pointer proof (GCS object,
+ * checksums, sizes, generation, compression and reducer identity); duplicating
+ * only a few columns here previously let malformed archives appear as normal
+ * machine-owned publication work without any durable reducer receipt.
+ */
+async function admitVerifiedArchiveReductionCandidate(
+  tx: DB,
+  input: {
+    resultId: string;
+    resultAttemptId: string;
+  },
+): Promise<boolean> {
+  const admitted = await enqueueVerifiedArchiveReductions(tx, {
+    resultIds: [input.resultId],
+    resultAttemptIds: [input.resultAttemptId],
+    limit: 1,
+  });
+  return admitted.admittedResultAttemptIds.includes(input.resultAttemptId);
+}
+
 /** Select one staged exact generation under the same revision lock and SQL
  * transaction that rebuilds the canonical classification and fitted polar.
  * The observed pointer + scheduling owner form the CAS: a stale writer may
@@ -4953,6 +5031,11 @@ async function publishStagedPoints(
           candidate.resultId,
           candidate.resultAttemptId,
         );
+        const awaitingArchiveReduction =
+          await admitVerifiedArchiveReductionCandidate(tx, {
+            resultId: candidate.resultId,
+            resultAttemptId: candidate.resultAttemptId,
+          });
         let currentStateRank = 0;
         let currentFidelityRank = 0;
         if (cell.currentAttemptId) {
@@ -4982,7 +5065,16 @@ async function publishStagedPoints(
             ),
           );
         }
-        const eligible = hasManifest && candidateStateRank > 0;
+        // Raw current URANS is deliberately not classifier-accepted before
+        // archive reduction, but it is still a completed physical generation.
+        // Publish the exact pointer/status so the durable queue can bind to it
+        // and scheduling cannot launch a duplicate solve.  Its result-level
+        // classifier remains fail-closed and the UI receives the separate
+        // machine-owned publication state.
+        const eligible =
+          hasManifest && (candidateStateRank > 0 || awaitingArchiveReduction);
+        const publicationWins =
+          awaitingArchiveReduction && !cell.currentAttemptId;
         const outranksCurrent = shouldPublishGeneration({
           hasCurrent: Boolean(cell.currentAttemptId),
           candidateState: candidateClassification?.state,
@@ -5003,12 +5095,27 @@ async function publishStagedPoints(
                   : null,
         });
 
-        if (eligible && outranksCurrent) {
+        if (eligible && (publicationWins || outranksCurrent)) {
           const payload = candidateAttempt.evidencePayload;
           const [published] = await tx
             .update(results)
             .set({
               currentResultAttemptId: candidate.resultAttemptId,
+              // A fresh raw solver generation cannot inherit an archive
+              // interpretation selected for a different immutable attempt.
+              // Preserve the pointer only for an exact replay of the same
+              // generation; otherwise clear the entire selection projection
+              // atomically with the attempt CAS.
+              currentResultInterpretationId: sql`CASE
+                WHEN ${results.currentResultAttemptId} IS DISTINCT FROM ${candidate.resultAttemptId}::uuid
+                THEN NULL
+                ELSE ${results.currentResultInterpretationId}
+              END`,
+              currentCanonicalSelectionId: sql`CASE
+                WHEN ${results.currentResultAttemptId} IS DISTINCT FROM ${candidate.resultAttemptId}::uuid
+                THEN NULL
+                ELSE ${results.currentCanonicalSelectionId}
+              END`,
               bcId: candidate.bcId,
               status: candidateAttempt.status,
               source: candidateAttempt.source,
@@ -5070,6 +5177,12 @@ async function publishStagedPoints(
               simJobId: results.simJobId,
             });
           if (published && published.status === "done") {
+            await selectEngineInterpretation({
+              db: tx,
+              resultId: candidate.resultId,
+              resultAttemptId: candidate.resultAttemptId,
+              interpretationId: candidate.resultInterpretationId,
+            });
             finalized.set(published.resultId, published as FinalizedPoint);
           }
           continue;
@@ -5428,6 +5541,19 @@ export async function publishRepairedResultAttempt(opts: {
           .update(results)
           .set({
             currentResultAttemptId: attempt.id,
+            // Final-repair publication can replace a previous solver
+            // generation. Its raw coefficients may never retain a canonical
+            // archive interpretation that was certified for the old attempt.
+            currentResultInterpretationId: sql`CASE
+              WHEN ${results.currentResultAttemptId} IS DISTINCT FROM ${attempt.id}::uuid
+              THEN NULL
+              ELSE ${results.currentResultInterpretationId}
+            END`,
+            currentCanonicalSelectionId: sql`CASE
+              WHEN ${results.currentResultAttemptId} IS DISTINCT FROM ${attempt.id}::uuid
+              THEN NULL
+              ELSE ${results.currentCanonicalSelectionId}
+            END`,
             bcId: attempt.bcId,
             status: attempt.status,
             source: attempt.source,
@@ -5673,6 +5799,7 @@ export async function ingestResult(opts: {
       observedStatus: cell.status,
       observedSimJobId: cell.simJobId,
       quarantined: cell.quarantined,
+      resultInterpretationId: null,
     };
     if (
       input.reuseCandidate?.resultId === cell.id &&
@@ -5750,6 +5877,14 @@ export async function ingestResult(opts: {
       );
     }
     await stageForceHistory(db, cell.id, resultAttemptId, p);
+    const stagedInterpretation = await stageEngineResultInterpretation({
+      db,
+      resultId: cell.id,
+      resultAttemptId,
+      point: p,
+      fidelity: derived.fidelity,
+    });
+    staged.resultInterpretationId = stagedInterpretation.id;
     await opts.hooks?.afterPointEvidenceStaged?.({
       resultId: cell.id,
       resultAttemptId,
@@ -5954,6 +6089,36 @@ export async function ingestResult(opts: {
       .flat()
       .map((candidate) => [candidate.resultId, candidate] as const),
   );
+  // Commit the durable publication/recovery owner before campaign linking and
+  // its completion probe.  A raw URANS physical completion is not a rejected
+  // campaign point while this exact archive is being reduced; reversing this
+  // order briefly persisted an attention/rejected counter on every ingest.
+  // Pass immutable attempt ids rather than only current result pointers: an
+  // accepted RANS polar remains visible until the archive-derived URANS
+  // interpretation wins selection, so the newer raw URANS attempt can be
+  // intentionally non-current during this handoff.
+  const archivePublicationAttemptIds = [
+    ...candidatesByRevision.values(),
+    legacyCandidates,
+  ]
+    .flat()
+    .filter((candidate) => !candidate.quarantined)
+    .map((candidate) => candidate.resultAttemptId);
+  if (archivePublicationAttemptIds.length) {
+    await enqueueVerifiedArchiveReductions(db, {
+      resultAttemptIds: archivePublicationAttemptIds,
+      limit: archivePublicationAttemptIds.length,
+    });
+    await refreshCampaignProgressForResultIds(
+      db,
+      [...new Set(
+        [...candidatesByRevision.values(), legacyCandidates]
+          .flat()
+          .filter((candidate) => !candidate.quarantined)
+          .map((candidate) => candidate.resultId),
+      )],
+    );
+  }
   const campaignLinkOutcome =
     await linkResultsToCampaignsWithAutomaticPrecalcHandoff(
       db,

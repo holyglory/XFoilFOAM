@@ -17,6 +17,7 @@ export const SOLVER_WORK_STATES = [
   "provisional",
   "solving",
   "queued",
+  "evidence_processing",
   "ladder",
   "needs_time",
   "needs_review",
@@ -48,6 +49,75 @@ const KNOWN_CLASSIFICATION_STATES = new Set([
 function hasKnownClassification(state: string | null | undefined): boolean {
   return Boolean(state && KNOWN_CLASSIFICATION_STATES.has(state));
 }
+
+/**
+ * Mirrors the canonical campaign-progress publication predicate.  The
+ * selected scalar attempt may intentionally remain an accepted RANS value
+ * while a newer verified URANS archive is being reduced, so this is keyed to
+ * the physical result identity rather than `current_result_attempt_id`.
+ * Terminal archive failures stay out of the neutral state; a `missing_evidence`
+ * row is nonterminal only when the durable recovery ledger owns it.
+ */
+const ARCHIVE_PUBLICATION_PENDING_SQL = sql`EXISTS (
+  SELECT 1
+  FROM result_archive_reduction_queue publication_queue
+  JOIN result_attempts publication_attempt
+    ON publication_attempt.id = publication_queue.result_attempt_id
+   AND publication_attempt.result_id = publication_queue.result_id
+  JOIN solver_evidence_archives publication_archive
+    ON publication_archive.id = publication_queue.source_archive_id
+   AND publication_archive.result_id = r.id
+   AND publication_archive.result_attempt_id = publication_queue.result_attempt_id
+   AND publication_archive.state = 'current'
+  JOIN solver_evidence_blobs publication_blob
+    ON publication_blob.id = publication_archive.blob_id
+  WHERE publication_queue.result_id = r.id
+    AND publication_queue.source_archive_id = publication_archive.id
+    AND (
+      publication_queue.state IN ('pending', 'hydrating', 'continuation_required', 'rerun_required')
+      OR (
+        publication_queue.state = 'missing_evidence'
+        AND EXISTS (
+          SELECT 1
+          FROM result_interpretation_recovery_actions publication_recovery
+          WHERE publication_recovery.result_id = publication_queue.result_id
+            AND publication_recovery.result_attempt_id = publication_queue.result_attempt_id
+            AND publication_recovery.source_archive_id = publication_queue.source_archive_id
+            AND publication_recovery.state IN (
+              'pending', 'routing', 'waiting_for_precalc',
+              'continuation_routed', 'fresh_rerun_routed'
+            )
+        )
+      )
+    )
+    AND publication_attempt.status = 'done'
+    AND publication_attempt.source = 'solved'
+    AND publication_attempt.evidence_payload ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+    AND (
+      (publication_attempt.regime = 'urans' AND publication_attempt.unsteady IN (TRUE, FALSE))
+      OR (publication_attempt.regime = 'rans' AND publication_attempt.unsteady = FALSE)
+    )
+    AND publication_blob.backend = 'gcs'
+    AND publication_blob.compression = 'zstd'
+    AND publication_blob.mime_type = 'application/zstd'
+    AND btrim(COALESCE(publication_blob.bucket, '')) <> ''
+    AND publication_blob.generation ~ '^[1-9][0-9]{0,19}$'
+    AND publication_blob."verifiedAt" IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM result_canonical_selections selected_publication
+      JOIN result_interpretations selected_interpretation
+        ON selected_interpretation.id = selected_publication.result_interpretation_id
+      WHERE selected_publication.result_id = r.id
+        AND selected_publication.result_attempt_id = publication_queue.result_attempt_id
+        AND selected_interpretation.result_id = r.id
+        AND selected_interpretation.result_attempt_id = publication_queue.result_attempt_id
+        AND selected_interpretation.source = 'archive_backfill'
+        AND selected_interpretation.state = 'accepted'
+        AND selected_interpretation.source_archive_id = publication_archive.id
+        AND selected_interpretation.reducer_version_id = publication_queue.reducer_version_id
+    )
+)`;
 
 export interface SolverWorkGate {
   name:
@@ -81,6 +151,9 @@ export interface SolverWorkPointStateRow {
   classificationState?: string | null;
   classificationReasons?: string[] | null;
   continuable?: boolean | null;
+  /** A verified URANS archive is in the automatic reduction/recovery queue.
+   *  This is not a failed/rejected result and exposes no operator action. */
+  archivePublicationPending?: boolean | null;
   openVerify?: boolean | null;
   openRequest?: boolean | null;
   mediaRepairState?: string | null;
@@ -135,6 +208,10 @@ export interface SolverWorkPayload {
 export function solverWorkStateForPoint(
   row: SolverWorkPointStateRow,
 ): SolverWorkState {
+  // Publication/recovery owns this exact verified URANS generation. Check it
+  // before any historical review, classification, or media state so an older
+  // scalar RANS selection cannot make an ordinary archive wait look blocked.
+  if (row.archivePublicationPending) return "evidence_processing";
   if (row.reviewVerdict === "exclude") return "excluded";
   if (row.classificationState === "superseded_by_urans") return "superseded";
 
@@ -223,6 +300,7 @@ type ResultPointRow = {
   frame_track: unknown;
   superseded_by_result_id: string | null;
   continuable: boolean | null;
+  archive_publication_pending: boolean | null;
   open_verify: boolean | null;
   open_request: boolean | null;
   review_id: string | null;
@@ -495,7 +573,12 @@ function gateChecksFromPoint(row: {
   classificationReasons?: string[] | null;
   error?: string | null;
   frameTrack?: unknown;
+  archivePublicationPending?: boolean | null;
 }): SolverWorkGateCheck[] {
+  // The archive reducer has already authenticated the physical generation.
+  // Do not surface the pre-publication classifier's fail-closed diagnostics as
+  // a user-facing quality failure while it is still owned by the machine.
+  if (row.archivePublicationPending) return [];
   const checks = new Map<SolverWorkGate["name"], SolverWorkGateCheck>();
   const put = (check: SolverWorkGateCheck) => {
     const existing = checks.get(check.name);
@@ -591,6 +674,8 @@ function plainForPoint(
       return "The solver is working on this point and will publish evidence when the run settles.";
     case "queued":
       return "This point is queued and has not produced solver evidence yet.";
+    case "evidence_processing":
+      return "Verified URANS evidence is being processed automatically before publication.";
     case "ladder":
       return "RANS → FAST URANS (automatic).";
     case "needs_time":
@@ -662,6 +747,9 @@ function chainForPoint(
   attempts: AttemptRow[],
   state: SolverWorkState,
 ): Array<{ label: string; tone: SolverWorkTone }> {
+  if (row.archivePublicationPending) {
+    return [{ label: "Processing verified evidence", tone: "neutral" }];
+  }
   if (
     ["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? "")
   ) {
@@ -750,6 +838,7 @@ function makePoint(
     classificationState: row.classification_state,
     classificationReasons: row.classification_reasons,
     continuable: row.continuable,
+    archivePublicationPending: row.archive_publication_pending,
     openVerify: row.open_verify,
     openRequest: row.open_request,
     mediaRepairState: row.media_repair_state,
@@ -782,7 +871,9 @@ function makePoint(
       }
     : null;
   const classificationGate: SolverWorkGate | null =
-    row.status === "done" && !hasKnownClassification(row.classification_state)
+    !row.archive_publication_pending &&
+    row.status === "done" &&
+    !hasKnownClassification(row.classification_state)
       ? {
           name: "quality gate",
           detail: UNCLASSIFIED_EVIDENCE_DETAIL,
@@ -812,6 +903,7 @@ function makePoint(
     classificationReasons: row.classification_reasons,
     error: row.error,
     frameTrack: row.frame_track,
+    archivePublicationPending: row.archive_publication_pending,
   });
   const cl = numberOrNull(row.cl);
   const cd = numberOrNull(row.cd);
@@ -820,7 +912,10 @@ function makePoint(
     aoaDeg: opts.displayAoa ?? Number(row.aoa_deg),
     state,
     resultId: row.result_id,
-    continuationResultAttemptId: row.continuable ? row.result_attempt_id : null,
+    continuationResultAttemptId:
+      !row.archive_publication_pending && row.continuable
+        ? row.result_attempt_id
+        : null,
     fidelity: normalizeFidelity(row.fidelity, row.regime),
     cl: opts.derivedBySymmetry ? negated(cl) : cl,
     cd,
@@ -828,8 +923,10 @@ function makePoint(
     plain: plainForPoint(state, gate),
     gate,
     gates,
-    reviewed: row.review_verdict === "exclude",
+    reviewed:
+      !row.archive_publication_pending && row.review_verdict === "exclude",
     review:
+      !row.archive_publication_pending &&
       row.review_verdict === "exclude" &&
       row.review_created_at &&
       row.review_reviewer
@@ -841,9 +938,10 @@ function makePoint(
           }
         : null,
     chain: chainForPoint(stateRow, attempts, state),
-    continuable: Boolean(row.continuable),
+    continuable: !row.archive_publication_pending && Boolean(row.continuable),
     actions: actionsForPoint(stateRow, state),
     supersededBy:
+      !row.archive_publication_pending &&
       row.classification_state === "superseded_by_urans"
         ? row.superseded_by_result_id
         : null,
@@ -948,6 +1046,7 @@ async function loadResultRows(
              OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
         )
       ) AS continuable,
+      ${ARCHIVE_PUBLICATION_PENDING_SQL} AS archive_publication_pending,
       EXISTS (
         SELECT 1 FROM sim_urans_verify_queue q
         WHERE q.airfoil_id = r.airfoil_id
@@ -1042,6 +1141,7 @@ async function loadCampaignPointRows(
              OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
         )
       ) AS continuable,
+      ${ARCHIVE_PUBLICATION_PENDING_SQL} AS archive_publication_pending,
       EXISTS (
         SELECT 1 FROM sim_urans_verify_queue q
         WHERE q.airfoil_id = p.airfoil_id

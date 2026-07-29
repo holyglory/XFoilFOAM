@@ -1686,6 +1686,10 @@ export interface CampaignProgressTotals {
   /** Terminal machine-owned PRECALC obligations whose bounded attempts are
    *  exhausted or deterministically blocked. Never a review count. */
   blocked?: number;
+  /** Verified URANS archive reduction/recovery that remains automatic,
+   *  nonterminal, and outstanding until a canonical interpretation publishes.
+   *  Optional during API rolling deploys; absent means zero. */
+  awaitingArchiveReduction?: number;
   remaining: number;
 }
 

@@ -83,6 +83,7 @@ export function campaignHubStatusLine(
 ): string {
   const totals = summary?.totals ?? item.totals;
   const blocked = totals.blocked ?? 0;
+  const evidenceProcessing = totals.awaitingArchiveReduction ?? 0;
   const automaticFast = campaignAutomaticFastCount(item);
   const scheduler = summary?.scheduler;
   const campaignJobsRunning =
@@ -95,6 +96,9 @@ export function campaignHubStatusLine(
       : "Cancelled — evidence kept.";
   }
   if (item.status === "completed") {
+    if (evidenceProcessing > 0) {
+      return `Processing verified evidence · ${fCount(evidenceProcessing)} result${evidenceProcessing === 1 ? "" : "s"} will publish automatically.`;
+    }
     if (blocked > 0) {
       return `Completed · ${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted; system investigation required.`;
     }
@@ -121,6 +125,9 @@ export function campaignHubStatusLine(
     if (automaticFast > 0) {
       return `Awaiting FAST URANS · ${fCount(automaticFast)} point${automaticFast === 1 ? "" : "s"}`;
     }
+    if (evidenceProcessing > 0) {
+      return `Processing verified evidence · ${fCount(evidenceProcessing)} result${evidenceProcessing === 1 ? "" : "s"} will publish automatically.`;
+    }
     // Legacy result counters remain inspectable in Solver job logs, but they
     // cannot become a red campaign failure without typed exhausted recovery.
     return "Evidence retained · details in Solver logs.";
@@ -138,6 +145,9 @@ export function campaignHubStatusLine(
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
   if (automaticFast > 0)
     parts.push(`${fCount(automaticFast)} awaiting FAST URANS`);
+  if (evidenceProcessing > 0) {
+    parts.push(`${fCount(evidenceProcessing)} processing verified evidence`);
+  }
   if (blocked > 0)
     parts.push(
       `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted`,

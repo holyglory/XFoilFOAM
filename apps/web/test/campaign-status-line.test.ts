@@ -34,6 +34,7 @@ function summary(overrides: {
   failed?: number;
   rejected?: number;
   blocked?: number;
+  awaitingArchiveReduction?: number;
   closedWithFailedCount?: number | null;
   closedWithRejectedCount?: number | null;
   reviewBuckets?: { awaitingUrans: number; needsReview: number };
@@ -59,6 +60,7 @@ function summary(overrides: {
       derived: 0,
       rejected: overrides.rejected ?? 0,
       blocked: overrides.blocked ?? 0,
+      awaitingArchiveReduction: overrides.awaitingArchiveReduction ?? 0,
       remaining: overrides.remaining ?? 32,
     } as AdminCampaignSummary["totals"],
     scheduler: {
@@ -356,6 +358,22 @@ describe("campaignInstrumentStatus — one truthful hero message", () => {
       title: "Campaign running",
       detail: "4 active jobs · 631,000 points remain",
       tone: "teal",
+      action: null,
+    });
+  });
+
+  it("MUST-CATCH: a numerically settled campaign waits neutrally for verified evidence publication", () => {
+    const view = campaignInstrumentStatus(
+      summary({
+        jobs: 0,
+        remaining: 0,
+        awaitingArchiveReduction: 2,
+      }),
+    );
+    expect(view).toEqual({
+      title: "Processing verified evidence",
+      detail: "2 URANS results will publish automatically",
+      tone: "dim",
       action: null,
     });
   });

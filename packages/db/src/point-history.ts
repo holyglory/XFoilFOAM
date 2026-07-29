@@ -43,6 +43,7 @@ export const POINT_HISTORY_BUCKETS = [
   "failed",
   "rejected",
   "awaiting_urans",
+  "evidence_processing",
   "needs_review",
   "accepted",
   "needs_urans",
@@ -158,6 +159,78 @@ const RANS_FAST_HANDOFF_SQL = sql`(
   )
 )`;
 
+/**
+ * A verified URANS archive is being reduced into the only interpretation that
+ * may publish to a polar.  This mirrors the campaign-progress predicate in
+ * campaign-execution.ts deliberately: the scalar `results` row can still
+ * select an older accepted RANS generation while this newer physical URANS
+ * generation is machine-owned publication/recovery work.  It is therefore
+ * neither a rejected result nor a blocked/retry/review task.
+ *
+ * Keep terminal queue failures out of this predicate.  `missing_evidence` is
+ * nonterminal only while its durable recovery action owns the exact attempt.
+ */
+const ARCHIVE_PUBLICATION_PENDING_SQL = sql`EXISTS (
+  SELECT 1
+  FROM result_archive_reduction_queue publication_queue
+  JOIN result_attempts publication_attempt
+    ON publication_attempt.id = publication_queue.result_attempt_id
+   AND publication_attempt.result_id = publication_queue.result_id
+  JOIN solver_evidence_archives publication_archive
+    ON publication_archive.id = publication_queue.source_archive_id
+   AND publication_archive.result_id = r.id
+   AND publication_archive.result_attempt_id = publication_queue.result_attempt_id
+   AND publication_archive.state = 'current'
+  JOIN solver_evidence_blobs publication_blob
+    ON publication_blob.id = publication_archive.blob_id
+  WHERE publication_queue.result_id = r.id
+    AND publication_queue.source_archive_id = publication_archive.id
+    AND (
+      publication_queue.state IN ('pending', 'hydrating', 'continuation_required', 'rerun_required')
+      OR (
+        publication_queue.state = 'missing_evidence'
+        AND EXISTS (
+          SELECT 1
+          FROM result_interpretation_recovery_actions publication_recovery
+          WHERE publication_recovery.result_id = publication_queue.result_id
+            AND publication_recovery.result_attempt_id = publication_queue.result_attempt_id
+            AND publication_recovery.source_archive_id = publication_queue.source_archive_id
+            AND publication_recovery.state IN (
+              'pending', 'routing', 'waiting_for_precalc',
+              'continuation_routed', 'fresh_rerun_routed'
+            )
+        )
+      )
+    )
+    AND publication_attempt.status = 'done'
+    AND publication_attempt.source = 'solved'
+    AND publication_attempt.evidence_payload ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+    AND (
+      (publication_attempt.regime = 'urans' AND publication_attempt.unsteady IN (TRUE, FALSE))
+      OR (publication_attempt.regime = 'rans' AND publication_attempt.unsteady = FALSE)
+    )
+    AND publication_blob.backend = 'gcs'
+    AND publication_blob.compression = 'zstd'
+    AND publication_blob.mime_type = 'application/zstd'
+    AND btrim(COALESCE(publication_blob.bucket, '')) <> ''
+    AND publication_blob.generation ~ '^[1-9][0-9]{0,19}$'
+    AND publication_blob."verifiedAt" IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM result_canonical_selections selected_publication
+      JOIN result_interpretations selected_interpretation
+        ON selected_interpretation.id = selected_publication.result_interpretation_id
+      WHERE selected_publication.result_id = r.id
+        AND selected_publication.result_attempt_id = publication_queue.result_attempt_id
+        AND selected_interpretation.result_id = r.id
+        AND selected_interpretation.result_attempt_id = publication_queue.result_attempt_id
+        AND selected_interpretation.source = 'archive_backfill'
+        AND selected_interpretation.state = 'accepted'
+        AND selected_interpretation.source_archive_id = publication_archive.id
+        AND selected_interpretation.reducer_version_id = publication_queue.reducer_version_id
+    )
+)`;
+
 /** Single source of truth for the status chips AND the bucket filter.
  *  `r` = results row, `rc` = LEFT-joined result-level classification.
  *  - solving covers the whole open pipeline: pending (re-claimable), queued
@@ -168,6 +241,7 @@ const RANS_FAST_HANDOFF_SQL = sql`(
  *    unclassified / stale) fall into 'other' — they appear under "all" only,
  *    never silently inflate a chip. */
 const BUCKET_SQL = sql`CASE
+  WHEN ${ARCHIVE_PUBLICATION_PENDING_SQL} THEN 'evidence_processing'
   WHEN ${RANS_FAST_HANDOFF_SQL} THEN 'rejected'
   WHEN r.status = 'failed' THEN 'failed'
   WHEN r.status IN ('pending', 'queued', 'running') THEN 'solving'
@@ -178,6 +252,7 @@ const BUCKET_SQL = sql`CASE
 END`;
 
 const WORK_DISPOSITION_SQL = sql`CASE
+  WHEN ${ARCHIVE_PUBLICATION_PENDING_SQL} THEN NULL
   WHEN ${BLOCKED_WORK_SQL} THEN 'blocked'
   WHEN ${SCHEDULED_WORK_SQL} THEN 'scheduled'
   ELSE NULL
@@ -254,6 +329,7 @@ const NEEDS_REVIEW_RESULT_SQL = sql`FALSE`;
  *  `needs_review` has an empty canonical predicate; machine failures are
  *  reported through status and workDisposition. */
 const REVIEW_BUCKET_SQL = sql`CASE
+  WHEN ${ARCHIVE_PUBLICATION_PENDING_SQL} THEN NULL
   WHEN ${AWAITING_URANS_RESULT_SQL} THEN 'awaiting_urans'
   WHEN ${NEEDS_REVIEW_RESULT_SQL} THEN 'needs_review'
   ELSE NULL
@@ -338,6 +414,9 @@ export interface PointHistoryItem {
   /** Explicit machine disposition for rejected/failed evidence. Scheduling is
    *  claimed only when an open obligation/request/verify row actually exists. */
   workDisposition: "scheduled" | "blocked" | null;
+  /** The exact URANS archive is verified and is still owned by automatic
+   *  archive reduction/recovery. It must never be presented as user work. */
+  archivePublicationPending: boolean;
   /** Amendment C: the rejected urans solve has restartable saved case state
    *  after either a wall-budget stop or the bounded same-case chunk cap. */
   continuable: boolean;
@@ -362,6 +441,7 @@ export interface PointHistoryCounts {
    *  awaiting_urans / needs_review split refines). */
   rejected: number;
   awaiting_urans: number;
+  evidence_processing: number;
   needs_review: number;
   accepted: number;
   needs_urans: number;
@@ -511,6 +591,7 @@ interface PageRow {
   fidelity: string | null;
   review_bucket: "awaiting_urans" | "needs_review" | null;
   work_disposition: "scheduled" | "blocked" | null;
+  archive_publication_pending: boolean | null;
   continuable: boolean | null;
   verify_state: string | null;
   verify_delta_cl: number | string | null;
@@ -573,7 +654,8 @@ export async function pointHistoryPage(
         -- Mirrors are never review-bucketed or continuable in their own right.
         NULL AS review_bucket,
         FALSE AS continuable,
-        NULL AS work_disposition
+        NULL AS work_disposition,
+        FALSE AS archive_publication_pending
       FROM sim_campaign_points p
       JOIN results r ON r.id = p.result_id
       JOIN airfoils af ON af.id = p.airfoil_id
@@ -609,7 +691,8 @@ export async function pointHistoryPage(
         r.fidelity AS fidelity,
         ${REVIEW_BUCKET_SQL} AS review_bucket,
         ${CONTINUABLE_SQL} AS continuable,
-        ${WORK_DISPOSITION_SQL} AS work_disposition
+        ${WORK_DISPOSITION_SQL} AS work_disposition,
+        ${ARCHIVE_PUBLICATION_PENDING_SQL} AS archive_publication_pending
       FROM results r
       JOIN airfoils af ON af.id = r.airfoil_id
       LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -706,6 +789,7 @@ export async function pointHistoryPage(
       count(*) FILTER (WHERE b.bucket = 'failed')::int AS failed,
       count(*) FILTER (WHERE b.bucket = 'rejected')::int AS rejected,
       count(*) FILTER (WHERE b.review_bucket = 'awaiting_urans')::int AS awaiting_urans,
+      count(*) FILTER (WHERE b.bucket = 'evidence_processing')::int AS evidence_processing,
       count(*) FILTER (WHERE b.review_bucket = 'needs_review')::int AS needs_review,
       count(*) FILTER (WHERE b.bucket = 'accepted')::int AS accepted,
       count(*) FILTER (WHERE b.bucket = 'needs_urans')::int AS needs_urans,
@@ -722,6 +806,7 @@ export async function pointHistoryPage(
     failed: number;
     rejected: number;
     awaiting_urans: number;
+    evidence_processing: number;
     needs_review: number;
     accepted: number;
     needs_urans: number;
@@ -732,6 +817,7 @@ export async function pointHistoryPage(
     failed: 0,
     rejected: 0,
     awaiting_urans: 0,
+    evidence_processing: 0,
     needs_review: 0,
     accepted: 0,
     needs_urans: 0,
@@ -801,6 +887,7 @@ export async function pointHistoryPage(
       fidelity: row.fidelity,
       reviewBucket: row.review_bucket ?? null,
       workDisposition: row.work_disposition ?? null,
+      archivePublicationPending: Boolean(row.archive_publication_pending),
       continuable: Boolean(row.continuable),
       verify:
         row.verify_state == null
@@ -831,6 +918,7 @@ export async function pointHistoryPage(
       failed: Number(c.failed),
       rejected: Number(c.rejected),
       awaiting_urans: Number(c.awaiting_urans),
+      evidence_processing: Number(c.evidence_processing),
       needs_review: Number(c.needs_review),
       accepted: Number(c.accepted),
       needs_urans: Number(c.needs_urans),
@@ -919,6 +1007,9 @@ export interface PointStory {
     /** Rolling-compatibility ladder bucket (see PointHistoryItem.reviewBucket). */
     reviewBucket: "awaiting_urans" | "needs_review" | null;
     workDisposition: "scheduled" | "blocked" | null;
+    /** Verified URANS archive publication/recovery is automatic and remains
+     *  outstanding until a reducer accepts a canonical interpretation. */
+    archivePublicationPending: boolean;
     /** Amendment C: rejected urans row with restartable saved case state — the
      *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
@@ -955,6 +1046,7 @@ export async function pointStory(
         THEN r.current_result_attempt_id ELSE NULL
       END AS continuation_result_attempt_id,
       ${WORK_DISPOSITION_SQL} AS work_disposition,
+      ${ARCHIVE_PUBLICATION_PENDING_SQL} AS archive_publication_pending,
       rc.state::text AS cls_state, rc.reasons AS cls_reasons, rc.confidence AS cls_confidence,
       rc.classifier_version AS cls_version,
       cp.campaign_id, cp.condition_id, sc.name AS campaign_name,
@@ -1013,6 +1105,7 @@ export async function pointStory(
     fidelity: string | null;
     review_bucket: "awaiting_urans" | "needs_review" | null;
     work_disposition: "scheduled" | "blocked" | null;
+    archive_publication_pending: boolean | null;
     continuable: boolean | null;
     continuation_result_attempt_id: string | null;
     verify_state: string | null;
@@ -1161,6 +1254,7 @@ export async function pointStory(
       fidelity: p.fidelity,
       reviewBucket: p.review_bucket ?? null,
       workDisposition: p.work_disposition ?? null,
+      archivePublicationPending: Boolean(p.archive_publication_pending),
       continuable: Boolean(p.continuable),
       continuationResultAttemptId: p.continuation_result_attempt_id,
       verify:
@@ -1254,7 +1348,8 @@ export async function requeueSinglePoint(
       SELECT r.id, r.status::text AS status, r.error, r.airfoil_id,
         r.simulation_preset_revision_id AS revision_id,
         r.aoa_deg::float8 AS aoa_deg, r.regime, r.fidelity,
-        EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected') AS rejected
+        EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected') AS rejected,
+        ${ARCHIVE_PUBLICATION_PENDING_SQL} AS archive_publication_pending
       FROM results r WHERE r.id = ${resultId}
     `)) as unknown as Array<{
       id: string;
@@ -1266,6 +1361,7 @@ export async function requeueSinglePoint(
       regime: string | null;
       fidelity: string | null;
       rejected: boolean;
+      archive_publication_pending: boolean;
     }>;
     const initial = initialRows[0];
     if (!initial) throw new CampaignError("not_found", "point not found");
@@ -1302,11 +1398,18 @@ export async function requeueSinglePoint(
       SELECT r.id, r.status::text AS status, r.error, r.airfoil_id,
         r.simulation_preset_revision_id AS revision_id,
         r.aoa_deg::float8 AS aoa_deg, r.regime, r.fidelity,
-        EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected') AS rejected
+        EXISTS (SELECT 1 FROM result_classifications rc WHERE rc.result_id = r.id AND rc.state = 'rejected') AS rejected,
+        ${ARCHIVE_PUBLICATION_PENDING_SQL} AS archive_publication_pending
       FROM results r WHERE r.id = ${resultId} FOR UPDATE OF r
     `)) as unknown as typeof initialRows;
     const row = rows[0];
     if (!row) throw new CampaignError("not_found", "point not found");
+    if (row.archive_publication_pending) {
+      throw new CampaignError(
+        "invalid_state",
+        "Verified URANS evidence is being processed automatically before publication and cannot be retried manually",
+      );
+    }
     if (row.regime === "urans" || (row.fidelity ?? "").startsWith("urans")) {
       throw new CampaignError(
         "invalid_state",

@@ -133,17 +133,20 @@ export function CampaignDetail({
 
   const stripRef = useRef<HTMLDivElement>(null);
 
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const next = await getCampaign(campaignId, signal);
-      setSummary(next);
-      setLoadError(null);
-      setPollKey((k) => k + 1);
-    } catch (e) {
-      if (signal?.aborted) return;
-      setLoadError((e as Error).message);
-    }
-  }, [campaignId]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      try {
+        const next = await getCampaign(campaignId, signal);
+        setSummary(next);
+        setLoadError(null);
+        setPollKey((k) => k + 1);
+      } catch (e) {
+        if (signal?.aborted) return;
+        setLoadError((e as Error).message);
+      }
+    },
+    [campaignId],
+  );
 
   usePoll(refresh, 10_000);
 
@@ -606,6 +609,8 @@ export function CampaignDetail({
         <span data-testid={line.gate ? "campaign-gate-badge" : undefined}>
           {instrumentStatus.tone === "teal" ? (
             <ShieldCheck size={22} aria-hidden />
+          ) : instrumentStatus.tone === "dim" ? (
+            <Clock3 size={22} aria-hidden />
           ) : (
             <ShieldAlert size={22} aria-hidden />
           )}
@@ -738,7 +743,7 @@ export function CampaignDetail({
             <Clock3 size={30} strokeWidth={1.6} aria-hidden />
             <span>
               <strong>{fCount(barSegments.solvingCount)}</strong>
-              <small>processing</small>
+              <small>active solver jobs</small>
             </span>
           </div>
           <div
@@ -810,6 +815,7 @@ export function CampaignDetail({
             )}
           </div>
           {(barSegments.awaitingCount > 0 ||
+            barSegments.evidenceProcessingCount > 0 ||
             (barSegments.blockedCount > 0 && remediationCopy)) && (
             <div
               data-testid="campaign-exception-actions"
@@ -829,6 +835,21 @@ export function CampaignDetail({
                     <small>awaiting FAST URANS</small>
                   </span>
                 </button>
+              )}
+              {barSegments.evidenceProcessingCount > 0 && (
+                <div
+                  data-testid="campaign-evidence-processing-count"
+                  className="campaign-instrument-exception-action"
+                  title="The URANS archive is verified. Automatic reduction is preparing the publishable result; no action is needed."
+                >
+                  <Clock3 size={18} strokeWidth={1.6} aria-hidden />
+                  <span>
+                    <strong>
+                      {fCount(barSegments.evidenceProcessingCount)}
+                    </strong>
+                    <small>processing verified evidence</small>
+                  </span>
+                </div>
               )}
               {barSegments.blockedCount > 0 && remediationCopy && (
                 <div

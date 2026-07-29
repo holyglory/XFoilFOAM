@@ -86,6 +86,15 @@
   generation-pinned GCS archive before same-case continuation, without
   fulfilling its remote point or consuming a fresh physical-solver attempt.
   [D-2026-07-25-rejected-checkpoint-broker]
+- Confirmed intent: raw solver evidence remains immutable while scientific
+  interpretation is versioned and append-only. URANS publishes only the exact
+  final clean contiguous suffix (FAST: 3 cycles; FINAL: 5), with corrupt
+  prefixes retained as evidence. A current RANS point needs an exact
+  all-channel 200-row final-window proof or takes the normal targeted FAST
+  URANS path. Archive-backed reinterpretation selects only authenticated,
+  generation-pinned raw evidence and routes recoverable trajectories to exact
+  continuation before a fresh run.
+  [D-2026-07-28-immutable-result-interpretations]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -244,6 +253,32 @@
   implementation queue. Progressive disclosure plus one shared authenticated
   read model preserves both compact routine inspection and full forensic
   depth.
+
+## D-2026-07-28-immutable-result-interpretations — Raw evidence stays immutable; reductions are selected explicitly
+
+- Decision: preserve each solver attempt and its generation-pinned GCS archive
+  unchanged, then record every RANS/URANS reduction as an append-only,
+  versioned interpretation with an append-only canonical-selection event.
+  FAST URANS selects exactly the final 3 contiguous clean cycles and FINAL
+  URANS exactly the final 5; a damaged tail continues the exact checkpoint in
+  bounded physical-period increments before any fresh solve. Recovery counts
+  only authenticated transient time, owns each period boundary exactly once,
+  and accepts a later repair only from the same resolved boundary-condition and
+  solver-implementation cell; competing archive actions cannot share an active
+  request or verify receipt. Current RANS values publish only when the raw final
+  200 iterations prove stable Cl, Cd, and Cm; otherwise the angle proceeds to
+  FAST URANS. A no-shedding URANS result needs its own typed slow-wake
+  certificate and an exact time-weighted Cl/Cd/Cm bounded-force-history
+  witness; it waits for the verified GCS archive reduction instead of
+  publishing from an engine summary.
+  [detail](DecisionDetails/D-2026-07-28-immutable-result-interpretations.md)
+- Why: overwriting attempts or averaging a fixed trailing slice loses the
+  corrupt-startup diagnosis and makes later numerical improvements impossible
+  to audit. Re-solving every old result wastes valid GCS evidence, while
+  accepting an arbitrary clean-looking subset can stitch across a corrupt
+  period. An immutable ledger plus exact suffix selection conserves evidence,
+  lets a newer reducer repair historical projections reproducibly, and keeps
+  continuation ahead of a costly fresh generation.
 
 ## D-2026-07-24-urans-clean-tail — Prevent startup bursts and publish only clean whole periods
 

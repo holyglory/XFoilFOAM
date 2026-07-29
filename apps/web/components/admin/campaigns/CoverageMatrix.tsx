@@ -608,7 +608,8 @@ export function CoverageMatrix({
                     const fillH = segmentFillHeight(view);
                     const workflowFillH = segmentWorkflowFillHeight(view);
                     // Amendment-A recolor: red strictly for needs-review /
-                    // failed; violet = calm awaiting-URANS; amber only for
+                    // failed; violet = calm awaiting-URANS; muted = verified
+                    // evidence still publishing automatically; amber only for
                     // legacy payloads without the split counters.
                     const red =
                       view.state === "failed" ||
@@ -616,7 +617,11 @@ export function CoverageMatrix({
                       view.state === "blocked";
                     const fillColor = red ? C.red : C.teal;
                     const workflowColor =
-                      view.state === "awaiting_urans" ? C.violet : C.amber;
+                      view.state === "awaiting_urans"
+                        ? C.violet
+                        : view.state === "evidence_processing"
+                          ? C.muted
+                          : C.amber;
                     return (
                       <button
                         key={c.id}

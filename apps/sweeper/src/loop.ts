@@ -58,6 +58,7 @@ import {
   scheduleRemoteSolverTransfer,
   type RemoteEngineAdmissionDecision,
 } from "./remote-solver";
+import { scheduleArchiveReductionQueueDrain } from "./archive-reduction-queue";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 
@@ -935,6 +936,11 @@ export async function tick(
   // Retention has its own serial process loop and is intentionally absent from
   // this scheduler progress boundary.
   scheduleRemoteSolverTransfer(db, engine);
+  // A completed URANS physical generation may need only its verified GCS
+  // archive reduced before it becomes a polar point.  Keep this nonblocking:
+  // the live queue is durable and globally deduplicated, while this tick must
+  // remain free to reconcile and admit CFD work.
+  scheduleArchiveReductionQueueDrain(db, engine);
   await markTickCompleted(db);
 }
 

@@ -55,12 +55,13 @@ function condition(
 }
 
 describe("solver-work state taxonomy", () => {
-  it("pins the style/class mapping for all ten states", () => {
+  it("pins the style/class mapping for every solver state", () => {
     expect(SOLVER_WORK_STATES).toEqual([
       "verified",
       "provisional",
       "solving",
       "queued",
+      "evidence_processing",
       "ladder",
       "needs_time",
       "needs_review",
@@ -79,6 +80,13 @@ describe("solver-work state taxonomy", () => {
       background: "#25140a",
       border: "#7c2d12",
       className: "solver-work-state--needs-review",
+    });
+    expect(SOLVER_WORK_STATE_STYLES.evidence_processing).toMatchObject({
+      label: "processing verified evidence",
+      color: "#cbd5e1",
+      background: "#111827",
+      border: "#334155",
+      className: "solver-work-state--evidence-processing",
     });
     expect(SOLVER_WORK_STATE_STYLES.excluded).toMatchObject({
       label: "excluded",
@@ -258,6 +266,29 @@ describe("solver-work popover assembly", () => {
     expect(view.actions.map((action) => action.label)).toEqual([
       "full results ▸",
     ]);
+  });
+
+  it("keeps verified archive publication neutral and exposes no manual recovery action", () => {
+    const processing = point({
+      aoaDeg: 7,
+      state: "evidence_processing",
+      resultId: "archive-result",
+      fidelity: "urans_precalc",
+      plain:
+        "Verified URANS evidence is being processed automatically before publication.",
+      chain: [{ label: "Processing verified evidence", tone: "neutral" }],
+      actions: [],
+    });
+    const view = buildSolverWorkPopoverView(
+      condition({ points: [processing] }),
+      processing,
+      true,
+    );
+
+    expect(view.stateLabel).toBe("processing verified evidence");
+    expect(view.plain).toContain("processed automatically");
+    expect(view.provisionalNote).toBe(false);
+    expect(view.actions.map((action) => action.kind)).toEqual(["open-results"]);
   });
 
   it("pins the continuation POST payload used by the shared admin endpoint", () => {

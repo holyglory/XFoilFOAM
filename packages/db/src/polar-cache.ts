@@ -2,15 +2,20 @@ import {
   buildPolarFit,
   canonicalAoa,
   classifyPolarEvidence,
+  hasCertifiedSelectedArchiveInterpretation,
   type FrameTrackEvidence,
   mirrorClassifiedEvidence,
+  type RansHoldCertificateEvidence,
+  type SelectedArchiveInterpretationEvidence,
   type SteadyHistoryEvidence,
+  type UransCycleCertificateEvidence,
   POLAR_CLASSIFIER_VERSION,
   POLAR_FIT_VERSION,
   type PolarEvidenceClassification,
   type PolarEvidencePoint,
 } from "@aerodb/core";
 import { and, eq, inArray, isNotNull, sql, type SQL } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
@@ -20,11 +25,16 @@ import {
   polarCompatibilityFitSets,
   polarFitPoints,
   polarFitSets,
+  resultCanonicalSelections,
+  resultArchiveReductionQueue,
   resultAttempts,
   resultClassifications,
+  resultInterpretations,
   resultMedia,
   results,
   simulationPresetRevisions,
+  solverEvidenceArchives,
+  solverEvidenceBlobs,
 } from "./schema";
 import {
   ensureRevisionMethodCompatibilityHash,
@@ -42,7 +52,38 @@ type EvidenceWithDbIds = PolarEvidencePoint & {
   simJobId?: string | null;
   engineJobId?: string | null;
   updatedAt?: Date | null;
+  canonicalResultProjection?: boolean;
 };
+
+// These aliases make the result-level read model prove the entire selection
+// chain in one query: result -> current selection -> interpretation -> current
+// archive.  The raw attempt remains the immutable provenance source for every
+// other field; only certified archive-reduced coefficients may override its
+// display summary.
+const currentResultInterpretation = alias(
+  resultInterpretations,
+  "current_result_interpretation",
+);
+const currentResultCanonicalSelection = alias(
+  resultCanonicalSelections,
+  "current_result_canonical_selection",
+);
+const currentInterpretationArchive = alias(
+  solverEvidenceArchives,
+  "current_interpretation_archive",
+);
+const currentInterpretationBlob = alias(
+  solverEvidenceBlobs,
+  "current_interpretation_blob",
+);
+const currentArchiveSelectedAttempt = alias(
+  resultAttempts,
+  "current_archive_selected_attempt",
+);
+const pendingArchiveReductionAttempt = alias(
+  resultAttempts,
+  "pending_archive_reduction_attempt",
+);
 
 export interface PolarCacheRefreshResult {
   airfoilId: string;
@@ -112,12 +153,25 @@ function toEvidence(row: {
   hasForceHistory?: boolean | null;
   hasVideo?: boolean | null;
   frameTrack?: unknown;
+  uransCycleCertificate?: unknown;
+  uransCycleCertificatePresent?: boolean;
+  ransHoldCertificate?: unknown;
+  ransHoldCertificatePresent?: boolean;
+  selectedArchiveInterpretationCurrent?: boolean;
+  selectedArchiveInterpretationId?: string | null;
+  selectedArchiveInterpretationSource?: string | null;
+  selectedArchiveInterpretationState?: string | null;
+  selectedArchiveInterpretationRegime?: string | null;
+  selectedArchiveInterpretationSelectionNamespace?: string | null;
+  selectedArchiveInterpretationSourceArchiveId?: string | null;
+  selectedArchiveInterpretationInputEvidenceSignature?: string | null;
   fidelity?: string | null;
   steadyHistory?: unknown;
   qualityWarnings?: string[] | null;
   simJobId?: string | null;
   engineJobId?: string | null;
   updatedAt?: Date | null;
+  canonicalResultProjection?: boolean | null;
 }): EvidenceWithDbIds {
   return {
     id: row.id ?? null,
@@ -125,6 +179,7 @@ function toEvidence(row: {
     attemptId: row.attemptId ?? null,
     resultAttemptId: row.attemptId ?? null,
     currentGenerationAttemptId: row.currentGenerationAttemptId ?? null,
+    canonicalResultProjection: row.canonicalResultProjection === true,
     a: row.aoaDeg,
     cl: row.cl,
     cd: row.cd,
@@ -153,6 +208,36 @@ function toEvidence(row: {
     // Raw jsonb passthrough: null/undefined = legacy pre-contract evidence →
     // the classifier's frame-track gate is not applied (no mass-reject).
     frameTrack: (row.frameTrack ?? null) as FrameTrackEvidence | null,
+    // Preserve an absent legacy key separately from an explicit JSON null:
+    // the former is historical evidence, while the latter is a current
+    // shedding producer that failed to ship a required certificate.
+    uransCycleCertificate: row.uransCycleCertificatePresent
+      ? (row.uransCycleCertificate as UransCycleCertificateEvidence | null)
+      : undefined,
+    // RANS hold proof uses the same three-way distinction: absent is legacy;
+    // explicit JSON null is a current engine's deliberate lack of proof and
+    // must route the point to targeted URANS rather than look historical.
+    ransHoldCertificate: row.ransHoldCertificatePresent
+      ? (row.ransHoldCertificate as RansHoldCertificateEvidence | null)
+      : undefined,
+    // The SQL projection sets this only when the current selection, result,
+    // exact current attempt, accepted archive interpretation, and current
+    // archive all agree.  Preserve the proof object rather than a boolean so
+    // core repeats its structural fail-closed validation before it can waive
+    // stale engine-side URANS metadata gates.
+    selectedArchiveInterpretation: row.selectedArchiveInterpretationCurrent
+      ? ({
+          id: row.selectedArchiveInterpretationId,
+          source: row.selectedArchiveInterpretationSource,
+          state: row.selectedArchiveInterpretationState,
+          regime: row.selectedArchiveInterpretationRegime,
+          selectionNamespace:
+            row.selectedArchiveInterpretationSelectionNamespace,
+          sourceArchiveId: row.selectedArchiveInterpretationSourceArchiveId,
+          inputEvidenceSignature:
+            row.selectedArchiveInterpretationInputEvidenceSignature,
+        } satisfies SelectedArchiveInterpretationEvidence)
+      : null,
     // Fidelity ladder (v4): tier string drives the fidelity-aware period bar;
     // steady_history.mean_stable === true accepts oscillating-steady rows.
     fidelity: row.fidelity ?? null,
@@ -172,10 +257,62 @@ async function loadResultEvidence(
   const currentAttemptForce = hasAttemptForceHistory(
     sql.raw('"current_attempt"."evidence_payload"'),
   );
+  // A selected archive interpretation is usable only when all ownership links
+  // agree, its archive is still the current generation for this exact attempt,
+  // and the immutable selection semantics match the raw URANS shape.  A
+  // periodic clean tail and a no-shedding physical-observation window are
+  // deliberately not interchangeable.  If any link changes (including archive
+  // supersession), the result never falls back to raw current URANS evidence:
+  // it remains unavailable until a new reduction is explicitly selected.
+  const selectedArchiveProjection = sql<boolean>`(
+    ${currentResultInterpretation.id} IS NOT NULL
+    AND ${currentResultInterpretation.state} = 'accepted'
+    AND ${currentResultInterpretation.source} = 'archive_backfill'
+    AND ${currentResultInterpretation.sourceArchiveId} IS NOT NULL
+    AND ${currentResultCanonicalSelection.id} IS NOT NULL
+    AND ${currentResultCanonicalSelection.resultInterpretationId} = ${currentResultInterpretation.id}
+    AND ${currentInterpretationArchive.id} IS NOT NULL
+    AND ${currentInterpretationArchive.state} = 'current'
+    AND ${currentInterpretationBlob.id} IS NOT NULL
+    AND ${currentInterpretationBlob.backend} = 'gcs'
+    AND ${currentInterpretationBlob.compression} = 'zstd'
+    AND ${currentInterpretationBlob.mimeType} = 'application/zstd'
+    AND btrim(COALESCE(${currentInterpretationBlob.bucket}, '')) <> ''
+    AND ${currentInterpretationBlob.generation} ~ '^[1-9][0-9]{0,19}$'
+    AND ${currentInterpretationBlob.verifiedAt} IS NOT NULL
+    AND (
+      (
+        ${currentResultInterpretation.regime} = 'periodic'
+        AND ${currentResultCanonicalSelection.selectionNamespace} = 'archive-clean-cycle-v3'
+        AND ${resultAttempts.regime} = 'urans'
+        AND ${resultAttempts.unsteady} = TRUE
+        AND ${resultAttempts.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+      )
+      OR (
+        ${currentResultInterpretation.regime} = 'steady_equivalent'
+        AND ${currentResultCanonicalSelection.selectionNamespace} = 'archive-no-shedding-v1'
+        AND ${resultAttempts.regime} IN ('urans', 'rans')
+        AND ${resultAttempts.unsteady} = FALSE
+        AND ${resultAttempts.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+      )
+    )
+  )`;
   const rows = await db
     .select({
       id: results.id,
       currentGenerationAttemptId: results.currentResultAttemptId,
+      canonicalResultProjection: sql<boolean>`${results.currentResultAttemptId} IS NOT NULL`,
+      selectedArchiveInterpretationCurrent: selectedArchiveProjection,
+      selectedArchiveInterpretationId: currentResultInterpretation.id,
+      selectedArchiveInterpretationSource: currentResultInterpretation.source,
+      selectedArchiveInterpretationState: currentResultInterpretation.state,
+      selectedArchiveInterpretationRegime: currentResultInterpretation.regime,
+      selectedArchiveInterpretationSelectionNamespace:
+        currentResultCanonicalSelection.selectionNamespace,
+      selectedArchiveInterpretationSourceArchiveId:
+        currentResultInterpretation.sourceArchiveId,
+      selectedArchiveInterpretationInputEvidenceSignature:
+        currentResultInterpretation.inputEvidenceSignature,
       // The canonical results row is a mutable projection. Under an explicit
       // current-attempt pointer every classifier input and provenance value
       // comes from that immutable attempt, never from a mixed generation.
@@ -184,18 +321,26 @@ async function loadResultEvidence(
       // pointer is explicitly unavailable/repairable (DecisionHistory 0053),
       // so the synthetic pending/null shape below fails classification closed.
       aoaDeg: sql<number>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.aoaDeg} ELSE ${results.aoaDeg} END`,
-      cl: sql<
-        number | null
-      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cl} ELSE NULL END`,
-      cd: sql<
-        number | null
-      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cd} ELSE NULL END`,
-      cm: sql<
-        number | null
-      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cm} ELSE NULL END`,
-      clCd: sql<
-        number | null
-      >`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.clCd} ELSE NULL END`,
+      cl: sql<number | null>`CASE
+        WHEN ${selectedArchiveProjection} THEN ${currentResultInterpretation.cl}
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cl}
+        ELSE NULL
+      END`,
+      cd: sql<number | null>`CASE
+        WHEN ${selectedArchiveProjection} THEN ${currentResultInterpretation.cd}
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cd}
+        ELSE NULL
+      END`,
+      cm: sql<number | null>`CASE
+        WHEN ${selectedArchiveProjection} THEN ${currentResultInterpretation.cm}
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.cm}
+        ELSE NULL
+      END`,
+      clCd: sql<number | null>`CASE
+        WHEN ${selectedArchiveProjection} THEN ${currentResultInterpretation.clCd}
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.clCd}
+        ELSE NULL
+      END`,
       status: sql<string>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.status} ELSE 'pending' END`,
       source: sql<string>`CASE WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.source} ELSE 'queued' END`,
       regime: sql<
@@ -233,6 +378,10 @@ async function loadResultEvidence(
       // not make the replacement look complete. Pointer-less rows fail closed;
       // unscoped legacy artifacts remain historical/admin evidence only.
       hasForceHistory: sql<boolean>`CASE
+        -- An accepted archive interpretation can only be selected after the
+        -- reducer authenticated its exact raw force history.  This is real
+        -- archive evidence, not a synthetic browser-side substitute.
+        WHEN ${selectedArchiveProjection} THEN TRUE
         WHEN "results"."current_result_attempt_id" IS NOT NULL THEN EXISTS (
           SELECT 1
           FROM ${resultAttempts} current_attempt
@@ -263,6 +412,34 @@ async function loadResultEvidence(
         )
         ELSE NULL
       END`,
+      uransCycleCertificatePresent: sql<boolean>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN (
+          ${resultAttempts.evidencePayload} ? 'urans_cycle_certificate'
+          OR ${resultAttempts.evidencePayload} ? 'uransCycleCertificate'
+        )
+        ELSE FALSE
+      END`,
+      uransCycleCertificate: sql<unknown>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(
+          ${resultAttempts.evidencePayload} -> 'urans_cycle_certificate',
+          ${resultAttempts.evidencePayload} -> 'uransCycleCertificate'
+        )
+        ELSE NULL
+      END`,
+      ransHoldCertificatePresent: sql<boolean>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN (
+          ${resultAttempts.evidencePayload} ? 'rans_hold_certificate'
+          OR ${resultAttempts.evidencePayload} ? 'ransHoldCertificate'
+        )
+        ELSE FALSE
+      END`,
+      ransHoldCertificate: sql<unknown>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(
+          ${resultAttempts.evidencePayload} -> 'rans_hold_certificate',
+          ${resultAttempts.evidencePayload} -> 'ransHoldCertificate'
+        )
+        ELSE NULL
+      END`,
       fidelity: sql<string | null>`CASE
         WHEN ${results.currentResultAttemptId} IS NOT NULL THEN ${resultAttempts.evidencePayload} ->> 'fidelity'
         ELSE NULL
@@ -286,6 +463,53 @@ async function loadResultEvidence(
         eq(resultAttempts.id, results.currentResultAttemptId),
         eq(resultAttempts.resultId, results.id),
       ),
+    )
+    .leftJoin(
+      currentResultInterpretation,
+      and(
+        eq(
+          currentResultInterpretation.id,
+          results.currentResultInterpretationId,
+        ),
+        eq(currentResultInterpretation.resultId, results.id),
+        eq(
+          currentResultInterpretation.resultAttemptId,
+          results.currentResultAttemptId,
+        ),
+      ),
+    )
+    .leftJoin(
+      currentResultCanonicalSelection,
+      and(
+        eq(
+          currentResultCanonicalSelection.id,
+          results.currentCanonicalSelectionId,
+        ),
+        eq(currentResultCanonicalSelection.resultId, results.id),
+        eq(
+          currentResultCanonicalSelection.resultAttemptId,
+          results.currentResultAttemptId,
+        ),
+      ),
+    )
+    .leftJoin(
+      currentInterpretationArchive,
+      and(
+        eq(
+          currentInterpretationArchive.id,
+          currentResultInterpretation.sourceArchiveId,
+        ),
+        eq(currentInterpretationArchive.resultId, results.id),
+        eq(
+          currentInterpretationArchive.resultAttemptId,
+          results.currentResultAttemptId,
+        ),
+        eq(currentInterpretationArchive.state, "current"),
+      ),
+    )
+    .leftJoin(
+      currentInterpretationBlob,
+      eq(currentInterpretationBlob.id, currentInterpretationArchive.blobId),
     )
     .where(
       and(
@@ -348,6 +572,22 @@ async function loadAttemptEvidence(
       frameTrack: sql<unknown>`COALESCE(
         NULLIF("result_attempts"."evidence_payload" -> 'frame_track', 'null'::jsonb),
         "result_attempts"."evidence_payload" -> 'frameTrack'
+      )`,
+      uransCycleCertificatePresent: sql<boolean>`(
+        "result_attempts"."evidence_payload" ? 'urans_cycle_certificate'
+        OR "result_attempts"."evidence_payload" ? 'uransCycleCertificate'
+      )`,
+      uransCycleCertificate: sql<unknown>`COALESCE(
+        "result_attempts"."evidence_payload" -> 'urans_cycle_certificate',
+        "result_attempts"."evidence_payload" -> 'uransCycleCertificate'
+      )`,
+      ransHoldCertificatePresent: sql<boolean>`(
+        "result_attempts"."evidence_payload" ? 'rans_hold_certificate'
+        OR "result_attempts"."evidence_payload" ? 'ransHoldCertificate'
+      )`,
+      ransHoldCertificate: sql<unknown>`COALESCE(
+        "result_attempts"."evidence_payload" -> 'rans_hold_certificate',
+        "result_attempts"."evidence_payload" -> 'ransHoldCertificate'
       )`,
       // Ladder evidence lives inside the same verbatim engine PolarPoint.
       fidelity: sql<
@@ -453,6 +693,15 @@ function preserveSelectedAttemptDowngrades(
     if (!selectedAttemptId || resultClassification.state !== "accepted") {
       continue;
     }
+    // A currently selected archive reduction is deliberately the one narrow
+    // exception to the raw-attempt downgrade rule below.  The archive reducer
+    // has re-audited that exact attempt's immutable fields and the result
+    // projection proved its selection/current-archive chain.  Retaining a
+    // historical `needs_urans` verdict here would make the selected values
+    // unreachable and force a needless rerun.
+    if (hasCertifiedSelectedArchiveInterpretation(resultEvidence)) {
+      continue;
+    }
     const selectedAttemptClassification =
       attemptClassificationById.get(selectedAttemptId);
     if (selectedAttemptClassification?.state !== "needs_urans") continue;
@@ -483,6 +732,8 @@ function signatureFor(
       return [
         e.resultId,
         e.currentGenerationAttemptId ?? "",
+        e.selectedArchiveInterpretation?.id ?? "",
+        e.selectedArchiveInterpretation?.inputEvidenceSignature ?? "",
         e.a,
         e.regime,
         c.state,
@@ -607,7 +858,101 @@ async function retireInvalidSelectedAttempts(
   simulationPresetRevisionId: string,
   compatibilityHash: string | null,
 ): Promise<number> {
-  const eligibleExactClassification = sql`EXISTS (
+  // The normal path requires a current attempt classification. A selected
+  // archive backfill is the deliberate exception: it has re-reduced the exact
+  // attempt from its current authenticated archive, and therefore must not be
+  // cleared merely because the original engine summary lacked a clean-cycle
+  // certificate. Keep the archive identity/currentness and raw/selector
+  // semantic checks here as well as in the read model so cache retirement
+  // cannot race the projection.
+  const acceptedCurrentArchiveInterpretation = sql`EXISTS (
+    SELECT 1
+    FROM ${resultCanonicalSelections} selected_interpretation_selection
+    JOIN ${resultInterpretations} selected_interpretation
+      ON selected_interpretation.id = selected_interpretation_selection.result_interpretation_id
+     AND selected_interpretation.result_id = ${results.id}
+     AND selected_interpretation.result_attempt_id = ${results.currentResultAttemptId}
+    JOIN ${currentArchiveSelectedAttempt}
+      ON ${currentArchiveSelectedAttempt.id} = ${results.currentResultAttemptId}
+     AND ${currentArchiveSelectedAttempt.resultId} = ${results.id}
+    JOIN ${solverEvidenceArchives} selected_archive
+      ON selected_archive.id = selected_interpretation.source_archive_id
+     AND selected_archive.result_id = ${results.id}
+     AND selected_archive.result_attempt_id = ${results.currentResultAttemptId}
+     AND selected_archive.state = 'current'
+    JOIN ${solverEvidenceBlobs} selected_archive_blob
+      ON selected_archive_blob.id = selected_archive.blob_id
+    WHERE selected_interpretation_selection.id = ${results.currentCanonicalSelectionId}
+      AND selected_interpretation_selection.result_id = ${results.id}
+      AND selected_interpretation_selection.result_attempt_id = ${results.currentResultAttemptId}
+      AND selected_interpretation_selection.result_interpretation_id = ${results.currentResultInterpretationId}
+      AND selected_interpretation.state = 'accepted'
+      AND selected_interpretation.source = 'archive_backfill'
+      AND selected_archive_blob.backend = 'gcs'
+      AND selected_archive_blob.compression = 'zstd'
+      AND selected_archive_blob.mime_type = 'application/zstd'
+      AND btrim(COALESCE(selected_archive_blob.bucket, '')) <> ''
+      AND selected_archive_blob.generation ~ '^[1-9][0-9]{0,19}$'
+      AND selected_archive_blob."verifiedAt" IS NOT NULL
+      AND (
+        (
+          selected_interpretation.regime = 'periodic'
+          AND selected_interpretation_selection.selection_namespace = 'archive-clean-cycle-v3'
+          AND ${currentArchiveSelectedAttempt.regime} = 'urans'
+          AND ${currentArchiveSelectedAttempt.unsteady} = TRUE
+          AND ${currentArchiveSelectedAttempt.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+        )
+        OR (
+          selected_interpretation.regime = 'steady_equivalent'
+          AND selected_interpretation_selection.selection_namespace = 'archive-no-shedding-v1'
+          AND ${currentArchiveSelectedAttempt.regime} IN ('urans', 'rans')
+          AND ${currentArchiveSelectedAttempt.unsteady} = FALSE
+          AND ${currentArchiveSelectedAttempt.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+        )
+      )
+  )`;
+  // Archive reduction happens asynchronously after the engine has completed
+  // the exact physical run. Preserve that current pointer only after the
+  // global queue has durably admitted its exact archive. A merely GCS-looking
+  // blob is not enough: without a receipt, retaining the raw pointer would
+  // suppress recovery while no reducer owns the work.
+  const pendingCurrentUransArchiveReduction = sql`EXISTS (
+    SELECT 1
+    FROM ${resultArchiveReductionQueue} publication_queue
+    JOIN ${pendingArchiveReductionAttempt}
+      ON ${pendingArchiveReductionAttempt.id} = publication_queue.result_attempt_id
+     AND ${pendingArchiveReductionAttempt.resultId} = publication_queue.result_id
+    JOIN ${solverEvidenceArchives} pending_archive
+      ON pending_archive.id = publication_queue.source_archive_id
+     AND pending_archive.result_id = ${results.id}
+     AND pending_archive.result_attempt_id = publication_queue.result_attempt_id
+     AND pending_archive.state = 'current'
+    JOIN ${solverEvidenceBlobs} pending_archive_blob
+      ON pending_archive_blob.id = pending_archive.blob_id
+    WHERE publication_queue.result_id = ${results.id}
+      AND publication_queue.result_attempt_id = ${results.currentResultAttemptId}
+      AND publication_queue.source_archive_id = pending_archive.id
+      AND publication_queue.state IN ('pending', 'hydrating', 'continuation_required', 'rerun_required')
+      AND ${pendingArchiveReductionAttempt.id} = ${results.currentResultAttemptId}
+      AND ${pendingArchiveReductionAttempt.resultId} = ${results.id}
+      AND ${pendingArchiveReductionAttempt.status} = 'done'
+      AND ${pendingArchiveReductionAttempt.source} = 'solved'
+      AND ${pendingArchiveReductionAttempt.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')
+      AND (
+        (${pendingArchiveReductionAttempt.regime} = 'urans' AND ${pendingArchiveReductionAttempt.unsteady} IN (TRUE, FALSE))
+        OR (${pendingArchiveReductionAttempt.regime} = 'rans' AND ${pendingArchiveReductionAttempt.unsteady} = FALSE)
+      )
+      AND pending_archive_blob.backend = 'gcs'
+      AND pending_archive_blob.compression = 'zstd'
+      AND pending_archive_blob.mime_type = 'application/zstd'
+      AND btrim(COALESCE(pending_archive_blob.bucket, '')) <> ''
+      AND pending_archive_blob.generation ~ '^[1-9][0-9]{0,19}$'
+      AND pending_archive_blob."verifiedAt" IS NOT NULL
+  )`;
+  const eligibleExactClassification = sql`(
+    ${acceptedCurrentArchiveInterpretation}
+    OR ${pendingCurrentUransArchiveReduction}
+    OR EXISTS (
     SELECT 1
     FROM ${resultClassifications} selected_classification
     JOIN ${resultAttempts} selected_attempt
@@ -641,6 +986,7 @@ async function retireInvalidSelectedAttempts(
             AND length(trim(selected_manifest.mime_type)) > 0
           )
       )
+    )
   )`;
   const invalidSelected = await db
     .select({ id: results.id })
@@ -685,7 +1031,16 @@ async function retireInvalidSelectedAttempts(
 
   const cleared = await db
     .update(results)
-    .set({ currentResultAttemptId: null, updatedAt: new Date() })
+    // A raw current-attempt pointer and its archive-derived interpretation are
+    // one projection. Clearing only the attempt left an accepted
+    // interpretation/selection pointing at a now-null generation, which a
+    // later publication could mistake for a valid prior choice.
+    .set({
+      currentResultAttemptId: null,
+      currentResultInterpretationId: null,
+      currentCanonicalSelectionId: null,
+      updatedAt: new Date(),
+    })
     .where(
       and(
         inArray(

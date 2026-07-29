@@ -13,6 +13,7 @@
   "scripts": {
     "generate": "drizzle-kit generate",
     "migrate": "tsx src/migrate.ts",
+    "preflight:result-interpretation-ledger": "tsx src/result-interpretation-ledger-preflight-cli.ts",
     "push": "drizzle-kit push",
     "seed": "tsx seed/index.ts",
     "backfill:polar-cache": "tsx src/backfill-polar-cache.ts",

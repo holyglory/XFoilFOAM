@@ -164,6 +164,19 @@ describe("progressBarSegments", () => {
     expect(progressSummaryLine(seg, 1750)).toContain("7 critical");
   });
 
+  it("MUST-CATCH: archive publication is a neutral outstanding readout, not a second completed bar segment", () => {
+    const seg = progressBarSegments(
+      totals({ solved: 1240, remaining: 0, awaitingArchiveReduction: 3 }),
+      { awaitingUrans: 0, needsReview: 0 },
+    );
+    expect(seg.doneCount).toBe(1280);
+    expect(seg.evidenceProcessingCount).toBe(3);
+    expect(seg.evidenceProcessing).toBeCloseTo(3 / 1750, 10);
+    expect(progressSummaryLine(seg, 1750)).toContain(
+      "3 processing verified evidence",
+    );
+  });
+
   it("requested = 0 never divides by zero; open never goes negative", () => {
     const seg = progressBarSegments(
       totals({ requested: 0, solved: 0, derived: 0, remaining: 0 }),

@@ -21,7 +21,10 @@ import {
 } from "./campaign-execution";
 import {
   resultAttempts,
+  resultArchiveReductionQueue,
+  resultCanonicalSelections,
   resultClassifications,
+  resultInterpretations,
   results,
   simJobs,
   simPrecalcObligationAttempts,
@@ -29,6 +32,8 @@ import {
   simPrecalcObligationRequests,
   simPrecalcObligations,
   simUransRequests,
+  solverEvidenceArchives,
+  simulationPresets,
   simulationPresetRevisions,
   type SimJob,
   type SimPrecalcObligation,
@@ -2347,12 +2352,92 @@ export async function settlePrecalcObligationsForJobInTransaction(
         }),
         classification: resultClassifications.state,
         reasons: resultClassifications.reasons,
+        /**
+         * An accepted classification is evidence about one immutable attempt,
+         * not permission to close every legacy `(airfoil, revision, AoA)`
+         * obligation that happens to share the job.  The target revision
+         * resolves its physical boundary condition from its snapshot (with the
+         * legacy preset fallback), and the producing job must have owned that
+         * one boundary condition under the same normalized OpenFOAM
+         * implementation.  Keep this as a projection flag rather than
+         * filtering the evidence query: rejected/failed rows still need their
+         * normal terminal audit and retry handling.
+         */
+        acceptedTargetCellCompatible: sql<boolean>`COALESCE((
+          ${resultAttempts.bcId} = ${revisionBoundaryConditionSql({
+            snapshot: simulationPresetRevisions.snapshot,
+            fallbackBoundaryConditionId:
+              simulationPresets.legacyBoundaryConditionId,
+          })}
+          AND ${simJobs.airfoilId} = ${resultAttempts.airfoilId}
+          AND ${simJobs.simulationPresetRevisionId} =
+            ${simulationPresetRevisions.id}
+          AND jsonb_array_length(${simJobs.bcIds}) = 1
+          AND ${simJobs.bcIds} ->> 0 = ${resultAttempts.bcId}::text
+          AND ${compatiblePrecalcCheckpointImplementationSql({
+            targetSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            targetRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointAttemptSolverImplementationId:
+              resultAttempts.solverImplementationId,
+            checkpointJobSolverImplementationId: simJobs.solverImplementationId,
+          })}
+        ), false)`,
+        /** Raw accepted URANS remains in-progress until its current result
+         * projection selects the exact accepted archive interpretation. */
+        canonicalArchiveSelected: sql<boolean>`COALESCE(EXISTS (
+          SELECT 1
+          FROM results canonical_result
+          JOIN result_canonical_selections canonical_selection
+            ON canonical_selection.id = canonical_result.current_canonical_selection_id
+           AND canonical_selection.result_id = canonical_result.id
+           AND canonical_selection.result_attempt_id = ${resultAttempts.id}
+          JOIN result_interpretations canonical_interpretation
+            ON canonical_interpretation.id = canonical_selection.result_interpretation_id
+           AND canonical_interpretation.result_id = canonical_result.id
+           AND canonical_interpretation.result_attempt_id = ${resultAttempts.id}
+           AND canonical_interpretation.source = 'archive_backfill'
+           AND canonical_interpretation.state = 'accepted'
+          JOIN solver_evidence_archives canonical_archive
+            ON canonical_archive.id = canonical_interpretation.source_archive_id
+           AND canonical_archive.result_id = canonical_result.id
+           AND canonical_archive.result_attempt_id = ${resultAttempts.id}
+           AND canonical_archive.state = 'current'
+          WHERE canonical_result.id = ${resultAttempts.resultId}
+            AND canonical_result.current_result_attempt_id = ${resultAttempts.id}
+            AND canonical_result.current_result_interpretation_id =
+              canonical_interpretation.id
+        ), false)`,
+        archivePublicationPending: sql<boolean>`COALESCE(EXISTS (
+          SELECT 1
+          FROM result_archive_reduction_queue publication_queue
+          WHERE publication_queue.result_id = ${resultAttempts.resultId}
+            AND publication_queue.result_attempt_id = ${resultAttempts.id}
+            AND publication_queue.state IN (
+              'pending', 'hydrating', 'continuation_required', 'rerun_required'
+            )
+        ), false)`,
       })
       .from(resultAttempts)
       .leftJoin(
         resultClassifications,
         eq(resultClassifications.resultAttemptId, resultAttempts.id),
       )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(
+          simulationPresetRevisions.id,
+          resultAttempts.simulationPresetRevisionId,
+        ),
+      )
+      .innerJoin(
+        simulationPresets,
+        eq(simulationPresets.id, simulationPresetRevisions.presetId),
+      )
+      .leftJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
       .where(
         and(
           eq(resultAttempts.simJobId, job.id),
@@ -2386,14 +2471,23 @@ export async function settlePrecalcObligationsForJobInTransaction(
                 isDeterministicMeshBlockerError(row.error))),
         ) ?? null)
       : null;
-    const accepted = precalcEvidence.find(
+    const acceptedRaw = precalcEvidence.find(
       (row) =>
         row.classification === "accepted" &&
+        row.acceptedTargetCellCompatible === true &&
         !hasPrecalcContinuationWarning(row.qualityWarnings) &&
         !row.queuedRestartable,
     );
+    const awaitingArchivePublication = Boolean(
+      acceptedRaw &&
+        !acceptedRaw.canonicalArchiveSelected &&
+        acceptedRaw.archivePublicationPending,
+    );
+    const accepted =
+      acceptedRaw?.canonicalArchiveSelected === true ? acceptedRaw : undefined;
     const judged =
       accepted ??
+      acceptedRaw ??
       precalcEvidence.find((row) => row.classification != null) ??
       precalcEvidence[0] ??
       exactPrecalcFailureFallback ??
@@ -2531,10 +2625,14 @@ export async function settlePrecalcObligationsForJobInTransaction(
       obligation.attemptCount = Math.max(0, obligation.attemptCount - 1);
     }
 
-    let state: "pending" | "satisfied" | "blocked" | "cancelled";
+    let state: "pending" | "running" | "satisfied" | "blocked" | "cancelled";
     let attemptState: "accepted" | "rejected" | "failed" | "cancelled";
     let lastOutcome: string;
-    if (accepted) {
+    if (awaitingArchivePublication) {
+      state = "running";
+      attemptState = "accepted";
+      lastOutcome = "awaiting_archive_reduction";
+    } else if (accepted) {
       state = "satisfied";
       attemptState = "accepted";
       lastOutcome = "accepted";
@@ -2653,6 +2751,24 @@ export async function settlePrecalcObligationsForJobInTransaction(
       outcome.satisfied.push(obligation.id);
       continue;
     }
+    if (awaitingArchivePublication) {
+      // This exact CFD generation is complete, but publication is owned by
+      // the durable archive reducer. Keep the obligation running rather than
+      // scheduling a duplicate URANS solve; `satisfy...AcceptedResult` closes
+      // it only after the canonical archive pointer is selected.
+      await tx
+        .update(simPrecalcObligations)
+        .set({
+          state: "running",
+          latestSimJobId: job.id,
+          lastOutcome: "awaiting_archive_reduction",
+          lastError: null,
+          nextSubmitAt: null,
+          completedAt: null,
+        })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      continue;
+    }
     // A late replay may finish its own immutable attempt audit row, but it
     // cannot regress the physical obligation after a newer job was recorded.
     if (obligation.latestSimJobId && obligation.latestSimJobId !== job.id) {
@@ -2738,7 +2854,10 @@ export async function settlePrecalcObligationsForJobInTransaction(
         },
       });
     }
-    outcome[state].push(obligation.id);
+    // `running` is reserved for a completed physical URANS generation whose
+    // exact archive is still being reduced. It exits above after recording
+    // the publication wait and therefore has no terminal settlement bucket.
+    if (state !== "running") outcome[state].push(obligation.id);
     if (continuationPermanent && state === "blocked") {
       outcome.continuationPermanent.push(obligation.id);
     }
@@ -2848,17 +2967,41 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       })
       .from(results)
       .innerJoin(
+        simulationPresetRevisions,
+        eq(
+          simulationPresetRevisions.id,
+          results.simulationPresetRevisionId,
+        ),
+      )
+      .innerJoin(
+        simulationPresets,
+        eq(simulationPresets.id, simulationPresetRevisions.presetId),
+      )
+      .innerJoin(
         resultClassifications,
         and(
           eq(resultClassifications.resultId, results.id),
+          eq(
+            resultClassifications.resultAttemptId,
+            results.currentResultAttemptId,
+          ),
           eq(resultClassifications.state, "accepted"),
         ),
       )
       .innerJoin(
         resultAttempts,
         and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
           eq(resultAttempts.resultId, results.id),
+          eq(resultAttempts.airfoilId, results.airfoilId),
+          eq(
+            resultAttempts.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(resultAttempts.bcId, results.bcId),
+          eq(resultAttempts.aoaDeg, results.aoaDeg),
           eq(resultAttempts.status, "done"),
+          eq(resultAttempts.source, "solved"),
           sql`(
             ${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'
             OR (
@@ -2868,6 +3011,52 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
           )`,
         ),
       )
+      // PRECALC closure is not a historical accepted classification. The
+      // current result projection must point at one accepted archive-derived
+      // interpretation and its exact archive must still be current. This
+      // keeps raw URANS completion in the publication queue until the clean
+      // cycle reducer has made a canonical selection.
+      .innerJoin(
+        resultCanonicalSelections,
+        and(
+          eq(
+            resultCanonicalSelections.id,
+            results.currentCanonicalSelectionId,
+          ),
+          eq(
+            results.currentResultInterpretationId,
+            resultCanonicalSelections.resultInterpretationId,
+          ),
+          eq(resultCanonicalSelections.resultId, results.id),
+          eq(resultCanonicalSelections.resultAttemptId, resultAttempts.id),
+        ),
+      )
+      .innerJoin(
+        resultInterpretations,
+        and(
+          eq(
+            resultInterpretations.id,
+            resultCanonicalSelections.resultInterpretationId,
+          ),
+          eq(resultInterpretations.resultId, results.id),
+          eq(resultInterpretations.resultAttemptId, resultAttempts.id),
+          eq(resultInterpretations.source, "archive_backfill"),
+          eq(resultInterpretations.state, "accepted"),
+        ),
+      )
+      .innerJoin(
+        solverEvidenceArchives,
+        and(
+          eq(
+            solverEvidenceArchives.id,
+            resultInterpretations.sourceArchiveId,
+          ),
+          eq(solverEvidenceArchives.resultId, results.id),
+          eq(solverEvidenceArchives.resultAttemptId, resultAttempts.id),
+          eq(solverEvidenceArchives.state, "current"),
+        ),
+      )
+      .innerJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
       .where(
         and(
           eq(results.id, resultId),
@@ -2890,6 +3079,33 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
             WHERE accepted_attempt_classification.result_attempt_id = ${resultAttempts.id}
               AND accepted_attempt_classification.state = 'accepted'
           )`,
+          // A result row's revision/AoA is not sufficient to satisfy the
+          // legacy obligation natural key. The immutable target revision can
+          // resolve a different boundary condition or OpenFOAM implementation
+          // than a historical/imported candidate. Require the exact target
+          // physical cell and a single-BC producing job before allowing this
+          // repair projection to close the obligation.
+          eq(
+            resultAttempts.bcId,
+            revisionBoundaryConditionSql({
+              snapshot: simulationPresetRevisions.snapshot,
+              fallbackBoundaryConditionId:
+                simulationPresets.legacyBoundaryConditionId,
+            }),
+          ),
+          sql`jsonb_array_length(${simJobs.bcIds}) = 1`,
+          sql`${simJobs.bcIds} ->> 0 = ${resultAttempts.bcId}::text`,
+          compatiblePrecalcCheckpointImplementationSql({
+            targetSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            targetRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointAttemptSolverImplementationId:
+              resultAttempts.solverImplementationId,
+            checkpointJobSolverImplementationId: simJobs.solverImplementationId,
+          }),
         ),
       )
       .orderBy(sql`${resultAttempts.createdAt} DESC`)

@@ -3,6 +3,7 @@ export const SOLVER_WORK_STATES = [
   "provisional",
   "solving",
   "queued",
+  "evidence_processing",
   "ladder",
   "needs_time",
   "needs_review",
@@ -135,6 +136,13 @@ export const SOLVER_WORK_STATE_STYLES: Record<
     label: "queued",
     className: "solver-work-state--queued",
     color: "#94a3b8",
+    background: "#111827",
+    border: "#334155",
+  },
+  evidence_processing: {
+    label: "processing verified evidence",
+    className: "solver-work-state--evidence-processing",
+    color: "#cbd5e1",
     background: "#111827",
     border: "#334155",
   },
@@ -609,6 +617,7 @@ function isUransRelated(point: SolverWorkPoint): boolean {
     /urans/i.test(point.fidelity ?? "") ||
     point.chain.some((item) => /urans/i.test(item.label)) ||
     point.state === "ladder" ||
+    point.state === "evidence_processing" ||
     point.state === "needs_time" ||
     point.state === "needs_review" ||
     point.state === "blocked" ||

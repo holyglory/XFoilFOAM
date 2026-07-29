@@ -52,6 +52,7 @@ from airfoilfoam.postprocess.unsteady import (
     PeriodEstimate,
     coefficient_series,
     estimate_period,
+    force_history,
     frame_coefficients,
     frame_target_times,
     measure_period,
@@ -564,6 +565,63 @@ def test_precalc_frame_density_matches_exported_last_three_periods(tmp_path):
     assert quality.retained_cycles >= 5.0
     assert quality.retained_frame_count == pytest.approx(91, abs=2)
     assert quality.frames_per_cycle >= pipeline.URANS_FRAME_WRITE_PER_CYCLE
+
+
+def test_real_case_clean_cycle_gate_requires_frames_for_each_selected_period(tmp_path):
+    """A real OpenFOAM case cannot certify coefficient-only periodic data."""
+
+    period = 0.2
+    (tmp_path / "system").mkdir()
+    (tmp_path / "system" / "controlDict").write_text("application pimpleFoam;\n")
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    times = np.linspace(0.0, 6 * period, 2401)
+    _write_coeff_rows(
+        coeff,
+        times,
+        lambda t: 0.7 + 0.08 * math.sin(2 * math.pi * t / period),
+    )
+    params = SolverParams(
+        force_transient=True,
+        urans_fidelity="precalc",
+        urans_min_periods=3,
+        transient_discard_fraction=0.0,
+    )
+    initial = UransQuality(
+        ok=True,
+        can_refine=False,
+        reason="URANS quality target met.",
+        measured_period_s=period,
+    )
+    without_frames = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        params,
+        initial,
+        early_stopped=False,
+    )
+    assert not without_frames.ok
+    assert without_frames.can_refine
+    assert without_frames.clean_cycle_audit is not None
+    assert any(
+        "frames" in reason
+        for cycle in without_frames.clean_cycle_audit.cycles
+        for reason in cycle.hard_reasons
+    )
+
+    for t in np.arange(0.0, 6 * period + 1e-9, period / 30.0):
+        (tmp_path / f"{float(t):.10g}").mkdir(exist_ok=True)
+    with_frames = pipeline._grade_precalc_established_oscillation(
+        tmp_path,
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=15.0),
+        params,
+        initial,
+        early_stopped=False,
+    )
+    assert with_frames.ok
+    assert with_frames.clean_cycle_audit is not None
+    assert with_frames.clean_cycle_audit.terminal_clean_cycles >= 3
 
 
 def _grade_precalc_trailing_signal(
@@ -3574,7 +3632,28 @@ def _fake_transient_with_series(tmp_path, *, period=0.5, no_shedding=False):
     else:
         _write_coeff_rows(coeff, ts, lambda t: 0.75 + 0.05 * math.sin(2 * math.pi * t / period))
     hist = _history_over(602.4, 606.0, period)
-    avg = SimpleNamespace(cl=99.0, cd=99.0, cm=99.0, cl_cd=1.0, cl_std=9.0, cd_std=9.0, cm_std=9.0)
+    if no_shedding:
+        # A current steady-equivalent URANS payload must carry the real
+        # slow-wake observation, not the old summary-only fixture.
+        hist = force_history(
+            coeff,
+            speed=10.0,
+            chord=1.0,
+            discard_fraction=0.0,
+            observation_start_time=601.8,
+            preserve_observation_window=True,
+        )
+        avg = SimpleNamespace(
+            cl=hist.cl_mean,
+            cd=hist.cd_mean,
+            cm=hist.cm_mean,
+            cl_cd=hist.cl_mean / hist.cd_mean,
+            cl_std=hist.cl_rms,
+            cd_std=hist.cd_rms,
+            cm_std=hist.cm_rms,
+        )
+    else:
+        avg = SimpleNamespace(cl=99.0, cd=99.0, cm=99.0, cl_cd=1.0, cl_std=9.0, cd_std=9.0, cm_std=9.0)
     quality = UransQuality(
         ok=True,
         can_refine=False,
@@ -3585,7 +3664,7 @@ def _fake_transient_with_series(tmp_path, *, period=0.5, no_shedding=False):
     return TransientResult(
         avg=avg,
         case_dir=tcase,
-        force_history=None if no_shedding else hist,
+        force_history=hist,
         quality=quality,
         start_time=600.0,
         end_time=606.0,
@@ -3759,7 +3838,8 @@ def test_no_shedding_point_ships_frame_track_null(tmp_path, monkeypatch):
 
     assert not outcome.unsteady  # steady-equivalent point
     assert outcome.frame_track is None
-    assert outcome.cl == pytest.approx(99.0)  # time-averaged path untouched
+    assert outcome.cl == pytest.approx(0.011)  # real no-shedding mean preserved
+    assert outcome.no_shedding_certificate is not None
     data = json.loads(_outcome_to_point("job", "slug", outcome).model_dump_json())
     assert data["frame_track"] is None
 

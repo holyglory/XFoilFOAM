@@ -2056,6 +2056,10 @@ export interface CampaignProgressTotals {
   /** Terminal machine-owned PRECALC obligations whose bounded attempts are
    *  exhausted or deterministically blocked. Disjoint from failed/rejected. */
   blocked: number;
+  /** Verified URANS evidence whose immutable archive is still being reduced
+   *  into a publishable interpretation. It remains outstanding work, but is
+   *  machine-owned and deliberately disjoint from failed/rejected/blocked. */
+  awaitingArchiveReduction: number;
   remaining: number;
 }
 
@@ -2219,6 +2223,7 @@ async function campaignProgressSnapshot(
       COALESCE(sum(derived), 0)::int AS derived,
       COALESCE(sum(rejected), 0)::int AS rejected,
       COALESCE(sum(blocked), 0)::int AS blocked,
+      COALESCE(sum(awaiting_archive_reduction), 0)::int AS awaiting_archive_reduction,
       COALESCE(sum(precalc_mesh_repairing), 0)::int AS precalc_mesh_repairing,
       COALESCE(sum(blocked_mesh_quality), 0)::int AS blocked_mesh_quality,
       COALESCE(sum(blocked_precalc_exhausted), 0)::int AS blocked_precalc_exhausted,
@@ -2230,7 +2235,8 @@ async function campaignProgressSnapshot(
     WHERE progress.campaign_id = ${campaignId}
       AND condition.generation = campaign.current_condition_generation
   `)) as unknown as Array<
-    Omit<CampaignProgressTotals, "remaining"> & {
+    Omit<CampaignProgressTotals, "remaining" | "awaitingArchiveReduction"> & {
+      awaiting_archive_reduction: number;
       precalc_mesh_repairing: number;
       blocked_mesh_quality: number;
       blocked_precalc_exhausted: number;
@@ -2247,6 +2253,7 @@ async function campaignProgressSnapshot(
     derived: 0,
     rejected: 0,
     blocked: 0,
+    awaiting_archive_reduction: 0,
     precalc_mesh_repairing: 0,
     blocked_mesh_quality: 0,
     blocked_precalc_exhausted: 0,
@@ -2262,6 +2269,7 @@ async function campaignProgressSnapshot(
     derived: Number(totals.derived),
     rejected: Number(totals.rejected),
     blocked: Number(totals.blocked),
+    awaitingArchiveReduction: Number(totals.awaiting_archive_reduction),
     remaining: Math.max(
       0,
       Number(totals.requested) -
@@ -2298,10 +2306,14 @@ export async function campaignProgressTotals(
  *  zero failed/rejected/blocked → completed; settled with failures,
  *  physics-rejected evidence, or machine-blocked PRECALC work
  *  points → attention (a rejected point is settled but NOT solved work); else
- *  active. */
+ *  active. A verified URANS archive that is still being reduced is also
+ *  explicitly outstanding: it can coexist with a currently selected RANS
+ *  result, so arithmetic over the legacy bucket counters alone cannot safely
+ *  establish completion. */
 export function deriveCampaignCompletion(
   totals: CampaignProgressTotals,
 ): "active" | "attention" | "completed" {
+  if (totals.awaitingArchiveReduction > 0) return "active";
   if (totals.requested > 0 && totals.remaining <= 0)
     return totals.failed > 0 || totals.rejected > 0 || totals.blocked > 0
       ? "attention"
@@ -7177,6 +7189,7 @@ export async function listCampaigns(
       COALESCE(pr.derived, 0)::int AS derived,
       COALESCE(pr.rejected, 0)::int AS rejected,
       COALESCE(pr.blocked, 0)::int AS blocked,
+      COALESCE(pr.awaiting_archive_reduction, 0)::int AS awaiting_archive_reduction,
       COALESCE(pr.precalc_mesh_repairing, 0)::int AS precalc_mesh_repairing,
       COALESCE(pr.blocked_mesh_quality, 0)::int AS blocked_mesh_quality,
       COALESCE(pr.blocked_precalc_exhausted, 0)::int AS blocked_precalc_exhausted,
@@ -7229,6 +7242,7 @@ export async function listCampaigns(
       SELECT progress.campaign_id AS campaign_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
              sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
              sum(rejected) AS rejected, sum(blocked) AS blocked,
+             sum(awaiting_archive_reduction) AS awaiting_archive_reduction,
              sum(precalc_mesh_repairing) AS precalc_mesh_repairing,
              sum(blocked_mesh_quality) AS blocked_mesh_quality,
              sum(blocked_precalc_exhausted) AS blocked_precalc_exhausted,
@@ -7309,6 +7323,7 @@ export async function listCampaigns(
         derived: Number(r.derived),
         rejected: Number(r.rejected),
         blocked: Number(r.blocked),
+        awaitingArchiveReduction: Number(r.awaiting_archive_reduction),
         remaining: Math.max(
           0,
           Number(r.requested) -
@@ -7459,14 +7474,16 @@ export async function campaignSummary(
       COALESCE(pr.superseded, 0)::int AS superseded,
       COALESCE(pr.derived, 0)::int AS derived,
       COALESCE(pr.rejected, 0)::int AS rejected,
-      COALESCE(pr.blocked, 0)::int AS blocked
+      COALESCE(pr.blocked, 0)::int AS blocked,
+      COALESCE(pr.awaiting_archive_reduction, 0)::int AS awaiting_archive_reduction
     FROM sim_campaign_conditions cc
     JOIN simulation_presets p ON p.id = cc.preset_id
     JOIN simulation_preset_revisions rev ON rev.id = cc.simulation_preset_revision_id
     LEFT JOIN (
       SELECT condition_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
              sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
-             sum(rejected) AS rejected, sum(blocked) AS blocked
+             sum(rejected) AS rejected, sum(blocked) AS blocked,
+             sum(awaiting_archive_reduction) AS awaiting_archive_reduction
       FROM sim_campaign_progress WHERE campaign_id = ${campaignId} GROUP BY condition_id
     ) pr ON pr.condition_id = cc.id
     WHERE cc.campaign_id = ${campaignId}
@@ -7602,6 +7619,7 @@ export async function campaignSummary(
         derived: Number(r.derived),
         rejected: Number(r.rejected),
         blocked: Number(r.blocked),
+        awaitingArchiveReduction: Number(r.awaiting_archive_reduction),
         remaining: Math.max(
           0,
           Number(r.requested) -
@@ -7727,6 +7745,7 @@ export async function campaignAirfoilRows(
       derived: row.derived,
       rejected: row.rejected,
       blocked: row.blocked,
+      awaitingArchiveReduction: row.awaitingArchiveReduction,
       remaining: Math.max(
         0,
         row.requested -

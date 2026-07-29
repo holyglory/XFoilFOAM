@@ -145,6 +145,44 @@ export const solverEvidenceArchiveStateEnum = pgEnum(
   "solver_evidence_archive_state",
   ["current", "superseded"],
 );
+/**
+ * The interpretation is the versioned scientific reduction of immutable raw
+ * solver evidence.  It deliberately has a different lifecycle from the
+ * producing result attempt: an attempt can be reinterpreted as the reducer
+ * improves without ever rewriting the attempt or its archive.
+ */
+export const resultInterpretationStateEnum = pgEnum(
+  "result_interpretation_state",
+  [
+    "accepted",
+    "continuation_required",
+    "terminal_failure",
+    "legacy_uncertified",
+  ],
+);
+export const resultInterpretationRegimeEnum = pgEnum(
+  "result_interpretation_regime",
+  [
+    "legacy_engine_reported",
+    "rans_hold",
+    "steady_equivalent",
+    "periodic",
+    "broadband_stationary",
+    "trending_unresolved",
+  ],
+);
+export const resultInterpretationCycleDispositionEnum = pgEnum(
+  "result_interpretation_cycle_disposition",
+  [
+    "selected",
+    "startup",
+    "hard_corrupt",
+    "settling_outlier",
+    "cadence_unresolved",
+    "numerically_noisy",
+    "insufficient_frames",
+  ],
+);
 
 const ts = () => timestamp({ withTimezone: true });
 export const ALL_IMAGE_FIELDS = [
@@ -1201,6 +1239,14 @@ export const results = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     currentResultAttemptId: uuid("current_result_attempt_id"),
+    /**
+     * Current coefficient interpretation and the append-only selection event
+     * that selected it.  Both are nullable during the migration/dual-read
+     * period.  Their composite ownership FKs below forbid cross-result
+     * pointers once a versioned interpretation is selected.
+     */
+    currentResultInterpretationId: uuid("current_result_interpretation_id"),
+    currentCanonicalSelectionId: uuid("current_canonical_selection_id"),
     airfoilId: uuid("airfoil_id")
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
@@ -1314,6 +1360,17 @@ export const results = pgTable(
     currentAttemptIdx: index("results_current_attempt_idx").on(
       t.currentResultAttemptId,
     ),
+    // Migration 0096 owns the composite current-interpretation/current-
+    // selection FKs.  Keeping those two reverse FKs migration-only avoids a
+    // recursive Drizzle table inference cycle (`results` <- interpretations
+    // <- selections <- results), just as solver_evidence_archives keeps its
+    // self-referential ownership FK migration-only.
+    currentInterpretationIdx: index("results_current_interpretation_idx").on(
+      t.currentResultInterpretationId,
+    ),
+    currentCanonicalSelectionIdx: index(
+      "results_current_canonical_selection_idx",
+    ).on(t.currentCanonicalSelectionId),
     naturalUq: uniqueIndex("results_revision_natural_uq").on(
       t.airfoilId,
       t.simulationPresetRevisionId,
@@ -2021,6 +2078,879 @@ export const solverEvidenceArtifactMembers = pgTable(
     pathCheck: check(
       "solver_evidence_artifact_members_path_check",
       sql`btrim(${t.memberPath}) <> '' AND ${t.memberPath} NOT LIKE '/%' AND ${t.memberPath} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.memberPath}) = 0`,
+    ),
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Versioned coefficient interpretations — immutable reductions of raw solver
+// evidence.  These tables intentionally sit beside archive identity rather
+// than `results`: a result is a mutable canonical projection, while an
+// interpretation is a reproducible scientific claim over one exact attempt.
+// ---------------------------------------------------------------------------
+
+/** Immutable reducer policy/build identity.  A changed policy creates a new
+ * row and a new interpretation; it never rewrites an older reduction. */
+export const resultReducerVersions = pgTable(
+  "result_reducer_versions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reducerKey: text("reducer_key").notNull(),
+    reducerVersion: text("reducer_version").notNull(),
+    buildId: text("build_id").notNull(),
+    policySha256: text("policy_sha256").notNull(),
+    policy: jsonb("policy")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    source: text("source").notNull().default("application"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    identityUq: uniqueIndex("result_reducer_versions_identity_uq").on(
+      t.reducerKey,
+      t.reducerVersion,
+      t.buildId,
+      t.policySha256,
+    ),
+    policyShaCheck: check(
+      "result_reducer_versions_policy_sha_check",
+      sql`${t.policySha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    textShapeCheck: check(
+      "result_reducer_versions_text_shape_check",
+      sql`btrim(${t.reducerKey}) <> '' AND btrim(${t.reducerVersion}) <> '' AND btrim(${t.buildId}) <> '' AND btrim(${t.source}) <> ''`,
+    ),
+   policyShapeCheck: check(
+     "result_reducer_versions_policy_shape_check",
+     sql`jsonb_typeof(${t.policy}) = 'object'`,
+   ),
+  }),
+);
+
+/**
+ * Immutable calculation of coefficients from one exact result attempt and
+ * reducer policy. `statistics` contains the complete reproducible vector
+ * covariance/CI payload; promoted scalar columns make selected values cheap
+ * to project into the legacy `results` read model.
+ */
+export const resultInterpretations = pgTable(
+  "result_interpretations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    reducerVersionId: uuid("reducer_version_id")
+      .notNull()
+      .references(() => resultReducerVersions.id, { onDelete: "restrict" }),
+    sourceArchiveId: uuid("source_archive_id"),
+    source: text("source").notNull(),
+    inputEvidenceSignature: text("input_evidence_signature").notNull(),
+    state: resultInterpretationStateEnum("state").notNull(),
+    regime: resultInterpretationRegimeEnum("regime").notNull(),
+    continuationReason: text("continuation_reason"),
+    terminalReason: text("terminal_reason"),
+    selectedWindow: jsonb("selected_window")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    statistics: jsonb("statistics")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    diagnostics: jsonb("diagnostics")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    cl: doublePrecision("cl"),
+    cd: doublePrecision("cd"),
+    cm: doublePrecision("cm"),
+    clCd: doublePrecision("cl_cd"),
+    clWaveformRms: doublePrecision("cl_waveform_rms"),
+    cdWaveformRms: doublePrecision("cd_waveform_rms"),
+    cmWaveformRms: doublePrecision("cm_waveform_rms"),
+    clStandardError: doublePrecision("cl_standard_error"),
+    cdStandardError: doublePrecision("cd_standard_error"),
+    cmStandardError: doublePrecision("cm_standard_error"),
+    clCi95Low: doublePrecision("cl_ci95_low"),
+    clCi95High: doublePrecision("cl_ci95_high"),
+    cdCi95Low: doublePrecision("cd_ci95_low"),
+    cdCi95High: doublePrecision("cd_ci95_high"),
+    cmCi95Low: doublePrecision("cm_ci95_low"),
+    cmCi95High: doublePrecision("cm_ci95_high"),
+    clCdCi95Low: doublePrecision("cl_cd_ci95_low"),
+    clCdCi95High: doublePrecision("cl_cd_ci95_high"),
+    clCdIntervalState: text("cl_cd_interval_state")
+      .notNull()
+      .default("unavailable"),
+    uncertaintyBasis: text("uncertainty_basis")
+      .notNull()
+      .default("not_available"),
+    effectiveBlocks: integer("effective_blocks"),
+    maxIatSeconds: doublePrecision("max_iat_seconds"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_interpretations_attempt_owner_fk",
+    }).onDelete("cascade"),
+    archiveOwnerFk: foreignKey({
+      columns: [t.sourceArchiveId, t.resultAttemptId],
+      foreignColumns: [
+        solverEvidenceArchives.id,
+        solverEvidenceArchives.resultAttemptId,
+      ],
+      name: "result_interpretations_archive_owner_fk",
+    }).onDelete("restrict"),
+    // Archive identity is causal provenance, not a decorative pointer. Two
+    // current/retired archive generations can contain byte-identical raw
+    // members yet remain distinct immutable inputs; collapsing them here lets
+    // an A->B archive replacement return an interpretation bound to A.
+    archiveAttemptReducerSourceEvidenceUq: uniqueIndex(
+      "result_interpretations_archive_attempt_reducer_source_evidence_uq",
+    )
+      .on(
+        t.resultAttemptId,
+        t.reducerVersionId,
+        t.sourceArchiveId,
+        t.inputEvidenceSignature,
+      )
+      .where(sql`${t.source} = 'archive_backfill'`),
+    // Keep the original replay identity for engine-derived interpretations,
+    // which intentionally have no source archive.
+    nonArchiveAttemptReducerEvidenceUq: uniqueIndex(
+      "result_interpretations_nonarchive_attempt_reducer_evidence_uq",
+    )
+      .on(t.resultAttemptId, t.reducerVersionId, t.inputEvidenceSignature)
+      .where(sql`${t.source} <> 'archive_backfill'`),
+    idResultUq: unique("result_interpretations_id_result_uq").on(
+      t.id,
+      t.resultId,
+    ),
+    idAttemptResultUq: unique("result_interpretations_id_attempt_result_uq").on(
+      t.id,
+      t.resultAttemptId,
+      t.resultId,
+    ),
+    resultCreatedIdx: index("result_interpretations_result_created_idx").on(
+      t.resultId,
+      t.createdAt,
+    ),
+    attemptCreatedIdx: index("result_interpretations_attempt_created_idx").on(
+      t.resultAttemptId,
+      t.createdAt,
+    ),
+    stateIdx: index("result_interpretations_state_idx").on(
+      t.state,
+      t.createdAt,
+    ),
+    jsonShapeCheck: check(
+      "result_interpretations_json_shape_check",
+      sql`jsonb_typeof(${t.selectedWindow}) = 'object' AND jsonb_typeof(${t.statistics}) = 'object' AND jsonb_typeof(${t.diagnostics}) = 'object'`,
+    ),
+    sourceCheck: check(
+      "result_interpretations_source_check",
+      sql`${t.source} IN ('engine_reported', 'archive_backfill', 'continuation', 'corrective_generation') AND btrim(${t.inputEvidenceSignature}) <> '' AND ((${t.source} = 'archive_backfill' AND ${t.sourceArchiveId} IS NOT NULL) OR (${t.source} <> 'archive_backfill'))`,
+    ),
+    stateShapeCheck: check(
+      "result_interpretations_state_shape_check",
+      sql`(
+        ${t.state} = 'accepted'
+        AND ${t.cl} IS NOT NULL
+        AND ${t.cd} IS NOT NULL
+        AND ${t.cm} IS NOT NULL
+        AND ${t.continuationReason} IS NULL
+        AND ${t.terminalReason} IS NULL
+      ) OR (
+        ${t.state} = 'continuation_required'
+        AND btrim(COALESCE(${t.continuationReason}, '')) <> ''
+        AND ${t.terminalReason} IS NULL
+        AND ${t.cl} IS NULL
+        AND ${t.cd} IS NULL
+        AND ${t.cm} IS NULL
+        AND ${t.clCd} IS NULL
+      ) OR (
+        ${t.state} = 'terminal_failure'
+        AND btrim(COALESCE(${t.terminalReason}, '')) <> ''
+        AND ${t.continuationReason} IS NULL
+        AND ${t.cl} IS NULL
+        AND ${t.cd} IS NULL
+        AND ${t.cm} IS NULL
+        AND ${t.clCd} IS NULL
+      ) OR (
+        ${t.state} = 'legacy_uncertified'
+        AND ${t.regime} = 'legacy_engine_reported'
+        AND ${t.continuationReason} IS NULL
+        AND ${t.terminalReason} IS NULL
+      )`,
+    ),
+    intervalStateCheck: check(
+      "result_interpretations_cl_cd_interval_state_check",
+      sql`${t.clCdIntervalState} IN ('bounded', 'unbounded', 'unavailable')`,
+    ),
+    uncertaintyBasisCheck: check(
+      "result_interpretations_uncertainty_basis_check",
+      sql`${t.uncertaintyBasis} IN ('paired_cycles', 'paired_blocks', 'stability_envelope', 'numerical_plateau', 'legacy_engine_reported', 'not_available')`,
+    ),
+    effectiveBlocksCheck: check(
+      "result_interpretations_effective_blocks_check",
+      sql`${t.effectiveBlocks} IS NULL OR ${t.effectiveBlocks} >= 0`,
+    ),
+    maxIatCheck: check(
+      "result_interpretations_max_iat_check",
+      sql`${t.maxIatSeconds} IS NULL OR ${t.maxIatSeconds} >= 0`,
+    ),
+  }),
+);
+
+/** Immutable per-cycle audit.  The selected suffix, discarded startup cycles,
+ * and every corruption reason remain inspectable after a newer reducer ships. */
+export const resultInterpretationCycles = pgTable(
+  "result_interpretation_cycles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    resultInterpretationId: uuid("result_interpretation_id").notNull(),
+    cycleIndex: integer("cycle_index").notNull(),
+    startTimeS: doublePrecision("start_time_s").notNull(),
+    endTimeS: doublePrecision("end_time_s").notNull(),
+    periodS: doublePrecision("period_s").notNull(),
+    disposition:
+      resultInterpretationCycleDispositionEnum("disposition").notNull(),
+    coefficientSampleCount: integer("coefficient_sample_count").notNull(),
+    fieldFrameCount: integer("field_frame_count").notNull(),
+    phaseMaxGapFraction: doublePrecision("phase_max_gap_fraction"),
+    metrics: jsonb("metrics")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    interpretationOwnerFk: foreignKey({
+      columns: [t.resultInterpretationId, t.resultAttemptId, t.resultId],
+      foreignColumns: [
+        resultInterpretations.id,
+        resultInterpretations.resultAttemptId,
+        resultInterpretations.resultId,
+      ],
+      name: "result_interpretation_cycles_interpretation_owner_fk",
+    }).onDelete("cascade"),
+    interpretationCycleUq: uniqueIndex(
+      "result_interpretation_cycles_interpretation_cycle_uq",
+    ).on(t.resultInterpretationId, t.cycleIndex),
+    attemptIdx: index("result_interpretation_cycles_attempt_idx").on(
+      t.resultAttemptId,
+      t.cycleIndex,
+    ),
+    timeShapeCheck: check(
+      "result_interpretation_cycles_time_shape_check",
+      sql`${t.cycleIndex} >= 0 AND ${t.startTimeS} >= 0 AND ${t.endTimeS} > ${t.startTimeS} AND ${t.periodS} > 0`,
+    ),
+    countCheck: check(
+      "result_interpretation_cycles_count_check",
+      sql`${t.coefficientSampleCount} >= 0 AND ${t.fieldFrameCount} >= 0`,
+    ),
+    gapCheck: check(
+      "result_interpretation_cycles_gap_check",
+      sql`${t.phaseMaxGapFraction} IS NULL OR (${t.phaseMaxGapFraction} >= 0 AND ${t.phaseMaxGapFraction} <= 1)`,
+    ),
+    metricsCheck: check(
+      "result_interpretation_cycles_metrics_check",
+      sql`jsonb_typeof(${t.metrics}) = 'object'`,
+    ),
+  }),
+);
+
+/** Mutable work queue for authenticated archive interpretation/backfill.  It
+ * is deliberately not solver evidence: lease and retry fields can change
+ * while the resulting interpretation remains append-only. */
+export const resultInterpretationBackfillRuns = pgTable(
+  "result_interpretation_backfill_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reducerVersionId: uuid("reducer_version_id")
+      .notNull()
+      .references(() => resultReducerVersions.id, { onDelete: "restrict" }),
+    state: text("state").notNull().default("planned"),
+    scope: jsonb("scope")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    summary: jsonb("summary")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    requestedBy: text("requested_by").notNull().default("system"),
+    startedAt: ts(),
+    completedAt: ts(),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    reducerIdx: index("result_interpretation_backfill_runs_reducer_idx").on(
+      t.reducerVersionId,
+      t.createdAt,
+    ),
+    stateIdx: index("result_interpretation_backfill_runs_state_idx").on(
+      t.state,
+      t.createdAt,
+    ),
+    stateCheck: check(
+      "result_interpretation_backfill_runs_state_check",
+      sql`${t.state} IN ('planned', 'running', 'completed', 'failed', 'cancelled')`,
+    ),
+    jsonShapeCheck: check(
+      "result_interpretation_backfill_runs_json_shape_check",
+      sql`jsonb_typeof(${t.scope}) = 'object' AND jsonb_typeof(${t.summary}) = 'object'`,
+    ),
+    requestedByCheck: check(
+      "result_interpretation_backfill_runs_requested_by_check",
+      sql`btrim(${t.requestedBy}) <> ''`,
+    ),
+  }),
+);
+
+export const resultInterpretationBackfillItems = pgTable(
+  "result_interpretation_backfill_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => resultInterpretationBackfillRuns.id, {
+        onDelete: "cascade",
+      }),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    sourceArchiveId: uuid("source_archive_id"),
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: ts(),
+    nextAttemptAt: ts().notNull().defaultNow(),
+    lastError: text("last_error"),
+    resultInterpretationId: uuid("result_interpretation_id"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_interpretation_backfill_items_attempt_owner_fk",
+    }).onDelete("cascade"),
+    archiveOwnerFk: foreignKey({
+      columns: [t.sourceArchiveId, t.resultAttemptId],
+      foreignColumns: [
+        solverEvidenceArchives.id,
+        solverEvidenceArchives.resultAttemptId,
+      ],
+      name: "result_interpretation_backfill_items_archive_owner_fk",
+    }).onDelete("restrict"),
+    interpretationOwnerFk: foreignKey({
+      columns: [t.resultInterpretationId, t.resultAttemptId, t.resultId],
+      foreignColumns: [
+        resultInterpretations.id,
+        resultInterpretations.resultAttemptId,
+        resultInterpretations.resultId,
+      ],
+      name: "result_interpretation_backfill_items_interpretation_owner_fk",
+    }).onDelete("restrict"),
+    runAttemptUq: uniqueIndex(
+      "result_interpretation_backfill_items_run_attempt_uq",
+    ).on(t.runId, t.resultAttemptId),
+    readyIdx: index("result_interpretation_backfill_items_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    leaseIdx: index("result_interpretation_backfill_items_lease_idx").on(
+      t.state,
+      t.claimExpiresAt,
+    ),
+    runIdx: index("result_interpretation_backfill_items_run_idx").on(
+      t.runId,
+      t.state,
+    ),
+    stateCheck: check(
+      "result_interpretation_backfill_items_state_check",
+      sql`${t.state} IN ('pending', 'hydrating', 'reduced', 'missing_evidence', 'continuation_required', 'rerun_required', 'terminal_failure', 'failed')`,
+    ),
+    attemptCountCheck: check(
+      "result_interpretation_backfill_items_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    leaseShapeCheck: check(
+      "result_interpretation_backfill_items_lease_shape_check",
+      sql`(
+        ${t.state} = 'hydrating'
+        AND ${t.claimToken} IS NOT NULL
+        AND ${t.claimExpiresAt} IS NOT NULL
+      ) OR (
+        ${t.state} <> 'hydrating'
+        AND ${t.claimToken} IS NULL
+        AND ${t.claimExpiresAt} IS NULL
+      )`,
+    ),
+    reducedShapeCheck: check(
+      "result_interpretation_backfill_items_reduced_shape_check",
+      sql`${t.state} <> 'reduced' OR ${t.resultInterpretationId} IS NOT NULL`,
+    ),
+  }),
+);
+
+/**
+ * Live, globally deduplicated archive-reduction work.  Unlike the historical
+ * backfill run receipts above, this queue is the production publication
+ * handoff: one exact (attempt, immutable archive generation, reducer
+ * version) can be reduced at most once at a time, even when ingestion is
+ * replayed or the sweeper restarts.  `backfillRunId` is optional audit
+ * provenance for the bounded historical receipt created by the drain; it is
+ * never the queue identity.
+ */
+export const resultArchiveReductionQueue = pgTable(
+  "result_archive_reduction_queue",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    sourceArchiveId: uuid("source_archive_id").notNull(),
+    reducerVersionId: uuid("reducer_version_id")
+      .notNull()
+      .references(() => resultReducerVersions.id, { onDelete: "restrict" }),
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: ts(),
+    nextAttemptAt: ts().notNull().defaultNow(),
+    lastError: text("last_error"),
+    backfillRunId: uuid("backfill_run_id").references(
+      () => resultInterpretationBackfillRuns.id,
+      { onDelete: "restrict" },
+    ),
+    resultInterpretationId: uuid("result_interpretation_id"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_archive_reduction_queue_attempt_owner_fk",
+    }).onDelete("cascade"),
+    archiveOwnerFk: foreignKey({
+      columns: [t.sourceArchiveId, t.resultAttemptId],
+      foreignColumns: [
+        solverEvidenceArchives.id,
+        solverEvidenceArchives.resultAttemptId,
+      ],
+      name: "result_archive_reduction_queue_archive_owner_fk",
+    }).onDelete("restrict"),
+    interpretationOwnerFk: foreignKey({
+      columns: [t.resultInterpretationId, t.resultAttemptId, t.resultId],
+      foreignColumns: [
+        resultInterpretations.id,
+        resultInterpretations.resultAttemptId,
+        resultInterpretations.resultId,
+      ],
+      name: "result_archive_reduction_queue_interpretation_owner_fk",
+    }).onDelete("restrict"),
+    identityUq: uniqueIndex("result_archive_reduction_queue_identity_uq").on(
+      t.resultAttemptId,
+      t.sourceArchiveId,
+      t.reducerVersionId,
+    ),
+    readyIdx: index("result_archive_reduction_queue_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    leaseIdx: index("result_archive_reduction_queue_lease_idx").on(
+      t.state,
+      t.claimExpiresAt,
+    ),
+    resultIdx: index("result_archive_reduction_queue_result_idx").on(
+      t.resultId,
+      t.state,
+    ),
+    stateCheck: check(
+      "result_archive_reduction_queue_state_check",
+      sql`${t.state} IN ('pending', 'hydrating', 'reduced', 'superseded', 'missing_evidence', 'continuation_required', 'rerun_required', 'terminal_failure', 'failed')`,
+    ),
+    attemptCountCheck: check(
+      "result_archive_reduction_queue_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    leaseShapeCheck: check(
+      "result_archive_reduction_queue_lease_shape_check",
+      sql`(
+        ${t.state} = 'hydrating'
+        AND ${t.claimToken} IS NOT NULL
+        AND ${t.claimExpiresAt} IS NOT NULL
+      ) OR (
+        ${t.state} <> 'hydrating'
+        AND ${t.claimToken} IS NULL
+        AND ${t.claimExpiresAt} IS NULL
+      )`,
+    ),
+    reducedShapeCheck: check(
+      "result_archive_reduction_queue_reduced_shape_check",
+      sql`${t.state} <> 'reduced' OR ${t.resultInterpretationId} IS NOT NULL`,
+    ),
+  }),
+);
+
+/**
+ * Mutable scheduler handoff for an authenticated archive interpretation that
+ * cannot yet publish a clean URANS window.  This is intentionally separate
+ * from both immutable `result_interpretations` and the bounded backfill-run
+ * receipt: the same source archive can be revisited by a later reducer run,
+ * while the physical recovery must remain one idempotent, auditable action.
+ *
+ * The action never replaces its source attempt or archive.  A scheduler may
+ * attach a new continuation/fresh-generation owner below, but that target is
+ * only a pointer to separately immutable solver work.
+ */
+export const resultInterpretationRecoveryActions = pgTable(
+  "result_interpretation_recovery_actions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    sourceArchiveId: uuid("source_archive_id").notNull(),
+    inputEvidenceSignature: text("input_evidence_signature").notNull(),
+    /** urans_precalc | urans_full — never infer it from a generic regime. */
+    fidelity: text("fidelity").notNull(),
+    /** continue_exact_case | verify_restart_proof_then_rerun */
+    requestedAction: text("requested_action").notNull(),
+    /**
+     * Exact raw-archive reducer recommendation for a same-case continuation.
+     * NULL is retained for historical actions produced before the clean-tail
+     * contract and for rerun-required actions, which must not borrow a saved
+     * trajectory.
+     */
+    correctiveTailPeriods: integer("corrective_tail_periods"),
+    /**
+     * pending -> routing -> routed/waiting/blocked/satisfied.  Lease fields
+     * belong here rather than to scientific evidence, so a sweeper restart
+     * cannot lose a discovered recovery obligation.
+     */
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: ts(),
+    nextAttemptAt: ts().notNull().defaultNow(),
+    targetUransRequestId: uuid("target_urans_request_id").references(
+      (): AnyPgColumn => simUransRequests.id,
+      { onDelete: "restrict" },
+    ),
+    targetVerifyQueueId: uuid("target_verify_queue_id").references(
+      (): AnyPgColumn => simUransVerifyQueue.id,
+      { onDelete: "restrict" },
+    ),
+    decisionReason: text("decision_reason"),
+    lastError: text("last_error"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_interpretation_recovery_actions_attempt_owner_fk",
+    }).onDelete("cascade"),
+    archiveOwnerFk: foreignKey({
+      columns: [t.sourceArchiveId, t.resultAttemptId],
+      foreignColumns: [
+        solverEvidenceArchives.id,
+        solverEvidenceArchives.resultAttemptId,
+      ],
+      name: "result_interpretation_recovery_actions_archive_owner_fk",
+    }).onDelete("restrict"),
+    sourceFidelityUq: uniqueIndex(
+      "result_interpretation_recovery_actions_source_fidelity_uq",
+    ).on(t.resultAttemptId, t.sourceArchiveId, t.fidelity),
+    readyIdx: index("result_interpretation_recovery_actions_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    leaseIdx: index("result_interpretation_recovery_actions_lease_idx").on(
+      t.state,
+      t.claimExpiresAt,
+    ),
+    requestIdx: index("result_interpretation_recovery_actions_request_idx").on(
+      t.targetUransRequestId,
+    ),
+    verifyIdx: index("result_interpretation_recovery_actions_verify_idx").on(
+      t.targetVerifyQueueId,
+    ),
+    /** One active archive handoff owns one request receipt. Terminal history
+     * may retain that pointer for audit, but a replacement archive must never
+     * compete with an in-flight physical owner. */
+    activeRequestOwnerUq: uniqueIndex("ri_recovery_active_request_owner_uq")
+      .on(t.targetUransRequestId)
+      .where(
+        sql`${t.targetUransRequestId} IS NOT NULL AND ${t.state} IN ('waiting_for_precalc', 'continuation_routed', 'fresh_rerun_routed')`,
+      ),
+    /** The same invariant for an action-owned FINAL checkpoint queue. */
+    activeVerifyOwnerUq: uniqueIndex("ri_recovery_active_verify_owner_uq")
+      .on(t.targetVerifyQueueId)
+      .where(
+        sql`${t.targetVerifyQueueId} IS NOT NULL AND ${t.state} = 'continuation_routed'`,
+      ),
+    inputEvidenceSignatureCheck: check(
+      "result_interpretation_recovery_actions_signature_check",
+      sql`${t.inputEvidenceSignature} ~ '^[0-9a-f]{64}$'`,
+    ),
+    fidelityCheck: check(
+      "result_interpretation_recovery_actions_fidelity_check",
+      sql`${t.fidelity} IN ('urans_precalc', 'urans_full')`,
+    ),
+    actionCheck: check(
+      "result_interpretation_recovery_actions_action_check",
+      sql`${t.requestedAction} IN ('continue_exact_case', 'verify_restart_proof_then_rerun')`,
+    ),
+    correctiveTailPeriodsCheck: check(
+      "ri_recovery_tail_periods_ck",
+      sql`${t.correctiveTailPeriods} IS NULL OR ${t.correctiveTailPeriods} BETWEEN 1 AND 3`,
+    ),
+    stateCheck: check(
+      "result_interpretation_recovery_actions_state_check",
+      sql`${t.state} IN ('pending', 'routing', 'waiting_for_precalc', 'continuation_routed', 'fresh_rerun_routed', 'satisfied', 'blocked', 'cancelled')`,
+    ),
+    attemptCountCheck: check(
+      "result_interpretation_recovery_actions_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    leaseShapeCheck: check(
+      "result_interpretation_recovery_actions_lease_shape_check",
+      sql`(
+        ${t.state} = 'routing'
+        AND ${t.claimToken} IS NOT NULL
+        AND ${t.claimExpiresAt} IS NOT NULL
+      ) OR (
+        ${t.state} <> 'routing'
+        AND ${t.claimToken} IS NULL
+        AND ${t.claimExpiresAt} IS NULL
+      )`,
+    ),
+    targetShapeCheck: check(
+      "result_interpretation_recovery_actions_target_shape_check",
+      sql`NOT (
+        ${t.targetUransRequestId} IS NOT NULL
+        AND ${t.targetVerifyQueueId} IS NOT NULL
+      )`,
+    ),
+    routedTargetCheck: check(
+      "result_interpretation_recovery_actions_routed_target_check",
+      sql`(
+        ${t.state} NOT IN (
+          'waiting_for_precalc',
+          'continuation_routed',
+          'fresh_rerun_routed'
+        )
+      ) OR (
+        ${t.state} IN ('waiting_for_precalc', 'fresh_rerun_routed')
+        AND ${t.targetUransRequestId} IS NOT NULL
+        AND ${t.targetVerifyQueueId} IS NULL
+      ) OR (
+        ${t.state} = 'continuation_routed'
+        AND (
+          (${t.targetUransRequestId} IS NOT NULL AND ${t.targetVerifyQueueId} IS NULL)
+          OR (${t.targetUransRequestId} IS NULL AND ${t.targetVerifyQueueId} IS NOT NULL)
+        )
+      )`,
+    ),
+  }),
+);
+
+/**
+ * Durable recovery receipt for a legacy FAST-URANS attempt whose source has
+ * no current, verified GCS archive.  It is deliberately separate from
+ * `resultInterpretationRecoveryActions`: that archive-backed ledger can prove
+ * an exact continuation, whereas this one can only request a bounded *fresh*
+ * PRECALC generation.  The original attempt remains immutable historical
+ * evidence and this row is only a scheduler ownership record.
+ */
+export const legacyUransArchiveGapRecoveryActions = pgTable(
+  "legacy_urans_archive_gap_recovery_actions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    /** Fixed evidence predicate; never claim that a local/partial archive is
+     * a restart source. */
+    sourceCondition: text("source_condition")
+      .notNull()
+      .default("missing_current_verified_gcs_archive"),
+    /** This ledger is FAST-only. FULL remains the ordinary verify stage after
+     * a newly accepted FAST generation. */
+    fidelity: text("fidelity").notNull().default("urans_precalc"),
+    // pending | routing | fresh_rerun_routed | satisfied | blocked | cancelled
+    state: text("state").notNull().default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: ts(),
+    nextAttemptAt: ts().notNull().defaultNow(),
+    /** Immutable ownership receipt for the normal PRECALC request. */
+    targetUransRequestId: uuid("target_urans_request_id").references(
+      (): AnyPgColumn => simUransRequests.id,
+      { onDelete: "restrict" },
+    ),
+    decisionReason: text("decision_reason"),
+    lastError: text("last_error"),
+    createdBy: text("created_by")
+      .notNull()
+      .default("legacy-archive-gap-planner"),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "legacy_urans_archive_gap_recovery_attempt_owner_fk",
+    }).onDelete("cascade"),
+    sourceAttemptUq: uniqueIndex("legacy_urans_archive_gap_recovery_source_uq").on(
+      t.resultAttemptId,
+    ),
+    readyIdx: index("legacy_urans_archive_gap_recovery_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    leaseIdx: index("legacy_urans_archive_gap_recovery_lease_idx").on(
+      t.state,
+      t.claimExpiresAt,
+    ),
+    requestIdx: index("legacy_urans_archive_gap_recovery_request_idx").on(
+      t.targetUransRequestId,
+    ),
+    activeRequestOwnerUq: uniqueIndex(
+      "legacy_urans_archive_gap_recovery_active_request_uq",
+    )
+      .on(t.targetUransRequestId)
+      .where(
+        sql`${t.targetUransRequestId} IS NOT NULL AND ${t.state} = 'fresh_rerun_routed'`,
+      ),
+    sourceConditionCheck: check(
+      "legacy_urans_archive_gap_recovery_source_condition_check",
+      sql`${t.sourceCondition} = 'missing_current_verified_gcs_archive'`,
+    ),
+    fidelityCheck: check(
+      "legacy_urans_archive_gap_recovery_fidelity_check",
+      sql`${t.fidelity} = 'urans_precalc'`,
+    ),
+    stateCheck: check(
+      "legacy_urans_archive_gap_recovery_state_check",
+      sql`${t.state} IN ('pending', 'routing', 'fresh_rerun_routed', 'satisfied', 'blocked', 'cancelled')`,
+    ),
+    attemptCountCheck: check(
+      "legacy_urans_archive_gap_recovery_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    leaseShapeCheck: check(
+      "legacy_urans_archive_gap_recovery_lease_shape_check",
+      sql`(
+        ${t.state} = 'routing'
+        AND ${t.claimToken} IS NOT NULL
+        AND ${t.claimExpiresAt} IS NOT NULL
+      ) OR (
+        ${t.state} <> 'routing'
+        AND ${t.claimToken} IS NULL
+        AND ${t.claimExpiresAt} IS NULL
+      )`,
+    ),
+    routedTargetCheck: check(
+      "legacy_urans_archive_gap_recovery_routed_target_check",
+      sql`${t.state} <> 'fresh_rerun_routed' OR ${t.targetUransRequestId} IS NOT NULL`,
+    ),
+    createdByCheck: check(
+      "legacy_urans_archive_gap_recovery_created_by_check",
+      sql`btrim(${t.createdBy}) <> ''`,
+    ),
+  }),
+);
+
+/**
+ * Append-only choice of which immutable interpretation projects into a
+ * result.  Rollback means adding a later selection, never editing a prior
+ * scientific claim or selection record.
+ */
+export const resultCanonicalSelections = pgTable(
+  "result_canonical_selections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    resultInterpretationId: uuid("result_interpretation_id").notNull(),
+    backfillRunId: uuid("backfill_run_id").references(
+      () => resultInterpretationBackfillRuns.id,
+      { onDelete: "restrict" },
+    ),
+    selectionNamespace: text("selection_namespace").notNull(),
+    reason: text("reason").notNull(),
+    actor: text("actor").notNull().default("system"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "result_canonical_selections_attempt_owner_fk",
+    }).onDelete("cascade"),
+    interpretationOwnerFk: foreignKey({
+      columns: [t.resultInterpretationId, t.resultAttemptId, t.resultId],
+      foreignColumns: [
+        resultInterpretations.id,
+        resultInterpretations.resultAttemptId,
+        resultInterpretations.resultId,
+      ],
+      name: "result_canonical_selections_interpretation_owner_fk",
+    }).onDelete("restrict"),
+    idResultUq: unique("result_canonical_selections_id_result_uq").on(
+      t.id,
+      t.resultId,
+    ),
+    resultCreatedIdx: index(
+      "result_canonical_selections_result_created_idx",
+    ).on(t.resultId, t.createdAt),
+    namespaceIdx: index("result_canonical_selections_namespace_idx").on(
+      t.selectionNamespace,
+      t.createdAt,
+    ),
+    textShapeCheck: check(
+      "result_canonical_selections_text_shape_check",
+      sql`btrim(${t.selectionNamespace}) <> '' AND btrim(${t.reason}) <> '' AND btrim(${t.actor}) <> ''`,
     ),
   }),
 );
@@ -3669,6 +4599,14 @@ export const simCampaignProgress = pgTable(
     // cell whose bounded PRECALC ledger is blocked is unavailable work, not a
     // human review item and not an ordinary RANS retry candidate.
     blocked: integer("blocked").notNull().default(0),
+    // Exact URANS physical generations with a verified immutable archive are
+    // awaiting the automatic clean-cycle reducer.  This is intentionally
+    // neither failed/rejected nor blocked: the solver work is complete and
+    // publication is machine-owned, so a new URANS request would duplicate
+    // the same physical evidence.
+    awaitingArchiveReduction: integer("awaiting_archive_reduction")
+      .notNull()
+      .default(0),
     // Open work which the engine-capability reconciler has already reopened
     // under a newer deterministic mesh-recovery strategy. This is progress,
     // not a terminal blocked point, so it is deliberately excluded from the
@@ -3702,6 +4640,7 @@ export const simCampaignProgress = pgTable(
     remediationNonnegativeCheck: check(
       "sim_campaign_progress_remediation_nonnegative_check",
       sql`${t.precalcMeshRepairing} >= 0
+        AND ${t.awaitingArchiveReduction} >= 0
         AND ${t.blockedMeshQuality} >= 0
         AND ${t.blockedPrecalcExhausted} >= 0
         AND ${t.blockedEngineSubmit} >= 0
@@ -4034,6 +4973,10 @@ export const simUransRequests = pgTable(
     /** Continuation budget override [s]: replaces the fidelity-derived solver
      *  budget for the resumed run (+2h / +6h UI choices). NULL = tier default. */
     budgetOverrideS: integer("budget_override_s"),
+    /** Exact archive reducer recommendation for a continuation's additional
+     * whole-period tail. NULL preserves legacy/source-heuristic continuations
+     * and is mandatory for a fresh request. */
+    correctiveTailPeriods: integer("corrective_tail_periods"),
     /** Immutable audit provenance for the creator. Never infer current
      * scheduling or cancellation ownership from this value. */
     requestedBy: text("requested_by"),
@@ -4056,6 +4999,17 @@ export const simUransRequests = pgTable(
     continuationAttemptShapeCheck: check(
       "sim_urans_requests_continuation_attempt_shape_check",
       sql`${t.continueFromResultAttemptId} IS NULL OR ${t.continueFromResultId} IS NOT NULL`,
+    ),
+    correctiveTailPeriodsCheck: check(
+      "sim_urans_tail_periods_ck",
+      sql`${t.correctiveTailPeriods} IS NULL OR ${t.correctiveTailPeriods} BETWEEN 1 AND 3`,
+    ),
+    correctiveTailContinuationCheck: check(
+      "sim_urans_tail_continue_ck",
+      sql`${t.correctiveTailPeriods} IS NULL OR (
+        ${t.continueFromResultId} IS NOT NULL
+        AND ${t.continueFromResultAttemptId} IS NOT NULL
+      )`,
     ),
     openCellUq: uniqueIndex("sim_urans_requests_open_cell_uq")
       .on(
@@ -5605,6 +6559,20 @@ export type Result = typeof results.$inferSelect;
 export type ResultInsert = typeof results.$inferInsert;
 export type ResultAttempt = typeof resultAttempts.$inferSelect;
 export type ResultAttemptInsert = typeof resultAttempts.$inferInsert;
+export type ResultReducerVersion = typeof resultReducerVersions.$inferSelect;
+export type ResultInterpretation = typeof resultInterpretations.$inferSelect;
+export type ResultInterpretationCycle =
+  typeof resultInterpretationCycles.$inferSelect;
+export type ResultInterpretationBackfillRun =
+  typeof resultInterpretationBackfillRuns.$inferSelect;
+export type ResultInterpretationBackfillItem =
+  typeof resultInterpretationBackfillItems.$inferSelect;
+export type ResultArchiveReductionQueueItem =
+  typeof resultArchiveReductionQueue.$inferSelect;
+export type ResultInterpretationRecoveryAction =
+  typeof resultInterpretationRecoveryActions.$inferSelect;
+export type ResultCanonicalSelection =
+  typeof resultCanonicalSelections.$inferSelect;
 export type ResultMedia = typeof resultMedia.$inferSelect;
 export type ResultEvidenceFieldInventory =
   typeof resultEvidenceFieldInventory.$inferSelect;

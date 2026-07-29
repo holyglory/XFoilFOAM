@@ -131,12 +131,18 @@ export interface ProgressBarSegments {
   solving: number;
   awaitingUrans: number;
   blocked: number;
+  /** A verified URANS archive is being reduced before it can publish. This is
+   * intentionally a separate neutral readout, not another bar segment: it
+   * can coexist with a selected accepted RANS point and would otherwise
+   * double-count the physical cell. */
+  evidenceProcessing: number;
   /** Open = requested − done − solving − awaiting counts (never negative). */
   openCount: number;
   doneCount: number;
   solvingCount: number;
   awaitingCount: number;
   blockedCount: number;
+  evidenceProcessingCount: number;
 }
 
 /** Done = solved + derived (settled evidence). Solving = running (mid-ingest).
@@ -152,6 +158,7 @@ export function progressBarSegments(
   const solvingCount = totals.running;
   const awaitingCount = reviewBuckets?.awaitingUrans ?? 0;
   const blockedCount = totals.blocked ?? 0;
+  const evidenceProcessingCount = totals.awaitingArchiveReduction ?? 0;
   const frac = (n: number) =>
     requested > 0 ? Math.min(1, Math.max(0, n / requested)) : 0;
   return {
@@ -159,6 +166,7 @@ export function progressBarSegments(
     solving: frac(solvingCount),
     awaitingUrans: frac(awaitingCount),
     blocked: frac(blockedCount),
+    evidenceProcessing: frac(evidenceProcessingCount),
     openCount: Math.max(
       0,
       requested - doneCount - solvingCount - awaitingCount - blockedCount,
@@ -167,6 +175,7 @@ export function progressBarSegments(
     solvingCount,
     awaitingCount,
     blockedCount,
+    evidenceProcessingCount,
   };
 }
 
@@ -254,6 +263,11 @@ export function progressSummaryLine(
   if (seg.solvingCount > 0) parts.push(`${fCount(seg.solvingCount)} solving`);
   if (seg.awaitingCount > 0)
     parts.push(`${fCount(seg.awaitingCount)} awaiting FAST URANS`);
+  if (seg.evidenceProcessingCount > 0) {
+    parts.push(
+      `${fCount(seg.evidenceProcessingCount)} processing verified evidence`,
+    );
+  }
   if (seg.blockedCount > 0) parts.push(`${fCount(seg.blockedCount)} critical`);
   parts.push(`${fCount(seg.openCount)} open of ${fCount(requested)}`);
   return parts.join(" · ");

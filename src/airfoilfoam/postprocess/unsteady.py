@@ -39,6 +39,25 @@ class ForceHistory:
 
 
 @dataclass(frozen=True)
+class ForceHistoryTransportStatistics:
+    """Time-weighted statistics from the bounded force-history witness.
+
+    ``ForceHistory`` retains source-window statistics calculated before its
+    arrays are downsampled for transport.  These values intentionally describe
+    the *transported* arrays instead, so a consumer can bind a certificate to
+    the exact witness it receives without treating a lossy projection as raw
+    source evidence.
+    """
+
+    cl_mean: float
+    cl_rms: float
+    cd_mean: float
+    cd_rms: float
+    cm_mean: float
+    cm_rms: float
+
+
+@dataclass(frozen=True)
 class PeriodWindow:
     start: float
     end: float
@@ -59,6 +78,335 @@ class StablePeriodResult:
     frames_per_cycle: float = 0.0
     similarity: float | None = None
     mean_drift: float | None = None
+    clean_cycles: int = 0
+    required_clean_cycles: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# Clean-cycle certification v3
+# --------------------------------------------------------------------------- #
+#
+# A credible shedding period is only a cadence candidate.  A physical URANS
+# mean must be backed by a *contiguous terminal suffix* of individually clean
+# cycles; otherwise a damaged startup period, restart overshoot, or one bad
+# adaptive step can leak into the average merely because a whole-window FFT
+# happened to find the right frequency.  These values deliberately live in
+# post-processing rather than the API: the exact per-cycle audit is a
+# deterministic interpretation of immutable coefficient/field evidence.
+
+#: Versioned in result evidence by the caller when this interpretation is
+#: persisted.  Keeping the reducer version here makes the numerical policy
+#: discoverable to tests and prevents a future threshold change from silently
+#: looking like the same certification.
+CLEAN_CYCLE_CERTIFICATION_VERSION = "clean-cycle-v3"
+
+#: Phase-grid resolution used for the median template and every per-cycle
+#: comparison.  This is intentionally fixed: a cycle cannot improve its score
+#: merely because a sparse write cadence happened to reduce comparison detail.
+CLEAN_CYCLE_PHASE_SAMPLES = 96
+
+#: Tier-specific minimum *contiguous clean terminal* cycles.  Two cycles are
+#: sufficient to request a safer write cadence in the live monitor, but are
+#: never a publishable FAST/FULL certification window.
+FAST_CLEAN_CYCLE_MINIMUM = 3
+FINAL_CLEAN_CYCLE_MINIMUM = 5
+
+#: Recovery limits are expressed in *measured physical periods*, not solver
+#: chunks.  A terminal corruption gets one three-period repair opportunity;
+#: after that, each continuation must earn one more clean period at a time.
+#: These caps prevent an unbounded retry loop while still leaving enough
+#: evidence to recover from a damaged startup tail.
+FAST_CLEAN_CYCLE_MAX_PERIODS = 9
+FINAL_CLEAN_CYCLE_MAX_PERIODS = 12
+
+#: The clean-cycle rules compare all three force coefficients.  These are the
+#: existing engineering repeatability budgets, used for a cycle-mean outlier
+#: rather than inventing a denominator which collapses near zero lift/drag.
+_CYCLE_MEAN_ABS_BUDGET = {"cl": 0.02, "cd": 0.002, "cm": 0.01}
+_CYCLE_MEAN_REL_BUDGET = {"cl": 0.03, "cd": 0.05, "cm": 0.05}
+
+CLEAN_CYCLE_MIN_SAMPLES = 20
+CLEAN_CYCLE_MAX_PHASE_GAP = 0.10
+CLEAN_CYCLE_MAX_PHASE_SHIFT_BINS = 4
+CLEAN_CYCLE_MAX_SHAPE_NRMSE = 0.12
+CLEAN_CYCLE_MAX_AMPLITUDE_DEVIATION = 0.30
+CLEAN_CYCLE_HIGH_FREQUENCY_START_BIN = 9
+CLEAN_CYCLE_HIGH_FREQUENCY_FRACTION = 0.05
+
+
+@dataclass(frozen=True)
+class CycleAudit:
+    """Evidence-backed quality verdict for one whole URANS cycle.
+
+    ``hard_reasons`` mean the cycle is structurally unusable (missing samples
+    or frames, a phase hole, an isolated force impulse, or a numerical burst).
+    ``soft_reasons`` mean it is a physically plausible but non-repeatable
+    settling/outlier cycle.  Both are excluded from the selected suffix, but
+    keeping the distinction lets the continuation controller choose whether to
+    add periods or first tighten numerics.
+    """
+
+    index: int
+    start: float
+    end: float
+    samples: int
+    frames: int | None
+    phase_gap: float
+    phase_shift_bins: int
+    cl_mean: float
+    cd_mean: float
+    cm_mean: float
+    cl_shape_error: float
+    cd_shape_error: float
+    cm_shape_error: float
+    cl_amplitude_deviation: float
+    cd_amplitude_deviation: float
+    cm_amplitude_deviation: float
+    cl_high_frequency: float
+    cd_high_frequency: float
+    cm_high_frequency: float
+    hard_reasons: tuple[str, ...] = ()
+    soft_reasons: tuple[str, ...] = ()
+
+    @property
+    def hard(self) -> bool:
+        return bool(self.hard_reasons)
+
+    @property
+    def clean(self) -> bool:
+        return not self.hard_reasons and not self.soft_reasons
+
+    @property
+    def disposition(self) -> str:
+        if self.hard_reasons:
+            return "hard_corrupt"
+        if self.soft_reasons:
+            return "settling_outlier"
+        return "clean"
+
+
+@dataclass(frozen=True)
+class CleanCycleAudit:
+    """All cycle verdicts for one candidate cadence and its terminal suffix."""
+
+    period_s: float
+    phase_samples: int
+    cycles: tuple[CycleAudit, ...]
+    terminal_clean_cycles: int
+    required_clean_cycles: int
+    template_cycles: int
+    shape_error: float
+    cadence_adjusted: bool = False
+    # ``cycles`` describes the candidate evidence suffix supplied to this
+    # classifier.  It is deliberately not a runtime budget counter: the live
+    # pipeline may discard a settling prefix and an archived reducer may only
+    # inspect a short terminal tail.  Keep measured same-case progress
+    # separately so an unclean tail cannot reset the 9/12-period recovery
+    # ceiling merely by shrinking the audit input.
+    measured_periods: int = 0
+    recovery_origin_time: float | None = None
+    recovery_latest_time: float | None = None
+
+    @property
+    def certified(self) -> bool:
+        return self.terminal_clean_cycles >= self.required_clean_cycles
+
+    @property
+    def physical_periods(self) -> int:
+        """Whole measured same-case periods represented by this audit.
+
+        Older/in-memory audit constructors only know their classified cycles;
+        use that as the conservative baseline.  A trusted transient marker
+        may later raise this count, but never lower it.
+        """
+        try:
+            measured = int(self.measured_periods)
+        except (TypeError, ValueError):
+            measured = 0
+        return max(len(self.cycles), max(0, measured))
+
+    @property
+    def terminal_clean_start(self) -> float | None:
+        """First cycle in the entire contiguous clean terminal suffix."""
+        if self.terminal_clean_cycles <= 0:
+            return None
+        return self.cycles[-self.terminal_clean_cycles].start
+
+    @property
+    def selected_start(self) -> float | None:
+        """First cycle in the exact published clean-period window.
+
+        ``terminal_clean_cycles`` deliberately records all clean evidence at
+        the end of the trajectory.  The public reduction, however, owns only
+        the fidelity-required final 3/5 cycles so newer clean cycles do not
+        silently widen a previously defined averaging window.  Keeping those
+        two concepts separate makes the certificate read naturally as
+        ``3 selected of N terminal-clean cycles``.
+        """
+        if self.terminal_clean_cycles < self.required_clean_cycles:
+            return None
+        return self.cycles[-self.required_clean_cycles].start
+
+
+def clean_cycle_minimum(
+    fidelity: str | None = None,
+    *,
+    minimum_cycles: int | None = None,
+) -> int:
+    """Return the configured FAST/FULL terminal clean-cycle floor.
+
+    ``precalc``/``fast`` are FAST URANS; ``full``/``final`` are FINAL URANS.
+    Unknown/legacy callers use the FAST floor so adding certification does not
+    silently raise a legacy monitor's requested horizon.  A caller may raise,
+    but never lower, the chosen floor with ``minimum_cycles``.
+    """
+    key = (fidelity or "").strip().lower().replace("_", "-")
+    if key in {"candidate", "live", "monitor"}:
+        # Live two-period inspection controls write cadence only; it is not a
+        # publishable FAST/FULL result and therefore has its own explicit
+        # candidate floor.
+        base = 2
+    elif key in {"full", "final", "urans-full", "urans-final"}:
+        base = FINAL_CLEAN_CYCLE_MINIMUM
+    else:
+        base = FAST_CLEAN_CYCLE_MINIMUM
+    if minimum_cycles is None:
+        return base
+    try:
+        requested = int(minimum_cycles)
+    except (TypeError, ValueError):
+        requested = base
+    return max(base, requested)
+
+
+def required_clean_cycle_count(
+    *,
+    fidelity: str | None = None,
+    required_cycles: float = 0.0,
+    minimum_cycles: int | None = None,
+) -> int:
+    """Return the clean-cycle floor compatible with an exact output window."""
+    try:
+        horizon = float(required_cycles)
+    except (TypeError, ValueError):
+        horizon = 0.0
+    horizon_floor = int(math.ceil(horizon - 1e-12)) if horizon > 0 else 0
+    return max(clean_cycle_minimum(fidelity, minimum_cycles=minimum_cycles), horizon_floor)
+
+
+def clean_cycle_max_periods(fidelity: str | None = None) -> int:
+    """Maximum measured periods allowed for automatic clean-tail recovery."""
+    key = (fidelity or "").strip().lower().replace("_", "-")
+    if key in {"full", "final", "urans-full", "urans-final"}:
+        return FINAL_CLEAN_CYCLE_MAX_PERIODS
+    return FAST_CLEAN_CYCLE_MAX_PERIODS
+
+
+def clean_cycle_recovery_exhausted(
+    audit: CleanCycleAudit | None,
+    *,
+    fidelity: str | None = None,
+) -> bool:
+    """Return whether automatic recovery reached this tier's explicit cap.
+
+    A long clean suffix is useful provenance, not a reason to abandon a
+    recoverable result early.  FAST may collect through nine audited periods
+    and FINAL through twelve; only those explicit ceilings make the automatic
+    recovery path terminal.
+    """
+    return bool(
+        audit is not None
+        and audit.physical_periods >= clean_cycle_max_periods(fidelity)
+    )
+
+
+def with_clean_cycle_recovery_progress(
+    audit: CleanCycleAudit | None,
+    *,
+    origin_time: float | None,
+    latest_time: float | None,
+) -> CleanCycleAudit | None:
+    """Attach trusted same-case physical progress to an immutable audit.
+
+    Cycle selection intentionally works on a trailing candidate, so its
+    ``cycles`` count is not proof of how much physical URANS has already run.
+    Controllers that own a verified transient-start marker call this helper to
+    cap continuation from the whole same-case trajectory.  Unknown or malformed
+    marker data leaves the audit unchanged rather than inventing progress.
+    """
+    if audit is None:
+        return None
+    try:
+        origin = float(origin_time) if origin_time is not None else math.nan
+        latest = float(latest_time) if latest_time is not None else math.nan
+        period = float(audit.period_s)
+    except (TypeError, ValueError):
+        return audit
+    if (
+        not math.isfinite(origin)
+        or not math.isfinite(latest)
+        or not math.isfinite(period)
+        or period <= 0.0
+        or latest < origin
+    ):
+        return audit
+    measured = int(math.floor((latest - origin) / period + 1e-9))
+    return replace(
+        audit,
+        measured_periods=max(audit.physical_periods, measured),
+        recovery_origin_time=origin,
+        recovery_latest_time=latest,
+    )
+
+
+def additional_periods_for_clean_suffix(
+    audit: CleanCycleAudit | None,
+    *,
+    fidelity: str | None = None,
+    required_cycles: float = 0.0,
+    minimum_cycles: int | None = None,
+    borderline: bool = False,
+    maximum_chunk_periods: int = 3,
+) -> int:
+    """Bound the next automatic continuation chunk for clean-cycle recovery.
+
+    A damaged terminal cycle gets a three-period recovery chunk; a merely
+    short clean suffix asks only for the missing number of cycles, capped at
+    three.  ``borderline`` intentionally adds three guard periods after a
+    barely-passing suffix so the controller can decide on real new evidence.
+    The helper does not schedule work itself.
+    """
+    target = required_clean_cycle_count(
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+        minimum_cycles=minimum_cycles,
+    )
+    cap = max(1, int(maximum_chunk_periods))
+    if audit is None or not audit.cycles:
+        return cap
+    # The FAST/FINAL ceiling is a physical-period ceiling, not merely a
+    # classifier threshold checked after the next pimpleFoam chunk completes.
+    # A terminal impulse at FAST period 8 or FINAL period 11 therefore has
+    # room for exactly one more period, even though a newly corrupted tail
+    # would ordinarily earn a three-period repair chunk.  Without this clamp
+    # the runner can integrate past the advertised 9/12-period limit before
+    # the next audit has a chance to terminalize it.
+    remaining = max(0, clean_cycle_max_periods(fidelity) - audit.physical_periods)
+    cap = min(cap, remaining)
+    if cap <= 0:
+        return 0
+    if audit.terminal_clean_cycles < target:
+        final_is_clean = audit.cycles[-1].clean
+        if not final_is_clean:
+            return cap
+        # Once the first post-corruption clean suffix has been captured, grow
+        # it one physical period at a time.  Repeated three-period chunks were
+        # the source of the visibly noisy first retained period: they blurred
+        # the diagnosis and wrote unnecessary transient state.
+        if any(not cycle.clean for cycle in audit.cycles):
+            return 1
+        return min(cap, max(1, target - audit.terminal_clean_cycles))
+    return cap if borderline else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -430,6 +778,51 @@ def _time_weighted_mean_std(times: np.ndarray, values: np.ndarray) -> tuple[floa
     return mean, max(variance, 0.0) ** 0.5
 
 
+def force_history_transport_statistics(
+    history: ForceHistory,
+) -> ForceHistoryTransportStatistics:
+    """Return finite time-weighted statistics for the bounded witness.
+
+    This is intentionally stricter than the generic statistic helper: a
+    certificate witness must contain aligned finite coefficient samples and a
+    strictly increasing time axis.  The no-shedding certificate callers apply
+    their separate minimum-count policy; this utility only proves that the
+    actual payload can be integrated faithfully.
+    """
+    try:
+        times = np.asarray(history.t, dtype=float)
+        cl = np.asarray(history.cl, dtype=float)
+        cd = np.asarray(history.cd, dtype=float)
+        cm = np.asarray(history.cm, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("force-history transport values are malformed") from exc
+
+    channels = (times, cl, cd, cm)
+    count = int(times.size)
+    if (
+        count < 2
+        or any(channel.ndim != 1 or channel.size != count for channel in channels)
+        or not all(np.all(np.isfinite(channel)) for channel in channels)
+        or np.any(np.diff(times) <= 0)
+    ):
+        raise ValueError("force-history transport is not a finite ordered witness")
+
+    cl_mean, cl_rms = _time_weighted_mean_std(times, cl)
+    cd_mean, cd_rms = _time_weighted_mean_std(times, cd)
+    cm_mean, cm_rms = _time_weighted_mean_std(times, cm)
+    values = (cl_mean, cl_rms, cd_mean, cd_rms, cm_mean, cm_rms)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("force-history transport statistics are non-finite")
+    return ForceHistoryTransportStatistics(
+        cl_mean=cl_mean,
+        cl_rms=cl_rms,
+        cd_mean=cd_mean,
+        cd_rms=cd_rms,
+        cm_mean=cm_mean,
+        cm_rms=cm_rms,
+    )
+
+
 def _coefficient_series(
     path: "Path | Sequence[Path]",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -524,6 +917,96 @@ def coefficient_series(
     return _coefficient_series(path)
 
 
+def _coefficient_invalid_value_times_one(path: Path) -> np.ndarray:
+    """Return timestamped non-finite Cl/Cd/Cm rows from one raw member.
+
+    ``coefficient_series`` intentionally returns a finite, interpolation-safe
+    numeric series to its many display and monitoring callers.  Certification
+    needs one more piece of provenance: a raw non-finite coefficient row must
+    remain visible to the cycle audit instead of disappearing during that
+    normalisation.  This helper carries only the timestamp, never a made-up
+    replacement coefficient.
+    """
+    header, rows = _data_rows(path)
+    if not rows:
+        return np.empty(0, dtype=float)
+    if not header:
+        header = [
+            "Time", "Cd", "Cd(f)", "Cd(r)", "Cl", "Cl(f)", "Cl(r)",
+            "CmPitch", "CmRoll", "CmYaw", "Cs", "Cs(f)", "Cs(r)",
+        ]
+    indices = {name: index for index, name in enumerate(header)}
+    cm_key = "CmPitch" if "CmPitch" in indices else ("Cm" if "Cm" in indices else None)
+    if not {"Time", "Cl", "Cd"}.issubset(indices) or cm_key is None:
+        return np.empty(0, dtype=float)
+    required = (indices["Time"], indices["Cl"], indices["Cd"], indices[cm_key])
+    invalid: list[float] = []
+    for row in rows:
+        if len(row) <= indices["Time"]:
+            continue
+        timestamp = float(row[indices["Time"]])
+        if not math.isfinite(timestamp):
+            # A non-finite time cannot be assigned honestly to one period.
+            # The normal numeric reader will reject any fully unusable source;
+            # do not fabricate a phase location here.
+            continue
+        if len(row) <= max(required) or any(
+            not math.isfinite(float(row[index])) for index in required[1:]
+        ):
+            invalid.append(timestamp)
+    return np.unique(np.asarray(invalid, dtype=float))
+
+
+def coefficient_invalid_value_times(
+    path: "Path | Sequence[Path]",
+) -> np.ndarray:
+    """Raw non-finite coefficient timestamps after the same restart ownership.
+
+    Each continuation's newer numeric directory owns the seam.  Mirror
+    :func:`coefficient_series` clipping here so a discarded older seam row
+    cannot falsely poison the cycle owned by the restarted segment.
+    """
+    paths = [Path(item) for item in path] if isinstance(path, (list, tuple)) else [Path(path)]
+    starts: dict[Path, float | None] = {}
+    numeric_boundaries: list[float] = []
+    for member in paths:
+        try:
+            start = float(member.parent.name)
+        except ValueError:
+            start = None
+        starts[member] = start if start is not None and math.isfinite(start) else None
+        if starts[member] is not None:
+            numeric_boundaries.append(starts[member])
+    numeric_boundaries = sorted(set(numeric_boundaries))
+    collected: list[np.ndarray] = []
+    for member in paths:
+        try:
+            invalid = _coefficient_invalid_value_times_one(member)
+        except (OSError, ValueError):
+            # The normal series reader owns the resulting missing-data error.
+            # This provenance sidecar must not turn a recoverable in-flight
+            # header-only segment into invented corruption.
+            continue
+        start = starts[member]
+        if start is not None:
+            next_start = next(
+                (
+                    boundary
+                    for boundary in numeric_boundaries
+                    if boundary > start + max(1e-12, abs(start) * 1e-12)
+                ),
+                None,
+            )
+            if next_start is not None:
+                tolerance = max(1e-12, abs(next_start) * 1e-12)
+                invalid = invalid[invalid < next_start - tolerance]
+        if invalid.size:
+            collected.append(invalid)
+    if not collected:
+        return np.empty(0, dtype=float)
+    return np.unique(np.concatenate(collected))
+
+
 def _coefficient_series_one(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     header, rows = _data_rows(path)
     if not rows:
@@ -575,6 +1058,7 @@ def _tail_candidate_series(
     cm: np.ndarray,
     *,
     min_samples: int,
+    include_dense_tail_counts: bool = False,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Return distinct trailing evidence suffixes, shortest/latest first."""
     if t.size < min_samples or float(t[-1]) <= float(t[0]):
@@ -582,15 +1066,40 @@ def _tail_candidate_series(
     span = float(t[-1] - t[0])
     out: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     starts: set[int] = set()
+
+    def append(index: int) -> None:
+        index = max(0, min(int(index), int(t.size) - min_samples))
+        if index in starts or t.size - index < min_samples:
+            return
+        starts.add(index)
+        out.append((t[index:], cl[index:], cd[index:], cm[index:]))
+
+    if include_dense_tail_counts:
+        # A same-case trajectory can span many continuations.  Its final clean
+        # 4.5-cycle certificate may then be much shorter than 2.5% of the
+        # complete immutable history, so percentage-only candidates all begin
+        # inside the corrupt prefix.  Search recent sample-count suffixes at a
+        # dense geometric cadence until the ordinary 2.5% candidate takes
+        # over.  This path is reserved for final clean-tail certification;
+        # the frequently polled two-period live monitor keeps the bounded
+        # percentage list below.
+        first_fraction_count = max(
+            min_samples,
+            int(math.ceil(_CLEAN_TAIL_FRACTIONS[0] * t.size)),
+        )
+        count = min_samples
+        while count < min(first_fraction_count, int(t.size)):
+            append(int(t.size) - count)
+            next_count = max(count + 1, int(math.ceil(count * 1.10)))
+            count = next_count
+        append(int(t.size) - min(first_fraction_count, int(t.size)))
+
     for fraction in _CLEAN_TAIL_FRACTIONS:
         start_time = float(t[-1]) - fraction * span
         index = max(0, int(np.searchsorted(t, start_time, side="left")))
-        if index in starts or t.size - index < min_samples:
-            continue
-        starts.add(index)
-        out.append((t[index:], cl[index:], cd[index:], cm[index:]))
+        append(index)
     if 0 not in starts:
-        out.append((t, cl, cd, cm))
+        append(0)
     return out
 
 
@@ -608,13 +1117,15 @@ def stable_two_period_window(
     alpha_deg: float | None = None,
     section_thickness_ratio: float | None = None,
 ) -> StablePeriodResult:
-    """Return an early-stop candidate when the final two periods are repeatable.
+    """Return a live-cadence candidate when the final two periods are repeatable.
 
     Two periods are enough only when the final two force cycles are nearly the
     same phase shape and the retained field writes can animate them at the
-    requested cadence. The result is deliberately conservative: missing period,
-    sparse samples, shape drift, or too few field frames all keep the solver
-    running.
+    requested cadence. They are never a publishable FAST/FULL certificate;
+    :func:`clean_periodic_tail` applies the 3/5-cycle terminal certification
+    floor after the run. The result is deliberately conservative: missing
+    period, sparse samples, shape drift, or too few field frames all keep the
+    solver running.
     """
     if speed <= 0 or chord <= 0:
         return StablePeriodResult(ok=False, reason="invalid speed/chord")
@@ -730,8 +1241,9 @@ def stable_two_period_window(
 
         cl_similarity, cl_drift = compare(clc)
         cd_similarity, cd_drift = compare(cdc)
-        similarity = max(cl_similarity, cd_similarity)
-        mean_drift = max(cl_drift, cd_drift)
+        cm_similarity, cm_drift = compare(cmc)
+        similarity = max(cl_similarity, cd_similarity, cm_similarity)
+        mean_drift = max(cl_drift, cd_drift, cm_drift)
         stable = (
             similarity <= similarity_tolerance
             and mean_drift <= mean_drift_tolerance
@@ -740,6 +1252,21 @@ def stable_two_period_window(
             ((frames >= window.start) & (frames <= window.end)).sum()
         )
         frames_per_cycle = frame_count / 2.0
+        candidate_series = trailing_period_series(tc, clc, cdc, cmc, period, 2.0)
+        audit = audit_period_cycles(
+            candidate_series[0],
+            candidate_series[1],
+            candidate_series[2],
+            candidate_series[3],
+            period,
+            fidelity="candidate",
+            required_cycles=2.0,
+            min_clean_cycles=2,
+            frame_times=frames,
+            min_frames_per_cycle=min_frames_per_cycle,
+            min_samples_per_cycle=min_samples_per_cycle,
+            phase_samples=phase_samples,
+        )
         base = StablePeriodResult(
             ok=False,
             reason="",
@@ -752,6 +1279,8 @@ def stable_two_period_window(
             frames_per_cycle=frames_per_cycle,
             similarity=similarity,
             mean_drift=mean_drift,
+            clean_cycles=audit.terminal_clean_cycles,
+            required_clean_cycles=audit.required_clean_cycles,
         )
         if not stable:
             best = best or replace(
@@ -760,6 +1289,31 @@ def stable_two_period_window(
                     f"periods differ: similarity {similarity:.3f}, "
                     f"mean drift {mean_drift:.3f}"
                 ),
+            )
+            continue
+        # Preserve the legacy aggregate-frame explanation when the total is
+        # plainly sparse.  When the aggregate clears the floor but one cycle
+        # does not, the stricter per-cycle audit below owns the rejection.
+        audit_frame_only_legacy = (
+            frames_per_cycle + 1e-9 < min_frames_per_cycle
+            and all(
+                not cycle.clean
+                and cycle.hard_reasons
+                and all(reason.startswith("frames ") for reason in cycle.hard_reasons)
+                for cycle in audit.cycles
+            )
+        )
+        if not audit.certified and not audit_frame_only_legacy:
+            latest = next(
+                (cycle for cycle in reversed(audit.cycles) if not cycle.clean),
+                None,
+            )
+            detail = "; ".join(
+                (latest.hard_reasons + latest.soft_reasons) if latest else ()
+            ) or "cycle audit did not find a contiguous clean suffix"
+            best = best or replace(
+                base,
+                reason=f"candidate periods need recovery: {detail}",
             )
             continue
         if frames_per_cycle + 1e-9 < min_frames_per_cycle:
@@ -1097,6 +1651,11 @@ class CleanPeriodicTail:
 
     series: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
     estimate: PeriodEstimate
+    audit: CleanCycleAudit | None = None
+    clean_cycles: int = 0
+    required_clean_cycles: int = 0
+    certification_reason: str = ""
+    cadence_adjusted: bool = False
 
 
 def _has_impulsive_discontinuity(
@@ -1152,6 +1711,642 @@ def _has_impulsive_discontinuity(
     return False
 
 
+@dataclass(frozen=True)
+class _CycleEvidence:
+    """Interpolated coefficient evidence for one exact whole period."""
+
+    index: int
+    start: float
+    end: float
+    time: np.ndarray
+    cl: np.ndarray
+    cd: np.ndarray
+    cm: np.ndarray
+    phase_cl: np.ndarray
+    phase_cd: np.ndarray
+    phase_cm: np.ndarray
+    samples: int
+    frames: int | None
+    phase_gap: float
+    hard_reasons: tuple[str, ...]
+
+
+def _finite_frame_times(
+    frame_times: "Sequence[float] | np.ndarray | None",
+) -> np.ndarray | None:
+    if frame_times is None:
+        return None
+    raw = np.asarray(frame_times, dtype=float)
+    raw = raw[np.isfinite(raw)]
+    return np.unique(np.sort(raw))
+
+
+def _invalid_value_times(
+    times: "np.ndarray | list[float]",
+    *channels: "np.ndarray | list[float]",
+) -> np.ndarray:
+    """Return timestamps with a finite time but a missing coefficient value.
+
+    Normalisation necessarily drops non-finite records before interpolation.
+    Retaining their timestamps here lets the cycle audit call the affected
+    period corrupt instead of accidentally smoothing a NaN away.
+    """
+    raw_t = np.asarray(times, dtype=float)
+    arrays = [np.asarray(channel, dtype=float) for channel in channels]
+    if any(values.size != raw_t.size for values in arrays):
+        return np.empty(0, dtype=float)
+    finite_values = np.ones(raw_t.size, dtype=bool)
+    for values in arrays:
+        finite_values &= np.isfinite(values)
+    return raw_t[np.isfinite(raw_t) & ~finite_values]
+
+
+def _normalise_invalid_times(
+    values: "Sequence[float] | np.ndarray | None",
+) -> np.ndarray:
+    """Return finite, unique timestamps supplied by an outer raw reader.
+
+    The clean-tail selector normally sees the coefficient arrays directly and
+    can retain the timestamp of a non-finite coefficient before it normalises
+    the series.  A restart merger or archive reader may already have removed
+    that row, however.  This narrow adapter lets that reader carry the
+    immutable corruption timestamp forward without asking the reducer to
+    manufacture a coefficient value for it.
+    """
+    if values is None:
+        return np.empty(0, dtype=float)
+    try:
+        raw = np.asarray(values, dtype=float)
+    except (TypeError, ValueError):
+        return np.empty(0, dtype=float)
+    return np.unique(np.sort(raw[np.isfinite(raw)]))
+
+
+def _cycle_phase_gap(
+    times: np.ndarray,
+    start: float,
+    end: float,
+) -> float:
+    span = end - start
+    if times.size < 2 or not math.isfinite(span) or span <= 0:
+        return 1.0
+    phase = np.clip((times - start) / span, 0.0, 1.0)
+    phase = np.unique(phase)
+    if phase.size < 2:
+        return 1.0
+    return float(np.max(np.diff(np.concatenate(([0.0], phase, [1.0])))))
+
+
+def _has_cycle_impulse(
+    times: np.ndarray,
+    *channels: np.ndarray,
+) -> bool:
+    """Apply the normal impulse guard, including 20-sample certificate cycles.
+
+    The shared history guard intentionally needs 32 samples to avoid reacting
+    to a sparse in-flight monitor.  Certified cycles legitimately permit 20
+    samples, so give that small range an equivalent robust fallback rather
+    than letting a single corrupt sample escape solely due to row count.
+    """
+    if _has_impulsive_discontinuity(times, *channels):
+        return True
+    if times.size >= 32 or times.size < 8:
+        return False
+    dt = np.diff(times)
+    valid = np.isfinite(dt) & (dt > 0)
+    if int(valid.sum()) < 6:
+        return True
+    for values in channels:
+        if int(np.isfinite(values).sum()) != values.size:
+            return True
+        jumps = np.abs(np.diff(values))
+        slopes = jumps[valid] / dt[valid]
+        if slopes.size < 6:
+            continue
+        reference = float(np.nanpercentile(slopes, 75))
+        robust_span = float(
+            np.nanpercentile(values, 95) - np.nanpercentile(values, 5)
+        )
+        if (
+            float(np.nanmax(slopes)) > max(12.0 * reference, 1e-12)
+            and float(np.nanmax(jumps)) > max(0.25 * robust_span, 1e-9)
+        ):
+            return True
+    return False
+
+
+def _channel_scale(values: np.ndarray) -> tuple[float, float, float]:
+    """Return comparison scale, robust amplitude and time/phase mean."""
+    if values.size == 0:
+        return 1e-9, 0.0, 0.0
+    amplitude = float(np.nanpercentile(values, 95) - np.nanpercentile(values, 5))
+    mean = float(np.nanmean(values))
+    return max(amplitude, 0.05 * abs(mean), 1e-9), max(amplitude, 0.0), mean
+
+
+def _high_frequency_amplitude(values: np.ndarray) -> float:
+    """RMS-equivalent phase energy above the resolved waveform harmonics."""
+    if values.size < CLEAN_CYCLE_HIGH_FREQUENCY_START_BIN * 2:
+        return 0.0
+    centered = np.asarray(values, dtype=float) - float(np.nanmean(values))
+    spectrum = np.fft.rfft(centered)
+    start = min(CLEAN_CYCLE_HIGH_FREQUENCY_START_BIN, spectrum.size)
+    if start >= spectrum.size:
+        return 0.0
+    # rfft coefficients carry N/2 of a sinusoid amplitude.  The root-sum
+    # conversion below is deliberately comparable with the coefficient units,
+    # not an arbitrary spectral-bin magnitude.
+    return float(math.sqrt(2.0) * np.linalg.norm(spectrum[start:]) / values.size)
+
+
+def _phase_aligned_errors(
+    values: tuple[np.ndarray, np.ndarray, np.ndarray],
+    template: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> tuple[int, tuple[float, float, float], tuple[float, float, float]]:
+    """Align a cycle to the vector template and return shift/shape/amplitude.
+
+    Search the full 96-bin circle to *measure* an excessive phase offset, then
+    use its best alignment for shape comparison.  A shift greater than four
+    bins is still rejected by the caller; it is not hidden by alignment.
+    """
+    scales = tuple(_channel_scale(channel)[0] for channel in template)
+    best_shift = 0
+    best_cost = math.inf
+    count = values[0].size
+    for shift in range(count):
+        cost = 0.0
+        for actual, expected, scale in zip(values, template, scales):
+            delta = np.roll(actual, shift) - expected
+            cost += float(np.nanmean(delta**2)) / (scale**2)
+        if cost < best_cost:
+            best_cost = cost
+            best_shift = shift
+    # Report the shortest signed circle movement, not its equivalent 95-bin
+    # positive representation.
+    signed_shift = best_shift if best_shift <= count // 2 else best_shift - count
+    aligned = tuple(np.roll(channel, best_shift) for channel in values)
+    shape = tuple(
+        float(math.sqrt(float(np.nanmean((actual - expected) ** 2))) / scale)
+        for actual, expected, scale in zip(aligned, template, scales)
+    )
+    amplitude_deviation: list[float] = []
+    for actual, expected in zip(aligned, template):
+        _actual_scale, actual_amplitude, _actual_mean = _channel_scale(actual)
+        _expected_scale, expected_amplitude, _expected_mean = _channel_scale(expected)
+        if expected_amplitude <= max(1e-8, 0.01 * _expected_scale):
+            amplitude_deviation.append(0.0 if actual_amplitude <= 1e-8 else float("inf"))
+        else:
+            amplitude_deviation.append(
+                abs(actual_amplitude - expected_amplitude) / expected_amplitude
+            )
+    return signed_shift, shape, tuple(amplitude_deviation)
+
+
+def _mean_outlier(
+    name: str,
+    actual: float,
+    expected: float,
+) -> bool:
+    budget = max(
+        _CYCLE_MEAN_ABS_BUDGET[name],
+        _CYCLE_MEAN_REL_BUDGET[name] * abs(expected),
+    )
+    return abs(actual - expected) > budget
+
+
+def _cycle_evidence(
+    t: np.ndarray,
+    cl: np.ndarray,
+    cd: np.ndarray,
+    cm: np.ndarray,
+    *,
+    index: int,
+    is_last: bool,
+    start: float,
+    end: float,
+    phase_samples: int,
+    frame_times: np.ndarray | None,
+    min_samples_per_cycle: int,
+    min_frames_per_cycle: float,
+    invalid_times: np.ndarray,
+) -> _CycleEvidence:
+    eps = max(abs(start), abs(end), 1.0) * 1e-10
+    # Every raw coefficient row has exactly one cycle owner. Adjacent
+    # inclusive windows used to let a period-boundary row satisfy both
+    # neighbouring cycles' 20-sample gate. Use [start, end) windows and let
+    # only the final cycle include the physical terminal endpoint.
+    if is_last:
+        raw_mask = (t >= start - eps) & (t <= end + eps)
+        invalid_mask = (invalid_times >= start - eps) & (invalid_times <= end + eps)
+    else:
+        raw_mask = (t >= start - eps) & (t < end - eps)
+        invalid_mask = (invalid_times >= start - eps) & (invalid_times < end - eps)
+    samples = int(raw_mask.sum())
+    raw_times = t[raw_mask]
+    phase_gap = _cycle_phase_gap(raw_times, start, end)
+    if frame_times is None:
+        frames: int | None = None
+    else:
+        if is_last:
+            frame_mask = (frame_times >= start - eps) & (frame_times <= end + eps)
+        else:
+            frame_mask = (frame_times >= start - eps) & (frame_times < end - eps)
+        frames = int(frame_mask.sum())
+
+    hard: list[str] = []
+    if samples < min_samples_per_cycle:
+        hard.append(f"samples {samples} < {min_samples_per_cycle}")
+    if phase_gap > CLEAN_CYCLE_MAX_PHASE_GAP:
+        hard.append(
+            f"phase gap {phase_gap:.1%} > {CLEAN_CYCLE_MAX_PHASE_GAP:.0%}"
+        )
+    if frames is not None and frames + 1e-9 < min_frames_per_cycle:
+        hard.append(f"frames {frames} < {min_frames_per_cycle:g}")
+    if invalid_times.size and np.any(invalid_mask):
+        hard.append("non-finite coefficient sample")
+
+    window = PeriodWindow(start=start, end=end, cycles=1, period_s=end - start)
+    wt, wcl, wcd, wcm = _window_series(t, cl, cd, cm, window)
+    if _has_cycle_impulse(wt, wcl, wcd, wcm):
+        hard.append("impulsive discontinuity")
+    phase = np.linspace(start, end, max(8, int(phase_samples)), endpoint=False)
+    return _CycleEvidence(
+        index=index,
+        start=start,
+        end=end,
+        time=wt,
+        cl=wcl,
+        cd=wcd,
+        cm=wcm,
+        phase_cl=np.interp(phase, wt, wcl),
+        phase_cd=np.interp(phase, wt, wcd),
+        phase_cm=np.interp(phase, wt, wcm),
+        samples=samples,
+        frames=frames,
+        phase_gap=phase_gap,
+        hard_reasons=tuple(hard),
+    )
+
+
+def _cycle_template(
+    cycles: Sequence[_CycleEvidence],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return tuple(
+        np.median(np.stack([getattr(cycle, name) for cycle in cycles]), axis=0)
+        for name in ("phase_cl", "phase_cd", "phase_cm")
+    )  # type: ignore[return-value]
+
+
+def audit_period_cycles(
+    times: "np.ndarray | list[float]",
+    cl: "np.ndarray | list[float]",
+    cd: "np.ndarray | list[float]",
+    cm: "np.ndarray | list[float]",
+    period_s: float,
+    *,
+    fidelity: str | None = None,
+    required_cycles: float = 0.0,
+    min_clean_cycles: int | None = None,
+    frame_times: "Sequence[float] | np.ndarray | None" = None,
+    min_frames_per_cycle: float = 20.0,
+    min_samples_per_cycle: int = CLEAN_CYCLE_MIN_SAMPLES,
+    phase_samples: int = CLEAN_CYCLE_PHASE_SAMPLES,
+    invalid_coefficient_times: "Sequence[float] | np.ndarray | None" = None,
+) -> CleanCycleAudit:
+    """Audit every exact whole terminal period and select a clean suffix.
+
+    The median template is built from the latest usable cycles, which makes an
+    old damaged startup unable to define what "normal" looks like.  A cycle is
+    clean only when Cl, Cd *and* Cm pass hard integrity and soft repeatability
+    checks.  The returned object contains every disposition so callers can
+    distinguish a request for more periods from a numerical-recovery trigger.
+    """
+    requirement = required_clean_cycle_count(
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+        minimum_cycles=min_clean_cycles,
+    )
+    if (
+        not math.isfinite(period_s)
+        or period_s <= 0
+        or int(phase_samples) < 8
+    ):
+        return CleanCycleAudit(
+            period_s=float(period_s) if math.isfinite(period_s) else 0.0,
+            phase_samples=max(8, int(phase_samples)),
+            cycles=(),
+            terminal_clean_cycles=0,
+            required_clean_cycles=requirement,
+            template_cycles=0,
+            shape_error=math.inf,
+        )
+
+    # Keep both defects visible: values supplied directly to this audit and
+    # timestamps preserved by an outer archive/restart reader after it had to
+    # normalise its numeric arrays.  A terminal NaN must make its owning cycle
+    # non-publishable; silently interpolating over it would defeat the entire
+    # clean-suffix contract.
+    invalid_times = _invalid_value_times(times, cl, cd, cm)
+    inherited_invalid_times = _normalise_invalid_times(invalid_coefficient_times)
+    if inherited_invalid_times.size:
+        invalid_times = np.unique(
+            np.concatenate((invalid_times, inherited_invalid_times))
+        )
+    t, vcl, vcd, vcm = _normalise_series(times, cl, cd, cm)
+    if t.size < 2 or float(t[-1]) <= float(t[0]):
+        return CleanCycleAudit(
+            period_s=float(period_s),
+            phase_samples=int(phase_samples),
+            cycles=(),
+            terminal_clean_cycles=0,
+            required_clean_cycles=requirement,
+            template_cycles=0,
+            shape_error=math.inf,
+        )
+
+    available = int(math.floor((float(t[-1]) - float(t[0])) / period_s + 1e-9))
+    if available < 1:
+        return CleanCycleAudit(
+            period_s=float(period_s),
+            phase_samples=int(phase_samples),
+            cycles=(),
+            terminal_clean_cycles=0,
+            required_clean_cycles=requirement,
+            template_cycles=0,
+            shape_error=math.inf,
+        )
+    end = float(t[-1])
+    first = end - available * period_s
+    frames = _finite_frame_times(frame_times)
+    evidence = tuple(
+        _cycle_evidence(
+            t,
+            vcl,
+            vcd,
+            vcm,
+            index=index,
+            is_last=index == available - 1,
+            start=first + index * period_s,
+            end=first + (index + 1) * period_s,
+            phase_samples=int(phase_samples),
+            frame_times=frames,
+            min_samples_per_cycle=max(2, int(min_samples_per_cycle)),
+            min_frames_per_cycle=max(0.0, float(min_frames_per_cycle)),
+            invalid_times=invalid_times,
+        )
+        for index in range(available)
+    )
+
+    usable = [cycle for cycle in evidence if not cycle.hard_reasons]
+    # A terminal weighted lookback keeps a long corrupted beginning from
+    # winning the median.  Two extra cycles make a single bad final/penultimate
+    # cycle unable to redefine the template; five is also the final-tier floor.
+    template_limit = max(requirement + 2, FINAL_CLEAN_CYCLE_MINIMUM)
+    template_source = usable[-template_limit:]
+    if not template_source:
+        audits = tuple(
+            CycleAudit(
+                index=cycle.index,
+                start=cycle.start,
+                end=cycle.end,
+                samples=cycle.samples,
+                frames=cycle.frames,
+                phase_gap=cycle.phase_gap,
+                phase_shift_bins=0,
+                cl_mean=0.0,
+                cd_mean=0.0,
+                cm_mean=0.0,
+                cl_shape_error=math.inf,
+                cd_shape_error=math.inf,
+                cm_shape_error=math.inf,
+                cl_amplitude_deviation=math.inf,
+                cd_amplitude_deviation=math.inf,
+                cm_amplitude_deviation=math.inf,
+                cl_high_frequency=0.0,
+                cd_high_frequency=0.0,
+                cm_high_frequency=0.0,
+                hard_reasons=cycle.hard_reasons,
+                soft_reasons=(),
+            )
+            for cycle in evidence
+        )
+        return CleanCycleAudit(
+            period_s=float(period_s),
+            phase_samples=int(phase_samples),
+            cycles=audits,
+            terminal_clean_cycles=0,
+            required_clean_cycles=requirement,
+            template_cycles=0,
+            shape_error=math.inf,
+            measured_periods=available,
+        )
+
+    template = _cycle_template(template_source)
+    template_means = tuple(float(np.nanmean(channel)) for channel in template)
+    high_frequency_by_cycle = {
+        cycle.index: tuple(
+            _high_frequency_amplitude(channel)
+            for channel in (cycle.phase_cl, cycle.phase_cd, cycle.phase_cm)
+        )
+        for cycle in evidence
+    }
+    high_frequency_peer = tuple(
+        np.asarray(
+            [high_frequency_by_cycle[cycle.index][channel] for cycle in template_source],
+            dtype=float,
+        )
+        for channel in range(3)
+    )
+    high_frequency_median = tuple(
+        float(np.median(values)) if values.size else 0.0
+        for values in high_frequency_peer
+    )
+    high_frequency_mad = tuple(
+        float(np.median(np.abs(values - median))) if values.size else 0.0
+        for values, median in zip(high_frequency_peer, high_frequency_median)
+    )
+    template_scales = tuple(_channel_scale(channel)[0] for channel in template)
+
+    audits_list: list[CycleAudit] = []
+    for cycle in evidence:
+        values = (cycle.phase_cl, cycle.phase_cd, cycle.phase_cm)
+        shift, shapes, amplitudes = _phase_aligned_errors(values, template)
+        means = tuple(
+            _time_weighted_mean_std(cycle.time, values_raw)[0]
+            for values_raw in (cycle.cl, cycle.cd, cycle.cm)
+        )
+        high_frequency = high_frequency_by_cycle[cycle.index]
+        hard = list(cycle.hard_reasons)
+        soft: list[str] = []
+        names = ("cl", "cd", "cm")
+        for name, mean, expected in zip(names, means, template_means):
+            if _mean_outlier(name, mean, expected):
+                soft.append(f"{name} mean outlier")
+        for name, shape in zip(names, shapes):
+            if shape > CLEAN_CYCLE_MAX_SHAPE_NRMSE:
+                soft.append(f"{name} shape {shape:.3f} > {CLEAN_CYCLE_MAX_SHAPE_NRMSE:.2f}")
+        for name, amplitude in zip(names, amplitudes):
+            if amplitude > CLEAN_CYCLE_MAX_AMPLITUDE_DEVIATION:
+                soft.append(
+                    f"{name} amplitude deviation {amplitude:.1%} > "
+                    f"{CLEAN_CYCLE_MAX_AMPLITUDE_DEVIATION:.0%}"
+                )
+        if abs(shift) > CLEAN_CYCLE_MAX_PHASE_SHIFT_BINS:
+            soft.append(
+                f"phase shift {shift:+d} bins > "
+                f"{CLEAN_CYCLE_MAX_PHASE_SHIFT_BINS}"
+            )
+        for name, energy, scale, median, mad in zip(
+            names,
+            high_frequency,
+            template_scales,
+            high_frequency_median,
+            high_frequency_mad,
+        ):
+            # Require a material fraction of the physical waveform *and* an
+            # outlier against peer cycles.  A repeatable sharp wake is present
+            # in the median/template and therefore does not get labelled noise.
+            peer_outlier = energy > 3.0 * max(median, 1e-12) or energy > median + 6.0 * max(mad, 1e-12)
+            if energy > CLEAN_CYCLE_HIGH_FREQUENCY_FRACTION * scale and peer_outlier:
+                hard.append(f"{name} high-frequency burst")
+        audits_list.append(
+            CycleAudit(
+                index=cycle.index,
+                start=cycle.start,
+                end=cycle.end,
+                samples=cycle.samples,
+                frames=cycle.frames,
+                phase_gap=cycle.phase_gap,
+                phase_shift_bins=shift,
+                cl_mean=means[0],
+                cd_mean=means[1],
+                cm_mean=means[2],
+                cl_shape_error=shapes[0],
+                cd_shape_error=shapes[1],
+                cm_shape_error=shapes[2],
+                cl_amplitude_deviation=amplitudes[0],
+                cd_amplitude_deviation=amplitudes[1],
+                cm_amplitude_deviation=amplitudes[2],
+                cl_high_frequency=high_frequency[0],
+                cd_high_frequency=high_frequency[1],
+                cm_high_frequency=high_frequency[2],
+                hard_reasons=tuple(hard),
+                soft_reasons=tuple(soft),
+            )
+        )
+    audits = tuple(audits_list)
+    terminal = 0
+    for cycle in reversed(audits):
+        if not cycle.clean:
+            break
+        terminal += 1
+    finite_shape = [
+        max(cycle.cl_shape_error, cycle.cd_shape_error, cycle.cm_shape_error)
+        for cycle in audits
+        if math.isfinite(cycle.cl_shape_error)
+        and math.isfinite(cycle.cd_shape_error)
+        and math.isfinite(cycle.cm_shape_error)
+    ]
+    return CleanCycleAudit(
+        period_s=float(period_s),
+        phase_samples=int(phase_samples),
+        cycles=audits,
+        terminal_clean_cycles=terminal,
+        required_clean_cycles=requirement,
+        template_cycles=len(template_source),
+        shape_error=max(finite_shape) if finite_shape else math.inf,
+        measured_periods=available,
+    )
+
+
+def _period_in_physical_band(
+    period_s: float,
+    *,
+    speed: float,
+    chord: float,
+    alpha_deg: "float | None",
+    section_thickness_ratio: "float | None",
+) -> bool:
+    band = shedding_period_band(
+        speed,
+        chord,
+        alpha_deg=alpha_deg,
+        section_thickness_ratio=section_thickness_ratio,
+    )
+    if band is None:
+        return True
+    return band[0] - 1e-12 <= period_s <= band[1] + 1e-12
+
+
+def _choose_clean_cycle_cadence(
+    times: np.ndarray,
+    cl: np.ndarray,
+    cd: np.ndarray,
+    cm: np.ndarray,
+    period_s: float,
+    *,
+    speed: float,
+    chord: float,
+    fidelity: str | None,
+    required_cycles: float,
+    min_clean_cycles: int | None,
+    frame_times: "Sequence[float] | np.ndarray | None",
+    min_frames_per_cycle: float,
+    phase_samples: int,
+    alpha_deg: "float | None",
+    section_thickness_ratio: "float | None",
+    invalid_coefficient_times: "Sequence[float] | np.ndarray | None",
+) -> CleanCycleAudit:
+    """Use T, then test T/2 and 2T only when T cannot certify.
+
+    An alternating wake is a common false rejection: T sees adjacent cycles as
+    different while 2T is the actual vector repeat.  Conversely a harmonic
+    lock at 2T can hide a clean T cadence.  An alternate cadence is accepted
+    only if it certifies a terminal suffix and lowers vector template error by
+    at least 30%, so the detector never changes cadence merely to obtain more
+    cycle count.
+    """
+    common = dict(
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+        min_clean_cycles=min_clean_cycles,
+        frame_times=frame_times,
+        min_frames_per_cycle=min_frames_per_cycle,
+        phase_samples=phase_samples,
+        invalid_coefficient_times=invalid_coefficient_times,
+    )
+    baseline = audit_period_cycles(times, cl, cd, cm, period_s, **common)
+    if baseline.certified:
+        return baseline
+    candidates: list[tuple[float, CleanCycleAudit]] = [(period_s, baseline)]
+    for factor in (0.5, 2.0):
+        candidate = period_s * factor
+        if (
+            not math.isfinite(candidate)
+            or candidate <= 0
+            or not _period_in_physical_band(
+                candidate,
+                speed=speed,
+                chord=chord,
+                alpha_deg=alpha_deg,
+                section_thickness_ratio=section_thickness_ratio,
+            )
+        ):
+            continue
+        candidates.append(
+            (candidate, audit_period_cycles(times, cl, cd, cm, candidate, **common))
+        )
+    baseline_error = baseline.shape_error
+    for candidate_period, candidate in candidates[1:]:
+        improves = (
+            not math.isfinite(baseline_error)
+            or candidate.shape_error <= 0.70 * baseline_error
+        )
+        if candidate.certified and improves:
+            return replace(candidate, cadence_adjusted=True)
+    return baseline
+
+
 def clean_periodic_tail(
     times: "np.ndarray | list[float]",
     cl: "np.ndarray | list[float]",
@@ -1161,8 +2356,16 @@ def clean_periodic_tail(
     speed: float,
     chord: float,
     required_cycles: float,
+    fidelity: str | None = None,
+    min_clean_cycles: int | None = None,
+    frame_times: "Sequence[float] | np.ndarray | None" = None,
+    min_frames_per_cycle: float = 20.0,
+    phase_samples: int = CLEAN_CYCLE_PHASE_SAMPLES,
     alpha_deg: "float | None" = None,
     section_thickness_ratio: "float | None" = None,
+    recovery_origin_time: float | None = None,
+    recovery_latest_time: float | None = None,
+    invalid_coefficient_times: "Sequence[float] | np.ndarray | None" = None,
 ) -> "CleanPeriodicTail | None":
     """Find the latest clean, corroborated periodic suffix.
 
@@ -1170,11 +2373,45 @@ def clean_periodic_tail(
     settling can outlive it.  Search trailing immutable evidence suffixes,
     require the period to agree across both halves, then retain an exact final
     ``required_cycles`` horizon with the same independently corroborated
-    cadence and no isolated timestep discontinuity.
+    cadence.  The horizon is publishable only when the larger whole-cycle
+    suffix has a contiguous terminal run of individually clean Cl/Cd/Cm
+    cycles.  ``frame_times`` is optional for historical coefficient-only
+    callers; when supplied each selected cycle must independently satisfy the
+    requested frame floor.
     """
+    # Preserve a direct raw non-finite row before normalisation drops it.  The
+    # archive/live callers may additionally provide defects found while
+    # parsing a merged restart history.
+    direct_invalid_times = _invalid_value_times(times, cl, cd, cm)
+    inherited_invalid_times = _normalise_invalid_times(invalid_coefficient_times)
+    all_invalid_times = (
+        np.unique(np.concatenate((direct_invalid_times, inherited_invalid_times)))
+        if inherited_invalid_times.size
+        else direct_invalid_times
+    )
     t, vcl, vcd, vcm = _normalise_series(times, cl, cd, cm)
+    # The cadence candidate below may intentionally inspect only a short
+    # terminal suffix.  Preserve an independently supplied same-case progress
+    # interval for recovery-budget accounting; normal callers fall back to the
+    # complete input interval.
+    progress_origin = (
+        float(recovery_origin_time)
+        if recovery_origin_time is not None
+        else (float(t[0]) if t.size else None)
+    )
+    progress_latest = (
+        float(recovery_latest_time)
+        if recovery_latest_time is not None
+        else (float(t[-1]) if t.size else None)
+    )
+    clean_requirement = required_clean_cycle_count(
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+        minimum_cycles=min_clean_cycles,
+    )
     cycles = max(
         float(required_cycles),
+        float(clean_requirement),
         2.0 * PERIOD_ESTIMATE_MIN_CYCLES + 0.5,
     )
     minimum_samples = max(64, int(math.ceil(cycles * 20.0)))
@@ -1184,6 +2421,7 @@ def clean_periodic_tail(
         vcd,
         vcm,
         min_samples=minimum_samples,
+        include_dense_tail_counts=True,
     ):
         tc, clc, cdc, cmc = candidate
         estimate = estimate_period(
@@ -1203,7 +2441,7 @@ def clean_periodic_tail(
             or float(tc[-1] - tc[0]) + 1e-12 < cycles * period
         ):
             continue
-        exact = trailing_period_series(
+        verification = trailing_period_series(
             tc,
             clc,
             cdc,
@@ -1212,8 +2450,8 @@ def clean_periodic_tail(
             cycles,
         )
         confirmed = estimate_period(
-            exact[0],
-            exact[1],
+            verification[0],
+            verification[1],
             speed=speed,
             chord=chord,
             alpha_deg=alpha_deg,
@@ -1231,7 +2469,7 @@ def clean_periodic_tail(
             < cycles * confirmed_period
         ):
             continue
-        exact = trailing_period_series(
+        verification = trailing_period_series(
             tc,
             clc,
             cdc,
@@ -1239,14 +2477,156 @@ def clean_periodic_tail(
             confirmed_period,
             cycles,
         )
-        if _has_impulsive_discontinuity(*exact):
+        audit = _choose_clean_cycle_cadence(
+            tc,
+            clc,
+            cdc,
+            cmc,
+            confirmed_period,
+            speed=speed,
+            chord=chord,
+            fidelity=fidelity,
+            required_cycles=required_cycles,
+            min_clean_cycles=min_clean_cycles,
+            frame_times=frame_times,
+            min_frames_per_cycle=min_frames_per_cycle,
+            phase_samples=phase_samples,
+            alpha_deg=alpha_deg,
+            section_thickness_ratio=section_thickness_ratio,
+            invalid_coefficient_times=all_invalid_times,
+        )
+        audit = with_clean_cycle_recovery_progress(
+            audit,
+            origin_time=progress_origin,
+            latest_time=progress_latest,
+        )
+        assert audit is not None
+        if not audit.certified:
+            continue
+        selected_period = audit.period_s
+        exact = trailing_period_series(
+            tc,
+            clc,
+            cdc,
+            cmc,
+            selected_period,
+            required_cycles,
+        )
+        if exact[0].size < 2 or float(exact[0][-1] - exact[0][0]) + 1e-12 < required_cycles * selected_period:
+            continue
+        # The selected fractional publication horizon must sit inside the
+        # terminal whole-cycle suffix.  This is explicit rather than inferred
+        # from a sample count because adaptive timesteps move row boundaries.
+        suffix_start = audit.terminal_clean_start
+        if suffix_start is None or float(exact[0][0]) + 1e-10 < suffix_start:
             continue
         # Publish only the exact corroborated horizon.  The candidate may be
         # wider than this window and still contain an old startup burst whose
         # energy is too small to change its dominant trailing period.  Returning
         # that wider suffix would reintroduce precisely the corrupt prefix this
         # selector exists to remove.
-        return CleanPeriodicTail(series=exact, estimate=confirmed)
+        selected_estimate = PeriodEstimate(
+            period_s=selected_period,
+            ambiguous=False,
+            first_half_s=confirmed.first_half_s,
+            second_half_s=confirmed.second_half_s,
+        )
+        return CleanPeriodicTail(
+            series=exact,
+            estimate=selected_estimate,
+            audit=audit,
+            clean_cycles=audit.terminal_clean_cycles,
+            required_clean_cycles=audit.required_clean_cycles,
+            certification_reason=(
+                f"{audit.terminal_clean_cycles}/{audit.required_clean_cycles} "
+                "terminal cycles clean"
+            ),
+            cadence_adjusted=audit.cadence_adjusted,
+        )
+    return None
+
+
+def terminal_period_estimate(
+    times: "np.ndarray | list[float]",
+    cl: "np.ndarray | list[float]",
+    cd: "np.ndarray | list[float]",
+    cm: "np.ndarray | list[float]",
+    *,
+    speed: float,
+    chord: float,
+    required_cycles: float,
+    fidelity: str | None = None,
+    min_clean_cycles: int | None = None,
+    alpha_deg: "float | None" = None,
+    section_thickness_ratio: "float | None" = None,
+) -> "PeriodEstimate | None":
+    """Find a corroborated cadence from the latest usable raw trajectory.
+
+    This is deliberately *not* a certification path.  It exists for the one
+    recovery case where a corrupt terminal row prevents the whole-history
+    period estimator from agreeing across its halves.  The caller must still
+    run :func:`audit_period_cycles` with the preserved corruption timestamps
+    before it can request more physical periods.  Returning a cadence here
+    therefore enables a bounded exact continuation, never a false publish.
+    """
+    t, vcl, vcd, vcm = _normalise_series(times, cl, cd, cm)
+    requirement = required_clean_cycle_count(
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+        minimum_cycles=min_clean_cycles,
+    )
+    cycles = max(
+        float(required_cycles),
+        float(requirement),
+        2.0 * PERIOD_ESTIMATE_MIN_CYCLES + 0.5,
+    )
+    minimum_samples = max(64, int(math.ceil(cycles * 20.0)))
+    for candidate in _tail_candidate_series(
+        t,
+        vcl,
+        vcd,
+        vcm,
+        min_samples=minimum_samples,
+        include_dense_tail_counts=True,
+    ):
+        tc, clc, cdc, cmc = candidate
+        estimate = estimate_period(
+            tc,
+            clc,
+            speed=speed,
+            chord=chord,
+            alpha_deg=alpha_deg,
+            section_thickness_ratio=section_thickness_ratio,
+        )
+        if estimate is None or estimate.ambiguous or estimate.period_s <= 0:
+            continue
+        period = float(estimate.period_s)
+        if float(tc[-1] - tc[0]) + 1e-12 < cycles * period:
+            continue
+        verification = trailing_period_series(tc, clc, cdc, cmc, period, cycles)
+        confirmed = estimate_period(
+            verification[0],
+            verification[1],
+            speed=speed,
+            chord=chord,
+            alpha_deg=alpha_deg,
+            section_thickness_ratio=section_thickness_ratio,
+        )
+        if confirmed is None or confirmed.ambiguous or confirmed.period_s <= 0:
+            continue
+        confirmed_period = float(confirmed.period_s)
+        if (
+            abs(confirmed_period - period) / max(confirmed_period, period)
+            > PERIOD_AMBIGUITY_TOLERANCE
+            or float(tc[-1] - tc[0]) + 1e-12 < cycles * confirmed_period
+        ):
+            continue
+        return PeriodEstimate(
+            period_s=confirmed_period,
+            ambiguous=False,
+            first_half_s=confirmed.first_half_s,
+            second_half_s=confirmed.second_half_s,
+        )
     return None
 
 
@@ -1571,6 +2951,40 @@ NO_SHEDDING_REL_TOL = 5e-3
 # genuinely flat lift signal whose mean is ~0 is still classified as steady
 # rather than being judged only against its own (tiny) mean.
 NO_SHEDDING_ABS_FLOOR = 1e-3
+# A physical no-shedding verdict must observe more than a pair of points.  This
+# is deliberately the same floor carried by the cross-runtime certificate: a
+# sparse, apparently flat trace cannot demonstrate that a slow wake is absent.
+NO_SHEDDING_MIN_SAMPLE_COUNT = 20
+# The slow edge of the physically plausible shedding band is the one a flat
+# trace must rule out.  Keep the small margin beyond two complete periods so a
+# boundary sample cannot turn an exactly-two-period observation into a verdict.
+NO_SHEDDING_MIN_SLOW_PERIODS = 2.1
+
+
+def no_shedding_min_observation_s(speed: float, chord: float) -> float:
+    """Physical slow-wake horizon required before a flat URANS trace can pass.
+
+    The policy belongs with the unsteady reducer rather than with one caller:
+    live results and authenticated archive reductions must use the same
+    ``2.1 * c / (St_low * U)`` horizon.  Invalid physical inputs deliberately
+    return infinity so every caller fails closed.
+    """
+    try:
+        u = float(speed)
+        c = float(chord)
+    except (TypeError, ValueError):
+        return math.inf
+    slow_st = float(SHEDDING_STROUHAL_BAND[0])
+    if not (
+        math.isfinite(u)
+        and math.isfinite(c)
+        and math.isfinite(slow_st)
+        and u > 0
+        and c > 0
+        and slow_st > 0
+    ):
+        return math.inf
+    return NO_SHEDDING_MIN_SLOW_PERIODS * c / (slow_st * u)
 
 
 def _no_shedding_from_stats(
@@ -1578,15 +2992,30 @@ def _no_shedding_from_stats(
     cl_rms: float,
     cd_mean: float,
     cd_rms: float,
+    cm_mean: float,
+    cm_rms: float,
     *,
     rel_tol: float = NO_SHEDDING_REL_TOL,
     abs_floor: float = NO_SHEDDING_ABS_FLOOR,
 ) -> bool:
-    """Amplitude-only no-shedding verdict shared by raw and stored histories."""
-    fluctuation = max(abs(cl_rms), abs(cd_rms))
-    scale = abs(cl_mean) + abs(cd_mean)
-    threshold = max(rel_tol * scale, abs_floor)
-    return fluctuation <= threshold
+    """All-channel amplitude verdict shared by raw and stored histories.
+
+    A large lift coefficient must not mask a noisy moment coefficient.  Grade
+    Cl, Cd, and Cm independently against their own mean plus the common
+    near-zero absolute floor; each coefficient is a separately reported
+    physical result and all must be quiet before calling a wake steady.
+    """
+    channels = (
+        (cl_mean, cl_rms),
+        (cd_mean, cd_rms),
+        (cm_mean, cm_rms),
+    )
+    if not all(math.isfinite(value) for pair in channels for value in pair):
+        return False
+    return all(
+        abs(rms) <= max(rel_tol * abs(mean), abs_floor)
+        for mean, rms in channels
+    )
 
 
 def is_no_shedding(
@@ -1605,13 +3034,21 @@ def is_no_shedding(
     no-shedding (that is an honest failure, handled by the caller), because
     there is nothing to average.
     """
-    if history is None or history.samples < 2 or len(history.t) < 2:
+    if history is None or history.samples < NO_SHEDDING_MIN_SAMPLE_COUNT:
+        return False
+    channels = (history.t, history.cl, history.cd, history.cm)
+    if (
+        len(history.t) < NO_SHEDDING_MIN_SAMPLE_COUNT
+        or any(len(channel) != len(history.t) for channel in channels)
+    ):
         return False
     return _no_shedding_from_stats(
         history.cl_mean,
         history.cl_rms,
         history.cd_mean,
         history.cd_rms,
+        history.cm_mean,
+        history.cm_rms,
         rel_tol=rel_tol,
         abs_floor=abs_floor,
     )
@@ -1688,6 +3125,8 @@ def force_history(
         full_cl_rms,
         full_cd_mean,
         full_cd_rms,
+        full_cm_mean,
+        full_cm_rms,
     )
     # The configured discard is not evidence that an oscillating wake has
     # settled.  A high-Courant startup burst can extend beyond that elapsed-time

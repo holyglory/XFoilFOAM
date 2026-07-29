@@ -1,7 +1,11 @@
 import { URANS_CONTINUATION_REQUIRED_MARKER } from "@aerodb/core";
 import {
   FINAL_URANS_OUTCOMES,
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   airfoils,
+  boundaryConditions,
+  blockFinalUransVerificationBeforeSubmit,
+  blockFinalUransVerificationBeforeSubmitInTransaction,
   blockFinalUransVerificationAfterMediaRepair,
   cancelCampaign,
   createClient,
@@ -35,6 +39,9 @@ import {
   simUransVerifyQueue,
   simUransVerifyQueueCampaigns,
   simUransVerifyQueueRequests,
+  simulationPresetRevisions,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
   solverEvidenceArchives,
   solverEvidenceArtifacts,
   solverEvidenceBlobs,
@@ -274,6 +281,24 @@ beforeAll(async () => {
   revisionId = solverFixture.revisionId;
   solverImplementationId = solverFixture.solverImplementationId;
   bcId = solverFixture.bcId;
+  // The fixture deliberately keeps a compact historical snapshot. This suite
+  // exercises current FINAL admission, whose execution target is the pinned
+  // snapshot's BC + solver implementation rather than a mutable result row.
+  const [revision] = await db
+    .select({ snapshot: simulationPresetRevisions.snapshot })
+    .from(simulationPresetRevisions)
+    .where(eq(simulationPresetRevisions.id, revisionId))
+    .limit(1);
+  await db
+    .update(simulationPresetRevisions)
+    .set({
+      snapshot: {
+        ...((revision?.snapshot ?? {}) as Record<string, unknown>),
+        preset: { legacyBoundaryConditionId: bcId },
+        engine: { implementationId: solverImplementationId },
+      },
+    })
+    .where(eq(simulationPresetRevisions.id, revisionId));
   cleanupSolverFixture = solverFixture.cleanup;
 });
 
@@ -1115,6 +1140,32 @@ describe("final URANS media-repair recovery", () => {
       })
       .where(eq(simUransVerifyQueue.id, queueA.id));
 
+    const sourceJobStartedAt = new Date();
+    const [sourceJobB] = await db
+      .insert(simJobs)
+      .values({
+        engineJobId: `${PREFIX}-generation-b-precalc`,
+        methodKey: "openfoam.urans",
+        solverImplementationId,
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: 0.987654,
+        wave: 2,
+        status: "done",
+        totalCases: 1,
+        completedCases: 1,
+        requestPayload: {
+          aoas: [aoaDeg],
+          uransFidelity: "precalc",
+        },
+        submittedAt: sourceJobStartedAt,
+        finishedAt: sourceJobStartedAt,
+      })
+      .returning();
+    jobIds.push(sourceJobB.id);
+
     const [attemptB] = await db
       .insert(resultAttempts)
       .values({
@@ -1123,6 +1174,7 @@ describe("final URANS media-repair recovery", () => {
         bcId,
         simulationPresetRevisionId: revisionId,
         aoaDeg,
+        simJobId: sourceJobB.id,
         engineJobId: `${PREFIX}-generation-b-precalc`,
         engineCaseSlug: `aoa_${aoaDeg}_precalc_b`,
         solverImplementationId,
@@ -1145,6 +1197,7 @@ describe("final URANS media-repair recovery", () => {
       resultId: result.id,
       resultAttemptId: attemptB.id,
       aoaDeg,
+      simJobId: sourceJobB.id,
       engineJobId: attemptB.engineJobId!,
       engineCaseSlug: attemptB.engineCaseSlug!,
     });
@@ -1205,11 +1258,153 @@ describe("final URANS media-repair recovery", () => {
     queueIds.push(queueB!.id);
 
     expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
-      resultAttemptId: attemptB.id,
-      cl: attemptB.cl,
-      cd: attemptB.cd,
-      cm: attemptB.cm,
+      outcome: "accepted",
+      snapshot: {
+        resultAttemptId: attemptB.id,
+        cl: attemptB.cl,
+        cd: attemptB.cd,
+        cm: attemptB.cm,
+      },
     });
+
+    // A matching result key alone must never let FINAL reuse a FAST-URANS
+    // generation from a different physical or numerical cell.
+    const [targetBoundary] = await db
+      .select()
+      .from(boundaryConditions)
+      .where(eq(boundaryConditions.id, bcId))
+      .limit(1);
+    if (!targetBoundary) throw new Error("target boundary fixture is missing");
+    const [otherBoundary] = await db
+      .insert(boundaryConditions)
+      .values({
+        slug: `${PREFIX}-generation-b-other-bc`,
+        name: `${PREFIX} generation B other BC`,
+        mediumId: targetBoundary.mediumId,
+        reynolds: targetBoundary.reynolds,
+        referenceChordM: targetBoundary.referenceChordM,
+        speedMps: targetBoundary.speedMps,
+      })
+      .returning();
+    const [targetRevision] = await db
+      .select({ snapshot: simulationPresetRevisions.snapshot })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!targetRevision) throw new Error("target revision fixture is missing");
+    try {
+      await db
+        .update(resultAttempts)
+        .set({ bcId: otherBoundary.id })
+        .where(eq(resultAttempts.id, attemptB.id));
+      await db
+        .update(simJobs)
+        .set({ bcIds: [otherBoundary.id] })
+        .where(eq(simJobs.id, sourceJobB.id));
+      expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+        outcome: "rejected",
+        reason: "boundary_condition_mismatch",
+      });
+
+      // The attempt can be correct while the job provenance is not. That is
+      // still a hard admission failure rather than an opportunity to submit
+      // FINAL against an ambiguous source sweep.
+      await db
+        .update(resultAttempts)
+        .set({ bcId })
+        .where(eq(resultAttempts.id, attemptB.id));
+      expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+        outcome: "rejected",
+        reason: "source_job_boundary_condition_mismatch",
+      });
+      await db
+        .update(simJobs)
+        .set({ bcIds: [bcId] })
+        .where(eq(simJobs.id, sourceJobB.id));
+
+      const otherImplementationId =
+        solverImplementationId === OPENCFD_2406_SOLVER_IMPLEMENTATION_ID
+          ? OPENCFD_2606_SOLVER_IMPLEMENTATION_ID
+          : OPENCFD_2406_SOLVER_IMPLEMENTATION_ID;
+      await db
+        .update(resultAttempts)
+        .set({ solverImplementationId: otherImplementationId })
+        .where(eq(resultAttempts.id, attemptB.id));
+      await db
+        .update(simJobs)
+        .set({ solverImplementationId: otherImplementationId })
+        .where(eq(simJobs.id, sourceJobB.id));
+      expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+        outcome: "rejected",
+        reason: "solver_implementation_mismatch",
+      });
+
+      await db
+        .update(resultAttempts)
+        .set({ solverImplementationId })
+        .where(eq(resultAttempts.id, attemptB.id));
+      expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+        outcome: "rejected",
+        reason: "source_job_solver_implementation_mismatch",
+      });
+      await db
+        .update(simJobs)
+        .set({ solverImplementationId })
+        .where(eq(simJobs.id, sourceJobB.id));
+
+      // Historical `legacy/unknown` evidence is the one intentional
+      // compatibility normalization: it denotes OpenCFD 2406, not a wildcard
+      // implementation. Both the attempt and producing job must agree.
+      await db
+        .update(simulationPresetRevisions)
+        .set({
+          snapshot: {
+            ...(targetRevision.snapshot as Record<string, unknown>),
+            engine: {
+              implementationId: OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+            },
+          },
+        })
+        .where(eq(simulationPresetRevisions.id, revisionId));
+      await db
+        .update(resultAttempts)
+        .set({
+          solverImplementationId: LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+        })
+        .where(eq(resultAttempts.id, attemptB.id));
+      await db
+        .update(simJobs)
+        .set({
+          solverImplementationId: LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+        })
+        .where(eq(simJobs.id, sourceJobB.id));
+      expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
+        outcome: "accepted",
+        snapshot: {
+          resultAttemptId: attemptB.id,
+          cl: attemptB.cl,
+          cd: attemptB.cd,
+          cm: attemptB.cm,
+        },
+      });
+    } finally {
+      await db
+        .update(resultAttempts)
+        .set({ bcId, solverImplementationId })
+        .where(eq(resultAttempts.id, attemptB.id));
+      await db
+        .update(simJobs)
+        .set({ bcIds: [bcId], solverImplementationId })
+        .where(eq(simJobs.id, sourceJobB.id));
+      await db
+        .update(simulationPresetRevisions)
+        .set({ snapshot: targetRevision.snapshot })
+        .where(eq(simulationPresetRevisions.id, revisionId));
+      await db
+        .delete(boundaryConditions)
+        .where(eq(boundaryConditions.id, otherBoundary.id));
+    }
+
     // Simulate the natural-cell projection being overwritten after B was
     // queued. The immutable queue owner and comparison coefficients stay B.
     await db
@@ -1217,10 +1412,13 @@ describe("final URANS media-repair recovery", () => {
       .set({ fidelity: "urans_full", cl: 9.9, cd: 8.8, cm: 7.7 })
       .where(eq(results.id, result.id));
     expect(await precalcSnapshotForVerifyItem(db, queueB!)).toEqual({
-      resultAttemptId: attemptB.id,
-      cl: attemptB.cl,
-      cd: attemptB.cd,
-      cm: attemptB.cm,
+      outcome: "accepted",
+      snapshot: {
+        resultAttemptId: attemptB.id,
+        cl: attemptB.cl,
+        cd: attemptB.cd,
+        cm: attemptB.cm,
+      },
     });
     expect(
       await enqueuePrecalcVerifications(db, {
@@ -2312,6 +2510,115 @@ describe("final URANS media-repair recovery", () => {
     expect(blockedRequest).toMatchObject({
       state: "blocked",
       simJobId: null,
+    });
+  });
+
+  it("MUST-CATCH: an archive-authorized FINAL queue healed back to pending is fenced atomically before generic FULL planning can claim it", async () => {
+    const fixture = await createMediaPendingFixture(
+      "archive-proof-loss-pending",
+      82.25 + (process.pid % 1000) / 100_000,
+    );
+    const request = await linkFullRequest(
+      fixture.queue.id,
+      fixture.queue.aoaDeg,
+      "archive-proof-loss-pending-request",
+    );
+    const reason =
+      "the reducer-pinned GCS archive is no longer the exact verified restart archive for this FINAL continuation";
+
+    // A failed enclosing transaction must not leave an alert-only ghost: the
+    // queue, linked request projection, and idempotent incident all roll back
+    // together before a healer can expose this row as pending work again.
+    await expect(
+      db.transaction(async (rawTx) => {
+        const blocked =
+          await blockFinalUransVerificationBeforeSubmitInTransaction(
+            rawTx as unknown as typeof db,
+            {
+              verifyQueueId: fixture.queue.id,
+              reason,
+              incidentReason: "archive-pinned-continuation-proof-lost",
+              targetSolverImplementationId: solverImplementationId,
+              allowPendingUnsubmitted: true,
+            },
+          );
+        expect(blocked).toBe(true);
+        throw new Error("intentional final proof-loss rollback");
+      }),
+    ).rejects.toThrow("intentional final proof-loss rollback");
+
+    const [rolledBackQueue] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, fixture.queue.id));
+    expect(rolledBackQueue).toMatchObject({ state: "pending", simJobId: null });
+    const [rolledBackRequest] = await db
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, request.id));
+    expect(rolledBackRequest).toMatchObject({ state: "running" });
+    expect(
+      await db
+        .select({ id: simSolverIncidents.id })
+        .from(simSolverIncidents)
+        .where(eq(simSolverIncidents.verifyQueueId, fixture.queue.id)),
+    ).toEqual([]);
+
+    expect(
+      await blockFinalUransVerificationBeforeSubmit(db, {
+        verifyQueueId: fixture.queue.id,
+        reason,
+        incidentReason: "archive-pinned-continuation-proof-lost",
+        targetSolverImplementationId: solverImplementationId,
+        allowPendingUnsubmitted: true,
+        metadata: { archiveContinuationProof: "lost_at_submit" },
+      }),
+    ).toBe(true);
+    // Replay is harmless: once terminal, this source cannot create a second
+    // incident or re-open generic FINAL work.
+    expect(
+      await blockFinalUransVerificationBeforeSubmit(db, {
+        verifyQueueId: fixture.queue.id,
+        reason,
+        incidentReason: "archive-pinned-continuation-proof-lost",
+        targetSolverImplementationId: solverImplementationId,
+        allowPendingUnsubmitted: true,
+      }),
+    ).toBe(false);
+
+    const [blockedQueue] = await db
+      .select()
+      .from(simUransVerifyQueue)
+      .where(eq(simUransVerifyQueue.id, fixture.queue.id));
+    expect(blockedQueue).toMatchObject({
+      state: "blocked",
+      simJobId: null,
+      lastOutcome: FINAL_URANS_OUTCOMES.recoveryExhausted,
+      lastError: reason,
+    });
+    const [blockedRequest] = await db
+      .select()
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, request.id));
+    expect(blockedRequest).toMatchObject({ state: "blocked", simJobId: null });
+    const incidents = await db
+      .select()
+      .from(simSolverIncidents)
+      .where(
+        and(
+          eq(simSolverIncidents.verifyQueueId, fixture.queue.id),
+          eq(
+            simSolverIncidents.reason,
+            "archive-pinned-continuation-proof-lost",
+          ),
+        ),
+      );
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({
+      stage: "final",
+      severity: "critical",
+      status: "open",
+      solverImplementationId,
     });
   });
 

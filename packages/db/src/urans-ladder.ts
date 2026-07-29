@@ -55,6 +55,7 @@ import {
   resultClassifications,
   results,
   simulationPresetRevisions,
+  simulationPresets,
   simCampaigns,
   simJobs,
   simPrecalcObligationAttempts,
@@ -70,6 +71,10 @@ import {
   type SimUransRequest,
   type SimUransVerifyQueueItem,
 } from "./schema";
+import {
+  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+} from "./solver-implementations";
 
 // ---------------------------------------------------------------------------
 // Verify-queue enqueue (contract 4): an immutable result_attempt that
@@ -4364,11 +4369,123 @@ export interface VerifyPrecalcSnapshot {
   cm: number | null;
 }
 
+/**
+ * A FINAL verification is not permitted to inherit coefficients from merely a
+ * matching (airfoil, revision, AoA) row.  The pinned preliminary generation
+ * must also be from the exact boundary-condition cell and numerical solver
+ * implementation that the queued FINAL job will compose.
+ *
+ * `legacy/unknown` is intentionally the explicit OpenCFD 2406 compatibility
+ * generation.  Any other missing provenance is not a wildcard.
+ */
+export type VerifyPrecalcSnapshotFailureReason =
+  | "pinned_precalc_attempt_missing"
+  | "pinned_precalc_evidence_invalid"
+  | "target_cell_unresolvable"
+  | "boundary_condition_mismatch"
+  | "solver_implementation_mismatch"
+  | "source_job_provenance_missing"
+  | "source_job_target_mismatch"
+  | "source_job_boundary_condition_mismatch"
+  | "source_job_solver_implementation_mismatch";
+
+export type VerifyPrecalcSnapshotResolution =
+  | {
+      outcome: "accepted";
+      snapshot: VerifyPrecalcSnapshot;
+    }
+  | {
+      outcome: "rejected";
+      reason: VerifyPrecalcSnapshotFailureReason;
+    };
+
+const UUID_TEXT =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function normalizedVerifySolverImplementationId(
+  implementationId: string | null | undefined,
+): string | null {
+  if (!implementationId) return null;
+  return implementationId === LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID
+    ? OPENCFD_2406_SOLVER_IMPLEMENTATION_ID
+    : implementationId;
+}
+
+function nestedSnapshotString(
+  snapshot: unknown,
+  parent: string,
+  key: string,
+): string | null {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const parentValue = (snapshot as Record<string, unknown>)[parent];
+  if (!parentValue || typeof parentValue !== "object") return null;
+  const value = (parentValue as Record<string, unknown>)[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+/** Mirrors the exact target resolver used by the sweeper: revision snapshot
+ * first, then the legacy preset fallback only when the immutable snapshot did
+ * not record a boundary-condition id. */
+function verifyTargetBoundaryConditionId(
+  snapshot: unknown,
+  presetFallbackId: string | null,
+): string | null {
+  const snapshotId = nestedSnapshotString(
+    snapshot,
+    "preset",
+    "legacyBoundaryConditionId",
+  );
+  const candidate = snapshotId ?? presetFallbackId;
+  return candidate && UUID_TEXT.test(candidate) ? candidate : null;
+}
+
+/** Mirrors `solverImplementationIdForSetup` without importing the sweeper
+ * package into the DB layer. Historical snapshots with no engine identity
+ * explicitly route through OpenCFD 2406. */
+function verifyTargetSolverImplementationId(snapshot: unknown): string | null {
+  const snapshotId = nestedSnapshotString(
+    snapshot,
+    "engine",
+    "implementationId",
+  );
+  const candidate = snapshotId ?? OPENCFD_2406_SOLVER_IMPLEMENTATION_ID;
+  return UUID_TEXT.test(candidate)
+    ? normalizedVerifySolverImplementationId(candidate)
+    : null;
+}
+
+export function verifyPrecalcSnapshotFailureMessage(
+  reason: VerifyPrecalcSnapshotFailureReason,
+): string {
+  switch (reason) {
+    case "pinned_precalc_attempt_missing":
+      return "the queue's pinned preliminary result attempt no longer exists";
+    case "pinned_precalc_evidence_invalid":
+      return "the queue's pinned preliminary attempt is not accepted FAST URANS evidence for this exact result cell";
+    case "target_cell_unresolvable":
+      return "the queued FINAL target has no resolvable boundary-condition or solver implementation";
+    case "boundary_condition_mismatch":
+      return "the pinned preliminary attempt belongs to a different boundary-condition cell";
+    case "solver_implementation_mismatch":
+      return "the pinned preliminary attempt was solved by a different solver implementation";
+    case "source_job_provenance_missing":
+      return "the pinned preliminary attempt has no producing solver job provenance";
+    case "source_job_target_mismatch":
+      return "the producing preliminary job belongs to a different airfoil or setup revision";
+    case "source_job_boundary_condition_mismatch":
+      return "the producing preliminary job does not own exactly the queued boundary-condition cell";
+    case "source_job_solver_implementation_mismatch":
+      return "the producing preliminary job was executed by a different solver implementation";
+  }
+}
+
 export async function precalcSnapshotForVerifyItem(
   db: DB,
   item: SimUransVerifyQueueItem,
-): Promise<VerifyPrecalcSnapshot | null> {
-  if (!item.precalcResultAttemptId) return null;
+): Promise<VerifyPrecalcSnapshotResolution> {
+  if (!item.precalcResultAttemptId) {
+    return { outcome: "rejected", reason: "pinned_precalc_attempt_missing" };
+  }
   const [row] = await db
     .select({
       resultAttemptId: resultAttempts.id,
@@ -4376,25 +4493,47 @@ export async function precalcSnapshotForVerifyItem(
       airfoilId: resultAttempts.airfoilId,
       revisionId: resultAttempts.simulationPresetRevisionId,
       aoaDeg: resultAttempts.aoaDeg,
+      bcId: resultAttempts.bcId,
       cl: resultAttempts.cl,
       cd: resultAttempts.cd,
       cm: resultAttempts.cm,
       status: resultAttempts.status,
       source: resultAttempts.source,
+      solverImplementationId: resultAttempts.solverImplementationId,
       fidelity: sql<
         string | null
       >`${resultAttempts.evidencePayload} ->> 'fidelity'`,
       classification: resultClassifications.state,
+      sourceJobId: simJobs.id,
+      sourceJobAirfoilId: simJobs.airfoilId,
+      sourceJobRevisionId: simJobs.simulationPresetRevisionId,
+      sourceJobBoundaryConditionIds: simJobs.bcIds,
+      sourceJobSolverImplementationId: simJobs.solverImplementationId,
+      targetRevisionId: simulationPresetRevisions.id,
+      targetSnapshot: simulationPresetRevisions.snapshot,
+      targetPresetBoundaryConditionId:
+        simulationPresets.legacyBoundaryConditionId,
     })
     .from(resultAttempts)
     .leftJoin(
       resultClassifications,
       eq(resultClassifications.resultAttemptId, resultAttempts.id),
     )
+    .leftJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
+    .leftJoin(
+      simulationPresetRevisions,
+      eq(simulationPresetRevisions.id, item.revisionId),
+    )
+    .leftJoin(
+      simulationPresets,
+      eq(simulationPresets.id, simulationPresetRevisions.presetId),
+    )
     .where(eq(resultAttempts.id, item.precalcResultAttemptId))
     .limit(1);
+  if (!row) {
+    return { outcome: "rejected", reason: "pinned_precalc_attempt_missing" };
+  }
   if (
-    !row ||
     row.resultId !== item.precalcResultId ||
     row.airfoilId !== item.airfoilId ||
     row.revisionId !== item.revisionId ||
@@ -4403,13 +4542,69 @@ export async function precalcSnapshotForVerifyItem(
     row.source !== "solved" ||
     row.fidelity !== "urans_precalc" ||
     row.classification !== "accepted"
-  )
-    return null;
+  ) {
+    return { outcome: "rejected", reason: "pinned_precalc_evidence_invalid" };
+  }
+
+  if (!row.targetRevisionId) {
+    return { outcome: "rejected", reason: "target_cell_unresolvable" };
+  }
+  const targetBoundaryConditionId = verifyTargetBoundaryConditionId(
+    row.targetSnapshot,
+    row.targetPresetBoundaryConditionId,
+  );
+  const targetSolverImplementationId = verifyTargetSolverImplementationId(
+    row.targetSnapshot,
+  );
+  if (!targetBoundaryConditionId || !targetSolverImplementationId) {
+    return { outcome: "rejected", reason: "target_cell_unresolvable" };
+  }
+  if (row.bcId !== targetBoundaryConditionId) {
+    return { outcome: "rejected", reason: "boundary_condition_mismatch" };
+  }
+  if (
+    normalizedVerifySolverImplementationId(row.solverImplementationId) !==
+    targetSolverImplementationId
+  ) {
+    return { outcome: "rejected", reason: "solver_implementation_mismatch" };
+  }
+  if (!row.sourceJobId) {
+    return { outcome: "rejected", reason: "source_job_provenance_missing" };
+  }
+  if (
+    row.sourceJobAirfoilId !== item.airfoilId ||
+    row.sourceJobRevisionId !== item.revisionId
+  ) {
+    return { outcome: "rejected", reason: "source_job_target_mismatch" };
+  }
+  if (
+    !Array.isArray(row.sourceJobBoundaryConditionIds) ||
+    row.sourceJobBoundaryConditionIds.length !== 1 ||
+    row.sourceJobBoundaryConditionIds[0] !== targetBoundaryConditionId
+  ) {
+    return {
+      outcome: "rejected",
+      reason: "source_job_boundary_condition_mismatch",
+    };
+  }
+  if (
+    normalizedVerifySolverImplementationId(
+      row.sourceJobSolverImplementationId,
+    ) !== targetSolverImplementationId
+  ) {
+    return {
+      outcome: "rejected",
+      reason: "source_job_solver_implementation_mismatch",
+    };
+  }
   return {
-    resultAttemptId: row.resultAttemptId,
-    cl: row.cl,
-    cd: row.cd,
-    cm: row.cm,
+    outcome: "accepted",
+    snapshot: {
+      resultAttemptId: row.resultAttemptId,
+      cl: row.cl,
+      cd: row.cd,
+      cm: row.cm,
+    },
   };
 }
 
@@ -4427,24 +4622,38 @@ export type FinalUransRecoveryPlan =
   | { mode: "media_repair" }
   | { mode: "exhausted"; reason: string };
 
-/** A final verification can become terminal before a new sim_job exists:
- * either its durable retry ledger is already exhausted, or the only saved
- * continuation checkpoint is incompatible with the target implementation.
- * Fence the running claim and write the matching critical incident in the
- * same transaction so scheduler replays cannot create alert-only ghosts. */
-export async function blockFinalUransVerificationBeforeSubmit(
-  db: DB,
-  input: {
-    verifyQueueId: string;
-    reason: string;
-    incidentReason: string;
-    targetSolverImplementationId: string;
-    metadata?: Record<string, unknown>;
-  },
+export interface BlockFinalUransVerificationBeforeSubmitInput {
+  verifyQueueId: string;
+  reason: string;
+  incidentReason: string;
+  targetSolverImplementationId: string;
+  metadata?: Record<string, unknown>;
+  /**
+   * A crashed claim healer can release a special, archive-authorized FINAL
+   * queue item back to `pending` before the next consumer detects that its
+   * immutable archive proof disappeared.  That pending item must be fenced
+   * before ordinary FINAL planning can claim it as fresh work.
+   *
+   * Callers may opt in only when they already hold the special authorization
+   * boundary; normal final-recovery callers remain running-claim-only.
+   */
+  allowPendingUnsubmitted?: boolean;
+}
+
+/**
+ * Transaction primitive for terminal FINAL admission failures.  Keeping the
+ * queue fence, the solver-owned incident, and linked-request projection in
+ * the caller's transaction lets an archive-recovery action join the same
+ * atomic boundary instead of leaving a crash window between two commits.
+ */
+export async function blockFinalUransVerificationBeforeSubmitInTransaction(
+  tx: DB,
+  input: BlockFinalUransVerificationBeforeSubmitInput,
 ): Promise<boolean> {
-  return db.transaction(async (rawTx) => {
-    const tx = rawTx as unknown as DB;
-    const rows = (await tx.execute(sql`
+  const queueStateFence = input.allowPendingUnsubmitted
+    ? sql`q.state IN ('pending', 'running')`
+    : sql`q.state = 'running'`;
+  const rows = (await tx.execute(sql`
       UPDATE sim_urans_verify_queue q
       SET state = 'blocked',
           sim_job_id = NULL,
@@ -4453,7 +4662,7 @@ export async function blockFinalUransVerificationBeforeSubmit(
           next_submit_at = NULL,
           "updatedAt" = now()
       WHERE q.id = ${input.verifyQueueId}
-        AND q.state = 'running'
+        AND ${queueStateFence}
         AND q.sim_job_id IS NULL
       RETURNING
         q.id,
@@ -4463,59 +4672,75 @@ export async function blockFinalUransVerificationBeforeSubmit(
         q.continuation_attempt_count,
         q.continuation_no_progress_count
     `)) as unknown as Array<{
-      id: string;
-      latest_result_attempt_id: string | null;
-      fresh_attempt_count: number;
-      max_fresh_attempts: number;
-      continuation_attempt_count: number;
-      continuation_no_progress_count: number;
-    }>;
-    const row = rows[0];
-    if (!row) return false;
+    id: string;
+    latest_result_attempt_id: string | null;
+    fresh_attempt_count: number;
+    max_fresh_attempts: number;
+    continuation_attempt_count: number;
+    continuation_no_progress_count: number;
+  }>;
+  const row = rows[0];
+  if (!row) return false;
 
-    const [attempt] = row.latest_result_attempt_id
-      ? await tx
-          .select({
-            id: resultAttempts.id,
-            simJobId: resultAttempts.simJobId,
-            solverImplementationId: resultAttempts.solverImplementationId,
-            classificationReasons: resultClassifications.reasons,
-          })
-          .from(resultAttempts)
-          .leftJoin(
-            resultClassifications,
-            eq(resultClassifications.resultAttemptId, resultAttempts.id),
-          )
-          .where(eq(resultAttempts.id, row.latest_result_attempt_id))
-          .limit(1)
-      : [];
-    const solverImplementationId =
-      attempt?.solverImplementationId ?? input.targetSolverImplementationId;
-    await recordSolverIncidentInTransaction(tx, {
-      stage: "final",
-      reason: input.incidentReason,
-      severity: "critical",
-      owner: { verifyQueueId: row.id },
-      solverImplementationId,
-      occurrenceKey: `final:${row.id}:${attempt?.id ?? row.id}:${FINAL_URANS_OUTCOMES.recoveryExhausted}`,
-      remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
-      simJobId: attempt?.simJobId ?? null,
-      resultAttemptId: attempt?.id ?? null,
-      metadata: {
-        lastOutcome: FINAL_URANS_OUTCOMES.recoveryExhausted,
-        schedulerReason: input.reason,
-        classificationReasons: attempt?.classificationReasons ?? [],
-        freshAttemptCount: row.fresh_attempt_count,
-        maxFreshAttempts: row.max_fresh_attempts,
-        continuationAttemptCount: row.continuation_attempt_count,
-        continuationNoProgressCount: row.continuation_no_progress_count,
-        targetSolverImplementationId: input.targetSolverImplementationId,
-        ...input.metadata,
-      },
-    });
-    await refreshFullUransRequestsForVerifyQueueInTransaction(tx, row.id);
-    return true;
+  const [attempt] = row.latest_result_attempt_id
+    ? await tx
+        .select({
+          id: resultAttempts.id,
+          simJobId: resultAttempts.simJobId,
+          solverImplementationId: resultAttempts.solverImplementationId,
+          classificationReasons: resultClassifications.reasons,
+        })
+        .from(resultAttempts)
+        .leftJoin(
+          resultClassifications,
+          eq(resultClassifications.resultAttemptId, resultAttempts.id),
+        )
+        .where(eq(resultAttempts.id, row.latest_result_attempt_id))
+        .limit(1)
+    : [];
+  const solverImplementationId =
+    attempt?.solverImplementationId ?? input.targetSolverImplementationId;
+  await recordSolverIncidentInTransaction(tx, {
+    stage: "final",
+    reason: input.incidentReason,
+    severity: "critical",
+    owner: { verifyQueueId: row.id },
+    solverImplementationId,
+    occurrenceKey: `final:${row.id}:${attempt?.id ?? row.id}:${FINAL_URANS_OUTCOMES.recoveryExhausted}`,
+    remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+    simJobId: attempt?.simJobId ?? null,
+    resultAttemptId: attempt?.id ?? null,
+    metadata: {
+      lastOutcome: FINAL_URANS_OUTCOMES.recoveryExhausted,
+      schedulerReason: input.reason,
+      classificationReasons: attempt?.classificationReasons ?? [],
+      freshAttemptCount: row.fresh_attempt_count,
+      maxFreshAttempts: row.max_fresh_attempts,
+      continuationAttemptCount: row.continuation_attempt_count,
+      continuationNoProgressCount: row.continuation_no_progress_count,
+      targetSolverImplementationId: input.targetSolverImplementationId,
+      ...input.metadata,
+    },
   });
+  await refreshFullUransRequestsForVerifyQueueInTransaction(tx, row.id);
+  return true;
+}
+
+/** A final verification can become terminal before a new sim_job exists:
+ * either its durable retry ledger is already exhausted, or the only saved
+ * continuation checkpoint is incompatible with the target implementation.
+ * Fence the running claim and write the matching critical incident in the
+ * same transaction so scheduler replays cannot create alert-only ghosts. */
+export async function blockFinalUransVerificationBeforeSubmit(
+  db: DB,
+  input: BlockFinalUransVerificationBeforeSubmitInput,
+): Promise<boolean> {
+  return db.transaction((rawTx) =>
+    blockFinalUransVerificationBeforeSubmitInTransaction(
+      rawTx as unknown as DB,
+      input,
+    ),
+  );
 }
 
 /** Resolve the next full-fidelity action from the durable queue ledger.

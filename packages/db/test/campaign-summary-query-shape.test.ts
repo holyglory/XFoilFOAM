@@ -8,8 +8,9 @@ import {
   materializeCampaignResultLinkProjections,
   probeCampaignCompletion,
   probeCampaignCompletions,
+  recomputeProgressForCampaign,
 } from "../src/campaign-execution";
-import { listCampaigns } from "../src/campaigns";
+import { deriveCampaignCompletion, listCampaigns } from "../src/campaigns";
 import {
   campaignOpenTierCounts,
   campaignReviewBucketRows,
@@ -37,6 +38,40 @@ function recordingDb(resultRows: unknown[]) {
 }
 
 describe("campaign summary sparse-query guardrails", () => {
+  it("MUST-CATCH: verified URANS evidence still awaiting archive publication keeps a numerically settled campaign active", () => {
+    expect(
+      deriveCampaignCompletion({
+        requested: 1,
+        solved: 1,
+        failed: 0,
+        running: 0,
+        superseded: 0,
+        derived: 0,
+        rejected: 0,
+        blocked: 0,
+        awaitingArchiveReduction: 1,
+        remaining: 0,
+      }),
+    ).toBe("active");
+  });
+
+  it("MUST-CATCH: durable archive-publication work is disjoint from solved and derived counters", async () => {
+    const { db, queries } = recordingDb([]);
+
+    await recomputeProgressForCampaign(db, CAMPAIGN_ID);
+
+    const [query] = queries;
+    expect(query).toBeDefined();
+    // Both real and symmetry-derived usable classifications must exclude the
+    // exact archive queue predicate. Otherwise an accepted RANS projection
+    // plus a waiting URANS archive double-books one physical campaign cell.
+    const usableCounterGuards = query!.match(
+      /rc\.state in \('accepted', 'needs_urans', 'superseded_by_urans'\)[\s\S]{0,120}not \(exists \(/g,
+    );
+    expect(usableCounterGuards).toHaveLength(2);
+    expect(query).toContain("awaiting_archive_reduction");
+  });
+
   it("MUST-CATCH: completion probing short-circuits active campaigns before terminal scans", async () => {
     const { db, queries } = recordingDb([{ open: true }]);
 
