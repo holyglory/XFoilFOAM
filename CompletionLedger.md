@@ -8,14 +8,15 @@
   terminal period can request only one to three additional physical periods,
   capped at FAST 9 / FINAL 12 periods measured from authenticated transient
   state. Current RANS without an all-channel 200-iteration hold proof routes to
-  targeted FAST URANS. Production database migrations 0094–0100 and the
-  prior control-plane rollout are present, but the live engine still reports
-  recovery v9 and no archive-reduction capability. The new control-plane
-  source needs its safe normal deployment, then the guarded engine rebuild
-  after every live OpenFOAM child drains. Before any historical mutation, run
-  the read-only all-explicit-FAST/FINAL inventory (including failed, queued,
-  local, malformed, and archive-free generations); only completed solved,
-  generation-pinned authenticated GCS evidence may enter exact bounded
+  targeted FAST URANS. Production database migrations 0094–0100 and the new
+  control-plane release are live, but the unchanged engine still reports
+  recovery v9 and no archive-reduction capability. The guarded engine rebuild
+  must wait for every live OpenFOAM child to drain. Before any historical
+  mutation, the 2026-07-30 production read-only all-explicit-FAST/FINAL
+  inventory completed with 3,713 attempts: 3,621 verified-GCS interpretation
+  candidates, 26 exact FAST attempts without a current archive, and 66
+  terminal failed attempts. Only completed solved, generation-pinned
+  authenticated GCS evidence may enter exact bounded
   interpretation backfill. Legacy FAST without a current verified archive
   must create one separately leased fresh-FAST recovery receipt, never a
   fabricated continuation; FINAL/no-archive and malformed/archive-failure
