@@ -12,7 +12,7 @@ from airfoilfoam.capabilities import (
     URANS_RECOVERY_VERSION,
 )
 from airfoilfoam.celery_app import celery_app
-from airfoilfoam.api.main import app
+from airfoilfoam.api.main import QUEUE_OBSERVATION_HEALTH_VERSION, app
 from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.models import (
@@ -80,6 +80,7 @@ def test_health_and_capabilities(client):
     assert health["mesh_recovery_version"] == 2
     assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION
     assert health["archive_reduction_version"] == ARCHIVE_REDUCTION_VERSION
+    assert health["queue_observation_version"] == QUEUE_OBSERVATION_HEALTH_VERSION
     assert health["evidence_storage"]["backend"] == "volume"
     assert health["evidence_storage"]["bucket"] is None
     caps = client.get("/capabilities").json()

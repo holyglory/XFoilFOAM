@@ -815,6 +815,12 @@ def _summarize_tasks(tasks_by_worker: dict | None) -> list[dict]:
 QUEUE_SNAPSHOT_TTL_SECONDS = 5.0
 QUEUE_SNAPSHOT_COLD_WAIT_SECONDS = 0.35
 QUEUE_SNAPSHOT_FAILURE_RETRY_SECONDS = 5.0
+# A build that advertises this field has the bounded, single-flight `/queue`
+# implementation below.  The guarded engine-maintenance script uses its
+# *absence* only for a narrowly constrained, independently verified one-time
+# recovery from the older gateway's known Celery-inspect wedge; it is never a
+# reason to accept an unavailable queue observation from this implementation.
+QUEUE_OBSERVATION_HEALTH_VERSION = 1
 
 
 def create_app() -> FastAPI:
@@ -891,6 +897,7 @@ def create_app() -> FastAPI:
             "mesh_recovery_version": MESH_RECOVERY_VERSION,
             "urans_recovery_version": URANS_RECOVERY_VERSION,
             "archive_reduction_version": ARCHIVE_REDUCTION_VERSION,
+            "queue_observation_version": QUEUE_OBSERVATION_HEALTH_VERSION,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
             # provenance appears solely on worker-acknowledged status/results.

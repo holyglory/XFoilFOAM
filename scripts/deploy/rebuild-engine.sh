@@ -107,6 +107,17 @@ compose() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" "$@"
 }
 
+compose_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  # `timeout compose ...` would try to execute the shell function named
+  # `compose`; invoke the resolved Compose command directly instead.  The
+  # maintenance-only direct broker proof below must remain bounded even if a
+  # damaged legacy gateway has wedged its own request workers.
+  timeout --signal=TERM "$timeout_seconds" "${COMPOSE[@]}" \
+    --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" "$@"
+}
+
 verify_deployment_source() {
   local tool fields revision tree_sha file_count
   tool="$APP_DIR/scripts/deploy/deployment-source-manifest.py"
@@ -435,8 +446,215 @@ if any(counts.values()):
 ' "$expected_worker_count"
 }
 
+pre_queue_observation_gateway_recovery_allowed() {
+  local health
+  # This deliberately recognizes only the known, pre-single-flight OpenCFD
+  # 2606 gateway family.  Once the gateway advertises queue_observation_version
+  # (including the build this script is about to install), an unavailable
+  # `/queue` endpoint is a hard refusal: direct inspection must not become a
+  # general maintenance escape hatch.
+  health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || return 1
+  printf '%s' "$health" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+engine = payload.get("default_engine")
+if not isinstance(engine, dict) or engine.get("version") != "2606":
+    raise SystemExit("unavailable /queue is not eligible for pre-observation recovery")
+if "queue_observation_version" in payload:
+    raise SystemExit("gateway advertises queue observation; direct recovery is forbidden")
+if not isinstance(payload.get("build_id"), str) or not payload["build_id"]:
+    raise SystemExit("legacy gateway health lacks an exact build identity")
+# Bound the exception to the deployed archive-reduction/URANS-recovery family
+# whose `/queue` endpoint could wedge behind Celery inspect.conf().  An older
+# or otherwise unknown 2606 image must be repaired through its own runbook.
+if payload.get("urans_recovery_version") != 10 or payload.get("archive_reduction_version") != 1:
+    raise SystemExit("gateway is not the known pre-observation recovery generation")
+'
+}
+
+direct_celery_redis_recovery_activity() {
+  local expected_worker_count="$1"
+  local snapshot
+  # The old endpoint can block while obtaining worker runtime `inspect.conf()`.
+  # This emergency, source-controlled recovery proof avoids that command while
+  # independently requiring every running worker to answer active/reserved/
+  # scheduled/active_queues and every registered Redis route (plus Celery's
+  # unacked bookkeeping keys) to be empty.  It is deliberately unavailable to
+  # all gateways that advertise the normal queue-observation contract.
+  snapshot="$(compose_with_timeout 20 exec -T api python3 -c '
+# AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE
+import json
+import signal
+
+from redis import Redis
+
+from airfoilfoam.celery_app import celery_app
+from airfoilfoam.config import get_settings
+from airfoilfoam.openfoam.dialects import get_openfoam_dialect, supported_openfoam_identities
+
+
+def deadline(_signum, _frame):
+    raise TimeoutError("direct Celery/Redis idle proof exceeded 15 seconds")
+
+
+signal.signal(signal.SIGALRM, deadline)
+signal.alarm(15)
+settings = get_settings()
+inspect = celery_app.control.inspect(timeout=3.0)
+snapshot = {
+    "active": inspect.active(),
+    "reserved": inspect.reserved(),
+    "scheduled": inspect.scheduled(),
+    "active_queues": inspect.active_queues(),
+}
+queue_names = sorted(
+    {get_openfoam_dialect(identity).queue_name for identity in supported_openfoam_identities()}
+)
+redis = Redis.from_url(
+    settings.broker_url,
+    socket_connect_timeout=2.0,
+    socket_timeout=2.0,
+    retry_on_timeout=False,
+)
+snapshot["queue_depths"] = {name: int(redis.llen(name)) for name in queue_names}
+transport_counts = {}
+for name in ("unacked", "unacked_index"):
+    kind = redis.type(name)
+    if isinstance(kind, bytes):
+        kind = kind.decode("ascii", "strict")
+    if kind == "none":
+        transport_counts[name] = 0
+    elif kind == "hash":
+        transport_counts[name] = int(redis.hlen(name))
+    elif kind == "zset":
+        transport_counts[name] = int(redis.zcard(name))
+    elif kind == "list":
+        transport_counts[name] = int(redis.llen(name))
+    else:
+        raise RuntimeError(f"unexpected Celery transport key type for {name}: {kind!r}")
+snapshot["transport_unacked_counts"] = transport_counts
+print(json.dumps(snapshot, separators=(",", ":")))
+')" || return 1
+  printf '%s' "$snapshot" | python3 -c '
+import json
+import sys
+
+snapshot = json.load(sys.stdin)
+expected_worker_count = int(sys.argv[1])
+if expected_worker_count <= 0:
+    raise SystemExit("no running worker container is available to inspect")
+
+names = ("active", "reserved", "scheduled", "active_queues")
+worker_sets = {}
+for name in names:
+    replies = snapshot.get(name)
+    if not isinstance(replies, dict):
+        raise SystemExit(f"direct Celery/Redis recovery lacks a complete {name} snapshot")
+    if any(not isinstance(worker, str) or not worker for worker in replies):
+        raise SystemExit(f"direct Celery/Redis recovery returned an invalid {name} worker name")
+    worker_sets[name] = set(replies)
+
+expected_workers = worker_sets["active_queues"]
+if len(expected_workers) != expected_worker_count:
+    raise SystemExit(
+        "direct Celery/Redis recovery does not cover running worker containers: "
+        f"containers={expected_worker_count}, inspected={len(expected_workers)}"
+    )
+for name in names[:-1]:
+    if worker_sets[name] != expected_workers:
+        raise SystemExit(
+            f"direct Celery/Redis recovery worker coverage is incomplete for {name}: "
+            f"expected={sorted(expected_workers)}, observed={sorted(worker_sets[name])}"
+        )
+
+counts = {}
+for name in names[:-1]:
+    replies = snapshot[name]
+    for worker, tasks in replies.items():
+        if not isinstance(tasks, list) or any(not isinstance(task, dict) for task in tasks):
+            raise SystemExit(
+                f"direct Celery/Redis recovery returned an invalid {name} snapshot for {worker}"
+            )
+    counts[name] = sum(len(tasks) for tasks in replies.values())
+
+for worker, queues in snapshot["active_queues"].items():
+    if (
+        not isinstance(queues, list)
+        or not queues
+        or any(
+            not isinstance(queue, dict)
+            or not isinstance(queue.get("name"), str)
+            or not queue["name"]
+            for queue in queues
+        )
+    ):
+        raise SystemExit(
+            f"direct Celery/Redis recovery returned invalid active_queues for {worker}"
+        )
+
+queue_depths = snapshot.get("queue_depths")
+if (
+    not isinstance(queue_depths, dict)
+    or not queue_depths
+    or any(not isinstance(name, str) or not name or type(depth) is not int for name, depth in queue_depths.items())
+):
+    raise SystemExit("direct Celery/Redis recovery lacks registered queue depths")
+registered_queues = set(queue_depths)
+for worker, queues in snapshot["active_queues"].items():
+    for queue in queues:
+        queue_name = queue["name"]
+        if queue_name not in registered_queues:
+            raise SystemExit(
+                "direct Celery/Redis recovery observed a worker bound to an "
+                f"unregistered route: worker={worker!r}, queue={queue_name!r}"
+            )
+transport_counts = snapshot.get("transport_unacked_counts")
+if (
+    not isinstance(transport_counts, dict)
+    or set(transport_counts) != {"unacked", "unacked_index"}
+    or any(type(count) is not int for count in transport_counts.values())
+):
+    raise SystemExit("direct Celery/Redis recovery lacks complete transport bookkeeping")
+
+if any(counts.values()) or any(queue_depths.values()) or any(transport_counts.values()):
+    print(
+        "direct Celery/Redis recovery reports work: "
+        f"counts={counts} queue_depths={queue_depths} "
+        f"transport_unacked_counts={transport_counts} workers={sorted(expected_workers)}"
+    )
+' "$expected_worker_count"
+}
+
+direct_hub_database_recovery_activity() {
+  # A broker snapshot alone cannot prove that a local job submission did not
+  # reach Postgres immediately before the old `/queue` endpoint wedged.  This
+  # reads executable `sim_jobs` state only. Remote promises live in their own
+  # lease tables and are neither killed nor retargeted by this primary-engine
+  # maintenance action; any live sim_job is conservatively treated as work
+  # that must drain before the local worker can be recreated.
+  compose_with_timeout 15 exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 \
+    -U aerodb -d aerodb -c "
+WITH activity AS (
+  SELECT
+    (SELECT count(*) FROM sim_jobs
+      WHERE status IN ('pending','submitted','running','ingesting'))::int AS live_jobs
+)
+SELECT row_to_json(activity)::text FROM activity;" | python3 -c '
+import json
+import sys
+
+row = json.loads(sys.stdin.read())
+if set(row) != {"live_jobs"} or type(row["live_jobs"]) is not int:
+    raise SystemExit(f"invalid direct maintenance database snapshot: {row!r}")
+if row["live_jobs"]:
+    print(f"direct maintenance database reports live local jobs: {row}")
+'
+}
+
 engine_queue_activity() {
-  local payload services service running expected_worker_count=0
+  local payload services service running expected_worker_count=0 queue_probe_rc
   services="$(known_engine_worker_services)" || return 1
   while IFS= read -r service; do
     [[ -n "$service" ]] || continue
@@ -445,7 +663,34 @@ engine_queue_activity() {
       expected_worker_count=$((expected_worker_count + $(wc -l <<<"$running")))
     fi
   done <<<"$services"
-  payload="$(curl -fsS --max-time "$ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS" http://127.0.0.1:8000/queue)" || return 1
+  if payload="$(curl -fsS --max-time "$ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS" http://127.0.0.1:8000/queue 2>/dev/null)"; then
+    :
+  else
+    queue_probe_rc=$?
+    # Only curl's precise timeout result may enter the emergency proof.  HTTP
+    # errors, TLS/name failures, malformed bodies, and every modern stale or
+    # incomplete observation stay hard refusals through the normal path.
+    if (( queue_probe_rc != 28 )); then
+      return 1
+    fi
+    if [[ "$LEGACY_2406_QUEUE_COMPATIBILITY" == "true" ]]; then
+      return 1
+    fi
+    if ! pre_queue_observation_gateway_recovery_allowed; then
+      return 1
+    fi
+    local database_activity
+    if ! database_activity="$(direct_hub_database_recovery_activity 2>&1)"; then
+      printf '%s\n' "$database_activity" >&2
+      return 1
+    fi
+    if [[ -n "$database_activity" ]]; then
+      printf '%s\n' "$database_activity"
+      return 0
+    fi
+    direct_celery_redis_recovery_activity "$expected_worker_count"
+    return $?
+  fi
   if [[ "$LEGACY_2406_QUEUE_COMPATIBILITY" == "true" ]]; then
     local legacy_activity
     if ! legacy_activity="$(printf '%s' "$payload" | python3 -c '

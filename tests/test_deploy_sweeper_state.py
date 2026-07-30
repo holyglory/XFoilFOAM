@@ -109,10 +109,14 @@ def _deploy_harness(
     sweeper_state: str,
     probe_fails: bool = False,
     queue_active_after: int = 0,
+    queue_endpoint_failure_code: int = 0,
     disabled_queue_depth: int = 0,
     queue_observability_mode: str = "complete",
     queue_observation_mode: str = "fresh",
     legacy_inspector_mode: str = "complete",
+    direct_recovery_mode: str = "complete",
+    direct_database_mode: str = "complete",
+    queue_snapshot_capability: bool = True,
     force_legacy_queue_shape: bool = False,
     foundation_profile: bool = False,
     active_engine_service: str = "",
@@ -276,6 +280,54 @@ if [[ "$joined" == *" exec -T api "* && "$joined" == *"AIRFOILS_PRO_LEGACY_CELER
   esac
   exit 0
 fi
+if [[ "$joined" == *" exec -T api "* && "$joined" == *"AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE"* ]]; then
+  case "$FAKE_DIRECT_RECOVERY_MODE" in
+    complete)
+      printf '{"active":{"celery@current":[]},"reserved":{"celery@current":[]},"scheduled":{"celery@current":[]},"active_queues":{"celery@current":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+      ;;
+    active)
+      printf '{"active":{"celery@current":[{"id":"active-task"}]},"reserved":{"celery@current":[]},"scheduled":{"celery@current":[]},"active_queues":{"celery@current":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+      ;;
+    queued)
+      printf '{"active":{"celery@current":[]},"reserved":{"celery@current":[]},"scheduled":{"celery@current":[]},"active_queues":{"celery@current":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":2,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+      ;;
+    disabled)
+      printf '{"active":{"celery@current":[]},"reserved":{"celery@current":[]},"scheduled":{"celery@current":[]},"active_queues":{"celery@current":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":2},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+      ;;
+    transport)
+      printf '{"active":{"celery@current":[]},"reserved":{"celery@current":[]},"scheduled":{"celery@current":[]},"active_queues":{"celery@current":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":1,"unacked_index":0}}\n'
+      ;;
+    unregistered)
+      printf '{"active":{"celery@current":[]},"reserved":{"celery@current":[]},"scheduled":{"celery@current":[]},"active_queues":{"celery@current":[{"name":"celery-unknown"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+      ;;
+    partial)
+      printf '{"active":{"celery@current":[]},"reserved":{"celery@current":[]},"scheduled":{},"active_queues":{"celery@current":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+      ;;
+    *)
+      printf 'unsupported fake direct recovery mode\n' >&2
+      exit 99
+      ;;
+  esac
+  exit 0
+fi
+if [[ "$joined" == *" exec -T postgres "* ]]; then
+  case "$FAKE_DIRECT_DATABASE_MODE" in
+    complete)
+      printf '{"live_jobs":0}\n'
+      ;;
+    live)
+      printf '{"live_jobs":1}\n'
+      ;;
+    malformed)
+      printf '{}\n'
+      ;;
+    *)
+      printf 'unsupported fake direct database mode\n' >&2
+      exit 99
+      ;;
+  esac
+  exit 0
+fi
 if [[ "$joined" == *" exec -T worker "* || "$joined" == *" exec -T worker-foundation14 "* ]]; then
   exit 0
 fi
@@ -310,6 +362,10 @@ case "$url" in
     fi
     count=$((count + 1))
     printf '%s\n' "$count" >"$QUEUE_PROBE_COUNT"
+    if (( FAKE_QUEUE_ENDPOINT_FAILURE_CODE != 0 )); then
+      printf 'simulated queue endpoint failure\n' >&2
+      exit "$FAKE_QUEUE_ENDPOINT_FAILURE_CODE"
+    fi
     disabled_depth="${FAKE_DISABLED_QUEUE_DEPTH:-0}"
     case "$FAKE_QUEUE_OBSERVATION_MODE" in
       fresh)
@@ -360,7 +416,11 @@ case "$url" in
     if [[ "$FAKE_LEGACY_HEALTH_SHAPE" == "1" && ! -f "$ENGINE_RECREATED" ]]; then
       printf '{"status":"ok","build_id":"%s","mesh_recovery_version":1}\n' "$FAKE_BUILD_ID"
     else
-      printf '{"status":"ok","build_id":"%s","default_engine":{"version":"%s"},"evidence_storage":{"backend":"gcs","bucket":"test-evidence-bucket","object_prefix":"solver-evidence/v1","archive_format":"tar+zstd","compression":"zstd","zstd_level":10,"remote_only":true}}\n' "$FAKE_BUILD_ID" "$engine_version"
+      queue_snapshot_capability=""
+      if [[ "$FAKE_QUEUE_SNAPSHOT_CAPABILITY" == "1" ]]; then
+        queue_snapshot_capability=',"queue_observation_version":1'
+      fi
+      printf '{"status":"ok","build_id":"%s","default_engine":{"version":"%s"}%s,"urans_recovery_version":10,"archive_reduction_version":1,"evidence_storage":{"backend":"gcs","bucket":"test-evidence-bucket","object_prefix":"solver-evidence/v1","archive_format":"tar+zstd","compression":"zstd","zstd_level":10,"remote_only":true}}\n' "$FAKE_BUILD_ID" "$engine_version" "$queue_snapshot_capability"
     fi
     ;;
   *:8000/capabilities)
@@ -520,10 +580,16 @@ exec "$REAL_PYTHON" "$@"
             "FAKE_SWEEPER_STATE": sweeper_state,
             "FAKE_STATE_PROBE_FAIL": "1" if probe_fails else "0",
             "FAKE_QUEUE_ACTIVE_AFTER": str(queue_active_after),
+            "FAKE_QUEUE_ENDPOINT_FAILURE_CODE": str(queue_endpoint_failure_code),
             "FAKE_DISABLED_QUEUE_DEPTH": str(disabled_queue_depth),
             "FAKE_QUEUE_OBSERVABILITY_MODE": queue_observability_mode,
             "FAKE_QUEUE_OBSERVATION_MODE": queue_observation_mode,
             "FAKE_LEGACY_INSPECTOR_MODE": legacy_inspector_mode,
+            "FAKE_DIRECT_RECOVERY_MODE": direct_recovery_mode,
+            "FAKE_DIRECT_DATABASE_MODE": direct_database_mode,
+            "FAKE_QUEUE_SNAPSHOT_CAPABILITY": (
+                "1" if queue_snapshot_capability else "0"
+            ),
             "FAKE_FORCE_LEGACY_QUEUE_SHAPE": (
                 "1" if force_legacy_queue_shape else "0"
             ),
@@ -1030,6 +1096,155 @@ def test_strict_2606_queue_guard_rejects_the_legacy_queue_shape(
     assert "queue observation is not fresh and complete" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert not any("AIRFOILS_PRO_LEGACY_CELERY_IDLE_PROBE" in call for call in calls)
+    assert not any(" build api" in call for call in calls)
+
+
+def test_pre_observation_2606_timeout_uses_bounded_direct_idle_recovery(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_endpoint_failure_code=28,
+        queue_snapshot_capability=False,
+        idle_engine_service="worker",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
+    assert any(" exec -T postgres " in call for call in calls)
+    assert any(" build api" in call for call in calls)
+    assert Path(env["ENV_FILE"]).read_text().count("AIRFOILFOAM_BUILD_ID=test-build") == 1
+
+
+def test_modern_2606_timeout_never_uses_direct_idle_recovery(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_endpoint_failure_code=28,
+        queue_snapshot_capability=True,
+        idle_engine_service="worker",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "gateway advertises queue observation; direct recovery is forbidden" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert not any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
+    assert not any(" build api" in call for call in calls)
+
+
+def test_non_timeout_queue_failure_never_uses_direct_idle_recovery(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_endpoint_failure_code=22,
+        queue_snapshot_capability=False,
+        idle_engine_service="worker",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert not any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
+    assert not any(" exec -T postgres " in call for call in calls)
+    assert not any(" build api" in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("direct_recovery_mode", "expected_error"),
+    [
+        ("active", "direct Celery/Redis recovery reports work"),
+        ("queued", "direct Celery/Redis recovery reports work"),
+        ("disabled", "direct Celery/Redis recovery reports work"),
+        ("transport", "direct Celery/Redis recovery reports work"),
+        ("partial", "worker coverage is incomplete for scheduled"),
+        ("unregistered", "worker bound to an unregistered route"),
+    ],
+)
+def test_pre_observation_timeout_recovery_rejects_direct_work_or_incomplete_snapshot(
+    tmp_path: Path,
+    direct_recovery_mode: str,
+    expected_error: str,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_endpoint_failure_code=28,
+        queue_snapshot_capability=False,
+        direct_recovery_mode=direct_recovery_mode,
+        idle_engine_service="worker",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert expected_error in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
+    assert not any(" build api" in call for call in calls)
+
+
+@pytest.mark.parametrize("direct_database_mode", ["live", "malformed"])
+def test_pre_observation_timeout_recovery_rejects_live_or_invalid_database_state(
+    tmp_path: Path,
+    direct_database_mode: str,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_endpoint_failure_code=28,
+        queue_snapshot_capability=False,
+        direct_database_mode=direct_database_mode,
+        idle_engine_service="worker",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "direct maintenance database" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any(" exec -T postgres " in call for call in calls)
+    assert not any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
     assert not any(" build api" in call for call in calls)
 
 
