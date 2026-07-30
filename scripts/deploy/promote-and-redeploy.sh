@@ -3,6 +3,12 @@
 # lock used by every control-plane and engine maintenance action.
 set -Eeuo pipefail
 
+# Runtime state and the shared deployment lock are private to the deploying
+# user.  ``rsync -a`` deliberately preserves source permissions, so the
+# release-tree hardening below separately removes unsafe write bits from source
+# files after each materialization.
+umask 077
+
 STAGING_DIR="${STAGING_DIR:?STAGING_DIR is required}"
 APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
 LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
@@ -70,6 +76,21 @@ validate_regular_private_env() {
     echo "Deployment environment must be owned by the deploying user: $path" >&2
     return 2
   fi
+}
+
+harden_release_tree() {
+  local tree="$1"
+  if [[ ! -d "$tree" || -L "$tree" ]]; then
+    echo "Release tree is missing or is a symbolic link: $tree" >&2
+    return 2
+  fi
+  # Never recurse through links or cross a filesystem boundary.  Source
+  # manifests bind content, but Git and rsync preserve the uploader's mode;
+  # group-writable files or directories would let a future route/deploy guard
+  # correctly refuse an otherwise immutable release.  Clear only go+w so
+  # executable bits and intentional owner access remain intact.
+  find -P "$tree" -xdev -type d -exec chmod go-w -- {} +
+  find -P "$tree" -xdev -type f -exec chmod go-w -- {} +
 }
 
 if [[ -L "$AIRFOILS_PRO_STATE_DIR" || -L "$RELEASES_DIR" ]]; then
@@ -183,6 +204,7 @@ if [[ -e "$release_dir" || -L "$release_dir" ]]; then
     echo "Versioned release path has an unsafe type: $release_dir" >&2
     exit 2
   fi
+  harden_release_tree "$release_dir"
   promoted_fields="$(python3 "$manifest_tool" \
     --verify --root "$release_dir" --manifest "$release_dir/.deployment-source.json")"
 else
@@ -190,6 +212,7 @@ else
   trap 'rm -rf "${release_temp:-}"; rm -f "${env_temp:-}"' EXIT
   echo "Materializing source revision $source_revision ($source_tree_sha256; $source_file_count files)."
   rsync -a --delete-delay --exclude-from="$exclude_file" "$staging_real/" "$release_temp/"
+  harden_release_tree "$release_temp"
   promoted_fields="$(python3 "$manifest_tool" \
     --verify --root "$release_temp" --manifest "$release_temp/.deployment-source.json")"
   if [[ "$promoted_fields" != "$manifest_fields" ]]; then

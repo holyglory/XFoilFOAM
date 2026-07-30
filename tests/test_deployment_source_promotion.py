@@ -102,6 +102,18 @@ printf '%s\\t%s\\t%s\\n' \
 """
     )
     vps_script.chmod(0o755)
+    compose = root / "docker-compose.deploy.yml"
+    compose.write_text("services: {}\n")
+    # Git does not record the distinction between 0644 and 0664.  The
+    # production uploader uses rsync archive mode, so make this fixture model
+    # the unsafe-but-common source mode that must be normalized after copy.
+    compose.chmod(0o664)
+    writable_tree = root / "nested-source-tree"
+    writable_tree.mkdir()
+    writable_tree.chmod(0o775)
+    executable = writable_tree / "runner.sh"
+    executable.write_text("#!/usr/bin/env bash\nexit 0\n")
+    executable.chmod(0o775)
     (root / "payload.txt").write_text("sealed payload\n")
     created = _run_manifest(root, "--create", revision=REVISION)
     assert created.returncode == 0, created.stderr
@@ -306,6 +318,12 @@ def test_promotion_holds_shared_lock_preserves_env_and_verifies_exact_source(
     assert app.is_symlink()
     assert not (app / "stale-source.txt").exists()
     assert (app / "payload.txt").read_text() == "sealed payload\n"
+    assert (app / "docker-compose.deploy.yml").stat().st_mode & 0o022 == 0
+    assert (app / "nested-source-tree").stat().st_mode & 0o022 == 0
+    runner_mode = (app / "nested-source-tree" / "runner.sh").stat().st_mode
+    assert runner_mode & 0o022 == 0
+    assert runner_mode & 0o111
+    assert (tmp_path / "deploy.lock").stat().st_mode & 0o777 == 0o600
     manifest = json.loads((app / ".deployment-source.json").read_text())
     logged_revision, logged_hash, logged_app = log.read_text().strip().split("\t")
     assert logged_revision == manifest["sourceRevision"] == REVISION
@@ -315,6 +333,48 @@ def test_promotion_holds_shared_lock_preserves_env_and_verifies_exact_source(
     assert len(legacy_releases) == 1
     assert (legacy_releases[0] / ".env.deploy").is_symlink()
     assert (legacy_releases[0] / ".env.deploy").resolve() == shared_env
+
+
+def test_promotion_repairs_an_existing_release_with_unsafe_source_modes(
+    tmp_path: Path,
+) -> None:
+    stage = tmp_path / "deploy-staging" / "repair-existing"
+    app = tmp_path / "app"
+    log = tmp_path / "promotion.log"
+    stage.mkdir(parents=True)
+    app.mkdir()
+    _staged_payload(stage, log)
+    _write_legacy_env(app, "SECRET=legacy\n")
+    fake_bin = tmp_path / "bin"
+    _fake_rsync(fake_bin)
+    env = os.environ | {
+        "STAGING_DIR": str(stage),
+        "APP_DIR": str(app),
+        "LOCK_FILE": str(tmp_path / "deploy.lock"),
+        "PROMOTION_LOG": str(log),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    }
+
+    first = subprocess.run(
+        [str(PROMOTION_SCRIPT)], env=env, text=True, capture_output=True, check=False
+    )
+    assert first.returncode == 0, first.stdout + first.stderr
+    compose = app / "docker-compose.deploy.yml"
+    nested_tree = app / "nested-source-tree"
+    runner = app / "nested-source-tree" / "runner.sh"
+    compose.chmod(0o664)
+    nested_tree.chmod(0o775)
+    runner.chmod(0o775)
+
+    second = subprocess.run(
+        [str(PROMOTION_SCRIPT)], env=env, text=True, capture_output=True, check=False
+    )
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert compose.stat().st_mode & 0o022 == 0
+    assert nested_tree.stat().st_mode & 0o022 == 0
+    runner_mode = runner.stat().st_mode
+    assert runner_mode & 0o022 == 0
+    assert runner_mode & 0o111
 
 
 def test_promotion_rejects_wrong_revision_before_mutating_application(tmp_path: Path) -> None:
