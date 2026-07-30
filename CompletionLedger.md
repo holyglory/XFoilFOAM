@@ -11,7 +11,10 @@
   targeted FAST URANS. Production database migrations 0094–0100 and the new
   control-plane release are live, but the unchanged engine still reports
   recovery v9 and no archive-reduction capability. The guarded engine rebuild
-  must wait for every live OpenFOAM child to drain. Before any historical
+  must wait for every live OpenFOAM child to drain; then intentionally stop
+  the hub sweeper before the rebuild so its unconditional archive-queue drain
+  cannot race the one-item canary, and let the guarded script preserve that
+  stopped state. Before any historical
   mutation, the 2026-07-30 production read-only all-explicit-FAST/FINAL
   inventory completed with 3,713 attempts: 3,621 verified-GCS interpretation
   candidates, 26 exact FAST attempts without a current archive, and 66
