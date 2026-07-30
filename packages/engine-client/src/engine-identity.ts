@@ -249,6 +249,10 @@ export function liveWorkerConsumesExecutionPool(
 ): boolean {
   if (
     !queue ||
+    queue.queue_observation_state !== "fresh" ||
+    typeof queue.queue_observed_at !== "string" ||
+    !queue.queue_observed_at ||
+    queue.queue_observation_error != null ||
     queue.worker_queues_error != null ||
     queue.worker_runtime_error != null ||
     !Array.isArray(queue.worker_queues)

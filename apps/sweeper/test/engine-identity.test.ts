@@ -330,6 +330,9 @@ describe("engine identity contract", () => {
 
   it("requires fresh exact live-worker queue binding evidence for pool availability", () => {
     const queue = {
+      queue_observation_state: "fresh" as const,
+      queue_observed_at: "2026-07-30T00:00:00+00:00",
+      queue_observation_error: null,
       queue_depth: 0,
       active: [],
       reserved: [],
@@ -362,6 +365,20 @@ describe("engine identity contract", () => {
         queue,
         "celery",
         LEGACY_OPENCFD_2406_ENGINE,
+      ),
+    ).toBe(false);
+    expect(
+      liveWorkerConsumesExecutionPool(
+        { ...queue, queue_observation_state: "stale" },
+        "openfoam-foundation-14",
+        FOUNDATION_OPENFOAM_14_ENGINE,
+      ),
+    ).toBe(false);
+    expect(
+      liveWorkerConsumesExecutionPool(
+        { ...queue, queue_observed_at: null },
+        "openfoam-foundation-14",
+        FOUNDATION_OPENFOAM_14_ENGINE,
       ),
     ).toBe(false);
     expect(
@@ -404,6 +421,9 @@ describe("engine identity contract", () => {
       engine: runtime(OPENCFD_2606_ENGINE),
     };
     const queue = {
+      queue_observation_state: "fresh" as const,
+      queue_observed_at: "2026-07-30T00:00:00+00:00",
+      queue_observation_error: null,
       queue_depth: 0,
       active: [],
       reserved: [],

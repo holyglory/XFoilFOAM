@@ -169,7 +169,10 @@ def _validate_deployment_profile(path: Path, state: Path) -> None:
 def _validate_engine_route(path: Path, state: Path) -> None:
     """Fence control-plane deploys to the explicitly active engine gateway."""
     marker = state / "engine-route.json"
-    if not marker.exists():
+    # ``Path.exists`` hides a dangling symlink. A missing marker is tolerated
+    # only for the one-time pre-marker migration; a dangling or substituted
+    # marker is route state tampering and must fail closed.
+    if not os.path.lexists(marker):
         return
     _validate_regular_owned_file(marker, "engine route marker")
     payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -187,6 +190,24 @@ def _validate_engine_route(path: Path, state: Path) -> None:
             "deployment ENGINE_URL does not match the active engine route marker: "
             f"expected {expected}, found {actual or '<unset>'}"
         )
+
+
+def _validate_no_pending_engine_route_switch(state: Path) -> None:
+    """Fail closed if a two-file route transaction did not finish.
+
+    ``switch-engine-route.py`` journals before replacing either the external
+    env or the active-route marker. A process loss between those durable
+    renames must never let a later control-plane deploy guess which gateway is
+    authoritative. The switch helper is the only supported recovery path.
+    """
+    pending = state / ".engine-route-switch.pending.json"
+    if not os.path.lexists(pending):
+        return
+    _validate_regular_owned_file(pending, "pending engine route transaction")
+    raise ValueError(
+        "engine route switch is incomplete; re-run scripts/deploy/switch-engine-route.sh "
+        "with the exact original candidate URLs, active route, and candidate build ids"
+    )
 
 
 def _reject_symlink_components(path: Path) -> None:
@@ -233,6 +254,7 @@ def main() -> int:
         raise ValueError("deployment env must be owned by the deploying user")
     _validate_remote_evidence_auth(env)
     _validate_deployment_profile(env, state)
+    _validate_no_pending_engine_route_switch(state)
     _validate_engine_route(env, state)
     print(env.resolve(strict=True))
     return 0

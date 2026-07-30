@@ -526,6 +526,10 @@ export async function liveOpenCfd2606Runtime(
     );
   }
   if (
+    queue.queue_observation_state !== "fresh" ||
+    typeof queue.queue_observed_at !== "string" ||
+    !queue.queue_observed_at ||
+    queue.queue_observation_error != null ||
     queue.worker_queues_error != null ||
     queue.worker_runtime_error != null ||
     Object.keys(queue.inspection_errors ?? {}).length > 0 ||

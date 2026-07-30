@@ -491,6 +491,20 @@ import sys
 
 queue = json.load(sys.stdin)
 expected_worker_count = int(sys.argv[1])
+observation_state = queue.get("queue_observation_state")
+observed_at = queue.get("queue_observed_at")
+observation_error = queue.get("queue_observation_error")
+if (
+    observation_state != "fresh"
+    or not isinstance(observed_at, str)
+    or not observed_at
+    or observation_error is not None
+):
+    raise SystemExit(
+        "engine queue observation is not fresh and complete: "
+        f"state={observation_state!r} observed_at={observed_at!r} "
+        f"error={observation_error!r}"
+    )
 keys = ("active_count", "reserved_count", "scheduled_count")
 counts = {key: queue.get(key) for key in keys}
 depth = queue.get("queue_depth")

@@ -104,6 +104,53 @@ def test_control_plane_deploy_rejects_engine_route_drift_before_compose(
     assert not call_log.exists() or call_log.read_text().splitlines() == []
 
 
+def test_control_plane_deploy_rejects_a_dangling_engine_route_marker_before_compose(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    state = Path(env["AIRFOILS_PRO_STATE_DIR"])
+    state.mkdir()
+    marker = state / "engine-route.json"
+    marker.symlink_to(state / "missing-engine-route.json")
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "state path contains symbolic-link component" in completed.stderr
+    call_log = Path(env["CALL_LOG"])
+    assert not call_log.exists() or call_log.read_text().splitlines() == []
+
+
+def test_control_plane_deploy_refuses_an_incomplete_engine_route_transaction_before_compose(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    state = Path(env["AIRFOILS_PRO_STATE_DIR"])
+    state.mkdir()
+    pending = state / ".engine-route-switch.pending.json"
+    pending.write_text('{"schema_version":1}\n', encoding="utf-8")
+    pending.chmod(0o600)
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "engine route switch is incomplete" in completed.stderr
+    call_log = Path(env["CALL_LOG"])
+    assert not call_log.exists() or call_log.read_text().splitlines() == []
+
+
 @pytest.mark.parametrize(
     "token",
     [

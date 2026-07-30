@@ -436,6 +436,9 @@ function enginePreflight(): ThreeStageUransEnginePreflight {
       ],
     },
     queue: {
+      queue_observation_state: "fresh",
+      queue_observed_at: "2026-07-30T00:00:00+00:00",
+      queue_observation_error: null,
       queue_depth: 0,
       queue_depths: { "openfoam-opencfd-2606": 0 },
       queue_enabled: { "openfoam-opencfd-2606": true },
@@ -1289,6 +1292,18 @@ describe("three-stage URANS engine admission preflight", () => {
       "inspection failure",
       (p: ThreeStageUransEnginePreflight) => {
         p.queue.worker_queues_error = "inspector unavailable";
+      },
+    ],
+    [
+      "stale queue observation",
+      (p: ThreeStageUransEnginePreflight) => {
+        p.queue.queue_observation_state = "stale";
+      },
+    ],
+    [
+      "missing queue observation timestamp",
+      (p: ThreeStageUransEnginePreflight) => {
+        p.queue.queue_observed_at = null;
       },
     ],
     [

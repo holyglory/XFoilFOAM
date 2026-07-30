@@ -725,6 +725,13 @@ export interface EngineQueueDescriptor {
 }
 
 export interface EngineQueueState {
+  /** Full /queue observations are cached by the gateway.  Only a fresh,
+   * timestamped observation may authorize maintenance or an execution pool;
+   * stale observations remain useful for display but are not idle evidence. */
+  queue_observation_state?: "fresh" | "stale";
+  queue_observed_at?: string | null;
+  queue_refresh_in_progress?: boolean;
+  queue_observation_error?: string | null;
   queue_depth: number | null;
   /** Legacy/default queue depth plus exact per-route inventory. */
   default_queue_depth?: number | null;

@@ -188,6 +188,20 @@ queue_activity() {
   curl -fsS --max-time 15 http://127.0.0.1:8000/queue | python3 -c '
 import json, sys
 queue = json.load(sys.stdin)
+observation_state = queue.get("queue_observation_state")
+observed_at = queue.get("queue_observed_at")
+observation_error = queue.get("queue_observation_error")
+if (
+    observation_state != "fresh"
+    or not isinstance(observed_at, str)
+    or not observed_at
+    or observation_error is not None
+):
+    raise SystemExit(
+        "engine queue observation is not fresh and complete: "
+        f"state={observation_state!r} observed_at={observed_at!r} "
+        f"error={observation_error!r}"
+    )
 modern = "worker_queues_error" in queue
 if modern:
     for key in ("worker_queues_error", "worker_runtime_error"):

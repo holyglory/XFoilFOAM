@@ -399,6 +399,9 @@ describe("OpenCFD 2606 canary attestation", () => {
     const client = {
       capabilities: async () => ({ engines: [capability()] }),
       getQueue: async () => ({
+        queue_observation_state: "fresh",
+        queue_observed_at: "2026-07-30T00:00:00+00:00",
+        queue_observation_error: null,
         queue_enabled: { "openfoam-opencfd-2606": true },
         inspection_errors: {},
         worker_queues_error: null,
@@ -424,6 +427,36 @@ describe("OpenCFD 2606 canary attestation", () => {
     };
     await expect(liveOpenCfd2606Runtime(client as never)).rejects.toThrow(
       /2406 worker|wrong or malformed runtime/,
+    );
+  });
+
+  it("rejects a stale zero-count queue observation before accepting a worker", async () => {
+    const client = {
+      capabilities: async () => ({ engines: [capability()] }),
+      getQueue: async () => ({
+        queue_observation_state: "stale",
+        queue_observed_at: "2026-07-30T00:00:00+00:00",
+        queue_observation_error: null,
+        queue_enabled: { "openfoam-opencfd-2606": true },
+        inspection_errors: {},
+        worker_queues_error: null,
+        worker_runtime_error: null,
+        worker_queues: [
+          {
+            worker: "good@worker",
+            queues: ["openfoam-opencfd-2606"],
+            execution_pool: "openfoam-opencfd-2606",
+            engine: runtime,
+          },
+        ],
+      }),
+      getResult: async () => {
+        throw new Error("unused");
+      },
+    };
+
+    await expect(liveOpenCfd2606Runtime(client as never)).rejects.toThrow(
+      "live OpenCFD 2606 worker inspection is incomplete",
     );
   });
 

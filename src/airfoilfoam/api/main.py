@@ -14,7 +14,8 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
+from time import monotonic
 from typing import ContextManager, Iterator, Literal
 
 import numpy as np
@@ -805,6 +806,17 @@ def _summarize_tasks(tasks_by_worker: dict | None) -> list[dict]:
     return rows
 
 
+# A Celery broadcast inspection has one timeout per command, not one timeout
+# for the complete ``/queue`` response.  Four serial commands can therefore
+# occupy a FastAPI worker for several seconds under broker pressure.  Cache the
+# complete observation, rather than one sub-command, so concurrent admin polls
+# share one bounded refresh.  A cold caller waits only this short amount for a
+# real snapshot; it never receives invented zero queues.
+QUEUE_SNAPSHOT_TTL_SECONDS = 5.0
+QUEUE_SNAPSHOT_COLD_WAIT_SECONDS = 0.35
+QUEUE_SNAPSHOT_FAILURE_RETRY_SECONDS = 5.0
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="XFoilFOAM",
@@ -828,6 +840,18 @@ def create_app() -> FastAPI:
         ]
         | None
     ) = None
+    # The complete queue observation is immutable once published.  A single
+    # background refresher prevents a burst of browser polls from multiplying
+    # Celery broadcast commands.  If it is stale, callers can see that exact
+    # fact; only a fresh observation may authorize a maintenance idle guard.
+    queue_snapshot_lock = Lock()
+    queue_snapshot: dict | None = None
+    queue_snapshot_observed_at: datetime | None = None
+    queue_snapshot_fresh_until = 0.0
+    queue_snapshot_refreshing = False
+    queue_snapshot_refresh_ready: Event | None = None
+    queue_snapshot_last_error: str | None = None
+    queue_snapshot_retry_after = 0.0
 
     def registered_dialects():
         return [
@@ -1068,8 +1092,13 @@ def create_app() -> FastAPI:
         store.write_status(status)
         return status
 
-    @app.get("/queue")
-    def queue_state() -> dict:
+    def collect_queue_snapshot() -> dict:
+        """Collect one complete, internally consistent live queue observation.
+
+        This function deliberately performs the broker work in a single
+        background refresher.  Request handlers below only serve a published
+        snapshot, a clearly marked stale snapshot, or a bounded truthful 503.
+        """
         nonlocal worker_runtime_cache
         from ..celery_app import celery_app
 
@@ -1277,6 +1306,171 @@ def create_app() -> FastAPI:
             "inspection_errors": inspection_errors,
             "inspection_workers": inspection_workers,
         }
+
+    def decorated_queue_snapshot(
+        snapshot: dict,
+        observed_at: datetime,
+        state: Literal["fresh", "stale"],
+        refreshing: bool,
+        observation_error: str | None,
+    ) -> dict:
+        """Expose cache provenance without changing the observed queue values."""
+        return {
+            **snapshot,
+            "queue_observation_state": state,
+            "queue_observed_at": observed_at.isoformat(),
+            "queue_refresh_in_progress": refreshing,
+            "queue_observation_error": observation_error,
+        }
+
+    def refresh_queue_snapshot(ready: Event) -> None:
+        nonlocal queue_snapshot
+        nonlocal queue_snapshot_observed_at
+        nonlocal queue_snapshot_fresh_until
+        nonlocal queue_snapshot_refreshing
+        nonlocal queue_snapshot_last_error
+        nonlocal queue_snapshot_retry_after
+
+        snapshot: dict | None = None
+        refresh_error: str | None = None
+        try:
+            snapshot = collect_queue_snapshot()
+        except Exception as exc:  # noqa: BLE001 - an unavailable probe is never an empty queue
+            refresh_error = f"{type(exc).__name__}: {exc}"
+
+        completed_at = datetime.now(timezone.utc)
+        with queue_snapshot_lock:
+            if snapshot is not None:
+                queue_snapshot = snapshot
+                queue_snapshot_observed_at = completed_at
+                queue_snapshot_fresh_until = monotonic() + QUEUE_SNAPSHOT_TTL_SECONDS
+                queue_snapshot_last_error = None
+                queue_snapshot_retry_after = 0.0
+            else:
+                queue_snapshot_last_error = refresh_error or "queue observation did not complete"
+                # A failing broker must not let a burst of callers start one
+                # failed broadcast each.  Keep the failure truthful and retry
+                # once this small cooldown expires.
+                queue_snapshot_retry_after = (
+                    monotonic() + QUEUE_SNAPSHOT_FAILURE_RETRY_SECONDS
+                )
+            queue_snapshot_refreshing = False
+            ready.set()
+
+    def request_queue_snapshot_refresh() -> Event | None:
+        nonlocal queue_snapshot_refreshing
+        nonlocal queue_snapshot_refresh_ready
+        nonlocal queue_snapshot_last_error
+        nonlocal queue_snapshot_retry_after
+
+        with queue_snapshot_lock:
+            if queue_snapshot_refreshing:
+                return queue_snapshot_refresh_ready
+            if monotonic() < queue_snapshot_retry_after:
+                return queue_snapshot_refresh_ready
+            ready = Event()
+            queue_snapshot_refreshing = True
+            queue_snapshot_refresh_ready = ready
+
+        # Celery's advertised control timeout does not cap a whole sequence of
+        # inspect calls.  Run that sequence outside FastAPI's request workers;
+        # the daemon thread has one global owner and cannot accumulate.
+        try:
+            Thread(
+                target=refresh_queue_snapshot,
+                args=(ready,),
+                name="airfoilfoam-queue-snapshot",
+                daemon=True,
+            ).start()
+        except Exception as exc:  # noqa: BLE001 - a failed refresher is unavailable, never idle
+            # Thread start is normally infallible, but leaving the single-flight
+            # flag set would turn one local runtime failure into a permanent
+            # invisible refresh. Wake bounded cold callers and retain a
+            # truthful error/backoff instead.
+            with queue_snapshot_lock:
+                queue_snapshot_refreshing = False
+                queue_snapshot_last_error = f"{type(exc).__name__}: {exc}"
+                queue_snapshot_retry_after = (
+                    monotonic() + QUEUE_SNAPSHOT_FAILURE_RETRY_SECONDS
+                )
+                ready.set()
+        return ready
+
+    def published_queue_snapshot() -> tuple[dict | None, datetime | None, bool, bool, str | None]:
+        with queue_snapshot_lock:
+            snapshot = queue_snapshot
+            observed_at = queue_snapshot_observed_at
+            fresh = (
+                snapshot is not None
+                and observed_at is not None
+                and monotonic() < queue_snapshot_fresh_until
+            )
+            return (
+                snapshot,
+                observed_at,
+                fresh,
+                queue_snapshot_refreshing,
+                queue_snapshot_last_error,
+            )
+
+    @app.get("/queue")
+    def queue_state() -> dict:
+        snapshot, observed_at, fresh, refreshing, observation_error = (
+            published_queue_snapshot()
+        )
+        if fresh:
+            assert snapshot is not None and observed_at is not None
+            return decorated_queue_snapshot(
+                snapshot,
+                observed_at,
+                "fresh",
+                refreshing,
+                observation_error,
+            )
+
+        ready = request_queue_snapshot_refresh()
+        # A completed snapshot remains useful for UI status, but it is marked
+        # stale so safety/maintenance callers can fail closed rather than
+        # mistaking old zero counts for a live idle worker pool.
+        snapshot, observed_at, fresh, refreshing, observation_error = (
+            published_queue_snapshot()
+        )
+        if snapshot is not None and observed_at is not None:
+            return decorated_queue_snapshot(
+                snapshot,
+                observed_at,
+                "fresh" if fresh else "stale",
+                refreshing,
+                observation_error,
+            )
+
+        # There is no prior truth to show.  Let the one owner complete briefly,
+        # then report unavailability rather than manufacturing empty lists.
+        if ready is not None:
+            ready.wait(timeout=QUEUE_SNAPSHOT_COLD_WAIT_SECONDS)
+        snapshot, observed_at, fresh, refreshing, observation_error = (
+            published_queue_snapshot()
+        )
+        if snapshot is not None and observed_at is not None:
+            return decorated_queue_snapshot(
+                snapshot,
+                observed_at,
+                "fresh" if fresh else "stale",
+                refreshing,
+                observation_error,
+            )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "queue_observation_unavailable",
+                "message": (
+                    "No completed engine queue observation is available; "
+                    "maintenance must remain blocked until a fresh snapshot arrives."
+                ),
+                "refresh_in_progress": refreshing,
+                "error": observation_error,
+            },
+        )
 
     @app.get("/maintenance/jobs")
     def maintenance_jobs() -> dict:

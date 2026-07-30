@@ -111,6 +111,7 @@ def _deploy_harness(
     queue_active_after: int = 0,
     disabled_queue_depth: int = 0,
     queue_observability_mode: str = "complete",
+    queue_observation_mode: str = "fresh",
     legacy_inspector_mode: str = "complete",
     force_legacy_queue_shape: bool = False,
     foundation_profile: bool = False,
@@ -310,6 +311,24 @@ case "$url" in
     count=$((count + 1))
     printf '%s\n' "$count" >"$QUEUE_PROBE_COUNT"
     disabled_depth="${FAKE_DISABLED_QUEUE_DEPTH:-0}"
+    case "$FAKE_QUEUE_OBSERVATION_MODE" in
+      fresh)
+        queue_observation='"queue_observation_state":"fresh","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":false,"queue_observation_error":null,'
+        ;;
+      stale)
+        queue_observation='"queue_observation_state":"stale","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":true,"queue_observation_error":null,'
+        ;;
+      missing-observed-at)
+        queue_observation='"queue_observation_state":"fresh","queue_refresh_in_progress":false,"queue_observation_error":null,'
+        ;;
+      observation-error)
+        queue_observation='"queue_observation_state":"fresh","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":false,"queue_observation_error":"fake refresh failure",'
+        ;;
+      *)
+        printf 'unsupported fake queue observation mode\n' >&2
+        exit 99
+        ;;
+    esac
     if { [[ "$FAKE_ENGINE_VERSION" == "2406" && ! -f "$ENGINE_RECREATED" ]] || [[ "$FAKE_FORCE_LEGACY_QUEUE_SHAPE" == "1" ]]; }; then
       if (( FAKE_QUEUE_ACTIVE_AFTER > 0 && count >= FAKE_QUEUE_ACTIVE_AFTER )); then
         printf '{"queue_depth":1,"active":[],"reserved":[],"scheduled":[],"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":["arrived-after-stop"],"duplicates":{},"redelivered":[]}\n'
@@ -319,18 +338,18 @@ case "$url" in
       exit 0
     fi
     if [[ "$FAKE_QUEUE_OBSERVABILITY_MODE" == "missing-task-snapshot" ]]; then
-      printf '{"queue_depth":0,"queue_depths":{"celery":0,"openfoam-foundation-14":0},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"reserved":[],"scheduled":[]}}\n'
+      printf '{%s"queue_depth":0,"queue_depths":{"celery":0,"openfoam-foundation-14":0},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"reserved":[],"scheduled":[]}}\n' "$queue_observation"
       exit 0
     fi
     if [[ "$FAKE_QUEUE_OBSERVABILITY_MODE" == "worker-error" ]]; then
-      printf '{"queue_depth":0,"queue_depths":{"celery":0,"openfoam-foundation-14":0},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":null,"worker_queues_error":"inspect timed out","worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n'
+      printf '{%s"queue_depth":0,"queue_depths":{"celery":0,"openfoam-foundation-14":0},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":null,"worker_queues_error":"inspect timed out","worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$queue_observation"
       exit 0
     fi
     if (( FAKE_QUEUE_ACTIVE_AFTER > 0 && count >= FAKE_QUEUE_ACTIVE_AFTER )); then
       total_depth=$((disabled_depth + 1))
-      printf '{"queue_depth":%s,"queue_depths":{"celery":1,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":["arrived-after-stop"],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$total_depth" "$disabled_depth"
+      printf '{%s"queue_depth":%s,"queue_depths":{"celery":1,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":["arrived-after-stop"],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$queue_observation" "$total_depth" "$disabled_depth"
     else
-      printf '{"queue_depth":%s,"queue_depths":{"celery":0,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$disabled_depth" "$disabled_depth"
+      printf '{%s"queue_depth":%s,"queue_depths":{"celery":0,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$queue_observation" "$disabled_depth" "$disabled_depth"
     fi
     ;;
   *:8000/health)
@@ -503,6 +522,7 @@ exec "$REAL_PYTHON" "$@"
             "FAKE_QUEUE_ACTIVE_AFTER": str(queue_active_after),
             "FAKE_DISABLED_QUEUE_DEPTH": str(disabled_queue_depth),
             "FAKE_QUEUE_OBSERVABILITY_MODE": queue_observability_mode,
+            "FAKE_QUEUE_OBSERVATION_MODE": queue_observation_mode,
             "FAKE_LEGACY_INSPECTOR_MODE": legacy_inspector_mode,
             "FAKE_FORCE_LEGACY_QUEUE_SHAPE": (
                 "1" if force_legacy_queue_shape else "0"
@@ -1007,7 +1027,7 @@ def test_strict_2606_queue_guard_rejects_the_legacy_queue_shape(
     )
 
     assert completed.returncode == 12
-    assert "engine worker inspection failed" in completed.stderr
+    assert "queue observation is not fresh and complete" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert not any("AIRFOILS_PRO_LEGACY_CELERY_IDLE_PROBE" in call for call in calls)
     assert not any(" build api" in call for call in calls)
@@ -1126,6 +1146,35 @@ def test_engine_rebuild_rejects_missing_live_worker_snapshot(
     assert "does not cover running worker containers" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert not any(" up -d --no-deps --force-recreate api" in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "queue_observation_mode",
+    ["stale", "missing-observed-at", "observation-error"],
+)
+def test_engine_rebuild_rejects_nonfresh_or_incomplete_queue_observation(
+    tmp_path: Path,
+    queue_observation_mode: str,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_observation_mode=queue_observation_mode,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "queue observation is not fresh and complete" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert not any(" build api" in call for call in calls)
+    assert not any("up -d --no-deps --force-recreate api" in call for call in calls)
 
 
 def test_engine_rebuild_includes_every_worker_in_active_profiles(tmp_path: Path) -> None:

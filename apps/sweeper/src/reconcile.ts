@@ -1530,7 +1530,16 @@ function classifyLostRunning(
     Number.isFinite(Number(runtime.runtime_heartbeat_age_sec)) &&
     Number(runtime.runtime_heartbeat_age_sec) <= 120;
   if (heartbeatAlive) return null;
-  if (!queue || engineQueueListsJob(queue, job.engineJobId)) return null;
+  if (
+    !queue ||
+    queue.queue_observation_state !== "fresh" ||
+    typeof queue.queue_observed_at !== "string" ||
+    !queue.queue_observed_at ||
+    queue.queue_observation_error != null ||
+    engineQueueListsJob(queue, job.engineJobId)
+  ) {
+    return null;
+  }
   const lastProgress =
     parseEngineDate(status.last_progress_at) ??
     parseEngineDate(status.started_at) ??

@@ -1101,7 +1101,14 @@ export function validateThreeStageUransEnginePreflight(
       "the live adapter does not advertise same-case continuation",
     );
 
-  if (queue.worker_queues_error != null || queue.worker_runtime_error != null)
+  if (
+    queue.queue_observation_state !== "fresh" ||
+    typeof queue.queue_observed_at !== "string" ||
+    !queue.queue_observed_at ||
+    queue.queue_observation_error != null ||
+    queue.worker_queues_error != null ||
+    queue.worker_runtime_error != null
+  )
     throw canaryError("live worker inspection is unavailable");
   if (Object.keys(queue.inspection_errors ?? {}).length)
     throw canaryError("Celery queue inspection reported an error");

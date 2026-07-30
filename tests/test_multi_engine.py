@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from time import monotonic, sleep
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from airfoilfoam import pipeline, tasks
@@ -610,6 +612,7 @@ def test_queue_caches_runtime_inspection_until_worker_queue_binding_changes(
 
     inspect = FakeInspect()
     monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_main, "QUEUE_SNAPSHOT_TTL_SECONDS", 0.01)
     monkeypatch.setattr(redis_module, "Redis", FakeRedis)
     monkeypatch.setattr(
         celery_app.control,
@@ -626,22 +629,36 @@ def test_queue_caches_runtime_inspection_until_worker_queue_binding_changes(
     assert inspect.conf_calls == 1
     assert second["worker_queues"][0]["execution_pool"] == OPENCFD_2606.queue_name
 
+    # Full snapshots are intentionally reused for their short TTL.  Once the
+    # cache expires, a changed worker binding invalidates the embedded runtime
+    # config cache and is observed on the next completed refresh.
+    sleep(0.02)
     inspect.queue_name = FOUNDATION_14.queue_name
-    changed = client.get("/queue").json()
+    changed = None
+    for _ in range(50):
+        response = client.get("/queue")
+        if (
+            response.status_code == 200
+            and response.json()["queue_observation_state"] == "fresh"
+        ):
+            changed = response.json()
+            break
+        sleep(0.01)
 
+    assert changed is not None
     assert changed["worker_runtime_error"] is None
     assert inspect.conf_calls == 2
     assert changed["worker_queues"][0]["execution_pool"] == FOUNDATION_14.queue_name
 
 
-def test_queue_does_not_block_concurrent_poll_behind_runtime_inspection(
+def test_queue_snapshot_single_flight_bounds_cold_polls_and_marks_stale_snapshots(
     tmp_path, monkeypatch
 ):
     import redis as redis_module
 
     settings = Settings(data_dir=tmp_path / "data")
-    conf_started = Event()
-    release_conf = Event()
+    active_started = Event()
+    release_active = Event()
 
     class FakeRedis:
         @classmethod
@@ -652,7 +669,14 @@ def test_queue_does_not_block_concurrent_poll_behind_runtime_inspection(
             return 0
 
     class FakeInspect:
+        active_calls = 0
+        block_active = True
+
         def active(self):
+            self.active_calls += 1
+            if self.block_active:
+                active_started.set()
+                assert release_active.wait(timeout=5)
             return {"worker@engine": []}
 
         def reserved(self):
@@ -665,8 +689,6 @@ def test_queue_does_not_block_concurrent_poll_behind_runtime_inspection(
             return {"worker@engine": [{"name": OPENCFD_2606.queue_name}]}
 
         def conf(self):
-            conf_started.set()
-            assert release_conf.wait(timeout=5)
             return {
                 "worker@engine": {
                     "airfoilfoam_worker_runtime": {
@@ -677,36 +699,138 @@ def test_queue_does_not_block_concurrent_poll_behind_runtime_inspection(
             }
 
     monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_main, "QUEUE_SNAPSHOT_TTL_SECONDS", 0.01)
+    monkeypatch.setattr(api_main, "QUEUE_SNAPSHOT_COLD_WAIT_SECONDS", 0.04)
     monkeypatch.setattr(redis_module, "Redis", FakeRedis)
+    inspect = FakeInspect()
     monkeypatch.setattr(
         celery_app.control,
         "inspect",
-        lambda timeout=None: FakeInspect(),
+        lambda timeout=None: inspect,
     )
+    app = api_main.create_app()
+    client = TestClient(app)
+    queue_endpoint = next(
+        route.endpoint for route in app.routes if route.path == "/queue"
+    )
+
+    def invoke_queue_endpoint():
+        try:
+            return ("ok", queue_endpoint())
+        except HTTPException as exc:
+            return ("error", exc)
+
+    def wait_for_fresh_snapshot() -> dict:
+        for _ in range(100):
+            outcome, value = invoke_queue_endpoint()
+            if outcome == "ok" and value["queue_observation_state"] == "fresh":
+                return value
+            sleep(0.01)
+        raise AssertionError("queue snapshot did not become fresh")
+
+    try:
+        cold_http = client.get("/queue")
+        assert cold_http.status_code == 503
+        assert cold_http.json()["detail"]["code"] == "queue_observation_unavailable"
+        assert active_started.wait(timeout=1)
+
+        started_at = monotonic()
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            cold = list(executor.map(lambda _: invoke_queue_endpoint(), range(12)))
+        assert monotonic() - started_at < 0.5
+        assert inspect.active_calls == 1
+        assert all(
+            outcome == "error"
+            and value.status_code == 503
+            and value.detail["code"] == "queue_observation_unavailable"
+            for outcome, value in cold
+        )
+
+        # Completing that one background refresh gives subsequent callers a
+        # real immutable snapshot.  The same stale snapshot can be rendered
+        # while one later refresh is in flight, but must never be mistaken for
+        # fresh maintenance evidence.
+        release_active.set()
+        first_body = wait_for_fresh_snapshot()
+        assert first_body["queue_observation_state"] == "fresh"
+        assert first_body["queue_refresh_in_progress"] is False
+        first_observed_at = first_body["queue_observed_at"]
+
+        sleep(0.02)
+        active_started.clear()
+        release_active.clear()
+        stale_body = queue_endpoint()
+        assert stale_body["queue_observation_state"] == "stale"
+        assert stale_body["queue_observed_at"] == first_observed_at
+        assert stale_body["queue_refresh_in_progress"] is True
+        assert active_started.wait(timeout=1)
+        assert inspect.active_calls == 2
+
+        started_at = monotonic()
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            stale = list(executor.map(lambda _: invoke_queue_endpoint(), range(12)))
+        assert monotonic() - started_at < 0.5
+        assert inspect.active_calls == 2
+        assert all(
+            outcome == "ok"
+            and value["queue_observation_state"] == "stale"
+            and value["queue_observed_at"] == first_observed_at
+            for outcome, value in stale
+        )
+
+        release_active.set()
+        refreshed = wait_for_fresh_snapshot()
+        assert refreshed["queue_observation_state"] == "fresh"
+        assert refreshed["queue_observed_at"] != first_observed_at
+    finally:
+        # The production refresher is intentionally a daemon, but tests must
+        # never leave a blocked fake broker command behind.
+        release_active.set()
+
+
+def test_queue_snapshot_thread_start_failure_is_bounded_and_truthful(
+    tmp_path, monkeypatch
+):
+    settings = Settings(data_dir=tmp_path / "data")
+    starts = 0
+
+    class BrokenThread:
+        def __init__(self, *_args, **_kwargs):
+            return
+
+        def start(self):
+            nonlocal starts
+            starts += 1
+            raise RuntimeError("thread resources unavailable")
+
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_main, "Thread", BrokenThread)
     app = api_main.create_app()
     queue_endpoint = next(
         route.endpoint for route in app.routes if route.path == "/queue"
     )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(queue_endpoint)
-        assert conf_started.wait(timeout=2)
-        second = executor.submit(queue_endpoint)
-        try:
-            concurrent_body = second.result(timeout=2)
-        except TimeoutError:
-            release_conf.set()
-            raise
-        finally:
-            release_conf.set()
+    started_at = monotonic()
+    with pytest.raises(HTTPException) as first:
+        queue_endpoint()
+    assert monotonic() - started_at < 0.1
+    assert first.value.status_code == 503
+    assert first.value.detail == {
+        "code": "queue_observation_unavailable",
+        "message": (
+            "No completed engine queue observation is available; "
+            "maintenance must remain blocked until a fresh snapshot arrives."
+        ),
+        "refresh_in_progress": False,
+        "error": "RuntimeError: thread resources unavailable",
+    }
 
-        first_body = first.result(timeout=2)
-
-    assert (
-        concurrent_body["worker_runtime_error"]
-        == "Celery worker-runtime inspection already in progress"
-    )
-    assert first_body["worker_runtime_error"] is None
+    # The error cooldown prevents a local thread-start failure from turning a
+    # burst of cold callers into repeated synchronous retry attempts.
+    with pytest.raises(HTTPException) as second:
+        queue_endpoint()
+    assert second.value.status_code == 503
+    assert starts == 1
 
 
 def test_queue_reports_incomplete_task_and_runtime_worker_coverage(

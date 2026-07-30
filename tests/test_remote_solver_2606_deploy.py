@@ -328,6 +328,18 @@ def test_remote_rollback_preserves_an_empty_previous_engine_key_list() -> None:
     ) not in source
 
 
+def test_remote_engine_maintenance_rejects_stale_or_incomplete_queue_observation() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+    queue_guard_start = source.index("queue_activity()")
+    queue_guard_end = source.index("\ndatabase_activity()", queue_guard_start)
+    queue_guard = source[queue_guard_start:queue_guard_end]
+
+    assert 'observation_state != "fresh"' in queue_guard
+    assert 'not isinstance(observed_at, str)' in queue_guard
+    assert 'observation_error is not None' in queue_guard
+    assert "engine queue observation is not fresh and complete" in queue_guard
+
+
 def test_remote_rollback_returns_containers_to_normal_compose_references() -> None:
     source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
 
