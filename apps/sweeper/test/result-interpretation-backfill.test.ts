@@ -112,12 +112,40 @@ describe("archive clean-cycle interpretation backfill", () => {
         "--result-id",
         UUID_A,
         "--limit",
-        "12",
+        "8",
+        "--max-items",
+        "8",
       ]),
     ).toMatchObject({
       execute: true,
-      scope: { resultIds: [UUID_A], limit: 12 },
+      scope: { resultIds: [UUID_A], limit: 8 },
     });
+  });
+
+  it("MUST-CATCH: requires an exact bounded scope before execution admission", () => {
+    expect(() => parseArchiveInterpretationBackfillArgs(["--execute"])).toThrow(
+      /requires at least one --result-id or --result-attempt-id/,
+    );
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs([
+        "--execute",
+        "--result-id",
+        UUID_A,
+        "--max-items",
+        "9",
+      ]),
+    ).toThrow(/no greater than 8/);
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs([
+        "--execute",
+        "--result-id",
+        UUID_A,
+        "--limit",
+        "3",
+        "--max-items",
+        "2",
+      ]),
+    ).toThrow(/cannot exceed --max-items/);
   });
 
   it("builds an exact recovery action for the durable scheduler ledger instead of silently rerunning", () => {
@@ -314,9 +342,9 @@ describe("archive clean-cycle interpretation backfill", () => {
   });
 
   it("MUST-CATCH: never creates another recovery handoff after the physical clean-cycle cap", () => {
-    expect(
-      archiveReducerNeedsRecoveryHandoff("continuation_required"),
-    ).toBe(true);
+    expect(archiveReducerNeedsRecoveryHandoff("continuation_required")).toBe(
+      true,
+    );
     expect(archiveReducerNeedsRecoveryHandoff("rerun_required")).toBe(true);
     expect(archiveReducerNeedsRecoveryHandoff("recovery_exhausted")).toBe(
       false,

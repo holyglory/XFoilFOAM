@@ -67,6 +67,13 @@ export const ARCHIVE_REDUCTION_QUEUE_LEASE_RENEW_MS = Math.max(
 );
 export const ARCHIVE_REDUCTION_QUEUE_SCAN_LIMIT = 64;
 export const ARCHIVE_REDUCTION_QUEUE_DRAIN_LIMIT = 2;
+/**
+ * Hard operator and scheduler ceiling for one archive-reduction invocation.
+ * Keep this exported so every admission entry point rejects an oversized
+ * request before it can create durable work that the same invocation is not
+ * allowed to process.
+ */
+export const ARCHIVE_REDUCTION_QUEUE_MAX_DRAIN_LIMIT = 8;
 
 export type ArchiveReductionQueueDrainReport = {
   scanned: number;
@@ -1088,7 +1095,11 @@ export async function drainArchiveReductionQueue(
           resultAttemptIds: opts.resultAttemptIds,
         });
   const maxItems = opts.maxItems ?? ARCHIVE_REDUCTION_QUEUE_DRAIN_LIMIT;
-  if (!Number.isSafeInteger(maxItems) || maxItems <= 0 || maxItems > 8) {
+  if (
+    !Number.isSafeInteger(maxItems) ||
+    maxItems <= 0 ||
+    maxItems > ARCHIVE_REDUCTION_QUEUE_MAX_DRAIN_LIMIT
+  ) {
     throw new Error("archive-reduction queue drain maxItems must be 1..8");
   }
   let processed = 0;

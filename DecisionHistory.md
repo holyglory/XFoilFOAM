@@ -95,6 +95,13 @@
   generation-pinned raw evidence and routes recoverable trajectories to exact
   continuation before a fresh run.
   [D-2026-07-28-immutable-result-interpretations]
+- Confirmed intent: historical GCS migration and URANS repair start with a
+  complete, read-only inventory of explicit FAST/FINAL attempts—including
+  failed, queued, local, malformed, and archive-free generations. Only an
+  exact completed generation with authenticated GCS evidence may enter an
+  automatic interpretation or recovery path; all other history stays visible
+  with a truthful next-state classification.
+  [D-2026-07-30-historical-urans-inventory]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -165,6 +172,21 @@
   reachable without horizontal scrolling; narrow layouts use accessible burger
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-07-30-historical-urans-inventory — Exhaustive read-only evidence inventory
+
+- Decision: inventory every explicit FAST/FINAL URANS attempt before historical
+  migration or remediation, retaining execution state and archive integrity
+  state for completed, failed, queued, running, stale, local, malformed, and
+  archive-free generations. Keep the inventory side-effect free; only exact
+  completed solved attempts with authenticated GCS evidence may be handed to
+  existing automatic workflows.
+  [detail](DecisionDetails/D-2026-07-30-historical-urans-inventory.md)
+- Why: executable backfill/recovery discovery rightly excludes non-admissible
+  sources, but using it as an audit silently hid retained failed/queued GCS
+  evidence and no-archive rows. A separate bounded reader makes the migration
+  scope honest without creating solver work or weakening immutable evidence
+  gates.
 
 ## D-2026-07-28-scheduler-delay-and-campaign-polling — Honest advisory and bounded live reads
 

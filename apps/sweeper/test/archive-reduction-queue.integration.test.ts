@@ -6,12 +6,14 @@
 import {
   airfoils,
   createClient,
+  type DB,
   resultArchiveReductionQueue,
   resultAttempts,
   resultClassifications,
   resultInterpretationBackfillItems,
   resultInterpretationBackfillRuns,
   resultInterpretations,
+  resultMedia,
   resultReducerVersions,
   results,
   simCampaignConditions,
@@ -64,7 +66,30 @@ let setup: {
 const fixtureResultIds: string[] = [];
 const fixtureBlobIds: string[] = [];
 const fixtureCampaignIds: string[] = [];
-const fixtureReducerVersionIds: string[] = [];
+
+/**
+ * Reducer versions are intentionally append-only production scientific
+ * identity.  The two precedence regressions need a newer version, but must
+ * not leave that newer release behind to suppress ordinary V1 admissions in
+ * later shared-DB tests.  Exercise the real nested queue transactions inside
+ * one outer transaction, then deliberately roll it back.
+ */
+class RollbackIntegrationFixture extends Error {}
+
+async function withRolledBackFixture<T>(
+  work: (tx: DB) => Promise<T>,
+): Promise<T> {
+  let value!: T;
+  try {
+    await db.transaction(async (rawTx) => {
+      value = await work(rawTx as unknown as DB);
+      throw new RollbackIntegrationFixture();
+    });
+  } catch (error) {
+    if (!(error instanceof RollbackIntegrationFixture)) throw error;
+  }
+  return value;
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -89,10 +114,10 @@ async function waitFor<T>(
   throw new Error(message);
 }
 
-async function createExactArchiveFixture(label: string) {
+async function createExactArchiveFixture(label: string, client: DB = db) {
   const aoaDeg = 9_000 + (fixtureResultIds.length + 1) / 1000;
   if (!setup) throw new Error("archive queue solver setup fixture is missing");
-  const [result] = await db
+  const [result] = await client
     .insert(results)
     .values({
       airfoilId,
@@ -106,7 +131,7 @@ async function createExactArchiveFixture(label: string) {
     .returning({ id: results.id });
   if (!result) throw new Error("could not create archive queue result fixture");
 
-  const [attempt] = await db
+  const [attempt] = await client
     .insert(resultAttempts)
     .values({
       resultId: result.id,
@@ -124,12 +149,12 @@ async function createExactArchiveFixture(label: string) {
     .returning({ id: resultAttempts.id });
   if (!attempt)
     throw new Error("could not create archive queue attempt fixture");
-  await db
+  await client
     .update(results)
     .set({ currentResultAttemptId: attempt.id })
     .where(eq(results.id, result.id));
 
-  const [artifact] = await db
+  const [artifact] = await client
     .insert(solverEvidenceArtifacts)
     .values({
       resultId: result.id,
@@ -147,7 +172,22 @@ async function createExactArchiveFixture(label: string) {
   if (!artifact)
     throw new Error("could not create archive queue artifact fixture");
 
-  const [blob] = await db
+  // Archive selection authenticates the raw coefficients, but it must never
+  // invent the independently persisted URANS video. Model the solver's real
+  // finalized media artifact on this exact immutable attempt.
+  await client.insert(resultMedia).values({
+    resultId: result.id,
+    resultAttemptId: attempt.id,
+    kind: "video",
+    field: "velocity_magnitude",
+    role: "instantaneous",
+    storageKey: `${PREFIX}/${label}/velocity_magnitude.mp4`,
+    mimeType: "video/mp4",
+    sha256: SHA_B,
+    byteSize: 101,
+  });
+
+  const [blob] = await client
     .insert(solverEvidenceBlobs)
     .values({
       backend: "gcs",
@@ -167,7 +207,7 @@ async function createExactArchiveFixture(label: string) {
     .returning({ id: solverEvidenceBlobs.id });
   if (!blob) throw new Error("could not create archive queue blob fixture");
 
-  const [archive] = await db
+  const [archive] = await client
     .insert(solverEvidenceArchives)
     .values({
       resultId: result.id,
@@ -272,26 +312,30 @@ function engineReturning(
   } as unknown as EngineClient;
 }
 
-async function attachCampaignPoint(fixture: {
-  resultId: string;
-  resultAttemptId: string;
-  aoaDeg: number;
-}) {
+async function attachCampaignPoint(
+  fixture: {
+    resultId: string;
+    resultAttemptId: string;
+    aoaDeg: number;
+  },
+  client: DB = db,
+) {
   if (!setup) throw new Error("archive queue solver setup fixture is missing");
   const suffix = `${fixtureCampaignIds.length + 1}`;
-  const [campaign] = await db
+  const [campaign] = await client
     .insert(simCampaigns)
     .values({
       slug: `${PREFIX}-campaign-${suffix}`,
       name: `${PREFIX} archive queue publication ${suffix}`,
       idempotencyKey: `${PREFIX}-campaign-${suffix}`,
       status: "active",
+      currentConditionGeneration: 1,
     })
     .returning({ id: simCampaigns.id });
   if (!campaign)
     throw new Error("could not create archive queue campaign fixture");
   fixtureCampaignIds.push(campaign.id);
-  const [plan] = await db
+  const [plan] = await client
     .insert(simCampaignPlanRevisions)
     .values({
       campaignId: campaign.id,
@@ -304,11 +348,11 @@ async function attachCampaignPoint(fixture: {
     .returning({ id: simCampaignPlanRevisions.id });
   if (!plan)
     throw new Error("could not create archive queue campaign plan fixture");
-  await db
+  await client
     .update(simCampaigns)
     .set({ currentPlanRevisionId: plan.id })
     .where(eq(simCampaigns.id, campaign.id));
-  const [condition] = await db
+  const [condition] = await client
     .insert(simCampaignConditions)
     .values({
       campaignId: campaign.id,
@@ -328,7 +372,7 @@ async function attachCampaignPoint(fixture: {
     throw new Error(
       "could not create archive queue campaign condition fixture",
     );
-  await db.insert(simCampaignPoints).values({
+  await client.insert(simCampaignPoints).values({
     campaignId: campaign.id,
     conditionId: condition.id,
     airfoilId,
@@ -339,19 +383,6 @@ async function attachCampaignPoint(fixture: {
     resultId: fixture.resultId,
     resultAttemptId: fixture.resultAttemptId,
     derivedBySymmetry: false,
-  });
-  await db.insert(resultClassifications).values({
-    resultId: fixture.resultId,
-    resultAttemptId: fixture.resultAttemptId,
-    airfoilId,
-    simulationPresetRevisionId: setup.revisionId,
-    aoaDeg: fixture.aoaDeg,
-    regime: "urans",
-    classifierVersion: `${PREFIX}-classification`,
-    state: "accepted",
-    region: "attached",
-    confidence: 1,
-    reasons: [],
   });
   return { campaignId: campaign.id, conditionId: condition.id };
 }
@@ -434,11 +465,6 @@ afterAll(async () => {
           ...new Set(backfillRunIds),
         ]),
       );
-  }
-  if (fixtureReducerVersionIds.length) {
-    await db
-      .delete(resultReducerVersions)
-      .where(inArray(resultReducerVersions.id, fixtureReducerVersionIds));
   }
   await solverFixture?.cleanup();
   await sql.end();
@@ -719,6 +745,9 @@ describe("archive reduction publication queue", () => {
         .select({
           currentResultInterpretationId: results.currentResultInterpretationId,
           currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+          status: results.status,
+          fidelity: results.fidelity,
+          regime: results.regime,
         })
         .from(results)
         .where(eq(results.id, fixture.resultId))
@@ -751,55 +780,77 @@ describe("archive reduction publication queue", () => {
     );
     expect(report.processed).toBe(1);
 
-    const [[queue], [result], [progress]] = await Promise.all([
-      db
-        .select({
-          state: resultArchiveReductionQueue.state,
-          resultInterpretationId:
-            resultArchiveReductionQueue.resultInterpretationId,
-          backfillRunId: resultArchiveReductionQueue.backfillRunId,
-        })
-        .from(resultArchiveReductionQueue)
-        .where(
-          eq(
-            resultArchiveReductionQueue.resultAttemptId,
-            fixture.resultAttemptId,
-          ),
-        )
-        .limit(1),
-      db
-        .select({
-          currentResultInterpretationId: results.currentResultInterpretationId,
-          currentCanonicalSelectionId: results.currentCanonicalSelectionId,
-        })
-        .from(results)
-        .where(eq(results.id, fixture.resultId))
-        .limit(1),
-      db
-        .select({
-          requested: simCampaignProgress.requested,
-          solved: simCampaignProgress.solved,
-          awaitingArchiveReduction:
-            simCampaignProgress.awaitingArchiveReduction,
-          blocked: simCampaignProgress.blocked,
-        })
-        .from(simCampaignProgress)
-        .where(
-          and(
-            eq(simCampaignProgress.campaignId, campaign.campaignId),
-            eq(simCampaignProgress.conditionId, campaign.conditionId),
-            eq(simCampaignProgress.airfoilId, airfoilId),
-          ),
-        )
-        .limit(1),
-    ]);
+    const [[queue], [result], [progress], [classification]] = await Promise.all(
+      [
+        db
+          .select({
+            state: resultArchiveReductionQueue.state,
+            resultInterpretationId:
+              resultArchiveReductionQueue.resultInterpretationId,
+            backfillRunId: resultArchiveReductionQueue.backfillRunId,
+          })
+          .from(resultArchiveReductionQueue)
+          .where(
+            eq(
+              resultArchiveReductionQueue.resultAttemptId,
+              fixture.resultAttemptId,
+            ),
+          )
+          .limit(1),
+        db
+          .select({
+            currentResultInterpretationId:
+              results.currentResultInterpretationId,
+            currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+            status: results.status,
+            fidelity: results.fidelity,
+            regime: results.regime,
+          })
+          .from(results)
+          .where(eq(results.id, fixture.resultId))
+          .limit(1),
+        db
+          .select({
+            requested: simCampaignProgress.requested,
+            solved: simCampaignProgress.solved,
+            awaitingArchiveReduction:
+              simCampaignProgress.awaitingArchiveReduction,
+            blocked: simCampaignProgress.blocked,
+          })
+          .from(simCampaignProgress)
+          .where(
+            and(
+              eq(simCampaignProgress.campaignId, campaign.campaignId),
+              eq(simCampaignProgress.conditionId, campaign.conditionId),
+              eq(simCampaignProgress.airfoilId, airfoilId),
+            ),
+          )
+          .limit(1),
+        db
+          .select({
+            state: resultClassifications.state,
+            resultAttemptId: resultClassifications.resultAttemptId,
+            reasons: resultClassifications.reasons,
+          })
+          .from(resultClassifications)
+          .where(eq(resultClassifications.resultId, fixture.resultId)),
+      ],
+    );
     expect(queue).toMatchObject({ state: "reduced" });
     expect(queue?.backfillRunId).toBeTruthy();
     expect(queue?.resultInterpretationId).toBeTruthy();
     expect(result).toMatchObject({
       currentResultInterpretationId: queue?.resultInterpretationId,
+      status: "done",
+      fidelity: "urans_precalc",
+      regime: "urans",
     });
     expect(result?.currentCanonicalSelectionId).toBeTruthy();
+    expect(classification).toEqual({
+      state: "accepted",
+      resultAttemptId: null,
+      reasons: [],
+    });
     // This proves the real non-solver publication transition refreshes the
     // exact campaign cell rather than leaving it in "awaiting reduction".
     expect(progress).toEqual({
@@ -811,196 +862,15 @@ describe("archive reduction publication queue", () => {
   });
 
   it("does not re-admit V1 after a later V2 receipt has been persisted", async () => {
-    const fixture = await createExactArchiveFixture("reducer-precedence");
-    const firstAdmission = await enqueueVerifiedArchiveReductions(db, {
-      resultAttemptIds: [fixture.resultAttemptId],
-      limit: 1,
-    });
-    const v1 = firstAdmission.reducerVersionId;
-    await db
-      .delete(resultArchiveReductionQueue)
-      .where(
-        and(
-          eq(
-            resultArchiveReductionQueue.resultAttemptId,
-            fixture.resultAttemptId,
-          ),
-          eq(resultArchiveReductionQueue.reducerVersionId, v1),
-        ),
-      );
-    const [v1Row] = await db
-      .select({ reducerKey: resultReducerVersions.reducerKey })
-      .from(resultReducerVersions)
-      .where(eq(resultReducerVersions.id, v1))
-      .limit(1);
-    if (!v1Row)
-      throw new Error("archive queue V1 reducer fixture was not found");
-    const [v2] = await db
-      .insert(resultReducerVersions)
-      .values({
-        reducerKey: v1Row.reducerKey,
-        reducerVersion: `${PREFIX}-v2`,
-        buildId: `${PREFIX}-build-v2`,
-        policySha256: "c".repeat(64),
-        policy: { regression: "queue-v1-v2" },
-        source: "test",
-        createdAt: new Date(Date.now() + 1_000),
-      })
-      .returning({ id: resultReducerVersions.id });
-    if (!v2) throw new Error("could not create V2 reducer fixture");
-    fixtureReducerVersionIds.push(v2.id);
-    await db.insert(resultArchiveReductionQueue).values({
-      resultId: fixture.resultId,
-      resultAttemptId: fixture.resultAttemptId,
-      sourceArchiveId: fixture.sourceArchiveId,
-      reducerVersionId: v2.id,
-      state: "pending",
-    });
-
-    const staleAdmission = await enqueueVerifiedArchiveReductions(db, {
-      resultAttemptIds: [fixture.resultAttemptId],
-      limit: 1,
-    });
-    expect(staleAdmission.enqueued).toBe(0);
-    expect(staleAdmission.admittedResultAttemptIds).toEqual([]);
-    const rows = await db
-      .select({
-        reducerVersionId: resultArchiveReductionQueue.reducerVersionId,
-      })
-      .from(resultArchiveReductionQueue)
-      .where(
-        eq(
-          resultArchiveReductionQueue.resultAttemptId,
-          fixture.resultAttemptId,
-        ),
-      );
-    expect(rows).toEqual([{ reducerVersionId: v2.id }]);
-  });
-
-  it("cannot let an old V1 worker overwrite a V2 canonical selection that completed first", async () => {
-    const fixture = await createExactArchiveFixture("stale-v1-after-v2");
-    const firstAdmission = await enqueueVerifiedArchiveReductions(db, {
-      resultAttemptIds: [fixture.resultAttemptId],
-      limit: 1,
-    });
-    const v1 = firstAdmission.reducerVersionId;
-    const [v1Row] = await db
-      .select({ reducerKey: resultReducerVersions.reducerKey })
-      .from(resultReducerVersions)
-      .where(eq(resultReducerVersions.id, v1))
-      .limit(1);
-    if (!v1Row)
-      throw new Error("archive queue V1 reducer fixture was not found");
-    const [v2] = await db
-      .insert(resultReducerVersions)
-      .values({
-        reducerKey: v1Row.reducerKey,
-        reducerVersion: `${PREFIX}-stale-v1-v2`,
-        buildId: `${PREFIX}-stale-v1-build-v2`,
-        policySha256: "d".repeat(64),
-        policy: { regression: "stale-v1-after-v2-selection" },
-        source: "test",
-        createdAt: new Date(Date.now() + 1_000),
-      })
-      .returning({ id: resultReducerVersions.id });
-    if (!v2) throw new Error("could not create V2 reducer fixture");
-    fixtureReducerVersionIds.push(v2.id);
-
-    // V1 was admitted first but cannot be claimed yet; V2 is the later
-    // release and completes first.  This models the real race where an old
-    // reducer has already been queued while a rollout adds V2.
-    await db
-      .update(resultArchiveReductionQueue)
-      .set({ nextAttemptAt: new Date(Date.now() + 60_000) })
-      .where(
-        and(
-          eq(
-            resultArchiveReductionQueue.resultAttemptId,
-            fixture.resultAttemptId,
-          ),
-          eq(resultArchiveReductionQueue.reducerVersionId, v1),
-        ),
-      );
-    await db.insert(resultArchiveReductionQueue).values({
-      resultId: fixture.resultId,
-      resultAttemptId: fixture.resultAttemptId,
-      sourceArchiveId: fixture.sourceArchiveId,
-      reducerVersionId: v2.id,
-      state: "pending",
-      nextAttemptAt: new Date(),
-    });
-
-    await drainArchiveReductionQueue(
-      db,
-      engineReturning(
-        acceptedReduction({
-          aoaDeg: fixture.aoaDeg,
-          signature: "e".repeat(64),
-        }),
-      ),
-      {
-        enqueue: false,
+    await withRolledBackFixture(async (tx) => {
+      const fixture = await createExactArchiveFixture("reducer-precedence", tx);
+      const firstAdmission = await enqueueVerifiedArchiveReductions(tx, {
         resultAttemptIds: [fixture.resultAttemptId],
-        maxItems: 1,
-      },
-    );
-    const [afterV2] = await db
-      .select({
-        currentResultInterpretationId: results.currentResultInterpretationId,
-        currentCanonicalSelectionId: results.currentCanonicalSelectionId,
-      })
-      .from(results)
-      .where(eq(results.id, fixture.resultId))
-      .limit(1);
-    expect(afterV2?.currentResultInterpretationId).toBeTruthy();
-    expect(afterV2?.currentCanonicalSelectionId).toBeTruthy();
-
-    // Let the already-admitted V1 worker finish after V2. Its immutable
-    // historical interpretation may be retained, but the selector must see
-    // V2's exact receipt/selection and refuse to retarget the projection.
-    await db
-      .update(resultArchiveReductionQueue)
-      .set({ nextAttemptAt: new Date() })
-      .where(
-        and(
-          eq(
-            resultArchiveReductionQueue.resultAttemptId,
-            fixture.resultAttemptId,
-          ),
-          eq(resultArchiveReductionQueue.reducerVersionId, v1),
-        ),
-      );
-    await drainArchiveReductionQueue(
-      db,
-      engineReturning(
-        acceptedReduction({
-          aoaDeg: fixture.aoaDeg,
-          signature: "f".repeat(64),
-        }),
-      ),
-      {
-        enqueue: false,
-        resultAttemptIds: [fixture.resultAttemptId],
-        maxItems: 1,
-      },
-    );
-    const [[afterV1], [v1Queue]] = await Promise.all([
-      db
-        .select({
-          currentResultInterpretationId: results.currentResultInterpretationId,
-          currentCanonicalSelectionId: results.currentCanonicalSelectionId,
-        })
-        .from(results)
-        .where(eq(results.id, fixture.resultId))
-        .limit(1),
-      db
-        .select({
-          state: resultArchiveReductionQueue.state,
-          resultInterpretationId:
-            resultArchiveReductionQueue.resultInterpretationId,
-          lastError: resultArchiveReductionQueue.lastError,
-        })
-        .from(resultArchiveReductionQueue)
+        limit: 1,
+      });
+      const v1 = firstAdmission.reducerVersionId;
+      await tx
+        .delete(resultArchiveReductionQueue)
         .where(
           and(
             eq(
@@ -1009,15 +879,199 @@ describe("archive reduction publication queue", () => {
             ),
             eq(resultArchiveReductionQueue.reducerVersionId, v1),
           ),
-        )
-        .limit(1),
-    ]);
-    expect(afterV1).toEqual(afterV2);
-    expect(v1Queue).toMatchObject({
-      state: "superseded",
-      lastError: expect.stringContaining("older reducer release"),
+        );
+      const [v1Row] = await tx
+        .select({ reducerKey: resultReducerVersions.reducerKey })
+        .from(resultReducerVersions)
+        .where(eq(resultReducerVersions.id, v1))
+        .limit(1);
+      if (!v1Row)
+        throw new Error("archive queue V1 reducer fixture was not found");
+      const [v2] = await tx
+        .insert(resultReducerVersions)
+        .values({
+          reducerKey: v1Row.reducerKey,
+          reducerVersion: `${PREFIX}-v2`,
+          buildId: `${PREFIX}-build-v2`,
+          policySha256: "c".repeat(64),
+          policy: { regression: "queue-v1-v2" },
+          source: "test",
+          createdAt: new Date(Date.now() + 1_000),
+        })
+        .returning({ id: resultReducerVersions.id });
+      if (!v2) throw new Error("could not create V2 reducer fixture");
+      await tx.insert(resultArchiveReductionQueue).values({
+        resultId: fixture.resultId,
+        resultAttemptId: fixture.resultAttemptId,
+        sourceArchiveId: fixture.sourceArchiveId,
+        reducerVersionId: v2.id,
+        state: "pending",
+      });
+
+      const staleAdmission = await enqueueVerifiedArchiveReductions(tx, {
+        resultAttemptIds: [fixture.resultAttemptId],
+        limit: 1,
+      });
+      expect(staleAdmission.enqueued).toBe(0);
+      expect(staleAdmission.admittedResultAttemptIds).toEqual([]);
+      const rows = await tx
+        .select({
+          reducerVersionId: resultArchiveReductionQueue.reducerVersionId,
+        })
+        .from(resultArchiveReductionQueue)
+        .where(
+          eq(
+            resultArchiveReductionQueue.resultAttemptId,
+            fixture.resultAttemptId,
+          ),
+        );
+      expect(rows).toEqual([{ reducerVersionId: v2.id }]);
     });
-    expect(v1Queue?.resultInterpretationId).toBeTruthy();
+  });
+
+  it("cannot let an old V1 worker overwrite a V2 canonical selection that completed first", async () => {
+    await withRolledBackFixture(async (tx) => {
+      const fixture = await createExactArchiveFixture("stale-v1-after-v2", tx);
+      const firstAdmission = await enqueueVerifiedArchiveReductions(tx, {
+        resultAttemptIds: [fixture.resultAttemptId],
+        limit: 1,
+      });
+      const v1 = firstAdmission.reducerVersionId;
+      const [v1Row] = await tx
+        .select({ reducerKey: resultReducerVersions.reducerKey })
+        .from(resultReducerVersions)
+        .where(eq(resultReducerVersions.id, v1))
+        .limit(1);
+      if (!v1Row)
+        throw new Error("archive queue V1 reducer fixture was not found");
+      const [v2] = await tx
+        .insert(resultReducerVersions)
+        .values({
+          reducerKey: v1Row.reducerKey,
+          reducerVersion: `${PREFIX}-stale-v1-v2`,
+          buildId: `${PREFIX}-stale-v1-build-v2`,
+          policySha256: "d".repeat(64),
+          policy: { regression: "stale-v1-after-v2-selection" },
+          source: "test",
+          createdAt: new Date(Date.now() + 1_000),
+        })
+        .returning({ id: resultReducerVersions.id });
+      if (!v2) throw new Error("could not create V2 reducer fixture");
+
+      // V1 was admitted first but cannot be claimed yet; V2 is the later
+      // release and completes first.  This models the real race where an old
+      // reducer has already been queued while a rollout adds V2.
+      await tx
+        .update(resultArchiveReductionQueue)
+        .set({ nextAttemptAt: new Date(Date.now() + 60_000) })
+        .where(
+          and(
+            eq(
+              resultArchiveReductionQueue.resultAttemptId,
+              fixture.resultAttemptId,
+            ),
+            eq(resultArchiveReductionQueue.reducerVersionId, v1),
+          ),
+        );
+      await tx.insert(resultArchiveReductionQueue).values({
+        resultId: fixture.resultId,
+        resultAttemptId: fixture.resultAttemptId,
+        sourceArchiveId: fixture.sourceArchiveId,
+        reducerVersionId: v2.id,
+        state: "pending",
+        nextAttemptAt: new Date(),
+      });
+
+      await drainArchiveReductionQueue(
+        tx,
+        engineReturning(
+          acceptedReduction({
+            aoaDeg: fixture.aoaDeg,
+            signature: "e".repeat(64),
+          }),
+        ),
+        {
+          enqueue: false,
+          resultAttemptIds: [fixture.resultAttemptId],
+          maxItems: 1,
+        },
+      );
+      const [afterV2] = await tx
+        .select({
+          currentResultInterpretationId: results.currentResultInterpretationId,
+          currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+        })
+        .from(results)
+        .where(eq(results.id, fixture.resultId))
+        .limit(1);
+      expect(afterV2?.currentResultInterpretationId).toBeTruthy();
+      expect(afterV2?.currentCanonicalSelectionId).toBeTruthy();
+
+      // Let the already-admitted V1 worker finish after V2. Its immutable
+      // historical interpretation may be retained, but the selector must see
+      // V2's exact receipt/selection and refuse to retarget the projection.
+      await tx
+        .update(resultArchiveReductionQueue)
+        .set({ nextAttemptAt: new Date() })
+        .where(
+          and(
+            eq(
+              resultArchiveReductionQueue.resultAttemptId,
+              fixture.resultAttemptId,
+            ),
+            eq(resultArchiveReductionQueue.reducerVersionId, v1),
+          ),
+        );
+      await drainArchiveReductionQueue(
+        tx,
+        engineReturning(
+          acceptedReduction({
+            aoaDeg: fixture.aoaDeg,
+            signature: "f".repeat(64),
+          }),
+        ),
+        {
+          enqueue: false,
+          resultAttemptIds: [fixture.resultAttemptId],
+          maxItems: 1,
+        },
+      );
+      const [[afterV1], [v1Queue]] = await Promise.all([
+        tx
+          .select({
+            currentResultInterpretationId:
+              results.currentResultInterpretationId,
+            currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+          })
+          .from(results)
+          .where(eq(results.id, fixture.resultId))
+          .limit(1),
+        tx
+          .select({
+            state: resultArchiveReductionQueue.state,
+            resultInterpretationId:
+              resultArchiveReductionQueue.resultInterpretationId,
+            lastError: resultArchiveReductionQueue.lastError,
+          })
+          .from(resultArchiveReductionQueue)
+          .where(
+            and(
+              eq(
+                resultArchiveReductionQueue.resultAttemptId,
+                fixture.resultAttemptId,
+              ),
+              eq(resultArchiveReductionQueue.reducerVersionId, v1),
+            ),
+          )
+          .limit(1),
+      ]);
+      expect(afterV1).toEqual(afterV2);
+      expect(v1Queue).toMatchObject({
+        state: "superseded",
+        lastError: expect.stringContaining("older reducer release"),
+      });
+      expect(v1Queue?.resultInterpretationId).toBeTruthy();
+    });
   });
 
   it("supersedes only the recovered source receipt and clears its lease", async () => {

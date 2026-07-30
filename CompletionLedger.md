@@ -8,14 +8,21 @@
   terminal period can request only one to three additional physical periods,
   capped at FAST 9 / FINAL 12 periods measured from authenticated transient
   state. Current RANS without an all-channel 200-iteration hold proof routes to
-  targeted FAST URANS. Production still needs the guarded 0094–0097 migration,
-  matching engine/control-plane rollout after live CFD work drains, GCS-backed
-  interpretation backfill, and verification that raw hashes/attempts remain
-  unchanged while repaired projections select only the exact current archive.
-  Legacy URANS without a current verified archive must create one separately
-  leased fresh-FAST recovery receipt, never a fabricated continuation. Remove
-  this item only after a representative API/cache check and the historical run
-  prove no noisy prefix or capped trajectory publishes.
+  targeted FAST URANS. Production database migrations 0094–0100 and the
+  prior control-plane rollout are present, but the live engine still reports
+  recovery v9 and no archive-reduction capability. The new control-plane
+  source needs its safe normal deployment, then the guarded engine rebuild
+  after every live OpenFOAM child drains. Before any historical mutation, run
+  the read-only all-explicit-FAST/FINAL inventory (including failed, queued,
+  local, malformed, and archive-free generations); only completed solved,
+  generation-pinned authenticated GCS evidence may enter exact bounded
+  interpretation backfill. Legacy FAST without a current verified archive
+  must create one separately leased fresh-FAST recovery receipt, never a
+  fabricated continuation; FINAL/no-archive and malformed/archive-failure
+  generations remain visible for investigation. Remove this item only after a
+  representative API/cache check and the completed historical run prove raw
+  hashes/attempts are unchanged while repaired projections select only the
+  exact current archive and no noisy prefix or capped trajectory publishes.
   A current no-shedding URANS result is also evidence-gated: it needs a
   versioned slow-wake certificate, at least 20 raw and transported samples,
   finite all-channel statistics, and a time-weighted Cl/Cd/Cm witness that
