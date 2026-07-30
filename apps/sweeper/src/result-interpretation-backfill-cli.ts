@@ -48,6 +48,13 @@ function requiredValue(argv: string[], index: number, label: string): string {
 }
 
 export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
+  // `pnpm --filter <pkg> <script> -- --execute ...` forwards one literal
+  // runner separator to the package script. Treat only that conventional
+  // *leading* separator as transport, never as a permissive end-of-options
+  // marker: a second separator or any malformed argument must still fail
+  // closed below.
+  const argumentsWithoutRunnerSeparator =
+    argv[0] === "--" ? argv.slice(1) : argv;
   const scope: ArchiveInterpretationBackfillScope = {
     resultIds: [],
     resultAttemptIds: [],
@@ -57,8 +64,12 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
     scope,
     maxItems: undefined,
   };
-  for (let index = 0; index < argv.length; index += 1) {
-    const argument = argv[index];
+  for (
+    let index = 0;
+    index < argumentsWithoutRunnerSeparator.length;
+    index += 1
+  ) {
+    const argument = argumentsWithoutRunnerSeparator[index];
     if (argument === "--execute") {
       parsed.execute = true;
       continue;
@@ -68,7 +79,11 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
         "--run-id is not supported: archive publication must run through the global exact-source queue",
       );
     }
-    const value = requiredValue(argv, index, argument ?? "argument");
+    const value = requiredValue(
+      argumentsWithoutRunnerSeparator,
+      index,
+      argument ?? "argument",
+    );
     if (argument === "--result-id") scope.resultIds!.push(value);
     else if (argument === "--result-attempt-id")
       scope.resultAttemptIds!.push(value);

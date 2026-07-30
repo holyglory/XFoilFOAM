@@ -122,6 +122,34 @@ describe("archive clean-cycle interpretation backfill", () => {
     });
   });
 
+  it("accepts exactly one conventional pnpm runner separator", () => {
+    expect(
+      parseArchiveInterpretationBackfillArgs([
+        "--",
+        "--execute",
+        "--result-attempt-id",
+        UUID_A,
+        "--limit",
+        "1",
+        "--max-items",
+        "1",
+      ]),
+    ).toMatchObject({
+      execute: true,
+      scope: { resultAttemptIds: [UUID_A], limit: 1 },
+      maxItems: 1,
+    });
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs([
+        "--",
+        "--",
+        "--execute",
+        "--result-attempt-id",
+        UUID_A,
+      ]),
+    ).toThrow(/-- requires a value/);
+  });
+
   it("MUST-CATCH: requires an exact bounded scope before execution admission", () => {
     expect(() => parseArchiveInterpretationBackfillArgs(["--execute"])).toThrow(
       /requires at least one --result-id or --result-attempt-id/,
