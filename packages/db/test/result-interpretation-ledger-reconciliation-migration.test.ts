@@ -30,7 +30,7 @@ const LEGACY_TIMESTAMP = {
   resultMediaIndex: 1788825600000,
   ingestCompletion: 1788912000000,
 } as const;
-const LEGACY_ARCHIVE_GAP_TIMESTAMP = 1789257600000;
+const MESH_IDENTITY_RECONCILIATION_TIMESTAMP = 1789344000000;
 
 let admin: ReturnType<typeof postgres> | null = null;
 let client: ReturnType<typeof postgres> | null = null;
@@ -211,7 +211,7 @@ describe("0096 result interpretation ledger reconciliation", () => {
         "ri_recovery_active_request_owner_uq",
         "ri_recovery_active_verify_owner_uq",
       ],
-      latestMigration: String(LEGACY_ARCHIVE_GAP_TIMESTAMP),
+      latestMigration: String(MESH_IDENTITY_RECONCILIATION_TIMESTAMP),
       historicalIngestTable: true,
       promiseTtlDefault: "72",
       legacyArchiveGapTable: true,
@@ -271,5 +271,44 @@ describe("0096 result interpretation ledger reconciliation", () => {
       triggers: 4,
       terminalState: true,
     });
+  });
+
+  it("repairs the production interpretation table that predates mesh identity ownership", async () => {
+    if (!client) throw new Error("migration test database is unavailable");
+
+    await client.unsafe(`
+      ALTER TABLE result_interpretations
+        DROP COLUMN mesh_identity_id CASCADE;
+    `);
+    const migration = readFileSync(
+      join(
+        migrations,
+        "0098_result_interpretation_mesh_identity_reconciliation.sql",
+      ),
+      "utf8",
+    );
+    await client.unsafe(migration);
+    await client.unsafe(migration);
+
+    const [shape] = await client<
+      Array<{ meshColumn: boolean; meshOwnerFk: boolean }>
+    >`
+      SELECT
+        EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'result_interpretations'
+            AND column_name = 'mesh_identity_id'
+        ) AS "meshColumn",
+        EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'public.result_interpretations'::regclass
+            AND conname = 'result_interpretations_mesh_owner_fk'
+        ) AS "meshOwnerFk";
+    `;
+
+    expect(shape).toEqual({ meshColumn: true, meshOwnerFk: true });
   });
 });
