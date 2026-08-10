@@ -2,6 +2,14 @@
 
 ## Direction
 
+- Confirmed intent: in-flight CFD runtime and stored solver outputs are
+  reproducible, disposable compute. During an explicitly requested clean
+  installation, reset, recovery, or maintenance operation, jobs, promises,
+  queues, checkpoints, cases, results, and evidence may be cancelled or erased
+  without backup and restarted as often as needed. Preserve only canonical
+  non-solver configuration and reconnection credentials. Regenerated results
+  must still come from real solver evidence and pass the normal acceptance
+  gates. [D-2026-08-10-disposable-inflight-cfd]
 - Confirmed intent: hub-issued remote solver promises exclusively own their
   exact cells while alive, use one refreshed 72-hour failover horizon across
   claim/solve/transfer, and serialize against local claims at the mutation
@@ -144,6 +152,20 @@
   reachable without horizontal scrolling; narrow layouts use accessible burger
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
+
+## D-2026-08-10-disposable-inflight-cfd — In-flight CFD work is disposable compute
+
+- Decision: allow explicitly requested clean installs, resets, recoveries, and
+  solver maintenance to cancel or erase active jobs, remote promises, queues,
+  checkpoints, live cases, stored results, and solver evidence without backup;
+  restore only canonical non-solver configuration, deployment credentials, and
+  capacity before solving again. Never publish an interrupted run or synthetic
+  replacement as evidence.
+  [detail](DecisionDetails/D-2026-08-10-disposable-inflight-cfd.md)
+- Why: preserving and recovering the current CFD runtime costs more time than
+  recomputing it. The former preservation-first and idle-only paths are still
+  available when preservation is explicitly requested, but they no longer
+  block a user-authorized clean recovery.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

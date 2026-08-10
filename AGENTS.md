@@ -137,20 +137,34 @@
 
 ## Production Deployment And OpenFOAM Safety
 
+- In-flight CFD work is disposable compute, not valuable data. During an
+  explicitly requested deployment, reset, recovery, or solver maintenance
+  operation, active jobs, promises, queue entries, checkpoints, and live case
+  directories may be cancelled, removed, and restarted without waiting for an
+  idle worker and without creating a backup. Restart as many times as needed
+  to restore a healthy system. Never publish a partial or interrupted run as
+  solved evidence; clear stale ownership and resubmit it through the normal
+  controller.
+- Stored solver results and evidence are reproducible. An explicitly requested
+  clean installation or solver-domain reset may erase them without archival or
+  recovery work. Preserve only non-solver canonical configuration and the
+  credentials required to reconnect instances unless the user asks for a
+  broader reset. This permission does not allow invented replacement results:
+  new published values must come from new real solver evidence.
 - Production VPS deployment is done manually over SSH or through GitHub Actions,
   not through the local development coordinator.
 - The VPS host does not need host-level OpenFOAM. OpenFOAM is provided by the
   Docker `worker` image/container and its live child processes run inside that
   container.
-- Normal production redeploys must update only the Node control-plane services:
+- Ordinary production redeploys update only the Node control-plane services:
   `node-api`, `web`, and `sweeper`. Do not restart or recreate the OpenFOAM
-  engine services `api` or `worker` during an ordinary deploy, because that can
-  terminate active CFD solves.
+  engine services `api` or `worker` unless solver maintenance or a clean reset
+  is part of the requested operation.
 - Redeploying `api` or `worker` in production requires an explicit solver
-  maintenance action and an idle-worker guard that checks for active
-  `simpleFoam`, `pimpleFoam`, meshing, decomposition, reconstruction, or
-  related OpenFOAM processes first. If such processes are active, preserve them
-  and defer the solver-service redeploy.
+  maintenance or reset action. For preservation-oriented maintenance, retain
+  the idle-worker guard. For an explicitly disposable reset, stop the writers
+  and workers, clear stale database/queue ownership, and recreate them without
+  waiting for active OpenFOAM children to finish.
 - Manual engine rebuilds MUST go through `scripts/deploy/rebuild-engine.sh`
   (never a raw `docker compose up -d --force-recreate api worker`). Build-id
   expectations are baked into container env at recreate time
@@ -168,6 +182,10 @@
   jobs, unsettled deliveries/cancellations, Redis work, media repair, or any
   OpenFOAM child; it must prove the merged nofile limit and restore the exact
   prior execution-pool/writer state before scheduling resumes.
+  An explicitly requested clean remote-solver reset is different: the remote
+  DB, Redis queue, cases, and promises are disposable and may be cleared before
+  a fresh deployment, while the deployment role, upstream credentials, solver
+  registration, and 40-slot capacity are restored and verified afterwards.
 - Never edit a live OpenFOAM case dictionary with `foamDictionary`, `sed`, or
   another in-place command. OpenFOAM hot-reloads `controlDict`; even a
   momentarily empty or partial value can terminate the physical run and turn
