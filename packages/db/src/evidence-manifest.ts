@@ -71,7 +71,14 @@ export function exactValidSolverManifestSql(
 export function exactVerifiedRestartableEvidenceArchiveSql(
   resultId: string | SQLWrapper,
   resultAttemptId: string | SQLWrapper,
+  archiveId?: string | SQLWrapper,
 ) {
+  // Archive recovery is authorized by the immutable archive selected by the
+  // reducer, not merely by any newer current archive for the same result
+  // attempt.  The optional pin deliberately remains inside this shared proof
+  // so every caller gets the identical manifest/member/GCS checks.
+  const exactArchive =
+    archiveId == null ? sql`` : sql`AND archive.id = ${archiveId}`;
   return sql`EXISTS (
       SELECT 1
       FROM result_attempts attempt
@@ -113,6 +120,7 @@ export function exactVerifiedRestartableEvidenceArchiveSql(
        AND source.aoa_deg IS NOT DISTINCT FROM attempt.aoa_deg
       WHERE result.id = ${resultId}
         AND attempt.id = ${resultAttemptId}
+        ${exactArchive}
         AND EXISTS (
           SELECT 1
           FROM solver_evidence_artifact_members manifest_member
@@ -224,6 +232,28 @@ export async function hasExactVerifiedRestartableEvidenceArchive(
     SELECT ${exactVerifiedRestartableEvidenceArchiveSql(
       resultId,
       resultAttemptId,
+    )} AS valid
+  `)) as unknown as Array<{ valid: boolean }>;
+  return rows[0]?.valid === true;
+}
+
+/**
+ * Archive-reducer continuations must keep the archive generation that the
+ * immutable interpretation inspected.  A replacement `current` archive may
+ * be valid for the same result attempt, but it is not evidence that the
+ * reducer's clean-tail recommendation applies to that replacement.
+ */
+export async function hasExactVerifiedRestartableEvidenceArchiveForArchive(
+  tx: EvidenceQueryExecutor,
+  resultId: string,
+  resultAttemptId: string,
+  archiveId: string,
+): Promise<boolean> {
+  const rows = (await tx.execute(sql`
+    SELECT ${exactVerifiedRestartableEvidenceArchiveSql(
+      resultId,
+      resultAttemptId,
+      archiveId,
     )} AS valid
   `)) as unknown as Array<{ valid: boolean }>;
   return rows[0]?.valid === true;

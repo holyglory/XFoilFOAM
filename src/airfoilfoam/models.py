@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+import math
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -715,6 +716,15 @@ class PolarRequest(BaseModel):
         description="Per-job URANS wall-clock budget [s] replacing the fidelity-tier "
         "budget (continuations submit the increased budget here). Capped at 24 h.",
     )
+    corrective_tail_periods: Optional[int] = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        le=3,
+        description="Exact archive-reducer recommendation for a same-case URANS "
+        "continuation. This requests one to three additional whole periods after "
+        "the saved terminal evidence and is valid only with continue_from.",
+    )
     expected_mesh_recovery_version: Optional[int] = Field(
         default=None,
         ge=0,
@@ -765,6 +775,10 @@ class PolarRequest(BaseModel):
                     "continue_from targets one saved case; the request must expand to exactly one "
                     "(chord, speed, AoA) case."
                 )
+        elif self.corrective_tail_periods is not None:
+            raise ValueError(
+                "corrective_tail_periods is valid only for an exact continue_from URANS request."
+            )
         return self
 
     def cases(self) -> list["CaseSpec"]:
@@ -886,6 +900,283 @@ class FrameTrack(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# URANS CLEAN-CYCLE CERTIFICATE (reducer v2)
+# --------------------------------------------------------------------------- #
+#
+# ``frame_track`` is intentionally a frozen, strict transport contract.  The
+# clean-cycle audit is a *versioned interpretation* of the immutable force and
+# field evidence, so it travels beside frame_track instead of adding a field to
+# it.  The control plane persists the complete audit in
+# ``result_interpretation_cycles`` and can later re-run a newer reducer without
+# changing this producing attempt or the raw archive.
+# --------------------------------------------------------------------------- #
+class UransCycleDisposition(str, Enum):
+    selected = "selected"
+    startup = "startup"
+    hard_corrupt = "hard_corrupt"
+    settling_outlier = "settling_outlier"
+    cadence_unresolved = "cadence_unresolved"
+    numerically_noisy = "numerically_noisy"
+    insufficient_frames = "insufficient_frames"
+
+
+class UransCycleCertificateCycle(BaseModel):
+    """One audited physical shedding cycle.
+
+    All values are calculated from stored coefficient history and actual field
+    write times.  ``metrics`` is deliberately explicit rather than a prose
+    warning so the database ledger and a later reducer can explain why a cycle
+    was excluded without treating a diagnostic as solver evidence.
+    """
+
+    index: int = Field(ge=0)
+    t_start: float = Field(ge=0)
+    t_end: float = Field(gt=0)
+    coefficient_samples: int = Field(ge=0)
+    field_frames: int = Field(ge=0)
+    phase_max_gap: float = Field(ge=0, le=1)
+    phase_shift_bins: int = Field(ge=0)
+    cl_mean: float
+    cd_mean: float
+    cm_mean: float
+    cl_shape_error: float = Field(ge=0)
+    cd_shape_error: float = Field(ge=0)
+    cm_shape_error: float = Field(ge=0)
+    cl_amplitude_deviation: float = Field(ge=0)
+    cd_amplitude_deviation: float = Field(ge=0)
+    cm_amplitude_deviation: float = Field(ge=0)
+    cl_high_frequency: float = Field(ge=0)
+    cd_high_frequency: float = Field(ge=0)
+    cm_high_frequency: float = Field(ge=0)
+    disposition: UransCycleDisposition
+    reasons: list[str] = Field(default_factory=list)
+
+
+class UransCycleCertificate(BaseModel):
+    """Versioned certification of the contiguous terminal URANS suffix.
+
+    Two repeatable cycles only establish cadence.  ``certified`` is true only
+    when the final contiguous clean suffix meets the fidelity-specific bar
+    (FAST >= 3, FINAL >= 5), all selected cycles have real coefficient and
+    field-frame proof, and no selected cycle is corrupt or settling.
+    """
+
+    reducer_version: str = Field(min_length=1, max_length=160)
+    period_s: float = Field(gt=0)
+    phase_samples: int = Field(ge=20, le=512)
+    required_clean_cycles: int = Field(ge=1)
+    terminal_clean_cycles: int = Field(ge=0)
+    selected_cycle_start_index: Optional[int] = Field(default=None, ge=0)
+    certified: bool
+    cadence_adjusted: bool = False
+    cycles: list[UransCycleCertificateCycle] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# NO-SHEDDING URANS OBSERVATION CERTIFICATE (reducer v1)
+# --------------------------------------------------------------------------- #
+#
+# A no-shedding URANS result is physically steady, but it is not a shortcut
+# around evidence.  The live engine may call it steady-equivalent only after
+# the exact retained force observation spans the slow edge of the plausible
+# shedding band and all three reported force channels are demonstrably finite.
+# This certificate deliberately carries the measured observation facts rather
+# than a bare boolean.  The control plane validates the transport against the
+# accompanying force-history before it can select the point.
+# --------------------------------------------------------------------------- #
+NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v1"
+# The certificate is a cross-runtime proof rather than a UI summary.  Keep a
+# conservative floor on both the raw source interval and its transported
+# witness so two sparse endpoints cannot masquerade as a physical observation.
+NO_SHEDDING_MIN_SAMPLE_COUNT = 20
+
+
+class NoSheddingCertificate(BaseModel):
+    """Proof-bearing physical-observation verdict for a flat URANS wake."""
+
+    reducer_version: Literal[NO_SHEDDING_CERTIFICATE_VERSION]
+    certified: Literal[True]
+    required_observation_s: float = Field(gt=0)
+    observation_start_time: float = Field(ge=0)
+    observation_end_time: float = Field(gt=0)
+    observed_observation_s: float = Field(gt=0)
+    source_sample_count: int = Field(ge=NO_SHEDDING_MIN_SAMPLE_COUNT)
+    transport_sample_count: int = Field(ge=NO_SHEDDING_MIN_SAMPLE_COUNT)
+    relative_tolerance: float = Field(gt=0)
+    absolute_floor: float = Field(gt=0)
+    cl_mean: float
+    cd_mean: float
+    cm_mean: float
+    cl_rms: float = Field(ge=0)
+    cd_rms: float = Field(ge=0)
+    cm_rms: float = Field(ge=0)
+    # These are deliberately distinct from the unprefixed raw-source
+    # statistics above.  They are remeasured from the exact bounded
+    # ``force_history`` payload sent with the point, so a control plane can
+    # prove that its transport witness still represents the certified source
+    # observation even when the source had to be downsampled.
+    transport_cl_mean: float
+    transport_cd_mean: float
+    transport_cm_mean: float
+    transport_cl_rms: float = Field(ge=0)
+    transport_cd_rms: float = Field(ge=0)
+    transport_cm_rms: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_observation(self) -> "NoSheddingCertificate":
+        values = (
+            self.required_observation_s,
+            self.observation_start_time,
+            self.observation_end_time,
+            self.observed_observation_s,
+            self.relative_tolerance,
+            self.absolute_floor,
+            self.cl_mean,
+            self.cd_mean,
+            self.cm_mean,
+            self.cl_rms,
+            self.cd_rms,
+            self.cm_rms,
+            self.transport_cl_mean,
+            self.transport_cd_mean,
+            self.transport_cm_mean,
+            self.transport_cl_rms,
+            self.transport_cd_rms,
+            self.transport_cm_rms,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("no-shedding certificate values must be finite")
+        if self.observation_end_time <= self.observation_start_time:
+            raise ValueError("no-shedding observation window is reversed")
+        measured_span = self.observation_end_time - self.observation_start_time
+        tolerance = 1e-10 * max(
+            1.0, abs(measured_span), abs(self.observed_observation_s)
+        )
+        if abs(self.observed_observation_s - measured_span) > tolerance:
+            raise ValueError(
+                "no-shedding observed_observation_s does not match the time window"
+            )
+        if self.observed_observation_s + tolerance < self.required_observation_s:
+            raise ValueError(
+                "no-shedding observation is below the physical slow-shedding horizon"
+            )
+        if self.source_sample_count < self.transport_sample_count:
+            raise ValueError(
+                "no-shedding source sample count is below the transported history count"
+            )
+        for name, mean, rms in (
+            ("Cl", self.cl_mean, self.cl_rms),
+            ("Cd", self.cd_mean, self.cd_rms),
+            ("Cm", self.cm_mean, self.cm_rms),
+        ):
+            threshold = max(
+                self.relative_tolerance * abs(mean),
+                self.absolute_floor,
+            )
+            if abs(rms) > threshold + 1e-12 * max(1.0, threshold):
+                raise ValueError(
+                    f"no-shedding certificate {name} fluctuation exceeds its stamped amplitude tolerance"
+                )
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# RANS ALL-CHANNEL HOLD CERTIFICATE (reducer v1)
+# --------------------------------------------------------------------------- #
+#
+# A conventional SIMPLE residual/Cl-Cd plateau is not enough to make a
+# canonical steady point: it can hide a drifting moment coefficient.  This
+# small immutable certificate records the exact *raw* final iteration window
+# used to prove Cl, Cd, and Cm all held within the configured tolerance.  It
+# is deliberately separate from ``steady_history``: the latter is a bounded
+# transport record for oscillating-steady diagnostics, whereas the hold
+# certificate is a versioned reducer result over the full coefficient file.
+# ``None`` means no such proof exists (including legacy results) and must be
+# treated as uncertified by downstream canonical-selection logic.
+# --------------------------------------------------------------------------- #
+class RansHoldChannel(BaseModel):
+    """Final-window spread for one steady force/moment channel."""
+
+    mean: float
+    min_value: float
+    max_value: float
+    peak_to_peak: float = Field(ge=0)
+    relative_spread: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_measured_spread(self) -> "RansHoldChannel":
+        values = (
+            self.mean,
+            self.min_value,
+            self.max_value,
+            self.peak_to_peak,
+            self.relative_spread,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("RANS hold channel values must be finite")
+        if self.max_value < self.min_value:
+            raise ValueError("RANS hold channel max_value is below min_value")
+        expected_peak_to_peak = self.max_value - self.min_value
+        tolerance = 1e-12 * max(
+            1.0, abs(expected_peak_to_peak), abs(self.peak_to_peak)
+        )
+        if abs(self.peak_to_peak - expected_peak_to_peak) > tolerance:
+            raise ValueError("RANS hold channel peak_to_peak does not match min/max")
+        return self
+
+
+class RansHoldCertificate(BaseModel):
+    """Proof that an exact raw RANS final window held in all channels.
+
+    A producer emits this object only for a certified window.  It never
+    contains downsampled ``steady_history`` samples or synthesized values;
+    the source coefficient artifact remains the immutable evidence.
+    """
+
+    reducer_version: str = Field(min_length=1, max_length=160)
+    sample_count: int = Field(ge=1)
+    required_sample_count: int = Field(ge=1)
+    start_iteration: int = Field(ge=0)
+    end_iteration: int = Field(ge=0)
+    relative_tolerance: float = Field(gt=0)
+    absolute_floor: float = Field(gt=0)
+    certified: Literal[True] = True
+    cl: RansHoldChannel
+    cd: RansHoldChannel
+    cm: RansHoldChannel
+
+    @model_validator(mode="after")
+    def _validate_final_window(self) -> "RansHoldCertificate":
+        if self.sample_count < self.required_sample_count:
+            raise ValueError("RANS hold certificate lacks its required final-window samples")
+        if self.end_iteration < self.start_iteration:
+            raise ValueError("RANS hold certificate iteration window is reversed")
+        if self.end_iteration - self.start_iteration + 1 != self.sample_count:
+            raise ValueError("RANS hold certificate iteration window does not match sample count")
+        if not all(
+            math.isfinite(value)
+            for value in (self.relative_tolerance, self.absolute_floor)
+        ):
+            raise ValueError("RANS hold certificate tolerances must be finite")
+        for name, channel in (("Cl", self.cl), ("Cd", self.cd), ("Cm", self.cm)):
+            expected_spread = channel.peak_to_peak / (
+                abs(channel.mean) + self.absolute_floor
+            )
+            tolerance = 1e-12 * max(
+                1.0, abs(expected_spread), abs(channel.relative_spread)
+            )
+            if abs(channel.relative_spread - expected_spread) > tolerance:
+                raise ValueError(
+                    f"RANS hold {name} relative_spread does not match its raw window"
+                )
+            if channel.relative_spread > self.relative_tolerance:
+                raise ValueError(
+                    f"RANS hold {name} relative_spread exceeds the configured tolerance"
+                )
+        return self
+
+
+# --------------------------------------------------------------------------- #
 # STEADY-HISTORY CONTRACT (pinned 2026-07-07, task #30). Shipped per steady
 # point in result.json as ``point.steady_history`` with EXACTLY this shape
 # whenever the steady solve used oscillating-averaging OR failed both
@@ -987,6 +1278,23 @@ class PolarPoint(BaseModel):
         description="Pinned URANS recording contract: integer-period window, time-weighted stats, "
         "stationarity verdict and per-frame coefficient samples. None for steady and no-shedding "
         "points (frame_track=null in result.json).",
+    )
+    urans_cycle_certificate: Optional[UransCycleCertificate] = Field(
+        default=None,
+        description="Versioned clean-cycle certification beside the frozen frame_track contract. "
+        "Present for new shedding URANS evidence; null for steady/no-shedding or legacy evidence.",
+    )
+    no_shedding_certificate: Optional[NoSheddingCertificate] = Field(
+        default=None,
+        description="Versioned slow-wake observation proof for a current no-shedding URANS "
+        "steady-equivalent result. Null means a current engine could not certify the "
+        "physical observation; absent is legacy evidence.",
+    )
+    rans_hold_certificate: Optional[RansHoldCertificate] = Field(
+        default=None,
+        description="Versioned all-channel steady RANS final-window proof. Present only when raw "
+        "Cl/Cd/Cm history has a certified hold; null means this point is legacy or lacks "
+        "publishable RANS hold evidence.",
     )
     fidelity: Literal["rans", "urans_precalc", "urans_full"] = Field(
         default="rans",

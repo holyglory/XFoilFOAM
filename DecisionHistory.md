@@ -48,6 +48,7 @@
   geometry in a true modal that owns focus and scroll.
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
+  [D-2026-07-27-workload-aware-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
@@ -64,6 +65,15 @@
   generation-pinned GCS archive before same-case continuation, without
   fulfilling its remote point or consuming a fresh physical-solver attempt.
   [D-2026-07-25-rejected-checkpoint-broker]
+- Confirmed intent: raw solver evidence remains immutable while scientific
+  interpretation is versioned and append-only. URANS publishes only the exact
+  final clean contiguous suffix (FAST: 3 cycles; FINAL: 5), with corrupt
+  prefixes retained as evidence. A current RANS point needs an exact
+  all-channel 200-row final-window proof or takes the normal targeted FAST
+  URANS path. Archive-backed reinterpretation selects only authenticated,
+  generation-pinned raw evidence and routes recoverable trajectories to exact
+  continuation before a fresh run.
+  [D-2026-07-28-immutable-result-interpretations]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -149,6 +159,32 @@
   offered a polar promotion action that could never succeed; hiding every
   conflict would instead conceal genuinely distinct immutable evidence.
 
+## D-2026-07-28-immutable-result-interpretations — Raw evidence stays immutable; reductions are selected explicitly
+
+- Decision: preserve each solver attempt and its generation-pinned GCS archive
+  unchanged, then record every RANS/URANS reduction as an append-only,
+  versioned interpretation with an append-only canonical-selection event.
+  FAST URANS selects exactly the final 3 contiguous clean cycles and FINAL
+  URANS exactly the final 5; a damaged tail continues the exact checkpoint in
+  bounded physical-period increments before any fresh solve. Recovery counts
+  only authenticated transient time, owns each period boundary exactly once,
+  and accepts a later repair only from the same resolved boundary-condition and
+  solver-implementation cell; competing archive actions cannot share an active
+  request or verify receipt. Current RANS
+  values publish only when the raw final 200 iterations prove stable Cl, Cd,
+  and Cm; otherwise the angle proceeds to FAST URANS. A no-shedding URANS
+  result needs its own typed slow-wake certificate and an exact time-weighted
+  Cl/Cd/Cm bounded-force-history witness; it waits for the verified GCS archive
+  reduction instead of publishing from an engine summary.
+  [detail](DecisionDetails/D-2026-07-28-immutable-result-interpretations.md)
+- Why: overwriting attempts or averaging a fixed trailing slice loses the
+  corrupt-startup diagnosis and makes later numerical improvements impossible
+  to audit. Re-solving every old result wastes valid GCS evidence, while
+  accepting an arbitrary clean-looking subset can stitch across a corrupt
+  period. An immutable ledger plus exact suffix selection conserves evidence,
+  lets a newer reducer repair historical projections reproducibly, and keeps
+  continuation ahead of a costly fresh generation.
+
 ## D-2026-07-25-solver-incident-log — Solver incidents are a compact, system-owned event log
 
 - Decision: replace the permanently expanded solver-reliability panel with one
@@ -187,7 +223,10 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
   a write boundary never shortens or otherwise reschedules the physical
   Courant-controlled timestep. Raw trajectories remain immutable, but
   preliminary certification searches the latest clean physical suffix when a
-  fixed startup discard leaves the period missing or ambiguous. Accepted
+  fixed startup discard leaves the period missing or ambiguous. Final
+  certification searches dense trailing sample-count suffixes before the
+  percentage-of-history candidates, so a short clean wake cannot be hidden by
+  a long chain of retained continuations. Accepted
   preliminary force histories and media expose exactly the last three clean
   whole periods; the existing 4.5-period independent-half/stationarity
   certificate remains the acceptance floor.
@@ -215,7 +254,11 @@ Detail: [DecisionDetails/D-2026-07-24-urans-clean-tail.md](DecisionDetails/D-202
   its one derivative from the live trigger preserves throughput without
   weakening the acceptance gate. The physically banded
   suffix selector then reuses only valid stored evidence without deleting raw
-  history or weakening stationarity.
+  history or weakening stationarity. A percentage-only suffix search was also
+  insufficient after many continuations: even its shortest 2.5% window could
+  contain a long corrupt prefix. Dense end-anchored sample candidates find the
+  same byte-backed certificate without changing the live monitor or acceptance
+  gates.
 
 ## D-2026-07-25-geometry-scale-wake — Measure thick-section wakes on real projected height
 
@@ -5231,3 +5274,38 @@ Detail: [DecisionDetails/D-2026-07-19-urans-physical-tail.md](DecisionDetails/D-
 
 - Decision: preliminary URANS decides steady versus shedding from the complete trailing 2.1-slow-period physical horizon, while its compact trailing integer-period window remains responsible only for periodic coefficients, frame density, and publication. A non-flat physical tail must continue through the existing stationarity controller even when its final compact slice is locally quiet.
 - Why: using one period-cropped history for both decisions repeatedly rejected a real AoA 20 continuation after restoring its complete GCS trajectory. Treating the quiet slice as steady discards physical evidence; accepting it immediately bypasses stationarity; extending every case blindly wastes solver capacity. Independent byte-backed windows preserve the real solver sequence and route the still-relaxing case to bounded same-case continuation.
+
+## D-2026-07-27-docker-storage-gc — Age-bounded Docker garbage collection
+
+Detail: [DecisionDetails/D-2026-07-27-docker-storage-gc.md](DecisionDetails/D-2026-07-27-docker-storage-gc.md)
+
+- Decision: production runs a daily, persistent systemd cleanup that removes
+  only Docker images unused by every container and older than 72 hours, then
+  bounds rebuildable BuildKit cache to a 10 GB hot set independent of age.
+  Never prune containers, volumes, networks, databases, solver state, or
+  evidence.
+- Why: manual cleanup let 300 unused image records and 80.23 GB of rebuildable
+  cache close solver storage admission again. Unrestricted system pruning is
+  broader than the observed defect; immediate post-deploy deletion removes the
+  local rollback window. Age-bounded, low-priority garbage collection reclaims
+  deployment churn automatically while preserving live services and recent
+  rollback images.
+
+## D-2026-07-27-workload-aware-disk-admission — Reserve remaining local work
+
+Detail: [DecisionDetails/D-2026-07-27-workload-aware-disk-admission.md](DecisionDetails/D-2026-07-27-workload-aware-disk-admission.md)
+
+- Decision: replace the fixed `24 GiB × active CPU-slot count` admission
+  estimate with conservative per-remaining-case reserves for local RANS, fast
+  URANS, and final URANS work. Keep a 20 GiB system floor, one 24 GiB unknown
+  next-local-job reserve, a 95% emergency ceiling, and a full fallback for
+  malformed work. Do not charge hub-issued work executing on another solver as
+  production local jobs; use local mounted-volume `statfs` when the engine disk
+  endpoint is temporarily saturated.
+- Why: the old rule reported 236 GiB required for a live mixed workload whose
+  directories occupied about 8.2 GiB because it treated execution slots as
+  full-batch disk exposures. Removing admission would repeat the full-disk
+  outage, while charging remote promises double-counts storage already owned by
+  the remote/GCS path. Measured p95 evidence sizes support conservative
+  fidelity-specific reserves that still allocate 24.375 GiB to a fresh
+  78-angle RANS sweep and fail safe for unknown work.

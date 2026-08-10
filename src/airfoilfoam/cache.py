@@ -234,15 +234,24 @@ class EngineCache:
         polymesh_dir: Path,
         n_cells: int,
         evidence_dir: Optional[Path] = None,
+        resolved_mesh_identity: Optional[dict[str, object]] = None,
     ) -> bool:
-        """Atomically publish a built ``constant/polyMesh`` under ``key``."""
+        """Atomically publish a built ``constant/polyMesh`` under ``key``.
+
+        ``resolved_mesh_identity`` is copied from the signed mesh-evidence
+        manifest after hashing the actual mesh bytes.  It is informational for
+        cache inspection only; cache validity still authenticates every payload
+        member and never trusts this field as a substitute for byte checks.
+        """
         try:
             if not polymesh_dir.is_dir():
                 return False
             entry_dir = self.mesh_root / key
             if (entry_dir / MANIFEST_NAME).exists():
                 return False  # already published by a concurrent job
-            extra = {"nCells": int(n_cells)}
+            extra: dict[str, object] = {"nCells": int(n_cells)}
+            if resolved_mesh_identity is not None:
+                extra["resolvedMeshIdentity"] = dict(resolved_mesh_identity)
             evidence_files = (
                 [
                     (src, Path(MESH_EVIDENCE_PAYLOAD_DIR) / rel)

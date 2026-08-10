@@ -24,6 +24,10 @@ from pydantic import BaseModel, Field
 
 from .. import __version__, physics
 from ..airfoil import load_airfoil
+from ..archive_reduction import (
+    ArchiveReductionError,
+    reduce_remote_archive_clean_cycles,
+)
 from ..cache import EngineCache
 from ..capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
 from ..config import get_settings
@@ -347,6 +351,19 @@ class VerifyRemoteEvidenceManifestRequest(BaseModel):
                 "manifestMemberSetSha256"
             )
         return manifest
+
+
+class ArchiveCleanCycleReductionRequest(BaseModel):
+    """One authenticated, generation-pinned archive interpretation request.
+
+    This deliberately names only an immutable evidence pointer and the
+    fidelity policy.  Chord, speed, AoA, force history, and frame samples are
+    read from the verified raw archive; callers cannot substitute a browser
+    payload or a downsampled historical result.
+    """
+
+    remote: dict[str, object]
+    fidelity: Literal["urans_precalc", "urans_full"]
 
 
 def _sha256_file(path: Path) -> str:
@@ -1542,6 +1559,45 @@ def create_app() -> FastAPI:
             }
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except EvidenceStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/internal/evidence-archives/reduce-clean-cycles")
+    def reduce_remote_evidence_clean_cycles(
+        request: ArchiveCleanCycleReductionRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        """Create a read-only clean-cycle interpretation from raw GCS evidence.
+
+        This is intentionally a control-plane operation rather than a result
+        mutation: the sweeper persists the returned reduction as an append-only
+        interpretation and separately decides whether an accepted result may
+        become canonical.  The endpoint always reads the exact GCS generation
+        and never accepts force-history/frame data from the caller.
+        """
+
+        _require_control_plane_bearer(
+            settings.control_plane_token, authorization
+        )
+        try:
+            pointer = RemoteEvidencePointer.from_dict(request.remote)
+            if pointer.to_dict() != request.remote:
+                raise ValueError(
+                    "remote must be the exact canonical complete evidence pointer"
+                )
+            remote_store = evidence_object_store(settings)
+            if remote_store is None:
+                raise EvidenceStoreError("GCS evidence storage is not configured")
+            reduction = reduce_remote_archive_clean_cycles(
+                remote_store,
+                pointer,
+                fidelity=request.fidelity,
+            )
+            return reduction.to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ArchiveReductionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except EvidenceStoreError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

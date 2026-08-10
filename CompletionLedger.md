@@ -1,5 +1,49 @@
 # Completion Ledger
 
+- **Immutable clean-cycle interpretation rollout:** The engine now certifies
+  only a terminal contiguous clean suffix (FAST: exactly 3 cycles; FINAL:
+  exactly 5), and the control plane has additive interpretation,
+  selection, archive-backfill, and recovery-action paths. Raw attempts and
+  GCS archives remain immutable; corrected coefficients can be selected only
+  from an authenticated, current, exact-generation archive. A selected cycle
+  is independently rejected at the engine-client, core, staging, and archive
+  selector boundaries if it violates the 20-sample/20-frame, phase,
+  shape/amplitude, or producer-verdict contract. Reaching the FAST 9 or FINAL
+  12 physical-period cap is recorded as a critical terminal interpretation,
+  never another automatic recovery handoff. The cap now counts only the
+  authenticated transient interval (`transient_start` through the latest
+  archived coefficient/frame time), never retained steady-prefix rows; a
+  missing/corrupt marker permits a fresh rerun but never an exact continuation.
+  Cross-version acceptance is fenced to the resolved boundary condition and
+  normalized producing-job implementation, and one active recovery action owns
+  each request/verify receipt. Production still needs an append-only migration
+  reconciliation after its already-applied historical 0091–0093 receipts,
+  the bounded GCS-backed backfill, routing of any
+  continuation/fresh-rerun receipts through the normal FAST → FINAL ladder,
+  and a post-run cache/API check showing representative repaired points use
+  their selected interpretation. Verify that no uncertified/noisy first
+  period is published, no capped trajectory is resubmitted automatically, and
+  that raw evidence hashes and attempt rows are unchanged before removing this
+  item. Do not roll out the engine half while live OpenFOAM work exists, and
+  retire or hand off the unmanaged production recovery gateway through a
+  guarded idle-only procedure so no control-plane writer remains pinned to an
+  older engine image. The authenticated reducer's one-to-three-period recommendation now
+  reaches only its exact same-case continuation; a migration-era pending,
+  target-less action may adopt it once, while routed work remains immutable.
+  FULL recovery is fenced to airfoil, revision, boundary condition, AoA, and
+  solver implementation, and a later accepted exact FINAL satisfies the action
+  instead of creating a duplicate physical owner. The current reducer build is
+  `clean-cycle-v3`, which changes immutable interpretation identity because it
+  eliminates shared period-boundary samples and records authenticated physical
+  recovery progress. A current no-shedding URANS result is also evidence-gated:
+  it needs a versioned slow-wake certificate, at least 20 raw and transported
+  samples, finite all-channel statistics, and a time-weighted Cl/Cd/Cm witness
+  that recomputes exactly from the bounded force-history payload. It cannot
+  publish directly from an engine summary; only the matching verified GCS
+  archive reduction may select it. Production backfill must route malformed,
+  shortened, or witness-mismatched no-shedding history through the same
+  bounded recovery path before this item can close.
+
 - **Three-stage solver rollout and campaign burn-in:** The regression-backed
   RANS screening → fast preliminary URANS → final verified URANS controller,
   exact-generation continuation gate, automatic final scheduling, critical
@@ -132,8 +176,15 @@
   and AoA 1 is bound on the hub. AoA 7 and 9 are now live non-consuming
   continuations from their exact GCS-verified checkpoints; AoA 7 reports
   `mesh_build_count=0` and resumed at `t=0.12888 s`. AoA 0 had no authenticated
-  restartable archive and is one explicit replacement solve. The remote pool is
-  saturated at its 40-slot cap; AoA -2 remains pending until capacity returns.
+  restartable archive and is one explicit replacement solve. The live repair
+  exposed one remaining selector-scale gap: after many continuations, a clean
+  final wake can be shorter than the shortest 2.5%-of-history candidate.
+  Recovery v10's failing-before/fixed-after regression and focused 140-test
+  force/frame suite pass; it searches dense end-anchored sample suffixes
+  without changing the final 4.5-period certificate or three-period output.
+  The remote pool is in a controlled admission drain at its retained 40-slot
+  cap while active AoA -2, 0, and 7 jobs finish uninterrupted; AoA 9 remains
+  queued for the v10 runtime.
   Readiness still requires accepted clean-period evidence plus verified
   hub/GCS binding for AoA -2, 0, 7, and 9, retirement of obsolete generations,
   the already-committed cancellation-preservation worker code to be installed
@@ -154,9 +205,10 @@
   cancelled/invalid point generations still require the separate
   forensic/rejected-evidence path. Do not claim migration complete or remove
   any of those six local sources until their exact durable acknowledgement
-  exists. Preserve at least 80 GiB free while the campaign is active, keep the
-  temporary hydration cache bounded, and remeasure active-case growth before
-  increasing solver concurrency.
+  exists. Preserve the workload-aware 20 GiB system floor, measured remaining
+  local-work reserve, and 24 GiB next-local-job reserve while the campaign is
+  active; keep the temporary hydration cache bounded, and remeasure active-case
+  growth before increasing solver concurrency.
 
 - **Parallel remote-solver GCS delivery:** The credential-redacted,
   generation-pinned brokered upload path and the role-separated `hz-solver2`

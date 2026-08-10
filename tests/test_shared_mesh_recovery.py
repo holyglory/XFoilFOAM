@@ -7,6 +7,7 @@ failure.
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -405,6 +406,12 @@ def test_recovered_mesh_evidence_is_checksummed_cached_and_archived_per_point(
         "name": actual.mesher,
         "cacheVersion": meshers[actual.mesher].cache_version,
     }
+    identity = manifest["resolvedMeshIdentity"]
+    assert identity["schemaVersion"] == 1
+    assert len(identity["contentSha256"]) == 64
+    assert len(identity["recipeSha256"]) == 64
+    assert identity["fileCount"] == 5
+    assert identity["logicalByteSize"] > 0
     assert manifest["qaVerdict"]["maxNonOrthogonalityDeg"] == pytest.approx(54.0)
     assert manifest["attempts"][0]["disposition"] == "deterministic_mesh"
     assert manifest["attempts"][0]["mesher"]["name"] == pipeline.MESH_RECOVERY_PUBLIC_MESHER
@@ -422,7 +429,10 @@ def test_recovered_mesh_evidence_is_checksummed_cached_and_archived_per_point(
         actual,
         mesher=meshers[actual.mesher],
     )
-    assert (cache.mesh_root / cache_key / "meshEvidence" / "manifest.json").is_file()
+    cached_entry = cache.mesh_root / cache_key
+    assert (cached_entry / "meshEvidence" / "manifest.json").is_file()
+    cached_manifest = json.loads((cached_entry / "manifest.json").read_text())
+    assert cached_manifest["resolvedMeshIdentity"] == identity
 
     point_case = tmp_path / "point"
     pipeline._link_mesh(point_case, mesh_dir, NoopRunner())
@@ -450,6 +460,38 @@ def test_recovered_mesh_evidence_is_checksummed_cached_and_archived_per_point(
     archived_paths = {entry["path"] for entry in point_evidence["files"]}
     assert "openfoam/mesh_evidence/manifest.json" in archived_paths
     assert "openfoam/mesh_evidence/manifest.sha256" in archived_paths
+
+
+def test_resolved_mesh_identity_hashes_logical_gzip_members(tmp_path):
+    """Compression metadata must not turn the same OpenFOAM mesh into a new series."""
+    mesh_dir = tmp_path / "mesh"
+    _fake_polymesh(mesh_dir, "v1")
+    resolved = MeshParams(first_cell_height_chords=0.002)
+    mesher = CountingMesher()
+
+    raw = pipeline.resolved_mesh_identity(mesh_dir, resolved, mesher, 1.0)
+
+    points = mesh_dir / "constant" / "polyMesh" / "points"
+    points_bytes = points.read_bytes()
+    points.unlink()
+    # Different gzip metadata is intentionally irrelevant: identity is over
+    # the logical decompressed member and the normalized suffix-free path.
+    (points.with_suffix(".gz")).write_bytes(gzip.compress(points_bytes, mtime=1))
+    compressed = pipeline.resolved_mesh_identity(mesh_dir, resolved, mesher, 1.0)
+
+    assert compressed["contentSha256"] == raw["contentSha256"]
+    assert compressed["recipeSha256"] == raw["recipeSha256"]
+    assert compressed["fileCount"] == raw["fileCount"]
+    assert compressed["logicalByteSize"] == raw["logicalByteSize"]
+
+    changed_recipe = pipeline.resolved_mesh_identity(
+        mesh_dir,
+        resolved.model_copy(update={"first_cell_height_chords": 0.004}),
+        mesher,
+        1.0,
+    )
+    assert changed_recipe["contentSha256"] == raw["contentSha256"]
+    assert changed_recipe["recipeSha256"] != raw["recipeSha256"]
 
 
 def test_link_mesh_replaces_stale_evidence_symlink_with_verified_copy(tmp_path):

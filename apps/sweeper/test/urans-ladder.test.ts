@@ -181,6 +181,34 @@ async function createAcceptedPrecalcGeneration(input: {
   cm: number;
   createdAt?: Date;
 }): Promise<string> {
+  const createdAt = input.createdAt ?? new Date();
+  // A pinned FAST-URANS generation is only eligible to seed FINAL when its
+  // producing job proves the exact same cell. Keep this fixture truthful so
+  // verify consumption exercises the production provenance gate.
+  const [sourceJob] = await db
+    .insert(simJobs)
+    .values({
+      engineJobId: `${PREFIX}-${input.label}`,
+      methodKey: "openfoam.urans",
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      campaignId,
+      jobKind: "targeted",
+      referenceChordM: CHORD,
+      wave: 2,
+      status: "done",
+      totalCases: 1,
+      completedCases: 1,
+      requestPayload: {
+        aoas: [input.aoaDeg],
+        uransFidelity: "precalc",
+      },
+      submittedAt: createdAt,
+      finishedAt: createdAt,
+    })
+    .returning({ id: simJobs.id });
   const [attempt] = await db
     .insert(resultAttempts)
     .values({
@@ -189,6 +217,7 @@ async function createAcceptedPrecalcGeneration(input: {
       bcId,
       simulationPresetRevisionId: revisionId,
       aoaDeg: input.aoaDeg,
+      simJobId: sourceJob.id,
       engineJobId: `${PREFIX}-${input.label}`,
       engineCaseSlug: `aoa_${input.aoaDeg}_precalc`,
       methodKey: "openfoam.urans",
@@ -204,8 +233,8 @@ async function createAcceptedPrecalcGeneration(input: {
       converged: true,
       unsteady: true,
       evidencePayload: { fidelity: "urans_precalc" },
-      solvedAt: input.createdAt ?? new Date(),
-      createdAt: input.createdAt ?? new Date(),
+      solvedAt: createdAt,
+      createdAt,
     })
     .returning({ id: resultAttempts.id });
   await db.insert(resultClassifications).values({
@@ -235,6 +264,7 @@ async function createAcceptedPrecalcGeneration(input: {
       resultId: input.resultId,
       resultAttemptId: attempt.id,
       airfoilId,
+      simJobId: sourceJob.id,
       engineJobId: `${PREFIX}-${input.label}`,
       engineCaseSlug: `aoa_${input.aoaDeg}_precalc`,
       solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
@@ -250,7 +280,7 @@ async function createAcceptedPrecalcGeneration(input: {
     resultId: input.resultId,
     resultAttemptId: attempt.id,
     airfoilId,
-    simJobId: null,
+    simJobId: sourceJob.id,
     engineJobId: `${PREFIX}-${input.label}`,
     engineCaseSlug: `aoa_${input.aoaDeg}_precalc`,
     aoaDeg: input.aoaDeg,
@@ -2815,10 +2845,13 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       classification: "accepted",
     });
     expect(await precalcSnapshotForVerifyItem(db, pendingVerify!)).toEqual({
-      resultAttemptId: pendingVerify!.precalcResultAttemptId,
-      cl: 1,
-      cd: 0.05,
-      cm: -0.06,
+      outcome: "accepted",
+      snapshot: {
+        resultAttemptId: pendingVerify!.precalcResultAttemptId,
+        cl: 1,
+        cd: 0.05,
+        cm: -0.06,
+      },
     });
     // The natural-cell projection is mutable and may already reflect another
     // generation. Submission must still copy generation B's exact immutable
@@ -4330,15 +4363,14 @@ describe("tier-2a durable-obligation priority MUST-CATCH", () => {
         })
         .returning();
       checkpointResultId = checkpointResult.id;
-      checkpointResultAttemptId =
-        await attachRestartableContinuationAttempt({
-          resultId: checkpointResult.id,
-          aoaDeg: targetAoa,
-          simJobId: checkpointJob.id,
-          engineJobId: checkpointJob.engineJobId,
-          engineCaseSlug: "aoa_14.475",
-          qualityWarnings: warnings,
-        });
+      checkpointResultAttemptId = await attachRestartableContinuationAttempt({
+        resultId: checkpointResult.id,
+        aoaDeg: targetAoa,
+        simJobId: checkpointJob.id,
+        engineJobId: checkpointJob.engineJobId,
+        engineCaseSlug: "aoa_14.475",
+        qualityWarnings: warnings,
+      });
       await db.insert(simPrecalcObligationAttempts).values({
         obligationId: obligation.id,
         simJobId: checkpointJob.id,

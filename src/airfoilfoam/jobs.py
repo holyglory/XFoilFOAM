@@ -1,9 +1,11 @@
-"""Execute a polar job with one mesh per chord and CPU-budgeted AoA scheduling."""
+"""Execute a polar job with speed-resolved meshes and CPU-budgeted AoA scheduling."""
 from __future__ import annotations
 
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 from . import physics
@@ -12,7 +14,7 @@ from .cache import EngineCache
 from .cancellation import JobCancelled
 from .capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
 from .config import Settings, get_settings
-from .meshing.base import get_mesher
+from .meshing.base import Mesher, get_mesher
 from .models import (
     CaseSpec,
     ContinuationFailureKind,
@@ -22,6 +24,7 @@ from .models import (
     JobResult,
     JobState,
     JobStatus,
+    MeshParams,
     Polar,
     PolarPoint,
     PolarRequest,
@@ -48,6 +51,23 @@ from .storage import JobStore
 logger = logging.getLogger(__name__)
 
 ProgressCb = Optional[Callable[[JobStatus], None]]
+
+
+@dataclass(frozen=True)
+class PreparedMesh:
+    """One physically resolved mesh shared only by compatible AoA cells.
+
+    A request can list multiple speeds for the same chord.  The wall spacing is
+    resolved from the actual speed, so the ownership key is the speed-specific
+    resolved recipe rather than the chord alone.  Equal recipes intentionally
+    share this object; all AoAs for a physical cell reuse it.
+    """
+
+    mesh_dir: Path
+    resolved: MeshParams
+    n_cells: int
+    mesher: Mesher
+    requested_recipe_key: str
 
 
 def _slug(text: str) -> str:
@@ -96,6 +116,9 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         mean_images={field: url(rel) for field, rel in outcome.mean_images.items()},
         force_history=history,
         frame_track=outcome.frame_track,
+        urans_cycle_certificate=outcome.urans_cycle_certificate,
+        no_shedding_certificate=outcome.no_shedding_certificate,
+        rans_hold_certificate=outcome.rans_hold_certificate,
         fidelity=outcome.fidelity,
         steady_history=outcome.steady_history,
         quality_warnings=outcome.quality_warnings,
@@ -312,10 +335,12 @@ def execute_job(
     ensure_not_cancelled()
     set_status(JobState.running, "resolving job resources", phase=JobPhase.waiting_cpu)
 
-    # 1. Mesh ONCE per chord (sized for the highest speed -> finest wall; reused by
-    #    every speed/AoA of that chord). URANS precalc jobs build the DERIVED
-    #    half-resolution mesh (contract item 1) — the mesh cache keys on the
-    #    resolved params, so it caches separately from the full mesh.
+    # 1. Resolve mesh wall spacing for every physical (chord, speed) cell.
+    #    Earlier jobs resolved only at max(speeds), causing lower-speed cases to
+    #    inherit a batch-dependent first-cell height.  Dedupe only cells whose
+    #    complete resolved recipe is byte-for-byte identical; every AoA of a
+    #    cell then reuses that one prepared mesh.  URANS precalc jobs still use
+    #    the derived half-resolution profile before this per-speed resolution.
     #    Continuation jobs skip meshing entirely: the staged saved case already
     #    contains the mesh it was solved on.
     job_mesh, mesh_quality_warnings = effective_mesh_params_for_airfoil(
@@ -325,59 +350,109 @@ def execute_job(
         urans_mesh=request.urans_mesh,
         urans_precalc_mesh=request.urans_precalc_mesh,
     )
-    max_speed = max(speeds)
-    meshes: dict[float, tuple] = {}
-    for chord in chords if request.continue_from is None else []:
-        ensure_not_cancelled()
-        resolved = resolve_mesh_params(
-            job_mesh, CaseSpec(chord=chord, speed=max_speed, aoa_deg=0.0), request.fluid
-        )
-        mesh_dir = store.job_dir(job_id) / "meshes" / _chord_slug(chord)
-        wait_for_cpu(1, f"waiting for CPU before meshing chord {chord:g}")
-        with cpu_tokens.acquire(
-            1,
-            on_wait=lambda _snapshot, c=chord: wait_for_cpu(1, f"waiting for CPU before meshing chord {c:g}"),
-            on_acquired=lambda _snapshot, c=chord: cpu_acquired(1, JobPhase.meshing, f"meshing chord {c:g}"),
-        ):
-            qa_spec = CaseSpec(chord=chord, speed=max_speed, aoa_deg=0.0)
-
-            def validate(candidate_dir, candidate_resolved):
-                return validate_shared_mesh(
-                    candidate_dir,
+    meshes: dict[tuple[float, float], PreparedMesh] = {}
+    prepared_by_recipe: dict[str, PreparedMesh] = {}
+    if request.continue_from is None:
+        for chord in chords:
+            for speed in speeds:
+                cell = (chord, speed)
+                # Preserve request de-duplication semantics if callers include
+                # a repeated speed/chord value.
+                if cell in meshes:
+                    continue
+                ensure_not_cancelled()
+                qa_spec = CaseSpec(chord=chord, speed=speed, aoa_deg=0.0)
+                resolved = resolve_mesh_params(job_mesh, qa_spec, request.fluid)
+                requested_mesher = get_mesher(resolved.mesher)
+                # This key includes airfoil bytes, chord, all resolved mesh
+                # params, and the selected mesher implementation.  It is a
+                # safe in-job dedupe key before any recovery candidate runs.
+                requested_recipe_key = cache.mesh_key(
                     airfoil,
-                    candidate_resolved,
-                    qa_spec,
-                    request.fluid,
-                    request.roughness,
-                    request.solver,
-                    runner,
-                    plan.solver_processes,
-                    mesh_quality_warnings,
+                    chord,
+                    resolved,
+                    mesher=requested_mesher,
                 )
+                prepared = prepared_by_recipe.get(requested_recipe_key)
+                if prepared is None:
+                    mesh_dir = (
+                        store.job_dir(job_id)
+                        / "meshes"
+                        / _chord_slug(chord)
+                        # Keep the complete content-addressed key in the
+                        # worktree too.  A visual prefix is not a safe
+                        # ownership identity: a collision must never make
+                        # two distinct resolved recipes share a mutable mesh
+                        # directory before cache authentication runs.
+                        / f"recipe-{requested_recipe_key}"
+                    )
+                    wait_for_cpu(
+                        1,
+                        f"waiting for CPU before meshing c={chord:g} m, U={speed:g} m/s",
+                        case=qa_spec,
+                    )
+                    with cpu_tokens.acquire(
+                        1,
+                        on_wait=lambda _snapshot, c=chord, s=speed, case=qa_spec: wait_for_cpu(
+                            1,
+                            f"waiting for CPU before meshing c={c:g} m, U={s:g} m/s",
+                            case=case,
+                        ),
+                        on_acquired=lambda _snapshot, c=chord, s=speed, case=qa_spec: cpu_acquired(
+                            1,
+                            JobPhase.meshing,
+                            f"meshing c={c:g} m, U={s:g} m/s",
+                            case=case,
+                        ),
+                    ):
 
-            mr, resolved, _recovered = prepare_mesh_with_recovery(
-                mesh_dir,
-                airfoil,
-                resolved,
-                chord,
-                mesher,
-                runner,
-                cancel_check=ensure_not_cancelled,
-                cache=cache,
-                validate=validate,
-                quality_warnings=mesh_quality_warnings,
-            )
-        mesh_stats["count"] += 1
-        set_status(JobState.running, "mesh ready", phase=JobPhase.waiting_cpu, cpu_tokens_waiting=0, cpu_tokens_held=0)
-        # A recovery candidate is a different, fingerprinted mesher.  Carry
-        # that exact implementation into every downstream case instead of
-        # continuing to pass the request-level public/default mesher.
-        meshes[chord] = (
-            mesh_dir,
-            resolved,
-            mr.n_cells,
-            get_mesher(resolved.mesher),
-        )
+                        def validate(candidate_dir, candidate_resolved, *, _qa_spec=qa_spec):
+                            return validate_shared_mesh(
+                                candidate_dir,
+                                airfoil,
+                                candidate_resolved,
+                                _qa_spec,
+                                request.fluid,
+                                request.roughness,
+                                request.solver,
+                                runner,
+                                plan.solver_processes,
+                                mesh_quality_warnings,
+                            )
+
+                        mr, actual_resolved, _recovered = prepare_mesh_with_recovery(
+                            mesh_dir,
+                            airfoil,
+                            resolved,
+                            chord,
+                            requested_mesher,
+                            runner,
+                            cancel_check=ensure_not_cancelled,
+                            cache=cache,
+                            validate=validate,
+                            quality_warnings=mesh_quality_warnings,
+                        )
+                    mesh_stats["count"] += 1
+                    set_status(
+                        JobState.running,
+                        "mesh ready",
+                        phase=JobPhase.waiting_cpu,
+                        cpu_tokens_waiting=0,
+                        cpu_tokens_held=0,
+                    )
+                    # Recovery can change topology or wall height.  Carry its
+                    # exact mesher and resolved params into every point that
+                    # shares this recipe; do not fall back to the request-level
+                    # mesher after the evidence has named a different one.
+                    prepared = PreparedMesh(
+                        mesh_dir=mesh_dir,
+                        resolved=actual_resolved,
+                        n_cells=mr.n_cells,
+                        mesher=get_mesher(actual_resolved.mesher),
+                        requested_recipe_key=requested_recipe_key,
+                    )
+                    prepared_by_recipe[requested_recipe_key] = prepared
+                meshes[cell] = prepared
 
     render_images = bool(request.solver.write_images)
     results: dict[tuple, dict[float, tuple[str, CaseOutcome]]] = {}
@@ -501,6 +576,7 @@ def execute_job(
                 settings=settings,
                 aoa_deg=spec.aoa_deg,
                 expected_engine=expected_engine,
+                corrective_tail_periods=request.corrective_tail_periods,
             )
         except OpenFOAMError as exc:
             permanent = isinstance(exc, ContinuationPermanentError)
@@ -617,7 +693,11 @@ def execute_job(
         #     polars run concurrently. Image URLs are namespaced under the polar dir.
         def run_polar(chord: float, speed: float) -> tuple[float, float, PolarMarchResult]:
             ensure_not_cancelled()
-            mesh_dir, resolved, n_cells, mesh_mesher = meshes[chord]
+            prepared = meshes[(chord, speed)]
+            mesh_dir = prepared.mesh_dir
+            resolved = prepared.resolved
+            n_cells = prepared.n_cells
+            mesh_mesher = prepared.mesher
             polar_dir = store.case_dir(job_id, polar_slug(chord, speed))
             wait_for_cpu(plan.solver_processes, f"waiting for CPU before polar U={speed:g}")
 
@@ -709,7 +789,11 @@ def execute_job(
         #     reuses the prebuilt mesh; all cases run concurrently (best throughput).
         def run_one(spec: CaseSpec) -> tuple:
             ensure_not_cancelled()
-            mesh_dir, resolved, n_cells, mesh_mesher = meshes[spec.chord]
+            prepared = meshes[(spec.chord, spec.speed)]
+            mesh_dir = prepared.mesh_dir
+            resolved = prepared.resolved
+            n_cells = prepared.n_cells
+            mesh_mesher = prepared.mesher
             solver_phase = JobPhase.solving_urans if request.solver.force_transient else JobPhase.solving_rans
             solver_name = (
                 dialect.transient_solver_command

@@ -32,7 +32,13 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildPolarRequest } from "../src/build-request";
-import { fidelityForPoint, qualityWarningsForPoint, STEADY_OSCILLATING_MARKER, steadyHistoryForPoint } from "../src/ingest";
+import {
+  fidelityForPoint,
+  qualityWarningsForPoint,
+  solverRegimeForPoint,
+  STEADY_OSCILLATING_MARKER,
+  steadyHistoryForPoint,
+} from "../src/ingest";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractFixture = (): Record<string, unknown> =>
@@ -196,17 +202,39 @@ describe("ingest fidelity/steady-history persistence helpers", () => {
     expect(fidelityForPoint({ ...base, fidelity: "rans" } as PolarPoint, undefined, "t")).toBe("rans");
   });
 
-  it("fidelityForPoint: missing echo on a fidelity-requesting URANS job falls back to the REQUESTED tier with a loud drift log", () => {
+  it("fidelityForPoint: missing echo on a fidelity-requesting URANS job falls back to the REQUESTED tier, including no-shedding points", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     expect(fidelityForPoint({ ...base, unsteady: true } as PolarPoint, "precalc", "t")).toBe("urans_precalc");
     expect(fidelityForPoint({ ...base, unsteady: true } as PolarPoint, "full", "t")).toBe("urans_full");
-    expect(errorSpy).toHaveBeenCalledTimes(2);
+    expect(fidelityForPoint(base, "precalc", "t")).toBe("urans_precalc");
+    expect(errorSpy).toHaveBeenCalledTimes(3);
     expect(String(errorSpy.mock.calls[0][0])).toContain("fidelity echo MISSING");
   });
 
   it("fidelityForPoint: legacy engines (no echo, no request) grade by regime — the 0034 backfill semantics", () => {
     expect(fidelityForPoint({ ...base, unsteady: true } as PolarPoint, undefined, "t")).toBe("urans_full");
     expect(fidelityForPoint(base, undefined, "t")).toBe("rans");
+  });
+
+  it("keeps a certified no-shedding URANS point attributable to URANS", () => {
+    expect(
+      solverRegimeForPoint(
+        { ...base, unsteady: false } as PolarPoint,
+        "urans_precalc",
+        "test",
+      ),
+    ).toBe("urans");
+    expect(solverRegimeForPoint(base, "rans", "test")).toBe("rans");
+  });
+
+  it("MUST-CATCH: fails closed when a shedding payload claims RANS fidelity", () => {
+    expect(() =>
+      solverRegimeForPoint(
+        { ...base, unsteady: true } as PolarPoint,
+        "rans",
+        "test",
+      ),
+    ).toThrow(/regime contract drift/);
   });
 
   it("steadyHistoryForPoint: persists a contract-valid payload verbatim; null passes through", () => {

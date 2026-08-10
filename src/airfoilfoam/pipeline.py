@@ -8,6 +8,7 @@ Two entry points:
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import logging
@@ -25,7 +26,11 @@ from typing import Callable, Optional
 from . import physics
 from .airfoil import Airfoil, max_concave_curvature
 from .cache import EngineCache, SeedHit
-from .capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
+from .capabilities import (
+    MESH_IDENTITY_VERSION,
+    MESH_RECOVERY_VERSION,
+    URANS_RECOVERY_VERSION,
+)
 from .case.builder import CaseBuilder
 from .cancellation import JobCancelled
 from .config import Settings, get_settings
@@ -60,12 +65,18 @@ from .models import (
     FrameTrackWindow,
     JobPhase,
     MeshParams,
+    NoSheddingCertificate,
     RansFailurePolicy,
+    RansHoldCertificate,
+    RansHoldChannel,
     RansPrecalcPromotion,
     RoughnessParams,
     SolverParams,
     SteadyHistory,
     SteadyHistoryWindow,
+    UransCycleCertificate,
+    UransCycleCertificateCycle,
+    UransCycleDisposition,
     UransFidelity,
     apply_urans_fidelity,
     derive_precalc_resolved_wall_mesh_params,
@@ -91,7 +102,11 @@ from .openfoam.dialects import (
 )
 from .postprocess.forces import (
     AveragedCoefficients,
+    RansHoldAnalysis,
+    RansHoldChannelAnalysis,
+    RANS_HOLD_CERTIFICATE_VERSION,
     analyze_steady_oscillation,
+    analyze_rans_hold,
     force_is_steady,
     parse_force_coefficients,
     parse_y_plus,
@@ -108,27 +123,41 @@ from .postprocess.images import (
 )
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
+    CLEAN_CYCLE_CERTIFICATION_VERSION,
     DRIFT_ABS_FLOOR,
     ESTABLISHED_MIN_CYCLES,
     PERIOD_AMBIGUITY_TOLERANCE,
     PERIOD_ESTIMATE_MIN_CYCLES,
     SHEDDING_STROUHAL_BAND,
     ChannelWindowStats,
+    CleanCycleAudit,
     ForceHistory,
     PeriodEstimate,
     PeriodWindowStats,
     StablePeriodResult,
+    additional_periods_for_clean_suffix,
+    audit_period_cycles,
+    clean_cycle_recovery_exhausted,
+    clean_cycle_minimum,
     clean_periodic_tail,
+    coefficient_invalid_value_times,
     coefficient_series,
     discard_startup,
     estimate_period,
     force_history as compute_force_history,
+    force_history_transport_statistics,
     frame_coefficients,
     frame_target_times,
     is_no_shedding,
+    NO_SHEDDING_ABS_FLOOR,
+    NO_SHEDDING_MIN_SAMPLE_COUNT,
+    NO_SHEDDING_REL_TOL,
+    no_shedding_min_observation_s,
     period_window_stats,
     stable_two_period_window,
+    terminal_period_estimate,
     trailing_period_series,
+    with_clean_cycle_recovery_progress,
 )
 
 CancelCheck = Optional[Callable[[], None]]
@@ -177,6 +206,21 @@ class CaseOutcome:
     continuation_transient_subdir: Optional[str] = None
     force_history: Optional[ForceHistory] = None
     frame_track: Optional[FrameTrack] = None
+    #: Versioned per-cycle reduction beside the frozen ``frame_track``
+    #: transport. Emitted for every new shedding URANS attempt, including a
+    #: non-certified attempt which must be continued rather than published.
+    urans_cycle_certificate: Optional[UransCycleCertificate] = None
+    #: Versioned physical-observation proof for a URANS result whose wake is
+    #: genuinely steady.  This is intentionally separate from the periodic
+    #: clean-cycle certificate: no-shedding has no meaningful period, but it
+    #: still needs a slow-wake horizon and real force samples before it can be
+    #: selected as a steady-equivalent polar point.
+    no_shedding_certificate: Optional[NoSheddingCertificate] = None
+    #: Versioned all-channel final-window proof for current steady RANS.  It
+    #: remains ``None`` when the raw source cannot prove the hold; that is an
+    #: explicit current-engine null on the wire, distinct from legacy payload
+    #: omission and intentionally handled fail-closed by the control plane.
+    rans_hold_certificate: Optional[RansHoldCertificate] = None
     #: Solve tier that produced the reported values (contract echo):
     #: "rans" | "urans_precalc" | "urans_full".
     fidelity: str = "rans"
@@ -187,6 +231,42 @@ class CaseOutcome:
     quality_warnings: list[str] = field(default_factory=list)
     failure_disposition: FailureDisposition = FailureDisposition.none
     error: Optional[str] = None
+
+
+def _rans_hold_certificate_from_raw(
+    coefficient_path: Path,
+) -> Optional[RansHoldCertificate]:
+    """Build a proof-only RANS certificate from the exact raw final window.
+
+    The reducer deliberately returns ``None`` for a short, malformed,
+    non-finite, non-monotone, or unsettled Cl/Cd/Cm window.  It must never
+    serialize a downsampled steady-history diagnostic as a hold proof.
+    """
+    analysis: Optional[RansHoldAnalysis] = analyze_rans_hold(coefficient_path)
+    if analysis is None or not analysis.certified:
+        return None
+
+    def channel(value: RansHoldChannelAnalysis) -> RansHoldChannel:
+        return RansHoldChannel(
+            mean=value.mean,
+            min_value=value.min_value,
+            max_value=value.max_value,
+            peak_to_peak=value.peak_to_peak,
+            relative_spread=value.relative_spread,
+        )
+
+    return RansHoldCertificate(
+        reducer_version=RANS_HOLD_CERTIFICATE_VERSION,
+        sample_count=analysis.sample_count,
+        required_sample_count=analysis.required_sample_count,
+        start_iteration=analysis.start_iteration,
+        end_iteration=analysis.end_iteration,
+        relative_tolerance=analysis.relative_tolerance,
+        absolute_floor=analysis.absolute_floor,
+        cl=channel(analysis.cl),
+        cd=channel(analysis.cd),
+        cm=channel(analysis.cm),
+    )
 
 
 @dataclass
@@ -1158,6 +1238,141 @@ URANS_STABLE_RETAINED_CYCLES = 5.0
 #: tail) can never floor the whole-period count below the retention target.
 URANS_STABLE_STOP_MARGIN_CYCLES = 0.5
 URANS_MIN_FRAMES_PER_CYCLE = 20.0
+
+
+def _canonical_json_digest(payload: object) -> str:
+    """SHA-256 for a compact, key-sorted JSON value.
+
+    Mesh identity deliberately uses the logical OpenFOAM files only.  It must
+    not depend on filesystem mtimes, cache hit state, the job directory, or
+    quality/evidence sidecars whose contents can legitimately differ while
+    the mesh itself is identical.
+    """
+
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _logical_mesh_file_record(path: Path) -> tuple[str, int]:
+    """Return ``(sha256, byte_size)`` over a mesh file's logical bytes.
+
+    OpenFOAM may gzip individual ``polyMesh`` members.  Compression headers
+    embed non-physical details such as timestamps, so a ``.gz`` member is
+    represented by the decompressed bytes under the equivalent suffix-free
+    path.  Reading to EOF also validates the gzip trailer before an identity
+    can be emitted.
+    """
+
+    digest = hashlib.sha256()
+    byte_size = 0
+    try:
+        # Keep the two call forms explicit: ``Path.open`` is an instance
+        # method, while ``gzip.open`` takes the path as its first argument.
+        source_context = (
+            gzip.open(path, "rb")
+            if path.suffix.lower() == ".gz"
+            else path.open("rb")
+        )
+        with source_context as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_size += len(chunk)
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        raise InfrastructureError(
+            f"cannot read logical mesh member {path}: {exc}"
+        ) from exc
+    return digest.hexdigest(), byte_size
+
+
+def resolved_mesh_identity(
+    mesh_dir: Path,
+    resolved: MeshParams,
+    actual_mesher: Mesher,
+    chord: float,
+) -> dict[str, object]:
+    """Fingerprint the exact shared ``polyMesh`` and its resolved recipe.
+
+    ``contentSha256`` is a digest of a canonical file manifest built from all
+    regular members below ``constant/polyMesh``.  ``recipeSha256`` separately
+    identifies the resolved, physical mesh recipe that was requested and the
+    implementation that generated it.  This makes a batch-independent mesh
+    compatibility key available without claiming that matching Reynolds or a
+    display label implies matching wall spacing.
+    """
+
+    mesh_dir = Path(mesh_dir)
+    poly_mesh = mesh_dir / "constant" / "polyMesh"
+    if not poly_mesh.is_dir():
+        raise InfrastructureError(
+            f"resolved mesh identity requires constant/polyMesh: {poly_mesh}"
+        )
+
+    records: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    for member in sorted(poly_mesh.rglob("*"), key=lambda item: item.as_posix()):
+        # The prepared shared mesh must be material bytes, not an alias to a
+        # mutable case tree.  Point cases may symlink the whole polyMesh, but
+        # this function is called only for the prepared source mesh.
+        if member.is_symlink():
+            raise InfrastructureError(
+                f"resolved mesh identity refuses symlinked member {member}"
+            )
+        if not member.is_file():
+            continue
+        relative = member.relative_to(poly_mesh).as_posix()
+        logical_relative = relative[:-3] if relative.lower().endswith(".gz") else relative
+        if not logical_relative or logical_relative in seen_paths:
+            raise InfrastructureError(
+                "resolved mesh identity has ambiguous logical member path "
+                f"{logical_relative!r} in {poly_mesh}"
+            )
+        seen_paths.add(logical_relative)
+        sha256, byte_size = _logical_mesh_file_record(member)
+        records.append(
+            {
+                "path": logical_relative,
+                "logicalByteSize": byte_size,
+                "sha256": sha256,
+            }
+        )
+    if not records:
+        raise InfrastructureError(
+            f"resolved mesh identity found no regular polyMesh members in {poly_mesh}"
+        )
+
+    content_sha256 = _canonical_json_digest(
+        {
+            "schemaVersion": MESH_IDENTITY_VERSION,
+            "files": records,
+        }
+    )
+    recipe_sha256 = _canonical_json_digest(
+        {
+            "schemaVersion": MESH_IDENTITY_VERSION,
+            "chordM": float(chord),
+            "params": resolved.model_dump(mode="json"),
+            "mesher": {
+                "name": actual_mesher.name,
+                "cacheVersion": actual_mesher.cache_version,
+            },
+        }
+    )
+    return {
+        "schemaVersion": MESH_IDENTITY_VERSION,
+        "contentSha256": content_sha256,
+        "recipeSha256": recipe_sha256,
+        "fileCount": len(records),
+        "logicalByteSize": sum(int(record["logicalByteSize"]) for record in records),
+    }
 #: Field-write cadence for URANS frame/media evidence. This is deliberately
 #: denser than ``URANS_MIN_FRAMES_PER_CYCLE``: the latter is the cross-runtime
 #: quality gate, while this controls how many real states the player can export.
@@ -1183,6 +1398,9 @@ URANS_IMPULSE_CORRECTORS = 3
 #: band.  Two periods are the minimum needed to distinguish a weak, slowly
 #: emerging wake from a genuinely flat signal; the extra tenth period keeps
 #: the evidence floor clear of an exact two-cycle edge verdict.
+# Compatibility name retained for runbook/tests that report this policy.  The
+# authoritative computation itself now lives beside the shared unsteady
+# reducer, so archive and live proof horizons cannot drift.
 URANS_NO_SHEDDING_MIN_SLOW_PERIODS = 2.1
 #: The acquisition controller overshoots the evidence floor by another tenth
 #: of a slow period so
@@ -1280,22 +1498,184 @@ def _no_shedding_min_observation_s(speed: float, chord: float) -> float:
     and chord before solving; an invalid value returns infinity so this safety
     gate fails closed if it is ever called outside that boundary.
     """
-    try:
-        u = float(speed)
-        c = float(chord)
-    except (TypeError, ValueError):
-        return math.inf
-    slow_st = float(SHEDDING_STROUHAL_BAND[0])
-    if not (
-        math.isfinite(u)
-        and math.isfinite(c)
-        and math.isfinite(slow_st)
-        and u > 0
-        and c > 0
-        and slow_st > 0
+    return no_shedding_min_observation_s(speed, chord)
+
+
+def _no_shedding_observation_certificate(
+    history: Optional[ForceHistory],
+    quality: "UransQuality",
+    spec: CaseSpec,
+    *,
+    raw_coefficient_paths: list[Path] | None = None,
+) -> tuple[Optional[NoSheddingCertificate], str | None]:
+    """Build the current-engine proof for a physically steady URANS wake.
+
+    A no-shedding boolean is a solver-internal conclusion, not publishable
+    evidence on its own.  This adapter makes the exact retained observation
+    auditable on the wire: it requires finite, strictly ordered force samples,
+    a real slow-wake physical duration, and coefficient statistics that still
+    meet the stamped amplitude floor.  It intentionally never manufactures a
+    certificate from a summary, a final time marker, or a missing history.
+    """
+    if not quality.ok or not quality.no_shedding:
+        return None, "URANS did not produce an accepted no-shedding quality verdict"
+    if history is None:
+        return None, "URANS no-shedding verdict has no retained force history"
+
+    channels = (history.t, history.cl, history.cd, history.cm)
+    transport_count = len(history.t)
+    if (
+        transport_count < NO_SHEDDING_MIN_SAMPLE_COUNT
+        or any(len(channel) != transport_count for channel in channels)
     ):
-        return math.inf
-    return URANS_NO_SHEDDING_MIN_SLOW_PERIODS * c / (slow_st * u)
+        return None, "URANS no-shedding force-history channels are incomplete"
+    try:
+        numbers = [float(value) for channel in channels for value in channel]
+        source_count = int(history.samples)
+    except (TypeError, ValueError, OverflowError):
+        return None, "URANS no-shedding force-history values are malformed"
+    if source_count < NO_SHEDDING_MIN_SAMPLE_COUNT:
+        return None, "URANS no-shedding source history has too few raw samples"
+    if source_count < transport_count:
+        return None, "URANS no-shedding source sample count is below transported history"
+    if not all(math.isfinite(value) for value in numbers):
+        return None, "URANS no-shedding force history contains non-finite values"
+    if any(
+        float(history.t[index + 1]) <= float(history.t[index])
+        for index in range(transport_count - 1)
+    ):
+        return None, "URANS no-shedding force-history times are not strictly increasing"
+
+    def _finite_time(candidate: object) -> float | None:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) else None
+
+    # ``evaluate_urans_quality`` owns these endpoints for a real current run.
+    # The history endpoints are a strict compatible fallback for direct engine
+    # tests and archival fixtures which reconstruct the same raw observation.
+    start = _finite_time(quality.retained_start_time)
+    end = _finite_time(quality.retained_end_time)
+    if start is None:
+        start = _finite_time(history.window_start)
+    if end is None:
+        end = _finite_time(history.window_end)
+    if start is None:
+        start = float(history.t[0])
+    if end is None:
+        end = float(history.t[-1])
+    if end <= start:
+        return None, "URANS no-shedding observation window is invalid"
+
+    first_time = float(history.t[0])
+    last_time = float(history.t[-1])
+    endpoint_tolerance = 1e-9 * max(1.0, abs(start), abs(end), abs(first_time), abs(last_time))
+    if abs(first_time - start) > endpoint_tolerance or abs(last_time - end) > endpoint_tolerance:
+        return None, "URANS no-shedding observation window does not match retained force samples"
+
+    required = _no_shedding_min_observation_s(spec.speed, spec.chord)
+    observed = end - start
+    if not math.isfinite(required) or required <= 0:
+        return None, "URANS no-shedding physical observation horizon is invalid"
+    if observed + endpoint_tolerance < required:
+        return None, (
+            "URANS no-shedding observation is below the physical slow-wake horizon "
+            f"({observed:.6g}s < {required:.6g}s)"
+        )
+
+    if raw_coefficient_paths:
+        # A permissive coefficient reader intentionally drops non-finite rows
+        # for visualization.  A certification path must recover those raw
+        # timestamps before deciding which terminal physical window it owns;
+        # otherwise a NaN written after the last valid row could make the
+        # earlier trajectory look like a complete clean observation.
+        try:
+            raw_times, _raw_cl, _raw_cd, _raw_cm = coefficient_series(
+                raw_coefficient_paths
+            )
+            invalid_times = coefficient_invalid_value_times(raw_coefficient_paths)
+        except Exception as exc:  # noqa: BLE001 - proof must fail closed
+            return None, f"URANS no-shedding raw coefficient evidence is unreadable: {exc}"
+        if raw_times.size == 0:
+            return None, "URANS no-shedding raw coefficient evidence has no finite samples"
+        invalid_latest = (
+            max(float(timestamp) for timestamp in invalid_times)
+            if invalid_times.size
+            else float("-inf")
+        )
+        raw_latest = max(float(raw_times[-1]), invalid_latest)
+        expected_start = raw_latest - required
+        raw_tolerance = 1e-9 * max(
+            1.0,
+            abs(raw_latest),
+            abs(expected_start),
+            abs(start),
+            abs(end),
+        )
+        if abs(end - raw_latest) > raw_tolerance:
+            return None, (
+                "URANS no-shedding retained history does not reach the latest raw "
+                "coefficient timestamp"
+            )
+        if abs(start - expected_start) > raw_tolerance:
+            return None, (
+                "URANS no-shedding retained history is not the exact terminal "
+                "physical observation horizon"
+            )
+        if any(
+            expected_start - raw_tolerance
+            <= float(timestamp)
+            <= raw_latest + raw_tolerance
+            for timestamp in invalid_times
+        ):
+            return None, (
+                "URANS no-shedding terminal physical observation contains a "
+                "non-finite coefficient sample"
+            )
+        source_count = int(
+            sum(
+                expected_start - raw_tolerance
+                <= float(timestamp)
+                <= raw_latest + raw_tolerance
+                for timestamp in raw_times
+            )
+        )
+        if source_count < NO_SHEDDING_MIN_SAMPLE_COUNT:
+            return None, "URANS no-shedding terminal history has too few raw samples"
+        if source_count < transport_count:
+            return None, "URANS no-shedding raw sample count is below transported history"
+
+    try:
+        transport_statistics = force_history_transport_statistics(history)
+        certificate = NoSheddingCertificate(
+            reducer_version="no-shedding-v1",
+            certified=True,
+            required_observation_s=required,
+            observation_start_time=start,
+            observation_end_time=end,
+            observed_observation_s=observed,
+            source_sample_count=source_count,
+            transport_sample_count=transport_count,
+            relative_tolerance=NO_SHEDDING_REL_TOL,
+            absolute_floor=NO_SHEDDING_ABS_FLOOR,
+            cl_mean=float(history.cl_mean),
+            cd_mean=float(history.cd_mean),
+            cm_mean=float(history.cm_mean),
+            cl_rms=float(history.cl_rms),
+            cd_rms=float(history.cd_rms),
+            cm_rms=float(history.cm_rms),
+            transport_cl_mean=transport_statistics.cl_mean,
+            transport_cd_mean=transport_statistics.cd_mean,
+            transport_cm_mean=transport_statistics.cm_mean,
+            transport_cl_rms=transport_statistics.cl_rms,
+            transport_cd_rms=transport_statistics.cd_rms,
+            transport_cm_rms=transport_statistics.cm_rms,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, f"URANS no-shedding observation certificate is invalid: {exc}"
+    return certificate, None
 
 
 def _force_history_for_no_shedding_horizon(
@@ -1322,21 +1702,38 @@ def _force_history_for_no_shedding_horizon(
         return None
     try:
         times, _cl, _cd, _cm = coefficient_series(coeff_paths)
+        invalid_times = coefficient_invalid_value_times(coeff_paths)
     except Exception:  # noqa: BLE001 - ordinary in-flight evidence degradation
         return None
     if times.size < 2:
         return None
     first = float(times[0])
-    last = float(times[-1])
-    total_span = last - first
+    last_valid = float(times[-1])
+    raw_latest = max(
+        last_valid,
+        max(float(timestamp) for timestamp in invalid_times)
+        if invalid_times.size
+        else float("-inf"),
+    )
+    total_span = raw_latest - first
     if not math.isfinite(total_span) or total_span <= 0:
         return None
     required = _no_shedding_min_observation_s(spec.speed, spec.chord)
     cutoff = first
     if math.isfinite(required) and required > 0 and total_span > required:
-        cutoff = last - required
+        cutoff = raw_latest - required
+    # `coefficient_series` deliberately removes bad rows for ordinary plots.
+    # A current no-shedding proof owns the exact terminal physical horizon, so
+    # any non-finite raw sample inside it (including one after the last valid
+    # row) must force a normal URANS recovery instead of being averaged away.
+    raw_tolerance = 1e-9 * max(1.0, abs(cutoff), abs(raw_latest))
+    if any(
+        cutoff - raw_tolerance <= float(timestamp) <= raw_latest + raw_tolerance
+        for timestamp in invalid_times
+    ):
+        return None
     try:
-        return compute_force_history(
+        history = compute_force_history(
             coeff_paths,
             spec.speed,
             spec.chord,
@@ -1349,6 +1746,18 @@ def _force_history_for_no_shedding_horizon(
         )
     except Exception:  # noqa: BLE001 - caller retains its primary force history
         return None
+    if not history.t:
+        return None
+    # Do not silently move the endpoint back to the last valid row after an
+    # invalid terminal write.  The later certificate repeats this proof from
+    # raw members before publication; this early guard keeps the quality path
+    # from mistakenly taking its fallback steady shortcut.
+    if (
+        abs(float(history.t[-1]) - raw_latest) > raw_tolerance
+        or (total_span >= required and abs(float(history.t[0]) - cutoff) > raw_tolerance)
+    ):
+        return None
+    return history
 
 
 class MediaBudget:
@@ -1388,6 +1797,9 @@ class UransQuality:
     # True when the transient is physically steady (no vortex shedding); its
     # time-averaged coefficients are the valid answer and no refine is possible.
     no_shedding: bool = False
+    #: Versioned per-cycle evidence audit.  It remains a runtime object here;
+    #: finalization serializes it beside the immutable force/field artifacts.
+    clean_cycle_audit: Optional[CleanCycleAudit] = None
 
 
 @dataclass
@@ -2186,14 +2598,28 @@ def _require_exact_source_result_point(
 
 def _continuation_corrective_tail_periods(
     source_result: dict[str, object] | None,
+    requested_corrective_tail_periods: int | None = None,
 ) -> float:
-    """Return only the corrective tail justified by immutable source evidence.
+    """Return the validated archive request or source-evidence corrective tail.
 
-    Three newly measured periods are needed to replace a non-stationary or
-    sparse published tail.  A pure retained-cycle deficit or wall-budget stop
-    keeps the ordinary one-period floor; blindly giving every continuation
-    three periods can itself create a timeout under the bounded tier budget.
+    The archive reducer has a more complete view of the terminal raw evidence
+    than the live result projection.  When its exact same-case recommendation
+    is present, preserve it rather than trying to infer a lower tail from a
+    collapsed warning list.  Direct internal callers still reject malformed
+    values so a bypass of the API model cannot turn a fresh/corrupt request
+    into an unbounded physical run.
     """
+
+    if requested_corrective_tail_periods is not None:
+        if (
+            isinstance(requested_corrective_tail_periods, bool)
+            or not isinstance(requested_corrective_tail_periods, int)
+            or not 1 <= requested_corrective_tail_periods <= 3
+        ):
+            raise _continuation_permanent(
+                "continuation corrective_tail_periods must be an integer from 1 through 3"
+            )
+        return float(requested_corrective_tail_periods)
 
     if source_result is None:
         return 1.0
@@ -2807,6 +3233,7 @@ def stage_continuation_case(
     settings: Settings | None = None,
     aoa_deg: float | None = None,
     expected_engine: EngineIdentity | None = None,
+    corrective_tail_periods: int | None = None,
 ) -> ContinuationSource:
     """Stage a prior trajectory from live state or exact immutable evidence.
 
@@ -2847,7 +3274,10 @@ def stage_continuation_case(
                 f"case and AoA {aoa_deg:g}"
             )
     source_result = _require_exact_source_result_point(metadata, aoa_deg)
-    corrective_tail_periods = _continuation_corrective_tail_periods(source_result)
+    corrective_tail_periods = _continuation_corrective_tail_periods(
+        source_result,
+        corrective_tail_periods,
+    )
     selected_transient_subdir = None
     if source_result is not None:
         recorded_subdir = source_result.get("continuation_transient_subdir")
@@ -3100,6 +3530,7 @@ def evaluate_urans_quality(
     min_frames_per_cycle: float = URANS_MIN_FRAMES_PER_CYCLE,
     min_no_shedding_observation_s: Optional[float] = None,
     no_shedding_history: Optional[ForceHistory] = None,
+    no_shedding_history_authoritative: bool = False,
 ) -> UransQuality:
     # No-shedding first: a symmetric airfoil at alpha~0 (or any weakly-loaded
     # point) escalated to URANS runs a physically steady transient. Its force
@@ -3114,8 +3545,15 @@ def evaluate_urans_quality(
     # is not.  When the caller supplies that byte-backed tail, it exclusively
     # owns the steady-vs-shedding decision; the compact history continues to
     # own periodic coefficient/period grading.
+    # A live caller that has parsed raw coefficient evidence supplies an
+    # authoritative terminal no-shedding witness.  `None` in that mode means
+    # the raw source was corrupt/incomplete, not "fall back to a shorter
+    # display history".  Direct/unit callers keep the legacy fallback unless
+    # they explicitly opt into the raw-evidence contract.
     steady_decision_history = (
-        no_shedding_history if no_shedding_history is not None else history
+        no_shedding_history
+        if no_shedding_history_authoritative
+        else (no_shedding_history if no_shedding_history is not None else history)
     )
     if (
         steady_decision_history is not None
@@ -3223,6 +3661,7 @@ def _precalc_stationarity_unavailable(
     *,
     period_s: Optional[float] = None,
     allow_continuation: bool = True,
+    clean_cycle_audit: Optional[CleanCycleAudit] = None,
 ) -> UransQuality:
     """Fail a mandatory precalc stationarity grade closed.
 
@@ -3257,6 +3696,7 @@ def _precalc_stationarity_unavailable(
         retained_start_time=quality.retained_start_time,
         retained_end_time=quality.retained_end_time,
         no_shedding=quality.no_shedding,
+        clean_cycle_audit=clean_cycle_audit or quality.clean_cycle_audit,
     )
 
 
@@ -3281,6 +3721,7 @@ class _PrecalcCertifiedWindow:
     stats: PeriodWindowStats
     stationarity_stats: PeriodWindowStats
     total_retained_cycles: float
+    clean_cycle_audit: Optional[CleanCycleAudit]
 
 
 class _PrecalcCertifiedWindowUnavailable(RuntimeError):
@@ -3292,11 +3733,226 @@ class _PrecalcCertifiedWindowUnavailable(RuntimeError):
         *,
         period_s: Optional[float] = None,
         allow_continuation: bool = True,
+        clean_cycle_audit: Optional[CleanCycleAudit] = None,
     ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.period_s = period_s
         self.allow_continuation = allow_continuation
+        self.clean_cycle_audit = clean_cycle_audit
+
+
+def _cycle_certificate_disposition(
+    cycle,
+    *,
+    selected_start: float | None,
+) -> UransCycleDisposition:
+    """Map reducer-local cycle evidence into the stable engine contract.
+
+    A terminal clean suffix is the only selected data.  Earlier clean cycles
+    are explicitly marked ``startup`` rather than silently disappearing, so a
+    later reducer/UI can show why the published mean starts where it does.
+    """
+    if cycle.clean and selected_start is not None and cycle.start + 1e-10 >= selected_start:
+        return UransCycleDisposition.selected
+    if cycle.clean:
+        return UransCycleDisposition.startup
+    reasons = (*cycle.hard_reasons, *cycle.soft_reasons)
+    lowered = " ".join(reasons).lower()
+    if "frame" in lowered or "phase gap" in lowered or "sample" in lowered:
+        return UransCycleDisposition.insufficient_frames
+    if "high-frequency" in lowered or "noise" in lowered:
+        return UransCycleDisposition.numerically_noisy
+    if cycle.hard_reasons:
+        return UransCycleDisposition.hard_corrupt
+    return UransCycleDisposition.settling_outlier
+
+
+def _urans_cycle_certificate(audit: CleanCycleAudit) -> UransCycleCertificate:
+    """Build the transport certificate without mutating raw solver evidence."""
+    selected_start = audit.selected_start
+    selected_cycles = [
+        cycle
+        for cycle in audit.cycles
+        if cycle.clean
+        and selected_start is not None
+        and cycle.start + 1e-10 >= selected_start
+    ]
+    return UransCycleCertificate(
+        reducer_version=CLEAN_CYCLE_CERTIFICATION_VERSION,
+        period_s=audit.period_s,
+        phase_samples=audit.phase_samples,
+        required_clean_cycles=audit.required_clean_cycles,
+        terminal_clean_cycles=audit.terminal_clean_cycles,
+        selected_cycle_start_index=(
+            selected_cycles[0].index if selected_cycles else None
+        ),
+        certified=audit.certified,
+        cadence_adjusted=audit.cadence_adjusted,
+        cycles=[
+            UransCycleCertificateCycle(
+                index=cycle.index,
+                t_start=cycle.start,
+                t_end=cycle.end,
+                coefficient_samples=cycle.samples,
+                field_frames=cycle.frames or 0,
+                phase_max_gap=cycle.phase_gap,
+                phase_shift_bins=abs(cycle.phase_shift_bins),
+                cl_mean=cycle.cl_mean,
+                cd_mean=cycle.cd_mean,
+                cm_mean=cycle.cm_mean,
+                cl_shape_error=cycle.cl_shape_error,
+                cd_shape_error=cycle.cd_shape_error,
+                cm_shape_error=cycle.cm_shape_error,
+                cl_amplitude_deviation=cycle.cl_amplitude_deviation,
+                cd_amplitude_deviation=cycle.cd_amplitude_deviation,
+                cm_amplitude_deviation=cycle.cm_amplitude_deviation,
+                cl_high_frequency=cycle.cl_high_frequency,
+                cd_high_frequency=cycle.cd_high_frequency,
+                cm_high_frequency=cycle.cm_high_frequency,
+                disposition=_cycle_certificate_disposition(
+                    cycle,
+                    selected_start=selected_start,
+                ),
+                reasons=[*cycle.hard_reasons, *cycle.soft_reasons],
+            )
+            for cycle in audit.cycles
+        ],
+    )
+
+
+def _evidence_backed_cycle_certificate(
+    audit: CleanCycleAudit | None,
+) -> UransCycleCertificate | None:
+    """Return a transport certificate only when actual field times were seen.
+
+    Coefficient-only unit fixtures are intentionally a separate synthetic
+    mode.  They can exercise period math but must not serialize a deceptive
+    `field_frames=0` production certificate.  Real case/archive inputs carry
+    an OpenFOAM control dictionary and therefore produce integer frame counts
+    (including an honest zero when the field recorder failed).
+    """
+    if audit is None or any(cycle.frames is None for cycle in audit.cycles):
+        return None
+    return _urans_cycle_certificate(audit)
+
+
+def _clean_cycle_tail_for_case(
+    case_dir: Path,
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    solver_params: SolverParams,
+    *,
+    early_stopped: bool,
+):
+    """Return the exact clean tail plus a diagnostic audit when available.
+
+    The engine never promotes a periodic result from a whole-history average.
+    This helper gives live grading and finalization the identical source
+    selection: the current retained trajectory, actual written field times,
+    and the fidelity-specific 3/5 clean-cycle floor.
+    """
+    if not coeff_paths:
+        return None, None, None
+    source = coefficient_series(coeff_paths)
+    t_all, cl_all, cd_all, cm_all = source
+    invalid_coefficient_times = coefficient_invalid_value_times(coeff_paths)
+    candidate = (
+        _early_stop_retained_series(case_dir, t_all, cl_all, cd_all, cm_all)
+        if early_stopped
+        else discard_startup(
+            t_all,
+            cl_all,
+            cd_all,
+            cm_all,
+            fraction=solver_params.transient_discard_fraction,
+        )
+    )
+    t_c, cl_c, cd_c, cm_c = candidate
+    fidelity = solver_params.urans_fidelity.value
+    required_cycles = clean_cycle_minimum(fidelity)
+    if not _has_openfoam_case_evidence(case_dir):
+        # Unit-level coefficient fixtures deliberately have no OpenFOAM case or
+        # field-state source.  Preserve that explicit synthetic-test mode as
+        # "frame evidence unavailable" rather than pretending coefficient
+        # samples are field frames.  Every real/live/archive case contains its
+        # frozen controlDict, so a real empty numeric-time set remains a hard
+        # missing-frame failure below.
+        return None, None, source
+    frame_times = _numeric_time_dirs(case_dir)
+    transient_origin = read_transient_start_marker(case_dir)
+    physical_latest = max(
+        float(t_all[-1]),
+        max(frame_times) if frame_times else float("-inf"),
+    )
+    tail = clean_periodic_tail(
+        t_c,
+        cl_c,
+        cd_c,
+        cm_c,
+        speed=spec.speed,
+        chord=spec.chord,
+        required_cycles=required_cycles,
+        fidelity=fidelity,
+        frame_times=frame_times,
+        min_frames_per_cycle=URANS_MIN_FRAMES_PER_CYCLE,
+        alpha_deg=spec.aoa_deg,
+        section_thickness_ratio=spec.section_thickness_ratio,
+        recovery_origin_time=transient_origin,
+        recovery_latest_time=physical_latest,
+        invalid_coefficient_times=invalid_coefficient_times,
+    )
+    if tail is not None:
+        return tail, tail.audit, source
+    # A failed tail still needs a visible, immutable audit.  Do not make up a
+    # cadence if it cannot be measured; explicit null then fails closed at the
+    # control plane rather than looking like a certificate.
+    estimate = estimate_period(
+        t_c,
+        cl_c,
+        speed=spec.speed,
+        chord=spec.chord,
+        alpha_deg=spec.aoa_deg,
+        section_thickness_ratio=spec.section_thickness_ratio,
+    )
+    if estimate is None or estimate.ambiguous:
+        estimate = terminal_period_estimate(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            speed=spec.speed,
+            chord=spec.chord,
+            required_cycles=required_cycles,
+            fidelity=fidelity,
+            alpha_deg=spec.aoa_deg,
+            section_thickness_ratio=spec.section_thickness_ratio,
+        )
+    if estimate is None or estimate.period_s <= 0 or not math.isfinite(estimate.period_s):
+        return None, None, source
+    audit = audit_period_cycles(
+        t_c,
+        cl_c,
+        cd_c,
+        cm_c,
+        estimate.period_s,
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+        frame_times=frame_times,
+        min_frames_per_cycle=URANS_MIN_FRAMES_PER_CYCLE,
+        invalid_coefficient_times=invalid_coefficient_times,
+    )
+    audit = with_clean_cycle_recovery_progress(
+        audit,
+        origin_time=transient_origin,
+        latest_time=physical_latest,
+    )
+    return None, audit, source
+
+
+def _has_openfoam_case_evidence(case_dir: Path) -> bool:
+    """Whether this is a real/archive case rather than a coefficient fixture."""
+    return (case_dir / "system" / "controlDict").is_file()
 
 
 def _precalc_certified_window(
@@ -3379,6 +4035,28 @@ def _precalc_certified_window(
                 alpha_deg=spec.aoa_deg,
                 section_thickness_ratio=spec.section_thickness_ratio,
             )
+    strict_cycle_evidence = _has_openfoam_case_evidence(case_dir)
+    clean_tail, clean_audit, _clean_source = _clean_cycle_tail_for_case(
+        case_dir,
+        coeff_paths,
+        spec,
+        solver_params,
+        early_stopped=early_stopped,
+    )
+    if strict_cycle_evidence and (clean_tail is None or clean_audit is None):
+        raise _PrecalcCertifiedWindowUnavailable(
+            "no terminal clean-cycle suffix with 20 coefficient samples and 20 field frames per cycle",
+            period_s=(
+                source_estimate.period_s
+                if source_estimate is not None
+                and source_estimate.period_s is not None
+                and math.isfinite(source_estimate.period_s)
+                else None
+            ),
+            clean_cycle_audit=clean_audit,
+        )
+    if clean_tail is not None and (source_estimate is None or source_estimate.ambiguous):
+        source_estimate = clean_tail.estimate
     if source_estimate is None:
         raise _PrecalcCertifiedWindowUnavailable(
             "no corroborated shedding period"
@@ -3395,10 +4073,18 @@ def _precalc_certified_window(
             allow_continuation=False,
         )
 
-    certified_estimate = source_estimate
-    certified_series = selected
-    total_retained_cycles = 0.0
-    if not early_stopped:
+    certified_estimate = clean_tail.estimate if clean_tail is not None else source_estimate
+    certified_series = clean_tail.series if clean_tail is not None else selected
+    total_retained_cycles = (
+        float(clean_audit.terminal_clean_cycles)
+        if clean_audit is not None
+        else 0.0
+    )
+    # Legacy pre-v2 trailing-window code remains below only as a compatibility
+    # reference for older diagnostic tests.  New evidence always owns the
+    # exact 3-cycle terminal clean suffix selected above; it must never be
+    # replaced by a longer whole-history or arbitrary 4.5-cycle window.
+    if not early_stopped and clean_tail is None:
         certification_cycles = _early_stop_certification_cycles(solver_params)
         available_span = float(t_c[-1]) - float(t_c[0])
         positive_steps = sorted(
@@ -3504,7 +4190,7 @@ def _precalc_certified_window(
         )
 
     stationarity_stats = stats
-    if not early_stopped:
+    if not early_stopped and clean_tail is None:
         cycle_mean_net_fraction = 0.0
         if len(stats.cycle_means) >= 2:
             drift_scale = max(
@@ -3577,6 +4263,7 @@ def _precalc_certified_window(
         stats=stats,
         stationarity_stats=stationarity_stats,
         total_retained_cycles=total_retained_cycles,
+        clean_cycle_audit=clean_audit,
     )
 
 
@@ -3668,6 +4355,7 @@ def _grade_precalc_established_oscillation(
                 else quality.measured_period_s
             ),
             allow_continuation=exc.allow_continuation,
+            clean_cycle_audit=exc.clean_cycle_audit,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed; log retains the diagnostic
         logger.warning(
@@ -3720,6 +4408,7 @@ def _grade_precalc_established_oscillation(
         frames_per_cycle=frames_per_cycle,
         retained_start_time=stats.window_start,
         retained_end_time=stats.window_end,
+        clean_cycle_audit=certified.clean_cycle_audit,
     )
 
 
@@ -3761,7 +4450,162 @@ def _grade_full_strict_stationarity(
         or URANS_APPARENT_FLAT_OBSERVATION_MARKER in quality.reason.lower()
     ):
         return quality
+    if not _has_openfoam_case_evidence(case_dir):
+        # Coefficient-only unit fixtures exercise the historical frame-track
+        # arithmetic, not a physical evidence archive.  Keep that narrow test
+        # compatibility path separate from live/archive cases, where missing
+        # numeric field directories are a hard certification failure.
+        return _grade_full_strict_stationarity_coefficient_fixture(
+            case_dir,
+            coeff_paths,
+            spec,
+            solver_params,
+            quality,
+            early_stopped=early_stopped,
+        )
 
+    period: Optional[float] = quality.measured_period_s
+    if not coeff_paths:
+        return _quality_with(
+            quality,
+            ok=False,
+            can_refine=False,
+            reason=(
+                "URANS strict stationarity verdict unavailable: coefficient "
+                f"evidence is missing; prior force-history grade: {quality.reason}"
+            ),
+        )
+    try:
+        clean_tail, clean_audit, _clean_source = _clean_cycle_tail_for_case(
+            case_dir,
+            coeff_paths,
+            spec,
+            solver_params,
+            early_stopped=early_stopped,
+        )
+        if clean_tail is None or clean_audit is None:
+            audit_period = (
+                clean_audit.period_s
+                if clean_audit is not None
+                and clean_audit.period_s > 0
+                and math.isfinite(clean_audit.period_s)
+                else period
+            )
+            return _quality_with(
+                quality,
+                ok=False,
+                can_refine=audit_period is not None,
+                measured_period_s=audit_period,
+                clean_cycle_audit=clean_audit,
+                reason=(
+                    "URANS clean-cycle certification unavailable: need a contiguous "
+                    "terminal suffix of 5 clean cycles with 20 coefficient samples "
+                    "and 20 field frames per cycle; prior force-history grade: "
+                    f"{quality.reason}"
+                ),
+            )
+        period = clean_tail.estimate.period_s
+        if period is None or not math.isfinite(period) or period <= 0:
+            return _quality_with(
+                quality,
+                ok=False,
+                can_refine=False,
+                clean_cycle_audit=clean_audit,
+                reason=(
+                    "URANS strict stationarity verdict unavailable: no valid "
+                    f"shedding period; prior force-history grade: {quality.reason}"
+                ),
+            )
+        t_c, cl_c, cd_c, cm_c = clean_tail.series
+        stats = period_window_stats(
+            t_c,
+            cl_c,
+            cd_c,
+            cm_c,
+            period,
+            drift_tolerance=solver_params.urans_drift_tolerance,
+            established_oscillation=False,
+            period_stable=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed before finalization
+        logger.warning(
+            "full strict stationarity grading failed for %s",
+            case_dir,
+            exc_info=True,
+        )
+        valid_period = (
+            period
+            if period is not None and math.isfinite(period) and period > 0
+            else None
+        )
+        return _quality_with(
+            quality,
+            ok=False,
+            can_refine=valid_period is not None,
+            measured_period_s=valid_period,
+            reason=(
+                "URANS strict stationarity verdict unavailable: grading error "
+                f"({type(exc).__name__}); prior force-history grade: {quality.reason}"
+            ),
+        )
+    if stats is None:
+        return _quality_with(
+            quality,
+            ok=False,
+            can_refine=True,
+            measured_period_s=period,
+            clean_cycle_audit=clean_audit,
+            reason=(
+                "URANS strict stationarity verdict unavailable: no whole-period "
+                f"statistics; prior force-history grade: {quality.reason}"
+            ),
+        )
+    if stats.stationary:
+        return _quality_with(
+            quality,
+            measured_period_s=stats.period_s,
+            retained_cycles=max(
+                quality.retained_cycles,
+                float(clean_audit.terminal_clean_cycles),
+            ),
+            retained_start_time=stats.window_start,
+            retained_end_time=stats.window_end,
+            clean_cycle_audit=clean_audit,
+        )
+
+    strict_reason = _full_strict_stationarity_reason(
+        stats,
+        solver_params.urans_drift_tolerance,
+    )
+    prior_reason = "" if quality.ok else quality.reason.strip()
+    return _quality_with(
+        quality,
+        ok=False,
+        can_refine=True,
+        reason=(f"{prior_reason}; {strict_reason}" if prior_reason else strict_reason),
+        measured_period_s=stats.period_s,
+        retained_cycles=float(stats.whole_periods),
+        retained_start_time=stats.window_start,
+        retained_end_time=stats.window_end,
+        clean_cycle_audit=clean_audit,
+    )
+
+
+def _grade_full_strict_stationarity_coefficient_fixture(
+    case_dir: Path,
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    solver_params: SolverParams,
+    quality: UransQuality,
+    *,
+    early_stopped: bool,
+) -> UransQuality:
+    """Legacy arithmetic retained only for non-OpenFOAM unit fixtures.
+
+    This code is deliberately unreachable for a real or archived CFD case;
+    it lets existing coefficient-only tests continue to validate the prior
+    frame-track contract without pretending their samples are field frames.
+    """
     period: Optional[float] = quality.measured_period_s
     if not coeff_paths:
         return _quality_with(
@@ -3815,16 +4659,11 @@ def _grade_full_strict_stationarity(
             period,
             drift_tolerance=solver_params.urans_drift_tolerance,
             established_oscillation=False,
-            # The strict full-tier verdict is drift-only, but pass the same
-            # period-stability value as the final frame-track path so these two
-            # grades remain structurally identical as that contract evolves.
-            period_stable=(
-                estimate is not None and not estimate.ambiguous
-            ),
+            period_stable=(estimate is not None and not estimate.ambiguous),
         )
-    except Exception as exc:  # noqa: BLE001 - fail closed before finalization
+    except Exception as exc:  # noqa: BLE001 - fixture path stays fail closed
         logger.warning(
-            "full strict stationarity grading failed for %s",
+            "full strict stationarity fixture grading failed for %s",
             case_dir,
             exc_info=True,
         )
@@ -3856,7 +4695,6 @@ def _grade_full_strict_stationarity(
         )
     if stats.stationary:
         return quality
-
     strict_reason = _full_strict_stationarity_reason(
         stats,
         solver_params.urans_drift_tolerance,
@@ -4458,6 +5296,7 @@ def _run_transient_attempt(
             spec.speed, spec.chord
         ),
         no_shedding_history=no_shedding_tail,
+        no_shedding_history_authoritative=True,
     )
     quality = _grade_precalc_established_oscillation(
         tcase,
@@ -4489,6 +5328,7 @@ def _run_transient_attempt(
             frames_per_cycle=quality.frames_per_cycle,
             retained_start_time=quality.retained_start_time,
             retained_end_time=quality.retained_end_time,
+            clean_cycle_audit=quality.clean_cycle_audit,
         )
     if timed_out:
         # Honest partial grade: the requested span was NOT simulated, so the
@@ -4522,6 +5362,7 @@ def _run_transient_attempt(
             retained_start_time=quality.retained_start_time,
             retained_end_time=quality.retained_end_time,
             no_shedding=quality.no_shedding,
+            clean_cycle_audit=quality.clean_cycle_audit,
         )
     return TransientResult(
         avg=avg,
@@ -4601,6 +5442,7 @@ def _quality_with(quality: UransQuality, **updates) -> UransQuality:
         retained_start_time=quality.retained_start_time,
         retained_end_time=quality.retained_end_time,
         no_shedding=quality.no_shedding,
+        clean_cycle_audit=quality.clean_cycle_audit,
     )
     base.update(updates)
     return UransQuality(**base)
@@ -4635,7 +5477,11 @@ def _quality_allows_more_integration(quality: UransQuality, target_cycles: float
         quality.frames_per_cycle > 0.0
         and quality.frames_per_cycle + eps < URANS_MIN_FRAMES_PER_CYCLE
     )
-    not_stationary = "not stationary" in reason or "established-oscillation" in reason
+    not_stationary = (
+        "not stationary" in reason
+        or "established-oscillation" in reason
+        or "clean-cycle certification" in reason
+    )
     return too_short or too_sparse or not_stationary
 
 
@@ -4970,12 +5816,61 @@ def _extend_transient_until_periods(
             not_stationary = (
                 "not stationary" in reason
                 or "established-oscillation" in reason
+                or "clean-cycle certification" in reason
                 or (
                     solver_params.urans_fidelity == UransFidelity.full
                     and "strict stationarity verdict unavailable" in reason
                 )
             )
-            if target_deficit <= 1e-6 and not (sparse or not_stationary):
+            audit = with_clean_cycle_recovery_progress(
+                result.quality.clean_cycle_audit,
+                origin_time=transient_start,
+                latest_time=_transient_physical_progress_time(tcase, result),
+            )
+            if audit is not result.quality.clean_cycle_audit:
+                result.quality = _quality_with(
+                    result.quality,
+                    clean_cycle_audit=audit,
+                )
+            fidelity = solver_params.urans_fidelity.value
+            required_clean_cycles = clean_cycle_minimum(fidelity)
+            clean_extension = (
+                additional_periods_for_clean_suffix(
+                    audit,
+                    fidelity=fidelity,
+                    required_cycles=required_clean_cycles,
+                    borderline=not_stationary and audit.certified,
+                    maximum_chunk_periods=(
+                        1
+                        if audit.terminal_clean_cycles >= required_clean_cycles
+                        else 3
+                    ),
+                )
+                if audit is not None
+                else 0
+            )
+            if audit is not None and not result.quality.ok:
+                # A terminal interpretation cannot be abandoned merely
+                # because it already has a long clean suffix: the explicit
+                # tier ceilings are FAST=9 and FINAL=12 physical periods. This
+                # lets the controller collect the approved additional clean
+                # physical cycles after a corrupt terminal period.
+                if clean_cycle_recovery_exhausted(audit, fidelity=fidelity):
+                    result.quality = _quality_with(
+                        result.quality,
+                        ok=False,
+                        can_refine=False,
+                        clean_cycle_audit=audit,
+                        reason=(
+                            "URANS clean-cycle recovery exhausted: "
+                            f"{audit.terminal_clean_cycles} terminal clean cycles across "
+                            f"{audit.physical_periods} measured periods; automatic publication is "
+                            "withheld for solver recovery. "
+                            + result.quality.reason
+                        ),
+                    )
+                    break
+            if target_deficit <= 1e-6 and not (sparse or not_stationary or clean_extension):
                 break
             sparse_tail_only = sparse and target_deficit <= 1e-6 and not not_stationary
             if sparse_tail_only:
@@ -5004,6 +5899,16 @@ def _extend_transient_until_periods(
                         chunk_sim,
                         URANS_NONSTATIONARY_EXTENSION_PERIODS * period,
                     )
+            if clean_extension:
+                # Clean-cycle repair starts only after the normal retained
+                # horizon exists.  It must append actual physical periods to
+                # the terminal suffix, never re-apply startup discard and
+                # overrun the requested three-then-one recovery sequence.
+                repair_span = clean_extension * period
+                if target_deficit <= 1e-6:
+                    chunk_sim = repair_span
+                else:
+                    chunk_sim = max(chunk_sim, repair_span)
             write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
         # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
         # frames/cycle and was not yet stationary, but still had a measurable
@@ -5159,6 +6064,7 @@ def _extend_transient_until_periods(
             result.quality.retained_cycles + 1e-9 < target
             or "not stationary" in reason_lower
             or "established-oscillation" in reason_lower
+            or "clean-cycle certification" in reason_lower
         )
         if needs_more_aerodynamic_evidence:
             reason = (
@@ -6070,6 +6976,7 @@ def _finalize_outcome(
     """
     _check_cancel(cancel_check)
     coeff_files = _coeff_files(case_dir)
+    steady_coeff: Optional[Path] = None
     steady_field_accepted = bool(steady_field_dir is not None and outcome.converged)
     if coeff_files:
         steady_coeff = coeff_files[-1]
@@ -6242,11 +7149,42 @@ def _finalize_outcome(
             outcome.force_history = transient.force_history
             if transient.force_history is not None and not transient.quality.no_shedding:
                 outcome.strouhal = transient.force_history.strouhal
+            if transient.quality.no_shedding:
+                no_shedding_certificate, certificate_reason = (
+                    _no_shedding_observation_certificate(
+                        transient.force_history,
+                        transient.quality,
+                        spec,
+                        raw_coefficient_paths=transient.coeff_paths,
+                    )
+                )
+                if no_shedding_certificate is None:
+                    # Do not let an internal amplitude flag turn a missing,
+                    # shortened, or corrupt force trajectory into a canonical
+                    # steady point.  Preserve/archive the attempt, then route
+                    # it through the ordinary URANS recovery path.
+                    outcome.converged = False
+                    message = (
+                        "URANS no-shedding evidence rejected: "
+                        f"{certificate_reason or 'physical observation proof unavailable'}"
+                    )
+                    outcome.quality_warnings.append(message)
+                    urans_rejection = HardSolverError(message)
+                else:
+                    outcome.no_shedding_certificate = no_shedding_certificate
+            if transient.quality.clean_cycle_audit is not None:
+                # Keep the full audit beside the immutable raw evidence.  It
+                # is an interpretation record, not a replacement for the
+                # original coefficient or field artifacts.
+                outcome.urans_cycle_certificate = _evidence_backed_cycle_certificate(
+                    transient.quality.clean_cycle_audit
+                )
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)
-                urans_rejection = HardSolverError(
-                    "URANS evidence rejected: " + transient.quality.reason
-                )
+                if urans_rejection is None:
+                    urans_rejection = HardSolverError(
+                        "URANS evidence rejected: " + transient.quality.reason
+                    )
             # Frame-track recording contract: integer-period time-weighted stats
             # become the SINGLE SOURCE OF TRUTH for the point coefficients and
             # the measured Strouhal number. No-shedding points stay on the plain
@@ -6257,7 +7195,44 @@ def _finalize_outcome(
                         solver_params.urans_fidelity == UransFidelity.precalc
                     )
                     frame_estimate: Optional[PeriodEstimate] = None
-                    if precalc_tier:
+                    strict_cycle_evidence = _has_openfoam_case_evidence(
+                        transient.case_dir
+                    )
+                    clean_tail, clean_audit, clean_source = _clean_cycle_tail_for_case(
+                        transient.case_dir,
+                        list(transient.coeff_paths),
+                        spec,
+                        solver_params,
+                        early_stopped=transient.early_stopped,
+                    )
+                    if clean_audit is not None:
+                        outcome.urans_cycle_certificate = _evidence_backed_cycle_certificate(
+                            clean_audit
+                        )
+                    if clean_tail is None:
+                        if strict_cycle_evidence:
+                            certification_warning = (
+                                "URANS clean-cycle certification window unavailable "
+                                "during finalization"
+                            )
+                            outcome.quality_warnings.append(certification_warning)
+                            if urans_rejection is None:
+                                outcome.converged = False
+                                urans_rejection = HardSolverError(
+                                    "URANS evidence rejected: " + certification_warning
+                                )
+                    else:
+                        frame_estimate = clean_tail.estimate
+                        frame_series = clean_source
+                        frame_stats = period_window_stats(
+                            *clean_tail.series,
+                            clean_tail.estimate.period_s,
+                            drift_tolerance=solver_params.urans_drift_tolerance,
+                            established_oscillation=precalc_tier,
+                            period_stable=True,
+                        )
+                        frame_stationarity_stats = frame_stats
+                    if precalc_tier and frame_stats is None:
                         try:
                             certified = _precalc_certified_window(
                                 transient.case_dir,
@@ -6295,7 +7270,9 @@ def _finalize_outcome(
                             frame_stats = certified.stats
                             frame_stationarity_stats = certified.stationarity_stats
 
-                    if frame_stats is None:
+                    if frame_stats is None and (
+                        urans_rejection is None or not strict_cycle_evidence
+                    ):
                         t_all, cl_all, cd_all, cm_all = coefficient_series(
                             transient.coeff_paths
                         )
@@ -6422,6 +7399,36 @@ def _finalize_outcome(
                     f"t={reached_s}s); see {transient_subdir}/log.pimpleFoam"
                 )
             raise HardSolverError("URANS transient produced no coefficient.dat")
+
+    # A current steady-RANS producer always carries the field (with an
+    # explicit null when raw proof is unavailable).  The certificate comes
+    # only from the exact final raw `coefficient.dat` window and never from the
+    # bounded/downsampled `steady_history` transport payload.  Do not emit it
+    # for a forced/no-shedding URANS result: its solver identity and evidence
+    # are URANS even when the physical response is steady-equivalent.
+    if (
+        outcome.method_key == "openfoam.rans"
+        and outcome.fidelity == "rans"
+        and outcome.converged
+        and not outcome.unsteady
+        and steady_coeff is not None
+    ):
+        outcome.rans_hold_certificate = _rans_hold_certificate_from_raw(
+            steady_coeff
+        )
+        # The published RANS point must be the exact window that the new proof
+        # certifies.  Leaving the historical 50-row display average beside a
+        # 200-row proof would make an accepted coefficient and its provenance
+        # disagree, and would bias RANS-vs-URANS comparisons for the same
+        # physical cell.  No certificate means no replacement: the point is
+        # retained as evidence and routed through the normal URANS ladder.
+        if outcome.rans_hold_certificate is not None:
+            outcome.cl = outcome.rans_hold_certificate.cl.mean
+            outcome.cd = outcome.rans_hold_certificate.cd.mean
+            outcome.cm = outcome.rans_hold_certificate.cm.mean
+            outcome.cl_cd = (
+                outcome.cl / outcome.cd if outcome.cd else None
+            )
 
     # Truthful stage transition: everything below (y+ / foamToVTK / renders /
     # frame export) is post-processing, not solving. The phase change also
@@ -7212,8 +8219,23 @@ def write_shared_mesh_evidence(
                 "verified shared mesh is missing its checkMesh log or QA marker"
             )
 
-        extra = mesh_result.extra if isinstance(mesh_result.extra, dict) else {}
+        # ``MeshResult.extra`` is a dict by model contract, but keep this
+        # evidence writer defensive for legacy/custom mesh adapters.
+        if not isinstance(mesh_result.extra, dict):
+            mesh_result.extra = {}
+        extra = mesh_result.extra
         cache_hit = bool(extra.get("meshCacheHit", False))
+        identity = resolved_mesh_identity(
+            mesh_dir,
+            resolved,
+            actual_mesher,
+            chord,
+        )
+        # ``MeshResult`` is the only in-process carrier that survives from
+        # preparation into cache publication.  Keep the immutable identity on
+        # it as well as in the signed evidence manifest; never infer it later
+        # from request-level mesh settings.
+        mesh_result.extra["resolvedMeshIdentity"] = identity
         accepted_attempt = {
             "attemptNumber": len(attempt_diagnostics) + 1,
             "disposition": "accepted" if qa_payload is not None else "prepared_unverified",
@@ -7230,6 +8252,7 @@ def write_shared_mesh_evidence(
             "engine": engine.model_dump(mode="json") if engine is not None else None,
             "engineNamespace": engine.compatibility_key if engine is not None else None,
             "meshRecoveryVersion": MESH_RECOVERY_VERSION,
+            "meshIdentityVersion": MESH_IDENTITY_VERSION,
             "createdAtEpochS": time.time(),
             "status": "verified" if qa_payload is not None else "prepared_unverified",
             "actualMesh": {
@@ -7246,6 +8269,7 @@ def write_shared_mesh_evidence(
                 "meshCacheKey": extra.get("meshCacheKey"),
                 "cacheHit": cache_hit,
             },
+            "resolvedMeshIdentity": identity,
             "qaVerdict": qa_payload,
             "attempts": [*attempt_diagnostics, accepted_attempt],
             "artifacts": artifacts,
@@ -7460,6 +8484,11 @@ def prepare_mesh(
             mesh_dir / "constant" / "polyMesh",
             n_cells=result.n_cells,
             evidence_dir=evidence_dir,
+            resolved_mesh_identity=(
+                result.extra.get("resolvedMeshIdentity")
+                if isinstance(result.extra, dict)
+                else None
+            ),
         )
     return result
 

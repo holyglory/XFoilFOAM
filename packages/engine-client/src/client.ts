@@ -1,4 +1,7 @@
 import type {
+  ArchiveCleanCycleReductionRequest,
+  ArchiveCleanCycleReductionResponse,
+  ArchiveCleanCycleReductionState,
   EngineCapabilities,
   EngineCacheStats,
   EngineHealth,
@@ -26,6 +29,7 @@ import type {
   RenderFieldRequest,
   RenderFieldResponse,
 } from "./types";
+import { parseArchiveCleanCycleRecoveryProgress } from "./types";
 import {
   LEGACY_OPENCFD_2406_ENGINE,
   OPENCFD_2606_ENGINE,
@@ -609,6 +613,82 @@ export class EngineClient {
         );
       }
       return response as unknown as VerifyRemoteEvidenceManifestResponse;
+    });
+  }
+
+  /**
+   * Re-reduce one exact immutable GCS archive from raw force/field evidence.
+   * This is deliberately read-only: callers must persist the returned
+   * interpretation separately and never treat it as a result mutation.
+   */
+  reduceRemoteEvidenceCleanCycles(
+    request: ArchiveCleanCycleReductionRequest,
+    opts?: EngineCallOptions,
+  ): Promise<ArchiveCleanCycleReductionResponse> {
+    if (!this.controlPlaneToken) {
+      throw new EngineError(
+        "ENGINE_CONTROL_PLANE_TOKEN is required for archive clean-cycle reduction",
+        undefined,
+        "archive_reduction_auth_missing",
+      );
+    }
+    return this.json<unknown>(
+      "/internal/evidence-archives/reduce-clean-cycles",
+      opts?.timeoutMs ?? ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.controlPlaneToken}` },
+        body: JSON.stringify(request),
+      },
+    ).then((raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new EngineError(
+          "archive clean-cycle reducer returned a malformed response",
+          undefined,
+          "archive_reduction_contract_drift",
+        );
+      }
+      const response = raw as Record<string, unknown>;
+      const states = new Set([
+        "accepted",
+        "continuation_required",
+        "recovery_exhausted",
+        "rerun_required",
+        "missing_evidence",
+      ]);
+      if (
+        typeof response.state !== "string" ||
+        !states.has(response.state) ||
+        typeof response.inputEvidenceSignature !== "string" ||
+        !/^[0-9a-f]{64}$/.test(response.inputEvidenceSignature) ||
+        !response.point ||
+        typeof response.point !== "object" ||
+        Array.isArray(response.point) ||
+        !response.diagnostics ||
+        typeof response.diagnostics !== "object" ||
+        Array.isArray(response.diagnostics)
+      ) {
+        throw new EngineError(
+          "archive clean-cycle reducer violated its immutable-evidence contract",
+          undefined,
+          "archive_reduction_contract_drift",
+        );
+      }
+      const recoveryProgress = parseArchiveCleanCycleRecoveryProgress(
+        response.diagnostics as Record<string, unknown>,
+        {
+          state: response.state as ArchiveCleanCycleReductionState,
+          fidelity: request.fidelity,
+        },
+      );
+      if (!recoveryProgress.ok) {
+        throw new EngineError(
+          `archive clean-cycle reducer recovery progress contract drift: ${recoveryProgress.errors.join("; ")}`,
+          undefined,
+          "archive_reduction_contract_drift",
+        );
+      }
+      return response as unknown as ArchiveCleanCycleReductionResponse;
     });
   }
 

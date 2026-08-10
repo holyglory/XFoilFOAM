@@ -29,6 +29,7 @@ import {
   simPrecalcObligationRequests,
   simPrecalcObligations,
   simUransRequests,
+  simulationPresets,
   simulationPresetRevisions,
   type SimJob,
   type SimPrecalcObligation,
@@ -2347,12 +2348,58 @@ export async function settlePrecalcObligationsForJobInTransaction(
         }),
         classification: resultClassifications.state,
         reasons: resultClassifications.reasons,
+        /**
+         * An accepted classification is evidence about one immutable attempt,
+         * not permission to close every legacy `(airfoil, revision, AoA)`
+         * obligation that happens to share the job.  The target revision
+         * resolves its physical boundary condition from its snapshot (with the
+         * legacy preset fallback), and the producing job must have owned that
+         * one boundary condition under the same normalized OpenFOAM
+         * implementation.  Keep this as a projection flag rather than
+         * filtering the evidence query: rejected/failed rows still need their
+         * normal terminal audit and retry handling.
+         */
+        acceptedTargetCellCompatible: sql<boolean>`COALESCE((
+          ${resultAttempts.bcId} = ${revisionBoundaryConditionSql({
+            snapshot: simulationPresetRevisions.snapshot,
+            fallbackBoundaryConditionId:
+              simulationPresets.legacyBoundaryConditionId,
+          })}
+          AND ${simJobs.airfoilId} = ${resultAttempts.airfoilId}
+          AND ${simJobs.simulationPresetRevisionId} =
+            ${simulationPresetRevisions.id}
+          AND jsonb_array_length(${simJobs.bcIds}) = 1
+          AND ${simJobs.bcIds} ->> 0 = ${resultAttempts.bcId}::text
+          AND ${compatiblePrecalcCheckpointImplementationSql({
+            targetSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            targetRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointAttemptSolverImplementationId:
+              resultAttempts.solverImplementationId,
+            checkpointJobSolverImplementationId: simJobs.solverImplementationId,
+          })}
+        ), false)`,
       })
       .from(resultAttempts)
       .leftJoin(
         resultClassifications,
         eq(resultClassifications.resultAttemptId, resultAttempts.id),
       )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(
+          simulationPresetRevisions.id,
+          resultAttempts.simulationPresetRevisionId,
+        ),
+      )
+      .innerJoin(
+        simulationPresets,
+        eq(simulationPresets.id, simulationPresetRevisions.presetId),
+      )
+      .leftJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
       .where(
         and(
           eq(resultAttempts.simJobId, job.id),
@@ -2389,6 +2436,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
     const accepted = precalcEvidence.find(
       (row) =>
         row.classification === "accepted" &&
+        row.acceptedTargetCellCompatible === true &&
         !hasPrecalcContinuationWarning(row.qualityWarnings) &&
         !row.queuedRestartable,
     );
@@ -2848,6 +2896,17 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       })
       .from(results)
       .innerJoin(
+        simulationPresetRevisions,
+        eq(
+          simulationPresetRevisions.id,
+          results.simulationPresetRevisionId,
+        ),
+      )
+      .innerJoin(
+        simulationPresets,
+        eq(simulationPresets.id, simulationPresetRevisions.presetId),
+      )
+      .innerJoin(
         resultClassifications,
         and(
           eq(resultClassifications.resultId, results.id),
@@ -2858,6 +2917,13 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
         resultAttempts,
         and(
           eq(resultAttempts.resultId, results.id),
+          eq(resultAttempts.airfoilId, results.airfoilId),
+          eq(
+            resultAttempts.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(resultAttempts.bcId, results.bcId),
+          eq(resultAttempts.aoaDeg, results.aoaDeg),
           eq(resultAttempts.status, "done"),
           sql`(
             ${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'
@@ -2868,6 +2934,7 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
           )`,
         ),
       )
+      .innerJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
       .where(
         and(
           eq(results.id, resultId),
@@ -2890,6 +2957,33 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
             WHERE accepted_attempt_classification.result_attempt_id = ${resultAttempts.id}
               AND accepted_attempt_classification.state = 'accepted'
           )`,
+          // A result row's revision/AoA is not sufficient to satisfy the
+          // legacy obligation natural key. The immutable target revision can
+          // resolve a different boundary condition or OpenFOAM implementation
+          // than a historical/imported candidate. Require the exact target
+          // physical cell and a single-BC producing job before allowing this
+          // repair projection to close the obligation.
+          eq(
+            resultAttempts.bcId,
+            revisionBoundaryConditionSql({
+              snapshot: simulationPresetRevisions.snapshot,
+              fallbackBoundaryConditionId:
+                simulationPresets.legacyBoundaryConditionId,
+            }),
+          ),
+          sql`jsonb_array_length(${simJobs.bcIds}) = 1`,
+          sql`${simJobs.bcIds} ->> 0 = ${resultAttempts.bcId}::text`,
+          compatiblePrecalcCheckpointImplementationSql({
+            targetSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            targetRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointAttemptSolverImplementationId:
+              resultAttempts.solverImplementationId,
+            checkpointJobSolverImplementationId: simJobs.solverImplementationId,
+          }),
         ),
       )
       .orderBy(sql`${resultAttempts.createdAt} DESC`)

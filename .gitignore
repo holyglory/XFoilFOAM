@@ -39,6 +39,8 @@ Airfoil Database and Simulation Portal-handoff.zip
 .claude/
 .codex/*
 !.codex/dev-runtime.json
+!.codex/tests.json
+!.codex/devcoordinator_test_harness.py
 .codex-artifacts/
 .codex-db-backups/
 test-results/

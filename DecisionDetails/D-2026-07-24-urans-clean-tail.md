@@ -90,6 +90,20 @@ The must-catch regression places a catastrophic startup burst after the legacy
 returns no period and transports the burst. The corrected path detects the
 clean two-period live window and publishes exactly three clean periods.
 
+The first percentage-based selector still had a long-continuation blind spot:
+its shortest candidate was 2.5% of the complete retained trajectory. A
+40-second adversarial history whose final 5.5 periods are clean therefore
+returned no certificate because every candidate still began in the corrupt
+prefix. Recovery v10 adds end-anchored sample-count candidates in 10% geometric
+steps until the ordinary 2.5% candidate takes over. The old path fails the
+must-catch test; v10 selects an exact clean 4.5-period certificate entirely
+after the corruption. Candidate search remains finalization-only, so the
+frequently polled two-period live monitor keeps its bounded search cost.
+Simply lowering the global percentage was rejected because the same fraction
+can be too short or too long as retained history and adaptive sample density
+change; sample-count growth supplies the missing scale without weakening
+period, impulse, stationarity, or frame-density gates.
+
 The first v3 corrective run supplied a second must-catch observation before it
 could publish: AoA 9 released to `maxCo=4` with only three field frames per
 candidate period while the latest coefficient suffix still contained an
@@ -181,4 +195,7 @@ restart-seam ownership, finalization/live-window identity, and conservative
 startup Courant release. The recovery capability is version 8 and solver
 incident grouping uses `urans-recovery-2026-07-24-v8` so exact pre-fix
 exhaustions remain auditable and may receive only the existing one
-source-pinned remediation allowance.
+source-pinned remediation allowance. Later geometry-aware wake measurement is
+recovery v9; the long-continuation clean-tail selector is recovery v10. Every
+version retains the same immutable evidence and exact three-period publication
+contract.

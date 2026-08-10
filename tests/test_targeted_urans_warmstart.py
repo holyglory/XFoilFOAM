@@ -43,6 +43,7 @@ from airfoilfoam.pipeline import (
     _run_transient_attempt,
     run_case,
 )
+from airfoilfoam.postprocess.unsteady import ForceHistory
 
 FLUID = FluidProperties(density=1.225, kinematic_viscosity=1.5e-5)
 
@@ -143,7 +144,29 @@ class FakeCaseBuilder:
 
 def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
     tcase.mkdir(parents=True, exist_ok=True)
-    (tcase / "0.1").mkdir(exist_ok=True)
+    (tcase / "0.42").mkdir(exist_ok=True)
+    # This shared fast-URANS fixture needs genuine temporal density.  The
+    # 0.42-s span is the physical slow-wake horizon for its main 0.5 m / 50
+    # m/s call site; 21 raw-equivalent points satisfy the no-shedding witness
+    # rather than using a synthetic `samples=420` label.
+    t = [0.42 * index / 20 for index in range(21)]
+    history = ForceHistory(
+        t=t,
+        cl=[0.3] * len(t),
+        cd=[0.03] * len(t),
+        cm=[-0.02] * len(t),
+        cl_mean=0.3,
+        cl_rms=0.0,
+        cd_mean=0.03,
+        cd_rms=0.0,
+        cm_mean=-0.02,
+        cm_rms=0.0,
+        shedding_freq_hz=0.0,
+        strouhal=0.0,
+        samples=len(t),
+        window_start=0.0,
+        window_end=0.42,
+    )
     return TransientResult(
         avg=SimpleNamespace(
             cl=0.3,
@@ -155,7 +178,7 @@ def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
             cm_std=0.0,
         ),
         case_dir=tcase,
-        force_history=None,
+        force_history=history,
         quality=UransQuality(
             ok=True,
             can_refine=False,
@@ -163,8 +186,8 @@ def _successful_no_shedding_transient(tcase: Path) -> TransientResult:
             no_shedding=True,
         ),
         start_time=0.0,
-        end_time=0.1,
-        run_time=0.1,
+        end_time=0.42,
+        run_time=0.42,
     )
 
 

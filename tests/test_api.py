@@ -126,7 +126,6 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert status["total_cases"] == 3
     assert status["completed_cases"] == 3
     assert status["mesh_recovery_version"] == 2
-
     result = client.get(f"/jobs/{job_id}/result").json()
     assert result["state"] == "completed"
     assert result["mesh_recovery_version"] == 2

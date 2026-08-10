@@ -1,0 +1,130 @@
+{
+  "schema_version": 2,
+  "defaults": {
+    "timeout_seconds": 7200,
+    "resources": {
+      "cpu_millis": 6000,
+      "memory_mib": 12288,
+      "pids": 2048
+    },
+    "network": "external",
+    "environment": {
+      "CI": "true",
+      "NEXT_TELEMETRY_DISABLED": "1",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "PYTHONHASHSEED": "0"
+    }
+  },
+  "global_inputs": [
+    ".codex/tests.json",
+    ".codex/devcoordinator_test_harness.py",
+    ".npmrc",
+    "AGENTS.md",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "pyproject.toml",
+    "tsconfig.base.json",
+    "uv.lock"
+  ],
+  "intents": {
+    "change": {
+      "source_mode": "live",
+      "allow_reuse": false
+    },
+    "checkpoint": {
+      "source_mode": "live",
+      "allow_reuse": false
+    },
+    "handoff": {
+      "source_mode": "immutable",
+      "allow_reuse": true
+    },
+    "release": {
+      "source_mode": "immutable",
+      "allow_reuse": false
+    },
+    "manual": {
+      "source_mode": "immutable",
+      "allow_reuse": false
+    }
+  },
+  "fixtures": {},
+  "targets": {
+    "python-suite": {
+      "driver": "automation",
+      "reporter": "automation-events",
+      "cwd": ".",
+      "argv": [
+        "{python}",
+        ".codex/devcoordinator_test_harness.py",
+        "python-suite"
+      ],
+      "inputs": [
+        ".codex/devcoordinator_test_harness.py",
+        "src/**",
+        "tests/**",
+        "scripts/**/*.py",
+        "pyproject.toml",
+        "uv.lock"
+      ],
+      "depends_on": [],
+      "intents": [
+        "change",
+        "checkpoint",
+        "handoff",
+        "release",
+        "manual"
+      ],
+      "network": "external"
+    },
+    "node-suite": {
+      "driver": "automation",
+      "reporter": "automation-events",
+      "cwd": ".",
+      "argv": [
+        "{python}",
+        ".codex/devcoordinator_test_harness.py",
+        "node-suite"
+      ],
+      "inputs": [
+        ".codex/devcoordinator_test_harness.py",
+        "apps/**",
+        "packages/**",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "tsconfig.base.json"
+      ],
+      "depends_on": [],
+      "intents": [
+        "change",
+        "checkpoint",
+        "handoff",
+        "release",
+        "manual"
+      ],
+      "network": "external"
+    }
+  },
+  "evidence_policies": {
+    "handoff": {
+      "intent": "handoff",
+      "required_targets": [
+        "python-suite",
+        "node-suite"
+      ],
+      "max_age_seconds": 86400,
+      "allow_reuse": true
+    },
+    "release": {
+      "intent": "release",
+      "required_targets": [
+        "python-suite",
+        "node-suite"
+      ],
+      "max_age_seconds": 3600,
+      "allow_reuse": false
+    }
+  }
+}

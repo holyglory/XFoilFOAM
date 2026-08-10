@@ -15,6 +15,7 @@ import zstandard
 from fastapi.testclient import TestClient
 
 from airfoilfoam.api import main as api_main
+from airfoilfoam.archive_reduction import ArchiveCleanCycleReduction
 from airfoilfoam.config import Settings
 from airfoilfoam.evidence_store import (
     ARCHIVE_FORMAT,
@@ -319,6 +320,52 @@ def test_internal_archive_verification_returns_only_exact_authenticated_proof(
         "manifestMemberCount": request["manifestMemberCount"],
     }
     assert fixture.storage.downloads == 1
+
+
+def test_internal_clean_cycle_reduction_accepts_only_pointer_and_fidelity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The API must not accept a browser force-history substitute.
+
+    The raw reducer receives only the generation-pinned pointer plus the
+    fidelity tier; the extra caller field is intentionally ignored and cannot
+    influence the immutable calculation.
+    """
+    fixture = archive_fixture(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_reduce(store, pointer, *, fidelity):
+        seen.update({"store": store, "pointer": pointer, "fidelity": fidelity})
+        return ArchiveCleanCycleReduction(
+            state="missing_evidence",
+            input_evidence_signature="c" * 64,
+            point={"force_history": None, "unsteady": True},
+            diagnostics={"reason": "no raw coefficients"},
+        )
+
+    monkeypatch.setattr(api_main, "reduce_remote_archive_clean_cycles", fake_reduce)
+    request = {
+        "remote": fixture.pointer.to_dict(),
+        "fidelity": "urans_precalc",
+        # If an endpoint ever forwards this to the reducer, the test's exact
+        # argument assertion below will fail instead of silently accepting a
+        # fabricated/downsampled user payload.
+        "force_history": {"cl": [999.0], "cd": [0.0]},
+    }
+    response = api_client(tmp_path, monkeypatch, fixture).post(
+        "/internal/evidence-archives/reduce-clean-cycles",
+        json=request,
+        headers={"authorization": f"Bearer {TOKEN}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["inputEvidenceSignature"] == "c" * 64
+    assert seen == {
+        "store": fixture.store,
+        "pointer": fixture.pointer,
+        "fidelity": "urans_precalc",
+    }
 
 
 @pytest.mark.parametrize("token", [None, "wrong-control-plane-token"])

@@ -325,9 +325,13 @@ def _continuation_request(naca0012_selig_text, **overrides) -> PolarRequest:
 
 
 def test_continue_from_request_contract(naca0012_selig_text):
-    req = _continuation_request(naca0012_selig_text)
+    req = _continuation_request(
+        naca0012_selig_text,
+        corrective_tail_periods=3,
+    )
     assert req.continue_from is not None
     assert req.budget_override_s == 21600
+    assert req.corrective_tail_periods == 3
 
     # Nested slug (one level) is a real engine layout: <polar>/urans_aN.
     ContinueFrom(engine_job_id="deadbeef" * 4, case_slug="c0p1_u25/urans_a3")
@@ -364,6 +368,21 @@ def test_continue_from_request_contract(naca0012_selig_text):
         ).budget_override_s
         == 86_400
     )
+
+    # The archive reducer may request only a bounded whole-period clean tail;
+    # floats/bools must not silently coerce into a physical run instruction.
+    for bad_tail in (0, 4, 1.5, True):
+        with pytest.raises(ValueError, match="corrective_tail_periods"):
+            _continuation_request(
+                naca0012_selig_text,
+                corrective_tail_periods=bad_tail,
+            )
+    with pytest.raises(ValueError, match="valid only for an exact continue_from"):
+        _continuation_request(
+            naca0012_selig_text,
+            continue_from=None,
+            corrective_tail_periods=1,
+        )
 
 
 def test_urans_budget_seconds_override():
@@ -1171,6 +1190,26 @@ def test_continuation_source_carries_only_evidence_backed_corrective_tail(tmp_pa
         pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS
     )
 
+    # An authenticated archive reducer is more precise than collapsed source
+    # warnings. A damaged terminal period needs the full bounded replacement,
+    # while a post-corruption clean suffix can request one period only.
+    archive_corrupt_tail = stage_continuation_case(
+        nonstationary,
+        tmp_path / "continued-nonstationary-archive-corrupt-tail",
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+        corrective_tail_periods=3,
+    )
+    assert archive_corrupt_tail.corrective_tail_periods == pytest.approx(3.0)
+    archive_clean_suffix = stage_continuation_case(
+        nonstationary,
+        tmp_path / "continued-nonstationary-archive-clean-suffix",
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+        corrective_tail_periods=1,
+    )
+    assert archive_clean_suffix.corrective_tail_periods == pytest.approx(1.0)
+
     budget_only = tmp_path / "jobs" / ("c2" * 16) / "cases" / "budget-only"
     _make_saved_case(budget_only)
     _write_source_job_metadata(
@@ -1332,6 +1371,12 @@ def test_resume_restarts_from_latest_time_and_merges_both_segments(tmp_path):
     dst = tmp_path / "staged"
     source = stage_continuation_case(case_dir, dst)
     tcase = dst / "transient"
+    # This test exercises a seven-period terminal grade.  The production gate
+    # now requires 20 *real saved field times* per retained period, so shape
+    # both the pre-restart and resumed segments like pimpleFoam's actual
+    # write cadence instead of treating four illustrative time dirs as frames.
+    for millis in range(1, 101):
+        _write_time_dir(tcase, f"{millis / 1_000:g}")
 
     calls: dict[str, object] = {}
 
@@ -1349,9 +1394,12 @@ def test_resume_restarts_from_latest_time_and_merges_both_segments(tmp_path):
             # by the restart time (OpenFOAM restart-segment behaviour).
             seg = Path(cdir) / "postProcessing" / "forceCoeffs1" / f"{start:g}" / "coefficient.dat"
             seg.parent.mkdir(parents=True, exist_ok=True)
-            seg.write_text(_coeff_rows(start + 0.001, 0.2))
-            _write_time_dir(Path(cdir), "0.15")
-            _write_time_dir(Path(cdir), "0.2")
+            # A live force function samples more densely than field output.
+            # Keep the split at t=0.1 free of a synthetic 19-sample cycle
+            # while the independently-written field dirs remain 20/cycle.
+            seg.write_text(_coeff_rows(start + 0.0005, 0.2, dt=0.0005))
+            for millis in range(round(start * 1_000) + 1, 201):
+                _write_time_dir(Path(cdir), f"{millis / 1_000:g}")
             return SimpleNamespace(ok=True, returncode=0, timed_out=False, stdout="Time = 0.2\n")
 
         def application(self, *_args, **_kwargs):
@@ -1648,12 +1696,14 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
         settings=None,
         aoa_deg=None,
         expected_engine=None,
+        corrective_tail_periods=None,
     ):
         captured["src_case"] = src_case
         captured["dst_case"] = dst_case
         captured["settings"] = settings
         captured["aoa_deg"] = aoa_deg
         captured["expected_engine"] = expected_engine
+        captured["corrective_tail_periods"] = corrective_tail_periods
         return source
 
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
@@ -1691,7 +1741,10 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
                 )
             super().write_status(status)
 
-    request = _continuation_request(naca0012_selig_text)
+    request = _continuation_request(
+        naca0012_selig_text,
+        corrective_tail_periods=3,
+    )
     settings = get_settings()
     store = ObservingStore(settings)
     result = jobs.execute_job("continuation-wiring-test", request, store=store, settings=settings)
@@ -1703,6 +1756,7 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     assert captured["settings"] is settings
     assert captured["aoa_deg"] == SPEC.aoa_deg
     assert captured["expected_engine"] == OPENCFD_2606_IDENTITY
+    assert captured["corrective_tail_periods"] == 3
     assert captured["case_dir"] == captured["dst_case"]
     resume = captured["resume"]
     assert isinstance(resume, TransientResume)

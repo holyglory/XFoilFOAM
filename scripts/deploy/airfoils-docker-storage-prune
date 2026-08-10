@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RETENTION_HOURS="${DOCKER_PRUNE_RETENTION_HOURS:-72}"
+BUILD_CACHE_KEEP_STORAGE="${DOCKER_BUILD_CACHE_KEEP_STORAGE:-10GB}"
+LOCK_FILE="${DOCKER_PRUNE_LOCK_FILE:-/run/lock/airfoils-docker-storage-prune.lock}"
+
+if [[ ! "$RETENTION_HOURS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DOCKER_PRUNE_RETENTION_HOURS must be a positive integer." >&2
+  exit 2
+fi
+if [[ ! "$BUILD_CACHE_KEEP_STORAGE" =~ ^[1-9][0-9]*([KMGT]B|[kMGT]B|B)$ ]]; then
+  echo "DOCKER_BUILD_CACHE_KEEP_STORAGE must be a positive Docker byte value such as 10GB." >&2
+  exit 2
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Docker storage cleanup is already running; leaving this invocation idle."
+  exit 0
+fi
+
+before_bytes="$(df -B1 --output=avail / | awk 'NR == 2 { print $1 }')"
+
+# Images referenced by any running or stopped container are never eligible.
+# The age fence leaves a short rollback window for images from recent deploys.
+image_summary="$(
+  docker image prune \
+    --all \
+    --force \
+    --filter "until=${RETENTION_HOURS}h"
+)"
+
+# BuildKit cache is rebuildable. Keep a useful hot set while preventing deploy
+# churn from consuming the solver's evidence reserve again.
+cache_summary="$(
+  docker builder prune \
+    --all \
+    --force \
+    --keep-storage "$BUILD_CACHE_KEEP_STORAGE"
+)"
+
+after_bytes="$(df -B1 --output=avail / | awk 'NR == 2 { print $1 }')"
+free_bytes_delta=$((after_bytes - before_bytes))
+
+printf '%s\n' "${image_summary##*$'\n'}"
+printf '%s\n' "${cache_summary##*$'\n'}"
+printf 'Docker storage cleanup complete: free_bytes=%s free_bytes_delta_during_run=%s retention_hours=%s build_cache_keep=%s\n' \
+  "$after_bytes" "$free_bytes_delta" "$RETENTION_HOURS" "$BUILD_CACHE_KEEP_STORAGE"

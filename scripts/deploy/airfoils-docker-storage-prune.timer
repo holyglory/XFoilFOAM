@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Airfoils.Pro Docker storage cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=airfoils-docker-storage-prune.service
+
+[Install]
+WantedBy=timers.target

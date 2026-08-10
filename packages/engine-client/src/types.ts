@@ -3,6 +3,9 @@
 
 import type { PointFidelity, SteadyHistory, UransFidelity } from "./fidelity";
 import type { FrameTrack } from "./frame-track";
+import type { NoSheddingCertificate } from "./no-shedding-certificate";
+import type { RansHoldCertificate } from "./rans-hold-certificate";
+import type { UransCycleCertificate } from "./urans-cycle-certificate";
 
 /** Logical numerical implementation identity. Runtime/build provenance is
  * deliberately separate: rebuilding an image without changing numerics must
@@ -228,6 +231,9 @@ export interface PolarRequest {
   /** Amendment C: increased wall-clock solver budget [s] for the continuation
    *  (+2h/+6h UI choices); replaces the fidelity-derived tier budget. */
   budget_override_s?: number | null;
+  /** Exact raw-archive clean-cycle recommendation for the resumed transient:
+   * one to three additional whole periods. Valid only with continue_from. */
+  corrective_tail_periods?: number | null;
   /** Required worker mesh-repair strategy for this submission. PRECALC callers
    * set it from a live capability probe; API and worker reject mismatches. */
   expected_mesh_recovery_version?: number | null;
@@ -422,6 +428,218 @@ export interface VerifyRemoteEvidenceManifestResponse {
   manifestByteSize: number;
   manifestMemberSetSha256: string;
   manifestMemberCount: number;
+}
+
+/** The physical clean-cycle ceilings are part of the cross-runtime archive
+ * reducer contract. A FAST trajectory ends at nine measured periods; FINAL
+ * ends at twelve. They are not UI preferences and must never be silently
+ * widened by a client that receives a reducer response. */
+export const ARCHIVE_CLEAN_CYCLE_MAX_PERIODS = {
+  urans_precalc: 9,
+  urans_full: 12,
+} as const;
+
+export type ArchiveCleanCycleFidelity = keyof typeof ARCHIVE_CLEAN_CYCLE_MAX_PERIODS;
+
+export type ArchiveCleanCycleReductionState =
+  | "accepted"
+  | "continuation_required"
+  /** The exact archive reached its FAST/FINAL recovery period cap. */
+  | "recovery_exhausted"
+  | "rerun_required"
+  | "missing_evidence";
+
+/** Additive progress proof emitted by new archive reducers. The containing
+ * diagnostics object deliberately remains extensible because historical
+ * archives carry free-form evidence context. This nested object is exact so a
+ * producer/client version mismatch fails closed rather than minting another
+ * physical continuation from ambiguous counters. */
+export interface ArchiveCleanCycleRecoveryProgress {
+  measuredPeriods: number;
+  maxPeriods: number;
+  recommendedAdditionalPeriods?: number;
+}
+
+export type ArchiveCleanCycleReductionDiagnostics = Record<string, unknown> & {
+  recoveryProgress?: ArchiveCleanCycleRecoveryProgress;
+};
+
+export type ArchiveCleanCycleRecoveryProgressParseResult =
+  | { ok: true; value: ArchiveCleanCycleRecoveryProgress | null }
+  | { ok: false; errors: string[] };
+
+function isArchiveCleanCycleRecord(
+  value: unknown,
+): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function archiveCleanCyclePositiveInteger(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value > 0
+  );
+}
+
+function archiveCleanCycleExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  at: string,
+  errors: string[],
+): void {
+  for (const key of expected) {
+    if (!Object.hasOwn(value, key)) errors.push(`${at}: missing key "${key}"`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!expected.includes(key)) {
+      errors.push(`${at}: unexpected key "${key}" (contract drift)`);
+    }
+  }
+}
+
+/**
+ * Parse the optional v1 recovery-progress proof.
+ *
+ * Absence is intentionally valid: responses written before this contract used
+ * legacy fields such as `auditedPeriods` and `maximumPeriods`. Once a producer
+ * opts into `recoveryProgress`, however, all counters must agree exactly with
+ * the requested FAST/FINAL tier and the reducer state. This keeps historical
+ * responses readable without allowing new responses to hide an over-cap or
+ * unbounded continuation behind untyped diagnostics.
+ */
+export function parseArchiveCleanCycleRecoveryProgress(
+  diagnostics: Record<string, unknown>,
+  context: {
+    state: ArchiveCleanCycleReductionState;
+    fidelity: ArchiveCleanCycleFidelity;
+  },
+): ArchiveCleanCycleRecoveryProgressParseResult {
+  if (!Object.hasOwn(diagnostics, "recoveryProgress")) {
+    return { ok: true, value: null };
+  }
+
+  const errors: string[] = [];
+  const raw = diagnostics.recoveryProgress;
+  const at = "diagnostics.recoveryProgress";
+  if (!isArchiveCleanCycleRecord(raw)) {
+    return {
+      ok: false,
+      errors: [
+        `${at}: expected object, got ${raw === null ? "null" : typeof raw}`,
+      ],
+    };
+  }
+
+  const continuation = context.state === "continuation_required";
+  const exhausted = context.state === "recovery_exhausted";
+  if (!continuation && !exhausted) {
+    errors.push(
+      `${at}: only valid for continuation_required or recovery_exhausted`,
+    );
+  }
+  archiveCleanCycleExactKeys(
+    raw,
+    continuation
+      ? ["measuredPeriods", "maxPeriods", "recommendedAdditionalPeriods"]
+      : ["measuredPeriods", "maxPeriods"],
+    at,
+    errors,
+  );
+
+  if (!archiveCleanCyclePositiveInteger(raw.measuredPeriods)) {
+    errors.push(`${at}.measuredPeriods: expected positive safe integer`);
+  }
+  if (!archiveCleanCyclePositiveInteger(raw.maxPeriods)) {
+    errors.push(`${at}.maxPeriods: expected positive safe integer`);
+  }
+
+  const expectedMaximum = ARCHIVE_CLEAN_CYCLE_MAX_PERIODS[context.fidelity];
+  if (
+    archiveCleanCyclePositiveInteger(raw.maxPeriods) &&
+    raw.maxPeriods !== expectedMaximum
+  ) {
+    errors.push(
+      `${at}.maxPeriods: expected ${expectedMaximum} for ${context.fidelity}`,
+    );
+  }
+
+  if (continuation) {
+    if (
+      archiveCleanCyclePositiveInteger(raw.measuredPeriods) &&
+      archiveCleanCyclePositiveInteger(raw.maxPeriods) &&
+      raw.measuredPeriods >= raw.maxPeriods
+    ) {
+      errors.push(
+        `${at}.measuredPeriods: continuation must remain below maxPeriods`,
+      );
+    }
+    if (!archiveCleanCyclePositiveInteger(raw.recommendedAdditionalPeriods)) {
+      errors.push(
+        `${at}.recommendedAdditionalPeriods: expected positive safe integer`,
+      );
+    } else {
+      if (raw.recommendedAdditionalPeriods > 3) {
+        errors.push(
+          `${at}.recommendedAdditionalPeriods: expected integer from 1 through 3`,
+        );
+      }
+      if (
+        archiveCleanCyclePositiveInteger(raw.measuredPeriods) &&
+        archiveCleanCyclePositiveInteger(raw.maxPeriods) &&
+        raw.recommendedAdditionalPeriods > raw.maxPeriods - raw.measuredPeriods
+      ) {
+        errors.push(
+          `${at}.recommendedAdditionalPeriods: exceeds remaining physical-period budget`,
+        );
+      }
+    }
+  }
+
+  if (
+    exhausted &&
+    archiveCleanCyclePositiveInteger(raw.measuredPeriods) &&
+    archiveCleanCyclePositiveInteger(raw.maxPeriods) &&
+    raw.measuredPeriods !== raw.maxPeriods
+  ) {
+    errors.push(
+      `${at}.measuredPeriods: exhausted recovery must equal maxPeriods exactly`,
+    );
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+  return {
+    ok: true,
+    value: continuation
+      ? {
+          measuredPeriods: raw.measuredPeriods as number,
+          maxPeriods: raw.maxPeriods as number,
+          recommendedAdditionalPeriods:
+            raw.recommendedAdditionalPeriods as number,
+        }
+      : {
+          measuredPeriods: raw.measuredPeriods as number,
+          maxPeriods: raw.maxPeriods as number,
+        },
+  };
+}
+
+/** Read-only archive reducer request.  The caller supplies only the exact
+ * generation-pinned GCS pointer and target fidelity; the engine reads raw
+ * force coefficients and actual field writes from the authenticated archive.
+ */
+export interface ArchiveCleanCycleReductionRequest {
+  remote: RemoteEvidencePointerPayload;
+  fidelity: ArchiveCleanCycleFidelity;
+}
+
+/** Immutable raw-evidence interpretation returned to the sweeper ledger.
+ * This is intentionally not a result upsert or canonical-selection command. */
+export interface ArchiveCleanCycleReductionResponse {
+  state: ArchiveCleanCycleReductionState;
+  inputEvidenceSignature: string;
+  point: PolarPoint;
+  diagnostics: ArchiveCleanCycleReductionDiagnostics;
 }
 
 export interface PrepareBrokeredLegacyEvidenceRequest {
@@ -620,6 +838,18 @@ export interface PolarPoint {
    *  time-weighted stats. `null` on steady/no-shedding points; absent on
    *  legacy engine versions that predate the contract. */
   frame_track?: FrameTrack | null;
+  /** Per-cycle URANS evidence certification. Kept separate from the strict
+   * frame_track shape so reducer policy can evolve without breaking media
+   * transport. Null for steady/no-shedding points; absent on legacy runs. */
+  urans_cycle_certificate?: UransCycleCertificate | null;
+  /** Proof-bearing current-engine no-shedding observation. `undefined` is
+   * legacy omission; explicit `null` means the engine could not certify the
+   * physical slow-wake horizon and must fail closed downstream. */
+  no_shedding_certificate?: NoSheddingCertificate | null;
+  /** Dedicated all-channel steady RANS final-window proof. `undefined` is
+   * legacy engine evidence; explicit `null` means a current engine could not
+   * certify its raw Cl/Cd/Cm hold and must fail closed downstream. */
+  rans_hold_certificate?: RansHoldCertificate | null;
   /** Fidelity ladder echo (pinned contract 1): the tier this point was solved
    *  at. Absent on legacy engine versions that predate the ladder. */
   fidelity?: PointFidelity | null;

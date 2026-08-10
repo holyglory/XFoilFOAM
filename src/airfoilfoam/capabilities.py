@@ -10,6 +10,14 @@
 # repair for obligations that were terminal under the previous version.
 MESH_RECOVERY_VERSION = 2
 
+# Version 1 records the exact mesh that produced every new result as a stable
+# content fingerprint plus a separate resolved-recipe fingerprint.  The mesh
+# recovery ladder remains version 2: this is provenance/compatibility
+# information, not a new repair algorithm.  Keep the versions separate so a
+# controller can distinguish an engine that can repair a geometry from one
+# that can prove the exact mesh used for a result.
+MESH_IDENTITY_VERSION = 1
+
 # Version 2 adds an in-engine numerical recovery pass for pimpleFoam: a
 # last-known-good same-case checkpoint is restored before one conservative
 # upwind/Co<=1 retry, failed-pass evidence remains immutable, and a retry that
@@ -42,4 +50,4 @@ MESH_RECOVERY_VERSION = 2
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 9
+URANS_RECOVERY_VERSION = 10

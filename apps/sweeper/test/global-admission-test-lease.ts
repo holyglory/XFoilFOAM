@@ -46,7 +46,13 @@ const EXCLUSIVE_FILES = new Set([
 /** Pure calculation tests neither read nor mutate the shared database. Keeping
  * them independent lets the storage-admission guard be verified even while a
  * local database runtime is deliberately offline. */
-const DATABASE_FREE_FILES = new Set(["disk-admission.test.ts"]);
+const DATABASE_FREE_FILES = new Set([
+  "archive-clean-cycle-reduction-client.test.ts",
+  "archive-interpretation-recovery-policy.test.ts",
+  "legacy-urans-archive-gap-recovery-policy.test.ts",
+  "disk-admission.test.ts",
+  "result-interpretation-backfill.test.ts",
+]);
 
 interface VitestWorkerState {
   filepath?: string;

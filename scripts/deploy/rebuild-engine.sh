@@ -17,6 +17,7 @@
 #
 # Usage:
 #   scripts/deploy/rebuild-engine.sh <BUILD_ID>
+#   scripts/deploy/rebuild-engine.sh --handoff-unmanaged-recovery-gateway <BUILD_ID>
 #   scripts/deploy/rebuild-engine.sh --certify-opencfd-2606-continuation
 #
 # Optional environment:
@@ -32,14 +33,30 @@ set -Eeuo pipefail
 ACTION="${1:-}"
 DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTIFY_CONTINUATION_ONLY=false
-if [[ "$ACTION" == "--certify-opencfd-2606-continuation" ]]; then
+HANDOFF_UNMANAGED_RECOVERY_GATEWAY=false
+if [[ "$ACTION" == "--handoff-unmanaged-recovery-gateway" ]]; then
+  HANDOFF_UNMANAGED_RECOVERY_GATEWAY=true
+  BUILD_ID="${2:-}"
+  if (($# != 2)); then
+    echo "Usage: $0 --handoff-unmanaged-recovery-gateway <BUILD_ID>" >&2
+    exit 2
+  fi
+elif [[ "$ACTION" == "--certify-opencfd-2606-continuation" ]]; then
   CERTIFY_CONTINUATION_ONLY=true
   BUILD_ID=""
+  if (($# != 1)); then
+    echo "Usage: $0 --certify-opencfd-2606-continuation" >&2
+    exit 2
+  fi
 else
   BUILD_ID="$ACTION"
+  if (($# != 1)); then
+    echo "Usage: $0 <BUILD_ID>" >&2
+    exit 2
+  fi
 fi
 if [[ -z "$BUILD_ID" && "$CERTIFY_CONTINUATION_ONLY" != "true" ]]; then
-  echo "Usage: $0 <BUILD_ID> | --certify-opencfd-2606-continuation" >&2
+  echo "Usage: $0 <BUILD_ID> | --handoff-unmanaged-recovery-gateway <BUILD_ID> | --certify-opencfd-2606-continuation" >&2
   exit 2
 fi
 if [[ -n "$BUILD_ID" && ! "$BUILD_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -77,6 +94,17 @@ OPENCFD2606_POOL_FAIL_SAFE_DISABLED=false
 # the exact legacy image and worker runtime.
 LEGACY_2406_QUEUE_COMPATIBILITY=false
 OPENCFD2606_RETAINED_RECEIPT_REPROVED=false
+# A previous incident left an ad-hoc `docker compose run` API gateway alive
+# under the hub project and pointed every Node writer at it.  That one-off is
+# not part of the source-reviewed Compose service graph, so a normal rebuild
+# must never silently leave it serving, recreate writers against it, or remove
+# it while work may still be in flight.  These values are populated only by
+# the explicit, source-verified handoff path below.
+CANONICAL_ENGINE_URL="http://api:8000"
+UNMANAGED_RECOVERY_GATEWAY_ID=""
+UNMANAGED_RECOVERY_GATEWAY_NAME=""
+UNMANAGED_RECOVERY_GATEWAY_STOPPED=false
+UNMANAGED_RECOVERY_GATEWAY_STOP_ATTEMPTED=false
 
 cd "$APP_DIR"
 
@@ -105,6 +133,509 @@ fi
 
 compose() {
   "${COMPOSE[@]}" --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" "$@"
+}
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Emit one tab-delimited record for every *running* gateway which is not the
+# canonical `api` service container.  Compose one-offs are deliberately not
+# trusted merely because `docker compose ps api` may list them: `compose run`
+# labels them as one-offs and can leave an arbitrary name/alias attached to the
+# deployment network.  We also catch the production-shaped exact recovery name
+# without relying on Compose labels, because a manually-created container has
+# no trustworthy labels at all.
+active_unmanaged_recovery_gateways() {
+  local listing id name project service oneoff container_number details oneoff_is_true
+  if ! listing="$(docker ps --filter status=running --format '{{.ID}}{{"\t"}}{{.Names}}{{"\t"}}{{.Label "com.docker.compose.project"}}{{"\t"}}{{.Label "com.docker.compose.service"}}')"; then
+    echo "Could not inspect running Docker containers for unmanaged recovery gateways." >&2
+    return 12
+  fi
+
+  while IFS=$'\t' read -r id name project service; do
+    [[ -n "$id" ]] || continue
+    # Only inspect containers that belong to the authoritative Compose project
+    # and claim to be an API, plus the exact recovery name.  Do not scan or
+    # classify unrelated host containers.
+    if [[ "$name" != "${COMPOSE_PROJECT_NAME}-api-recovery" && \
+          !( "$project" == "$COMPOSE_PROJECT_NAME" && "$service" == "api" ) ]]; then
+      continue
+    fi
+    if ! details="$(docker inspect --format '{{.Name}}{{"\t"}}{{index .Config.Labels "com.docker.compose.project"}}{{"\t"}}{{index .Config.Labels "com.docker.compose.service"}}{{"\t"}}{{index .Config.Labels "com.docker.compose.oneoff"}}{{"\t"}}{{index .Config.Labels "com.docker.compose.container-number"}}' "$id")"; then
+      echo "Could not inspect candidate engine gateway container $id; refusing maintenance." >&2
+      return 12
+    fi
+    IFS=$'\t' read -r name project service oneoff container_number <<<"$details"
+    name="${name#/}"
+    oneoff_is_true=false
+    if is_true "$oneoff"; then
+      oneoff_is_true=true
+    fi
+    # A canonical Compose service has project=app, service=api,
+    # container-number=1, and is not a one-off.  Everything else claiming to
+    # be that gateway is an unmanaged competing endpoint until explicitly
+    # retired.  The exact recovery name is unsafe even with missing labels.
+    if [[ "$name" == "${COMPOSE_PROJECT_NAME}-api-recovery" || \
+          ( "$project" == "$COMPOSE_PROJECT_NAME" && "$service" == "api" && \
+            ( "$container_number" != "1" || "$oneoff_is_true" == "true" ) ) ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$id" "$name" "$service" "$oneoff" "$container_number"
+    fi
+  done <<<"$listing"
+}
+
+deployment_engine_url() {
+  python3 - "$ENV_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+values = []
+for raw in path.read_text(encoding="utf-8").splitlines():
+    if not raw or raw.lstrip().startswith("#") or "=" not in raw:
+        continue
+    key, value = raw.split("=", 1)
+    if key == "ENGINE_URL":
+        values.append(value)
+if len(values) != 1 or not values[0] or values[0] != values[0].strip():
+    raise SystemExit("deployment ENGINE_URL must occur exactly once as a non-empty, whitespace-free value")
+print(values[0])
+PY
+}
+
+engine_url_hostname() {
+  python3 - "$1" <<'PY'
+from urllib.parse import urlsplit
+import sys
+
+value = sys.argv[1]
+try:
+    parsed = urlsplit(value)
+    port = parsed.port
+except ValueError as error:
+    raise SystemExit(f"invalid ENGINE_URL: {error}")
+if (
+    parsed.scheme != "http"
+    or not parsed.hostname
+    or port != 8000
+    or parsed.username is not None
+    or parsed.password is not None
+    or parsed.path not in ("", "/")
+    or parsed.query
+    or parsed.fragment
+):
+    raise SystemExit("ENGINE_URL must be an unauthenticated http://<gateway>:8000 endpoint")
+print(parsed.hostname.lower())
+PY
+}
+
+recovery_gateway_aliases() {
+  local gateway_id="$1" aliases line
+  if ! aliases="$(docker inspect --format '{{.Name}}{{"\n"}}{{.Config.Hostname}}{{"\n"}}{{range $network, $settings := .NetworkSettings.Networks}}{{range $settings.Aliases}}{{println .}}{{end}}{{end}}' "$gateway_id")"; then
+    echo "Could not inspect recovery gateway $gateway_id network identity." >&2
+    return 12
+  fi
+  while IFS= read -r line; do
+    line="${line#/}"
+    [[ -n "$line" && "$line" != "<no value>" ]] || continue
+    printf '%s\n' "${line,,}"
+  done <<<"$aliases" | awk '!seen[$0]++'
+}
+
+container_engine_url() {
+  local container_id="$1" environment line
+  local -a values=()
+  if ! environment="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id")"; then
+    echo "Could not inspect ENGINE_URL for container $container_id." >&2
+    return 12
+  fi
+  while IFS= read -r line; do
+    [[ "$line" == ENGINE_URL=* ]] || continue
+    values+=("${line#ENGINE_URL=}")
+  done <<<"$environment"
+  if ((${#values[@]} != 1)) || [[ -z "${values[0]:-}" ]]; then
+    echo "Container $container_id does not expose exactly one non-empty ENGINE_URL; refusing an endpoint handoff." >&2
+    return 12
+  fi
+  printf '%s\n' "${values[0]}"
+}
+
+running_service_container_ids() {
+  local service="$1" ids
+  if ! ids="$(compose ps --status running -q "$service")"; then
+    echo "Could not determine running $service containers for recovery-gateway handoff." >&2
+    return 12
+  fi
+  printf '%s\n' "$ids" | awk 'NF'
+}
+
+# `compose ps -a` is intentionally used only after the handoff has recreated
+# an otherwise-stopped writer with `up --no-start`.  That lets us prove the
+# exact env baked into its replacement container without letting that writer
+# submit work against an endpoint which has not yet been proven canonical.
+all_service_container_ids() {
+  local service="$1" ids
+  if ! ids="$(compose ps -a -q "$service")"; then
+    echo "Could not determine prepared $service containers for recovery-gateway handoff." >&2
+    return 12
+  fi
+  printf '%s\n' "$ids" | awk 'NF'
+}
+
+configured_writer_services() {
+  local services
+  if ! services="$(compose config --services)"; then
+    echo "Could not determine configured writer services for recovery-gateway handoff." >&2
+    return 12
+  fi
+  while IFS= read -r service; do
+    case "$service" in
+      node-api|sweeper|media-repair) printf '%s\n' "$service" ;;
+    esac
+  done <<<"$services"
+}
+
+# A handoff may only retire the gateway which the currently-running writers
+# demonstrably use.  A stopped writer is fine: it will be recreated from the
+# authoritative env after the canonical API is healthy.  A running writer
+# with a different endpoint is not safe to guess about.
+prove_recovery_gateway_writer_binding() {
+  local gateway_id="$1" configured_url hostname aliases services service ids id url
+  local inspected=0
+  if ! configured_url="$(deployment_engine_url 2>&1)"; then
+    echo "Could not read the authoritative ENGINE_URL before recovery-gateway handoff:" >&2
+    echo "$configured_url" >&2
+    return 12
+  fi
+  if ! hostname="$(engine_url_hostname "$configured_url" 2>&1)"; then
+    echo "The authoritative ENGINE_URL is not a safe engine-gateway endpoint:" >&2
+    echo "$hostname" >&2
+    return 12
+  fi
+  if ! aliases="$(recovery_gateway_aliases "$gateway_id" 2>&1)"; then
+    echo "$aliases" >&2
+    return 12
+  fi
+  if ! grep -Fxq "$hostname" <<<"$aliases"; then
+    echo "ENGINE_URL=$configured_url does not resolve to the detected unmanaged recovery gateway; refusing to retire an endpoint whose clients are not proven." >&2
+    return 12
+  fi
+  if ! services="$(configured_writer_services 2>&1)"; then
+    echo "$services" >&2
+    return 12
+  fi
+  if [[ -z "$services" ]]; then
+    echo "No configured Node writer services were found; refusing recovery-gateway handoff." >&2
+    return 12
+  fi
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    if ! ids="$(running_service_container_ids "$service" 2>&1)"; then
+      echo "$ids" >&2
+      return 12
+    fi
+    if [[ -z "$ids" ]]; then
+      continue
+    fi
+    if (( $(wc -l <<<"$ids") != 1 )); then
+      echo "Writer service $service has more than one running container; refusing to guess its ENGINE_URL during handoff." >&2
+      return 12
+    fi
+    id="$(head -n1 <<<"$ids")"
+    if ! url="$(container_engine_url "$id" 2>&1)"; then
+      echo "$url" >&2
+      return 12
+    fi
+    if [[ "$url" != "$configured_url" ]]; then
+      echo "Running $service container $id has ENGINE_URL=$url, but the authoritative deployment value is $configured_url; refusing recovery-gateway handoff." >&2
+      return 12
+    fi
+    inspected=$((inspected + 1))
+  done <<<"$services"
+  if ((inspected == 0)); then
+    echo "No running Node writer proves that the detected recovery gateway owns the current ENGINE_URL; refusing retirement." >&2
+    return 12
+  fi
+  echo "Verified $inspected running writer(s) are bound to the detected recovery gateway via ENGINE_URL=$configured_url."
+}
+
+recovery_gateway_get() {
+  local gateway_id="$1" path="$2"
+  docker exec -T "$gateway_id" python3 -c '
+import sys
+from urllib.request import urlopen
+
+with urlopen("http://127.0.0.1:8000" + sys.argv[1], timeout=15) as response:
+    if response.status != 200:
+        raise SystemExit(f"gateway returned HTTP {response.status}")
+    sys.stdout.buffer.write(response.read())
+' "$path"
+}
+
+require_recovery_gateway_health() {
+  local gateway_id="$1" expected_build payload
+  expected_build="$(read_env_var ENGINE_EXPECTED_BUILD_ID || true)"
+  if [[ -z "$expected_build" ]]; then
+    echo "ENGINE_EXPECTED_BUILD_ID is missing; cannot prove recovery-gateway identity." >&2
+    return 12
+  fi
+  if ! payload="$(recovery_gateway_get "$gateway_id" /health 2>&1)"; then
+    echo "Could not query /health from unmanaged recovery gateway $gateway_id:" >&2
+    echo "$payload" >&2
+    return 12
+  fi
+  if ! printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+health = json.load(sys.stdin)
+expected = sys.argv[1]
+if health.get("status") != "ok":
+    raise SystemExit(f"recovery gateway status is {health.get('"'"'status'"'"')!r}")
+if health.get("build_id") != expected:
+    raise SystemExit(
+        f"recovery gateway build_id={health.get('"'"'build_id'"'"')!r} does not match "
+        f"ENGINE_EXPECTED_BUILD_ID={expected!r}"
+    )
+' "$expected_build"; then
+    echo "Unmanaged recovery gateway health does not match the current writer expectation; refusing handoff." >&2
+    return 12
+  fi
+  echo "Recovery gateway health matches the current expected engine build $expected_build."
+}
+
+require_recovery_gateway_idle() {
+  local gateway_id="$1" stage="$2" payload services service running expected_worker_count=0
+  services="$(known_engine_worker_services)" || return 12
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    running="$(compose --profile '*' ps --status running -q "$service")" || return 12
+    if [[ -n "$running" ]]; then
+      expected_worker_count=$((expected_worker_count + $(wc -l <<<"$running")))
+    fi
+  done <<<"$services"
+  if ! payload="$(recovery_gateway_get "$gateway_id" /queue 2>&1)"; then
+    echo "Refusing recovery-gateway handoff at $stage because its queue probe failed:" >&2
+    echo "$payload" >&2
+    return 12
+  fi
+  if ! printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+queue = json.load(sys.stdin)
+expected_worker_count = int(sys.argv[1])
+keys = ("active_count", "reserved_count", "scheduled_count")
+counts = {key: queue.get(key) for key in keys}
+depth = queue.get("queue_depth")
+if type(depth) is not int or any(type(value) is not int for value in counts.values()):
+    raise SystemExit("recovery gateway queue observability is incomplete")
+for error_key in ("worker_queues_error", "worker_runtime_error"):
+    if error_key not in queue or queue[error_key] is not None:
+        raise SystemExit(f"recovery gateway worker inspection failed: {error_key}={queue.get(error_key)!r}")
+errors = queue.get("inspection_errors")
+if not isinstance(errors, dict) or errors:
+    raise SystemExit(f"recovery gateway task inspection failed: {errors!r}")
+depths = queue.get("queue_depths")
+if not isinstance(depths, dict) or not depths or any(type(value) is not int for value in depths.values()):
+    raise SystemExit("recovery gateway registered queue depths are incomplete")
+if sum(depths.values()) != depth:
+    raise SystemExit("recovery gateway aggregate queue depth disagrees with registered queues")
+workers = queue.get("worker_queues")
+if not isinstance(workers, list):
+    raise SystemExit("recovery gateway worker inventory is unavailable")
+names = []
+for binding in workers:
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(binding.get("worker"), str)
+        or not binding["worker"]
+        or not isinstance(binding.get("queues"), list)
+        or any(not isinstance(route, str) or not route for route in binding["queues"])
+    ):
+        raise SystemExit("recovery gateway worker inventory is invalid")
+    names.append(binding["worker"])
+if len(set(names)) != len(names) or len(names) != expected_worker_count:
+    raise SystemExit(
+        "recovery gateway worker inventory does not cover running worker containers: "
+        f"containers={expected_worker_count}, inspected={len(names)}"
+    )
+inspected = queue.get("inspection_workers")
+if not isinstance(inspected, dict):
+    raise SystemExit("recovery gateway task worker coverage is unavailable")
+expected_workers = set(names)
+for key in keys:
+    kind = key.removesuffix("_count")
+    observed = inspected.get(kind)
+    if (
+        not isinstance(observed, list)
+        or any(not isinstance(worker, str) or not worker for worker in observed)
+        or set(observed) != expected_workers
+    ):
+        raise SystemExit(f"recovery gateway worker coverage is incomplete for {kind}")
+if depth or any(counts.values()):
+    raise SystemExit(
+        f"recovery gateway has work: queue_depth={depth} counts={counts} "
+        f"job_ids={queue.get('"'"'job_ids'"'"') or []}"
+    )
+' "$expected_worker_count"; then
+    echo "Refusing recovery-gateway handoff at $stage because that gateway is not proven idle." >&2
+    return 12
+  fi
+  echo "Recovery gateway idle check passed ($stage)."
+}
+
+guard_unmanaged_recovery_gateway() {
+  local gateways line_count
+  if ! gateways="$(active_unmanaged_recovery_gateways 2>&1)"; then
+    echo "$gateways" >&2
+    return 12
+  fi
+  if [[ -z "$gateways" ]]; then
+    if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]]; then
+      echo "--handoff-unmanaged-recovery-gateway was requested, but no active unmanaged recovery gateway was found; refusing a no-op retirement." >&2
+      return 12
+    fi
+    return 0
+  fi
+  if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" != "true" ]]; then
+    echo "Refusing generic engine rebuild: an active unmanaged recovery gateway is attached to the hub Compose project:" >&2
+    echo "$gateways" >&2
+    echo "It may still own ENGINE_URL for Node writers. Do not remove it manually while solver work may exist." >&2
+    echo "After reviewing the exact source and proving idle work, run: $0 --handoff-unmanaged-recovery-gateway $BUILD_ID" >&2
+    return 12
+  fi
+  line_count="$(wc -l <<<"$gateways")"
+  if ((line_count != 1)); then
+    echo "Refusing recovery-gateway handoff because $line_count unmanaged API gateways are active; a one-to-one endpoint transition is required:" >&2
+    echo "$gateways" >&2
+    return 12
+  fi
+  IFS=$'\t' read -r UNMANAGED_RECOVERY_GATEWAY_ID UNMANAGED_RECOVERY_GATEWAY_NAME _ _ _ <<<"$gateways"
+  if [[ -z "$UNMANAGED_RECOVERY_GATEWAY_ID" || -z "$UNMANAGED_RECOVERY_GATEWAY_NAME" ]]; then
+    echo "The unmanaged recovery gateway identity is incomplete; refusing handoff." >&2
+    return 12
+  fi
+  echo "Explicit recovery-gateway handoff requested for $UNMANAGED_RECOVERY_GATEWAY_NAME ($UNMANAGED_RECOVERY_GATEWAY_ID)."
+}
+
+prove_unmanaged_recovery_gateway_handoff() {
+  [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]] || return 0
+  prove_recovery_gateway_writer_binding "$UNMANAGED_RECOVERY_GATEWAY_ID" || return $?
+  require_recovery_gateway_health "$UNMANAGED_RECOVERY_GATEWAY_ID" || return $?
+  require_recovery_gateway_idle "$UNMANAGED_RECOVERY_GATEWAY_ID" "before image build" || return $?
+}
+
+stop_unmanaged_recovery_gateway_for_handoff() {
+  [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]] || return 0
+  # A transport error from `docker stop` is not proof that the gateway kept
+  # running.  From this point on, never restore scheduler writers to the old
+  # endpoint unless an operator has inspected the exact transition state.
+  UNMANAGED_RECOVERY_GATEWAY_STOP_ATTEMPTED=true
+  docker stop "$UNMANAGED_RECOVERY_GATEWAY_ID" >/dev/null || {
+    echo "Could not stop unmanaged recovery gateway $UNMANAGED_RECOVERY_GATEWAY_NAME; refusing the endpoint transition." >&2
+    return 12
+  }
+  UNMANAGED_RECOVERY_GATEWAY_STOPPED=true
+  local running
+  if ! running="$(docker inspect --format '{{.State.Running}}' "$UNMANAGED_RECOVERY_GATEWAY_ID")" || [[ "$running" != "false" ]]; then
+    echo "Unmanaged recovery gateway $UNMANAGED_RECOVERY_GATEWAY_NAME did not remain stopped; refusing to recreate the canonical API." >&2
+    return 12
+  fi
+  echo "Stopped unmanaged recovery gateway $UNMANAGED_RECOVERY_GATEWAY_NAME after dual idle proof."
+}
+
+fail_closed_after_recovery_gateway_stop() {
+  [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" && "$UNMANAGED_RECOVERY_GATEWAY_STOP_ATTEMPTED" == "true" ]] || return 0
+  # Do not restart the one-off after an endpoint transition has begun: doing
+  # so would reintroduce split gateway truth after we have changed the
+  # authoritative endpoint.  Keep scheduling and media publication stopped so
+  # an operator can inspect the exact failed phase against the verified source.
+  echo "Recovery-gateway handoff did not reach canonical writer proof. The recovery gateway transition is unproven and solver writers are being kept quiescent fail-closed." >&2
+  compose stop sweeper >/dev/null 2>&1 || true
+  compose stop media-repair >/dev/null 2>&1 || true
+}
+
+prepare_writers_for_canonical_gateway_proof() {
+  local media_repair_initial_state="$1"
+  # Both scheduler-side writers remain stopped while their replacement
+  # containers are constructed. `--no-start` is a strict admission barrier:
+  # the container gets the reviewed ENV_FILE but cannot call the engine.
+  compose up --no-start --no-deps --force-recreate sweeper || return $?
+  case "$media_repair_initial_state" in
+    running|stopped)
+      compose up --no-start --no-deps --force-recreate media-repair || return $?
+      ;;
+    absent)
+      ;;
+    *)
+      echo "Unknown pre-rebuild media-repair state '$media_repair_initial_state'; refusing canonical writer preparation." >&2
+      return 12
+      ;;
+  esac
+}
+
+verify_prepared_writers_use_canonical_gateway() {
+  local services service ids id url node_api_seen=false
+  if ! services="$(configured_writer_services 2>&1)"; then
+    echo "$services" >&2
+    return 12
+  fi
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    if [[ "$service" == "node-api" ]]; then
+      ids="$(running_service_container_ids "$service" 2>&1)" || {
+        echo "$ids" >&2
+        return 12
+      }
+    else
+      ids="$(all_service_container_ids "$service" 2>&1)" || {
+        echo "$ids" >&2
+        return 12
+      }
+    fi
+    if [[ -z "$ids" ]]; then
+      echo "Writer service $service has no replacement container after canonical API recreation; refusing recovery-gateway retirement." >&2
+      return 12
+    fi
+    if (( $(wc -l <<<"$ids") != 1 )); then
+      echo "Writer service $service has more than one replacement container after handoff; refusing to claim the canonical endpoint is installed." >&2
+      return 12
+    fi
+    id="$(head -n1 <<<"$ids")"
+    if ! url="$(container_engine_url "$id" 2>&1)"; then
+      echo "$url" >&2
+      return 12
+    fi
+    if [[ "$url" != "$CANONICAL_ENGINE_URL" ]]; then
+      echo "Prepared $service container $id still has ENGINE_URL=$url instead of $CANONICAL_ENGINE_URL; refusing recovery-gateway retirement." >&2
+      return 12
+    fi
+    [[ "$service" == "node-api" ]] && node_api_seen=true
+  done <<<"$services"
+  if [[ "$node_api_seen" != "true" ]]; then
+    echo "node-api is not running with the canonical ENGINE_URL after handoff; refusing recovery-gateway retirement." >&2
+    return 12
+  fi
+  echo "Canonical ENGINE_URL=$CANONICAL_ENGINE_URL is proven in node-api and every prepared scheduler writer before admission resumes."
+}
+
+retire_unmanaged_recovery_gateway() {
+  [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]] || return 0
+  [[ "$UNMANAGED_RECOVERY_GATEWAY_STOPPED" == "true" ]] || {
+    echo "Recovery gateway was not stopped by the guarded handoff; refusing retirement." >&2
+    return 12
+  }
+  if ! docker rm "$UNMANAGED_RECOVERY_GATEWAY_ID" >/dev/null; then
+    echo "Canonical engine handoff is live, but stopped recovery gateway $UNMANAGED_RECOVERY_GATEWAY_NAME could not be removed. It remains stopped; inspect it before any manual action." >&2
+    fail_closed_after_recovery_gateway_stop
+    return 13
+  fi
+  echo "Retired unmanaged recovery gateway $UNMANAGED_RECOVERY_GATEWAY_NAME after canonical health and writer-endpoint proof."
 }
 
 verify_deployment_source() {
@@ -271,31 +802,43 @@ restore_pre_migration_writers_after_refusal() {
 }
 
 restore_sweeper_after_rebuild() {
-  local initial_state="$1"
+  local initial_state="$1" prepared_without_start="${2:-false}"
   if [[ "$initial_state" == "running" ]]; then
     echo "Restoring the previously running sweeper..."
-    compose up -d --no-deps --force-recreate sweeper
+    if [[ "$prepared_without_start" == "true" ]]; then
+      compose start sweeper
+    else
+      compose up -d --no-deps --force-recreate sweeper
+    fi
   else
     echo "Preserving the intentionally stopped sweeper..."
-    # Bake the new build-id environment into a replacement container, but do
-    # not start it. A later intentional `compose up -d sweeper` then uses the
-    # same verified engine generation without a stale-id transition.
-    compose up --no-start --no-deps --force-recreate sweeper
+    if [[ "$prepared_without_start" != "true" ]]; then
+      # Bake the new build-id environment into a replacement container, but do
+      # not start it. A later intentional `compose up -d sweeper` then uses the
+      # same verified engine generation without a stale-id transition.
+      compose up --no-start --no-deps --force-recreate sweeper
+    fi
   fi
 }
 
 restore_media_repair_after_rebuild() {
-  local initial_state="$1"
+  local initial_state="$1" prepared_without_start="${2:-false}"
   case "$initial_state" in
     running)
       echo "Restoring the previously running media-repair writer..."
-      compose up -d --no-deps --force-recreate media-repair
+      if [[ "$prepared_without_start" == "true" ]]; then
+        compose start media-repair
+      else
+        compose up -d --no-deps --force-recreate media-repair
+      fi
       ;;
     stopped)
       echo "Preserving the intentionally stopped media-repair writer..."
-      # media-repair reads AIRFOILFOAM_BUILD_ID. Recreate it without starting
-      # so a later intentional start cannot retain the previous engine id.
-      compose up --no-start --no-deps --force-recreate media-repair
+      if [[ "$prepared_without_start" != "true" ]]; then
+        # media-repair reads AIRFOILFOAM_BUILD_ID. Recreate it without starting
+        # so a later intentional start cannot retain the previous engine id.
+        compose up --no-start --no-deps --force-recreate media-repair
+      fi
       ;;
     absent)
       echo "media-repair is not configured in this deployment source; no writer to restore."
@@ -1368,6 +1911,11 @@ certify_opencfd_2606_continuation() {
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
   validate_opencfd_2606_cutover_state pending-certifiable || exit $?
+  # Certification never substitutes an engine endpoint.  Refuse rather than
+  # silently certifying through an unmanaged one-off; the explicit handoff
+  # action requires a BUILD_ID and is intentionally a different maintenance
+  # transaction.
+  guard_unmanaged_recovery_gateway || exit $?
   if [[ -z "$ADMIN_COOKIE" ]]; then
     echo "ADMIN_COOKIE is required for continuation certification." >&2
     exit 14
@@ -1620,6 +2168,10 @@ main() {
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
   validate_opencfd_2606_cutover_state any || exit $?
+  # This is deliberately before any queue, cutover, build, env, or writer
+  # mutation. A regular BUILD_ID invocation therefore cannot accidentally
+  # keep an ad-hoc gateway alive or redirect fresh containers to it.
+  guard_unmanaged_recovery_gateway || exit $?
 
   echo "Engine rebuild starting: BUILD_ID=$BUILD_ID"
 
@@ -1710,6 +2262,12 @@ main() {
     wait_for_opencfd_2606_cutover_drain
   fi
 
+  # An explicit recovery-gateway handoff must prove the old endpoint's health,
+  # writer ownership, and complete queue observability before we even build an
+  # image.  The canonical worker guard below is deliberately separate: both
+  # gateways must agree that the physical engine is idle.
+  prove_unmanaged_recovery_gateway_handoff || exit $?
+
   # 1. Refuse maintenance while a solve is active. The check is repeated
   #    after the potentially long image build so a solve that started during
   #    that window cannot be terminated by the recreate below.
@@ -1754,6 +2312,12 @@ main() {
       "$sweeper_restore_state" "$media_repair_initial_state"
     exit 12
   fi
+  if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]] && \
+      ! require_recovery_gateway_idle "$UNMANAGED_RECOVERY_GATEWAY_ID" "before service recreate"; then
+    restore_pre_migration_writers_after_refusal \
+      "$sweeper_restore_state" "$media_repair_initial_state"
+    exit 12
+  fi
   # A submit HTTP request sent just before the sweeper stopped can finish in
   # the engine after the first sample. Require a stable second empty sample
   # before mutating env or recreating either engine service.
@@ -1761,6 +2325,24 @@ main() {
   if ! require_idle_worker "stabilized before service recreate"; then
     restore_pre_migration_writers_after_refusal \
       "$sweeper_restore_state" "$media_repair_initial_state"
+    exit 12
+  fi
+  if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]] && \
+      ! require_recovery_gateway_idle "$UNMANAGED_RECOVERY_GATEWAY_ID" "stabilized before service recreate"; then
+    restore_pre_migration_writers_after_refusal \
+      "$sweeper_restore_state" "$media_repair_initial_state"
+    exit 12
+  fi
+
+  # The old endpoint is stopped only after the canonical and recovery
+  # gateways have each passed two independent empty-queue samples.  At this
+  # point the writers are already quiescent, so no request can be rerouted
+  # while the service-name alias changes hands.
+  if ! stop_unmanaged_recovery_gateway_for_handoff; then
+    # Once the explicit stop was attempted, an error cannot prove that the
+    # legacy endpoint is still available.  Do not restore writers to an
+    # endpoint that may already be gone or mid-transition.
+    fail_closed_after_recovery_gateway_stop
     exit 12
   fi
 
@@ -1771,6 +2353,12 @@ main() {
     "AIRFOILFOAM_BUILD_ID=$BUILD_ID"
     "ENGINE_EXPECTED_BUILD_ID=$BUILD_ID"
   )
+  if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]]; then
+    # The service DNS name is owned by the reviewed Compose `api` service.
+    # This is intentionally in the same atomic env write as both build ids,
+    # so a newly recreated writer cannot retain the retired one-off endpoint.
+    engine_identity_updates+=("ENGINE_URL=$CANONICAL_ENGINE_URL")
+  fi
   if [[ "$cutover_active" == "true" ]]; then
     local migrated_enabled_engine_keys
     if ! migrated_enabled_engine_keys="$(compute_migrated_opencfd_enabled_engine_keys)"; then
@@ -1783,8 +2371,17 @@ main() {
       "AIRFOILFOAM_ENABLED_ENGINE_KEYS=$migrated_enabled_engine_keys"
     )
   fi
-  set_env_vars_atomic "${engine_identity_updates[@]}"
+  if set_env_vars_atomic "${engine_identity_updates[@]}"; then
+    :
+  else
+    local identity_update_rc=$?
+    fail_closed_after_recovery_gateway_stop
+    exit "$identity_update_rc"
+  fi
   echo "Updated AIRFOILFOAM_BUILD_ID and ENGINE_EXPECTED_BUILD_ID in $ENV_FILE"
+  if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]]; then
+    echo "Atomically changed ENGINE_URL to the canonical Compose gateway $CANONICAL_ENGINE_URL."
+  fi
   if [[ "$cutover_active" == "true" ]]; then
     echo "Updated gateway engine allow-list for OpenCFD v2606 (other engine keys preserved) in the same atomic identity transaction."
   fi
@@ -1799,20 +2396,32 @@ main() {
   #    The two idle guards above make an in-flight solver termination a refused
   #    maintenance action. Recovery below is still required for stale rows
   #    left by an earlier crash or interrupted deployment.
-  # node-api may apply a pending schema migration as it starts. The old
-  # sweeper and media-repair processes are already quiescent from the final
-  # idle proof above, so no pre-migration writer can publish evidence during
-  # that cutover. media-repair is restored only after node-api is healthy.
-  compose up -d --no-deps --force-recreate api "${worker_services[@]}" node-api
+  # Start the canonical API/worker pair first.  In the explicit handoff this
+  # leaves the old node-api intact until the replacement gateway has passed
+  # health/build proof; it avoids migrating the control-plane writer across an
+  # endpoint transition that has not yet become live.  node-api may then apply
+  # its pending schema migration while the old sweeper/media writers remain
+  # quiescent.
+  if ! compose up -d --no-deps --force-recreate api "${worker_services[@]}"; then
+    fail_closed_after_recovery_gateway_stop
+    exit 13
+  fi
 
   # 5. Verify the engine actually serves the new build.
-  wait_http "engine API" "http://127.0.0.1:8000/health" 60
+  if ! wait_http "engine API" "http://127.0.0.1:8000/health" 60; then
+    fail_closed_after_recovery_gateway_stop
+    exit 13
+  fi
   local health served_build
-  health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)"
+  if ! health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)"; then
+    fail_closed_after_recovery_gateway_stop
+    exit 13
+  fi
   served_build="$(printf '%s' "$health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("build_id") or "")')"
   if [[ "$served_build" != "$BUILD_ID" ]]; then
     echo "Engine /health build_id mismatch: expected $BUILD_ID, got '$served_build'" >&2
     echo "Full /health payload: $health" >&2
+    fail_closed_after_recovery_gateway_stop
     exit 13
   fi
   echo "Engine serves build_id=$BUILD_ID"
@@ -1821,12 +2430,44 @@ main() {
     verify_opencfd_2606_runtime
   fi
 
-  wait_http "node-api" "http://127.0.0.1:4000/health" 90
+  if ! compose up -d --no-deps --force-recreate node-api; then
+    fail_closed_after_recovery_gateway_stop
+    exit 13
+  fi
+  if ! wait_http "node-api" "http://127.0.0.1:4000/health" 90; then
+    fail_closed_after_recovery_gateway_stop
+    exit 13
+  fi
+
+  # This ordering is deliberately strict.  No scheduler or media writer may
+  # start after the legacy gateway stops until a replacement container proves
+  # it has the canonical endpoint baked in.  Building those containers with
+  # `--no-start`, then retiring the legacy gateway, leaves no interval in
+  # which fresh work can run through an unproven or split-brain endpoint.
+  local writers_prepared_without_start=false
+  if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]]; then
+    if ! prepare_writers_for_canonical_gateway_proof "$media_repair_initial_state"; then
+      fail_closed_after_recovery_gateway_stop
+      exit 13
+    fi
+    if ! verify_prepared_writers_use_canonical_gateway; then
+      fail_closed_after_recovery_gateway_stop
+      exit 13
+    fi
+    if retire_unmanaged_recovery_gateway; then
+      writers_prepared_without_start=true
+    else
+      local retirement_rc=$?
+      # `retire_unmanaged_recovery_gateway` has already stopped writer
+      # admission if the final Docker removal could not be proved.
+      exit "$retirement_rc"
+    fi
+  fi
   if [[ "$cutover_active" == "true" ]]; then
     finish_opencfd_2606_cutover
   fi
-  restore_media_repair_after_rebuild "$media_repair_initial_state"
-  restore_sweeper_after_rebuild "$sweeper_restore_state"
+  restore_media_repair_after_rebuild "$media_repair_initial_state" "$writers_prepared_without_start"
+  restore_sweeper_after_rebuild "$sweeper_restore_state" "$writers_prepared_without_start"
   if [[ "$cutover_active" == "true" ]]; then
     if [[ "$sweeper_restore_state" == "running" ]]; then
       if ! wait_for_opencfd_2606_continuation_evidence "$CUTOVER_ATTESTATION_ID"; then

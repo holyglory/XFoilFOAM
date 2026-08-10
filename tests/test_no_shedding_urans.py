@@ -33,19 +33,29 @@ from airfoilfoam.pipeline import (
 )
 
 
-def _flat_history(cl_mean, cd_mean, *, t0=0.0, t1=1.0, n=400, noise_rms=0.0):
+def _flat_history(
+    cl_mean,
+    cd_mean,
+    *,
+    cm_mean=0.0,
+    t0=0.0,
+    t1=1.0,
+    n=400,
+    noise_rms=0.0,
+    cm_noise_rms=None,
+):
     ts = [t0 + (t1 - t0) * i / (n - 1) for i in range(n)]
     return ForceHistory(
         t=ts,
         cl=[cl_mean] * n,
         cd=[cd_mean] * n,
-        cm=[0.0] * n,
+        cm=[cm_mean] * n,
         cl_mean=cl_mean,
         cl_rms=noise_rms,
         cd_mean=cd_mean,
         cd_rms=noise_rms,
-        cm_mean=0.0,
-        cm_rms=0.0,
+        cm_mean=cm_mean,
+        cm_rms=noise_rms if cm_noise_rms is None else cm_noise_rms,
         shedding_freq_hz=0.0,
         strouhal=0.0,
         samples=n,
@@ -158,6 +168,24 @@ def test_flat_lift_signal_is_no_shedding():
     assert is_no_shedding(_flat_history(cl_mean=0.7, cd_mean=0.3, noise_rms=1e-4))
 
 
+def test_no_shedding_requires_dense_quiet_all_channel_evidence():
+    """A flat pair of endpoints or noisy Cm cannot certify a steady wake."""
+    assert not is_no_shedding(
+        _flat_history(cl_mean=0.0006, cd_mean=0.012, n=19)
+    )
+    assert not is_no_shedding(
+        _flat_history(
+            cl_mean=0.7,
+            cd_mean=0.03,
+            cm_mean=-0.08,
+            cm_noise_rms=0.01,
+        )
+    )
+    assert is_no_shedding(
+        _flat_history(cl_mean=0.0006, cd_mean=0.012, n=20)
+    )
+
+
 def test_periodic_signal_is_not_no_shedding():
     # A genuine post-stall shedding history has a real oscillation amplitude.
     assert not is_no_shedding(_shedding_history(cl_mean=0.9, cd_mean=0.2, cl_rms=0.08, cd_rms=0.02))
@@ -184,6 +212,63 @@ def test_no_shedding_takes_steady_mean_path_not_refine(tmp_path):
     assert not quality.can_refine
     assert quality.measured_period_s is None
     assert "no vortex shedding" in quality.reason
+
+
+def test_no_shedding_certificate_refuses_a_corrupt_terminal_force_sample(tmp_path):
+    """MUST-CATCH: the no-shedding escape hatch cannot hide NaN history."""
+    hist = _flat_history(cl_mean=0.0006, cd_mean=0.012, t1=4.3)
+    quality = evaluate_urans_quality(tmp_path, hist, speed=10.0, chord=1.0)
+    assert quality.ok and quality.no_shedding
+
+    hist.cd[-1] = math.nan
+    certificate, reason = pipeline._no_shedding_observation_certificate(
+        hist,
+        quality,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
+    )
+
+    assert certificate is None
+    assert reason is not None
+    assert "non-finite" in reason
+
+
+def test_no_shedding_certificate_stamps_bounded_transport_statistics() -> None:
+    """The live producer must not relabel raw stats as its transport witness."""
+    history = _flat_history(
+        cl_mean=0.7,
+        cd_mean=0.035,
+        cm_mean=-0.08,
+        t1=4.3,
+        n=21,
+        noise_rms=0.0001,
+    )
+    # Model an otherwise finite projection whose first transmitted sample was
+    # altered after source-window aggregation. The producer must stamp what it
+    # actually transports; the control plane will reject a mismatched witness.
+    history.cl[0] = 0.4
+    quality = pipeline.UransQuality(
+        ok=True,
+        can_refine=False,
+        no_shedding=True,
+        reason="test no-shedding verdict",
+        retained_start_time=0.0,
+        retained_end_time=4.3,
+    )
+
+    certificate, reason = pipeline._no_shedding_observation_certificate(
+        history,
+        quality,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
+    )
+
+    assert reason is None
+    assert certificate is not None
+    assert certificate.cl_mean == pytest.approx(0.7)
+    assert certificate.cl_rms == pytest.approx(0.0001)
+    assert certificate.transport_cl_mean == pytest.approx(0.6925)
+    assert certificate.transport_cl_rms == pytest.approx(0.04683, abs=1e-5)
+    assert certificate.transport_cl_mean != certificate.cl_mean
+    assert certificate.transport_cl_rms != certificate.cl_rms
 
 
 @pytest.mark.parametrize(
@@ -362,12 +447,19 @@ def test_transient_attempt_routes_physical_tail_to_quality_gate(
                 / "coefficient.dat"
             )
             coeff.parent.mkdir(parents=True, exist_ok=True)
-            coeff.write_text(
+            rows = [
                 "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
-                "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)\n"
-                "0 0.33 0 0 1 0 0 -0.17 0 0 0 0 0\n"
-                "0.08 0.331 0 0 1.02 0 0 -0.17 0 0 0 0 0\n"
-            )
+                "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+            ]
+            # A real slow-wake witness needs temporal density too.  Match the
+            # exact 0.07-s physical tail returned by the fake reducer while
+            # supplying 41 raw rows, rather than relying on two endpoints.
+            for index in range(41):
+                t = 0.0782 + 0.07 * index / 40
+                rows.append(
+                    f"{t:.6g} 0.33 0 0 1 0 0 -0.17 0 0 0 0 0"
+                )
+            coeff.write_text("\n".join(rows) + "\n")
             return SimpleNamespace(ok=True, stdout="pimple ok")
 
     captured = {}
@@ -855,6 +947,28 @@ def _write_flat_coeff(path: Path, cl: float, cd: float, cm: float, n: int = 60):
     path.write_text("\n".join(rows) + "\n")
 
 
+def test_no_shedding_tail_rejects_a_terminal_nonfinite_raw_row(tmp_path):
+    """A NaN written after valid coefficients extends the physical tail.
+
+    The permissive coefficient reader omits the NaN itself, so the live
+    no-shedding gate must still see its timestamp and refuse to certify the
+    preceding clean-looking history as a complete terminal observation.
+    """
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    coeff.parent.mkdir(parents=True)
+    _write_flat_coeff(coeff, cl=0.0006, cd=0.012, cm=-0.0002, n=430)
+    with coeff.open("a") as stream:
+        stream.write("4.31 0.012 0 0 nan 0 0 -0.0002 0 0 0 0 0\n")
+
+    history = pipeline._force_history_for_no_shedding_horizon(
+        [coeff],
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
+        target_cycles=3,
+    )
+
+    assert history is None
+
+
 def test_restart_boundary_force_impulses_do_not_mint_false_shedding(tmp_path):
     """Production-shaped integration guard: a flat trajectory split across
     continuation segments remains no-shedding even when each older segment's
@@ -1134,7 +1248,9 @@ def test_no_shedding_finalize_recovers_naca0012_alpha0_as_steady(tmp_path, monke
     from airfoilfoam.postprocess.forces import AveragedCoefficients
 
     cl_true, cd_true, cm_true = 0.0006, 0.0118, -0.0002
-    hist = _flat_history(cl_mean=cl_true, cd_mean=cd_true)
+    # The finalizer now requires the same physical slow-wake horizon as a
+    # production no-shedding result; a one-second mock must not bypass it.
+    hist = _flat_history(cl_mean=cl_true, cd_mean=cd_true, t1=4.3)
     avg = AveragedCoefficients(
         cl=cl_true, cd=cd_true, cm=cm_true, cl_std=0.0, cd_std=0.0, cm_std=0.0, samples=hist.samples
     )
@@ -1184,6 +1300,10 @@ def test_no_shedding_finalize_recovers_naca0012_alpha0_as_steady(tmp_path, monke
     assert outcome.cd == pytest.approx(cd_true)
     # A non-shedding case has no meaningful Strouhal to report.
     assert outcome.strouhal is None
+    assert outcome.no_shedding_certificate is not None
+    assert outcome.no_shedding_certificate.observed_observation_s >= (
+        outcome.no_shedding_certificate.required_observation_s
+    )
 
 
 def test_finalize_rejects_short_flat_urans_before_publishing_transient_media(

@@ -47,6 +47,7 @@ from airfoilfoam.models import (
     urans_point_fidelity,
 )
 from airfoilfoam.pipeline import CaseOutcome, TransientResult, UransQuality, _finalize_outcome
+from airfoilfoam.postprocess.unsteady import ForceHistory
 from airfoilfoam.storage import JobStore
 
 
@@ -341,10 +342,30 @@ def test_urans_point_echoes_tier_fidelity(tmp_path, monkeypatch, fidelity, echo)
     still URANS-produced values) echoes the tier on PolarPoint.fidelity."""
     tcase = tmp_path / "transient"
     tcase.mkdir(parents=True, exist_ok=True)
+    # A no-shedding certificate is a real dense force witness, not a claimed
+    # `samples=420` count attached to four endpoint values.
+    t = [4.2 * index / 20 for index in range(21)]
+    history = ForceHistory(
+        t=t,
+        cl=[0.02] * len(t),
+        cd=[0.011] * len(t),
+        cm=[0.0] * len(t),
+        cl_mean=0.02,
+        cl_rms=0.0,
+        cd_mean=0.011,
+        cd_rms=0.0,
+        cm_mean=0.0,
+        cm_rms=0.0,
+        shedding_freq_hz=0.0,
+        strouhal=0.0,
+        samples=len(t),
+        window_start=0.0,
+        window_end=4.2,
+    )
     transient = TransientResult(
         avg=SimpleNamespace(cl=0.02, cd=0.011, cm=0.0, cl_cd=1.8, cl_std=0.0, cd_std=0.0, cm_std=0.0),
         case_dir=tcase,
-        force_history=None,
+        force_history=history,
         quality=UransQuality(ok=True, can_refine=False, no_shedding=True, reason="no vortex shedding"),
         start_time=0.0,
         end_time=1.0,

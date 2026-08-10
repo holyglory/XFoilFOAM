@@ -645,6 +645,48 @@
       "when": 1788739200000,
       "tag": "0091_remote_promise_failover_lease",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1788825600000,
+      "tag": "0092_result_media_storage_key_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1788912000000,
+      "tag": "0093_result_attempt_ingest_completion",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1788998400000,
+      "tag": "0094_archive_clean_tail_continuation_override",
+      "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1789084800000,
+      "tag": "0095_archive_recovery_target_ownership",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1789171200000,
+      "tag": "0096_result_interpretation_ledger_reconciliation",
+      "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1789257600000,
+      "tag": "0097_legacy_urans_archive_gap_recovery",
+      "breakpoints": true
     }
   ]
 }

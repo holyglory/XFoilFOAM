@@ -29,6 +29,7 @@ import {
   ensureFullUransRequestCoverage,
   ensurePrecalcObligations,
   finalUransRecoveryPlanForVerifyItem,
+  FINAL_URANS_CONTINUATION_BUDGET_S,
   FINAL_URANS_OUTCOMES,
   finalVerifyInterleaveDecision,
   FullUransRequestCoverageIncompleteError,
@@ -36,6 +37,7 @@ import {
   precalcContinuationsForObligations,
   precalcRequestStateFromObligations,
   precalcSnapshotForVerifyItem,
+  verifyPrecalcSnapshotFailureMessage,
   requeueRestartablePrecalcContinuations,
   refreshFullUransRequestState,
   releaseClaimedUransRequest,
@@ -101,6 +103,16 @@ import {
   submitPendingJobWithLifecycleGuard,
   type SubmissionAdmissionLane,
 } from "./submit-lifecycle";
+import {
+  archiveBackfillFinalContinuationForVerifyItem,
+  archiveBackfillPrecalcContinuationForRequest,
+  archiveBackfillPrecalcRequestRequiresActionProof,
+  archiveBackfillFinalVerifyQueueRequiresActionProof,
+  blockArchiveBackfillFinalContinuationAtSubmit,
+  blockArchiveBackfillPrecalcContinuationAtSubmit,
+  routeArchiveInterpretationRecoveryActions,
+} from "./archive-interpretation-recovery";
+import { routeLegacyUransArchiveGapRecoveryActions } from "./legacy-urans-archive-gap-recovery";
 
 /** Parents whose recovery was already re-attempted this process lifetime —
  *  a parent whose retry plan is empty must not be re-planned every tick
@@ -1752,6 +1764,9 @@ async function submitLadderJob(
     continueFrom?: { engineJobId: string; caseSlug: string } | null;
     /** Continuation budget override [s] — replaces the tier-derived budget. */
     budgetOverrideS?: number | null;
+    /** Exact archive-reducer instruction for the resumed transient's clean
+     * tail. Only archive-authorized same-case continuations may set this. */
+    correctiveTailPeriods?: number | null;
     /** Live engine capability stamped into PRECALC execution provenance. */
     meshRecoveryVersion?: number;
     /** Exact live durable URANS recovery contract. Required only when this
@@ -1788,6 +1803,11 @@ async function submitLadderJob(
   if (opts.fidelity === "full" && opts.uransRequestId) {
     throw new Error(
       "direct full-fidelity request submission is forbidden; route through preliminary coverage and a verify queue item",
+    );
+  }
+  if (opts.correctiveTailPeriods != null && !opts.continueFrom) {
+    throw new Error(
+      "corrective tail periods are valid only for an exact same-case continuation",
     );
   }
   const {
@@ -1885,6 +1905,18 @@ async function submitLadderJob(
     };
     if (opts.budgetOverrideS != null)
       request.budget_override_s = opts.budgetOverrideS;
+    if (opts.correctiveTailPeriods != null) {
+      if (
+        !Number.isSafeInteger(opts.correctiveTailPeriods) ||
+        opts.correctiveTailPeriods < 1 ||
+        opts.correctiveTailPeriods > 3
+      ) {
+        throw new Error(
+          "continuation corrective tail must be an integer from 1 through 3",
+        );
+      }
+      request.corrective_tail_periods = opts.correctiveTailPeriods;
+    }
   }
   const jobValues: typeof simJobs.$inferInsert = {
     parentJobId: opts.recordedPromotion?.parentJobId ?? null,
@@ -1918,6 +1950,9 @@ async function submitLadderJob(
         : {}),
       ...(opts.uransRecoveryVersion != null
         ? { uransRecoveryVersion: opts.uransRecoveryVersion }
+        : {}),
+      ...(opts.correctiveTailPeriods != null
+        ? { correctiveTailPeriods: opts.correctiveTailPeriods }
         : {}),
       resources: request.resources,
       setupSnapshot: target.snapshot,
@@ -2239,8 +2274,13 @@ async function consumeUransRequest(
   // without it there is no case state to resume, so the item cancels loudly
   // instead of pretending a fresh solve is a continuation.
   let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
+  /** A recovery action, unlike a request payload, is a durable exact-archive
+   * authorization. It permits only this action's source checkpoint to bypass
+   * the normal marker-based PRECALC continuation predicate. */
+  let archiveBackfillContinuation = false;
   let effectiveBudgetOverrideS =
     requestedFidelity === "precalc" ? (request.budgetOverrideS ?? null) : null;
+  let effectiveCorrectiveTailPeriods: number | null = null;
   let aoas: number[];
   if (requestedFidelity === "precalc" && request.continueFromResultId) {
     if (!request.continueFromResultAttemptId) {
@@ -2295,23 +2335,56 @@ async function consumeUransRequest(
         eq(sourceRevision.id, resultAttempts.simulationPresetRevisionId),
       )
       .limit(1);
+    archiveBackfillContinuation =
+      await archiveBackfillPrecalcContinuationForRequest(db, {
+        requestId: request.id,
+        resultId: request.continueFromResultId,
+        resultAttemptId: request.continueFromResultAttemptId,
+        airfoilId: request.airfoilId,
+        revisionId: request.revisionId,
+        bcId: target.bcId,
+        aoaDeg: request.aoaDeg ?? Number.NaN,
+        correctiveTailPeriods: request.correctiveTailPeriods ?? null,
+      });
+    const archiveBackfillRequiresActionProof =
+      await archiveBackfillPrecalcRequestRequiresActionProof(db, request.id);
+    // The DB request field is not an operator knob. It is consumed only after
+    // the exact action/source/archive proof above; otherwise a manual or
+    // legacy continuation keeps the established source-derived heuristic.
+    if (archiveBackfillContinuation) {
+      effectiveCorrectiveTailPeriods =
+        request.correctiveTailPeriods ?? null;
+    }
     if (
       !source ||
       !source.engineJobId ||
       !source.engineCaseSlug ||
-      !(await isExactRestartablePrecalcAttempt(
-        db,
-        request.continueFromResultId,
-        request.continueFromResultAttemptId,
-      ))
+      !(
+        archiveBackfillContinuation ||
+        (!archiveBackfillRequiresActionProof &&
+          (await isExactRestartablePrecalcAttempt(
+          db,
+          request.continueFromResultId,
+          request.continueFromResultAttemptId,
+          )))
+      )
     ) {
+      if (archiveBackfillRequiresActionProof) {
+        await blockArchiveBackfillPrecalcContinuationAtSubmit(db, {
+          requestId: request.id,
+          reason:
+            "the reducer-pinned GCS archive is no longer the exact verified restart archive for this continuation request",
+        });
+      }
       console.error(
         `[sweeper] URANS request ${request.id} cancelled: continuation source ${request.continueFromResultId} has no exact verified restart archive`,
       );
-      await db
-        .update(simUransRequests)
-        .set({ state: "cancelled" })
-        .where(eq(simUransRequests.id, request.id));
+      if (!archiveBackfillRequiresActionProof) {
+        await db
+          .update(simUransRequests)
+          .set({ state: "cancelled" })
+          .where(eq(simUransRequests.id, request.id));
+      }
       return false;
     }
     const targetImplementationId = normalizedContinuationImplementationId(
@@ -2452,10 +2525,18 @@ async function consumeUransRequest(
     const continuationIds = new Set(
       continuations.map((continuation) => continuation.obligationId),
     );
+    const isContinuationObligation = (
+      obligation: (typeof obligations)[number],
+    ) =>
+      continuationIds.has(obligation.id) ||
+      (archiveBackfillContinuation &&
+        obligation.sourceResultId === request.continueFromResultId &&
+        obligation.sourceResultAttemptId ===
+          request.continueFromResultAttemptId);
     const schedulable = obligations.filter(
       (obligation) =>
         obligation.state === "pending" &&
-        (continuationIds.has(obligation.id)
+        (isContinuationObligation(obligation)
           ? durableRecoveryAvailable
           : obligation.attemptCount < obligation.maxAttempts) &&
         (!obligation.nextSubmitAt ||
@@ -2466,7 +2547,7 @@ async function consumeUransRequest(
         obligations.some(
           (obligation) =>
             obligation.state === "pending" &&
-            (continuationIds.has(obligation.id)
+            (isContinuationObligation(obligation)
               ? durableRecoveryAvailable
               : obligation.attemptCount < obligation.maxAttempts),
         )
@@ -2519,6 +2600,7 @@ async function consumeUransRequest(
       obligationContinuationResultAttemptId =
         latestContinuation.resultAttemptId;
       effectiveBudgetOverrideS = latestContinuation.budgetOverrideS;
+      effectiveCorrectiveTailPeriods = null;
     }
   }
   const outcome = await submitLadderJob(db, engine, {
@@ -2545,12 +2627,16 @@ async function consumeUransRequest(
             continueFromResultId: request.continueFromResultId,
             continueFromResultAttemptId: request.continueFromResultAttemptId,
             budgetOverrideS: request.budgetOverrideS ?? null,
+            ...(effectiveCorrectiveTailPeriods != null
+              ? { correctiveTailPeriods: effectiveCorrectiveTailPeriods }
+              : {}),
           }
         : {}),
     },
     cpuSlots,
     continueFrom,
     budgetOverrideS: effectiveBudgetOverrideS,
+    correctiveTailPeriods: effectiveCorrectiveTailPeriods,
     meshRecoveryVersion,
     uransRecoveryVersion: continueFrom
       ? (uransRecoveryVersion ?? undefined)
@@ -2629,20 +2715,29 @@ async function consumeVerifyItem(
     allowAutomaticRecovery: durableRecoveryAvailable,
   });
   if (!item) return false;
-  const precalc = await precalcSnapshotForVerifyItem(db, item);
-  if (!precalc) {
+  const precalcResolution = await precalcSnapshotForVerifyItem(db, item);
+  if (precalcResolution.outcome !== "accepted") {
     // Runnable queue rows own one exact immutable accepted preliminary
-    // attempt. Missing/mismatched evidence is a controller invariant breach;
-    // never fall back to whichever generation the mutable results row selects.
+    // attempt from the exact BC + solver implementation cell. Missing or
+    // mismatched provenance is a controller invariant breach; never fall back
+    // to whichever generation the mutable results row selects.
+    const failure = verifyPrecalcSnapshotFailureMessage(
+      precalcResolution.reason,
+    );
     console.error(
-      `[sweeper] verify item ${item.id} cancelled: exact preliminary attempt ${item.precalcResultAttemptId ?? "missing"} is not accepted urans_precalc evidence for result ${item.precalcResultId}`,
+      `[sweeper] verify item ${item.id} cancelled: ${precalcResolution.reason}: ${failure}`,
     );
     await db
       .update(simUransVerifyQueue)
-      .set({ state: "cancelled", simJobId: null })
+      .set({
+        state: "cancelled",
+        simJobId: null,
+        lastError: `FINAL admission rejected (${precalcResolution.reason}): ${failure}`,
+      })
       .where(eq(simUransVerifyQueue.id, item.id));
     return false;
   }
+  const precalc = precalcResolution.snapshot;
   const target = await resolveTarget(db, item.airfoilId, item.revisionId);
   if (!target) {
     console.error(
@@ -2654,7 +2749,34 @@ async function consumeVerifyItem(
       .where(eq(simUransVerifyQueue.id, item.id));
     return false;
   }
-  let recovery = await finalUransRecoveryPlanForVerifyItem(db, item);
+  const archiveBackfillRequiresActionProof =
+    await archiveBackfillFinalVerifyQueueRequiresActionProof(db, item.id);
+  const archiveBackfillRecovery =
+    await archiveBackfillFinalContinuationForVerifyItem(db, item, target.bcId);
+  if (archiveBackfillRequiresActionProof && !archiveBackfillRecovery) {
+    const reason =
+      "the reducer-pinned GCS archive is no longer the exact verified restart archive for this FINAL continuation";
+    await blockArchiveBackfillFinalContinuationAtSubmit(db, {
+      verifyQueueId: item.id,
+      reason,
+      targetSolverImplementationId: solverImplementationIdForSetup(
+        target.snapshot,
+      ),
+    });
+    return false;
+  }
+  let recovery = archiveBackfillRecovery
+    ? {
+        mode: "continuation" as const,
+        resultId: archiveBackfillRecovery.resultId,
+        resultAttemptId: archiveBackfillRecovery.resultAttemptId,
+        engineJobId: archiveBackfillRecovery.engineJobId,
+        engineCaseSlug: archiveBackfillRecovery.engineCaseSlug,
+        solverImplementationId: archiveBackfillRecovery.solverImplementationId,
+        budgetOverrideS:
+          item.continuationBudgetOverrideS ?? FINAL_URANS_CONTINUATION_BUDGET_S,
+      }
+    : await finalUransRecoveryPlanForVerifyItem(db, item);
   if (recovery.mode === "media_repair") {
     await releaseClaimedVerifyItem(db, item.id);
     return false;
@@ -2726,6 +2848,16 @@ async function consumeVerifyItem(
       : null;
   const budgetOverrideS =
     recovery.mode === "continuation" ? recovery.budgetOverrideS : null;
+  // Only the exact archive-owned FINAL checkpoint may carry a reducer tail
+  // instruction. The normal final recovery planner remains source-heuristic
+  // based, and a compatibility fallback to a fresh run must not inherit it.
+  const correctiveTailPeriods =
+    recovery.mode === "continuation" &&
+    archiveBackfillRecovery != null &&
+    recovery.resultId === archiveBackfillRecovery.resultId &&
+    recovery.resultAttemptId === archiveBackfillRecovery.resultAttemptId
+      ? archiveBackfillRecovery.correctiveTailPeriods
+      : null;
   const usesAutomaticRecoveryContract =
     recovery.mode === "continuation" ||
     item.freshAttemptCount > 0 ||
@@ -2755,12 +2887,16 @@ async function consumeVerifyItem(
             continueFromResultId: recovery.resultId,
             continueFromResultAttemptId: recovery.resultAttemptId,
             budgetOverrideS,
+            ...(correctiveTailPeriods != null
+              ? { correctiveTailPeriods }
+              : {}),
           }
         : {}),
     },
     cpuSlots,
     continueFrom: continuation,
     budgetOverrideS,
+    correctiveTailPeriods,
     uransRecoveryVersion: usesAutomaticRecoveryContract
       ? (scope.uransRecoveryVersion ?? undefined)
       : undefined,
@@ -2936,6 +3072,27 @@ export async function uransLadderTick(
       : await engineUransRecoveryVersion(engine);
   const durableRecoveryAvailable =
     supportsDurableUransRecovery(uransRecoveryVersion);
+
+  // Archive clean-cycle reduction never submits CFD itself. It creates exact
+  // action records; materialize their normal ladder owners before any request
+  // or verify item can be claimed in this tick. A source archive is re-proven
+  // again by the consuming path immediately before engine composition.
+  if (durableRecoveryAvailable) {
+    const routedArchiveRecoveryActions =
+      await routeArchiveInterpretationRecoveryActions(db);
+    if (routedArchiveRecoveryActions > 0) {
+      console.log(
+        `[sweeper] archive interpretation recovery: routed ${routedArchiveRecoveryActions} durable action(s) into the URANS ladder`,
+      );
+    }
+    const routedLegacyArchiveGapActions =
+      await routeLegacyUransArchiveGapRecoveryActions(db);
+    if (routedLegacyArchiveGapActions > 0) {
+      console.log(
+        `[sweeper] legacy archive-gap recovery: routed or reconciled ${routedLegacyArchiveGapActions} bounded FAST action(s) into the URANS ladder`,
+      );
+    }
+  }
 
   if (meshRecoveryVersion != null) {
     const continuationRecoveryScope = opts.requestIds?.length

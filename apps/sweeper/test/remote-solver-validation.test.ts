@@ -1,7 +1,7 @@
 import "./enabled-engine-pool-fixture";
 
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -806,7 +806,13 @@ async function parsedRequestBody(init?: RequestInit): Promise<unknown> {
     else if (typeof chunk === "string" || chunk instanceof Uint8Array)
       chunks.push(Buffer.from(chunk));
   }
-  const text = Buffer.concat(chunks).toString("utf8");
+  const body = Buffer.concat(chunks);
+  (
+    init as RequestInit & {
+      __bodyByteLength?: number;
+    }
+  ).__bodyByteLength = body.byteLength;
+  const text = body.toString("utf8");
   const contentType = new Headers(init.headers).get("content-type") ?? "";
   const boundary = /boundary=([^;]+)/i.exec(contentType)?.[1];
   if (!boundary) return JSON.parse(text);
@@ -941,6 +947,7 @@ function stubFetch(
     conflictIdsByPolarIndex?: Record<number, string[]>;
     conflictStatuses?: Record<string, "pending" | "promoted" | "archived">;
     failPolarIndex?: number;
+    incompleteMultipartPolarIndex?: number;
     failCancelCount?: number;
     unfulfilledPolarIndex?: number;
     observeJobId?: string;
@@ -975,6 +982,16 @@ function stubFetch(
       > & {
         results?: Array<{ aoaDeg?: unknown }>;
       };
+      if (opts.incompleteMultipartPolarIndex === polarIndex)
+        return new Response(
+          JSON.stringify({
+            error: "manifest references missing multipart upload field media_23",
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
       const pushedAoas = Array.isArray(body.results)
         ? body.results
             .map((result: { aoaDeg?: unknown }) => result.aoaDeg)
@@ -1083,6 +1100,14 @@ function requests(fetchMock: ReturnType<typeof vi.fn>, suffix: string) {
   return fetchMock.mock.calls
     .map(([url, init]) => ({
       url: String(url),
+      headers: new Headers(init?.headers),
+      bodyByteLength: (
+        init as
+          | (RequestInit & {
+              __bodyByteLength?: number;
+            })
+          | undefined
+      )?.__bodyByteLength,
       body:
         (init as (RequestInit & { __parsedBody?: unknown }) | undefined)
           ?.__parsedBody ??
@@ -4174,6 +4199,75 @@ describe("remote solver push validation regressions", () => {
       (await deliveriesForJob(job.id)).filter((row) => row.resultId),
     ).toSatisfy((rows: Array<{ state: string }>) =>
       rows.every((row) => row.state === "delivered"),
+    );
+    const [polar] = requests(waitingFetch.fetchMock, "/polars");
+    expect(Number(polar.headers.get("content-length"))).toBe(
+      polar.bodyByteLength,
+    );
+  });
+
+  it("MUST-CATCH: preflights every declared multipart byte before the hub request and keeps the promise recoverable", async () => {
+    const aoa = 822.1025;
+    const job = await seedDoneRemoteJob("multipart-source-preflight", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("multipart-source-preflight", [aoa], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [media] = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, result.id))
+      .limit(1);
+    unlinkSync(join(MEDIA_DIR, media.storageKey));
+    const transport = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(transport.fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => row.resultId),
+    ).toMatchObject([
+      {
+        state: "retry_wait",
+        lastError: expect.stringContaining(
+          "remote multipart source is unavailable",
+        ),
+      },
+    ]);
+    expect((await readPromise(promiseId)).promise.status).toBe("active");
+    expect(requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`)).toHaveLength(
+      0,
+    );
+  });
+
+  it("MUST-CATCH: an incomplete multipart response retries transport without cancelling valid solver evidence", async () => {
+    const aoa = 822.1026;
+    const job = await seedDoneRemoteJob("multipart-response-incomplete", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("multipart-response-incomplete", [aoa], promiseId);
+    const transport = stubFetch({ incompleteMultipartPolarIndex: 1 });
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(transport.fetchMock, "/polars")).toHaveLength(1);
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => row.resultId),
+    ).toMatchObject([
+      {
+        state: "retry_wait",
+        lastHttpStatus: 400,
+        lastError: expect.stringContaining(
+          "missing multipart upload field media_23",
+        ),
+      },
+    ]);
+    expect((await readPromise(promiseId)).promise.status).toBe("active");
+    expect(requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`)).toHaveLength(
+      0,
     );
   });
 

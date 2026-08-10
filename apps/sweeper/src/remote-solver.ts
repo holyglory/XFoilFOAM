@@ -63,7 +63,7 @@ import {
 } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 
 import {
@@ -2370,6 +2370,84 @@ interface StreamUpload {
   fieldName: string;
   storageKey: string;
   mimeType: string;
+  sha256: string;
+  byteSize: number;
+}
+
+class RemoteMultipartSourceError extends Error {}
+
+function localMultipartSourcePath(storageKey: string): string {
+  const root = resolve(MEDIA_DIR);
+  const full = resolve(root, storageKey);
+  if (full !== root && !full.startsWith(`${root}${sep}`)) {
+    throw new RemoteMultipartSourceError(
+      `remote multipart source escapes the media root: ${storageKey}`,
+    );
+  }
+  return full;
+}
+
+async function preflightMultipartUploads(
+  uploads: StreamUpload[],
+): Promise<void> {
+  for (const upload of uploads) {
+    const sourcePath = localMultipartSourcePath(upload.storageKey);
+    let source;
+    try {
+      source = await stat(sourcePath);
+    } catch {
+      throw new RemoteMultipartSourceError(
+        `remote multipart source is unavailable: ${upload.storageKey}`,
+      );
+    }
+    if (!source.isFile() || source.size !== upload.byteSize) {
+      throw new RemoteMultipartSourceError(
+        `remote multipart source byte-size mismatch for ${upload.storageKey}: expected ${upload.byteSize}, found ${
+          source.isFile() ? source.size : "non-file"
+        }`,
+      );
+    }
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(sourcePath)) hash.update(chunk);
+    const actualSha256 = hash.digest("hex");
+    if (actualSha256 !== upload.sha256.toLowerCase()) {
+      throw new RemoteMultipartSourceError(
+        `remote multipart source checksum mismatch for ${upload.storageKey}`,
+      );
+    }
+  }
+}
+
+function multipartUploadHeader(
+  boundary: string,
+  upload: StreamUpload,
+): Buffer {
+  const filename = basename(upload.storageKey).replace(/["\r\n]/g, "_");
+  return Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${upload.fieldName}"; filename="${filename}"\r\nContent-Type: ${upload.mimeType}\r\n\r\n`,
+  );
+}
+
+function multipartPolarContentLength(
+  boundary: string,
+  manifestJson: string,
+  uploads: StreamUpload[],
+): number {
+  let total = Buffer.byteLength(
+    `--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n${manifestJson}\r\n`,
+  );
+  for (const upload of uploads) {
+    total += multipartUploadHeader(boundary, upload).byteLength;
+    total += upload.byteSize;
+    total += 2; // trailing CRLF after the file bytes
+  }
+  total += Buffer.byteLength(`--${boundary}--\r\n`);
+  if (!Number.isSafeInteger(total) || total <= 0) {
+    throw new RemoteMultipartSourceError(
+      "remote multipart body length is invalid",
+    );
+  }
+  return total;
 }
 
 function completedUploadGeneration(
@@ -2563,22 +2641,19 @@ export async function uploadBrokeredEvidenceFile(
 
 async function* multipartPolarBody(
   boundary: string,
-  manifest: unknown,
+  manifestJson: string,
   uploads: StreamUpload[],
   onProgress: () => Promise<void>,
 ): AsyncGenerator<Buffer> {
   await onProgress();
   yield Buffer.from(
-    `--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(manifest)}\r\n`,
+    `--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n${manifestJson}\r\n`,
   );
   for (const upload of uploads) {
     await onProgress();
-    const filename = basename(upload.storageKey).replace(/["\r\n]/g, "_");
-    yield Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${upload.fieldName}"; filename="${filename}"\r\nContent-Type: ${upload.mimeType}\r\n\r\n`,
-    );
+    yield multipartUploadHeader(boundary, upload);
     for await (const chunk of createReadStream(
-      join(MEDIA_DIR, upload.storageKey),
+      localMultipartSourcePath(upload.storageKey),
     )) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       await onProgress();
@@ -4163,6 +4238,8 @@ async function pushOneRemoteResult(
         fieldName: uploadField,
         storageKey: artifact.storageKey,
         mimeType: artifact.mimeType,
+        sha256: artifact.sha256,
+        byteSize: artifact.byteSize,
       });
       return {
         kind: artifact.kind,
@@ -4182,6 +4259,8 @@ async function pushOneRemoteResult(
           fieldName: uploadField,
           storageKey: item.storageKey,
           mimeType: item.mimeType,
+          sha256: item.sha256!,
+          byteSize: item.byteSize!,
         });
         return {
           kind: item.kind,
@@ -4296,7 +4375,14 @@ async function pushOneRemoteResult(
       bcId: job.bcIds[0],
       results: [point],
     };
+    await preflightMultipartUploads(uploads);
     const boundary = `xfoilfoam-${randomBytes(18).toString("hex")}`;
+    const manifestJson = JSON.stringify(manifest);
+    const contentLength = multipartPolarContentLength(
+      boundary,
+      manifestJson,
+      uploads,
+    );
     const uploadAbort = createProgressAwareAbort();
     let lastClaimRenewal = Date.now();
     let lastSweeperHeartbeat = 0;
@@ -4319,9 +4405,10 @@ async function pushOneRemoteResult(
       headers: {
         ...headers(settings),
         "content-type": `multipart/form-data; boundary=${boundary}`,
+        "content-length": String(contentLength),
       },
       body: Readable.from(
-        multipartPolarBody(boundary, manifest, uploads, onProgress),
+        multipartPolarBody(boundary, manifestJson, uploads, onProgress),
       ) as unknown as RequestInit["body"],
       duplex: "half",
     };
@@ -4353,7 +4440,11 @@ async function pushOneRemoteResult(
       const error = `remote polar push failed (${response.status})${
         remoteDetail ? `: ${remoteDetail}` : ""
       }`;
+      const incompleteMultipart =
+        response.status === 400 &&
+        /missing multipart upload field/i.test(remoteDetail);
       if (
+        incompleteMultipart ||
         response.status >= 500 ||
         response.status === 408 ||
         response.status === 429

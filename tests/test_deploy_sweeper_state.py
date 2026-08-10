@@ -140,6 +140,10 @@ def _deploy_harness(
     media_repair_stop_fails: bool = False,
     media_repair_running: bool = True,
     sweeper_dies_after_restore: bool = False,
+    unmanaged_recovery_gateway: bool = False,
+    recovery_gateway_queue_active: bool = False,
+    recovery_gateway_stop_fails: bool = False,
+    recovery_gateway_remove_fails: bool = False,
 ) -> dict[str, str]:
     app_dir = tmp_path / "app"
     fake_bin = tmp_path / "bin"
@@ -148,6 +152,7 @@ def _deploy_harness(
     env_text = (
         "AIRFOILFOAM_BUILD_ID=old-build\n"
         "ENGINE_EXPECTED_BUILD_ID=old-build\n"
+        + "ENGINE_URL=http://api:8000\n"
         + REMOTE_EVIDENCE_ENV
         + "OPENCFD2606_CUTOVER_PENDING=0\n"
         + f"OPENCFD2606_CUTOVER_COMPLETE={1 if cutover_complete else 0}\n"
@@ -163,6 +168,11 @@ def _deploy_harness(
         env_text += "OPENCFD2606_CERTIFIED_EVIDENCE_CONTRACT_SHA256=\n"
     if enabled_engine_keys is not None:
         env_text += f"AIRFOILFOAM_ENABLED_ENGINE_KEYS={enabled_engine_keys}\n"
+    if unmanaged_recovery_gateway:
+        env_text = env_text.replace(
+            "ENGINE_URL=http://api:8000\n",
+            "ENGINE_URL=http://app-api-recovery:8000\n",
+        )
     (app_dir / ".env.deploy").write_text(env_text)
     (app_dir / ".env.deploy").chmod(0o600)
     (app_dir / "docker-compose.deploy.yml").write_text("services: {}\n")
@@ -198,11 +208,89 @@ if [[ "${1:-}" == "compose" && "${2:-}" == "version" ]]; then
   exit 0
 fi
 joined="$*"
+if [[ "$joined" == "ps --filter status=running --format "* ]]; then
+  if [[ "${FAKE_UNMANAGED_RECOVERY_GATEWAY:-0}" == "1" && ! -f "$RECOVERY_RETIRED" ]]; then
+    printf 'fake-recovery-gateway\tapp-api-recovery\tapp\tapi\n'
+  fi
+  exit 0
+fi
+if [[ "$joined" == "inspect "* && "$joined" == *"fake-recovery-gateway"* ]]; then
+  if [[ "$joined" == *".State.Running"* ]]; then
+    if [[ -f "$RECOVERY_STOPPED" ]]; then
+      printf 'false\n'
+    else
+      printf 'true\n'
+    fi
+  elif [[ "$joined" == *".NetworkSettings.Networks"* ]]; then
+    printf '/app-api-recovery\napp-api-recovery\napp-api-recovery\n'
+  else
+    printf '/app-api-recovery\tapp\tapi\tTrue\t\n'
+  fi
+  exit 0
+fi
+if [[ "$joined" == "inspect "* && \
+      ( "$joined" == *"fake-node-api-container"* || "$joined" == *"fake-sweeper-container"* || "$joined" == *"fake-media-repair-container"* ) ]]; then
+  if [[ "$joined" == *".Config.Env"* ]]; then
+    url="http://api:8000"
+    if [[ "${FAKE_UNMANAGED_RECOVERY_GATEWAY:-0}" == "1" ]]; then
+      if [[ "$joined" == *"fake-node-api-container"* && ! -f "$NODE_API_RECREATED" ]]; then
+        url="http://app-api-recovery:8000"
+      elif [[ "$joined" != *"fake-node-api-container"* && ! -f "$ENGINE_RECREATED" ]]; then
+        url="http://app-api-recovery:8000"
+      fi
+    fi
+    printf 'ENGINE_URL=%s\n' "$url"
+  fi
+  exit 0
+fi
+if [[ "$joined" == "stop fake-recovery-gateway"* ]]; then
+  if [[ "${FAKE_RECOVERY_GATEWAY_STOP_FAILS:-0}" == "1" ]]; then
+    printf 'simulated recovery gateway stop transport failure\n' >&2
+    exit 46
+  fi
+  : >"$RECOVERY_STOPPED"
+  exit 0
+fi
+if [[ "$joined" == "rm fake-recovery-gateway"* ]]; then
+  if [[ "${FAKE_RECOVERY_GATEWAY_REMOVE_FAILS:-0}" == "1" ]]; then
+    printf 'simulated recovery gateway removal failure\n' >&2
+    exit 47
+  fi
+  [[ -f "$RECOVERY_STOPPED" ]] || exit 48
+  : >"$RECOVERY_RETIRED"
+  exit 0
+fi
+if [[ "$joined" == "exec -T fake-recovery-gateway"* ]]; then
+  if [[ "$joined" == *"/health"* ]]; then
+    printf '{"status":"ok","build_id":"old-build"}\n'
+  elif [[ "$joined" == *"/queue"* ]]; then
+    if [[ "${FAKE_RECOVERY_GATEWAY_QUEUE_ACTIVE:-0}" == "1" ]]; then
+      printf '{"queue_depth":1,"queue_depths":{"celery":1},"queue_enabled":{"celery":true},"active_count":1,"reserved_count":0,"scheduled_count":0,"job_ids":["recovery-active"],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n'
+    else
+      printf '{"queue_depth":0,"queue_depths":{"celery":0},"queue_enabled":{"celery":true},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n'
+    fi
+  else
+    printf 'unsupported fake recovery request\n' >&2
+    exit 49
+  fi
+  exit 0
+fi
 if [[ "$joined" == *" up -d --no-deps --force-recreate api "* ]]; then
   : >"$ENGINE_RECREATED"
 fi
+if [[ "$joined" == *" up -d --no-deps --force-recreate node-api"* ]]; then
+  : >"$NODE_API_RECREATED"
+fi
 if [[ "$joined" == *" up -d --no-deps sweeper"* && "$FAKE_SWEEPER_DIES_AFTER_RESTORE" == "1" ]]; then
   : >"$SWEEPER_RESTORED"
+fi
+if [[ "$joined" == *" ps -a -q sweeper"* ]]; then
+  printf 'fake-sweeper-container\n'
+  exit 0
+fi
+if [[ "$joined" == *" ps -a -q media-repair"* ]]; then
+  printf 'fake-media-repair-container\n'
+  exit 0
 fi
 if [[ "$joined" == *" ps --status running -q sweeper"* ]]; then
   if [[ "${FAKE_STATE_PROBE_FAIL:-0}" == "1" ]]; then
@@ -219,8 +307,14 @@ if [[ "$joined" == *" ps --status running -q media-repair"* ]]; then
   fi
   exit 0
 fi
+if [[ "$joined" == *" ps --status running -q node-api"* ]]; then
+  printf 'fake-node-api-container\n'
+  exit 0
+fi
 if [[ "$joined" == *" config --services"* ]]; then
   printf 'worker\n'
+  printf 'node-api\n'
+  printf 'sweeper\n'
   printf 'media-repair\n'
   if [[ "$joined" == *"--profile *"* || "$FAKE_FOUNDATION_PROFILE" == "1" ]]; then
     printf 'worker-foundation14\n'
@@ -540,9 +634,24 @@ exec "$REAL_PYTHON" "$@"
             "FAKE_SWEEPER_DIES_AFTER_RESTORE": (
                 "1" if sweeper_dies_after_restore else "0"
             ),
+            "FAKE_UNMANAGED_RECOVERY_GATEWAY": (
+                "1" if unmanaged_recovery_gateway else "0"
+            ),
+            "FAKE_RECOVERY_GATEWAY_QUEUE_ACTIVE": (
+                "1" if recovery_gateway_queue_active else "0"
+            ),
+            "FAKE_RECOVERY_GATEWAY_STOP_FAILS": (
+                "1" if recovery_gateway_stop_fails else "0"
+            ),
+            "FAKE_RECOVERY_GATEWAY_REMOVE_FAILS": (
+                "1" if recovery_gateway_remove_fails else "0"
+            ),
             "SWEEPER_RESTORED": str(tmp_path / "sweeper-restored"),
             "REAL_PYTHON": sys.executable,
             "ENGINE_RECREATED": str(tmp_path / "engine-recreated"),
+            "NODE_API_RECREATED": str(tmp_path / "node-api-recreated"),
+            "RECOVERY_STOPPED": str(tmp_path / "recovery-stopped"),
+            "RECOVERY_RETIRED": str(tmp_path / "recovery-retired"),
             "POOL_ACTIVATION_COUNT": str(tmp_path / "pool-activation-count"),
             "POOL_DISABLE_LOG": str(tmp_path / "pool-disable.log"),
             "QUEUE_PROBE_COUNT": str(tmp_path / "queue-probe-count"),
@@ -859,10 +968,15 @@ def test_engine_rebuild_quiesces_and_restores_media_repair_around_node_migration
     media_stop_index = next(
         index for index, call in enumerate(calls) if " stop media-repair" in call
     )
+    engine_restart_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up -d --no-deps --force-recreate api worker" in call
+    )
     node_restart_index = next(
         index
         for index, call in enumerate(calls)
-        if " up -d --no-deps --force-recreate api worker node-api" in call
+        if " up -d --no-deps --force-recreate node-api" in call
     )
     if media_repair_running:
         media_restore = " up -d --no-deps --force-recreate media-repair"
@@ -871,7 +985,217 @@ def test_engine_rebuild_quiesces_and_restores_media_repair_around_node_migration
     media_restore_index = next(
         index for index, call in enumerate(calls) if media_restore in call
     )
-    assert media_stop_index < node_restart_index < media_restore_index
+    # The engine must become healthy before node-api applies a migration. This
+    # also gives the guarded unmanaged-gateway handoff a rollback-free point
+    # before the control plane moves to the canonical endpoint.
+    assert media_stop_index < engine_restart_index < node_restart_index < media_restore_index
+
+
+def test_generic_engine_rebuild_refuses_active_unmanaged_recovery_gateway_before_mutation(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        unmanaged_recovery_gateway=True,
+    )
+    initial_env = Path(env["ENV_FILE"]).read_text()
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "Refusing generic engine rebuild" in completed.stderr
+    assert "--handoff-unmanaged-recovery-gateway test-build" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any(call.startswith("ps --filter status=running") for call in calls)
+    assert not any(" build api" in call for call in calls)
+    assert not any(" stop fake-recovery-gateway" in call for call in calls)
+    assert not Path(env["RECOVERY_STOPPED"]).exists()
+    assert Path(env["ENV_FILE"]).read_text() == initial_env
+
+
+def test_explicit_recovery_gateway_handoff_refuses_non_idle_gateway_before_build(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        unmanaged_recovery_gateway=True,
+        recovery_gateway_queue_active=True,
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"),
+            "--handoff-unmanaged-recovery-gateway",
+            "test-build",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "recovery gateway has work" in completed.stderr
+    assert "not proven idle" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any("exec -T fake-recovery-gateway" in call for call in calls)
+    assert any(call == " /queue" for call in calls)
+    assert not any(" build api" in call for call in calls)
+    assert not any(" stop sweeper" in call for call in calls)
+    assert not Path(env["RECOVERY_STOPPED"]).exists()
+
+
+def test_recovery_gateway_handoff_keeps_writers_quiescent_when_gateway_stop_is_unproven(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        media_repair_running=True,
+        unmanaged_recovery_gateway=True,
+        recovery_gateway_stop_fails=True,
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"),
+            "--handoff-unmanaged-recovery-gateway",
+            "test-build",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "Could not stop unmanaged recovery gateway" in completed.stderr
+    assert "transition is unproven" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    stop_index = next(
+        index for index, call in enumerate(calls) if call.startswith("stop fake-recovery-gateway")
+    )
+    assert not any(
+        " up -d --no-deps --force-recreate api worker" in call
+        for call in calls[stop_index + 1 :]
+    )
+    assert any(" stop sweeper" in call for call in calls[stop_index + 1 :])
+    assert any(" stop media-repair" in call for call in calls[stop_index + 1 :])
+    assert not any(call.endswith(" start sweeper") for call in calls)
+    assert not any(call.endswith(" start media-repair") for call in calls)
+
+
+def test_recovery_gateway_handoff_proves_prepared_writers_then_retires_before_resume(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        media_repair_running=True,
+        unmanaged_recovery_gateway=True,
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"),
+            "--handoff-unmanaged-recovery-gateway",
+            "test-build",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Canonical ENGINE_URL=http://api:8000 is proven" in completed.stdout
+    assert "Retired unmanaged recovery gateway" in completed.stdout
+    assert "ENGINE_URL=http://api:8000" in Path(env["ENV_FILE"]).read_text()
+    assert Path(env["RECOVERY_STOPPED"]).exists()
+    assert Path(env["RECOVERY_RETIRED"]).exists()
+
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    gateway_stop_index = next(
+        index for index, call in enumerate(calls) if call.startswith("stop fake-recovery-gateway")
+    )
+    canonical_api_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up -d --no-deps --force-recreate api worker" in call
+    )
+    prepare_media_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up --no-start --no-deps --force-recreate media-repair" in call
+    )
+    prepare_sweeper_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up --no-start --no-deps --force-recreate sweeper" in call
+    )
+    retire_index = next(
+        index for index, call in enumerate(calls) if call.startswith("rm fake-recovery-gateway")
+    )
+    resume_media_index = next(
+        index for index, call in enumerate(calls) if call.endswith(" start media-repair")
+    )
+    resume_sweeper_index = next(
+        index for index, call in enumerate(calls) if call.endswith(" start sweeper")
+    )
+    assert gateway_stop_index < canonical_api_index < prepare_media_index < retire_index
+    assert canonical_api_index < prepare_sweeper_index < retire_index
+    assert retire_index < resume_media_index < resume_sweeper_index
+    assert not any(
+        " up -d --no-deps --force-recreate media-repair" in call
+        or " up -d --no-deps --force-recreate sweeper" in call
+        for call in calls
+    )
+
+
+def test_recovery_gateway_handoff_keeps_writers_stopped_if_retirement_cannot_be_proved(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        media_repair_running=True,
+        unmanaged_recovery_gateway=True,
+        recovery_gateway_remove_fails=True,
+    )
+
+    completed = subprocess.run(
+        [
+            str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"),
+            "--handoff-unmanaged-recovery-gateway",
+            "test-build",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 13
+    assert "could not be removed" in completed.stderr
+    assert "being kept quiescent fail-closed" in completed.stderr
+    assert Path(env["RECOVERY_STOPPED"]).exists()
+    assert not Path(env["RECOVERY_RETIRED"]).exists()
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    retire_index = next(
+        index for index, call in enumerate(calls) if call.startswith("rm fake-recovery-gateway")
+    )
+    assert any(" stop sweeper" in call for call in calls[retire_index + 1 :])
+    assert any(" stop media-repair" in call for call in calls[retire_index + 1 :])
+    assert not any(call.endswith(" start sweeper") for call in calls)
+    assert not any(call.endswith(" start media-repair") for call in calls)
 
 
 def test_engine_rebuild_fails_before_migration_when_media_repair_cannot_stop(
@@ -897,7 +1221,7 @@ def test_engine_rebuild_fails_before_migration_when_media_repair_cannot_stop(
     assert any(" stop media-repair" in call for call in calls)
     assert any(" up -d --no-deps sweeper" in call for call in calls)
     assert not any(
-        " up -d --no-deps --force-recreate api worker node-api" in call
+        " up -d --no-deps --force-recreate api worker" in call
         for call in calls
     )
 
@@ -927,7 +1251,7 @@ def test_engine_rebuild_refusal_restores_exact_prior_sweeper_state(
         assert any(running_restore in call for call in calls)
     assert any(" up -d --no-deps media-repair" in call for call in calls)
     assert not any(
-        " up -d --no-deps --force-recreate api worker node-api" in call
+        " up -d --no-deps --force-recreate api worker" in call
         for call in calls
     )
     assert Path(env["ENV_FILE"]).read_text() == initial_env
@@ -1150,8 +1474,12 @@ def test_engine_rebuild_includes_every_worker_in_active_profiles(tmp_path: Path)
         for call in calls
     )
     assert any(
-        " up -d --no-deps --force-recreate api worker worker-foundation14 node-api"
+        " up -d --no-deps --force-recreate api worker worker-foundation14"
         in call
+        for call in calls
+    )
+    assert any(
+        " up -d --no-deps --force-recreate node-api" in call
         for call in calls
     )
 

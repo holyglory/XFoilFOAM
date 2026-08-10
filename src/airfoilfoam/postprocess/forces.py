@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +36,34 @@ def _data_rows(path: Path) -> tuple[list[str], list[list[float]]]:
             rows.append([float(p) for p in parts])
         except ValueError:
             continue
+    return header, rows
+
+
+def _strict_data_rows(path: Path) -> tuple[list[str], Optional[list[list[float]]]]:
+    """Read a coefficient artifact without silently skipping corrupt rows.
+
+    Ordinary display/post-processing remains permissive through ``_data_rows``
+    so an old truncated trailing line can still be diagnosed.  A certification
+    reducer has the opposite responsibility: discarding an unreadable final
+    row and certifying the earlier rows would fabricate an exact final-window
+    proof.  Therefore every non-comment, non-empty line must be numeric here.
+    """
+    header: list[str] = []
+    rows: list[list[float]] = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            stripped = line.lstrip("#").strip()
+            tokens = stripped.replace("\t", " ").split()
+            if "Cl" in tokens and "Cd" in tokens:
+                header = tokens
+            continue
+        try:
+            rows.append([float(part) for part in line.replace("\t", " ").split()])
+        except ValueError:
+            return header, None
     return header, rows
 
 
@@ -147,6 +176,159 @@ def force_is_steady(path: Path, window: int = 200, tol: float = 2.5e-3) -> bool:
         return (max(vals) - min(vals)) / (abs(mean) + 1e-3)
 
     return spread("Cl") < tol and spread("Cd") < tol
+
+
+# --------------------------------------------------------------------------- #
+# RANS all-channel hold reducer
+# --------------------------------------------------------------------------- #
+#
+# This is intentionally independent from ``force_is_steady``.  The latter is
+# a long-standing Cl/Cd convenience predicate used to decide whether a
+# residual-stalled solve has a usable developed field.  A canonical RANS
+# result now needs stronger, separately versioned proof that *all* integrated
+# channels, including Cm, hold over one exact final raw iteration window.
+# Keeping the reducer separate avoids silently changing the historic
+# steady-versus-URANS control flow while downstream consumers roll out the
+# fail-closed certificate gate.
+# --------------------------------------------------------------------------- #
+RANS_HOLD_CERTIFICATE_VERSION = "rans-hold-v1"
+RANS_HOLD_REQUIRED_SAMPLES = 200
+RANS_HOLD_RELATIVE_TOLERANCE = 2.5e-3
+RANS_HOLD_ABSOLUTE_FLOOR = 1.0e-3
+
+
+@dataclass(frozen=True)
+class RansHoldChannelAnalysis:
+    """Measured spread of one exact final-window coefficient channel."""
+
+    mean: float
+    min_value: float
+    max_value: float
+    peak_to_peak: float
+    relative_spread: float
+
+
+@dataclass(frozen=True)
+class RansHoldAnalysis:
+    """All-channel final-window RANS hold verdict over raw coefficient rows.
+
+    ``certified`` is deliberately false for a valid but unsettled raw window;
+    malformed, incomplete, missing-Cm, non-finite, or non-monotone evidence
+    returns ``None`` instead so a caller cannot accidentally turn a partial
+    history into a certificate.
+    """
+
+    sample_count: int
+    required_sample_count: int
+    start_iteration: int
+    end_iteration: int
+    relative_tolerance: float
+    absolute_floor: float
+    cl: RansHoldChannelAnalysis
+    cd: RansHoldChannelAnalysis
+    cm: RansHoldChannelAnalysis
+    certified: bool
+    reason: str
+
+
+def analyze_rans_hold(
+    path: Path,
+    window: int = RANS_HOLD_REQUIRED_SAMPLES,
+    relative_tolerance: float = RANS_HOLD_RELATIVE_TOLERANCE,
+    absolute_floor: float = RANS_HOLD_ABSOLUTE_FLOOR,
+) -> Optional[RansHoldAnalysis]:
+    """Reduce the exact final raw RANS coefficient window into a hold verdict.
+
+    The reducer refuses to fill in a missing moment channel, discard malformed
+    final rows, or downsample the source evidence.  All final ``window`` rows
+    must contain finite Time/Cl/Cd/Cm values and monotonically increasing
+    integer SIMPLE iterations.  The stable spread is
+    ``(max - min) / (abs(mean) + absolute_floor)`` for each channel; the
+    floor is recorded in the certificate so a near-zero Cm is judged
+    deterministically rather than divided by noise.
+    """
+    required = int(window)
+    if required < 1 or not math.isfinite(relative_tolerance) or relative_tolerance <= 0:
+        raise ValueError("RANS hold reducer requires a positive finite window and tolerance")
+    if not math.isfinite(absolute_floor) or absolute_floor <= 0:
+        raise ValueError("RANS hold reducer requires a positive finite absolute floor")
+
+    header, rows = _strict_data_rows(path)
+    if rows is None or not rows:
+        return None
+    if not header:
+        header = [
+            "Time", "Cd", "Cd(f)", "Cd(r)", "Cl", "Cl(f)", "Cl(r)",
+            "CmPitch", "CmRoll", "CmYaw", "Cs", "Cs(f)", "Cs(r)",
+        ]
+    idx = {name: i for i, name in enumerate(header)}
+    cm_key = "CmPitch" if "CmPitch" in idx else ("Cm" if "Cm" in idx else None)
+    if not {"Time", "Cl", "Cd"}.issubset(idx) or cm_key is None:
+        return None
+    if len(rows) < required:
+        return None
+
+    final_rows = rows[-required:]
+    required_indices = (idx["Time"], idx["Cl"], idx["Cd"], idx[cm_key])
+    if any(len(row) <= max(required_indices) for row in final_rows):
+        return None
+
+    raw_iterations = [row[idx["Time"]] for row in final_rows]
+    if any(not math.isfinite(value) for value in raw_iterations):
+        return None
+    # steady SIMPLE writes integer iteration time.  Rounding a fractional or
+    # reset series would falsely claim an exact window, so reject it instead.
+    if any(abs(value - round(value)) > 1e-9 for value in raw_iterations):
+        return None
+    iterations = [int(round(value)) for value in raw_iterations]
+    if any(next_value <= value for value, next_value in zip(iterations, iterations[1:])):
+        return None
+
+    def channel(index: int) -> Optional[RansHoldChannelAnalysis]:
+        values = [row[index] for row in final_rows]
+        if any(not math.isfinite(value) for value in values):
+            return None
+        mean = sum(values) / len(values)
+        minimum = min(values)
+        maximum = max(values)
+        peak_to_peak = maximum - minimum
+        relative_spread = peak_to_peak / (abs(mean) + absolute_floor)
+        return RansHoldChannelAnalysis(
+            mean=mean,
+            min_value=minimum,
+            max_value=maximum,
+            peak_to_peak=peak_to_peak,
+            relative_spread=relative_spread,
+        )
+
+    cl = channel(idx["Cl"])
+    cd = channel(idx["Cd"])
+    cm = channel(idx[cm_key])
+    if cl is None or cd is None or cm is None:
+        return None
+    unstable = [
+        name
+        for name, result in (("Cl", cl), ("Cd", cd), ("Cm", cm))
+        if result.relative_spread > relative_tolerance
+    ]
+    certified = not unstable
+    return RansHoldAnalysis(
+        sample_count=required,
+        required_sample_count=required,
+        start_iteration=iterations[0],
+        end_iteration=iterations[-1],
+        relative_tolerance=float(relative_tolerance),
+        absolute_floor=float(absolute_floor),
+        cl=cl,
+        cd=cd,
+        cm=cm,
+        certified=certified,
+        reason=(
+            "all channels held within the final-window tolerance"
+            if certified
+            else "final-window spread exceeds tolerance for " + ", ".join(unstable)
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
