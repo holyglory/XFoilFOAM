@@ -44,6 +44,7 @@ Airfoil Database and Simulation Portal-handoff.zip
 .codex-artifacts/
 .codex-db-backups/
 test-results/
+.deployment-source.json
 **/test-results/
 product-design-audits/
 
