@@ -30,7 +30,7 @@ const LEGACY_TIMESTAMP = {
   resultMediaIndex: 1788825600000,
   ingestCompletion: 1788912000000,
 } as const;
-const MESH_IDENTITY_RECONCILIATION_TIMESTAMP = 1789344000000;
+const MESH_IDENTITY_RECONCILIATION_TIMESTAMP = 1791417600000;
 
 let admin: ReturnType<typeof postgres> | null = null;
 let client: ReturnType<typeof postgres> | null = null;
