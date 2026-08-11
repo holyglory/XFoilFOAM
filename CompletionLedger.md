@@ -1,12 +1,5 @@
 # Completion Ledger
 
-- **hz-solver2 64-slot activation:** The configurable 64-slot deployment
-  contract is implemented and regression-tested, but production still runs 40
-  slots. Commit and promote the source, cancel disposable mirrored work through
-  the normal authority-release path, recreate the guarded remote runtime at 64,
-  then verify live quota/environment/database/heartbeat capacity, renewed
-  promises, real solve progress, host memory/I/O headroom, and storage.
-
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation
   and runtime identity. Add a physical operating-cell comparison identity that

@@ -139,6 +139,19 @@ worker may use the slots across independent jobs/cases and MPI ranks.
 Continuous utilization also requires the production hub to expose eligible
 gaps and `remoteSolverEnabled` plus the sweeper to remain running.
 
+For a capacity change, first disable remote solving and let its normal
+authority-release outbox reach zero active promises, jobs, deliveries, and
+cancellations. Stop the worker before changing the three capacity values and
+the external Compose override. Clear the dedicated Redis database, including
+unacknowledged restoration state, while the worker is stopped. Do not run
+`compose up worker`: a changed CPU limit makes Compose recreate it outside the
+guarded workflow. Run `rebuild-remote-solver-engine.sh` so it exclusively owns
+the final worker recreate, then update the remote database CPU budget, restore
+the OpenCFD 2606 pool after a clean database reset, and re-enable remote
+solving. Verify the live container ID changed only in the guarded recreate,
+the broker was empty before worker start, and the hub heartbeat reports the
+new reserved-slot and capacity values.
+
 Confirm that the sweeper is running, its remote-solver status is not disabled
 or error, promises continue to arrive, completed jobs create durable delivery
 rows, and those rows reach `delivered` or `superseded`. Generic retention will

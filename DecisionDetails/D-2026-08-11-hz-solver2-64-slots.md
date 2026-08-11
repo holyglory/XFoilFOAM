@@ -28,3 +28,13 @@ capacity, fresh heartbeat, active promises, real solve progress, memory and I/O
 headroom, and completed-point throughput. Revisit the value if load stays below
 roughly 60% with eligible work or if memory pressure, I/O wait, or per-point
 completion time regresses.
+
+## Production outcome
+
+The disposable reset recreated the remote database from current migrations,
+restored only its upstream registration and credentials, enabled the OpenCFD
+2606 pool, and refilled to 64 jobs, 64 reserved slots, and 64 active promises.
+The authoritative hub heartbeat then reported 69% logical-CPU load, 17% memory
+use, zero measured I/O wait, 3.17 TB free storage, and 1,410 active AoAs. The
+fresh run had already stored 141 result attempts and completed three delivery
+outbox rows at the verification sample.
