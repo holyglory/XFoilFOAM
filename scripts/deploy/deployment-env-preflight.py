@@ -154,13 +154,27 @@ def _validate_deployment_profile(path: Path, state: Path) -> None:
             "remote-solver deployment requires an unquoted, whitespace-free "
             "AIRFOILFOAM_CONTROL_PLANE_TOKEN of at least 32 characters"
         )
-    for key in (
+    capacity_keys = (
         "AIRFOILFOAM_WORKER_CPU_BUDGET",
         "AIRFOILFOAM_CASE_CONCURRENCY",
         "AIRFOILFOAM_CELERY_CONCURRENCY",
-    ):
-        if values.get(key) != "40":
-            raise ValueError(f"remote-solver deployment requires {key}=40")
+    )
+    raw_capacity = values.get(capacity_keys[0], "")
+    try:
+        capacity = int(raw_capacity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "remote-solver deployment requires an integer worker CPU budget"
+        ) from exc
+    if not 1 <= capacity <= 256 or str(capacity) != raw_capacity:
+        raise ValueError(
+            "remote-solver worker CPU budget must be a canonical integer from 1 through 256"
+        )
+    for key in capacity_keys[1:]:
+        if values.get(key) != raw_capacity:
+            raise ValueError(
+                f"remote-solver deployment requires {key}={raw_capacity}"
+            )
 
 
 def _reject_symlink_components(path: Path) -> None:

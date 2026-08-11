@@ -10,6 +10,11 @@
   non-solver configuration and reconnection credentials. Regenerated results
   must still come from real solver evidence and pass the normal acceptance
   gates. [D-2026-08-10-disposable-inflight-cfd]
+- Confirmed intent: hz-solver2 uses a reversible 64-slot capacity contract on
+  its 48-core/96-thread host. Worker budget, case concurrency, Celery
+  concurrency, and container quota must agree; throughput and host headroom,
+  not the displayed logical-CPU percentage alone, decide later tuning.
+  [D-2026-08-11-hz-solver2-64-slots]
 - Confirmed intent: solver filesystems keep a bounded working set. A remote
   case is reclaimed as soon as the hub has authenticated and bound its exact
   archive, even while later angles in the same job continue. At 80% measured
@@ -125,6 +130,16 @@
   a newer build remains eligible.
   [D-2026-07-16-preliminary-urans-reliability]
   [D-2026-07-22-remote-capacity-and-promise-caps]
+
+- Decision: run hz-solver2 with a reversible 64-slot worker, case, Celery, and
+  container-CPU contract; require those four values to agree.
+  [D-2026-08-11-hz-solver2-64-slots](DecisionDetails/D-2026-08-11-hz-solver2-64-slots.md)
+- Why: the 48-core/96-thread host had 56% idle CPU, no measurable I/O wait,
+  and about 98 GiB available memory at 40 slots. Keeping 40 knowingly left
+  physical cores idle; using all 96 logical CPUs would risk SMT and
+  memory-bandwidth contention. Sixty-four adds useful parallelism while
+  retaining control-plane headroom and is directly reversible after measured
+  throughput comparison.
 
 - Decision: treat remote CPU capacity and hub-issued polar promises as separate
   execution controls. A remote node admits independent serial polars until its

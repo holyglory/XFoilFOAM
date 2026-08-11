@@ -89,19 +89,25 @@ verify_deployment_source() {
 }
 
 validate_compose_profile() {
-  local temporary
+  local temporary expected_cpu_slots
+  expected_cpu_slots="$(read_env_var AIRFOILFOAM_WORKER_CPU_BUDGET)"
+  if [[ ! "$expected_cpu_slots" =~ ^[1-9][0-9]*$ ]] || (( expected_cpu_slots > 256 )); then
+    echo "Invalid remote-solver CPU-slot contract: $expected_cpu_slots" >&2
+    return 2
+  fi
   temporary="$(mktemp)"
   chmod 600 "$temporary"
   if ! compose config --format json >"$temporary"; then
     rm -f "$temporary"
     return 2
   fi
-  if ! python3 "$DEPLOY_SCRIPT_DIR/validate-remote-solver-compose.py" <"$temporary"; then
+  if ! python3 "$DEPLOY_SCRIPT_DIR/validate-remote-solver-compose.py" \
+    --expected-cpu-slots "$expected_cpu_slots" <"$temporary"; then
     rm -f "$temporary"
     return 2
   fi
   rm -f "$temporary"
-  echo "Merged Compose profile preserves the 40-CPU volume-backed hz-solver2 contract."
+  echo "Merged Compose profile preserves the ${expected_cpu_slots}-CPU volume-backed hz-solver2 contract."
 }
 
 set_env_vars_atomic() {
@@ -1227,7 +1233,7 @@ main() {
     --current-source-revision "$DEPLOY_SOURCE_REVISION" --current-source-tree-sha256 "$DEPLOY_SOURCE_TREE_SHA256" \
     --require-state non-pending >/dev/null
   FAIL_SAFE_ARMED=false
-  echo "hz-solver2 now runs attested OpenCFD 2606 with 40 CPU slots and retained volume tar.zst evidence."
+  echo "hz-solver2 now runs attested OpenCFD 2606 with $(read_env_var AIRFOILFOAM_WORKER_CPU_BUDGET) CPU slots and retained volume tar.zst evidence."
   compose ps
 }
 

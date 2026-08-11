@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from typing import Any
@@ -57,7 +58,13 @@ def _volume_sources(service: dict[str, Any], label: str) -> set[str]:
     return sources
 
 
-def validate(value: object) -> None:
+def validate(value: object, expected_cpu_slots: int = 40) -> None:
+    if (
+        not isinstance(expected_cpu_slots, int)
+        or not 1 <= expected_cpu_slots <= 256
+    ):
+        raise ValueError("expected CPU slots must be an integer from 1 through 256")
+    expected = str(expected_cpu_slots)
     root = _mapping(value, "Compose config")
     services = _mapping(root.get("services"), "Compose services")
     missing = sorted(REQUIRED_SERVICES - set(services))
@@ -70,8 +77,10 @@ def validate(value: object) -> None:
         "AIRFOILFOAM_CASE_CONCURRENCY",
         "AIRFOILFOAM_CELERY_CONCURRENCY",
     ):
-        if worker_env.get(key) != "40":
-            raise ValueError(f"merged worker config must retain {key}=40")
+        if worker_env.get(key) != expected:
+            raise ValueError(
+                f"merged worker config must retain {key}={expected_cpu_slots}"
+            )
     limits = _mapping(
         _mapping(
             _mapping(worker.get("deploy"), "worker.deploy").get("resources"),
@@ -83,8 +92,10 @@ def validate(value: object) -> None:
         cpu_limit = float(limits.get("cpus"))
     except (TypeError, ValueError) as exc:
         raise ValueError("merged worker CPU limit is missing") from exc
-    if cpu_limit != 40.0:
-        raise ValueError(f"merged worker CPU limit is {cpu_limit:g}, expected 40")
+    if cpu_limit != float(expected_cpu_slots):
+        raise ValueError(
+            f"merged worker CPU limit is {cpu_limit:g}, expected {expected_cpu_slots}"
+        )
     nofile = _mapping(
         _mapping(worker.get("ulimits"), "worker.ulimits").get("nofile"),
         "worker.ulimits.nofile",
@@ -132,9 +143,12 @@ def validate(value: object) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-cpu-slots", type=int, default=40)
+    args = parser.parse_args()
     try:
         value = json.load(sys.stdin)
-        validate(value)
+        validate(value, args.expected_cpu_slots)
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"remote-solver Compose profile error: {exc}", file=sys.stderr)
         return 2

@@ -28,7 +28,8 @@ def _module(name: str, filename: str):
     return module
 
 
-def _compose_config() -> dict[str, object]:
+def _compose_config(capacity: int = 40) -> dict[str, object]:
+    slots = str(capacity)
     evidence = {
         "AIRFOILFOAM_EVIDENCE_BUCKET": "",
         "AIRFOILFOAM_EVIDENCE_OBJECT_PREFIX": "solver-evidence/v1",
@@ -49,11 +50,11 @@ def _compose_config() -> dict[str, object]:
             "worker": {
                 "environment": {
                     **evidence,
-                    "AIRFOILFOAM_WORKER_CPU_BUDGET": "40",
-                    "AIRFOILFOAM_CASE_CONCURRENCY": "40",
-                    "AIRFOILFOAM_CELERY_CONCURRENCY": "40",
+                    "AIRFOILFOAM_WORKER_CPU_BUDGET": slots,
+                    "AIRFOILFOAM_CASE_CONCURRENCY": slots,
+                    "AIRFOILFOAM_CELERY_CONCURRENCY": slots,
                 },
-                "deploy": {"resources": {"limits": {"cpus": "40"}}},
+                "deploy": {"resources": {"limits": {"cpus": slots}}},
                 "ulimits": {"nofile": {"soft": 65_536, "hard": 524_288}},
                 "volumes": [
                     {"type": "volume", "source": "results", "target": "/data"},
@@ -82,6 +83,7 @@ def _remote_env(
     *,
     remote_only: str = "false",
     control_plane_token: str = "remote-solver-control-plane-token-at-least-32-bytes",
+    capacity: str = "40",
 ) -> str:
     return "\n".join(
         (
@@ -93,9 +95,9 @@ def _remote_env(
             "AIRFOILFOAM_EVIDENCE_ZSTD_LEVEL=10",
             f"AIRFOILFOAM_EVIDENCE_REMOTE_ONLY={remote_only}",
             f"AIRFOILFOAM_CONTROL_PLANE_TOKEN={control_plane_token}",
-            "AIRFOILFOAM_WORKER_CPU_BUDGET=40",
-            "AIRFOILFOAM_CASE_CONCURRENCY=40",
-            "AIRFOILFOAM_CELERY_CONCURRENCY=40",
+            f"AIRFOILFOAM_WORKER_CPU_BUDGET={capacity}",
+            f"AIRFOILFOAM_CASE_CONCURRENCY={capacity}",
+            f"AIRFOILFOAM_CELERY_CONCURRENCY={capacity}",
         )
     ) + "\n"
 
@@ -213,30 +215,40 @@ def _volume_receipt() -> dict[str, object]:
     }
 
 
-def test_merged_remote_compose_requires_all_40_cpu_and_volume_contracts() -> None:
+def test_merged_remote_compose_requires_configured_cpu_and_volume_contracts() -> None:
     module = _module("remote_compose_validator", "validate-remote-solver-compose.py")
-    value = _compose_config()
-    module.validate(value)
+    value = _compose_config(64)
+    module.validate(value, 64)
 
     bad_cpu = json.loads(json.dumps(value))
     bad_cpu["services"]["worker"]["deploy"]["resources"]["limits"]["cpus"] = "8"
-    with pytest.raises(ValueError, match="expected 40"):
-        module.validate(bad_cpu)
+    with pytest.raises(ValueError, match="expected 64"):
+        module.validate(bad_cpu, 64)
+
+    bad_concurrency = json.loads(json.dumps(value))
+    bad_concurrency["services"]["worker"]["environment"][
+        "AIRFOILFOAM_CASE_CONCURRENCY"
+    ] = "40"
+    with pytest.raises(ValueError, match="CASE_CONCURRENCY=64"):
+        module.validate(bad_concurrency, 64)
 
     bad_nofile = json.loads(json.dumps(value))
     bad_nofile["services"]["worker"]["ulimits"]["nofile"]["soft"] = 1024
     with pytest.raises(ValueError, match="nofile limit"):
-        module.validate(bad_nofile)
+        module.validate(bad_nofile, 64)
 
     gcs = json.loads(json.dumps(value))
     gcs["services"]["api"]["environment"]["AIRFOILFOAM_EVIDENCE_BUCKET"] = "hub-bucket"
     with pytest.raises(ValueError, match="must not receive a GCS bucket"):
-        module.validate(gcs)
+        module.validate(gcs, 64)
 
     detached = json.loads(json.dumps(value))
     detached["services"]["worker"]["volumes"] = []
     with pytest.raises(ValueError, match="does not mount persistent volume"):
-        module.validate(detached)
+        module.validate(detached, 64)
+
+    with pytest.raises(ValueError, match="1 through 256"):
+        module.validate(value, 0)
 
 
 def test_remote_environment_preflight_requires_external_override_and_explicit_volume_retention(
@@ -265,6 +277,17 @@ def test_remote_environment_preflight_requires_external_override_and_explicit_vo
 
     accepted = subprocess.run(command, text=True, capture_output=True, check=False)
     assert accepted.returncode == 0, accepted.stderr
+
+    env_file.write_text(_remote_env(state, capacity="64"), encoding="utf-8")
+    accepted_64 = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert accepted_64.returncode == 0, accepted_64.stderr
+
+    env_file.write_text(_remote_env(state, capacity="064"), encoding="utf-8")
+    rejected_capacity = subprocess.run(
+        command, text=True, capture_output=True, check=False
+    )
+    assert rejected_capacity.returncode == 2
+    assert "canonical integer" in rejected_capacity.stderr
 
     env_file.write_text(_remote_env(state, remote_only=""), encoding="utf-8")
     rejected = subprocess.run(command, text=True, capture_output=True, check=False)

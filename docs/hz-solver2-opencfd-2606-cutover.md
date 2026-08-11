@@ -23,7 +23,7 @@ The exact invariants are:
 - both the base deployment Compose file and the external remote-solver
   override are used for every Compose operation
 - worker CPU budget, case concurrency, Celery concurrency, and container CPU
-  limit are all 40
+  limit are one equal, validated capacity value; hz-solver2 currently uses 64
 - evidence bucket is empty, object prefix is `solver-evidence/v1`, compression
   is Zstandard level 10, and remote-only is explicitly false
 - the existing `results`, `engine_runtime`, and `pgdata` volumes remain mounted
@@ -47,7 +47,8 @@ docker compose \
   -f /opt/airfoils-pro/app/docker-compose.deploy.yml \
   -f /opt/airfoils-pro/state/docker-compose.remote-solver.yml \
   config --format json \
-  | python3 scripts/deploy/validate-remote-solver-compose.py
+  | python3 scripts/deploy/validate-remote-solver-compose.py \
+      --expected-cpu-slots 64
 ```
 
 Promote the control-plane source through the existing atomic release workflow.
@@ -80,7 +81,7 @@ sudo scripts/deploy/rebuild-remote-solver-engine.sh \
 ```
 
 The script holds the shared deployment lock, verifies the promoted source and
-the merged 40-CPU profile, records and scratch-restores a custom-format
+the configured CPU profile, records and scratch-restores a custom-format
 PostgreSQL backup, retains exact 2406 image rollback tags, disables both
 OpenCFD pools, builds the target images, and recreates only `api`, `worker`, and
 `node-api`. Scheduler containers are recreated stopped during the proof.
@@ -129,10 +130,10 @@ docker inspect hz-solver2-worker-1 \
   --format '{{.HostConfig.NanoCpus}}'
 ```
 
-All three settings must be 40 and `NanoCpus` must be `40000000000` (a 40-CPU
-CFS quota). `nproc` must not be below 40; depending on the host's coreutils and
+All three settings must be 64 and `NanoCpus` must be `64000000000` (a 64-CPU
+CFS quota). `nproc` must not be below 64; depending on the host's coreutils and
 cgroup implementation it can report the broader host affinity instead of the
-quota, so it is not the authoritative limit check. A 40-slot worker does not
+quota, so it is not the authoritative limit check. A 64-slot worker does not
 mean one promise contains 40 sweeps: the hub decides promise size, while the
 worker may use the slots across independent jobs/cases and MPI ranks.
 Continuous utilization also requires the production hub to expose eligible
