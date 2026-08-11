@@ -1742,16 +1742,47 @@ def create_app() -> FastAPI:
             # data. Requiring the whole multi-angle job to finish retained
             # every accepted case for hours and filled hz-solver2 even though
             # later cases no longer read those evidence paths.
-            completed_case = result is not None and any(
-                point.case_slug == request.case_slug
-                for polar in result.polars
-                for point in (*polar.points, *polar.attempts)
+            receipt_aoa = request.receipt.get("aoaDeg")
+            completed_case = (
+                result is not None
+                and isinstance(receipt_aoa, (int, float))
+                and not isinstance(receipt_aoa, bool)
+                and any(
+                    point.case_slug == request.case_slug
+                    and abs(point.aoa_deg - float(receipt_aoa)) <= 1e-9
+                    for polar in result.polars
+                    for point in (*polar.points, *polar.attempts)
+                )
             )
+            evidence_dir = store.file_path(
+                request.job_id,
+                f"cases/{request.case_slug}/{request.evidence_base}",
+            )
+            execution_case_dir = evidence_dir.parent
+            active_process_in_case = False
+            try:
+                resolved_execution_case = execution_case_dir.resolve(strict=True)
+                for process in store.job_process_details(request.job_id):
+                    cwd = process.get("cwd")
+                    if not isinstance(cwd, str) or not cwd:
+                        continue
+                    if Path(cwd).resolve().is_relative_to(resolved_execution_case):
+                        active_process_in_case = True
+                        break
+            except (OSError, ValueError):
+                active_process_in_case = True
+            evidence_parent = Path(request.evidence_base).parent
+            execution_case_slug = (
+                Path(request.case_slug)
+                if evidence_parent == Path(".")
+                else Path(request.case_slug) / evidence_parent
+            ).as_posix()
             if (
                 status is None
                 or result is None
                 or not completed_case
-                or status.active_case_slug == request.case_slug
+                or status.active_case_slug == execution_case_slug
+                or active_process_in_case
             ):
                 raise HTTPException(
                     status_code=409,
@@ -1776,6 +1807,7 @@ def create_app() -> FastAPI:
                 job_root,
                 evidence_dir,
                 authorization_record,
+                acquire_job_lock=terminal_job and terminal_result,
             ).to_dict()
         except EvidenceCleanupError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

@@ -17,7 +17,7 @@ import shutil
 import stat
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -978,6 +978,7 @@ def reclaim_brokered_remote_evidence(
     authorization: BrokeredRemoteEvidenceReclaim,
     *,
     crash_after_deletions: int | None = None,
+    acquire_job_lock: bool = True,
 ) -> EvidenceCleanupResult:
     """Reclaim credentialless remote-solver bytes after an exact hub receipt.
 
@@ -1040,7 +1041,15 @@ def reclaim_brokered_remote_evidence(
         raise EvidenceCleanupError("hub receipt contains invalid zstd level")
 
     canonical_authorization = authorization.authorization()
-    with _cleanup_job_guard(job_root):
+    # Terminal-job maintenance owns the job-wide execution lock. A running
+    # multi-angle job holds that lock for its entire sweep, though an already
+    # published AoA evidence directory is immutable and no longer read by the
+    # solver. The API may therefore waive this lock only after it has proved
+    # the exact receipt AoA is complete and no live process is inside the exact
+    # evidence case directory. All receipt, archive, manifest, durable-intent,
+    # and repopulation checks below remain mandatory.
+    guard = _cleanup_job_guard(job_root) if acquire_job_lock else nullcontext()
+    with guard:
         ack_path = evidence_dir / BROKERED_HUB_BINDING_ACK_NAME
         existing_ack = _read_optional_json(ack_path)
         if existing_ack is not None and existing_ack.get("authorization") != canonical_authorization:

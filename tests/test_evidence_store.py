@@ -524,6 +524,30 @@ def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
     assert (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).read_bytes() == immutable_receipt
 
 
+def test_brokered_reclaim_can_skip_job_lock_after_api_proves_case_inactive(
+    tmp_path: Path,
+) -> None:
+    job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    authorization = _brokered_reclaim_authorization(
+        job_root, evidence, publication
+    )
+    lock_path = job_root / ".execute.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(EvidenceCleanupError, match="execution lock is held"):
+            reclaim_brokered_remote_evidence(
+                job_root, evidence, authorization
+            )
+        completed = reclaim_brokered_remote_evidence(
+            job_root,
+            evidence,
+            authorization,
+            acquire_job_lock=False,
+        )
+    assert completed.state == "complete"
+    assert completed.bytes_freed > 0
+
+
 def test_brokered_reclaim_refuses_repopulated_or_changed_intended_paths(
     tmp_path: Path,
 ) -> None:

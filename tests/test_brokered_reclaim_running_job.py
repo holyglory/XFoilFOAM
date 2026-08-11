@@ -18,8 +18,11 @@ def test_brokered_reclaim_accepts_only_completed_inactive_case_from_running_job(
     get_settings.cache_clear()
     calls: list[str] = []
 
-    def reclaim(job_root, evidence_dir, authorization):
+    lock_modes: list[bool] = []
+
+    def reclaim(job_root, evidence_dir, authorization, *, acquire_job_lock=True):
         calls.append(authorization.case_slug)
+        lock_modes.append(acquire_job_lock)
         return SimpleNamespace(
             to_dict=lambda: {
                 "state": "complete",
@@ -81,7 +84,7 @@ def test_brokered_reclaim_accepts_only_completed_inactive_case_from_running_job(
                 "jobId": job_id,
                 "caseSlug": completed_slug,
                 "evidenceBase": "evidence",
-                "receipt": {},
+                "receipt": {"aoaDeg": 0.0},
                 "receiptHmac": "a" * 64,
             },
         )
@@ -92,7 +95,7 @@ def test_brokered_reclaim_accepts_only_completed_inactive_case_from_running_job(
                 "jobId": job_id,
                 "caseSlug": active_slug,
                 "evidenceBase": "evidence",
-                "receipt": {},
+                "receipt": {"aoaDeg": 1.0},
                 "receiptHmac": "a" * 64,
             },
         )
@@ -103,7 +106,7 @@ def test_brokered_reclaim_accepts_only_completed_inactive_case_from_running_job(
                 "jobId": job_id,
                 "caseSlug": "condition_missing",
                 "evidenceBase": "evidence",
-                "receipt": {},
+                "receipt": {"aoaDeg": 2.0},
                 "receiptHmac": "a" * 64,
             },
         )
@@ -113,5 +116,6 @@ def test_brokered_reclaim_accepts_only_completed_inactive_case_from_running_job(
         assert active.status_code == 409
         assert missing.status_code == 409
         assert calls == [completed_slug]
+        assert lock_modes == [False]
     finally:
         get_settings.cache_clear()
