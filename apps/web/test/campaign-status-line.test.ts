@@ -276,12 +276,13 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       "Storage admission stopped: 93.0% used; 21.0 GiB free; 68.0 GiB required.";
     const line = campaignStatusLine(
       summary({
+        jobs: 8,
         diskAdmissionBlocked: true,
         diskAdmissionReason: reason,
       }),
     );
     expect(line.gate).toEqual({
-      text: "GUARDED — new-job storage reserve",
+      text: "8 JOBS RUNNING · NEW LOCAL STARTS PAUSED",
       tone: "amber",
     });
     expect(line.text).toBe(reason);
@@ -331,9 +332,9 @@ describe("campaignInstrumentStatus — one truthful hero message", () => {
     });
     const view = campaignInstrumentStatus(s);
     expect(view).toEqual({
-      title: "Capacity safeguard",
+      title: "New local starts paused",
       detail:
-        "8 active jobs continue; new work resumes automatically when capacity returns",
+        "8 active jobs continue; admission resumes automatically when storage returns",
       tone: "amber",
       action: null,
     });
@@ -395,7 +396,11 @@ describe("gateFromSolverState — hub/backlog gate from the global derivation", 
       tone: "amber",
     });
     expect(gateFromSolverState("storage_blocked")).toEqual({
-      text: "GUARDED — new-job storage reserve",
+      text: "NEW LOCAL STARTS PAUSED · STORAGE FORECAST",
+      tone: "amber",
+    });
+    expect(gateFromSolverState("storage_blocked", 8)).toEqual({
+      text: "8 JOBS RUNNING · NEW LOCAL STARTS PAUSED",
       tone: "amber",
     });
   });

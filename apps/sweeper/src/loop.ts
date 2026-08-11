@@ -909,6 +909,12 @@ export async function tick(
     for (let i = 0; i < MAX_LOCAL_ADMISSIONS_PER_TICK; i++) {
       if ((await inFlight(db)) >= state.maxConcurrentJobs) break;
       if (engineBackoffActive()) break;
+      // A clean start may have several empty slots. Re-measure after every
+      // successful submission so its exact DB job shape joins the active
+      // future-growth forecast before another slot is filled. One permissive
+      // pre-loop decision must never authorize a multi-job storage burst.
+      diskAdmission = await refreshDiskAdmission(db, engine);
+      if (!diskAdmission.allowed) break;
       const interleavedVerifySubmitted = await submitInterleavedVerifyIfDue(
         db,
         engine,

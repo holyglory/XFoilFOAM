@@ -9,8 +9,12 @@ unpacked evidence while later cases in the same multi-angle job continue. The
 signed receipt, exact manifest/archive hashes, generation-pinned hub readback,
 case identity, and inactive-case check remain mandatory.
 
-The workload-aware admission forecast continues to stop new submissions before
-their expected growth consumes the reserve. A separate measured emergency
+The workload-aware admission forecast stops new submissions before their
+expected growth consumes the reserve. Per-case reserves use measured production
+p95 plus explicit packaging headroom, and the unknown next-job reserve covers
+one ordinary FAST-URANS batch. The sweeper re-measures and recomputes all active
+future growth before every refill submission so one permissive decision cannot
+authorize a multi-job burst. A separate measured emergency
 high-water mark defaults to 80% filesystem use. At that mark the sweeper
 cancels a bounded batch of active reproducible jobs, releases their claimed
 points for restart, and bypasses ordinary age and remote-terminal retention
@@ -40,13 +44,21 @@ only for terminal-job retention was rejected because one long remaining angle
 retains every earlier accepted case. Admission-only protection was rejected
 because active jobs can continue writing after admission closes.
 
+Treating every remaining FAST-URANS case as 2 GiB was also rejected after the
+2026-08-11 hub run: completed cases occupied 0.5–0.62 GiB each and the recorded
+production p95 was 1.196 GiB, so the old reserve unnecessarily withheld an
+otherwise safe eighth-slot refill. The selected 1.5 GiB reserve remains 25%
+above p95 and over twice the observed run, while the next-job reserve increases
+from 24 GiB to 40 GiB to cover a 26-case FAST-URANS batch.
+
 ## Verification
 
 Regression coverage proves that a running job reclaims only a completed,
 inactive case; the active and missing cases remain 409 conflicts. Sweeper
 coverage distinguishes forecast-only blocking from measured emergency use and
 proves pressure-cancelled remote jobs bypass the ordinary delivery/age fence
-with `keep_case_state=false`. Production proof requires healthy PostgreSQL and
+with `keep_case_state=false`. Coverage also pins the observed eight-job
+FAST-URANS shape and per-refill re-evaluation. Production proof requires healthy PostgreSQL and
 Redis, 8/40 active slot limits, fresh remote heartbeats and promises, real job
 progress, successful delivery/reclaim, and measured disk headroom after the
 delivery cycle.

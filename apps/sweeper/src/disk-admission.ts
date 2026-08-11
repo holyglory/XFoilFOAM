@@ -14,9 +14,11 @@ const MIB = 1024 ** 2;
 
 export const DEFAULT_DISK_MAX_USED_PCT = 95;
 export const DEFAULT_DISK_MIN_FREE_BYTES = 20 * GIB;
-export const DEFAULT_DISK_JOB_RESERVE_BYTES = 24 * GIB;
+// One ordinary 26-case FAST-URANS batch at the calibrated per-case reserve.
+// This is intentionally larger than the 24.375 GiB full RANS batch reserve.
+export const DEFAULT_DISK_JOB_RESERVE_BYTES = 40 * GIB;
 export const DEFAULT_DISK_RANS_CASE_RESERVE_BYTES = 320 * MIB;
-export const DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES = 2 * GIB;
+export const DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES = 1.5 * GIB;
 export const DEFAULT_DISK_FULL_CASE_RESERVE_BYTES = 6 * GIB;
 export const DEFAULT_DISK_EMERGENCY_USED_PCT = 80;
 export const DISK_PRESSURE_CANCELLATION_MARKER =
@@ -127,9 +129,10 @@ function objectPayload(value: unknown): Record<string, unknown> | null {
 /**
  * Estimate only growth which has not happened yet. Production evidence on
  * 2026-07-27 measured p95 uncompressed archives at 0.235 GiB for RANS,
- * 1.196 GiB for FAST URANS and 3.739 GiB for FINAL URANS. These defaults add
- * material packaging headroom above those measurements. Unknown/malformed
- * work keeps the former full-job reserve and therefore fails safe.
+ * 1.196 GiB for FAST URANS and 3.739 GiB for FINAL URANS. The FAST default is
+ * 25% above its measured p95 (and over 2x the 0.5–0.62 GiB/case observed in
+ * the 2026-08-11 hub run). Unknown/malformed work keeps a full ordinary-job
+ * reserve and therefore fails safe.
  */
 export function diskAdmissionExposureForJobs(
   jobs: readonly LocalDiskJob[],

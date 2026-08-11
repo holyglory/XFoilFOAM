@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -31,7 +32,7 @@ describe("disk admission", () => {
     ).toMatchObject({
       allowed: true,
       reason: null,
-      requiredFreeBytes: 116 * GIB,
+      requiredFreeBytes: 132 * GIB,
     });
   });
 
@@ -78,7 +79,7 @@ describe("disk admission", () => {
       config,
     );
     expect(decision.allowed).toBe(false);
-    expect(decision.reason).toContain("116.0 GiB required");
+    expect(decision.reason).toContain("132.0 GiB required");
     expect(decision.reason).toContain(
       "72.0 GiB remaining local work across 3 jobs",
     );
@@ -126,8 +127,8 @@ describe("disk admission", () => {
 
     expect(exposure).toEqual({
       activeLocalJobCount: 3,
-      // 0.3125 GiB RANS + 2 × 2 GiB FAST + 1 × 6 GiB FINAL URANS.
-      activeLocalReservedBytes: 10.3125 * GIB,
+      // 0.3125 GiB RANS + 2 × 1.5 GiB FAST + 1 × 6 GiB FINAL URANS.
+      activeLocalReservedBytes: 9.3125 * GIB,
     });
   });
 
@@ -150,13 +151,13 @@ describe("disk admission", () => {
     });
     expect(
       evaluateDiskAdmission(
-        { total_bytes: 500 * GIB, free_bytes: 50 * GIB, used_pct: 70 },
+        { total_bytes: 500 * GIB, free_bytes: 70 * GIB, used_pct: 70 },
         exposure,
         config,
       ),
     ).toMatchObject({
       allowed: true,
-      requiredFreeBytes: 44.3125 * GIB,
+      requiredFreeBytes: 60.3125 * GIB,
     });
   });
 
@@ -206,10 +207,10 @@ describe("disk admission", () => {
       config,
     );
 
-    expect(exposure.activeLocalReservedBytes / GIB).toBeCloseTo(85, 5);
+    expect(exposure.activeLocalReservedBytes / GIB).toBeCloseTo(81.5, 5);
     expect(decision).toMatchObject({
       allowed: true,
-      requiredFreeBytes: 129 * GIB,
+      requiredFreeBytes: 141.5 * GIB,
     });
     expect(
       diskAdmissionExposureForJobs(
@@ -217,6 +218,54 @@ describe("disk admission", () => {
         config,
       ).activeLocalReservedBytes,
     ).toBeCloseTo(24.375 * GIB, 4);
+  });
+
+  it("admits the observed eight-job FAST-URANS workload with measured headroom", () => {
+    const exposure = diskAdmissionExposureForJobs(
+      [12, 15, 6, 13, 18, 15, 22, 11].map((remainingCases) => ({
+        totalCases: remainingCases,
+        completedCases: 0,
+        requestPayload: { uransFidelity: "precalc" },
+      })),
+      config,
+    );
+    const decision = evaluateDiskAdmission(
+      { total_bytes: 492 * GIB, free_bytes: 252 * GIB, used_pct: 49 },
+      exposure,
+      config,
+    );
+
+    expect(exposure.activeLocalReservedBytes).toBe(168 * GIB);
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: null,
+      requiredFreeBytes: 228 * GIB,
+    });
+  });
+
+  it("re-evaluates storage before every local refill submission", () => {
+    const loopSource = readFileSync(
+      new URL("../src/loop.ts", import.meta.url),
+      "utf8",
+    );
+    const refillStart = loopSource.indexOf(
+      "for (let i = 0; i < MAX_LOCAL_ADMISSIONS_PER_TICK; i++)",
+    );
+    const refillEnd = loopSource.indexOf(
+      "// Artifact publication",
+      refillStart,
+    );
+    const refillLoop = loopSource.slice(refillStart, refillEnd);
+
+    expect(refillStart).toBeGreaterThan(-1);
+    expect(refillEnd).toBeGreaterThan(refillStart);
+    expect(refillLoop).toContain(
+      "diskAdmission = await refreshDiskAdmission(db, engine)",
+    );
+    expect(refillLoop.indexOf("refreshDiskAdmission")).toBeLessThan(
+      refillLoop.indexOf("submitInterleavedVerifyIfDue"),
+    );
+    expect(refillLoop).toContain("if (!diskAdmission.allowed) break");
   });
 
   it("can measure the mounted media volume without waiting for the engine API", () => {

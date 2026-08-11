@@ -5786,7 +5786,7 @@ function QueueDashboard({
           {queue?.backlogStrip && (
             <CampaignBacklogStrip
               strip={queue.backlogStrip}
-              gate={gateFromSolverState(solver.state)}
+              gate={gateFromSolverState(solver.state, activeJobs.length)}
               onOpenCampaign={onOpenCampaign}
               onOpenSimulations={onOpenSimulations}
             />

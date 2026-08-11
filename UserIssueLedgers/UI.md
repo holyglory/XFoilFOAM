@@ -1,0 +1,5 @@
+# User Issue Ledger: UI
+
+| ID | Applies to | Mistake pattern | Required behavior | Prevention and verification |
+| --- | --- | --- | --- | --- |
+| UIL-UI-001 | Admin scheduler and campaign status | Storage admission copy used `blocked`/`guarded` labels without saying that the disk was not full, existing jobs were still running, or only new local starts were paused by a conservative forecast. The global chip and campaign badge therefore contradicted the visible Active campaign state. | Display measured disk use separately from forecast reserve. Name the affected action (`new local job starts`), state whether existing jobs continue, show the active-job count when known, and say that admission resumes automatically. Never use a bare storage-blocked/guarded badge for forecast-only admission. | Unit tests cover full-disk, forecast-reserve with active jobs, forecast-reserve with zero jobs, and healthy scheduling copy. Render the Admin campaigns route at desktop and narrow widths and verify the chip, campaign badge, explanatory status panel, text fit, and absence of contradictory state labels. |

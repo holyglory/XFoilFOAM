@@ -26,9 +26,15 @@ describe("solver terminology contract", () => {
     expect(pointHistory).toContain(">final URANS queued<");
   });
 
-  it("keeps blocked terminology for the real storage-admission gate", () => {
+  it("names the affected action instead of calling forecast reserve a storage block", () => {
     const solverState = source("lib/solver-state.ts");
-    expect(solverState).toContain("scheduler · storage blocked");
+    const campaignsHub = source(
+      "components/admin/campaigns/CampaignsHub.tsx",
+    );
+    expect(solverState).toContain("new local starts paused");
+    expect(solverState).toContain("forecast reserve, not a full disk");
+    expect(solverState).not.toContain("scheduler · storage blocked");
+    expect(campaignsHub).toContain("hub-storage-admission-status");
   });
 
   it("MUST-CATCH: aggregate surfaces never promote retained RANS evidence as a failed point", () => {

@@ -254,15 +254,15 @@ describe("deriveSolverState gate precedence", () => {
     expect(d.headline).toMatch(/build mismatch/i);
   });
 
-  it("enabled scheduler with measured disk pressure -> storage_blocked with the real admission reason", () => {
+  it("measured storage cutoff pauses only new local starts and preserves the real reason", () => {
     const reason =
-      "Storage admission stopped: 93.0% used; 21.0 GiB free; 68.0 GiB required.";
+      "Storage admission stopped: 95.1% used (admission limit 95.0%).";
     const d = deriveSolverState(
       {
         ...healthy,
         diskAdmissionBlocked: true,
         diskAdmissionReason: reason,
-        diskUsedPct: 93,
+        diskUsedPct: 95.1,
         diskFreeBytes: 21 * 1024 ** 3,
         diskRequiredFreeBytes: 68 * 1024 ** 3,
       },
@@ -270,8 +270,50 @@ describe("deriveSolverState gate precedence", () => {
     );
     expect(d.state).toBe("storage_blocked");
     expect(d.tone).toBe("amber");
-    expect(d.headline).toMatch(/no new solver jobs/i);
-    expect(d.detail).toBe(reason);
+    expect(d.headline).toBe(
+      "3 jobs are running — only new local starts are paused.",
+    );
+    expect(d.detail).toContain("storage admission limit has been reached");
+    expect(d.detail).toContain(reason);
+    expect(d.detail).not.toContain("not a full disk");
+  });
+
+  it("forecast reserve says the disk is not full while existing jobs continue", () => {
+    const reason =
+      "Storage admission stopped: 252.0 GiB free; 272.0 GiB required (20.0 GiB system floor + 228.0 GiB remaining local work across 8 jobs + 24.0 GiB for the next local job).";
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        activeJobCount: 8,
+        diskAdmissionBlocked: true,
+        diskAdmissionReason: reason,
+        diskUsedPct: 48.8,
+        diskFreeBytes: 252 * 1024 ** 3,
+        diskRequiredFreeBytes: 272 * 1024 ** 3,
+      },
+      NOW,
+    );
+    expect(d.headline).toBe(
+      "8 jobs are running — only new local starts are paused.",
+    );
+    expect(d.detail).toContain("forecast reserve, not a full disk");
+    expect(d.detail).toContain(reason);
+  });
+
+  it("forecast reserve with no active jobs does not imply work is running", () => {
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        activeJobCount: 0,
+        diskAdmissionBlocked: true,
+        diskUsedPct: 49,
+        diskFreeBytes: 252,
+        diskRequiredFreeBytes: 272,
+      },
+      NOW,
+    );
+    expect(d.headline).toBe("Only new local job starts are paused.");
+    expect(d.detail).toContain("forecast reserve, not a full disk");
   });
 
   it("manual pause and process death keep precedence over storage admission", () => {
@@ -438,9 +480,15 @@ describe("helpers", () => {
     expect(solverChipText("engine_unreachable")).toBe(
       "scheduler · engine unreachable",
     );
-    expect(solverStateLabel("storage_blocked")).toBe("STORAGE BLOCKED");
+    expect(solverStateLabel("storage_blocked")).toBe("NEW STARTS PAUSED");
     expect(solverChipText("storage_blocked")).toBe(
-      "scheduler · storage blocked",
+      "scheduler · new local starts paused · storage forecast",
+    );
+    expect(solverChipText("storage_blocked", 8)).toBe(
+      "scheduler · 8 jobs running · new local starts paused",
+    );
+    expect(solverChipText("storage_blocked", 1)).toBe(
+      "scheduler · 1 job running · new local starts paused",
     );
     expect(solverChipText("idle")).toBe("scheduler · ready");
   });

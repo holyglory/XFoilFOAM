@@ -198,7 +198,7 @@ export function solverStateLabel(state: SolverStateName): string {
     case "engine_unhealthy":
       return "ENGINE UNHEALTHY";
     case "storage_blocked":
-      return "STORAGE BLOCKED";
+      return "NEW STARTS PAUSED";
     case "tick_stalled":
       return "TICK STALLED";
     case "idle":
@@ -234,7 +234,9 @@ export function solverChipText(
     case "engine_unhealthy":
       return "scheduler · engine unhealthy";
     case "storage_blocked":
-      return "scheduler · storage blocked";
+      return activeJobCount != null && activeJobCount > 0
+        ? `scheduler · ${activeJobCount} job${activeJobCount === 1 ? "" : "s"} running · new local starts paused`
+        : "scheduler · new local starts paused · storage forecast";
     case "tick_stalled":
       return "scheduler · tick stalled";
     case "unknown":
@@ -335,14 +337,27 @@ export function deriveSolverState(
   }
 
   if (input.diskAdmissionBlocked) {
+    const jobs = input.activeJobCount;
+    const forecastReserve =
+      input.diskUsedPct != null &&
+      input.diskUsedPct < 80 &&
+      input.diskFreeBytes != null &&
+      input.diskRequiredFreeBytes != null &&
+      input.diskFreeBytes < input.diskRequiredFreeBytes;
     return {
       state: "storage_blocked",
       tone: "amber",
       headline:
-        "Storage reserve reached — existing evidence is safe; no new solver jobs are being submitted.",
-      detail:
+        jobs != null && jobs > 0
+          ? `${jobs} job${jobs === 1 ? " is" : "s are"} running — only new local starts are paused.`
+          : "Only new local job starts are paused.",
+      detail: [
+        forecastReserve
+          ? "This is a forecast reserve, not a full disk."
+          : "The storage admission limit has been reached.",
         input.diskAdmissionReason ??
-        "Free storage before resuming job admission. Reconciliation and evidence ingestion continue automatically.",
+          "Admission resumes automatically when enough storage is available; running work, reconciliation, and evidence ingestion continue.",
+      ].join(" "),
       secondary: secondary.filter(
         (item) => item !== "new-job admission stopped by storage reserve",
       ),

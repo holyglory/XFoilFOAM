@@ -27,8 +27,8 @@ function hhmm(iso: string): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-/** Primary badge shown INSTEAD of the lifecycle chip while a scheduler gate
- *  blocks all work for an active campaign. */
+/** Primary badge shown beside the demoted lifecycle chip while a scheduler
+ *  condition changes what the active campaign can submit. */
 export interface CampaignGate {
   text: string;
   tone: "amber" | "red";
@@ -69,11 +69,11 @@ export function campaignInstrumentStatus(
 
   if (campaign.status === "active" && scheduler.diskAdmissionBlocked) {
     return {
-      title: "Capacity safeguard",
+      title: "New local starts paused",
       detail:
         jobs > 0
-          ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new work resumes automatically when capacity returns`
-          : "New work resumes automatically when storage capacity returns",
+          ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; admission resumes automatically when storage returns`
+          : "Admission resumes automatically when storage returns",
       tone: "amber",
       action: null,
     };
@@ -266,6 +266,7 @@ export function pausedCampaignStatusText(
  *  engine unhealthy / sweeper disabled ("paused" solver state). */
 export function gateFromSolverState(
   state: SolverStateName,
+  activeJobCount?: number,
 ): CampaignGate | null {
   switch (state) {
     case "process_not_running":
@@ -277,7 +278,13 @@ export function gateFromSolverState(
     case "engine_unhealthy":
       return { text: "BLOCKED — engine unhealthy", tone: "red" };
     case "storage_blocked":
-      return { text: "GUARDED — new-job storage reserve", tone: "amber" };
+      return {
+        text:
+          activeJobCount != null && activeJobCount > 0
+            ? `${activeJobCount} JOB${activeJobCount === 1 ? "" : "S"} RUNNING · NEW LOCAL STARTS PAUSED`
+            : "NEW LOCAL STARTS PAUSED · STORAGE FORECAST",
+        tone: "amber",
+      };
     case "paused":
       return { text: "BLOCKED — sweeper disabled", tone: "amber" };
     case "tick_stalled":
@@ -602,14 +609,11 @@ export function campaignStatusLine(
       }
       if (scheduler.diskAdmissionBlocked) {
         return {
-          gate: {
-            text: "GUARDED — new-job storage reserve",
-            tone: "amber",
-          },
+          gate: gateFromSolverState("storage_blocked", jobs),
           lifecycle,
           text:
             scheduler.diskAdmissionReason ??
-            "Storage reserve reached — existing evidence remains available, but no new jobs are being submitted.",
+            "Only new local job starts are paused; running jobs continue and admission resumes automatically when storage returns.",
           tone: "amber",
         };
       }

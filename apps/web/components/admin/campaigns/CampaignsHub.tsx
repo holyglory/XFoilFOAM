@@ -315,7 +315,11 @@ export function CampaignsHub({
         <button
           type="button"
           data-testid="hub-solver-chip"
-          title="Open the Solver page"
+          title={
+            solver.state === "storage_blocked"
+              ? `${solver.headline} ${solver.detail ?? ""}`.trim()
+              : "Open the Solver page"
+          }
           onClick={onOpenSolver}
           style={{
             fontFamily: MONO,
@@ -356,6 +360,34 @@ export function CampaignsHub({
           </button>
         </div>
       </div>
+
+      {solver.state === "storage_blocked" && (
+        <div
+          data-testid="hub-storage-admission-status"
+          style={{
+            ...card,
+            marginBottom: 12,
+            borderColor: "rgba(245,158,11,0.45)",
+            background: "rgba(245,158,11,0.06)",
+            display: "grid",
+            gap: 5,
+          }}
+        >
+          <strong style={{ color: C.amber, fontSize: 13 }}>
+            {solver.headline}
+          </strong>
+          <span
+            style={{
+              color: C.muted,
+              fontFamily: MONO,
+              fontSize: 11,
+              lineHeight: 1.55,
+            }}
+          >
+            {solver.detail}
+          </span>
+        </div>
+      )}
 
       {err && <ErrorLine text={err} />}
 
@@ -449,7 +481,10 @@ export function CampaignsHub({
             // headline next to a contradictory red line.
             const gate =
               item.status === "active"
-                ? gateFromSolverState(solver.state)
+                ? gateFromSolverState(
+                    solver.state,
+                    solverPayload?.activeJobCount,
+                  )
                 : null;
             return (
               <div
