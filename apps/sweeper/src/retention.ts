@@ -16,6 +16,8 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
+import { DISK_PRESSURE_CANCELLATION_MARKER } from "./disk-admission";
+
 export const DEFAULT_STRIP_MIN_AGE_MS = 30 * 60 * 1000;
 export const DEFAULT_RETENTION_CONTINUABLE_DAYS = 14;
 export const DEFAULT_STRIP_MAX_PER_TICK = 5;
@@ -142,6 +144,7 @@ export async function stripTerminalJobs(
       SELECT
         j.id,
         j.engine_job_id,
+        j.error,
         j.stripped_at,
         j.strip_report,
         COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") AS terminal_at,
@@ -264,22 +267,29 @@ export async function stripTerminalJobs(
         -- retains packaged evidence too, but this explicit fence prevents a
         -- future retention expansion from racing the federation ACK.
         AND (
-          NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
-          OR EXISTS (
-            SELECT 1
-            FROM sync_remote_result_deliveries remote_delivery
-            WHERE remote_delivery.sim_job_id = j.id
-              AND remote_delivery.result_id IS NULL
-              AND remote_delivery.state IN ('delivered', 'superseded')
+          j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
+          OR (
+            (
+              NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
+              OR EXISTS (
+                SELECT 1
+                FROM sync_remote_result_deliveries remote_delivery
+                WHERE remote_delivery.sim_job_id = j.id
+                  AND remote_delivery.result_id IS NULL
+                  AND remote_delivery.state IN ('delivered', 'superseded')
+              )
+            )
+            AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
+              ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
           )
         )
-        AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
-          ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
     )
     SELECT
       id,
       engine_job_id,
       CASE
+        WHEN error = ${DISK_PRESSURE_CANCELLATION_MARKER}
+          THEN false
         WHEN stripped_at IS NOT NULL
           AND strip_report ->> 'kept_case_state' = 'true'
           AND NOT has_live_continuation

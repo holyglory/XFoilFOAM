@@ -10,6 +10,14 @@
   non-solver configuration and reconnection credentials. Regenerated results
   must still come from real solver evidence and pass the normal acceptance
   gates. [D-2026-08-10-disposable-inflight-cfd]
+- Confirmed intent: solver filesystems keep a bounded working set. A remote
+  case is reclaimed as soon as the hub has authenticated and bound its exact
+  archive, even while later angles in the same job continue. At 80% measured
+  use, active reproducible jobs are cancelled, stripped, and requeued rather
+  than allowing already-admitted work to exhaust the filesystem. Forecast-only
+  admission blocking remains distinct from measured emergency use, and local
+  deployment/backup accumulation is bounded.
+  [D-2026-08-11-disposable-storage-headroom]
 - Confirmed intent: hub-issued remote solver promises exclusively own their
   exact cells while alive, use one refreshed 72-hour failover horizon across
   claim/solve/transfer, and serialize against local claims at the mutation

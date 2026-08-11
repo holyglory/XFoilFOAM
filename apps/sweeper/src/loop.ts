@@ -26,7 +26,11 @@ import {
   solverImplementationIdForSetup,
 } from "./build-request";
 import { claimAoas } from "./claim";
-import { refreshDiskAdmission } from "./disk-admission";
+import {
+  cancelDisposableJobsForDiskPressure,
+  isDiskPressureEmergency,
+  refreshDiskAdmission,
+} from "./disk-admission";
 import {
   submitCampaignPrecalcRecoveries,
   submitInterleavedVerifyIfDue,
@@ -735,6 +739,16 @@ export async function tick(
   // recover automatically instead of turning storage pressure into fake job
   // failures or a PostgreSQL outage.
   let diskAdmission = await refreshDiskAdmission(db, engine);
+  if (isDiskPressureEmergency(diskAdmission)) {
+    const cancelled = await cancelDisposableJobsForDiskPressure(db, engine);
+    if (cancelled > 0) {
+      // The engine may need a short interval to release its execution lock.
+      // This immediate pass reclaims every already-stopped directory; the
+      // ordinary retention call at the next tick retries any 409 refusal.
+      await retentionTick(db, engine, { stripMaxPerTick: cancelled });
+      diskAdmission = await refreshDiskAdmission(db, engine);
+    }
+  }
   // Remote authority/evidence reconciliation remains early and admission-free.
   // Its NEW RANS lane is considered only after durable FAST URANS below.
   const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);

@@ -32,6 +32,7 @@ import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
+import { DISK_PRESSURE_CANCELLATION_MARKER } from "../src/disk-admission";
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `sw-retention-${process.pid}-${Date.now().toString(36)}`;
@@ -366,8 +367,7 @@ beforeAll(async () => {
   revisionId = condition.simulationPresetRevisionId;
   const [revision] = await db
     .select({
-      solverImplementationId:
-        simulationPresetRevisions.solverImplementationId,
+      solverImplementationId: simulationPresetRevisions.solverImplementationId,
     })
     .from(simulationPresetRevisions)
     .where(eq(simulationPresetRevisions.id, revisionId))
@@ -928,6 +928,28 @@ describe("terminal strip reaper", () => {
     expect((await readJob(running.id)).strippedAt).toBeNull();
     expect((await readJob(pending.id)).strippedAt).toBeNull();
     expect((await readJob(young.id)).strippedAt).toBeNull();
+  });
+
+  it("immediately strips disposable pressure cancellations behind the remote-delivery fence", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-pressure-cancelled`, {
+      status: "cancelled",
+      error: DISK_PRESSURE_CANCELLATION_MARKER,
+      requestPayload: { syncPromiseId: `${PREFIX}-pressure-promise` },
+      finishedAt: NOW,
+      ingestedAt: null,
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: job.engineJobId, keepCaseState: false },
+    ]);
+    expect((await readJob(job.id)).strippedAt).toEqual(NOW);
   });
 });
 

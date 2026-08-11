@@ -7,6 +7,7 @@ import {
   diskAdmissionExposureForJobs,
   diskMeasurementFromStatfs,
   evaluateDiskAdmission,
+  isDiskPressureEmergency,
 } from "../src/disk-admission";
 
 const GIB = 1024 ** 3;
@@ -45,6 +46,26 @@ describe("disk admission", () => {
     );
     expect(decision.allowed).toBe(false);
     expect(decision.reason).toContain("95.1% used");
+  });
+
+  it("distinguishes forecast-only admission blocking from emergency measured use", () => {
+    const forecastOnly = evaluateDiskAdmission(
+      { total_bytes: 500 * GIB, free_bytes: 279 * GIB, used_pct: 47.2 },
+      {
+        activeLocalJobCount: 8,
+        activeLocalReservedBytes: 256 * GIB,
+      },
+      config,
+    );
+    const emergency = evaluateDiskAdmission(
+      { total_bytes: 500 * GIB, free_bytes: 90 * GIB, used_pct: 82 },
+      { activeLocalJobCount: 1, activeLocalReservedBytes: 2 * GIB },
+      config,
+    );
+
+    expect(forecastOnly.allowed).toBe(false);
+    expect(isDiskPressureEmergency(forecastOnly)).toBe(false);
+    expect(isDiskPressureEmergency(emergency)).toBe(true);
   });
 
   it("reserves worst-case growth for active jobs and the next admission", () => {

@@ -277,7 +277,7 @@ export function gateFromSolverState(
     case "engine_unhealthy":
       return { text: "BLOCKED — engine unhealthy", tone: "red" };
     case "storage_blocked":
-      return { text: "BLOCKED — storage reserve reached", tone: "amber" };
+      return { text: "GUARDED — new-job storage reserve", tone: "amber" };
     case "paused":
       return { text: "BLOCKED — sweeper disabled", tone: "amber" };
     case "tick_stalled":
@@ -603,7 +603,7 @@ export function campaignStatusLine(
       if (scheduler.diskAdmissionBlocked) {
         return {
           gate: {
-            text: "BLOCKED — storage reserve reached",
+            text: "GUARDED — new-job storage reserve",
             tone: "amber",
           },
           lifecycle,

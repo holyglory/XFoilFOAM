@@ -1,10 +1,13 @@
 import { type DB, simJobs, sweeperState } from "@aerodb/db";
-import type {
-  EngineClient,
-  EngineMaintenanceDiskResponse,
+import {
+  EngineError,
+  type EngineClient,
+  type EngineMaintenanceDiskResponse,
 } from "@aerodb/engine-client";
 import { statfs } from "node:fs/promises";
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, desc, eq, inArray, or } from "drizzle-orm";
+
+import { cancelJobAndReleaseClaims, type SimJobRow } from "./reconcile";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -15,6 +18,9 @@ export const DEFAULT_DISK_JOB_RESERVE_BYTES = 24 * GIB;
 export const DEFAULT_DISK_RANS_CASE_RESERVE_BYTES = 320 * MIB;
 export const DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES = 2 * GIB;
 export const DEFAULT_DISK_FULL_CASE_RESERVE_BYTES = 6 * GIB;
+export const DEFAULT_DISK_EMERGENCY_USED_PCT = 80;
+export const DISK_PRESSURE_CANCELLATION_MARKER =
+  "Storage pressure emergency: cancelled disposable solver work for restart";
 
 export interface DiskAdmissionConfig {
   maxUsedPct: number;
@@ -46,6 +52,23 @@ export interface DiskAdmissionDecision {
   usedPct: number | null;
   freeBytes: number | null;
   requiredFreeBytes: number | null;
+}
+
+export function diskPressureEmergencyFromEnv(): number {
+  const value = positiveEnv(
+    "SWEEPER_DISK_EMERGENCY_USED_PCT",
+    DEFAULT_DISK_EMERGENCY_USED_PCT,
+  );
+  return value > 0 && value < DEFAULT_DISK_MAX_USED_PCT
+    ? value
+    : DEFAULT_DISK_EMERGENCY_USED_PCT;
+}
+
+export function isDiskPressureEmergency(
+  decision: DiskAdmissionDecision,
+  thresholdPct = diskPressureEmergencyFromEnv(),
+): boolean {
+  return decision.usedPct != null && decision.usedPct >= thresholdPct;
 }
 
 function positiveEnv(name: string, fallback: number): number {
@@ -178,6 +201,67 @@ export async function loadDiskAdmissionExposure(
       ),
     );
   return diskAdmissionExposureForJobs(jobs, config);
+}
+
+/**
+ * A closed admission gate cannot stop bytes already being produced by active
+ * OpenFOAM children. At the emergency high-water mark, cancel a bounded batch
+ * of reproducible jobs and release their claimed points for a clean restart.
+ * Retention recognizes the exact marker and strips these job directories
+ * without waiting for the ordinary terminal-age or remote-delivery fences.
+ */
+export async function cancelDisposableJobsForDiskPressure(
+  db: DB,
+  engine: EngineClient,
+  limit = 8,
+): Promise<number> {
+  const jobs = (await db
+    .select()
+    .from(simJobs)
+    .where(
+      or(
+        inArray(simJobs.status, ["submitted", "running"]),
+        and(
+          eq(simJobs.status, "pending"),
+          eq(simJobs.engineState, "submitting"),
+        ),
+      ),
+    )
+    .orderBy(desc(simJobs.completedCases), desc(simJobs.updatedAt))
+    .limit(Math.max(0, Math.trunc(limit)))) as SimJobRow[];
+
+  let cancelled = 0;
+  for (const job of jobs) {
+    if (job.engineJobId) {
+      try {
+        await engine.cancelJob(job.engineJobId);
+      } catch (error) {
+        if (!(error instanceof EngineError && error.status === 404)) {
+          console.error(
+            `[sweeper] DISK EMERGENCY: engine cancellation failed for ${job.engineJobId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          continue;
+        }
+      }
+    }
+    if (
+      await cancelJobAndReleaseClaims(
+        db,
+        job,
+        DISK_PRESSURE_CANCELLATION_MARKER,
+      )
+    ) {
+      cancelled += 1;
+    }
+  }
+  if (cancelled) {
+    console.warn(
+      `[sweeper] DISK EMERGENCY: cancelled ${cancelled} disposable job(s); their points were released for restart`,
+    );
+  }
+  return cancelled;
 }
 
 /**

@@ -281,7 +281,7 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       }),
     );
     expect(line.gate).toEqual({
-      text: "BLOCKED — storage reserve reached",
+      text: "GUARDED — new-job storage reserve",
       tone: "amber",
     });
     expect(line.text).toBe(reason);
@@ -395,7 +395,7 @@ describe("gateFromSolverState — hub/backlog gate from the global derivation", 
       tone: "amber",
     });
     expect(gateFromSolverState("storage_blocked")).toEqual({
-      text: "BLOCKED — storage reserve reached",
+      text: "GUARDED — new-job storage reserve",
       tone: "amber",
     });
   });

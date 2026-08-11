@@ -1733,16 +1733,33 @@ def create_app() -> FastAPI:
         status = store.read_status(request.job_id)
         result = store.read_result(request.job_id)
         terminal = {JobState.completed, JobState.failed, JobState.cancelled}
-        if status is None or status.state not in terminal:
-            raise HTTPException(
-                status_code=409,
-                detail="Brokered evidence reclaim requires a terminal engine job",
+        terminal_job = status is not None and status.state in terminal
+        terminal_result = result is not None and result.state in terminal
+        if not (terminal_job and terminal_result):
+            # Partial running results are published after each completed case.
+            # Once the hub has returned an exact signed binding receipt, that
+            # case's packaged evidence is reproducible remote-solver working
+            # data. Requiring the whole multi-angle job to finish retained
+            # every accepted case for hours and filled hz-solver2 even though
+            # later cases no longer read those evidence paths.
+            completed_case = result is not None and any(
+                point.case_slug == request.case_slug
+                for polar in result.polars
+                for point in (*polar.points, *polar.attempts)
             )
-        if result is None or result.state not in terminal:
-            raise HTTPException(
-                status_code=409,
-                detail="Brokered evidence reclaim requires a terminal result payload",
-            )
+            if (
+                status is None
+                or result is None
+                or not completed_case
+                or status.active_case_slug == request.case_slug
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Brokered evidence reclaim requires a completed inactive "
+                        "case in the current result payload"
+                    ),
+                )
         try:
             evidence_dir = store.file_path(
                 request.job_id,

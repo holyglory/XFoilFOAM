@@ -140,7 +140,7 @@ export { touchHeartbeat } from "./heartbeat";
 const MISSING_JOB_REQUEUE_MS = Number(
   process.env.SWEEPER_MISSING_JOB_REQUEUE_MS ?? 10 * 60 * 1000,
 );
-type SimJobRow = typeof simJobs.$inferSelect;
+export type SimJobRow = typeof simJobs.$inferSelect;
 interface ReconcileOptions {
   jobIds?: string[];
   recoverFailedJobIds?: string[];
@@ -1454,7 +1454,7 @@ async function setupSnapshotForJob(
  *  helper existed, engine state `cancelled` fell through the status mapping to
  *  "running" and the sweeper polled the dead job forever. Never ingests
  *  coefficients — released rows stay coefficient-free until re-solved. */
-async function cancelJobAndReleaseClaims(
+export async function cancelJobAndReleaseClaims(
   db: DB,
   job: SimJobRow,
   msg: string,
