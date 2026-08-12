@@ -221,6 +221,19 @@ export function archiveBackfillFidelity(
     : null;
 }
 
+/** Attempt payload is descriptive evidence, not authority to relabel the
+ * immutable result row. Both identities must name the same URANS fidelity. */
+export function exactArchiveBackfillFidelity(
+  evidencePayload: unknown,
+  resultFidelity: unknown,
+): "urans_precalc" | "urans_full" | null {
+  const attemptFidelity = archiveBackfillFidelity(evidencePayload);
+  const storedFidelity = parsePointFidelity(resultFidelity);
+  return attemptFidelity && storedFidelity === attemptFidelity
+    ? attemptFidelity
+    : null;
+}
+
 /**
  * Construct the only pointer the reducer is allowed to read.  This mirrors
  * the render-pointer validation but stays local to the backfill so no caller
@@ -336,6 +349,7 @@ export async function discoverArchiveInterpretationBackfill(
   const rows = await db
     .select({
       resultId: results.id,
+      resultFidelity: results.fidelity,
       resultAttemptId: resultAttempts.id,
       evidencePayload: resultAttempts.evidencePayload,
       sourceArchiveId: solverEvidenceArchives.id,
@@ -361,6 +375,8 @@ export async function discoverArchiveInterpretationBackfill(
       and(
         sql`${resultAttempts.resultId} IS NOT NULL`,
         sql`${resultAttempts.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')`,
+        inArray(results.fidelity, ["urans_precalc", "urans_full"]),
+        sql`${results.fidelity} = ${resultAttempts.evidencePayload} ->> 'fidelity'`,
         scope.resultIds.length
           ? inArray(results.id, scope.resultIds)
           : undefined,
@@ -373,7 +389,10 @@ export async function discoverArchiveInterpretationBackfill(
     .limit(scope.limit);
 
   const candidates = rows.flatMap((row) => {
-    const fidelity = archiveBackfillFidelity(row.evidencePayload);
+    const fidelity = exactArchiveBackfillFidelity(
+      row.evidencePayload,
+      row.resultFidelity,
+    );
     // The SQL predicate is deliberately duplicated with a strict parser: the
     // parser is the actual provenance contract, and protects us from a future
     // JSON coercion or a malformed historical payload.

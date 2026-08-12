@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   archiveBackfillFidelity,
+  exactArchiveBackfillFidelity,
   archiveBackfillRecoveryProgress,
   archiveBackfillRecoveryHandoff,
   archiveRecoveryMayAdoptCorrectiveTail,
@@ -45,6 +46,24 @@ describe("archive clean-cycle interpretation backfill", () => {
     expect(archiveBackfillFidelity({ fidelity: "rans" })).toBeNull();
     expect(archiveBackfillFidelity({ unsteady: true })).toBeNull();
     expect(archiveBackfillFidelity(null)).toBeNull();
+  });
+
+  it("MUST-CATCH: requires the immutable result and attempt payload to agree on URANS fidelity", () => {
+    expect(
+      exactArchiveBackfillFidelity(
+        { fidelity: "urans_precalc" },
+        "urans_precalc",
+      ),
+    ).toBe("urans_precalc");
+    expect(
+      exactArchiveBackfillFidelity({ fidelity: "urans_full" }, "urans_full"),
+    ).toBe("urans_full");
+    expect(
+      exactArchiveBackfillFidelity({ fidelity: "urans_precalc" }, "rans"),
+    ).toBeNull();
+    expect(
+      exactArchiveBackfillFidelity({ fidelity: "urans_full" }, "urans_precalc"),
+    ).toBeNull();
   });
 
   it("MUST-CATCH: creates only an exact generation-pinned GCS pointer", () => {
@@ -314,9 +333,9 @@ describe("archive clean-cycle interpretation backfill", () => {
   });
 
   it("MUST-CATCH: never creates another recovery handoff after the physical clean-cycle cap", () => {
-    expect(
-      archiveReducerNeedsRecoveryHandoff("continuation_required"),
-    ).toBe(true);
+    expect(archiveReducerNeedsRecoveryHandoff("continuation_required")).toBe(
+      true,
+    );
     expect(archiveReducerNeedsRecoveryHandoff("rerun_required")).toBe(true);
     expect(archiveReducerNeedsRecoveryHandoff("recovery_exhausted")).toBe(
       false,
