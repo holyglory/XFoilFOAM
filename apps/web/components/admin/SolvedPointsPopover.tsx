@@ -17,7 +17,7 @@ import type { Point, SimulationDetail } from "@aerodb/core";
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 
 import { type AdminSolvedPoint, getSolvedPoints } from "@/lib/admin";
-import { getSim } from "@/lib/api";
+import { getCachedSim, getSim, prefetchSimDetails } from "@/lib/api";
 import { mergeSolvedPointsPages, stepSolvedPoint } from "@/lib/solved-points";
 import { C, MONO } from "@/lib/tokens";
 import { SimModal } from "../detail/SimModal";
@@ -170,7 +170,6 @@ export function SolvedPointsPopover({
   useEffect(() => {
     if (!openRow) return;
     let cancelled = false;
-    setSim(null);
     setSimMessage(null);
     getSim(openRow.airfoilSlug, openRow.reynolds ?? 0, openRow.aoaDeg, openRow.resultId)
       .then((d) => {
@@ -183,7 +182,6 @@ export function SolvedPointsPopover({
       })
       .catch((e) => {
         if (cancelled) return;
-        setSim(null);
         setSimMessage(`Could not load the stored OpenFOAM result (${(e as Error).message}). The API or its media backend may be unreachable.`);
       });
     return () => {
@@ -194,9 +192,29 @@ export function SolvedPointsPopover({
   const openIndex = openRow ? items.findIndex((row) => row.resultId === openRow.resultId) : -1;
 
   const openRowAt = useCallback((row: AdminSolvedPoint) => {
+    const cached = getCachedSim(
+      row.airfoilSlug,
+      row.reynolds ?? 0,
+      row.aoaDeg,
+      row.resultId,
+    );
+    if (cached) setSim(cached);
     setOpenRow(row);
     setPlaying(true);
   }, []);
+
+  useEffect(() => {
+    if (!openRow) return;
+    prefetchSimDetails(
+      items.map((row) => ({
+        slug: row.airfoilSlug,
+        re: row.reynolds ?? 0,
+        aoa: row.aoaDeg,
+        resultId: row.resultId,
+      })),
+      simField,
+    );
+  }, [items, openRow, simField]);
 
   const step = useCallback(
     async (direction: -1 | 1) => {

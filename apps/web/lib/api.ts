@@ -113,12 +113,148 @@ export async function getHashtags(): Promise<HashtagDTO[]> {
   return (await res.json()).items as HashtagDTO[];
 }
 
+const SIM_DETAIL_CACHE_TTL_MS = 2 * 60_000;
+const SIM_DETAIL_CACHE_LIMIT = 96;
+type SimDetailCacheEntry = {
+  value?: SimulationDetail;
+  promise?: Promise<SimulationDetail>;
+  expiresAt: number;
+};
+const simDetailCache = new Map<string, SimDetailCacheEntry>();
+const simMediaPreloads = new Map<string, HTMLImageElement>();
+
+function simDetailKey(
+  slug: string,
+  re: number,
+  aoa: number,
+  resultId?: string | null,
+): string {
+  return resultId ? `result:${resultId}` : `point:${slug}:${re}:${aoa}`;
+}
+
+function trimSimDetailCache(): void {
+  while (simDetailCache.size > SIM_DETAIL_CACHE_LIMIT) {
+    const oldest = simDetailCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    simDetailCache.delete(oldest);
+  }
+}
+
+export function getCachedSim(
+  slug: string,
+  re: number,
+  aoa: number,
+  resultId?: string | null,
+): SimulationDetail | null {
+  const key = simDetailKey(slug, re, aoa, resultId);
+  const entry = simDetailCache.get(key);
+  if (!entry?.value || entry.expiresAt <= Date.now()) return null;
+  simDetailCache.delete(key);
+  simDetailCache.set(key, entry);
+  return entry.value;
+}
+
 export async function getSim(slug: string, re: number, aoa: number, resultId?: string | null): Promise<SimulationDetail> {
+  const key = simDetailKey(slug, re, aoa, resultId);
+  const cached = getCachedSim(slug, re, aoa, resultId);
+  if (cached) return cached;
+  const inFlight = simDetailCache.get(key)?.promise;
+  if (inFlight) return inFlight;
+
   const qs = new URLSearchParams({ re: String(re), aoa: String(aoa) });
   if (resultId) qs.set("resultId", resultId);
-  const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/sim?${qs.toString()}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`GET sim → ${res.status}`);
-  return res.json();
+  const promise = (async () => {
+    const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/sim?${qs.toString()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`GET sim → ${res.status}`);
+    const value = (await res.json()) as SimulationDetail;
+    // Bridge mixed-version deploys: older API instances did not echo this id.
+    if (!value.resultId && resultId) value.resultId = resultId;
+    simDetailCache.delete(key);
+    simDetailCache.set(key, {
+      value,
+      expiresAt: Date.now() + SIM_DETAIL_CACHE_TTL_MS,
+    });
+    trimSimDetailCache();
+    return value;
+  })();
+  simDetailCache.set(key, {
+    promise,
+    expiresAt: Date.now() + SIM_DETAIL_CACHE_TTL_MS,
+  });
+  trimSimDetailCache();
+  try {
+    return await promise;
+  } catch (error) {
+    if (simDetailCache.get(key)?.promise === promise) simDetailCache.delete(key);
+    throw error;
+  }
+}
+
+export interface SimDetailPrefetchTarget {
+  slug: string;
+  re: number;
+  aoa: number;
+  resultId?: string | null;
+}
+
+function preloadSimField(detail: SimulationDetail, preferredField?: FieldId): void {
+  if (typeof window === "undefined" || typeof Image === "undefined") return;
+  const field =
+    preferredField && detail.availableFields.includes(preferredField)
+      ? preferredField
+      : detail.availableFields[0];
+  if (!field) return;
+  const media = detail.media?.[field];
+  const url = media?.imageUrl ?? (media?.kind === "image" ? media.url : null);
+  if (!url) return;
+  const absoluteUrl = browserUrl(url);
+  if (simMediaPreloads.has(absoluteUrl)) return;
+  const image = new Image();
+  image.decoding = "async";
+  image.src = absoluteUrl;
+  simMediaPreloads.set(absoluteUrl, image);
+  while (simMediaPreloads.size > SIM_DETAIL_CACHE_LIMIT) {
+    const oldest = simMediaPreloads.keys().next().value as string | undefined;
+    if (!oldest) break;
+    simMediaPreloads.delete(oldest);
+  }
+}
+
+/** Warm immutable sibling evidence with bounded concurrency so AoA slider
+ *  navigation can switch detail JSON and the selected field image instantly. */
+export function prefetchSimDetails(
+  targets: SimDetailPrefetchTarget[],
+  preferredField?: FieldId,
+): void {
+  if (typeof window === "undefined" || targets.length === 0) return;
+  const unique = Array.from(
+    new Map(
+      targets.map((target) => [
+        simDetailKey(target.slug, target.re, target.aoa, target.resultId),
+        target,
+      ]),
+    ).values(),
+  );
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < unique.length) {
+      const target = unique[cursor++];
+      try {
+        const detail = await getSim(
+          target.slug,
+          target.re,
+          target.aoa,
+          target.resultId,
+        );
+        preloadSimField(detail, preferredField);
+      } catch {
+        // Prefetch is opportunistic; the selected-point request owns errors.
+      }
+    }
+  };
+  void Promise.all(
+    Array.from({ length: Math.min(4, unique.length) }, () => worker()),
+  );
 }
 
 export async function getFieldTrack(slug: string, revisionId?: string | null): Promise<FieldTrackPoint[]> {

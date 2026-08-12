@@ -354,6 +354,10 @@ export function SimModal(props: {
       (p) => Math.abs(p.aoa - (sim?.alpha ?? ctx?.aoa ?? 0)) < 1e-6,
     );
   }, [ctx?.aoa, ctx?.resultId, sim?.alpha, sortedTrack]);
+  const transitioning = Boolean(
+    sim?.resultId && ctx?.resultId && sim.resultId !== ctx.resultId,
+  );
+  const transitionPending = transitioning && !unavailableMessage;
   const evidenceBundle =
     sim?.evidenceArtifacts?.find(
       (artifact) => artifact.kind === "engine_bundle",
@@ -1528,7 +1532,15 @@ export function SimModal(props: {
   };
 
   const resultContent = () => (
-    <>
+    <div
+      data-testid="sim-result-content"
+      data-result-id={sim?.resultId ?? ""}
+      aria-busy={transitionPending}
+      style={{
+        opacity: transitionPending ? 0.72 : 1,
+        transition: "opacity 120ms ease",
+      }}
+    >
       {meansRow()}
       {activeScaleChip()}
       {heroSection()}
@@ -1565,7 +1577,7 @@ export function SimModal(props: {
           {provenanceText()}
         </div>
       </div>
-    </>
+    </div>
   );
 
   // Derived-by-symmetry view (spec §9.3): the media element itself is flipped
@@ -1687,6 +1699,11 @@ export function SimModal(props: {
           <span>AoA evidence</span>
           <span data-testid="sim-alpha-label">
             α {f1(shown ?? 0)}° · {value + 1}/{total}
+            {transitionPending
+              ? " · loading"
+              : transitioning
+                ? " · unavailable"
+                : ""}
           </span>
         </div>
         <input
@@ -1707,6 +1724,14 @@ export function SimModal(props: {
             opacity: hasSiblings && total > 1 ? 1 : 0.55,
           }}
         />
+        {transitioning && unavailableMessage ? (
+          <div
+            data-testid="sim-alpha-error"
+            style={{ fontFamily: MONO, fontSize: 9, color: C.amber }}
+          >
+            {unavailableMessage}
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -2041,6 +2066,30 @@ export function SimModal(props: {
   );
 
   const chartsColumn = () => {
+    if (!framesMode && !steadyModel) {
+      return (
+        <div
+          data-testid="sim-history-unavailable"
+          style={{
+            border: `1px solid ${C.stroke2}`,
+            borderRadius: 10,
+            padding: "14px 16px",
+            background: C.panel2,
+            minWidth: 0,
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.muted,
+            lineHeight: 1.6,
+          }}
+        >
+          <div style={{ color: C.teal, marginBottom: 4 }}>
+            Final coefficients recorded
+          </div>
+          This pointwise-converged RANS solve records its final coefficients and
+          convergence summary, not an iteration-by-iteration coefficient series.
+        </div>
+      );
+    }
     const labels = framesMode
       ? ([
           ["Cl(t)", C.teal, clMonRef, "sim-frame-chart", 136],
@@ -2079,9 +2128,7 @@ export function SimModal(props: {
               <span style={{ fontSize: 9, color: C.dim, whiteSpace: "nowrap" }}>
                 {transportActive
                   ? "click / drag to seek"
-                  : steadyModel
-                    ? "recorded iterations"
-                    : "no history"}
+                  : "recorded iterations"}
               </span>
             </div>
             {chartCanvas(ref, testId, height)}

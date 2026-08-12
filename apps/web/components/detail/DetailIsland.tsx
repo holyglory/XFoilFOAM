@@ -17,7 +17,12 @@ import {
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { getFieldTrack, getSim } from "@/lib/api";
+import {
+  getCachedSim,
+  getFieldTrack,
+  getSim,
+  prefetchSimDetails,
+} from "@/lib/api";
 import {
   initialSeriesVisibility,
   publicSolvedPointCount,
@@ -189,7 +194,6 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
       })
       .catch(() => {
         if (!cancelled) {
-          setSimDetail(null);
           setSimMessage("No solved OpenFOAM result is stored for this point yet. Queue or rerun the sweep to inspect real CFD media here.");
         }
       });
@@ -213,13 +217,27 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     };
   }, [simOpen, detail.slug, pinnedRevisionId]);
 
+  useEffect(() => {
+    if (!simOpen || simTrack.length === 0) return;
+    prefetchSimDetails(
+      simTrack.map((point) => ({ slug: detail.slug, ...point })),
+      simField,
+    );
+  }, [simOpen, simTrack, detail.slug, simField]);
+
   const selectTrackPoint = useCallback((point: FieldTrackPoint) => {
     setSimCtx({ re: point.re, aoa: point.aoa, resultId: point.resultId });
-    setSimDetail(null);
+    const cached = getCachedSim(
+      detail.slug,
+      point.re,
+      point.aoa,
+      point.resultId,
+    );
+    if (cached) setSimDetail(cached);
     setSimMessage(null);
     setSimReview(null);
     setPlaying(true);
-  }, []);
+  }, [detail.slug]);
 
   return (
     <>

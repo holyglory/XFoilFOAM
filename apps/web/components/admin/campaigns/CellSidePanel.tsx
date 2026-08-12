@@ -36,7 +36,13 @@ import {
   isAdminApiError,
   requestUrans,
 } from "@/lib/admin";
-import { getAirfoilDetail, getFieldTrack, getSim } from "@/lib/api";
+import {
+  getAirfoilDetail,
+  getCachedSim,
+  getFieldTrack,
+  getSim,
+  prefetchSimDetails,
+} from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import {
   initialSeriesVisibility,
@@ -478,7 +484,6 @@ export function CellSidePanel({
       })
       .catch(() => {
         if (!cancelled) {
-          setSimDetail(null);
           setSimMessage(
             "No solved OpenFOAM result is stored for this point yet.",
           );
@@ -503,6 +508,14 @@ export function CellSidePanel({
       cancelled = true;
     };
   }, [simOpen, airfoil.slug, condition.revisionId]);
+
+  useEffect(() => {
+    if (!simOpen || simTrack.length === 0) return;
+    prefetchSimDetails(
+      simTrack.map((point) => ({ slug: airfoil.slug, ...point })),
+      simField,
+    );
+  }, [simOpen, simTrack, airfoil.slug, simField]);
 
   const counters = cell ?? null;
   const openFinalVerification = ladder?.requests.find(
@@ -916,7 +929,8 @@ export function CellSidePanel({
         track={simTrack}
         onTrackPoint={(p) => {
           setSimCtx({ re: p.re, aoa: p.aoa, resultId: p.resultId });
-          setSimDetail(null);
+          const cached = getCachedSim(airfoil.slug, p.re, p.aoa, p.resultId);
+          if (cached) setSimDetail(cached);
           setSimMessage(null);
           setPlaying(true);
         }}

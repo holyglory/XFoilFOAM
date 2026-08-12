@@ -482,6 +482,9 @@ export interface UransVerifyDetail {
 export type PointFidelityTier = "rans" | "urans_precalc" | "urans_full";
 
 export interface SimulationDetail {
+  /** Stable stored-result identity. Used by the evidence viewer to keep the
+   *  previous frame visible until a newly selected AoA has actually loaded. */
+  resultId?: string;
   status: SimStatus;
   regime: SimRegime;
   airfoilName: string;

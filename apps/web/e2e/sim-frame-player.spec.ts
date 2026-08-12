@@ -150,9 +150,28 @@ const ransSim = {
   },
 };
 
+const classicRansSim = {
+  ...ransSim,
+  alpha: 7,
+  cl: 0.7312,
+  cd: 0.02184,
+  cm: -0.0311,
+  ld: 33.48,
+  steadyHistory: null,
+  condition: {
+    ...ransSim.condition,
+    mesh: {
+      ...ransSim.condition.mesh,
+      iterations: 598,
+      finalResidual: 0.00000474,
+    },
+  },
+};
+
 const fieldTrackFixture = {
   items: [
     { resultId: "fixture-rans-a4", aoa: 4, re: 200000, mach: 0.06, regime: "rans", fields: ["velocity_magnitude", "pressure"] },
+    { resultId: "fixture-classic-a7", aoa: 7, re: 200000, mach: 0.06, regime: "rans", fields: ["velocity_magnitude", "pressure"] },
     { resultId: "fixture-urans-a16", aoa: 16, re: 200000, mach: 0.06, regime: "urans", fields: FIELDS },
   ],
 };
@@ -163,15 +182,30 @@ const PNG = Buffer.from(
   "base64",
 );
 
-async function interceptSim(page: Page) {
+async function interceptSim(
+  page: Page,
+  options?: { delayedResultId?: string; release?: Promise<void> },
+) {
+  const requestCounts = new Map<string, number>();
   await page.route("**/api/airfoils/*/field-track*", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(fieldTrackFixture) }),
   );
-  await page.route("**/api/airfoils/*/sim*", (route) => {
+  await page.route("**/api/airfoils/*/sim*", async (route) => {
     const url = new URL(route.request().url());
     const resultId = url.searchParams.get("resultId");
-    const body = resultId === "fixture-rans-a4" ? ransSim : fixtureSim;
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    if (resultId) requestCounts.set(resultId, (requestCounts.get(resultId) ?? 0) + 1);
+    if (resultId === options?.delayedResultId) await options.release;
+    const body =
+      resultId === "fixture-rans-a4"
+        ? ransSim
+        : resultId === "fixture-classic-a7"
+          ? classicRansSim
+          : fixtureSim;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ...body, resultId: resultId ?? undefined }),
+    });
   });
   await page.route("**/api/media/e2e-frames/**", (route) =>
     route.fulfill({ status: 200, contentType: "image/png", body: PNG }),
@@ -179,6 +213,7 @@ async function interceptSim(page: Page) {
   await page.route("**/api/media/e2e-static/**", (route) =>
     route.fulfill({ status: 200, contentType: "image/png", body: PNG }),
   );
+  return requestCounts;
 }
 
 /** Find any real airfoil with a solved (clickable) polar point in the dev DB. */
@@ -247,7 +282,7 @@ test.describe("URANS frame-synced player (fixture-intercepted sim payload)", () 
     await expect(chips).toContainText("f 2.50 Hz");
 
     // Primary alpha track bar is the sibling-result navigation, sorted by α.
-    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 16.0° · 2/2");
+    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 16.0° · 3/3");
 
     // Accent stats: time-weighted means ± std, L/D, period + frequency.
     const stats = page.getByTestId("sim-accent-stats");
@@ -314,11 +349,20 @@ test.describe("URANS frame-synced player (fixture-intercepted sim payload)", () 
     // New default frame field is generic over the engine contract and includes pressure.
     await expect(page.getByTestId("sim-frame-field-pressure")).toBeVisible();
 
-    // Alpha slider navigation loads the sibling RANS result into the SAME layout.
+    // Classic pointwise RANS has valid final evidence but no optional recorded
+    // iteration series: one compact explanation replaces three empty charts.
     const alphaSlider = page.getByTestId("sim-alpha-slider");
     await alphaSlider.focus();
     await page.keyboard.press("ArrowLeft");
-    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 4.0° · 1/2");
+    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 7.0° · 2/3");
+    await expect(page.getByTestId("sim-history-unavailable")).toContainText(
+      "Final coefficients recorded",
+    );
+    await expect(page.getByText("no history", { exact: true })).toHaveCount(0);
+
+    // The oscillating-steady sibling still shows its real recorded histories.
+    await page.keyboard.press("ArrowLeft");
+    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 4.0° · 1/3");
     await expect(page.getByTestId("sim-frame-chips")).toContainText("RANS · steady");
     await expect(page.getByTestId("sim-accent-stats")).toContainText("oscillating steady");
     await expect(page.getByTestId("sim-frame-player")).toBeVisible();
@@ -326,5 +370,55 @@ test.describe("URANS frame-synced player (fixture-intercepted sim payload)", () 
     await expect(page.getByTestId("sim-frame-play")).toBeDisabled();
     await expect(page.getByTestId("sim-frame-scrub")).toBeDisabled();
     await expect(page.getByTestId("sim-transport")).toContainText("static");
+  });
+
+  test("AoA scrub retains the modal and prior frame until delayed evidence is ready", async ({ page }) => {
+    const slug = await findSolvedSlug();
+    test.skip(!slug, "No solved polar point (or no API) in the dev DB — the modal cannot be opened from a real chart point.");
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requests = await interceptSim(page, {
+      delayedResultId: "fixture-classic-a7",
+      release: gate,
+    });
+    await page.goto(`/airfoils/${slug}`);
+    expect(await openSimModal(page)).toBe(true);
+
+    const dialog = page.getByTestId("sim-modal-dialog");
+    await dialog.evaluate((node) => {
+      node.dataset.scrubInstance = "retained";
+      node.scrollTop = 180;
+    });
+    const beforeScroll = await dialog.evaluate((node) => node.scrollTop);
+    const slider = page.getByTestId("sim-alpha-slider");
+    await slider.evaluate((node) => {
+      const input = node as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, "1");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    await expect(page.getByTestId("sim-alpha-label")).toContainText("α 7.0° · 2/3 · loading");
+    await expect(page.getByTestId("sim-result-content")).toBeVisible();
+    await expect(page.getByTestId("sim-result-content")).toHaveAttribute("aria-busy", "true");
+    await expect(page.getByText("loading OpenFOAM result...", { exact: true })).toHaveCount(0);
+    await expect(dialog).toHaveAttribute("data-scrub-instance", "retained");
+    expect(await dialog.evaluate((node) => node.scrollTop)).toBe(beforeScroll);
+
+    release();
+    await expect(page.getByTestId("sim-result-content")).toHaveAttribute(
+      "data-result-id",
+      "fixture-classic-a7",
+    );
+    await expect(page.getByTestId("sim-result-content")).toHaveAttribute("aria-busy", "false");
+    await expect(page.getByTestId("sim-history-unavailable")).toBeVisible();
+    expect(requests.get("fixture-classic-a7")).toBe(1);
   });
 });

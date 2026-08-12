@@ -437,6 +437,7 @@ async function solvedDetail(
         }
       : null;
   return {
+    resultId: r.id,
     status: "solved",
     regime: r.unsteady ? "stalled" : "attached",
     airfoilName: name,
