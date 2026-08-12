@@ -1,14 +1,5 @@
 # Completion Ledger
 
-- **Production hub 8-slot admission:** The hub OpenFOAM worker is healthy and
-  configured for 8 concurrent cases, but new admission is durably fenced by 50
-  current-generation critical preliminary-URANS incidents produced by four
-  exhausted aggregate jobs (`missing-clean-cycle-certificate`, missing video,
-  and two exact three-period shortfalls). Four already-running targeted jobs
-  continue. Do not bypass the fence: repair or reset the affected preliminary
-  obligations/incidents under the disposable-CFD policy, explicitly resume the
-  scheduler at 8 slots, and verify it refills without immediately re-tripping.
-
 - **AoA evidence rendered interaction proof:** Commit `d17c991` is deployed and
   the live API/build prove the stable result identity, classic-RANS explanation,
   retained-content transition, cache, and prefetch implementation. The two-case
