@@ -2463,8 +2463,10 @@ export const resultInterpretationBackfillItems = pgTable(
     state: text("state").notNull().default("pending"),
     attemptCount: integer("attempt_count").notNull().default(0),
     claimToken: uuid("claim_token"),
-    claimExpiresAt: ts(),
-    nextAttemptAt: ts().notNull().defaultNow(),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     lastError: text("last_error"),
     resultInterpretationId: uuid("result_interpretation_id"),
     createdAt: ts().notNull().defaultNow(),
