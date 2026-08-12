@@ -10,7 +10,10 @@ vi.mock("@aerodb/db", () => ({
   solverEvidenceArchives: {},
 }));
 
-import { canSelectAcceptedArchiveInterpretation } from "../src/result-interpretations";
+import {
+  archiveAttemptMayPromotePointerlessResult,
+  canSelectAcceptedArchiveInterpretation,
+} from "../src/result-interpretations";
 
 const INTERPRETATION_ID = "11111111-1111-4111-8111-111111111111";
 const ARCHIVE_ID = "22222222-2222-4222-8222-222222222222";
@@ -239,35 +242,57 @@ describe("accepted archive interpretation selection", () => {
   });
 
   it.each([
-    ["a missing certificate", (candidate: ReturnType<typeof noSheddingInput>) => {
-      candidate.interpretation.diagnostics = {};
-    }],
-    ["a missing archived URANS provenance marker", (candidate: ReturnType<typeof noSheddingInput>) => {
-      delete (
-        (candidate.interpretation.diagnostics as Record<string, unknown>)
-          .archiveBackfill as Record<string, unknown>
-      ).unsteadyEvidence;
-    }],
-    ["a mismatched selected observation window", (candidate: ReturnType<typeof noSheddingInput>) => {
-      (candidate.interpretation.selectedWindow as Record<string, unknown>).observationEndTime =
-        4.1;
-    }],
-    ["a mismatched persisted statistic", (candidate: ReturnType<typeof noSheddingInput>) => {
-      ((candidate.interpretation.statistics as Record<string, unknown>).cm as Record<
-        string,
-        unknown
-      >).rms = 0.02;
-    }],
-    ["a mismatched projected coefficient", (candidate: ReturnType<typeof noSheddingInput>) => {
-      candidate.interpretation.cl = 0.82;
-      candidate.interpretation.clCd = 0.82 / 0.031;
-    }],
-    ["a periodic cycle mixed into a steady-equivalent proof", (candidate: ReturnType<typeof noSheddingInput>) => {
-      candidate.cycles = [input().cycles[0]!];
-    }],
-    ["a shedding attempt", (candidate: ReturnType<typeof noSheddingInput>) => {
-      candidate.attempt.unsteady = true;
-    }],
+    [
+      "a missing certificate",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        candidate.interpretation.diagnostics = {};
+      },
+    ],
+    [
+      "a missing archived URANS provenance marker",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        delete (
+          (candidate.interpretation.diagnostics as Record<string, unknown>)
+            .archiveBackfill as Record<string, unknown>
+        ).unsteadyEvidence;
+      },
+    ],
+    [
+      "a mismatched selected observation window",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        (
+          candidate.interpretation.selectedWindow as Record<string, unknown>
+        ).observationEndTime = 4.1;
+      },
+    ],
+    [
+      "a mismatched persisted statistic",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        (
+          (candidate.interpretation.statistics as Record<string, unknown>)
+            .cm as Record<string, unknown>
+        ).rms = 0.02;
+      },
+    ],
+    [
+      "a mismatched projected coefficient",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        candidate.interpretation.cl = 0.82;
+        candidate.interpretation.clCd = 0.82 / 0.031;
+      },
+    ],
+    [
+      "a periodic cycle mixed into a steady-equivalent proof",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        candidate.cycles = [input().cycles[0]!];
+      },
+    ],
+    [
+      "a shedding attempt",
+      (candidate: ReturnType<typeof noSheddingInput>) => {
+        candidate.attempt.unsteady = true;
+      },
+    ],
   ])("MUST-CATCH: refuses a no-shedding archive with %s", (_label, mutate) => {
     const candidate = noSheddingInput();
     mutate(candidate);
@@ -275,19 +300,62 @@ describe("accepted archive interpretation selection", () => {
   });
 
   it.each([
-    ["a producer-reported corruption reason", { reasons: ["impulsive discontinuity"] }],
+    [
+      "a producer-reported corruption reason",
+      { reasons: ["impulsive discontinuity"] },
+    ],
     ["a phase gap above 10%", null],
     ["a phase shift above four bins", { phaseShiftBins: 5 }],
-    ["a shape error above the policy", { cl: { shapeError: 0.13, amplitudeDeviation: 0.02, highFrequency: 0.01 } }],
-    ["an amplitude deviation above the policy", { cd: { shapeError: 0.02, amplitudeDeviation: 0.31, highFrequency: 0.01 } }],
-  ])("MUST-CATCH: refuses archive selection with %s", (_label, metricsMutation) => {
-    const candidate = input();
-    if (metricsMutation == null) {
-      candidate.cycles[1]!.phaseMaxGapFraction = 0.11;
-    } else {
-      candidate.cycles[1]!.metrics = cleanMetrics(metricsMutation);
-    }
+    [
+      "a shape error above the policy",
+      {
+        cl: { shapeError: 0.13, amplitudeDeviation: 0.02, highFrequency: 0.01 },
+      },
+    ],
+    [
+      "an amplitude deviation above the policy",
+      {
+        cd: { shapeError: 0.02, amplitudeDeviation: 0.31, highFrequency: 0.01 },
+      },
+    ],
+  ])(
+    "MUST-CATCH: refuses archive selection with %s",
+    (_label, metricsMutation) => {
+      const candidate = input();
+      if (metricsMutation == null) {
+        candidate.cycles[1]!.phaseMaxGapFraction = 0.11;
+      } else {
+        candidate.cycles[1]!.metrics = cleanMetrics(metricsMutation);
+      }
 
-    expect(canSelectAcceptedArchiveInterpretation(candidate)).toBe(false);
+      expect(canSelectAcceptedArchiveInterpretation(candidate)).toBe(false);
+    },
+  );
+});
+
+describe("pointer-less archive recovery projection", () => {
+  const exactFailed = {
+    currentAttemptId: null,
+    currentInterpretationId: null,
+    currentCanonicalSelectionId: null,
+    resultStatus: "failed",
+    resultSimJobId: INTERPRETATION_ID,
+    attemptSimJobId: INTERPRETATION_ID,
+  };
+
+  it("allows only the exact failed projection left by legacy classification", () => {
+    expect(archiveAttemptMayPromotePointerlessResult(exactFailed)).toBe(true);
+  });
+
+  it.each([
+    ["active work", { resultStatus: "running" }],
+    ["another job", { attemptSimJobId: ARCHIVE_ID }],
+    ["a current attempt", { currentAttemptId: ARCHIVE_ID }],
+    ["an existing interpretation", { currentInterpretationId: ARCHIVE_ID }],
+    ["an existing selection", { currentCanonicalSelectionId: ARCHIVE_ID }],
+  ])("MUST-CATCH: refuses %s", (_label, change) => {
+    expect(
+      archiveAttemptMayPromotePointerlessResult({ ...exactFailed, ...change }),
+    ).toBe(false);
   });
 });

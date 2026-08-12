@@ -2591,9 +2591,19 @@ export async function settlePrecalcObligationsForJobInTransaction(
       attemptState = "cancelled";
       lastOutcome = "ownerless";
     } else if (continuationPermanent) {
-      state = "blocked";
+      // The saved trajectory is disposable compute. A typed permanent
+      // continuation failure proves only that this checkpoint cannot resume;
+      // it must not strand the physical cell while one bounded fresh-solve
+      // ordinal remains.
+      state =
+        obligation.attemptCount < obligation.maxAttempts
+          ? "pending"
+          : "blocked";
       attemptState = "failed";
-      lastOutcome = "continuation_permanent_failure";
+      lastOutcome =
+        state === "pending"
+          ? "continuation_fresh_retry_pending"
+          : "continuation_permanent_failure";
     } else if (continuationNoProgressExhausted) {
       state = "blocked";
       attemptState = infrastructure
@@ -2897,25 +2907,16 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       .from(results)
       .innerJoin(
         simulationPresetRevisions,
-        eq(
-          simulationPresetRevisions.id,
-          results.simulationPresetRevisionId,
-        ),
+        eq(simulationPresetRevisions.id, results.simulationPresetRevisionId),
       )
       .innerJoin(
         simulationPresets,
         eq(simulationPresets.id, simulationPresetRevisions.presetId),
       )
       .innerJoin(
-        resultClassifications,
-        and(
-          eq(resultClassifications.resultId, results.id),
-          eq(resultClassifications.state, "accepted"),
-        ),
-      )
-      .innerJoin(
         resultAttempts,
         and(
+          eq(resultAttempts.id, results.currentResultAttemptId),
           eq(resultAttempts.resultId, results.id),
           eq(resultAttempts.airfoilId, results.airfoilId),
           eq(
@@ -2951,11 +2952,38 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
             WHERE warning LIKE ${`%${URANS_BUDGET_STOP_MARKER}%`}
                OR warning LIKE ${`%${URANS_CONTINUATION_REQUIRED_MARKER}%`}
           )`,
-          sql`EXISTS (
-            SELECT 1
-            FROM result_classifications accepted_attempt_classification
-            WHERE accepted_attempt_classification.result_attempt_id = ${resultAttempts.id}
-              AND accepted_attempt_classification.state = 'accepted'
+          sql`(
+            EXISTS (
+              SELECT 1
+              FROM result_classifications accepted_attempt_classification
+              WHERE accepted_attempt_classification.result_attempt_id = ${resultAttempts.id}
+                AND accepted_attempt_classification.state = 'accepted'
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM result_canonical_selections selected
+              JOIN result_interpretations interpretation
+                ON interpretation.id = selected.result_interpretation_id
+               AND interpretation.result_id = ${results.id}
+               AND interpretation.result_attempt_id = ${resultAttempts.id}
+              JOIN solver_evidence_archives archive
+                ON archive.id = interpretation.source_archive_id
+               AND archive.result_id = ${results.id}
+               AND archive.result_attempt_id = ${resultAttempts.id}
+               AND archive.state = 'current'
+              JOIN solver_evidence_blobs blob ON blob.id = archive.blob_id
+              WHERE selected.id = ${results.currentCanonicalSelectionId}
+                AND selected.result_id = ${results.id}
+                AND selected.result_attempt_id = ${resultAttempts.id}
+                AND selected.result_interpretation_id = ${results.currentResultInterpretationId}
+                AND interpretation.state = 'accepted'
+                AND interpretation.source = 'archive_backfill'
+                AND interpretation.regime IN ('periodic', 'steady_equivalent')
+                AND blob.backend = 'gcs'
+                AND blob.compression = 'zstd'
+                AND blob.mime_type = 'application/zstd'
+                AND blob."verifiedAt" IS NOT NULL
+            )
           )`,
           // A result row's revision/AoA is not sufficient to satisfy the
           // legacy obligation natural key. The immutable target revision can

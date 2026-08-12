@@ -2059,11 +2059,19 @@ def test_live_monitor_releases_startup_courant_only_after_repeatable_periods(
     assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
 
 
-def test_live_monitor_recovers_impulsive_tail_with_tight_numerics(
+@pytest.mark.parametrize(
+    "trigger_reason",
+    [
+        "candidate periods contain an impulsive discontinuity",
+        "candidate periods contain a Cl high-frequency burst",
+    ],
+)
+def test_live_monitor_recovers_noisy_tail_with_tight_numerics(
     tmp_path,
     monkeypatch,
+    trigger_reason,
 ):
-    """MUST-CATCH: a transient impulse train must trigger a clean-tail retry.
+    """MUST-CATCH: a transient numerical-noise tail triggers clean-tail retry.
 
     A live OpenCFD 2606 canary at 20-32C/Re~102k/alpha=13 retained recurring
     one/two-step Cl/Cd/Cm discontinuities at the ordinary startup settings.
@@ -2122,7 +2130,7 @@ PIMPLE
             stable,
             pipeline.StablePeriodResult(
                 ok=False,
-                reason="candidate periods contain an impulsive discontinuity",
+                reason=trigger_reason,
                 stable=False,
                 period_s=0.2,
                 window_start=0.6,
@@ -2170,9 +2178,7 @@ PIMPLE
     marker = json.loads(
         (tcase / pipeline.URANS_IMPULSE_RECOVERY_MARKER).read_text()
     )
-    assert marker["trigger_reason"] == (
-        "candidate periods contain an impulsive discontinuity"
-    )
+    assert marker["trigger_reason"] == trigger_reason
     assert marker["trigger_time"] == pytest.approx(1.0)
 
     monitor()

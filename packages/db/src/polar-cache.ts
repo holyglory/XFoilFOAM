@@ -251,7 +251,7 @@ async function loadResultEvidence(
     ${currentResultInterpretation.id} IS NOT NULL
     AND ${currentResultInterpretation.state} = 'accepted'
     AND ${currentResultInterpretation.source} = 'archive_backfill'
-    AND ${currentResultInterpretation.regime} = 'periodic'
+    AND ${currentResultInterpretation.regime} IN ('periodic', 'steady_equivalent')
     AND ${currentResultInterpretation.sourceArchiveId} IS NOT NULL
     AND ${currentResultCanonicalSelection.id} IS NOT NULL
     AND ${currentResultCanonicalSelection.resultInterpretationId} = ${currentResultInterpretation.id}
@@ -849,7 +849,7 @@ async function retireInvalidSelectedAttempts(
       AND selected_interpretation_selection.result_interpretation_id = ${results.currentResultInterpretationId}
       AND selected_interpretation.state = 'accepted'
       AND selected_interpretation.source = 'archive_backfill'
-      AND selected_interpretation.regime = 'periodic'
+      AND selected_interpretation.regime IN ('periodic', 'steady_equivalent')
       AND selected_archive_blob.backend = 'gcs'
       AND selected_archive_blob.compression = 'zstd'
       AND selected_archive_blob.mime_type = 'application/zstd'

@@ -87,6 +87,10 @@ export const FRAME_TRACK_MIN_PERIODS_FULL = FRAME_TRACK_MIN_PERIODS;
  *  on the half-resolution mesh, so acceptance demands >= 3 — the verify queue
  *  re-solves accepted precalc points at full fidelity afterwards. */
 export const FRAME_TRACK_MIN_PERIODS_PRECALC = 3;
+/** Absorb only floating-point representation noise at an exact period floor.
+ * Production has emitted mathematically complete three-period windows as
+ * 2.9999999999999987; this epsilon is many orders below one solver sample. */
+export const FRAME_TRACK_PERIOD_EPSILON = 1e-9;
 
 /** Minimum retained periods demanded of a frame_track given the row's
  *  fidelity tier. Unknown/legacy/absent fidelity keeps the strict full bar. */
@@ -293,8 +297,9 @@ const UUID_TEXT =
 /**
  * This is intentionally a narrow, fail-closed proof.  A selected archive
  * interpretation is allowed to supersede stale point payload gates only for
- * a periodic URANS result reduced from a current immutable archive.  Other
- * interpretation types continue through the legacy/raw-evidence path.
+ * a periodic or physically steady-equivalent URANS result reduced from a
+ * current immutable archive. Other interpretation types continue through the
+ * legacy/raw-evidence path.
  */
 export function hasCertifiedSelectedArchiveInterpretation(
   p: PolarEvidencePoint,
@@ -305,7 +310,8 @@ export function hasCertifiedSelectedArchiveInterpretation(
     isRecord(interpretation) &&
     interpretation.source === "archive_backfill" &&
     interpretation.state === "accepted" &&
-    interpretation.regime === "periodic" &&
+    (interpretation.regime === "periodic" ||
+      interpretation.regime === "steady_equivalent") &&
     typeof interpretation.id === "string" &&
     UUID_TEXT.test(interpretation.id) &&
     typeof interpretation.sourceArchiveId === "string" &&
@@ -448,7 +454,14 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     }
     if (!archiveBacked && !p.hasForceHistory)
       reasons.push("missing-force-history");
-    if (!p.hasVideo) reasons.push(MISSING_URANS_VIDEO_REASON);
+    // A selected steady-equivalent archive proves that the transient wake is
+    // physically non-shedding. It owns stored static fields, not a fabricated
+    // periodic animation. Periodic URANS still requires its real video.
+    const selectedSteadyEquivalent =
+      archiveBacked &&
+      p.selectedArchiveInterpretation?.regime === "steady_equivalent";
+    if (!p.hasVideo && !selectedSteadyEquivalent)
+      reasons.push(MISSING_URANS_VIDEO_REASON);
     // Frame-track stationarity gate (v3): applies ONLY to evidence whose
     // engine version shipped frame_track (non-null). Reads fail closed — a
     // drifted payload without a literal stationary=true / numeric
@@ -464,7 +477,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
         !(
           typeof periods === "number" &&
           Number.isFinite(periods) &&
-          periods >= minPeriods
+          periods + FRAME_TRACK_PERIOD_EPSILON >= minPeriods
         )
       ) {
         reasons.push("insufficient-periods");
@@ -546,14 +559,16 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
           if (
             selected.length < required ||
             selectedQualityIssues.some(
-              (issue) => issue === "coefficient-samples" || issue === "field-frames",
+              (issue) =>
+                issue === "coefficient-samples" || issue === "field-frames",
             )
           ) {
             reasons.push("insufficient-clean-cycle-evidence");
           }
           if (
             selectedQualityIssues.some(
-              (issue) => issue !== "coefficient-samples" && issue !== "field-frames",
+              (issue) =>
+                issue !== "coefficient-samples" && issue !== "field-frames",
             )
           ) {
             reasons.push("invalid-clean-cycle-quality");

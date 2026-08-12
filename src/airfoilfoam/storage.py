@@ -1,6 +1,7 @@
 """Filesystem-backed job storage shared between the API and the worker."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -24,6 +25,7 @@ _STATE_TO_PHASE = {
     JobState.failed: JobPhase.failed,
     JobState.cancelled: JobPhase.cancelled,
 }
+_CONTINUATION_METADATA_SCHEMA_VERSION = 1
 
 
 class JobStore:
@@ -196,6 +198,60 @@ class JobStore:
                         status.continuation_failure_kind
                     )
         self._write_json_atomic(path, result.model_dump_json(indent=2))
+        self._write_continuation_metadata(result)
+
+    def _write_continuation_metadata(self, result: JobResult) -> None:
+        """Persist bounded, exact per-case continuation metadata.
+
+        Aggregate campaign ``result.json`` grows with every point and can be
+        much larger than a safe continuation metadata read. These sidecars
+        retain only the exact addressed point/attempt plus job-level engine
+        identity, so continuation cost stays independent of batch size.
+        """
+
+        by_case: dict[str, dict[str, object]] = {}
+        for polar in result.polars:
+            for collection_name in ("points", "attempts"):
+                for point in getattr(polar, collection_name):
+                    if not point.case_slug:
+                        continue
+                    case = by_case.setdefault(
+                        point.case_slug,
+                        {
+                            "speed": polar.speed,
+                            "chord": polar.chord,
+                            "reynolds": polar.reynolds,
+                            "mach": polar.mach,
+                            "points": [],
+                            "attempts": [],
+                        },
+                    )
+                    collection = case[collection_name]
+                    assert isinstance(collection, list)
+                    collection.append(point.model_dump(mode="json"))
+        metadata_dir = self.job_dir(result.job_id) / "continuation-metadata"
+        for case_slug, polar in by_case.items():
+            digest = hashlib.sha256(case_slug.encode("utf-8")).hexdigest()
+            payload = {
+                "schema_version": _CONTINUATION_METADATA_SCHEMA_VERSION,
+                "case_slug": case_slug,
+                "job_id": result.job_id,
+                "requested_engine": (
+                    result.requested_engine.model_dump(mode="json")
+                    if result.requested_engine is not None
+                    else None
+                ),
+                "engine": (
+                    result.engine.model_dump(mode="json")
+                    if result.engine is not None
+                    else None
+                ),
+                "polars": [polar],
+            }
+            self._write_json_atomic(
+                metadata_dir / f"{digest}.json",
+                json.dumps(payload, indent=2),
+            )
 
     def read_result(self, job_id: str) -> Optional[JobResult]:
         result, _ = self.read_result_info(job_id)

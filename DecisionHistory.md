@@ -107,8 +107,12 @@
   all-channel 200-row final-window proof or takes the normal targeted FAST
   URANS path. Archive-backed reinterpretation selects only authenticated,
   generation-pinned raw evidence and routes recoverable trajectories to exact
-  continuation before a fresh run.
+  continuation before a fresh run. An accepted archive interpretation may
+  atomically recover its exact pointer-less failed projection; oversized or
+  otherwise unrestartable disposable checkpoints fall back once to a fresh
+  solve instead of becoming permanent queue blockers.
   [D-2026-07-28-immutable-result-interpretations]
+  [D-2026-08-12-archive-truth-and-disposable-continuation]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -216,6 +220,22 @@
   results; clearing or deleting state under the old policy immediately
   retrips. Separating publication validity from global admission keeps truth
   intact and compute moving, while the older durable mode remains reversible.
+
+## D-2026-08-12-archive-truth-and-disposable-continuation — Archive truth repairs projection; bad checkpoints restart fresh
+
+- Decision: allow an accepted, authenticated archive interpretation to
+  atomically select its exact attempt when the legacy live-summary classifier
+  left the same terminal result pointer-less; settle the exact preliminary
+  obligation from that selection. Persist bounded per-case continuation
+  metadata, and when an old exact checkpoint is permanently unrestartable,
+  retain its failure evidence but spend at most the remaining fresh-attempt
+  budget.
+  [detail](DecisionDetails/D-2026-08-12-archive-truth-and-disposable-continuation.md)
+- Why: leaving accepted archive truth blocked wastes already-completed CFD,
+  while requiring monolithic batch metadata made valid cases inaccessible.
+  Mutating attempts or bypassing evidence gates was rejected; endlessly
+  retrying the same checkpoint was also rejected. Exact CAS selection plus a
+  one-time fresh fallback preserves truth and the disposable-compute policy.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

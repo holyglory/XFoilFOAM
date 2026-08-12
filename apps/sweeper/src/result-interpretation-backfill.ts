@@ -19,6 +19,7 @@ import {
   type DB,
   type SolverEvidenceBlob,
   refreshPolarCacheForRevision,
+  satisfyPrecalcObligationFromAcceptedResult,
   resultAttempts,
   resultCanonicalSelections,
   resultInterpretationBackfillItems,
@@ -48,6 +49,7 @@ import {
   selectAcceptedArchiveInterpretation,
   stageArchiveResultInterpretation,
 } from "./result-interpretations";
+import { createSingleFlightBackgroundRunner } from "./single-flight";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const GCS_GENERATION = /^[1-9][0-9]{0,19}$/;
@@ -993,6 +995,13 @@ async function processClaimedArchiveInterpretationItem(opts: {
       selectionOutcome === "selected" ||
       selectionOutcome === "already_selected"
     ) {
+      // Archive selection is the scientific acceptance event. Close the
+      // exact physical PRECALC obligation from that event even when the old
+      // live-summary classifier had rejected the immutable attempt.
+      await satisfyPrecalcObligationFromAcceptedResult(
+        opts.db,
+        opts.item.resultId,
+      );
       const [resultScope] = await opts.db
         .select({
           airfoilId: results.airfoilId,
@@ -1011,25 +1020,24 @@ async function processClaimedArchiveInterpretationItem(opts: {
         );
       }
     }
-    const recoveryHandoff =
-      archiveReducerNeedsRecoveryHandoff(reduction.state)
-        ? archiveBackfillRecoveryHandoff({
-            state:
-              reduction.state === "continuation_required"
-                ? "continuation_required"
-                : "rerun_required",
-            fidelity: source.fidelity,
-            resultId: opts.item.resultId,
-            resultAttemptId: opts.item.resultAttemptId,
-            sourceArchiveId: opts.item.sourceArchiveId!,
-            inputEvidenceSignature: reduction.inputEvidenceSignature,
-            recommendedAdditionalPeriods:
-              reduction.state === "continuation_required"
-                ? recoveryProgress?.recommendedAdditionalPeriods ??
-                  reduction.diagnostics.recommendedAdditionalPeriods
-                : undefined,
-          })
-        : null;
+    const recoveryHandoff = archiveReducerNeedsRecoveryHandoff(reduction.state)
+      ? archiveBackfillRecoveryHandoff({
+          state:
+            reduction.state === "continuation_required"
+              ? "continuation_required"
+              : "rerun_required",
+          fidelity: source.fidelity,
+          resultId: opts.item.resultId,
+          resultAttemptId: opts.item.resultAttemptId,
+          sourceArchiveId: opts.item.sourceArchiveId!,
+          inputEvidenceSignature: reduction.inputEvidenceSignature,
+          recommendedAdditionalPeriods:
+            reduction.state === "continuation_required"
+              ? (recoveryProgress?.recommendedAdditionalPeriods ??
+                reduction.diagnostics.recommendedAdditionalPeriods)
+              : undefined,
+        })
+      : null;
     await settleClaim(opts.db, opts.item, {
       state,
       resultInterpretationId: staged?.id ?? null,
@@ -1257,4 +1265,77 @@ export async function runArchiveInterpretationBackfill(opts: {
     processed += 1;
   }
   return refreshRunSummary(opts.db, run.id, { processed });
+}
+
+/** One bounded automatic archive-reduction pass. Historical/current URANS
+ * evidence is discovered only when no compatible durable run is already
+ * open, avoiding empty-run ledger churn during ordinary scheduler polling. */
+export async function archiveInterpretationMaintenanceTick(opts: {
+  db: DB;
+  engine: EngineClient;
+  discoveryLimit?: number;
+  maxItems?: number;
+}): Promise<ArchiveInterpretationBackfillReport | null> {
+  const reducerVersionId = await ensureResultInterpretationReducerVersion(
+    opts.db,
+  );
+  const [openRun] = await opts.db
+    .select({ id: resultInterpretationBackfillRuns.id })
+    .from(resultInterpretationBackfillRuns)
+    .where(
+      and(
+        eq(resultInterpretationBackfillRuns.reducerVersionId, reducerVersionId),
+        inArray(resultInterpretationBackfillRuns.state, ["planned", "running"]),
+      ),
+    )
+    .orderBy(asc(resultInterpretationBackfillRuns.createdAt))
+    .limit(1);
+  let runId = openRun?.id ?? null;
+  if (!runId) {
+    const scope = { limit: opts.discoveryLimit ?? 16 };
+    const discovery = await discoverArchiveInterpretationBackfill(opts.db, {
+      reducerVersionId,
+      scope,
+    });
+    if (!discovery.candidates.length) return null;
+    const created = await createArchiveInterpretationBackfillRun({
+      db: opts.db,
+      scope,
+      requestedBy: "system:sweeper-archive-maintenance",
+    });
+    runId = created.runId;
+  }
+  return runArchiveInterpretationBackfill({
+    db: opts.db,
+    engine: opts.engine,
+    runId,
+    maxItems: opts.maxItems ?? 4,
+  });
+}
+
+const scheduleArchiveMaintenanceOnce = createSingleFlightBackgroundRunner(
+  (error) => {
+    console.error(
+      "[sweeper] archive interpretation maintenance failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  },
+);
+
+/** Keep raw-archive interpretation off the admission loop: a GCS download and
+ * reduction may take minutes, while CPU scheduling and heartbeats must keep
+ * progressing. Durable item claims make restart/retry safe. */
+export function startArchiveInterpretationMaintenanceTimer(
+  db: DB,
+  engine: EngineClient,
+  intervalMs = 30_000,
+): () => void {
+  const schedule = () => {
+    scheduleArchiveMaintenanceOnce(() =>
+      archiveInterpretationMaintenanceTick({ db, engine }),
+    );
+  };
+  schedule();
+  const timer = setInterval(schedule, intervalMs);
+  return () => clearInterval(timer);
 }

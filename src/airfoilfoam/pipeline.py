@@ -2272,6 +2272,7 @@ class ContinuationJobMetadata:
 
 
 _CONTINUATION_METADATA_MAX_BYTES = 64 * 1024**2
+_CONTINUATION_METADATA_SCHEMA_VERSION = 1
 _KNOWN_CONTINUATION_ENGINES = (
     OPENCFD_2406_IDENTITY,
     OPENCFD_2606_IDENTITY,
@@ -2336,6 +2337,33 @@ def _read_continuation_metadata_file(
         ) from exc
     if not isinstance(payload, dict):
         raise _continuation_permanent(f"source {label} is not a JSON object")
+    return payload
+
+
+def _read_case_continuation_result(
+    job_root: Path,
+    case_slug: str,
+) -> dict[str, object] | None:
+    """Read the bounded per-case source projection when present.
+
+    The SHA-256 filename is only an address; the embedded exact case slug is
+    revalidated before any identity or restart evidence is trusted.
+    """
+
+    digest = hashlib.sha256(case_slug.encode("utf-8")).hexdigest()
+    payload = _read_continuation_metadata_file(
+        job_root / "continuation-metadata" / f"{digest}.json",
+        label="per-case continuation metadata",
+    )
+    if payload is None:
+        return None
+    if (
+        payload.get("schema_version") != _CONTINUATION_METADATA_SCHEMA_VERSION
+        or payload.get("case_slug") != case_slug
+    ):
+        raise _continuation_permanent(
+            "per-case continuation metadata has an invalid schema or address"
+        )
     return payload
 
 
@@ -2455,12 +2483,18 @@ def _load_continuation_job_metadata(src_case: Path) -> ContinuationJobMetadata:
     except ValueError:
         return ContinuationJobMetadata(None, None, None, False)
     job_root = cases_root.parent
+    bounded_result = _read_case_continuation_result(job_root, case_slug)
     documents = {
-        name: _read_continuation_metadata_file(
-            job_root / f"{name}.json",
-            label=f"{name}.json",
-        )
-        for name in ("request", "status", "result")
+        "request": _read_continuation_metadata_file(
+            job_root / "request.json", label="request.json"
+        ),
+        "status": _read_continuation_metadata_file(
+            job_root / "status.json", label="status.json"
+        ),
+        "result": bounded_result
+        or _read_continuation_metadata_file(
+            job_root / "result.json", label="result.json"
+        ),
     }
     identities: list[tuple[str, EngineIdentity]] = []
     namespaces: list[tuple[str, str]] = []
@@ -3035,9 +3069,16 @@ def _result_continuation_evidence_dir(
     result_path = cases_root.parent / "result.json"
     if not result_path.is_file() or result_path.is_symlink():
         return None
-    try:
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    payload = _read_case_continuation_result(cases_root.parent, case_slug)
+    if payload is None:
+        try:
+            payload = _read_continuation_metadata_file(
+                result_path,
+                label="result.json",
+            )
+        except ContinuationTransientError:
+            return None
+    if payload is None:
         return None
     polars = payload.get("polars") if isinstance(payload, dict) else None
     if not isinstance(polars, list):
@@ -3441,10 +3482,15 @@ def _make_urans_monitor(
                     cadence_entries,
                 )
                 state["cadence_period"] = period
-        impulse_candidate = (
-            "impulsive discontinuity" in result.reason.lower()
+        quality_recovery_candidate = any(
+            marker in result.reason.lower()
+            for marker in (
+                "impulsive discontinuity",
+                "high-frequency burst",
+                "numerically noisy",
+            )
         )
-        if impulse_candidate and not state.get("impulse_recovery_armed"):
+        if quality_recovery_candidate and not state.get("impulse_recovery_armed"):
             _arm_urans_impulse_recovery(
                 tcase,
                 result,

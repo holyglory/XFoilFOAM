@@ -15,6 +15,7 @@ import {
   FRAME_TRACK_MIN_PERIODS,
   FRAME_TRACK_MIN_PERIODS_FULL,
   FRAME_TRACK_MIN_PERIODS_PRECALC,
+  FRAME_TRACK_PERIOD_EPSILON,
   frameTrackMinPeriodsFor,
   isOscillatingSteadyStable,
   POLAR_CLASSIFIER_VERSION,
@@ -119,6 +120,35 @@ describe("fidelity-aware frame-track period bar (v6)", () => {
     ]);
     expect(classified.classifications[0].state).toBe("rejected");
     expect(classified.classifications[0].reasons).toContain(
+      "insufficient-periods",
+    );
+  });
+
+  it("accepts only floating-point noise below the exact period boundary", () => {
+    const representedThree = classifyPolarEvidence([
+      {
+        ...uransRow,
+        fidelity: "urans_precalc",
+        frameTrack: {
+          ...contractFrameTrack,
+          periods_retained: 2.9999999999999987,
+        },
+      },
+    ]);
+    expect(representedThree.classifications[0].state).toBe("accepted");
+
+    const physicallyShort = classifyPolarEvidence([
+      {
+        ...uransRow,
+        fidelity: "urans_precalc",
+        frameTrack: {
+          ...contractFrameTrack,
+          periods_retained: 3 - FRAME_TRACK_PERIOD_EPSILON * 2,
+        },
+      },
+    ]);
+    expect(physicallyShort.classifications[0].state).toBe("rejected");
+    expect(physicallyShort.classifications[0].reasons).toContain(
       "insufficient-periods",
     );
   });

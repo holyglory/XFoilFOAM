@@ -52,8 +52,11 @@ from airfoilfoam.models import (
     EngineRuntimeIdentity,
     FailureDisposition,
     FluidProperties,
+    JobResult,
     JobState,
     MeshParams,
+    Polar,
+    PolarPoint,
     PolarRequest,
     RoughnessParams,
     SolverParams,
@@ -446,6 +449,52 @@ def test_stage_continuation_copies_state_and_locates_restart(tmp_path):
     assert not (dst / "transient" / "VTK").exists()
     assert not (dst / "transient" / "processor0").exists()
     assert not (dst / "transient" / "divergence_condemned.json").exists()
+
+
+def test_continuation_uses_bounded_case_metadata_when_batch_result_is_oversized(
+    tmp_path,
+):
+    settings = get_settings().model_copy(update={"data_dir": tmp_path / "data"})
+    store = JobStore(settings)
+    job_id = "b" * 32
+    case_slug = "c0p1_u25_a15"
+    src = store.case_dir(job_id, case_slug)
+    _make_saved_case(src)
+    store.write_result(
+        JobResult(
+            job_id=job_id,
+            state=JobState.completed,
+            requested_engine=OPENCFD_2606_IDENTITY,
+            polars=[
+                Polar(
+                    speed=SPEC.speed,
+                    chord=SPEC.chord,
+                    reynolds=SPEC.speed * SPEC.chord / FLUID.kinematic_viscosity,
+                    attempts=[
+                        PolarPoint(
+                            case_slug=case_slug,
+                            aoa_deg=SPEC.aoa_deg,
+                            fidelity="urans_precalc",
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+    # Simulate the production aggregate growing beyond the metadata safety
+    # cap. The exact per-case sidecar remains small and authoritative.
+    with (store.job_dir(job_id) / "result.json").open("r+b") as oversized:
+        oversized.truncate(64 * 1024**2 + 1)
+
+    dst = store.case_dir("c" * 32, case_slug)
+    source = stage_continuation_case(
+        src,
+        dst,
+        aoa_deg=SPEC.aoa_deg,
+        expected_engine=OPENCFD_2606_IDENTITY,
+    )
+    assert source.resume_from == pytest.approx(0.1)
+    assert (dst / "transient" / "0.1" / "U").is_file()
 
 
 def test_stage_continuation_requires_exact_same_engine_before_live_copy(tmp_path):

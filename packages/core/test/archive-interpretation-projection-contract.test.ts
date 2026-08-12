@@ -42,6 +42,13 @@ function currentArchiveInterpretation() {
   };
 }
 
+function currentSteadyEquivalentArchiveInterpretation() {
+  return {
+    ...currentArchiveInterpretation(),
+    regime: "steady_equivalent",
+  };
+}
+
 describe("selected archive interpretation projection", () => {
   it("uses a current accepted archive reduction rather than stale attempt summaries", () => {
     const classified = classifyPolarEvidence([
@@ -90,5 +97,23 @@ describe("selected archive interpretation projection", () => {
     expect(classified.classifications[0].reasons).toEqual([
       "missing-urans-video",
     ]);
+  });
+
+  it("accepts selected no-shedding archive evidence without inventing a periodic video", () => {
+    const classified = classifyPolarEvidence([
+      {
+        ...staleAttempt(),
+        unsteady: false,
+        stalled: false,
+        hasVideo: false,
+        selectedArchiveInterpretation:
+          currentSteadyEquivalentArchiveInterpretation(),
+      },
+    ]);
+
+    expect(classified.classifications[0]).toMatchObject({
+      state: "accepted",
+      reasons: [],
+    });
   });
 });

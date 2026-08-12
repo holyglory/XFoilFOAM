@@ -177,8 +177,7 @@ function timeWeightedTransportStatistics(
   for (let index = 1; index < times.length; index += 1) {
     const dt = times[index]! - times[index - 1]!;
     if (!isFiniteNumber(dt) || dt <= 0) return null;
-    integral +=
-      0.5 * (values[index - 1]! + values[index]!) * dt;
+    integral += 0.5 * (values[index - 1]! + values[index]!) * dt;
   }
   const mean = integral / span;
   if (!isFiniteNumber(mean)) return null;
@@ -189,7 +188,9 @@ function timeWeightedTransportStatistics(
     const previousDeviation = values[index - 1]! - mean;
     const deviation = values[index]! - mean;
     varianceIntegral +=
-      0.5 * (previousDeviation * previousDeviation + deviation * deviation) * dt;
+      0.5 *
+      (previousDeviation * previousDeviation + deviation * deviation) *
+      dt;
   }
   const rms = Math.sqrt(Math.max(varianceIntegral / span, 0));
   return isFiniteNumber(rms) ? { mean, rms } : null;
@@ -207,7 +208,9 @@ function noSheddingHistoryContractReason(
   const count = history.t.length;
   if (
     count < 2 ||
-    channels.some((channel) => !Array.isArray(channel) || channel.length !== count)
+    channels.some(
+      (channel) => !Array.isArray(channel) || channel.length !== count,
+    )
   ) {
     return "no-shedding force-history channels are incomplete";
   }
@@ -238,9 +241,24 @@ function noSheddingHistoryContractReason(
     return "no-shedding force-history endpoints do not match the certificate";
   }
   const transport = [
-    ["cl", history.cl, certificate.transport_cl_mean, certificate.transport_cl_rms],
-    ["cd", history.cd, certificate.transport_cd_mean, certificate.transport_cd_rms],
-    ["cm", history.cm, certificate.transport_cm_mean, certificate.transport_cm_rms],
+    [
+      "cl",
+      history.cl,
+      certificate.transport_cl_mean,
+      certificate.transport_cl_rms,
+    ],
+    [
+      "cd",
+      history.cd,
+      certificate.transport_cd_mean,
+      certificate.transport_cd_rms,
+    ],
+    [
+      "cm",
+      history.cm,
+      certificate.transport_cm_mean,
+      certificate.transport_cm_rms,
+    ],
   ] as const;
   for (const [channel, values, expectedMean, expectedRms] of transport) {
     const statistics = timeWeightedTransportStatistics(history.t, values);
@@ -299,13 +317,15 @@ function noSheddingUransProof(
     }
     return {
       state: "missing",
-      reason: "current no-shedding URANS result has no physical observation certificate",
+      reason:
+        "current no-shedding URANS result has no physical observation certificate",
     };
   }
   if (point.no_shedding_certificate === null) {
     return {
       state: "missing",
-      reason: "current no-shedding URANS result could not certify its physical observation",
+      reason:
+        "current no-shedding URANS result could not certify its physical observation",
     };
   }
   const parsed = parseNoSheddingCertificate(point.no_shedding_certificate);
@@ -569,7 +589,7 @@ export function draftResultInterpretationForPoint(
           noSheddingCertificate:
             noShedding.state === "invalid" ? "invalid" : "missing",
           contractErrors:
-            noShedding.state === "invalid" ? noShedding.errors ?? [] : [],
+            noShedding.state === "invalid" ? (noShedding.errors ?? []) : [],
         },
       ),
     };
@@ -604,8 +624,7 @@ export function draftResultInterpretationForPoint(
         "current URANS result is neither an explicit no-shedding result nor certified periodic evidence; route this angle to FAST URANS",
         {
           frameTrack: point.frame_track ?? "missing",
-          uransCycleCertificate:
-            point.urans_cycle_certificate ?? "missing",
+          uransCycleCertificate: point.urans_cycle_certificate ?? "missing",
         },
       ),
     };
@@ -1040,6 +1059,25 @@ export type ArchiveInterpretationSelectionOutcome =
   | "stale_attempt"
   | "not_eligible";
 
+/** Narrow compare-and-swap policy for archive recovery of a result whose old
+ * live-summary classifier left no current attempt pointer. */
+export function archiveAttemptMayPromotePointerlessResult(input: {
+  currentAttemptId: string | null;
+  currentInterpretationId: string | null;
+  currentCanonicalSelectionId: string | null;
+  resultStatus: string;
+  resultSimJobId: string | null;
+  attemptSimJobId: string | null;
+}): boolean {
+  return (
+    input.currentAttemptId === null &&
+    input.currentInterpretationId === null &&
+    input.currentCanonicalSelectionId === null &&
+    input.resultStatus === "failed" &&
+    input.resultSimJobId === input.attemptSimJobId
+  );
+}
+
 const UUID_TEXT =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256_TEXT = /^[0-9a-f]{64}$/;
@@ -1150,7 +1188,10 @@ function exactNoSheddingWindow(
       certificate.observation_start_time,
     ) &&
     isFiniteNumber(window.observationEndTime) &&
-    sameCertifiedMean(window.observationEndTime, certificate.observation_end_time) &&
+    sameCertifiedMean(
+      window.observationEndTime,
+      certificate.observation_end_time,
+    ) &&
     isFiniteNumber(window.requiredObservationS) &&
     sameCertifiedMean(
       window.requiredObservationS,
@@ -1364,7 +1405,8 @@ export async function stageArchiveResultInterpretation(opts: {
   const archiveRecoveryExhausted =
     opts.diagnostics.recoveryState === "exhausted";
   const exhaustionReason =
-    typeof opts.diagnostics.reason === "string" && opts.diagnostics.reason.trim()
+    typeof opts.diagnostics.reason === "string" &&
+    opts.diagnostics.reason.trim()
       ? opts.diagnostics.reason.trim()
       : "clean-cycle recovery exhausted";
   const effectiveDraft: InterpretationDraft = archiveRecoveryExhausted
@@ -1503,11 +1545,12 @@ export async function stageArchiveResultInterpretation(opts: {
 }
 
 /**
- * Select an accepted archive reduction only when its producing attempt is
- * still the result's current generation and the archive itself has not been
- * superseded.  Selection is append-only; a compare-and-swap race merely
- * leaves an honest historical selection event and never retargets another
- * generation.
+ * Select an accepted archive reduction when its producing attempt is either
+ * the result's current generation or the exact terminal attempt projected
+ * into a pointer-less failed cell. The latter is the archive-recovery path:
+ * old live-summary classification may have rejected the attempt before its
+ * authenticated archive was reduced. Selection is append-only and the result
+ * update remains a compare-and-swap, so active/newer work is never retargeted.
  */
 export async function selectAcceptedArchiveInterpretation(opts: {
   db: DB;
@@ -1553,13 +1596,17 @@ export async function selectAcceptedArchiveInterpretation(opts: {
       currentAttemptId: results.currentResultAttemptId,
       currentInterpretationId: results.currentResultInterpretationId,
       currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+      airfoilId: results.airfoilId,
+      bcId: results.bcId,
+      revisionId: results.simulationPresetRevisionId,
+      aoaDeg: results.aoaDeg,
+      status: results.status,
+      simJobId: results.simJobId,
     })
     .from(results)
     .where(eq(results.id, opts.resultId))
     .limit(1);
-  if (!current || current.currentAttemptId !== opts.resultAttemptId) {
-    return "stale_attempt";
-  }
+  if (!current) return "stale_attempt";
   if (
     current.currentInterpretationId === interpretation.id &&
     current.currentCanonicalSelectionId
@@ -1570,11 +1617,37 @@ export async function selectAcceptedArchiveInterpretation(opts: {
   const [[attempt], [archive], cycles] = await Promise.all([
     opts.db
       .select({
+        id: resultAttempts.id,
+        airfoilId: resultAttempts.airfoilId,
+        bcId: resultAttempts.bcId,
+        revisionId: resultAttempts.simulationPresetRevisionId,
+        aoaDeg: resultAttempts.aoaDeg,
         status: resultAttempts.status,
         source: resultAttempts.source,
         regime: resultAttempts.regime,
         unsteady: resultAttempts.unsteady,
+        converged: resultAttempts.converged,
+        stalled: resultAttempts.stalled,
+        clStd: resultAttempts.clStd,
+        cdStd: resultAttempts.cdStd,
+        cmStd: resultAttempts.cmStd,
+        finalResidual: resultAttempts.finalResidual,
+        iterations: resultAttempts.iterations,
+        yPlusAvg: resultAttempts.yPlusAvg,
+        yPlusMax: resultAttempts.yPlusMax,
+        nCells: resultAttempts.nCells,
+        firstOrderFallback: resultAttempts.firstOrderFallback,
+        strouhal: resultAttempts.strouhal,
         error: resultAttempts.error,
+        qualityWarnings: resultAttempts.qualityWarnings,
+        evidencePayload: resultAttempts.evidencePayload,
+        engineJobId: resultAttempts.engineJobId,
+        engineCaseSlug: resultAttempts.engineCaseSlug,
+        simJobId: resultAttempts.simJobId,
+        methodKey: resultAttempts.methodKey,
+        solverImplementationId: resultAttempts.solverImplementationId,
+        solverRuntimeBuildId: resultAttempts.solverRuntimeBuildId,
+        solvedAt: resultAttempts.solvedAt,
         fidelity: sql<unknown>`COALESCE(
           ${resultAttempts.evidencePayload} ->> 'fidelity',
           ${resultAttempts.evidencePayload} ->> 'fidelityTier'
@@ -1638,6 +1711,10 @@ export async function selectAcceptedArchiveInterpretation(opts: {
   ]);
   if (
     !attempt ||
+    attempt.airfoilId !== current.airfoilId ||
+    attempt.bcId !== current.bcId ||
+    attempt.revisionId !== current.revisionId ||
+    attempt.aoaDeg !== current.aoaDeg ||
     !canSelectAcceptedArchiveInterpretation({
       interpretation,
       expectedSourceArchiveId: opts.sourceArchiveId,
@@ -1647,6 +1724,21 @@ export async function selectAcceptedArchiveInterpretation(opts: {
     })
   ) {
     return "not_eligible";
+  }
+  const promotesPointerlessTerminalAttempt =
+    archiveAttemptMayPromotePointerlessResult({
+      currentAttemptId: current.currentAttemptId,
+      currentInterpretationId: current.currentInterpretationId,
+      currentCanonicalSelectionId: current.currentCanonicalSelectionId,
+      resultStatus: current.status,
+      resultSimJobId: current.simJobId,
+      attemptSimJobId: attempt.simJobId,
+    });
+  if (
+    current.currentAttemptId !== opts.resultAttemptId &&
+    !promotesPointerlessTerminalAttempt
+  ) {
+    return "stale_attempt";
   }
 
   const [selection] = await opts.db
@@ -1665,8 +1757,8 @@ export async function selectAcceptedArchiveInterpretation(opts: {
           : "archive-clean-cycle-v3",
       reason:
         interpretation.regime === "steady_equivalent"
-          ? "accepted exact raw archive no-shedding observation for current URANS attempt"
-          : "accepted exact raw archive clean-cycle interpretation for current attempt",
+          ? "accepted exact raw archive no-shedding observation for an exact URANS attempt"
+          : "accepted exact raw archive clean-cycle interpretation for an exact attempt",
       actor: opts.actor ?? "system:archive-interpretation-backfill",
     })
     .returning({ id: resultCanonicalSelections.id });
@@ -1682,9 +1774,52 @@ export async function selectAcceptedArchiveInterpretation(opts: {
         current.currentCanonicalSelectionId,
       )
     : isNull(results.currentCanonicalSelectionId);
+  const attemptEvidence = asRecord(attempt.evidencePayload);
+  const attemptFidelity =
+    typeof attemptEvidence.fidelity === "string"
+      ? attemptEvidence.fidelity
+      : null;
   const [updated] = await opts.db
     .update(results)
     .set({
+      ...(promotesPointerlessTerminalAttempt
+        ? {
+            currentResultAttemptId: attempt.id,
+            status: attempt.status,
+            source: attempt.source,
+            regime: attempt.regime,
+            cl: interpretation.cl,
+            cd: interpretation.cd,
+            cm: interpretation.cm,
+            clCd: interpretation.clCd,
+            clStd: attempt.clStd,
+            cdStd: attempt.cdStd,
+            cmStd: attempt.cmStd,
+            stalled: attempt.stalled,
+            unsteady: attempt.unsteady,
+            converged: attempt.converged,
+            finalResidual: attempt.finalResidual,
+            iterations: attempt.iterations,
+            yPlusAvg: attempt.yPlusAvg,
+            yPlusMax: attempt.yPlusMax,
+            nCells: attempt.nCells,
+            firstOrderFallback: attempt.firstOrderFallback,
+            strouhal: attempt.strouhal,
+            error: attempt.error,
+            qualityWarnings: attempt.qualityWarnings,
+            frameTrack: attemptEvidence.frame_track ?? null,
+            fidelity: attemptFidelity,
+            steadyHistory: attemptEvidence.steady_history ?? null,
+            engineJobId: attempt.engineJobId,
+            engineCaseSlug: attempt.engineCaseSlug,
+            simJobId: attempt.simJobId,
+            methodKey: attempt.methodKey,
+            solverImplementationId: attempt.solverImplementationId,
+            solverRuntimeBuildId: attempt.solverRuntimeBuildId,
+            solvedAt: attempt.solvedAt,
+            priority: 0,
+          }
+        : {}),
       currentResultInterpretationId: interpretation.id,
       currentCanonicalSelectionId: selection.id,
       updatedAt: new Date(),
@@ -1692,7 +1827,13 @@ export async function selectAcceptedArchiveInterpretation(opts: {
     .where(
       and(
         eq(results.id, opts.resultId),
-        eq(results.currentResultAttemptId, opts.resultAttemptId),
+        promotesPointerlessTerminalAttempt
+          ? and(
+              isNull(results.currentResultAttemptId),
+              eq(results.status, "failed"),
+              sql`${results.simJobId} IS NOT DISTINCT FROM ${attempt.simJobId}::uuid`,
+            )
+          : eq(results.currentResultAttemptId, opts.resultAttemptId),
         currentInterpretationGuard,
         currentCanonicalSelectionGuard,
       ),

@@ -6594,7 +6594,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
     }
   }, 180000);
 
-  it("MUST-CATCH: a typed permanent same-case continuation failure is a critical non-physical terminal outcome and never restarts unchanged or fresh", async () => {
+  it("MUST-CATCH: a typed permanent same-case continuation failure falls back once to fresh disposable compute", async () => {
     const aoaDeg = 38.125;
     const jobIds: string[] = [];
     const resultIds: string[] = [];
@@ -6818,24 +6818,24 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
         skipFailedRecovery: true,
       });
 
-      const [blocked] = await db
+      const [pending] = await db
         .select()
         .from(simPrecalcObligations)
         .where(eq(simPrecalcObligations.id, obligation!.id));
-      expect(blocked).toMatchObject({
-        state: "blocked",
+      expect(pending).toMatchObject({
+        state: "pending",
         attemptCount: 1,
-        lastOutcome: "continuation_permanent_failure",
+        lastOutcome: "continuation_fresh_retry_pending",
         lastError: failure,
         nextSubmitAt: null,
       });
-      const [blockedRequest] = await db
+      const [pendingRequest] = await db
         .select()
         .from(simUransRequests)
         .where(eq(simUransRequests.id, request.id));
-      expect(blockedRequest).toMatchObject({
-        state: "blocked",
-        simJobId: continuationJob.id,
+      expect(pendingRequest).toMatchObject({
+        state: "pending",
+        simJobId: null,
       });
       const audit = await db
         .select()
@@ -6847,7 +6847,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
         solverAttemptNumber: null,
         consumesSolverAttempt: false,
         state: "failed",
-        outcome: "continuation_permanent_failure",
+        outcome: "continuation_fresh_retry_pending",
         resultAttemptId: null,
         error: failure,
       });
@@ -6875,9 +6875,9 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
           db,
           stubEngine(
             submissions,
-            `${PREFIX}-permanent-continuation-must-not-resubmit`,
+            `${PREFIX}-permanent-continuation-fresh-retry`,
           ),
-          0,
+          8,
           {
             campaignIds: [],
             parentJobIds: [],
@@ -6887,8 +6887,9 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
             meshRecoveryVersion: 0,
           },
         ),
-      ).toBe(false);
-      expect(submissions).toEqual([]);
+      ).toBe(true);
+      expect(submissions).toHaveLength(1);
+      expect(submissions[0]?.continue_from).toBeNull();
     } finally {
       resetUransLadderMemory();
       errorSpy.mockRestore();

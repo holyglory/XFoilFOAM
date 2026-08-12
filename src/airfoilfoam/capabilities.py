@@ -26,6 +26,11 @@ MESH_IDENTITY_VERSION = 1
 # recovery: immutable evidence archives could hydrate a saved case after local
 # retention, continuations used the adaptive extension budget, and requests
 # were rejected before CFD when controller and worker disagreed.
+# Version 11 extends the one-time conservative live recovery rung from
+# discontinuous impulses to the same clean-cycle reducer's typed high-frequency
+# and numerically-noisy terminal verdicts. It does not globally slow healthy
+# jobs: the tighter Co<=1 / 4x3 PIMPLE settings remain marker-gated and persist
+# only for that exact physical trajectory and its bounded continuation.
 # Version 9 derives the high-frequency wake bound from the larger of projected
 # AoA height and measured section thickness. Thick/cambered sections therefore
 # retain a physically plausible thickness-scale limit cycle while the legacy
@@ -50,4 +55,4 @@ MESH_IDENTITY_VERSION = 1
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 10
+URANS_RECOVERY_VERSION = 11

@@ -7,6 +7,7 @@ import {
 } from "./config";
 import { startHeartbeatTimer } from "./heartbeat";
 import { runLoop } from "./loop";
+import { startArchiveInterpretationMaintenanceTimer } from "./result-interpretation-backfill";
 
 const { db, sql, engine } = makeContext();
 try {
@@ -37,9 +38,14 @@ console.log(
 // process as "PROCESS NOT RUNNING"). Tick progress is stamped separately by
 // the loop (lastTickStartedAt/lastTickCompletedAt).
 const stopHeartbeat = startHeartbeatTimer(db);
+const stopArchiveMaintenance = startArchiveInterpretationMaintenanceTimer(
+  db,
+  engine,
+);
 try {
   await runLoop(db, engine, ac.signal);
 } finally {
+  stopArchiveMaintenance();
   stopHeartbeat();
 }
 await sql.end();
