@@ -1,5 +1,25 @@
 # Completion Ledger
 
+- **Production hub 8-slot admission:** The hub OpenFOAM worker is healthy and
+  configured for 8 concurrent cases, but new admission is durably fenced by 50
+  current-generation critical preliminary-URANS incidents produced by four
+  exhausted aggregate jobs (`missing-clean-cycle-certificate`, missing video,
+  and two exact three-period shortfalls). Four already-running targeted jobs
+  continue. Do not bypass the fence: repair or reset the affected preliminary
+  obligations/incidents under the disposable-CFD policy, explicitly resume the
+  scheduler at 8 slots, and verify it refills without immediately re-tripping.
+
+- **AoA evidence rendered interaction proof:** Commit `d17c991` is deployed and
+  the live API/build prove the stable result identity, classic-RANS explanation,
+  retained-content transition, cache, and prefetch implementation. The two-case
+  Playwright regression collects successfully, but its rendered run remains
+  blocked because DevCoordinator could not materialize the declared local API
+  target (`bug-0e77ea2105a944639bda2dfb740bf1b1`) and the repository test
+  manifest is still unsupported schema 2. Run the exact Admin campaign modal
+  scrub after the governed runtime is available; verify retained dialog/scroll,
+  no full-body loading screen, one request per cached AoA, final slider/result
+  agreement, and the compact classic-RANS history notice, then remove this item.
+
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation
   and runtime identity. Add a physical operating-cell comparison identity that
