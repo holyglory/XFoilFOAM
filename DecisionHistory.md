@@ -10,6 +10,12 @@
   non-solver configuration and reconnection credentials. Regenerated results
   must still come from real solver evidence and pass the normal acceptance
   gates. [D-2026-08-10-disposable-inflight-cfd]
+- Confirmed intent: on disposable-compute deployments, an exhausted per-angle
+  solver/evidence path stays unpublished and retryable but does not infer a
+  fleet-wide admission hazard. Publication safety and global scheduling are
+  separate controls; the older latched breaker remains available for an
+  explicitly preservation-oriented deployment.
+  [D-2026-08-12-disposable-admission]
 - Confirmed intent: hz-solver2 uses a reversible 64-slot capacity contract on
   its 48-core/96-thread host. Worker budget, case concurrency, Celery
   concurrency, and container quota must agree; throughput and host headroom,
@@ -61,11 +67,10 @@
   evidence. Each point is one RANS screening → fast preliminary URANS → final
   verified URANS journey; aerodynamic RANS rejection is a normal handoff. Due
   fast-URANS obligations strictly outrank unrelated new RANS from their durable
-  ledger, including after a scheduler restart. A current-generation critical or
-  exhausted preliminary/final hazard durably fences only NEW admission while
-  reconciliation, ingestion, retention, and accepted work continue; operator
-  resume clears the latch, but admission checks re-trip it before submission if
-  the hazard remains, and legacy-generation hazards are inert.
+  ledger, including after a scheduler restart. Preservation-oriented
+  deployments may durably fence NEW admission on a current-generation hazard;
+  the production disposable-compute policy instead keeps rejected points
+  unpublished without stopping unrelated submissions.
   A mesh/runtime problem is repaired automatically before fast URANS, and only
   exhaustion of that non-aerodynamic recovery or of fast/final URANS is a
   critical system incident. A reproduced and fixed engine/controller defect
@@ -82,6 +87,7 @@
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
   [D-2026-07-16-preliminary-urans-reliability]
+  [D-2026-08-12-disposable-admission]
   [D-2026-07-19-urans-physical-tail]
   [D-2026-07-20-urans-continuation-wall-budget]
   [D-2026-07-24-urans-clean-tail]
@@ -198,6 +204,19 @@
   available when preservation is explicitly requested, but they no longer
   block a user-authorized clean recovery.
 
+## D-2026-08-12-disposable-admission — Rejected points do not stop disposable compute
+
+- Decision: keep solver evidence validation fail-closed while production uses
+  a reversible `disposable_compute` admission policy that does not infer a
+  global stop from per-angle and per-job solver ledgers. Preserve an existing
+  latch until one explicit Resume.
+  [detail](DecisionDetails/D-2026-08-12-disposable-admission.md)
+- Why: fifty non-publishable FAST-URANS points stopped unrelated work in a
+  631,000-point campaign despite healthy hosts. Bypassing validation risks fake
+  results; clearing or deleting state under the old policy immediately
+  retrips. Separating publication validity from global admission keeps truth
+  intact and compute moving, while the older durable mode remains reversible.
+
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 
 - Decision: give every hub-issued remote polar one refreshed 72-hour failover
@@ -256,7 +275,6 @@
   counts would conceal a slow node. Authenticated push telemetry plus
   hub-derived immutable result attribution remains truthful during outages,
   preserves secrets, and exposes capacity safeguards without inventing data.
-
 
 ## D-2026-07-25-solver-incident-log — Solver incidents are a compact, system-owned event log
 

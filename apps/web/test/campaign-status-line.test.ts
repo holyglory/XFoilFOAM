@@ -31,6 +31,11 @@ function summary(overrides: {
   diskAdmissionBlocked?: boolean;
   diskAdmissionReason?: string | null;
   admissionFenceActive?: boolean;
+  lastAdmissionFenceReason?: string | null;
+  lastAdmissionFenceDetails?: {
+    stage?: "rans" | "preliminary" | "final";
+    fidelity?: "precalc" | "full";
+  } | null;
   failed?: number;
   rejected?: number;
   blocked?: number;
@@ -74,6 +79,8 @@ function summary(overrides: {
       diskAdmissionBlocked: overrides.diskAdmissionBlocked ?? false,
       diskAdmissionReason: overrides.diskAdmissionReason ?? null,
       admissionFenceActive: overrides.admissionFenceActive ?? false,
+      lastAdmissionFenceReason: overrides.lastAdmissionFenceReason ?? null,
+      lastAdmissionFenceDetails: overrides.lastAdmissionFenceDetails ?? null,
     } as AdminCampaignSummary["scheduler"],
   } as AdminCampaignSummary;
 }
@@ -238,28 +245,59 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       summary({
         sweeperEnabled: false,
         admissionFenceActive: true,
+        lastAdmissionFenceReason: "critical_solver_incident",
+        lastAdmissionFenceDetails: { stage: "preliminary" },
         jobs: 2,
       }),
     );
     expect(line.gate).toEqual({
-      text: "SAFETY STOP — critical solver outcome",
+      text: "FAST URANS RETRIES EXHAUSTED — NEW SUBMISSIONS PAUSED",
       tone: "red",
     });
     expect(line.text).toMatch(/2 active jobs continue/i);
-    expect(line.text).toMatch(/new submissions are fenced/i);
+    expect(line.text).toMatch(/only new submissions are paused/i);
 
     const hero = campaignInstrumentStatus(
       summary({
         sweeperEnabled: false,
         admissionFenceActive: true,
+        lastAdmissionFenceReason: "critical_solver_incident",
+        lastAdmissionFenceDetails: { stage: "preliminary" },
         jobs: 2,
       }),
     );
     expect(hero).toMatchObject({
-      title: "Solver safety stop",
+      title: "Fast URANS retries exhausted",
+      detail: "2 active jobs continue; only new submissions are paused",
       tone: "red",
       action: null,
     });
+  });
+
+  it.each([
+    [
+      "final stage",
+      { stage: "final" as const },
+      "Final URANS retries exhausted",
+    ],
+    [
+      "fast request",
+      { fidelity: "precalc" as const },
+      "Fast URANS retries exhausted",
+    ],
+    ["generic fallback", null, "Solver retries exhausted"],
+  ])("names %s without vague investigation copy", (_name, details, title) => {
+    const hero = campaignInstrumentStatus(
+      summary({
+        sweeperEnabled: false,
+        admissionFenceActive: true,
+        lastAdmissionFenceDetails: details,
+        jobs: 0,
+      }),
+    );
+    expect(hero.title).toBe(title);
+    expect(hero.detail).toMatch(/only new submissions are paused/i);
+    expect(hero.detail).not.toMatch(/investigation/i);
   });
 
   it("engine unhealthy → red gate badge", () => {

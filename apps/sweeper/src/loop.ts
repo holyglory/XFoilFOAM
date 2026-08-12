@@ -31,6 +31,7 @@ import {
   isDiskPressureEmergency,
   refreshDiskAdmission,
 } from "./disk-admission";
+import { configuredAdmissionFencePolicy } from "./config";
 import {
   submitCampaignPrecalcRecoveries,
   submitInterleavedVerifyIfDue,
@@ -169,7 +170,9 @@ async function checkAdmissionFence(
   phase: "before_reconcile" | "after_reconcile" | "after_mesh_remediation",
 ): Promise<AdmissionFenceGate> {
   try {
-    const result = await enforceSweeperAdmissionFence(db);
+    const result = await enforceSweeperAdmissionFence(db, {
+      policy: configuredAdmissionFencePolicy(),
+    });
     if (result.fencedNow) {
       console.error(
         `[sweeper] NEW admission fenced after ${result.trigger?.reason ?? "critical solver outcome"}` +

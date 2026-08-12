@@ -252,6 +252,9 @@ services:
       # Keep Node admission in the same logical-CPU units as the worker's
       # durable token pool. sweeper_state max_concurrent_jobs=0 means auto.
       AIRFOILFOAM_WORKER_CPU_BUDGET: ${AIRFOILFOAM_WORKER_CPU_BUDGET:-8}
+      # Rejected CFD remains unpublished, but reproducible per-point failures
+      # must not idle the whole campaign on disposable-compute deployments.
+      AIRFOILFOAM_DISPOSABLE_CFD: ${AIRFOILFOAM_DISPOSABLE_CFD:-true}
     volumes:
       - results:/data/airfoilfoam
       - sync_imports:/data/airfoilfoam/sync-imports # GC crash-orphan sync uploads

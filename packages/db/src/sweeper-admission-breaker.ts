@@ -27,6 +27,10 @@ export interface SweeperAdmissionFenceResult {
   trigger: SweeperAdmissionFenceTrigger | null;
 }
 
+export type SweeperAdmissionFencePolicy =
+  | "durable_evidence"
+  | "disposable_compute";
+
 interface BreakerRow {
   active: boolean;
   fenced_now: boolean;
@@ -49,7 +53,48 @@ interface BreakerRow {
  */
 export async function enforceSweeperAdmissionFence(
   db: DB,
+  options: { policy?: SweeperAdmissionFencePolicy } = {},
 ): Promise<SweeperAdmissionFenceResult> {
+  if (options.policy === "disposable_compute") {
+    const [state] = (await db.execute(sql`
+      SELECT
+        admission_fence_active AS active,
+        last_admission_fence_reason AS reason,
+        last_admission_fence_trigger_key AS trigger_key,
+        last_admission_fence_details AS details
+      FROM sweeper_state
+      WHERE id = 1
+    `)) as unknown as Array<{
+      active: boolean;
+      reason: SweeperAdmissionFenceReason | null;
+      trigger_key: string | null;
+      details: Record<string, unknown> | null;
+    }>;
+    const details = state?.details ?? null;
+    const campaignId =
+      typeof details?.campaignId === "string" ? details.campaignId : null;
+    const generation =
+      typeof details?.generation === "number" ? details.generation : null;
+    return {
+      hazardPresent: false,
+      fencedNow: false,
+      active: Boolean(state?.active),
+      trigger:
+        state?.active &&
+        state.reason &&
+        state.trigger_key &&
+        campaignId &&
+        generation != null
+          ? {
+              reason: state.reason,
+              triggerKey: state.trigger_key,
+              campaignId,
+              generation,
+              details: details ?? {},
+            }
+          : null,
+    };
+  }
   const [row] = (await db.execute(sql`
     WITH hazards AS (
       SELECT

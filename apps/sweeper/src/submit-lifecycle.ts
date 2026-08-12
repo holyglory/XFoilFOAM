@@ -33,6 +33,8 @@ import {
 } from "@aerodb/engine-client";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
+import { configuredAdmissionFencePolicy } from "./config";
+
 import { isEngineConnectionFailure } from "./engine-backoff";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
 
@@ -845,7 +847,9 @@ async function submitWithGlobalAdmissionPermit(
           };
         }
       }
-      const fence = await enforceSweeperAdmissionFence(tx);
+      const fence = await enforceSweeperAdmissionFence(tx, {
+        policy: configuredAdmissionFencePolicy(),
+      });
       if (fence.active || fence.hazardPresent) {
         return {
           kind: "denied" as const,

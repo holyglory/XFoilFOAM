@@ -4,6 +4,15 @@ import {
   EngineClient,
   openFoamEngineIdentityFromConfig,
 } from "@aerodb/engine-client";
+import type { SweeperAdmissionFencePolicy } from "@aerodb/db";
+
+export function configuredAdmissionFencePolicy(): SweeperAdmissionFencePolicy {
+  return /^(?:1|true|yes|on)$/i.test(
+    process.env.AIRFOILFOAM_DISPOSABLE_CFD?.trim() ?? "",
+  )
+    ? "disposable_compute"
+    : "durable_evidence";
+}
 
 export function configuredEngineIdentity() {
   return openFoamEngineIdentityFromConfig({

@@ -95,13 +95,21 @@ export function campaignInstrumentStatus(
   }
 
   if (line.gate) {
-    if (line.gate.text.toLowerCase().includes("safety stop")) {
+    if (scheduler.admissionFenceActive) {
+      const stage = scheduler.lastAdmissionFenceDetails?.stage;
+      const fidelity = scheduler.lastAdmissionFenceDetails?.fidelity;
+      const title =
+        stage === "preliminary" || fidelity === "precalc"
+          ? "Fast URANS retries exhausted"
+          : stage === "final" || fidelity === "full"
+            ? "Final URANS retries exhausted"
+            : "Solver retries exhausted";
       return {
-        title: "Solver safety stop",
+        title,
         detail:
           jobs > 0
-            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are fenced`
-            : "New submissions are fenced pending solver investigation",
+            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; only new submissions are paused`
+            : "Only new submissions are paused; no solver result is being published from the failed attempts",
         tone: "red",
         action: null,
       };
@@ -578,16 +586,24 @@ export function campaignStatusLine(
         };
       }
       if (scheduler.admissionFenceActive) {
+        const stage = scheduler.lastAdmissionFenceDetails?.stage;
+        const fidelity = scheduler.lastAdmissionFenceDetails?.fidelity;
+        const subject =
+          stage === "preliminary" || fidelity === "precalc"
+            ? "fast URANS retries exhausted"
+            : stage === "final" || fidelity === "full"
+              ? "final URANS retries exhausted"
+              : "solver retries exhausted";
         return {
           gate: {
-            text: "SAFETY STOP — critical solver outcome",
+            text: `${subject.toUpperCase()} — NEW SUBMISSIONS PAUSED`,
             tone: "red",
           },
           lifecycle,
           text:
             jobs > 0
-              ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are fenced pending investigation.`
-              : "New submissions are fenced pending solver investigation.",
+              ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; only new submissions are paused because ${subject}.`
+              : `Only new submissions are paused because ${subject}.`,
           tone: "red",
         };
       }
