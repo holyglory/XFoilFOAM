@@ -2414,8 +2414,8 @@ export const resultInterpretationBackfillRuns = pgTable(
       .notNull()
       .default(sql`'{}'::jsonb`),
     requestedBy: text("requested_by").notNull().default("system"),
-    startedAt: ts(),
-    completedAt: ts(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2759,9 +2759,9 @@ export const legacyUransArchiveGapRecoveryActions = pgTable(
       foreignColumns: [resultAttempts.id, resultAttempts.resultId],
       name: "legacy_urans_archive_gap_recovery_attempt_owner_fk",
     }).onDelete("cascade"),
-    sourceAttemptUq: uniqueIndex("legacy_urans_archive_gap_recovery_source_uq").on(
-      t.resultAttemptId,
-    ),
+    sourceAttemptUq: uniqueIndex(
+      "legacy_urans_archive_gap_recovery_source_uq",
+    ).on(t.resultAttemptId),
     readyIdx: index("legacy_urans_archive_gap_recovery_ready_idx").on(
       t.state,
       t.nextAttemptAt,
