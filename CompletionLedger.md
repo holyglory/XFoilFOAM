@@ -1,5 +1,16 @@
 # Completion Ledger
 
+- **Remote rejected-result reclamation:** A terminal hz-solver2 job containing
+  rejected result rows never receives its job-level delivery terminal, so
+  generic retention cannot reclaim the local case even after every publishable
+  generation was delivered. This stranded roughly 2.2 TiB and stopped refill
+  at 46/64 processes. Release the disposable remote promises/jobs, clean-reset
+  the remote solver while retaining registration/credentials and 64-slot
+  policy, then terminally account jobs whose remaining rows are immutable
+  rejected evidence so their unpublishable local cases can be reclaimed and
+  their unfulfilled hub points can be re-promised. Verify hub authority release,
+  remote disk reclaim, 64-slot refill, valid delivery, and post-terminal strip.
+
 - **Disposable archive-backfill cancellation:** The active production archive
   run must be cancelled without worker revival, all open exact receipts must be
   terminally abandoned for the pinned reducer, and the 100 blocked campaign

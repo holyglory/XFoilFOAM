@@ -5680,6 +5680,64 @@ async function processRemoteResultDeliveries(
     if (allDelivered) {
       await markRemoteJobDeliveryTerminal(db, promiseId, job.id, "delivered");
       await completeMirroredPromiseIfReady(db, settings, promiseId, job.id);
+      continue;
+    }
+
+    const rejectedRows = await db
+      .select({ resultId: resultClassifications.resultId })
+      .from(resultClassifications)
+      .where(
+        and(
+          inArray(
+            resultClassifications.resultId,
+            resultRows.map((result) => result.id),
+          ),
+          eq(resultClassifications.state, "rejected"),
+        ),
+      );
+    const rejectedResultIds = new Set(
+      rejectedRows
+        .map((row) => row.resultId)
+        .filter((resultId): resultId is string => Boolean(resultId)),
+    );
+    if (!rejectedResultIds.size) continue;
+
+    let everyOtherResultDelivered = true;
+    for (const result of resultRows) {
+      if (rejectedResultIds.has(result.id)) continue;
+      if (!result.currentResultAttemptId) {
+        everyOtherResultDelivered = false;
+        break;
+      }
+      const attempt = await currentAttemptForResult(db, job, result);
+      const delivery = deliveredByResult.get(result.id);
+      if (
+        delivery?.state !== "delivered" ||
+        delivery.generationKey !== attempt.id
+      ) {
+        everyOtherResultDelivered = false;
+        break;
+      }
+    }
+    if (everyOtherResultDelivered) {
+      const reason =
+        `remote job completed with ${rejectedResultIds.size} rejected ` +
+        `result${rejectedResultIds.size === 1 ? "" : "s"}; ` +
+        "unfulfilled points were released for a fresh solve";
+      await cancelMirroredRemotePromise(
+        db,
+        settings,
+        promiseId,
+        reason,
+        "terminal_local_state",
+      );
+      await markRemoteJobDeliveryTerminal(
+        db,
+        promiseId,
+        job.id,
+        "superseded",
+        reason,
+      );
     }
   }
   return false;

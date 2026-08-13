@@ -3942,6 +3942,66 @@ describe("remote solver push validation regressions", () => {
     ]);
   });
 
+  it("MUST-CATCH: releases rejected terminal points and acknowledges the job for local reclamation", async () => {
+    const aoas = [812.101, 812.102];
+    const job = await seedDoneRemoteJob("terminal-rejected", aoas);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("terminal-rejected", aoas, promiseId);
+    const resultRows = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id))
+      .orderBy(results.aoaDeg);
+    const rejected = resultRows[1]!;
+    await db
+      .update(resultClassifications)
+      .set({ state: "rejected", reasons: ["non-stationary"] })
+      .where(eq(resultClassifications.resultId, rejected.id));
+    await db
+      .update(results)
+      .set({ status: "failed", currentResultAttemptId: null })
+      .where(eq(results.id, rejected.id));
+    const transport = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+    await remoteSolverTick(db, {} as never);
+
+    expect(requests(transport.fetchMock, "/polars")).toHaveLength(1);
+    expect(
+      requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`),
+    ).toEqual([
+      {
+        url: `${UPSTREAM}/sweeps/${promiseId}/cancel`,
+        body: {
+          disposition: "terminal_local_state",
+          reason: expect.stringContaining(
+            "1 rejected result; unfulfilled points were released",
+          ),
+        },
+      },
+    ]);
+    const mirror = await readPromise(promiseId);
+    expect(mirror.promise.status).toBe("cancelled");
+    expect(mirror.points.map((row) => row.status)).toEqual([
+      "fulfilled",
+      "cancelled",
+    ]);
+    expect(await deliveriesForJob(job.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          resultId: resultRows[0]!.id,
+          state: "delivered",
+        }),
+        expect.objectContaining({
+          resultId: null,
+          state: "superseded",
+          lastError: expect.stringContaining("1 rejected result"),
+        }),
+      ]),
+    );
+  });
+
   it("blocks a 200 response that explicitly leaves the exact AoA unfulfilled", async () => {
     const aoaDeg = 813.001;
     const job = await seedDoneRemoteJob("urans-evidence", [aoaDeg]);
@@ -4503,9 +4563,7 @@ describe("remote solver push validation regressions", () => {
           heartbeatBodies.push(JSON.parse(String(init?.body ?? "{}")));
           return Response.json({
             ok: true,
-            expiresAt: new Date(
-              Date.now() + 72 * 3_600_000,
-            ).toISOString(),
+            expiresAt: new Date(Date.now() + 72 * 3_600_000).toISOString(),
           });
         }),
       );
