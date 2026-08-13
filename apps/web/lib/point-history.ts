@@ -937,11 +937,11 @@ export function assembleTimeline(story: PointStoryPayload): TimelineEvent[] {
     events.push({
       kind: "classification",
       at: null,
-      tone: "red",
-      title: "CRITICAL · URANS final unavailable",
+      tone: "amber",
+      title: "URANS final not published",
       detail: `${verify.submitHttpStatus ? `HTTP ${verify.submitHttpStatus} — ` : ""}${verify.submitError ?? "the engine rejected the full-fidelity submit after its bounded automatic retry"}`,
       whyLines: [
-        "system-owned incident · automatic recovery and investigation required",
+        "solver-owned follow-up · the campaign continues",
         "accepted URANS fast evidence is retained",
       ],
     });

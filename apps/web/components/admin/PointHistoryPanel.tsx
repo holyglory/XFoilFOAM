@@ -1000,7 +1000,7 @@ export function PointHistoryPanel() {
             <option value="">final stage: any</option>
             <option value="pending">final URANS queued</option>
             <option value="disagreed">final differs from fast</option>
-            <option value="blocked">final URANS critical</option>
+            <option value="blocked">final not published</option>
           </select>
           <span style={{ fontFamily: MONO, fontSize: 9.5, color: C.dim }}>
             sorted by last activity

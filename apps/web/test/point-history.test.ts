@@ -563,7 +563,7 @@ describe("assembleTimeline", () => {
     );
   });
 
-  it("MUST-CATCH: exhausted final URANS is red, critical, and explicitly system-owned", () => {
+  it("MUST-CATCH: exhausted final URANS stays calm, unpublished, and solver-owned", () => {
     const events = assembleTimeline(
       storyPayload({
         point: {
@@ -579,13 +579,15 @@ describe("assembleTimeline", () => {
         } as never,
       }),
     );
-    const critical = events.find((event) => event.title.startsWith("CRITICAL"));
-    expect(critical).toMatchObject({
-      tone: "red",
-      title: "CRITICAL · URANS final unavailable",
+    const unpublished = events.find((event) =>
+      event.title.includes("not published"),
+    );
+    expect(unpublished).toMatchObject({
+      tone: "amber",
+      title: "URANS final not published",
     });
-    expect(critical?.whyLines.join(" ")).toContain("system-owned incident");
-    expect(critical?.whyLines.join(" ")).toContain(
+    expect(unpublished?.whyLines.join(" ")).toContain("solver-owned follow-up");
+    expect(unpublished?.whyLines.join(" ")).toContain(
       "accepted URANS fast evidence is retained",
     );
   });

@@ -19,7 +19,9 @@ describe("solver terminology contract", () => {
     expect(adminConsole).toContain("not published");
     expect(adminConsole).not.toContain("critical recover");
     expect(pointHistory).not.toContain(">verify blocked<");
+    expect(pointHistory).not.toContain(">final URANS critical<");
     expect(pointHistory).toContain(">final URANS queued<");
+    expect(pointHistory).toContain(">final not published<");
     expect(pointHistory).toContain(
       'data-testid="point-publication-explanation"',
     );
