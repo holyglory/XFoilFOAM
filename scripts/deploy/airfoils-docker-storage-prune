@@ -38,7 +38,14 @@ if ! flock -n 9; then
   echo "Deployment-host storage cleanup is already running; leaving this invocation idle."
   exit 0
 fi
-exec 8>"$DEPLOY_LOCK_FILE"
+if [[ ! -f "$DEPLOY_LOCK_FILE" || -L "$DEPLOY_LOCK_FILE" ]]; then
+  echo "Canonical deployment lock must be an existing non-symlink regular file: $DEPLOY_LOCK_FILE" >&2
+  exit 2
+fi
+# The deploy user owns this protected /tmp file on the hub. Opening it for
+# truncating write from a system service is denied by fs.protected_regular;
+# flock needs only the shared inode, so use a non-mutating descriptor.
+exec 8<"$DEPLOY_LOCK_FILE"
 if ! flock -n 8; then
   echo "A deployment is running; leaving deployment-host storage cleanup idle."
   exit 0

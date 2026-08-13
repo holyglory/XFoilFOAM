@@ -52,12 +52,15 @@ def _run_prune(tmp_path: Path, deploy_root: Path, **extra: str) -> tuple[subproc
     docker_log = _fake_docker(fake_bin)
     docker_root = tmp_path / "docker-root"
     docker_root.mkdir()
+    deploy_lock = tmp_path / "deploy.lock"
+    deploy_lock.touch(mode=0o444, exist_ok=True)
+    deploy_lock.chmod(0o444)
     env = os.environ | {
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DOCKER_LOG": str(docker_log),
         "DOCKER_ROOT_DIR": str(docker_root),
         "DOCKER_PRUNE_LOCK_FILE": str(tmp_path / "cleanup.lock"),
-        "AIRFOILS_PRO_DEPLOY_LOCK_FILE": str(tmp_path / "deploy.lock"),
+        "AIRFOILS_PRO_DEPLOY_LOCK_FILE": str(deploy_lock),
         "AIRFOILS_PRO_DEPLOY_ROOT": str(deploy_root),
         "AIRFOILS_PRO_APP_DIR": str(deploy_root / "app"),
         "AIRFOILS_PRO_RELEASES_DIR": str(deploy_root / "releases"),
