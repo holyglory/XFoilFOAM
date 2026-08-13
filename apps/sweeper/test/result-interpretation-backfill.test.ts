@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { EngineError, EngineTimeoutError } from "@aerodb/engine-client";
 
 import {
   archiveBackfillFidelity,
@@ -10,6 +11,7 @@ import {
   archivePointerForBackfill,
   archiveReducerNeedsRecoveryHandoff,
   normaliseArchiveInterpretationBackfillScope,
+  isArchiveInterpretationTransientError,
 } from "../src/result-interpretation-backfill";
 import { parseArchiveInterpretationBackfillArgs } from "../src/result-interpretation-backfill-cli";
 
@@ -36,6 +38,47 @@ function gcsBlob(overrides: Record<string, unknown> = {}) {
 }
 
 describe("archive clean-cycle interpretation backfill", () => {
+  it("MUST-CATCH: retries only unanswered fetch transport failures and typed transient engine failures", () => {
+    expect(
+      isArchiveInterpretationTransientError(new TypeError("fetch failed")),
+    ).toBe(true);
+    expect(
+      isArchiveInterpretationTransientError(
+        new EngineTimeoutError("archive reduction timed out", 900_000),
+      ),
+    ).toBe(true);
+    expect(
+      isArchiveInterpretationTransientError(
+        new EngineError("engine unavailable", 503),
+      ),
+    ).toBe(true);
+    expect(
+      isArchiveInterpretationTransientError(
+        new EngineError("connection failed before an answer"),
+      ),
+    ).toBe(true);
+
+    expect(
+      isArchiveInterpretationTransientError(
+        new TypeError("Failed to parse URL from malformed input"),
+      ),
+    ).toBe(false);
+    expect(
+      isArchiveInterpretationTransientError(
+        new EngineError("archive evidence rejected", 422),
+      ),
+    ).toBe(false);
+    expect(
+      isArchiveInterpretationTransientError(
+        new EngineError(
+          "reducer contract drift",
+          500,
+          "archive_reduction_contract_drift",
+        ),
+      ),
+    ).toBe(false);
+  });
+
   it("accepts only explicit FAST/FINAL provenance", () => {
     expect(archiveBackfillFidelity({ fidelity: "urans_precalc" })).toBe(
       "urans_precalc",

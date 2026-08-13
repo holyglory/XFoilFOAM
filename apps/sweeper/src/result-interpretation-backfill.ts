@@ -641,6 +641,24 @@ function backoffForAttempt(attemptCount: number): number {
   return Math.min(30 * 60_000, 60_000 * 2 ** Math.max(0, attemptCount - 1));
 }
 
+/** Node's fetch reports connection resets, DNS failures, and other failures
+ * that occur before an HTTP response as a deliberately terse TypeError. Keep
+ * this exact transport shape retryable without broadening all TypeErrors
+ * (invalid URLs and reducer programming defects must remain terminal). */
+export function isArchiveInterpretationTransientError(error: unknown): boolean {
+  if (error instanceof EngineTimeoutError) return true;
+  if (error instanceof TypeError && error.message.trim() === "fetch failed") {
+    return true;
+  }
+  return (
+    error instanceof EngineError &&
+    error.code !== "archive_reduction_contract_drift" &&
+    error.status !== 409 &&
+    error.status !== 422 &&
+    (error.status == null || error.status >= 500)
+  );
+}
+
 async function settleClaim(
   db: DB,
   item: ClaimedBackfillItem,
@@ -1071,15 +1089,7 @@ async function processClaimedArchiveInterpretationItem(opts: {
     const answeredArchiveProblem =
       error instanceof EngineError &&
       (error.status === 409 || error.status === 422);
-    const contractDrift =
-      error instanceof EngineError &&
-      error.code === "archive_reduction_contract_drift";
-    const transient =
-      error instanceof EngineTimeoutError ||
-      (error instanceof EngineError &&
-        !answeredArchiveProblem &&
-        !contractDrift &&
-        (error.status == null || error.status >= 500));
+    const transient = isArchiveInterpretationTransientError(error);
     if (answeredArchiveProblem) {
       await settleClaim(opts.db, opts.item, {
         state: "missing_evidence",
