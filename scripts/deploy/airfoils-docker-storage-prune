@@ -4,6 +4,13 @@ set -Eeuo pipefail
 RETENTION_HOURS="${DOCKER_PRUNE_RETENTION_HOURS:-72}"
 BUILD_CACHE_KEEP_STORAGE="${DOCKER_BUILD_CACHE_KEEP_STORAGE:-10GB}"
 LOCK_FILE="${DOCKER_PRUNE_LOCK_FILE:-/run/lock/airfoils-docker-storage-prune.lock}"
+DEPLOY_ROOT="${AIRFOILS_PRO_DEPLOY_ROOT:-/opt/airfoils-pro}"
+APP_DIR="${AIRFOILS_PRO_APP_DIR:-$DEPLOY_ROOT/app}"
+RELEASES_DIR="${AIRFOILS_PRO_RELEASES_DIR:-$DEPLOY_ROOT/releases}"
+DEPLOY_LOCK_FILE="${AIRFOILS_PRO_DEPLOY_LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
+RELEASE_KEEP_COUNT="${DEPLOYMENT_RELEASE_KEEP_COUNT:-3}"
+STAGING_MAX_AGE_HOURS="${DEPLOYMENT_STAGING_MAX_AGE_HOURS:-24}"
+DOCKER_ROOT_DIR="${DOCKER_ROOT_DIR:-}"
 
 if [[ ! "$RETENTION_HOURS" =~ ^[1-9][0-9]*$ ]]; then
   echo "DOCKER_PRUNE_RETENTION_HOURS must be a positive integer." >&2
@@ -13,14 +20,38 @@ if [[ ! "$BUILD_CACHE_KEEP_STORAGE" =~ ^[1-9][0-9]*([KMGT]B|[kMGT]B|B)$ ]]; then
   echo "DOCKER_BUILD_CACHE_KEEP_STORAGE must be a positive Docker byte value such as 10GB." >&2
   exit 2
 fi
+if [[ ! "$RELEASE_KEEP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DEPLOYMENT_RELEASE_KEEP_COUNT must be a positive integer." >&2
+  exit 2
+fi
+if [[ ! "$STAGING_MAX_AGE_HOURS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DEPLOYMENT_STAGING_MAX_AGE_HOURS must be a positive integer." >&2
+  exit 2
+fi
+if [[ "$DEPLOY_ROOT" != /* || "$DEPLOY_ROOT" == "/" ]]; then
+  echo "AIRFOILS_PRO_DEPLOY_ROOT must be a specific absolute directory." >&2
+  exit 2
+fi
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  echo "Docker storage cleanup is already running; leaving this invocation idle."
+  echo "Deployment-host storage cleanup is already running; leaving this invocation idle."
+  exit 0
+fi
+exec 8>"$DEPLOY_LOCK_FILE"
+if ! flock -n 8; then
+  echo "A deployment is running; leaving deployment-host storage cleanup idle."
   exit 0
 fi
 
-before_bytes="$(df -B1 --output=avail / | awk 'NR == 2 { print $1 }')"
+if [[ -z "$DOCKER_ROOT_DIR" ]]; then
+  DOCKER_ROOT_DIR="$(docker info --format '{{.DockerRootDir}}')"
+fi
+if [[ "$DOCKER_ROOT_DIR" != /* || ! -d "$DOCKER_ROOT_DIR" ]]; then
+  echo "Docker root is not a specific existing absolute directory: $DOCKER_ROOT_DIR" >&2
+  exit 2
+fi
+before_bytes="$(df -B1 --output=avail -- "$DOCKER_ROOT_DIR" | awk 'NR == 2 { print $1 }')"
 
 # Images referenced by any running or stopped container are never eligible.
 # The age fence leaves a short rollback window for images from recent deploys.
@@ -40,10 +71,106 @@ cache_summary="$(
     --keep-storage "$BUILD_CACHE_KEEP_STORAGE"
 )"
 
-after_bytes="$(df -B1 --output=avail / | awk 'NR == 2 { print $1 }')"
+after_bytes="$(df -B1 --output=avail -- "$DOCKER_ROOT_DIR" | awk 'NR == 2 { print $1 }')"
 free_bytes_delta=$((after_bytes - before_bytes))
+
+removed_source_trees=0
+removed_source_bytes=0
+staging_age_minutes=$((STAGING_MAX_AGE_HOURS * 60))
+
+remove_source_tree() {
+  local target="$1" target_real bytes
+  [[ -d "$target" && ! -L "$target" ]] || return 0
+  target_real="$(realpath "$target")"
+  if [[ "$target_real" != "$DEPLOY_ROOT/"* || "$target_real" == "$DEPLOY_ROOT" ]]; then
+    echo "Refusing deployment cleanup outside the configured root: $target_real" >&2
+    return 2
+  fi
+  bytes="$(du -sb -- "$target_real" | awk '{ print $1 }')"
+  find "$target_real" -depth -delete
+  removed_source_trees=$((removed_source_trees + 1))
+  removed_source_bytes=$((removed_source_bytes + bytes))
+}
+
+remove_old_children() {
+  local base="$1"
+  if [[ ! -e "$base" ]]; then
+    return 0
+  fi
+  if [[ ! -d "$base" || -L "$base" ]]; then
+    echo "Deployment staging base has an unsafe type: $base" >&2
+    return 2
+  fi
+  while IFS= read -r -d '' child; do
+    remove_source_tree "$child"
+  done < <(
+    find "$base" -mindepth 1 -maxdepth 1 -type d \
+      -mmin "+$staging_age_minutes" -print0
+  )
+}
+
+deployment_cleanup="complete"
+remove_old_children "$DEPLOY_ROOT/deploy-staging"
+remove_old_children "$DEPLOY_ROOT/staging"
+remove_old_children "$DEPLOY_ROOT/incoming"
+while IFS= read -r -d '' child; do
+  remove_source_tree "$child"
+done < <(
+  find "$DEPLOY_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name 'staging-*' -mmin "+$staging_age_minutes" -print0
+)
+
+if [[ -e "$RELEASES_DIR" ]]; then
+  if [[ ! -d "$RELEASES_DIR" || -L "$RELEASES_DIR" ]]; then
+    echo "Deployment releases path has an unsafe type: $RELEASES_DIR" >&2
+    exit 2
+  fi
+  while IFS= read -r -d '' partial; do
+    remove_source_tree "$partial"
+  done < <(
+    find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
+      -name '.materializing-*' -mmin "+$staging_age_minutes" -print0
+  )
+
+  current_release=""
+  if [[ -L "$APP_DIR" ]]; then
+    current_release="$(readlink -f "$APP_DIR")"
+    if [[ "$current_release" != "$RELEASES_DIR/"* || \
+          "$(dirname "$current_release")" != "$RELEASES_DIR" ]]; then
+      echo "Live application symlink does not target one direct release: $current_release" >&2
+      exit 2
+    fi
+  fi
+
+  declare -A kept_releases=()
+  kept_count=0
+  if [[ -n "$current_release" ]]; then
+    kept_releases["$current_release"]=1
+    kept_count=1
+  fi
+  while IFS= read -r -d '' release_record; do
+    release="${release_record#* }"
+    release="$(realpath "$release")"
+    if [[ -n "${kept_releases[$release]:-}" ]]; then
+      continue
+    fi
+    if ((kept_count < RELEASE_KEEP_COUNT)); then
+      kept_releases["$release"]=1
+      kept_count=$((kept_count + 1))
+      continue
+    fi
+    remove_source_tree "$release"
+  done < <(
+    find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d \
+      ! -name '.materializing-*' -printf '%T@ %p\0' | sort -z -nr
+  )
+fi
 
 printf '%s\n' "${image_summary##*$'\n'}"
 printf '%s\n' "${cache_summary##*$'\n'}"
-printf 'Docker storage cleanup complete: free_bytes=%s free_bytes_delta_during_run=%s retention_hours=%s build_cache_keep=%s\n' \
-  "$after_bytes" "$free_bytes_delta" "$RETENTION_HOURS" "$BUILD_CACHE_KEEP_STORAGE"
+printf 'Deployment source cleanup: state=%s removed_trees=%s removed_bytes=%s release_keep=%s staging_max_age_hours=%s\n' \
+  "$deployment_cleanup" "$removed_source_trees" "$removed_source_bytes" \
+  "$RELEASE_KEEP_COUNT" "$STAGING_MAX_AGE_HOURS"
+printf 'Docker storage cleanup complete: docker_root=%s free_bytes=%s free_bytes_delta_during_run=%s retention_hours=%s build_cache_keep=%s\n' \
+  "$DOCKER_ROOT_DIR" "$after_bytes" "$free_bytes_delta" "$RETENTION_HOURS" \
+  "$BUILD_CACHE_KEEP_STORAGE"

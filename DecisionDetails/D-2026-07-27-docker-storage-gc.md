@@ -1,4 +1,4 @@
-# D-2026-07-27-docker-storage-gc — Age-bounded Docker garbage collection
+# D-2026-07-27-docker-storage-gc — Bounded deployment-host garbage collection
 
 ## Evidence
 
@@ -11,6 +11,13 @@ space to 298 GiB without restarting any service.
 The former deployment path accumulated every superseded application image and
 its BuildKit records. Solver evidence, PostgreSQL, Docker volumes, active
 images, and active or stopped containers were not part of the cleanup.
+
+The 2026-08-13 audit found the same unbounded lifecycle outside Docker: the hub
+retained 185 immutable source releases plus stale staging trees, hz-solver2
+retained more than 100 releases plus stale staging/incoming payloads, and the
+remote host had no installed cleanup timer. Those sources are reproducible from
+Git and are not runtime state. Docker also lives on a separate filesystem on
+hz-solver2, so measuring `/` did not measure the resource being reclaimed.
 
 ## Alternatives considered
 
@@ -25,13 +32,24 @@ images, and active or stopped containers were not part of the cleanup.
 4. Run daily, age-bounded image and BuildKit cleanup. Container-referenced
    images remain ineligible, recent unused images provide a rollback window,
    and rebuildable cache is held to a small hot set.
+5. Keep every sealed source release and rely on manual staging cleanup. This is
+   safe per release but has no aggregate bound and had already accumulated
+   thousands of redundant source megabytes.
+6. Keep the live sealed release plus two newest rollback releases, and remove
+   abandoned staging/incoming payloads after 24 hours while holding the same
+   deployment lock. Git remains the durable source and the short local rollback
+   path remains available.
 
-Option 4 is selected. A systemd timer runs daily with a randomized delay,
-removes only images unused by every container and older than 72 hours, and
-bounds rebuildable BuildKit records to a 10 GB hot cache independent of age.
-The job uses an exclusive lock, low CPU priority, and idle I/O priority. It
-never prunes containers, volumes, networks, databases, solver results, or
-evidence.
+Options 4 and 6 are selected. A systemd timer runs daily with a randomized
+delay, retains the exact live source plus two most recent rollback releases,
+removes isolated staging and incoming payloads older than 24 hours only while
+the deployment lock is available, removes only images unused by every
+container and older than 72 hours, and bounds rebuildable BuildKit records to a
+10 GB hot cache independent of age. Docker free-space deltas use Docker's
+reported root filesystem. The job uses an exclusive cleanup lock, the existing
+deployment lock for source mutations, low CPU priority, and idle I/O priority.
+It never prunes containers, volumes, networks, databases, solver results,
+evidence, shared deployment state, or the live sealed release.
 
 ## Verification contract
 
@@ -43,4 +61,11 @@ evidence.
 - Runtime logs label the observed filesystem delta as a during-run measurement,
   not as Docker-attributed reclaimed bytes, because solver writes may overlap.
 - The script rejects invalid retention and cache values.
+- Exactly the live release plus at most two rollback releases remain; the live
+  release remains manifest-verifiable and is never selected by age.
+- Staging/incoming children younger than 24 hours survive; older isolated
+  children are deleted only when the deployment lock is held. A concurrent
+  deploy makes source cleanup a safe no-op.
+- Free-space measurement targets Docker's reported root directory, including
+  when it is a separate mount from `/`.
 - Shell syntax and systemd unit structure validate before installation.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Airfoils.Pro Docker storage cleanup daily
+Description=Run Airfoils.Pro deployment-host storage cleanup daily
 
 [Timer]
 OnCalendar=*-*-* 03:20:00 UTC

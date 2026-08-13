@@ -244,6 +244,28 @@ wait_for_stable_background_service() {
   return 1
 }
 
+install_storage_cleanup_timer() {
+  local installer="$DEPLOY_SCRIPT_DIR/install-docker-storage-prune-timer.sh"
+  if [[ ! -x "$installer" ]]; then
+    echo "Deployment-host cleanup installer is missing or not executable: $installer" >&2
+    return 2
+  fi
+  # The deploy lock deliberately makes an immediate cleanup invocation a
+  # no-op. Install/refresh the persistent timer here; the post-deploy operator
+  # or the next scheduled tick performs reclamation outside this transaction.
+  if [[ "$(id -u)" -eq 0 ]]; then
+    RUN_INITIAL_CLEANUP=0 "$installer" >/dev/null
+  elif sudo -n true 2>/dev/null; then
+    sudo -n env RUN_INITIAL_CLEANUP=0 "$installer" >/dev/null
+  else
+    echo "Production deploy user cannot install the required storage cleanup timer." >&2
+    return 2
+  fi
+  systemctl is-enabled --quiet airfoils-docker-storage-prune.timer
+  systemctl is-active --quiet airfoils-docker-storage-prune.timer
+  echo "Deployment-host storage cleanup timer is installed and active."
+}
+
 main() {
   acquire_deploy_lock || exit $?
   verify_deployment_source || exit $?
@@ -324,6 +346,8 @@ main() {
     wait_for_stable_background_service sweeper "sweeper"
   fi
   wait_for_stable_background_service media-repair "media-repair"
+
+  install_storage_cleanup_timer
 
   echo "Skipping engine gateway/worker redeploy. Engine maintenance is available only through scripts/deploy/rebuild-engine.sh."
 

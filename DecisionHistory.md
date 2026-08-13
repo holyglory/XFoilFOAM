@@ -5389,21 +5389,23 @@ Detail: [DecisionDetails/D-2026-07-19-urans-physical-tail.md](DecisionDetails/D-
 - Decision: preliminary URANS decides steady versus shedding from the complete trailing 2.1-slow-period physical horizon, while its compact trailing integer-period window remains responsible only for periodic coefficients, frame density, and publication. A non-flat physical tail must continue through the existing stationarity controller even when its final compact slice is locally quiet.
 - Why: using one period-cropped history for both decisions repeatedly rejected a real AoA 20 continuation after restoring its complete GCS trajectory. Treating the quiet slice as steady discards physical evidence; accepting it immediately bypasses stationarity; extending every case blindly wastes solver capacity. Independent byte-backed windows preserve the real solver sequence and route the still-relaxing case to bounded same-case continuation.
 
-## D-2026-07-27-docker-storage-gc — Age-bounded Docker garbage collection
+## D-2026-07-27-docker-storage-gc — Bounded deployment-host garbage collection
 
 Detail: [DecisionDetails/D-2026-07-27-docker-storage-gc.md](DecisionDetails/D-2026-07-27-docker-storage-gc.md)
 
-- Decision: production runs a daily, persistent systemd cleanup that removes
-  only Docker images unused by every container and older than 72 hours, then
-  bounds rebuildable BuildKit cache to a 10 GB hot set independent of age.
-  Never prune containers, volumes, networks, databases, solver state, or
-  evidence.
-- Why: manual cleanup let 300 unused image records and 80.23 GB of rebuildable
-  cache close solver storage admission again. Unrestricted system pruning is
-  broader than the observed defect; immediate post-deploy deletion removes the
-  local rollback window. Age-bounded, low-priority garbage collection reclaims
-  deployment churn automatically while preserving live services and recent
-  rollback images.
+- Decision: production runs one daily, persistent cleanup that retains the live
+  sealed source plus two rollback releases, removes isolated deployment payloads
+  older than 24 hours under the deploy lock, removes only unused Docker images
+  older than 72 hours, and bounds BuildKit cache to 10 GB on Docker's actual
+  filesystem. It never prunes containers, volumes, networks, databases, solver
+  state, evidence, shared deployment state, or the live release.
+- Why: keeping every reproducible source release and abandoned staging tree had
+  accumulated another 7–8 GB per host, while hz-solver2 lacked the existing
+  Docker timer and its separate Docker filesystem held 25.59 GB of rebuildable
+  cache. Manual cleanup and unbounded releases repeat the outage; unrestricted
+  system pruning is too broad; deleting every rollback impairs recovery. A
+  deploy-lock-aware current-plus-two policy bounds growth without touching
+  canonical configuration or live compute.
 
 ## D-2026-07-27-workload-aware-disk-admission — Reserve remaining local work
 

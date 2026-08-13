@@ -1,5 +1,5 @@
 [Unit]
-Description=Airfoils.Pro unused Docker image and build-cache cleanup
+Description=Airfoils.Pro bounded deployment-source and Docker cleanup
 Documentation=https://github.com/holyglory/XFoilFOAM
 After=docker.service
 Requires=docker.service
@@ -8,6 +8,8 @@ Requires=docker.service
 Type=oneshot
 Environment=DOCKER_PRUNE_RETENTION_HOURS=72
 Environment=DOCKER_BUILD_CACHE_KEEP_STORAGE=10GB
+Environment=DEPLOYMENT_RELEASE_KEEP_COUNT=3
+Environment=DEPLOYMENT_STAGING_MAX_AGE_HOURS=24
 ExecStart=/usr/local/sbin/airfoils-docker-storage-prune
 Nice=10
 IOSchedulingClass=idle
