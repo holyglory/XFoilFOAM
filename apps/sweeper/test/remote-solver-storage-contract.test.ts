@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   assertRemoteSolverHubUrlContract,
   assertRemoteSolverNodeEvidenceContract,
+  configuredBuildVersion,
 } from "../src/config";
 
 const savedBucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET;
@@ -72,5 +73,23 @@ describe("remote solver hub URL startup contract", () => {
     "https://hub.example.test/api/sync/v1/",
   ])("fails startup closed for unsafe stored endpoint %s", (url) => {
     expect(() => assertRemoteSolverHubUrlContract(url)).toThrow();
+  });
+});
+
+describe("remote solver build identity", () => {
+  it("reports the current deployment build instead of the registration-era value", () => {
+    expect(
+      configuredBuildVersion({
+        AIRFOILFOAM_BUILD_ID: " hz-solver2-current-v12 ",
+        npm_package_version: "0.1.0",
+      }),
+    ).toBe("hz-solver2-current-v12");
+  });
+
+  it("uses package provenance only when no deployment build is configured", () => {
+    expect(configuredBuildVersion({ npm_package_version: " 0.1.0 " })).toBe(
+      "0.1.0",
+    );
+    expect(configuredBuildVersion({})).toBeNull();
   });
 });

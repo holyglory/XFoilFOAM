@@ -77,6 +77,7 @@ import { claimAoas } from "./claim";
 import {
   assertRemoteSolverNodeEvidenceContract,
   assertRemoteSolverHubUrlContract,
+  configuredBuildVersion,
   configuredControlPlaneToken,
   configuredEngineIdentity,
 } from "./config";
@@ -937,10 +938,7 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
       publicEndpoint: settings.publicEndpointOverride,
       cpuCapacity: remoteWorkerCpuCapacity(settings),
       cpuBudget: settings.remoteSolverCpuBudget,
-      buildVersion:
-        process.env.AIRFOILFOAM_BUILD_ID ??
-        process.env.npm_package_version ??
-        null,
+      buildVersion: configuredBuildVersion(),
       metadata: { engine: configuredEngineIdentity() },
     }),
   });
@@ -1017,6 +1015,7 @@ async function heartbeat(
         activeAoaCount,
         cpuCapacity: remoteWorkerCpuCapacity(settings),
         cpuBudget: settings.remoteSolverCpuBudget,
+        buildVersion: configuredBuildVersion(),
         solvedCount,
         pushedCount,
         health: telemetry,
@@ -2354,10 +2353,7 @@ export async function persistClaimedRemotePromise(
       publicEndpoint: settings.publicEndpointOverride,
       cpuCapacity: remoteWorkerCpuCapacity(settings),
       cpuBudget: settings.remoteSolverCpuBudget,
-      buildVersion:
-        process.env.AIRFOILFOAM_BUILD_ID ??
-        process.env.npm_package_version ??
-        null,
+      buildVersion: configuredBuildVersion(),
       authTokenHash: null,
       credentialVersion: 0,
       revokedAt: null,

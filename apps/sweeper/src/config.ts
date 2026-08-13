@@ -14,6 +14,18 @@ export function configuredAdmissionFencePolicy(): SweeperAdmissionFencePolicy {
     : "durable_evidence";
 }
 
+/** Current control-plane build identity advertised on every remote-solver
+ * heartbeat. Registration is deliberately long-lived, so its original value
+ * cannot remain the fleet view's deployment truth after an in-place upgrade. */
+export function configuredBuildVersion(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const buildId = env.AIRFOILFOAM_BUILD_ID?.trim();
+  if (buildId) return buildId;
+  const packageVersion = env.npm_package_version?.trim();
+  return packageVersion || null;
+}
+
 export function configuredEngineIdentity() {
   return openFoamEngineIdentityFromConfig({
     distribution:
