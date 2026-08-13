@@ -9,6 +9,7 @@
 import { pathToFileURL } from "node:url";
 
 import {
+  cancelArchiveInterpretationBackfillRun,
   createArchiveInterpretationBackfillRun,
   discoverArchiveInterpretationBackfill,
   normaliseArchiveInterpretationBackfillScope,
@@ -24,19 +25,24 @@ interface Args {
   scope: ArchiveInterpretationBackfillScope;
   maxItems: number | undefined;
   requestedBy: string | undefined;
+  cancelRunId: string | null;
+  cancellationReason: string | undefined;
 }
 
 function positiveInteger(value: string | undefined, label: string): number {
   const parsed = Number.parseInt(value ?? "", 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 100_000) {
-    throw new Error(`${label} must be a positive integer no greater than 100000`);
+    throw new Error(
+      `${label} must be a positive integer no greater than 100000`,
+    );
   }
   return parsed;
 }
 
 function requiredValue(argv: string[], index: number, label: string): string {
   const value = argv[index + 1];
-  if (!value || value.startsWith("--")) throw new Error(`${label} requires a value`);
+  if (!value || value.startsWith("--"))
+    throw new Error(`${label} requires a value`);
   return value;
 }
 
@@ -51,6 +57,8 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
     scope,
     maxItems: undefined,
     requestedBy: undefined,
+    cancelRunId: null,
+    cancellationReason: undefined,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -60,9 +68,13 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
     }
     const value = requiredValue(argv, index, argument ?? "argument");
     if (argument === "--run-id") parsed.runId = value;
+    else if (argument === "--cancel-run") parsed.cancelRunId = value;
+    else if (argument === "--reason") parsed.cancellationReason = value;
     else if (argument === "--result-id") scope.resultIds!.push(value);
-    else if (argument === "--result-attempt-id") scope.resultAttemptIds!.push(value);
-    else if (argument === "--limit") scope.limit = positiveInteger(value, "--limit");
+    else if (argument === "--result-attempt-id")
+      scope.resultAttemptIds!.push(value);
+    else if (argument === "--limit")
+      scope.limit = positiveInteger(value, "--limit");
     else if (argument === "--max-items") {
       parsed.maxItems = positiveInteger(value, "--max-items");
     } else if (argument === "--requested-by") {
@@ -73,10 +85,35 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
     index += 1;
   }
   normaliseArchiveInterpretationBackfillScope(scope);
-  if (parsed.runId && !parsed.execute) {
-    throw new Error("--run-id requires --execute; planning is always read-only");
+  if (parsed.cancelRunId) {
+    if (
+      parsed.execute ||
+      parsed.runId ||
+      scope.resultIds!.length ||
+      scope.resultAttemptIds!.length ||
+      scope.limit != null ||
+      parsed.maxItems != null ||
+      parsed.requestedBy != null
+    ) {
+      throw new Error(
+        "--cancel-run can be combined only with one non-empty --reason",
+      );
+    }
+    if (!parsed.cancellationReason?.trim()) {
+      throw new Error("--cancel-run requires a non-empty --reason");
+    }
+  } else if (parsed.cancellationReason != null) {
+    throw new Error("--reason requires --cancel-run");
   }
-  if (parsed.runId && (scope.resultIds!.length || scope.resultAttemptIds!.length)) {
+  if (parsed.runId && !parsed.execute) {
+    throw new Error(
+      "--run-id requires --execute; planning is always read-only",
+    );
+  }
+  if (
+    parsed.runId &&
+    (scope.resultIds!.length || scope.resultAttemptIds!.length)
+  ) {
     throw new Error("--run-id cannot be combined with a new result scope");
   }
   return parsed;
@@ -88,6 +125,17 @@ export async function runArchiveInterpretationBackfillCli(
   const args = parseArchiveInterpretationBackfillArgs(argv);
   const { db, sql, engine } = makeContext();
   try {
+    if (args.cancelRunId) {
+      const report = await cancelArchiveInterpretationBackfillRun({
+        db,
+        runId: args.cancelRunId,
+        reason: args.cancellationReason!,
+      });
+      process.stdout.write(
+        `${JSON.stringify({ mode: "cancel", ...report })}\n`,
+      );
+      return;
+    }
     if (!args.execute) {
       const reducerVersionId = await findResultInterpretationReducerVersion(db);
       const discovery = await discoverArchiveInterpretationBackfill(db, {

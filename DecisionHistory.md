@@ -228,14 +228,17 @@
   left the same terminal result pointer-less; settle the exact preliminary
   obligation from that selection. Persist bounded per-case continuation
   metadata, and when an old exact checkpoint is permanently unrestartable,
-  retain its failure evidence but spend at most the remaining fresh-attempt
-  budget.
+  or when its preservation path exceeds an explicit disposable-recovery time
+  budget, retain its failure evidence but spend at most the remaining
+  fresh-attempt budget. A cancelled preservation run is terminal for its exact
+  attempts under that reducer version.
   [detail](DecisionDetails/D-2026-08-12-archive-truth-and-disposable-continuation.md)
-- Why: leaving accepted archive truth blocked wastes already-completed CFD,
-  while requiring monolithic batch metadata made valid cases inaccessible.
-  Mutating attempts or bypassing evidence gates was rejected; endlessly
-  retrying the same checkpoint was also rejected. Exact CAS selection plus a
-  one-time fresh fallback preserves truth and the disposable-compute policy.
+- Why: leaving quickly recoverable accepted archive truth blocked wastes
+  already-completed CFD, while requiring monolithic batch metadata made valid
+  cases inaccessible. Mutating attempts or bypassing evidence gates was
+  rejected; so was preservation that takes longer than a fresh solve. Exact
+  CAS selection plus a terminal operator abandonment and one-time fresh
+  fallback preserve truth and the disposable-compute policy.
 
 ## D-2026-07-25-remote-promise-ownership-review — Exclusive remote leases and decision-ready review
 

@@ -3,10 +3,12 @@ import { EngineError, EngineTimeoutError } from "@aerodb/engine-client";
 
 import {
   archiveBackfillFidelity,
+  archiveInterpretationCandidateDisposition,
   exactArchiveBackfillFidelity,
   archiveBackfillRecoveryProgress,
   archiveBackfillRecoveryHandoff,
   archiveRecoveryMayAdoptCorrectiveTail,
+  archiveInterpretationRunSummaryState,
   archiveRecommendedAdditionalPeriods,
   archivePointerForBackfill,
   archiveReducerNeedsRecoveryHandoff,
@@ -180,6 +182,62 @@ describe("archive clean-cycle interpretation backfill", () => {
       execute: true,
       scope: { resultIds: [UUID_A], limit: 12 },
     });
+  });
+
+  it("MUST-CATCH: archive cancellation is explicit, reasoned, and cannot be mixed with execution", () => {
+    expect(
+      parseArchiveInterpretationBackfillArgs([
+        "--cancel-run",
+        UUID_A,
+        "--reason",
+        "fresh v11 solve is cheaper than archive hydration",
+      ]),
+    ).toMatchObject({
+      execute: false,
+      cancelRunId: UUID_A,
+      cancellationReason: "fresh v11 solve is cheaper than archive hydration",
+    });
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs(["--cancel-run", UUID_A]),
+    ).toThrow(/requires a non-empty --reason/);
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs([
+        "--execute",
+        "--cancel-run",
+        UUID_A,
+        "--reason",
+        "conflicting operation",
+      ]),
+    ).toThrow(/combined only/);
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs(["--reason", "no run"]),
+    ).toThrow(/requires --cancel-run/);
+    expect(
+      archiveInterpretationRunSummaryState({
+        currentState: "cancelled",
+        openItems: 16,
+      }),
+    ).toBe("cancelled");
+    expect(
+      archiveInterpretationRunSummaryState({
+        currentState: "running",
+        openItems: 0,
+      }),
+    ).toBe("completed");
+    expect(
+      archiveInterpretationCandidateDisposition(
+        { sourceArchiveId: UUID_A, resultAttemptId: UUID_B },
+        new Set(),
+        new Set([UUID_B]),
+      ),
+    ).toBe("abandoned");
+    expect(
+      archiveInterpretationCandidateDisposition(
+        { sourceArchiveId: UUID_A, resultAttemptId: UUID_B },
+        new Set([UUID_A]),
+        new Set([UUID_B]),
+      ),
+    ).toBe("interpreted");
   });
 
   it("builds an exact recovery action for the durable scheduler ledger instead of silently rerunning", () => {

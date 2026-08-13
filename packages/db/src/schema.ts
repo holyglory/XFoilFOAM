@@ -2515,7 +2515,7 @@ export const resultInterpretationBackfillItems = pgTable(
     ),
     stateCheck: check(
       "result_interpretation_backfill_items_state_check",
-      sql`${t.state} IN ('pending', 'hydrating', 'reduced', 'missing_evidence', 'continuation_required', 'rerun_required', 'terminal_failure', 'failed')`,
+      sql`${t.state} IN ('pending', 'hydrating', 'reduced', 'missing_evidence', 'continuation_required', 'rerun_required', 'terminal_failure', 'failed', 'abandoned')`,
     ),
     attemptCountCheck: check(
       "result_interpretation_backfill_items_attempt_count_check",

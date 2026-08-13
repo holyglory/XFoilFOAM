@@ -41,6 +41,13 @@ repair that representation problem.
    tighter pressure/transport, 4x3 PIMPLE rung now also triggers on typed
    high-frequency/noisy tails, persists with the exact trajectory, and never
    slows healthy jobs globally.
+7. Archive recovery is opportunistic in a user-authorized disposable-CFD
+   recovery. If authenticated hydration exceeds the operator's explicit time
+   budget or no longer beats recomputation, cancel the exact backfill run and
+   atomically mark its open receipts abandoned. That cancellation is terminal
+   for those attempt/reducer pairs, cannot be revived by an in-flight worker,
+   and yields only to a separately audited bounded fresh physical solve. The
+   old attempt and archive remain immutable and unpublished.
 
 ## Alternatives considered
 
@@ -66,6 +73,14 @@ Rejected. Healthy trajectories should retain normal throughput. The stronger
 settings are justified only after the live quality reducer identifies the
 typed numerical-noise class.
 
+### Continue archive hydration regardless of elapsed time
+
+Rejected for an explicitly disposable recovery. Archive interpretation is
+valuable only while it is faster than producing new evidence. Continuing a
+slow preservation path delays recovery and contradicts the established compute
+economics; abandoning the mutable work receipt is safe because it neither
+changes the source evidence nor relaxes publication validation.
+
 ## Verification
 
 - Core regressions cover ulp-level period tolerance, a genuinely short period
@@ -79,3 +94,6 @@ typed numerical-noise class.
 - DB-backed ladder regression proves permanent continuation failure produces
   one fresh request without another `continue_from`, while preserving the
   failed submission audit and physical-attempt limit.
+- Archive-worker regressions prove cancellation is terminal, claim races cannot
+  revive it, and maintenance does not rediscover an abandoned attempt under the
+  same reducer version.

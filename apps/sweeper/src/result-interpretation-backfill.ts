@@ -82,6 +82,8 @@ export type ArchiveInterpretationBackfillDiscovery = {
   candidates: ArchiveInterpretationBackfillCandidate[];
   scanned: number;
   skippedExistingInterpretations: number;
+  /** Exact attempt/reducer pairs deliberately retired by an operator. */
+  skippedAbandonedReceipts: number;
   scope: Required<ArchiveInterpretationBackfillScope>;
 };
 
@@ -90,8 +92,27 @@ export type ArchiveInterpretationBackfillRun = {
   reducerVersionId: string;
   enqueued: number;
   skippedExistingInterpretations: number;
+  skippedAbandonedReceipts: number;
   state: "running" | "completed";
 };
+
+export function archiveInterpretationCandidateDisposition(
+  candidate: Pick<
+    ArchiveInterpretationBackfillCandidate,
+    "sourceArchiveId" | "resultAttemptId"
+  >,
+  interpretedArchiveIds: ReadonlySet<string>,
+  abandonedAttemptIds: ReadonlySet<string>,
+): "pending" | "interpreted" | "abandoned" {
+  if (
+    candidate.sourceArchiveId &&
+    interpretedArchiveIds.has(candidate.sourceArchiveId)
+  ) {
+    return "interpreted";
+  }
+  if (abandonedAttemptIds.has(candidate.resultAttemptId)) return "abandoned";
+  return "pending";
+}
 
 export type ArchiveInterpretationBackfillReport = {
   runId: string;
@@ -157,7 +178,8 @@ type BackfillItemState =
   | "continuation_required"
   | "rerun_required"
   | "terminal_failure"
-  | "failed";
+  | "failed"
+  | "abandoned";
 
 type ClaimedBackfillItem = {
   id: string;
@@ -428,15 +450,59 @@ export async function discoverArchiveInterpretationBackfill(
       if (row.sourceArchiveId) interpretedArchiveIds.add(row.sourceArchiveId);
     }
   }
+  const abandonedAttemptIds = new Set<string>();
+  const candidateAttemptIds = candidates.map(
+    (candidate) => candidate.resultAttemptId,
+  );
+  if (candidateAttemptIds.length && opts.reducerVersionId) {
+    const abandoned = await db
+      .select({
+        resultAttemptId: resultInterpretationBackfillItems.resultAttemptId,
+      })
+      .from(resultInterpretationBackfillItems)
+      .innerJoin(
+        resultInterpretationBackfillRuns,
+        eq(
+          resultInterpretationBackfillRuns.id,
+          resultInterpretationBackfillItems.runId,
+        ),
+      )
+      .where(
+        and(
+          eq(
+            resultInterpretationBackfillRuns.reducerVersionId,
+            opts.reducerVersionId,
+          ),
+          eq(resultInterpretationBackfillItems.state, "abandoned"),
+          inArray(
+            resultInterpretationBackfillItems.resultAttemptId,
+            candidateAttemptIds,
+          ),
+        ),
+      );
+    for (const row of abandoned) {
+      abandonedAttemptIds.add(row.resultAttemptId);
+    }
+  }
+  const dispositions = candidates.map((candidate) =>
+    archiveInterpretationCandidateDisposition(
+      candidate,
+      interpretedArchiveIds,
+      abandonedAttemptIds,
+    ),
+  );
   const pending = candidates.filter(
-    (candidate) =>
-      !candidate.sourceArchiveId ||
-      !interpretedArchiveIds.has(candidate.sourceArchiveId),
+    (_candidate, index) => dispositions[index] === "pending",
   );
   return {
     candidates: pending,
     scanned: candidates.length,
-    skippedExistingInterpretations: candidates.length - pending.length,
+    skippedExistingInterpretations: dispositions.filter(
+      (disposition) => disposition === "interpreted",
+    ).length,
+    skippedAbandonedReceipts: dispositions.filter(
+      (disposition) => disposition === "abandoned",
+    ).length,
     scope,
   };
 }
@@ -474,6 +540,7 @@ export async function createArchiveInterpretationBackfillRun(opts: {
         enqueued: discovery.candidates.length,
         skippedExistingInterpretations:
           discovery.skippedExistingInterpretations,
+        skippedAbandonedReceipts: discovery.skippedAbandonedReceipts,
         canonicalSelectionsCreated: 0,
         resultProjectionsUpdated: 0,
       },
@@ -504,6 +571,7 @@ export async function createArchiveInterpretationBackfillRun(opts: {
     reducerVersionId,
     enqueued: discovery.candidates.length,
     skippedExistingInterpretations: discovery.skippedExistingInterpretations,
+    skippedAbandonedReceipts: discovery.skippedAbandonedReceipts,
     state: initialState,
   };
 }
@@ -515,6 +583,15 @@ async function claimNextArchiveInterpretationItem(
   const now = new Date();
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+    // Serialize claims with operator cancellation. Once cancellation owns this
+    // row, no already-running worker loop may claim another archive receipt.
+    const [run] = await tx
+      .select({ state: resultInterpretationBackfillRuns.state })
+      .from(resultInterpretationBackfillRuns)
+      .where(eq(resultInterpretationBackfillRuns.id, runId))
+      .limit(1)
+      .for("update");
+    if (run?.state !== "running") return null;
     const [item] = await tx
       .select({
         id: resultInterpretationBackfillItems.id,
@@ -1194,44 +1271,141 @@ async function countRunCanonicalSelections(
   };
 }
 
+export function archiveInterpretationRunSummaryState(input: {
+  currentState: "planned" | "running" | "completed" | "failed" | "cancelled";
+  openItems: number;
+  forceFailed?: boolean;
+}): ArchiveInterpretationBackfillReport["state"] {
+  if (input.currentState === "cancelled") return "cancelled";
+  if (input.currentState === "failed" || input.forceFailed) return "failed";
+  return input.openItems === 0 ? "completed" : "running";
+}
+
 async function refreshRunSummary(
   db: DB,
   runId: string,
   opts: { processed: number; forceFailed?: boolean } = { processed: 0 },
 ): Promise<ArchiveInterpretationBackfillReport> {
-  const [counts, selections] = await Promise.all([
-    countRunItems(db, runId),
-    countRunCanonicalSelections(db, runId),
-  ]);
-  const open = (counts.pending ?? 0) + (counts.hydrating ?? 0);
-  const state = opts.forceFailed
-    ? "failed"
-    : open === 0
-      ? "completed"
-      : "running";
-  const now = new Date();
-  await db
-    .update(resultInterpretationBackfillRuns)
-    .set({
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    // Summary refresh shares the run-row mutex with claim and cancellation.
+    // Without this lock, a worker that read "running" just before cancellation
+    // could write that stale state back after the cancellation committed.
+    const [lockedRun] = await tx
+      .select({ id: resultInterpretationBackfillRuns.id })
+      .from(resultInterpretationBackfillRuns)
+      .where(eq(resultInterpretationBackfillRuns.id, runId))
+      .limit(1)
+      .for("update");
+    if (!lockedRun) {
+      throw new Error(
+        `archive interpretation backfill run ${runId} was not found`,
+      );
+    }
+    const currentRun = await readRun(tx, runId);
+    const counts = await countRunItems(tx, runId);
+    const selections = await countRunCanonicalSelections(tx, runId);
+    if (!currentRun) {
+      throw new Error(
+        `archive interpretation backfill run ${runId} was not found`,
+      );
+    }
+    const open = (counts.pending ?? 0) + (counts.hydrating ?? 0);
+    const state = archiveInterpretationRunSummaryState({
+      currentState: currentRun.state,
+      openItems: open,
+      forceFailed: opts.forceFailed,
+    });
+    const now = new Date();
+    await tx
+      .update(resultInterpretationBackfillRuns)
+      .set({
+        state,
+        completedAt:
+          state === "completed" || state === "failed" || state === "cancelled"
+            ? now
+            : null,
+        summary: {
+          counts,
+          processedThisInvocation: opts.processed,
+          canonicalSelectionsCreated: selections.events,
+          resultProjectionsUpdated: selections.currentProjections,
+          rawEvidenceImmutable: true,
+        },
+      })
+      .where(eq(resultInterpretationBackfillRuns.id, runId));
+    return {
+      runId,
       state,
-      completedAt: state === "completed" || state === "failed" ? now : null,
-      summary: {
-        counts,
-        processedThisInvocation: opts.processed,
-        canonicalSelectionsCreated: selections.events,
-        resultProjectionsUpdated: selections.currentProjections,
-        rawEvidenceImmutable: true,
-      },
-    })
-    .where(eq(resultInterpretationBackfillRuns.id, runId));
-  return {
-    runId,
-    state,
-    processed: opts.processed,
-    counts,
-    canonicalSelectionsCreated: selections.events,
-    resultProjectionsUpdated: selections.currentProjections,
-  };
+      processed: opts.processed,
+      counts,
+      canonicalSelectionsCreated: selections.events,
+      resultProjectionsUpdated: selections.currentProjections,
+    };
+  });
+}
+
+/**
+ * Stop mutable archive-preservation work without changing source evidence.
+ * The run row is the cancellation mutex; open item claims become terminal
+ * before the mutex is released, so late reducer responses lose their item CAS
+ * and the same attempt cannot be rediscovered under this reducer version.
+ */
+export async function cancelArchiveInterpretationBackfillRun(opts: {
+  db: DB;
+  runId: string;
+  reason: string;
+}): Promise<ArchiveInterpretationBackfillReport> {
+  const reason = opts.reason.trim();
+  if (!reason)
+    throw new Error("archive interpretation cancellation requires a reason");
+  await opts.db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [run] = await tx
+      .select({ state: resultInterpretationBackfillRuns.state })
+      .from(resultInterpretationBackfillRuns)
+      .where(eq(resultInterpretationBackfillRuns.id, opts.runId))
+      .limit(1)
+      .for("update");
+    if (!run) {
+      throw new Error(
+        `archive interpretation backfill run ${opts.runId} was not found`,
+      );
+    }
+    if (run.state === "cancelled") return;
+    if (run.state === "completed" || run.state === "failed") {
+      throw new Error(
+        `archive interpretation backfill run ${opts.runId} is already ${run.state}`,
+      );
+    }
+    const now = new Date();
+    await tx
+      .update(resultInterpretationBackfillItems)
+      .set({
+        state: "abandoned",
+        claimToken: null,
+        claimExpiresAt: null,
+        nextAttemptAt: now,
+        lastError: `operator abandoned archive preservation: ${reason}`.slice(
+          0,
+          2_000,
+        ),
+      })
+      .where(
+        and(
+          eq(resultInterpretationBackfillItems.runId, opts.runId),
+          inArray(resultInterpretationBackfillItems.state, [
+            "pending",
+            "hydrating",
+          ]),
+        ),
+      );
+    await tx
+      .update(resultInterpretationBackfillRuns)
+      .set({ state: "cancelled", completedAt: now })
+      .where(eq(resultInterpretationBackfillRuns.id, opts.runId));
+  });
+  return refreshRunSummary(opts.db, opts.runId, { processed: 0 });
 }
 
 /**
@@ -1277,10 +1451,19 @@ export async function runArchiveInterpretationBackfill(opts: {
   }
   if (run.state === "completed")
     return refreshRunSummary(opts.db, run.id, { processed: 0 });
-  await opts.db
+  const [started] = await opts.db
     .update(resultInterpretationBackfillRuns)
     .set({ state: "running", startedAt: new Date(), completedAt: null })
-    .where(eq(resultInterpretationBackfillRuns.id, run.id));
+    .where(
+      and(
+        eq(resultInterpretationBackfillRuns.id, run.id),
+        inArray(resultInterpretationBackfillRuns.state, ["planned", "running"]),
+      ),
+    )
+    .returning({ id: resultInterpretationBackfillRuns.id });
+  if (!started) {
+    return refreshRunSummary(opts.db, run.id, { processed: 0 });
+  }
 
   let processed = 0;
   while (processed < maxItems) {
