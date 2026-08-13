@@ -5528,6 +5528,17 @@ async function processRemoteResultDeliveries(
                 )
               )
           )
+          OR (
+            ${simJobs.status} = 'done'
+            AND EXISTS (
+              SELECT 1
+              FROM results rejected_result
+              JOIN result_classifications rejected_classification
+                ON rejected_classification.result_id = rejected_result.id
+               AND rejected_classification.state = 'rejected'
+              WHERE rejected_result.sim_job_id = ${simJobs.id}
+            )
+          )
         )`,
       ),
     )

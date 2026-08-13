@@ -11,13 +11,6 @@
   their unfulfilled hub points can be re-promised. Verify hub authority release,
   remote disk reclaim, 64-slot refill, valid delivery, and post-terminal strip.
 
-- **Disposable archive-backfill cancellation:** The active production archive
-  run must be cancelled without worker revival, all open exact receipts must be
-  terminally abandoned for the pinned reducer, and the 100 blocked campaign
-  cells must spend their existing remaining fresh-v11 attempt. Verify zero open
-  archive receipts, zero `rejected_exhausted` obligations, real replacement
-  jobs entering the hub/remote queues, and no legacy canonical selection.
-
 - **AoA evidence rendered interaction proof:** Commit `d17c991` is deployed and
   the live API/build prove the stable result identity, classic-RANS explanation,
   retained-content transition, cache, and prefetch implementation. The two-case
