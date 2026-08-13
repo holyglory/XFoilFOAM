@@ -10,20 +10,21 @@ const source = (relativePath: string) =>
   );
 
 describe("solver terminology contract", () => {
-  it("MUST-CATCH: never presents exhausted URANS recovery as an ordinary blocked point", () => {
+  it("MUST-CATCH: unpublished point evidence stays calm and links to exact point tools", () => {
     const adminConsole = source("components/admin/AdminConsole.tsx");
     const pointHistory = source("components/admin/PointHistoryPanel.tsx");
+    const correctionForm = source("components/admin/PointCorrectionForm.tsx");
 
-    expect(adminConsole).not.toContain("failed or blocked point");
-    expect(adminConsole).not.toContain(
-      "{(c.blockedPoints ?? 0).toLocaleString()} blocked",
-    );
-    expect(adminConsole).toContain(
-      "{(c.blockedPoints ?? 0).toLocaleString()} critical",
-    );
+    expect(adminConsole).toContain('onOpenCampaignPoints(c.id, "unpublished")');
+    expect(adminConsole).toContain("not published");
+    expect(adminConsole).not.toContain("critical recover");
     expect(pointHistory).not.toContain(">verify blocked<");
-    expect(pointHistory).toContain(">final URANS critical<");
     expect(pointHistory).toContain(">final URANS queued<");
+    expect(pointHistory).toContain(
+      'data-testid="point-publication-explanation"',
+    );
+    expect(correctionForm).toContain('data-testid="point-correction-submit"');
+    expect(correctionForm).toContain("new immutable, single-angle setup");
   });
 
   it("names the affected action instead of calling forecast reserve a storage block", () => {

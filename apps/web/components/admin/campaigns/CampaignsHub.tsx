@@ -741,13 +741,24 @@ export function CampaignsHub({
                     {blocked > 0 && (
                       <>
                         {" · "}
-                        <span
+                        <button
+                          type="button"
                           data-testid={`campaign-blocked-${item.slug}`}
-                          title="These points used all automatic solver attempts and remain unpublished. The campaign continues; no user action is required."
-                          style={{ color: C.amber }}
+                          title="These points used all automatic solver attempts and remain unpublished. Open their stored evidence and point-scoped solver tools."
+                          onClick={() => onOpenPoints(item.id, "unpublished")}
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 10,
+                            color: C.amber,
+                            background: "transparent",
+                            border: "none",
+                            padding: 0,
+                            cursor: "pointer",
+                            textDecoration: "underline",
+                          }}
                         >
                           {fCount(blocked)} not published
-                        </span>
+                        </button>
                       </>
                     )}
                     {automaticFast > 0 && (

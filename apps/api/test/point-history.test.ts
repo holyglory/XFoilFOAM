@@ -13,6 +13,7 @@
 import { type Point } from "@aerodb/core";
 import {
   airfoils,
+  boundaryConditions,
   boundaryProfiles,
   categories,
   ensurePrecalcObligations,
@@ -20,13 +21,17 @@ import {
   meshProfiles,
   onResultIngested,
   outputProfiles,
+  pointCorrectionRuns,
   resultAttempts,
   resultClassifications,
   results,
   simJobs,
   simPrecalcObligations,
   simResultSubmitRetries,
+  simUransRequests,
+  simulationPresets,
   solverProfiles,
+  sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { createAcceptedPrecalcAttemptFixture } from "@aerodb/db/test-fixtures";
@@ -64,6 +69,18 @@ let conditionId = "";
 let revisionId = "";
 let bcId = "";
 let presetId = "";
+let rejectedCurrentAttemptId = "";
+let rejectedOlderAttemptId = "";
+let correctionCleanup:
+  | {
+      presetId: string;
+      requestId: string;
+      meshProfileId: string;
+      solverProfileId: string;
+      sweepDefinitionId: string;
+      boundaryConditionId: string | null;
+    }
+  | undefined;
 const numerics = {
   boundaryProfileId: "",
   meshProfileId: "",
@@ -372,47 +389,56 @@ beforeAll(async () => {
       engineJobId: `${PREFIX}-engine-1`,
     })
     .returning({ id: simJobs.id });
-  await db.insert(resultAttempts).values([
-    {
-      resultId: rejId,
-      airfoilId,
-      bcId,
-      simulationPresetRevisionId: revisionId,
-      aoaDeg: -1,
-      simJobId: job.id,
-      engineJobId: `${PREFIX}-engine-1`,
-      status: "done",
-      source: "solved",
-      regime: "rans",
-      validForPolar: false,
-      converged: false,
-      stalled: true,
-      cl: -0.4,
-      cd: 0.05,
-      createdAt: new Date(Date.now() - 60_000),
-      solvedAt: new Date(Date.now() - 60_000),
-    },
-    {
-      resultId: rejId,
-      airfoilId,
-      bcId,
-      simulationPresetRevisionId: revisionId,
-      aoaDeg: -1,
-      simJobId: job.id,
-      engineJobId: `${PREFIX}-engine-1`,
-      status: "done",
-      source: "solved",
-      regime: "urans",
-      validForPolar: true,
-      converged: true,
-      unsteady: true,
-      cl: -0.05,
-      cd: 0.03,
-      qualityWarnings: ["URANS shedding unmeasurable: no dominant frequency"],
-      createdAt: new Date(Date.now() - 30_000),
-      solvedAt: new Date(Date.now() - 30_000),
-    },
-  ]);
+  const rejectedAttempts = await db
+    .insert(resultAttempts)
+    .values([
+      {
+        resultId: rejId,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: -1,
+        simJobId: job.id,
+        engineJobId: `${PREFIX}-engine-1`,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        stalled: true,
+        cl: -0.4,
+        cd: 0.05,
+        createdAt: new Date(Date.now() - 60_000),
+        solvedAt: new Date(Date.now() - 60_000),
+      },
+      {
+        resultId: rejId,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: -1,
+        simJobId: job.id,
+        engineJobId: `${PREFIX}-engine-1`,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: true,
+        converged: true,
+        unsteady: true,
+        cl: -0.05,
+        cd: 0.03,
+        qualityWarnings: ["URANS shedding unmeasurable: no dominant frequency"],
+        createdAt: new Date(Date.now() - 30_000),
+        solvedAt: new Date(Date.now() - 30_000),
+      },
+    ])
+    .returning({ id: resultAttempts.id });
+  rejectedCurrentAttemptId = rejectedAttempts[1]!.id;
+  rejectedOlderAttemptId = rejectedAttempts[0]!.id;
+  await db
+    .update(results)
+    .set({ currentResultAttemptId: rejectedCurrentAttemptId })
+    .where(eq(results.id, rejId));
   // The failed α=0 point carries two failed attempts (RANS ✗ → URANS ✗ timeout).
   await db.insert(resultAttempts).values([
     {
@@ -475,6 +501,34 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
+  if (correctionCleanup) {
+    await db
+      .delete(pointCorrectionRuns)
+      .where(
+        eq(pointCorrectionRuns.uransRequestId, correctionCleanup.requestId),
+      );
+    await db
+      .delete(simUransRequests)
+      .where(eq(simUransRequests.id, correctionCleanup.requestId));
+    await db
+      .delete(simulationPresets)
+      .where(eq(simulationPresets.id, correctionCleanup.presetId));
+    if (correctionCleanup.boundaryConditionId)
+      await db
+        .delete(boundaryConditions)
+        .where(
+          eq(boundaryConditions.id, correctionCleanup.boundaryConditionId),
+        );
+    await db
+      .delete(meshProfiles)
+      .where(eq(meshProfiles.id, correctionCleanup.meshProfileId));
+    await db
+      .delete(solverProfiles)
+      .where(eq(solverProfiles.id, correctionCleanup.solverProfileId));
+    await db
+      .delete(sweepDefinitions)
+      .where(eq(sweepDefinitions.id, correctionCleanup.sweepDefinitionId));
+  }
   await cleanupCampaignFixtures(db, {
     campaignIds: cleanupCampaignIds,
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
@@ -676,6 +730,19 @@ describe("point-history table endpoint", () => {
   });
 
   it("classification filters return only their bucket (rejected + needs_urans)", async () => {
+    const unpublished = await app.inject({
+      method: "GET",
+      url: listUrl({ status: "unpublished", airfoil: `${PREFIX} Story` }),
+    });
+    expect(unpublished.statusCode).toBe(200);
+    expect(
+      unpublished
+        .json()
+        .items.map((item: { resultId: string }) => item.resultId)
+        .sort(),
+    ).toEqual([resultIdByAoa.get(-1), resultIdByAoa.get(0)].sort());
+    expect(unpublished.json().counts.unpublished).toBe(2);
+
     const rej = await app.inject({
       method: "GET",
       url: listUrl({ status: "rejected", airfoil: `${PREFIX} Story` }),
@@ -969,6 +1036,119 @@ describe("point-history story endpoint", () => {
       openAirfoils: 0,
       totalAirfoils: 1,
     });
+    expect(story.point.resultAttemptId).toBe(rejectedCurrentAttemptId);
+    expect(story.point.correctionSetup).toMatchObject({
+      mesh: { nSurface: expect.any(Number), nRadial: expect.any(Number) },
+      solver: {
+        transientCycles: expect.any(Number),
+        transientMaxCourant: expect.any(Number),
+      },
+    });
+  });
+
+  it("creates one idempotent immutable corrected setup and exact-angle URANS request", async () => {
+    const resultId = resultIdByAoa.get(-1)!;
+    const storyResponse = await app.inject({
+      method: "GET",
+      url: `/api/admin/point-history/${resultId}/story`,
+    });
+    expect(storyResponse.statusCode).toBe(200);
+    const story = storyResponse.json();
+    const payload = {
+      resultAttemptId: story.point.resultAttemptId,
+      fidelity: "precalc",
+      mesh: {
+        ...story.point.correctionSetup.mesh,
+        nSurface: story.point.correctionSetup.mesh.nSurface + 20,
+      },
+      solver: {
+        ...story.point.correctionSetup.solver,
+        transientCycles: story.point.correctionSetup.solver.transientCycles + 4,
+        transientMaxCourant: Math.min(
+          story.point.correctionSetup.solver.transientMaxCourant,
+          0.5,
+        ),
+      },
+    };
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/admin/point-history/${resultId}/corrected-run`,
+      payload,
+    });
+    expect(first.statusCode, JSON.stringify(first.json())).toBe(201);
+    const firstBody = first.json();
+    const [correctedPreset] = await db
+      .select()
+      .from(simulationPresets)
+      .where(eq(simulationPresets.id, firstBody.presetId));
+    correctionCleanup = {
+      presetId: correctedPreset.id,
+      requestId: firstBody.request.id,
+      meshProfileId: correctedPreset.meshProfileId,
+      solverProfileId: correctedPreset.solverProfileId,
+      sweepDefinitionId: correctedPreset.sweepDefinitionId,
+      boundaryConditionId: correctedPreset.legacyBoundaryConditionId,
+    };
+    expect(firstBody.created).toBe(true);
+    expect(firstBody.resultAttemptId).toBe(rejectedCurrentAttemptId);
+    expect(firstBody.revisionId).not.toBe(revisionId);
+    expect(firstBody.request).toMatchObject({
+      airfoilId,
+      revisionId: firstBody.revisionId,
+      aoaDeg: -1,
+      fidelity: "precalc",
+      state: "pending",
+    });
+
+    const replay = await app.inject({
+      method: "POST",
+      url: `/api/admin/point-history/${resultId}/corrected-run`,
+      payload,
+    });
+    expect(replay.statusCode, JSON.stringify(replay.json())).toBe(200);
+    expect(replay.json()).toMatchObject({
+      created: false,
+      presetId: firstBody.presetId,
+      revisionId: firstBody.revisionId,
+      request: { id: firstBody.request.id },
+    });
+
+    expect(correctedPreset).toMatchObject({
+      enabled: false,
+      targetScope: "airfoils",
+      meshProfileId: correctedPreset.uransMeshProfileId,
+      uransPrecalcMeshProfileId: correctedPreset.meshProfileId,
+    });
+    const [sourcePreset] = await db
+      .select({ enabled: simulationPresets.enabled })
+      .from(simulationPresets)
+      .where(eq(simulationPresets.id, presetId));
+    expect(sourcePreset.enabled).toBe(true);
+
+    const correctedStory = await app.inject({
+      method: "GET",
+      url: `/api/admin/point-history/${resultId}/story`,
+    });
+    expect(correctedStory.statusCode).toBe(200);
+    expect(correctedStory.json().corrections).toEqual([
+      expect.objectContaining({
+        id: firstBody.correctionRunId,
+        sourceResultAttemptId: rejectedCurrentAttemptId,
+        presetId: firstBody.presetId,
+        revisionId: firstBody.revisionId,
+        requestId: firstBody.request.id,
+        fidelity: "precalc",
+        state: "pending",
+      }),
+    ]);
+
+    const stale = await app.inject({
+      method: "POST",
+      url: `/api/admin/point-history/${resultId}/corrected-run`,
+      payload: { ...payload, resultAttemptId: rejectedOlderAttemptId },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error).toContain("point changed");
   });
 
   it("does NOT attribute the interruption to points outside the cancelled job's aoa list", async () => {
@@ -1552,12 +1732,21 @@ describe("legacy global failed-result requeue", () => {
 });
 
 describe("auth hardening", () => {
-  it("requires admin for all three point-history routes in prod mode", async () => {
+  it("requires admin for every point-history route in prod mode", async () => {
     process.env.ADMIN_AUTH_REQUIRED = "true";
     try {
       expect(
         (await app.inject({ method: "GET", url: "/api/admin/point-history" }))
           .statusCode,
+      ).toBe(401);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/admin/point-history/${resultIdByAoa.get(-1)}/corrected-run`,
+            payload: {},
+          })
+        ).statusCode,
       ).toBe(401);
       expect(
         (

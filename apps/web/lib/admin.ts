@@ -191,21 +191,14 @@ export interface AdminSolverIncidentEvent {
   reason: string;
   severity: AdminSolverIncidentSeverity;
   status: "open" | "resolved";
-  operationalState:
-    | "automatic_recovery"
-    | "system_attention"
-    | "resolved";
+  operationalState: "automatic_recovery" | "system_attention" | "resolved";
   userActionRequired: false;
   solverImplementationId: string;
   solverImplementationKey: string;
   remediationVersion: string;
   occurrenceKey: string;
   owner: {
-    type:
-      | "result"
-      | "precalc_obligation"
-      | "verify_queue"
-      | "urans_request";
+    type: "result" | "precalc_obligation" | "verify_queue" | "urans_request";
     id: string;
   };
   simJobId: string | null;
@@ -803,6 +796,27 @@ export const requeuePoint = (resultId: string) =>
   aj<{ requeued: 1; scope: "failed" | "rejected"; campaignIds: string[] }>(
     `/api/admin/point-history/${encodeURIComponent(resultId)}/requeue`,
     { method: "POST", body: JSON.stringify({}) },
+  );
+export interface PointCorrectedRunOutcome {
+  correctionRunId: string;
+  presetId: string;
+  revisionId: string;
+  resultAttemptId: string;
+  request: AdminUransRequest;
+  created: boolean;
+}
+export const createPointCorrectedRun = (
+  resultId: string,
+  input: {
+    resultAttemptId: string;
+    fidelity: "precalc" | "full";
+    mesh: import("./point-history").PointCorrectionSettings["mesh"];
+    solver: import("./point-history").PointCorrectionSettings["solver"];
+  },
+) =>
+  aj<PointCorrectedRunOutcome>(
+    `/api/admin/point-history/${encodeURIComponent(resultId)}/corrected-run`,
+    { method: "POST", body: JSON.stringify(input) },
   );
 
 // ---- Fidelity ladder: admin request-URANS (contract 6) ----

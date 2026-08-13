@@ -117,15 +117,15 @@ describe("fidelityChipView", () => {
     });
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "cancelled" })),
-    ).toEqual({ label: "CRITICAL · URANS final", tone: "red" });
+    ).toEqual({ label: "final not published", tone: "amber" });
     expect(
       fidelityChipView(
         "urans_precalc",
         verifyInfo({ state: "blocked", submitError: "HTTP 422" }),
       ),
     ).toEqual({
-      label: "CRITICAL · URANS final",
-      tone: "red",
+      label: "final not published",
+      tone: "amber",
     });
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "done" })),
@@ -233,10 +233,13 @@ function storyWith(verify: PointVerifyInfo | null): PointStoryPayload {
       workDisposition: null,
       continuable: false,
       continuationResultAttemptId: null,
+      resultAttemptId: "attempt-1",
+      correctionSetup: null,
       verify,
     },
     attempts: [],
     interruptions: [],
+    corrections: [],
     closure: null,
   };
 }

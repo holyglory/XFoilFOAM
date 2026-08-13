@@ -11,6 +11,7 @@
  *  filter but is not advertised while no active solver path can assign it. */
 export const POINT_STATUS_CHIPS = [
   "all",
+  "unpublished",
   "failed",
   "awaiting_urans",
   "accepted",
@@ -98,6 +99,7 @@ export interface PointHistoryItem {
 }
 
 export interface PointHistoryCounts {
+  unpublished: number;
   failed: number;
   /** Deprecated union bucket (every done+physics-rejected row); kept for old
    *  links only — the chips render the split counts below instead. */
@@ -202,11 +204,30 @@ export interface PointStoryPayload {
     continuable: boolean;
     /** Exact immutable generation named by a continuation action. */
     continuationResultAttemptId: string | null;
+    /** Exact current generation named by point-scoped corrected-run actions. */
+    resultAttemptId: string | null;
+    correctionSetup: PointCorrectionSettings | null;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
   };
   attempts: PointStoryAttempt[];
   interruptions: PointStoryInterruption[];
+  corrections: Array<{
+    id: string;
+    sourceResultAttemptId: string;
+    presetId: string;
+    presetName: string;
+    revisionId: string;
+    requestId: string;
+    fidelity: "precalc" | "full";
+    state: string;
+    simJobId: string | null;
+    correctedResultId: string | null;
+    correctedResultStatus: string | null;
+    settings: Record<string, unknown>;
+    requestedBy: string | null;
+    createdAt: string;
+  }>;
   closure: {
     campaignId: string;
     campaignName: string | null;
@@ -214,6 +235,130 @@ export interface PointStoryPayload {
     openAirfoils: number;
     totalAirfoils: number;
   } | null;
+}
+
+export interface PointPublicationExplanation {
+  title: string;
+  detail: string;
+  tone: "teal" | "violet" | "amber" | "muted";
+}
+
+/** Plain-language publication verdict derived only from stored evidence. */
+export function pointPublicationExplanation(
+  story: PointStoryPayload,
+): PointPublicationExplanation {
+  const point = story.point;
+  if (point.classification?.state === "accepted") {
+    return {
+      title: "Published evidence",
+      detail: "This exact generation passed the stored publication checks.",
+      tone: "teal",
+    };
+  }
+  if (point.workDisposition === "scheduled") {
+    return {
+      title: "Not published yet — solver follow-up is queued",
+      detail:
+        "The stored evidence is not accepted yet, but an automatic URANS request owns this exact point.",
+      tone: "violet",
+    };
+  }
+  const latest = story.attempts.at(-1);
+  const evidenceReasons = [
+    ...(point.classification?.reasons ?? []),
+    ...(latest?.classification?.reasons ?? []),
+    ...point.qualityWarnings,
+    ...(latest?.qualityWarnings ?? []),
+  ]
+    .map((reason) => reason.trim())
+    .filter(Boolean);
+  const uniqueReasons = [...new Set(evidenceReasons)];
+  const error = point.error?.trim() || latest?.error?.trim() || null;
+  const detail = [...(error ? [error] : []), ...uniqueReasons].join(" · ");
+  if (point.status === "failed") {
+    return {
+      title: "Not published — the solver did not finish this point",
+      detail: detail || "The exact attempt ended without solved coefficients.",
+      tone: "amber",
+    };
+  }
+  if (point.classification?.state === "rejected") {
+    return {
+      title: "Not published — evidence checks did not pass",
+      detail:
+        detail ||
+        "The solve completed, but its stored evidence did not satisfy the publication classifier.",
+      tone: "amber",
+    };
+  }
+  return {
+    title: "Publication decision unavailable",
+    detail:
+      detail ||
+      "No accepted classification is stored for this exact generation.",
+    tone: "muted",
+  };
+}
+
+export type PointCorrectionKind =
+  | "mesh_refinement"
+  | "numerical_stability"
+  | "longer_sampling"
+  | "manual";
+
+/** Evidence-led starting points. They prefill editable settings; they do not
+ *  claim that a new calculation will necessarily be accepted. */
+export function recommendedPointCorrections(
+  story: PointStoryPayload,
+): PointCorrectionKind[] {
+  const latest = story.attempts.at(-1);
+  const text = [
+    story.point.error,
+    ...(story.point.classification?.reasons ?? []),
+    ...story.point.qualityWarnings,
+    latest?.error,
+    ...(latest?.classification?.reasons ?? []),
+    ...(latest?.qualityWarnings ?? []),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+    .toLowerCase();
+  const kinds: PointCorrectionKind[] = [];
+  if (/mesh|cell|y\+|orthogonal|skew|snappy|quality/.test(text))
+    kinds.push("mesh_refinement");
+  if (/diverg|residual|not converged|courant|solver|stalled/.test(text))
+    kinds.push("numerical_stability");
+  if (
+    /period|averag|clean cycle|repeatable|stationar|frame|video|sampling/.test(
+      text,
+    )
+  )
+    kinds.push("longer_sampling");
+  if (kinds.length === 0) kinds.push("numerical_stability");
+  kinds.push("manual");
+  return [...new Set(kinds)];
+}
+
+export interface PointCorrectionSettings {
+  mesh: {
+    mesher: string;
+    farfieldRadiusChords: number;
+    wakeLengthChords: number;
+    nSurface: number;
+    nRadial: number;
+    nWake: number;
+    targetYPlus: number;
+    spanChords: number;
+  };
+  solver: {
+    turbulenceModel: string;
+    nIterations: number;
+    convergenceTolerance: number;
+    momentumScheme: string;
+    transientCycles: number;
+    transientDiscardFraction: number;
+    transientMaxCourant: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +453,7 @@ export function pointFiltersToSearch(
  *  stays for surfaces whose payload only carries a failed count (backlog
  *  strip); 'rejected' is accepted for old callers only. */
 export type CampaignPointsBucket =
+  | "unpublished"
   | "failed"
   | "rejected"
   | "awaiting_urans"
@@ -435,7 +581,7 @@ export function fidelityChipView(
     };
   }
   if (verify?.state === "blocked")
-    return { label: "CRITICAL · URANS final", tone: "red" };
+    return { label: "final not published", tone: "amber" };
   if (fidelity === "urans_full")
     return { label: "URANS final · verified", tone: "teal" };
   if (fidelity === "urans_precalc") {
@@ -444,7 +590,7 @@ export function fidelityChipView(
     if (verify?.state === "done")
       return { label: "URANS final · verified", tone: "teal" };
     if (verify?.state === "cancelled")
-      return { label: "CRITICAL · URANS final", tone: "red" };
+      return { label: "final not published", tone: "amber" };
     return { label: "URANS fast", tone: "amber" };
   }
   return null;
@@ -496,17 +642,17 @@ export function statusChipDisplay(
     case "failed":
       if (reviewBucket === "awaiting_urans" && workDisposition === "scheduled")
         return { label: "fast URANS queued", tone: "violet" };
-      return { label: "result unavailable", tone: "red" };
+      return { label: "not published", tone: "amber" };
     case "rejected":
       if (workDisposition === "blocked")
-        return { label: "critical recovery failure", tone: "red" };
+        return { label: "not published", tone: "amber" };
       if (reviewBucket === "awaiting_urans")
         return { label: "fast URANS queued", tone: "violet" };
       if (reviewBucket === "needs_review")
-        return { label: "result unavailable", tone: "red" };
+        return { label: "not published", tone: "amber" };
       if (workDisposition === "scheduled")
         return { label: "automatic recovery queued", tone: "violet" };
-      return { label: "result unavailable", tone: "red" };
+      return { label: "not published", tone: "amber" };
     case "accepted":
       return { label: "accepted", tone: "teal" };
     case "needs_urans":

@@ -701,6 +701,13 @@
       "when": 1791504000000,
       "tag": "0099_archive_backfill_abandonment",
       "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1791849600000,
+      "tag": "0100_point_correction_runs",
+      "breakpoints": true
     }
   ]
 }

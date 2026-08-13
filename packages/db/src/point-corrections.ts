@@ -1,0 +1,334 @@
+import { createHash } from "node:crypto";
+
+import { and, eq } from "drizzle-orm";
+
+import {
+  CampaignError,
+  syncLegacyBoundaryConditionForPreset,
+} from "./campaigns";
+import type { DB } from "./client";
+import {
+  airfoils,
+  meshProfiles,
+  pointCorrectionRuns,
+  resultAttempts,
+  resultClassifications,
+  results,
+  simulationPresetAirfoilTargets,
+  simulationPresetRevisions,
+  simulationPresets,
+  solverProfiles,
+  sweepDefinitions,
+} from "./schema";
+import {
+  ensureSimulationPresetRevision,
+  type SimulationSetupSnapshot,
+} from "./simulation-setup";
+import { createUransRequest } from "./urans-ladder";
+
+export interface PointCorrectionSettings {
+  mesh: {
+    mesher: string;
+    farfieldRadiusChords: number;
+    wakeLengthChords: number;
+    nSurface: number;
+    nRadial: number;
+    nWake: number;
+    targetYPlus: number;
+    spanChords: number;
+  };
+  solver: {
+    turbulenceModel: string;
+    nIterations: number;
+    convergenceTolerance: number;
+    momentumScheme: string;
+    transientCycles: number;
+    transientDiscardFraction: number;
+    transientMaxCourant: number;
+  };
+}
+
+export interface PointCorrectionInput extends PointCorrectionSettings {
+  resultId: string;
+  resultAttemptId: string;
+  fidelity: "precalc" | "full";
+  requestedBy?: string | null;
+}
+
+function stableStringify(value: unknown): string {
+  if (value == null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([, child]) => child !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, child]) => `${JSON.stringify(key)}:${stableStringify(child)}`)
+    .join(",")}}`;
+}
+
+/**
+ * Create (or replay) one point-scoped corrected setup. The source generation
+ * is named exactly, every physical profile stays pinned to its immutable
+ * revision, and only the requested mesh/solver blocks are replaced. The
+ * generated preset is disabled so the normal background scheduler cannot
+ * widen this exact-angle operator request into a new campaign.
+ */
+export async function createPointCorrection(
+  db: DB,
+  input: PointCorrectionInput,
+) {
+  const [source] = await db
+    .select({
+      resultId: results.id,
+      currentResultAttemptId: results.currentResultAttemptId,
+      status: results.status,
+      classificationState: resultClassifications.state,
+      airfoilId: results.airfoilId,
+      airfoilName: airfoils.name,
+      aoaDeg: results.aoaDeg,
+      revisionId: simulationPresetRevisions.id,
+      snapshot: simulationPresetRevisions.snapshot,
+    })
+    .from(results)
+    .innerJoin(airfoils, eq(airfoils.id, results.airfoilId))
+    .innerJoin(
+      resultAttempts,
+      and(
+        eq(resultAttempts.id, input.resultAttemptId),
+        eq(resultAttempts.resultId, results.id),
+        eq(resultAttempts.airfoilId, results.airfoilId),
+        eq(resultAttempts.bcId, results.bcId),
+        eq(
+          resultAttempts.simulationPresetRevisionId,
+          results.simulationPresetRevisionId,
+        ),
+        eq(resultAttempts.aoaDeg, results.aoaDeg),
+      ),
+    )
+    .leftJoin(
+      resultClassifications,
+      eq(resultClassifications.resultId, results.id),
+    )
+    .innerJoin(
+      simulationPresetRevisions,
+      eq(simulationPresetRevisions.id, results.simulationPresetRevisionId),
+    )
+    .where(eq(results.id, input.resultId))
+    .limit(1);
+  if (!source)
+    throw new CampaignError(
+      "not_found",
+      "exact point result generation was not found",
+    );
+  if (source.currentResultAttemptId !== input.resultAttemptId) {
+    throw new CampaignError(
+      "conflict",
+      "the point changed after this evidence was loaded; refresh before creating a corrected run",
+    );
+  }
+  if (source.status !== "failed" && source.classificationState !== "rejected") {
+    throw new CampaignError(
+      "validation",
+      "a corrected run can be created only for an unpublished failed or rejected point",
+    );
+  }
+
+  const snapshot = source.snapshot as unknown as SimulationSetupSnapshot;
+  const implementationId = snapshot.engine?.implementationId;
+  if (!implementationId) {
+    throw new CampaignError(
+      "validation",
+      "the source revision has no pinned solver implementation",
+    );
+  }
+  const requiredIds = {
+    flowConditionId: snapshot.flowState?.id,
+    referenceGeometryProfileId: snapshot.referenceGeometry?.id,
+    boundaryProfileId: snapshot.boundary?.id,
+    schedulingProfileId: snapshot.scheduling?.id,
+    outputProfileId: snapshot.output?.id,
+  };
+  if (Object.values(requiredIds).some((id) => !id)) {
+    throw new CampaignError(
+      "validation",
+      "the source revision is incomplete and cannot be cloned safely",
+    );
+  }
+
+  const signature = createHash("sha256")
+    .update(
+      stableStringify({
+        sourceResultAttemptId: input.resultAttemptId,
+        fidelity: input.fidelity,
+        mesh: input.mesh,
+        solver: input.solver,
+      }),
+    )
+    .digest("hex");
+  const suffix = `${input.resultAttemptId.slice(0, 8)}-${signature.slice(0, 12)}`;
+  const displayAoa = Number(source.aoaDeg).toFixed(2).replace(/\.00$/, "");
+  const nameBase = `${source.airfoilName} α ${displayAoa}° correction`;
+  const slugs = {
+    mesh: `point-correction-mesh-${suffix}`,
+    solver: `point-correction-solver-${suffix}`,
+    sweep: `point-correction-sweep-${suffix}`,
+    preset: `point-correction-${suffix}`,
+  };
+
+  const created = await db.transaction(async (tx) => {
+    await tx
+      .insert(meshProfiles)
+      .values({
+        slug: slugs.mesh,
+        name: `${nameBase} mesh`,
+        ...input.mesh,
+      })
+      .onConflictDoNothing({ target: meshProfiles.slug });
+    const [mesh] = await tx
+      .select()
+      .from(meshProfiles)
+      .where(eq(meshProfiles.slug, slugs.mesh))
+      .limit(1);
+    if (!mesh)
+      throw new CampaignError("conflict", "corrected mesh profile unavailable");
+
+    await tx
+      .insert(solverProfiles)
+      .values({
+        slug: slugs.solver,
+        name: `${nameBase} solver`,
+        solverImplementationId: implementationId,
+        ...input.solver,
+      })
+      .onConflictDoNothing({ target: solverProfiles.slug });
+    const [solver] = await tx
+      .select()
+      .from(solverProfiles)
+      .where(eq(solverProfiles.slug, slugs.solver))
+      .limit(1);
+    if (!solver)
+      throw new CampaignError(
+        "conflict",
+        "corrected solver profile unavailable",
+      );
+
+    await tx
+      .insert(sweepDefinitions)
+      .values({
+        slug: slugs.sweep,
+        name: `${nameBase} single angle`,
+        aoaStart: Number(source.aoaDeg),
+        aoaStop: Number(source.aoaDeg),
+        aoaStep: 1,
+        aoaList: [Number(source.aoaDeg)],
+      })
+      .onConflictDoNothing({ target: sweepDefinitions.slug });
+    const [sweep] = await tx
+      .select()
+      .from(sweepDefinitions)
+      .where(eq(sweepDefinitions.slug, slugs.sweep))
+      .limit(1);
+    if (!sweep)
+      throw new CampaignError(
+        "conflict",
+        "corrected sweep definition unavailable",
+      );
+
+    await tx
+      .insert(simulationPresets)
+      .values({
+        slug: slugs.preset,
+        name: nameBase,
+        ...requiredIds,
+        meshProfileId: mesh.id,
+        // A point-scoped URANS correction must use the corrected mesh at both
+        // ladder tiers; inheriting the source preset's separate URANS mesh
+        // would make the visible mesh controls ineffective.
+        uransMeshProfileId: mesh.id,
+        uransPrecalcMeshProfileId: mesh.id,
+        solverProfileId: solver.id,
+        sweepDefinitionId: sweep.id,
+        targetScope: "airfoils",
+        origin: "library",
+        enabled: false,
+      })
+      .onConflictDoNothing({ target: simulationPresets.slug });
+    const [preset] = await tx
+      .select()
+      .from(simulationPresets)
+      .where(eq(simulationPresets.slug, slugs.preset))
+      .limit(1);
+    if (!preset)
+      throw new CampaignError(
+        "conflict",
+        "corrected simulation preset unavailable",
+      );
+    await tx
+      .insert(simulationPresetAirfoilTargets)
+      .values({ presetId: preset.id, airfoilId: source.airfoilId })
+      .onConflictDoNothing();
+    return { presetId: preset.id };
+  });
+
+  // The legacy boundary-condition row remains the ladder job's cell identity;
+  // synchronize it from the newly composed domain profiles before freezing
+  // the immutable revision.
+  await syncLegacyBoundaryConditionForPreset(db, created.presetId);
+  const resolved = await ensureSimulationPresetRevision(db, created.presetId);
+  if (!resolved)
+    throw new CampaignError(
+      "conflict",
+      "corrected simulation revision could not be created",
+    );
+  const outcome = await createUransRequest(db, {
+    airfoilId: source.airfoilId,
+    revisionId: resolved.revision.id,
+    aoaDeg: Number(source.aoaDeg),
+    fidelity: input.fidelity,
+    requestedBy: input.requestedBy ?? null,
+  });
+  await db
+    .insert(pointCorrectionRuns)
+    .values({
+      sourceResultId: source.resultId,
+      sourceResultAttemptId: input.resultAttemptId,
+      correctedPresetId: created.presetId,
+      correctedRevisionId: resolved.revision.id,
+      uransRequestId: outcome.request.id,
+      fidelity: input.fidelity,
+      settingsSha256: signature,
+      settings: {
+        mesh: input.mesh,
+        solver: input.solver,
+      },
+      requestedBy: input.requestedBy ?? null,
+    })
+    .onConflictDoNothing({
+      target: [
+        pointCorrectionRuns.sourceResultAttemptId,
+        pointCorrectionRuns.settingsSha256,
+      ],
+    });
+  const [correction] = await db
+    .select({ id: pointCorrectionRuns.id })
+    .from(pointCorrectionRuns)
+    .where(
+      and(
+        eq(pointCorrectionRuns.sourceResultAttemptId, input.resultAttemptId),
+        eq(pointCorrectionRuns.settingsSha256, signature),
+      ),
+    )
+    .limit(1);
+  if (!correction)
+    throw new CampaignError(
+      "conflict",
+      "corrected run provenance could not be recorded",
+    );
+  return {
+    correctionRunId: correction.id,
+    presetId: created.presetId,
+    revisionId: resolved.revision.id,
+    resultAttemptId: input.resultAttemptId,
+    request: outcome.request,
+    created: outcome.created,
+  };
+}

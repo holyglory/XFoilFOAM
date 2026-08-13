@@ -4939,6 +4939,59 @@ export const simUransRequests = pgTable(
   }),
 );
 
+/** Immutable provenance for an operator-created point correction. The source
+ * generation, corrected setup revision, exact URANS request, and submitted
+ * numeric settings remain navigable from the original unpublished point. */
+export const pointCorrectionRuns = pgTable(
+  "point_correction_runs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sourceResultId: uuid("source_result_id")
+      .notNull()
+      .references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+    sourceResultAttemptId: uuid("source_result_attempt_id").notNull(),
+    correctedPresetId: uuid("corrected_preset_id")
+      .notNull()
+      .references(() => simulationPresets.id),
+    correctedRevisionId: uuid("corrected_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id),
+    uransRequestId: uuid("urans_request_id")
+      .notNull()
+      .references(() => simUransRequests.id),
+    fidelity: text("fidelity").notNull(),
+    settingsSha256: text("settings_sha256").notNull(),
+    settings: jsonb("settings").$type<Record<string, unknown>>().notNull(),
+    requestedBy: text("requested_by"),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    sourceAttemptOwnerFk: foreignKey({
+      columns: [t.sourceResultAttemptId, t.sourceResultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "point_correction_runs_source_attempt_owner_fk",
+    }).onDelete("cascade"),
+    sourceSettingsUq: uniqueIndex(
+      "point_correction_runs_source_settings_uq",
+    ).on(t.sourceResultAttemptId, t.settingsSha256),
+    requestUq: uniqueIndex("point_correction_runs_request_uq").on(
+      t.uransRequestId,
+    ),
+    sourceIdx: index("point_correction_runs_source_idx").on(
+      t.sourceResultId,
+      t.createdAt,
+    ),
+    fidelityCheck: check(
+      "point_correction_runs_fidelity_check",
+      sql`${t.fidelity} IN ('precalc', 'full')`,
+    ),
+    settingsHashCheck: check(
+      "point_correction_runs_settings_hash_check",
+      sql`${t.settingsSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+  }),
+);
+
 /** Many-to-many campaign beneficiaries of one physical request. Automatic
  * continuations/fresh reused-evidence requests are campaign-owned; a covering
  * manual/admin request may also gain associations while retaining its
@@ -6525,6 +6578,7 @@ export type SimUransVerifyQueueItem = typeof simUransVerifyQueue.$inferSelect;
 export type SimUransVerifyQueueCampaign =
   typeof simUransVerifyQueueCampaigns.$inferSelect;
 export type SimUransRequest = typeof simUransRequests.$inferSelect;
+export type PointCorrectionRun = typeof pointCorrectionRuns.$inferSelect;
 export type SimLadderSubmitRetry = typeof simLadderSubmitRetries.$inferSelect;
 export type SimUransRequestCampaign =
   typeof simUransRequestCampaigns.$inferSelect;

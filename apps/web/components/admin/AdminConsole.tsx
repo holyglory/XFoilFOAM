@@ -1188,6 +1188,7 @@ export function AdminConsole() {
               }
               onOpenCampaign={openCampaign}
               onOpenSimulations={() => navigate({}, "push")}
+              onOpenCampaignPoints={openCampaignPoints}
             />
           )}
           {section === "health" && <HealthPanel />}
@@ -5146,8 +5147,7 @@ function SyncApiPanel() {
                   );
                   const bytes = item.states.reduce(
                     (sum, status) =>
-                      sum +
-                      (state.evidenceTransfers.bytesByState[status] ?? 0),
+                      sum + (state.evidenceTransfers.bytesByState[status] ?? 0),
                     0,
                   );
                   return (
@@ -5211,10 +5211,7 @@ function SyncApiPanel() {
             ) : (
               <div>
                 {state.conflicts.map((conflict) => (
-                  <div
-                    key={conflict.id}
-                    className="sync-conflict-review"
-                  >
+                  <div key={conflict.id} className="sync-conflict-review">
                     <div className="sync-conflict-copy">
                       <div className="sync-conflict-title">
                         {conflict.review.title}
@@ -5281,9 +5278,7 @@ function SyncApiPanel() {
                             >
                               <div className="sync-conflict-generation-title">
                                 {generationLabel}{" "}
-                                {evidence.solver
-                                  ? `· ${evidence.solver}`
-                                  : ""}
+                                {evidence.solver ? `· ${evidence.solver}` : ""}
                               </div>
                               <div className="sync-conflict-coefficients">
                                 <span>
@@ -5323,11 +5318,16 @@ function QueueDashboard({
   onTabChange,
   onOpenCampaign,
   onOpenSimulations,
+  onOpenCampaignPoints,
 }: {
   tab: SolverTab;
   onTabChange: (t: SolverTab) => void;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
+  onOpenCampaignPoints: (
+    campaignId: string,
+    status: CampaignPointsBucket,
+  ) => void;
 }) {
   const [queue, setQueue] = useState<AdminQueue | null>(null);
   const [engineSetup, setEngineSetup] = useState<AdminSimulationSetup | null>(
@@ -5789,6 +5789,7 @@ function QueueDashboard({
               gate={gateFromSolverState(solver.state, activeJobs.length)}
               onOpenCampaign={onOpenCampaign}
               onOpenSimulations={onOpenSimulations}
+              onOpenCampaignPoints={onOpenCampaignPoints}
             />
           )}
 
@@ -6437,6 +6438,7 @@ function CampaignBacklogStrip({
   gate,
   onOpenCampaign,
   onOpenSimulations,
+  onOpenCampaignPoints,
 }: {
   strip: AdminQueueBacklogStrip;
   /** Scheduler gate from the SAME deriveSolverState the banner uses — the
@@ -6444,6 +6446,10 @@ function CampaignBacklogStrip({
   gate: CampaignGate | null;
   onOpenCampaign: (id: string) => void;
   onOpenSimulations: () => void;
+  onOpenCampaignPoints: (
+    campaignId: string,
+    status: CampaignPointsBucket,
+  ) => void;
 }) {
   const gap = strip.backgroundGapFill;
   return (
@@ -6545,14 +6551,24 @@ function CampaignBacklogStrip({
                 </span>
               )}
               {(c.blockedPoints ?? 0) > 0 && (
-                <span
+                <button
+                  type="button"
                   data-testid={`backlog-blocked-${c.slug}`}
-                  title="Automatic recovery exhausted; this is a critical system incident requiring investigation"
-                  style={{ color: C.redText }}
+                  title="Open exact unpublished points, stored reasons, and point-scoped solver tools"
+                  onClick={() => onOpenCampaignPoints(c.id, "unpublished")}
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 10,
+                    color: C.amber,
+                    background: "transparent",
+                    border: "none",
+                    padding: 0,
+                    cursor: "pointer",
+                    textDecoration: "underline",
+                  }}
                 >
-                  {(c.blockedPoints ?? 0).toLocaleString()} critical recover
-                  {(c.blockedPoints ?? 0) === 1 ? "y" : "ies"} exhausted
-                </span>
+                  {(c.blockedPoints ?? 0).toLocaleString()} not published
+                </button>
               )}
               {c.status !== "active" && (
                 <span style={{ color: C.amber }}>{c.status}</span>

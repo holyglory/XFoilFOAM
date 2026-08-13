@@ -33,6 +33,7 @@ import {
 import {
   type AdminUransRequest,
   continueUransResult,
+  createPointCorrectedRun,
   getPointHistory,
   getPointStory,
   getUransRequests,
@@ -54,10 +55,12 @@ import {
   type PointHistoryFacets,
   type PointHistoryItem,
   pointFiltersToSearch,
+  pointPublicationExplanation,
   type PointStoryPayload,
   type PointVerifyInfo,
   POINT_ERROR_CLASSES,
   POINT_STATUS_CHIPS,
+  recommendedPointCorrections,
   statusChipDisplay,
   type StatusChipTone,
   type TimelineTone,
@@ -66,6 +69,7 @@ import { C, MONO } from "@/lib/tokens";
 import { useModalLayer } from "@/lib/use-modal-layer";
 import { ago, f, formatRe } from "./campaigns/ui";
 import { SimModal } from "../detail/SimModal";
+import { PointCorrectionForm } from "./PointCorrectionForm";
 
 const PAGE_LIMIT = 50;
 const EMPTY_CONTOUR: Point[] = [];
@@ -131,9 +135,10 @@ function statusChipStyle(active: boolean, tone: StatusChipTone): CSSProperties {
 // but it is presented as unavailable evidence, never required adjudication.
 const CHIP_TONES: Record<string, StatusChipTone> = {
   all: "muted",
-  failed: "red",
+  unpublished: "amber",
+  failed: "amber",
   awaiting_urans: "violet",
-  needs_review: "red",
+  needs_review: "amber",
   accepted: "teal",
   needs_urans: "amber",
   solving: "amber",
@@ -141,7 +146,8 @@ const CHIP_TONES: Record<string, StatusChipTone> = {
 
 const CHIP_LABELS: Record<string, string> = {
   all: "all",
-  failed: "failed",
+  unpublished: "not published",
+  failed: "did not finish",
   awaiting_urans: "awaiting FAST URANS",
   needs_review: "unavailable",
   accepted: "accepted",
@@ -241,7 +247,7 @@ function classificationChip(item: PointHistoryItem) {
       : state === "needs_urans"
         ? C.amber
         : state === "rejected"
-          ? C.redText
+          ? C.amber
           : C.dim;
   return (
     <span
@@ -318,6 +324,8 @@ export function PointHistoryPanel() {
   const [storyError, setStoryError] = useState<string | null>(null);
   const [requeueBusy, setRequeueBusy] = useState(false);
   const [requeueNotice, setRequeueNotice] = useState<string | null>(null);
+  const [correctionBusy, setCorrectionBusy] = useState(false);
+  const [correctionNotice, setCorrectionNotice] = useState<string | null>(null);
   // Request-URANS (fidelity ladder contract 6) state: the per-row overflow
   // menu, in-flight guard, table-level notice, and the open cell's existing
   // request items (idempotent-aware button state in the story panel).
@@ -440,6 +448,7 @@ export function PointHistoryPanel() {
     setStory(null);
     setStoryError(null);
     setRequeueNotice(null);
+    setCorrectionNotice(null);
     setCellRequests(null);
     getPointStory(item.resultId)
       .then((s) => {
@@ -679,6 +688,48 @@ export function PointHistoryPanel() {
     [continueBusy, story, openStory, fetchFirstPage],
   );
 
+  const doCorrectedRun = useCallback(
+    async (
+      settings: NonNullable<PointStoryPayload["point"]["correctionSetup"]>,
+      fidelity: "precalc" | "full",
+    ) => {
+      const item = openItemRef.current;
+      const resultAttemptId = story?.point.resultAttemptId;
+      if (!item || !resultAttemptId || correctionBusy) return;
+      if (
+        !window.confirm(
+          `Create a new immutable ${fidelity === "full" ? "FULL" : "FAST"} URANS setup for ${item.airfoilName} α ${item.aoaDeg}° and queue this exact angle? The source campaign, setup, and evidence will not be changed.`,
+        )
+      )
+        return;
+      setCorrectionBusy(true);
+      setCorrectionNotice(null);
+      try {
+        const outcome = await createPointCorrectedRun(item.resultId, {
+          resultAttemptId,
+          fidelity,
+          ...settings,
+        });
+        if (openItemRef.current?.rowKey === item.rowKey) {
+          openStory(item);
+          setCorrectionNotice(
+            outcome.created
+              ? `corrected ${fidelity === "full" ? "FULL" : "FAST"} URANS run queued on immutable revision ${outcome.revisionId.slice(0, 8)}…`
+              : `corrected run already exists; its ${outcome.request.state} request was reused`,
+          );
+        }
+        void fetchFirstPage(filtersRef.current);
+      } catch (error) {
+        setCorrectionNotice(
+          isAdminApiError(error) ? error.message : (error as Error).message,
+        );
+      } finally {
+        setCorrectionBusy(false);
+      }
+    },
+    [correctionBusy, story, openStory, fetchFirstPage],
+  );
+
   // ---- request final verification (FAST URANS is the automatic prerequisite) ----
   // Close any open row overflow menu on outside click.
   useEffect(() => {
@@ -767,6 +818,16 @@ export function PointHistoryPanel() {
   };
 
   const timeline = story ? assembleTimeline(story) : [];
+  const publicationExplanation = story
+    ? pointPublicationExplanation(story)
+    : null;
+  const correctionEligible =
+    story != null &&
+    story.point.resultAttemptId != null &&
+    story.point.correctionSetup != null &&
+    story.point.workDisposition !== "scheduled" &&
+    (story.point.status === "failed" ||
+      story.point.classification?.state === "rejected");
 
   // Header chips truthfulness: once the authoritative story payload is in,
   // status/class chips reflect IT (the table row snapshot may be stale — e.g.
@@ -1422,6 +1483,7 @@ export function PointHistoryPanel() {
                 requeueEligible ||
                 continueEligible) && (
                 <details
+                  open={Boolean(requeueEligible || continueEligible)}
                   data-testid="point-operator-overrides"
                   style={{
                     fontFamily: MONO,
@@ -1436,7 +1498,7 @@ export function PointHistoryPanel() {
                       letterSpacing: "0.08em",
                     }}
                   >
-                    OPERATOR DIAGNOSTICS &amp; OVERRIDES
+                    POINT ACTIONS
                   </summary>
                   <div
                     style={{
@@ -1466,8 +1528,8 @@ export function PointHistoryPanel() {
                           onClick={() => void doRequeue()}
                           style={{
                             ...smallBtn,
-                            color: C.redText,
-                            borderColor: "rgba(245, 101, 101, 0.4)",
+                            color: C.amber,
+                            borderColor: "rgba(245, 158, 11, 0.4)",
                             opacity: requeueBusy ? 0.6 : 1,
                           }}
                         >
@@ -1552,6 +1614,9 @@ export function PointHistoryPanel() {
                     )}
                     {uransNotice && openItem && (
                       <div style={{ color: C.amber }}>{uransNotice}</div>
+                    )}
+                    {correctionNotice && (
+                      <div style={{ color: C.amber }}>{correctionNotice}</div>
                     )}
                   </div>
                 </details>
@@ -1652,6 +1717,182 @@ export function PointHistoryPanel() {
                 </div>
               ) : (
                 <>
+                  {publicationExplanation && (
+                    <section
+                      data-testid="point-publication-explanation"
+                      style={{
+                        display: "grid",
+                        gap: 4,
+                        padding: 9,
+                        border: `1px solid ${C.borderSoft}`,
+                        borderRadius: 8,
+                        background: C.panel2,
+                        fontFamily: MONO,
+                      }}
+                    >
+                      <strong
+                        style={{
+                          color:
+                            publicationExplanation.tone === "teal"
+                              ? C.teal
+                              : publicationExplanation.tone === "violet"
+                                ? C.violet
+                                : publicationExplanation.tone === "amber"
+                                  ? C.amber
+                                  : C.muted,
+                          fontSize: 10.5,
+                        }}
+                      >
+                        {publicationExplanation.title}
+                      </strong>
+                      <span
+                        style={{
+                          color: C.muted,
+                          fontSize: 9.5,
+                          lineHeight: 1.5,
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        {publicationExplanation.detail}
+                      </span>
+                    </section>
+                  )}
+                  {correctionNotice && (
+                    <div
+                      data-testid="point-correction-notice"
+                      style={{
+                        fontFamily: MONO,
+                        fontSize: 10,
+                        color: C.amber,
+                      }}
+                    >
+                      {correctionNotice}
+                    </div>
+                  )}
+                  {story.corrections.length > 0 && (
+                    <section
+                      data-testid="point-correction-runs"
+                      style={{
+                        display: "grid",
+                        gap: 6,
+                        padding: 9,
+                        border: `1px solid ${C.borderSoft}`,
+                        borderRadius: 8,
+                        background: C.panel2,
+                        fontFamily: MONO,
+                      }}
+                    >
+                      <strong style={{ color: C.text, fontSize: 10 }}>
+                        Corrected runs
+                      </strong>
+                      {story.corrections.map((correction) => (
+                        <div
+                          key={correction.id}
+                          style={{
+                            display: "grid",
+                            gap: 4,
+                            padding: "6px 0",
+                            borderTop: `1px solid ${C.borderSoft}`,
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: 6,
+                              flexWrap: "wrap",
+                              alignItems: "center",
+                              fontSize: 9.5,
+                            }}
+                          >
+                            <span style={{ color: C.violet }}>
+                              {correction.fidelity === "full"
+                                ? "FULL URANS"
+                                : "FAST URANS"}
+                            </span>
+                            <span style={{ color: C.amber }}>
+                              {correction.correctedResultStatus ??
+                                correction.state}
+                            </span>
+                            <span style={{ color: C.dim }}>
+                              revision {correction.revisionId.slice(0, 8)}… ·{" "}
+                              {ago(correction.createdAt)}
+                            </span>
+                          </div>
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: 6,
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            {correction.correctedResultId && (
+                              <button
+                                type="button"
+                                data-testid="point-open-corrected-run"
+                                onClick={() =>
+                                  openStory({
+                                    ...openItem,
+                                    kind: "result",
+                                    rowKey: `r:${correction.correctedResultId}`,
+                                    resultId: correction.correctedResultId!,
+                                    revisionId: correction.revisionId,
+                                    campaignId: null,
+                                    campaignName: null,
+                                    conditionId: null,
+                                    status:
+                                      correction.correctedResultStatus ??
+                                      "pending",
+                                    bucket: bucketOfPoint(
+                                      correction.correctedResultStatus ??
+                                        "pending",
+                                      null,
+                                    ),
+                                    classificationState: null,
+                                    reviewBucket: null,
+                                    workDisposition: null,
+                                    continuable: false,
+                                    fidelity:
+                                      correction.fidelity === "full"
+                                        ? "urans_full"
+                                        : "urans_precalc",
+                                  })
+                                }
+                                style={{
+                                  ...smallBtn,
+                                  color: C.teal,
+                                  borderColor: C.tealBorder,
+                                }}
+                              >
+                                open corrected point ▸
+                              </button>
+                            )}
+                            <Link
+                              href="/admin?section=setup&tab=presets"
+                              style={{
+                                ...smallBtn,
+                                color: C.teal,
+                                borderColor: C.tealBorder,
+                                textDecoration: "none",
+                              }}
+                            >
+                              setup library ↗
+                            </Link>
+                          </div>
+                        </div>
+                      ))}
+                    </section>
+                  )}
+                  {correctionEligible && story.point.correctionSetup && (
+                    <PointCorrectionForm
+                      key={story.point.resultAttemptId}
+                      source={story.point.correctionSetup}
+                      recommended={recommendedPointCorrections(story)}
+                      busy={correctionBusy}
+                      onSubmit={(settings, fidelity) =>
+                        void doCorrectedRun(settings, fidelity)
+                      }
+                    />
+                  )}
                   <div
                     style={{
                       fontFamily: MONO,

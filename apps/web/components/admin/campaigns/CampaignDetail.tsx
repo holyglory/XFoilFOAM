@@ -830,17 +830,19 @@ export function CampaignDetail({
                 </button>
               )}
               {barSegments.blockedCount > 0 && remediationCopy && (
-                <div
+                <button
+                  type="button"
                   data-testid="campaign-blocked-count"
-                  className="campaign-instrument-exception-action is-red"
+                  className="campaign-instrument-exception-action is-amber"
                   title={remediationCopy.title}
+                  onClick={() => onOpenPoints("unpublished")}
                 >
                   <ShieldAlert size={18} strokeWidth={1.6} aria-hidden />
                   <span>
                     <strong>{fCount(barSegments.blockedCount)}</strong>
                     <small>{remediationCopy.label}</small>
                   </span>
-                </div>
+                </button>
               )}
             </div>
           )}
@@ -851,14 +853,14 @@ export function CampaignDetail({
                 fontFamily: MONO,
                 fontSize: 10.5,
                 color: C.text2,
-                border: "1px solid rgba(245,101,101,0.42)",
-                background: "rgba(245,101,101,0.07)",
+                border: "1px solid rgba(245,158,11,0.42)",
+                background: "rgba(245,158,11,0.07)",
                 borderRadius: 8,
                 padding: "8px 10px",
                 lineHeight: 1.5,
               }}
             >
-              <span style={{ color: C.redText, fontWeight: 700 }}>
+              <span style={{ color: C.amber, fontWeight: 700 }}>
                 {fCount(blocked)} {remediationCopy.label}
               </span>
               {" — "}

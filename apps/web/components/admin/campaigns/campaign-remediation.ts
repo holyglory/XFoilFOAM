@@ -23,36 +23,36 @@ export function campaignRemediationCopy(
   const reasons = new Set(remediation.groups.map((group) => group.reason));
   if (reasons.size === 1 && reasons.has("precalc_attempts_exhausted")) {
     return {
-      label: "critical preliminary failure",
+      label: "not published",
       title:
-        "Preliminary URANS ended without a publishable result. This is a solver reliability incident, not normal RANS handoff or a review task.",
+        "Preliminary URANS ended without accepted evidence. Open the exact points to inspect every attempt and choose a point-scoped correction.",
       detail:
-        "Required preliminary results are missing. The system must preserve the evidence, resume with corrected recovery capability, and investigate repeated incidents.",
+        "The campaign continues. These exact points remain unpublished; stored evidence and corrected-run tools are available in Solver › Points.",
     };
   }
   if (reasons.size === 1 && reasons.has("mesh_quality")) {
     return {
-      label: "critical mesh failure",
+      label: "not published",
       title:
-        "Automatic safer-mesh recovery did not produce a usable mesh. This is a system reliability incident, not a review task.",
+        "Automatic mesh attempts did not produce accepted evidence. Open the exact points to inspect mesh diagnostics and create a corrected mesh revision.",
       detail:
-        "Required preliminary results are missing. The system must adjust or repair the mesh path automatically and investigate recurrence.",
+        "The campaign continues. These exact points remain unpublished; mesh refinement and manual corrected-run tools are available in Solver › Points.",
     };
   }
   if (reasons.size === 1 && reasons.has("engine_submit_rejected")) {
     return {
-      label: "critical engine failure",
+      label: "not published",
       title:
-        "The engine did not accept automatic preliminary recovery. This is a system reliability incident, not a review task.",
+        "The engine did not accept the preliminary request. Open the exact points to inspect the stored request and attempt evidence.",
       detail:
-        "Required preliminary results are missing. The system must recover engine admission and investigate repeated submission failures.",
+        "The campaign continues. These exact points remain unpublished; retry and corrected-run tools are available in Solver › Points.",
     };
   }
   return {
-    label: "critical recovery failure",
+    label: "not published",
     title:
-      "Automatic recovery ended without a publishable result. This is a system reliability incident, not a review task.",
+      "Automatic solver attempts ended without accepted evidence. Open the exact points to inspect why and choose a point-scoped action.",
     detail:
-      "Required results are missing. Automatic recovery and evidence-led investigation are required.",
+      "The campaign continues. These exact points remain unpublished; stored evidence and point-scoped tools are available in Solver › Points.",
   };
 }

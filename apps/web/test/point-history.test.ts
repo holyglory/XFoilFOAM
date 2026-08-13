@@ -14,9 +14,11 @@ import {
   type PointAttemptDigestEvent,
   type PointFilters,
   pointFiltersToSearch,
+  pointPublicationExplanation,
   type PointStoryAttempt,
   type PointStoryPayload,
   POINT_STATUS_CHIPS,
+  recommendedPointCorrections,
   statusChipDisplay,
 } from "../lib/point-history";
 
@@ -81,6 +83,7 @@ describe("point filter query-param round-trip", () => {
     // needs-review chip now link to, plus the deprecated 'rejected' alias
     // old callers may still emit.
     for (const status of [
+      "unpublished",
       "failed",
       "rejected",
       "awaiting_urans",
@@ -103,6 +106,7 @@ describe("point filter query-param round-trip", () => {
   });
 
   it("chip row exposes machine-owned states but not inactive review workflows", () => {
+    expect(POINT_STATUS_CHIPS).toContain("unpublished");
     expect(POINT_STATUS_CHIPS).toContain("awaiting_urans");
     expect(POINT_STATUS_CHIPS as readonly string[]).not.toContain(
       "needs_review",
@@ -137,26 +141,26 @@ describe("statusChipDisplay", () => {
       tone: "violet",
     });
     expect(statusChipDisplay("rejected", "needs_review")).toEqual({
-      label: "result unavailable",
-      tone: "red",
+      label: "not published",
+      tone: "amber",
     });
     expect(statusChipDisplay("rejected", null)).toEqual({
-      label: "result unavailable",
-      tone: "red",
+      label: "not published",
+      tone: "amber",
     });
     expect(statusChipDisplay("rejected", null, "scheduled")).toEqual({
       label: "automatic recovery queued",
       tone: "violet",
     });
     expect(statusChipDisplay("rejected", null, "blocked")).toEqual({
-      label: "critical recovery failure",
-      tone: "red",
+      label: "not published",
+      tone: "amber",
     });
   });
 
-  it("red is strictly failed / needs-review — never the violet queue", () => {
-    expect(statusChipDisplay("failed", "needs_review").tone).toBe("red");
-    expect(statusChipDisplay("failed", null).tone).toBe("red");
+  it("unpublished point evidence is amber while active solver follow-up stays violet", () => {
+    expect(statusChipDisplay("failed", "needs_review").tone).toBe("amber");
+    expect(statusChipDisplay("failed", null).tone).toBe("amber");
     expect(statusChipDisplay("rejected", "awaiting_urans").tone).not.toBe(
       "red",
     );
@@ -360,14 +364,59 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       workDisposition: null,
       continuable: false,
       continuationResultAttemptId: null,
+      resultAttemptId: "attempt-1",
+      correctionSetup: null,
       verify: null,
       ...(over.point ?? {}),
     },
     attempts: over.attempts ?? [],
     interruptions: over.interruptions ?? [],
+    corrections: over.corrections ?? [],
     closure: over.closure ?? null,
   };
 }
+
+describe("unpublished point guidance", () => {
+  it("explains the exact stored rejection and recommends matching correction tools", () => {
+    const story = storyPayload({
+      point: {
+        status: "done",
+        classification: {
+          state: "rejected",
+          reasons: ["too few repeatable periods", "missing clean cycle"],
+          confidence: 1,
+          classifierVersion: "v4",
+        },
+      } as never,
+      attempts: [
+        attempt({
+          regime: "urans",
+          qualityWarnings: ["incomplete averaging window"],
+        }),
+      ],
+    });
+    const explanation = pointPublicationExplanation(story);
+    expect(explanation.title).toContain("Not published");
+    expect(explanation.detail).toContain("too few repeatable periods");
+    expect(recommendedPointCorrections(story)).toEqual([
+      "longer_sampling",
+      "manual",
+    ]);
+  });
+
+  it("does not offer a correction diagnosis when automatic URANS already owns the point", () => {
+    const explanation = pointPublicationExplanation(
+      storyPayload({
+        point: {
+          status: "failed",
+          workDisposition: "scheduled",
+        } as never,
+      }),
+    );
+    expect(explanation.title).toContain("solver follow-up is queued");
+    expect(explanation.tone).toBe("violet");
+  });
+});
 
 describe("assembleTimeline", () => {
   it("MUST-CATCH: a rejected stalled RANS row with scheduled PRECALC tells the operator the automatic next step", () => {

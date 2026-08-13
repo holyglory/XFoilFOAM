@@ -40,6 +40,7 @@ import { lockPrecalcCells } from "./precalc-cell-lock";
  *  the amendment-A semantic split ('awaiting_urans' violet vs the rejected
  *  part of 'needs_review' red) replaced in the UI. */
 export const POINT_HISTORY_BUCKETS = [
+  "unpublished",
   "failed",
   "rejected",
   "awaiting_urans",
@@ -102,6 +103,14 @@ const SCHEDULED_WORK_SQL = sql`(
       AND open_verify.aoa_deg = r.aoa_deg
       AND open_verify.state IN ('pending', 'running')
   )
+)`;
+
+/** Terminal output with no active solver owner. This is the campaign-facing
+ * "not published" set; ordinary RANS→FAST handoff is intentionally excluded
+ * because it is still progressing under an exact durable request. */
+const UNPUBLISHED_RESULT_SQL = sql`(
+  (r.status = 'failed' OR (r.status = 'done' AND rc.state = 'rejected'))
+  AND NOT ${SCHEDULED_WORK_SQL}
 )`;
 
 /** One per-point journey: a typed hard RANS failure (or legacy explicit
@@ -357,6 +366,9 @@ export interface PointVerifyInfo {
 }
 
 export interface PointHistoryCounts {
+  /** Terminal solver output that is not accepted for publication: failed or
+   *  completed with a rejected classification. */
+  unpublished: number;
   failed: number;
   /** Deprecated alias bucket: every done+physics-rejected row (the union the
    *  awaiting_urans / needs_review split refines). */
@@ -460,7 +472,9 @@ function resultArmFilters(
     // bucket CASE: needs_review unions failed + a rejected subset); every
     // other value — including the deprecated 'rejected' alias — matches the
     // raw bucket label as before.
-    if (f.bucket === "awaiting_urans") parts.push(AWAITING_URANS_RESULT_SQL);
+    if (f.bucket === "unpublished") parts.push(UNPUBLISHED_RESULT_SQL);
+    else if (f.bucket === "awaiting_urans")
+      parts.push(AWAITING_URANS_RESULT_SQL);
     else if (f.bucket === "needs_review") parts.push(NEEDS_REVIEW_RESULT_SQL);
     else parts.push(sql`${BUCKET_SQL} = ${f.bucket}`);
   }
@@ -703,6 +717,7 @@ export async function pointHistoryPage(
 
   const countRows = (await db.execute(sql`
     SELECT
+      count(*) FILTER (WHERE b.unpublished)::int AS unpublished,
       count(*) FILTER (WHERE b.bucket = 'failed')::int AS failed,
       count(*) FILTER (WHERE b.bucket = 'rejected')::int AS rejected,
       count(*) FILTER (WHERE b.review_bucket = 'awaiting_urans')::int AS awaiting_urans,
@@ -712,13 +727,15 @@ export async function pointHistoryPage(
       count(*) FILTER (WHERE b.bucket = 'solving')::int AS solving,
       count(*)::int AS all_results
     FROM (
-      SELECT ${BUCKET_SQL} AS bucket, ${REVIEW_BUCKET_SQL} AS review_bucket
+      SELECT ${BUCKET_SQL} AS bucket, ${REVIEW_BUCKET_SQL} AS review_bucket,
+             ${UNPUBLISHED_RESULT_SQL} AS unpublished
       FROM results r
       JOIN airfoils af ON af.id = r.airfoil_id
       LEFT JOIN result_classifications rc ON rc.result_id = r.id
       WHERE ${resultArmFilters(filters, { includeBucket: false })}
     ) b
   `)) as unknown as Array<{
+    unpublished: number;
     failed: number;
     rejected: number;
     awaiting_urans: number;
@@ -729,6 +746,7 @@ export async function pointHistoryPage(
     all_results: number;
   }>;
   const c = countRows[0] ?? {
+    unpublished: 0,
     failed: 0,
     rejected: 0,
     awaiting_urans: 0,
@@ -828,6 +846,7 @@ export async function pointHistoryPage(
         ? encodePointHistoryCursor(last.last_activity_us, last.row_key)
         : null,
     counts: {
+      unpublished: Number(c.unpublished),
       failed: Number(c.failed),
       rejected: Number(c.rejected),
       awaiting_urans: Number(c.awaiting_urans),
@@ -924,11 +943,52 @@ export interface PointStory {
     continuable: boolean;
     /** Exact immutable generation that the Continue action must name. */
     continuationResultAttemptId: string | null;
+    /** Exact current generation used by every point-scoped correction action. */
+    resultAttemptId: string | null;
+    /** Effective pinned mesh/solver values for a corrected immutable run.
+     *  Null only for historical or incomplete revisions. */
+    correctionSetup: {
+      mesh: {
+        mesher: string;
+        farfieldRadiusChords: number;
+        wakeLengthChords: number;
+        nSurface: number;
+        nRadial: number;
+        nWake: number;
+        targetYPlus: number;
+        spanChords: number;
+      };
+      solver: {
+        turbulenceModel: string;
+        nIterations: number;
+        convergenceTolerance: number;
+        momentumScheme: string;
+        transientCycles: number;
+        transientDiscardFraction: number;
+        transientMaxCourant: number;
+      };
+    } | null;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;
   };
   attempts: PointStoryAttempt[];
   interruptions: PointStoryInterruption[];
+  corrections: Array<{
+    id: string;
+    sourceResultAttemptId: string;
+    presetId: string;
+    presetName: string;
+    revisionId: string;
+    requestId: string;
+    fidelity: "precalc" | "full";
+    state: string;
+    simJobId: string | null;
+    correctedResultId: string | null;
+    correctedResultStatus: string | null;
+    settings: Record<string, unknown>;
+    requestedBy: string | null;
+    createdAt: string;
+  }>;
   /** Campaign closure context: how many airfoils still have this angle open
    *  in the same condition. null for non-campaign points. */
   closure: {
@@ -949,6 +1009,7 @@ export async function pointStory(
       r.id AS result_id, r.airfoil_id, af.slug AS airfoil_slug, af.name AS airfoil_name,
       r.aoa_deg::float8 AS aoa_deg, r.reynolds, r.mach, r.speed, r.regime, r.status::text AS status,
       r.error, r.quality_warnings, r.simulation_preset_revision_id AS revision_id,
+      r.current_result_attempt_id,
       r."solvedAt" AS solved_at, r."updatedAt" AS updated_at, r.fidelity,
       ${REVIEW_BUCKET_SQL} AS review_bucket, ${CONTINUABLE_SQL} AS continuable,
       CASE WHEN ${CONTINUABLE_SQL}
@@ -1015,6 +1076,7 @@ export async function pointStory(
     work_disposition: "scheduled" | "blocked" | null;
     continuable: boolean | null;
     continuation_result_attempt_id: string | null;
+    current_result_attempt_id: string | null;
     verify_state: string | null;
     verify_delta_cl: number | string | null;
     verify_delta_cd: number | string | null;
@@ -1024,6 +1086,84 @@ export async function pointStory(
   }>;
   const p = pointRows[0];
   if (!p) throw new CampaignError("not_found", "point not found");
+
+  const revisionRows = p.revision_id
+    ? ((await db.execute(sql`
+        SELECT snapshot
+        FROM simulation_preset_revisions
+        WHERE id = ${p.revision_id}
+        LIMIT 1
+      `)) as unknown as Array<{ snapshot: Record<string, unknown> }>)
+    : [];
+  const snapshot = revisionRows[0]?.snapshot ?? null;
+  const snapshotRecord =
+    snapshot && typeof snapshot === "object" ? snapshot : null;
+  const baseMesh = snapshotRecord?.mesh;
+  const uransMesh = snapshotRecord?.uransMesh;
+  const uransPrecalcMesh = snapshotRecord?.uransPrecalcMesh;
+  const solver = snapshotRecord?.solver;
+  const effectiveMesh =
+    p.fidelity === "urans_precalc"
+      ? (uransPrecalcMesh ?? uransMesh ?? baseMesh)
+      : p.fidelity === "urans_full"
+        ? (uransMesh ?? baseMesh)
+        : baseMesh;
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    value != null && typeof value === "object" && !Array.isArray(value);
+  const numberField = (record: Record<string, unknown>, key: string) =>
+    typeof record[key] === "number" && Number.isFinite(record[key])
+      ? (record[key] as number)
+      : null;
+  const stringField = (record: Record<string, unknown>, key: string) =>
+    typeof record[key] === "string" && (record[key] as string).trim()
+      ? (record[key] as string)
+      : null;
+  const correctionSetup =
+    isRecord(effectiveMesh) &&
+    isRecord(solver) &&
+    stringField(effectiveMesh, "mesher") != null &&
+    numberField(effectiveMesh, "farfieldRadiusChords") != null &&
+    numberField(effectiveMesh, "wakeLengthChords") != null &&
+    numberField(effectiveMesh, "nSurface") != null &&
+    numberField(effectiveMesh, "nRadial") != null &&
+    numberField(effectiveMesh, "nWake") != null &&
+    numberField(effectiveMesh, "targetYPlus") != null &&
+    numberField(effectiveMesh, "spanChords") != null &&
+    stringField(solver, "turbulenceModel") != null &&
+    numberField(solver, "nIterations") != null &&
+    numberField(solver, "convergenceTolerance") != null &&
+    stringField(solver, "momentumScheme") != null &&
+    numberField(solver, "transientCycles") != null &&
+    numberField(solver, "transientDiscardFraction") != null &&
+    numberField(solver, "transientMaxCourant") != null
+      ? {
+          mesh: {
+            mesher: stringField(effectiveMesh, "mesher")!,
+            farfieldRadiusChords: numberField(
+              effectiveMesh,
+              "farfieldRadiusChords",
+            )!,
+            wakeLengthChords: numberField(effectiveMesh, "wakeLengthChords")!,
+            nSurface: numberField(effectiveMesh, "nSurface")!,
+            nRadial: numberField(effectiveMesh, "nRadial")!,
+            nWake: numberField(effectiveMesh, "nWake")!,
+            targetYPlus: numberField(effectiveMesh, "targetYPlus")!,
+            spanChords: numberField(effectiveMesh, "spanChords")!,
+          },
+          solver: {
+            turbulenceModel: stringField(solver, "turbulenceModel")!,
+            nIterations: numberField(solver, "nIterations")!,
+            convergenceTolerance: numberField(solver, "convergenceTolerance")!,
+            momentumScheme: stringField(solver, "momentumScheme")!,
+            transientCycles: numberField(solver, "transientCycles")!,
+            transientDiscardFraction: numberField(
+              solver,
+              "transientDiscardFraction",
+            )!,
+            transientMaxCourant: numberField(solver, "transientMaxCourant")!,
+          },
+        }
+      : null;
 
   const attemptRows = (await db.execute(sql`
     SELECT
@@ -1108,6 +1248,48 @@ export async function pointStory(
     finished_at: Date | string | null;
   }>;
 
+  const correctionRows = (await db.execute(sql`
+    SELECT correction.id,
+           correction.source_result_attempt_id,
+           correction.corrected_preset_id,
+           preset.name AS preset_name,
+           correction.corrected_revision_id,
+           correction.urans_request_id,
+           correction.fidelity,
+           correction.settings,
+           correction.requested_by,
+           correction."createdAt" AS created_at,
+           request.state,
+           request.sim_job_id,
+           corrected_result.id AS corrected_result_id,
+           corrected_result.status::text AS corrected_result_status
+    FROM point_correction_runs correction
+    JOIN simulation_presets preset ON preset.id = correction.corrected_preset_id
+    JOIN sim_urans_requests request ON request.id = correction.urans_request_id
+    LEFT JOIN results corrected_result
+      ON corrected_result.airfoil_id = ${p.airfoil_id}
+     AND corrected_result.simulation_preset_revision_id = correction.corrected_revision_id
+     AND corrected_result.aoa_deg = ${p.aoa_deg}
+    WHERE correction.source_result_id = ${resultId}
+    ORDER BY correction."createdAt" DESC
+    LIMIT 20
+  `)) as unknown as Array<{
+    id: string;
+    source_result_attempt_id: string;
+    corrected_preset_id: string;
+    preset_name: string;
+    corrected_revision_id: string;
+    urans_request_id: string;
+    fidelity: "precalc" | "full";
+    settings: Record<string, unknown>;
+    requested_by: string | null;
+    created_at: Date | string;
+    state: string;
+    sim_job_id: string | null;
+    corrected_result_id: string | null;
+    corrected_result_status: string | null;
+  }>;
+
   let closure: PointStory["closure"] = null;
   if (p.campaign_id && p.condition_id) {
     const closureRows = (await db.execute(sql`
@@ -1163,6 +1345,8 @@ export async function pointStory(
       workDisposition: p.work_disposition ?? null,
       continuable: Boolean(p.continuable),
       continuationResultAttemptId: p.continuation_result_attempt_id,
+      resultAttemptId: p.current_result_attempt_id,
+      correctionSetup,
       verify:
         p.verify_state == null
           ? null
@@ -1225,6 +1409,22 @@ export async function pointStory(
       error: j.error,
       createdAt: iso(j.created_at),
       finishedAt: isoOrNull(j.finished_at),
+    })),
+    corrections: correctionRows.map((row) => ({
+      id: row.id,
+      sourceResultAttemptId: row.source_result_attempt_id,
+      presetId: row.corrected_preset_id,
+      presetName: row.preset_name,
+      revisionId: row.corrected_revision_id,
+      requestId: row.urans_request_id,
+      fidelity: row.fidelity,
+      state: row.state,
+      simJobId: row.sim_job_id,
+      correctedResultId: row.corrected_result_id,
+      correctedResultStatus: row.corrected_result_status,
+      settings: row.settings,
+      requestedBy: row.requested_by,
+      createdAt: iso(row.created_at),
     })),
     closure,
   };

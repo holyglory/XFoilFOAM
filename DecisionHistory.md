@@ -44,6 +44,11 @@
   with `CompletionLedger.md`. The UI never asks an administrator to
   “investigate” when no user action exists.
   [D-2026-07-25-solver-incident-log]
+- Confirmed intent: terminal unpublished CFD evidence is explored per exact
+  generation in Solver › Points. Continuation resumes a proven saved case;
+  mesh, numerical, sampling, or manual changes create a new immutable
+  single-angle setup and linked URANS request without mutating the campaign or
+  prior evidence. [D-2026-08-13-unpublished-point-correction]
 - Confirmed intent: Health is the fleet-wide operational source of truth.
   Every solver reports bounded host/execution/storage telemetry through its
   heartbeat; the hub shows actual reserved slots and CFD jobs separately from
@@ -178,6 +183,15 @@
   waiting two more periods to rediscover it wastes the retry budget. Weakening
   evidence gates would publish bad science, while making every first attempt
   conservative would unnecessarily reduce campaign throughput.
+
+- Decision: expose terminal unpublished points in one calm Solver › Points
+  workflow, and make every operator correction create an exact-generation,
+  immutable single-angle setup plus a linked FAST or FULL URANS request.
+  [D-2026-08-13-unpublished-point-correction](DecisionDetails/D-2026-08-13-unpublished-point-correction.md)
+- Why: mutating a campaign preset would change unrelated future work, while a
+  generic retry cannot represent mesh, numerical, sampling, or manual changes.
+  A new pinned revision preserves the rejected evidence, scopes compute to one
+  point, and keeps the correction and resulting request auditable.
 
 - Decision: treat remote CPU capacity and hub-issued polar promises as separate
   execution controls. A remote node admits independent serial polars until its
