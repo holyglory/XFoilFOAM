@@ -33,6 +33,10 @@ import {
   solverEvidenceBlobs,
 } from "@aerodb/db";
 import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
+import {
   EngineError,
   EngineTimeoutError,
   parseArchiveCleanCycleRecoveryProgress,
@@ -1481,16 +1485,30 @@ export async function routeCampaignPrecalcToFreshAfterArchiveAbandonment(opts: {
           WHERE active_owner.id = obligation.id::text
             AND active_job.status IN ('pending', 'submitted', 'running', 'ingesting')
         )
+        -- Immutable classifications retain history. Only evidence that still
+        -- owns the current publishable result may suppress the fresh solve.
         AND NOT EXISTS (
           SELECT 1
           FROM result_attempts accepted_attempt
+          JOIN results accepted_result
+            ON accepted_result.id = accepted_attempt.result_id
+           AND accepted_result.current_result_attempt_id = accepted_attempt.id
+           AND accepted_result.status = 'done'
+           AND accepted_result.fidelity = 'urans_precalc'
           JOIN result_classifications accepted_classification
             ON accepted_classification.result_attempt_id = accepted_attempt.id
            AND accepted_classification.state = 'accepted'
           WHERE accepted_attempt.airfoil_id = obligation.airfoil_id
             AND accepted_attempt.simulation_preset_revision_id = obligation.revision_id
             AND accepted_attempt.aoa_deg IS NOT DISTINCT FROM obligation.aoa_deg
+            AND accepted_attempt.status = 'done'
             AND accepted_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(accepted_result.quality_warnings, ARRAY[]::text[])) warning
+              WHERE warning LIKE ${`%${URANS_BUDGET_STOP_MARKER}%`}
+                 OR warning LIKE ${`%${URANS_CONTINUATION_REQUIRED_MARKER}%`}
+            )
         )
         AND EXISTS (
           SELECT 1
