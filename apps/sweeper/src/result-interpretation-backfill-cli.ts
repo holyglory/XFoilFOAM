@@ -13,6 +13,7 @@ import {
   createArchiveInterpretationBackfillRun,
   discoverArchiveInterpretationBackfill,
   normaliseArchiveInterpretationBackfillScope,
+  routeCampaignPrecalcToFreshAfterArchiveAbandonment,
   runArchiveInterpretationBackfill,
   type ArchiveInterpretationBackfillScope,
 } from "./result-interpretation-backfill";
@@ -27,6 +28,7 @@ interface Args {
   requestedBy: string | undefined;
   cancelRunId: string | null;
   cancellationReason: string | undefined;
+  freshRerunCampaignId: string | null;
 }
 
 function positiveInteger(value: string | undefined, label: string): number {
@@ -59,6 +61,7 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
     requestedBy: undefined,
     cancelRunId: null,
     cancellationReason: undefined,
+    freshRerunCampaignId: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -70,6 +73,8 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
     if (argument === "--run-id") parsed.runId = value;
     else if (argument === "--cancel-run") parsed.cancelRunId = value;
     else if (argument === "--reason") parsed.cancellationReason = value;
+    else if (argument === "--fresh-rerun-campaign")
+      parsed.freshRerunCampaignId = value;
     else if (argument === "--result-id") scope.resultIds!.push(value);
     else if (argument === "--result-attempt-id")
       scope.resultAttemptIds!.push(value);
@@ -96,12 +101,14 @@ export function parseArchiveInterpretationBackfillArgs(argv: string[]): Args {
       parsed.requestedBy != null
     ) {
       throw new Error(
-        "--cancel-run can be combined only with one non-empty --reason",
+        "--cancel-run can be combined only with one non-empty --reason and optional --fresh-rerun-campaign",
       );
     }
     if (!parsed.cancellationReason?.trim()) {
       throw new Error("--cancel-run requires a non-empty --reason");
     }
+  } else if (parsed.freshRerunCampaignId) {
+    throw new Error("--fresh-rerun-campaign requires --cancel-run");
   } else if (parsed.cancellationReason != null) {
     throw new Error("--reason requires --cancel-run");
   }
@@ -126,13 +133,21 @@ export async function runArchiveInterpretationBackfillCli(
   const { db, sql, engine } = makeContext();
   try {
     if (args.cancelRunId) {
-      const report = await cancelArchiveInterpretationBackfillRun({
+      const cancellation = await cancelArchiveInterpretationBackfillRun({
         db,
         runId: args.cancelRunId,
         reason: args.cancellationReason!,
       });
+      const freshRerun = args.freshRerunCampaignId
+        ? await routeCampaignPrecalcToFreshAfterArchiveAbandonment({
+            db,
+            runId: args.cancelRunId,
+            campaignId: args.freshRerunCampaignId,
+            reason: args.cancellationReason!,
+          })
+        : null;
       process.stdout.write(
-        `${JSON.stringify({ mode: "cancel", ...report })}\n`,
+        `${JSON.stringify({ mode: "cancel", cancellation, freshRerun })}\n`,
       );
       return;
     }

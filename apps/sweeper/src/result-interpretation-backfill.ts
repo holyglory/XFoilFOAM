@@ -18,6 +18,8 @@
 import {
   type DB,
   type SolverEvidenceBlob,
+  probeCampaignCompletion,
+  recomputeProgressForCampaign,
   refreshPolarCacheForRevision,
   satisfyPrecalcObligationFromAcceptedResult,
   resultAttempts,
@@ -123,6 +125,13 @@ export type ArchiveInterpretationBackfillReport = {
   canonicalSelectionsCreated: number;
   /** Current result pointers now owned by a selection from this run. */
   resultProjectionsUpdated: number;
+};
+
+export type DisposableArchiveFreshRerunReport = {
+  runId: string;
+  campaignId: string;
+  obligationsReopened: number;
+  attemptReceiptsAbandoned: number;
 };
 
 /**
@@ -1406,6 +1415,202 @@ export async function cancelArchiveInterpretationBackfillRun(opts: {
       .where(eq(resultInterpretationBackfillRuns.id, opts.runId));
   });
   return refreshRunSummary(opts.db, opts.runId, { processed: 0 });
+}
+
+/**
+ * Convert one campaign's exhausted legacy PRECALC cells to their already
+ * budgeted fresh attempt after an operator has cancelled archive preservation.
+ * Every prior URANS attempt receives a terminal receipt in the cancelled run;
+ * that exact receipt fences both rediscovery and same-case continuation.
+ */
+export async function routeCampaignPrecalcToFreshAfterArchiveAbandonment(opts: {
+  db: DB;
+  runId: string;
+  campaignId: string;
+  reason: string;
+}): Promise<DisposableArchiveFreshRerunReport> {
+  if (!UUID.test(opts.runId) || !UUID.test(opts.campaignId)) {
+    throw new Error(
+      "archive fresh rerun requires exact run and campaign UUIDs",
+    );
+  }
+  const reason = opts.reason.trim();
+  if (!reason) throw new Error("archive fresh rerun requires a reason");
+  const report = await opts.db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [run] = await tx
+      .select({ state: resultInterpretationBackfillRuns.state })
+      .from(resultInterpretationBackfillRuns)
+      .where(eq(resultInterpretationBackfillRuns.id, opts.runId))
+      .limit(1)
+      .for("update");
+    if (!run) {
+      throw new Error(
+        `archive interpretation backfill run ${opts.runId} was not found`,
+      );
+    }
+    if (run.state !== "cancelled") {
+      throw new Error(
+        `archive fresh rerun requires a cancelled backfill run (state ${run.state})`,
+      );
+    }
+
+    const candidates = (await tx.execute(sql`
+      SELECT obligation.id
+      FROM sim_precalc_obligations obligation
+      JOIN sim_precalc_obligation_campaigns ownership
+        ON ownership.obligation_id = obligation.id
+       AND ownership.campaign_id = ${opts.campaignId}::uuid
+       AND ownership.state = 'active'
+      JOIN sim_campaigns campaign
+        ON campaign.id = ownership.campaign_id
+       AND campaign.status IN ('active', 'attention', 'paused')
+      WHERE obligation.state = 'blocked'
+        AND obligation.last_outcome = 'rejected_exhausted'
+        AND obligation.attempt_count < obligation.max_attempts
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_jobs active_job
+          CROSS JOIN LATERAL jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(active_job.request_payload -> 'precalcObligationIds') = 'array'
+              THEN active_job.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) active_owner(id)
+          WHERE active_owner.id = obligation.id::text
+            AND active_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_attempts accepted_attempt
+          JOIN result_classifications accepted_classification
+            ON accepted_classification.result_attempt_id = accepted_attempt.id
+           AND accepted_classification.state = 'accepted'
+          WHERE accepted_attempt.airfoil_id = obligation.airfoil_id
+            AND accepted_attempt.simulation_preset_revision_id = obligation.revision_id
+            AND accepted_attempt.aoa_deg IS NOT DISTINCT FROM obligation.aoa_deg
+            AND accepted_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM sim_precalc_obligation_attempts submission
+          JOIN result_attempts source_attempt
+            ON source_attempt.id = submission.result_attempt_id
+           AND source_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+          JOIN solver_evidence_archives source_archive
+            ON source_archive.result_id = source_attempt.result_id
+           AND source_archive.result_attempt_id = source_attempt.id
+           AND source_archive.state = 'current'
+          WHERE submission.obligation_id = obligation.id
+        )
+      ORDER BY obligation.id
+      FOR UPDATE OF obligation
+    `)) as unknown as Array<{ id: string }>;
+    if (!candidates.length) {
+      return {
+        runId: opts.runId,
+        campaignId: opts.campaignId,
+        obligationsReopened: 0,
+        attemptReceiptsAbandoned: 0,
+      };
+    }
+    const obligationIds = sql`ARRAY[${sql.join(
+      candidates.map((candidate) => sql`${candidate.id}::uuid`),
+      sql`, `,
+    )}]`;
+    const inserted = (await tx.execute(sql`
+      INSERT INTO result_interpretation_backfill_items (
+        run_id,
+        result_id,
+        result_attempt_id,
+        source_archive_id,
+        state,
+        next_attempt_at,
+        last_error
+      )
+      SELECT DISTINCT
+        ${opts.runId}::uuid,
+        source_attempt.result_id,
+        source_attempt.id,
+        source_archive.id,
+        'abandoned',
+        now(),
+        ${`operator abandoned archive preservation: ${reason}`.slice(0, 2_000)}
+      FROM sim_precalc_obligation_attempts submission
+      JOIN result_attempts source_attempt
+        ON source_attempt.id = submission.result_attempt_id
+       AND source_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      JOIN solver_evidence_archives source_archive
+        ON source_archive.result_id = source_attempt.result_id
+       AND source_archive.result_attempt_id = source_attempt.id
+       AND source_archive.state = 'current'
+      WHERE submission.obligation_id = ANY(${obligationIds})
+      ON CONFLICT (run_id, result_attempt_id) DO NOTHING
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    const [coverage] = (await tx.execute(sql`
+      SELECT count(DISTINCT submission.obligation_id)::int AS covered,
+             count(DISTINCT receipt.id)::int AS receipts
+      FROM sim_precalc_obligation_attempts submission
+      JOIN result_interpretation_backfill_items receipt
+        ON receipt.run_id = ${opts.runId}::uuid
+       AND receipt.result_attempt_id = submission.result_attempt_id
+       AND receipt.state = 'abandoned'
+      WHERE submission.obligation_id = ANY(${obligationIds})
+    `)) as unknown as Array<{ covered: number; receipts: number }>;
+    if (Number(coverage?.covered ?? 0) !== candidates.length) {
+      throw new Error(
+        "archive fresh rerun could not terminally receipt every candidate obligation",
+      );
+    }
+    const reopened = (await tx.execute(sql`
+      UPDATE sim_precalc_obligations obligation
+      SET state = 'pending',
+          next_submit_at = NULL,
+          completed_at = NULL,
+          last_outcome = 'archive_abandoned_fresh_retry_pending',
+          last_error = NULL,
+          "updatedAt" = now()
+      WHERE obligation.id = ANY(${obligationIds})
+        AND obligation.state = 'blocked'
+        AND obligation.last_outcome = 'rejected_exhausted'
+        AND obligation.attempt_count < obligation.max_attempts
+      RETURNING obligation.id
+    `)) as unknown as Array<{ id: string }>;
+    if (reopened.length !== candidates.length) {
+      throw new Error(
+        "archive fresh rerun lost an obligation ownership race; no changes were committed",
+      );
+    }
+    await tx.execute(sql`
+      UPDATE result_interpretation_backfill_runs
+      SET scope = scope || jsonb_build_object(
+            'operatorFreshRerunCampaignId', ${opts.campaignId},
+            'operatorFreshRerunReason', ${reason}
+          ),
+          summary = summary || jsonb_build_object(
+            'attemptReceiptsAbandoned', (
+              SELECT count(*)::int
+              FROM result_interpretation_backfill_items receipt
+              WHERE receipt.run_id = ${opts.runId}::uuid
+                AND receipt.state = 'abandoned'
+            ),
+            'obligationsReopenedFresh', ${reopened.length}
+          ),
+          "updatedAt" = now()
+      WHERE id = ${opts.runId}::uuid
+    `);
+    return {
+      runId: opts.runId,
+      campaignId: opts.campaignId,
+      obligationsReopened: reopened.length,
+      attemptReceiptsAbandoned: Number(coverage?.receipts ?? inserted.length),
+    };
+  });
+  await recomputeProgressForCampaign(opts.db, opts.campaignId);
+  await probeCampaignCompletion(opts.db, opts.campaignId);
+  return report;
 }
 
 /**

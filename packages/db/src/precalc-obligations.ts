@@ -793,6 +793,22 @@ function restartablePrecalcEvidenceSql(input: {
   )`;
 }
 
+function notOperatorAbandonedArchiveAttemptSql(
+  resultId: SQLWrapper,
+  resultAttemptId: SQLWrapper,
+) {
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM result_interpretation_backfill_items abandoned_item
+    JOIN result_interpretation_backfill_runs abandoned_run
+      ON abandoned_run.id = abandoned_item.run_id
+     AND abandoned_run.state = 'cancelled'
+    WHERE abandoned_item.result_id = ${resultId}
+      AND abandoned_item.result_attempt_id = ${resultAttemptId}
+      AND abandoned_item.state = 'abandoned'
+  )`;
+}
+
 /** Final exact-generation trust gate for PRECALC continuation consumers.
  * Typed direct-engine evidence may be a solved rejected checkpoint. The
  * campaign-ingested `queued` projection is accepted only with the exact
@@ -839,6 +855,10 @@ export async function isExactRestartablePrecalcAttempt(
           evidencePayload: sql`exact_attempt.evidence_payload`,
           solverImplementationId: sql`exact_attempt.solver_implementation_id`,
         })}
+        AND ${notOperatorAbandonedArchiveAttemptSql(
+          sql`exact_attempt.result_id`,
+          sql`exact_attempt.id`,
+        )}
     ) AS valid
   `)) as unknown as Array<{ valid: boolean }>;
   if (rows[0]?.valid !== true) return false;
@@ -1150,6 +1170,10 @@ export function restartablePrecalcCheckpointSql(
         evidencePayload: sql`checkpoint_attempt.evidence_payload`,
         solverImplementationId: sql`checkpoint_attempt.solver_implementation_id`,
       })}
+      AND ${notOperatorAbandonedArchiveAttemptSql(
+        sql`checkpoint_attempt.result_id`,
+        sql`checkpoint_attempt.id`,
+      )}
       AND ${exactValidSolverManifestSql(
         sql`checkpoint_attempt.result_id`,
         sql`checkpoint_attempt.id`,
@@ -1515,6 +1539,10 @@ export async function requeueRestartablePrecalcContinuations(
             evidencePayload: sql`checkpoint_attempt.evidence_payload`,
             solverImplementationId: sql`checkpoint_attempt.solver_implementation_id`,
           })}
+          AND ${notOperatorAbandonedArchiveAttemptSql(
+            sql`checkpoint_attempt.result_id`,
+            sql`checkpoint_attempt.id`,
+          )}
           AND NOT EXISTS (
             SELECT 1
             FROM sim_precalc_obligation_attempts newer_submission
@@ -3228,16 +3256,10 @@ export async function precalcCheckpointCandidatesForObligations(
         -- policy, not a reclassification of the immutable checkpoint; it
         -- nevertheless fences this exact attempt from same-case continuation
         -- so cancellation cannot route straight back into the discarded path.
-        AND NOT EXISTS (
-          SELECT 1
-          FROM result_interpretation_backfill_items abandoned_item
-          JOIN result_interpretation_backfill_runs abandoned_run
-            ON abandoned_run.id = abandoned_item.run_id
-           AND abandoned_run.state = 'cancelled'
-          WHERE abandoned_item.result_id = result_attempt.result_id
-            AND abandoned_item.result_attempt_id = result_attempt.id
-            AND abandoned_item.state = 'abandoned'
-        )
+        AND ${notOperatorAbandonedArchiveAttemptSql(
+          sql`result_attempt.result_id`,
+          sql`result_attempt.id`,
+        )}
         AND NOT EXISTS (
           SELECT 1
           FROM sim_precalc_obligation_attempts newer

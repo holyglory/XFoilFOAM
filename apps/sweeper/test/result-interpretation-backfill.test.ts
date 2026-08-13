@@ -191,11 +191,14 @@ describe("archive clean-cycle interpretation backfill", () => {
         UUID_A,
         "--reason",
         "fresh v11 solve is cheaper than archive hydration",
+        "--fresh-rerun-campaign",
+        UUID_B,
       ]),
     ).toMatchObject({
       execute: false,
       cancelRunId: UUID_A,
       cancellationReason: "fresh v11 solve is cheaper than archive hydration",
+      freshRerunCampaignId: UUID_B,
     });
     expect(() =>
       parseArchiveInterpretationBackfillArgs(["--cancel-run", UUID_A]),
@@ -211,6 +214,12 @@ describe("archive clean-cycle interpretation backfill", () => {
     ).toThrow(/combined only/);
     expect(() =>
       parseArchiveInterpretationBackfillArgs(["--reason", "no run"]),
+    ).toThrow(/requires --cancel-run/);
+    expect(() =>
+      parseArchiveInterpretationBackfillArgs([
+        "--fresh-rerun-campaign",
+        UUID_B,
+      ]),
     ).toThrow(/requires --cancel-run/);
     expect(
       archiveInterpretationRunSummaryState({
