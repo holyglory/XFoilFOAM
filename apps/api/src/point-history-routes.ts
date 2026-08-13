@@ -23,6 +23,7 @@ import { z } from "zod";
 
 import { requireAdmin, sessionEmail } from "./admin-auth";
 import { db } from "./db";
+import { assembleAdminSim } from "./services/sim";
 
 const listQuerySchema = z.object({
   status: z.enum(POINT_HISTORY_BUCKETS).optional(),
@@ -131,6 +132,33 @@ export async function registerPointHistoryRoutes(
       } catch (e) {
         return sendPointError(reply, e);
       }
+    },
+  );
+
+  app.get(
+    "/api/admin/point-history/:id/sim",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const params = z.object({ id: z.string().uuid() }).safeParse(req.params);
+      if (!params.success)
+        return reply.code(400).send({ error: "invalid point id" });
+      const query = z
+        .object({ resultAttemptId: z.string().uuid() })
+        .safeParse(req.query);
+      if (!query.success)
+        return reply
+          .code(400)
+          .send({ error: "an exact resultAttemptId is required" });
+      const sim = await assembleAdminSim(
+        params.data.id,
+        query.data.resultAttemptId,
+      );
+      if (!sim)
+        return reply.code(404).send({
+          error:
+            "the exact stored attempt has no complete coefficient evidence",
+        });
+      return sim;
     },
   );
 

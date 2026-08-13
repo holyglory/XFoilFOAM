@@ -3,6 +3,7 @@ import type {
   CategoryNode,
   HashtagDTO,
   MediumDTO,
+  SimulationDetail,
   ViscosityModelName,
   ViscosityTablePointDTO,
 } from "@aerodb/core";
@@ -792,6 +793,15 @@ export const getPointStory = (resultId: string) =>
   aj<import("./point-history").PointStoryPayload>(
     `/api/admin/point-history/${encodeURIComponent(resultId)}/story`,
   );
+export const getPointAttemptSim = (
+  resultId: string,
+  resultAttemptId: string,
+) => {
+  const query = new URLSearchParams({ resultAttemptId });
+  return aj<SimulationDetail>(
+    `/api/admin/point-history/${encodeURIComponent(resultId)}/sim?${query.toString()}`,
+  );
+};
 export const requeuePoint = (resultId: string) =>
   aj<{ requeued: 1; scope: "failed" | "rejected"; campaignIds: string[] }>(
     `/api/admin/point-history/${encodeURIComponent(resultId)}/requeue`,

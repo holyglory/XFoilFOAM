@@ -943,8 +943,13 @@ export interface PointStory {
     continuable: boolean;
     /** Exact immutable generation that the Continue action must name. */
     continuationResultAttemptId: string | null;
-    /** Exact current generation used by every point-scoped correction action. */
+    /** Exact source generation used by point-scoped correction actions. This
+     *  is the selected generation when one exists, otherwise the newest
+     *  immutable attempt retained for the pointer-null failed cell. */
     resultAttemptId: string | null;
+    /** Exact stored attempt whose coefficients/media can be opened by the
+     *  admin evidence viewer. It may be historical and unpublished. */
+    viewResultAttemptId: string | null;
     /** Effective pinned mesh/solver values for a corrected immutable run.
      *  Null only for historical or incomplete revisions. */
     correctionSetup: {
@@ -1010,6 +1015,38 @@ export async function pointStory(
       r.aoa_deg::float8 AS aoa_deg, r.reynolds, r.mach, r.speed, r.regime, r.status::text AS status,
       r.error, r.quality_warnings, r.simulation_preset_revision_id AS revision_id,
       r.current_result_attempt_id,
+      (
+        SELECT latest_attempt.id
+        FROM result_attempts latest_attempt
+        WHERE latest_attempt.result_id = r.id
+          AND latest_attempt.airfoil_id = r.airfoil_id
+          AND latest_attempt.bc_id = r.bc_id
+          AND latest_attempt.simulation_preset_revision_id =
+              r.simulation_preset_revision_id
+          AND latest_attempt.aoa_deg = r.aoa_deg
+        ORDER BY latest_attempt."createdAt" DESC, latest_attempt.id DESC
+        LIMIT 1
+      ) AS latest_result_attempt_id,
+      (
+        SELECT view_attempt.id
+        FROM result_attempts view_attempt
+        WHERE view_attempt.result_id = r.id
+          AND view_attempt.airfoil_id = r.airfoil_id
+          AND view_attempt.bc_id = r.bc_id
+          AND view_attempt.simulation_preset_revision_id =
+              r.simulation_preset_revision_id
+          AND view_attempt.aoa_deg = r.aoa_deg
+          AND view_attempt.source = 'solved'
+          AND view_attempt.status = 'done'
+          AND view_attempt.cl IS NOT NULL
+          AND view_attempt.cd IS NOT NULL
+          AND view_attempt.cd > 0
+        ORDER BY
+          (view_attempt.id = r.current_result_attempt_id) DESC,
+          view_attempt."createdAt" DESC,
+          view_attempt.id DESC
+        LIMIT 1
+      ) AS view_result_attempt_id,
       r."solvedAt" AS solved_at, r."updatedAt" AS updated_at, r.fidelity,
       ${REVIEW_BUCKET_SQL} AS review_bucket, ${CONTINUABLE_SQL} AS continuable,
       CASE WHEN ${CONTINUABLE_SQL}
@@ -1077,6 +1114,8 @@ export async function pointStory(
     continuable: boolean | null;
     continuation_result_attempt_id: string | null;
     current_result_attempt_id: string | null;
+    latest_result_attempt_id: string | null;
+    view_result_attempt_id: string | null;
     verify_state: string | null;
     verify_delta_cl: number | string | null;
     verify_delta_cd: number | string | null;
@@ -1345,7 +1384,9 @@ export async function pointStory(
       workDisposition: p.work_disposition ?? null,
       continuable: Boolean(p.continuable),
       continuationResultAttemptId: p.continuation_result_attempt_id,
-      resultAttemptId: p.current_result_attempt_id,
+      resultAttemptId:
+        p.current_result_attempt_id ?? p.latest_result_attempt_id ?? null,
+      viewResultAttemptId: p.view_result_attempt_id ?? null,
       correctionSetup,
       verify:
         p.verify_state == null

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 
 import {
   CampaignError,
@@ -83,6 +83,7 @@ export async function createPointCorrection(
       status: results.status,
       classificationState: resultClassifications.state,
       airfoilId: results.airfoilId,
+      bcId: results.bcId,
       airfoilName: airfoils.name,
       aoaDeg: results.aoaDeg,
       revisionId: simulationPresetRevisions.id,
@@ -120,10 +121,32 @@ export async function createPointCorrection(
       "exact point result generation was not found",
     );
   if (source.currentResultAttemptId !== input.resultAttemptId) {
-    throw new CampaignError(
-      "conflict",
-      "the point changed after this evidence was loaded; refresh before creating a corrected run",
-    );
+    if (source.currentResultAttemptId != null) {
+      throw new CampaignError(
+        "conflict",
+        "the point changed after this evidence was loaded; refresh before creating a corrected run",
+      );
+    }
+    const [newestAttempt] = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.resultId, source.resultId),
+          eq(resultAttempts.airfoilId, source.airfoilId),
+          eq(resultAttempts.bcId, source.bcId),
+          eq(resultAttempts.simulationPresetRevisionId, source.revisionId),
+          eq(resultAttempts.aoaDeg, source.aoaDeg),
+        ),
+      )
+      .orderBy(desc(resultAttempts.createdAt), desc(resultAttempts.id))
+      .limit(1);
+    if (newestAttempt?.id !== input.resultAttemptId) {
+      throw new CampaignError(
+        "conflict",
+        "newer stored evidence exists for this pointer-null point; refresh before creating a corrected run",
+      );
+    }
   }
   if (source.status !== "failed" && source.classificationState !== "rejected") {
     throw new CampaignError(

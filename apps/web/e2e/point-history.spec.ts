@@ -91,4 +91,255 @@ test.describe("Point History Explorer (read-only)", () => {
     await page.getByTestId("points-chip-all").click();
     await expect(page).not.toHaveURL(/[?&]pstatus=/);
   });
+
+  test("pointer-null unpublished evidence opens an exact stored run and exposes fresh correction", async ({
+    page,
+  }) => {
+    const resultId = "10000000-0000-4000-8000-000000000001";
+    const attemptId = "20000000-0000-4000-8000-000000000002";
+    const revisionId = "30000000-0000-4000-8000-000000000003";
+    const campaignId = "40000000-0000-4000-8000-000000000004";
+    const correctionBodies: Array<Record<string, unknown>> = [];
+    await page.route("**/api/admin/point-history*", async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (
+        url.pathname === `/api/admin/point-history/${resultId}/corrected-run`
+      ) {
+        correctionBodies.push(
+          request.postDataJSON() as Record<string, unknown>,
+        );
+        await route.fulfill({
+          status: 201,
+          contentType: "application/json",
+          body: JSON.stringify({
+            correctionRunId: "50000000-0000-4000-8000-000000000005",
+            presetId: "60000000-0000-4000-8000-000000000006",
+            revisionId: "70000000-0000-4000-8000-000000000007",
+            resultAttemptId: attemptId,
+            created: true,
+            request: {
+              id: "80000000-0000-4000-8000-000000000008",
+              state: "pending",
+            },
+          }),
+        });
+        return;
+      }
+      if (url.pathname === `/api/admin/point-history/${resultId}/sim`) {
+        expect(url.searchParams.get("resultAttemptId")).toBe(attemptId);
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            resultId,
+            status: "solved",
+            regime: "attached",
+            airfoilName: "A18 (original)",
+            alpha: -5,
+            re: 307041,
+            mach: 0.09,
+            cl: -0.127,
+            cd: 0.031,
+            cm: -0.02,
+            ld: -4.1,
+            media: null,
+            availableFields: [],
+            history: null,
+            fidelity: "urans_precalc",
+            steadyHistory: null,
+            uransVerify: null,
+            condition: null,
+          }),
+        });
+        return;
+      }
+      if (url.pathname === `/api/admin/point-history/${resultId}/story`) {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            point: {
+              resultId,
+              resultAttemptId: attemptId,
+              viewResultAttemptId: attemptId,
+              airfoilId: "90000000-0000-4000-8000-000000000009",
+              airfoilSlug: "a18",
+              airfoilName: "A18 (original)",
+              aoaDeg: -5,
+              reynolds: 307041,
+              mach: 0.09,
+              speed: 28,
+              regime: "urans",
+              status: "failed",
+              error: "solver evidence rejected: missing-urans-video",
+              qualityWarnings: ["max non-orthogonality 83 deg"],
+              classification: {
+                state: "rejected",
+                reasons: ["not-solved", "missing-coefficients"],
+                confidence: 1,
+                classifierVersion: "test",
+              },
+              revisionId,
+              campaignId,
+              campaignName: "All seeded airfoils",
+              conditionId: "a0000000-0000-4000-8000-00000000000a",
+              solvedAt: null,
+              updatedAt: "2026-08-13T18:00:00.000Z",
+              fidelity: "urans_precalc",
+              reviewBucket: null,
+              workDisposition: "blocked",
+              continuable: false,
+              continuationResultAttemptId: null,
+              correctionSetup: {
+                mesh: {
+                  mesher: "blockmesh-cgrid",
+                  farfieldRadiusChords: 15,
+                  wakeLengthChords: 12,
+                  nSurface: 130,
+                  nRadial: 80,
+                  nWake: 60,
+                  targetYPlus: 1,
+                  spanChords: 0.1,
+                },
+                solver: {
+                  turbulenceModel: "kOmegaSST",
+                  nIterations: 3000,
+                  convergenceTolerance: 0.00001,
+                  momentumScheme: "linearUpwind",
+                  transientCycles: 10,
+                  transientDiscardFraction: 0.4,
+                  transientMaxCourant: 4,
+                },
+              },
+              verify: null,
+            },
+            attempts: [
+              {
+                id: attemptId,
+                regime: "urans",
+                status: "done",
+                validForPolar: true,
+                converged: true,
+                stalled: false,
+                unsteady: false,
+                firstOrderFallback: false,
+                cl: -0.127,
+                cd: 0.031,
+                clCd: -4.1,
+                strouhal: null,
+                error: null,
+                qualityWarnings: ["max non-orthogonality 83 deg"],
+                engineCaseSlug: "c0p05_u90_am5",
+                simJob: null,
+                classification: {
+                  state: "accepted",
+                  reasons: [],
+                  confidence: 1,
+                },
+                createdAt: "2026-08-13T17:00:00.000Z",
+                solvedAt: "2026-08-13T17:30:00.000Z",
+              },
+            ],
+            interruptions: [],
+            corrections: [],
+            closure: null,
+          }),
+        });
+        return;
+      }
+      if (url.pathname === "/api/admin/point-history") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            items: [
+              {
+                kind: "result",
+                rowKey: `r:${resultId}`,
+                resultId,
+                airfoilId: "90000000-0000-4000-8000-000000000009",
+                airfoilSlug: "a18",
+                airfoilName: "A18 (original)",
+                aoaDeg: -5,
+                sourceAoaDeg: null,
+                reynolds: 307041,
+                regime: "urans",
+                status: "failed",
+                bucket: "failed",
+                classificationState: "rejected",
+                errorClass: "physics",
+                error: "missing-urans-video",
+                attemptCount: 1,
+                attemptDigest: [],
+                campaignId,
+                campaignName: "All seeded airfoils",
+                conditionId: "a0000000-0000-4000-8000-00000000000a",
+                revisionId,
+                lastActivityAt: "2026-08-13T18:00:00.000Z",
+                fidelity: "urans_precalc",
+                reviewBucket: null,
+                workDisposition: "blocked",
+                continuable: false,
+                verify: null,
+              },
+            ],
+            nextCursor: null,
+            counts: {
+              unpublished: 1,
+              failed: 1,
+              rejected: 1,
+              awaiting_urans: 0,
+              needs_review: 0,
+              accepted: 0,
+              needs_urans: 0,
+              solving: 0,
+              all: 1,
+            },
+            facets: {
+              campaigns: [
+                {
+                  id: campaignId,
+                  name: "All seeded airfoils",
+                  status: "active",
+                },
+              ],
+              reynolds: [307041],
+            },
+          }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto("/admin?section=queue&tab=points&pstatus=unpublished");
+    await page.getByTestId("point-history-row").click();
+    const story = page.getByTestId("point-story-panel");
+    await expect(
+      story.getByTestId("point-continuation-unavailable"),
+    ).toContainText("cannot resume in place");
+    await expect(story.getByTestId("point-correction-form")).toBeVisible();
+    await expect(
+      story.getByTestId("point-correction-mesh_refinement"),
+    ).toContainText("Refine mesh");
+
+    await story.getByTestId("point-solver-results").click();
+    await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+    await expect(page.getByTestId("sim-modal-dialog")).toContainText(
+      "A18 (original)",
+    );
+    await page.keyboard.press("Escape");
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await story.getByTestId("point-correction-submit").click();
+    await expect(story.getByTestId("point-correction-notice")).toContainText(
+      "corrected FAST URANS run queued",
+    );
+    expect(correctionBodies).toHaveLength(1);
+    expect(correctionBodies[0]).toMatchObject({
+      resultAttemptId: attemptId,
+      fidelity: "precalc",
+    });
+  });
 });

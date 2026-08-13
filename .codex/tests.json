@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "defaults": {
     "timeout_seconds": 7200,
     "resources": {
@@ -69,13 +69,11 @@
         "uv.lock"
       ],
       "depends_on": [],
-      "intents": [
-        "change",
-        "checkpoint",
-        "handoff",
-        "release",
-        "manual"
-      ],
+      "intents": ["change", "checkpoint", "handoff", "release", "manual"],
+      "retry": {
+        "max_attempts": 2,
+        "retry_on": ["lease_expired_before_launch"]
+      },
       "network": "external"
     },
     "node-suite": {
@@ -97,32 +95,24 @@
         "tsconfig.base.json"
       ],
       "depends_on": [],
-      "intents": [
-        "change",
-        "checkpoint",
-        "handoff",
-        "release",
-        "manual"
-      ],
+      "intents": ["change", "checkpoint", "handoff", "release", "manual"],
+      "retry": {
+        "max_attempts": 2,
+        "retry_on": ["lease_expired_before_launch"]
+      },
       "network": "external"
     }
   },
   "evidence_policies": {
     "handoff": {
       "intent": "handoff",
-      "required_targets": [
-        "python-suite",
-        "node-suite"
-      ],
+      "required_targets": ["python-suite", "node-suite"],
       "max_age_seconds": 86400,
       "allow_reuse": true
     },
     "release": {
       "intent": "release",
-      "required_targets": [
-        "python-suite",
-        "node-suite"
-      ],
+      "required_targets": ["python-suite", "node-suite"],
       "max_age_seconds": 3600,
       "allow_reuse": false
     }

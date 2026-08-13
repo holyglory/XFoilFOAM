@@ -34,6 +34,7 @@ import {
   type AdminUransRequest,
   continueUransResult,
   createPointCorrectedRun,
+  getPointAttemptSim,
   getPointHistory,
   getPointStory,
   getUransRequests,
@@ -41,7 +42,6 @@ import {
   requestUrans,
   requeuePoint,
 } from "@/lib/admin";
-import { getSim } from "@/lib/api";
 import { airfoilDetailHref } from "@/lib/detail-links";
 import {
   assembleTimeline,
@@ -551,23 +551,22 @@ export function PointHistoryPanel() {
     }
   };
 
-  // "solver results ▸": fetch the stored result via the existing sim endpoint
-  // (resultId wins server-side) and open the existing SimModal in place.
+  // Stored-run viewer: unpublished evidence must use the admin-gated exact
+  // attempt route. The public sim endpoint intentionally accepts only the
+  // selected publishable generation and must remain fail-closed.
   const openSolverResults = useCallback(() => {
     const item = openItemRef.current;
-    if (!item) return;
+    const storyPoint = story?.point;
+    const resultAttemptId =
+      item && storyPoint && storyPoint.resultId === item.resultId
+        ? storyPoint.viewResultAttemptId
+        : null;
+    if (!item || !resultAttemptId) return;
     setSimOpen(true);
     setSim(null);
     setSimMessage(null);
     setPlaying(true);
-    getSim(
-      item.airfoilSlug,
-      item.reynolds ?? 0,
-      item.kind === "derived"
-        ? (item.sourceAoaDeg ?? item.aoaDeg)
-        : item.aoaDeg,
-      item.resultId,
-    )
+    getPointAttemptSim(item.resultId, resultAttemptId)
       .then((d) => {
         if (!simOpenRef.current) return;
         setSim(d);
@@ -587,7 +586,7 @@ export function PointHistoryPanel() {
           `Could not load the stored OpenFOAM result (${(e as Error).message}).`,
         );
       });
-  }, []);
+  }, [story]);
 
   // ---- per-point repair actions (approved design D: repair verbs live HERE,
   // not in the campaign header) ----
@@ -828,6 +827,10 @@ export function PointHistoryPanel() {
     story.point.workDisposition !== "scheduled" &&
     (story.point.status === "failed" ||
       story.point.classification?.state === "rejected");
+  const continuationRelevant =
+    story != null &&
+    (story.point.regime === "urans" ||
+      (story.point.fidelity ?? "").startsWith("urans"));
 
   // Header chips truthfulness: once the authoritative story payload is in,
   // status/class chips reflect IT (the table row snapshot may be stale — e.g.
@@ -840,6 +843,8 @@ export function PointHistoryPanel() {
     openItem != null &&
     openItem.kind === "result" &&
     story.point.resultId === openItem.resultId;
+  const viewResultAvailable =
+    storyMatchesOpen && story.point.viewResultAttemptId != null;
   const headerItem: PointHistoryItem | null =
     openItem == null
       ? null
@@ -1452,14 +1457,23 @@ export function PointHistoryPanel() {
                   ref={storyResultTriggerRef}
                   type="button"
                   data-testid="point-solver-results"
+                  disabled={!viewResultAvailable}
+                  title={
+                    viewResultAvailable
+                      ? "Open the newest exact stored attempt with coefficient evidence; this may be historical and unpublished"
+                      : "No stored attempt with complete coefficient evidence is available"
+                  }
                   onClick={openSolverResults}
                   style={{
                     ...smallBtn,
-                    color: C.teal,
-                    borderColor: C.tealBorder,
+                    color: viewResultAvailable ? C.teal : C.dim,
+                    borderColor: viewResultAvailable ? C.tealBorder : C.stroke,
+                    cursor: viewResultAvailable ? "pointer" : "not-allowed",
                   }}
                 >
-                  solver results ▸
+                  {viewResultAvailable
+                    ? "stored run results ▸"
+                    : "stored run unavailable"}
                 </button>
                 <Link
                   href={airfoilDetailHref(
@@ -1483,7 +1497,9 @@ export function PointHistoryPanel() {
                 requeueEligible ||
                 continueEligible) && (
                 <details
-                  open={Boolean(requeueEligible || continueEligible)}
+                  open={Boolean(
+                    requeueEligible || continueEligible || correctionEligible,
+                  )}
                   data-testid="point-operator-overrides"
                   style={{
                     fontFamily: MONO,
@@ -1754,6 +1770,48 @@ export function PointHistoryPanel() {
                         }}
                       >
                         {publicationExplanation.detail}
+                      </span>
+                    </section>
+                  )}
+                  {continuationRelevant && (
+                    <section
+                      data-testid={
+                        continueEligible
+                          ? "point-continuation-available"
+                          : "point-continuation-unavailable"
+                      }
+                      style={{
+                        display: "grid",
+                        gap: 4,
+                        padding: 9,
+                        border: `1px solid ${C.borderSoft}`,
+                        borderRadius: 8,
+                        background: C.panel2,
+                        fontFamily: MONO,
+                      }}
+                    >
+                      <strong
+                        style={{
+                          color: continueEligible ? C.violet : C.muted,
+                          fontSize: 10.5,
+                        }}
+                      >
+                        {continueEligible
+                          ? "URANS continuation available"
+                          : "URANS continuation unavailable"}
+                      </strong>
+                      <span
+                        style={{
+                          color: C.muted,
+                          fontSize: 9.5,
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        {continueEligible
+                          ? "This exact generation has authenticated restart state. Choose Continue +2h, +6h, or +24h under Point actions."
+                          : correctionEligible
+                            ? "No selected generation has an authenticated restart checkpoint, so it cannot resume in place. Use the corrected-run editor below to start a fresh single-angle URANS case; Refine mesh is available there."
+                            : "No selected generation has an authenticated restart checkpoint, so it cannot resume in place."}
                       </span>
                     </section>
                   )}

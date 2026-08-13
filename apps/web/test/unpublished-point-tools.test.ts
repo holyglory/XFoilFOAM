@@ -17,6 +17,7 @@ const story = (
   point: {
     resultId: "10000000-0000-4000-8000-000000000001",
     resultAttemptId: "20000000-0000-4000-8000-000000000002",
+    viewResultAttemptId: "20000000-0000-4000-8000-000000000002",
     airfoilId: "30000000-0000-4000-8000-000000000003",
     airfoilSlug: "test-foil",
     airfoilName: "Test Foil",

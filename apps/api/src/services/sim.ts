@@ -121,6 +121,11 @@ function selectedResultProjection(
       : {};
   return {
     ...result,
+    // The projection is explicitly bound to `attempt`; do not inherit a null
+    // or different selected-generation pointer from the owning cell row.
+    // Public callers still prove ownership by joining through
+    // results.current_result_attempt_id before reaching this helper.
+    currentResultAttemptId: attempt.id,
     status: attempt.status,
     source: attempt.source,
     regime: attempt.regime,
@@ -659,4 +664,44 @@ export async function assembleSim(
     }
   }
   return null;
+}
+
+/**
+ * Admin evidence viewer for one explicitly named immutable attempt. Unlike the
+ * public detail route, this may expose retained unpublished evidence, but it
+ * never guesses a generation and remains admin-gated at the route boundary.
+ */
+export async function assembleAdminSim(
+  resultId: string,
+  resultAttemptId: string,
+): Promise<SimulationDetail | null> {
+  const [selected] = await db
+    .select({
+      result: results,
+      attempt: resultAttempts,
+      airfoilName: airfoils.name,
+    })
+    .from(results)
+    .innerJoin(
+      resultAttempts,
+      and(
+        eq(resultAttempts.id, resultAttemptId),
+        eq(resultAttempts.resultId, results.id),
+        eq(resultAttempts.airfoilId, results.airfoilId),
+        eq(resultAttempts.bcId, results.bcId),
+        eq(
+          resultAttempts.simulationPresetRevisionId,
+          results.simulationPresetRevisionId,
+        ),
+        eq(resultAttempts.aoaDeg, results.aoaDeg),
+        eq(resultAttempts.source, "solved"),
+      ),
+    )
+    .innerJoin(airfoils, eq(airfoils.id, results.airfoilId))
+    .where(eq(results.id, resultId))
+    .limit(1);
+  if (!selected) return null;
+  const projected = selectedResultProjection(selected.result, selected.attempt);
+  if (!finiteStored(projected.reynolds) || projected.reynolds <= 0) return null;
+  return solvedDetail(selected.airfoilName, projected.reynolds, projected);
 }

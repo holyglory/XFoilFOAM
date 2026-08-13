@@ -204,8 +204,10 @@ export interface PointStoryPayload {
     continuable: boolean;
     /** Exact immutable generation named by a continuation action. */
     continuationResultAttemptId: string | null;
-    /** Exact current generation named by point-scoped corrected-run actions. */
+    /** Exact source generation named by point-scoped corrected-run actions. */
     resultAttemptId: string | null;
+    /** Exact stored attempt opened by the admin evidence viewer. */
+    viewResultAttemptId: string | null;
     correctionSetup: PointCorrectionSettings | null;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
     verify: PointVerifyInfo | null;

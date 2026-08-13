@@ -365,6 +365,7 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       continuable: false,
       continuationResultAttemptId: null,
       resultAttemptId: "attempt-1",
+      viewResultAttemptId: "attempt-1",
       correctionSetup: null,
       verify: null,
       ...(over.point ?? {}),

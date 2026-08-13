@@ -234,6 +234,7 @@ function storyWith(verify: PointVerifyInfo | null): PointStoryPayload {
       continuable: false,
       continuationResultAttemptId: null,
       resultAttemptId: "attempt-1",
+      viewResultAttemptId: "attempt-1",
       correctionSetup: null,
       verify,
     },
