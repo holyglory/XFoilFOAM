@@ -145,10 +145,10 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
   const panel = page.getByTestId("solver-incidents-health");
   await expect(panel).toBeVisible();
   await expect(panel).toHaveAccessibleName(
-    /Solver reliability, 1 active recovery event, 1 critical system-owned pattern, 7 occurrences/i,
+    /Solver quality log, 1 unresolved solver event, 1 pattern awaiting solver follow-up, 7 recorded outcomes, no user action/i,
   );
-  await expect(panel).toContainText("Solver recovery");
-  await expect(panel).toContainText("1 solver-owned");
+  await expect(panel).toContainText("Solver quality log");
+  await expect(panel).toContainText("1 solver follow-up");
   await expect(panel).not.toContainText("System investigation required");
 
   const current = panel.getByTestId("solver-incident-event-0");
@@ -162,7 +162,7 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
   );
   await expect(current).toContainText("FAST URANS");
   await expect(current).toContainText("continuation made no progress");
-  await expect(current).toContainText("solver fix");
+  await expect(current).toContainText("solver follow-up");
   await expect(current).not.toContainText("current-debug");
   await current.locator(":scope > summary").click();
   await expect(current).toContainText("current-debug");

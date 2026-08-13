@@ -128,11 +128,14 @@ describe("solver incident presentation", () => {
     );
 
     expect(html).toContain('data-testid="solver-incidents-health"');
-    expect(html).toContain(">Solver recovery<");
-    expect(html).toContain("21 solver-owned");
+    expect(html).toContain(">Solver quality log<");
+    expect(html).toContain("21 solver follow-ups");
     expect(html).toContain("2 retrying");
-    expect(html).toContain("newest first · system");
+    expect(html).toContain("publication checks and");
+    expect(html).toContain("solver owned · no user action");
     expect(html).toContain("no user action");
+    expect(html).not.toContain("has-critical");
+    expect(html).not.toContain("solver fix");
     expect(html).not.toContain("System investigation required");
     expect(html).not.toContain("same cause → critical");
     expect(html).not.toContain("INVESTIGATE");
@@ -194,7 +197,7 @@ describe("solver incident presentation", () => {
       <SolverIncidentPanel summary={incidents} surface="campaign" />,
     );
 
-    expect(html).toContain("mesh recovery exhausted");
+    expect(html).toContain("mesh checks not met");
     expect(html).toContain("solver system · no user action");
     expect(html).not.toContain("agent JSON");
   });
@@ -210,7 +213,7 @@ describe("solver incident presentation", () => {
     );
 
     expect(health).toContain('data-testid="solver-incidents-health"');
-    expect(health).toContain("Solver recovery clear");
+    expect(health).toContain("Solver quality clear");
     expect(health).toContain(">clear<");
     expect(campaign).toBe("");
   });
@@ -227,12 +230,12 @@ describe("solver incident presentation", () => {
     ]);
 
     expect(solverIncidentSummaryLabel(incidents)).toContain(
-      "critical system-owned pattern",
+      "pattern awaiting solver follow-up",
     );
     expect(
       renderToStaticMarkup(
         <SolverIncidentPanel summary={incidents} surface="health" showClear />,
       ),
-    ).toContain('aria-label="Solver reliability, 1 active recovery event');
+    ).toContain('aria-label="Solver quality log, 1 unresolved solver event');
   });
 });

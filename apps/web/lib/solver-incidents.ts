@@ -6,21 +6,21 @@ import type {
 } from "./admin";
 
 const REASON_LABELS: Record<string, string> = {
-  "auto-retry-exhausted": "automatic pre-solver repair exhausted",
+  "auto-retry-exhausted": "pre-solver attempts exhausted",
   "continuation-no-progress": "continuation made no progress",
   "continuation-segment-limit": "continuation limit reached",
   "continuation-source-unavailable": "restart checkpoint unavailable",
   "engine-infrastructure-failure": "engine infrastructure failed",
-  "engine-submit-rejected": "engine submission recovery exhausted",
+  "engine-submit-rejected": "engine did not accept submission",
   "incomplete-urans-integration": "incomplete averaging window",
   "infrastructure-failure": "solver infrastructure interrupted",
   "insufficient-periods": "too few repeatable periods",
-  "media-repair-exhausted": "media recovery exhausted",
-  "mesh-quality-failure": "mesh recovery exhausted",
+  "media-repair-exhausted": "required media unavailable",
+  "mesh-quality-failure": "mesh checks not met",
   "non-publishable-rans-evidence": "unexpected pre-solver evidence state",
   "non-publishable-evidence": "publication checks unmet",
   "non-stationary": "no repeatable cycle",
-  "recovery-exhausted": "automatic recovery exhausted",
+  "recovery-exhausted": "automatic attempts exhausted",
   "solver-execution-failed": "solver execution interrupted",
   "solver-stalled": "solver stalled",
 };
@@ -49,7 +49,7 @@ export function solverIncidentStageLabel(
 
 function humanizeReasonPart(reason: string): string {
   const normalized = reason.trim().toLowerCase();
-  if (!normalized) return "unclassified recovery issue";
+  if (!normalized) return "unclassified solver issue";
   return (
     REASON_LABELS[normalized] ??
     normalized.replace(/[_-]+/g, " ").replace(/\s+/g, " ")
@@ -58,7 +58,7 @@ function humanizeReasonPart(reason: string): string {
 
 export function solverIncidentReasonLabel(reason: string): string {
   const labels = reason.split("+").map(humanizeReasonPart).filter(Boolean);
-  return labels.length ? labels.join(" · ") : "unclassified recovery issue";
+  return labels.length ? labels.join(" · ") : "unclassified solver issue";
 }
 
 export function solverIncidentView(
@@ -127,12 +127,12 @@ export function solverIncidentSummaryLabel(
   summary: AdminSolverIncidentSummary,
 ): string {
   if (summary.groups.length === 0) {
-    return "Solver reliability clear; no recovery incidents";
+    return "Solver quality clear; no unresolved solver events";
   }
   if (summary.openCount === 0) {
     return [
-      "Solver reliability currently clear",
-      `${summary.occurrenceCount} historical occurrence${summary.occurrenceCount === 1 ? "" : "s"}`,
+      "Solver quality currently clear",
+      `${summary.occurrenceCount} historical outcome${summary.occurrenceCount === 1 ? "" : "s"}`,
     ].join(", ");
   }
   const currentCriticalGroupCount = summary.groups.filter(
@@ -143,11 +143,12 @@ export function solverIncidentSummaryLabel(
         group.effectiveSeverity === "critical"),
   ).length;
   return [
-    "Solver reliability",
-    `${summary.openCount} active recovery event${summary.openCount === 1 ? "" : "s"}`,
+    "Solver quality log",
+    `${summary.openCount} unresolved solver event${summary.openCount === 1 ? "" : "s"}`,
     currentCriticalGroupCount > 0
-      ? `${currentCriticalGroupCount} critical system-owned pattern${currentCriticalGroupCount === 1 ? "" : "s"}`
-      : "automatic recovery active",
-    `${summary.occurrenceCount} occurrence${summary.occurrenceCount === 1 ? "" : "s"}`,
+      ? `${currentCriticalGroupCount} pattern${currentCriticalGroupCount === 1 ? "" : "s"} awaiting solver follow-up`
+      : "automatic retries active",
+    `${summary.occurrenceCount} recorded outcome${summary.occurrenceCount === 1 ? "" : "s"}`,
+    "no user action",
   ].join(", ");
 }

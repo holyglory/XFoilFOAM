@@ -613,8 +613,8 @@ describe("campaignStatusLine — legacy result evidence stays technical", () => 
   });
 });
 
-describe("campaignStatusLine — exhausted automatic recovery", () => {
-  it("MUST-CATCH: names the state as critical, never as a normal blocked queue", () => {
+describe("campaignStatusLine — points that did not pass publication checks", () => {
+  it("MUST-CATCH: keeps the campaign state calm and explains solver ownership", () => {
     const line = campaignStatusLine(
       summary({
         status: "attention",
@@ -622,9 +622,10 @@ describe("campaignStatusLine — exhausted automatic recovery", () => {
         reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
       }),
     );
-    expect(line.tone).toBe("red");
-    expect(line.text).toContain("3 critical recoveries exhausted");
-    expect(line.text).toContain("system investigation required");
+    expect(line.tone).toBe("amber");
+    expect(line.text).toContain("3 points not published");
+    expect(line.text).toContain("solver follow-up is automatic");
+    expect(line.text).not.toMatch(/critical|recovery|corrupt/i);
     expect(line.text).not.toContain("machine-blocked");
   });
 });

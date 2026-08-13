@@ -1,10 +1,4 @@
-import {
-  Activity,
-  ChevronDown,
-  CircleCheck,
-  CircleDot,
-  ShieldAlert,
-} from "lucide-react";
+import { Activity, ChevronDown, CircleCheck, CircleDot } from "lucide-react";
 import React from "react";
 
 import type {
@@ -46,16 +40,14 @@ function stateCopy(event: AdminSolverIncidentEvent): {
     return { label: "resolved", tone: "resolved" };
   }
   if (event.operationalState === "automatic_recovery") {
-    return { label: "auto retry", tone: "warning" };
+    return { label: "retrying", tone: "warning" };
   }
-  return { label: "solver fix", tone: "critical" };
+  return { label: "solver follow-up", tone: "warning" };
 }
 
 function JsonBlock({ value }: { value: unknown }) {
   return (
-    <pre className="solver-event-json">
-      {JSON.stringify(value, null, 2)}
-    </pre>
+    <pre className="solver-event-json">{JSON.stringify(value, null, 2)}</pre>
   );
 }
 
@@ -127,7 +119,7 @@ function EventRow({
             <dd>{event.solverImplementationKey}</dd>
           </div>
           <div>
-            <dt>Recovery version</dt>
+            <dt>Retry policy</dt>
             <dd>{event.remediationVersion}</dd>
           </div>
           <div>
@@ -176,9 +168,10 @@ function PatternRow({
   index: number;
 }) {
   const view = solverIncidentView(group, threshold);
+  const presentationTone = view.tone === "critical" ? "warning" : view.tone;
   return (
     <details
-      className={`solver-event is-${view.tone}`}
+      className={`solver-event is-${presentationTone}`}
       data-testid={`solver-incident-group-${index}`}
       data-stage={group.stage}
       data-status={view.tone}
@@ -189,12 +182,12 @@ function PatternRow({
         </time>
         <span className="solver-event-stage">{view.stageLabel}</span>
         <strong title={group.reason}>{view.reasonLabel}</strong>
-        <span className={`solver-event-state is-${view.tone}`}>
+        <span className={`solver-event-state is-${presentationTone}`}>
           <CircleDot size={10} aria-hidden="true" />
           {view.tone === "critical"
-            ? "solver fix"
+            ? "solver follow-up"
             : view.tone === "warning"
-              ? "auto retry"
+              ? "retrying"
               : "resolved"}
         </span>
         <ChevronDown
@@ -228,7 +221,7 @@ function PatternRow({
             <dd>{group.solverImplementationKey}</dd>
           </div>
           <div>
-            <dt>Recovery version</dt>
+            <dt>Retry policy</dt>
             <dd>{group.remediationVersion}</dd>
           </div>
           <div>
@@ -273,7 +266,7 @@ export function SolverIncidentPanel({
             Date.parse(right.occurredAt) - Date.parse(left.occurredAt),
         )
       : null;
-  const criticalOpen = summary.groups.reduce(
+  const followUpOpen = summary.groups.reduce(
     (total, group) =>
       total +
       (group.effectiveSeverity === "critical"
@@ -281,15 +274,15 @@ export function SolverIncidentPanel({
         : group.openCriticalCount),
     0,
   );
-  const recoveringOpen = Math.max(0, summary.openCount - criticalOpen);
+  const retryingOpen = Math.max(0, summary.openCount - followUpOpen);
   const latest = newestAt(eventRows ?? undefined, orderedGroups);
   const hasOpen = summary.openCount > 0;
-  const title = hasOpen ? "Solver recovery" : "Solver recovery clear";
-  const SummaryIcon = criticalOpen > 0 ? ShieldAlert : CircleCheck;
+  const title = hasOpen ? "Solver quality log" : "Solver quality clear";
+  const SummaryIcon = hasOpen ? Activity : CircleCheck;
 
   return (
     <details
-      className={`solver-log ${criticalOpen > 0 ? "has-critical" : hasOpen ? "has-warning" : "is-clear"}`}
+      className={`solver-log ${hasOpen ? "has-warning" : "is-clear"}`}
       data-testid={`solver-incidents-${surface}`}
       aria-label={solverIncidentSummaryLabel(summary)}
     >
@@ -325,7 +318,7 @@ export function SolverIncidentPanel({
         .solver-log-icon {
           display: inline-grid;
           place-items: center;
-          color: ${criticalOpen > 0 ? C.redText : hasOpen ? C.amber : C.teal};
+          color: ${hasOpen ? C.amber : C.teal};
         }
         .solver-log-title {
           min-width: 0;
@@ -604,14 +597,15 @@ export function SolverIncidentPanel({
           <SummaryIcon size={17} strokeWidth={1.8} />
         </span>
         <strong className="solver-log-title">{title}</strong>
-        {criticalOpen > 0 && (
-          <span className="solver-log-indicator is-critical">
-            {criticalOpen.toLocaleString()} solver-owned
+        {followUpOpen > 0 && (
+          <span className="solver-log-indicator is-warning">
+            {followUpOpen.toLocaleString()} solver follow-up
+            {followUpOpen === 1 ? "" : "s"}
           </span>
         )}
-        {recoveringOpen > 0 && (
+        {retryingOpen > 0 && (
           <span className="solver-log-indicator is-warning">
-            {recoveringOpen.toLocaleString()} retrying
+            {retryingOpen.toLocaleString()} retrying
           </span>
         )}
         {!hasOpen && (
@@ -630,8 +624,8 @@ export function SolverIncidentPanel({
       <div className="solver-log-content">
         <div className="solver-log-toolbar">
           <span>
-            <Activity size={11} aria-hidden="true" /> newest first · system
-            owned · no user action
+            <Activity size={11} aria-hidden="true" /> publication checks and
+            retries · solver owned · no user action
           </span>
           {surface === "health" && (
             <a
@@ -663,7 +657,7 @@ export function SolverIncidentPanel({
           ))
         ) : (
           <div className="solver-log-empty">
-            No solver recovery events in this window.
+            No solver quality events in this window.
           </div>
         )}
       </div>

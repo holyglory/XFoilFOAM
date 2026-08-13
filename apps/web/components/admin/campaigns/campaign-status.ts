@@ -210,11 +210,11 @@ export function campaignInstrumentStatus(
           action: null,
         };
       }
-      if (line.tone === "red") {
+      if ((totals.blocked ?? 0) > 0) {
         return {
-          title: "Critical recovery exhausted",
-          detail: `${fCount(totals.blocked ?? 0)} point${(totals.blocked ?? 0) === 1 ? "" : "s"} require system investigation`,
-          tone: "red",
+          title: "Some points were not published",
+          detail: `${fCount(totals.blocked ?? 0)} point${(totals.blocked ?? 0) === 1 ? "" : "s"} await solver follow-up · no user action required`,
+          tone: "amber",
           action: null,
         };
       }
@@ -488,8 +488,8 @@ export function campaignStatusLine(
         return {
           gate: null,
           lifecycle,
-          text: `Completed · ${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted; system investigation required.`,
-          tone: "red",
+          text: `Completed · ${fCount(blocked)} point${blocked === 1 ? " was" : "s were"} not published; solver details retained.`,
+          tone: "amber",
         };
       }
       if (
@@ -520,8 +520,8 @@ export function campaignStatusLine(
         return {
           gate: null,
           lifecycle,
-          text: `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted${fastSuffix}; system investigation required.`,
-          tone: "red",
+          text: `${fCount(blocked)} point${blocked === 1 ? "" : "s"} not published${fastSuffix}; solver follow-up is automatic.`,
+          tone: "amber",
         };
       }
       if (automaticPrecalc > 0) {
@@ -534,8 +534,8 @@ export function campaignStatusLine(
       }
       // Rolling clients may carry the older review-bucket split. Awaiting
       // URANS is still the automatic stage-2 queue; the legacy needsReview and
-      // failed/rejected counters are technical evidence, not a typed critical
-      // recovery outcome and therefore never become red primary campaign UI.
+      // failed/rejected counters are technical evidence, not a campaign-wide
+      // outage, and therefore never become red primary campaign UI.
       const rb = s.reviewBuckets;
       if (rb) {
         if (rb.awaitingUrans > 0) {

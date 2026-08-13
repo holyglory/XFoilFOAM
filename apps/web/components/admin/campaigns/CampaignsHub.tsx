@@ -91,7 +91,7 @@ export function campaignHubStatusLine(
   }
   if (item.status === "completed") {
     if (blocked > 0) {
-      return `Completed · ${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted; system investigation required.`;
+      return `Completed · ${fCount(blocked)} point${blocked === 1 ? " was" : "s were"} not published; solver details retained.`;
     }
     return (item.closedWithFailedCount ?? 0) > 0 ||
       (item.closedWithRejectedCount ?? 0) > 0
@@ -111,7 +111,7 @@ export function campaignHubStatusLine(
         automaticFast > 0
           ? ` · ${fCount(automaticFast)} awaiting FAST URANS`
           : "";
-      return `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted${fastSuffix}; system investigation required.`;
+      return `${fCount(blocked)} point${blocked === 1 ? "" : "s"} not published${fastSuffix}; solver follow-up is automatic.`;
     }
     if (automaticFast > 0) {
       return `Awaiting FAST URANS · ${fCount(automaticFast)} point${automaticFast === 1 ? "" : "s"}`;
@@ -132,7 +132,7 @@ export function campaignHubStatusLine(
     parts.push(`${fCount(automaticFast)} awaiting FAST URANS`);
   if (blocked > 0)
     parts.push(
-      `${fCount(blocked)} critical recover${blocked === 1 ? "y" : "ies"} exhausted`,
+      `${fCount(blocked)} point${blocked === 1 ? "" : "s"} not published`,
     );
   return `Active — ${parts.join(" · ")}.`;
 }
@@ -468,13 +468,11 @@ export function CampaignsHub({
                 ]
               : [];
             const attentionColor =
-              blocked > 0 ? C.red : automaticFast > 0 ? C.violet : C.amber;
+              automaticFast > 0 && blocked === 0 ? C.violet : C.amber;
             const statusColor =
-              blocked > 0
-                ? C.red
-                : item.status === "attention"
-                  ? attentionColor
-                  : (STATUS_COLOR[item.status] ?? C.muted);
+              item.status === "attention"
+                ? attentionColor
+                : (STATUS_COLOR[item.status] ?? C.muted);
             // Gate badge (mockup fec7b453 screen 3): while a scheduler gate
             // blocks an ACTIVE campaign, the gate is the PRIMARY chip and the
             // lifecycle demotes to a small dim chip — never an "Active"
@@ -673,17 +671,19 @@ export function CampaignsHub({
                     fontFamily: MONO,
                     fontSize: 11,
                     color:
-                      blocked > 0
-                        ? C.redText
-                        : automaticFast > 0
-                          ? C.violet
-                          : item.status === "attention"
-                            ? attentionColor
-                            : gate
-                              ? gate.tone === "red"
-                                ? C.redText
-                                : C.amber
-                              : C.text2,
+                      item.status === "active"
+                        ? C.text2
+                        : blocked > 0
+                          ? C.amber
+                          : automaticFast > 0
+                            ? C.violet
+                            : item.status === "attention"
+                              ? attentionColor
+                              : gate
+                                ? gate.tone === "red"
+                                  ? C.redText
+                                  : C.amber
+                                : C.text2,
                   }}
                 >
                   {campaignHubStatusLine(item, summary, solver.state)}
@@ -698,7 +698,7 @@ export function CampaignsHub({
                   }}
                 >
                   <div
-                    aria-label={`progress ${settled} done and ${blocked} critical recoveries exhausted of ${totals.requested}`}
+                    aria-label={`progress ${settled} completed and ${blocked} not published of ${totals.requested}`}
                     style={{
                       height: 6,
                       borderRadius: 4,
@@ -707,8 +707,9 @@ export function CampaignsHub({
                       display: "flex",
                     }}
                   >
-                    {/* Red marks critical exhausted recovery; automatic
-                        precalc and awaiting-URANS work keep the teal bar. */}
+                    {/* Accepted/derived progress is teal. Terminal points that
+                        did not pass publication checks are a calm amber sliver,
+                        not a campaign-wide failure signal. */}
                     <div
                       style={{
                         width: `${progress * 100}%`,
@@ -721,7 +722,7 @@ export function CampaignsHub({
                         style={{
                           width: `${blockedProgress * 100}%`,
                           height: "100%",
-                          background: C.red,
+                          background: C.amber,
                         }}
                       />
                     )}
@@ -735,19 +736,17 @@ export function CampaignsHub({
                     }}
                   >
                     {fCount(settled)} / {fCount(totals.requested)}
-                    {/* Only typed states belong in the campaign summary:
-                        exhausted automatic recovery is red; queued/running
-                        FAST URANS is calm violet. Raw failed/rejected evidence
-                        stays in technical Solver logs. */}
+                    {/* Only typed states belong in the campaign summary. Raw
+                        failed/rejected attempts stay in technical Solver logs. */}
                     {blocked > 0 && (
                       <>
                         {" · "}
                         <span
                           data-testid={`campaign-blocked-${item.slug}`}
-                          title="Critical: automatic recovery exhausted without a publishable result"
-                          style={{ color: C.redText }}
+                          title="These points used all automatic solver attempts and remain unpublished. The campaign continues; no user action is required."
+                          style={{ color: C.amber }}
                         >
-                          {fCount(blocked)} critical
+                          {fCount(blocked)} not published
                         </span>
                       </>
                     )}
