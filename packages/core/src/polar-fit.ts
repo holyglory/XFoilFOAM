@@ -12,6 +12,7 @@ import {
   URANS_CONTINUATION_REQUIRED_MARKER,
 } from "./urans-quality";
 import { selectedCleanCycleQualityReasons } from "./urans-cycle-policy";
+import { parseNoSheddingCertificate } from "./no-shedding-certificate";
 
 // v2: solver-stalled applies only to non-converged STEADY points; unsteady
 // rows are judged on the URANS evidence gate (converged + force history +
@@ -46,7 +47,11 @@ import { selectedCleanCycleQualityReasons } from "./urans-cycle-policy";
 // can still be an alternate numerical branch. A narrowly bounded attached
 // baseline + discontinuity check routes only the incoherent low-angle run to
 // preliminary URANS; it never invents replacement coefficients.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v6";
+// v7 (certified no-shedding URANS, 2026-08-13): current no-shedding evidence
+// remains URANS for numerical provenance, but its strict physical observation
+// certificate replaces periodic video/frame/cycle requirements. The shared
+// certificate parser fails closed on malformed or contradictory payloads.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v7";
 
 /** A derived-media absence, not an aerodynamic verdict. The point remains
  * rejected until real stored video exists, but it belongs to automatic media
@@ -54,7 +59,7 @@ export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v6";
 export const MISSING_URANS_VIDEO_REASON = "missing-urans-video";
 // v6 invalidates fits whose selected RANS evidence may contain an alternate
 // low-angle branch that now requires preliminary URANS confirmation.
-export const POLAR_FIT_VERSION = "evidence-lowess-v6";
+export const POLAR_FIT_VERSION = "evidence-lowess-v7";
 
 /** Canonical classifier reason for restartable but incomplete URANS evidence. */
 export const INCOMPLETE_URANS_INTEGRATION_REASON =
@@ -246,6 +251,10 @@ export interface PolarEvidencePoint {
    * explicitly failed to ship a certificate for a shedding point and must
    * fail closed. */
   uransCycleCertificate?: UransCycleCertificateEvidence | null;
+  /** Undefined is a legacy omission, null means the current URANS producer
+   * did not certify a non-shedding wake, and a strict valid object proves a
+   * physical steady-equivalent observation without periodic media. */
+  noSheddingCertificate?: unknown;
   /** Undefined is pre-hold legacy evidence.  Explicit null is a current
    * steady-RANS producer that could not prove its exact raw final window;
    * that is an ordinary targeted URANS handoff, not a terminal result. */
@@ -439,6 +448,18 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   // the pointwise gates rather than inferring proof from display averages.
   reasons.push(...ransHoldCertificateReasons(p));
   if (p.regime === "urans") {
+    const noSheddingParse =
+      p.noSheddingCertificate === undefined || p.noSheddingCertificate === null
+        ? null
+        : parseNoSheddingCertificate(p.noSheddingCertificate);
+    const certifiedNoShedding =
+      p.unsteady === false && noSheddingParse?.ok === true;
+    if (
+      noSheddingParse != null &&
+      (!noSheddingParse.ok || p.unsteady !== false)
+    ) {
+      reasons.push("invalid-no-shedding-certificate");
+    }
     // A current accepted archive interpretation is a fresh raw-evidence
     // reduction, not a reinterpretation of the attempt's old summary
     // metadata.  Its exact raw force history has already been authenticated
@@ -448,11 +469,12 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     // invents a preview artifact and therefore cannot waive that gate.
     if (
       !archiveBacked &&
+      !certifiedNoShedding &&
       hasIncompleteUransIntegrationWarning(p.qualityWarnings)
     ) {
       reasons.push(INCOMPLETE_URANS_INTEGRATION_REASON);
     }
-    if (!archiveBacked && !p.hasForceHistory)
+    if (!archiveBacked && !certifiedNoShedding && !p.hasForceHistory)
       reasons.push("missing-force-history");
     // A selected steady-equivalent archive proves that the transient wake is
     // physically non-shedding. It owns stored static fields, not a fabricated
@@ -460,7 +482,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     const selectedSteadyEquivalent =
       archiveBacked &&
       p.selectedArchiveInterpretation?.regime === "steady_equivalent";
-    if (!p.hasVideo && !selectedSteadyEquivalent)
+    if (!p.hasVideo && !selectedSteadyEquivalent && !certifiedNoShedding)
       reasons.push(MISSING_URANS_VIDEO_REASON);
     // Frame-track stationarity gate (v3): applies ONLY to evidence whose
     // engine version shipped frame_track (non-null). Reads fail closed — a
@@ -469,7 +491,12 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     // v4: the period bar is fidelity-aware — precalc rows (half-resolution
     // pre-calculation tier) accept at >= 3 retained periods, full/legacy rows
     // keep the strict >= 5 bar.
-    if (!archiveBacked && p.frameTrack !== null && p.frameTrack !== undefined) {
+    if (
+      !archiveBacked &&
+      !certifiedNoShedding &&
+      p.frameTrack !== null &&
+      p.frameTrack !== undefined
+    ) {
       if (p.frameTrack.stationary !== true) reasons.push("non-stationary");
       const periods = p.frameTrack.periods_retained;
       const minPeriods = frameTrackMinPeriodsFor(p.fidelity);
@@ -490,7 +517,11 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     // fails closed. Strict payload-shape validation happens during ingestion,
     // while these checks keep an invalid/uncertified current point out of the
     // legacy canonical projection before a reducer can select it.
-    if (!archiveBacked && p.uransCycleCertificate !== undefined) {
+    if (
+      !archiveBacked &&
+      !certifiedNoShedding &&
+      p.uransCycleCertificate !== undefined
+    ) {
       const certificate = p.uransCycleCertificate;
       if (certificate === null) {
         reasons.push("missing-clean-cycle-certificate");

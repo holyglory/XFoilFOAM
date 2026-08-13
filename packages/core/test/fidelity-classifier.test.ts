@@ -1,4 +1,4 @@
-// Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v6):
+// Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v7):
 //   1. FIDELITY-AWARE frame-track period bar — urans_precalc accepts at >= 3
 //      retained periods, urans_full / legacy keeps the strict >= 5 bar.
 //   2. Oscillating-steady acceptance — a STEADY row with converged=false but
@@ -54,6 +54,31 @@ const uransRow: PolarEvidencePoint = {
   frameTrack: contractFrameTrack,
 };
 
+const noSheddingCertificate = {
+  reducer_version: "no-shedding-v1",
+  certified: true,
+  required_observation_s: 0.2,
+  observation_start_time: 1,
+  observation_end_time: 1.25,
+  observed_observation_s: 0.25,
+  source_sample_count: 120,
+  transport_sample_count: 100,
+  relative_tolerance: 0.01,
+  absolute_floor: 0.001,
+  cl_mean: 0.4,
+  cd_mean: 0.02,
+  cm_mean: -0.03,
+  cl_rms: 0.001,
+  cd_rms: 0.0001,
+  cm_rms: 0.0001,
+  transport_cl_mean: 0.4,
+  transport_cd_mean: 0.02,
+  transport_cm_mean: -0.03,
+  transport_cl_rms: 0.001,
+  transport_cd_rms: 0.0001,
+  transport_cm_rms: 0.0001,
+} as const;
+
 const steadyHistory = {
   iterations: [1000, 1500, 2000],
   cl: [0.84, 0.841, 0.84],
@@ -81,7 +106,7 @@ const oscillatingSteadyRow: PolarEvidencePoint = {
 
 describe("fidelity-aware frame-track period bar (v6)", () => {
   it("pins the version stamp and the per-tier bars", () => {
-    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v6");
+    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v7");
     expect(FRAME_TRACK_MIN_PERIODS_PRECALC).toBe(3);
     expect(FRAME_TRACK_MIN_PERIODS_FULL).toBe(5);
     expect(FRAME_TRACK_MIN_PERIODS).toBe(FRAME_TRACK_MIN_PERIODS_FULL);
@@ -178,6 +203,63 @@ describe("fidelity-aware frame-track period bar (v6)", () => {
       },
     ]);
     expect(classified.classifications[0].state).toBe("accepted");
+  });
+});
+
+describe("certified no-shedding URANS (v7)", () => {
+  const currentNoShedding: PolarEvidencePoint = {
+    ...uransRow,
+    a: -5,
+    unsteady: false,
+    stalled: false,
+    fidelity: "urans_precalc",
+    hasForceHistory: false,
+    hasVideo: false,
+    frameTrack: null,
+    uransCycleCertificate: null,
+    noSheddingCertificate,
+  };
+
+  it("MUST-CATCH: accepts a current certified no-shedding URANS result without invented periodic evidence", () => {
+    const classified = classifyPolarEvidence([currentNoShedding]);
+    expect(classified.classifications[0]).toMatchObject({
+      state: "accepted",
+      reasons: [],
+    });
+    expect(classified.classifications[0].evidence.regime).toBe("urans");
+  });
+
+  it("fails closed on a malformed certificate and does not waive periodic gates", () => {
+    const classified = classifyPolarEvidence([
+      {
+        ...currentNoShedding,
+        noSheddingCertificate: {
+          ...noSheddingCertificate,
+          certified: false,
+        },
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toEqual(
+      expect.arrayContaining([
+        "invalid-no-shedding-certificate",
+        "missing-urans-video",
+        "missing-clean-cycle-certificate",
+      ]),
+    );
+  });
+
+  it("does not let a certificate attached to a shedding payload bypass clean-cycle evidence", () => {
+    const classified = classifyPolarEvidence([
+      {
+        ...currentNoShedding,
+        unsteady: true,
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain(
+      "invalid-no-shedding-certificate",
+    );
   });
 });
 

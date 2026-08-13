@@ -113,6 +113,11 @@
   solve instead of becoming permanent queue blockers.
   [D-2026-07-28-immutable-result-interpretations]
   [D-2026-08-12-archive-truth-and-disposable-continuation]
+  A strict current no-shedding certificate proves a physically
+  steady-equivalent URANS observation and therefore replaces, rather than
+  fabricates, periodic video/frame/cycle evidence while retaining URANS
+  numerical provenance.
+  [D-2026-08-13-certified-no-shedding-classification]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -150,6 +155,15 @@
   memory-bandwidth contention. Sixty-four adds useful parallelism while
   retaining control-plane headroom and is directly reversible after measured
   throughput comparison.
+
+- Decision: classify a current URANS result with a strictly parsed certified
+  no-shedding certificate as steady-equivalent evidence without requiring
+  periodic video, frame-track, force-history, or clean-cycle artifacts.
+  [D-2026-08-13-certified-no-shedding-classification](DecisionDetails/D-2026-08-13-certified-no-shedding-classification.md)
+- Why: production held 116 certified no-shedding attempts rejected solely by
+  periodic-evidence rules across 111 physical campaign cells. Relabelling the
+  numerical method as RANS would falsify provenance, and inventing periodic
+  media is forbidden; the exact certificate is the real independent proof.
 
 - Decision: treat remote CPU capacity and hub-issued polar promises as separate
   execution controls. A remote node admits independent serial polars until its

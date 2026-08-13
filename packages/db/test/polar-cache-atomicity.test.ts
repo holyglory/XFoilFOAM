@@ -35,6 +35,30 @@ import {
 
 const { db, sql: pgClient } = createClient({ max: 4 });
 const PREFIX = `polar-atomic-${process.pid}-${Date.now().toString(36)}`;
+const noSheddingCertificateFixture = {
+  reducer_version: "no-shedding-v1",
+  certified: true,
+  required_observation_s: 0.2,
+  observation_start_time: 1,
+  observation_end_time: 1.25,
+  observed_observation_s: 0.25,
+  source_sample_count: 120,
+  transport_sample_count: 100,
+  relative_tolerance: 0.01,
+  absolute_floor: 0.001,
+  cl_mean: 0.4,
+  cd_mean: 0.02,
+  cm_mean: -0.03,
+  cl_rms: 0.001,
+  cd_rms: 0.0001,
+  cm_rms: 0.0001,
+  transport_cl_mean: 0.4,
+  transport_cd_mean: 0.02,
+  transport_cm_mean: -0.03,
+  transport_cl_rms: 0.001,
+  transport_cd_rms: 0.0001,
+  transport_cm_rms: 0.0001,
+} as const;
 
 describe("revision polar cache transaction boundary", () => {
   let airfoilId = "";
@@ -1153,6 +1177,71 @@ describe("revision polar cache transaction boundary", () => {
           .where(eq(results.id, result.id));
       },
     });
+  }, 60_000);
+
+  it("MUST-CATCH: persisted certified no-shedding URANS is accepted without periodic media", async () => {
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: -12,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        cl: 0.4,
+        cd: 0.02,
+        cm: -0.03,
+        clCd: 20,
+        converged: true,
+        stalled: false,
+        unsteady: false,
+      })
+      .returning({ id: results.id });
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: -12,
+        status: "done",
+        source: "solved",
+        regime: "urans",
+        validForPolar: true,
+        cl: 0.4,
+        cd: 0.02,
+        cm: -0.03,
+        clCd: 20,
+        converged: true,
+        stalled: false,
+        unsteady: false,
+        evidencePayload: {
+          fidelity: "urans_precalc",
+          urans_cycle_certificate: null,
+          no_shedding_certificate: noSheddingCertificateFixture,
+          video: {},
+        },
+      })
+      .returning({ id: resultAttempts.id });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, result.id));
+
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+
+    const [classification] = await db
+      .select({
+        state: resultClassifications.state,
+        reasons: resultClassifications.reasons,
+      })
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, attempt.id));
+    expect(classification).toEqual({ state: "accepted", reasons: [] });
   }, 60_000);
 
   it("preserves selected accepted and needs_urans exact generations", async () => {

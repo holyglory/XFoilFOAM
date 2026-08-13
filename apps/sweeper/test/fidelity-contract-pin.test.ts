@@ -34,6 +34,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPolarRequest } from "../src/build-request";
 import {
   fidelityForPoint,
+  incomingRejectionReasons,
   qualityWarningsForPoint,
   solverRegimeForPoint,
   STEADY_OSCILLATING_MARKER,
@@ -42,12 +43,21 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractFixture = (): Record<string, unknown> =>
-  JSON.parse(readFileSync(resolve(here, "fixtures/steady-history-contract.json"), "utf8"));
+  JSON.parse(
+    readFileSync(
+      resolve(here, "fixtures/steady-history-contract.json"),
+      "utf8",
+    ),
+  );
 
 describe("fidelity ladder literals + engine-derived values (contract 1, cross-runtime pin)", () => {
   it("pins the request/echo literal sets", () => {
     expect(URANS_FIDELITY_VALUES).toEqual(["precalc", "full"]);
-    expect(POINT_FIDELITY_VALUES).toEqual(["rans", "urans_precalc", "urans_full"]);
+    expect(POINT_FIDELITY_VALUES).toEqual([
+      "rans",
+      "urans_precalc",
+      "urans_full",
+    ]);
   });
 
   it("pins the engine-derived per-fidelity values (parity with models.py)", () => {
@@ -72,7 +82,16 @@ describe("fidelity ladder literals + engine-derived values (contract 1, cross-ru
     expect(parsePointFidelity("rans")).toBe("rans");
     expect(parsePointFidelity("urans_precalc")).toBe("urans_precalc");
     expect(parsePointFidelity("urans_full")).toBe("urans_full");
-    for (const bad of ["precalc", "full", "URANS_FULL", "", null, undefined, 3, {}]) {
+    for (const bad of [
+      "precalc",
+      "full",
+      "URANS_FULL",
+      "",
+      null,
+      undefined,
+      3,
+      {},
+    ]) {
       expect(parsePointFidelity(bad)).toBeNull();
     }
   });
@@ -93,18 +112,65 @@ describe("build-request: solver.urans_fidelity (contract 1 — node sends ONLY t
   } as unknown as Airfoil;
   const setup = {
     preset: { legacyBoundaryConditionId: null },
-    flowState: { mediumId: "m", temperatureK: 288.15, pressurePa: 101325, speedMps: 30, density: 1.225, dynamicViscosity: 1.789e-5, kinematicViscosity: 1.46e-5, mach: 0.09 },
-    referenceGeometry: { geometryType: "airfoil_2d", referenceLengthKind: "chord", referenceLengthM: 1, spanM: null, referenceAreaM2: null },
-    boundary: { turbulenceIntensity: 0.001, viscosityRatio: 10, sandGrainHeight: 0, roughnessConstant: 0.5 },
-    mesh: { mesher: "blockmesh-cgrid", farfieldRadiusChords: 15, wakeLengthChords: 12, nSurface: 130, nRadial: 80, nWake: 60, targetYPlus: 1, spanChords: 0.1 },
-    solver: { turbulenceModel: "kOmegaSST", nIterations: 3000, convergenceTolerance: 1e-5, momentumScheme: "linearUpwind", transientCycles: 10, transientDiscardFraction: 0.4, transientMaxCourant: 4 },
-    scheduling: { schedulingPolicy: "auto", cpuBudget: null, caseConcurrency: null, solverProcesses: null },
+    flowState: {
+      mediumId: "m",
+      temperatureK: 288.15,
+      pressurePa: 101325,
+      speedMps: 30,
+      density: 1.225,
+      dynamicViscosity: 1.789e-5,
+      kinematicViscosity: 1.46e-5,
+      mach: 0.09,
+    },
+    referenceGeometry: {
+      geometryType: "airfoil_2d",
+      referenceLengthKind: "chord",
+      referenceLengthM: 1,
+      spanM: null,
+      referenceAreaM2: null,
+    },
+    boundary: {
+      turbulenceIntensity: 0.001,
+      viscosityRatio: 10,
+      sandGrainHeight: 0,
+      roughnessConstant: 0.5,
+    },
+    mesh: {
+      mesher: "blockmesh-cgrid",
+      farfieldRadiusChords: 15,
+      wakeLengthChords: 12,
+      nSurface: 130,
+      nRadial: 80,
+      nWake: 60,
+      targetYPlus: 1,
+      spanChords: 0.1,
+    },
+    solver: {
+      turbulenceModel: "kOmegaSST",
+      nIterations: 3000,
+      convergenceTolerance: 1e-5,
+      momentumScheme: "linearUpwind",
+      transientCycles: 10,
+      transientDiscardFraction: 0.4,
+      transientMaxCourant: 4,
+    },
+    scheduling: {
+      schedulingPolicy: "auto",
+      cpuBudget: null,
+      caseConcurrency: null,
+      solverProcesses: null,
+    },
     output: { writeImages: [], imageZoomChords: 2 },
     sweep: { aoaStart: -8, aoaStop: 20, aoaStep: 1, aoaList: null },
   } as unknown as SimulationSetupSnapshot;
 
   it("wave 2 defaults to 'precalc' and sends ONLY the literal (no derived numbers)", () => {
-    const { request } = buildPolarRequest({ airfoil, setup, aoaList: [12], wave: 2 });
+    const { request } = buildPolarRequest({
+      airfoil,
+      setup,
+      aoaList: [12],
+      wave: 2,
+    });
     expect(request.solver?.urans_fidelity).toBe("precalc");
     expect(request.solver?.force_transient).toBe(true);
     // The node must NOT ship derived values — the engine owns the derivation.
@@ -113,12 +179,24 @@ describe("build-request: solver.urans_fidelity (contract 1 — node sends ONLY t
   });
 
   it("wave 2 passes 'full' through for verify/admin-full jobs", () => {
-    const { request } = buildPolarRequest({ airfoil, setup, aoaList: [12], wave: 2, uransFidelity: "full" });
+    const { request } = buildPolarRequest({
+      airfoil,
+      setup,
+      aoaList: [12],
+      wave: 2,
+      uransFidelity: "full",
+    });
     expect(request.solver?.urans_fidelity).toBe("full");
   });
 
   it("wave 1 (steady) never carries a urans_fidelity", () => {
-    const { request } = buildPolarRequest({ airfoil, setup, aoaList: [0, 1, 2], wave: 1, uransFidelity: "full" });
+    const { request } = buildPolarRequest({
+      airfoil,
+      setup,
+      aoaList: [0, 1, 2],
+      wave: 1,
+      uransFidelity: "full",
+    });
     expect(request.solver).not.toHaveProperty("urans_fidelity");
   });
 });
@@ -159,15 +237,21 @@ describe("steady_history contract pin (fixture JSON, contract 2)", () => {
   });
 
   it("rejects RETYPED keys (mean_stable as string, note as number, non-integer window)", () => {
-    expect(parseSteadyHistory({ ...contractFixture(), mean_stable: "true" }).ok).toBe(false);
-    expect(parseSteadyHistory({ ...contractFixture(), note: 7 }).ok).toBe(false);
+    expect(
+      parseSteadyHistory({ ...contractFixture(), mean_stable: "true" }).ok,
+    ).toBe(false);
+    expect(parseSteadyHistory({ ...contractFixture(), note: 7 }).ok).toBe(
+      false,
+    );
     const windowDrift = contractFixture();
     (windowDrift.window as Record<string, unknown>).start_iter = 1000.5;
     expect(parseSteadyHistory(windowDrift).ok).toBe(false);
   });
 
   it("rejects series drift: non-numeric samples, length mismatch, > 2000 samples", () => {
-    expect(parseSteadyHistory({ ...contractFixture(), cl: ["0.8"] }).ok).toBe(false);
+    expect(parseSteadyHistory({ ...contractFixture(), cl: ["0.8"] }).ok).toBe(
+      false,
+    );
     const mismatch = contractFixture();
     (mismatch.cd as number[]).push(0.019);
     expect(parseSteadyHistory(mismatch).ok).toBe(false);
@@ -191,28 +275,62 @@ describe("steady_history contract pin (fixture JSON, contract 2)", () => {
 });
 
 describe("ingest fidelity/steady-history persistence helpers", () => {
-  const base = { aoa_deg: 8, unsteady: false, converged: true, first_order_fallback: false, images: {} } as PolarPoint;
+  const base = {
+    aoa_deg: 8,
+    unsteady: false,
+    converged: true,
+    first_order_fallback: false,
+    images: {},
+  } as PolarPoint;
 
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
   it("fidelityForPoint: a valid engine echo always wins", () => {
-    expect(fidelityForPoint({ ...base, fidelity: "urans_precalc", unsteady: true } as PolarPoint, "full", "t")).toBe("urans_precalc");
-    expect(fidelityForPoint({ ...base, fidelity: "rans" } as PolarPoint, undefined, "t")).toBe("rans");
+    expect(
+      fidelityForPoint(
+        { ...base, fidelity: "urans_precalc", unsteady: true } as PolarPoint,
+        "full",
+        "t",
+      ),
+    ).toBe("urans_precalc");
+    expect(
+      fidelityForPoint(
+        { ...base, fidelity: "rans" } as PolarPoint,
+        undefined,
+        "t",
+      ),
+    ).toBe("rans");
   });
 
   it("fidelityForPoint: missing echo on a fidelity-requesting URANS job falls back to the REQUESTED tier, including no-shedding points", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(fidelityForPoint({ ...base, unsteady: true } as PolarPoint, "precalc", "t")).toBe("urans_precalc");
-    expect(fidelityForPoint({ ...base, unsteady: true } as PolarPoint, "full", "t")).toBe("urans_full");
+    expect(
+      fidelityForPoint(
+        { ...base, unsteady: true } as PolarPoint,
+        "precalc",
+        "t",
+      ),
+    ).toBe("urans_precalc");
+    expect(
+      fidelityForPoint({ ...base, unsteady: true } as PolarPoint, "full", "t"),
+    ).toBe("urans_full");
     expect(fidelityForPoint(base, "precalc", "t")).toBe("urans_precalc");
     expect(errorSpy).toHaveBeenCalledTimes(3);
-    expect(String(errorSpy.mock.calls[0][0])).toContain("fidelity echo MISSING");
+    expect(String(errorSpy.mock.calls[0][0])).toContain(
+      "fidelity echo MISSING",
+    );
   });
 
   it("fidelityForPoint: legacy engines (no echo, no request) grade by regime — the 0034 backfill semantics", () => {
-    expect(fidelityForPoint({ ...base, unsteady: true } as PolarPoint, undefined, "t")).toBe("urans_full");
+    expect(
+      fidelityForPoint(
+        { ...base, unsteady: true } as PolarPoint,
+        undefined,
+        "t",
+      ),
+    ).toBe("urans_full");
     expect(fidelityForPoint(base, undefined, "t")).toBe("rans");
   });
 
@@ -225,6 +343,50 @@ describe("ingest fidelity/steady-history persistence helpers", () => {
       ),
     ).toBe("urans");
     expect(solverRegimeForPoint(base, "rans", "test")).toBe("rans");
+  });
+
+  it("MUST-CATCH: ingest pre-classification accepts certified no-shedding URANS without periodic media", () => {
+    const point = {
+      ...base,
+      fidelity: "urans_precalc",
+      video: {},
+      urans_cycle_certificate: null,
+      no_shedding_certificate: {
+        reducer_version: "no-shedding-v1",
+        certified: true,
+        required_observation_s: 0.2,
+        observation_start_time: 1,
+        observation_end_time: 1.25,
+        observed_observation_s: 0.25,
+        source_sample_count: 120,
+        transport_sample_count: 100,
+        relative_tolerance: 0.01,
+        absolute_floor: 0.001,
+        cl_mean: 0.4,
+        cd_mean: 0.02,
+        cm_mean: -0.03,
+        cl_rms: 0.001,
+        cd_rms: 0.0001,
+        cm_rms: 0.0001,
+        transport_cl_mean: 0.4,
+        transport_cd_mean: 0.02,
+        transport_cm_mean: -0.03,
+        transport_cl_rms: 0.001,
+        transport_cd_rms: 0.0001,
+        transport_cm_rms: 0.0001,
+      },
+      cl: 0.4,
+      cd: 0.02,
+      cm: -0.03,
+    } as PolarPoint;
+    expect(
+      incomingRejectionReasons(point, {
+        fidelity: "urans_precalc",
+        frameTrack: null,
+        steadyHistory: null,
+        error: null,
+      }),
+    ).toEqual([]);
   });
 
   it("MUST-CATCH: fails closed when a shedding payload claims RANS fidelity", () => {
@@ -240,8 +402,12 @@ describe("ingest fidelity/steady-history persistence helpers", () => {
   it("steadyHistoryForPoint: persists a contract-valid payload verbatim; null passes through", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const fixture = contractFixture();
-    expect(steadyHistoryForPoint({ ...base, steady_history: fixture as never }, "t")).toBe(fixture);
-    expect(steadyHistoryForPoint({ ...base, steady_history: null }, "t")).toBeNull();
+    expect(
+      steadyHistoryForPoint({ ...base, steady_history: fixture as never }, "t"),
+    ).toBe(fixture);
+    expect(
+      steadyHistoryForPoint({ ...base, steady_history: null }, "t"),
+    ).toBeNull();
     expect(steadyHistoryForPoint(base, "t")).toBeNull();
     expect(errorSpy).not.toHaveBeenCalled();
   });
@@ -249,24 +415,42 @@ describe("ingest fidelity/steady-history persistence helpers", () => {
   it("steadyHistoryForPoint: persists a DRIFTED payload verbatim but logs the contract drift loudly", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const drifted = { ...contractFixture(), mean_stable: "yes" };
-    expect(steadyHistoryForPoint({ ...base, steady_history: drifted as never }, "t")).toBe(drifted);
+    expect(
+      steadyHistoryForPoint({ ...base, steady_history: drifted as never }, "t"),
+    ).toBe(drifted);
     expect(errorSpy).toHaveBeenCalledTimes(1);
-    expect(String(errorSpy.mock.calls[0][0])).toContain("steady_history CONTRACT DRIFT");
+    expect(String(errorSpy.mock.calls[0][0])).toContain(
+      "steady_history CONTRACT DRIFT",
+    );
   });
 
   it("qualityWarningsForPoint: appends the oscillating-steady marker with the engine note (mean_stable true, steady rows only)", () => {
-    const withHistory = { ...base, steady_history: contractFixture() as never, quality_warnings: ["engine-warning"] } as PolarPoint;
+    const withHistory = {
+      ...base,
+      steady_history: contractFixture() as never,
+      quality_warnings: ["engine-warning"],
+    } as PolarPoint;
     const warnings = qualityWarningsForPoint(withHistory);
     expect(warnings).not.toBeNull();
     expect(warnings![0]).toBe("engine-warning");
-    expect(warnings![1].startsWith(`${STEADY_OSCILLATING_MARKER}: `)).toBe(true);
+    expect(warnings![1].startsWith(`${STEADY_OSCILLATING_MARKER}: `)).toBe(
+      true,
+    );
     expect(warnings![1]).toContain("bounded oscillation");
   });
 
   it("qualityWarningsForPoint: NO marker for mean_stable false, unsteady rows, or absent history (fail closed)", () => {
     const unstable = { ...contractFixture(), mean_stable: false };
-    expect(qualityWarningsForPoint({ ...base, steady_history: unstable as never })).toBeNull();
-    expect(qualityWarningsForPoint({ ...base, unsteady: true, steady_history: contractFixture() as never })).toBeNull();
+    expect(
+      qualityWarningsForPoint({ ...base, steady_history: unstable as never }),
+    ).toBeNull();
+    expect(
+      qualityWarningsForPoint({
+        ...base,
+        unsteady: true,
+        steady_history: contractFixture() as never,
+      }),
+    ).toBeNull();
     expect(qualityWarningsForPoint(base)).toBeNull();
   });
 });

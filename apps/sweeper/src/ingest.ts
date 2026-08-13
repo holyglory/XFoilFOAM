@@ -1071,8 +1071,7 @@ export function solverRegimeForPoint(
   fidelity: PointFidelity,
   context: string,
 ): "rans" | "urans" {
-  const urans =
-    fidelity === "urans_precalc" || fidelity === "urans_full";
+  const urans = fidelity === "urans_precalc" || fidelity === "urans_full";
   if (p.unsteady && !urans) {
     throw new Error(
       `solver regime contract drift (${context}): shedding point carries non-URANS fidelity '${fidelity}'`,
@@ -1200,6 +1199,14 @@ export function incomingPointEvidence(
       p.urans_cycle_certificate === undefined
         ? undefined
         : (p.urans_cycle_certificate as PolarEvidencePoint["uransCycleCertificate"]),
+    // A physically non-shedding URANS point retains URANS provenance while
+    // carrying this independent steady-equivalent proof.  Preserve absent vs
+    // explicit null so the shared classifier can fail closed on current
+    // producer drift without imposing the contract on legacy evidence.
+    noSheddingCertificate:
+      p.no_shedding_certificate === undefined
+        ? undefined
+        : p.no_shedding_certificate,
     fidelity: derived.fidelity,
     steadyHistory: (derived.steadyHistory ??
       null) as PolarEvidencePoint["steadyHistory"],

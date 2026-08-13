@@ -145,6 +145,8 @@ function toEvidence(row: {
   frameTrack?: unknown;
   uransCycleCertificate?: unknown;
   uransCycleCertificatePresent?: boolean;
+  noSheddingCertificate?: unknown;
+  noSheddingCertificatePresent?: boolean;
   ransHoldCertificate?: unknown;
   ransHoldCertificatePresent?: boolean;
   selectedArchiveInterpretationCurrent?: boolean;
@@ -200,6 +202,9 @@ function toEvidence(row: {
     // shedding producer that failed to ship a required certificate.
     uransCycleCertificate: row.uransCycleCertificatePresent
       ? (row.uransCycleCertificate as UransCycleCertificateEvidence | null)
+      : undefined,
+    noSheddingCertificate: row.noSheddingCertificatePresent
+      ? row.noSheddingCertificate
       : undefined,
     // RANS hold proof uses the same three-way distinction: absent is legacy;
     // explicit JSON null is a current engine's deliberate lack of proof and
@@ -391,6 +396,20 @@ async function loadResultEvidence(
         )
         ELSE NULL
       END`,
+      noSheddingCertificatePresent: sql<boolean>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN (
+          ${resultAttempts.evidencePayload} ? 'no_shedding_certificate'
+          OR ${resultAttempts.evidencePayload} ? 'noSheddingCertificate'
+        )
+        ELSE FALSE
+      END`,
+      noSheddingCertificate: sql<unknown>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(
+          ${resultAttempts.evidencePayload} -> 'no_shedding_certificate',
+          ${resultAttempts.evidencePayload} -> 'noSheddingCertificate'
+        )
+        ELSE NULL
+      END`,
       ransHoldCertificatePresent: sql<boolean>`CASE
         WHEN ${results.currentResultAttemptId} IS NOT NULL THEN (
           ${resultAttempts.evidencePayload} ? 'rans_hold_certificate'
@@ -545,6 +564,14 @@ async function loadAttemptEvidence(
       uransCycleCertificate: sql<unknown>`COALESCE(
         "result_attempts"."evidence_payload" -> 'urans_cycle_certificate',
         "result_attempts"."evidence_payload" -> 'uransCycleCertificate'
+      )`,
+      noSheddingCertificatePresent: sql<boolean>`(
+        "result_attempts"."evidence_payload" ? 'no_shedding_certificate'
+        OR "result_attempts"."evidence_payload" ? 'noSheddingCertificate'
+      )`,
+      noSheddingCertificate: sql<unknown>`COALESCE(
+        "result_attempts"."evidence_payload" -> 'no_shedding_certificate',
+        "result_attempts"."evidence_payload" -> 'noSheddingCertificate'
       )`,
       ransHoldCertificatePresent: sql<boolean>`(
         "result_attempts"."evidence_payload" ? 'rans_hold_certificate'
