@@ -503,11 +503,6 @@ beforeAll(async () => {
 afterAll(async () => {
   if (correctionCleanup) {
     await db
-      .delete(pointCorrectionRuns)
-      .where(
-        eq(pointCorrectionRuns.uransRequestId, correctionCleanup.requestId),
-      );
-    await db
       .delete(simUransRequests)
       .where(eq(simUransRequests.id, correctionCleanup.requestId));
     await db
@@ -1149,6 +1144,15 @@ describe("point-history story endpoint", () => {
     });
     expect(stale.statusCode).toBe(409);
     expect(stale.json().error).toContain("point changed");
+
+    await db
+      .delete(simUransRequests)
+      .where(eq(simUransRequests.id, firstBody.request.id));
+    const correctionAfterRequestPurge = await db
+      .select({ id: pointCorrectionRuns.id })
+      .from(pointCorrectionRuns)
+      .where(eq(pointCorrectionRuns.id, firstBody.correctionRunId));
+    expect(correctionAfterRequestPurge).toEqual([]);
   });
 
   it("does NOT attribute the interruption to points outside the cancelled job's aoa list", async () => {

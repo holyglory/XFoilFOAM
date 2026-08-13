@@ -38,3 +38,6 @@ FULL URANS request are linked back to the source result attempt in
   the source angle.
 - Corrected runs remain visible from the source point and prior evidence is
   never relabelled or overwritten.
+- Correction provenance is part of the disposable solver domain: it remains
+  immutable while its source/corrected work exists and cascades when a clean
+  solver reset or explicit purge removes those generated rows.

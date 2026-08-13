@@ -4952,13 +4952,13 @@ export const pointCorrectionRuns = pgTable(
     sourceResultAttemptId: uuid("source_result_attempt_id").notNull(),
     correctedPresetId: uuid("corrected_preset_id")
       .notNull()
-      .references(() => simulationPresets.id),
+      .references(() => simulationPresets.id, { onDelete: "cascade" }),
     correctedRevisionId: uuid("corrected_revision_id")
       .notNull()
-      .references(() => simulationPresetRevisions.id),
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
     uransRequestId: uuid("urans_request_id")
       .notNull()
-      .references(() => simUransRequests.id),
+      .references(() => simUransRequests.id, { onDelete: "cascade" }),
     fidelity: text("fidelity").notNull(),
     settingsSha256: text("settings_sha256").notNull(),
     settings: jsonb("settings").$type<Record<string, unknown>>().notNull(),
