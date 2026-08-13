@@ -19,6 +19,7 @@ import {
   precalcContinuationsForObligations,
   precalcContinuationMadeProgress,
   precalcContinuationProgressFromEvidence,
+  requiresConservativePrecalcRetry,
   reconcileCampaigns,
   recomputeProgressForCampaign,
   recordRansPolarPromotion,
@@ -134,6 +135,10 @@ import {
   type RansRetryDecision,
 } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
+import {
+  applyConservativeUransRetryPlan,
+  conservativeUransRetryPlan,
+} from "./urans-quality-recovery";
 
 export { touchHeartbeat } from "./heartbeat";
 
@@ -2372,6 +2377,21 @@ export async function submitUransRetryForJob(
     aoas = [continuation.aoaDeg];
     obligationIds = [continuation.obligationId];
   }
+  const selectedObligationIds = new Set(obligationIds);
+  const conservativeRetry = conservativeUransRetryPlan(
+    requiresConservativePrecalcRetry(
+      obligations.filter((obligation) =>
+        selectedObligationIds.has(obligation.id),
+      ),
+    ),
+    uransRecoveryVersion,
+  );
+  if (conservativeRetry.kind === "deferred") {
+    console.error(
+      `[sweeper] URANS retry for job ${parent.id} deferred: ${conservativeRetry.error}`,
+    );
+    return;
+  }
   const [capacity] = await db
     .select({ cpuSlots: sweeperState.cpuSlots })
     .from(sweeperState)
@@ -2397,6 +2417,9 @@ export async function submitUransRetryForJob(
   });
   request.expected_execution_pool = executionPool.routingKey;
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
+  if (conservativeRetry.kind === "required") {
+    applyConservativeUransRetryPlan(request, conservativeRetry);
+  }
   if (continuation) {
     request.expected_urans_recovery_version = uransRecoveryVersion!;
     request.continue_from = {
@@ -2445,6 +2468,12 @@ export async function submitUransRetryForJob(
               continueFromResultAttemptId: continuation.resultAttemptId,
               budgetOverrideS: continuation.budgetOverrideS,
               uransRecoveryVersion,
+            }
+          : {}),
+        ...(conservativeRetry.kind === "required"
+          ? {
+              uransQualityRecovery: true,
+              uransRecoveryVersion: conservativeRetry.recoveryVersion,
             }
           : {}),
         uransFidelity: "precalc",
@@ -2726,6 +2755,21 @@ async function submitCampaignUransRetries(
       retryAoas = [continuation.aoaDeg];
       obligationIds = [continuation.obligationId];
     }
+    const selectedObligationIds = new Set(obligationIds);
+    const conservativeRetry = conservativeUransRetryPlan(
+      requiresConservativePrecalcRetry(
+        obligations.filter((obligation) =>
+          selectedObligationIds.has(obligation.id),
+        ),
+      ),
+      opts.uransRecoveryVersion,
+    );
+    if (conservativeRetry.kind === "deferred") {
+      console.error(
+        `[sweeper] URANS retry for job ${parent.id}, condition ${entry.conditionId} deferred: ${conservativeRetry.error}`,
+      );
+      continue;
+    }
     const snapshot = revision.snapshot as unknown as SimulationSetupSnapshot;
     let executionPool;
     try {
@@ -2747,6 +2791,9 @@ async function submitCampaignUransRetries(
     });
     request.expected_execution_pool = executionPool.routingKey;
     request.expected_mesh_recovery_version = opts.meshRecoveryVersion ?? 0;
+    if (conservativeRetry.kind === "required") {
+      applyConservativeUransRetryPlan(request, conservativeRetry);
+    }
     if (continuation) {
       request.expected_urans_recovery_version = opts.uransRecoveryVersion!;
       request.continue_from = {
@@ -2794,6 +2841,12 @@ async function submitCampaignUransRetries(
                 continueFromResultAttemptId: continuation.resultAttemptId,
                 budgetOverrideS: continuation.budgetOverrideS,
                 uransRecoveryVersion: opts.uransRecoveryVersion,
+              }
+            : {}),
+          ...(conservativeRetry.kind === "required"
+            ? {
+                uransQualityRecovery: true,
+                uransRecoveryVersion: conservativeRetry.recoveryVersion,
               }
             : {}),
           uransFidelity: "precalc",

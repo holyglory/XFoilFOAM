@@ -118,6 +118,11 @@
   fabricates, periodic video/frame/cycle evidence while retaining URANS
   numerical provenance.
   [D-2026-08-13-certified-no-shedding-classification]
+  A repeated preliminary-URANS physical attempt starts on the proven
+  conservative numerical rung from its first transient timestep; the first
+  attempt retains adaptive throughput, the controller pins engine capability
+  v12, and scientific acceptance gates do not change.
+  [D-2026-08-13-conservative-urans-retries]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -164,6 +169,15 @@
   periodic-evidence rules across 111 physical campaign cells. Relabelling the
   numerical method as RANS would falsify provenance, and inventing periodic
   media is forbidden; the exact certificate is the real independent proof.
+
+- Decision: start every repeated preliminary-URANS physical attempt on the
+  conservative pressure/transport/PIMPLE rung from its first transient step,
+  while keeping first attempts adaptive.
+  [D-2026-08-13-conservative-urans-retries](DecisionDetails/D-2026-08-13-conservative-urans-retries.md)
+- Why: current v11 rejected tails contain real numerical contamination, and
+  waiting two more periods to rediscover it wastes the retry budget. Weakening
+  evidence gates would publish bad science, while making every first attempt
+  conservative would unnecessarily reduce campaign throughput.
 
 - Decision: treat remote CPU capacity and hub-issued polar promises as separate
   execution controls. A remote node admits independent serial polars until its

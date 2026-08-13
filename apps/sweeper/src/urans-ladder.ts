@@ -35,6 +35,7 @@ import {
   FullUransRequestCoverageIncompleteError,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   precalcContinuationsForObligations,
+  precalcObligationsRequireConservativeRetry,
   precalcRequestStateFromObligations,
   precalcSnapshotForVerifyItem,
   verifyPrecalcSnapshotFailureMessage,
@@ -113,6 +114,10 @@ import {
   routeArchiveInterpretationRecoveryActions,
 } from "./archive-interpretation-recovery";
 import { routeLegacyUransArchiveGapRecoveryActions } from "./legacy-urans-archive-gap-recovery";
+import {
+  applyConservativeUransRetryPlan,
+  conservativeUransRetryPlan,
+} from "./urans-quality-recovery";
 
 /** Parents whose recovery was already re-attempted this process lifetime —
  *  a parent whose retry plan is empty must not be re-planned every tick
@@ -451,6 +456,7 @@ const RESERVED_LADDER_PAYLOAD_KEYS = new Set([
   "speedMap",
   "uransRecoveryVersion",
   "uransFidelity",
+  "uransQualityRecovery",
 ]);
 
 export function assertNoReservedLadderPayloadKeys(
@@ -1835,6 +1841,40 @@ async function submitLadderJob(
     };
   }
   assertNoReservedLadderPayloadKeys(payloadExtras);
+  const payloadObligationIds = Array.isArray(
+    (payloadExtras as { precalcObligationIds?: unknown }).precalcObligationIds,
+  )
+    ? (
+        payloadExtras as { precalcObligationIds: unknown[] }
+      ).precalcObligationIds.filter(
+        (id): id is string => typeof id === "string",
+      )
+    : [];
+  const conservativeRetryRequired =
+    fidelity === "precalc" && payloadObligationIds.length > 0
+      ? await precalcObligationsRequireConservativeRetry(
+          db,
+          payloadObligationIds,
+        )
+      : false;
+  const conservativeRetryVersion = conservativeRetryRequired
+    ? (opts.uransRecoveryVersion ?? (await engineUransRecoveryVersion(engine)))
+    : opts.uransRecoveryVersion;
+  const conservativeRetry = conservativeUransRetryPlan(
+    conservativeRetryRequired,
+    conservativeRetryVersion,
+  );
+  if (conservativeRetry.kind === "deferred") {
+    return {
+      jobId: "",
+      submitted: false,
+      connectionFailure: false,
+      lifecycleStopped: false,
+      submissionInProgress: false,
+      capabilityMismatch: true,
+      error: conservativeRetry.error,
+    };
+  }
   const [a] = await db
     .select()
     .from(airfoils)
@@ -1888,11 +1928,14 @@ async function submitLadderJob(
     force_transient: true,
     urans_fidelity: fidelity,
   };
+  if (conservativeRetry.kind === "required") {
+    applyConservativeUransRetryPlan(request, conservativeRetry);
+  }
   if (fidelity === "precalc") {
     request.expected_mesh_recovery_version = meshRecoveryVersion!;
   }
-  if (opts.uransRecoveryVersion != null) {
-    request.expected_urans_recovery_version = opts.uransRecoveryVersion;
+  if (conservativeRetryVersion != null) {
+    request.expected_urans_recovery_version = conservativeRetryVersion;
   }
   if (opts.continueFrom) {
     // Amendment C: the engine copies/links the saved case dir into the new
@@ -1948,8 +1991,11 @@ async function submitLadderJob(
       ...(fidelity === "precalc"
         ? { meshRecoveryVersion: meshRecoveryVersion! }
         : {}),
-      ...(opts.uransRecoveryVersion != null
-        ? { uransRecoveryVersion: opts.uransRecoveryVersion }
+      ...(conservativeRetryVersion != null
+        ? { uransRecoveryVersion: conservativeRetryVersion }
+        : {}),
+      ...(conservativeRetry.kind === "required"
+        ? { uransQualityRecovery: true }
         : {}),
       ...(opts.correctiveTailPeriods != null
         ? { correctiveTailPeriods: opts.correctiveTailPeriods }
@@ -1958,15 +2004,6 @@ async function submitLadderJob(
       setupSnapshot: target.snapshot,
     },
   };
-  const payloadObligationIds = Array.isArray(
-    (payloadExtras as { precalcObligationIds?: unknown }).precalcObligationIds,
-  )
-    ? (
-        payloadExtras as { precalcObligationIds: unknown[] }
-      ).precalcObligationIds.filter(
-        (id): id is string => typeof id === "string",
-      )
-    : [];
   if (
     opts.recordedPromotion &&
     ([...payloadObligationIds].sort().join(",") !==

@@ -1,5 +1,13 @@
 # Completion Ledger
 
+- **Conservative preliminary-URANS retry rollout:** Engine/controller v12 is
+  implemented and locally verified but not yet active in production. Deploy
+  exact `master`, clean-reset/rebuild both authorized solver roles, verify hub
+  capacity 8 and hz-solver2 capacity 64, and prove one real repeated PRECALC
+  request/evidence generation carries the controller recovery flag and marker
+  without changing scientific classification gates. Remove this item only
+  after the production burn-in evidence exists.
+
 - **Remote rejected-result reclamation:** A terminal hz-solver2 job containing
   rejected result rows never receives its job-level delivery terminal, so
   generic retention cannot reclaim the local case even after every publishable

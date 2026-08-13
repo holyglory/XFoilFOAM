@@ -72,6 +72,42 @@ export interface PrecalcObligationOwnership {
  * count cannot discard a slowly settling trajectory. */
 export const MAX_PRECALC_NO_PROGRESS_SEGMENTS = 2;
 
+export function requiresConservativePrecalcRetry(
+  obligations: ReadonlyArray<{ attemptCount: number }>,
+): boolean {
+  return obligations.some(
+    (obligation) =>
+      Number.isSafeInteger(obligation.attemptCount) &&
+      obligation.attemptCount > 0,
+  );
+}
+
+/** Resolve the controller's numerical rung from durable physical-attempt
+ * ownership. Missing obligation ids fail closed: silently treating them as a
+ * first attempt could submit a known retry to an older/looser engine. */
+export async function precalcObligationsRequireConservativeRetry(
+  db: DB,
+  obligationIds: string[],
+): Promise<boolean> {
+  const ids = [...new Set(obligationIds)].sort();
+  if (!ids.length) return false;
+  const rows = await db
+    .select({
+      id: simPrecalcObligations.id,
+      attemptCount: simPrecalcObligations.attemptCount,
+    })
+    .from(simPrecalcObligations)
+    .where(inArray(simPrecalcObligations.id, ids));
+  if (rows.length !== ids.length) {
+    const found = new Set(rows.map((row) => row.id));
+    const missing = ids.filter((id) => !found.has(id));
+    throw new Error(
+      `precalc retry policy could not resolve obligation(s): ${missing.join(", ")}`,
+    );
+  }
+  return requiresConservativePrecalcRetry(rows);
+}
+
 const liveOwnerSql = (obligationId: string | SQLWrapper) => sql`(
   EXISTS (
     SELECT 1 FROM sim_precalc_obligations owned_obligation

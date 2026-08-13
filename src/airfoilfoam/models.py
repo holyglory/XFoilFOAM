@@ -430,6 +430,12 @@ class SolverParams(BaseModel):
         "still be used as initialisation, but the steady RANS coefficients are not accepted as the "
         "reported polar result.",
     )
+    urans_quality_recovery: bool = Field(
+        default=False,
+        description="Start a controller-selected repeated preliminary-URANS attempt on the "
+        "conservative pressure/transport/PIMPLE recovery rung from its first transient step. "
+        "First attempts leave this off and retain the adaptive throughput path.",
+    )
     warm_start: bool = Field(
         default=False,
         description="Solve each polar by marching the angle of attack, warm-starting each AoA from "
@@ -736,9 +742,10 @@ class PolarRequest(BaseModel):
         default=None,
         ge=0,
         description="Controller-required durable URANS recovery contract. Set only for "
-        "automatic same-case continuation or corrective final-URANS recovery. The "
-        "API and worker reject a mismatch before CFD so a legacy engine cannot "
-        "consume newly reopened recovery work during a rolling deployment.",
+        "automatic same-case continuation, corrective final-URANS recovery, or a "
+        "controller-selected conservative preliminary retry. The API and worker "
+        "reject a mismatch before CFD so a legacy engine cannot consume newly "
+        "reopened recovery work during a rolling deployment.",
     )
     expected_engine: Optional[EngineIdentity] = Field(
         default=None,
@@ -779,6 +786,17 @@ class PolarRequest(BaseModel):
             raise ValueError(
                 "corrective_tail_periods is valid only for an exact continue_from URANS request."
             )
+        if self.solver.urans_quality_recovery:
+            if not self.solver.force_transient or self.solver.urans_fidelity != UransFidelity.precalc:
+                raise ValueError(
+                    "solver.urans_quality_recovery is valid only for force_transient "
+                    "preliminary URANS requests."
+                )
+            if self.expected_urans_recovery_version is None:
+                raise ValueError(
+                    "solver.urans_quality_recovery requires expected_urans_recovery_version "
+                    "so repeated work fails closed across mixed engine versions."
+                )
         return self
 
     def cases(self) -> list["CaseSpec"]:

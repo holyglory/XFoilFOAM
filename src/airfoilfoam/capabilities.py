@@ -26,6 +26,11 @@ MESH_IDENTITY_VERSION = 1
 # recovery: immutable evidence archives could hydrate a saved case after local
 # retention, continuations used the adaptive extension budget, and requests
 # were rejected before CFD when controller and worker disagreed.
+# Version 12 lets the controller select the same conservative recovery rung at
+# the start of every repeated preliminary-URANS physical attempt. First
+# attempts keep the adaptive live detector and production throughput; retries
+# no longer spend their initial periods repeating already-observed numerical
+# contamination. Scientific evidence gates are unchanged.
 # Version 11 extends the one-time conservative live recovery rung from
 # discontinuous impulses to the same clean-cycle reducer's typed high-frequency
 # and numerically-noisy terminal verdicts. It does not globally slow healthy
@@ -55,4 +60,4 @@ MESH_IDENTITY_VERSION = 1
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 11
+URANS_RECOVERY_VERSION = 12

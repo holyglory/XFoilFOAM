@@ -733,6 +733,100 @@ def test_stale_recovery_checkpoint_is_never_overwritten(tmp_path, monkeypatch):
     assert sentinel.read_text() == "last known good"
 
 
+def test_controller_retry_installs_conservative_rung_before_solver(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: a repeated PRECALC starts tight, not after two noisy periods."""
+
+    import json
+
+    from airfoilfoam import pipeline
+    from airfoilfoam.models import CaseSpec, FluidProperties, RoughnessParams, SolverParams
+
+    class RetryCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, case_dir, *_args, **_kwargs):
+            system = case_dir / "system"
+            system.mkdir(parents=True, exist_ok=True)
+            (system / "controlDict").write_text(
+                "maxCo 4;\nmaxDeltaT 0.2;\nrunTimeModifiable true;\n"
+            )
+            (system / "fvSolution").write_text(
+                """
+solvers
+{
+    p
+    {
+        tolerance 1e-06;
+        relTol 0.1;
+    }
+    pFinal
+    {
+        tolerance 1e-06;
+        relTol 0;
+    }
+    "(k|omega|U).*"
+    {
+        tolerance 1e-07;
+        relTol 0.1;
+    }
+}
+PIMPLE
+{
+    nOuterCorrectors 2;
+    nCorrectors 2;
+}
+"""
+            )
+
+    class InspectingRunner:
+        def solver(self, case_dir, *_args, **_kwargs):
+            control = (case_dir / "system" / "controlDict").read_text()
+            solution = (case_dir / "system" / "fvSolution").read_text()
+            marker = json.loads(
+                (case_dir / pipeline.URANS_IMPULSE_RECOVERY_MARKER).read_text()
+            )
+            assert "maxCo 1;" in control
+            assert "maxDeltaT 0.01;" in control
+            assert "nOuterCorrectors 4;" in solution
+            assert "nCorrectors 3;" in solution
+            assert "tolerance 1e-08;" in solution
+            assert "relTol 0.01;" in solution
+            assert marker["trigger_source"] == "controller_retry"
+            raise RuntimeError("inspection complete")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", RetryCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="inspection complete"):
+        pipeline._run_transient_attempt(
+            tcase,
+            airfoil=None,
+            tmesh=None,
+            patches={},
+            spec=CaseSpec(chord=1.0, speed=15.0, aoa_deg=8.0),
+            fluid=FluidProperties(
+                density=1.225,
+                kinematic_viscosity=1.5e-5,
+            ),
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(
+                force_transient=True,
+                urans_fidelity="precalc",
+                urans_quality_recovery=True,
+            ),
+            runner=InspectingRunner(),
+            n_proc=1,
+            timeout=7200,
+            run_time=0.333,
+            delta_t=1e-5,
+            max_delta_t=0.01,
+            coeff_start_time=0.0,
+        )
+
+
 def test_stale_marker_is_cleared_before_a_fresh_attempt(tmp_path, monkeypatch):
     """A marker left by a condemned earlier stage (e.g. the steady init) must
     not poison a healthy pimpleFoam pass: the attempt clears it and grades

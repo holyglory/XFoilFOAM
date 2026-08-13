@@ -1972,6 +1972,79 @@ def _apply_urans_impulse_solution_entries(tcase: Path) -> None:
     )
 
 
+def _write_urans_quality_recovery_marker(
+    tcase: Path,
+    marker: dict[str, object],
+) -> None:
+    """Publish one complete recovery marker for live and controller triggers."""
+    marker_path = tcase / URANS_IMPULSE_RECOVERY_MARKER
+    tmp = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(marker, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, marker_path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _urans_quality_recovery_marker(
+    *,
+    trigger_source: str,
+    trigger_reason: str,
+    trigger_time: float,
+    startup_max_delta_t: float | None,
+    period_s: float | None = None,
+    window_start: float | None = None,
+    window_end: float | None = None,
+) -> dict[str, object]:
+    return {
+        "trigger_source": trigger_source,
+        "trigger_reason": trigger_reason,
+        "trigger_time": trigger_time,
+        "period_s": period_s,
+        "window_start": window_start,
+        "window_end": window_end,
+        "max_courant": URANS_STARTUP_MAX_COURANT,
+        "max_delta_t": startup_max_delta_t,
+        "pressure_tolerance": URANS_IMPULSE_PRESSURE_TOLERANCE,
+        "pressure_rel_tolerance": URANS_IMPULSE_PRESSURE_REL_TOL,
+        "transport_tolerance": URANS_IMPULSE_TRANSPORT_TOLERANCE,
+        "transport_rel_tolerance": URANS_IMPULSE_TRANSPORT_REL_TOL,
+        "outer_correctors": URANS_IMPULSE_OUTER_CORRECTORS,
+        "correctors": URANS_IMPULSE_CORRECTORS,
+    }
+
+
+def _arm_controller_urans_quality_recovery(
+    tcase: Path,
+    *,
+    startup_max_delta_t: float | None,
+) -> None:
+    """Persist the controller-selected retry rung before dictionaries exist.
+
+    ``write_transient`` regenerates the dictionaries for every chunk. The
+    marker is therefore installed first and the existing restore path applies
+    its exact settings immediately after generation, before pimpleFoam starts.
+    """
+    marker_path = tcase / URANS_IMPULSE_RECOVERY_MARKER
+    if marker_path.is_file():
+        return
+    _write_urans_quality_recovery_marker(
+        tcase,
+        _urans_quality_recovery_marker(
+            trigger_source="controller_retry",
+            trigger_reason=(
+                "repeated preliminary URANS attempt starts on conservative "
+                "quality-recovery numerics"
+            ),
+            trigger_time=_latest_time(tcase),
+            startup_max_delta_t=startup_max_delta_t,
+        ),
+    )
+
+
 def _arm_urans_impulse_recovery(
     tcase: Path,
     result: StablePeriodResult,
@@ -1994,24 +2067,17 @@ def _arm_urans_impulse_recovery(
         tcase / "system" / "controlDict",
         control_entries,
     )
-    marker = {
-        "trigger_reason": result.reason,
-        "trigger_time": _latest_time(tcase),
-        "period_s": result.period_s,
-        "window_start": result.window_start,
-        "window_end": result.window_end,
-        "max_courant": URANS_STARTUP_MAX_COURANT,
-        "max_delta_t": startup_max_delta_t,
-        "pressure_tolerance": URANS_IMPULSE_PRESSURE_TOLERANCE,
-        "pressure_rel_tolerance": URANS_IMPULSE_PRESSURE_REL_TOL,
-        "transport_tolerance": URANS_IMPULSE_TRANSPORT_TOLERANCE,
-        "transport_rel_tolerance": URANS_IMPULSE_TRANSPORT_REL_TOL,
-        "outer_correctors": URANS_IMPULSE_OUTER_CORRECTORS,
-        "correctors": URANS_IMPULSE_CORRECTORS,
-    }
-    (tcase / URANS_IMPULSE_RECOVERY_MARKER).write_text(
-        json.dumps(marker, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    _write_urans_quality_recovery_marker(
+        tcase,
+        _urans_quality_recovery_marker(
+            trigger_source="live_quality_detector",
+            trigger_reason=result.reason,
+            trigger_time=_latest_time(tcase),
+            startup_max_delta_t=startup_max_delta_t,
+            period_s=result.period_s,
+            window_start=result.window_start,
+            window_end=result.window_end,
+        ),
     )
 
 
@@ -5004,6 +5070,11 @@ def _run_transient_attempt(
     # (e.g. the steady init) must not poison this pimpleFoam pass.
     clear_divergence_condemnation(tcase)
     clear_march_markers(tcase)
+    if solver_params.urans_quality_recovery:
+        _arm_controller_urans_quality_recovery(
+            tcase,
+            startup_max_delta_t=max_delta_t,
+        )
     start_t = _latest_time(tcase)
     end_t = start_t + run_time
     initial_remaining_timeout = float(timeout)

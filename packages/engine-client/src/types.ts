@@ -159,6 +159,9 @@ export interface SolverParams {
   transient_fallback?: boolean;
   rans_failure_policy?: RansFailurePolicy;
   force_transient?: boolean;
+  /** Controller-selected repeated PRECALC attempt: install the conservative
+   * pressure/transport/PIMPLE recovery rung before the first transient step. */
+  urans_quality_recovery?: boolean;
   warm_start?: boolean;
   transient_cycles?: number;
   transient_discard_fraction?: number;

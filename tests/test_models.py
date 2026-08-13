@@ -53,6 +53,43 @@ def test_transient_max_courant_default_pinned_at_practitioner_ceiling():
     assert SolverParams(transient_max_courant=15.0).transient_max_courant == pytest.approx(15.0)
 
 
+def test_controller_urans_quality_recovery_is_pinned_and_precalc_only():
+    points = [[1, 0], [0.5, 0.1], [0, 0], [0.5, -0.1], [1, 0]]
+    assert SolverParams().urans_quality_recovery is False
+    with pytest.raises(ValueError, match="expected_urans_recovery_version"):
+        PolarRequest(
+            airfoil={"name": "retry", "points": points},
+            aoa=AoASpec(angles=[8]),
+            solver=SolverParams(
+                force_transient=True,
+                urans_fidelity="precalc",
+                urans_quality_recovery=True,
+            ),
+        )
+    with pytest.raises(ValueError, match="preliminary URANS"):
+        PolarRequest(
+            airfoil={"name": "full", "points": points},
+            aoa=AoASpec(angles=[8]),
+            solver=SolverParams(
+                force_transient=True,
+                urans_fidelity="full",
+                urans_quality_recovery=True,
+            ),
+            expected_urans_recovery_version=12,
+        )
+    request = PolarRequest(
+        airfoil={"name": "retry", "points": points},
+        aoa=AoASpec(angles=[8]),
+        solver=SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            urans_quality_recovery=True,
+        ),
+        expected_urans_recovery_version=12,
+    )
+    assert request.solver.urans_quality_recovery is True
+
+
 def test_case_slug_safe():
     req = PolarRequest(
         airfoil={"name": "a", "points": [[1, 0], [0.5, 0.1], [0, 0], [0.5, -0.1], [1, 0]]},
