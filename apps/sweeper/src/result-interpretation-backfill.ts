@@ -1536,7 +1536,7 @@ export async function routeCampaignPrecalcToFreshAfterArchiveAbandonment(opts: {
         source_archive.id,
         'abandoned',
         now(),
-        ${`operator abandoned archive preservation: ${reason}`.slice(0, 2_000)}
+        ${`operator abandoned archive preservation: ${reason}`.slice(0, 2_000)}::text
       FROM sim_precalc_obligation_attempts submission
       JOIN result_attempts source_attempt
         ON source_attempt.id = submission.result_attempt_id
@@ -1583,21 +1583,18 @@ export async function routeCampaignPrecalcToFreshAfterArchiveAbandonment(opts: {
         "archive fresh rerun lost an obligation ownership race; no changes were committed",
       );
     }
+    const auditScope = JSON.stringify({
+      operatorFreshRerunCampaignId: opts.campaignId,
+      operatorFreshRerunReason: reason,
+    });
+    const auditSummary = JSON.stringify({
+      attemptReceiptsAbandoned: Number(coverage?.receipts ?? inserted.length),
+      obligationsReopenedFresh: reopened.length,
+    });
     await tx.execute(sql`
       UPDATE result_interpretation_backfill_runs
-      SET scope = scope || jsonb_build_object(
-            'operatorFreshRerunCampaignId', ${opts.campaignId}::text,
-            'operatorFreshRerunReason', ${reason}::text
-          ),
-          summary = summary || jsonb_build_object(
-            'attemptReceiptsAbandoned', (
-              SELECT count(*)::int
-              FROM result_interpretation_backfill_items receipt
-              WHERE receipt.run_id = ${opts.runId}::uuid
-                AND receipt.state = 'abandoned'
-            ),
-            'obligationsReopenedFresh', ${reopened.length}
-          ),
+      SET scope = scope || ${auditScope}::jsonb,
+          summary = summary || ${auditSummary}::jsonb,
           "updatedAt" = now()
       WHERE id = ${opts.runId}::uuid
     `);
