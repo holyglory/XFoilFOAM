@@ -5,6 +5,17 @@ const SAMPLE_AT = "2026-07-16T12:00:00.000Z";
 test("Health prioritizes open solver incidents and keeps resolved recurrence as history", async ({
   page,
 }) => {
+  await page.route("**/api/admin/me", (route) =>
+    route.fulfill({
+      json: {
+        authed: true,
+        mode: "dev",
+        email: "admin@example.test",
+        provider: "password",
+        providers: { google: false, password: true },
+      },
+    }),
+  );
   const sample = {
     at: SAMPLE_AT,
     cpu: {
@@ -45,6 +56,32 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
           memoryUsedPct: 61.2,
         },
         history: [sample],
+        fleet: {
+          local: {
+            id: "local",
+            instanceName: "Hub",
+            connectivity: "online",
+            status: "online",
+            lastHeartbeatAt: SAMPLE_AT,
+            activeJobs: 1,
+            reservedCpuSlots: 8,
+            capacityCpuSlots: 8,
+            health: null,
+          },
+          remotes: [],
+        },
+        performance: {
+          windowDays: 7,
+          daily: [],
+          totals24h: {
+            day: "2026-07-16",
+            rans: 0,
+            preliminary: 0,
+            final: 0,
+            total: 0,
+          },
+          sources: [],
+        },
         solverIncidents: {
           threshold: 3,
           occurrenceCount: 7,
@@ -163,7 +200,7 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
   await expect(current).toContainText("FAST URANS");
   await expect(current).toContainText("continuation made no progress");
   await expect(current).toContainText("solver follow-up");
-  await expect(current).not.toContainText("current-debug");
+  await expect(current.locator(".solver-event-body")).not.toBeVisible();
   await current.locator(":scope > summary").click();
   await expect(current).toContainText("current-debug");
   await expect(current).toContainText("solver system · no user action");
