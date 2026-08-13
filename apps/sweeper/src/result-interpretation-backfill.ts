@@ -1586,8 +1586,8 @@ export async function routeCampaignPrecalcToFreshAfterArchiveAbandonment(opts: {
     await tx.execute(sql`
       UPDATE result_interpretation_backfill_runs
       SET scope = scope || jsonb_build_object(
-            'operatorFreshRerunCampaignId', ${opts.campaignId},
-            'operatorFreshRerunReason', ${reason}
+            'operatorFreshRerunCampaignId', ${opts.campaignId}::text,
+            'operatorFreshRerunReason', ${reason}::text
           ),
           summary = summary || jsonb_build_object(
             'attemptReceiptsAbandoned', (
