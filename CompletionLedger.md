@@ -1,23 +1,18 @@
 # Completion Ledger
 
-- **Conservative preliminary-URANS retry rollout:** Engine/controller v12 is
-  implemented and locally verified but not yet active in production. Deploy
-  exact `master`, clean-reset/rebuild both authorized solver roles, verify hub
-  capacity 8 and hz-solver2 capacity 64, and prove one real repeated PRECALC
-  request/evidence generation carries the controller recovery flag and marker
-  without changing scientific classification gates. Remove this item only
-  after the production burn-in evidence exists.
+- **Conservative preliminary-URANS retry burn-in:** Both production roles run
+  engine/controller v12, and repeated hub PRECALC work carries the controller
+  recovery flag and the persisted time-zero conservative-numerics marker. No
+  repeated v12 job has reached terminal evidence yet. Keep the scientific
+  gates unchanged and verify one real repeated attempt publishes immutable
+  evidence and receives its normal classification before removing this item.
 
-- **Remote rejected-result reclamation:** A terminal hz-solver2 job containing
-  rejected result rows never receives its job-level delivery terminal, so
-  generic retention cannot reclaim the local case even after every publishable
-  generation was delivered. This stranded roughly 2.2 TiB and stopped refill
-  at 46/64 processes. Release the disposable remote promises/jobs, clean-reset
-  the remote solver while retaining registration/credentials and 64-slot
-  policy, then terminally account jobs whose remaining rows are immutable
-  rejected evidence so their unpublishable local cases can be reclaimed and
-  their unfulfilled hub points can be re-promised. Verify hub authority release,
-  remote disk reclaim, 64-slot refill, valid delivery, and post-terminal strip.
+- **Remote rejected-result post-terminal strip:** The disposable remote reset,
+  credential restoration, 64-slot refill, and fresh valid-result delivery are
+  proven. The remaining production proof is a new terminal job containing
+  rejected rows: every unpublishable point must be released for re-promise,
+  the job must receive its reclamation acknowledgement, and retention must
+  strip its local case without publishing the rejected evidence.
 
 - **AoA evidence rendered interaction proof:** Commit `d17c991` is deployed and
   the live API/build prove the stable result identity, classic-RANS explanation,
