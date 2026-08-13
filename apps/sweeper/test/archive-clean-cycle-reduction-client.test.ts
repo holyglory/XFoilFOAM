@@ -49,6 +49,30 @@ afterEach(() => {
 });
 
 describe("archive clean-cycle reduction engine client", () => {
+  it("MUST-CATCH: the 15-minute evidence budget is not cut off by Undici's five-minute header timeout", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const dispatcher = (
+        init as RequestInit & {
+          dispatcher?: { dispatch?: unknown };
+        }
+      )?.dispatcher;
+      expect(dispatcher).toBeDefined();
+      expect(typeof dispatcher?.dispatch).toBe("function");
+      return new Response(JSON.stringify(response()), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).resolves.toEqual(response());
+  });
+
   it("sends only the exact pointer/fidelity under the control-plane bearer", async () => {
     const expected = request();
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
@@ -61,7 +85,9 @@ describe("archive clean-cycle reduction engine client", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
     await expect(
       client.reduceRemoteEvidenceCleanCycles(expected, { timeoutMs: 2_000 }),
     ).resolves.toEqual(response());
@@ -90,8 +116,12 @@ describe("archive clean-cycle reduction engine client", () => {
           ),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).rejects.toEqual(
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).rejects.toEqual(
       expect.objectContaining({
         code: "archive_reduction_contract_drift",
       }),
@@ -120,8 +150,12 @@ describe("archive clean-cycle reduction engine client", () => {
           }),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).resolves.toEqual(exhausted);
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).resolves.toEqual(exhausted);
   });
 
   it("accepts a typed continuation proof only when its remaining physical budget is exact", async () => {
@@ -146,8 +180,12 @@ describe("archive clean-cycle reduction engine client", () => {
           }),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).resolves.toEqual(typed);
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).resolves.toEqual(typed);
   });
 
   it.each([
@@ -194,22 +232,29 @@ describe("archive clean-cycle reduction engine client", () => {
         },
       },
     ],
-  ])("fails closed when typed recovery progress %s", async (_label, input, body) => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(JSON.stringify(body), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          }),
-      ),
-    );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(input)).rejects.toEqual(
-      expect.objectContaining({ code: "archive_reduction_contract_drift" }),
-    );
-  });
+  ])(
+    "fails closed when typed recovery progress %s",
+    async (_label, input, body) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+        ),
+      );
+      const client = new EngineClient("http://engine.test", {
+        controlPlaneToken: TOKEN,
+      });
+      await expect(
+        client.reduceRemoteEvidenceCleanCycles(input),
+      ).rejects.toEqual(
+        expect.objectContaining({ code: "archive_reduction_contract_drift" }),
+      );
+    },
+  );
 
   it("preserves an answered archive rejection as an EngineError", async () => {
     vi.stubGlobal(
@@ -222,9 +267,11 @@ describe("archive clean-cycle reduction engine client", () => {
           }),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).rejects.toBeInstanceOf(
-      EngineError,
-    );
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).rejects.toBeInstanceOf(EngineError);
   });
 });

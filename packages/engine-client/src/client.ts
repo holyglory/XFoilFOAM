@@ -1,3 +1,5 @@
+import { Agent } from "undici";
+
 import type {
   ArchiveCleanCycleReductionRequest,
   ArchiveCleanCycleReductionResponse,
@@ -118,6 +120,17 @@ export const ENGINE_SUBMIT_TIMEOUT_MS = 60_000;
 export const ENGINE_RENDER_TIMEOUT_MS = 120_000;
 /** Fresh generation-pinned download plus complete archive/member verification. */
 export const ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS = 15 * 60_000;
+
+/** Node/Undici otherwise aborts a request that has not produced response
+ * headers after 300 seconds, even when AbortSignal grants a longer evidence
+ * budget. Long evidence operations use a dedicated dispatcher with those
+ * implicit transport clocks disabled; the explicit AbortSignal remains the
+ * single authoritative deadline. */
+export const ENGINE_FETCH_DEFAULT_HEADERS_TIMEOUT_MS = 5 * 60_000;
+const LONG_ENGINE_REQUEST_DISPATCHER = new Agent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+}) as unknown as NonNullable<RequestInit["dispatcher"]>;
 
 /** Thin typed client for the Python CFD solver API (FastAPI). Every call
  *  carries an AbortSignal timeout so a saturated engine can stall a caller
@@ -348,14 +361,18 @@ export class EngineClient {
   ): Promise<T> {
     const signal = AbortSignal.timeout(timeoutMs);
     try {
-      const res = await fetch(this.baseUrl + path, {
+      const fetchInit: RequestInit = {
         ...init,
         signal,
         headers: {
           "content-type": "application/json",
           ...(init?.headers ?? {}),
         },
-      });
+        ...(timeoutMs > ENGINE_FETCH_DEFAULT_HEADERS_TIMEOUT_MS
+          ? { dispatcher: LONG_ENGINE_REQUEST_DISPATCHER }
+          : {}),
+      };
+      const res = await fetch(this.baseUrl + path, fetchInit);
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw new EngineError(
