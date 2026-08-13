@@ -4518,7 +4518,7 @@ describe("remote solver push validation regressions", () => {
         requestPayload: {
           syncPromiseId: promiseId,
           remoteSolver: true,
-          recordedPromotionId: promotion.id,
+          conditionalPromotionId: promotion.id,
         },
       })
       .returning();

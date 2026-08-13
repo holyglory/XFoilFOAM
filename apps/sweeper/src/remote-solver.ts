@@ -3182,13 +3182,13 @@ async function settlePromotedRemoteParentDeliveries(
         SELECT 1
         FROM sim_jobs child
         WHERE child.parent_job_id = parent.id
-          AND child.request_payload ->> 'recordedPromotionId' = promotion.id::text
+          AND child.request_payload ->> 'conditionalPromotionId' = promotion.id::text
       )
       AND NOT EXISTS (
         SELECT 1
         FROM sim_jobs child
         WHERE child.parent_job_id = parent.id
-          AND child.request_payload ->> 'recordedPromotionId' = promotion.id::text
+          AND child.request_payload ->> 'conditionalPromotionId' = promotion.id::text
           AND (
             child.status NOT IN ('done', 'failed', 'cancelled')
             OR NOT EXISTS (
