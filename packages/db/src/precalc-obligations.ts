@@ -3223,6 +3223,21 @@ export async function precalcCheckpointCandidatesForObligations(
           evidencePayload: sql`result_attempt.evidence_payload`,
           solverImplementationId: sql`result_attempt.solver_implementation_id`,
         })}
+        -- An operator may explicitly abandon archive preservation when a
+        -- disposable fresh solve is cheaper. The receipt is mutable work
+        -- policy, not a reclassification of the immutable checkpoint; it
+        -- nevertheless fences this exact attempt from same-case continuation
+        -- so cancellation cannot route straight back into the discarded path.
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_interpretation_backfill_items abandoned_item
+          JOIN result_interpretation_backfill_runs abandoned_run
+            ON abandoned_run.id = abandoned_item.run_id
+           AND abandoned_run.state = 'cancelled'
+          WHERE abandoned_item.result_id = result_attempt.result_id
+            AND abandoned_item.result_attempt_id = result_attempt.id
+            AND abandoned_item.state = 'abandoned'
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM sim_precalc_obligation_attempts newer

@@ -47,7 +47,8 @@ repair that representation problem.
    atomically mark its open receipts abandoned. That cancellation is terminal
    for those attempt/reducer pairs, cannot be revived by an in-flight worker,
    and yields only to a separately audited bounded fresh physical solve. The
-   old attempt and archive remain immutable and unpublished.
+   old attempt and archive remain immutable and unpublished, and the abandoned
+   attempt is no longer eligible for same-case continuation.
 
 ## Alternatives considered
 

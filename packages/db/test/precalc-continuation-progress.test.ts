@@ -12,6 +12,9 @@ import {
   precalcContinuationProgressFromEvidence,
   precalcContinuationsForObligations,
   recordPrecalcObligationSubmission,
+  resultInterpretationBackfillItems,
+  resultInterpretationBackfillRuns,
+  resultReducerVersions,
   requeueRestartablePrecalcContinuations,
   resultAttempts,
   resultClassifications,
@@ -42,6 +45,8 @@ const resultAttemptIds: string[] = [];
 const resultIds: string[] = [];
 const evidenceBlobIds: string[] = [];
 const obligationIds: string[] = [];
+const backfillRunIds: string[] = [];
+const reducerVersionIds: string[] = [];
 let airfoilId = "";
 let otherAirfoilId = "";
 let createdOtherAirfoilId: string | null = null;
@@ -259,6 +264,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (backfillRunIds.length) {
+    await db
+      .delete(resultInterpretationBackfillRuns)
+      .where(inArray(resultInterpretationBackfillRuns.id, backfillRunIds));
+  }
   if (obligationIds.length) {
     await db
       .delete(simPrecalcObligations)
@@ -288,6 +298,11 @@ afterAll(async () => {
   }
   if (jobIds.length) {
     await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+  }
+  if (reducerVersionIds.length) {
+    await db
+      .delete(resultReducerVersions)
+      .where(inArray(resultReducerVersions.id, reducerVersionIds));
   }
   await fixture?.cleanup();
   await legacyFixture?.cleanup();
@@ -1060,6 +1075,54 @@ describe("cross-segment preliminary URANS progress", () => {
         resultAttemptId: flatHorizon.precalcAttempt.id,
       }),
     ]);
+
+    const abandoned = await createLegacyCheckpointVariant(
+      {
+        suffix: "legacy-operator-abandoned-archive",
+        manifest: "valid",
+        archive: "valid",
+      },
+      21,
+    );
+    expect(
+      await precalcContinuationsForObligations(db, [abandoned.obligation.id]),
+    ).toHaveLength(1);
+    const [reducerVersion] = await db
+      .insert(resultReducerVersions)
+      .values({
+        reducerKey: `${PREFIX}-abandoned`,
+        reducerVersion: "1",
+        buildId: PREFIX,
+        policySha256: "a".repeat(64),
+        policy: {},
+        source: "test",
+      })
+      .returning({ id: resultReducerVersions.id });
+    reducerVersionIds.push(reducerVersion.id);
+    const [cancelledRun] = await db
+      .insert(resultInterpretationBackfillRuns)
+      .values({
+        reducerVersionId: reducerVersion.id,
+        state: "cancelled",
+        scope: {},
+        summary: {},
+        requestedBy: "test:disposable-archive-abandonment",
+        startedAt: new Date(),
+        completedAt: new Date(),
+      })
+      .returning({ id: resultInterpretationBackfillRuns.id });
+    backfillRunIds.push(cancelledRun.id);
+    await db.insert(resultInterpretationBackfillItems).values({
+      runId: cancelledRun.id,
+      resultId: abandoned.result.id,
+      resultAttemptId: abandoned.precalcAttempt.id,
+      state: "abandoned",
+      nextAttemptAt: new Date(),
+      lastError: "operator selected a fresh disposable solve",
+    });
+    expect(
+      await precalcContinuationsForObligations(db, [abandoned.obligation.id]),
+    ).toEqual([]);
 
     await db
       .update(simPrecalcObligations)
