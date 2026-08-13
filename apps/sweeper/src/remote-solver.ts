@@ -2530,10 +2530,7 @@ async function preflightMultipartUploads(
   }
 }
 
-function multipartUploadHeader(
-  boundary: string,
-  upload: StreamUpload,
-): Buffer {
+function multipartUploadHeader(boundary: string, upload: StreamUpload): Buffer {
   const filename = basename(upload.storageKey).replace(/["\r\n]/g, "_");
   return Buffer.from(
     `--${boundary}\r\nContent-Disposition: form-data; name="${upload.fieldName}"; filename="${filename}"\r\nContent-Type: ${upload.mimeType}\r\n\r\n`,
@@ -3137,6 +3134,95 @@ async function markRemoteJobDeliveryTerminal(
         updatedAt: new Date(),
       },
     });
+}
+
+/** A conditional whole-polar promotion permanently suppresses delivery of
+ * its wave-1 RANS rows. Retention still needs an explicit job-level terminal
+ * acknowledgement for that parent, but writing it before the replacement is
+ * settled could strip the shared source while a PRECALC retry still needs it.
+ * Retire only exact remote-owned promotions whose complete obligation set is
+ * terminal and whose every directly composed replacement child has its own
+ * terminal delivery acknowledgement. */
+async function settlePromotedRemoteParentDeliveries(
+  db: DB,
+  settings: Settings,
+): Promise<number> {
+  const candidates = (await db.execute(sql`
+    SELECT
+      parent.id AS job_id,
+      promotion.sync_promise_id::text AS promise_id
+    FROM sim_jobs parent
+    JOIN sim_rans_polar_promotions promotion
+      ON promotion.parent_job_id = parent.id
+     AND promotion.revision_id = parent.simulation_preset_revision_id
+     AND promotion.owner_kind = 'sync_promise'
+     AND promotion.sync_promise_id IS NOT NULL
+    JOIN sync_sweep_promises remote_promise
+      ON remote_promise.id = promotion.sync_promise_id
+     AND remote_promise.source_base_url = ${syncBase(settings)}
+     AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+     AND ${remotePromiseOwnerSql(settings, "remote_promise")}
+    WHERE parent.wave = 1
+      AND parent.status IN ('done', 'failed', 'cancelled')
+      AND COALESCE(parent.request_payload, '{}'::jsonb) ->> 'remoteSolver' = 'true'
+      AND EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points promotion_point
+        WHERE promotion_point.promotion_id = promotion.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points promotion_point
+        JOIN sim_precalc_obligations obligation
+          ON obligation.id = promotion_point.obligation_id
+        WHERE promotion_point.promotion_id = promotion.id
+          AND obligation.state NOT IN ('satisfied', 'blocked', 'cancelled')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM sim_jobs child
+        WHERE child.parent_job_id = parent.id
+          AND child.request_payload ->> 'recordedPromotionId' = promotion.id::text
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs child
+        WHERE child.parent_job_id = parent.id
+          AND child.request_payload ->> 'recordedPromotionId' = promotion.id::text
+          AND (
+            child.status NOT IN ('done', 'failed', 'cancelled')
+            OR NOT EXISTS (
+              SELECT 1
+              FROM sync_remote_result_deliveries child_terminal
+              WHERE child_terminal.promise_id = promotion.sync_promise_id
+                AND child_terminal.sim_job_id = child.id
+                AND child_terminal.result_id IS NULL
+                AND child_terminal.state IN ('delivered', 'superseded', 'blocked')
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_remote_result_deliveries parent_terminal
+        WHERE parent_terminal.promise_id = promotion.sync_promise_id
+          AND parent_terminal.sim_job_id = parent.id
+          AND parent_terminal.result_id IS NULL
+          AND parent_terminal.state IN ('delivered', 'superseded', 'blocked')
+      )
+    ORDER BY parent."createdAt", parent.id
+    LIMIT 250
+  `)) as unknown as Array<{ job_id: string; promise_id: string }>;
+
+  for (const candidate of candidates) {
+    await markRemoteJobDeliveryTerminal(
+      db,
+      candidate.promise_id,
+      candidate.job_id,
+      "superseded",
+      "superseded after conditional whole-polar preliminary URANS replacement settled",
+    );
+  }
+  return candidates.length;
 }
 
 async function settleSuccessfulRemoteResultDelivery(
@@ -5997,6 +6083,7 @@ export async function transferRemoteSolverTick(
     }
     if (!settings.remoteSolverAuthToken) return false;
     const processedDurableDelivery =
+      Boolean(await settlePromotedRemoteParentDeliveries(db, settings)) ||
       (await processRestartableRemotePrecalcCheckpoint(db, engine, settings)) ||
       (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
       (await processRemoteResultDeliveries(db, engine, settings));

@@ -519,19 +519,17 @@ async function cleanupRemoteRows() {
     new Set([revisionId, ...promiseRows.map((row) => row.revisionId)]),
   );
   if (promiseIds.length) {
-    await db.delete(syncRemoteHubBindingReceipts).where(
-      inArray(syncRemoteHubBindingReceipts.promiseId, promiseIds),
-    );
-    await db.delete(syncRemotePromiseCancellations).where(
-      inArray(syncRemotePromiseCancellations.promiseId, promiseIds),
-    );
+    await db
+      .delete(syncRemoteHubBindingReceipts)
+      .where(inArray(syncRemoteHubBindingReceipts.promiseId, promiseIds));
+    await db
+      .delete(syncRemotePromiseCancellations)
+      .where(inArray(syncRemotePromiseCancellations.promiseId, promiseIds));
   }
   const resultIds = await db
     .select({ id: results.id })
     .from(results)
-    .where(
-      inArray(results.simulationPresetRevisionId, fixtureRevisionIds),
-    );
+    .where(inArray(results.simulationPresetRevisionId, fixtureRevisionIds));
   const evidenceBlobIds = resultIds.length
     ? await db
         .select({ id: solverEvidenceBlobs.id })
@@ -592,9 +590,7 @@ async function cleanupRemoteRows() {
     );
   await db
     .delete(simJobs)
-    .where(
-      inArray(simJobs.simulationPresetRevisionId, fixtureRevisionIds),
-    );
+    .where(inArray(simJobs.simulationPresetRevisionId, fixtureRevisionIds));
   if (cleanupRuntimeBuildIds.size) {
     await db
       .delete(solverRuntimeBuilds)
@@ -985,7 +981,8 @@ function stubFetch(
       if (opts.incompleteMultipartPolarIndex === polarIndex)
         return new Response(
           JSON.stringify({
-            error: "manifest references missing multipart upload field media_23",
+            error:
+              "manifest references missing multipart upload field media_23",
           }),
           {
             status: 400,
@@ -4298,9 +4295,9 @@ describe("remote solver push validation regressions", () => {
       },
     ]);
     expect((await readPromise(promiseId)).promise.status).toBe("active");
-    expect(requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`)).toHaveLength(
-      0,
-    );
+    expect(
+      requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`),
+    ).toHaveLength(0);
   });
 
   it("MUST-CATCH: an incomplete multipart response retries transport without cancelling valid solver evidence", async () => {
@@ -4308,7 +4305,11 @@ describe("remote solver push validation regressions", () => {
     const job = await seedDoneRemoteJob("multipart-response-incomplete", [aoa]);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
       .syncPromiseId;
-    await seedMirroredPromise("multipart-response-incomplete", [aoa], promiseId);
+    await seedMirroredPromise(
+      "multipart-response-incomplete",
+      [aoa],
+      promiseId,
+    );
     const transport = stubFetch({ incompleteMultipartPolarIndex: 1 });
 
     await remoteSolverTick(db, {} as never);
@@ -4326,9 +4327,9 @@ describe("remote solver push validation regressions", () => {
       },
     ]);
     expect((await readPromise(promiseId)).promise.status).toBe("active");
-    expect(requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`)).toHaveLength(
-      0,
-    );
+    expect(
+      requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`),
+    ).toHaveLength(0);
   });
 
   it("retires local media work after the authoritative hub accepted that exact generation", async () => {
@@ -4450,6 +4451,128 @@ describe("remote solver push validation regressions", () => {
     expect(requests(runningChildFetch.fetchMock, "/polars")).toHaveLength(0);
     expect(requests(runningChildFetch.fetchMock, "/complete")).toHaveLength(0);
     expect((await readJobPayload(blocked.id)).remotePushedAt).toBeUndefined();
+  });
+
+  it("MUST-CATCH: a promoted wave-1 parent becomes reclaimable only after its obligations and exact children settle", async () => {
+    const aoa = 4.001;
+    const parent = await seedDoneRemoteJob(
+      "promoted-parent-terminal",
+      [aoa],
+      1,
+    );
+    const promiseId = (parent.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("promoted-parent-terminal", [aoa], promiseId);
+    const [parentResult] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, parent.id))
+      .limit(1);
+    if (!parentResult?.currentResultAttemptId) {
+      throw new Error("promoted parent fixture needs one current attempt");
+    }
+    const [obligation] = await db
+      .insert(simPrecalcObligations)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: aoa,
+        sourceResultId: parentResult.id,
+        sourceResultAttemptId: parentResult.currentResultAttemptId,
+        state: "running",
+      })
+      .returning();
+    const [promotion] = await db
+      .insert(simRansPolarPromotions)
+      .values({
+        parentJobId: parent.id,
+        airfoilId,
+        revisionId,
+        ownerKind: "sync_promise",
+        syncPromiseId: promiseId,
+        triggerResultAttemptId: parentResult.currentResultAttemptId,
+        triggerAoaDeg: aoa,
+        failureDisposition: "hard_solver",
+        requestOrigin: "continuous-polar",
+      })
+      .returning();
+    await db.insert(simRansPolarPromotionPoints).values({
+      promotionId: promotion.id,
+      aoaDeg: aoa,
+      obligationId: obligation.id,
+    });
+    const [child] = await db
+      .insert(simJobs)
+      .values({
+        parentJobId: parent.id,
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "running",
+        engineJobId: `${PREFIX}-promoted-parent-child`,
+        totalCases: 1,
+        completedCases: 0,
+        submittedAt: new Date(),
+        requestPayload: {
+          syncPromiseId: promiseId,
+          remoteSolver: true,
+          recordedPromotionId: promotion.id,
+        },
+      })
+      .returning();
+    const fetchMock = stubFetch();
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(
+      (await deliveriesForJob(parent.id)).filter((row) => !row.resultId),
+    ).toHaveLength(0);
+    expect(requests(fetchMock.fetchMock, "/polars")).toHaveLength(0);
+
+    await db
+      .update(simJobs)
+      .set({
+        status: "done",
+        completedCases: 1,
+        ingestedAt: new Date(),
+        finishedAt: new Date(),
+      })
+      .where(eq(simJobs.id, child.id));
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId,
+      simJobId: child.id,
+      generationKey: `job:${child.id}`,
+      state: "delivered",
+      deliveredAt: new Date(),
+    });
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(
+      (await deliveriesForJob(parent.id)).filter((row) => !row.resultId),
+    ).toHaveLength(0);
+
+    await db
+      .update(simPrecalcObligations)
+      .set({ state: "satisfied", completedAt: new Date() })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+
+    await remoteSolverTick(db, {} as never);
+
+    expect(
+      (await deliveriesForJob(parent.id)).filter((row) => !row.resultId),
+    ).toMatchObject([
+      {
+        promiseId,
+        state: "superseded",
+        lastError:
+          "superseded after conditional whole-polar preliminary URANS replacement settled",
+      },
+    ]);
+    expect(requests(fetchMock.fetchMock, "/polars")).toHaveLength(0);
+    expect((await readPromise(promiseId)).promise.status).toBe("active");
   });
 
   it("does not complete a promise after a partial job push and fulfills it only after every promised point is pushed", async () => {
