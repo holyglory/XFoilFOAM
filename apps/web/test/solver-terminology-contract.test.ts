@@ -27,6 +27,12 @@ describe("solver terminology contract", () => {
     );
     expect(correctionForm).toContain('data-testid="point-correction-submit"');
     expect(correctionForm).toContain("new immutable, single-angle setup");
+    expect(correctionForm).toContain("Recalculate from scratch");
+    expect(correctionForm).toContain("starts at t = 0");
+    expect(pointHistory).toContain(
+      'data-testid="point-continuation-requirement"',
+    );
+    expect(pointHistory).not.toContain("authenticated restart checkpoint");
   });
 
   it("names the affected action instead of calling forecast reserve a storage block", () => {

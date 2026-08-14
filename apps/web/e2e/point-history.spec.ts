@@ -190,6 +190,7 @@ test.describe("Point History Explorer (read-only)", () => {
               reviewBucket: null,
               workDisposition: "blocked",
               continuable: false,
+              hasSelectedGeneration: false,
               continuationResultAttemptId: null,
               correctionSetup: {
                 mesh: {
@@ -318,11 +319,60 @@ test.describe("Point History Explorer (read-only)", () => {
     const story = page.getByTestId("point-story-panel");
     await expect(
       story.getByTestId("point-continuation-unavailable"),
-    ).toContainText("cannot resume in place");
-    await expect(story.getByTestId("point-correction-form")).toBeVisible();
+    ).toContainText("no solver generation is selected");
+    await story.getByTestId("point-continuation-requirement").click();
+    await expect(
+      story.getByTestId("point-continuation-requirement"),
+    ).toContainText("not user authentication");
+    await expect(
+      story.getByTestId("point-fresh-recalculation-guidance"),
+    ).toContainText("starts a new OpenFOAM case at time zero");
+
+    const form = story.getByTestId("point-correction-form");
+    await expect(form).toBeVisible();
+    await expect(form).toContainText("Recalculate from scratch");
+    await expect(
+      form.getByTestId("point-recalculation-identity"),
+    ).toContainText("A18 (original)");
+    await expect(
+      form.getByTestId("point-recalculation-identity"),
+    ).toContainText("Re 307,041");
     await expect(
       story.getByTestId("point-correction-mesh_refinement"),
-    ).toContainText("Refine mesh");
+    ).toContainText("Refine mesh · recommended");
+    await expect(form.getByLabel("surface cells")).toHaveValue("195");
+    await expect(
+      form.getByTestId("point-recalculation-change-count"),
+    ).toContainText("5 parameters changed from pinned");
+    await expect(form.getByLabel("mesher")).toHaveValue("blockmesh-cgrid");
+    await form.getByText("Mesh settings", { exact: true }).click();
+    await expect(form.getByLabel("surface cells")).toBeHidden();
+    await form.getByText("Mesh settings", { exact: true }).click();
+    await expect(form.getByLabel("surface cells")).toBeVisible();
+
+    await form.getByTestId("point-correction-numerical_stability").click();
+    await expect(form.getByLabel("max Courant")).toHaveValue("0.5");
+    await form.getByTestId("point-correction-longer_sampling").click();
+    await expect(form.getByLabel("transient cycles")).toHaveValue("20");
+    await form.getByTestId("point-correction-reset").click();
+    await expect(form.getByLabel("surface cells")).toHaveValue("130");
+    await expect(
+      form.getByTestId("point-recalculation-change-count"),
+    ).toContainText("using all pinned values");
+    await form.getByTestId("point-correction-mesh_refinement").click();
+    await form.getByLabel("surface cells").fill("5");
+    await expect(
+      form.getByTestId("point-recalculation-validation"),
+    ).toBeVisible();
+    await expect(form.getByTestId("point-correction-submit")).toBeDisabled();
+    await form.getByLabel("surface cells").fill("220");
+    await expect(
+      form.getByTestId("point-recalculation-validation"),
+    ).toHaveCount(0);
+    await form.getByLabel("URANS tier").selectOption("full");
+    await expect(form.getByTestId("point-recalculation-summary")).toContainText(
+      "fresh FULL URANS case",
+    );
 
     await story.getByTestId("point-solver-results").click();
     await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
@@ -331,15 +381,20 @@ test.describe("Point History Explorer (read-only)", () => {
     );
     await page.keyboard.press("Escape");
 
+    page.once("dialog", (dialog) => dialog.dismiss());
+    await form.getByTestId("point-correction-submit").click();
+    expect(correctionBodies).toHaveLength(0);
+
     page.once("dialog", (dialog) => dialog.accept());
-    await story.getByTestId("point-correction-submit").click();
+    await form.getByTestId("point-correction-submit").click();
     await expect(story.getByTestId("point-correction-notice")).toContainText(
-      "corrected FAST URANS run queued",
+      "fresh FULL URANS recalculation queued",
     );
     expect(correctionBodies).toHaveLength(1);
     expect(correctionBodies[0]).toMatchObject({
       resultAttemptId: attemptId,
-      fidelity: "precalc",
+      fidelity: "full",
+      mesh: expect.objectContaining({ nSurface: 220 }),
     });
   });
 });

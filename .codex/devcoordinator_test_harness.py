@@ -79,7 +79,15 @@ def _python_suite() -> int:
     sync = _run(
         "python-dependencies",
         "locked Python dependencies",
-        [str(UV), "sync", "--frozen", "--python", "/usr/bin/python3"],
+        [
+            str(UV),
+            "sync",
+            "--frozen",
+            "--extra",
+            "dev",
+            "--python",
+            "/usr/bin/python3",
+        ],
     )
     if sync != 0:
         return sync
@@ -119,7 +127,7 @@ def _node_suite() -> int:
         (
             "workspace-typecheck",
             "Workspace type checking",
-            ["/usr/bin/corepack", "pnpm", "run", "typecheck"],
+            ["/usr/bin/corepack", "pnpm", "-r", "typecheck"],
         ),
         (
             "web-build",

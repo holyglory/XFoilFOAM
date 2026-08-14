@@ -55,6 +55,7 @@ import {
   type PointHistoryFacets,
   type PointHistoryItem,
   pointFiltersToSearch,
+  pointContinuationGuidance,
   pointPublicationExplanation,
   type PointStoryPayload,
   type PointVerifyInfo,
@@ -697,7 +698,7 @@ export function PointHistoryPanel() {
       if (!item || !resultAttemptId || correctionBusy) return;
       if (
         !window.confirm(
-          `Create a new immutable ${fidelity === "full" ? "FULL" : "FAST"} URANS setup for ${item.airfoilName} α ${item.aoaDeg}° and queue this exact angle? The source campaign, setup, and evidence will not be changed.`,
+          `Recalculate ${item.airfoilName} α ${item.aoaDeg}° from scratch as a fresh ${fidelity === "full" ? "FULL" : "FAST"} URANS case? It starts at time zero on a new immutable revision. The source campaign, setup, and evidence will not be changed.`,
         )
       )
         return;
@@ -713,8 +714,8 @@ export function PointHistoryPanel() {
           openStory(item);
           setCorrectionNotice(
             outcome.created
-              ? `corrected ${fidelity === "full" ? "FULL" : "FAST"} URANS run queued on immutable revision ${outcome.revisionId.slice(0, 8)}…`
-              : `corrected run already exists; its ${outcome.request.state} request was reused`,
+              ? `fresh ${fidelity === "full" ? "FULL" : "FAST"} URANS recalculation queued on immutable revision ${outcome.revisionId.slice(0, 8)}…`
+              : `this fresh recalculation already exists; its ${outcome.request.state} request was reused`,
           );
         }
         void fetchFirstPage(filtersRef.current);
@@ -820,6 +821,7 @@ export function PointHistoryPanel() {
   const publicationExplanation = story
     ? pointPublicationExplanation(story)
     : null;
+  const continuationGuidance = story ? pointContinuationGuidance(story) : null;
   const correctionEligible =
     story != null &&
     story.point.resultAttemptId != null &&
@@ -1796,9 +1798,7 @@ export function PointHistoryPanel() {
                           fontSize: 10.5,
                         }}
                       >
-                        {continueEligible
-                          ? "URANS continuation available"
-                          : "URANS continuation unavailable"}
+                        {continuationGuidance?.title}
                       </strong>
                       <span
                         style={{
@@ -1807,12 +1807,31 @@ export function PointHistoryPanel() {
                           lineHeight: 1.5,
                         }}
                       >
-                        {continueEligible
-                          ? "This exact generation has authenticated restart state. Choose Continue +2h, +6h, or +24h under Point actions."
-                          : correctionEligible
-                            ? "No selected generation has an authenticated restart checkpoint, so it cannot resume in place. Use the corrected-run editor below to start a fresh single-angle URANS case; Refine mesh is available there."
-                            : "No selected generation has an authenticated restart checkpoint, so it cannot resume in place."}
+                        {continuationGuidance?.detail}
                       </span>
+                      <details
+                        data-testid="point-continuation-requirement"
+                        style={{ color: C.dim, fontSize: 9.25 }}
+                      >
+                        <summary style={{ cursor: "pointer", color: C.muted }}>
+                          What same-case continuation needs
+                        </summary>
+                        <p style={{ margin: "5px 0 0", lineHeight: 1.5 }}>
+                          {continuationGuidance?.requirement}
+                        </p>
+                      </details>
+                      {correctionEligible && (
+                        <span
+                          data-testid="point-fresh-recalculation-guidance"
+                          style={{
+                            color: C.teal,
+                            fontSize: 9.5,
+                            lineHeight: 1.5,
+                          }}
+                        >
+                          {continuationGuidance?.freshStart}
+                        </span>
+                      )}
                     </section>
                   )}
                   {correctionNotice && (
@@ -1841,7 +1860,7 @@ export function PointHistoryPanel() {
                       }}
                     >
                       <strong style={{ color: C.text, fontSize: 10 }}>
-                        Corrected runs
+                        Fresh recalculations
                       </strong>
                       {story.corrections.map((correction) => (
                         <div
@@ -1921,7 +1940,7 @@ export function PointHistoryPanel() {
                                   borderColor: C.tealBorder,
                                 }}
                               >
-                                open corrected point ▸
+                                open recalculated point ▸
                               </button>
                             )}
                             <Link
@@ -1943,6 +1962,13 @@ export function PointHistoryPanel() {
                   {correctionEligible && story.point.correctionSetup && (
                     <PointCorrectionForm
                       key={story.point.resultAttemptId}
+                      identity={{
+                        airfoilName: story.point.airfoilName,
+                        aoaDeg: story.point.aoaDeg,
+                        reynolds: story.point.reynolds,
+                        mach: story.point.mach,
+                        speed: story.point.speed,
+                      }}
                       source={story.point.correctionSetup}
                       recommended={recommendedPointCorrections(story)}
                       busy={correctionBusy}

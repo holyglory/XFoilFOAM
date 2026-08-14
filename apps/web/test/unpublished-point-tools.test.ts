@@ -5,11 +5,37 @@ import {
   campaignPointsSearch,
   DEFAULT_POINT_FILTERS,
   parsePointFilters,
+  type PointCorrectionSettings,
+  pointCorrectionSettingsForKind,
+  pointCorrectionSettingsValid,
+  pointContinuationGuidance,
   pointPublicationExplanation,
   recommendedPointCorrections,
   statusChipDisplay,
   type PointStoryPayload,
 } from "../lib/point-history";
+
+const pinnedCorrectionSettings: PointCorrectionSettings = {
+  mesh: {
+    mesher: "blockmesh-cgrid",
+    farfieldRadiusChords: 15,
+    wakeLengthChords: 12,
+    nSurface: 130,
+    nRadial: 80,
+    nWake: 60,
+    targetYPlus: 1,
+    spanChords: 0.1,
+  },
+  solver: {
+    turbulenceModel: "kOmegaSST",
+    nIterations: 3_000,
+    convergenceTolerance: 0.00001,
+    momentumScheme: "linearUpwind",
+    transientCycles: 10,
+    transientDiscardFraction: 0.4,
+    transientMaxCourant: 4,
+  },
+};
 
 const story = (
   point: Partial<PointStoryPayload["point"]> = {},
@@ -45,6 +71,7 @@ const story = (
     reviewBucket: null,
     workDisposition: "blocked",
     continuable: false,
+    hasSelectedGeneration: false,
     continuationResultAttemptId: null,
     correctionSetup: null,
     verify: null,
@@ -85,6 +112,60 @@ describe("unpublished point tools", () => {
       "longer_sampling",
       "manual",
     ]);
+  });
+
+  it("explains why a pointer-null attempt cannot resume but can recalculate", () => {
+    const guidance = pointContinuationGuidance(story());
+    expect(guidance).toMatchObject({
+      state: "no_selected_generation",
+      title: "This run cannot continue",
+      detail: expect.stringContaining("no solver generation is selected"),
+      requirement: expect.stringContaining("checksummed evidence manifest"),
+      freshStart: expect.stringContaining(
+        "starts a new OpenFOAM case at time zero",
+      ),
+    });
+    expect(guidance.requirement).toContain("not user authentication");
+  });
+
+  it("pre-fills every recalculation strategy from pinned values and validates edits", () => {
+    const refined = pointCorrectionSettingsForKind(
+      pinnedCorrectionSettings,
+      "mesh_refinement",
+    );
+    expect(refined.mesh).toMatchObject({
+      nSurface: 195,
+      nRadial: 108,
+      nWake: 81,
+      farfieldRadiusChords: 20,
+      wakeLengthChords: 16,
+    });
+    expect(pinnedCorrectionSettings.mesh.nSurface).toBe(130);
+    expect(pointCorrectionSettingsValid(refined)).toBe(true);
+
+    const stable = pointCorrectionSettingsForKind(
+      pinnedCorrectionSettings,
+      "numerical_stability",
+    );
+    expect(stable.solver).toMatchObject({
+      nIterations: 4_500,
+      transientCycles: 15,
+      transientMaxCourant: 0.5,
+    });
+
+    const sampled = pointCorrectionSettingsForKind(
+      pinnedCorrectionSettings,
+      "longer_sampling",
+    );
+    expect(sampled.solver).toMatchObject({
+      transientCycles: 20,
+      transientDiscardFraction: 0.5,
+      transientMaxCourant: 1,
+    });
+
+    const invalid = structuredClone(refined);
+    invalid.mesh.nSurface = 5;
+    expect(pointCorrectionSettingsValid(invalid)).toBe(false);
   });
 
   it("reports active automatic follow-up before any manual diagnosis", () => {

@@ -581,6 +581,43 @@ exec "$REAL_PYTHON" "$@"
 """,
     )
     _write_executable(fake_bin / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "id",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-u" ]]; then
+  # Keep the harness on the production deploy-user path even when the test
+  # runner itself happens to be root.
+  printf '1000\n'
+  exit 0
+fi
+exec /usr/bin/id "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "sudo",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'sudo %s\n' "$*" >>"$CALL_LOG"
+if [[ "$*" == "-n true" || "$*" == "-n env RUN_INITIAL_CLEANUP=0 "* ]]; then
+  exit 0
+fi
+printf 'unsupported fake sudo invocation: %s\n' "$*" >&2
+exit 97
+""",
+    )
+    _write_executable(
+        fake_bin / "systemctl",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'systemctl %s\n' "$*" >>"$CALL_LOG"
+case "${1:-}" in
+  is-enabled|is-active) exit 0 ;;
+esac
+printf 'unsupported fake systemctl invocation: %s\n' "$*" >&2
+exit 98
+""",
+    )
 
     env = os.environ.copy()
     env.update(

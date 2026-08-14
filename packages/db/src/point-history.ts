@@ -941,6 +941,8 @@ export interface PointStory {
     /** Amendment C: rejected urans row with restartable saved case state — the
      *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
+    /** True only when this result names one selected canonical generation. */
+    hasSelectedGeneration: boolean;
     /** Exact immutable generation that the Continue action must name. */
     continuationResultAttemptId: string | null;
     /** Exact source generation used by point-scoped correction actions. This
@@ -1383,6 +1385,7 @@ export async function pointStory(
       reviewBucket: p.review_bucket ?? null,
       workDisposition: p.work_disposition ?? null,
       continuable: Boolean(p.continuable),
+      hasSelectedGeneration: p.current_result_attempt_id != null,
       continuationResultAttemptId: p.continuation_result_attempt_id,
       resultAttemptId:
         p.current_result_attempt_id ?? p.latest_result_attempt_id ?? null,

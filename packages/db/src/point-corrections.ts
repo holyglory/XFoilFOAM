@@ -124,7 +124,7 @@ export async function createPointCorrection(
     if (source.currentResultAttemptId != null) {
       throw new CampaignError(
         "conflict",
-        "the point changed after this evidence was loaded; refresh before creating a corrected run",
+        "the point changed after this evidence was loaded; refresh before creating a fresh recalculation",
       );
     }
     const [newestAttempt] = await db
@@ -144,14 +144,14 @@ export async function createPointCorrection(
     if (newestAttempt?.id !== input.resultAttemptId) {
       throw new CampaignError(
         "conflict",
-        "newer stored evidence exists for this pointer-null point; refresh before creating a corrected run",
+        "newer stored evidence exists for this pointer-null point; refresh before creating a fresh recalculation",
       );
     }
   }
   if (source.status !== "failed" && source.classificationState !== "rejected") {
     throw new CampaignError(
       "validation",
-      "a corrected run can be created only for an unpublished failed or rejected point",
+      "a fresh recalculation can be created only for an unpublished failed or rejected point",
     );
   }
 
@@ -344,7 +344,7 @@ export async function createPointCorrection(
   if (!correction)
     throw new CampaignError(
       "conflict",
-      "corrected run provenance could not be recorded",
+      "fresh recalculation provenance could not be recorded",
     );
   return {
     correctionRunId: correction.id,

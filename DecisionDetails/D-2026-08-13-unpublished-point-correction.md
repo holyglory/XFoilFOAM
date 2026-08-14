@@ -36,6 +36,10 @@ FULL URANS request are linked back to the source result attempt in
 - The corrected mesh is pinned for both FAST and FULL URANS tiers, the preset
   is disabled and targets only the source airfoil, and the sweep contains only
   the source angle.
+- The UI distinguishes same-case continuation from a fresh recalculation:
+  continuation explains the exact saved-state chain it needs, while the fresh
+  path starts at time zero, shows the fixed physical point, and pre-fills the
+  editable pinned mesh and solver values.
 - Corrected runs remain visible from the source point and prior evidence is
   never relabelled or overwritten.
 - Correction provenance is part of the disposable solver domain: it remains

@@ -202,6 +202,9 @@ export interface PointStoryPayload {
     /** Amendment C: rejected urans row with restartable saved case state — the
      *  story panel renders Continue +2h/+6h on exactly these. */
     continuable: boolean;
+    /** Whether results.current_result_attempt_id names one canonical
+     *  generation. Historical attempts can exist while this is false. */
+    hasSelectedGeneration: boolean;
     /** Exact immutable generation named by a continuation action. */
     continuationResultAttemptId: string | null;
     /** Exact source generation named by point-scoped corrected-run actions. */
@@ -243,6 +246,60 @@ export interface PointPublicationExplanation {
   title: string;
   detail: string;
   tone: "teal" | "violet" | "amber" | "muted";
+}
+
+export interface PointContinuationGuidance {
+  state: "available" | "no_selected_generation" | "not_restartable";
+  title: string;
+  detail: string;
+  requirement: string;
+  freshStart: string;
+}
+
+/** Explain same-case continuation without collapsing it into ordinary
+ * recalculation. The server owns the strict eligibility predicate; the client
+ * only explains the selected-generation state it was given. */
+export function pointContinuationGuidance(
+  story: PointStoryPayload,
+): PointContinuationGuidance {
+  if (story.point.continuable) {
+    return {
+      state: "available",
+      title: "This saved run can continue",
+      detail:
+        "The selected URANS generation has a verified saved OpenFOAM case, so it can resume from its last written time step.",
+      requirement:
+        "Verified means the saved case, solver identity, last written time step, and checksummed evidence manifest all belong to this exact result attempt. This is evidence verification, not user authentication.",
+      freshStart:
+        "A fresh recalculation is also possible, but it starts a separate case at time zero and does not reuse the saved solver state.",
+    };
+  }
+
+  if (!story.point.hasSelectedGeneration) {
+    const retainedHistory = story.point.resultAttemptId != null;
+    return {
+      state: "no_selected_generation",
+      title: "This run cannot continue",
+      detail: retainedHistory
+        ? "This result has historical attempts, but no solver generation is selected as the current one. The controller therefore has no exact OpenFOAM case or last written time step it can safely resume."
+        : "This result has no selected solver generation. The controller therefore has no exact OpenFOAM case or last written time step it can safely resume.",
+      requirement:
+        "Same-case continuation needs one selected rejected URANS generation whose saved case, solver identity, last written time step, and checksummed evidence manifest all belong together. This is evidence verification, not user authentication.",
+      freshStart:
+        "Recalculate from scratch is still available. It copies the pinned physical setup, pre-fills the mesh and solver parameters, and starts a new OpenFOAM case at time zero.",
+    };
+  }
+
+  return {
+    state: "not_restartable",
+    title: "This run cannot continue",
+    detail:
+      "A solver generation is selected, but it is not a rejected URANS budget stop with a fully verified saved case. Reusing it could resume the wrong or incomplete solver state.",
+    requirement:
+      "Same-case continuation needs the selected attempt, saved case, solver identity, last written time step, and checksummed evidence manifest to match exactly. This is evidence verification, not user authentication.",
+    freshStart:
+      "Recalculate from scratch is still available. It copies the pinned physical setup, pre-fills the mesh and solver parameters, and starts a new OpenFOAM case at time zero.",
+  };
 }
 
 /** Plain-language publication verdict derived only from stored evidence. */
@@ -361,6 +418,81 @@ export interface PointCorrectionSettings {
     transientDiscardFraction: number;
     transientMaxCourant: number;
   };
+}
+
+const roundedCorrectionScale = (value: number, factor: number) =>
+  Math.max(1, Math.ceil(value * factor));
+const correctionValueWithin = (value: number, min: number, max: number) =>
+  Number.isFinite(value) && value >= min && value <= max;
+
+/** Copy the pinned source values and apply one evidence-led starting preset. */
+export function pointCorrectionSettingsForKind(
+  source: PointCorrectionSettings,
+  kind: PointCorrectionKind,
+): PointCorrectionSettings {
+  const next = structuredClone(source);
+  if (kind === "mesh_refinement") {
+    next.mesh.nSurface = roundedCorrectionScale(source.mesh.nSurface, 1.5);
+    next.mesh.nRadial = roundedCorrectionScale(source.mesh.nRadial, 1.35);
+    next.mesh.nWake = roundedCorrectionScale(source.mesh.nWake, 1.35);
+    next.mesh.farfieldRadiusChords = Math.max(
+      source.mesh.farfieldRadiusChords,
+      20,
+    );
+    next.mesh.wakeLengthChords = Math.max(source.mesh.wakeLengthChords, 16);
+  } else if (kind === "numerical_stability") {
+    next.mesh.nSurface = roundedCorrectionScale(source.mesh.nSurface, 1.15);
+    next.mesh.nRadial = roundedCorrectionScale(source.mesh.nRadial, 1.15);
+    next.solver.nIterations = roundedCorrectionScale(
+      source.solver.nIterations,
+      1.5,
+    );
+    next.solver.transientCycles = Math.max(
+      source.solver.transientCycles * 1.5,
+      12,
+    );
+    next.solver.transientMaxCourant = Math.min(
+      source.solver.transientMaxCourant,
+      0.5,
+    );
+  } else if (kind === "longer_sampling") {
+    next.solver.transientCycles = Math.max(
+      source.solver.transientCycles * 2,
+      20,
+    );
+    next.solver.transientDiscardFraction = Math.min(
+      0.7,
+      Math.max(source.solver.transientDiscardFraction, 0.5),
+    );
+    next.solver.transientMaxCourant = Math.min(
+      source.solver.transientMaxCourant,
+      1,
+    );
+  }
+  return next;
+}
+
+/** Mirror the backend's bounded correction contract before enabling submit. */
+export function pointCorrectionSettingsValid(
+  settings: PointCorrectionSettings,
+): boolean {
+  return (
+    settings.mesh.mesher.trim().length > 0 &&
+    correctionValueWithin(settings.mesh.nSurface, 20, 10_000) &&
+    correctionValueWithin(settings.mesh.nRadial, 10, 5_000) &&
+    correctionValueWithin(settings.mesh.nWake, 10, 5_000) &&
+    correctionValueWithin(settings.mesh.farfieldRadiusChords, 1, 500) &&
+    correctionValueWithin(settings.mesh.wakeLengthChords, 1, 500) &&
+    correctionValueWithin(settings.mesh.targetYPlus, 0.01, 1_000) &&
+    correctionValueWithin(settings.mesh.spanChords, 0.001, 100) &&
+    settings.solver.turbulenceModel.trim().length > 0 &&
+    settings.solver.momentumScheme.trim().length > 0 &&
+    correctionValueWithin(settings.solver.nIterations, 100, 1_000_000) &&
+    correctionValueWithin(settings.solver.convergenceTolerance, 1e-12, 1) &&
+    correctionValueWithin(settings.solver.transientCycles, 0.1, 10_000) &&
+    correctionValueWithin(settings.solver.transientDiscardFraction, 0, 0.95) &&
+    correctionValueWithin(settings.solver.transientMaxCourant, 0.01, 100)
+  );
 }
 
 // ---------------------------------------------------------------------------

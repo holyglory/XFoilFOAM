@@ -2,11 +2,6 @@
   "schema_version": 3,
   "defaults": {
     "timeout_seconds": 7200,
-    "resources": {
-      "cpu_millis": 6000,
-      "memory_mib": 12288,
-      "pids": 2048
-    },
     "network": "external",
     "environment": {
       "CI": "true",

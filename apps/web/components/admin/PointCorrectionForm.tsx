@@ -5,6 +5,8 @@ import { useState } from "react";
 import {
   type PointCorrectionKind,
   type PointCorrectionSettings,
+  pointCorrectionSettingsForKind,
+  pointCorrectionSettingsValid,
 } from "@/lib/point-history";
 import { C, MONO } from "@/lib/tokens";
 
@@ -38,60 +40,19 @@ const presetCopy: Record<
     detail: "More transient cycles and a longer post-discard averaging window.",
   },
   manual: {
-    label: "Manual",
-    detail: "Start from the pinned source values and edit every field below.",
+    label: "Edit pinned values",
+    detail:
+      "Reload the current mesh and solver values, then adjust them below.",
   },
 };
 
-const roundedScale = (value: number, factor: number) =>
-  Math.max(1, Math.ceil(value * factor));
-
-function settingsForKind(
-  source: PointCorrectionSettings,
-  kind: PointCorrectionKind,
-): PointCorrectionSettings {
-  const next = structuredClone(source);
-  if (kind === "mesh_refinement") {
-    next.mesh.nSurface = roundedScale(source.mesh.nSurface, 1.5);
-    next.mesh.nRadial = roundedScale(source.mesh.nRadial, 1.35);
-    next.mesh.nWake = roundedScale(source.mesh.nWake, 1.35);
-    next.mesh.farfieldRadiusChords = Math.max(
-      source.mesh.farfieldRadiusChords,
-      20,
-    );
-    next.mesh.wakeLengthChords = Math.max(source.mesh.wakeLengthChords, 16);
-  } else if (kind === "numerical_stability") {
-    next.mesh.nSurface = roundedScale(source.mesh.nSurface, 1.15);
-    next.mesh.nRadial = roundedScale(source.mesh.nRadial, 1.15);
-    next.solver.nIterations = roundedScale(source.solver.nIterations, 1.5);
-    next.solver.transientCycles = Math.max(
-      source.solver.transientCycles * 1.5,
-      12,
-    );
-    next.solver.transientMaxCourant = Math.min(
-      source.solver.transientMaxCourant,
-      0.5,
-    );
-  } else if (kind === "longer_sampling") {
-    next.solver.transientCycles = Math.max(
-      source.solver.transientCycles * 2,
-      20,
-    );
-    next.solver.transientDiscardFraction = Math.min(
-      0.7,
-      Math.max(source.solver.transientDiscardFraction, 0.5),
-    );
-    next.solver.transientMaxCourant = Math.min(
-      source.solver.transientMaxCourant,
-      1,
-    );
-  }
-  return next;
-}
+const within = (value: number, min: number, max: number) =>
+  Number.isFinite(value) && value >= min && value <= max;
 
 function NumericField({
   label,
   value,
+  sourceValue,
   min,
   max,
   step,
@@ -100,17 +61,33 @@ function NumericField({
 }: {
   label: string;
   value: number;
+  sourceValue: number;
   min: number;
   max: number;
   step: number;
   integer?: boolean;
   onChange: (value: number) => void;
 }) {
+  const invalid = !Number.isFinite(value) || value < min || value > max;
   return (
     <label style={{ display: "grid", gap: 3, minWidth: 0 }}>
-      <span style={{ color: C.dim, fontSize: 9 }}>{label}</span>
+      <span
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 5,
+          color: C.dim,
+          fontSize: 9,
+        }}
+      >
+        <span>{label}</span>
+        <span style={{ color: value === sourceValue ? C.dim : C.amber }}>
+          {value === sourceValue ? "pinned" : `was ${sourceValue}`}
+        </span>
+      </span>
       <input
         type="number"
+        aria-invalid={invalid || undefined}
         min={min}
         max={max}
         step={step}
@@ -126,12 +103,60 @@ function NumericField({
   );
 }
 
+function TextField({
+  label,
+  value,
+  sourceValue,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  sourceValue: string;
+  onChange: (value: string) => void;
+}) {
+  const invalid = value.trim().length === 0;
+  return (
+    <label style={{ display: "grid", gap: 3, minWidth: 0 }}>
+      <span
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 5,
+          color: C.dim,
+          fontSize: 9,
+        }}
+      >
+        <span>{label}</span>
+        <span style={{ color: value === sourceValue ? C.dim : C.amber }}>
+          {value === sourceValue ? "pinned" : `was ${sourceValue}`}
+        </span>
+      </span>
+      <input
+        value={value}
+        aria-invalid={invalid || undefined}
+        onChange={(event) => onChange(event.target.value)}
+        style={inputStyle}
+      />
+    </label>
+  );
+}
+
+export interface PointRecalculationIdentity {
+  airfoilName: string;
+  aoaDeg: number;
+  reynolds: number | null;
+  mach: number | null;
+  speed: number | null;
+}
+
 export function PointCorrectionForm({
+  identity,
   source,
   recommended,
   busy,
   onSubmit,
 }: {
+  identity: PointRecalculationIdentity;
   source: PointCorrectionSettings;
   recommended: PointCorrectionKind[];
   busy: boolean;
@@ -143,13 +168,13 @@ export function PointCorrectionForm({
   const initialKind = recommended[0] ?? "manual";
   const [kind, setKind] = useState<PointCorrectionKind>(initialKind);
   const [settings, setSettings] = useState<PointCorrectionSettings>(() =>
-    settingsForKind(source, initialKind),
+    pointCorrectionSettingsForKind(source, initialKind),
   );
   const [fidelity, setFidelity] = useState<"precalc" | "full">("precalc");
 
   const chooseKind = (nextKind: PointCorrectionKind) => {
     setKind(nextKind);
-    setSettings(settingsForKind(source, nextKind));
+    setSettings(pointCorrectionSettingsForKind(source, nextKind));
   };
   const setMesh = <K extends keyof PointCorrectionSettings["mesh"]>(
     key: K,
@@ -159,6 +184,26 @@ export function PointCorrectionForm({
       ...current,
       mesh: { ...current.mesh, [key]: value },
     }));
+
+  const changedCount =
+    Object.entries(settings.mesh).filter(
+      ([key, value]) =>
+        value !== source.mesh[key as keyof PointCorrectionSettings["mesh"]],
+    ).length +
+    Object.entries(settings.solver).filter(
+      ([key, value]) =>
+        value !== source.solver[key as keyof PointCorrectionSettings["solver"]],
+    ).length;
+  const identityParts = [
+    identity.airfoilName,
+    `α ${identity.aoaDeg}°`,
+    identity.reynolds == null
+      ? null
+      : `Re ${Math.round(identity.reynolds).toLocaleString("en-US")}`,
+    identity.mach == null ? null : `M ${identity.mach}`,
+    identity.speed == null ? null : `${identity.speed} m/s`,
+  ].filter((value): value is string => value != null);
+  const settingsValid = pointCorrectionSettingsValid(settings);
   const setSolver = <K extends keyof PointCorrectionSettings["solver"]>(
     key: K,
     value: PointCorrectionSettings["solver"][K],
@@ -173,25 +218,100 @@ export function PointCorrectionForm({
       data-testid="point-correction-form"
       style={{
         display: "grid",
-        gap: 9,
-        padding: 9,
-        border: `1px solid ${C.borderSoft}`,
+        gap: 12,
+        padding: 11,
+        border: `1px solid ${C.tealBorder}`,
         borderRadius: 8,
         background: C.panel2,
         fontFamily: MONO,
         fontSize: 10,
       }}
     >
-      <div style={{ display: "grid", gap: 3 }}>
-        <strong style={{ color: C.text }}>Run a corrected setup</strong>
+      <div style={{ display: "grid", gap: 5 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 8,
+            flexWrap: "wrap",
+          }}
+        >
+          <strong style={{ color: C.text, fontSize: 11.5 }}>
+            Recalculate from scratch
+          </strong>
+          <span
+            style={{
+              color: C.teal,
+              border: `1px solid ${C.tealBorder}`,
+              background: C.tealFill,
+              borderRadius: 999,
+              padding: "2px 7px",
+              fontSize: 9,
+            }}
+          >
+            fresh case · starts at t = 0
+          </span>
+        </div>
         <span style={{ color: C.muted, lineHeight: 1.45 }}>
-          Creates a new immutable, single-angle setup. The original campaign and
-          its evidence are unchanged. Presets are starting points, not an
-          acceptance guarantee.
+          Creates a new immutable, single-angle setup and leaves the original
+          campaign and evidence unchanged. It does not need a restart
+          checkpoint.
+        </span>
+      </div>
+
+      <div
+        data-testid="point-recalculation-identity"
+        style={{
+          display: "grid",
+          gap: 5,
+          padding: 8,
+          background: C.panel3,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 7,
+        }}
+      >
+        <strong style={{ color: C.muted, fontSize: 9.5 }}>
+          POINT STAYS FIXED
+        </strong>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+          {identityParts.map((part) => (
+            <span
+              key={part}
+              style={{
+                color: C.text,
+                border: `1px solid ${C.borderSoft}`,
+                borderRadius: 999,
+                padding: "2px 6px",
+                fontSize: 9,
+              }}
+            >
+              {part}
+            </span>
+          ))}
+        </div>
+        <span style={{ color: C.dim, fontSize: 9, lineHeight: 1.45 }}>
+          Airfoil, AoA, flow, geometry, and boundary profiles stay pinned. Only
+          the mesh, numerical settings, and URANS tier below can change.
         </span>
       </div>
 
       <div style={{ display: "grid", gap: 5 }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "baseline",
+            gap: 8,
+          }}
+        >
+          <strong style={{ color: C.muted, fontSize: 9.5 }}>
+            STARTING PARAMETERS
+          </strong>
+          <span style={{ color: C.dim, fontSize: 8.5 }}>
+            presets pre-fill the editor
+          </span>
+        </div>
         {recommended.map((candidate) => {
           const copy = presetCopy[candidate];
           return (
@@ -215,11 +335,48 @@ export function PointCorrectionForm({
                 cursor: "pointer",
               }}
             >
-              <strong>{copy.label}</strong>
+              <strong>
+                {copy.label}
+                {candidate === recommended[0] && candidate !== "manual"
+                  ? " · recommended"
+                  : ""}
+              </strong>
               <span style={{ color: C.dim }}>{copy.detail}</span>
             </button>
           );
         })}
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 8,
+          alignItems: "center",
+        }}
+      >
+        <span
+          data-testid="point-recalculation-change-count"
+          style={{ color: changedCount > 0 ? C.amber : C.dim, fontSize: 9 }}
+        >
+          {changedCount === 0
+            ? "using all pinned values"
+            : `${changedCount} parameter${changedCount === 1 ? "" : "s"} changed from pinned`}
+        </span>
+        <button
+          type="button"
+          data-testid="point-correction-reset"
+          onClick={() => chooseKind("manual")}
+          style={{
+            ...inputStyle,
+            width: "auto",
+            color: C.muted,
+            cursor: "pointer",
+            padding: "4px 7px",
+          }}
+        >
+          Reset to pinned
+        </button>
       </div>
 
       <details open>
@@ -234,17 +391,16 @@ export function PointCorrectionForm({
             marginTop: 7,
           }}
         >
-          <label style={{ display: "grid", gap: 3 }}>
-            <span style={{ color: C.dim, fontSize: 9 }}>mesher</span>
-            <input
-              value={settings.mesh.mesher}
-              onChange={(event) => setMesh("mesher", event.target.value)}
-              style={inputStyle}
-            />
-          </label>
+          <TextField
+            label="mesher"
+            value={settings.mesh.mesher}
+            sourceValue={source.mesh.mesher}
+            onChange={(value) => setMesh("mesher", value)}
+          />
           <NumericField
             label="surface cells"
             value={settings.mesh.nSurface}
+            sourceValue={source.mesh.nSurface}
             min={20}
             max={10000}
             step={10}
@@ -254,6 +410,7 @@ export function PointCorrectionForm({
           <NumericField
             label="radial cells"
             value={settings.mesh.nRadial}
+            sourceValue={source.mesh.nRadial}
             min={10}
             max={5000}
             step={5}
@@ -263,6 +420,7 @@ export function PointCorrectionForm({
           <NumericField
             label="wake cells"
             value={settings.mesh.nWake}
+            sourceValue={source.mesh.nWake}
             min={10}
             max={5000}
             step={5}
@@ -272,6 +430,7 @@ export function PointCorrectionForm({
           <NumericField
             label="farfield [chords]"
             value={settings.mesh.farfieldRadiusChords}
+            sourceValue={source.mesh.farfieldRadiusChords}
             min={1}
             max={500}
             step={1}
@@ -280,6 +439,7 @@ export function PointCorrectionForm({
           <NumericField
             label="wake [chords]"
             value={settings.mesh.wakeLengthChords}
+            sourceValue={source.mesh.wakeLengthChords}
             min={1}
             max={500}
             step={1}
@@ -288,6 +448,7 @@ export function PointCorrectionForm({
           <NumericField
             label="target y+"
             value={settings.mesh.targetYPlus}
+            sourceValue={source.mesh.targetYPlus}
             min={0.01}
             max={1000}
             step={0.1}
@@ -296,6 +457,7 @@ export function PointCorrectionForm({
           <NumericField
             label="span [chords]"
             value={settings.mesh.spanChords}
+            sourceValue={source.mesh.spanChords}
             min={0.001}
             max={100}
             step={0.01}
@@ -316,29 +478,22 @@ export function PointCorrectionForm({
             marginTop: 7,
           }}
         >
-          <label style={{ display: "grid", gap: 3 }}>
-            <span style={{ color: C.dim, fontSize: 9 }}>turbulence model</span>
-            <input
-              value={settings.solver.turbulenceModel}
-              onChange={(event) =>
-                setSolver("turbulenceModel", event.target.value)
-              }
-              style={inputStyle}
-            />
-          </label>
-          <label style={{ display: "grid", gap: 3 }}>
-            <span style={{ color: C.dim, fontSize: 9 }}>momentum scheme</span>
-            <input
-              value={settings.solver.momentumScheme}
-              onChange={(event) =>
-                setSolver("momentumScheme", event.target.value)
-              }
-              style={inputStyle}
-            />
-          </label>
+          <TextField
+            label="turbulence model"
+            value={settings.solver.turbulenceModel}
+            sourceValue={source.solver.turbulenceModel}
+            onChange={(value) => setSolver("turbulenceModel", value)}
+          />
+          <TextField
+            label="momentum scheme"
+            value={settings.solver.momentumScheme}
+            sourceValue={source.solver.momentumScheme}
+            onChange={(value) => setSolver("momentumScheme", value)}
+          />
           <NumericField
             label="iterations"
             value={settings.solver.nIterations}
+            sourceValue={source.solver.nIterations}
             min={100}
             max={1000000}
             step={100}
@@ -348,6 +503,7 @@ export function PointCorrectionForm({
           <NumericField
             label="convergence tolerance"
             value={settings.solver.convergenceTolerance}
+            sourceValue={source.solver.convergenceTolerance}
             min={1e-12}
             max={1}
             step={1e-6}
@@ -356,6 +512,7 @@ export function PointCorrectionForm({
           <NumericField
             label="transient cycles"
             value={settings.solver.transientCycles}
+            sourceValue={source.solver.transientCycles}
             min={0.1}
             max={10000}
             step={1}
@@ -364,6 +521,7 @@ export function PointCorrectionForm({
           <NumericField
             label="discard fraction"
             value={settings.solver.transientDiscardFraction}
+            sourceValue={source.solver.transientDiscardFraction}
             min={0}
             max={0.95}
             step={0.05}
@@ -372,6 +530,7 @@ export function PointCorrectionForm({
           <NumericField
             label="max Courant"
             value={settings.solver.transientMaxCourant}
+            sourceValue={source.solver.transientMaxCourant}
             min={0.01}
             max={100}
             step={0.1}
@@ -393,10 +552,35 @@ export function PointCorrectionForm({
           <option value="full">FULL URANS — final-fidelity correction</option>
         </select>
       </label>
+      <div
+        data-testid="point-recalculation-summary"
+        style={{
+          color: C.muted,
+          background: C.panel3,
+          border: `1px solid ${C.stroke}`,
+          borderRadius: 7,
+          padding: 8,
+          lineHeight: 1.5,
+          fontSize: 9.5,
+        }}
+      >
+        A fresh {fidelity === "full" ? "FULL" : "FAST"} URANS case will start at
+        time zero on a new immutable revision. Previous attempts remain
+        available as evidence.
+      </div>
+      {!settingsValid ? (
+        <div
+          role="alert"
+          data-testid="point-recalculation-validation"
+          style={{ color: C.amber, fontSize: 9.5 }}
+        >
+          Fix the highlighted parameter before queuing this recalculation.
+        </div>
+      ) : null}
       <button
         type="button"
         data-testid="point-correction-submit"
-        disabled={busy}
+        disabled={busy || !settingsValid}
         onClick={() => onSubmit(settings, fidelity)}
         style={{
           fontFamily: MONO,
@@ -407,11 +591,13 @@ export function PointCorrectionForm({
           border: "none",
           borderRadius: 7,
           padding: "7px 10px",
-          cursor: busy ? "default" : "pointer",
-          opacity: busy ? 0.65 : 1,
+          cursor: busy || !settingsValid ? "default" : "pointer",
+          opacity: busy || !settingsValid ? 0.65 : 1,
         }}
       >
-        {busy ? "creating corrected run…" : "Create corrected run"}
+        {busy
+          ? "queuing fresh recalculation…"
+          : `Queue fresh ${fidelity === "full" ? "FULL" : "FAST"} URANS recalculation`}
       </button>
     </section>
   );

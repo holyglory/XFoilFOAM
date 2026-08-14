@@ -363,6 +363,7 @@ function storyPayload(over: Partial<PointStoryPayload>): PointStoryPayload {
       reviewBucket: null,
       workDisposition: null,
       continuable: false,
+      hasSelectedGeneration: true,
       continuationResultAttemptId: null,
       resultAttemptId: "attempt-1",
       viewResultAttemptId: "attempt-1",

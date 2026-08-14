@@ -1,5 +1,18 @@
 # Completion Ledger
 
+- **Fresh point recalculation rendered proof:** The pointer-null continuation
+  explanation and from-zero, pre-filled recalculation UI are implemented with
+  a full mocked interaction regression. Unit tests, web/DB typechecks, and the
+  production web build pass, and the repaired test scheduler now accepts the
+  schema-3 manifest. Rendered execution is still pending because
+  DevCoordinator refuses this repository's declared runtime when the effective
+  Compose model requests the admin-approved `published_host_ports` access.
+  Once the governed runtime is approved, run the pointer-null Solver › Points
+  flow at desktop and narrow widths; exercise checkpoint disclosure, every
+  preset, reset, parameter validation, tier selection, confirm
+  cancellation/success, and verify the exact source attempt in the queued
+  request, then remove this item.
+
 - **Conservative preliminary-URANS retry burn-in:** Both production roles run
   engine/controller v12, and repeated hub PRECALC work carries the controller
   recovery flag and the persisted time-zero conservative-numerics marker. No
@@ -18,12 +31,13 @@
   the live API/build prove the stable result identity, classic-RANS explanation,
   retained-content transition, cache, and prefetch implementation. The two-case
   Playwright regression collects successfully, but its rendered run remains
-  blocked because DevCoordinator could not materialize the declared local API
-  target (`bug-0e77ea2105a944639bda2dfb740bf1b1`) and the repository test
-  manifest is still unsupported schema 2. Run the exact Admin campaign modal
-  scrub after the governed runtime is available; verify retained dialog/scroll,
-  no full-body loading screen, one request per cached AoA, final slider/result
-  agreement, and the compact classic-RANS history notice, then remove this item.
+  blocked because DevCoordinator cannot materialize the declared local runtime
+  while its effective Compose model requests admin-approved
+  `published_host_ports` access. The repository test manifest now validates as
+  schema 3. Run the exact Admin campaign modal scrub after the governed runtime
+  is approved; verify retained dialog/scroll, no full-body loading screen, one
+  request per cached AoA, final slider/result agreement, and the compact
+  classic-RANS history notice, then remove this item.
 
 - **Multi-solver evidence comparison and custom polars:** Preserve every
   OpenCFD 2406/2606 and future solver attempt under its immutable implementation
