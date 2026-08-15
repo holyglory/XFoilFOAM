@@ -1,13 +1,5 @@
 # Completion Ledger
 
-- **Campaign failed-point management controls:** The campaign point diagnostic
-  now resolves an exact retained result/attempt and mounts retry, continuation,
-  stored-evidence, and pre-filled fresh-recalculation controls. Static
-  typechecks and focused UI regressions pass. Governed DB/browser verification,
-  production deployment, and the reported live failed-row interaction remain;
-  remove this item only after every enabled control is exercised on the
-  campaign surface and the deployed hub/remote health stays green.
-
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with
   a full mocked interaction regression. Unit tests, web/DB typechecks, and the
