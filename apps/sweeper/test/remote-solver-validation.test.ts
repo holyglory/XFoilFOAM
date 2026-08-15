@@ -53,6 +53,7 @@ const {
   reconcileRemoteSolverTick,
   remoteSolverTick,
   renewResultDeliveryClaim,
+  startRemoteSolverFleetHeartbeatTimer,
   settleResultDelivery,
   startRemoteReclaimClaimLease,
   startRemotePromiseTransferLease,
@@ -1599,6 +1600,62 @@ afterAll(async () => {
 });
 
 describe("remote solver submit lifecycle", () => {
+  it("MUST-CATCH: reports fleet liveness while a promise renewal holds the scheduler tick", async () => {
+    const promise = await seedMirroredPromise("held-lease-renewal", [900.451]);
+    await db
+      .update(syncSweepPromises)
+      .set({
+        lastHeartbeatAt: new Date(Date.now() - 10 * 60_000),
+        updatedAt: new Date(),
+      })
+      .where(eq(syncSweepPromises.id, promise.id));
+
+    let releaseRenewal!: (response: Response) => void;
+    const heldRenewal = new Promise<Response>((resolve) => {
+      releaseRenewal = resolve;
+    });
+    const baseFetch = stubFetch().fetchMock;
+    const fetchMock = vi.fn(
+      async (input: string | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input);
+        if (url.endsWith(`/sweeps/${promise.id}/heartbeat`)) return heldRenewal;
+        return baseFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const reconcile = reconcileRemoteSolverTick(db, {} as EngineClient);
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).endsWith(`/sweeps/${promise.id}/heartbeat`),
+        )
+      )
+        break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const stop = startRemoteSolverFleetHeartbeatTimer(db, 20);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(
+        fetchMock.mock.calls.filter(
+          ([input]) =>
+            String(input).includes("/solvers/") &&
+            String(input).endsWith("/heartbeat"),
+        ).length,
+      ).toBeGreaterThanOrEqual(2);
+    } finally {
+      stop();
+      releaseRenewal(
+        Response.json({
+          ok: true,
+          expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        }),
+      );
+    }
+    expect(await reconcile).toBe(true);
+  });
+
   it("does not claim or contact the hub while maintenance pauses transfers", async () => {
     await db
       .update(syncApiSettings)

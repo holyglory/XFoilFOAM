@@ -101,6 +101,7 @@ const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
 // class), so every call carries an AbortSignal timeout. Aborts surface through
 // the existing failure handling (remoteSolverTick's catch → setStatus error).
 const REMOTE_POLL_TIMEOUT_MS = 15_000;
+export const REMOTE_FLEET_HEARTBEAT_INTERVAL_MS = 30_000;
 const REMOTE_PUSH_STALL_TIMEOUT_MS = Number(
   process.env.REMOTE_PUSH_STALL_TIMEOUT_MS ?? 120_000,
 );
@@ -999,11 +1000,11 @@ async function heartbeat(
       activeAoaCount: number;
     };
   },
-  solvedCount: number,
-  pushedCount: number,
-) {
-  if (!settings.remoteSolverRegisteredId) return;
-  await fetch(
+  solvedCount?: number,
+  pushedCount?: number,
+): Promise<boolean> {
+  if (!settings.remoteSolverRegisteredId) return false;
+  const response = await fetch(
     `${syncBase(settings)}/solvers/${settings.remoteSolverRegisteredId}/heartbeat`,
     {
       method: "POST",
@@ -1016,12 +1017,13 @@ async function heartbeat(
         cpuCapacity: remoteWorkerCpuCapacity(settings),
         cpuBudget: settings.remoteSolverCpuBudget,
         buildVersion: configuredBuildVersion(),
-        solvedCount,
-        pushedCount,
+        ...(solvedCount == null ? {} : { solvedCount }),
+        ...(pushedCount == null ? {} : { pushedCount }),
         health: telemetry,
       }),
     },
-  ).catch(() => undefined);
+  ).catch(() => null);
+  return response?.ok === true;
 }
 
 function percent(used: number, total: number): number {
@@ -1096,6 +1098,88 @@ async function remoteOutcomeCounters(db: DB, settings: Settings) {
     solvedCount: Number(solved?.count ?? 0),
     pushedCount: Number(pushed?.count ?? 0),
   };
+}
+
+async function reportRemoteSolverFleetHeartbeat(
+  db: DB,
+  settings: Settings,
+  options: { includeOutcomeCounters: boolean },
+): Promise<{ remoteCap: number; reservedCpuSlots: number }> {
+  const [active, reservedCpuSlots] = await Promise.all([
+    activeRemoteJobs(db, settings),
+    remoteReservedCpuSlots(db, settings),
+  ]);
+  const activeAoaCount = active.reduce((sum, job) => sum + job.totalCases, 0);
+  const remoteCap = configuredRemoteCpuCap(settings);
+  const [telemetry, counters] = await Promise.all([
+    remoteNodeHealth(db, active, reservedCpuSlots, remoteCap, activeAoaCount),
+    options.includeOutcomeCounters
+      ? remoteOutcomeCounters(db, settings)
+      : Promise.resolve(null),
+  ]);
+  await heartbeat(
+    settings,
+    active.length ? "solving" : "idle",
+    active.length,
+    activeAoaCount,
+    telemetry,
+    counters?.solvedCount,
+    counters?.pushedCount,
+  );
+  return { remoteCap, reservedCpuSlots };
+}
+
+/**
+ * Report remote-fleet liveness outside the main scheduler tick. The report is
+ * intentionally database-backed and does not renew promises, call the engine,
+ * or run transfer work, so slow CFD/reconciliation cannot make a live node
+ * disappear from the hub's Health view.
+ */
+export async function sendRemoteSolverFleetHeartbeat(db: DB): Promise<void> {
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  if (
+    !settings?.remoteSolverEnabled ||
+    !settings.upstreamBaseUrl ||
+    !settings.remoteSolverRegisteredId ||
+    !settings.remoteSolverAuthToken
+  )
+    return;
+  assertRemoteSolverHubUrlContract(settings.upstreamBaseUrl);
+  assertRemoteSolverNodeEvidenceContract(settings.remoteSolverEnabled);
+  await reportRemoteSolverFleetHeartbeat(db, settings, {
+    includeOutcomeCounters: false,
+  });
+}
+
+/** Independent single-flight fleet reporter. A held request cannot stack
+ * later reports, and every hub request retains REMOTE_POLL_TIMEOUT_MS. */
+export function startRemoteSolverFleetHeartbeatTimer(
+  db: DB,
+  intervalMs: number = REMOTE_FLEET_HEARTBEAT_INTERVAL_MS,
+): () => void {
+  let inFlight = false;
+  const beat = () => {
+    if (inFlight) return;
+    inFlight = true;
+    sendRemoteSolverFleetHeartbeat(db)
+      .catch((error) => {
+        console.error(
+          "[sweeper] remote fleet heartbeat failed:",
+          error instanceof Error ? error.message : error,
+        );
+      })
+      .finally(() => {
+        inFlight = false;
+      });
+  };
+  const timer = setInterval(beat, intervalMs);
+  timer.unref?.();
+  beat();
+  return () => clearInterval(timer);
 }
 
 function remoteJobOwnerSql(settings: Settings, tableAlias = "job") {
@@ -6009,23 +6093,10 @@ export async function reconcileRemoteSolverTick(
     await renewMirroredPromiseLeases(db, engine, settings);
     await expireMirroredRemotePromises(db, settings);
     await releaseUnacceptedPromiseResults(db, settings);
-    const active = await activeRemoteJobs(db, settings);
-    const activeAoaCount = active.reduce((sum, job) => sum + job.totalCases, 0);
-    const remoteCap = configuredRemoteCpuCap(settings);
-    const reservedCpuSlots = await remoteReservedCpuSlots(db, settings);
-    const [telemetry, counters] = await Promise.all([
-      remoteNodeHealth(db, active, reservedCpuSlots, remoteCap, activeAoaCount),
-      remoteOutcomeCounters(db, settings),
-    ]);
-    await heartbeat(
-      settings,
-      active.length ? "solving" : "idle",
-      active.length,
-      activeAoaCount,
-      telemetry,
-      counters.solvedCount,
-      counters.pushedCount,
-    );
+    const { remoteCap, reservedCpuSlots } =
+      await reportRemoteSolverFleetHeartbeat(db, settings, {
+        includeOutcomeCounters: true,
+      });
     return remoteCap > 0 && reservedCpuSlots < remoteCap;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
