@@ -1996,6 +1996,9 @@ export interface AdminCampaignPreliminaryOutcome {
   finalDeltaCm: number | null;
   finalSource: "verify" | "full_request" | null;
   criticalStage: "preflight" | "rans" | "fast" | "final" | null;
+  managementResultId: string | null;
+  managementResultAttemptId: string | null;
+  managementStage: "rans" | "fast" | "final" | null;
   fastResultId: string | null;
   fastResultAttemptId: string | null;
   finalResultId: string | null;

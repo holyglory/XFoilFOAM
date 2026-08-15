@@ -5586,6 +5586,12 @@ export interface CampaignPreliminaryOutcome {
   finalDeltaCm: number | null;
   finalSource: CampaignPreliminaryFinalSource | null;
   criticalStage: "preflight" | "rans" | "fast" | "final" | null;
+  /** Exact retained result used by point-scoped operator actions. This may be
+   * rejected evidence and therefore deliberately differs from the accepted
+   * FAST/FINAL result pointers below. */
+  managementResultId: string | null;
+  managementResultAttemptId: string | null;
+  managementStage: "rans" | "fast" | "final" | null;
   fastResultId: string | null;
   fastResultAttemptId: string | null;
   finalResultId: string | null;
@@ -5642,6 +5648,8 @@ export async function campaignPreliminaryOutcomes(
       promotion_origin.promotion_id,
       source_rans_attempt.id AS source_rans_attempt_id,
       lineage_rans_attempt.id AS lineage_rans_attempt_id,
+      latest_fast_attempt.result_id AS latest_fast_result_id,
+      latest_fast_attempt.result_attempt_id AS latest_fast_result_attempt_id,
       fast_evidence.result_id AS fast_result_id,
       fast_evidence.result_attempt_id AS fast_result_attempt_id,
       latest_verify.id AS verify_id,
@@ -5652,6 +5660,8 @@ export async function campaignPreliminaryOutcomes(
       latest_verify.delta_cd::float8 AS verify_delta_cd,
       latest_verify.delta_cm::float8 AS verify_delta_cm,
       latest_verify.classification_reasons AS verify_latest_evidence_reasons,
+      latest_verify.latest_result_id AS verify_latest_result_id,
+      latest_verify.latest_result_attempt_id AS verify_latest_result_attempt_id,
       latest_verify.submit_error AS verify_submit_error,
       latest_verify.submit_http_status AS verify_submit_http_status,
       latest_verify."createdAt" AS verify_created_at,
@@ -5671,6 +5681,8 @@ export async function campaignPreliminaryOutcomes(
       latest_full_request.state AS full_request_state,
       latest_full_request.sim_job_id AS full_request_sim_job_id,
       latest_full_request.classification_reasons AS request_latest_evidence_reasons,
+      latest_full_request.latest_result_id AS request_latest_result_id,
+      latest_full_request.latest_result_attempt_id AS request_latest_result_attempt_id,
       latest_full_request.submit_error AS full_request_submit_error,
       latest_full_request.submit_http_status AS full_request_submit_http_status,
       latest_full_request."createdAt" AS full_request_created_at,
@@ -5935,6 +5947,24 @@ export async function campaignPreliminaryOutcomes(
     ) lineage_rans_attempt ON TRUE
     LEFT JOIN LATERAL (
       SELECT
+        attempt.result_id,
+        attempt.id AS result_attempt_id
+      FROM sim_precalc_obligation_attempts submission
+      JOIN result_attempts attempt
+        ON attempt.id = submission.result_attempt_id
+       AND attempt.airfoil_id = obligation.airfoil_id
+       AND attempt.simulation_preset_revision_id = obligation.revision_id
+       AND attempt.aoa_deg = obligation.aoa_deg
+       AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+      WHERE submission.obligation_id = obligation.id
+      ORDER BY
+        submission.attempt_number DESC,
+        attempt."createdAt" DESC,
+        attempt.id DESC
+      LIMIT 1
+    ) latest_fast_attempt ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
         queue.id,
         queue.state,
         queue.sim_job_id,
@@ -5942,6 +5972,8 @@ export async function campaignPreliminaryOutcomes(
         queue.delta_cl,
         queue.delta_cd,
         queue.delta_cm,
+        latest_attempt.latest_result_id,
+        latest_attempt.latest_result_attempt_id,
         latest_attempt.classification_reasons,
         submit_retry.last_error AS submit_error,
         submit_retry.last_http_status AS submit_http_status,
@@ -5951,7 +5983,10 @@ export async function campaignPreliminaryOutcomes(
       LEFT JOIN sim_ladder_submit_retries submit_retry
         ON submit_retry.verify_queue_id = queue.id
       LEFT JOIN LATERAL (
-        SELECT classification.reasons AS classification_reasons
+        SELECT
+          attempt.result_id AS latest_result_id,
+          attempt.id AS latest_result_attempt_id,
+          classification.reasons AS classification_reasons
         FROM result_attempts attempt
         JOIN result_classifications classification
           ON classification.result_attempt_id = attempt.id
@@ -6024,6 +6059,8 @@ export async function campaignPreliminaryOutcomes(
         request.id,
         request.state,
         request.sim_job_id,
+        latest_attempt.latest_result_id,
+        latest_attempt.latest_result_attempt_id,
         latest_attempt.classification_reasons,
         submit_retry.last_error AS submit_error,
         submit_retry.last_http_status AS submit_http_status,
@@ -6037,7 +6074,10 @@ export async function campaignPreliminaryOutcomes(
       LEFT JOIN sim_ladder_submit_retries submit_retry
         ON submit_retry.urans_request_id = request.id
       LEFT JOIN LATERAL (
-        SELECT classification.reasons AS classification_reasons
+        SELECT
+          attempt.result_id AS latest_result_id,
+          attempt.id AS latest_result_attempt_id,
+          classification.reasons AS classification_reasons
         FROM result_attempts attempt
         JOIN result_classifications classification
           ON classification.result_attempt_id = attempt.id
@@ -6208,6 +6248,8 @@ export async function campaignPreliminaryOutcomes(
     promotion_id: string | null;
     source_rans_attempt_id: string | null;
     lineage_rans_attempt_id: string | null;
+    latest_fast_result_id: string | null;
+    latest_fast_result_attempt_id: string | null;
     fast_result_id: string | null;
     fast_result_attempt_id: string | null;
     verify_id: string | null;
@@ -6218,6 +6260,8 @@ export async function campaignPreliminaryOutcomes(
     verify_delta_cd: number | null;
     verify_delta_cm: number | null;
     verify_latest_evidence_reasons: string[] | null;
+    verify_latest_result_id: string | null;
+    verify_latest_result_attempt_id: string | null;
     verify_submit_error: string | null;
     verify_submit_http_status: number | null;
     verify_created_at: Date | string | null;
@@ -6237,6 +6281,8 @@ export async function campaignPreliminaryOutcomes(
     full_request_state: string | null;
     full_request_sim_job_id: string | null;
     request_latest_evidence_reasons: string[] | null;
+    request_latest_result_id: string | null;
+    request_latest_result_attempt_id: string | null;
     full_request_submit_error: string | null;
     full_request_submit_http_status: number | null;
     full_request_created_at: Date | string | null;
@@ -6289,6 +6335,7 @@ export async function campaignPreliminaryOutcomes(
     SELECT
       r.id AS result_id,
       r.aoa_deg::float8 AS aoa_deg,
+      latest_result_attempt.id AS result_attempt_id,
       latest_incident.reason,
       latest_incident.metadata,
       latest_incident.updated_at,
@@ -6311,6 +6358,17 @@ export async function campaignPreliminaryOutcomes(
       ) AS rans_evidence_runs
     FROM latest_incident
     JOIN results r ON r.id = latest_incident.result_id
+    LEFT JOIN LATERAL (
+      SELECT attempt.id
+      FROM result_attempts attempt
+      WHERE attempt.result_id = r.id
+        AND attempt.airfoil_id = r.airfoil_id
+        AND attempt.simulation_preset_revision_id =
+            r.simulation_preset_revision_id
+        AND attempt.aoa_deg = r.aoa_deg
+      ORDER BY attempt."createdAt" DESC, attempt.id DESC
+      LIMIT 1
+    ) latest_result_attempt ON TRUE
     JOIN sim_campaigns campaign ON campaign.id = ${campaignId}
     JOIN sim_campaign_conditions scoped_condition
       ON scoped_condition.id = ${scope.conditionId}
@@ -6342,6 +6400,7 @@ export async function campaignPreliminaryOutcomes(
     ORDER BY r.aoa_deg ASC
   `)) as unknown as Array<{
     result_id: string;
+    result_attempt_id: string | null;
     aoa_deg: number;
     reason: string;
     metadata: Record<string, unknown> | null;
@@ -6632,6 +6691,28 @@ export async function campaignPreliminaryOutcomes(
             ? (row.request_latest_evidence_reasons ?? [])
             : []
         : (acceptedEvidence?.reasons ?? []);
+    const managementTarget =
+      criticalStage === "final"
+        ? finalWork?.source === "verify"
+          ? {
+              resultId: row.verify_latest_result_id,
+              resultAttemptId: row.verify_latest_result_attempt_id,
+              stage: "final" as const,
+            }
+          : finalWork?.source === "full_request"
+            ? {
+                resultId: row.request_latest_result_id,
+                resultAttemptId: row.request_latest_result_attempt_id,
+                stage: "final" as const,
+              }
+            : null
+        : criticalStage === "fast"
+          ? {
+              resultId: row.latest_fast_result_id,
+              resultAttemptId: row.latest_fast_result_attempt_id,
+              stage: "fast" as const,
+            }
+          : null;
 
     return {
       aoaDeg: Number(row.aoa_deg),
@@ -6651,6 +6732,9 @@ export async function campaignPreliminaryOutcomes(
       finalDeltaCm: acceptedEvidence?.deltaCm ?? null,
       finalSource: acceptedEvidence?.source ?? finalWork?.source ?? null,
       criticalStage,
+      managementResultId: managementTarget?.resultId ?? null,
+      managementResultAttemptId: managementTarget?.resultAttemptId ?? null,
+      managementStage: managementTarget?.stage ?? null,
       fastResultId: row.fast_result_id,
       fastResultAttemptId: row.fast_result_attempt_id,
       finalResultId: acceptedEvidence?.resultId ?? null,
@@ -6703,6 +6787,9 @@ export async function campaignPreliminaryOutcomes(
         finalDeltaCm: null,
         finalSource: null,
         criticalStage: ransAttempted ? "rans" : "preflight",
+        managementResultId: row.result_id,
+        managementResultAttemptId: row.result_attempt_id,
+        managementStage: "rans",
         fastResultId: null,
         fastResultAttemptId: null,
         finalResultId: null,
@@ -6823,6 +6910,9 @@ export async function campaignPreliminaryOutcomes(
         finalDeltaCm: null,
         finalSource: null,
         criticalStage,
+        managementResultId: criticalStage ? row.result_id : null,
+        managementResultAttemptId: criticalStage ? row.result_attempt_id : null,
+        managementStage: criticalStage === "preflight" ? "rans" : criticalStage,
         fastResultId: acceptedFast ? row.result_id : null,
         fastResultAttemptId: acceptedFast ? row.result_attempt_id : null,
         finalResultId: acceptedFinal ? row.result_id : null,

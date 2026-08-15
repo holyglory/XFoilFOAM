@@ -480,6 +480,166 @@ test.describe
     let solverFlowRequestCount = 0;
     let activeSolverFlowRequests = 0;
     let maxConcurrentSolverFlowRequests = 0;
+    const managementResultId = `${state.stamp}-failed-point-result`;
+    const managementAttemptId = `${state.stamp}-failed-point-attempt`;
+    let managementRequeuePosts = 0;
+    let managementCorrectionPosts = 0;
+    await page.route(
+      `**/api/admin/point-history/${managementResultId}/*`,
+      async (route) => {
+        const url = new URL(route.request().url());
+        if (url.pathname.endsWith("/story")) {
+          await route.fulfill({
+            json: {
+              point: {
+                resultId: managementResultId,
+                resultAttemptId: managementAttemptId,
+                viewResultAttemptId: managementAttemptId,
+                airfoilId: state.camAirfoil.id,
+                airfoilSlug: state.camAirfoil.slug,
+                airfoilName: `${state.stamp} cam 4415`,
+                aoaDeg: 0,
+                reynolds: condition.reynolds,
+                mach: condition.mach,
+                speed: 10,
+                regime: "urans",
+                status: "done",
+                error: null,
+                qualityWarnings: ["mesh quality limit approached"],
+                classification: {
+                  state: "rejected",
+                  reasons: [
+                    "too few repeatable periods",
+                    "missing clean cycle certificate",
+                  ],
+                  confidence: 1,
+                  classifierVersion: "campaign-management-e2e",
+                },
+                revisionId: condition.revisionId,
+                campaignId: launched.campaign.id,
+                campaignName: `${state.stamp} cell modal contract`,
+                conditionId: condition.id,
+                solvedAt: "2026-08-15T00:00:00.000Z",
+                updatedAt: "2026-08-15T00:00:00.000Z",
+                fidelity: "urans_precalc",
+                reviewBucket: "needs_review",
+                workDisposition: "blocked",
+                continuable: false,
+                hasSelectedGeneration: false,
+                continuationResultAttemptId: null,
+                correctionSetup: {
+                  mesh: {
+                    mesher: "blockmesh-cgrid",
+                    farfieldRadiusChords: 15,
+                    wakeLengthChords: 12,
+                    nSurface: 130,
+                    nRadial: 80,
+                    nWake: 60,
+                    targetYPlus: 1,
+                    spanChords: 0.1,
+                  },
+                  solver: {
+                    turbulenceModel: "kOmegaSST",
+                    nIterations: 3000,
+                    convergenceTolerance: 0.00001,
+                    momentumScheme: "linearUpwind",
+                    transientCycles: 10,
+                    transientDiscardFraction: 0.4,
+                    transientMaxCourant: 4,
+                  },
+                },
+                verify: null,
+              },
+              attempts: [
+                {
+                  id: managementAttemptId,
+                  regime: "urans",
+                  status: "done",
+                  validForPolar: false,
+                  converged: false,
+                  stalled: false,
+                  unsteady: true,
+                  firstOrderFallback: false,
+                  cl: 0.12,
+                  cd: 0.01,
+                  clCd: 12,
+                  strouhal: null,
+                  error: null,
+                  qualityWarnings: ["mesh quality limit approached"],
+                  engineCaseSlug: "aoa_0.00",
+                  simJob: null,
+                  classification: {
+                    state: "rejected",
+                    reasons: ["too few repeatable periods"],
+                    confidence: 1,
+                  },
+                  createdAt: "2026-08-15T00:00:00.000Z",
+                  solvedAt: "2026-08-15T00:30:00.000Z",
+                },
+              ],
+              interruptions: [],
+              corrections: [],
+              closure: null,
+            },
+          });
+          return;
+        }
+        if (url.pathname.endsWith("/sim")) {
+          expect(url.searchParams.get("resultAttemptId")).toBe(
+            managementAttemptId,
+          );
+          await route.fulfill({
+            json: {
+              resultId: managementResultId,
+              status: "solved",
+              regime: "attached",
+              airfoilName: `${state.stamp} cam 4415`,
+              alpha: 0,
+              re: condition.reynolds,
+              mach: condition.mach,
+              cl: 0.12,
+              cd: 0.01,
+              cm: -0.01,
+              ld: 12,
+              media: null,
+              availableFields: [],
+              history: null,
+              fidelity: "urans_precalc",
+              steadyHistory: null,
+              uransVerify: null,
+              condition: null,
+            },
+          });
+          return;
+        }
+        if (url.pathname.endsWith("/requeue")) {
+          managementRequeuePosts += 1;
+          await route.fulfill({
+            json: {
+              requeued: 1,
+              scope: "rejected",
+              campaignIds: [launched.campaign.id],
+            },
+          });
+          return;
+        }
+        if (url.pathname.endsWith("/corrected-run")) {
+          managementCorrectionPosts += 1;
+          await route.fulfill({
+            json: {
+              correctionRunId: `${state.stamp}-correction`,
+              presetId: `${state.stamp}-preset`,
+              revisionId: condition.revisionId,
+              resultAttemptId: managementAttemptId,
+              created: true,
+              request: { state: "pending" },
+            },
+          });
+          return;
+        }
+        await route.continue();
+      },
+    );
     await page.route(
       `**/api/admin/campaigns/${launched.campaign.id}/preliminary-outcomes?*`,
       async (route) => {
@@ -604,6 +764,30 @@ test.describe
                       : fastCritical
                         ? "fast"
                         : finalCritical
+                          ? "final"
+                          : null,
+                  managementResultId:
+                    preflightCritical ||
+                    ransCritical ||
+                    fastCritical ||
+                    finalCritical ||
+                    criticalRerun
+                      ? managementResultId
+                      : null,
+                  managementResultAttemptId:
+                    preflightCritical ||
+                    ransCritical ||
+                    fastCritical ||
+                    finalCritical ||
+                    criticalRerun
+                      ? managementAttemptId
+                      : null,
+                  managementStage:
+                    preflightCritical || ransCritical
+                      ? "rans"
+                      : fastCritical
+                        ? "fast"
+                        : finalCritical || criticalRerun
                           ? "final"
                           : null,
                   fastResultId: fastAccepted
@@ -897,6 +1081,69 @@ test.describe
     await expect(currentCounts).toHaveAccessibleName(
       "Result and incident facets: 0 active, 0 RANS accepted, 0 fast ready, 0 verified, 1 critical",
     );
+
+    const failedDiagnostics = preliminary.getByTestId(
+      "cell-preliminary-diagnostics-0",
+    );
+    await failedDiagnostics.getByLabel("Stage evidence for α 0.0°").click();
+    const management = failedDiagnostics.getByTestId(
+      "campaign-point-management-0",
+    );
+    await expect(management).toBeVisible();
+    await expect(management).toContainText("Manage failed point");
+    await expect(
+      management.getByTestId("campaign-point-continuation-unavailable"),
+    ).toContainText("cannot continue");
+    await expect(
+      management.getByTestId("campaign-point-continue-2h"),
+    ).toHaveCount(0);
+    await expect(
+      management.getByTestId("campaign-point-requeue"),
+    ).toBeVisible();
+    await expect(
+      management.getByRole("link", { name: /Full point history/ }),
+    ).toHaveAttribute(
+      "href",
+      new RegExp(`pcampaign=${launched.campaign.id.replaceAll("-", "\\-")}`),
+    );
+
+    const recalculate = management.getByTestId("campaign-point-recalculate");
+    await recalculate.locator("summary").click();
+    const correctionForm = management.getByTestId("point-correction-form");
+    await expect(correctionForm).toBeVisible();
+    await expect(
+      correctionForm.getByTestId("point-correction-mesh_refinement"),
+    ).toContainText("Refine mesh · recommended");
+    await expect(correctionForm.getByLabel("surface cells")).toHaveValue("195");
+
+    page.once("dialog", (dialog) => dialog.dismiss());
+    await management.getByTestId("campaign-point-requeue").click();
+    expect(managementRequeuePosts).toBe(0);
+    page.once("dialog", (dialog) => dialog.accept());
+    await management.getByTestId("campaign-point-requeue").click();
+    await expect(
+      management.getByTestId("campaign-point-action-notice"),
+    ).toContainText("Point requeued");
+    expect(managementRequeuePosts).toBe(1);
+
+    page.once("dialog", (dialog) => dialog.dismiss());
+    await correctionForm.getByTestId("point-correction-submit").click();
+    expect(managementCorrectionPosts).toBe(0);
+    page.once("dialog", (dialog) => dialog.accept());
+    await correctionForm.getByTestId("point-correction-submit").click();
+    await expect(
+      management.getByTestId("campaign-point-action-notice"),
+    ).toContainText("Fresh FAST recalculation queued");
+    expect(managementCorrectionPosts).toBe(1);
+
+    await management.getByTestId("campaign-point-open-evidence").click();
+    await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+    await expect(page.getByTestId("sim-modal-dialog")).toContainText(
+      `${state.stamp} cam 4415`,
+    );
+    await page.keyboard.press("Escape");
+    await failedDiagnostics.getByLabel("Stage evidence for α 0.0°").click();
+    await expect(failedDiagnostics).not.toHaveAttribute("open", "");
 
     solverFlowPhase = "accepted-after-fast-critical";
     await expect(

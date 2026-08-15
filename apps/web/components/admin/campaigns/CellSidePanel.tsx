@@ -32,6 +32,7 @@ import {
   type AdminUransRequest,
   type CampaignProgressTotals,
   getCampaignPreliminaryOutcomes,
+  getPointAttemptSim,
   getUransRequests,
   isAdminApiError,
   requestUrans,
@@ -55,6 +56,7 @@ import { AirfoilProfilePlot } from "../../AirfoilProfilePlot";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
 import { SimModal } from "../../detail/SimModal";
+import { type CampaignPointEvidenceTarget } from "./CampaignPointManagement";
 import {
   PreliminaryOutcomePanel,
   type PreliminaryResultTarget,
@@ -138,6 +140,7 @@ export function CellSidePanel({
     re: number;
     aoa: number;
     resultId?: string | null;
+    resultAttemptId?: string | null;
     mirrored?: boolean;
     mirroredFromAoaDeg?: number | null;
   } | null>(null);
@@ -464,11 +467,37 @@ export function CellSidePanel({
     [condition.reynolds],
   );
 
+  const onCampaignPointEvidenceClick = useCallback(
+    (target: CampaignPointEvidenceTarget) => {
+      simTriggerRef.current =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : panelRef.current;
+      const mirrored = target.aoaDeg !== target.sourceAoaDeg;
+      setSimCtx({
+        re: condition.reynolds,
+        aoa: target.aoaDeg,
+        resultId: target.resultId,
+        resultAttemptId: target.resultAttemptId,
+        mirrored,
+        mirroredFromAoaDeg: mirrored ? target.sourceAoaDeg : null,
+      });
+      setSimDetail(null);
+      setSimMessage(null);
+      setPlaying(true);
+      setSimOpen(true);
+    },
+    [condition.reynolds],
+  );
+
   useEffect(() => {
     if (!simOpen || !simCtx) return;
     let cancelled = false;
     setSimMessage(null);
-    getSim(airfoil.slug, simCtx.re, simCtx.aoa, simCtx.resultId)
+    const request = simCtx.resultAttemptId
+      ? getPointAttemptSim(simCtx.resultId!, simCtx.resultAttemptId)
+      : getSim(airfoil.slug, simCtx.re, simCtx.aoa, simCtx.resultId);
+    request
       .then((d) => {
         if (cancelled) return;
         setSimDetail(d);
@@ -762,7 +791,10 @@ export function CellSidePanel({
         <PreliminaryOutcomePanel
           outcomes={preliminaryOutcomes}
           error={preliminaryOutcomesError}
+          campaignId={campaignId}
           onOpenResult={onPreliminaryResultClick}
+          onOpenPointEvidence={onCampaignPointEvidenceClick}
+          onChanged={onChanged}
         />
 
         <details

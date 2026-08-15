@@ -1,3 +1,5 @@
+"use client";
+
 import { f1 } from "@aerodb/core";
 import {
   ArrowRight,
@@ -9,7 +11,7 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 
 import type {
   AdminCampaignPreliminaryFastState,
@@ -24,6 +26,10 @@ import {
   preliminaryOutcomeView,
 } from "@/lib/preliminary-outcomes";
 import { C, MONO } from "@/lib/tokens";
+import {
+  CampaignPointManagement,
+  type CampaignPointEvidenceTarget,
+} from "./CampaignPointManagement";
 import { fCount } from "./ui";
 
 const angleLabel = (aoaDeg: number) => `α ${f1(aoaDeg)}°`;
@@ -146,12 +152,21 @@ function FinalStageIcon({
 export function PreliminaryOutcomePanel({
   outcomes,
   error,
+  campaignId,
   onOpenResult,
+  onOpenPointEvidence,
+  onChanged,
 }: {
   outcomes: AdminCampaignPreliminaryOutcomes | null;
   error: string | null;
+  campaignId: string;
   onOpenResult?: (target: PreliminaryResultTarget) => void;
+  onOpenPointEvidence?: (target: CampaignPointEvidenceTarget) => void;
+  onChanged: () => void;
 }) {
+  const [openedDiagnostics, setOpenedDiagnostics] = useState<Set<string>>(
+    () => new Set(),
+  );
   if (!error && outcomes?.total === 0) return null;
   const currentCounts = outcomes
     ? preliminaryOutcomeCurrentCounts(outcomes.items)
@@ -975,6 +990,7 @@ export function PreliminaryOutcomePanel({
       {outcomes && (
         <ul className="outcome-list" aria-label="Per-angle solver flow">
           {outcomes.items.map((item) => {
+            const rowKey = `${item.aoaDeg}:${item.sourceAoaDeg}`;
             const view = preliminaryOutcomeView(item);
             const label = angleLabel(item.aoaDeg);
             const hasActiveWork =
@@ -1015,7 +1031,7 @@ export function PreliminaryOutcomePanel({
                         : "skipped";
             return (
               <li
-                key={`${item.aoaDeg}:${item.sourceAoaDeg}`}
+                key={rowKey}
                 className={`outcome-row ${rowClass}`}
                 data-testid={`cell-preliminary-outcome-${item.aoaDeg}`}
                 data-current-stage={currentStage}
@@ -1196,6 +1212,15 @@ export function PreliminaryOutcomePanel({
                 <details
                   className="diagnostics"
                   data-testid={`cell-preliminary-diagnostics-${item.aoaDeg}`}
+                  onToggle={(event) => {
+                    if (!event.currentTarget.open) return;
+                    setOpenedDiagnostics((current) => {
+                      if (current.has(rowKey)) return current;
+                      const next = new Set(current);
+                      next.add(rowKey);
+                      return next;
+                    });
+                  }}
                 >
                   <summary
                     aria-label={`Stage evidence for ${label}`}
@@ -1299,6 +1324,33 @@ export function PreliminaryOutcomePanel({
                         <span>{view.incidentLabel ?? view.statusLabel}</span>
                       </div>
                     )}
+                    {view.critical &&
+                      openedDiagnostics.has(rowKey) &&
+                      item.managementResultId &&
+                      item.managementStage && (
+                        <CampaignPointManagement
+                          resultId={item.managementResultId}
+                          sourceResultAttemptId={item.managementResultAttemptId}
+                          campaignId={campaignId}
+                          aoaDeg={item.aoaDeg}
+                          sourceAoaDeg={item.sourceAoaDeg}
+                          stage={item.managementStage}
+                          onOpenEvidence={onOpenPointEvidence}
+                          onChanged={onChanged}
+                        />
+                      )}
+                    {view.critical &&
+                      openedDiagnostics.has(rowKey) &&
+                      !item.managementResultId && (
+                        <div
+                          role="status"
+                          style={{ color: C.dim, lineHeight: 1.45 }}
+                        >
+                          No retained result row exists for a safe point-level
+                          action. The technical evidence below identifies the
+                          solver incident for engineering repair.
+                        </div>
+                      )}
                     <details className="technical-evidence">
                       <summary>
                         Technical evidence

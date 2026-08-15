@@ -13,12 +13,7 @@
 // source of truth rule); the pure param round-trip + digest + timeline
 // builders live in lib/point-history (unit-tested, no React).
 
-import {
-  isDeterministicMeshBlockerError,
-  type FieldId,
-  type Point,
-  type SimulationDetail,
-} from "@aerodb/core";
+import { type FieldId, type Point, type SimulationDetail } from "@aerodb/core";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -66,6 +61,7 @@ import {
   type StatusChipTone,
   type TimelineTone,
 } from "@/lib/point-history";
+import { pointRepairEligibility } from "@/lib/point-repair";
 import { C, MONO } from "@/lib/tokens";
 import { useModalLayer } from "@/lib/use-modal-layer";
 import { ago, f, formatRe } from "./campaigns/ui";
@@ -593,29 +589,12 @@ export function PointHistoryPanel() {
   // not in the campaign header) ----
   // Retry: crash-class failed points (any surviving failed row already
   // consumed its automatic retry or predates the feature).
-  const retryEligible =
-    story != null &&
-    story.point.status === "failed" &&
-    story.point.regime !== "urans" &&
-    !(story.point.fidelity ?? "").startsWith("urans") &&
-    story.point.workDisposition == null &&
-    !isDeterministicMeshBlockerError(story.point.error);
-  // Continue: restartable rejected urans rows with saved case state
-  // (server-derived `continuable` — never guessed client-side).
-  const continueEligible =
-    story != null &&
-    story.point.continuable &&
-    story.point.continuationResultAttemptId != null;
-  // Legacy requeue stays ONLY for red needs-review rejected rows that cannot
-  // be continued (no saved case state). Calm awaiting-URANS rows and
-  // rescheduled rejected rows get NO repair verbs — stage 2 handles them.
-  const requeueRejectedEligible =
-    story != null &&
-    !continueEligible &&
-    story.point.status === "done" &&
-    story.point.classification?.state === "rejected" &&
-    story.point.reviewBucket === "needs_review";
-  const requeueEligible = retryEligible || requeueRejectedEligible;
+  const {
+    retryEligible,
+    continueEligible,
+    requeueEligible,
+    correctionEligible,
+  } = pointRepairEligibility(story);
 
   const doRequeue = useCallback(async () => {
     const item = openItemRef.current;
@@ -822,13 +801,6 @@ export function PointHistoryPanel() {
     ? pointPublicationExplanation(story)
     : null;
   const continuationGuidance = story ? pointContinuationGuidance(story) : null;
-  const correctionEligible =
-    story != null &&
-    story.point.resultAttemptId != null &&
-    story.point.correctionSetup != null &&
-    story.point.workDisposition !== "scheduled" &&
-    (story.point.status === "failed" ||
-      story.point.classification?.state === "rejected");
   const continuationRelevant =
     story != null &&
     (story.point.regime === "urans" ||

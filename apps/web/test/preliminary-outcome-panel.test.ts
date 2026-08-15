@@ -16,6 +16,9 @@ vi.mock(
   async () => import("../lib/preliminary-outcomes"),
 );
 vi.mock("@/lib/tokens", async () => import("../lib/tokens"));
+vi.mock("../components/admin/campaigns/CampaignPointManagement", () => ({
+  CampaignPointManagement: () => null,
+}));
 
 const source = readFileSync(
   fileURLToPath(
@@ -31,7 +34,10 @@ describe("per-point solver sequence panel", () => {
   it("MUST-CATCH: maps every AoA to one row containing the complete three-stage rail", () => {
     expect(source).toContain("POINT RESULTS");
     expect(source).toContain("outcomes.items.map((item)");
-    expect(source).toContain("key={`${item.aoaDeg}:${item.sourceAoaDeg}`}");
+    expect(source).toContain(
+      "const rowKey = `${item.aoaDeg}:${item.sourceAoaDeg}`",
+    );
+    expect(source).toContain("key={rowKey}");
     expect(source).toContain(
       "data-testid={`cell-preliminary-outcome-${item.aoaDeg}`}",
     );
@@ -96,6 +102,20 @@ describe("per-point solver sequence panel", () => {
     expect(source).toContain("SYSTEM");
   });
 
+  it("MUST-CATCH: mounts exact failed-point management only after its diagnostic is opened", () => {
+    expect(source).toContain("openedDiagnostics.has(rowKey)");
+    expect(source).toContain("item.managementResultId");
+    expect(source).toContain("<CampaignPointManagement");
+    expect(source).toContain("resultId={item.managementResultId}");
+    expect(source).toContain("item.managementResultAttemptId");
+    expect(source).toContain("stage={item.managementStage}");
+    expect(source).toContain("onOpenEvidence={onOpenPointEvidence}");
+    expect(source).toContain("onChanged={onChanged}");
+    expect(source).toContain(
+      "No retained result row exists for a safe point-level",
+    );
+  });
+
   it("MUST-CATCH: renders the handoff, physical budget, and evidence accounting inside the existing disclosure", () => {
     const item: AdminCampaignPreliminaryOutcome = {
       aoaDeg: 10,
@@ -115,6 +135,9 @@ describe("per-point solver sequence panel", () => {
       finalDeltaCm: null,
       finalSource: "verify",
       criticalStage: null,
+      managementResultId: null,
+      managementResultAttemptId: null,
+      managementStage: null,
       fastResultId: "fast-result",
       fastResultAttemptId: "fast-attempt",
       finalResultId: "final-result",
@@ -164,6 +187,8 @@ describe("per-point solver sequence panel", () => {
         React.createElement(PreliminaryOutcomePanel, {
           outcomes,
           error: null,
+          campaignId: "campaign-id",
+          onChanged: () => undefined,
         }),
       );
     } finally {
@@ -214,6 +239,9 @@ describe("per-point solver sequence panel", () => {
       finalDeltaCm: null,
       finalSource: "full_request",
       criticalStage: "fast",
+      managementResultId: "failed-fast-result",
+      managementResultAttemptId: "failed-fast-attempt",
+      managementStage: "fast",
       fastResultId: null,
       fastResultAttemptId: null,
       finalResultId: "final-result",
@@ -258,6 +286,8 @@ describe("per-point solver sequence panel", () => {
             items: [item],
           },
           error: null,
+          campaignId: "campaign-id",
+          onChanged: () => undefined,
         }),
       );
     } finally {
@@ -302,6 +332,9 @@ describe("per-point solver sequence panel", () => {
       finalDeltaCm: null,
       finalSource: null,
       criticalStage: null,
+      managementResultId: null,
+      managementResultAttemptId: null,
+      managementStage: null,
       fastResultId: "fast-result",
       fastResultAttemptId: "fast-attempt",
       finalResultId: null,
@@ -346,6 +379,8 @@ describe("per-point solver sequence panel", () => {
             items: [item],
           },
           error: null,
+          campaignId: "campaign-id",
+          onChanged: () => undefined,
         }),
       );
     } finally {
