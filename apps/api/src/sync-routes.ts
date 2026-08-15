@@ -6950,92 +6950,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     const terminalExclusionSolverId = registeredSolver?.id ?? null;
     const terminalExclusionBuildVersion =
       registeredSolver?.buildVersion ?? null;
-    const rows = (await db.execute(sql`
-      WITH latest_revision AS (
-        SELECT DISTINCT ON (preset_id) preset_id, id, signature_hash, reynolds, mach, reference_length_m, snapshot
-        FROM simulation_preset_revisions
-        ORDER BY preset_id, revision_number DESC
-      ),
-      gap_rows AS (
-        SELECT
-          a.id AS airfoil_id,
-          a.slug AS airfoil_slug,
-          a.name AS airfoil_name,
-          a.source AS airfoil_source,
-          a.point_format AS point_format,
-          a.points AS points,
-          p.id AS preset_id,
-          p.legacy_boundary_condition_id AS bc_id,
-          rev.id AS revision_id,
-          rev.signature_hash,
-          rev.reynolds,
-          rev.mach,
-          rev.reference_length_m,
-          rev.snapshot,
-          g.aoa::float8 AS aoa_deg,
-          COALESCE(r.priority, 0)::int AS priority
-        FROM airfoils a
-        CROSS JOIN simulation_presets p
-        JOIN latest_revision rev ON rev.preset_id = p.id
-        JOIN sweep_definitions sw ON sw.id = p.sweep_definition_id
-        CROSS JOIN LATERAL (
-          SELECT jsonb_array_elements_text(sw.aoa_list)::numeric AS aoa WHERE sw.aoa_list IS NOT NULL
-          UNION ALL
-          SELECT generate_series(sw.aoa_start::numeric, sw.aoa_stop::numeric, sw.aoa_step::numeric) AS aoa WHERE sw.aoa_list IS NULL
-        ) AS g
-        LEFT JOIN results r ON r.airfoil_id = a.id AND r.simulation_preset_revision_id = rev.id AND r.aoa_deg = g.aoa
-        WHERE p.enabled = true
-          AND (
-            p.target_scope = 'all'
-            OR EXISTS (
-              SELECT 1
-              FROM simulation_preset_airfoil_targets target
-              WHERE target.preset_id = p.id AND target.airfoil_id = a.id
-            )
-          )
-          AND p.legacy_boundary_condition_id IS NOT NULL
-          AND a."archivedAt" IS NULL
-          AND a."deletedAt" IS NULL
-          AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
-          AND NOT EXISTS (
-            SELECT 1
-            FROM sync_sweep_promise_points pp
-            JOIN sync_sweep_promises pr ON pr.id = pp.promise_id
-            WHERE pp.airfoil_id = a.id
-              AND pp.simulation_preset_revision_id = rev.id
-              AND pp.aoa_deg = g.aoa
-              AND pp.status = 'active'
-              AND pr.status = 'active'
-              AND pr."expiresAt" > now()
-          )
-          AND (
-            ${terminalExclusionSolverId}::uuid IS NULL
-            OR NOT EXISTS (
-              SELECT 1
-              FROM sync_sweep_promise_points terminal_point
-              JOIN sync_sweep_promises terminal_promise
-                ON terminal_promise.id = terminal_point.promise_id
-              WHERE terminal_point.airfoil_id = a.id
-                AND terminal_point.simulation_preset_revision_id = rev.id
-                AND terminal_point.aoa_deg = g.aoa
-                AND terminal_promise.registered_solver_id =
-                  ${terminalExclusionSolverId}::uuid
-                AND terminal_promise.status = 'cancelled'
-                AND terminal_promise.response_payload
-                  #>> '{remoteCancellation,disposition}' =
-                    'terminal_local_state'
-                AND terminal_promise.response_payload
-                  #>> '{remoteCancellation,buildVersion}'
-                    IS NOT DISTINCT FROM
-                      ${terminalExclusionBuildVersion}::text
-            )
-          )
-      )
-      SELECT *
-      FROM gap_rows
-      ORDER BY priority DESC, reynolds ASC, airfoil_slug ASC, aoa_deg ASC
-      LIMIT ${Math.max(body.limit * 3, body.limit)}
-    `)) as unknown as {
+    type ClaimGapRow = {
       airfoil_id: string;
       airfoil_slug: string;
       airfoil_name: string;
@@ -7051,7 +6966,254 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       reference_length_m: number;
       snapshot: Record<string, unknown>;
       aoa_deg: number;
-    }[];
+    };
+    const claimRowLimit = Math.max(body.limit * 3, body.limit);
+    const campaignRows = (await db.execute(sql`
+      SELECT
+        a.id AS airfoil_id,
+        a.slug AS airfoil_slug,
+        a.name AS airfoil_name,
+        a.source AS airfoil_source,
+        a.point_format AS point_format,
+        a.points AS points,
+        p.id AS preset_id,
+        p.legacy_boundary_condition_id AS bc_id,
+        rev.id AS revision_id,
+        rev.signature_hash,
+        rev.reynolds,
+        rev.mach,
+        rev.reference_length_m,
+        rev.snapshot,
+        campaign_point.aoa_deg::float8 AS aoa_deg,
+        campaign.priority::int AS priority
+      FROM sim_campaigns campaign
+      JOIN LATERAL (
+        SELECT
+          condition.id AS condition_id,
+          condition.preset_id,
+          condition.simulation_preset_revision_id AS revision_id,
+          condition.reynolds,
+          chosen_airfoil.airfoil_id
+        FROM sim_campaign_conditions condition
+        JOIN simulation_presets eligible_preset
+          ON eligible_preset.id = condition.preset_id
+         AND eligible_preset.legacy_boundary_condition_id IS NOT NULL
+        JOIN LATERAL (
+          SELECT candidate_airfoil.id AS airfoil_id
+          FROM airfoils candidate_airfoil
+          WHERE candidate_airfoil."archivedAt" IS NULL
+            AND candidate_airfoil."deletedAt" IS NULL
+            AND EXISTS (
+              SELECT 1
+              FROM sim_campaign_points candidate_point
+              LEFT JOIN results candidate_result
+                ON candidate_result.airfoil_id = candidate_point.airfoil_id
+               AND candidate_result.simulation_preset_revision_id =
+                   candidate_point.revision_id
+               AND candidate_result.aoa_deg = candidate_point.aoa_deg
+              WHERE candidate_point.campaign_id = campaign.id
+                AND candidate_point.condition_id = condition.id
+                AND candidate_point.airfoil_id = candidate_airfoil.id
+                AND candidate_point.revision_id =
+                    condition.simulation_preset_revision_id
+                AND candidate_point.state = 'requested'
+                AND NOT candidate_point.derived_by_symmetry
+                AND (
+                  candidate_result.id IS NULL
+                  OR candidate_result.status IN ('pending', 'stale')
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_sweep_promise_points promised_point
+                  JOIN sync_sweep_promises active_promise
+                    ON active_promise.id = promised_point.promise_id
+                  WHERE promised_point.airfoil_id = candidate_point.airfoil_id
+                    AND promised_point.simulation_preset_revision_id =
+                        candidate_point.revision_id
+                    AND promised_point.aoa_deg = candidate_point.aoa_deg
+                    AND promised_point.status = 'active'
+                    AND active_promise.status = 'active'
+                    AND active_promise."expiresAt" > now()
+                )
+                AND (
+                  ${terminalExclusionSolverId}::uuid IS NULL
+                  OR NOT EXISTS (
+                    SELECT 1
+                    FROM sync_sweep_promise_points terminal_point
+                    JOIN sync_sweep_promises terminal_promise
+                      ON terminal_promise.id = terminal_point.promise_id
+                    WHERE terminal_point.airfoil_id =
+                          candidate_point.airfoil_id
+                      AND terminal_point.simulation_preset_revision_id =
+                          candidate_point.revision_id
+                      AND terminal_point.aoa_deg = candidate_point.aoa_deg
+                      AND terminal_promise.registered_solver_id =
+                          ${terminalExclusionSolverId}::uuid
+                      AND terminal_promise.status = 'cancelled'
+                      AND terminal_promise.response_payload
+                        #>> '{remoteCancellation,disposition}' =
+                          'terminal_local_state'
+                      AND terminal_promise.response_payload
+                        #>> '{remoteCancellation,buildVersion}'
+                          IS NOT DISTINCT FROM
+                            ${terminalExclusionBuildVersion}::text
+                  )
+                )
+              LIMIT 1
+            )
+          ORDER BY candidate_airfoil.slug, candidate_airfoil.id
+          LIMIT 1
+        ) chosen_airfoil ON true
+        WHERE condition.campaign_id = campaign.id
+          AND condition.generation = campaign.current_condition_generation
+          AND condition.status IN ('active', 'kept')
+        ORDER BY condition.reynolds, condition.ord, condition.id
+        LIMIT 1
+      ) selected ON true
+      JOIN airfoils a ON a.id = selected.airfoil_id
+      JOIN simulation_preset_revisions rev ON rev.id = selected.revision_id
+      JOIN simulation_presets p ON p.id = selected.preset_id
+      JOIN sim_campaign_points campaign_point
+        ON campaign_point.campaign_id = campaign.id
+       AND campaign_point.condition_id = selected.condition_id
+       AND campaign_point.airfoil_id = selected.airfoil_id
+       AND campaign_point.revision_id = selected.revision_id
+      LEFT JOIN results r
+        ON r.airfoil_id = campaign_point.airfoil_id
+       AND r.simulation_preset_revision_id = campaign_point.revision_id
+       AND r.aoa_deg = campaign_point.aoa_deg
+      WHERE campaign.status = 'active'
+        AND campaign_point.state = 'requested'
+        AND NOT campaign_point.derived_by_symmetry
+        AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sync_sweep_promise_points promised_point
+          JOIN sync_sweep_promises active_promise
+            ON active_promise.id = promised_point.promise_id
+          WHERE promised_point.airfoil_id = campaign_point.airfoil_id
+            AND promised_point.simulation_preset_revision_id =
+                campaign_point.revision_id
+            AND promised_point.aoa_deg = campaign_point.aoa_deg
+            AND promised_point.status = 'active'
+            AND active_promise.status = 'active'
+            AND active_promise."expiresAt" > now()
+        )
+        AND (
+          ${terminalExclusionSolverId}::uuid IS NULL
+          OR NOT EXISTS (
+            SELECT 1
+            FROM sync_sweep_promise_points terminal_point
+            JOIN sync_sweep_promises terminal_promise
+              ON terminal_promise.id = terminal_point.promise_id
+            WHERE terminal_point.airfoil_id = campaign_point.airfoil_id
+              AND terminal_point.simulation_preset_revision_id =
+                  campaign_point.revision_id
+              AND terminal_point.aoa_deg = campaign_point.aoa_deg
+              AND terminal_promise.registered_solver_id =
+                  ${terminalExclusionSolverId}::uuid
+              AND terminal_promise.status = 'cancelled'
+              AND terminal_promise.response_payload
+                #>> '{remoteCancellation,disposition}' =
+                  'terminal_local_state'
+              AND terminal_promise.response_payload
+                #>> '{remoteCancellation,buildVersion}'
+                  IS NOT DISTINCT FROM
+                    ${terminalExclusionBuildVersion}::text
+          )
+        )
+      ORDER BY campaign.priority DESC, selected.reynolds,
+               a.slug, campaign_point.aoa_deg
+      LIMIT ${claimRowLimit}
+    `)) as unknown as ClaimGapRow[];
+    const rows = campaignRows.length
+      ? campaignRows
+      : ((await db.execute(sql`
+          WITH latest_revision AS (
+            SELECT DISTINCT ON (preset_id) preset_id, id, signature_hash, reynolds, mach, reference_length_m, snapshot
+            FROM simulation_preset_revisions
+            ORDER BY preset_id, revision_number DESC
+          ),
+          gap_rows AS (
+            SELECT
+              a.id AS airfoil_id,
+              a.slug AS airfoil_slug,
+              a.name AS airfoil_name,
+              a.source AS airfoil_source,
+              a.point_format AS point_format,
+              a.points AS points,
+              p.id AS preset_id,
+              p.legacy_boundary_condition_id AS bc_id,
+              rev.id AS revision_id,
+              rev.signature_hash,
+              rev.reynolds,
+              rev.mach,
+              rev.reference_length_m,
+              rev.snapshot,
+              g.aoa::float8 AS aoa_deg,
+              COALESCE(r.priority, 0)::int AS priority
+            FROM airfoils a
+            CROSS JOIN simulation_presets p
+            JOIN latest_revision rev ON rev.preset_id = p.id
+            JOIN sweep_definitions sw ON sw.id = p.sweep_definition_id
+            CROSS JOIN LATERAL (
+              SELECT jsonb_array_elements_text(sw.aoa_list)::numeric AS aoa WHERE sw.aoa_list IS NOT NULL
+              UNION ALL
+              SELECT generate_series(sw.aoa_start::numeric, sw.aoa_stop::numeric, sw.aoa_step::numeric) AS aoa WHERE sw.aoa_list IS NULL
+            ) AS g
+            LEFT JOIN results r ON r.airfoil_id = a.id AND r.simulation_preset_revision_id = rev.id AND r.aoa_deg = g.aoa
+            WHERE p.enabled = true
+              AND (
+                p.target_scope = 'all'
+                OR EXISTS (
+                  SELECT 1
+                  FROM simulation_preset_airfoil_targets target
+                  WHERE target.preset_id = p.id AND target.airfoil_id = a.id
+                )
+              )
+              AND p.legacy_boundary_condition_id IS NOT NULL
+              AND a."archivedAt" IS NULL
+              AND a."deletedAt" IS NULL
+              AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
+              AND NOT EXISTS (
+                SELECT 1
+                FROM sync_sweep_promise_points pp
+                JOIN sync_sweep_promises pr ON pr.id = pp.promise_id
+                WHERE pp.airfoil_id = a.id
+                  AND pp.simulation_preset_revision_id = rev.id
+                  AND pp.aoa_deg = g.aoa
+                  AND pp.status = 'active'
+                  AND pr.status = 'active'
+                  AND pr."expiresAt" > now()
+              )
+              AND (
+                ${terminalExclusionSolverId}::uuid IS NULL
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM sync_sweep_promise_points terminal_point
+                  JOIN sync_sweep_promises terminal_promise
+                    ON terminal_promise.id = terminal_point.promise_id
+                  WHERE terminal_point.airfoil_id = a.id
+                    AND terminal_point.simulation_preset_revision_id = rev.id
+                    AND terminal_point.aoa_deg = g.aoa
+                    AND terminal_promise.registered_solver_id =
+                      ${terminalExclusionSolverId}::uuid
+                    AND terminal_promise.status = 'cancelled'
+                    AND terminal_promise.response_payload
+                      #>> '{remoteCancellation,disposition}' =
+                        'terminal_local_state'
+                    AND terminal_promise.response_payload
+                      #>> '{remoteCancellation,buildVersion}'
+                        IS NOT DISTINCT FROM
+                          ${terminalExclusionBuildVersion}::text
+                )
+              )
+          )
+          SELECT *
+          FROM gap_rows
+          ORDER BY priority DESC, reynolds ASC, airfoil_slug ASC, aoa_deg ASC
+          LIMIT ${claimRowLimit}
+        `)) as unknown as ClaimGapRow[]);
     const first = rows[0];
     if (!first) return { promise: null };
     const candidateAoas = rows

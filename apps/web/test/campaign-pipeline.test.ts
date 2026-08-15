@@ -8,12 +8,52 @@ import {
   ETA_MIN_WINDOW_MS,
   PIPELINE_STAGE_NOTES,
   assemblePipelineModel,
+  campaignThroughputPresentation,
   formatEtaHours,
   progressBarSegments,
   progressSummaryLine,
   stageEta,
   sweepChipLabel,
 } from "../components/admin/campaigns/campaign-pipeline";
+
+describe("campaignThroughputPresentation", () => {
+  it("distinguishes no observations from a real low sample", () => {
+    expect(campaignThroughputPresentation(null)).toEqual({
+      value: "—",
+      detail: "no completed points · 24 h",
+      established: false,
+    });
+    expect(
+      campaignThroughputPresentation({
+        pointsLast24h: 28,
+        windowHours: 24,
+        baselineAt: null,
+        measuredSince: new Date().toISOString(),
+        remainingPoints: 100,
+      }),
+    ).toEqual({
+      value: "1.2",
+      detail: "28 points · 24 h",
+      established: false,
+    });
+  });
+
+  it("marks a fifty-point sample established without hiding its size", () => {
+    expect(
+      campaignThroughputPresentation({
+        pointsLast24h: 96,
+        windowHours: 24,
+        baselineAt: null,
+        measuredSince: new Date().toISOString(),
+        remainingPoints: 100,
+      }),
+    ).toMatchObject({
+      value: "4",
+      detail: "96 points · 24 h",
+      established: true,
+    });
+  });
+});
 
 const tiers = (ransOpen: number, precalcOpen: number, verifyOpen: number) => ({
   ransOpen,

@@ -128,6 +128,10 @@
   attempt retains adaptive throughput, the controller pins engine capability
   v12, and scientific acceptance gates do not change.
   [D-2026-08-13-conservative-urans-retries]
+- Confirmed intent: remote solvers serve active campaign gaps before global
+  enabled-preset backfill, preserving the campaign's exact current-generation
+  immutable setup revision and requested AoA scope. Global catalog filling is
+  only a spare-capacity fallback. [D-2026-08-15-campaign-first-remote-claims]
 - Confirmed intent: finalized solver evidence belongs in the private GCS
   archive as content-addressed Zstandard bundles, while the VPS retains only
   active solve state and bounded temporary render hydration. Complete solver
@@ -165,6 +169,15 @@
   memory-bandwidth contention. Sixty-four adds useful parallelism while
   retaining control-plane headroom and is directly reversible after measured
   throughput comparison.
+
+- Decision: issue remote promises from active current-generation campaign
+  gaps before considering globally enabled preset gaps.
+  [D-2026-08-15-campaign-first-remote-claims](DecisionDetails/D-2026-08-15-campaign-first-remote-claims.md)
+- Why: latest-enabled-revision backfill filled all 64 hz-solver2 slots with a
+  revision that had zero exact matches to the active campaign. Repinning the
+  campaign would violate immutable request identity, while crediting a merely
+  similar revision would weaken evidence attribution; exact campaign-first
+  leasing uses the available compute without either compromise.
 
 - Decision: classify a current URANS result with a strictly parsed certified
   no-shedding certificate as steady-equivalent evidence without requiring

@@ -7842,9 +7842,68 @@ export interface CampaignRate {
   remainingPoints: number;
 }
 
+/** Count live physical jobs owned by a campaign through every supported
+ * ownership shape. Shared PRECALC/FULL jobs intentionally keep
+ * sim_jobs.campaign_id NULL, so the scalar FK alone is not campaign liveness. */
+export async function campaignActiveJobCount(
+  db: DB,
+  campaignId: string,
+): Promise<number> {
+  const [row] = (await db.execute(sql`
+    SELECT count(*)::int AS n
+    FROM sim_jobs job
+    WHERE job.status IN ('submitted', 'running', 'ingesting')
+      AND (
+        job.campaign_id = ${campaignId}
+        OR EXISTS (
+          SELECT 1 FROM sim_urans_request_campaigns ownership
+          WHERE ownership.campaign_id = ${campaignId}
+            AND ownership.state = 'active'
+            AND ownership.request_id::text =
+              job.request_payload ->> 'uransRequestId'
+        )
+        OR EXISTS (
+          SELECT 1 FROM sim_urans_verify_queue_campaigns ownership
+          WHERE ownership.campaign_id = ${campaignId}
+            AND ownership.state = 'active'
+            AND ownership.queue_id::text =
+              job.request_payload ->> 'verifyQueueItemId'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM sim_urans_verify_queue_requests coverage
+          JOIN sim_urans_request_campaigns ownership
+            ON ownership.request_id = coverage.request_id
+           AND ownership.state = 'active'
+          WHERE ownership.campaign_id = ${campaignId}
+            AND coverage.queue_id::text =
+              job.request_payload ->> 'verifyQueueItemId'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(
+                job.request_payload -> 'precalcObligationIds'
+              ) = 'array'
+              THEN job.request_payload -> 'precalcObligationIds'
+              ELSE '[]'::jsonb
+            END
+          ) payload_obligation(id)
+          JOIN sim_precalc_obligation_campaigns ownership
+            ON ownership.obligation_id = payload_obligation.id::uuid
+           AND ownership.state = 'active'
+          WHERE ownership.campaign_id = ${campaignId}
+        )
+      )
+  `)) as unknown as Array<{ n: number }>;
+  return Number(row?.n ?? 0);
+}
+
 /** Measured ingest rate (spec §12): trailing 24 h of solvedAt on campaign
- *  solver cells, window reset to the latest plan-revision baseline. Returns
- *  null (suppressed) unless the campaign is active and ≥50 points landed. */
+ *  solver cells, window reset to the latest plan-revision baseline. Every
+ *  non-zero real sample is returned; callers may mark small samples as early
+ *  without hiding measured progress. */
 export async function campaignRate(
   db: DB,
   campaignId: string,
@@ -7867,7 +7926,7 @@ export async function campaignRate(
       AND r."solvedAt" > GREATEST(${baselineIso}::timestamptz, now() - interval '24 hours')
   `)) as unknown as Array<{ n: number; since: Date | string | null }>;
   const pointsLast24h = Number(row?.n ?? 0);
-  if (pointsLast24h < 50) return null;
+  if (pointsLast24h === 0) return null;
   return {
     pointsLast24h,
     windowHours: 24,

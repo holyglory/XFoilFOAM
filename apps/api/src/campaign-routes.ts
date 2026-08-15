@@ -10,6 +10,7 @@ import {
   CampaignError,
   type CampaignObjectiveKey,
   campaignAirfoilRows,
+  campaignActiveJobCount,
   campaignDuplicatePrefill,
   campaignFailures,
   campaignLaneDetail,
@@ -290,9 +291,7 @@ export async function registerCampaignRoutes(
         const engine = makeEngineClient();
         const { health, error: engineError } =
           await getCachedEngineHealth(engine);
-        const [jobsRow] = (await db.execute(sql`
-        SELECT count(*)::int AS n FROM sim_jobs WHERE campaign_id = ${id} AND status IN ('submitted', 'running', 'ingesting')
-      `)) as unknown as Array<{ n: number }>;
+        const campaignJobsRunning = await campaignActiveJobCount(db, id);
         // engineUnreachableSince lands with the sweeper phase (migration 0026);
         // readSweeperState() reads it defensively while the column may be absent.
         const engineUnreachableSince = sweeper?.engineUnreachableSince ?? null;
@@ -315,7 +314,7 @@ export async function registerCampaignRoutes(
             engineCheckedAt: new Date().toISOString(),
             engineError: engineError ?? null,
             engineUnreachableSince: isoOrNull(engineUnreachableSince),
-            campaignJobsRunning: Number(jobsRow?.n ?? 0),
+            campaignJobsRunning,
             // Tick-progress pair (liveness/progress split, migration 0033).
             lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
             lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),

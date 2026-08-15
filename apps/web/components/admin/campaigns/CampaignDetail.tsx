@@ -58,6 +58,7 @@ export { campaignStatusLine };
 import { AddAirfoilsDialog } from "./AddAirfoilsDialog";
 import {
   assemblePipelineModel,
+  campaignThroughputPresentation,
   progressBarSegments,
   stageEta,
   sweepChipLabel,
@@ -378,9 +379,7 @@ export function CampaignDetail({
     completionPercent > 0 && completionPercent < 0.01
       ? "<0.01%"
       : `${completionPercent < 1 ? completionPercent.toFixed(2) : completionPercent.toFixed(1)}%`;
-  const throughputPerHour = rate
-    ? Math.round(rate.pointsLast24h / rate.windowHours)
-    : null;
+  const throughput = campaignThroughputPresentation(rate);
   const eta = stageEta({
     phase: summary.phase,
     stageOpenByPhase: summary.tierCounts
@@ -392,9 +391,13 @@ export function CampaignDetail({
           verifyOpen: summary.tierCounts.verifyOpen,
         }
       : null,
-    rate: rate
-      ? { pointsLast24h: rate.pointsLast24h, measuredSince: rate.measuredSince }
-      : null,
+    rate:
+      rate && throughput.established
+        ? {
+            pointsLast24h: rate.pointsLast24h,
+            measuredSince: rate.measuredSince,
+          }
+        : null,
   });
   const sweepChip = sweepChipLabel(campaign.plan.baseSweep);
   const nextUpId = nextUpConditionId(
@@ -736,8 +739,8 @@ export function CampaignDetail({
           >
             <Clock3 size={30} strokeWidth={1.6} aria-hidden />
             <span>
-              <strong>{fCount(barSegments.solvingCount)}</strong>
-              <small>processing</small>
+              <strong>{fCount(scheduler.campaignJobsRunning)}</strong>
+              <small>active campaign jobs</small>
             </span>
           </div>
           <div
@@ -756,11 +759,12 @@ export function CampaignDetail({
           >
             <TrendingUp size={30} strokeWidth={1.6} aria-hidden />
             <span>
-              <strong>
-                {throughputPerHour == null ? "—" : fCount(throughputPerHour)}
-              </strong>
-              <small>solver pts / h · 24 h avg</small>
-              {eta && (
+              <strong>{throughput.value}</strong>
+              <small>solver pts / h · {throughput.detail}</small>
+              {!throughput.established && rate && (
+                <em data-testid="campaign-throughput-sample">early sample</em>
+              )}
+              {throughput.established && eta && (
                 <em
                   data-testid="campaign-eta"
                   title="From the measured trailing-24h ingest rate"

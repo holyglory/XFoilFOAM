@@ -52,7 +52,11 @@ import {
   solverImplementations,
   solverProfiles,
   sweeperState,
+  syncApiPermissions,
+  syncApiSettings,
+  syncSweepPromises,
 } from "@aerodb/db";
+import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -508,7 +512,7 @@ describe("campaign launch (§5)", () => {
     ).toBe(true);
   });
 
-  it("returns the bounded summary with scheduler + suppressed rate", async () => {
+  it("returns the bounded summary with scheduler and no unmeasured rate", async () => {
     const res = await app.inject({
       method: "GET",
       url: `/api/admin/campaigns/${campaignId}`,
@@ -535,13 +539,230 @@ describe("campaign launch (§5)", () => {
       criticalGroupCount: 0,
       groups: [],
     });
-    expect(body.rate).toBeNull(); // <50 measured points → suppressed (spec §12)
+    expect(body.rate).toBeNull(); // no completed points in the measured window
     const matrix = await app.inject({
       method: "GET",
       url: `/api/admin/campaigns/${campaignId}/airfoils?limit=10`,
     });
     expect(matrix.statusCode).toBe(200);
     expect(matrix.json().items.length).toBe(2);
+  });
+
+  it("counts shared campaign-owned PRECALC jobs without a scalar campaign id", async () => {
+    const [point] = (await db.execute(sql`
+      SELECT p.airfoil_id, p.revision_id, p.aoa_deg::float8 AS aoa_deg,
+             preset.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_points p
+      JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
+      JOIN simulation_presets preset ON preset.id = condition.preset_id
+      WHERE p.campaign_id = ${campaignId}
+        AND NOT p.derived_by_symmetry
+      ORDER BY p.aoa_deg
+      LIMIT 1
+    `)) as unknown as Array<{
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+      bc_id: string;
+    }>;
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId: point.airfoil_id,
+          revisionId: point.revision_id,
+          aoaDeg: point.aoa_deg,
+        },
+      ],
+      { campaignIds: [campaignId] },
+    );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: point.airfoil_id,
+        bcIds: [point.bc_id],
+        simulationPresetRevisionId: point.revision_id,
+        campaignId: null,
+        jobKind: "targeted",
+        referenceChordM: PRIMARY_CHORD_M,
+        wave: 2,
+        status: "running",
+        engineState: "running",
+        totalCases: 1,
+        completedCases: 0,
+        requestPayload: {
+          aoas: [point.aoa_deg],
+          precalcObligationIds: [obligation.id],
+          uransFidelity: "precalc",
+        },
+      })
+      .returning({ id: simJobs.id });
+    try {
+      await db
+        .update(simPrecalcObligations)
+        .set({ state: "running", latestSimJobId: job.id })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/admin/campaigns/${campaignId}`,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().scheduler.campaignJobsRunning).toBe(1);
+      expect(res.json().totals.running).toBe(0);
+    } finally {
+      await db.delete(simJobs).where(eq(simJobs.id, job.id));
+      await db
+        .delete(simPrecalcObligationCampaigns)
+        .where(
+          and(
+            eq(simPrecalcObligationCampaigns.obligationId, obligation.id),
+            eq(simPrecalcObligationCampaigns.campaignId, campaignId),
+          ),
+        );
+      await db
+        .delete(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligation.id));
+    }
+  });
+
+  it("returns a real low-sample trailing rate instead of suppressing it", async () => {
+    const [point] = (await db.execute(sql`
+      SELECT p.airfoil_id, p.revision_id, p.aoa_deg::float8 AS aoa_deg,
+             preset.legacy_boundary_condition_id AS bc_id
+      FROM sim_campaign_points p
+      JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
+      JOIN simulation_presets preset ON preset.id = condition.preset_id
+      WHERE p.campaign_id = ${campaignId}
+        AND NOT p.derived_by_symmetry
+      ORDER BY p.aoa_deg
+      LIMIT 1
+    `)) as unknown as Array<{
+      airfoil_id: string;
+      revision_id: string;
+      aoa_deg: number;
+      bc_id: string;
+    }>;
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId: point.airfoil_id,
+        bcId: point.bc_id,
+        simulationPresetRevisionId: point.revision_id,
+        aoaDeg: point.aoa_deg,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        solvedAt: new Date(),
+        converged: true,
+        stalled: false,
+        cl: 0.1,
+        cd: 0.01,
+        cm: 0,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.push(result.id);
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/admin/campaigns/${campaignId}`,
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().rate).toMatchObject({
+        pointsLast24h: 1,
+        windowHours: 24,
+      });
+    } finally {
+      await db.delete(results).where(eq(results.id, result.id));
+    }
+  });
+
+  it("leases active campaign gaps before a newer globally enabled revision", async () => {
+    const [condition] = (await db.execute(sql`
+      SELECT cc.preset_id, cc.simulation_preset_revision_id AS revision_id
+      FROM sim_campaign_conditions cc
+      WHERE cc.campaign_id = ${campaignId}
+      ORDER BY cc.ord
+      LIMIT 1
+    `)) as unknown as Array<{ preset_id: string; revision_id: string }>;
+    const [savedSettings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    const [savedPermission] = await db
+      .select()
+      .from(syncApiPermissions)
+      .where(eq(syncApiPermissions.dataType, "sweeps"))
+      .limit(1);
+    const sourceInstanceId = `${PREFIX}-campaign-first-remote`;
+    const secret = `${PREFIX}-campaign-first-secret`;
+    try {
+      await db
+        .update(simulationPresets)
+        .set({ enabled: true })
+        .where(eq(simulationPresets.id, condition.preset_id));
+      const newer = await ensureSimulationPresetRevision(
+        db,
+        condition.preset_id,
+      );
+      expect(newer?.revision.id).not.toBe(condition.revision_id);
+
+      await db
+        .insert(syncApiSettings)
+        .values({ id: 1, enabled: true, secret })
+        .onConflictDoUpdate({
+          target: syncApiSettings.id,
+          set: { enabled: true, secret, updatedAt: new Date() },
+        });
+      await db
+        .insert(syncApiPermissions)
+        .values({ dataType: "sweeps", canFetch: true, canPush: false })
+        .onConflictDoUpdate({
+          target: syncApiPermissions.dataType,
+          set: { canFetch: true, canPush: false, updatedAt: new Date() },
+        });
+
+      const claim = await app.inject({
+        method: "POST",
+        url: "/api/sync/v1/sweeps/claim",
+        headers: { "x-xfoilfoam-sync-secret": secret },
+        payload: { limit: 1, sourceInstanceId },
+      });
+      expect(claim.statusCode).toBe(200);
+      expect(claim.json().promise).toMatchObject({
+        setupRevision: { id: condition.revision_id },
+      });
+    } finally {
+      await db
+        .delete(syncSweepPromises)
+        .where(eq(syncSweepPromises.sourceInstanceId, sourceInstanceId));
+      await db
+        .update(simulationPresets)
+        .set({ enabled: false })
+        .where(eq(simulationPresets.id, condition.preset_id));
+      if (savedSettings) {
+        await db
+          .update(syncApiSettings)
+          .set({
+            enabled: savedSettings.enabled,
+            secret: savedSettings.secret,
+            defaultPromiseTtlHours: savedSettings.defaultPromiseTtlHours,
+            updatedAt: new Date(),
+          })
+          .where(eq(syncApiSettings.id, 1));
+      }
+      if (savedPermission) {
+        await db
+          .update(syncApiPermissions)
+          .set({
+            canFetch: savedPermission.canFetch,
+            canPush: savedPermission.canPush,
+            updatedAt: new Date(),
+          })
+          .where(eq(syncApiPermissions.dataType, "sweeps"));
+      }
+    }
   });
 
   describe("plan editing + closure (§6)", () => {

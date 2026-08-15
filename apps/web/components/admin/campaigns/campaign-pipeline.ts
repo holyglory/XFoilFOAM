@@ -25,6 +25,37 @@ function fCount(v: number): string {
   return v.toLocaleString("en-US");
 }
 
+export interface CampaignThroughputPresentation {
+  value: string;
+  detail: string;
+  established: boolean;
+}
+
+/** Present every real trailing-window sample. Fifty points is only the
+ * confidence threshold for projecting an ETA; it must never erase measured
+ * throughput from the instrument. */
+export function campaignThroughputPresentation(
+  rate: AdminCampaignSummary["rate"],
+): CampaignThroughputPresentation {
+  if (!rate || rate.pointsLast24h <= 0) {
+    return {
+      value: "—",
+      detail: "no completed points · 24 h",
+      established: false,
+    };
+  }
+  const perHour = rate.pointsLast24h / rate.windowHours;
+  const value =
+    perHour >= 10
+      ? fCount(Math.round(perHour))
+      : perHour.toFixed(1).replace(/\.0$/, "");
+  return {
+    value,
+    detail: `${fCount(rate.pointsLast24h)} points · ${rate.windowHours} h`,
+    established: rate.pointsLast24h >= 50,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 3-stage pipeline strip
 // ---------------------------------------------------------------------------
