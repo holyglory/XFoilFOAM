@@ -1134,6 +1134,33 @@ describe("point-history story endpoint", () => {
         request: { id: firstBody.request.id },
       });
 
+      // A failed/rejected ladder attempt can be the newest retained evidence
+      // while the canonical pointer deliberately remains on an older RANS
+      // generation. The exact newest attempt must still be usable as the
+      // immutable source for a corrected run.
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: rejectedOlderAttemptId })
+        .where(eq(results.id, resultId));
+      const nonSelectedLatest = await app.inject({
+        method: "POST",
+        url: `/api/admin/point-history/${resultId}/corrected-run`,
+        payload,
+      });
+      expect(
+        nonSelectedLatest.statusCode,
+        JSON.stringify(nonSelectedLatest.json()),
+      ).toBe(200);
+      expect(nonSelectedLatest.json()).toMatchObject({
+        created: false,
+        resultAttemptId: rejectedCurrentAttemptId,
+        request: { id: firstBody.request.id },
+      });
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(eq(results.id, resultId));
+
       expect(correctedPreset).toMatchObject({
         enabled: false,
         targetScope: "airfoils",

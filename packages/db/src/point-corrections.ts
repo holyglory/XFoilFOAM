@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 
 import {
   CampaignError,
@@ -82,6 +82,13 @@ export async function createPointCorrection(
       currentResultAttemptId: results.currentResultAttemptId,
       status: results.status,
       classificationState: resultClassifications.state,
+      sourceAttemptStatus: resultAttempts.status,
+      sourceAttemptRejected: sql<boolean>`EXISTS (
+        SELECT 1
+        FROM result_classifications source_attempt_classification
+        WHERE source_attempt_classification.result_attempt_id = ${resultAttempts.id}
+          AND source_attempt_classification.state = 'rejected'
+      )`,
       airfoilId: results.airfoilId,
       bcId: results.bcId,
       airfoilName: airfoils.name,
@@ -121,12 +128,6 @@ export async function createPointCorrection(
       "exact point result generation was not found",
     );
   if (source.currentResultAttemptId !== input.resultAttemptId) {
-    if (source.currentResultAttemptId != null) {
-      throw new CampaignError(
-        "conflict",
-        "the point changed after this evidence was loaded; refresh before creating a fresh recalculation",
-      );
-    }
     const [newestAttempt] = await db
       .select({ id: resultAttempts.id })
       .from(resultAttempts)
@@ -144,11 +145,18 @@ export async function createPointCorrection(
     if (newestAttempt?.id !== input.resultAttemptId) {
       throw new CampaignError(
         "conflict",
-        "newer stored evidence exists for this pointer-null point; refresh before creating a fresh recalculation",
+        "newer stored evidence exists for this point; refresh before creating a fresh recalculation",
       );
     }
   }
-  if (source.status !== "failed" && source.classificationState !== "rejected") {
+  const selectedGeneration =
+    source.currentResultAttemptId === input.resultAttemptId;
+  const exactAttemptIsRepairable =
+    source.sourceAttemptStatus === "failed" || source.sourceAttemptRejected;
+  const selectedResultIsRepairable =
+    selectedGeneration &&
+    (source.status === "failed" || source.classificationState === "rejected");
+  if (!exactAttemptIsRepairable && !selectedResultIsRepairable) {
     throw new CampaignError(
       "validation",
       "a fresh recalculation can be created only for an unpublished failed or rejected point",
