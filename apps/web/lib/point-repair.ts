@@ -39,7 +39,8 @@ export function pointRepairEligibility(
     story.point.correctionSetup != null &&
     story.point.workDisposition !== "scheduled" &&
     (story.point.status === "failed" ||
-      story.point.classification?.state === "rejected");
+      story.point.classification?.state === "rejected" ||
+      story.point.workDisposition === "blocked");
 
   return {
     retryEligible,

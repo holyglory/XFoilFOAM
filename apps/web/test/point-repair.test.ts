@@ -88,6 +88,31 @@ describe("point repair eligibility", () => {
     });
   });
 
+  it("MUST-CATCH: lets an exhausted campaign stage recalculate from its blocked retained source", () => {
+    expect(
+      pointRepairEligibility(
+        story({
+          status: "done",
+          regime: "rans",
+          fidelity: "rans",
+          classification: {
+            state: "needs_urans",
+            reasons: ["missing-rans-hold-certificate"],
+            confidence: 0.98,
+            classifierVersion: "test",
+          },
+          reviewBucket: null,
+          workDisposition: "blocked",
+        }),
+      ),
+    ).toMatchObject({
+      retryEligible: false,
+      continueEligible: false,
+      requeueEligible: false,
+      correctionEligible: true,
+    });
+  });
+
   it("does not offer ordinary retry for a deterministic mesh failure", () => {
     expect(
       pointRepairEligibility(
