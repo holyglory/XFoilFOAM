@@ -2927,6 +2927,13 @@ describe("sweeper: gap → claim → ingest", () => {
     expect(
       (submittedRequest as { aoa?: { angles?: number[] } })?.aoa?.angles,
     ).toEqual(rejectedAoas);
+    const submittedCpuBudget = (
+      submittedRequest as { resources?: { cpu_budget?: number } }
+    )?.resources?.cpu_budget;
+    expect(submittedCpuBudget).toBeGreaterThan(0);
+    expect(child.admissionCpuSlots).toBe(
+      Math.min(rejectedAoas.length, submittedCpuBudget!),
+    );
     await expectBackgroundPrecalcSubmission(child, rejectedAoas);
 
     const retained = await db

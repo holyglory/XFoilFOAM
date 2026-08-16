@@ -1154,8 +1154,12 @@ async function seedMirroredPromise(label: string, aoas: number[], id?: string) {
   return promise;
 }
 
-async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
-  const promise = await seedMirroredPromise(label, [aoaDeg]);
+async function seedRemoteRejectedParent(
+  label: string,
+  aoaInput: number | number[],
+) {
+  const aoas = Array.isArray(aoaInput) ? aoaInput : [aoaInput];
+  const promise = await seedMirroredPromise(label, aoas);
   const engineJobId = `${PREFIX}-${label}-rans`;
   const [parent] = await db
     .insert(simJobs)
@@ -1168,8 +1172,8 @@ async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
       jobKind: "targeted",
       status: "done",
       engineJobId,
-      totalCases: 1,
-      completedCases: 1,
+      totalCases: aoas.length,
+      completedCases: aoas.length,
       ingestedAt: new Date(),
       finishedAt: new Date(),
       requestPayload: {
@@ -1177,63 +1181,72 @@ async function seedRemoteRejectedParent(label: string, aoaDeg: number) {
         remoteSolver: true,
         upstreamBaseUrl: UPSTREAM,
         speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
-        aoas: [aoaDeg],
+        aoas,
       },
     })
     .returning();
-  const [result] = await db
-    .insert(results)
-    .values({
+  const seeded = [];
+  for (const aoaDeg of aoas) {
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "failed",
+        source: "queued",
+        regime: "rans",
+        fidelity: "rans",
+        simJobId: parent.id,
+        engineJobId,
+        converged: false,
+        stalled: true,
+        unsteady: false,
+        error: "RANS did not converge",
+        solvedAt: new Date(),
+      })
+      .returning();
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: parent.id,
+        engineJobId,
+        status: "failed",
+        source: "queued",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        stalled: true,
+        unsteady: false,
+        error: "RANS did not converge",
+        evidencePayload: { failure_disposition: "hard_solver" },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db.insert(resultClassifications).values({
+      resultAttemptId: attempt.id,
       airfoilId,
-      bcId,
       simulationPresetRevisionId: revisionId,
       aoaDeg,
-      status: "failed",
-      source: "queued",
       regime: "rans",
-      fidelity: "rans",
-      simJobId: parent.id,
-      engineJobId,
-      converged: false,
-      stalled: true,
-      unsteady: false,
-      error: "RANS did not converge",
-      solvedAt: new Date(),
-    })
-    .returning();
-  const [attempt] = await db
-    .insert(resultAttempts)
-    .values({
-      resultId: result.id,
-      airfoilId,
-      bcId,
-      simulationPresetRevisionId: revisionId,
-      aoaDeg,
-      simJobId: parent.id,
-      engineJobId,
-      status: "failed",
-      source: "queued",
-      regime: "rans",
-      validForPolar: false,
-      converged: false,
-      stalled: true,
-      unsteady: false,
-      error: "RANS did not converge",
-      evidencePayload: { failure_disposition: "hard_solver" },
-      solvedAt: new Date(),
-    })
-    .returning();
-  await db.insert(resultClassifications).values({
-    resultAttemptId: attempt.id,
-    airfoilId,
-    simulationPresetRevisionId: revisionId,
-    aoaDeg,
-    regime: "rans",
-    classifierVersion: "remote-lifecycle-test-v1",
-    state: "rejected",
-    reasons: ["RANS did not converge"],
-  });
-  return { promise, parent, result, attempt };
+      classifierVersion: "remote-lifecycle-test-v1",
+      state: "rejected",
+      reasons: ["RANS did not converge"],
+    });
+    seeded.push({ result, attempt });
+  }
+  return {
+    promise,
+    parent,
+    result: seeded[0]!.result,
+    attempt: seeded[0]!.attempt,
+  };
 }
 
 async function seedRemoteWholePolarParent(label: string) {
@@ -3422,6 +3435,62 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         latestSimJobId: children[1]!.id,
       },
     ]);
+  });
+
+  it("persists the bounded automatic reservation for a multi-angle remote PRECALC retry", async () => {
+    const aoas = [918.101, 918.201, 918.301, 918.401];
+    const { parent } = await seedRemoteRejectedParent(
+      "derived-auto-capacity",
+      aoas,
+    );
+    const [schedulerBefore] = await db
+      .select({ enabled: sweeperState.enabled })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    if (!schedulerBefore) throw new Error("seeded sweeper state required");
+    await db
+      .update(sweeperState)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(sweeperState.id, 1));
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: 64, updatedAt: new Date() })
+      .where(eq(syncApiSettings.id, 1));
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("derived-auto-capacity", aoas.length),
+    );
+    try {
+      await submitUransRetryForJob(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        parent,
+        {
+          meshRecoveryVersion: 4,
+          uransRecoveryVersion: 1,
+          cpuSlots: 64,
+        },
+      );
+      expect(submitPolar).toHaveBeenCalledTimes(1);
+      expect(submitPolar.mock.calls[0]![0]).toMatchObject({
+        aoa: { angles: aoas },
+        resources: { cpu_budget: 64 },
+      });
+      const [child] = await db
+        .select()
+        .from(simJobs)
+        .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+      expect(child).toMatchObject({
+        status: "submitted",
+        totalCases: aoas.length,
+        admissionCpuSlots: aoas.length,
+      });
+    } finally {
+      await db
+        .update(sweeperState)
+        .set({ enabled: schedulerBefore.enabled, updatedAt: new Date() })
+        .where(eq(sweeperState.id, 1));
+    }
   });
 
   it("submits an exact promised wave-2 child with conjunctive remote provenance and no background owner", async () => {

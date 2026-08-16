@@ -91,6 +91,7 @@ import {
 } from "drizzle-orm";
 
 import {
+  admissionCpuSlotsForRequest,
   buildPolarRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
@@ -2448,6 +2449,7 @@ export async function submitUransRetryForJob(
       referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
       wave: 2,
       status: "pending",
+      admissionCpuSlots: admissionCpuSlotsForRequest(request),
       totalCases: aoas.length,
       requestPayload: {
         ...(remoteProvenance ?? {}),
@@ -2820,6 +2822,7 @@ async function submitCampaignUransRetries(
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
         wave: 2,
         status: "pending",
+        admissionCpuSlots: admissionCpuSlotsForRequest(request),
         totalCases: retryAoas.length,
         requestPayload: {
           ...(remoteProvenance ?? {}),
