@@ -4231,6 +4231,16 @@ describe("remote solver push validation regressions", () => {
         ),
       },
     ]);
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => !row.resultId),
+    ).toMatchObject([
+      {
+        state: "superseded",
+        lastError: expect.stringContaining(
+          `explicitly left ${aoaDeg}° unfulfilled`,
+        ),
+      },
+    ]);
   });
 
   it("persists a failed point delivery and retries only undelivered results", async () => {
@@ -4914,6 +4924,57 @@ describe("remote solver push validation regressions", () => {
     expect(requests(fetchMock, `/sweeps/${promiseId}/heartbeat`)).toHaveLength(
       0,
     );
+  });
+
+  it("repairs a terminal job whose settled result delivery predates cancelled-promise job acknowledgement", async () => {
+    const aoaDeg = 865.9035;
+    const job = await seedDoneRemoteJob("cancelled-terminal-repair", [aoaDeg]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("cancelled-terminal-repair", [aoaDeg], promiseId);
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    await db
+      .update(syncSweepPromises)
+      .set({
+        status: "cancelled",
+        cancelledAt: new Date(),
+        responsePayload: { error: "legacy cancellation before terminal ack" },
+      })
+      .where(eq(syncSweepPromises.id, promiseId));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled", resultId: null, resultAttemptId: null })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId,
+      simJobId: job.id,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      aoaDeg,
+      generationKey: attempt.id,
+      state: "delivered",
+      deliveredAt: new Date(),
+    });
+    stubFetch();
+
+    await transferRemoteSolverTick(db, {} as EngineClient);
+    await transferRemoteSolverTick(db, {} as EngineClient);
+
+    expect(
+      (await deliveriesForJob(job.id)).filter((row) => !row.resultId),
+    ).toMatchObject([
+      {
+        state: "superseded",
+        lastError: "legacy cancellation before terminal ack",
+      },
+    ]);
   });
 
   it("MUST-CATCH: legacy migration selects only an exact unbound fulfilled point", async () => {

@@ -573,6 +573,9 @@ def test_promotion_snapshot_precedes_completed_counter_without_later_event(
         pass
 
     class FakeMesher:
+        name = "test-promotion-mesher"
+        cache_version = "test-promotion-v1"
+
         def patches(self, _resolved):
             return {}
 

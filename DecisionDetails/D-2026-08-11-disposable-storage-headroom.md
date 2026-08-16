@@ -1,5 +1,11 @@
 # D-2026-08-11 Disposable storage headroom
 
+> Superseded in part by
+> [D-2026-08-16-remote-working-set-reclamation](D-2026-08-16-remote-working-set-reclamation.md):
+> forecast admission remains, but the 80% destructive-cancellation threshold
+> is replaced by a later critical-use/free-floor backstop, and settled remote
+> jobs relinquish their complete local engine directories.
+
 ## Decision
 
 Keep solver storage as a bounded working set rather than a retention archive.

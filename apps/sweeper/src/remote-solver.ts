@@ -1910,6 +1910,32 @@ async function cancelMirroredRemotePromise(
           ]),
         ),
       );
+    const terminalJobs = await tx
+      .select({ id: simJobs.id })
+      .from(simJobs)
+      .where(
+        and(
+          inArray(simJobs.status, ["done", "failed", "cancelled"]),
+          sql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${promiseId}`,
+          sql`${simJobs.requestPayload} ->> 'remoteSolver' = 'true'`,
+          sql`NOT EXISTS (
+            SELECT 1
+            FROM sync_remote_result_deliveries terminal_delivery
+            WHERE terminal_delivery.promise_id = ${promiseId}::uuid
+              AND terminal_delivery.sim_job_id = ${simJobs.id}
+              AND terminal_delivery.result_id IS NULL
+          )`,
+        ),
+      );
+    for (const job of terminalJobs) {
+      await markRemoteJobDeliveryTerminal(
+        tx,
+        promiseId,
+        job.id,
+        "superseded",
+        error,
+      );
+    }
     return true;
   });
   if (queued && settings.remoteSolverAuthToken) {
@@ -3214,6 +3240,66 @@ async function markRemoteJobDeliveryTerminal(
         updatedAt: new Date(),
       },
     });
+}
+
+/** Repair the pre-transactional-cancellation gap. A cancelled mirrored
+ * promise no longer owns executable work; any already-terminal local job is
+ * therefore superseded and its reproducible directory may be reclaimed. */
+async function settleCancelledRemoteJobDeliveries(
+  db: DB,
+  settings: Settings,
+): Promise<number> {
+  const candidates = (await db.execute(sql`
+    SELECT
+      job.id AS job_id,
+      promise.id::text AS promise_id,
+      COALESCE(
+        promise.response_payload ->> 'error',
+        'remote promise cancelled; terminal solver work released for restart'
+      ) AS reason
+    FROM sim_jobs job
+    JOIN sync_sweep_promises promise
+      ON promise.id::text =
+          COALESCE(job.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
+     AND promise.status = 'cancelled'
+     AND promise.source_base_url = ${syncBase(settings)}
+     AND promise.request_payload ->> 'remoteSolver' = 'true'
+     AND ${remotePromiseOwnerSql(settings, "promise")}
+    WHERE job.status IN ('done', 'failed', 'cancelled')
+      AND COALESCE(job.request_payload, '{}'::jsonb) ->> 'remoteSolver' = 'true'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_remote_result_deliveries terminal_delivery
+        WHERE terminal_delivery.promise_id = promise.id
+          AND terminal_delivery.sim_job_id = job.id
+          AND terminal_delivery.result_id IS NULL
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_remote_result_deliveries unsettled_delivery
+        WHERE unsettled_delivery.promise_id = promise.id
+          AND unsettled_delivery.sim_job_id = job.id
+          AND unsettled_delivery.result_id IS NOT NULL
+          AND unsettled_delivery.state IN ('pending', 'pushing', 'retry_wait')
+      )
+    ORDER BY job."createdAt", job.id
+    LIMIT 250
+  `)) as unknown as Array<{
+    job_id: string;
+    promise_id: string;
+    reason: string;
+  }>;
+
+  for (const candidate of candidates) {
+    await markRemoteJobDeliveryTerminal(
+      db,
+      candidate.promise_id,
+      candidate.job_id,
+      "superseded",
+      candidate.reason,
+    );
+  }
+  return candidates.length;
 }
 
 /** A conditional whole-polar promotion permanently suppresses delivery of
@@ -6142,6 +6228,9 @@ export async function transferRemoteSolverTick(
       await processPendingPromiseCancellations(db, settings);
       await reopenResolvedConflictDeliveries(db, settings);
     }
+    const repairedCancelledJobs = settings?.upstreamBaseUrl
+      ? await settleCancelledRemoteJobDeliveries(db, settings)
+      : 0;
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
         await cancelMirroredPromisesForDisabledSolver(db, engine, settings);
@@ -6150,6 +6239,7 @@ export async function transferRemoteSolverTick(
     }
     if (!settings.remoteSolverAuthToken) return false;
     const processedDurableDelivery =
+      Boolean(repairedCancelledJobs) ||
       Boolean(await settlePromotedRemoteParentDeliveries(db, settings)) ||
       (await processRestartableRemotePrecalcCheckpoint(db, engine, settings)) ||
       (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||

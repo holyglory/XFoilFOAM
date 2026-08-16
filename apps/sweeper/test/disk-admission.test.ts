@@ -49,7 +49,7 @@ describe("disk admission", () => {
     expect(decision.reason).toContain("95.1% used");
   });
 
-  it("distinguishes forecast-only admission blocking from emergency measured use", () => {
+  it("keeps forecast-only and ordinary high-use admission separate from critical emergency use", () => {
     const forecastOnly = evaluateDiskAdmission(
       { total_bytes: 500 * GIB, free_bytes: 279 * GIB, used_pct: 47.2 },
       {
@@ -58,15 +58,31 @@ describe("disk admission", () => {
       },
       config,
     );
+    const ordinaryHighUse = evaluateDiskAdmission(
+      { total_bytes: 3_300 * GIB, free_bytes: 531 * GIB, used_pct: 83.9 },
+      { activeLocalJobCount: 1, activeLocalReservedBytes: 2 * GIB },
+      config,
+    );
     const emergency = evaluateDiskAdmission(
-      { total_bytes: 500 * GIB, free_bytes: 90 * GIB, used_pct: 82 },
+      { total_bytes: 500 * GIB, free_bytes: 7.5 * GIB, used_pct: 98.5 },
       { activeLocalJobCount: 1, activeLocalReservedBytes: 2 * GIB },
       config,
     );
 
     expect(forecastOnly.allowed).toBe(false);
     expect(isDiskPressureEmergency(forecastOnly)).toBe(false);
+    expect(isDiskPressureEmergency(ordinaryHighUse)).toBe(false);
     expect(isDiskPressureEmergency(emergency)).toBe(true);
+  });
+
+  it("uses the absolute free-space floor as an independent emergency backstop", () => {
+    const belowFloor = evaluateDiskAdmission(
+      { total_bytes: 1_000 * GIB, free_bytes: 19 * GIB, used_pct: 97 },
+      { activeLocalJobCount: 0, activeLocalReservedBytes: 0 },
+      config,
+    );
+
+    expect(isDiskPressureEmergency(belowFloor, 99, 20 * GIB)).toBe(true);
   });
 
   it("reserves worst-case growth for active jobs and the next admission", () => {

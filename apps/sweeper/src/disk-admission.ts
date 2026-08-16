@@ -20,7 +20,7 @@ export const DEFAULT_DISK_JOB_RESERVE_BYTES = 40 * GIB;
 export const DEFAULT_DISK_RANS_CASE_RESERVE_BYTES = 320 * MIB;
 export const DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES = 1.5 * GIB;
 export const DEFAULT_DISK_FULL_CASE_RESERVE_BYTES = 6 * GIB;
-export const DEFAULT_DISK_EMERGENCY_USED_PCT = 80;
+export const DEFAULT_DISK_EMERGENCY_USED_PCT = 98;
 export const DISK_PRESSURE_CANCELLATION_MARKER =
   "Storage pressure emergency: cancelled disposable solver work for restart";
 
@@ -61,16 +61,18 @@ export function diskPressureEmergencyFromEnv(): number {
     "SWEEPER_DISK_EMERGENCY_USED_PCT",
     DEFAULT_DISK_EMERGENCY_USED_PCT,
   );
-  return value > 0 && value < DEFAULT_DISK_MAX_USED_PCT
-    ? value
-    : DEFAULT_DISK_EMERGENCY_USED_PCT;
+  return value > 0 && value < 100 ? value : DEFAULT_DISK_EMERGENCY_USED_PCT;
 }
 
 export function isDiskPressureEmergency(
   decision: DiskAdmissionDecision,
   thresholdPct = diskPressureEmergencyFromEnv(),
+  minFreeBytes = diskAdmissionConfigFromEnv().minFreeBytes,
 ): boolean {
-  return decision.usedPct != null && decision.usedPct >= thresholdPct;
+  return (
+    (decision.usedPct != null && decision.usedPct >= thresholdPct) ||
+    (decision.freeBytes != null && decision.freeBytes < minFreeBytes)
+  );
 }
 
 function positiveEnv(name: string, fallback: number): number {

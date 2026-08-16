@@ -21,7 +21,7 @@ ADMISSION_CORE_FILE="${ADMISSION_CORE_FILE:-$ADMISSION_TOOL_ROOT/apps/sweeper/sr
 ADMISSION_CLI_FILE="${ADMISSION_CLI_FILE:-$ADMISSION_TOOL_ROOT/apps/sweeper/src/successor-continuation-once-cli.ts}"
 # Updated only when the two reviewed, additive one-shot source files change.
 # The sealed target image supplies every ordinary scheduler dependency.
-EXPECTED_ADMISSION_TOOL_SHA256="3a914de8cec03d3298a8a23217858e420b0364e0e2deb835db7bed61af82f806"
+EXPECTED_ADMISSION_TOOL_SHA256="16f34d913853f5d9fc2d06a98646849c15c1694250ea627afb10b64a84e2cc87"
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
 ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"

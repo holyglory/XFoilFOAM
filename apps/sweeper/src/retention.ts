@@ -51,6 +51,7 @@ interface StripCandidate {
   id: string;
   engine_job_id: string;
   keep_case_state: boolean;
+  delete_job_dir: boolean;
 }
 
 let lastOrphanSweepAtMs = 0;
@@ -258,6 +259,29 @@ export async function stripTerminalJobs(
               )
             )
         ) AS has_attempt_continuable
+        ,
+        (
+          j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
+          OR (
+            COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId'
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM sync_remote_result_deliveries terminal_delivery
+                WHERE terminal_delivery.sim_job_id = j.id
+                  AND terminal_delivery.result_id IS NULL
+                  AND terminal_delivery.state IN ('delivered', 'superseded', 'blocked')
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sync_sweep_promises closed_promise
+                WHERE closed_promise.id::text =
+                    COALESCE(j.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
+                  AND closed_promise.status = 'cancelled'
+              )
+            )
+          )
+        ) AS delete_job_dir
       FROM sim_jobs j
       WHERE j.status IN ('done', 'failed', 'cancelled')
         AND j.engine_job_id IS NOT NULL
@@ -277,6 +301,13 @@ export async function stripTerminalJobs(
                 WHERE remote_delivery.sim_job_id = j.id
                   AND remote_delivery.result_id IS NULL
                   AND remote_delivery.state IN ('delivered', 'superseded')
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sync_sweep_promises closed_promise
+                WHERE closed_promise.id::text =
+                    COALESCE(j.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
+                  AND closed_promise.status = 'cancelled'
               )
             )
             AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
@@ -308,6 +339,8 @@ export async function stripTerminalJobs(
           OR has_live_final_continuation
         )
       END AS keep_case_state
+      ,
+      delete_job_dir
     FROM candidates
     WHERE stripped_at IS NULL
       OR (
@@ -327,6 +360,20 @@ export async function stripTerminalJobs(
   let stripped = 0;
   for (const candidate of candidates) {
     try {
+      if (candidate.delete_job_dir) {
+        const response = await engine.deleteJob(candidate.engine_job_id);
+        await stampStrip(db, candidate.id, now, {
+          bytes_freed: response.bytes_freed,
+          files_removed: 0,
+          kept_case_state: false,
+          note: "engine job directory deleted",
+        });
+        stripped++;
+        console.log(
+          `[sweeper] RETENTION: deleted disposable job ${candidate.engine_job_id} freed ${mb(response.bytes_freed)} MB`,
+        );
+        continue;
+      }
       const response = await engine.stripJob(candidate.engine_job_id, {
         keep_case_state: candidate.keep_case_state,
       });
@@ -349,7 +396,7 @@ export async function stripTerminalJobs(
         continue;
       }
       console.error(
-        `[sweeper] RETENTION: strip failed for job ${candidate.engine_job_id}: ${
+        `[sweeper] RETENTION: ${candidate.delete_job_dir ? "delete" : "strip"} failed for job ${candidate.engine_job_id}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );

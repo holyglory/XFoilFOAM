@@ -488,7 +488,7 @@ describe("terminal strip reaper", () => {
     });
   });
 
-  it("keeps remote-solver source bytes until the job-level delivery is acknowledged", async () => {
+  it("keeps remote-solver source bytes until acknowledgement, then deletes the whole disposable job directory", async () => {
     const [promise] = await db
       .insert(syncSweepPromises)
       .values({
@@ -536,6 +536,7 @@ describe("terminal strip reaper", () => {
     });
 
     expect(own(engine.stripCalls)).toEqual([]);
+    expect(own(engine.deleteCalls)).toEqual([]);
     expect((await readJob(deliveredJob.id)).strippedAt).toBeNull();
     expect((await readJob(supersededJob.id)).strippedAt).toBeNull();
 
@@ -555,18 +556,11 @@ describe("terminal strip reaper", () => {
       stripMaxPerTick: 500,
     });
 
-    const acknowledgedCalls = own(engine.stripCalls);
-    expect(acknowledgedCalls).toHaveLength(2);
-    expect(acknowledgedCalls).toEqual(
+    expect(own(engine.stripCalls)).toEqual([]);
+    expect(own(engine.deleteCalls)).toEqual(
       expect.arrayContaining([
-        {
-          jobId: `${PREFIX}-remote-await-delivered`,
-          keepCaseState: false,
-        },
-        {
-          jobId: `${PREFIX}-remote-await-superseded`,
-          keepCaseState: false,
-        },
+        `${PREFIX}-remote-await-delivered`,
+        `${PREFIX}-remote-await-superseded`,
       ]),
     );
     expect((await readJob(deliveredJob.id)).strippedAt?.toISOString()).toBe(
@@ -575,6 +569,51 @@ describe("terminal strip reaper", () => {
     expect((await readJob(supersededJob.id)).strippedAt?.toISOString()).toBe(
       afterAck.toISOString(),
     );
+    expect((await readJob(deliveredJob.id)).stripReport).toMatchObject({
+      kept_case_state: false,
+      note: "engine job directory deleted",
+    });
+  });
+
+  it("deletes a terminal remote job after its mirrored promise is cancelled even when the legacy job acknowledgement is missing", async () => {
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${PREFIX}-cancelled-upstream`,
+        sourceInstanceName: `${PREFIX} cancelled upstream`,
+        sourceBaseUrl: "https://hub.invalid/api/sync/v1",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 1,
+        status: "cancelled",
+        cancelledAt: OLD,
+        expiresAt: OLD,
+        lastHeartbeatAt: OLD,
+        requestPayload: { fixture: PREFIX, remoteSolver: true },
+      })
+      .returning();
+    const job = await insertTerminalJob(`${PREFIX}-cancelled-promise-delete`, {
+      requestPayload: {
+        syncPromiseId: promise.id,
+        remoteSolver: true,
+      },
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([]);
+    expect(own(engine.deleteCalls)).toEqual([
+      `${PREFIX}-cancelled-promise-delete`,
+    ]);
+    expect((await readJob(job.id)).stripReport).toMatchObject({
+      kept_case_state: false,
+      note: "engine job directory deleted",
+    });
   });
 
   it("keeps case state for a budget-stop continuable row, then fully strips after supersession", async () => {
@@ -930,7 +969,7 @@ describe("terminal strip reaper", () => {
     expect((await readJob(young.id)).strippedAt).toBeNull();
   });
 
-  it("immediately strips disposable pressure cancellations behind the remote-delivery fence", async () => {
+  it("immediately deletes disposable pressure cancellations behind the remote-delivery fence", async () => {
     const job = await insertTerminalJob(`${PREFIX}-pressure-cancelled`, {
       status: "cancelled",
       error: DISK_PRESSURE_CANCELLATION_MARKER,
@@ -946,9 +985,8 @@ describe("terminal strip reaper", () => {
       stripMaxPerTick: 500,
     });
 
-    expect(own(engine.stripCalls)).toEqual([
-      { jobId: job.engineJobId, keepCaseState: false },
-    ]);
+    expect(own(engine.stripCalls)).toEqual([]);
+    expect(own(engine.deleteCalls)).toEqual([job.engineJobId]);
     expect((await readJob(job.id)).strippedAt).toEqual(NOW);
   });
 });

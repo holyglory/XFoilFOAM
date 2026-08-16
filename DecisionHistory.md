@@ -23,12 +23,13 @@
   [D-2026-08-11-hz-solver2-64-slots]
 - Confirmed intent: solver filesystems keep a bounded working set. A remote
   case is reclaimed as soon as the hub has authenticated and bound its exact
-  archive, even while later angles in the same job continue. At 80% measured
-  use, active reproducible jobs are cancelled, stripped, and requeued rather
-  than allowing already-admitted work to exhaust the filesystem. Forecast-only
-  admission blocking remains distinct from measured emergency use, and local
-  deployment/backup accumulation is bounded.
+  archive, and a settled or cancelled remote job relinquishes its whole local
+  engine directory. Forecast admission is the first storage control;
+  destructive cancellation is a later critical-use/free-floor backstop and
+  cannot contradict a safe admission decision. Local deployment and backup
+  accumulation remains bounded.
   [D-2026-08-11-disposable-storage-headroom]
+  [D-2026-08-16-remote-working-set-reclamation]
 - Confirmed intent: hub-issued remote solver promises exclusively own their
   exact cells while alive, use one refreshed 72-hour failover horizon across
   claim/solve/transfer, and serialize against local claims at the mutation
@@ -262,6 +263,20 @@
   recomputing it. The former preservation-first and idle-only paths are still
   available when preservation is explicitly requested, but they no longer
   block a user-authorized clean recovery.
+
+## D-2026-08-16-remote-working-set-reclamation — Remote storage is a disposable working set
+
+- Decision: transactionally terminalize cancelled-promise jobs, repair older
+  cancelled-promise rows, and delete the entire inactive engine directory for
+  terminal acknowledged/superseded remote work. Keep forecast admission ahead
+  of a later measured critical-use or free-floor emergency backstop.
+  [detail](DecisionDetails/D-2026-08-16-remote-working-set-reclamation.md)
+- Why: 363 terminal remote jobs retained multi-gigabyte working trees because
+  cancelled promises could never acquire the acknowledgement required by the
+  generic preservation path; eligible large strips also timed out. The 80%
+  emergency threshold simultaneously cancelled newly admitted jobs despite
+  hundreds of GiB of safe forecasted headroom. Preserving reproducible local
+  output was slower and less reliable than reclaiming it and restarting gaps.
 
 ## D-2026-08-12-disposable-admission — Rejected points do not stop disposable compute
 
