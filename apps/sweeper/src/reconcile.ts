@@ -93,6 +93,7 @@ import {
 import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
+  pinAdmissionCpuSlotsForRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
 import {
@@ -2449,7 +2450,9 @@ export async function submitUransRetryForJob(
       referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
       wave: 2,
       status: "pending",
-      admissionCpuSlots: admissionCpuSlotsForRequest(request),
+      admissionCpuSlots: remoteProvenance
+        ? pinAdmissionCpuSlotsForRequest(request)
+        : admissionCpuSlotsForRequest(request),
       totalCases: aoas.length,
       requestPayload: {
         ...(remoteProvenance ?? {}),
@@ -2822,7 +2825,9 @@ async function submitCampaignUransRetries(
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
         wave: 2,
         status: "pending",
-        admissionCpuSlots: admissionCpuSlotsForRequest(request),
+        admissionCpuSlots: remoteProvenance
+          ? pinAdmissionCpuSlotsForRequest(request)
+          : admissionCpuSlotsForRequest(request),
         totalCases: retryAoas.length,
         requestPayload: {
           ...(remoteProvenance ?? {}),

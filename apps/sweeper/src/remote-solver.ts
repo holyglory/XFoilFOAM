@@ -71,6 +71,7 @@ import { Readable } from "node:stream";
 import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
+  pinAdmissionCpuSlotsForRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
 import { claimAoas } from "./claim";
@@ -2204,10 +2205,14 @@ async function composeRemotePromiseJob(
       remoteCpuCap - (await remoteReservedCpuSlots(tx, settings)),
     );
     if (availableCpuSlots === 0) return { kind: "busy" as const, state };
-    const admissionCpuSlots = Math.min(naturalCpuSlots, availableCpuSlots);
+    const admissionCpuSlots = pinAdmissionCpuSlotsForRequest(
+      request,
+      Math.min(naturalCpuSlots, availableCpuSlots),
+    );
+    if (admissionCpuSlots === 0) return { kind: "busy" as const, state };
     // This is both the engine's per-job ceiling and the persisted admission
-    // reservation. Independent promises may consume the remaining node slots.
-    request.resources.cpu_budget = admissionCpuSlots;
+    // reservation. Explicit concurrency prevents the engine's auto policy
+    // from serializing admitted work merely because other jobs are queued.
     const payload = {
       remoteSolver: true,
       syncPromiseId: promiseId,

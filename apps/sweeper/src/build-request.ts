@@ -212,3 +212,58 @@ export function admissionCpuSlotsForRequest(
   }
   return 1;
 }
+
+/** Pin the engine's actual case concurrency to the durable admission weight.
+ *
+ * `policy=auto` is intentionally sensitive to live queue pressure. That is a
+ * useful default for unbounded ad-hoc work, but it is not safe after the
+ * control plane has admitted and persisted an exact CPU reservation: a later
+ * queue-depth observation can otherwise serialize the engine request while
+ * the scheduler continues to report every reserved slot as busy.
+ *
+ * Requests without an explicit CPU budget or case concurrency remain
+ * untouched because their engine resource shape is genuinely unresolved.
+ * A finite `maxCpuSlots` lets remote admission consume only the node's current
+ * remainder. Zero means even one complete solver-process group will not fit.
+ */
+export function pinAdmissionCpuSlotsForRequest(
+  request: Pick<PolarRequest, "resources"> &
+    Partial<Pick<PolarRequest, "aoa" | "speeds">>,
+  maxCpuSlots = Number.POSITIVE_INFINITY,
+): number {
+  const resources = request.resources;
+  const hasExplicitCpuBudget =
+    Number.isInteger(resources?.cpu_budget) && (resources?.cpu_budget ?? 0) > 0;
+  const hasExplicitCaseConcurrency =
+    Number.isInteger(resources?.case_concurrency) &&
+    (resources?.case_concurrency ?? 0) > 0;
+  if (!hasExplicitCpuBudget && !hasExplicitCaseConcurrency) {
+    return admissionCpuSlotsForRequest(request);
+  }
+
+  const solverProcesses =
+    Number.isInteger(resources?.solver_processes) &&
+    (resources?.solver_processes ?? 0) > 0
+      ? (resources?.solver_processes as number)
+      : 1;
+  const naturalSlots = admissionCpuSlotsForRequest(request);
+  const boundedSlots = Math.min(
+    naturalSlots,
+    Number.isFinite(maxCpuSlots)
+      ? Math.max(0, Math.floor(maxCpuSlots))
+      : naturalSlots,
+  );
+  if (boundedSlots < solverProcesses) return 0;
+
+  const caseConcurrency = Math.max(
+    1,
+    Math.floor(boundedSlots / solverProcesses),
+  );
+  const admissionCpuSlots = caseConcurrency * solverProcesses;
+  request.resources = {
+    ...(resources ?? {}),
+    cpu_budget: admissionCpuSlots,
+    case_concurrency: caseConcurrency,
+  };
+  return admissionCpuSlots;
+}

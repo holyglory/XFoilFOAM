@@ -84,6 +84,7 @@ import { alias } from "drizzle-orm/pg-core";
 import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
+  pinAdmissionCpuSlotsForRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
 import {
@@ -1974,7 +1975,11 @@ async function submitLadderJob(
     referenceChordM: target.snapshot.referenceGeometry.referenceLengthM,
     wave: 2,
     status: "pending",
-    admissionCpuSlots: admissionCpuSlotsForRequest(request),
+    admissionCpuSlots:
+      typeof (payloadExtras as { syncPromiseId?: unknown }).syncPromiseId ===
+      "string"
+        ? pinAdmissionCpuSlotsForRequest(request)
+        : admissionCpuSlotsForRequest(request),
     totalCases: aoas.length,
     requestPayload: {
       ...payloadExtras,

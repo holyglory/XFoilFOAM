@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
+  pinAdmissionCpuSlotsForRequest,
 } from "../src/build-request";
 
 const airfoil = {
@@ -205,5 +206,27 @@ describe("weighted scheduler admission", () => {
         speeds: [20, 30],
       }),
     ).toBe(64);
+  });
+
+  it("pins the submitted CPU budget and concurrency to the durable reservation", () => {
+    const request = {
+      resources: { policy: "auto" as const, cpu_budget: 64 },
+      aoa: { angles: Array.from({ length: 25 }, (_, index) => index - 4) },
+      speeds: [30],
+    };
+    expect(pinAdmissionCpuSlotsForRequest(request, 14)).toBe(14);
+    expect(request.resources).toMatchObject({
+      policy: "auto",
+      cpu_budget: 14,
+      case_concurrency: 14,
+    });
+  });
+
+  it("does not invent an engine resource shape for a genuinely unbounded request", () => {
+    const request: {
+      resources?: { cpu_budget?: number; case_concurrency?: number };
+    } = {};
+    expect(pinAdmissionCpuSlotsForRequest(request)).toBe(1);
+    expect(request.resources).toBeUndefined();
   });
 });

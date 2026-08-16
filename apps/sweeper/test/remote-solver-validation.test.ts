@@ -1881,6 +1881,11 @@ describe("remote solver submit lifecycle", () => {
           ([request]) => request.resources?.cpu_budget,
         ),
       ).toEqual([25, 25, 14]);
+      expect(
+        submitPolar.mock.calls.map(
+          ([request]) => request.resources?.case_concurrency,
+        ),
+      ).toEqual([25, 25, 14]);
       const jobs = (
         await Promise.all(promises.map((promise) => jobsForPromise(promise.id)))
       ).flat();
@@ -3474,7 +3479,10 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       expect(submitPolar).toHaveBeenCalledTimes(1);
       expect(submitPolar.mock.calls[0]![0]).toMatchObject({
         aoa: { angles: aoas },
-        resources: { cpu_budget: 64 },
+        resources: {
+          cpu_budget: aoas.length,
+          case_concurrency: aoas.length,
+        },
       });
       const [child] = await db
         .select()
