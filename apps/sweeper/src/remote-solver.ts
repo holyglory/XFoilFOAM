@@ -2191,14 +2191,23 @@ async function composeRemotePromiseJob(
     });
     request.expected_execution_pool = executionPool.routingKey;
     request.expected_mesh_recovery_version = meshRecoveryVersion;
-    const admissionCpuSlots = admissionCpuSlotsForRequest(request);
+    const remoteCpuCap = configuredRemoteCpuCap(settings);
     request.resources = {
       ...(request.resources ?? {}),
-      // remoteSolverCpuBudget is a node-wide admission cap, never a per-job
-      // budget. Give each polar its real process/concurrency weight so the
-      // engine cannot reserve the entire node for every admitted job.
-      cpu_budget: admissionCpuSlots,
+      // Seed auto concurrency with the node cap so the durable reservation can
+      // mirror the engine's real cases × processes resolution below.
+      cpu_budget: remoteCpuCap,
     };
+    const naturalCpuSlots = admissionCpuSlotsForRequest(request);
+    const availableCpuSlots = Math.max(
+      0,
+      remoteCpuCap - (await remoteReservedCpuSlots(tx, settings)),
+    );
+    if (availableCpuSlots === 0) return { kind: "busy" as const, state };
+    const admissionCpuSlots = Math.min(naturalCpuSlots, availableCpuSlots);
+    // This is both the engine's per-job ceiling and the persisted admission
+    // reservation. Independent promises may consume the remaining node slots.
+    request.resources.cpu_budget = admissionCpuSlots;
     const payload = {
       remoteSolver: true,
       syncPromiseId: promiseId,

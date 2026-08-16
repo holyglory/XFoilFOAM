@@ -179,10 +179,12 @@ export function buildPolarRequest(opts: {
 /** Durable scheduler weight for one engine job. OpenCFD runs one or more
  * solver processes per concurrently executed case; the control plane reserves
  * that product so a node cap represents real CPU pressure rather than merely
- * a count of database rows. Unknown/auto policies reserve one slot and let
- * the engine resolve its own internal defaults. */
+ * a count of database rows. When case concurrency is automatic but the request
+ * carries a bounded CPU budget and explicit case scope, mirror the engine's
+ * resolution instead of persisting a fictional one-slot reservation. */
 export function admissionCpuSlotsForRequest(
-  request: Pick<PolarRequest, "resources">,
+  request: Pick<PolarRequest, "resources"> &
+    Partial<Pick<PolarRequest, "aoa" | "speeds">>,
 ): number {
   const resources = request.resources;
   const solverProcesses =
@@ -194,6 +196,19 @@ export function admissionCpuSlotsForRequest(
     Number.isInteger(resources?.case_concurrency) &&
     (resources?.case_concurrency ?? 0) > 0
       ? (resources?.case_concurrency as number)
-      : 1;
-  return Math.max(1, solverProcesses * caseConcurrency);
+      : null;
+  if (caseConcurrency != null)
+    return Math.max(1, solverProcesses * caseConcurrency);
+
+  const cpuBudget =
+    Number.isInteger(resources?.cpu_budget) && (resources?.cpu_budget ?? 0) > 0
+      ? (resources?.cpu_budget as number)
+      : null;
+  const angleCount = request.aoa?.angles?.length ?? 0;
+  const speedCount = request.speeds?.length ?? 0;
+  const caseCount = angleCount * speedCount;
+  if (cpuBudget != null && caseCount > 0) {
+    return Math.max(1, Math.min(cpuBudget, caseCount * solverProcesses));
+  }
+  return 1;
 }

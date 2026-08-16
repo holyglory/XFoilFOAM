@@ -36,6 +36,7 @@ const EXCLUSIVE_FILES = new Set([
   "ladder-submit-retry.test.ts",
   "media-repair.test.ts",
   "replace-guard.test.ts",
+  "remote-solver-validation.test.ts",
   "retention.test.ts",
   "sweeper.test.ts",
   "three-stage-urans-canary-once-db.test.ts",

@@ -188,4 +188,22 @@ describe("weighted scheduler admission", () => {
       }),
     ).toBe(1);
   });
+
+  it("mirrors bounded automatic case concurrency from the explicit request scope", () => {
+    const angles = Array.from({ length: 25 }, (_, index) => index - 4);
+    expect(
+      admissionCpuSlotsForRequest({
+        resources: { cpu_budget: 64, case_concurrency: null },
+        aoa: { angles },
+        speeds: [30],
+      }),
+    ).toBe(25);
+    expect(
+      admissionCpuSlotsForRequest({
+        resources: { cpu_budget: 64, solver_processes: 2 },
+        aoa: { angles },
+        speeds: [20, 30],
+      }),
+    ).toBe(64);
+  });
 });

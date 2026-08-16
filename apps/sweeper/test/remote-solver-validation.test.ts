@@ -111,6 +111,7 @@ const {
   solverProfiles,
   solverRuntimeBuilds,
   solverRuntimeProvenanceKey,
+  sweeperState,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   syncApiSettings,
   syncRemotePromiseCancellations,
@@ -1819,6 +1820,69 @@ describe("remote solver submit lifecycle", () => {
       });
     },
   );
+
+  it("resolves automatic multi-angle jobs against the 64-slot node and gives the last promise only the remaining slots", async () => {
+    const [schedulerBefore] = await db
+      .select({ enabled: sweeperState.enabled })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    if (!schedulerBefore) throw new Error("seeded sweeper state required");
+    // A dedicated remote node deliberately leaves the local campaign
+    // scheduler disabled. Reproduce that production role so the independent
+    // remote 64-slot budget is the only applicable capacity boundary.
+    await db
+      .update(sweeperState)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(sweeperState.id, 1));
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: 64 })
+      .where(eq(syncApiSettings.id, 1));
+    const promiseAoas = Array.from({ length: 3 }, (_, promiseIndex) =>
+      Array.from(
+        { length: 25 },
+        (_, angleIndex) => 901.1 + promiseIndex + angleIndex / 1_000,
+      ),
+    );
+    const promises = await Promise.all(
+      promiseAoas.map((aoas, index) =>
+        seedMirroredPromise(`auto-capacity-${index}`, aoas),
+      ),
+    );
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus(`auto-capacity-${submitPolar.mock.calls.length}`, 25),
+    );
+
+    try {
+      expect(
+        await admitRemoteSolverTick(
+          db,
+          { submitPolar } as unknown as EngineClient,
+          { kind: "allow", meshRecoveryVersion: 17 },
+        ),
+      ).toBe(true);
+
+      expect(
+        submitPolar.mock.calls.map(
+          ([request]) => request.resources?.cpu_budget,
+        ),
+      ).toEqual([25, 25, 14]);
+      const jobs = (
+        await Promise.all(promises.map((promise) => jobsForPromise(promise.id)))
+      ).flat();
+      expect(
+        jobs
+          .map((job) => job.admissionCpuSlots)
+          .sort((left, right) => right - left),
+      ).toEqual([25, 25, 14]);
+    } finally {
+      await db
+        .update(sweeperState)
+        .set({ enabled: schedulerBefore.enabled, updatedAt: new Date() })
+        .where(eq(sweeperState.id, 1));
+    }
+  }, 20_000);
 
   it("MUST-CATCH: a running serial polar does not block the next mirrored polar from using free CPU capacity", async () => {
     const runningPromise = await seedMirroredPromise(

@@ -5,6 +5,12 @@
 Run hz-solver2 with a 64-slot worker, case, Celery, and container-CPU contract.
 Keep the capacity configurable but require all four controls to agree.
 
+Automatic case concurrency is part of that contract. Persist each job's
+resolved reservation from its case count, speed count, solver-process count,
+bounded CPU budget, and the node's remaining capacity. A database row count is
+not a CPU reservation, and an automatic multi-angle job must never be recorded
+as one slot while the engine runs many OpenFOAM children.
+
 ## Evidence and rationale
 
 The host has 48 physical Zen 4 cores and 96 logical CPUs. At 40 slots it ran
