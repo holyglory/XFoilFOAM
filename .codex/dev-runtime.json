@@ -122,7 +122,12 @@
     "services": [
       "redis",
       "api",
-      "worker"
+      "worker",
+      "postgres",
+      "storage-init",
+      "node-api",
+      "web",
+      "sweeper"
     ]
   }
 }
