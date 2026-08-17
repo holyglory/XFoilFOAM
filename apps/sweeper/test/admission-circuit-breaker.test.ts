@@ -1825,6 +1825,20 @@ describe("global solver admission circuit breaker", () => {
     const [capacityJob, remoteJob] = jobs;
     if (!capacityJob || !remoteJob)
       throw new Error("shared-capacity submit fixtures missing");
+    const [attachedResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: solverFixture.bcId,
+        simulationPresetRevisionId: solverFixture.revisionId,
+        aoaDeg: AOA + 0.000_001,
+        status: "queued",
+        source: "queued",
+        simJobId: remoteJob.id,
+      })
+      .returning({ id: results.id });
+    if (!attachedResult)
+      throw new Error("shared-capacity attached result fixture missing");
 
     const capacityWriterLocked = deferred<void>();
     const releaseCapacityWriter = deferred<void>();
@@ -1880,6 +1894,17 @@ describe("global solver admission circuit breaker", () => {
           : "",
       ).toMatch(/shared scheduler capacity is full \(1\/1\)/i);
       expect(submitCalls).toBe(0);
+      const [stoppedJob] = await db
+        .select({ status: simJobs.status, finishedAt: simJobs.finishedAt })
+        .from(simJobs)
+        .where(eq(simJobs.id, remoteJob.id));
+      expect(stoppedJob).toMatchObject({ status: "cancelled" });
+      expect(stoppedJob?.finishedAt).toBeInstanceOf(Date);
+      const [releasedResult] = await db
+        .select({ status: results.status, simJobId: results.simJobId })
+        .from(results)
+        .where(eq(results.id, attachedResult.id));
+      expect(releasedResult).toEqual({ status: "pending", simJobId: null });
     } finally {
       releaseCapacityWriter.resolve(undefined);
       await Promise.allSettled(
@@ -1887,6 +1912,7 @@ describe("global solver admission circuit breaker", () => {
           (item): item is Promise<unknown> => item !== null,
         ),
       );
+      await db.delete(results).where(eq(results.id, attachedResult.id));
       await db.delete(simJobs).where(
         inArray(
           simJobs.id,
@@ -1897,6 +1923,119 @@ describe("global solver admission circuit breaker", () => {
         .update(simCampaigns)
         .set({ currentConditionGeneration: 1 })
         .where(eq(simCampaigns.id, campaignId));
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: originalState.enabled,
+          maxConcurrentJobs: originalState.maxConcurrentJobs,
+          cpuSlots: originalState.cpuSlots,
+          pollIntervalMs: originalState.pollIntervalMs,
+          submitIntervalMs: originalState.submitIntervalMs,
+          admissionFenceActive: originalState.admissionFenceActive,
+          lastAdmissionFenceAt: originalState.lastAdmissionFenceAt,
+          lastAdmissionFenceReason: originalState.lastAdmissionFenceReason,
+          lastAdmissionFenceTriggerKey:
+            originalState.lastAdmissionFenceTriggerKey,
+          lastAdmissionFenceDetails: originalState.lastAdmissionFenceDetails,
+        })
+        .where(eq(sweeperState.id, 1));
+    }
+  }, 60_000);
+
+  it("shrinks only case concurrency to fill the exact remaining shared capacity", async () => {
+    const originalState = await readState();
+    await db
+      .update(sweeperState)
+      .set({
+        enabled: true,
+        maxConcurrentJobs: 0,
+        cpuSlots: 8,
+        admissionFenceActive: false,
+        lastAdmissionFenceAt: null,
+        lastAdmissionFenceReason: null,
+        lastAdmissionFenceTriggerKey: null,
+        lastAdmissionFenceDetails: null,
+      })
+      .where(eq(sweeperState.id, 1));
+    const [runningJob, candidateJob] = await db
+      .insert(simJobs)
+      .values([
+        {
+          airfoilId,
+          bcIds: [solverFixture.bcId],
+          simulationPresetRevisionId: solverFixture.revisionId,
+          solverImplementationId: solverFixture.solverImplementationId,
+          jobKind: "targeted",
+          referenceChordM: 0.987654,
+          status: "running" as const,
+          admissionCpuSlots: 4,
+          totalCases: 1,
+          engineJobId: `${PREFIX}-packing-running`,
+          engineState: "running",
+          requestPayload: { aoas: [AOA + 0.1] },
+        },
+        {
+          airfoilId,
+          bcIds: [solverFixture.bcId],
+          simulationPresetRevisionId: solverFixture.revisionId,
+          solverImplementationId: solverFixture.solverImplementationId,
+          jobKind: "sweep",
+          referenceChordM: 0.987654,
+          status: "pending" as const,
+          admissionCpuSlots: 8,
+          totalCases: 8,
+          requestPayload: {
+            aoas: [AOA + 0.2],
+            resources: { solver_processes: 1, case_concurrency: 8 },
+          },
+        },
+      ])
+      .returning({ id: simJobs.id });
+    if (!runningJob || !candidateJob)
+      throw new Error("adaptive packing fixtures missing");
+    const request = {
+      resources: { solver_processes: 1, case_concurrency: 8 },
+    } as PolarRequest;
+    const submittedRequests: PolarRequest[] = [];
+    try {
+      const outcome = await submitPendingJobWithLifecycleGuard({
+        db,
+        engine: {
+          submitPolar: async (submitted: PolarRequest): Promise<JobStatus> => {
+            submittedRequests.push(structuredClone(submitted));
+            return {
+              job_id: `${PREFIX}-packing-candidate`,
+              state: "pending",
+              total_cases: 8,
+              completed_cases: 0,
+            };
+          },
+        } as unknown as EngineClient,
+        jobId: candidateJob.id,
+        admissionLane: "local",
+        campaignId: null,
+        request,
+        connectionErrorPrefix: "unreachable: ",
+        submitErrorPrefix: "failed: ",
+      });
+      expect(outcome).toMatchObject({ kind: "submitted" });
+      expect(submittedRequests[0]?.resources?.case_concurrency).toBe(4);
+      const [resized] = await db
+        .select({
+          slots: simJobs.admissionCpuSlots,
+          requestPayload: simJobs.requestPayload,
+        })
+        .from(simJobs)
+        .where(eq(simJobs.id, candidateJob.id));
+      expect(resized?.slots).toBe(4);
+      expect(
+        (resized?.requestPayload as { resources?: { case_concurrency?: number } })
+          .resources?.case_concurrency,
+      ).toBe(4);
+    } finally {
+      await db
+        .delete(simJobs)
+        .where(inArray(simJobs.id, [runningJob.id, candidateJob.id]));
       await db
         .update(sweeperState)
         .set({

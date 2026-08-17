@@ -75,6 +75,50 @@ export type SubmissionAdmissionLane = "local" | "remote" | "operator_canary";
 const SUBMITTING_ENGINE_STATE = "submitting";
 const ANSWERED_SERVER_RETRY_BACKOFF_MS = 30_000;
 
+export interface FittedAdmissionResources {
+  slots: number;
+  resources: NonNullable<PolarRequest["resources"]>;
+}
+
+/** Fit only execution concurrency into an exact remaining node budget.
+ * Physics/numerics and per-case solver parallelism remain immutable. */
+export function fitAdmissionResourcesToAvailableSlots(
+  resources: PolarRequest["resources"],
+  durableSlots: number,
+  availableSlots: number,
+): FittedAdmissionResources | null {
+  if (
+    !Number.isInteger(durableSlots) ||
+    durableSlots < 1 ||
+    !Number.isInteger(availableSlots) ||
+    availableSlots < 1
+  )
+    return null;
+  const solverProcesses =
+    Number.isInteger(resources?.solver_processes) &&
+    (resources?.solver_processes ?? 0) > 0
+      ? (resources?.solver_processes as number)
+      : 1;
+  const caseConcurrency =
+    Number.isInteger(resources?.case_concurrency) &&
+    (resources?.case_concurrency ?? 0) > 0
+      ? (resources?.case_concurrency as number)
+      : 1;
+  if (solverProcesses * caseConcurrency !== durableSlots) return null;
+  const fittedCaseConcurrency = Math.min(
+    caseConcurrency,
+    Math.floor(availableSlots / solverProcesses),
+  );
+  if (fittedCaseConcurrency < 1) return null;
+  return {
+    slots: solverProcesses * fittedCaseConcurrency,
+    resources: {
+      ...(resources ?? {}),
+      case_concurrency: fittedCaseConcurrency,
+    },
+  };
+}
+
 function ladderOwnerId(owner: LadderSubmitOwner): string {
   return owner.uransRequestId ?? owner.verifyQueueId!;
 }
@@ -675,6 +719,7 @@ async function submitWithGlobalAdmissionPermit(
   db: DB,
   jobId: string,
   admissionLane: SubmissionAdmissionLane | undefined,
+  request: PolarRequest,
   submit: () => Promise<JobStatus>,
 ): Promise<GlobalAdmissionSubmitResult> {
   let acceptedStatus: JobStatus | null = null;
@@ -737,10 +782,46 @@ async function submitWithGlobalAdmissionPermit(
         WHERE id = ${jobId}
         LIMIT 1
       `)) as unknown as Array<{ admission_cpu_slots: number }>;
-      const requestedSlots = Math.max(
+      let requestedSlots = Math.max(
         1,
         Number(jobCapacity?.admission_cpu_slots ?? 1),
       );
+      const fitToRemainingCapacity = async (
+        availableSlots: number,
+      ): Promise<boolean> => {
+        if (requestedSlots <= availableSlots) return true;
+        const fitted = fitAdmissionResourcesToAvailableSlots(
+          request.resources,
+          requestedSlots,
+          availableSlots,
+        );
+        if (!fitted || fitted.slots >= requestedSlots) return false;
+        const [resized] = await tx
+          .update(simJobs)
+          .set({
+            admissionCpuSlots: fitted.slots,
+            requestPayload: sql`jsonb_set(
+              COALESCE(${simJobs.requestPayload}, '{}'::jsonb),
+              '{resources}',
+              ${JSON.stringify(fitted.resources)}::jsonb,
+              true
+            )`,
+            updatedAt: sql`now()`,
+          })
+          .where(
+            and(
+              eq(simJobs.id, jobId),
+              eq(simJobs.status, "pending"),
+              eq(simJobs.engineState, SUBMITTING_ENGINE_STATE),
+              eq(simJobs.admissionCpuSlots, requestedSlots),
+            ),
+          )
+          .returning({ id: simJobs.id });
+        if (!resized) return false;
+        request.resources = fitted.resources;
+        requestedSlots = fitted.slots;
+        return true;
+      };
       const activeReservationPredicate = sql`(
         job.status IN ('submitted', 'running')
         OR (
@@ -806,10 +887,14 @@ async function submitWithGlobalAdmissionPermit(
             AND ${activeReservationPredicate}
         `)) as unknown as Array<{ slots: number }>;
         const remoteReservedSlots = Number(remotePressure?.slots ?? 0);
-        if (remoteReservedSlots + requestedSlots > remoteCap) {
+        const attemptedSlots = requestedSlots;
+        if (
+          remoteReservedSlots + requestedSlots > remoteCap &&
+          !(await fitToRemainingCapacity(remoteCap - remoteReservedSlots))
+        ) {
           return {
             kind: "denied" as const,
-            error: `remote solver CPU cap is full (${remoteReservedSlots}+${requestedSlots}/${remoteCap})`,
+            error: `remote solver CPU cap is full (${remoteReservedSlots}+${attemptedSlots}/${remoteCap})`,
           };
         }
       }
@@ -840,10 +925,14 @@ async function submitWithGlobalAdmissionPermit(
         const reservedSlots = Number(
           (pressure as unknown as { slots: number } | undefined)?.slots ?? 0,
         );
-        if (reservedSlots + requestedSlots > sharedCapacity) {
+        const attemptedSlots = requestedSlots;
+        if (
+          reservedSlots + requestedSlots > sharedCapacity &&
+          !(await fitToRemainingCapacity(sharedCapacity - reservedSlots))
+        ) {
           return {
             kind: "denied" as const,
-            error: `shared scheduler capacity is full (${reservedSlots}+${requestedSlots}/${sharedCapacity})`,
+            error: `shared scheduler capacity is full (${reservedSlots}+${attemptedSlots}/${sharedCapacity})`,
           };
         }
       }
@@ -896,7 +985,8 @@ async function stopBeforeEngineSubmit(
         status: "cancelled",
         engineState: "cancelled",
         error: reason,
-        finishedAt: new Date(),
+        finishedAt: sql`now()`,
+        updatedAt: sql`now()`,
       })
       .where(
         and(
@@ -917,6 +1007,7 @@ async function stopBeforeEngineSubmit(
         simJobId: null,
         engineJobId: null,
         engineCaseSlug: null,
+        updatedAt: sql`now()`,
       })
       .where(
         and(
@@ -1784,6 +1875,7 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
     opts.db,
     opts.jobId,
     opts.admissionLane,
+    opts.request,
     () => opts.engine.submitPolar(opts.request),
   );
   if (admission.kind === "denied" || admission.kind === "check_failed") {
