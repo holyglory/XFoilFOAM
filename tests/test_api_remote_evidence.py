@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import shutil
@@ -11,10 +12,11 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from airfoilfoam.api import main as api_main
 from airfoilfoam.evidence_runtime import EVIDENCE_POINTER_NAME
-from airfoilfoam.evidence_store import EvidenceHydrationError
+from airfoilfoam.evidence_store import EvidenceHydrationError, RemoteEvidencePointer
 from airfoilfoam.storage import JobStore
 
 
@@ -84,6 +86,276 @@ def _expected_pointer_params(pointer: dict[str, object]) -> dict[str, object]:
         "expected_stored_sha256": pointer["storedSha256"],
         "expected_stored_size": pointer["storedSize"],
     }
+
+
+def test_render_field_request_preserves_inline_remote_pointer():
+    pointer = {"bucket": "airfoils-pro-storage-bucket", "generation": "42"}
+    request = api_main.RenderFieldRequest.model_validate(
+        {
+            "case_slug": "case-1",
+            "airfoil_points": [[0.0, 0.0], [1.0, 0.0]],
+            "chord": 1.0,
+            "speed": 20.0,
+            "field": "pressure",
+            "source_mode": "archive",
+            "remote": pointer,
+        }
+    )
+    assert request.remote == pointer
+
+
+def test_streamed_evidence_releases_lease_on_pre_body_disconnect(tmp_path):
+    """A disconnect before the generator starts must not leak the cache lease."""
+
+    artifact = tmp_path / "artifact.vtu"
+    artifact.write_bytes(b"verified-evidence")
+    lease = {"active": False, "enters": 0, "exits": 0}
+
+    @contextmanager
+    def source():
+        assert not lease["active"]
+        lease["active"] = True
+        lease["enters"] += 1
+        try:
+            yield artifact
+        finally:
+            lease["active"] = False
+            lease["exits"] += 1
+
+    response = api_main._stream_remote_evidence(
+        source(), media_type="application/octet-stream"
+    )
+    assert lease == {"active": True, "enters": 1, "exits": 0}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            raise OSError("client disconnected before body iteration")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/evidence",
+        "raw_path": b"/evidence",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 80),
+    }
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(response(scope, receive, send))
+
+    # The generator never began, so this proves the response-level finalizer
+    # owns the pre-body disconnect path. Background and generator finalizers
+    # may subsequently run but are deliberately idempotent.
+    assert lease == {"active": False, "enters": 1, "exits": 1}
+
+
+def test_lease_response_closes_once_after_normal_stream_completion():
+    """Response-level ownership also releases on a successful async stream.
+
+    An async body isolates Starlette's response/background order from the
+    separately tested synchronous-worker-pool saturation, while preserving the
+    exact same response-level closer used by remote evidence streams.
+    """
+
+    lease = {"active": True, "exits": 0}
+    events: list[str] = []
+
+    def close_source() -> None:
+        if not lease["active"]:
+            return
+        lease["active"] = False
+        lease["exits"] += 1
+
+    class CloseLeaseBackground:
+        async def __call__(self) -> None:
+            events.append("background")
+            close_source()
+
+    async def body():
+        events.append("body")
+        yield b"verified-evidence"
+
+    response = api_main._LeaseStreamingResponse(
+        body(),
+        media_type="application/octet-stream",
+        background=CloseLeaseBackground(),
+        close_lease=close_source,
+    )
+    messages: list[str] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message["type"])
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/evidence",
+        "raw_path": b"/evidence",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 80),
+    }
+
+    asyncio.run(response(scope, receive, send))
+
+    assert events == ["body", "background"]
+    assert messages == ["http.response.start", "http.response.body", "http.response.body"]
+    assert lease == {"active": False, "exits": 1}
+
+
+def test_streamed_evidence_releases_lease_on_mid_body_read_failure(tmp_path):
+    """A body failure after the first chunk releases the entered lease once."""
+
+    artifact = tmp_path / "artifact.vtu"
+    artifact.write_bytes(b"verified-evidence")
+    lease = {"active": False, "enters": 0, "exits": 0}
+
+    @contextmanager
+    def source():
+        assert not lease["active"]
+        lease["active"] = True
+        lease["enters"] += 1
+        try:
+            yield artifact
+        finally:
+            lease["active"] = False
+            lease["exits"] += 1
+
+    response = api_main._stream_remote_evidence(
+        source(), media_type="application/octet-stream"
+    )
+
+    async def interrupted_body():
+        # The source has already been entered by _stream_remote_evidence.  Use
+        # an async body here to exercise the response-level cleanup boundary
+        # without a thread-pool dependency in this low-level ASGI regression.
+        yield b"first evidence chunk"
+        raise OSError("simulated evidence read interruption")
+
+    response.body_iterator = interrupted_body()
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/evidence",
+        "raw_path": b"/evidence",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 80),
+    }
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(response(scope, receive, send))
+
+    assert [message["type"] for message in sent] == [
+        "http.response.start",
+        "http.response.body",
+    ]
+    assert lease == {"active": False, "enters": 1, "exits": 1}
+
+
+def test_streamed_evidence_releases_lease_when_identity_hash_fails(tmp_path, monkeypatch):
+    """Every exception after enter, before response construction, releases once."""
+
+    artifact = tmp_path / "artifact.vtu"
+    artifact.write_bytes(b"verified-evidence")
+    lease = {"active": False, "enters": 0, "exits": 0}
+
+    @contextmanager
+    def source():
+        lease["active"] = True
+        lease["enters"] += 1
+        try:
+            yield artifact
+        finally:
+            lease["active"] = False
+            lease["exits"] += 1
+
+    pointer = RemoteEvidencePointer(
+        bucket="airfoils-pro-storage-bucket",
+        object_key="solver-evidence/v1/sha256/aa/archive.tar.zst",
+        generation=42,
+        stored_sha256="a" * 64,
+        stored_size=artifact.stat().st_size,
+        tar_sha256="b" * 64,
+        tar_size=128,
+        crc32c="AAAAAA==",
+        zstd_level=10,
+        created_at="2026-08-02T00:00:00Z",
+    )
+
+    def hash_failure(_path):
+        raise OSError("simulated pre-response checksum read failure")
+
+    monkeypatch.setattr(api_main, "_sha256_file", hash_failure)
+    with pytest.raises(api_main.HTTPException) as raised:
+        api_main._stream_remote_evidence(
+            source(), media_type="application/octet-stream", identity=pointer
+        )
+    assert raised.value.status_code == 503
+    assert "checksum read failure" in str(raised.value.detail)
+    assert lease == {"active": False, "enters": 1, "exits": 1}
+
+
+def test_streamed_evidence_releases_lease_when_stat_fails():
+    """Stat failures happen after enter too, so they need the same cleanup."""
+
+    lease = {"active": False, "enters": 0, "exits": 0}
+
+    class UnstatableArtifact:
+        def is_file(self) -> bool:
+            return True
+
+        def is_symlink(self) -> bool:
+            return False
+
+        def stat(self):
+            raise OSError("simulated pre-response stat failure")
+
+    @contextmanager
+    def source():
+        lease["active"] = True
+        lease["enters"] += 1
+        try:
+            yield UnstatableArtifact()
+        finally:
+            lease["active"] = False
+            lease["exits"] += 1
+
+    with pytest.raises(api_main.HTTPException) as raised:
+        api_main._stream_remote_evidence(
+            source(), media_type="application/octet-stream"
+        )
+    assert raised.value.status_code == 503
+    assert "pre-response stat failure" in str(raised.value.detail)
+    assert lease == {"active": False, "enters": 1, "exits": 1}
 
 
 def test_remote_only_render_endpoints_hold_hydration_lease(

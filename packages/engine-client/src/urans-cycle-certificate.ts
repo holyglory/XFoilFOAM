@@ -21,6 +21,14 @@ export const URANS_CYCLE_DISPOSITIONS = [
 
 export type UransCycleDisposition = (typeof URANS_CYCLE_DISPOSITIONS)[number];
 
+/**
+ * A null diagnostic is an explicit fact that the reducer could not measure
+ * that cycle. It is permitted only on a hard-corrupt, non-selected cycle so
+ * legacy JSON (which could not represent the producer's old infinity
+ * sentinel) stays readable without becoming publishable science.
+ */
+type UransCycleMetric = number | null;
+
 export interface UransCycleCertificateCycle {
   index: number;
   t_start: number;
@@ -29,18 +37,18 @@ export interface UransCycleCertificateCycle {
   field_frames: number;
   phase_max_gap: number;
   phase_shift_bins: number;
-  cl_mean: number;
-  cd_mean: number;
-  cm_mean: number;
-  cl_shape_error: number;
-  cd_shape_error: number;
-  cm_shape_error: number;
-  cl_amplitude_deviation: number;
-  cd_amplitude_deviation: number;
-  cm_amplitude_deviation: number;
-  cl_high_frequency: number;
-  cd_high_frequency: number;
-  cm_high_frequency: number;
+  cl_mean: UransCycleMetric;
+  cd_mean: UransCycleMetric;
+  cm_mean: UransCycleMetric;
+  cl_shape_error: UransCycleMetric;
+  cd_shape_error: UransCycleMetric;
+  cm_shape_error: UransCycleMetric;
+  cl_amplitude_deviation: UransCycleMetric;
+  cd_amplitude_deviation: UransCycleMetric;
+  cm_amplitude_deviation: UransCycleMetric;
+  cl_high_frequency: UransCycleMetric;
+  cd_high_frequency: UransCycleMetric;
+  cm_high_frequency: UransCycleMetric;
   disposition: UransCycleDisposition;
   reasons: string[];
 }
@@ -108,6 +116,25 @@ const CYCLE_KEYS = [
   "disposition",
   "reasons",
 ] as const;
+
+const CYCLE_DIAGNOSTIC_KEYS = [
+  "cl_mean",
+  "cd_mean",
+  "cm_mean",
+  "cl_shape_error",
+  "cd_shape_error",
+  "cm_shape_error",
+  "cl_amplitude_deviation",
+  "cd_amplitude_deviation",
+  "cm_amplitude_deviation",
+  "cl_high_frequency",
+  "cd_high_frequency",
+  "cm_high_frequency",
+] as const;
+
+function unavailableDiagnosticKeys(value: Record<string, unknown>): string[] {
+  return CYCLE_DIAGNOSTIC_KEYS.filter((key) => value[key] === null);
+}
 
 function exactKeys(
   value: Record<string, unknown>,
@@ -229,23 +256,20 @@ export function parseUransCycleCertificate(
         errors.push(`${at}: cycles must be chronological and non-overlapping`);
       }
       if (finite(entry.t_end)) previousEnd = entry.t_end;
-      for (const key of [
-        "phase_max_gap",
-        "cl_mean",
-        "cd_mean",
-        "cm_mean",
-        "cl_shape_error",
-        "cd_shape_error",
-        "cm_shape_error",
-        "cl_amplitude_deviation",
-        "cd_amplitude_deviation",
-        "cm_amplitude_deviation",
-        "cl_high_frequency",
-        "cd_high_frequency",
-        "cm_high_frequency",
-      ] as const) {
-        if (!finite(entry[key]))
-          errors.push(`${at}.${key}: expected finite number`);
+      if (!finite(entry.phase_max_gap))
+        errors.push(`${at}.phase_max_gap: expected finite number`);
+      const unavailableMetrics = unavailableDiagnosticKeys(entry);
+      for (const key of CYCLE_DIAGNOSTIC_KEYS) {
+        if (entry[key] !== null && !finite(entry[key]))
+          errors.push(`${at}.${key}: expected finite number or null`);
+      }
+      if (
+        unavailableMetrics.length > 0 &&
+        entry.disposition !== "hard_corrupt"
+      ) {
+        errors.push(
+          `${at}: unavailable cycle metrics require hard_corrupt disposition`,
+        );
       }
       if (
         finite(entry.phase_max_gap) &&
@@ -283,6 +307,12 @@ export function parseUransCycleCertificate(
       }
       if (entry.disposition === "selected" && integerAtLeast(entry.index, 0)) {
         selectedIndexes.add(entry.index);
+        if (unavailableMetrics.length > 0) {
+          errors.push(
+            `${at}: selected cycle has unavailable metrics (${unavailableMetrics.join(", ")})`,
+          );
+          return;
+        }
         // A selected suffix is publishable science, not merely a topology
         // label. Refuse a remote/mixed-version payload that calls a cycle
         // selected while carrying its own corruption metrics or reasons.
@@ -308,7 +338,9 @@ export function parseUransCycleCertificate(
           },
           reasons: entry.reasons,
         })) {
-          errors.push(`${at}: selected cycle violates clean-cycle policy (${reason})`);
+          errors.push(
+            `${at}: selected cycle violates clean-cycle policy (${reason})`,
+          );
         }
       }
     });
@@ -345,7 +377,8 @@ export function parseUransCycleCertificate(
           const terminalIndexes = cycleIndexes.slice(startPosition);
           const selectedAreTerminalSuffix =
             terminalIndexes.length > 0 &&
-            terminalIndexes.length === (value.required_clean_cycles as number) &&
+            terminalIndexes.length ===
+              (value.required_clean_cycles as number) &&
             terminalIndexes.every((cycleIndex) =>
               selectedIndexes.has(cycleIndex),
             ) &&
@@ -364,9 +397,7 @@ export function parseUransCycleCertificate(
               "urans_cycle_certificate: selected terminal suffix length must equal required_clean_cycles",
             );
           }
-          if (
-            (value.terminal_clean_cycles as number) > cycleIndexes.length
-          ) {
+          if ((value.terminal_clean_cycles as number) > cycleIndexes.length) {
             errors.push(
               "urans_cycle_certificate: terminal_clean_cycles exceeds the audited cycle count",
             );
@@ -379,4 +410,3 @@ export function parseUransCycleCertificate(
     ? { ok: false, errors }
     : { ok: true, value: value as unknown as UransCycleCertificate };
 }
-

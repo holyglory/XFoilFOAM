@@ -10,6 +10,15 @@ const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
 
 export const DEFAULT_DISK_MAX_USED_PCT = 95;
+/**
+ * The remote solver owns a multi-terabyte, evidence-retaining results volume.
+ * Its real protection is the absolute floor plus the remaining-work reserve
+ * below; keeping the production 95% percentage ceiling would maroon more than
+ * one hundred GiB before either of those safety checks is reached. 99% remains
+ * an independent emergency ceiling for an unclassified or unexpected growth
+ * path. The remote role is opt-in through the deployment-owned role variable.
+ */
+export const DEFAULT_REMOTE_DISK_MAX_USED_PCT = 99;
 export const DEFAULT_DISK_MIN_FREE_BYTES = 20 * GIB;
 export const DEFAULT_DISK_JOB_RESERVE_BYTES = 24 * GIB;
 export const DEFAULT_DISK_RANS_CASE_RESERVE_BYTES = 320 * MIB;
@@ -17,6 +26,8 @@ export const DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES = 2 * GIB;
 export const DEFAULT_DISK_FULL_CASE_RESERVE_BYTES = 6 * GIB;
 
 export interface DiskAdmissionConfig {
+  /** A role can only relax the percentage guard when deployment states it. */
+  deploymentRole?: DiskAdmissionDeploymentRole;
   maxUsedPct: number;
   minFreeBytes: number;
   /** Conservative reserve for the next job before its exact shape is known. */
@@ -25,6 +36,8 @@ export interface DiskAdmissionConfig {
   precalcCaseReserveBytes?: number;
   fullCaseReserveBytes?: number;
 }
+
+export type DiskAdmissionDeploymentRole = "hub" | "remote-solver";
 
 export interface LocalDiskJob {
   totalCases: number;
@@ -48,43 +61,70 @@ export interface DiskAdmissionDecision {
   requiredFreeBytes: number | null;
 }
 
-function positiveEnv(name: string, fallback: number): number {
-  const parsed = Number(process.env[name]);
+function positiveEnv(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+): number {
+  const parsed = Number(env[name]);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export function diskAdmissionConfigFromEnv(): DiskAdmissionConfig {
+export function diskAdmissionDeploymentRoleFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): DiskAdmissionDeploymentRole {
+  // Default and malformed values deliberately preserve the tighter hub guard.
+  return env.AIRFOILFOAM_DEPLOYMENT_ROLE?.trim() === "remote-solver"
+    ? "remote-solver"
+    : "hub";
+}
+
+export function diskAdmissionConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): DiskAdmissionConfig {
+  const deploymentRole = diskAdmissionDeploymentRoleFromEnv(env);
+  const defaultMaxUsedPct =
+    deploymentRole === "remote-solver"
+      ? DEFAULT_REMOTE_DISK_MAX_USED_PCT
+      : DEFAULT_DISK_MAX_USED_PCT;
   const maxUsedPct = positiveEnv(
+    env,
     "SWEEPER_DISK_MAX_USED_PCT",
-    DEFAULT_DISK_MAX_USED_PCT,
+    defaultMaxUsedPct,
   );
   return {
+    deploymentRole,
     maxUsedPct:
       maxUsedPct > 0 && maxUsedPct < 100
         ? maxUsedPct
-        : DEFAULT_DISK_MAX_USED_PCT,
+        : defaultMaxUsedPct,
     minFreeBytes:
       positiveEnv(
+        env,
         "SWEEPER_DISK_MIN_FREE_GIB",
         DEFAULT_DISK_MIN_FREE_BYTES / GIB,
       ) * GIB,
     jobReserveBytes:
       positiveEnv(
+        env,
         "SWEEPER_DISK_JOB_RESERVE_GIB",
         DEFAULT_DISK_JOB_RESERVE_BYTES / GIB,
       ) * GIB,
     ransCaseReserveBytes:
       positiveEnv(
+        env,
         "SWEEPER_DISK_RANS_CASE_RESERVE_GIB",
         DEFAULT_DISK_RANS_CASE_RESERVE_BYTES / GIB,
       ) * GIB,
     precalcCaseReserveBytes:
       positiveEnv(
+        env,
         "SWEEPER_DISK_PRECALC_CASE_RESERVE_GIB",
         DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES / GIB,
       ) * GIB,
     fullCaseReserveBytes:
       positiveEnv(
+        env,
         "SWEEPER_DISK_FULL_CASE_RESERVE_GIB",
         DEFAULT_DISK_FULL_CASE_RESERVE_BYTES / GIB,
       ) * GIB,
@@ -220,8 +260,12 @@ export function evaluateDiskAdmission(
     config.jobReserveBytes;
   const reasons: string[] = [];
   if (disk.used_pct >= config.maxUsedPct) {
+    const limitLabel =
+      config.deploymentRole === "remote-solver"
+        ? "remote emergency limit"
+        : "admission limit";
     reasons.push(
-      `${disk.used_pct.toFixed(1)}% used (admission limit ${config.maxUsedPct.toFixed(1)}%)`,
+      `${disk.used_pct.toFixed(1)}% used (${limitLabel} ${config.maxUsedPct.toFixed(1)}%)`,
     );
   }
   if (disk.free_bytes < requiredFreeBytes) {

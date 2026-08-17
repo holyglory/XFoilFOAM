@@ -46,6 +46,8 @@ export const URANS_RECOVERY_CAPABILITY_MISMATCH_CODE =
 export const ARCHIVE_REDUCTION_CAPABILITY_MISMATCH_CODE =
   "archive_reduction_version_mismatch";
 export const ENGINE_IDENTITY_MISMATCH_CODE = "engine_identity_mismatch";
+export const ENGINE_PAYLOAD_DIGEST_MISMATCH_CODE =
+  "engine_payload_digest_mismatch";
 
 export class EngineError extends Error {
   constructor(
@@ -99,6 +101,10 @@ export interface EngineCallOptions {
    * control-plane job/result polls in a multi-engine gateway. */
   expectedEngine?: EngineIdentity;
   expectedExecutionPool?: string;
+  /** SHA-256 of the exact status.json/result.json bytes inspected before a
+   * guarded engine rebuild. When supplied, the engine must attest that the
+   * successful response came from that same immutable byte snapshot. */
+  expectedPayloadSha256?: string;
 }
 
 export interface EngineClientOptions {
@@ -347,7 +353,18 @@ export class EngineClient {
     path: string,
     timeoutMs: number,
     init?: RequestInit,
+    expectedPayloadSha256?: string,
   ): Promise<T> {
+    if (
+      expectedPayloadSha256 != null &&
+      !/^[0-9a-f]{64}$/.test(expectedPayloadSha256)
+    ) {
+      throw new EngineError(
+        `${init?.method ?? "GET"} ${path} received an invalid expected payload SHA-256`,
+        undefined,
+        ENGINE_PAYLOAD_DIGEST_MISMATCH_CODE,
+      );
+    }
     const signal = AbortSignal.timeout(timeoutMs);
     try {
       const res = await fetch(this.baseUrl + path, {
@@ -365,6 +382,16 @@ export class EngineClient {
           res.status,
           engineErrorCode(body),
         );
+      }
+      if (expectedPayloadSha256 != null) {
+        const sourceSha256 = res.headers.get("x-airfoilfoam-source-sha256");
+        if (sourceSha256 !== expectedPayloadSha256) {
+          throw new EngineError(
+            `${init?.method ?? "GET"} ${path} returned payload source SHA-256 ${JSON.stringify(sourceSha256)}; expected ${expectedPayloadSha256}`,
+            res.status,
+            ENGINE_PAYLOAD_DIGEST_MISMATCH_CODE,
+          );
+        }
       }
       return (await res.json()) as T;
     } catch (e) {
@@ -457,6 +484,8 @@ export class EngineClient {
     return this.json<JobStatus>(
       `/jobs/${encodeURIComponent(jobId)}`,
       opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+      undefined,
+      opts?.expectedPayloadSha256,
     ).then((status) => {
       this.verifyEngineAcknowledgement(
         status,
@@ -744,7 +773,11 @@ export class EngineClient {
       opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
       {
         method: "POST",
-        body: JSON.stringify({ job_ids: jobIds }),
+        // Runtime probes establish process/status ownership. Full result
+        // payloads are fetched and validated only by the result endpoint;
+        // parsing them here can exhaust the synchronous gateway pool before
+        // stale-job recovery gets a chance to run.
+        body: JSON.stringify({ job_ids: jobIds, inspect_result: false }),
       },
     );
   }
@@ -757,6 +790,8 @@ export class EngineClient {
     return this.json<JobResult>(
       `/jobs/${encodeURIComponent(jobId)}/result`,
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
+      undefined,
+      opts?.expectedPayloadSha256,
     ).then((result) => {
       this.verifyEngineAcknowledgement(
         result,

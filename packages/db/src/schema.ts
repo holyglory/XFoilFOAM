@@ -1241,9 +1241,11 @@ export const results = pgTable(
     currentResultAttemptId: uuid("current_result_attempt_id"),
     /**
      * Current coefficient interpretation and the append-only selection event
-     * that selected it.  Both are nullable during the migration/dual-read
-     * period.  Their composite ownership FKs below forbid cross-result
-     * pointers once a versioned interpretation is selected.
+     * that selected it. Both are nullable during the migration/dual-read
+     * period. Their composite ownership FKs below forbid cross-result
+     * pointers once a versioned interpretation is selected. Migration 0104
+     * additionally requires a set pair to name this result's selected attempt
+     * and rejects historical-audit provenance from the public projection.
      */
     currentResultInterpretationId: uuid("current_result_interpretation_id"),
     currentCanonicalSelectionId: uuid("current_canonical_selection_id"),
@@ -1307,12 +1309,11 @@ export const results = pgTable(
      *  classic pointwise convergence or legacy pre-contract evidence.
      *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
     steadyHistory: jsonb("steady_history"),
-    /** Auto-retry-once marker (migration 0036): set when the sweeper's
-     *  crash-class auto-retry requeued this cell after a failed ingest. A row
-     *  that fails AGAIN with this set stays terminal/unavailable instead of a
-     *  second silent retry or a human-review chore. Deliberately NEVER written by the ingest upsert
-     *  (absent from its SET list), so it survives re-ingest of the same
-     *  failed job. NULL = never auto-retried. */
+    /** Last clean-restart marker (migration 0036): set when the sweeper
+     *  discards an unexplained failed generation and requeues this physical
+     *  cell. It is observability state, never a retry cap. Deliberately NEVER
+     *  written by the ingest upsert, so a stale re-delivery cannot reset it.
+     *  NULL = no failed generation has yet been cleanly restarted. */
     autoRetriedAt: timestamp("auto_retried_at", { withTimezone: true }),
     // linkage to the engine run
     simJobId: uuid("sim_job_id").references((): AnyPgColumn => simJobs.id, {
@@ -1849,6 +1850,7 @@ export const solverEvidenceArtifacts = pgTable(
       t.airfoilId,
       t.aoaDeg,
     ),
+    simJobIdx: index("solver_evidence_artifacts_sim_job_idx").on(t.simJobId),
     blobIdx: index("solver_evidence_artifacts_blob_idx").on(
       t.storageKey,
       t.sha256,
@@ -2121,10 +2123,10 @@ export const resultReducerVersions = pgTable(
       "result_reducer_versions_text_shape_check",
       sql`btrim(${t.reducerKey}) <> '' AND btrim(${t.reducerVersion}) <> '' AND btrim(${t.buildId}) <> '' AND btrim(${t.source}) <> ''`,
     ),
-   policyShapeCheck: check(
-     "result_reducer_versions_policy_shape_check",
-     sql`jsonb_typeof(${t.policy}) = 'object'`,
-   ),
+    policyShapeCheck: check(
+      "result_reducer_versions_policy_shape_check",
+      sql`jsonb_typeof(${t.policy}) = 'object'`,
+    ),
   }),
 );
 
@@ -2220,13 +2222,31 @@ export const resultInterpretations = pgTable(
         t.inputEvidenceSignature,
       )
       .where(sql`${t.source} = 'archive_backfill'`),
+    // A released-evidence audit has a different authority boundary from the
+    // live publication queue.  Give it a separately scoped immutable identity
+    // so a scientific audit can never reuse an `archive_backfill` row merely
+    // because its raw bytes and reducer signature happen to match.
+    historicalArchiveAttemptReducerSourceEvidenceUq: uniqueIndex(
+      "ri_historical_archive_attempt_reducer_source_evidence_uq",
+    )
+      .on(
+        t.resultAttemptId,
+        t.reducerVersionId,
+        t.sourceArchiveId,
+        t.inputEvidenceSignature,
+      )
+      .where(sql`${t.source} = 'historical_archive_audit'`),
     // Keep the original replay identity for engine-derived interpretations,
-    // which intentionally have no source archive.
+    // which intentionally have no source archive. Both archive-scoped
+    // provenance classes are excluded: neither may collide with a nonarchive
+    // interpretation, nor with each other.
     nonArchiveAttemptReducerEvidenceUq: uniqueIndex(
       "result_interpretations_nonarchive_attempt_reducer_evidence_uq",
     )
       .on(t.resultAttemptId, t.reducerVersionId, t.inputEvidenceSignature)
-      .where(sql`${t.source} <> 'archive_backfill'`),
+      .where(
+        sql`${t.source} <> 'archive_backfill' AND ${t.source} <> 'historical_archive_audit'`,
+      ),
     idResultUq: unique("result_interpretations_id_result_uq").on(
       t.id,
       t.resultId,
@@ -2254,7 +2274,7 @@ export const resultInterpretations = pgTable(
     ),
     sourceCheck: check(
       "result_interpretations_source_check",
-      sql`${t.source} IN ('engine_reported', 'archive_backfill', 'continuation', 'corrective_generation') AND btrim(${t.inputEvidenceSignature}) <> '' AND ((${t.source} = 'archive_backfill' AND ${t.sourceArchiveId} IS NOT NULL) OR (${t.source} <> 'archive_backfill'))`,
+      sql`${t.source} IN ('engine_reported', 'archive_backfill', 'historical_archive_audit', 'continuation', 'corrective_generation') AND btrim(${t.inputEvidenceSignature}) <> '' AND ((${t.source} IN ('archive_backfill', 'historical_archive_audit') AND ${t.sourceArchiveId} IS NOT NULL) OR (${t.source} NOT IN ('archive_backfill', 'historical_archive_audit')))`,
     ),
     stateShapeCheck: check(
       "result_interpretations_state_shape_check",
@@ -2444,6 +2464,20 @@ export const resultInterpretationBackfillItems = pgTable(
       .defaultNow(),
     lastError: text("last_error"),
     resultInterpretationId: uuid("result_interpretation_id"),
+    /**
+     * A historical released-evidence audit has one child execution receipt
+     * and one immutable decision.  The child owns this reverse pointer so a
+     * decision cannot be inserted without a terminal, claimed execution
+     * lifecycle.  The database migration supplies the deferred FK because
+     * the decision table is declared below this table in the schema module.
+     */
+    historicalAuditDecisionId: uuid("historical_audit_decision_id"),
+    /** Exact reducer outcome bound to `historicalAuditDecisionId`. */
+    historicalAuditReducerState: text("historical_audit_reducer_state"),
+    /** SHA-256 of the exact archive evidence used for that audit outcome. */
+    historicalAuditInputEvidenceSignature: text(
+      "historical_audit_input_evidence_signature",
+    ),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
       .notNull()
@@ -2512,6 +2546,29 @@ export const resultInterpretationBackfillItems = pgTable(
       "result_interpretation_backfill_items_reduced_shape_check",
       sql`${t.state} <> 'reduced' OR ${t.resultInterpretationId} IS NOT NULL`,
     ),
+    /** The migration adds the deferred foreign key to the later-declared
+     * decision table. Keep the local shape/index contract here too, so schema
+     * readers cannot mistake a partial receipt for ordinary queue metadata. */
+    historicalAuditReceiptShapeCheck: check(
+      "ri_bf_item_audit_receipt_shape_ck",
+      sql`(
+        ${t.historicalAuditDecisionId} IS NULL
+        AND ${t.historicalAuditReducerState} IS NULL
+        AND ${t.historicalAuditInputEvidenceSignature} IS NULL
+      ) OR (
+        ${t.historicalAuditDecisionId} IS NOT NULL
+        AND ${t.historicalAuditReducerState} IS NOT NULL
+        AND ${t.historicalAuditReducerState} IN (
+          'accepted', 'continuation_required', 'recovery_exhausted',
+          'rerun_required', 'missing_evidence'
+        )
+        AND ${t.historicalAuditInputEvidenceSignature} IS NOT NULL
+        AND ${t.historicalAuditInputEvidenceSignature} ~ '^[0-9a-f]{64}$'
+      )`,
+    ),
+    historicalAuditDecisionUq: uniqueIndex("ri_bf_item_audit_decision_uq")
+      .on(t.historicalAuditDecisionId)
+      .where(sql`${t.historicalAuditDecisionId} IS NOT NULL`),
   }),
 );
 
@@ -2602,7 +2659,7 @@ export const resultArchiveReductionQueue = pgTable(
     ),
     stateCheck: check(
       "result_archive_reduction_queue_state_check",
-      sql`${t.state} IN ('pending', 'hydrating', 'reduced', 'superseded', 'missing_evidence', 'continuation_required', 'rerun_required', 'terminal_failure', 'failed')`,
+      sql`${t.state} IN ('pending', 'hydrating', 'reduced', 'superseded', 'historical_audit_required', 'missing_evidence', 'continuation_required', 'rerun_required', 'terminal_failure', 'failed')`,
     ),
     attemptCountCheck: check(
       "result_archive_reduction_queue_attempt_count_check",
@@ -2623,6 +2680,125 @@ export const resultArchiveReductionQueue = pgTable(
     reducedShapeCheck: check(
       "result_archive_reduction_queue_reduced_shape_check",
       sql`${t.state} <> 'reduced' OR ${t.resultInterpretationId} IS NOT NULL`,
+    ),
+  }),
+);
+
+/**
+ * Immutable, non-publishing record of a historical GCS archive audit.
+ *
+ * This is deliberately separate from both the live archive-publication queue
+ * and `result_interpretation_recovery_actions`: a retained historical attempt
+ * may be reduced for forensic/scientific inspection without becoming a
+ * canonical result or creating any scheduler-owned physical work.  The linked
+ * optional interpretation remains append-only evidence; this decision records
+ * the exact reducer outcome and, at most, an advisory same-case continuation
+ * instruction for a human/operator-owned next step.
+ */
+export const historicalArchiveAuditDecisions = pgTable(
+  "historical_archive_audit_decisions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    auditRunId: uuid("audit_run_id")
+      .notNull()
+      .references(() => resultInterpretationBackfillRuns.id, {
+        onDelete: "restrict",
+      }),
+    resultId: uuid("result_id")
+      .notNull()
+      .references(() => results.id, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    sourceArchiveId: uuid("source_archive_id").notNull(),
+    reducerVersionId: uuid("reducer_version_id")
+      .notNull()
+      .references(() => resultReducerVersions.id, { onDelete: "restrict" }),
+    inputEvidenceSignature: text("input_evidence_signature").notNull(),
+    /**
+     * Exact engine-side archive reducer outcome; it is not a scheduler state.
+     * The historical-audit insert trigger binds accepted/continuation/terminal
+     * outcomes to a same-source immutable interpretation and requires
+     * `missing_evidence` to remain pointer-free.
+     */
+    reducerState: text("reducer_state").notNull(),
+    /** Optional immutable scientific interpretation staged by the audit. */
+    resultInterpretationId: uuid("result_interpretation_id"),
+    /**
+     * A non-executable, exact-case recommendation.  Only a reducer that
+     * requests a clean-tail continuation may carry it; the audit table has no
+     * target request/queue fields by design.
+     */
+    advisoryContinuationAction: text("advisory_continuation_action"),
+    advisoryTailPeriods: integer("advisory_tail_periods"),
+    diagnostics: jsonb("diagnostics")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    attemptOwnerFk: foreignKey({
+      columns: [t.resultAttemptId, t.resultId],
+      foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+      name: "historical_archive_audit_decisions_attempt_owner_fk",
+    }).onDelete("cascade"),
+    archiveOwnerFk: foreignKey({
+      columns: [t.sourceArchiveId, t.resultAttemptId],
+      foreignColumns: [
+        solverEvidenceArchives.id,
+        solverEvidenceArchives.resultAttemptId,
+      ],
+      name: "historical_archive_audit_decisions_archive_owner_fk",
+    }).onDelete("restrict"),
+    interpretationOwnerFk: foreignKey({
+      columns: [t.resultInterpretationId, t.resultAttemptId, t.resultId],
+      foreignColumns: [
+        resultInterpretations.id,
+        resultInterpretations.resultAttemptId,
+        resultInterpretations.resultId,
+      ],
+      name: "historical_archive_audit_decisions_interpretation_owner_fk",
+    }).onDelete("restrict"),
+    identityUq: uniqueIndex(
+      "historical_archive_audit_decisions_identity_uq",
+    ).on(
+      t.resultAttemptId,
+      t.sourceArchiveId,
+      t.reducerVersionId,
+      t.inputEvidenceSignature,
+    ),
+    auditRunUq: uniqueIndex(
+      "historical_archive_audit_decisions_audit_run_uq",
+    ).on(t.auditRunId),
+    auditRunIdx: index("historical_archive_audit_decisions_audit_run_idx").on(
+      t.auditRunId,
+      t.createdAt,
+    ),
+    resultCreatedIdx: index(
+      "historical_archive_audit_decisions_result_created_idx",
+    ).on(t.resultId, t.createdAt),
+    signatureCheck: check(
+      "historical_archive_audit_decisions_signature_check",
+      sql`${t.inputEvidenceSignature} ~ '^[0-9a-f]{64}$'`,
+    ),
+    reducerStateCheck: check(
+      "historical_archive_audit_decisions_reducer_state_check",
+      sql`${t.reducerState} IN ('accepted', 'continuation_required', 'recovery_exhausted', 'rerun_required', 'missing_evidence')`,
+    ),
+    advisoryShapeCheck: check(
+      "historical_archive_audit_decisions_advisory_shape_check",
+      sql`(
+        ${t.reducerState} = 'continuation_required'
+        AND ${t.advisoryContinuationAction} = 'continue_exact_case'
+        AND ${t.advisoryTailPeriods} BETWEEN 1 AND 3
+      ) OR (
+        ${t.reducerState} <> 'continuation_required'
+        AND ${t.advisoryContinuationAction} IS NULL
+        AND ${t.advisoryTailPeriods} IS NULL
+      )`,
+    ),
+    diagnosticsShapeCheck: check(
+      "historical_archive_audit_decisions_diagnostics_shape_check",
+      sql`jsonb_typeof(${t.diagnostics}) = 'object'`,
     ),
   }),
 );
@@ -2659,6 +2835,11 @@ export const resultInterpretationRecoveryActions = pgTable(
      * trajectory.
      */
     correctiveTailPeriods: integer("corrective_tail_periods"),
+    /** Explicit v2 authority emitted by an authenticated archive reduction.
+     * NULL preserves the immutable legacy FAST=9 / FINAL=12 contract. */
+    cleanCycleRecoveryPolicyVersion: text(
+      "clean_cycle_recovery_policy_version",
+    ),
     /**
      * pending -> routing -> routed/waiting/blocked/satisfied.  Lease fields
      * belong here rather than to scientific evidence, so a sweeper restart
@@ -2747,6 +2928,10 @@ export const resultInterpretationRecoveryActions = pgTable(
     correctiveTailPeriodsCheck: check(
       "ri_recovery_tail_periods_ck",
       sql`${t.correctiveTailPeriods} IS NULL OR ${t.correctiveTailPeriods} BETWEEN 1 AND 3`,
+    ),
+    cleanCycleRecoveryPolicyVersionCheck: check(
+      "ri_recovery_policy_version_ck",
+      sql`${t.cleanCycleRecoveryPolicyVersion} IS NULL OR ${t.cleanCycleRecoveryPolicyVersion} = 'adaptive-clean-tail-v2'`,
     ),
     stateCheck: check(
       "result_interpretation_recovery_actions_state_check",
@@ -2852,9 +3037,9 @@ export const legacyUransArchiveGapRecoveryActions = pgTable(
       foreignColumns: [resultAttempts.id, resultAttempts.resultId],
       name: "legacy_urans_archive_gap_recovery_attempt_owner_fk",
     }).onDelete("cascade"),
-    sourceAttemptUq: uniqueIndex("legacy_urans_archive_gap_recovery_source_uq").on(
-      t.resultAttemptId,
-    ),
+    sourceAttemptUq: uniqueIndex(
+      "legacy_urans_archive_gap_recovery_source_uq",
+    ).on(t.resultAttemptId),
     readyIdx: index("legacy_urans_archive_gap_recovery_ready_idx").on(
       t.state,
       t.nextAttemptAt,
@@ -2914,8 +3099,10 @@ export const legacyUransArchiveGapRecoveryActions = pgTable(
 
 /**
  * Append-only choice of which immutable interpretation projects into a
- * result.  Rollback means adding a later selection, never editing a prior
- * scientific claim or selection record.
+ * result. Rollback means adding a later selection, never editing a prior
+ * scientific claim or selection record. Historical released-evidence audit
+ * interpretations remain retained scientific provenance, but migration 0104
+ * forbids them as new canonical selections and result projections.
  */
 export const resultCanonicalSelections = pgTable(
   "result_canonical_selections",
@@ -2964,281 +3151,6 @@ export const resultCanonicalSelections = pgTable(
     textShapeCheck: check(
       "result_canonical_selections_text_shape_check",
       sql`btrim(${t.selectionNamespace}) <> '' AND btrim(${t.reason}) <> '' AND btrim(${t.actor}) <> ''`,
-    ),
-  }),
-);
-
-/**
- * Immutable quarantine for a genuine solver archive whose exact engine
- * job/case has no result or result-attempt owner.  This is preservation and
- * operator discovery only: it deliberately carries no coefficients, AoA, or
- * polar/result ownership.  The exact manifest member set is retained as JSON
- * because no logical result-artifact rows existed when the worker died.
- */
-export const solverEvidenceOrphanQuarantines = pgTable(
-  "solver_evidence_orphan_quarantines",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    simJobId: uuid("sim_job_id")
-      .notNull()
-      .references((): AnyPgColumn => simJobs.id),
-    engineJobId: text("engine_job_id").notNull(),
-    engineCaseSlug: text("engine_case_slug").notNull(),
-    evidencePath: text("evidence_path").notNull(),
-    quarantineReason: text("quarantine_reason")
-      .notNull()
-      .default("terminal_engine_evidence_not_ingested"),
-    sourceArtifactId: uuid("source_artifact_id")
-      .notNull()
-      .references(() => solverEvidenceArtifacts.id),
-    blobId: uuid("blob_id")
-      .notNull()
-      .references(() => solverEvidenceBlobs.id),
-    manifestSha256: text("manifest_sha256").notNull(),
-    manifestByteSize: bigint("manifest_byte_size", {
-      mode: "number",
-    }).notNull(),
-    archiveMemberSetSha256: text("archive_member_set_sha256").notNull(),
-    archiveMemberCount: integer("archive_member_count").notNull(),
-    archiveMembers: jsonb("archive_members")
-      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
-      .notNull(),
-    sourceArchives: jsonb("source_archives")
-      .$type<
-        Array<{
-          path: string;
-          compression: "gzip" | "zstd";
-          sha256: string;
-          byteSize: number;
-          uncompressedTarSha256?: string;
-          uncompressedTarByteSize?: number;
-        }>
-      >()
-      .notNull(),
-    migrationReceiptSha256: text("migration_receipt_sha256").notNull(),
-    migrationReceiptByteSize: bigint("migration_receipt_byte_size", {
-      mode: "number",
-    }).notNull(),
-    verificationMode: text("verification_mode").notNull(),
-    remoteVerifiedAt: ts().notNull(),
-    createdAt: ts().notNull().defaultNow(),
-  },
-  (t) => ({
-    jobEvidenceUq: unique(
-      "solver_evidence_orphan_quarantines_job_evidence_uq",
-    ).on(t.engineJobId, t.evidencePath),
-    sourceArtifactUq: unique(
-      "solver_evidence_orphan_quarantines_source_artifact_uq",
-    ).on(t.sourceArtifactId),
-    simJobIdx: index("solver_evidence_orphan_quarantines_sim_job_idx").on(
-      t.simJobId,
-    ),
-    blobIdx: index("solver_evidence_orphan_quarantines_blob_idx").on(t.blobId),
-    createdIdx: index("solver_evidence_orphan_quarantines_created_idx").on(
-      t.createdAt,
-    ),
-    jobIdCheck: check(
-      "solver_evidence_orphan_quarantines_job_id_check",
-      sql`btrim(${t.engineJobId}) <> '' AND ${t.engineJobId} !~ '[/\\\\]'`,
-    ),
-    caseSlugCheck: check(
-      "solver_evidence_orphan_quarantines_case_slug_check",
-      sql`btrim(${t.engineCaseSlug}) <> '' AND ${t.engineCaseSlug} !~ '[/\\\\]' AND ${t.engineCaseSlug} NOT IN ('.', '..')`,
-    ),
-    evidencePathCheck: check(
-      "solver_evidence_orphan_quarantines_evidence_path_check",
-      sql`btrim(${t.evidencePath}) <> '' AND ${t.evidencePath} NOT LIKE '/%' AND ${t.evidencePath} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.evidencePath}) = 0`,
-    ),
-    reasonCheck: check(
-      "solver_evidence_orphan_quarantines_reason_check",
-      sql`${t.quarantineReason} = 'terminal_engine_evidence_not_ingested'`,
-    ),
-    manifestShaCheck: check(
-      "solver_evidence_orphan_quarantines_manifest_sha_check",
-      sql`${t.manifestSha256} ~ '^[0-9a-f]{64}$'`,
-    ),
-    manifestSizeCheck: check(
-      "solver_evidence_orphan_quarantines_manifest_size_check",
-      sql`${t.manifestByteSize} > 0`,
-    ),
-    memberSetShaCheck: check(
-      "solver_evidence_orphan_quarantines_member_set_sha_check",
-      sql`${t.archiveMemberSetSha256} ~ '^[0-9a-f]{64}$'`,
-    ),
-    memberCountCheck: check(
-      "solver_evidence_orphan_quarantines_member_count_check",
-      sql`${t.archiveMemberCount} > 0`,
-    ),
-    archiveMembersCheck: check(
-      "solver_evidence_orphan_quarantines_archive_members_check",
-      sql`jsonb_typeof(${t.archiveMembers}) = 'array'`,
-    ),
-    sourceArchivesCheck: check(
-      "solver_evidence_orphan_quarantines_source_archives_check",
-      sql`jsonb_typeof(${t.sourceArchives}) = 'array' AND jsonb_array_length(${t.sourceArchives}) > 0`,
-    ),
-    receiptShaCheck: check(
-      "solver_evidence_orphan_quarantines_receipt_sha_check",
-      sql`${t.migrationReceiptSha256} ~ '^[0-9a-f]{64}$'`,
-    ),
-    receiptSizeCheck: check(
-      "solver_evidence_orphan_quarantines_receipt_size_check",
-      sql`${t.migrationReceiptByteSize} > 0`,
-    ),
-  }),
-);
-
-/**
- * Immutable preservation record for a terminal solver evidence directory whose
- * original package is incomplete and therefore cannot be registered as a
- * canonical engine bundle.  The forensic package is intentionally linked only
- * to its physical GCS blob: it owns no result, result attempt, AoA, evidence
- * artifact, or solver-evidence archive.
- */
-export const solverEvidenceIncompleteQuarantines = pgTable(
-  "solver_evidence_incomplete_quarantines",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    simJobId: uuid("sim_job_id")
-      .notNull()
-      .references((): AnyPgColumn => simJobs.id),
-    engineJobId: text("engine_job_id").notNull(),
-    engineCaseSlug: text("engine_case_slug").notNull(),
-    evidencePath: text("evidence_path").notNull(),
-    quarantineReason: text("quarantine_reason")
-      .notNull()
-      .default("terminal_uningested_incomplete_archive"),
-    blobId: uuid("blob_id")
-      .notNull()
-      .references(() => solverEvidenceBlobs.id),
-    originalManifestSha256: text("original_manifest_sha256").notNull(),
-    originalManifestByteSize: bigint("original_manifest_byte_size", {
-      mode: "number",
-    }).notNull(),
-    expectedMemberSetSha256: text("expected_member_set_sha256").notNull(),
-    expectedMemberCount: integer("expected_member_count").notNull(),
-    retainedMemberSetSha256: text("retained_member_set_sha256").notNull(),
-    retainedMemberCount: integer("retained_member_count").notNull(),
-    missingMemberSetSha256: text("missing_member_set_sha256").notNull(),
-    missingMemberCount: integer("missing_member_count").notNull(),
-    expectedMembers: jsonb("expected_members")
-      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
-      .notNull(),
-    retainedMembers: jsonb("retained_members")
-      .$type<
-        Array<{
-          path: string;
-          sha256: string;
-          byteSize: number;
-          packagePath: string;
-          sources: Array<
-            | { kind: "local_raw"; sourcePath: string }
-            | {
-                kind: "corrupt_archive_member" | "sibling_archive_member";
-                sourceArchiveSha256: string;
-                memberPath: string;
-              }
-          >;
-        }>
-      >()
-      .notNull(),
-    missingMembers: jsonb("missing_members")
-      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
-      .notNull(),
-    sourceArchives: jsonb("source_archives")
-      .$type<
-        Array<{
-          role: "corrupt_original" | "recovery_sibling";
-          jobId: string;
-          evidencePath: string;
-          path: string;
-          compression: "gzip" | "zstd";
-          sha256: string;
-          byteSize: number;
-          integrity: "truncated" | "verified_complete";
-          packagePath?: string;
-          readableTarByteSize?: number;
-          terminalError?: string;
-          uncompressedTarSha256?: string;
-          uncompressedTarByteSize?: number;
-        }>
-      >()
-      .notNull(),
-    packageManifestSha256: text("package_manifest_sha256").notNull(),
-    packageManifestByteSize: bigint("package_manifest_byte_size", {
-      mode: "number",
-    }).notNull(),
-    packageMemberSetSha256: text("package_member_set_sha256").notNull(),
-    packageMemberCount: integer("package_member_count").notNull(),
-    packageMembers: jsonb("package_members")
-      .$type<Array<{ path: string; sha256: string; byteSize: number }>>()
-      .notNull(),
-    migrationReceiptSha256: text("migration_receipt_sha256").notNull(),
-    migrationReceiptByteSize: bigint("migration_receipt_byte_size", {
-      mode: "number",
-    }).notNull(),
-    verificationMode: text("verification_mode").notNull(),
-    remoteVerifiedAt: ts().notNull(),
-    createdAt: ts().notNull().defaultNow(),
-  },
-  (t) => ({
-    jobEvidenceUq: unique(
-      "solver_evidence_incomplete_quarantines_job_evidence_uq",
-    ).on(t.engineJobId, t.evidencePath),
-    blobUq: unique("solver_evidence_incomplete_quarantines_blob_uq").on(
-      t.blobId,
-    ),
-    simJobIdx: index("solver_evidence_incomplete_quarantines_sim_job_idx").on(
-      t.simJobId,
-    ),
-    createdIdx: index("solver_evidence_incomplete_quarantines_created_idx").on(
-      t.createdAt,
-    ),
-    jobIdCheck: check(
-      "solver_evidence_incomplete_quarantines_job_id_check",
-      sql`btrim(${t.engineJobId}) <> '' AND ${t.engineJobId} !~ '[/\\\\]'`,
-    ),
-    caseSlugCheck: check(
-      "solver_evidence_incomplete_quarantines_case_slug_check",
-      sql`btrim(${t.engineCaseSlug}) <> '' AND ${t.engineCaseSlug} !~ '[/\\\\]' AND ${t.engineCaseSlug} NOT IN ('.', '..')`,
-    ),
-    evidencePathCheck: check(
-      "solver_evidence_incomplete_quarantines_evidence_path_check",
-      sql`btrim(${t.evidencePath}) <> '' AND ${t.evidencePath} NOT LIKE '/%' AND ${t.evidencePath} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.evidencePath}) = 0`,
-    ),
-    reasonCheck: check(
-      "solver_evidence_incomplete_quarantines_reason_check",
-      sql`${t.quarantineReason} = 'terminal_uningested_incomplete_archive'`,
-    ),
-    identityChecks: check(
-      "solver_evidence_incomplete_quarantines_identity_checks",
-      sql`${t.originalManifestSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.originalManifestByteSize} > 0
-        AND ${t.expectedMemberSetSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.retainedMemberSetSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.missingMemberSetSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.packageManifestSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.packageManifestByteSize} > 0
-        AND ${t.packageMemberSetSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.migrationReceiptSha256} ~ '^[0-9a-f]{64}$'
-        AND ${t.migrationReceiptByteSize} > 0`,
-    ),
-    countChecks: check(
-      "solver_evidence_incomplete_quarantines_count_checks",
-      sql`${t.expectedMemberCount} > 0
-        AND ${t.retainedMemberCount} >= 0
-        AND ${t.missingMemberCount} >= 0
-        AND ${t.expectedMemberCount} = ${t.retainedMemberCount} + ${t.missingMemberCount}
-        AND ${t.packageMemberCount} > 0`,
-    ),
-    jsonChecks: check(
-      "solver_evidence_incomplete_quarantines_json_checks",
-      sql`jsonb_typeof(${t.expectedMembers}) = 'array'
-        AND jsonb_typeof(${t.retainedMembers}) = 'array'
-        AND jsonb_typeof(${t.missingMembers}) = 'array'
-        AND jsonb_typeof(${t.sourceArchives}) = 'array'
-        AND jsonb_array_length(${t.sourceArchives}) > 0
-        AND jsonb_typeof(${t.packageMembers}) = 'array'`,
     ),
   }),
 );
@@ -3983,6 +3895,7 @@ export const simJobs = pgTable(
       files_removed?: number;
       kept_case_state?: boolean;
       note?: string;
+      unknown_entries_count?: number;
     }>(),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
@@ -4165,6 +4078,13 @@ export const sweeperState = pgTable(
     lastAdmissionFenceDetails: jsonb("last_admission_fence_details").$type<
       Record<string, unknown>
     >(),
+    // Production-only engine maintenance ownership.  The watcher acquires
+    // this token atomically with enabled=false; no file receipt or admin
+    // action may infer ownership of the pause.
+    maintenanceDrainToken: uuid("maintenance_drain_token"),
+    maintenanceDrainStartedAt: timestamp("maintenance_drain_started_at", {
+      withTimezone: true,
+    }),
     updatedAt: ts()
       .notNull()
       .defaultNow()
@@ -4182,6 +4102,18 @@ export const sweeperState = pgTable(
       AND btrim(COALESCE(${t.lastAdmissionFenceTriggerKey}, '')) <> ''
       AND ${t.lastAdmissionFenceDetails} IS NOT NULL
     )`,
+    ),
+    maintenanceDrainShapeCheck: check(
+      "sweeper_state_maintenance_drain_shape_check",
+      sql`(${t.maintenanceDrainToken} IS NULL) =
+        (${t.maintenanceDrainStartedAt} IS NULL)
+      AND (
+        ${t.maintenanceDrainToken} IS NULL
+        OR (
+          ${t.enabled} = false
+          AND ${t.admissionFenceActive} = false
+        )
+      )`,
     ),
   }),
 );
@@ -4990,6 +4922,10 @@ export const simUransRequests = pgTable(
      * whole-period tail. NULL preserves legacy/source-heuristic continuations
      * and is mandatory for a fresh request. */
     correctiveTailPeriods: integer("corrective_tail_periods"),
+    /** Durable policy lineage for an exact resumed transient. NULL is v1. */
+    cleanCycleRecoveryPolicyVersion: text(
+      "clean_cycle_recovery_policy_version",
+    ),
     /** Immutable audit provenance for the creator. Never infer current
      * scheduling or cancellation ownership from this value. */
     requestedBy: text("requested_by"),
@@ -5023,6 +4959,17 @@ export const simUransRequests = pgTable(
         ${t.continueFromResultId} IS NOT NULL
         AND ${t.continueFromResultAttemptId} IS NOT NULL
       )`,
+    ),
+    cleanCycleRecoveryPolicyContinuationCheck: check(
+      "sim_urans_recovery_policy_continue_ck",
+      sql`${t.cleanCycleRecoveryPolicyVersion} IS NULL OR (
+        ${t.continueFromResultId} IS NOT NULL
+        AND ${t.continueFromResultAttemptId} IS NOT NULL
+      )`,
+    ),
+    cleanCycleRecoveryPolicyVersionCheck: check(
+      "sim_urans_recovery_policy_version_ck",
+      sql`${t.cleanCycleRecoveryPolicyVersion} IS NULL OR ${t.cleanCycleRecoveryPolicyVersion} = 'adaptive-clean-tail-v2'`,
     ),
     openCellUq: uniqueIndex("sim_urans_requests_open_cell_uq")
       .on(
@@ -6582,6 +6529,8 @@ export type ResultInterpretationBackfillItem =
   typeof resultInterpretationBackfillItems.$inferSelect;
 export type ResultArchiveReductionQueueItem =
   typeof resultArchiveReductionQueue.$inferSelect;
+export type HistoricalArchiveAuditDecision =
+  typeof historicalArchiveAuditDecisions.$inferSelect;
 export type ResultInterpretationRecoveryAction =
   typeof resultInterpretationRecoveryActions.$inferSelect;
 export type ResultCanonicalSelection =
@@ -6595,10 +6544,6 @@ export type SolverEvidenceBlob = typeof solverEvidenceBlobs.$inferSelect;
 export type SolverEvidenceArchive = typeof solverEvidenceArchives.$inferSelect;
 export type SolverEvidenceArtifactMember =
   typeof solverEvidenceArtifactMembers.$inferSelect;
-export type SolverEvidenceOrphanQuarantine =
-  typeof solverEvidenceOrphanQuarantines.$inferSelect;
-export type SolverEvidenceIncompleteQuarantine =
-  typeof solverEvidenceIncompleteQuarantines.$inferSelect;
 export type FieldRenderCache = typeof fieldRenderCache.$inferSelect;
 export type ForceHistoryRow = typeof forceHistory.$inferSelect;
 export type ResultClassification = typeof resultClassifications.$inferSelect;

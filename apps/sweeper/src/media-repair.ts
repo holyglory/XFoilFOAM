@@ -27,6 +27,7 @@ import {
   repairDefaultMediaForStoredResult,
   verifyStoredDefaultMediaForResult,
 } from "./ingest";
+import { ordinaryWriterBlockedByMaintenanceDrain } from "./maintenance-drain";
 
 interface CampaignOwner {
   campaign_id: string;
@@ -215,6 +216,17 @@ export async function resultMediaRepairTick(
   } = {},
 ): Promise<ResultMediaRepairTickOutcome> {
   const dirty = new Map<string, CampaignLaneKey>();
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) {
+    return {
+      discovered: 0,
+      finalized: 0,
+      claimed: false,
+      repairedMedia: 0,
+      retrying: 0,
+      blocked: 0,
+      dirtyLanes: [],
+    };
+  }
   const discovered = await discoverMissingResultMediaRepairs(db, {
     limit: opts.discoveryLimit,
     resultId: opts.resultId,

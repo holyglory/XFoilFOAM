@@ -35,6 +35,8 @@ beforeAll(async () => {
       lastAdmissionFenceAt: new Date(),
       lastAdmissionFenceReason: "blocked_final_urans",
       lastAdmissionFenceTriggerKey: "verify:test-resume-contract",
+      maintenanceDrainToken: null,
+      maintenanceDrainStartedAt: null,
       lastAdmissionFenceDetails: {
         stage: "final",
         fidelity: "full",
@@ -64,6 +66,8 @@ afterAll(async () => {
         lastAdmissionFenceTriggerKey:
           originalState.lastAdmissionFenceTriggerKey,
         lastAdmissionFenceDetails: originalState.lastAdmissionFenceDetails,
+        maintenanceDrainToken: originalState.maintenanceDrainToken,
+        maintenanceDrainStartedAt: originalState.maintenanceDrainStartedAt,
       })
       .where(eq(sweeperState.id, 1));
   }
@@ -263,5 +267,108 @@ describe("sweeper admission-fence operator recovery", () => {
         previousCpuSlots: 12,
       },
     });
+  });
+
+  it("keeps maintenance ownership private and returns 409 for operator pause or resume", async () => {
+    const maintenanceToken = "5a1b3b8b-c9dd-4b5e-a4d0-9fb6c3786f40";
+    const maintenanceStartedAt = new Date("2026-08-02T00:00:00.000Z");
+    await db
+      .update(sweeperState)
+      .set({
+        enabled: false,
+        admissionFenceActive: false,
+        maintenanceDrainToken: maintenanceToken,
+        maintenanceDrainStartedAt: maintenanceStartedAt,
+      })
+      .where(eq(sweeperState.id, 1));
+
+    try {
+      const publicResponse = await app.inject({
+        method: "GET",
+        url: "/api/sweeper",
+      });
+      expect(publicResponse.statusCode).toBe(200);
+      expect(publicResponse.json()).not.toHaveProperty("maintenanceDrainToken");
+      expect(publicResponse.json()).not.toHaveProperty(
+        "maintenanceDrainStartedAt",
+      );
+
+      const adminResponse = await app.inject({
+        method: "GET",
+        url: "/api/admin/sweeper",
+      });
+      expect(adminResponse.statusCode).toBe(200);
+      const adminState = adminResponse.json();
+      expect(adminState).toMatchObject({
+        enabled: false,
+        maintenanceDrainActive: true,
+      });
+      expect(Date.parse(adminState.maintenanceDrainStartedAt)).toBe(
+        maintenanceStartedAt.getTime(),
+      );
+      expect(adminState).not.toHaveProperty("maintenanceDrainToken");
+
+      const campaignsResponse = await app.inject({
+        method: "GET",
+        url: "/api/admin/campaigns?limit=1",
+      });
+      expect(campaignsResponse.statusCode).toBe(200);
+      const campaignState = campaignsResponse.json().solverState;
+      expect(campaignState).toMatchObject({
+        enabled: false,
+        admissionFenceActive: false,
+        maintenanceDrainActive: true,
+      });
+      expect(Date.parse(campaignState.maintenanceDrainStartedAt)).toBe(
+        maintenanceStartedAt.getTime(),
+      );
+      expect(campaignState).not.toHaveProperty("maintenanceDrainToken");
+
+      const queueResponse = await app.inject({
+        method: "GET",
+        url: "/api/admin/queue?scope=activity",
+      });
+      expect(queueResponse.statusCode).toBe(200);
+      const queueState = queueResponse.json().sweeper;
+      expect(queueState).toMatchObject({
+        enabled: false,
+        admissionFenceActive: false,
+        maintenanceDrainActive: true,
+      });
+      expect(Date.parse(queueState.maintenanceDrainStartedAt)).toBe(
+        maintenanceStartedAt.getTime(),
+      );
+      expect(queueState).not.toHaveProperty("maintenanceDrainToken");
+
+      for (const enabled of [false, true]) {
+        const writeResponse = await app.inject({
+          method: "PATCH",
+          url: "/api/admin/sweeper",
+          payload: { enabled },
+        });
+        expect(writeResponse.statusCode).toBe(409);
+        expect(writeResponse.json()).toMatchObject({
+          code: "SWEEPER_MAINTENANCE_DRAIN_ACTIVE",
+        });
+      }
+
+      await expect(writeSweeperState({ enabled: true })).rejects.toMatchObject({
+        statusCode: 409,
+        code: "SWEEPER_MAINTENANCE_DRAIN_ACTIVE",
+      });
+      expect(await readRawState()).toMatchObject({
+        enabled: false,
+        admissionFenceActive: false,
+        maintenanceDrainToken: maintenanceToken,
+      });
+    } finally {
+      await db
+        .update(sweeperState)
+        .set({
+          maintenanceDrainToken: null,
+          maintenanceDrainStartedAt: null,
+        })
+        .where(eq(sweeperState.id, 1));
+    }
   });
 });

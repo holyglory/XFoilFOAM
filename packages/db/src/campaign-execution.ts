@@ -20,14 +20,10 @@ import { createHash } from "node:crypto";
 import type { DB } from "./client";
 import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
-  RANS_RECOVERY_REMEDIATION_VERSION,
-  ransMeshRecoveryRemediationVersion,
-  recordSolverIncidentInTransaction,
   resolveOlderRansMeshIncidentsInTransaction,
   resolveSolverIncidentsForAcceptedResultsInTransaction,
 } from "./solver-incidents";
 import {
-  LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_SNAPSHOT,
   type SolverImplementationSnapshot,
 } from "./solver-implementations";
@@ -40,6 +36,8 @@ import {
   simCampaignPlanRevisions,
   simCampaignPoints,
   simCampaigns,
+  simJobs,
+  results,
 } from "./schema";
 
 // ---------------------------------------------------------------------------
@@ -798,8 +796,8 @@ const AUTOMATIC_RANS_HANDOFF_RESULT_SQL = sql`(
   )
 )`;
 
-/** Deterministic RANS mesh/setup evidence is terminal without consuming the
- * generic crash retry. Typed disposition wins over text. Only when the latest
+/** Deterministic RANS mesh/setup evidence is terminal without a clean
+ * restart. Typed disposition wins over text. Only when the latest
  * exact attempt predates typed dispositions (or no attempt exists at all) may
  * the paired legacy markers classify the result as mesh-quality work. */
 const TERMINAL_RANS_DETERMINISTIC_MESH_SQL = sql`(
@@ -845,7 +843,7 @@ const RESULT_SUBMIT_BLOCKED_SQL = sql`EXISTS (
  * only after machine recovery is genuinely terminal:
  *   - deterministic mesh/setup evidence has no unchanged retry;
  *   - an answered engine submission is durably blocked; or
- *   - the one generic crash retry was already consumed.
+ *   - its typed repair/continuation route explicitly owns it.
  *
  * The first untyped/infrastructure-shaped crash remains transient between
  * partial ingest and autoRetryCrashedResultsForJob; otherwise fast polling can
@@ -859,10 +857,7 @@ const TERMINAL_RANS_MACHINE_BLOCKER_SQL = sql`(
     (${RESULT_SUBMIT_BLOCKED_SQL})
     OR (
       r.status = 'failed'
-      AND (
-        r.auto_retried_at IS NOT NULL
-        OR (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
-      )
+      AND (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
     )
     OR (
       r.status = 'done'
@@ -873,7 +868,7 @@ const TERMINAL_RANS_MACHINE_BLOCKER_SQL = sql`(
 
 /** Temporary visibility guard for the narrow ingest→generic-retry boundary.
  * This state is still machine-owned open work, never a failed/rejected point
- * and never a critical blocker until retry exhaustion is persisted. */
+ * and never a critical blocker before its typed recovery state is persisted. */
 const TRANSIENT_RANS_MACHINE_RECOVERY_SQL = sql`(
   r.status = 'failed'
   AND (${NON_URANS_RESULT_SQL})
@@ -1180,7 +1175,9 @@ export async function refreshCampaignProgressForResultIds(
       airfoil_id: simCampaignPoints.airfoilId,
     })
     .from(simCampaignPoints)
-    .where(inArray(simCampaignPoints.resultId, ids))) as CampaignProgressKeyRow[];
+    .where(
+      inArray(simCampaignPoints.resultId, ids),
+    )) as CampaignProgressKeyRow[];
   const keys = dedupeProgressKeys(rows);
   await recomputeProgressForKeys(db, keys);
   await probeCampaignCompletions(
@@ -1799,14 +1796,12 @@ export async function onResultIngested(
 }
 
 // ---------------------------------------------------------------------------
-// Auto-retry-once (approved design c19fd74a, amendment B): a crash-class
-// failed point (results.status = 'failed') gets ONE automatic requeue before
-// remaining failed/blocked. Marker = results.auto_retried_at (migration 0036):
-// it lives on the durable cell row so it survives re-ingest of the same failed
-// job (the ingest upsert never writes it). Wave-1 failures return to `pending`
-// for the ordinary gap finder. Campaign precalc failures remain on their
-// wave-2 ownership path: legacy scalar jobs are reclaimed by the parent scan,
-// while association-owned jobs reopen the same physical precalc request.
+// Clean failed-generation restart: an unexplained/non-restorable crash deletes
+// that exact failed generation and returns its physical cell to scheduling.
+// `auto_retried_at` is an observational "last clean restart" timestamp, not a
+// retry cap. Typed mesh/configuration blockers, valid continuation sources,
+// accepted canonical evidence, and media-repair work remain on their own
+// explicit paths.
 // ---------------------------------------------------------------------------
 export interface AutoRetriedCell {
   resultId: string;
@@ -1817,15 +1812,15 @@ export interface AutoRetriedCell {
 }
 
 export interface AutoRetryOutcome {
-  /** Cells flipped back to pending/requested — their ONE automatic retry. */
+  /** Cells flipped back to pending/requested for a clean new generation. */
   retried: AutoRetriedCell[];
   /** Campaign precalc failures released from their dead child but deliberately
-   *  left `queued`, not `pending`: the URANS ladder must create their next
+   *  left `queued`, not `pending`: the URANS ladder must create the next
    *  wave-2/forced-transient job. Treating them as an ordinary campaign gap
    *  would silently downgrade the retry to wave-1 RANS. */
   precalcRouted: AutoRetriedCell[];
-  /** Cells that failed AGAIN after their automatic retry (marker already
-   *  present): left failed/blocked. The caller logs these loudly. */
+  /** Compatibility field for callers from the retired fixed-cap policy. Clean
+   * restart never escalates an otherwise retryable crash, so this is empty. */
   escalated: AutoRetriedCell[];
   /** First-attempt deterministic precalc mesh-QA failures. Their campaign
    *  revision and tier pin the same setup/mesh for the generic retry, so an
@@ -1841,6 +1836,246 @@ export interface AutoRetryOutcome {
    * This is output-repair work, not a CFD crash: the bounded media-repair
    * queue owns it and generic solver retry must not submit a duplicate solve. */
   mediaRepairDeferred: AutoRetriedCell[];
+  /** Failed immutable attempt generations removed after their exact cell was
+   * returned to clean scheduling. This excludes selected canonical evidence,
+   * continuation sources, deterministic mesh blockers, and media repair. */
+  discardedFailedAttemptCount: number;
+}
+
+export interface AutoRetryCrashedResultsOptions {
+  /** A running engine task was conclusively lost after partial ingestion. Its
+   * unaccepted generation must join the same guarded clean-restart reducer as
+   * a terminal failed generation: preserve accepted/canonical evidence, but
+   * turn every other owned projection into a failed candidate before routing
+   * and attempt/artifact cleanup. */
+  lostRunningGeneration?: { error: string };
+  /** Optional transaction-scoped lifecycle settlement. The callback runs only
+   * after every disposable attempt has been detached/deleted and the physical
+   * cell has been reopened, but before that same transaction commits. This is
+   * used by lost PRECALC recovery so a replacement child can never observe a
+   * pending obligation alongside the old generation's ownership graph. */
+  afterGenerationDetached?: (tx: DB) => Promise<void>;
+}
+
+/**
+ * A lost runtime is cancelled at the engine before its database claims may be
+ * released.  The follow-up clean restart is deliberately a separate
+ * transaction, so a transient database failure cannot be rolled back into a
+ * live engine task.  This small durable marker lets the sweeper retry that
+ * second step safely until either the disposable engine generation has been
+ * deleted or the only remaining attachments are immutable accepted evidence.
+ */
+export type CleanRestartPendingSettlement =
+  | "not_pending"
+  | "awaiting_engine_cleanup"
+  | "protected_evidence"
+  | "stripped";
+
+export async function settleCleanRestartPendingMarker(
+  db: DB,
+  simJobId: string,
+): Promise<CleanRestartPendingSettlement> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [job] = await tx
+      .select({
+        id: simJobs.id,
+        status: simJobs.status,
+        strippedAt: simJobs.strippedAt,
+      })
+      .from(simJobs)
+      .where(
+        and(
+          eq(simJobs.id, simJobId),
+          sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb) ? 'cleanRestartPending'`,
+        ),
+      )
+      .for("update");
+    if (!job) return "not_pending";
+
+    // A marker belongs only to the engine-cancelled clean-restart path.  Do
+    // not erase it if another lifecycle owner has made the job live again.
+    if (job.status !== "cancelled") return "awaiting_engine_cleanup";
+
+    const clear = async (
+      settlement: Extract<
+        CleanRestartPendingSettlement,
+        "protected_evidence" | "stripped"
+      >,
+    ) => {
+      await tx
+        .update(simJobs)
+        .set({
+          requestPayload: sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb) - 'cleanRestartPending'`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(simJobs.id, simJobId),
+            eq(simJobs.status, "cancelled"),
+            sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb) ? 'cleanRestartPending'`,
+          ),
+        );
+      return settlement;
+    };
+
+    // `stripped_at` is written only after deleteJob succeeded, including its
+    // 404 idempotency case.  An empty attachment set alone is not enough:
+    // keep retrying until that engine-side outcome is durable too.
+    if (job.strippedAt) return clear("stripped");
+
+    const [remaining] = (await tx.execute(sql`
+      SELECT
+        count(*) FILTER (
+          WHERE NOT (${CLEAN_RESTART_PROTECTED_EVIDENCE_SQL})
+        )::integer AS unprotected_count,
+        count(*) FILTER (
+          WHERE ${CLEAN_RESTART_PROTECTED_EVIDENCE_SQL}
+        )::integer AS protected_count
+      FROM results r
+      WHERE r.sim_job_id = ${simJobId}::uuid
+    `)) as unknown as Array<{
+      unprotected_count: number;
+      protected_count: number;
+    }>;
+    if (Number(remaining?.unprotected_count ?? 0) > 0)
+      return "awaiting_engine_cleanup";
+
+    // Canonical evidence is intentionally retained with its terminal job.
+    // Once it is the only attachment, the lost-generation retry has no work
+    // left and must not rescan it on every scheduler tick.
+    if (Number(remaining?.protected_count ?? 0) > 0)
+      return clear("protected_evidence");
+    return "awaiting_engine_cleanup";
+  });
+}
+
+/**
+ * Discard only the failed generation that just lost its scheduling ownership
+ * to a clean restart. `results` is the durable physical-cell/scheduling
+ * identity, so it stays in place; its failed immutable attempts and every
+ * attempt-owned artifact/media/interpretation cascade away instead.
+ *
+ * This intentionally requires all three mutable canonical pointers to be null
+ * *and* independently checks the append-only accepted/canonical relations.
+ * A pointer-null legacy projection is not proof that the matching immutable
+ * evidence is disposable.
+ */
+async function discardFailedGenerationForCleanRetry(
+  tx: DB,
+  simJobId: string,
+  resultIds: string[],
+): Promise<number> {
+  if (!resultIds.length) return 0;
+  const ids = sql`ARRAY[${sql.join(
+    resultIds.map((id) => sql`${id}::uuid`),
+    sql`, `,
+  )}]`;
+  const disposableAttempts = cleanRestartDisposableAttemptsSql(simJobId, ids);
+
+  // The composite attempt-owner FKs below are intentionally NO ACTION: their
+  // parent result remains useful scheduling identity, but the deleted
+  // generation must not leave a dangling exact-attempt reference.  Unlink
+  // only rows that still name one of the disposable (unaccepted/unbound)
+  // attempts selected above.  Do not erase the physical result/cell link.
+  await tx.execute(sql`
+    UPDATE sim_campaign_points point
+    SET result_attempt_id = NULL, "updatedAt" = now()
+    FROM (${disposableAttempts}) discarded
+    WHERE point.result_attempt_id = discarded.id
+      AND point.result_id = discarded.result_id
+  `);
+  await tx.execute(sql`
+    UPDATE sync_sweep_promise_points point
+    SET result_attempt_id = NULL, "updatedAt" = now()
+    FROM (${disposableAttempts}) discarded
+    WHERE point.result_attempt_id = discarded.id
+      AND point.result_id = discarded.result_id
+  `);
+  await tx.execute(sql`
+    UPDATE sim_precalc_obligations obligation
+    SET source_result_attempt_id = NULL, source_result_id = NULL,
+        "updatedAt" = now()
+    FROM (${disposableAttempts}) discarded
+    WHERE obligation.source_result_attempt_id = discarded.id
+      AND obligation.source_result_id = discarded.result_id
+  `);
+  await tx.execute(sql`
+    UPDATE sim_solver_incidents incident
+    SET result_attempt_id = NULL, "updatedAt" = now()
+    FROM (${disposableAttempts}) discarded
+    WHERE incident.result_attempt_id = discarded.id
+      AND incident.result_id = discarded.result_id
+  `);
+  await tx.execute(sql`
+    DELETE FROM remote_asset_references asset
+    USING (${disposableAttempts}) discarded
+    WHERE asset.result_attempt_id = discarded.id
+      AND asset.result_id = discarded.result_id
+  `);
+
+  const discarded = (await tx.execute(sql`
+    DELETE FROM result_attempts failed_attempt
+    USING (${disposableAttempts}) disposable
+    WHERE failed_attempt.id = disposable.id
+    RETURNING failed_attempt.id
+  `)) as unknown as Array<{ id: string }>;
+
+  // The cell is scheduling state, not failed solver evidence. Keep only the
+  // last-restart marker and route/fidelity information needed by the
+  // gap finder; clear all stale calculated values before a new engine job can
+  // reclaim it. The pointer guard is redundant with the DELETE above but makes
+  // the accepted-canonical boundary explicit at the projection write too.
+  await tx
+    .update(results)
+    .set({
+      source: "queued",
+      regime: null,
+      reynolds: null,
+      speed: null,
+      chord: null,
+      mach: null,
+      cl: null,
+      cd: null,
+      cm: null,
+      clCd: null,
+      clStd: null,
+      cdStd: null,
+      cmStd: null,
+      stalled: false,
+      unsteady: false,
+      converged: false,
+      finalResidual: null,
+      iterations: null,
+      yPlusAvg: null,
+      yPlusMax: null,
+      nCells: null,
+      firstOrderFallback: false,
+      strouhal: null,
+      error: null,
+      qualityWarnings: null,
+      frameTrack: null,
+      steadyHistory: null,
+      engineJobId: null,
+      engineCaseSlug: null,
+      methodKey: null,
+      solverImplementationId: null,
+      solverRuntimeBuildId: null,
+      solvedAt: null,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        inArray(results.id, resultIds),
+        sql`${results.status} IN ('pending', 'queued')`,
+        sql`${results.simJobId} IS NULL`,
+        sql`${results.currentResultAttemptId} IS NULL`,
+        sql`${results.currentResultInterpretationId} IS NULL`,
+        sql`${results.currentCanonicalSelectionId} IS NULL`,
+        sql`NOT (${cleanRestartProtectedEvidenceSql(results.id)})`,
+      ),
+    );
+  return discarded.length;
 }
 
 // Production campaign b96594a6 proved that the generic crash retry was not
@@ -1848,8 +2083,8 @@ export interface AutoRetryOutcome {
 // immutable revision 4-5 times at max non-orthogonality 88.2/88.3 degrees.
 // Scope this suppression narrowly to that deterministic engine QA class and
 // to campaign wave-2 precalc jobs whose job revision is the result revision.
-// Other mesh errors, wave-1 work, admin jobs, and transient crashes keep the
-// existing one-shot retry policy.
+// Other mesh errors, wave-1 work, admin jobs, and transient crashes use the
+// ordinary clean-restart policy.
 const PRECALC_WAVE2_JOB_SQL = sql`
   EXISTS (
     SELECT 1
@@ -1903,7 +2138,7 @@ const LADDER_SCOPED_PRECALC_SQL = sql`
  * the wave-1 payload would then reopen that same cell as pending RANS and
  * double-schedule it. A cancelled obligation only fences the cell after it
  * spent a physical attempt; an unsubmitted cancellation does not consume the
- * ordinary one-shot crash retry. */
+ * ordinary clean restart. */
 const EXACT_PRECALC_OBLIGATION_SQL = sql`
   EXISTS (
     SELECT 1
@@ -1997,7 +2232,7 @@ const BOUNDED_CONTINUATION_PRECALC_SQL = sql`
   )
 `;
 
-/** A fresh automatic precalc request may receive the normal one crash retry.
+/** A fresh automatic precalc request may receive the normal clean restart.
  * Bounded same-result continuations are spent at engine submission and stay
  * terminal on failure instead of silently receiving another continuation.
  * The shared request is reopened only after terminal ingest has settled it to
@@ -2079,7 +2314,7 @@ const CURRENT_HARD_SOLVER_ATTEMPT_SQL = sql`EXISTS (
  * the result-media repair queue has the bounded, token-fenced retry budget.
  *
  * Read only the latest exact attempt from this job. A later actual CFD crash
- * for the same cell must still receive the normal one-shot retry even if an
+ * for the same cell must still receive the normal clean restart even if an
  * earlier attempt from this job once awaited media repair. */
 const MEDIA_REPAIR_OWNED_SQL = sql`EXISTS (
   SELECT 1
@@ -2107,52 +2342,96 @@ const MEDIA_REPAIR_OWNED_SQL = sql`EXISTS (
     )
 )`;
 
-type ExhaustedRansIncidentRow = {
-  result_id: string;
-  airfoil_id: string;
-  revision_id: string | null;
-  aoa_deg: number;
-  error: string | null;
-  result_attempt_id: string | null;
-  failure_disposition: string | null;
-  solver_implementation_id: string;
-  mesh_recovery_version?: number;
-};
-
-function exhaustedRansIncidentReason(
-  row: Pick<ExhaustedRansIncidentRow, "error" | "failure_disposition">,
-): string {
-  const error = (row.error ?? "").toLowerCase();
-  if (
-    row.failure_disposition === "deterministic_mesh" ||
-    (error.includes(DETERMINISTIC_MESH_BLOCKER_ERROR_MARKER) &&
-      error.includes(DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER))
-  ) {
-    return "mesh-quality-failure";
-  }
-  if (
-    row.failure_disposition === "infrastructure" ||
-    /\b(engine|worker|container|openmpi|mpi|queue|database|storage|disk)\b/.test(
-      error,
-    ) ||
-    /\b(connection refused|http 5\d\d|no space left|out of memory|oom[- ]killed)\b/.test(
-      error,
+/** A pointer-null projection is not sufficient proof that a failed generation
+ * is disposable. Historical repairs can leave a selected/accepted attempt in
+ * an append-only relation while the mutable result pointers are NULL. A clean
+ * restart must refuse that cell rather than deleting the accepted evidence or
+ * its signed remote binding. */
+function cleanRestartProtectedEvidenceSql(resultId: SQLWrapper) {
+  return sql`EXISTS (
+  SELECT 1
+  FROM result_attempts protected_attempt
+  WHERE protected_attempt.result_id = ${resultId}
+    AND (
+      EXISTS (
+        SELECT 1
+        FROM result_classifications accepted_classification
+        WHERE accepted_classification.result_attempt_id = protected_attempt.id
+          AND accepted_classification.state = 'accepted'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM result_interpretations accepted_interpretation
+        WHERE accepted_interpretation.result_attempt_id = protected_attempt.id
+          AND accepted_interpretation.state = 'accepted'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM result_canonical_selections canonical_selection
+        WHERE canonical_selection.result_attempt_id = protected_attempt.id
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM sync_remote_hub_binding_receipts hub_binding
+        WHERE hub_binding.result_attempt_id = protected_attempt.id
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM sync_sweep_promise_points fulfilled_promise_point
+        WHERE fulfilled_promise_point.result_attempt_id = protected_attempt.id
+          AND fulfilled_promise_point.status = 'fulfilled'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM sync_brokered_evidence_uploads bound_upload
+        WHERE bound_upload.canonical_result_attempt_id = protected_attempt.id
+          AND bound_upload.state = 'bound'
+      )
     )
-  ) {
-    return "engine-infrastructure-failure";
-  }
-  return "solver-execution-failed";
+)`;
 }
 
-/** Route every generic crash-class unmarked failed row of one sim job exactly once:
- *  result → pending for wave-1 or queued-without-owner for campaign
- *  precalc (claim links cleared, marker stamped, error text kept as evidence
- *  of the crash), linked campaign points → requested, counters
- *  recomputed. Deterministic identical precalc mesh-QA failures stay failed
- *  and are returned as `suppressed`; rows already carrying the marker stay
- *  failed and are returned as `escalated`. Exact current `hard_solver` RANS
- *  attempts stay attached to their parent for targeted/whole-polar URANS
- *  routing and are never silently downgraded to another generic RANS try.
+const CLEAN_RESTART_PROTECTED_EVIDENCE_SQL = cleanRestartProtectedEvidenceSql(
+  sql`r.id`,
+);
+
+/** The DELETE candidate must repeat every ownership/protection check rather
+ * than relying on the prior UPDATE.  This makes a concurrent canonical bind
+ * a safe no-op rather than an evidence-deletion race. */
+function cleanRestartDisposableAttemptsSql(
+  simJobId: string,
+  resultIds: SQLWrapper,
+) {
+  return sql`
+    SELECT failed_attempt.id, failed_attempt.result_id
+    FROM result_attempts failed_attempt
+    JOIN results cell ON cell.id = failed_attempt.result_id
+    WHERE failed_attempt.sim_job_id = ${simJobId}::uuid
+      AND failed_attempt.result_id = ANY(${resultIds})
+      -- Exact-job ownership, not attempt status, defines the discarded
+      -- generation. A lost task can leave pending/queued/running/stale
+      -- attempt shells as well as done/failed rows; retaining any of them
+      -- would keep the cancelled generation attached forever and prevent
+      -- engine-directory cleanup. The independent accepted/canonical guard
+      -- below still protects every publishable attempt.
+      AND cell.status IN ('pending', 'queued')
+      AND cell.sim_job_id IS NULL
+      AND cell.current_result_attempt_id IS NULL
+      AND cell.current_result_interpretation_id IS NULL
+      AND cell.current_canonical_selection_id IS NULL
+      AND NOT (${cleanRestartProtectedEvidenceSql(sql`cell.id`)})
+  `;
+}
+
+/** Route every unexplained crash-class failed row of one sim job to a clean
+ *  new generation: result → pending for wave-1 or queued-without-owner for
+ *  campaign precalc, exact failed attempts/artifacts → deleted, linked
+ *  campaign points → requested, counters → recomputed. `auto_retried_at`
+ *  records the latest restart but never blocks a later failed generation.
+ *  Deterministic mesh-QA failures stay on their typed repair/block path;
+ *  exact current `hard_solver` RANS attempts stay attached to their parent
+ *  for targeted/whole-polar URANS routing and are never downgraded to another
+ *  generic RANS try.
  *  Callers MUST invoke this AFTER
  *  every polar-cache refresh of the job's ingest path — flipping a row to
  *  pending and re-refreshing would overwrite its stored at-ingest
@@ -2160,6 +2439,7 @@ function exhaustedRansIncidentReason(
 export async function autoRetryCrashedResultsForJob(
   db: DB,
   simJobId: string,
+  opts: AutoRetryCrashedResultsOptions = {},
 ): Promise<AutoRetryOutcome> {
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
@@ -2175,6 +2455,30 @@ export async function autoRetryCrashedResultsForJob(
     ORDER BY campaign.id
     FOR SHARE OF campaign
   `);
+
+    if (opts.lostRunningGeneration) {
+      // A stopped worker can leave a running job with partially ingested
+      // `done` evidence and coefficient-bearing projections.  They are not
+      // publishable merely because they were written before the task died.
+      // Normalize only the exact, noncanonical generation into the ordinary
+      // failed clean-restart path.  The independent append-only protection is
+      // intentionally stronger than the mutable current-pointer check: an
+      // accepted or remotely bound attempt remains attached and prevents the
+      // engine directory from being discarded.
+      await tx.execute(sql`
+        UPDATE results r
+        SET status = 'failed',
+            source = 'queued',
+            error = COALESCE(r.error, ${opts.lostRunningGeneration.error}),
+            current_result_attempt_id = NULL,
+            current_result_interpretation_id = NULL,
+            current_canonical_selection_id = NULL,
+            "updatedAt" = now()
+        WHERE r.sim_job_id = ${simJobId}
+          AND r.status IN ('pending', 'queued', 'running', 'stale', 'done', 'failed')
+          AND NOT (${CLEAN_RESTART_PROTECTED_EVIDENCE_SQL})
+      `);
+    }
     await tx.execute(sql`
     SELECT campaign.id
     FROM sim_jobs job
@@ -2197,7 +2501,6 @@ export async function autoRetryCrashedResultsForJob(
     FROM results r
     WHERE r.sim_job_id = ${simJobId}
       AND r.status = 'failed'
-      AND r.auto_retried_at IS NULL
       AND r.simulation_preset_revision_id IS NOT NULL
       AND (
         (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
@@ -2218,7 +2521,6 @@ export async function autoRetryCrashedResultsForJob(
     FROM results r
     WHERE r.sim_job_id = ${simJobId}
       AND r.status = 'failed'
-      AND r.auto_retried_at IS NULL
       AND r.simulation_preset_revision_id IS NOT NULL
       AND (${LADDER_SCOPED_PRECALC_SQL})
       AND (
@@ -2235,276 +2537,43 @@ export async function autoRetryCrashedResultsForJob(
       error: string | null;
     }>;
 
-    const escalated = (await tx.execute(sql`
-    SELECT r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
-           r.aoa_deg::float8 AS aoa_deg, r.error
-    FROM results r
-    WHERE r.sim_job_id = ${simJobId}
-      AND r.status = 'failed'
-      AND r.auto_retried_at IS NOT NULL
-      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
-  `)) as unknown as Array<{
+    const escalated: Array<{
       result_id: string;
       airfoil_id: string;
       revision_id: string | null;
       aoa_deg: number;
       error: string | null;
-    }>;
-
-    // A second non-aerodynamic steady-RANS crash is not the normal
-    // RANS->preliminary handoff. Record it as a critical result-owned solver
-    // incident in the same transaction that observes the exhausted retry.
-    //
-    // Do not derive this set from `escalated` in application code: that broad
-    // return list intentionally also contains exhausted wave-2 rows. Those are
-    // already owned by preliminary/final recovery ledgers and must not acquire
-    // a duplicate, misleading RANS incident.
-    const exhaustedRansIncidents = (await tx.execute(sql`
-    SELECT
-      r.id AS result_id,
-      r.airfoil_id,
-      r.simulation_preset_revision_id AS revision_id,
-      r.aoa_deg::float8 AS aoa_deg,
-      COALESCE(latest.error, r.error) AS error,
-      latest.id AS result_attempt_id,
-      latest.failure_disposition,
-      COALESCE(
-        latest.solver_implementation_id,
-        r.solver_implementation_id,
-        job.solver_implementation_id,
-        revision.solver_implementation_id,
-        ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
-      ) AS solver_implementation_id
-    FROM results r
-    JOIN sim_jobs job ON job.id = r.sim_job_id
-    LEFT JOIN simulation_preset_revisions revision
-      ON revision.id = r.simulation_preset_revision_id
-    LEFT JOIN LATERAL (
-      SELECT
-        attempt.id,
-        attempt.error,
-        attempt.regime,
-        attempt.solver_implementation_id,
-        attempt.evidence_payload ->> 'fidelity' AS fidelity,
-        attempt.evidence_payload ->> 'failure_disposition'
-          AS failure_disposition
-      FROM result_attempts attempt
-      WHERE attempt.result_id = r.id
-        AND attempt.sim_job_id = r.sim_job_id
-      ORDER BY attempt."createdAt" DESC, attempt.id DESC
-      LIMIT 1
-    ) latest ON true
-    WHERE r.sim_job_id = ${simJobId}
-      AND r.status = 'failed'
-      AND r.auto_retried_at IS NOT NULL
-      AND job.wave = 1
-      AND COALESCE(job.request_payload ->> 'uransFidelity', 'rans') = 'rans'
-      AND COALESCE(latest.regime::text, r.regime::text, 'rans') = 'rans'
-      AND COALESCE(latest.fidelity, r.fidelity::text, 'rans') = 'rans'
-      AND COALESCE(latest.failure_disposition, '') <> 'hard_solver'
-      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
-      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
-  `)) as unknown as ExhaustedRansIncidentRow[];
-    for (const incident of exhaustedRansIncidents) {
-      await recordSolverIncidentInTransaction(tx, {
-        stage: "rans",
-        reason: exhaustedRansIncidentReason(incident),
-        severity: "critical",
-        owner: { resultId: incident.result_id },
-        solverImplementationId: incident.solver_implementation_id,
-        occurrenceKey: `rans:${incident.result_id}:${simJobId}:auto-retry-exhausted`,
-        remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
-        simJobId,
-        resultAttemptId: incident.result_attempt_id,
-        metadata: {
-          airfoilId: incident.airfoil_id,
-          revisionId: incident.revision_id,
-          aoaDeg: Number(incident.aoa_deg),
-          error: incident.error,
-          failureDisposition: incident.failure_disposition,
-          recovery: "auto-retry-exhausted",
-        },
-      });
-    }
-    const deterministicRansIncidents = (await tx.execute(sql`
-    SELECT
-      r.id AS result_id,
-      r.airfoil_id,
-      r.simulation_preset_revision_id AS revision_id,
-      r.aoa_deg::float8 AS aoa_deg,
-      COALESCE(latest.error, r.error) AS error,
-      latest.id AS result_attempt_id,
-      latest.failure_disposition,
-      CASE
-        WHEN latest.mesh_recovery_version ~ '^[0-9]+$'
-        THEN latest.mesh_recovery_version::int
-        WHEN job.request_payload ->> 'executedMeshRecoveryVersion'
-               ~ '^[0-9]+$'
-        THEN (job.request_payload ->> 'executedMeshRecoveryVersion')::int
-        ELSE 0
-      END AS mesh_recovery_version,
-      COALESCE(
-        latest.solver_implementation_id,
-        r.solver_implementation_id,
-        job.solver_implementation_id,
-        revision.solver_implementation_id,
-        ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
-      ) AS solver_implementation_id
-    FROM results r
-    JOIN sim_jobs job ON job.id = r.sim_job_id
-    LEFT JOIN simulation_preset_revisions revision
-      ON revision.id = r.simulation_preset_revision_id
-    LEFT JOIN LATERAL (
-      SELECT
-        attempt.id,
-        attempt.error,
-        attempt.regime,
-        attempt.solver_implementation_id,
-        attempt.evidence_payload ->> 'fidelity' AS fidelity,
-        attempt.evidence_payload ->> 'mesh_recovery_version'
-          AS mesh_recovery_version,
-        attempt.evidence_payload ->> 'failure_disposition'
-          AS failure_disposition
-      FROM result_attempts attempt
-      WHERE attempt.result_id = r.id
-        AND attempt.sim_job_id = r.sim_job_id
-      ORDER BY attempt."createdAt" DESC, attempt.id DESC
-      LIMIT 1
-    ) latest ON true
-    WHERE r.sim_job_id = ${simJobId}
-      AND r.status = 'failed'
-      AND r.auto_retried_at IS NULL
-      AND job.wave = 1
-      AND COALESCE(job.request_payload ->> 'uransFidelity', 'rans') = 'rans'
-      AND COALESCE(latest.regime::text, r.regime::text, 'rans') = 'rans'
-      AND COALESCE(latest.fidelity, r.fidelity::text, 'rans') = 'rans'
-      AND (${TERMINAL_RANS_DETERMINISTIC_MESH_SQL})
-      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
-      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
-  `)) as unknown as ExhaustedRansIncidentRow[];
-    for (const incident of deterministicRansIncidents) {
-      await recordSolverIncidentInTransaction(tx, {
-        stage: "rans",
-        reason: "mesh-quality-failure",
-        severity: "critical",
-        owner: { resultId: incident.result_id },
-        solverImplementationId: incident.solver_implementation_id,
-        occurrenceKey: `rans:${incident.result_id}:${simJobId}:deterministic-mesh:v${incident.mesh_recovery_version ?? 0}`,
-        remediationVersion: ransMeshRecoveryRemediationVersion(
-          incident.mesh_recovery_version ?? 0,
-        ),
-        simJobId,
-        resultAttemptId: incident.result_attempt_id,
-        metadata: {
-          airfoilId: incident.airfoil_id,
-          revisionId: incident.revision_id,
-          aoaDeg: Number(incident.aoa_deg),
-          error: incident.error,
-          failureDisposition:
-            incident.failure_disposition ?? "deterministic_mesh",
-          recovery: "deterministic-mesh",
-          meshRecoveryVersion: incident.mesh_recovery_version ?? 0,
-        },
-      });
-    }
-    // A completed RANS row can still fail the classifier while lacking
-    // physical handoff provenance (for example, a typed-none contract conflict
-    // or an invalid/errored execution shell). Every completed, solved,
-    // error-free legacy physical rejection is excluded by
-    // AUTOMATIC_RANS_HANDOFF_RESULT_SQL and remains normal
-    // RANS→preliminary-URANS input. Everything selected here has no automatic
-    // fidelity owner and is therefore a critical machine incident, not a
-    // user-review task.
-    const rejectedRansIncidents = (await tx.execute(sql`
-    SELECT
-      r.id AS result_id,
-      r.airfoil_id,
-      r.simulation_preset_revision_id AS revision_id,
-      r.aoa_deg::float8 AS aoa_deg,
-      COALESCE(latest.error, r.error) AS error,
-      latest.id AS result_attempt_id,
-      latest.failure_disposition,
-      result_classification.reasons AS classification_reasons,
-      COALESCE(
-        latest.solver_implementation_id,
-        r.solver_implementation_id,
-        job.solver_implementation_id,
-        revision.solver_implementation_id,
-        ${LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID}::uuid
-      ) AS solver_implementation_id
-    FROM results r
-    JOIN sim_jobs job ON job.id = r.sim_job_id
-    JOIN result_classifications result_classification
-      ON result_classification.result_id = r.id
-     AND result_classification.state = 'rejected'
-    LEFT JOIN simulation_preset_revisions revision
-      ON revision.id = r.simulation_preset_revision_id
-    LEFT JOIN LATERAL (
-      SELECT
-        attempt.id,
-        attempt.error,
-        attempt.regime,
-        attempt.solver_implementation_id,
-        attempt.evidence_payload ->> 'fidelity' AS fidelity,
-        attempt.evidence_payload ->> 'failure_disposition'
-          AS failure_disposition
-      FROM result_attempts attempt
-      WHERE attempt.result_id = r.id
-        AND attempt.sim_job_id = r.sim_job_id
-      ORDER BY attempt."createdAt" DESC, attempt.id DESC
-      LIMIT 1
-    ) latest ON true
-    WHERE r.sim_job_id = ${simJobId}
-      AND r.status = 'done'
-      AND job.wave = 1
-      AND COALESCE(job.request_payload ->> 'uransFidelity', 'rans') = 'rans'
-      AND COALESCE(latest.regime::text, r.regime::text, 'rans') = 'rans'
-      AND COALESCE(latest.fidelity, r.fidelity::text, 'rans') = 'rans'
-      AND NOT (${AUTOMATIC_RANS_HANDOFF_RESULT_SQL})
-      AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
-      AND NOT (${MEDIA_REPAIR_OWNED_SQL})
-  `)) as unknown as Array<
-      ExhaustedRansIncidentRow & { classification_reasons: string[] }
-    >;
-    for (const incident of rejectedRansIncidents) {
-      await recordSolverIncidentInTransaction(tx, {
-        stage: "rans",
-        reason: "non-publishable-rans-evidence",
-        severity: "critical",
-        owner: { resultId: incident.result_id },
-        solverImplementationId: incident.solver_implementation_id,
-        occurrenceKey: `rans:${incident.result_id}:${simJobId}:evidence-rejected`,
-        remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
-        simJobId,
-        resultAttemptId: incident.result_attempt_id,
-        metadata: {
-          airfoilId: incident.airfoil_id,
-          revisionId: incident.revision_id,
-          aoaDeg: Number(incident.aoa_deg),
-          error: incident.error,
-          failureDisposition: incident.failure_disposition,
-          classificationReasons: incident.classification_reasons,
-          recovery: "evidence-rejected",
-        },
-      });
-    }
+    }> = [];
 
     // A failed campaign precalc cell must never fall through the ordinary
     // campaign gap finder: that composer is wave-1 RANS by definition. Release
-    // ownership from the dead child, retain the failed evidence/one-shot marker,
-    // and use `queued` as the durable "awaiting another wave-2 child" state.
+    // ownership from the dead child, discard its failed generation, retain a
+    // last-restart marker, and use `queued` as the durable "awaiting another
+    // wave-2 child" state.
     // campaignHasOpenRansGaps and findCampaignGapBatch both already distinguish
     // this from a schedulable pending/stale RANS gap; the gated parent rescan
     // creates the actual precalc request and reclaims the row.
+    const lostGenerationExactPrecalcRoute = opts.lostRunningGeneration
+      ? sql`OR (
+          (${LADDER_SCOPED_PRECALC_SQL})
+          AND (${EXACT_PRECALC_OBLIGATION_SQL})
+        )`
+      : sql``;
     const precalcRouted = (await tx.execute(sql`
     UPDATE results r
     SET status = 'queued', source = 'queued', sim_job_id = NULL, engine_job_id = NULL,
         engine_case_slug = NULL, auto_retried_at = now(), "updatedAt" = now()
     WHERE r.sim_job_id = ${simJobId}
       AND r.status = 'failed'
-      AND r.auto_retried_at IS NULL
       AND r.simulation_preset_revision_id IS NOT NULL
-      AND (${ROUTABLE_CAMPAIGN_PRECALC_SQL})
+      AND (
+        (${ROUTABLE_CAMPAIGN_PRECALC_SQL})
+        ${lostGenerationExactPrecalcRoute}
+      )
+      AND r.current_result_attempt_id IS NULL
+      AND r.current_result_interpretation_id IS NULL
+      AND r.current_canonical_selection_id IS NULL
+      AND NOT (${CLEAN_RESTART_PROTECTED_EVIDENCE_SQL})
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
       AND NOT (${MEDIA_REPAIR_OWNED_SQL})
     RETURNING r.id AS result_id, r.airfoil_id, r.simulation_preset_revision_id AS revision_id,
@@ -2525,7 +2594,10 @@ export async function autoRetryCrashedResultsForJob(
         engine_case_slug = NULL, auto_retried_at = now(), "updatedAt" = now()
     WHERE r.sim_job_id = ${simJobId}
       AND r.status = 'failed'
-      AND r.auto_retried_at IS NULL
+      AND r.current_result_attempt_id IS NULL
+      AND r.current_result_interpretation_id IS NULL
+      AND r.current_canonical_selection_id IS NULL
+      AND NOT (${CLEAN_RESTART_PROTECTED_EVIDENCE_SQL})
       AND NOT (${LADDER_SCOPED_PRECALC_SQL})
       AND NOT (${EXACT_PRECALC_OBLIGATION_SQL})
       AND NOT (${DETERMINISTIC_PRECALC_MESH_QA_SQL})
@@ -2567,6 +2639,12 @@ export async function autoRetryCrashedResultsForJob(
     }
 
     const reopened = [...retried, ...precalcRouted];
+    const discardedFailedAttemptCount =
+      await discardFailedGenerationForCleanRetry(
+        tx,
+        simJobId,
+        reopened.map((row) => row.result_id),
+      );
     if (reopened.length) {
       // A crash retry is a fresh submit lifecycle too. This is normally a
       // no-op because an accepted engine submission already clears the
@@ -2619,6 +2697,8 @@ export async function autoRetryCrashedResultsForJob(
       }
     }
 
+    await opts.afterGenerationDetached?.(tx);
+
     const toCell = (row: {
       result_id: string;
       airfoil_id: string;
@@ -2638,7 +2718,6 @@ export async function autoRetryCrashedResultsForJob(
     FROM results r
     WHERE r.sim_job_id = ${simJobId}
       AND r.status = 'failed'
-      AND r.auto_retried_at IS NULL
       AND (${MEDIA_REPAIR_OWNED_SQL})
   `)) as unknown as Array<{
       result_id: string;
@@ -2654,6 +2733,7 @@ export async function autoRetryCrashedResultsForJob(
       suppressed: suppressed.map(toCell),
       terminalBlocked: terminalBlocked.map(toCell),
       mediaRepairDeferred: mediaRepairDeferred.map(toCell),
+      discardedFailedAttemptCount,
     };
   });
 }

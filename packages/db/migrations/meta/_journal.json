@@ -708,6 +708,160 @@
       "when": 1789516800000,
       "tag": "0100_archive_interpretation_source_identity_reconcile",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1789603200000,
+      "tag": "0101_historical_archive_audit_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1789689600000,
+      "tag": "0102_historical_audit_interpretation_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1789776000000,
+      "tag": "0103_historical_archive_audit_decision_source_and_state_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1789862400000,
+      "tag": "0104_historical_audit_canonical_selection_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1789948800000,
+      "tag": "0105_historical_audit_run_identity_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1790035200000,
+      "tag": "0106_historical_audit_child_receipt_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1790121600000,
+      "tag": "0107_precalc_remediation_clears_job_owner",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1790208000000,
+      "tag": "0108_legacy_terminal_precalc_remediation",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "7",
+      "when": 1790294400000,
+      "tag": "0109_clean_cycle_recovery_policy_lineage",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1790380800000,
+      "tag": "0110_sweeper_maintenance_drain_ownership",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "7",
+      "when": 1790467200000,
+      "tag": "0111_remote_terminal_evidence_preservation",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1790553600000,
+      "tag": "0112_remote_terminal_evidence_outbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1790640000000,
+      "tag": "0113_terminal_evidence_zero_result_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "7",
+      "when": 1790726400000,
+      "tag": "0114_brokered_terminal_evidence_immutable_quarantine",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "7",
+      "when": 1790812800000,
+      "tag": "0115_remote_terminal_evidence_outbox_retry_backoff",
+      "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1790899200000,
+      "tag": "0116_brokered_terminal_evidence_reverse_result_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1790985600000,
+      "tag": "0117_remote_terminal_evidence_reverse_result_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1791072000000,
+      "tag": "0118_permanent_continuation_fresh_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1791158400000,
+      "tag": "0119_permanent_continuation_batched_lineage_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 120,
+      "version": "7",
+      "when": 1791244800000,
+      "tag": "0120_urans_period_roundoff_reconciliation",
+      "breakpoints": true
+    },
+    {
+      "idx": 121,
+      "version": "7",
+      "when": 1791331200000,
+      "tag": "0121_evidence_only_forensic_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 122,
+      "version": "7",
+      "when": 1791417600000,
+      "tag": "0122_solver_evidence_artifacts_sim_job_index",
+      "breakpoints": true
     }
   ]
 }

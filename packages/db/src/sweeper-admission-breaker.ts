@@ -1,6 +1,56 @@
 import { sql } from "drizzle-orm";
 
 import type { DB } from "./client";
+import {
+  RANS_RECOVERY_REMEDIATION_VERSION,
+  REPEATED_SOLVER_INCIDENT_THRESHOLD,
+  URANS_RECOVERY_REMEDIATION_VERSION,
+} from "./solver-incidents";
+
+/**
+ * A selected, current, accepted archive reduction is exact proof that this
+ * physical PRECALC cell is publishable. The raw CFD attempt may remain
+ * rejected: archive interpretation acceptance is the authority for this
+ * recovery path. The normal publication path settles the matching obligation
+ * in the same tick, but admission must not briefly re-fence in the small
+ * post-selection/pre-settlement window. Require the same latest physical job
+ * so a later failed generation cannot be hidden by an older archive pointer.
+ */
+const exactAcceptedArchivePrecalcSelectionSql = sql`
+  EXISTS (
+    SELECT 1
+    FROM results accepted_result
+    JOIN result_attempts accepted_attempt
+      ON accepted_attempt.id = accepted_result.current_result_attempt_id
+     AND accepted_attempt.result_id = accepted_result.id
+     AND accepted_attempt.status = 'done'
+     AND accepted_attempt.source = 'solved'
+     AND accepted_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+    JOIN result_canonical_selections accepted_selection
+      ON accepted_selection.id = accepted_result.current_canonical_selection_id
+     AND accepted_selection.result_id = accepted_result.id
+     AND accepted_selection.result_attempt_id = accepted_attempt.id
+    JOIN result_interpretations accepted_interpretation
+      ON accepted_interpretation.id = accepted_selection.result_interpretation_id
+     AND accepted_interpretation.id = accepted_result.current_result_interpretation_id
+     AND accepted_interpretation.result_id = accepted_result.id
+     AND accepted_interpretation.result_attempt_id = accepted_attempt.id
+     AND accepted_interpretation.source = 'archive_backfill'
+     AND accepted_interpretation.state = 'accepted'
+    JOIN solver_evidence_archives accepted_archive
+      ON accepted_archive.id = accepted_interpretation.source_archive_id
+     AND accepted_archive.result_id = accepted_result.id
+     AND accepted_archive.result_attempt_id = accepted_attempt.id
+     AND accepted_archive.state = 'current'
+    WHERE accepted_result.airfoil_id = obligation.airfoil_id
+      AND accepted_result.simulation_preset_revision_id = obligation.revision_id
+      AND accepted_result.aoa_deg = obligation.aoa_deg
+      AND accepted_result.status = 'done'
+      AND accepted_result.source = 'solved'
+      AND accepted_result.fidelity = 'urans_precalc'
+      AND accepted_attempt.sim_job_id = obligation.latest_sim_job_id
+  )
+`;
 
 export type SweeperAdmissionFenceReason =
   | "critical_solver_incident"
@@ -38,10 +88,14 @@ interface BreakerRow {
 }
 
 /**
- * Close NEW solver admission when durable current-generation ledgers show a
- * critical outcome. The detector and singleton update are one SQL statement,
- * so concurrent sweeper ticks cannot admit work between observation and the
- * durable fence. Campaign lifecycle and already-submitted jobs are untouched.
+ * Close NEW solver admission only for a systemic current-generation incident:
+ * repeated equal implementation/remediation/reason failures, or a direct
+ * infrastructure/evidence-integrity loss. One isolated point remains a
+ * durable critical record and receives its normal automated recovery, but
+ * must not idle healthy local and remote capacity. The detector and singleton
+ * update are one SQL statement, so concurrent sweeper ticks cannot admit work
+ * between systemic observation and the durable fence. Campaign lifecycle and
+ * already-submitted jobs are untouched.
  *
  * A fence is intentionally latched. Resolving the originating ledger does not
  * silently resume solver admission; an operator must explicitly re-enable the
@@ -65,6 +119,32 @@ export async function enforceSweeperAdmissionFence(
           'reason', incident.reason,
           'remediationVersion', incident.remediation_version,
           'solverImplementationId', incident.solver_implementation_id,
+          -- New incidents carry this stable classification directly. The
+          -- structured compatibility arm recognizes the already-recorded v11
+          -- clean-cycle cap outcomes without relying on their free-text error.
+          'admissionScope', CASE
+            WHEN (
+              incident.metadata ->> 'admissionScope' = 'cell'
+              AND incident.metadata ->> 'recoveryDisposition' IN (
+                'urans_clean_cycle_cap_exhausted',
+                'continuation_source_permanent'
+              )
+            ) OR (
+              incident.stage = 'preliminary'
+              AND incident.metadata ->> 'lastOutcome' IN (
+                'failed_exhausted',
+                'rejected_exhausted'
+              )
+              AND incident.metadata ->> 'failureDisposition' IN (
+                'hard_solver',
+                'none'
+              )
+              AND incident.metadata -> 'classificationReasons' @>
+                '["insufficient-periods", "non-stationary", "uncertified-urans-cycles"]'::jsonb
+            ) THEN 'cell'
+            ELSE 'systemic'
+          END,
+          'recoveryDisposition', incident.metadata ->> 'recoveryDisposition',
           'campaignId', campaign.id,
           'generation', campaign.current_condition_generation
         ) AS details
@@ -119,6 +199,15 @@ export async function enforceSweeperAdmissionFence(
          AND point.derived_by_symmetry = false
         WHERE incident.precalc_obligation_id IS NOT NULL
           AND obligation.id = incident.precalc_obligation_id
+          -- A bounded corrective generation has durable ownership and is
+          -- already queued for normal submission.  Its historical incident
+          -- remains immutable evidence, but must not re-trip the global fence
+          -- while the recovery owner is queued or actively running.
+          AND NOT (
+            obligation.state IN ('pending', 'running')
+            AND obligation.remediation_attempts_granted > 0
+            OR ${exactAcceptedArchivePrecalcSelectionSql}
+          )
 
         UNION ALL
 
@@ -190,6 +279,17 @@ export async function enforceSweeperAdmissionFence(
       ) current_owner ON true
       WHERE incident.status = 'open'
         AND incident.severity = 'critical'
+        -- A correction changes the remediation contract. Older generations
+        -- stay immutable and visible in the incident log, but cannot keep
+        -- re-fencing a live controller after its replacement is deployed.
+        AND (
+          (incident.stage = 'rans'
+            AND incident.remediation_version = ${RANS_RECOVERY_REMEDIATION_VERSION})
+          OR (
+            incident.stage IN ('preliminary', 'final')
+            AND incident.remediation_version = ${URANS_RECOVERY_REMEDIATION_VERSION}
+          )
+        )
 
       UNION ALL
 
@@ -217,6 +317,15 @@ export async function enforceSweeperAdmissionFence(
         ON campaign.id = owner.campaign_id
        AND campaign.status IN ('active', 'attention')
       WHERE obligation.state = 'blocked'
+        -- A typed permanent continuation source is terminal only for this
+        -- exact physical cell. Its incident remains durable and visible, but
+        -- must not enter this raw blocked-owner fleet fence (the incident arm
+        -- above independently accepts only its explicit cell scope).
+        AND obligation.last_outcome IS DISTINCT FROM
+          'continuation_permanent_failure'
+        -- The selected archive result above has not yet been reconciled into
+        -- this mutable owner. It is exact current evidence, not a new failure.
+        AND NOT (${exactAcceptedArchivePrecalcSelectionSql})
         AND EXISTS (
           SELECT 1
           FROM sim_campaign_conditions condition
@@ -269,6 +378,11 @@ export async function enforceSweeperAdmissionFence(
         ON campaign.id = owner.campaign_id
        AND campaign.status IN ('active', 'attention')
       WHERE verification.state = 'blocked'
+        -- Match the PRECALC rule above: an exact permanent continuation source
+        -- remains a critical cell outcome, never a generic final-URANS fleet
+        -- outage. Every other blocked verification remains a global hazard.
+        AND verification.last_outcome IS DISTINCT FROM
+          'continuation_permanent_failure'
         AND EXISTS (
           SELECT 1
           FROM sim_campaign_conditions condition
@@ -364,9 +478,46 @@ export async function enforceSweeperAdmissionFence(
        AND condition.status IN ('active', 'kept')
       WHERE progress.blocked > 0
     ),
+    systemic_hazards AS (
+      SELECT *
+      FROM hazards hazard
+      WHERE hazard.reason = 'critical_solver_incident'
+        AND (
+          -- Infrastructure/evidence-integrity loss is systemic at first
+          -- observation: accepting new work could compound the loss.
+          hazard.details ->> 'reason' IN (
+            'engine-infrastructure-failure',
+            'engine-submit-rejected',
+            'evidence-integrity-failure',
+            'evidence-manifest-integrity-failure',
+            'archive-pinned-continuation-proof-lost'
+          )
+          OR (
+            -- Count only exact current campaign hazards already proven by the
+            -- ownership joins above. Historical, released, cancelled, and
+            -- unowned incident rows are durable audit evidence, not grounds
+            -- to idle the live fleet. A typed clean-cycle recovery ceiling is
+            -- critical for its one physical cell, not a fleet-wide recurring
+            -- defect, so it is excluded from both the candidate and count.
+            COALESCE(hazard.details ->> 'admissionScope', 'systemic') <> 'cell'
+            AND (
+            SELECT count(DISTINCT peer.trigger_key)
+            FROM hazards peer
+            WHERE peer.reason = 'critical_solver_incident'
+              AND COALESCE(peer.details ->> 'admissionScope', 'systemic') <> 'cell'
+              AND peer.details ->> 'stage' = hazard.details ->> 'stage'
+              AND peer.details ->> 'reason' = hazard.details ->> 'reason'
+              AND peer.details ->> 'solverImplementationId' =
+                hazard.details ->> 'solverImplementationId'
+              AND peer.details ->> 'remediationVersion' =
+                hazard.details ->> 'remediationVersion'
+            ) >= ${REPEATED_SOLVER_INCIDENT_THRESHOLD}
+          )
+        )
+    ),
     selected AS (
       SELECT *
-      FROM hazards
+      FROM systemic_hazards
       ORDER BY priority, observed_at, trigger_key
       LIMIT 1
     ),
@@ -376,6 +527,8 @@ export async function enforceSweeperAdmissionFence(
           max_concurrent_jobs = 0,
           cpu_slots = 0,
           admission_fence_active = true,
+          maintenance_drain_token = NULL,
+          maintenance_drain_started_at = NULL,
           last_admission_fence_at = now(),
           last_admission_fence_reason = selected.reason,
           last_admission_fence_trigger_key = selected.trigger_key,

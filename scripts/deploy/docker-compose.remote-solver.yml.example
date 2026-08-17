@@ -33,4 +33,3 @@ services:
     environment:
       AIRFOILFOAM_EVIDENCE_BUCKET: ""
       AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: "false"
-

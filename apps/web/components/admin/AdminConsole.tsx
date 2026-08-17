@@ -5506,8 +5506,11 @@ function QueueDashboard({
     lastAdmissionFenceAt: sw?.lastAdmissionFenceAt ?? null,
     lastAdmissionFenceReason: sw?.lastAdmissionFenceReason ?? null,
     lastAdmissionFenceDetails: sw?.lastAdmissionFenceDetails ?? null,
+    maintenanceDrainActive: sw?.maintenanceDrainActive ?? false,
+    maintenanceDrainStartedAt: sw?.maintenanceDrainStartedAt ?? null,
   });
   const processDead = solver.state === "process_not_running";
+  const maintenanceDrainActive = solver.state === "maintenance_drain";
   const toneColor =
     solver.tone === "red"
       ? C.redText
@@ -5732,6 +5735,13 @@ function QueueDashboard({
                 >
                   Pause/Resume is unavailable while the solver process is down.
                 </span>
+              ) : maintenanceDrainActive ? (
+                <span
+                  data-testid="solver-controls-maintenance"
+                  style={{ fontFamily: MONO, fontSize: 10.5, color: C.amber }}
+                >
+                  Scheduling is held by system maintenance.
+                </span>
               ) : (
                 <button
                   type="button"
@@ -5805,9 +5815,11 @@ function QueueDashboard({
                 text={
                   processDead
                     ? `No active jobs — the solver process is not running (${queue.sweeper.heartbeatAt ? `last heartbeat ${ago(queue.sweeper.heartbeatAt)}` : "no heartbeat ever recorded"}), so nothing can be submitted.`
-                    : queue.sweeper.enabled
-                      ? "No active jobs. The sweeper is running and will submit the next pending case on its coming tick."
-                      : "No active jobs. Resume the sweeper to submit pending cases."
+                    : maintenanceDrainActive
+                      ? "No active jobs. System maintenance is holding new submissions."
+                      : queue.sweeper.enabled
+                        ? "No active jobs. The sweeper is running and will submit the next pending case on its coming tick."
+                        : "No active jobs. Resume the sweeper to submit pending cases."
                 }
               />
             ) : (
@@ -6912,6 +6924,25 @@ function activeSolverLabel(job: AdminJob): string | null {
   return command.split(/\s+/)[0]?.slice(-36) || null;
 }
 
+/** The API has already reconciled singular status callbacks with fresh worker
+ * ownership. Keep the visual unit equally truthful: a case-parallel heartbeat
+ * with multiple case directories is shown as case slots; a serial/MPI solve
+ * remains CPU slots. */
+function activeSlotLabel(job: AdminJob): string | null {
+  const held = job.cpuTokensHeld;
+  if (held == null || held <= 0) return null;
+  const capacity = job.cpuBudget ?? job.workerCpuBudget;
+  const activeCases = new Set(
+    job.processes
+      .map((process) => process.case_slug)
+      .filter((caseSlug): caseSlug is string => Boolean(caseSlug)),
+  ).size;
+  const unit = activeCases > 1 ? "active case slots" : "active CPU slots";
+  return capacity != null && capacity > 0
+    ? `${held} / ${capacity} ${unit}`
+    : `${held} ${unit}`;
+}
+
 function runtimeTone(job: AdminJob): string {
   if (
     job.runtimeState === "orphaned" ||
@@ -6988,6 +7019,7 @@ function ActiveJobCard({
     job.totalCases > 0
       ? Math.min(100, Math.round((job.completedCases / job.totalCases) * 100))
       : 0;
+  const slotLabel = activeSlotLabel(job);
   return (
     <div
       style={{
@@ -7117,9 +7149,7 @@ function ActiveJobCard({
                 {job.activeAoaDeg != null
                   ? ` · AoA ${f(job.activeAoaDeg, 1)}°`
                   : ""}
-                {job.cpuTokensHeld != null && job.cpuTokensHeld > 0
-                  ? ` · ${job.cpuTokensHeld} CPU`
-                  : ""}
+                {slotLabel ? ` · ${slotLabel}` : ""}
               </span>
             )}
           </div>

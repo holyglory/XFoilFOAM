@@ -330,6 +330,7 @@ export function ReviewStep({
     ? reviewQueueOperationalState({
         processDead: isProcessDead(queue.sweeper.heartbeatAt),
         admissionFenceActive: queue.sweeper.admissionFenceActive ?? false,
+        maintenanceDrainActive: queue.sweeper.maintenanceDrainActive ?? false,
         sweeperEnabled: queue.sweeper.enabled,
         engineUnreachableSince: queue.engineUnreachableSince,
       })
@@ -858,11 +859,13 @@ export function ReviewStep({
                     ? "process not running"
                     : queueOperationalState === "safety_stop"
                       ? "safety stop"
-                      : queueOperationalState === "engine_unreachable"
-                        ? "engine unreachable"
-                        : queueOperationalState === "sweeper_disabled"
-                          ? "disabled"
-                          : "enabled"
+                      : queueOperationalState === "maintenance_drain"
+                        ? "maintenance drain"
+                        : queueOperationalState === "engine_unreachable"
+                          ? "engine unreachable"
+                          : queueOperationalState === "sweeper_disabled"
+                            ? "disabled"
+                            : "enabled"
                 }
               />
             </div>
@@ -887,6 +890,11 @@ export function ReviewStep({
               <InfoLine
                 tone="red"
                 text="Solver safety stop — critical outcome; new submissions are fenced while running jobs continue."
+              />
+            ) : queueOperationalState === "maintenance_drain" ? (
+              <InfoLine
+                tone="amber"
+                text="System maintenance is holding new submissions; active jobs, if any, continue."
               />
             ) : queueOperationalState === "engine_unreachable" ? (
               <InfoLine

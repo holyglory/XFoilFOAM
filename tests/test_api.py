@@ -1,8 +1,14 @@
 """End-to-end API/job-lifecycle test using eager Celery and a mocked CFD runner."""
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
+import shutil
 from pathlib import Path
 
+import anyio
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -12,12 +18,13 @@ from airfoilfoam.capabilities import (
     URANS_RECOVERY_VERSION,
 )
 from airfoilfoam.celery_app import celery_app
-from airfoilfoam.api.main import QUEUE_OBSERVATION_HEALTH_VERSION, app
+from airfoilfoam.api.main import QUEUE_OBSERVATION_HEALTH_VERSION, RuntimeRequest, app
 from airfoilfoam.storage import JobStore
 from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.models import (
     AirfoilInput,
     ContinuationFailureKind,
+    JobPhase,
     JobResult,
     JobState,
     JobStatus,
@@ -89,6 +96,59 @@ def test_health_and_capabilities(client):
     assert "kOmegaSSTLM" in caps["turbulence_models"]  # transition model exposed
 
 
+def test_liveness_routes_are_coroutines():
+    routes = {
+        route.path: route
+        for route in app.routes
+        if hasattr(route, "path") and hasattr(route, "endpoint")
+    }
+    assert inspect.iscoroutinefunction(routes["/health"].endpoint)
+    assert inspect.iscoroutinefunction(routes["/capabilities"].endpoint)
+
+
+def test_liveness_routes_bypass_a_saturated_sync_worker_pool():
+    """Control-plane liveness does not wait behind a blocked sync endpoint."""
+
+    async def exercise() -> None:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        previous_tokens = limiter.total_tokens
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def occupy_only_worker_token() -> None:
+            # Reserving the sole real AnyIO worker token is equivalent to a
+            # blocked sync endpoint but keeps this ASGI-only regression free
+            # from an OS-thread scheduling dependency.
+            async with limiter:
+                started.set()
+                await release.wait()
+
+        limiter.total_tokens = 1
+        try:
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(occupy_only_worker_token)
+                with anyio.fail_after(1):
+                    await started.wait()
+
+                try:
+                    transport = httpx.ASGITransport(app=app)
+                    async with httpx.AsyncClient(
+                        transport=transport, base_url="http://testserver"
+                    ) as client:
+                        for path in ("/health", "/capabilities"):
+                            with anyio.fail_after(2):
+                                response = await client.get(path)
+                            assert response.status_code == 200
+                finally:
+                    # Always free the only worker before the task group waits
+                    # to join it, including if a liveness assertion fails.
+                    release.set()
+        finally:
+            limiter.total_tokens = previous_tokens
+
+    anyio.run(exercise)
+
+
 def test_settings_treat_empty_optional_compose_values_as_unset(monkeypatch):
     from airfoilfoam.config import Settings
 
@@ -126,15 +186,25 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert r.status_code == 202
     job_id = r.json()["job_id"]
 
-    status = client.get(f"/jobs/{job_id}").json()
+    status_response = client.get(f"/jobs/{job_id}")
+    status = status_response.json()
     assert status["state"] == "completed"
     assert status["total_cases"] == 3
     assert status["completed_cases"] == 3
     assert status["mesh_recovery_version"] == 2
+    status_bytes = (JobStore().job_dir(job_id) / "status.json").read_bytes()
+    assert status_response.headers["x-airfoilfoam-source-sha256"] == hashlib.sha256(
+        status_bytes
+    ).hexdigest()
 
-    result = client.get(f"/jobs/{job_id}/result").json()
+    result_response = client.get(f"/jobs/{job_id}/result")
+    result = result_response.json()
     assert result["state"] == "completed"
     assert result["mesh_recovery_version"] == 2
+    result_bytes = (JobStore().job_dir(job_id) / "result.json").read_bytes()
+    assert result_response.headers["x-airfoilfoam-source-sha256"] == hashlib.sha256(
+        result_bytes
+    ).hexdigest()
     assert len(result["polars"]) == 1
     polar = result["polars"][0]
     assert polar["reynolds"] == pytest.approx(50 * 1.0 / 1.5e-5)
@@ -154,6 +224,74 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert csv.status_code == 200
     assert "aoa_deg,cl,cd" in csv.text
     assert csv.text.count("\n") >= 4  # header + 3 rows
+
+
+def test_result_endpoint_keeps_legacy_no_shedding_certificate_readable(client):
+    """An engine upgrade must not make immutable v1 terminal evidence unreadable."""
+    job_id = "f6bc7a18428e4a32a3d73c4123eca78f"
+    job_root = JobStore().job_dir(job_id)
+    shutil.rmtree(job_root, ignore_errors=True)
+    job_root.mkdir(parents=True)
+    payload = {
+        "job_id": job_id,
+        "state": "failed",
+        "polars": [
+            {
+                "speed": 166.0,
+                "chord": 0.05,
+                "reynolds": 566000.0,
+                "points": [
+                    {
+                        "case_slug": "c0p05_u166_a11",
+                        "aoa_deg": 11.0,
+                        "unsteady": True,
+                        "no_shedding_certificate": {
+                            "reducer_version": "no-shedding-v1",
+                            "certified": True,
+                            "required_observation_s": 4.2,
+                            "observation_start_time": 1.8,
+                            "observation_end_time": 6.0,
+                            "observed_observation_s": 4.2,
+                            "source_sample_count": 401,
+                            "transport_sample_count": 400,
+                            "relative_tolerance": 0.005,
+                            "absolute_floor": 0.001,
+                            "cl_mean": 0.0006,
+                            "cd_mean": 0.012,
+                            "cm_mean": -0.0002,
+                            "cl_rms": 0.0001,
+                            "cd_rms": 0.00002,
+                            "cm_rms": 0.00001,
+                            "transport_cl_mean": 0.00059,
+                            "transport_cd_mean": 0.01201,
+                            "transport_cm_mean": -0.00019,
+                            "transport_cl_rms": 0.00012,
+                            "transport_cd_rms": 0.00003,
+                            "transport_cm_rms": 0.00002,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    raw = (json.dumps(payload, sort_keys=True) + "\n").encode()
+    (job_root / "result.json").write_bytes(raw)
+
+    try:
+        response = client.get(f"/jobs/{job_id}/result")
+    finally:
+        shutil.rmtree(job_root, ignore_errors=True)
+
+    assert response.status_code == 200, response.text
+    assert (
+        response.json()["polars"][0]["points"][0]["no_shedding_certificate"][
+            "reducer_version"
+        ]
+        == "no-shedding-v1"
+    )
+    assert response.headers["x-airfoilfoam-source-sha256"] == hashlib.sha256(
+        raw
+    ).hexdigest()
 
 
 def test_polar_submit_rejects_capability_cutover_before_queueing(
@@ -689,6 +827,35 @@ def test_runtime_endpoint_reports_typed_continuation_failure(client):
     assert row["status_continuation_failure_kind"] == "permanent"
     assert row["result_failure_disposition"] is None
     assert row["result_continuation_failure_kind"] == "permanent"
+
+
+def test_runtime_endpoint_can_omit_large_result_payload_inspection():
+    store = JobStore()
+    job_id = "runtime-result-inspection-omitted"
+    store.job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    store.write_status(
+        JobStatus(job_id=job_id, state=JobState.completed, phase=JobPhase.completed)
+    )
+    # Deliberately invalid: the runtime ownership probe must not parse or
+    # describe the body when its caller opts out. Full ingestion remains the
+    # endpoint which discovers this corruption.
+    (store.job_dir(job_id) / "result.json").write_text("{not-json")
+
+    runtime_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/jobs/runtime"
+    )
+    body = runtime_endpoint(
+        RuntimeRequest(job_ids=[job_id], inspect_result=False)
+    )
+    row = body["jobs"][0]
+    assert row["status_readable"] is True
+    assert row["status_state"] == "completed"
+    assert row["has_result"] is True
+    assert row["result_readable"] is False
+    assert row["result_state"] is None
+    assert row["result_error"] == "result payload inspection omitted by request"
 
 
 def test_file_traversal_blocked(client, fake_run_case, naca0012_selig_text):

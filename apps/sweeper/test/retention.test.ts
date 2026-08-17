@@ -1,4 +1,5 @@
 import { URANS_BUDGET_STOP_MARKER } from "@aerodb/core";
+import { URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER } from "@aerodb/engine-client";
 import {
   airfoils,
   boundaryProfiles,
@@ -22,13 +23,17 @@ import {
   simUransRequests,
   solverEvidenceArtifacts,
   solverProfiles,
+  syncRemoteHubBindingReceipts,
   syncRemoteResultDeliveries,
+  syncRemotePromiseCancellations,
+  syncSweepPromisePoints,
   syncSweepPromises,
   sweepDefinitions,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { EngineError, type EngineClient } from "@aerodb/engine-client";
 import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
@@ -48,6 +53,7 @@ let mediumId = "";
 let revisionId = "";
 let solverImplementationId = "";
 let bcId = "";
+const remotePromiseIds = new Set<string>();
 const profileIds = { boundary: "", mesh: "", solver: "", output: "" };
 let nextAoa = 1000;
 
@@ -249,7 +255,10 @@ async function insertClassifiedResult(
     sha256: "b".repeat(64),
     byteSize: 1,
   });
-  return row;
+  // The row returned by INSERT predates the current-attempt pointer update.
+  // Return the exact persisted pointer so remote-delivery fixtures satisfy the
+  // database's result/result-attempt shape invariant.
+  return { ...row, currentResultAttemptId: attempt.id };
 }
 
 async function readJob(id: string) {
@@ -366,8 +375,7 @@ beforeAll(async () => {
   revisionId = condition.simulationPresetRevisionId;
   const [revision] = await db
     .select({
-      solverImplementationId:
-        simulationPresetRevisions.solverImplementationId,
+      solverImplementationId: simulationPresetRevisions.solverImplementationId,
     })
     .from(simulationPresetRevisions)
     .where(eq(simulationPresetRevisions.id, revisionId))
@@ -394,6 +402,29 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // `sync_remote_promise_cancellations` deliberately uses ON DELETE NO ACTION:
+  // an upstream cancellation receipt must not disappear during runtime
+  // cleanup. These are exact test-owned promises, so remove their dependent
+  // receipts before campaign fixture cleanup cascades the promises.
+  if (remotePromiseIds.size) {
+    await db
+      .delete(syncRemoteHubBindingReceipts)
+      .where(
+        inArray(syncRemoteHubBindingReceipts.promiseId, [...remotePromiseIds]),
+      );
+    await db
+      .delete(syncRemoteResultDeliveries)
+      .where(
+        inArray(syncRemoteResultDeliveries.promiseId, [...remotePromiseIds]),
+      );
+    await db
+      .delete(syncRemotePromiseCancellations)
+      .where(
+        inArray(syncRemotePromiseCancellations.promiseId, [
+          ...remotePromiseIds,
+        ]),
+      );
+  }
   if (revisionId)
     await db
       .delete(simUransRequests)
@@ -488,45 +519,306 @@ describe("terminal strip reaper", () => {
     });
   });
 
-  it("keeps remote-solver source bytes until the job-level delivery is acknowledged", async () => {
+  it("MUST-CATCH: a mixed failed remote sweep waits for accepted receipt reclaim and failed-sibling clean restart", async () => {
     const [promise] = await db
       .insert(syncSweepPromises)
       .values({
-        sourceInstanceId: `${PREFIX}-upstream`,
-        sourceInstanceName: `${PREFIX} upstream`,
-        sourceBaseUrl: "https://hub.invalid/api/sync/v1",
+        sourceInstanceId: `${PREFIX}-hub`,
+        sourceInstanceName: "Retention hub fixture",
+        sourceBaseUrl: "https://retention-hub.invalid/api/sync/v1",
         airfoilId,
         simulationPresetRevisionId: revisionId,
         aoaCount: 2,
-        expiresAt: new Date(NOW.getTime() + 60 * 60 * 1000),
-        lastHeartbeatAt: NOW,
-        requestPayload: { fixture: PREFIX },
+        expiresAt: new Date(NOW.getTime() + 24 * 60 * 60 * 1000),
+        requestPayload: { remoteSolver: true },
       })
       .returning();
-    const deliveredJob = await insertTerminalJob(
-      `${PREFIX}-remote-await-delivered`,
-      { requestPayload: { syncPromiseId: promise.id, remoteSolver: true } },
-    );
-    const supersededJob = await insertTerminalJob(
-      `${PREFIX}-remote-await-superseded`,
-      { requestPayload: { syncPromiseId: promise.id, remoteSolver: true } },
-    );
-    await db.insert(syncRemoteResultDeliveries).values([
-      {
-        promiseId: promise.id,
-        simJobId: deliveredJob.id,
-        generationKey: `${PREFIX}-delivered-generation`,
-        state: "pending",
-        nextAttemptAt: OLD,
+    remotePromiseIds.add(promise.id);
+    const job = await insertTerminalJob(`${PREFIX}-remote-mixed-receipt`, {
+      status: "failed",
+      engineState: "failed",
+      totalCases: 2,
+      completedCases: 1,
+      requestPayload: {
+        remoteSolver: true,
+        syncPromiseId: promise.id,
       },
-      {
+    });
+    const accepted = await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "rans",
+      regime: "rans",
+    });
+    const failedAoa = aoa();
+    const [failedResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: failedAoa,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        simJobId: job.id,
+        engineJobId: job.engineJobId,
+        engineCaseSlug: `aoa_${failedAoa}`,
+        methodKey: "openfoam.rans",
+        solverImplementationId,
+        error: "mixed remote sibling failed",
+        solvedAt: OLD,
+      })
+      .returning();
+    const [failedAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: failedResult.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: failedAoa,
+        simJobId: job.id,
+        engineJobId: job.engineJobId,
+        engineCaseSlug: `aoa_${failedAoa}`,
+        methodKey: "openfoam.rans",
+        solverImplementationId,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        error: "mixed remote sibling failed",
+        evidencePayload: { fidelity: "rans" },
+        solvedAt: OLD,
+      })
+      .returning();
+    await db.insert(syncSweepPromisePoints).values({
+      promiseId: promise.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: accepted.aoaDeg,
+      status: "fulfilled",
+      resultId: accepted.id,
+      resultAttemptId: accepted.currentResultAttemptId,
+    });
+    const [delivery] = await db
+      .insert(syncRemoteResultDeliveries)
+      .values({
         promiseId: promise.id,
-        simJobId: supersededJob.id,
-        generationKey: `${PREFIX}-superseded-generation`,
-        state: "pending",
-        nextAttemptAt: OLD,
-      },
+        simJobId: job.id,
+        resultId: accepted.id,
+        resultAttemptId: accepted.currentResultAttemptId,
+        aoaDeg: accepted.aoaDeg,
+        generationKey: accepted.currentResultAttemptId!,
+        state: "delivered",
+      })
+      .returning();
+    const brokeredUploadId = randomUUID();
+    const receipt = {
+      schemaVersion: 1,
+      kind: "hub-canonical-evidence-binding",
+      promiseId: promise.id,
+      remoteResultId: accepted.id,
+      remoteResultAttemptId: accepted.currentResultAttemptId,
+      brokeredUploadId,
+      aoaDeg: accepted.aoaDeg,
+      bindingState: "bound",
+      promisePointState: "fulfilled",
+    };
+    const [binding] = await db
+      .insert(syncRemoteHubBindingReceipts)
+      .values({
+        deliveryId: delivery.id,
+        promiseId: promise.id,
+        simJobId: job.id,
+        resultId: accepted.id,
+        resultAttemptId: accepted.currentResultAttemptId!,
+        aoaDeg: accepted.aoaDeg,
+        brokeredUploadId,
+        receiptCanonical: JSON.stringify(receipt),
+        receipt,
+        receiptHmac: "a".repeat(64),
+      })
+      .returning();
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+    expect(own(engine.stripCalls)).toEqual([]);
+
+    await db
+      .update(syncRemoteHubBindingReceipts)
+      .set({
+        reclaimState: "reclaimed",
+        reclaimedAt: NOW,
+        reclaimedBytes: 4096,
+      })
+      .where(eq(syncRemoteHubBindingReceipts.id, binding.id));
+    await stripTerminalJobs(db, engine, {
+      now: new Date(NOW.getTime() + 60_000),
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+    // The accepted point is safe, but the failed sibling still owns this raw
+    // engine generation and has no receipt. Generic retention must defer.
+    expect(own(engine.stripCalls)).toEqual([]);
+
+    await db
+      .delete(resultAttempts)
+      .where(eq(resultAttempts.id, failedAttempt.id));
+    await db
+      .update(results)
+      .set({
+        status: "pending",
+        source: "queued",
+        simJobId: null,
+        engineJobId: null,
+        engineCaseSlug: null,
+        error: null,
+        autoRetriedAt: NOW,
+      })
+      .where(eq(results.id, failedResult.id));
+    await stripTerminalJobs(db, engine, {
+      now: new Date(NOW.getTime() + 120_000),
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: `${PREFIX}-remote-mixed-receipt`, keepCaseState: false },
     ]);
+  }, 240000);
+
+  it("MUST-CATCH: a closed remote promise fully compacts local-only accepted evidence without deleting it", async () => {
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${PREFIX}-closed-compaction-hub`,
+        sourceInstanceName: "Closed compaction hub fixture",
+        sourceBaseUrl: "https://retention-hub.invalid/api/sync/v1",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 1,
+        status: "cancelled",
+        cancelledAt: OLD,
+        expiresAt: OLD,
+        requestPayload: { remoteSolver: true },
+      })
+      .returning();
+    remotePromiseIds.add(promise.id);
+    const job = await insertTerminalJob(`${PREFIX}-closed-accepted-compact`, {
+      requestPayload: {
+        remoteSolver: true,
+        syncPromiseId: promise.id,
+      },
+    });
+    const accepted = await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "urans_precalc",
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: `${PREFIX}-closed-accepted-compact`, keepCaseState: false },
+    ]);
+    expect(await readJob(job.id)).toMatchObject({
+      strippedAt: NOW,
+      stripReport: {
+        bytes_freed: 2048,
+        files_removed: 2,
+        kept_case_state: false,
+      },
+    });
+    expect(
+      await db
+        .select({ id: results.id, currentAttempt: results.currentResultAttemptId })
+        .from(results)
+        .where(eq(results.id, accepted.id)),
+    ).toEqual([
+      { id: accepted.id, currentAttempt: accepted.currentResultAttemptId },
+    ]);
+    expect(
+      await db
+        .select({ state: resultClassifications.state })
+        .from(resultClassifications)
+        .where(
+          and(
+            eq(resultClassifications.resultId, accepted.id),
+            eq(resultClassifications.state, "accepted"),
+          ),
+        ),
+    ).toEqual([{ state: "accepted" }]);
+  });
+
+  it("MUST-CATCH: an engine partial strip with unknown entries stays retryable", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-unknown-strip-retry`);
+    await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "urans_full",
+    });
+    const engine = fakeEngine({
+      strip: async (_jobId, keepCaseState) => ({
+        bytes_freed: 1024,
+        files_removed: 1,
+        kept_case_state: Boolean(keepCaseState),
+        unknown_entries_count: 1,
+        unknown_entries: ["cases/aoa_1/new-engine-member"],
+      }),
+    });
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: `${PREFIX}-unknown-strip-retry`, keepCaseState: false },
+    ]);
+    expect(await readJob(job.id)).toMatchObject({
+      strippedAt: null,
+      stripReport: {
+        bytes_freed: 1024,
+        files_removed: 1,
+        kept_case_state: false,
+        unknown_entries_count: 1,
+        note: "engine retained unknown entries; verified strip retry required",
+      },
+    });
+  });
+
+  it("MUST-CATCH: generic retention leaves a zero-owner failed remote job to immediate clean-restart deletion", async () => {
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${PREFIX}-zero-owner-hub`,
+        sourceInstanceName: "Zero owner hub fixture",
+        sourceBaseUrl: "https://retention-hub.invalid/api/sync/v1",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 1,
+        expiresAt: new Date(NOW.getTime() + 24 * 60 * 60 * 1000),
+        requestPayload: { remoteSolver: true },
+      })
+      .returning();
+    remotePromiseIds.add(promise.id);
+    const job = await insertTerminalJob(`${PREFIX}-remote-zero-owner`, {
+      status: "failed",
+      engineState: "failed",
+      completedCases: 0,
+      requestPayload: {
+        remoteSolver: true,
+        syncPromiseId: promise.id,
+      },
+    });
     const engine = fakeEngine();
 
     await stripTerminalJobs(db, engine, {
@@ -536,45 +828,7 @@ describe("terminal strip reaper", () => {
     });
 
     expect(own(engine.stripCalls)).toEqual([]);
-    expect((await readJob(deliveredJob.id)).strippedAt).toBeNull();
-    expect((await readJob(supersededJob.id)).strippedAt).toBeNull();
-
-    await db
-      .update(syncRemoteResultDeliveries)
-      .set({ state: "delivered", deliveredAt: NOW })
-      .where(eq(syncRemoteResultDeliveries.simJobId, deliveredJob.id));
-    await db
-      .update(syncRemoteResultDeliveries)
-      .set({ state: "superseded" })
-      .where(eq(syncRemoteResultDeliveries.simJobId, supersededJob.id));
-
-    const afterAck = new Date(NOW.getTime() + 60_000);
-    await stripTerminalJobs(db, engine, {
-      now: afterAck,
-      stripMinAgeMs: THIRTY_MIN,
-      stripMaxPerTick: 500,
-    });
-
-    const acknowledgedCalls = own(engine.stripCalls);
-    expect(acknowledgedCalls).toHaveLength(2);
-    expect(acknowledgedCalls).toEqual(
-      expect.arrayContaining([
-        {
-          jobId: `${PREFIX}-remote-await-delivered`,
-          keepCaseState: false,
-        },
-        {
-          jobId: `${PREFIX}-remote-await-superseded`,
-          keepCaseState: false,
-        },
-      ]),
-    );
-    expect((await readJob(deliveredJob.id)).strippedAt?.toISOString()).toBe(
-      afterAck.toISOString(),
-    );
-    expect((await readJob(supersededJob.id)).strippedAt?.toISOString()).toBe(
-      afterAck.toISOString(),
-    );
+    expect((await readJob(job.id)).strippedAt).toBeNull();
   });
 
   it("keeps case state for a budget-stop continuable row, then fully strips after supersession", async () => {
@@ -620,6 +874,28 @@ describe("terminal strip reaper", () => {
     ]);
     after = await readJob(job.id);
     expect(after.stripReport).toMatchObject({ kept_case_state: false });
+  });
+
+  it("MUST-CATCH: fully strips a terminal physical-cap row even when legacy restart wording remains", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-physical-cap-strip`);
+    await insertClassifiedResult(job, {
+      state: "rejected",
+      qualityWarnings: [
+        `URANS integration ${URANS_BUDGET_STOP_MARKER}`,
+        `URANS integration ${URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER}`,
+      ],
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: `${PREFIX}-physical-cap-strip`, keepCaseState: false },
+    ]);
   });
 
   it("fully strips an expired continuable-kept job even while the continuable row remains", async () => {

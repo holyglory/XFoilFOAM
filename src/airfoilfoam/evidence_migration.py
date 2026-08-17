@@ -41,7 +41,6 @@ from .evidence_store import (
     EvidenceStoreError,
     RemoteEvidencePointer,
     inspect_tar_zst,
-    manifest_bundle_member_set_sha256,
     read_remote_pointer,
     transcode_gzip_tar_to_zst,
 )
@@ -373,11 +372,8 @@ def migrate_target(
             )
             acknowledgement_fields: dict[str, Any] = {
                 "databaseAcknowledgement": ack,
+                "databaseRegistration": ack,
             }
-            if ack.get("state") == "quarantined":
-                acknowledgement_fields["databaseQuarantine"] = ack
-            else:
-                acknowledgement_fields["databaseRegistration"] = ack
             existing_receipt.update(
                 {
                     "state": "complete",
@@ -759,50 +755,9 @@ def _validate_database_ack(
             "archiveId",
         )
         timestamp_key = "registeredAt"
-    elif state == "quarantined":
-        if ack.get("registrationKind") != "orphan_evidence_quarantine":
-            raise EvidenceMigrationError(
-                "orphan database acknowledgement has the wrong registrationKind"
-            )
-        if ack.get("quarantineReason") != "terminal_engine_evidence_not_ingested":
-            raise EvidenceMigrationError(
-                "orphan database acknowledgement has the wrong quarantineReason"
-            )
-        if any(
-            ack.get(key) is not None
-            for key in ("resultId", "resultAttemptId", "archiveId")
-        ):
-            raise EvidenceMigrationError(
-                "orphan database acknowledgement must not claim result ownership"
-            )
-        required_identity = (
-            "quarantineId",
-            "sourceArtifactId",
-            "blobId",
-        )
-        timestamp_key = "quarantinedAt"
-
-        manifest_bytes = manifest_path.read_bytes()
-        manifest_member_count, manifest_member_set_sha256 = (
-            manifest_bundle_member_set_sha256(manifest_bytes)
-        )
-        receipt_bytes = receipt_path.read_bytes()
-        orphan_expected = {
-            "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
-            "manifestByteSize": len(manifest_bytes),
-            "archiveMemberSetSha256": manifest_member_set_sha256,
-            "archiveMemberCount": manifest_member_count,
-            "migrationReceiptSha256": hashlib.sha256(receipt_bytes).hexdigest(),
-            "migrationReceiptByteSize": len(receipt_bytes),
-        }
-        for key, value in orphan_expected.items():
-            if ack.get(key) != value:
-                raise EvidenceMigrationError(
-                    f"orphan database acknowledgement mismatch for {key}"
-                )
     else:
         raise EvidenceMigrationError(
-            "database acknowledgement state must be registered or quarantined"
+            "database acknowledgement state must be registered"
         )
 
     for key in required_identity:

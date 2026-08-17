@@ -49,7 +49,11 @@ import { selectedCleanCycleQualityReasons } from "./urans-cycle-policy";
 // v7 (frame-sample physics, 2026-07-27): accepted URANS means can no longer
 // hide a non-positive-drag or numerically diverged sample inside frame_track.
 // Immutable raw evidence remains stored; only polar eligibility changes.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v7";
+// v8 (integer-period boundary, 2026-08-05): a frame window which is exactly
+// N physical periods may arrive a few binary64 ULPs below N after timestamp /
+// period division.  Accept only that machine-roundoff neighbourhood; this is
+// not a physical-period relaxation and values outside it remain rejected.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v8";
 
 /** A derived-media absence, not an aerodynamic verdict. The point remains
  * rejected until real stored video exists, but it belongs to automatic media
@@ -91,6 +95,11 @@ export const FRAME_TRACK_MIN_PERIODS_FULL = FRAME_TRACK_MIN_PERIODS;
  *  re-solves accepted precalc points at full fidelity afterwards. */
 export const FRAME_TRACK_MIN_PERIODS_PRECALC = 3;
 
+/** Maximum binary64 rounding distance admitted at an exact integer-period
+ * boundary. Four ULPs covers the observed timestamp-division underflow while
+ * remaining many orders of magnitude below one physical sample or period. */
+export const FRAME_TRACK_PERIOD_BOUNDARY_ULPS = 4;
+
 /** Minimum retained periods demanded of a frame_track given the row's
  *  fidelity tier. Unknown/legacy/absent fidelity keeps the strict full bar. */
 export function frameTrackMinPeriodsFor(
@@ -99,6 +108,28 @@ export function frameTrackMinPeriodsFor(
   return fidelity === "urans_precalc"
     ? FRAME_TRACK_MIN_PERIODS_PRECALC
     : FRAME_TRACK_MIN_PERIODS_FULL;
+}
+
+/** Strict integer-period gate with an ULP-scale arithmetic boundary only.
+ * The tolerance is relative to the configured threshold, never to a measured
+ * sample interval or a fraction of a physical period. */
+export function meetsFrameTrackPeriodMinimum(
+  periods: unknown,
+  minPeriods: number,
+): boolean {
+  if (
+    typeof periods !== "number" ||
+    !Number.isFinite(periods) ||
+    !Number.isFinite(minPeriods)
+  ) {
+    return false;
+  }
+  if (periods >= minPeriods) return true;
+  const thresholdMagnitude = Math.max(1, Math.abs(minPeriods));
+  const thresholdUlp =
+    Number.EPSILON * 2 ** Math.floor(Math.log2(thresholdMagnitude));
+  const tolerance = thresholdUlp * FRAME_TRACK_PERIOD_BOUNDARY_ULPS;
+  return minPeriods - periods <= tolerance;
 }
 
 /** Non-physical coefficient magnitude bound (|cl| / |cm| beyond this =
@@ -524,13 +555,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
       if (p.frameTrack.stationary !== true) reasons.push("non-stationary");
       const periods = p.frameTrack.periods_retained;
       const minPeriods = frameTrackMinPeriodsFor(p.fidelity);
-      if (
-        !(
-          typeof periods === "number" &&
-          Number.isFinite(periods) &&
-          periods >= minPeriods
-        )
-      ) {
+      if (!meetsFrameTrackPeriodMinimum(periods, minPeriods)) {
         reasons.push("insufficient-periods");
       }
       if (Array.isArray(p.frameTrack.frames)) {
@@ -640,14 +665,16 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
           if (
             selected.length < required ||
             selectedQualityIssues.some(
-              (issue) => issue === "coefficient-samples" || issue === "field-frames",
+              (issue) =>
+                issue === "coefficient-samples" || issue === "field-frames",
             )
           ) {
             reasons.push("insufficient-clean-cycle-evidence");
           }
           if (
             selectedQualityIssues.some(
-              (issue) => issue !== "coefficient-samples" && issue !== "field-frames",
+              (issue) =>
+                issue !== "coefficient-samples" && issue !== "field-frames",
             )
           ) {
             reasons.push("invalid-clean-cycle-quality");

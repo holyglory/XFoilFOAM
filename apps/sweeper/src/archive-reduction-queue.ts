@@ -9,12 +9,15 @@
  */
 import {
   type DB,
+  hasExactLivePrecalcPublicationWinner,
   refreshCampaignProgressForResultIds,
   refreshPolarCacheForRevision,
+  satisfyPrecalcObligationFromAcceptedResult,
   resultArchiveReductionQueue,
   resultAttempts,
   resultCanonicalSelections,
   resultInterpretationBackfillItems,
+  resultInterpretationBackfillRuns,
   resultInterpretations,
   resultReducerVersions,
   results,
@@ -26,6 +29,7 @@ import {
   and,
   asc,
   eq,
+  gte,
   inArray,
   isNotNull,
   isNull,
@@ -33,6 +37,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { randomUUID } from "node:crypto";
 
 import {
@@ -42,12 +47,14 @@ import {
 } from "./result-interpretation-backfill";
 import {
   ensureResultInterpretationReducerVersion,
+  hasExactLegacyUransArchiveGapRecoveryLineage,
   hasExactPrecalcUransPromotionLineage,
   mayPromoteArchiveUransFromExactPrecalcRans,
   selectAcceptedArchiveInterpretation,
 } from "./result-interpretations";
 import {
   archiveReductionRetryDelayMs,
+  CLEAN_CYCLE_V5_SELECTION_COMPATIBILITY,
   mayRunArchiveReduction,
   reducerVersionIsNewer,
   selectArchiveReductionScanPage,
@@ -56,6 +63,7 @@ import {
   engineArchiveReductionVersion,
   supportsArchiveCleanCycleReduction,
 } from "./engine-capabilities";
+import { ordinaryWriterBlockedByMaintenanceDrain } from "./maintenance-drain";
 import { createSingleFlightBackgroundRunner } from "./single-flight";
 
 export const ARCHIVE_REDUCTION_QUEUE_LEASE_MS = 30 * 60_000;
@@ -97,7 +105,10 @@ type QueueState =
   | "continuation_required"
   | "rerun_required"
   | "terminal_failure"
-  | "failed";
+  | "failed"
+  /** Legacy persisted value. New code never assigns it; a reopened current
+   * source may be re-armed through the compatibility branch below. */
+  | "historical_audit_required";
 
 type QueueItem = {
   id: string;
@@ -110,6 +121,20 @@ type QueueItem = {
   claimToken: string;
   backfillRunId: string | null;
 };
+
+/** A completed normal child may outlive the live projection that selected it.
+ * When the exact result is deliberately reopened, it is safe to replay that
+ * immutable child selection; any other historical child must be detached so a
+ * fresh live receipt can decide the current generation. */
+type ReplayableHistoricalChild = {
+  backfillRunId: string;
+  resultInterpretationId: string;
+};
+
+const selectedArchiveReducer = alias(
+  resultReducerVersions,
+  "selected_archive_reducer",
+);
 
 function completedUransSql() {
   // The query uses only fixed aliases below.  Keep raw regime in the proof:
@@ -155,17 +180,64 @@ export async function enqueueVerifiedArchiveReductions(
   admittedResultAttemptIds: string[];
 }> {
   const reducerVersionId = await ensureResultInterpretationReducerVersion(db);
+  const [candidateReducer] = await db
+    .select({
+      id: resultReducerVersions.id,
+      reducerKey: resultReducerVersions.reducerKey,
+      reducerVersion: resultReducerVersions.reducerVersion,
+      reducerBuildId: resultReducerVersions.buildId,
+      createdAt: resultReducerVersions.createdAt,
+    })
+    .from(resultReducerVersions)
+    .where(eq(resultReducerVersions.id, reducerVersionId))
+    .limit(1);
+  if (!candidateReducer) {
+    throw new Error(
+      `archive reducer version ${reducerVersionId} was not found`,
+    );
+  }
   const limit = opts.limit ?? ARCHIVE_REDUCTION_QUEUE_SCAN_LIMIT;
   if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
     throw new Error("archive-reduction queue scan limit must be 1..10000");
   }
   const resultIds = [...new Set(opts.resultIds ?? [])];
   const resultAttemptIds = [...new Set(opts.resultAttemptIds ?? [])];
+  const scanMode =
+    resultIds.length || resultAttemptIds.length
+      ? "explicit_historical_repair"
+      : "routine";
+  // An explicit exact source is an operator/ingest repair path. The bounded
+  // unscoped crash-recovery scanner is prospective from the v6 release so it
+  // cannot create work for every historical verified archive.
+  const routineV5SelectionCompatibility =
+    scanMode === "routine"
+      ? sql`
+          OR (
+            ${candidateReducer.reducerKey} = 'airfoilfoam'
+            AND ${candidateReducer.reducerVersion} = 'result-interpretation-v2'
+            AND ${candidateReducer.reducerBuildId} = 'clean-cycle-v6'
+            AND EXISTS (
+              SELECT 1
+              FROM result_reducer_versions compatible_v5_reducer
+              WHERE compatible_v5_reducer.id
+                = existing_interpretation.reducer_version_id
+                AND compatible_v5_reducer.reducer_key
+                  = ${CLEAN_CYCLE_V5_SELECTION_COMPATIBILITY.reducerKey}
+                AND compatible_v5_reducer.reducer_version
+                  = ${CLEAN_CYCLE_V5_SELECTION_COMPATIBILITY.reducerVersion}
+                AND compatible_v5_reducer.build_id
+                  = ${CLEAN_CYCLE_V5_SELECTION_COMPATIBILITY.reducerBuildId}
+            )
+          )`
+      : sql``;
   const rows = await db
     .select({
       resultId: results.id,
       resultAttemptId: resultAttempts.id,
+      resultAttemptCreatedAt: resultAttempts.createdAt,
+      currentResultAttemptId: results.currentResultAttemptId,
       sourceArchiveId: solverEvidenceArchives.id,
+      sourceArchiveCreatedAt: solverEvidenceArchives.createdAt,
       blob: solverEvidenceBlobs,
       currentSelectionId: results.currentCanonicalSelectionId,
       selectedInterpretationId: results.currentResultInterpretationId,
@@ -173,6 +245,9 @@ export async function enqueueVerifiedArchiveReductions(
       selectedSource: resultInterpretations.source,
       selectedArchiveId: resultInterpretations.sourceArchiveId,
       selectedReducerVersionId: resultInterpretations.reducerVersionId,
+      selectedReducerKey: selectedArchiveReducer.reducerKey,
+      selectedReducerVersion: selectedArchiveReducer.reducerVersion,
+      selectedReducerBuildId: selectedArchiveReducer.buildId,
     })
     .from(resultAttempts)
     .innerJoin(results, eq(results.id, resultAttempts.resultId))
@@ -196,6 +271,10 @@ export async function enqueueVerifiedArchiveReductions(
       resultInterpretations,
       eq(resultInterpretations.id, results.currentResultInterpretationId),
     )
+    .leftJoin(
+      selectedArchiveReducer,
+      eq(selectedArchiveReducer.id, resultInterpretations.reducerVersionId),
+    )
     .where(
       and(
         completedUransSql(),
@@ -205,6 +284,9 @@ export async function enqueueVerifiedArchiveReductions(
         sql`btrim(COALESCE(${solverEvidenceBlobs.bucket}, '')) <> ''`,
         sql`${solverEvidenceBlobs.generation} ~ '^[1-9][0-9]{0,19}$'`,
         isNotNull(solverEvidenceBlobs.verifiedAt),
+        scanMode === "routine"
+          ? gte(solverEvidenceArchives.createdAt, candidateReducer.createdAt)
+          : undefined,
         sql`NOT EXISTS (
           SELECT 1
           FROM result_canonical_selections existing_selection
@@ -219,7 +301,10 @@ export async function enqueueVerifiedArchiveReductions(
             AND existing_interpretation.source = 'archive_backfill'
             AND existing_interpretation.state = 'accepted'
             AND existing_interpretation.source_archive_id = ${solverEvidenceArchives.id}
-            AND existing_interpretation.reducer_version_id = ${reducerVersionId}::uuid
+            AND (
+              existing_interpretation.reducer_version_id = ${reducerVersionId}::uuid
+              ${routineV5SelectionCompatibility}
+            )
         )`,
         resultIds.length ? inArray(results.id, resultIds) : undefined,
         resultAttemptIds.length
@@ -233,10 +318,17 @@ export async function enqueueVerifiedArchiveReductions(
     // pointer prefix before it applies the bounded candidate limit.
     .limit(Math.min(limit * 4, 10_000));
 
-  const candidates = selectArchiveReductionScanPage(
-    rows.map((row) => ({
+  const rowsWithExactPublicationOwner = await Promise.all(
+    rows.map(async (row) => ({
       ...row,
       archivePointerValid: archivePointerForBackfill(row.blob).pointer != null,
+      resultHasCurrentAttempt: row.currentResultAttemptId != null,
+      hasExactLivePrecalcPublicationOwner:
+        row.currentResultAttemptId == null &&
+        (await hasExactLivePrecalcPublicationWinner(db, {
+          resultId: row.resultId,
+          resultAttemptId: row.resultAttemptId,
+        })),
       currentSelection: {
         acceptedArchive:
           row.currentSelectionId != null &&
@@ -245,10 +337,17 @@ export async function enqueueVerifiedArchiveReductions(
           row.selectedSource === "archive_backfill",
         sourceArchiveId: row.selectedArchiveId,
         reducerVersionId: row.selectedReducerVersionId,
+        reducerKey: row.selectedReducerKey,
+        reducerVersion: row.selectedReducerVersion,
+        reducerBuildId: row.selectedReducerBuildId,
       },
     })),
-    reducerVersionId,
+  );
+  const candidates = selectArchiveReductionScanPage(
+    rowsWithExactPublicationOwner,
+    candidateReducer,
     limit,
+    scanMode,
   );
   if (!candidates.length) {
     return {
@@ -258,21 +357,6 @@ export async function enqueueVerifiedArchiveReductions(
       admittedResultAttemptIds: [],
     };
   }
-  const [candidateReducer] = await db
-    .select({
-      id: resultReducerVersions.id,
-      reducerKey: resultReducerVersions.reducerKey,
-      createdAt: resultReducerVersions.createdAt,
-    })
-    .from(resultReducerVersions)
-    .where(eq(resultReducerVersions.id, reducerVersionId))
-    .limit(1);
-  if (!candidateReducer) {
-    throw new Error(
-      `archive reducer version ${reducerVersionId} was not found`,
-    );
-  }
-
   let enqueued = 0;
   const admittedResultAttemptIds = new Set<string>();
   for (const candidate of candidates) {
@@ -283,12 +367,41 @@ export async function enqueueVerifiedArchiveReductions(
     const outcome = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       const [lockedResult] = await tx
-        .select({ id: results.id })
+        .select({
+          id: results.id,
+          currentResultAttemptId: results.currentResultAttemptId,
+        })
         .from(results)
         .where(eq(results.id, candidate.resultId))
         .limit(1)
         .for("update");
-      if (!lockedResult) return { inserted: false, active: false };
+      // The outer scan is intentionally bounded and cannot hold result locks.
+      // Re-prove this result still owns a live generation under the same lock
+      // that inserts the queue receipt; otherwise a concurrent release could
+      // turn historical GCS evidence into live publication work.
+      const exactLivePrecalcOwner =
+        lockedResult?.currentResultAttemptId == null &&
+        lockedResult != null &&
+        (await hasExactLivePrecalcPublicationWinner(tx, {
+          resultId: candidate.resultId,
+          resultAttemptId: candidate.resultAttemptId,
+          lockForPublication: true,
+        }));
+      if (
+        !lockedResult ||
+        (!lockedResult.currentResultAttemptId && !exactLivePrecalcOwner)
+      ) {
+        return { inserted: false, active: false };
+      }
+      // The outer scan only proves that *some* generation was current when it
+      // read the row. Recheck the full exact-source publication contract while
+      // the result is locked: an old archived attempt must not wake from its
+      // historical-audit hold merely because a different generation became
+      // current. The sole non-current exception is the explicit PRECALC RANS
+      // lineage encoded by `publicationCandidateState`.
+      if ((await publicationCandidateState(tx, candidate)) !== "publishable") {
+        return { inserted: false, active: false };
+      }
 
       const reducerRows = await tx
         .select({
@@ -303,7 +416,7 @@ export async function enqueueVerifiedArchiveReductions(
         reducerVersionIsNewer(version, candidateReducer),
       );
       // A stale sweeper process must not admit V1 after V2 was deployed. V1
-      // receipts that were already admitted remain historical audit work, but
+      // receipts that were already admitted remain retained queue history, but
       // selection will see V2's durable receipt and refuse to publish V1.
       if (laterReducerExists) return { inserted: false, active: false };
 
@@ -318,11 +431,182 @@ export async function enqueueVerifiedArchiveReductions(
         })
         .onConflictDoNothing()
         .returning({ id: resultArchiveReductionQueue.id });
+      // A released result deliberately parks an inherited receipt outside the
+      // runnable queue. If the exact result is later deliberately reopened,
+      // that audit-only hold must not suppress its ordinary archive
+      // publication forever: the same immutable source is now live again and
+      // may resume its normal archive_backfill authority. The result row lock
+      // above makes this re-proof and state transition atomic with respect to
+      // a concurrent release/selection. A child that reduced successfully
+      // before the release stays immutable scientific evidence and is replayed
+      // without reducer I/O; an incomplete/failed child is detached so the
+      // revived live receipt creates a fresh exact child instead.
+      if (!inserted) {
+        const [replayableHistoricalChild] = await tx
+          .select({
+            backfillRunId: resultArchiveReductionQueue.backfillRunId,
+            resultInterpretationId:
+              resultInterpretationBackfillItems.resultInterpretationId,
+          })
+          .from(resultArchiveReductionQueue)
+          .innerJoin(
+            resultInterpretationBackfillItems,
+            and(
+              eq(
+                resultInterpretationBackfillItems.runId,
+                resultArchiveReductionQueue.backfillRunId,
+              ),
+              eq(
+                resultInterpretationBackfillItems.resultId,
+                resultArchiveReductionQueue.resultId,
+              ),
+              eq(
+                resultInterpretationBackfillItems.resultAttemptId,
+                resultArchiveReductionQueue.resultAttemptId,
+              ),
+              eq(
+                resultInterpretationBackfillItems.sourceArchiveId,
+                resultArchiveReductionQueue.sourceArchiveId,
+              ),
+              eq(resultInterpretationBackfillItems.state, "reduced"),
+            ),
+          )
+          .innerJoin(
+            resultInterpretations,
+            and(
+              eq(
+                resultInterpretations.id,
+                resultInterpretationBackfillItems.resultInterpretationId,
+              ),
+              eq(
+                resultInterpretations.resultId,
+                resultArchiveReductionQueue.resultId,
+              ),
+              eq(
+                resultInterpretations.resultAttemptId,
+                resultArchiveReductionQueue.resultAttemptId,
+              ),
+              eq(
+                resultInterpretations.sourceArchiveId,
+                resultArchiveReductionQueue.sourceArchiveId,
+              ),
+              eq(
+                resultInterpretations.reducerVersionId,
+                resultArchiveReductionQueue.reducerVersionId,
+              ),
+              eq(resultInterpretations.source, "archive_backfill"),
+              eq(resultInterpretations.state, "accepted"),
+            ),
+          )
+          .where(
+            and(
+              eq(resultArchiveReductionQueue.resultId, candidate.resultId),
+              eq(
+                resultArchiveReductionQueue.resultAttemptId,
+                candidate.resultAttemptId,
+              ),
+              eq(
+                resultArchiveReductionQueue.sourceArchiveId,
+                candidate.sourceArchiveId,
+              ),
+              eq(
+                resultArchiveReductionQueue.reducerVersionId,
+                reducerVersionId,
+              ),
+              eq(
+                resultArchiveReductionQueue.state,
+                "historical_audit_required",
+              ),
+            ),
+          )
+          .limit(1);
+        const preservedChild: ReplayableHistoricalChild | null =
+          replayableHistoricalChild?.backfillRunId &&
+          replayableHistoricalChild.resultInterpretationId
+            ? {
+                backfillRunId: replayableHistoricalChild.backfillRunId,
+                resultInterpretationId:
+                  replayableHistoricalChild.resultInterpretationId,
+              }
+            : null;
+        await tx
+          .update(resultArchiveReductionQueue)
+          .set({
+            state: "pending",
+            claimToken: null,
+            claimExpiresAt: null,
+            attemptCount: 0,
+            backfillRunId: preservedChild?.backfillRunId ?? null,
+            resultInterpretationId:
+              preservedChild?.resultInterpretationId ?? null,
+            lastError: null,
+            nextAttemptAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(resultArchiveReductionQueue.resultId, candidate.resultId),
+              eq(
+                resultArchiveReductionQueue.resultAttemptId,
+                candidate.resultAttemptId,
+              ),
+              eq(
+                resultArchiveReductionQueue.sourceArchiveId,
+                candidate.sourceArchiveId,
+              ),
+              eq(
+                resultArchiveReductionQueue.reducerVersionId,
+                reducerVersionId,
+              ),
+              eq(
+                resultArchiveReductionQueue.state,
+                "historical_audit_required",
+              ),
+            ),
+          );
+
+        // A receipt may already have reduced normally before an operator
+        // released the result projection. When that same exact generation is
+        // deliberately made live again, retain its immutable normal child and
+        // interpretation and re-arm the parent only to replay canonical
+        // selection. Re-reducing the same authenticated archive would waste
+        // work and manufacture duplicate scientific history.
+        await tx
+          .update(resultArchiveReductionQueue)
+          .set({
+            state: "pending",
+            claimToken: null,
+            claimExpiresAt: null,
+            attemptCount: 0,
+            lastError: null,
+            nextAttemptAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(resultArchiveReductionQueue.resultId, candidate.resultId),
+              eq(
+                resultArchiveReductionQueue.resultAttemptId,
+                candidate.resultAttemptId,
+              ),
+              eq(
+                resultArchiveReductionQueue.sourceArchiveId,
+                candidate.sourceArchiveId,
+              ),
+              eq(
+                resultArchiveReductionQueue.reducerVersionId,
+                reducerVersionId,
+              ),
+              eq(resultArchiveReductionQueue.state, "reduced"),
+            ),
+          );
+      }
       const [active] = await tx
         .select({ id: resultArchiveReductionQueue.id })
         .from(resultArchiveReductionQueue)
         .where(
           and(
+            eq(resultArchiveReductionQueue.resultId, candidate.resultId),
             eq(
               resultArchiveReductionQueue.resultAttemptId,
               candidate.resultAttemptId,
@@ -341,7 +625,12 @@ export async function enqueueVerifiedArchiveReductions(
           ),
         )
         .limit(1);
-      return { inserted: inserted != null, active: active != null };
+      return {
+        // Preserve the `enqueued` metric as a count of new durable receipts;
+        // a reactivated row is nevertheless live for scheduler admission.
+        inserted: inserted != null,
+        active: active != null,
+      };
     });
     if (outcome.inserted) enqueued += 1;
     if (outcome.active) admittedResultAttemptIds.add(candidate.resultAttemptId);
@@ -358,6 +647,226 @@ type ArchiveReductionQueueScope = {
   resultIds?: string[];
   resultAttemptIds?: string[];
 };
+
+const LEGACY_NATIVE_FETCH_FAILURE = "fetch failed";
+
+/**
+ * Before native fetch failures were recognized as connection failures, the
+ * first failed request terminally settled both a queue receipt and its child
+ * run. The child is immutable operational history, but the queue receipt is
+ * deliberately mutable scheduling state. Re-arm only that receipt, and only
+ * when no scientific row was ever staged and the exact source is still the
+ * current live publication target. A fresh child run therefore gets the
+ * normal bounded retry budget without rewriting the forensic failure.
+ *
+ * This is intentionally much narrower than a generic failed-row retry. It
+ * repairs the one known native-fetch misclassification and cannot revive a
+ * superseded source, accepted/rejected interpretation, or any engine answer.
+ */
+export async function rearmLegacyNativeFetchArchiveReductionReceipts(
+  db: DB,
+  scope: ArchiveReductionQueueScope = {},
+): Promise<number> {
+  const candidates = await db
+    .select({
+      queueId: resultArchiveReductionQueue.id,
+      resultId: resultArchiveReductionQueue.resultId,
+      resultAttemptId: resultArchiveReductionQueue.resultAttemptId,
+      sourceArchiveId: resultArchiveReductionQueue.sourceArchiveId,
+      reducerVersionId: resultArchiveReductionQueue.reducerVersionId,
+      backfillRunId: resultArchiveReductionQueue.backfillRunId,
+      childId: resultInterpretationBackfillItems.id,
+    })
+    .from(resultArchiveReductionQueue)
+    .innerJoin(
+      resultInterpretationBackfillRuns,
+      eq(
+        resultInterpretationBackfillRuns.id,
+        resultArchiveReductionQueue.backfillRunId,
+      ),
+    )
+    .innerJoin(
+      resultInterpretationBackfillItems,
+      and(
+        eq(
+          resultInterpretationBackfillItems.runId,
+          resultArchiveReductionQueue.backfillRunId,
+        ),
+        eq(
+          resultInterpretationBackfillItems.resultId,
+          resultArchiveReductionQueue.resultId,
+        ),
+        eq(
+          resultInterpretationBackfillItems.resultAttemptId,
+          resultArchiveReductionQueue.resultAttemptId,
+        ),
+        eq(
+          resultInterpretationBackfillItems.sourceArchiveId,
+          resultArchiveReductionQueue.sourceArchiveId,
+        ),
+      ),
+    )
+    .innerJoin(results, eq(results.id, resultArchiveReductionQueue.resultId))
+    .where(
+      and(
+        eq(resultArchiveReductionQueue.state, "failed"),
+        eq(resultArchiveReductionQueue.attemptCount, 1),
+        eq(resultArchiveReductionQueue.lastError, LEGACY_NATIVE_FETCH_FAILURE),
+        isNull(resultArchiveReductionQueue.resultInterpretationId),
+        eq(resultInterpretationBackfillRuns.state, "completed"),
+        eq(resultInterpretationBackfillItems.state, "failed"),
+        eq(resultInterpretationBackfillItems.attemptCount, 1),
+        eq(
+          resultInterpretationBackfillItems.lastError,
+          LEGACY_NATIVE_FETCH_FAILURE,
+        ),
+        isNull(resultInterpretationBackfillItems.resultInterpretationId),
+        eq(
+          results.currentResultAttemptId,
+          resultArchiveReductionQueue.resultAttemptId,
+        ),
+        isNull(results.currentResultInterpretationId),
+        isNull(results.currentCanonicalSelectionId),
+        // A failed child must not be detached if any archive interpretation
+        // exists for its exact scientific identity, even if an older worker
+        // crashed before writing the reverse receipt pointer.
+        sql`NOT EXISTS (
+          SELECT 1
+          FROM result_interpretations existing_interpretation
+          WHERE existing_interpretation.result_id = ${resultArchiveReductionQueue.resultId}
+            AND existing_interpretation.result_attempt_id = ${resultArchiveReductionQueue.resultAttemptId}
+            AND existing_interpretation.source_archive_id = ${resultArchiveReductionQueue.sourceArchiveId}
+            AND existing_interpretation.source = 'archive_backfill'
+        )`,
+        scope.resultIds?.length
+          ? inArray(resultArchiveReductionQueue.resultId, scope.resultIds)
+          : undefined,
+        scope.resultAttemptIds?.length
+          ? inArray(
+              resultArchiveReductionQueue.resultAttemptId,
+              scope.resultAttemptIds,
+            )
+          : undefined,
+      ),
+    )
+    .orderBy(asc(resultArchiveReductionQueue.createdAt))
+    .limit(ARCHIVE_REDUCTION_QUEUE_MAX_DRAIN_LIMIT);
+
+  let rearmed = 0;
+  for (const candidate of candidates) {
+    const repaired = await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      // All writers that change a result's publication identity take this
+      // lock. Re-prove the exact current attempt under it so a historical
+      // source cannot be revived between discovery and the mutable repair.
+      const [lockedResult] = await tx
+        .select({
+          currentResultAttemptId: results.currentResultAttemptId,
+          currentResultInterpretationId: results.currentResultInterpretationId,
+          currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+        })
+        .from(results)
+        .where(eq(results.id, candidate.resultId))
+        .limit(1)
+        .for("update");
+      if (
+        !lockedResult ||
+        lockedResult.currentResultAttemptId !== candidate.resultAttemptId ||
+        lockedResult.currentResultInterpretationId != null ||
+        lockedResult.currentCanonicalSelectionId != null
+      ) {
+        return false;
+      }
+
+      // Take both mutable receipt rows under the same exact failure shape.
+      // The old child is never modified; its terminal `fetch failed` record
+      // remains attached to the completed historical run.
+      const [child] = await tx
+        .select({ id: resultInterpretationBackfillItems.id })
+        .from(resultInterpretationBackfillItems)
+        .where(
+          and(
+            eq(resultInterpretationBackfillItems.id, candidate.childId),
+            eq(
+              resultInterpretationBackfillItems.runId,
+              candidate.backfillRunId!,
+            ),
+            eq(resultInterpretationBackfillItems.state, "failed"),
+            eq(resultInterpretationBackfillItems.attemptCount, 1),
+            eq(
+              resultInterpretationBackfillItems.lastError,
+              LEGACY_NATIVE_FETCH_FAILURE,
+            ),
+            isNull(resultInterpretationBackfillItems.resultInterpretationId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!child) return false;
+
+      const [existingInterpretation] = await tx
+        .select({ id: resultInterpretations.id })
+        .from(resultInterpretations)
+        .where(
+          and(
+            eq(resultInterpretations.resultId, candidate.resultId),
+            eq(
+              resultInterpretations.resultAttemptId,
+              candidate.resultAttemptId,
+            ),
+            eq(
+              resultInterpretations.sourceArchiveId,
+              candidate.sourceArchiveId,
+            ),
+            eq(resultInterpretations.source, "archive_backfill"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (existingInterpretation) return false;
+
+      const publicationState = await publicationCandidateState(tx, candidate);
+      if (publicationState !== "publishable") return false;
+
+      const [rearmedQueue] = await tx
+        .update(resultArchiveReductionQueue)
+        .set({
+          state: "pending",
+          claimToken: null,
+          claimExpiresAt: null,
+          // Detach only the mutable parent. Its preserved child/run remains
+          // the durable forensic proof of the original native-fetch failure.
+          backfillRunId: null,
+          resultInterpretationId: null,
+          lastError:
+            `rearmed after preserved native-fetch child ${candidate.childId}; ` +
+            "the original failed run remains immutable operational history",
+          nextAttemptAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(resultArchiveReductionQueue.id, candidate.queueId),
+            eq(resultArchiveReductionQueue.state, "failed"),
+            eq(resultArchiveReductionQueue.attemptCount, 1),
+            eq(
+              resultArchiveReductionQueue.lastError,
+              LEGACY_NATIVE_FETCH_FAILURE,
+            ),
+            eq(
+              resultArchiveReductionQueue.backfillRunId,
+              candidate.backfillRunId!,
+            ),
+            isNull(resultArchiveReductionQueue.resultInterpretationId),
+          ),
+        )
+        .returning({ id: resultArchiveReductionQueue.id });
+      return rearmedQueue != null;
+    });
+    if (repaired) rearmed += 1;
+  }
+  return rearmed;
+}
 
 async function claimNextQueueItem(
   db: DB,
@@ -444,6 +953,9 @@ async function settleQueueItem(
     resultInterpretationId?: string | null;
     lastError?: string | null;
     nextAttemptAt?: Date;
+    /** Historical released evidence is not a campaign transition. Do not make
+     * a queue-cleanup receipt look like solved/blocked campaign work. */
+    refreshCampaignProgress?: boolean;
   },
 ): Promise<boolean> {
   const [settled] = await db
@@ -473,8 +985,86 @@ async function settleQueueItem(
   // This is an observable campaign transition, not just background metadata.
   // Recompute the exact linked cells after every successful queue settlement
   // so a publication wait cannot linger as solved/rejected/blocked.
-  await refreshCampaignProgressForResultIds(db, [item.resultId]);
+  if (values.refreshCampaignProgress !== false) {
+    await refreshCampaignProgressForResultIds(db, [item.resultId]);
+  }
   return true;
+}
+
+async function holdHistoricalReleasedArchiveQueueItem(
+  db: DB,
+  item: QueueItem,
+): Promise<PublicationCandidateState | "claim_lost"> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    // The optimistic state check performed by the queue worker is deliberately
+    // outside a transaction. Re-prove the release while holding the result
+    // before parking its queue receipt; otherwise a concurrent publication
+    // could revive the result after the check and strand live work in the
+    // dormant historical-audit state forever.
+    const [lockedResult] = await tx
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, item.resultId))
+      .limit(1)
+      .for("update");
+    if (!lockedResult) return "superseded";
+
+    if (lockedResult.currentResultAttemptId != null) {
+      // The result is live again while its row is locked. Re-evaluate the
+      // exact archive/lineage state in this same transaction, rather than
+      // continuing based on the stale historical observation.
+      return publicationCandidateState(tx, item);
+    }
+    if (
+      await hasExactLivePrecalcPublicationWinner(tx, {
+        resultId: item.resultId,
+        resultAttemptId: item.resultAttemptId,
+        lockForPublication: true,
+      })
+    ) {
+      return publicationCandidateState(tx, item);
+    }
+
+    const [queue] = await tx
+      .select({ id: resultArchiveReductionQueue.id })
+      .from(resultArchiveReductionQueue)
+      .where(
+        and(
+          eq(resultArchiveReductionQueue.id, item.id),
+          eq(resultArchiveReductionQueue.state, "hydrating"),
+          eq(resultArchiveReductionQueue.claimToken, item.claimToken),
+          sql`${resultArchiveReductionQueue.claimExpiresAt} > clock_timestamp()`,
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!queue) return "claim_lost";
+
+    const [held] = await tx
+      .update(resultArchiveReductionQueue)
+      .set({
+        // Released evidence is outside the accepted-current publication
+        // contract. It is ineligible queue history, not audit work.
+        state: "superseded",
+        claimToken: null,
+        claimExpiresAt: null,
+        lastError:
+          "released archive evidence is ineligible for reduction; discard the unpublished generation and rerun if needed",
+        nextAttemptAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(resultArchiveReductionQueue.id, item.id),
+          eq(resultArchiveReductionQueue.state, "hydrating"),
+          eq(resultArchiveReductionQueue.claimToken, item.claimToken),
+          sql`${resultArchiveReductionQueue.claimExpiresAt} > clock_timestamp()`,
+        ),
+      )
+      .returning({ id: resultArchiveReductionQueue.id });
+    return held ? "superseded" : "claim_lost";
+  });
 }
 
 /**
@@ -537,7 +1127,12 @@ export async function supersedeArchiveReductionQueueForRecoveredAction(
 async function ensureBackfillRunForQueueClaim(
   db: DB,
   item: QueueItem,
-): Promise<string | null> {
+): Promise<
+  | { state: "attached"; runId: string }
+  | { state: "historical_released" }
+  | { state: "superseded" }
+  | { state: "claim_lost" }
+> {
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     // Match the staging/selection and admission lock order. Creating the
@@ -545,12 +1140,44 @@ async function ensureBackfillRunForQueueClaim(
     // queue first would deadlock a concurrent stage that correctly holds the
     // result row before it renews/fences this queue claim.
     const [lockedResult] = await tx
-      .select({ id: results.id })
+      .select({
+        id: results.id,
+        currentResultAttemptId: results.currentResultAttemptId,
+      })
       .from(results)
       .where(eq(results.id, item.resultId))
       .limit(1)
       .for("update");
-    if (!lockedResult) return null;
+    const exactLivePrecalcOwner =
+      lockedResult?.currentResultAttemptId == null &&
+      lockedResult != null &&
+      (await hasExactLivePrecalcPublicationWinner(tx, {
+        resultId: item.resultId,
+        resultAttemptId: item.resultAttemptId,
+        lockForPublication: true,
+      }));
+    if (
+      !lockedResult ||
+      (!lockedResult.currentResultAttemptId && !exactLivePrecalcOwner)
+    ) {
+      // This guard is deliberately inside the child-run transaction. The
+      // earlier optimistic status read may be stale; without this proof a
+      // release between the precheck and child creation could reduce
+      // historical evidence and create a physical recovery action.
+      return { state: "historical_released" };
+    }
+    // A non-null pointer only proves some generation is live. Re-evaluate the
+    // exact result/attempt/archive relationship under the result-row lock
+    // before attaching a durable child. Otherwise A can pass the optimistic
+    // read, B can become current, and the stale A worker can manufacture a
+    // child receipt before its later pre-I/O guard notices the supersession.
+    const lockedPublicationState = await publicationCandidateState(tx, item);
+    if (lockedPublicationState === "historical_released") {
+      return { state: "historical_released" };
+    }
+    if (lockedPublicationState !== "publishable") {
+      return { state: "superseded" };
+    }
     const [queue] = await tx
       .select({ backfillRunId: resultArchiveReductionQueue.backfillRunId })
       .from(resultArchiveReductionQueue)
@@ -564,12 +1191,16 @@ async function ensureBackfillRunForQueueClaim(
       )
       .limit(1)
       .for("update");
-    if (!queue) return null;
+    if (!queue) return { state: "claim_lost" };
     // Do not let an expired claimant attach or reuse a durable child run.
     // This renewal is inside the queue-row transaction, so a successor cannot
     // claim the parent between the expiry proof and child-run ownership.
-    if (!(await renewQueueClaimLease(tx, item))) return null;
-    if (queue.backfillRunId) return queue.backfillRunId;
+    if (!(await renewQueueClaimLease(tx, item))) {
+      return { state: "claim_lost" };
+    }
+    if (queue.backfillRunId) {
+      return { state: "attached", runId: queue.backfillRunId };
+    }
 
     const created = await createArchiveInterpretationBackfillRun({
       db: tx,
@@ -598,7 +1229,7 @@ async function ensureBackfillRunForQueueClaim(
       // The throw rolls back the freshly-created child run as well.
       throw new ArchiveReductionQueueClaimLostError();
     }
-    return created.runId;
+    return { state: "attached", runId: created.runId };
   });
 }
 
@@ -707,16 +1338,55 @@ async function alreadySelected(
 }
 
 /**
+ * Selection is not merely a presentation change for preliminary URANS: it is
+ * the moment the exact archive-derived result becomes eligible to close the
+ * physical PRECALC recovery owner.  Keep the reducer replay path on the same
+ * reconciliation sequence as a newly reduced receipt, otherwise a process
+ * crash between selection and settlement can leave stale blocked obligations
+ * and their incidents visible to the admission breaker.
+ */
+async function reconcileAcceptedArchiveSelection(
+  db: DB,
+  item: QueueItem,
+): Promise<void> {
+  const [scope] = await db
+    .select({
+      airfoilId: results.airfoilId,
+      revisionId: results.simulationPresetRevisionId,
+    })
+    .from(results)
+    .where(eq(results.id, item.resultId))
+    .limit(1);
+  if (scope?.revisionId) {
+    await refreshPolarCacheForRevision(db, scope.airfoilId, scope.revisionId);
+  }
+  await satisfyPrecalcObligationFromAcceptedResult(db, item.resultId);
+  await refreshCampaignProgressForResultIds(db, [item.resultId]);
+}
+
+type PublicationCandidateState =
+  | "publishable"
+  | "historical_released"
+  | "superseded";
+
+type PublicationCandidate = Pick<
+  QueueItem,
+  "resultId" | "resultAttemptId" | "sourceArchiveId"
+>;
+
+/**
  * A queue row refers to one immutable archive, so it must stop before reducer
  * I/O when a newer generation has superseded that source.  The one allowed
  * non-current case is deliberate: an exact source-pinned RANS handoff stays
- * public while its URANS successor is reduced.  The selector performs
- * the same CAS again immediately before promotion.
+ * public while its URANS successor is reduced. A cleared projection is
+ * historical by default, except for an active exact PRECALC owner whose own
+ * latest archived child has not yet been published. The selector performs the
+ * same exact-owner proof and CAS again immediately before promotion.
  */
-async function publicationCandidateCanStillPublish(
+async function publicationCandidateState(
   db: DB,
-  item: QueueItem,
-): Promise<boolean> {
+  item: PublicationCandidate,
+): Promise<PublicationCandidateState> {
   const [[source], [target], [current]] = await Promise.all([
     db
       .select({ id: solverEvidenceArchives.id })
@@ -754,15 +1424,35 @@ async function publicationCandidateCanStillPublish(
       .where(eq(results.id, item.resultId))
       .limit(1),
   ]);
-  if (!source || !target || !current) return false;
+  if (!source || !target || !current) return "superseded";
+  if (!current.currentAttemptId) {
+    const hasExactLivePrecalcOwner =
+      typeof target.fidelity === "string" &&
+      parsePointFidelity(target.fidelity) === "urans_precalc" &&
+      (await hasExactLivePrecalcPublicationWinner(db, {
+        resultId: item.resultId,
+        resultAttemptId: item.resultAttemptId,
+      }));
+    return mayRunArchiveReduction({
+      sourceArchiveCurrent: true,
+      targetAttemptCurrent: false,
+      hasExactPrecalcRansLineage: false,
+      hasExactLegacyRecoveryLineage: false,
+      hasExactLivePrecalcPublicationOwner: hasExactLivePrecalcOwner,
+    })
+      ? "publishable"
+      : "historical_released";
+  }
   if (current.currentAttemptId === item.resultAttemptId) {
     return mayRunArchiveReduction({
       sourceArchiveCurrent: true,
       targetAttemptCurrent: true,
       hasExactPrecalcRansLineage: false,
-    });
+      hasExactLegacyRecoveryLineage: false,
+    })
+      ? "publishable"
+      : "superseded";
   }
-  if (!current.currentAttemptId) return false;
 
   const [predecessor] = await db
     .select({
@@ -798,11 +1488,23 @@ async function publicationCandidateCanStillPublish(
       hasExactPrecalcLineage,
     },
   );
+  const hasExactLegacyRecoveryLineage =
+    typeof target.fidelity === "string" &&
+    parsePointFidelity(target.fidelity) === "urans_precalc" &&
+    (await hasExactLegacyUransArchiveGapRecoveryLineage({
+      db,
+      resultId: item.resultId,
+      currentLegacyAttemptId: current.currentAttemptId,
+      targetUransAttemptId: item.resultAttemptId,
+    }));
   return mayRunArchiveReduction({
     sourceArchiveCurrent: true,
     targetAttemptCurrent: false,
     hasExactPrecalcRansLineage,
-  });
+    hasExactLegacyRecoveryLineage,
+  })
+    ? "publishable"
+    : "superseded";
 }
 
 function queueStateForBackfillItem(
@@ -837,13 +1539,33 @@ async function processQueueItemImpl(
 ) {
   const selected = await alreadySelected(db, item);
   if (selected) {
+    // A prior process can crash after immutable selection but before the
+    // mutable PRECALC owner/progress ledgers settle. Replaying this queue
+    // receipt must use the same post-selection reconciliation as a fresh
+    // reduction, otherwise one stale blocked owner can unnecessarily fence
+    // healthy solver admission.
+    await reconcileAcceptedArchiveSelection(db, item);
     await settleQueueItem(db, item, {
       state: "reduced",
       resultInterpretationId: selected.interpretationId,
     });
     return;
   }
-  if (!(await publicationCandidateCanStillPublish(db, item))) {
+  let initialPublicationState: PublicationCandidateState | "claim_lost" =
+    await publicationCandidateState(db, item);
+  if (initialPublicationState === "historical_released") {
+    initialPublicationState = await holdHistoricalReleasedArchiveQueueItem(
+      db,
+      item,
+    );
+    if (
+      initialPublicationState === "historical_released" ||
+      initialPublicationState === "claim_lost"
+    ) {
+      return;
+    }
+  }
+  if (initialPublicationState !== "publishable") {
     await settleQueueItem(db, item, {
       state: "superseded",
       lastError:
@@ -855,11 +1577,73 @@ async function processQueueItemImpl(
   // A queue claim resumes the same bounded audit run after a transient engine
   // failure.  Only the first claim creates a run; recurring sweeper ticks
   // therefore never manufacture one run per tick.
-  const runId =
-    item.backfillRunId ?? (await ensureBackfillRunForQueueClaim(db, item));
-  if (!runId) {
+  const ensuredRun = item.backfillRunId
+    ? { state: "attached" as const, runId: item.backfillRunId }
+    : await ensureBackfillRunForQueueClaim(db, item);
+  if (ensuredRun.state === "historical_released") {
+    const reconciled = await holdHistoricalReleasedArchiveQueueItem(db, item);
+    if (reconciled === "historical_released" || reconciled === "claim_lost") {
+      return;
+    }
+    if (reconciled === "superseded") {
+      await settleQueueItem(db, item, {
+        state: "superseded",
+        lastError:
+          "archive source or URANS generation was superseded while its released-evidence state was reconciled",
+      });
+      return;
+    }
+    // The result became live again while its row was locked. No child receipt
+    // was attached, so leave this durable queue row immediately runnable for
+    // a fresh exact-source admission rather than stranding it as historical
+    // or proceeding from a stale release observation.
+    await settleQueueItem(db, item, {
+      state: "pending",
+      nextAttemptAt: new Date(),
+      lastError:
+        "result became live while historical released-evidence state was reconciled; retrying exact archive admission",
+    });
+    return;
+  }
+  if (ensuredRun.state === "claim_lost") {
     // The claim was lost before the child could be attached. The next owner
     // will resume this queue row; do not fabricate an unowned child run.
+    return;
+  }
+  if (ensuredRun.state === "superseded") {
+    // No child was attached under the lock, so this is a pure stale-receipt
+    // settlement. A different live generation owns subsequent publication.
+    await settleQueueItem(db, item, {
+      state: "superseded",
+      lastError:
+        "archive source or URANS generation was superseded before a child receipt could be attached",
+    });
+    return;
+  }
+  const runId = ensuredRun.runId;
+  // A previously attached child can survive a process crash. Reprove the
+  // released/live boundary immediately before it receives any reducer I/O;
+  // the stage and recovery-action write boundaries repeat it under lock.
+  let beforeReductionPublicationState:
+    | PublicationCandidateState
+    | "claim_lost" = await publicationCandidateState(db, item);
+  if (beforeReductionPublicationState === "historical_released") {
+    beforeReductionPublicationState =
+      await holdHistoricalReleasedArchiveQueueItem(db, item);
+    if (
+      beforeReductionPublicationState === "historical_released" ||
+      beforeReductionPublicationState === "claim_lost"
+    ) {
+      return;
+    }
+  }
+  if (beforeReductionPublicationState !== "publishable") {
+    await settleQueueItem(db, item, {
+      state: "superseded",
+      backfillRunId: runId,
+      lastError:
+        "archive source or URANS generation was superseded before archive reduction began",
+    });
     return;
   }
   const report = await withQueueClaimLease(db, item, () =>
@@ -901,7 +1685,19 @@ async function processQueueItemImpl(
   // The child receipt is exact-source-pinned. If A was superseded by B while
   // the engine reduced A, settle this queue row as superseded; never turn the
   // stale source into a retry that silently reads B.
-  if (!(await publicationCandidateCanStillPublish(db, item))) {
+  let afterReductionPublicationState: PublicationCandidateState | "claim_lost" =
+    await publicationCandidateState(db, item);
+  if (afterReductionPublicationState === "historical_released") {
+    afterReductionPublicationState =
+      await holdHistoricalReleasedArchiveQueueItem(db, item);
+    if (
+      afterReductionPublicationState === "historical_released" ||
+      afterReductionPublicationState === "claim_lost"
+    ) {
+      return;
+    }
+  }
+  if (afterReductionPublicationState !== "publishable") {
     await settleQueueItem(db, item, {
       state: "superseded",
       backfillRunId: runId,
@@ -915,6 +1711,9 @@ async function processQueueItemImpl(
     // A prior completed reduction can make discovery intentionally empty.
     // Re-check the canonical pointer before declaring anything terminal.
     const selectedAfter = await alreadySelected(db, item);
+    if (selectedAfter) {
+      await reconcileAcceptedArchiveSelection(db, item);
+    }
     await settleQueueItem(
       db,
       item,
@@ -938,6 +1737,14 @@ async function processQueueItemImpl(
   }
   const state = queueStateForBackfillItem(child.state);
   if (state === "reduced") {
+    // The child has committed a terminal reduction receipt. Selection can be
+    // visible through the immutable result projection even if this worker's
+    // immediately preceding `alreadySelected` probe observed the narrow
+    // commit boundary. Reconcile here unconditionally: it is idempotent when
+    // selection is not yet publishable, and closes the exact owner as soon as
+    // it is. A stale blocked owner must never survive a successful archive
+    // publication merely because a process crossed that boundary once.
+    await reconcileAcceptedArchiveSelection(db, item);
     const selectedAfter = await alreadySelected(db, item);
     if (selectedAfter) {
       await settleQueueItem(db, item, {
@@ -947,7 +1754,19 @@ async function processQueueItemImpl(
       });
       return;
     }
-    if (!(await publicationCandidateCanStillPublish(db, item))) {
+    let beforeReplayPublicationState: PublicationCandidateState | "claim_lost" =
+      await publicationCandidateState(db, item);
+    if (beforeReplayPublicationState === "historical_released") {
+      beforeReplayPublicationState =
+        await holdHistoricalReleasedArchiveQueueItem(db, item);
+      if (
+        beforeReplayPublicationState === "historical_released" ||
+        beforeReplayPublicationState === "claim_lost"
+      ) {
+        return;
+      }
+    }
+    if (beforeReplayPublicationState !== "publishable") {
       await settleQueueItem(db, item, {
         state: "superseded",
         backfillRunId: runId,
@@ -976,21 +1795,7 @@ async function processQueueItemImpl(
     });
     const selectedOnReplay = await alreadySelected(db, item);
     if (selectedOnReplay) {
-      const [scope] = await db
-        .select({
-          airfoilId: results.airfoilId,
-          revisionId: results.simulationPresetRevisionId,
-        })
-        .from(results)
-        .where(eq(results.id, item.resultId))
-        .limit(1);
-      if (scope?.revisionId) {
-        await refreshPolarCacheForRevision(
-          db,
-          scope.airfoilId,
-          scope.revisionId,
-        );
-      }
+      await reconcileAcceptedArchiveSelection(db, item);
     }
     await settleQueueItem(
       db,
@@ -1069,6 +1874,20 @@ export async function drainArchiveReductionQueue(
     archiveReductionVersion?: number | null;
   } = {},
 ): Promise<ArchiveReductionQueueDrainReport> {
+  // Archive reduction can create a backfill receipt, hydrate evidence and
+  // select a canonical interpretation. The watcher-owned maintenance receipt
+  // is the exclusive writer during its exact drain, so stop before a probe,
+  // discovery, claim, GCS read or publication mutation.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) {
+    return {
+      scanned: 0,
+      enqueued: 0,
+      admittedResultAttemptIds: [],
+      processed: 0,
+      archiveReductionVersion: opts.archiveReductionVersion ?? null,
+      deferredByCapability: false,
+    };
+  }
   const archiveReductionVersion =
     opts.archiveReductionVersion === undefined
       ? await engineArchiveReductionVersion(engine)
@@ -1087,6 +1906,14 @@ export async function drainArchiveReductionQueue(
       deferredByCapability: true,
     };
   }
+  // Reconcile only the pre-fix, first-attempt native-fetch terminal shape.
+  // This detaches a mutable queue parent from its preserved failed child; the
+  // following ordinary claim creates a fresh bounded child under all normal
+  // source/publication guards.
+  await rearmLegacyNativeFetchArchiveReductionReceipts(db, {
+    resultIds: opts.resultIds,
+    resultAttemptIds: opts.resultAttemptIds,
+  });
   const scan =
     opts.enqueue === false
       ? { scanned: 0, enqueued: 0, admittedResultAttemptIds: [] }

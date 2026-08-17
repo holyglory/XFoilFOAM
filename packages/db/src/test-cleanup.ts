@@ -320,22 +320,29 @@ export async function cleanupCampaignFixtures(
             revisionIds,
           ),
         );
-      // Exact-generation results point back to their selected immutable
-      // attempt. Break only this fixture graph's selection pointers before
-      // deleting its attempts; deleting the result afterward still cascades
-      // all result-owned media/evidence children in dependency order.
+      // A selected archive interpretation has a RESTRICT edge from its
+      // append-only canonical-selection record. Delete the owning result
+      // first so PostgreSQL cascades that complete immutable evidence graph
+      // together; deleting an attempt first can strand its selection and
+      // leave fixture GCS archives undeletable. Clear projections explicitly
+      // before the cascade to keep this cleanup valid across all schemas.
       await db
         .update(results)
-        .set({ currentResultAttemptId: null })
+        .set({
+          currentResultAttemptId: null,
+          currentResultInterpretationId: null,
+          currentCanonicalSelectionId: null,
+        })
         .where(inArray(results.simulationPresetRevisionId, revisionIds));
-      await db
-        .delete(resultAttempts)
-        .where(inArray(resultAttempts.simulationPresetRevisionId, revisionIds));
-      // result_media, result_media_repairs, extents, force history, render
-      // cache, verify rows and result-bound artifacts all cascade here.
       await db
         .delete(results)
         .where(inArray(results.simulationPresetRevisionId, revisionIds));
+      // Result-owned attempts cascaded with their parent above. This second
+      // delete removes only orphan attempt evidence such as a failed RANS
+      // submit that never materialized a results row.
+      await db
+        .delete(resultAttempts)
+        .where(inArray(resultAttempts.simulationPresetRevisionId, revisionIds));
     }
 
     // Immutable archived artifacts have now cascaded with their exact

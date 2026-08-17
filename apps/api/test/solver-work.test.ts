@@ -559,6 +559,12 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         cm: -0.04,
         converged: true,
         unsteady: true,
+        // A binary64 division of an exact three-period window may land a few
+        // ULPs below 3. The read model must mirror the shared classifier gate.
+        frameTrack: {
+          stationary: true,
+          periods_retained: 2.9999999999999987,
+        },
         solvedAt: new Date(),
       })
       .returning();
@@ -611,6 +617,12 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
         qualityWarnings: [CONTINUATION_WARNING],
         engineJobId: `${PREFIX}-engine-continuation`,
         engineCaseSlug: `${PREFIX}-case-continuation`,
+        frameTrack: {
+          stationary: true,
+          // Five ULPs below the FAST boundary: outside the four-ULP
+          // arithmetic allowance and therefore still a failed period gate.
+          periods_retained: 2.999999999999998,
+        },
         solvedAt: new Date(),
       })
       .returning();
@@ -1023,7 +1035,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     await pgClient.end();
   });
 
-  it("groups solver work by condition and preserves the legacy job row shape", async () => {
+  it("MUST-CATCH: mirrors the shared ULP period boundary in the solver-work read model while grouping conditions", async () => {
     const res = await app.inject({
       method: "GET",
       url: `/api/airfoils/${slug}/solver-work`,
@@ -1066,6 +1078,15 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     expect(conditionA.attentionCount).toBe(5);
     const byAoa = new Map(conditionA.points.map((p) => [p.aoaDeg, p]));
     expect(byAoa.get(2)?.state).toBe("provisional");
+    expect(byAoa.get(2)?.gates).toEqual(
+      expect.arrayContaining([
+        {
+          name: "period detector",
+          detail: "retained 2.9999999999999987 / 3 periods",
+          pass: true,
+        },
+      ]),
+    );
     expect(byAoa.get(3)?.state).toBe("needs_time");
     expect(byAoa.get(3)?.actions).toEqual(["continue"]);
     expect(byAoa.get(3)?.gate).toMatchObject({
@@ -1079,6 +1100,15 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     });
     expect(byAoa.get(4)?.plain).toContain("needs more same-case integration");
     expect(byAoa.get(4)?.plain).not.toContain("time budget");
+    expect(byAoa.get(4)?.gates).toEqual(
+      expect.arrayContaining([
+        {
+          name: "period detector",
+          detail: "retained 2.999999999999998 / 3 periods",
+          pass: false,
+        },
+      ]),
+    );
     expect(byAoa.get(5)).toMatchObject({ state: "queued", resultId: null });
     expect(byAoa.get(8)).toMatchObject({
       state: "ladder",

@@ -124,6 +124,20 @@ export interface PendingRemoteEvidenceCleanup {
   }>;
 }
 
+/**
+ * Receipt-scoped maintenance supplies this executor for writes that can alter
+ * canonical scheduling, selection, cache, or campaign state.  It runs the
+ * supplied mutation in a transaction that owns the exact maintenance drain;
+ * ordinary ingest deliberately leaves it absent.
+ *
+ * Immutable attempt/evidence staging is intentionally outside this boundary:
+ * a retired receipt may retain truthful immutable history, but it must never
+ * create a result shell, publish a pointer, or advance workflow state.
+ */
+export type CanonicalIngestMutation = <T>(
+  mutation: (db: DB) => Promise<T>,
+) => Promise<T>;
+
 export class TerminalEvidenceCleanupPendingError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -1076,8 +1090,7 @@ export function solverRegimeForPoint(
   fidelity: PointFidelity,
   context: string,
 ): "rans" | "urans" {
-  const urans =
-    fidelity === "urans_precalc" || fidelity === "urans_full";
+  const urans = fidelity === "urans_precalc" || fidelity === "urans_full";
   if (p.unsteady && !urans) {
     throw new Error(
       `solver regime contract drift (${context}): shedding point carries non-URANS fidelity '${fidelity}'`,
@@ -1142,7 +1155,7 @@ export const REPLACE_GUARD_MARKER = "higher-tier attempt rejected";
 /** Quality-warning marker prefix stamped on the ATTEMPT row when the
  *  released-cell guard quarantines a failed shipment (live gap 2026-07-08,
  *  campaign 495d78e0): an incoming FAILED point must never re-terminalize a
- *  cell its job no longer owns — the auto-retry-once pass (amendment B)
+ *  cell its job no longer owns — the clean-restart pass
  *  releases a crashed cell back to pending mid-job, and the same job's later
  *  partial/terminal ingests re-ship the identical failed case. Exported for
  *  the must-catch tests. */
@@ -4833,6 +4846,37 @@ async function ensureIngestCell(opts: {
   };
 }
 
+/** A clean restart deliberately erased one exact failed generation. A later
+ * terminal replay from that retired engine job must not recreate an attempt
+ * merely because the replayed point now looks converged/successful. The
+ * restart timestamp is generation-scoped by ordering it after the incoming
+ * job's creation, and the exact cell must no longer be owned by that job.
+ *
+ * Keep this narrower than the ordinary quarantine rule: without this direct
+ * clean-restart proof, late output remains immutable historical attempt
+ * evidence even though it cannot mutate the canonical result projection. */
+async function isDiscardedCleanRestartGeneration(
+  db: DB,
+  input: {
+    resultId: string;
+    simJobId: string;
+    engineJobId: string;
+  },
+): Promise<boolean> {
+  const rows = (await db.execute(sql`
+    SELECT 1
+    FROM results cell
+    JOIN sim_jobs retired_job ON retired_job.id = ${input.simJobId}
+    WHERE cell.id = ${input.resultId}
+      AND retired_job.engine_job_id = ${input.engineJobId}
+      AND cell.sim_job_id IS DISTINCT FROM retired_job.id
+      AND cell.auto_retried_at IS NOT NULL
+      AND cell.auto_retried_at >= retired_job."createdAt"
+    LIMIT 1
+  `)) as unknown as Array<{ "?column?": number }>;
+  return rows.length > 0;
+}
+
 async function stageForceHistory(
   db: DB,
   resultId: string,
@@ -5645,6 +5689,23 @@ export async function ingestResult(opts: {
    *  flight read as PROCESS NOT RUNNING on a healthy process). Defaults to
    *  the real touchHeartbeat; tests inject a spy to count touches. */
   heartbeat?: () => Promise<void>;
+  /**
+   * Optional staging-only stop hook. It can avoid extra immutable evidence
+   * work after a constrained writer notices it has become stale, but it is
+   * never authority for a canonical write: a token can change after this
+   * callback returns. Receipt reconciliation uses `canonicalMutation` below
+   * for every canonical result/cache/campaign mutation.
+   */
+  beforeMutation?: () => Promise<void>;
+  /**
+   * Atomic counterpart to `beforeMutation` for receipt-scoped maintenance.
+   * Every write that can alter a canonical result, cache, or campaign is
+   * supplied to this executor, which locks and rechecks the durable receipt
+   * in the same transaction as that write.  A preliminary lease renewal on
+   * its own is not sufficient: the maintenance token may change before the
+   * next SQL statement starts.
+   */
+  canonicalMutation?: CanonicalIngestMutation;
   /** Deterministic crash-boundary hook used by the exact-generation replay
    * regression. It runs after every immutable evidence row is committed but
    * before classification/pointer publication. */
@@ -5680,10 +5741,17 @@ export async function ingestResult(opts: {
     conditionMap,
     result,
   } = opts;
-  const jobRuntime = await persistEngineRuntimeForJob(
-    db,
-    simJobId,
-    result.engine,
+  // Keep the normal hot path unchanged.  Only a source-pinned receipt passes
+  // this fence, where every durable phase must re-prove its drain token.
+  const guardBeforeMutation = async (): Promise<void> => {
+    if (opts.beforeMutation) await opts.beforeMutation();
+  };
+  const mutateCanonical = <T>(
+    mutation: (mutationDb: DB) => Promise<T>,
+  ): Promise<T> =>
+    opts.canonicalMutation ? opts.canonicalMutation(mutation) : mutation(db);
+  const jobRuntime = await mutateCanonical((mutationDb) =>
+    persistEngineRuntimeForJob(mutationDb, simJobId, result.engine),
   );
   const heartbeat = opts.heartbeat ?? (() => touchHeartbeat(db));
   let points = 0;
@@ -5715,10 +5783,15 @@ export async function ingestResult(opts: {
      * already completed. We still resolve the cell and run the immutable
      * attempt replay check before reusing it. */
     reuseCandidate?: StagedPoint;
-  }): Promise<StagedPoint> => {
+  }): Promise<StagedPoint | null> => {
+    // `persistEngineRuntimeForJob` and `ensureIngestCell` can both write, so
+    // fence before either.  In particular, never create a new result cell
+    // after a watcher has retired the receipt token.
     const p = input.point;
     const pointRuntime = p.engine
-      ? await persistEngineRuntimeForJob(db, simJobId, p.engine)
+      ? await mutateCanonical((mutationDb) =>
+          persistEngineRuntimeForJob(mutationDb, simJobId, p.engine),
+        )
       : jobRuntime;
     const runtime =
       pointRuntime ?? (await resolveEngineRuntimeBuild(db, p.engine));
@@ -5735,20 +5808,41 @@ export async function ingestResult(opts: {
       steadyHistory: steadyHistoryForPoint(p, pointContext),
       error: pointError,
     };
-    const cell = await ensureIngestCell({
-      db,
-      airfoilId,
-      bcId: input.bcId,
-      presetRevisionId: input.presetRevisionId,
-      aoaDeg: p.aoa_deg,
-      simJobId,
-      engineJobId,
-      ingestLeaseToken: opts.ingestLeaseToken,
-      reynolds: Math.round(input.reynolds),
-      speed: input.speed,
-      chord: input.chord,
-      mach: p.unsteady ? (input.mappedMach ?? null) : input.mappedMach,
-    });
+    const cell = await mutateCanonical((mutationDb) =>
+      ensureIngestCell({
+        db: mutationDb,
+        airfoilId,
+        bcId: input.bcId,
+        presetRevisionId: input.presetRevisionId,
+        aoaDeg: p.aoa_deg,
+        simJobId,
+        engineJobId,
+        ingestLeaseToken: opts.ingestLeaseToken,
+        reynolds: Math.round(input.reynolds),
+        speed: input.speed,
+        chord: input.chord,
+        mach: p.unsteady ? (input.mappedMach ?? null) : input.mappedMach,
+      }),
+    );
+    // Once a cell generation has been cleanly restarted, terminal re-delivery
+    // from the abandoned engine job must not recreate any version of that
+    // discarded attempt/artifact graph — including a stale point that now
+    // claims success. Running partial races and other non-discarded late
+    // generations retain their exact history through ordinary quarantine.
+    const discardedCleanRestartGeneration =
+      cell.quarantined &&
+      ["completed", "failed", "cancelled"].includes(result.state) &&
+      (await isDiscardedCleanRestartGeneration(db, {
+        resultId: cell.id,
+        simJobId,
+        engineJobId,
+      }));
+    if (discardedCleanRestartGeneration) {
+      console.error(
+        `[sweeper] RELEASED-CELL GUARD: discarded terminal replay of a clean-restarted generation (${pointContext}); cell was ${cell.status}${cell.simJobId ? ` under ${cell.simJobId}` : " (released)"}; no attempt or artifact retained`,
+      );
+      return null;
+    }
     const incomingReasons = incomingRejectionReasons(p, derived);
     const extraQualityWarnings: string[] = [];
     if (cell.quarantined) {
@@ -5843,6 +5937,7 @@ export async function ingestResult(opts: {
     // current pointer can change. Every row carries both owner ids, enforced
     // by the 0053 composite foreign keys.
     for (const artifact of p.evidence_artifacts ?? []) {
+      await guardBeforeMutation();
       const cleanup = await registerEvidenceArtifacts({
         db,
         engine,
@@ -5860,6 +5955,7 @@ export async function ingestResult(opts: {
       }
     }
     if (!failed) {
+      await guardBeforeMutation();
       media += await registerShippedMedia(
         db,
         engine,
@@ -5867,6 +5963,7 @@ export async function ingestResult(opts: {
         resultAttemptId,
         p,
       );
+      await guardBeforeMutation();
       await registerEvidenceFieldInventory(
         db,
         cell.id,
@@ -5876,7 +5973,9 @@ export async function ingestResult(opts: {
         p,
       );
     }
+    await guardBeforeMutation();
     await stageForceHistory(db, cell.id, resultAttemptId, p);
+    await guardBeforeMutation();
     const stagedInterpretation = await stageEngineResultInterpretation({
       db,
       resultId: cell.id,
@@ -5891,12 +5990,14 @@ export async function ingestResult(opts: {
       aoaDeg: p.aoa_deg,
       regime: p.unsteady ? "urans" : "rans",
     });
-    await recordResultAttemptIngestProjection({
-      db,
-      resultId: cell.id,
-      resultAttemptId,
-      payloadSignature: projectionSignature,
-    });
+    await mutateCanonical((mutationDb) =>
+      recordResultAttemptIngestProjection({
+        db: mutationDb,
+        resultId: cell.id,
+        resultAttemptId,
+        payloadSignature: projectionSignature,
+      }),
+    );
     // Field extents and scaled default media belong to the separate, durable
     // media-repair worker. Calling the renderer while a continuous sweep is
     // publishing partial evidence makes the scheduler wait on I/O instead of
@@ -5952,12 +6053,13 @@ export async function ingestResult(opts: {
         speed: polar.speed,
         chord: polar.chord,
       });
+      points++;
+      if (!staged) continue;
       pointCandidates.push(staged);
       canonicalCandidates.set(
         `${p.aoa_deg}\0${p.unsteady ? "urans" : "rans"}`,
         staged,
       );
-      points++;
     }
     const attemptOnlyByAoa = new Map<number, StagedPoint>();
     const stagedAttemptByAoa = new Map<number, StagedPoint>();
@@ -5976,6 +6078,7 @@ export async function ingestResult(opts: {
           `${p.aoa_deg}\0${p.unsteady ? "urans" : "rans"}`,
         ),
       });
+      if (!staged) continue;
       stagedAttemptByAoa.set(p.aoa_deg, staged);
       if (!canonicalAoas.has(p.aoa_deg))
         attemptOnlyByAoa.set(p.aoa_deg, staged);
@@ -6023,21 +6126,24 @@ export async function ingestResult(opts: {
   const evidenceCleanups = ["completed", "failed", "cancelled"].includes(
     result.state,
   )
-    ? await acknowledgeTerminalRemoteEvidenceCleanups(
-        db,
-        engine,
-        engineJobId,
-        remoteEvidenceCleanups,
+    ? await mutateCanonical((mutationDb) =>
+        // Remote cleanup deletes only after authenticated evidence coverage.
+        // It is still an external mutation, so receipt mode holds the exact
+        // drain token through this acknowledgement rather than treating a
+        // prior staging probe as authority.
+        acknowledgeTerminalRemoteEvidenceCleanups(
+          mutationDb,
+          engine,
+          engineJobId,
+          remoteEvidenceCleanups,
+        ),
       )
     : 0;
 
   const finalizedByResult = new Map<string, FinalizedPoint>();
   for (const [revisionId, candidates] of candidatesByRevision) {
-    const finalized = await publishStagedPoints(
-      db,
-      airfoilId,
-      revisionId,
-      candidates,
+    const finalized = await mutateCanonical((mutationDb) =>
+      publishStagedPoints(mutationDb, airfoilId, revisionId, candidates),
     );
     for (const row of finalized) finalizedByResult.set(row.resultId, row);
   }
@@ -6047,30 +6153,33 @@ export async function ingestResult(opts: {
   // selected revision-backed generation.
   for (const candidate of legacyCandidates) {
     if (candidate.quarantined) continue;
-    const [failed] = await db
-      .update(results)
-      .set({
-        status: "failed",
-        source: "queued",
-        error: "solver evidence has no immutable setup revision",
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(results.id, candidate.resultId),
-          sql`${results.currentResultAttemptId} IS NULL`,
-          eq(results.status, candidate.observedStatus as never),
-          sql`${results.simJobId} IS NOT DISTINCT FROM ${candidate.observedSimJobId}::uuid`,
-        ),
-      )
-      .returning({
-        resultId: results.id,
-        aoaDeg: results.aoaDeg,
-        status: results.status,
-        regime: results.regime,
-        resultAttemptId: results.currentResultAttemptId,
-        simJobId: results.simJobId,
-      });
+    const failed = await mutateCanonical(async (mutationDb) => {
+      const [failed] = await mutationDb
+        .update(results)
+        .set({
+          status: "failed",
+          source: "queued",
+          error: "solver evidence has no immutable setup revision",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(results.id, candidate.resultId),
+            sql`${results.currentResultAttemptId} IS NULL`,
+            eq(results.status, candidate.observedStatus as never),
+            sql`${results.simJobId} IS NOT DISTINCT FROM ${candidate.observedSimJobId}::uuid`,
+          ),
+        )
+        .returning({
+          resultId: results.id,
+          aoaDeg: results.aoaDeg,
+          status: results.status,
+          regime: results.regime,
+          resultAttemptId: results.currentResultAttemptId,
+          simJobId: results.simJobId,
+        });
+      return failed;
+    });
     if (failed)
       finalizedByResult.set(failed.resultId, failed as FinalizedPoint);
   }
@@ -6105,23 +6214,26 @@ export async function ingestResult(opts: {
     .filter((candidate) => !candidate.quarantined)
     .map((candidate) => candidate.resultAttemptId);
   if (archivePublicationAttemptIds.length) {
-    await enqueueVerifiedArchiveReductions(db, {
-      resultAttemptIds: archivePublicationAttemptIds,
-      limit: archivePublicationAttemptIds.length,
-    });
-    await refreshCampaignProgressForResultIds(
-      db,
-      [...new Set(
-        [...candidatesByRevision.values(), legacyCandidates]
-          .flat()
-          .filter((candidate) => !candidate.quarantined)
-          .map((candidate) => candidate.resultId),
-      )],
+    await mutateCanonical((mutationDb) =>
+      enqueueVerifiedArchiveReductions(mutationDb, {
+        resultAttemptIds: archivePublicationAttemptIds,
+        limit: archivePublicationAttemptIds.length,
+      }),
+    );
+    await mutateCanonical((mutationDb) =>
+      refreshCampaignProgressForResultIds(mutationDb, [
+        ...new Set(
+          [...candidatesByRevision.values(), legacyCandidates]
+            .flat()
+            .filter((candidate) => !candidate.quarantined)
+            .map((candidate) => candidate.resultId),
+        ),
+      ]),
     );
   }
-  const campaignLinkOutcome =
-    await linkResultsToCampaignsWithAutomaticPrecalcHandoff(
-      db,
+  const campaignLinkOutcome = await mutateCanonical((mutationDb) =>
+    linkResultsToCampaignsWithAutomaticPrecalcHandoff(
+      mutationDb,
       [...finalizedByResult.values()].map((finalized) => {
         const candidate = candidateByResultId.get(finalized.resultId);
         return {
@@ -6135,10 +6247,11 @@ export async function ingestResult(opts: {
           simJobId: finalized.simJobId,
         };
       }),
-    );
-  for (const key of await finalizeCampaignResultLinkBatch(db, [
-    campaignLinkOutcome,
-  ])) {
+    ),
+  );
+  for (const key of await mutateCanonical((mutationDb) =>
+    finalizeCampaignResultLinkBatch(mutationDb, [campaignLinkOutcome]),
+  )) {
     dirtyLanes.set(laneKeyId(key), key);
   }
   return {

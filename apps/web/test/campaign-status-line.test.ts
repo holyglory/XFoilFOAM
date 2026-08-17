@@ -31,6 +31,8 @@ function summary(overrides: {
   diskAdmissionBlocked?: boolean;
   diskAdmissionReason?: string | null;
   admissionFenceActive?: boolean;
+  maintenanceDrainActive?: boolean;
+  maintenanceDrainStartedAt?: string | null;
   failed?: number;
   rejected?: number;
   blocked?: number;
@@ -76,6 +78,8 @@ function summary(overrides: {
       diskAdmissionBlocked: overrides.diskAdmissionBlocked ?? false,
       diskAdmissionReason: overrides.diskAdmissionReason ?? null,
       admissionFenceActive: overrides.admissionFenceActive ?? false,
+      maintenanceDrainActive: overrides.maintenanceDrainActive ?? false,
+      maintenanceDrainStartedAt: overrides.maintenanceDrainStartedAt ?? null,
     } as AdminCampaignSummary["scheduler"],
   } as AdminCampaignSummary;
 }
@@ -126,6 +130,7 @@ describe("CampaignsHub — admission-fence precedence", () => {
       reviewQueueOperationalState({
         processDead: false,
         admissionFenceActive: true,
+        maintenanceDrainActive: false,
         sweeperEnabled: false,
         engineUnreachableSince: new Date().toISOString(),
       }),
@@ -134,6 +139,7 @@ describe("CampaignsHub — admission-fence precedence", () => {
       reviewQueueOperationalState({
         processDead: false,
         admissionFenceActive: false,
+        maintenanceDrainActive: false,
         sweeperEnabled: true,
         engineUnreachableSince: new Date().toISOString(),
       }),
@@ -142,10 +148,29 @@ describe("CampaignsHub — admission-fence precedence", () => {
       reviewQueueOperationalState({
         processDead: true,
         admissionFenceActive: true,
+        maintenanceDrainActive: false,
         sweeperEnabled: false,
         engineUnreachableSince: new Date().toISOString(),
       }),
     ).toBe("process_not_running");
+  });
+
+  it("renders a system-owned maintenance drain instead of a user-actionable disabled sweeper", () => {
+    expect(
+      reviewQueueOperationalState({
+        processDead: false,
+        admissionFenceActive: false,
+        maintenanceDrainActive: true,
+        sweeperEnabled: false,
+        engineUnreachableSince: null,
+      }),
+    ).toBe("maintenance_drain");
+    expect(
+      campaignHubSchedulerStatusText("maintenance_drain", {
+        sweeperEnabled: false,
+        maintenanceDrainActive: true,
+      }),
+    ).toMatch(/Maintenance drain — system maintenance/i);
   });
 
   it("keeps SAFETY STOP primary when the engine is also unreachable", () => {
@@ -240,6 +265,7 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       summary({
         sweeperEnabled: false,
         admissionFenceActive: true,
+        maintenanceDrainActive: true,
         jobs: 2,
       }),
     );
@@ -254,12 +280,42 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       summary({
         sweeperEnabled: false,
         admissionFenceActive: true,
+        maintenanceDrainActive: true,
         jobs: 2,
       }),
     );
     expect(hero).toMatchObject({
       title: "Solver safety stop",
       tone: "red",
+      action: null,
+    });
+  });
+
+  it("MUST-CATCH: maintenance drain replaces stale fence history without a Resume action", () => {
+    const state = summary({
+      sweeperEnabled: false,
+      admissionFenceActive: false,
+      maintenanceDrainActive: true,
+      maintenanceDrainStartedAt: "2026-08-02T00:00:00.000Z",
+      jobs: 2,
+    });
+    const line = campaignStatusLine(state);
+    expect(line.gate).toEqual({
+      text: "DRAINING — system maintenance",
+      tone: "amber",
+    });
+    expect(line.text).toMatch(/2 active jobs continue/i);
+    expect(line.text).toMatch(/held for system maintenance/i);
+    expect(`${line.gate?.text} ${line.text}`).not.toMatch(
+      /safety stop|resume|enable/i,
+    );
+
+    const hero = campaignInstrumentStatus(state, line);
+    expect(hero).toEqual({
+      title: "Maintenance drain",
+      detail:
+        "2 active jobs continue; new submissions are held for system maintenance",
+      tone: "amber",
       action: null,
     });
   });
@@ -393,6 +449,12 @@ describe("gateFromSolverState — hub/backlog gate from the global derivation", 
     expect(gateFromSolverState("admission_fenced")).toEqual({
       text: "SAFETY STOP — critical solver outcome",
       tone: "red",
+    });
+  });
+  it("maps an active maintenance drain to its own amber gate", () => {
+    expect(gateFromSolverState("maintenance_drain")).toEqual({
+      text: "DRAINING — system maintenance",
+      tone: "amber",
     });
   });
   it("maps the blocking solver states to gate badges", () => {

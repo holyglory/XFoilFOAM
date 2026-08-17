@@ -23,6 +23,13 @@ describe("admin health compute fleet", () => {
     expect(source).toContain("admissionBlocked");
   });
 
+  it("MUST-CATCH: leads with real fleet health and omits the obsolete solver-recovery rail", () => {
+    expect(source).not.toContain("SolverIncidentPanel");
+    expect(source).not.toContain("Solver recovery");
+    expect(source).toContain('data-testid="health-compute-fleet"');
+    expect(source).toContain('data-testid="health-performance"');
+  });
+
   it("labels whole-host load with its CPU scope so it cannot masquerade as solver-slot utilization", () => {
     expect(source).toContain("1m whole-host load · not solver CPU");
     expect(source).toContain("load1.toFixed(1)");

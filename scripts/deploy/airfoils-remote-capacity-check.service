@@ -1,0 +1,13 @@
+[Unit]
+Description=Airfoils.Pro remote solver capacity audit
+After=docker.service
+ConditionPathIsExecutable=/opt/airfoils-pro/app/scripts/ops/check-remote-solver-capacity.sh
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/airfoils-pro/app
+Environment=APP_DIR=/opt/airfoils-pro/app
+Environment=AIRFOILS_PRO_STATE_DIR=/opt/airfoils-pro/state
+ExecStart=/opt/airfoils-pro/app/scripts/ops/check-remote-solver-capacity.sh
+Nice=10
+IOSchedulingClass=idle

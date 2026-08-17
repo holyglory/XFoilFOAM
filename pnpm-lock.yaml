@@ -110,6 +110,9 @@ importers:
       '@aerodb/core':
         specifier: workspace:*
         version: link:../core
+      '@aerodb/engine-client':
+        specifier: workspace:*
+        version: link:../engine-client
       dotenv:
         specifier: ^16.4.7
         version: 16.6.1

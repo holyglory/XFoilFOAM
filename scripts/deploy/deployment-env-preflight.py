@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
+from typing import Any
 from urllib.parse import urlsplit
 
 
@@ -109,7 +112,178 @@ def _validate_regular_owned_file(path: Path, label: str) -> None:
         raise ValueError(f"{label} must not be group/world writable")
 
 
-def _validate_deployment_profile(path: Path, state: Path) -> None:
+def _require_regular_compose_file(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} is missing") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular non-symlink file")
+
+
+def _compose_environment(value: object, label: str) -> dict[str, str]:
+    if isinstance(value, dict):
+        return {
+            str(key): "" if item is None else str(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        result: dict[str, str] = {}
+        for item in value:
+            if not isinstance(item, str) or "=" not in item:
+                raise ValueError(f"{label}.environment contains an invalid entry")
+            key, item_value = item.split("=", 1)
+            result[key] = item_value
+        return result
+    raise ValueError(f"{label}.environment must be an object or KEY=VALUE list")
+
+
+def _compose_api_mounts(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("merged remote-solver api.volumes must be a list")
+    mounts: list[dict[str, Any]] = []
+    for mount in value:
+        if not isinstance(mount, dict):
+            raise ValueError("merged remote-solver api.volumes must use long syntax")
+        mounts.append(mount)
+    return mounts
+
+
+def _read_merged_remote_compose(
+    *, app: Path, env_file: Path, override: Path, project: str
+) -> dict[str, Any]:
+    """Read the exact Compose profile that will mount the remote API.
+
+    This uses Docker Compose's resolved JSON rather than recreating its merge,
+    interpolation, project-name, or volume-name rules in the preflight.  It is
+    a read-only command: no containers, volumes, images, or network state are
+    created by ``config``.
+    """
+
+    try:
+        release = app.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("deployment application directory cannot be resolved") from exc
+    base = release / "docker-compose.deploy.yml"
+    _require_regular_compose_file(base, "deployment Compose file")
+    _require_regular_compose_file(override, "remote-solver Compose override")
+    command = [
+        "docker",
+        "compose",
+        "--env-file",
+        str(env_file),
+        "--project-name",
+        project,
+        "--file",
+        str(base),
+        "--file",
+        str(override),
+        "config",
+        "--format",
+        "json",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(
+            "remote-solver stage verification requires Docker Compose JSON configuration"
+        ) from exc
+    if completed.returncode != 0:
+        raise ValueError(
+            "remote-solver Compose configuration could not be resolved for stage verification"
+        )
+    try:
+        parsed = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "remote-solver Compose configuration did not produce JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("remote-solver Compose configuration must be an object")
+    return parsed
+
+
+def _configured_results_volume_mountpoint(
+    *, app: Path, env_file: Path, override: Path, project: str
+) -> Path:
+    """Find the API's real Docker-volume mountpoint without naming it by guess."""
+
+    config = _read_merged_remote_compose(
+        app=app, env_file=env_file, override=override, project=project
+    )
+    if config.get("name") != project:
+        raise ValueError("resolved remote-solver Compose project name is not authoritative")
+    services = config.get("services")
+    if not isinstance(services, dict) or not isinstance(services.get("api"), dict):
+        raise ValueError("resolved remote-solver Compose profile has no api service")
+    api = services["api"]
+    environment = _compose_environment(api.get("environment", {}), "api")
+    data_dir_raw = environment.get("AIRFOILFOAM_DATA_DIR", "")
+    data_dir = Path(data_dir_raw)
+    if not data_dir_raw or not data_dir.is_absolute():
+        raise ValueError("resolved remote-solver api data directory must be absolute")
+    mounts = _compose_api_mounts(api.get("volumes", []))
+    result_mounts = [
+        mount
+        for mount in mounts
+        if mount.get("type") == "volume" and mount.get("target") == str(data_dir)
+    ]
+    if len(result_mounts) != 1 or not isinstance(result_mounts[0].get("source"), str):
+        raise ValueError(
+            "resolved remote-solver api must mount exactly one named results volume at its data directory"
+        )
+    volumes = config.get("volumes")
+    if not isinstance(volumes, dict):
+        raise ValueError("resolved remote-solver Compose profile has no volumes")
+    logical_volume = result_mounts[0]["source"]
+    definition = volumes.get(logical_volume)
+    if not isinstance(definition, dict):
+        raise ValueError("resolved remote-solver results volume definition is missing")
+    volume_name = definition.get("name")
+    if not isinstance(volume_name, str) or not volume_name:
+        raise ValueError(
+            "resolved remote-solver results volume has no Docker-assigned name"
+        )
+    try:
+        inspected = subprocess.run(
+            ["docker", "volume", "inspect", "--format", "{{ .Mountpoint }}", volume_name],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(
+            "remote-solver results-volume inspection is required for stage verification"
+        ) from exc
+    mountpoint_raw = inspected.stdout.strip()
+    if inspected.returncode != 0 or not mountpoint_raw or "\n" in mountpoint_raw:
+        raise ValueError(
+            "remote-solver results-volume inspection did not return one mountpoint"
+        )
+    mountpoint = Path(mountpoint_raw)
+    try:
+        metadata = mountpoint.stat()
+    except OSError as exc:
+        raise ValueError(
+            "remote-solver results-volume mountpoint cannot be inspected"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("remote-solver results-volume mountpoint is not a directory")
+    return mountpoint
+
+
+def _validate_deployment_profile(path: Path, state: Path, app: Path) -> None:
     values = _read_profile_values(path)
     role = values.get("AIRFOILFOAM_DEPLOYMENT_ROLE", "hub")
     if role == "hub":
@@ -253,7 +427,7 @@ def main() -> int:
     if metadata.st_uid != os.geteuid():
         raise ValueError("deployment env must be owned by the deploying user")
     _validate_remote_evidence_auth(env)
-    _validate_deployment_profile(env, state)
+    _validate_deployment_profile(env, state, app)
     _validate_no_pending_engine_route_switch(state)
     _validate_engine_route(env, state)
     print(env.resolve(strict=True))

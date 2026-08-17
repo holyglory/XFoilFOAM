@@ -39,10 +39,14 @@ MESH_RECOVERY_VERSION = 2
 # ``adjustableRunTime``, so a write boundary cannot inject a one-step
 # coefficient impulse. Version 4 kept startup Co<=1 until two repeatable,
 # discontinuity-free periods also carried >=20 real field frames per period.
+# Version 11 makes the low-amplitude no-shedding certificate admit only a
+# bounded, temporally clean absolute-RMS tail; wall-budget-stopped chunks that
+# have not exhausted their measured physical clean-cycle allowance remain
+# explicitly restartable instead of becoming terminal evidence.
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 10
+URANS_RECOVERY_VERSION = 12
 
 # Version 1 is the first authenticated, generation-pinned GCS archive
 # clean-cycle reducer.  The control plane treats a missing field as legacy
@@ -50,4 +54,15 @@ URANS_RECOVERY_VERSION = 10
 # interpret from immutable evidence.  Increment only when the reducer's
 # durable output contract changes compatibly and needs a new control-plane
 # admission fence.
-ARCHIVE_REDUCTION_VERSION = 1
+# v4 adds the versioned adaptive clean-tail policy.  Its recovery proof carries
+# truthful measured periods and finite FAST 18 / FINAL 27 ceilings; older
+# reducers keep the exact v3 static-cap contract.
+# v3 aligns archive-backed no-shedding certificates with the current live
+# bounded-RMS reducer.  The generation-pinned archive is replayed under the
+# same v2 certificate contract rather than allowing live and archived evidence
+# to disagree about a physically steady tail.
+# v2 distinguishes the typed legacy-provenance outcome from v1, which returned
+# a generic 409 for an otherwise readable URANS archive whose immutable
+# manifest did not assert ``unsteady=true``.  The version boundary is required
+# so durable v1 terminal queue receipts can be reduced again without mutation.
+ARCHIVE_REDUCTION_VERSION = 4

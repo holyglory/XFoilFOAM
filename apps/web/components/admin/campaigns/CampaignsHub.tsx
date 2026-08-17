@@ -79,6 +79,8 @@ export function campaignHubStatusLine(
   listScheduler?: {
     sweeperEnabled: boolean;
     engineUnreachableSince: string | null;
+    maintenanceDrainActive?: boolean;
+    maintenanceDrainStartedAt?: string | null;
   },
 ): string {
   const totals = summary?.totals ?? item.totals;
@@ -232,6 +234,8 @@ export function CampaignsHub({
           admissionFenceActive: solverPayload.admissionFenceActive,
           lastAdmissionFenceAt: solverPayload.lastAdmissionFenceAt,
           lastAdmissionFenceReason: solverPayload.lastAdmissionFenceReason,
+          maintenanceDrainActive: solverPayload.maintenanceDrainActive,
+          maintenanceDrainStartedAt: solverPayload.maintenanceDrainStartedAt,
         }
       : {
           fetchOk: false,
@@ -654,6 +658,10 @@ export function CampaignsHub({
                           sweeperEnabled: solverPayload.enabled,
                           engineUnreachableSince:
                             solverPayload.engineUnreachableSince,
+                          maintenanceDrainActive:
+                            solverPayload.maintenanceDrainActive,
+                          maintenanceDrainStartedAt:
+                            solverPayload.maintenanceDrainStartedAt,
                         }
                       : undefined,
                   )}

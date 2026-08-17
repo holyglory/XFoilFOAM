@@ -16,12 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import ContextManager, Iterator, Literal
+from typing import Callable, ContextManager, Iterator, Literal
 
 import numpy as np
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .. import __version__, physics
 from ..airfoil import load_airfoil
@@ -93,6 +94,7 @@ from ..storage import JobStore
 
 class RuntimeRequest(BaseModel):
     job_ids: list[str] = Field(default_factory=list, max_length=250)
+    inspect_result: bool = True
 
 
 class RenderFieldRequest(BaseModel):
@@ -114,6 +116,28 @@ class RenderFieldRequest(BaseModel):
     params_hash: str | None = None
     source_mode: Literal["auto", "archive"] = "auto"
     remote: dict[str, object] | None = None
+
+
+class _LeaseStreamingResponse(StreamingResponse):
+    """Ensure an already-entered evidence lease closes on every ASGI exit.
+
+    ``StreamingResponse`` only invokes its ``background`` task after a normal
+    stream return.  On ASGI 2.4 a client disconnect can raise from ``send``
+    before the body iterator starts, skipping that task.  The evidence source
+    is entered before the response so that its file and immutable identity can
+    be checked; therefore response-level finalization is the last ownership
+    boundary for the lease.
+    """
+
+    def __init__(self, *args, close_lease: Callable[[], None], **kwargs) -> None:
+        self._close_lease = close_lease
+        super().__init__(*args, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._close_lease()
 
 
 class FieldScaleRequest(BaseModel):
@@ -691,6 +715,17 @@ def _stream_remote_evidence(
 ) -> StreamingResponse:
     """Enter a verified cache lease before responding and hold it to EOF."""
 
+    closed = False
+
+    def close_source(exc_type=None, exc=None, traceback=None) -> None:
+        """Release the entered source exactly once on every response path."""
+
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        source.__exit__(exc_type, exc, traceback)
+
     try:
         path = source.__enter__()
     except FileNotFoundError as exc:
@@ -709,46 +744,54 @@ def _stream_remote_evidence(
             detail=f"Remote evidence could not be verified: {exc}",
         ) from exc
 
-    if not path.is_file() or path.is_symlink():
-        source.__exit__(None, None, None)
-        raise HTTPException(
-            status_code=502,
-            detail="Verified remote evidence did not materialize a regular file",
-        )
     try:
+        if not path.is_file() or path.is_symlink():
+            raise HTTPException(
+                status_code=502,
+                detail="Verified remote evidence did not materialize a regular file",
+            )
         content_length = path.stat().st_size
+        if identity is not None:
+            if (
+                content_length != identity.stored_size
+                or _sha256_file(path) != identity.stored_sha256
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Verified remote evidence does not match the expected immutable generation",
+                )
+
+        def body() -> Iterator[bytes]:
+            try:
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        yield chunk
+            finally:
+                close_source()
+
+        headers = {"content-length": str(content_length)}
+        if identity is not None:
+            headers.update(_evidence_identity_headers(identity))
+        return _LeaseStreamingResponse(
+            body(),
+            media_type=media_type,
+            headers=headers,
+            background=BackgroundTask(close_source),
+            close_lease=close_source,
+        )
     except OSError as exc:
-        source.__exit__(type(exc), exc, exc.__traceback__)
+        # ``stat`` and the immutable digest happen after the cache source has
+        # been entered.  They are still a transient evidence-storage failure
+        # at the HTTP boundary (rather than an unhandled 500), but must first
+        # release the lease carrying the original exception context.
+        close_source(type(exc), exc, exc.__traceback__)
         raise HTTPException(
             status_code=503,
             detail=f"Verified remote evidence became unavailable: {exc}",
         ) from exc
-
-    def body() -> Iterator[bytes]:
-        try:
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    yield chunk
-        finally:
-            source.__exit__(None, None, None)
-
-    headers = {"content-length": str(content_length)}
-    if identity is not None:
-        if (
-            content_length != identity.stored_size
-            or _sha256_file(path) != identity.stored_sha256
-        ):
-            source.__exit__(None, None, None)
-            raise HTTPException(
-                status_code=502,
-                detail="Verified remote evidence does not match the expected immutable generation",
-            )
-        headers.update(_evidence_identity_headers(identity))
-    return StreamingResponse(
-        body(),
-        media_type=media_type,
-        headers=headers,
-    )
+    except BaseException as exc:
+        close_source(type(exc), exc, exc.__traceback__)
+        raise
 
 
 def _field_scales(scales: dict[ImageField, FieldScaleRequest]) -> dict[ImageField, tuple[float, float]]:
@@ -882,7 +925,7 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------------------ #
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
         enabled = enabled_dialects()
         disabled = [
             dialect
@@ -929,7 +972,7 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/capabilities")
-    def capabilities() -> dict:
+    async def capabilities() -> dict:
         dialects = enabled_dialects()
         disabled = [
             dialect
@@ -1504,7 +1547,26 @@ def create_app() -> FastAPI:
         rows: list[dict] = []
         for job_id in request.job_ids:
             status, status_error = store.read_status_info(job_id)
-            result, result_error = store.read_result_info(job_id)
+            if request.inspect_result:
+                result, result_error = store.read_result_info(job_id)
+                has_result = result is not None
+            else:
+                # Reconciliation first needs process/status ownership, not a
+                # second copy of a potentially enormous result.json. Full
+                # result validation remains owned by the normal result
+                # endpoint before ingestion or publication.
+                result = None
+                result_path = store.job_dir(job_id) / "result.json"
+                try:
+                    has_result = result_path.is_file() and not result_path.is_symlink()
+                    result_error = (
+                        "result payload inspection omitted by request"
+                        if has_result
+                        else None
+                    )
+                except OSError as exc:
+                    has_result = False
+                    result_error = f"{type(exc).__name__}: {exc}"
             runtime, runtime_error = store.read_runtime_info(job_id)
             direct_processes = store.job_process_details(job_id)
             direct_process_count = len(direct_processes)
@@ -1567,7 +1629,7 @@ def create_app() -> FastAPI:
                     ),
                     "result_readable": result is not None,
                     "result_error": result_error,
-                    "has_result": result is not None,
+                    "has_result": has_result,
                     "result_state": result.state.value if result else None,
                     "result_message": result.message if result else None,
                     "result_failure_disposition": (
@@ -1585,12 +1647,14 @@ def create_app() -> FastAPI:
         return {"jobs": rows}
 
     @app.get("/jobs/{job_id}", response_model=JobStatus)
-    def job_status(job_id: str) -> JobStatus:
-        status, error = store.read_status_info(job_id)
+    def job_status(job_id: str, response: Response) -> JobStatus:
+        status, error, source_sha256 = store.read_status_info_with_sha256(job_id)
         if status is None and error:
             raise HTTPException(status_code=409, detail=f"Job status unreadable: {error}")
         if status is None:
             raise HTTPException(status_code=404, detail="Job not found")
+        if source_sha256 is not None:
+            response.headers["x-airfoilfoam-source-sha256"] = source_sha256
         return status
 
     @app.post("/jobs/{job_id}/cancel")
@@ -2079,14 +2143,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc))
 
     @app.get("/jobs/{job_id}/result", response_model=JobResult)
-    def job_result(job_id: str) -> JobResult:
+    def job_result(job_id: str, response: Response) -> JobResult:
         if not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
-        result = store.read_result(job_id)
+        result, error, source_sha256 = store.read_result_info_with_sha256(job_id)
+        if result is None and error:
+            raise HTTPException(status_code=409, detail=f"Job result unreadable: {error}")
         if result is None:
             status = store.read_status(job_id)
             state = status.state if status else JobState.pending
             raise HTTPException(status_code=409, detail=f"Result not ready (state={state.value})")
+        if source_sha256 is not None:
+            response.headers["x-airfoilfoam-source-sha256"] = source_sha256
         return result
 
     @app.get("/jobs/{job_id}/polar.csv")

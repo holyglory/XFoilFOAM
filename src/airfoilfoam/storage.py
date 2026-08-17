@@ -1,6 +1,7 @@
 """Filesystem-backed job storage shared between the API and the worker."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -163,8 +164,14 @@ class JobStore:
         return status
 
     def read_status_info(self, job_id: str) -> tuple[Optional[JobStatus], Optional[str]]:
+        status, error, _ = self.read_status_info_with_sha256(job_id)
+        return status, error
+
+    def read_status_info_with_sha256(
+        self, job_id: str
+    ) -> tuple[Optional[JobStatus], Optional[str], Optional[str]]:
         path = self.job_dir(job_id) / "status.json"
-        return self._read_model_info(path, JobStatus)
+        return self._read_model_info_with_sha256(path, JobStatus)
 
     def write_result(self, result: JobResult) -> None:
         path = self.job_dir(result.job_id) / "result.json"
@@ -202,8 +209,14 @@ class JobStore:
         return result
 
     def read_result_info(self, job_id: str) -> tuple[Optional[JobResult], Optional[str]]:
+        result, error, _ = self.read_result_info_with_sha256(job_id)
+        return result, error
+
+    def read_result_info_with_sha256(
+        self, job_id: str
+    ) -> tuple[Optional[JobResult], Optional[str], Optional[str]]:
         path = self.job_dir(job_id) / "result.json"
-        return self._read_model_info(path, JobResult)
+        return self._read_model_info_with_sha256(path, JobResult)
 
     def read_request(self, job_id: str) -> Optional[PolarRequest]:
         path = self.job_dir(job_id) / "request.json"
@@ -457,12 +470,24 @@ class JobStore:
             pass
 
     def _read_model_info(self, path: Path, model: type[T]) -> tuple[Optional[T], Optional[str]]:
+        value, error, _ = self._read_model_info_with_sha256(path, model)
+        return value, error
+
+    def _read_model_info_with_sha256(
+        self, path: Path, model: type[T]
+    ) -> tuple[Optional[T], Optional[str], Optional[str]]:
         if not path.exists():
-            return None, None
+            return None, None, None
+        digest: str | None = None
         try:
-            text = path.read_text(encoding="utf-8")
-            if not text.strip():
-                return None, "empty JSON file"
-            return model.model_validate_json(text), None
+            # Hash and parse the same immutable byte snapshot. The maintenance
+            # receipt reconciler uses this digest to prove that the post-rebuild
+            # API served exactly the terminal evidence inspected before the
+            # engine services were replaced.
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if not raw.strip():
+                return None, "empty JSON file", digest
+            return model.model_validate_json(raw), None, digest
         except Exception as exc:  # noqa: BLE001 - runtime endpoint needs the exact read failure
-            return None, f"{type(exc).__name__}: {exc}"
+            return None, f"{type(exc).__name__}: {exc}", digest

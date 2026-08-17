@@ -395,6 +395,34 @@ describe("campaign launch (§5)", () => {
     expect(rows.length).toBe(1);
   });
 
+  it("MUST-CATCH: live scheduler summaries are never cacheable after a fence clears", async () => {
+    const launched = await app.inject({
+      method: "POST",
+      url: "/api/admin/campaigns",
+      payload: {
+        name: `${PREFIX} cache-control`,
+        priority: 5,
+        idempotencyKey: `${PREFIX}-cache-control`,
+        airfoilIds: [asymId],
+        plan: planBody(),
+      },
+    });
+    expect(launched.statusCode).toBe(201);
+    const cacheControlCampaignId = launched.json().campaign.id as string;
+    cleanupCampaignIds.push(cacheControlCampaignId);
+    const [list, detail] = await Promise.all([
+      app.inject({ method: "GET", url: "/api/admin/campaigns?limit=1" }),
+      app.inject({
+        method: "GET",
+        url: `/api/admin/campaigns/${cacheControlCampaignId}`,
+      }),
+    ]);
+    expect(list.statusCode).toBe(200);
+    expect(detail.statusCode).toBe(200);
+    expect(list.headers["cache-control"]).toBe("private, no-store");
+    expect(detail.headers["cache-control"]).toBe("private, no-store");
+  });
+
   it("reuses physics-hash revisions across campaigns (no duplicate presets)", async () => {
     const [presetCountBefore] = (await db.execute(
       sql`SELECT count(*)::int AS n FROM simulation_presets
@@ -723,11 +751,16 @@ describe("campaign launch (§5)", () => {
   it("carries only sanitized safety-stop stage/fidelity on the bounded campaign summary", async () => {
     const [previous] = await db
       .select({
+        enabled: sweeperState.enabled,
+        maxConcurrentJobs: sweeperState.maxConcurrentJobs,
+        cpuSlots: sweeperState.cpuSlots,
         admissionFenceActive: sweeperState.admissionFenceActive,
         lastAdmissionFenceAt: sweeperState.lastAdmissionFenceAt,
         lastAdmissionFenceReason: sweeperState.lastAdmissionFenceReason,
         lastAdmissionFenceTriggerKey: sweeperState.lastAdmissionFenceTriggerKey,
         lastAdmissionFenceDetails: sweeperState.lastAdmissionFenceDetails,
+        maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+        maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
       })
       .from(sweeperState)
       .where(eq(sweeperState.id, 1))
@@ -736,6 +769,9 @@ describe("campaign launch (§5)", () => {
     await db
       .update(sweeperState)
       .set({
+        enabled: false,
+        maxConcurrentJobs: 0,
+        cpuSlots: 0,
         admissionFenceActive: true,
         lastAdmissionFenceAt: new Date(),
         lastAdmissionFenceReason: "critical_solver_incident",
@@ -748,6 +784,8 @@ describe("campaign launch (§5)", () => {
           error: "private solver error",
           previousCpuSlots: 12,
         },
+        maintenanceDrainToken: null,
+        maintenanceDrainStartedAt: null,
       })
       .where(eq(sweeperState.id, 1));
 
@@ -772,6 +810,53 @@ describe("campaign launch (§5)", () => {
       expect(res.json().scheduler).not.toHaveProperty(
         "lastAdmissionFenceTriggerKey",
       );
+    } finally {
+      await db.update(sweeperState).set(previous).where(eq(sweeperState.id, 1));
+    }
+  });
+
+  it("carries the live maintenance drain state on the bounded campaign summary", async () => {
+    const [previous] = await db
+      .select({
+        enabled: sweeperState.enabled,
+        admissionFenceActive: sweeperState.admissionFenceActive,
+        lastAdmissionFenceReason: sweeperState.lastAdmissionFenceReason,
+        maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+        maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
+      })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    expect(previous).toBeDefined();
+    const maintenanceStartedAt = new Date("2026-08-02T00:00:00.000Z");
+    await db
+      .update(sweeperState)
+      .set({
+        enabled: false,
+        admissionFenceActive: false,
+        lastAdmissionFenceReason: "critical_solver_incident",
+        maintenanceDrainToken: "5a1b3b8b-c9dd-4b5e-a4d0-9fb6c3786f40",
+        maintenanceDrainStartedAt: maintenanceStartedAt,
+      })
+      .where(eq(sweeperState.id, 1));
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/admin/campaigns/${campaignId}`,
+      });
+      expect(res.statusCode).toBe(200);
+      const scheduler = res.json().scheduler;
+      expect(scheduler).toMatchObject({
+        sweeperEnabled: false,
+        admissionFenceActive: false,
+        lastAdmissionFenceReason: "critical_solver_incident",
+        maintenanceDrainActive: true,
+      });
+      expect(Date.parse(scheduler.maintenanceDrainStartedAt)).toBe(
+        maintenanceStartedAt.getTime(),
+      );
+      expect(scheduler).not.toHaveProperty("maintenanceDrainToken");
     } finally {
       await db.update(sweeperState).set(previous).where(eq(sweeperState.id, 1));
     }
@@ -2860,6 +2945,28 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       bc_id: string;
     }>;
 
+    // Each immutable preliminary-obligation attempt is an engine submission.
+    // The live schema requires its producing job even when a deterministic
+    // setup failure or interrupted continuation has no result-attempt row.
+    const precalcJobs = await db
+      .insert(simJobs)
+      .values(
+        [1, 2, 3].map((wave) => ({
+          airfoilId: asymId,
+          bcIds: [condition.bc_id],
+          simulationPresetRevisionId: condition.revision_id,
+          campaignId,
+          jobKind: "targeted" as const,
+          referenceChordM: PRIMARY_CHORD_M,
+          wave,
+          status: "failed" as const,
+          totalCases: 1,
+          completedCases: 1,
+          requestPayload: { aoas: [10], uransFidelity: "precalc" },
+        })),
+      )
+      .returning({ id: simJobs.id });
+
     const [failedResult] = await db
       .insert(results)
       .values({
@@ -2977,6 +3084,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
     await db.insert(simPrecalcObligationAttempts).values([
       {
         obligationId: obligation.id,
+        simJobId: precalcJobs[0].id,
         attemptNumber: 1,
         solverAttemptNumber: null,
         consumesSolverAttempt: false,
@@ -2986,6 +3094,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       },
       {
         obligationId: obligation.id,
+        simJobId: precalcJobs[1].id,
         attemptNumber: 2,
         solverAttemptNumber: 1,
         consumesSolverAttempt: true,
@@ -2995,6 +3104,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       },
       {
         obligationId: obligation.id,
+        simJobId: precalcJobs[2].id,
         attemptNumber: 3,
         solverAttemptNumber: 2,
         consumesSolverAttempt: true,

@@ -201,12 +201,15 @@
   evidence for the same AoA arrives. Once accepted URANS exists, the matching
   RANS evidence becomes `superseded_by_urans` and must be excluded from final
   metrics and final curves.
-- Failed, non-converged, stalled, noisy, or otherwise rejected RANS attempts must
-  remain stored as evidence/attempt history so they are not silently repeated,
-  but they must not be drawn as valid polar curves or used for Browse ranking.
+- Failed, non-converged, stalled, noisy, or otherwise rejected unpublished
+  generations are disposable. Keep only the minimal operational cause needed
+  to make retry state truthful; remove their aerodynamic result/attempt,
+  artifact, media, and raw engine data before a clean replacement generation.
+  Never draw them as valid polar curves or use them for Browse ranking.
 - Tests that touch solver display must assert both sides of the contract:
-  rejected evidence is retained, and rejected evidence is excluded from valid
-  polar metrics/charts.
+  rejected unpublished evidence is absent from valid polar metrics/charts, and
+  accepted canonical evidence is preserved when failed-generation cleanup
+  runs.
 - Chart legends, polar tabs, ranking rows, and comparison chips must be created
   only from accepted stored solver points. Do not render configured Reynolds,
   queued sweeps, defaults, or zero-count placeholders as if they were polars;
@@ -295,26 +298,17 @@
   dictionaries, logs/stdout/stderr, force coefficients, y+ output when present,
   selected RANS latest time or exact URANS integer-period window, and VTU/VTK
   field exports.
-- Full retention must preflight the entire job before its first deletion. Every
-  local archive candidate relied on to protect an evidence directory must
-  stream to end-of-file and authenticate every bundled manifest member; every
-  evidence directory with a sidecar manifest and local gzip/Zstandard
-  candidate set must retain at least one such complete proof. If any directory
-  has no authenticated candidate, keep its shared mesh, live solver state,
-  archive bytes, and unpacked raw evidence and refuse the full strip.
-- Incomplete or corrupt terminal packaging is forensic material, never
-  canonical solver evidence. Preserve the exact original blobs in a separate
-  immutable blob-only quarantine. A forensic tar.zst is only a lossless outer
-  envelope: original gzip/raw blob bytes remain unchanged and are not repacked
-  as a canonical evidence archive. Conserve and record manifest-declared,
-  original-retained, exact sibling-derived, and missing members; a sibling may
-  supply a member only when its bytes match the declared size/hash exactly and
-  its source provenance is retained. Never shrink the manifest, invent a
-  placeholder, repack a subset as complete, or widen complete-evidence orphan
-  ownership. Local cleanup requires an exact database acknowledgement plus a
-  fresh generation-pinned restore of every quarantined blob. A corrective
-  rerun is a separate result generation and must not replace or mutate the
-  incident bytes.
+- Full retention applies only to accepted canonical evidence. Before deleting
+  its local duplicate, stream the selected archive to end-of-file and
+  authenticate every declared manifest member against the generation-pinned
+  remote object.
+- Incomplete or corrupt terminal packaging is unpublished working data, not
+  canonical solver evidence and not forensic material. Do not repair, package,
+  quarantine, upload, or permanently retain it. Remove the exact failed
+  generation after proving it does not supply accepted canonical evidence,
+  then schedule a clean replacement for the same physical point. A minimal
+  operational failure event may remain; no failed coefficients, fields,
+  archive, or media may be promoted into a polar or rendering surface.
 - Result media is a stored artifact, not an on-open side effect. Solver
   finalization must render and persist the default media for every supported
   evidence-backed field. Detail dialogs, Browse/Search/Compare surfaces, and

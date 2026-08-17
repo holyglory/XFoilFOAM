@@ -64,6 +64,53 @@ describe("clean-cycle certificate parser", () => {
     }
   });
 
+  it("accepts legacy null diagnostics only as explicit hard-corrupt evidence", () => {
+    const certificate = certifiedCertificate() as unknown as {
+      cycles: Array<Record<string, unknown>>;
+    };
+    certificate.cycles[0] = {
+      ...cycle(0, "hard_corrupt"),
+      cl_amplitude_deviation: null,
+      cd_amplitude_deviation: null,
+      cm_amplitude_deviation: null,
+      reasons: [
+        "unavailable cycle metrics: cl_amplitude_deviation, cd_amplitude_deviation, cm_amplitude_deviation",
+      ],
+    };
+
+    const parsed = parseUransCycleCertificate(certificate);
+
+    expect(parsed).toMatchObject({ ok: true });
+    if (parsed.ok) {
+      expect(parsed.value.cycles[0]).toMatchObject({
+        disposition: "hard_corrupt",
+        cl_amplitude_deviation: null,
+      });
+      expect(
+        parsed.value.cycles.filter((entry) => entry.disposition === "selected"),
+      ).toHaveLength(3);
+    }
+  });
+
+  it("MUST-CATCH: rejects an unavailable diagnostic presented as a selected cycle", () => {
+    const certificate = certifiedCertificate() as unknown as {
+      cycles: Array<Record<string, unknown>>;
+    };
+    certificate.cycles[1] = {
+      ...cycle(1, "selected"),
+      cl_amplitude_deviation: null,
+    };
+
+    const parsed = parseUransCycleCertificate(certificate);
+
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.errors).toContain(
+        "urans_cycle_certificate.cycles[1]: unavailable cycle metrics require hard_corrupt disposition",
+      );
+    }
+  });
+
   it("fails closed when selected cycles stitch around a corrupt middle cycle", () => {
     const certificate = certifiedCertificate();
     certificate.cycles = [
@@ -129,27 +176,45 @@ describe("clean-cycle certificate parser", () => {
   });
 
   it.each([
-    ["reported corruption reason", { reasons: ["impulsive discontinuity"] }, "reasons"],
-    ["phase gap above the clean-cycle limit", { phase_max_gap: 0.11 }, "phase-gap"],
-    ["phase shift above the clean-cycle limit", { phase_shift_bins: 5 }, "phase-shift"],
-    ["shape error above the clean-cycle limit", { cl_shape_error: 0.13 }, "cl-shape-error"],
+    [
+      "reported corruption reason",
+      { reasons: ["impulsive discontinuity"] },
+      "reasons",
+    ],
+    [
+      "phase gap above the clean-cycle limit",
+      { phase_max_gap: 0.11 },
+      "phase-gap",
+    ],
+    [
+      "phase shift above the clean-cycle limit",
+      { phase_shift_bins: 5 },
+      "phase-shift",
+    ],
+    [
+      "shape error above the clean-cycle limit",
+      { cl_shape_error: 0.13 },
+      "cl-shape-error",
+    ],
     [
       "amplitude deviation above the clean-cycle limit",
       { cd_amplitude_deviation: 0.31 },
       "cd-amplitude-deviation",
     ],
-  ])("MUST-CATCH: rejects a selected cycle with %s", (_label, mutation, reason) => {
-    const certificate = certifiedCertificate();
-    certificate.cycles[1] = { ...certificate.cycles[1], ...mutation };
+  ])(
+    "MUST-CATCH: rejects a selected cycle with %s",
+    (_label, mutation, reason) => {
+      const certificate = certifiedCertificate();
+      certificate.cycles[1] = { ...certificate.cycles[1], ...mutation };
 
-    const parsed = parseUransCycleCertificate(certificate);
+      const parsed = parseUransCycleCertificate(certificate);
 
-    expect(parsed.ok).toBe(false);
-    if (!parsed.ok) {
-      expect(parsed.errors).toContain(
-        `urans_cycle_certificate.cycles[1]: selected cycle violates clean-cycle policy (${reason})`,
-      );
-    }
-  });
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.errors).toContain(
+          `urans_cycle_certificate.cycles[1]: selected cycle violates clean-cycle policy (${reason})`,
+        );
+      }
+    },
+  );
 });
-

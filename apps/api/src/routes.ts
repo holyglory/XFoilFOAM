@@ -80,7 +80,33 @@ import {
 } from "./services/mediums";
 import { assembleSim } from "./services/sim";
 import { assembleSolverWork } from "./services/solver-work";
-import { readSweeperState, writeSweeperState } from "./services/sweeper-state";
+import {
+  readSweeperState,
+  type SweeperStateRow,
+  writeSweeperState,
+} from "./services/sweeper-state";
+
+function publicSweeperResponse(state: SweeperStateRow) {
+  // Maintenance ownership is internal execution metadata. Public health
+  // consumers may observe that admission is disabled, but never the bearer
+  // token or the private maintenance timeline.
+  const {
+    lastAdmissionFenceAt,
+    lastAdmissionFenceReason,
+    lastAdmissionFenceTriggerKey,
+    lastAdmissionFenceDetails,
+    maintenanceDrainToken,
+    maintenanceDrainStartedAt,
+    ...publicState
+  } = state;
+  void lastAdmissionFenceAt;
+  void lastAdmissionFenceReason;
+  void lastAdmissionFenceTriggerKey;
+  void lastAdmissionFenceDetails;
+  void maintenanceDrainToken;
+  void maintenanceDrainStartedAt;
+  return publicState;
+}
 
 const nacaSchema = z.object({
   t: z.number().positive(),
@@ -2022,18 +2048,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     // Public health consumers need the current gate, not exact incident
     // provenance. Trigger ids, timestamps and structured solver evidence stay
     // on the authenticated admin endpoint.
-    const {
-      lastAdmissionFenceAt,
-      lastAdmissionFenceReason,
-      lastAdmissionFenceTriggerKey,
-      lastAdmissionFenceDetails,
-      ...publicState
-    } = s;
-    void lastAdmissionFenceAt;
-    void lastAdmissionFenceReason;
-    void lastAdmissionFenceTriggerKey;
-    void lastAdmissionFenceDetails;
-    return publicState;
+    return publicSweeperResponse(s);
   });
 
   // Admin-only (spec §10 auth hardening): sweeper writes control the solver
@@ -2048,7 +2063,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         submitIntervalMs: z.number().int().positive().optional(),
       })
       .parse(req.body);
-    return writeSweeperState(b);
+    return publicSweeperResponse(await writeSweeperState(b));
   });
 
   // Admin-only (spec §10): sim_jobs rows now carry campaignId and must not

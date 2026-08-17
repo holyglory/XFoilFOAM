@@ -245,7 +245,20 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       ENGINE_URL: ${ENGINE_URL}
       MEDIA_DIR: ${MEDIA_DIR}
+      # The deployment role selects the role-aware storage emergency ceiling.
+      # Hub default remains conservative; the dedicated remote keeps its
+      # absolute floor and active-work reserve on the large evidence volume.
+      AIRFOILFOAM_DEPLOYMENT_ROLE: ${AIRFOILFOAM_DEPLOYMENT_ROLE:-hub}
+      # Optional stricter deployment-owned emergency ceiling. An empty value
+      # retains the role default inside the sweeper.
+      SWEEPER_DISK_MAX_USED_PCT: ${SWEEPER_DISK_MAX_USED_PCT:-}
+      # Operational throttle for the independent retention loop. Set to zero
+      # during bounded engine-gateway recovery without stopping reconciliation
+      # or new-result ingestion; restore a positive batch after the gateway is
+      # responsive again.
+      SWEEPER_STRIP_MAX_PER_TICK: ${SWEEPER_STRIP_MAX_PER_TICK:-5}
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+      AIRFOILFOAM_RECOVERY_SOURCE_REVISION: ${AIRFOILFOAM_RECOVERY_SOURCE_REVISION:-}
       AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
       AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}
       ENGINE_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}
@@ -277,6 +290,7 @@ services:
       ENGINE_URL: ${ENGINE_URL}
       MEDIA_DIR: ${MEDIA_DIR}
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID}
+      AIRFOILFOAM_RECOVERY_SOURCE_REVISION: ${AIRFOILFOAM_RECOVERY_SOURCE_REVISION:-}
       AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
       AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}
       ENGINE_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}

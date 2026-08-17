@@ -12,6 +12,7 @@
 import {
   type DB,
   resultAttempts,
+  results,
   solverEvidenceArchives,
   solverEvidenceBlobs,
   type SolverEvidenceBlob,
@@ -39,8 +40,10 @@ export type HistoricalUransAttemptSource =
  * An explicit FAST/FINAL fidelity payload can exist before a result is
  * published, or on a terminal failed attempt whose immutable archive is still
  * important forensic evidence.  Inventory is exhaustive across those states,
- * but only the completed solved state can be handed to an existing automatic
- * reducer/recovery workflow.
+ * but only a completed solved state that still owns a live result generation
+ * can be handed to an existing automatic reducer/recovery workflow. Completed
+ * authenticated GCS evidence from a released result is explicitly labelled
+ * for the separate append-only historical-audit path.
  */
 export type HistoricalUransExecutionState =
   | "completed_solved"
@@ -90,6 +93,9 @@ export type HistoricalUransProvenanceState =
 /** This is only a recommendation for a separately invoked workflow. None of
  * these values creates a queue row, a recovery receipt, or a solver request. */
 export type HistoricalUransInventoryPlan =
+  /** The immutable GCS archive belongs to a released generation. It is
+   * ineligible for both archive reduction and solver work. */
+  | "ineligible_released_evidence"
   | "archive_interpretation_backfill_plan"
   | "wait_for_archive_migration"
   | "investigate_archive_integrity"
@@ -100,6 +106,20 @@ export type HistoricalUransInventoryPlan =
   | "await_result_publication"
   | "await_execution"
   | "investigate_stale_execution";
+
+/**
+ * The live publication queue is allowed to reduce either the result's current
+ * generation or the narrow exact RANS -> PRECALC successor case.  A result
+ * with no current generation is materially different: its archive is retained
+ * history, not a deferred live polar.  Keep that distinction in the read model
+ * so an inventory consumer cannot mistake historical GCS evidence for an
+ * automatic publication candidate.
+ */
+export type HistoricalUransPublicationState =
+  | "current_attempt"
+  | "other_current_attempt"
+  | "historical_released"
+  | "no_result_owner";
 
 export type HistoricalUransInventoryCandidate = {
   resultId: string | null;
@@ -116,6 +136,7 @@ export type HistoricalUransInventoryCandidate = {
   provenanceState: HistoricalUransProvenanceState;
   archiveState: HistoricalUransArchiveState;
   archiveReason: string | null;
+  publicationState: HistoricalUransPublicationState;
   plan: HistoricalUransInventoryPlan;
 };
 
@@ -293,11 +314,29 @@ export function historicalUransArchiveState(input: {
   return { state: "verified_gcs_archive", reason: null };
 }
 
+export function historicalUransPublicationState(input: {
+  resultId: string | null;
+  resultAttemptId: string;
+  currentResultAttemptId: string | null;
+}): HistoricalUransPublicationState {
+  // `resultId === null` is classified separately as missing ownership. It
+  // cannot be handed to any live or historical writer, so do not make it look
+  // like an intentional released result.
+  if (!input.resultId) return "no_result_owner";
+  if (!input.currentResultAttemptId) {
+    return "historical_released";
+  }
+  return input.currentResultAttemptId === input.resultAttemptId
+    ? "current_attempt"
+    : "other_current_attempt";
+}
+
 export function historicalUransInventoryPlan(input: {
   fidelity: HistoricalUransFidelity;
   provenanceState: HistoricalUransProvenanceState;
   archiveState: HistoricalUransArchiveState;
   executionState: HistoricalUransExecutionState;
+  publicationState: HistoricalUransPublicationState;
 }): HistoricalUransInventoryPlan {
   switch (input.executionState) {
     case "terminal_failed":
@@ -311,8 +350,17 @@ export function historicalUransInventoryPlan(input: {
     case "completed_solved":
       break;
   }
-  if (input.provenanceState !== "eligible_for_existing_handoffs") {
+  if (
+    input.publicationState === "no_result_owner" ||
+    input.provenanceState !== "eligible_for_existing_handoffs"
+  ) {
     return "investigate_attempt_provenance";
+  }
+  if (
+    input.archiveState === "verified_gcs_archive" &&
+    input.publicationState === "historical_released"
+  ) {
+    return "ineligible_released_evidence";
   }
   switch (input.archiveState) {
     case "verified_gcs_archive":
@@ -345,6 +393,7 @@ function emptyStageSummary(): HistoricalUransInventoryStageSummary {
       verified_gcs_archive: 0,
     },
     byPlan: {
+      ineligible_released_evidence: 0,
       archive_interpretation_backfill_plan: 0,
       wait_for_archive_migration: 0,
       investigate_archive_integrity: 0,
@@ -403,6 +452,7 @@ export async function discoverHistoricalUransInventory(
     .select({
       resultId: resultAttempts.resultId,
       resultAttemptId: resultAttempts.id,
+      currentResultAttemptId: results.currentResultAttemptId,
       fidelity: sql<HistoricalUransFidelity>`${resultAttempts.evidencePayload} ->> 'fidelity'`,
       attemptStatus: resultAttempts.status,
       attemptSource: resultAttempts.source,
@@ -413,6 +463,7 @@ export async function discoverHistoricalUransInventory(
       blob: solverEvidenceBlobs,
     })
     .from(resultAttempts)
+    .leftJoin(results, eq(results.id, resultAttempts.resultId))
     .leftJoin(
       solverEvidenceArchives,
       and(
@@ -456,6 +507,11 @@ export async function discoverHistoricalUransInventory(
       sourceArchiveId: row.sourceArchiveId,
       blob: row.blob,
     });
+    const publicationState = historicalUransPublicationState({
+      resultId: row.resultId,
+      resultAttemptId: row.resultAttemptId,
+      currentResultAttemptId: row.currentResultAttemptId,
+    });
     const fidelity = row.fidelity;
     return {
       resultId: row.resultId,
@@ -472,11 +528,13 @@ export async function discoverHistoricalUransInventory(
       provenanceState,
       archiveState: archive.state,
       archiveReason: archive.reason,
+      publicationState,
       plan: historicalUransInventoryPlan({
         fidelity,
         provenanceState,
         archiveState: archive.state,
         executionState,
+        publicationState,
       }),
     } satisfies HistoricalUransInventoryCandidate;
   });

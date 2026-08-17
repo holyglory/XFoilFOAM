@@ -1,4 +1,4 @@
-// Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v7):
+// Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v8):
 //   1. FIDELITY-AWARE frame-track period bar — urans_precalc accepts at >= 3
 //      retained periods, urans_full / legacy keeps the strict >= 5 bar.
 //   2. Oscillating-steady acceptance — a STEADY row with converged=false but
@@ -15,8 +15,10 @@ import {
   FRAME_TRACK_MIN_PERIODS,
   FRAME_TRACK_MIN_PERIODS_FULL,
   FRAME_TRACK_MIN_PERIODS_PRECALC,
+  FRAME_TRACK_PERIOD_BOUNDARY_ULPS,
   frameTrackMinPeriodsFor,
   isOscillatingSteadyStable,
+  meetsFrameTrackPeriodMinimum,
   POLAR_CLASSIFIER_VERSION,
   type PolarEvidencePoint,
 } from "../src/polar-fit";
@@ -78,9 +80,9 @@ const oscillatingSteadyRow: PolarEvidencePoint = {
   steadyHistory,
 };
 
-describe("fidelity-aware frame-track period bar (v6)", () => {
+describe("fidelity-aware frame-track period bar (v8)", () => {
   it("pins the version stamp and the per-tier bars", () => {
-    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v7");
+    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v8");
     expect(FRAME_TRACK_MIN_PERIODS_PRECALC).toBe(3);
     expect(FRAME_TRACK_MIN_PERIODS_FULL).toBe(5);
     expect(FRAME_TRACK_MIN_PERIODS).toBe(FRAME_TRACK_MIN_PERIODS_FULL);
@@ -90,6 +92,51 @@ describe("fidelity-aware frame-track period bar (v6)", () => {
     expect(frameTrackMinPeriodsFor(null)).toBe(5);
     expect(frameTrackMinPeriodsFor(undefined)).toBe(5);
     expect(frameTrackMinPeriodsFor("PRECALC")).toBe(5); // unknown → strict
+  });
+
+  it("MUST-CATCH: admits only ULP-scale underflow at exact FAST and FINAL integer-period boundaries", () => {
+    for (const [fidelity, minPeriods, represented] of [
+      ["urans_precalc", 3, 2.9999999999999987],
+      ["urans_full", 5, 4.9999999999999964],
+    ] as const) {
+      expect(meetsFrameTrackPeriodMinimum(represented, minPeriods)).toBe(true);
+      const classified = classifyPolarEvidence([
+        {
+          ...uransRow,
+          fidelity,
+          frameTrack: {
+            ...contractFrameTrack,
+            periods_retained: represented,
+          },
+        },
+      ]);
+      expect(classified.classifications[0].state).toBe("accepted");
+      expect(classified.classifications[0].reasons).toEqual([]);
+    }
+  });
+
+  it("FALSE-POSITIVE GUARD: a value just outside the ULP boundary still rejects", () => {
+    const minPeriods = FRAME_TRACK_MIN_PERIODS_PRECALC;
+    const thresholdUlp =
+      Number.EPSILON *
+      2 ** Math.floor(Math.log2(Math.max(1, Math.abs(minPeriods))));
+    const outside =
+      minPeriods - thresholdUlp * (FRAME_TRACK_PERIOD_BOUNDARY_ULPS + 1);
+    expect(meetsFrameTrackPeriodMinimum(outside, minPeriods)).toBe(false);
+    const classified = classifyPolarEvidence([
+      {
+        ...uransRow,
+        fidelity: "urans_precalc",
+        frameTrack: {
+          ...contractFrameTrack,
+          periods_retained: outside,
+        },
+      },
+    ]);
+    expect(classified.classifications[0].state).toBe("rejected");
+    expect(classified.classifications[0].reasons).toContain(
+      "insufficient-periods",
+    );
   });
 
   it("MUST-CATCH: a precalc row with 3 retained periods ACCEPTS; the same track at full/legacy fidelity REJECTS", () => {

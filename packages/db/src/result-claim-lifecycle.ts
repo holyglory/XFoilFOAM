@@ -6,7 +6,7 @@ import { results } from "./schema";
 /** Evidence that an ownerless result still belongs to the wave-2 precalc
  * ladder rather than the generic wave-1 gap queue.
  *
- * A precalc crash carries the durable one-shot retry marker. A RANS row carries
+ * A precalc crash carries the durable last-clean-restart marker. A RANS row carries
  * the rejected/needs_urans classification that originally created the wave-2
  * obligation. Merely having been attached to a wave-2 job is not enough: an
  * empty placeholder has no evidence-backed fidelity and safely returns to the

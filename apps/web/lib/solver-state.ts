@@ -27,6 +27,7 @@ export type SolverStateName =
   | "unknown"
   | "process_not_running"
   | "admission_fenced"
+  | "maintenance_drain"
   | "paused"
   | "engine_unreachable"
   | "engine_unhealthy"
@@ -73,6 +74,10 @@ export interface SolverStateInput {
   lastAdmissionFenceAt?: string | null;
   lastAdmissionFenceReason?: string | null;
   lastAdmissionFenceDetails?: Record<string, unknown> | null;
+  /** Live system-owned drain distinct from a historical admission-fence
+   *  reason. The drain token is intentionally never browser-visible. */
+  maintenanceDrainActive?: boolean;
+  maintenanceDrainStartedAt?: string | null;
 }
 
 export interface DerivedSolverState {
@@ -128,6 +133,8 @@ export interface SolverStateListPayload {
   admissionFenceActive?: boolean;
   lastAdmissionFenceAt?: string | null;
   lastAdmissionFenceReason?: string | null;
+  maintenanceDrainActive?: boolean;
+  maintenanceDrainStartedAt?: string | null;
 }
 
 export function heartbeatAgeMs(
@@ -183,6 +190,18 @@ function timeOfDay(iso: string): string {
   return new Date(iso).toLocaleTimeString();
 }
 
+function maintenanceDrainDetail(
+  startedAt: string | null | undefined,
+  nowMs: number,
+): string {
+  const startedMs = startedAt ? new Date(startedAt).getTime() : Number.NaN;
+  const started =
+    Number.isFinite(startedMs) && startedMs <= nowMs
+      ? `Maintenance drain began ${formatAge(nowMs - startedMs)} ago. `
+      : "";
+  return `${started}Active jobs, if any, continue while the maintenance drain is active.`;
+}
+
 export function solverStateLabel(state: SolverStateName): string {
   switch (state) {
     case "unknown":
@@ -191,6 +210,8 @@ export function solverStateLabel(state: SolverStateName): string {
       return "PROCESS NOT RUNNING";
     case "admission_fenced":
       return "SAFETY STOP";
+    case "maintenance_drain":
+      return "MAINTENANCE DRAIN";
     case "paused":
       return "PAUSED";
     case "engine_unreachable":
@@ -229,6 +250,8 @@ export function solverChipText(
       return "scheduler · process not running";
     case "admission_fenced":
       return "scheduler · safety stop";
+    case "maintenance_drain":
+      return "scheduler · maintenance drain";
     case "engine_unreachable":
       return "scheduler · engine unreachable";
     case "engine_unhealthy":
@@ -245,17 +268,18 @@ export function solverChipText(
 /** GATE PRECEDENCE (approved design, binding):
  *  fetch failed → unknown; heartbeat null/stale → process_not_running (TRUE
  *  process death now that liveness is an independent timer — red regardless
- *  of tick fields); alive+admission fence → red safety stop; alive+disabled →
- *  paused (the pinned paused-first order:
+ *  of tick fields); alive+admission fence → red safety stop; alive+active
+ *  maintenance drain → amber system-owned drain; alive+disabled → paused (the
+ *  pinned paused-first order:
  *  while disabled, engine trouble and slow ticks are secondary because
  *  "scheduling continues" copy would be false); alive+enabled+unreachable →
  *  engine_unreachable; reachable but unhealthy/build-mismatch →
  *  engine_unhealthy (advisory); heartbeat fresh but the current tick started
  *  >5 min ago without completing → tick_stalled (AMBER, never red — the
  *  2026-07-06 false "PROCESS NOT RUNNING"); else running / idle. Enabled-path
- *  order matches the locked design: process death > admission fence > engine
- *  unreachable > engine unhealthy > tick_stalled > healthy. engineQueueError is always
- *  secondary. */
+ *  order matches the locked design: process death > admission fence >
+ *  maintenance drain > engine unreachable > engine unhealthy > tick_stalled >
+ *  healthy. engineQueueError is always secondary. */
 export function deriveSolverState(
   input: SolverStateInput,
   nowMs: number = Date.now(),
@@ -303,6 +327,20 @@ export function deriveSolverState(
       headline: admissionFenceHeadline(input),
       detail:
         "New submissions are fenced. Running jobs continue; engineering investigation is required before Resume.",
+      secondary,
+    };
+  }
+
+  // This is intentionally below the live admission latch: maintenance must
+  // replace only historical fence provenance, never conceal an active safety
+  // stop. It also precedes the generic disabled state so no user-facing
+  // Resume/enable affordance is derived for a system-owned drain.
+  if (input.maintenanceDrainActive) {
+    return {
+      state: "maintenance_drain",
+      tone: "amber",
+      headline: "System maintenance is holding new submissions.",
+      detail: maintenanceDrainDetail(input.maintenanceDrainStartedAt, nowMs),
       secondary,
     };
   }

@@ -61,7 +61,9 @@ describe("archive clean-cycle reduction engine client", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
     await expect(
       client.reduceRemoteEvidenceCleanCycles(expected, { timeoutMs: 2_000 }),
     ).resolves.toEqual(response());
@@ -90,8 +92,12 @@ describe("archive clean-cycle reduction engine client", () => {
           ),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).rejects.toEqual(
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).rejects.toEqual(
       expect.objectContaining({
         code: "archive_reduction_contract_drift",
       }),
@@ -120,8 +126,12 @@ describe("archive clean-cycle reduction engine client", () => {
           }),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).resolves.toEqual(exhausted);
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).resolves.toEqual(exhausted);
   });
 
   it("accepts a typed continuation proof only when its remaining physical budget is exact", async () => {
@@ -146,13 +156,94 @@ describe("archive clean-cycle reduction engine client", () => {
           }),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).resolves.toEqual(typed);
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).resolves.toEqual(typed);
   });
 
   it.each([
     [
-      "uses the FINAL cap for a FAST continuation",
+      "FAST",
+      request(),
+      {
+        policyVersion: "adaptive-clean-tail-v2",
+        measuredPeriods: 13,
+        maxPeriods: 18,
+        recommendedAdditionalPeriods: 3,
+      },
+    ],
+    [
+      "FINAL",
+      request("urans_full"),
+      {
+        policyVersion: "adaptive-clean-tail-v2",
+        measuredPeriods: 14,
+        maxPeriods: 27,
+        recommendedAdditionalPeriods: 3,
+      },
+    ],
+  ])(
+    "accepts the fixed versioned %s emergency continuation ceiling",
+    async (_tier, input, recoveryProgress) => {
+      const typed = {
+        ...response(),
+        diagnostics: { recoveryProgress },
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify(typed), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+        ),
+      );
+      const client = new EngineClient("http://engine.test", {
+        controlPlaneToken: TOKEN,
+      });
+      await expect(
+        client.reduceRemoteEvidenceCleanCycles(input),
+      ).resolves.toEqual(typed);
+    },
+  );
+
+  it("accepts an adaptive exhausted proof only after its fixed ceiling, preserving a truthful cadence overrun", async () => {
+    const exhausted = {
+      ...response(),
+      state: "recovery_exhausted" as const,
+      diagnostics: {
+        recoveryProgress: {
+          policyVersion: "adaptive-clean-tail-v2",
+          measuredPeriods: 20,
+          maxPeriods: 18,
+        },
+      },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(exhausted), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).resolves.toEqual(exhausted);
+  });
+
+  it.each([
+    [
+      "widens an unversioned FAST continuation",
       request(),
       {
         ...response(),
@@ -161,6 +252,66 @@ describe("archive clean-cycle reduction engine client", () => {
             measuredPeriods: 8,
             maxPeriods: 12,
             recommendedAdditionalPeriods: 1,
+          },
+        },
+      },
+    ],
+    [
+      "widens a versioned FAST continuation beyond its fixed emergency ceiling",
+      request(),
+      {
+        ...response(),
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 13,
+            maxPeriods: 21,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      },
+    ],
+    [
+      "uses the FINAL adaptive ceiling for a FAST continuation",
+      request(),
+      {
+        ...response(),
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 13,
+            maxPeriods: 27,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      },
+    ],
+    [
+      "omits the required version on an emergency-width continuation",
+      request(),
+      {
+        ...response(),
+        diagnostics: {
+          recoveryProgress: {
+            measuredPeriods: 13,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      },
+    ],
+    [
+      "adds a salvage-specific field to the simpler versioned contract",
+      request(),
+      {
+        ...response(),
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 13,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 1,
+            tailSalvagePeriods: 3,
           },
         },
       },
@@ -180,6 +331,36 @@ describe("archive clean-cycle reduction engine client", () => {
       },
     ],
     [
+      "asks for more than the adaptive emergency ceiling has remaining",
+      request(),
+      {
+        ...response(),
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 17,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 2,
+          },
+        },
+      },
+    ],
+    [
+      "asks for an adaptive continuation chunk wider than three periods",
+      request(),
+      {
+        ...response(),
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 13,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 4,
+          },
+        },
+      },
+    ],
+    [
       "adds a continuation recommendation after the cap",
       request(),
       {
@@ -194,22 +375,60 @@ describe("archive clean-cycle reduction engine client", () => {
         },
       },
     ],
-  ])("fails closed when typed recovery progress %s", async (_label, input, body) => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(JSON.stringify(body), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          }),
-      ),
-    );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(input)).rejects.toEqual(
-      expect.objectContaining({ code: "archive_reduction_contract_drift" }),
-    );
-  });
+    [
+      "marks an adaptive exhaustion before its fixed ceiling",
+      request(),
+      {
+        ...response(),
+        state: "recovery_exhausted",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 17,
+            maxPeriods: 18,
+          },
+        },
+      },
+    ],
+    [
+      "adds a continuation recommendation to an adaptive exhaustion",
+      request(),
+      {
+        ...response(),
+        state: "recovery_exhausted",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 18,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      },
+    ],
+  ])(
+    "fails closed when typed recovery progress %s",
+    async (_label, input, body) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+        ),
+      );
+      const client = new EngineClient("http://engine.test", {
+        controlPlaneToken: TOKEN,
+      });
+      await expect(
+        client.reduceRemoteEvidenceCleanCycles(input),
+      ).rejects.toEqual(
+        expect.objectContaining({ code: "archive_reduction_contract_drift" }),
+      );
+    },
+  );
 
   it("preserves an answered archive rejection as an EngineError", async () => {
     vi.stubGlobal(
@@ -222,10 +441,11 @@ describe("archive clean-cycle reduction engine client", () => {
           }),
       ),
     );
-    const client = new EngineClient("http://engine.test", { controlPlaneToken: TOKEN });
-    await expect(client.reduceRemoteEvidenceCleanCycles(request())).rejects.toBeInstanceOf(
-      EngineError,
-    );
+    const client = new EngineClient("http://engine.test", {
+      controlPlaneToken: TOKEN,
+    });
+    await expect(
+      client.reduceRemoteEvidenceCleanCycles(request()),
+    ).rejects.toBeInstanceOf(EngineError);
   });
 });
-

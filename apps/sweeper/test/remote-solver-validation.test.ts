@@ -11,6 +11,7 @@ import {
   type JobStatus,
   type PolarRequest,
 } from "@aerodb/engine-client";
+import { CURRENT_ARCHIVE_REDUCTION_VERSION } from "../src/engine-capabilities";
 import {
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
@@ -47,9 +48,11 @@ const {
   brokeredEvidenceIdempotencyKey,
   claimResultDelivery,
   createProgressAwareAbort,
+  deleteDiscardedTerminalRemoteJobDirs,
   persistClaimedRemotePromise,
   processBrokeredRemoteEvidenceReclaims,
   processRestartableRemotePrecalcCheckpoint,
+  reclaimDisposableTerminalRemoteJobDirs,
   reconcileRemoteSolverTick,
   remoteSolverTick,
   renewResultDeliveryClaim,
@@ -105,12 +108,14 @@ const {
   simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
+  solverEvidenceArtifactMembers,
   solverEvidenceArchives,
   solverEvidenceBlobs,
   solverProfiles,
   solverRuntimeBuilds,
   solverRuntimeProvenanceKey,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  sweeperState,
   syncApiSettings,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
@@ -135,6 +140,10 @@ const contour = [
 ];
 
 let savedSettings: typeof syncApiSettings.$inferSelect | null = null;
+let savedSweeperAdmission: {
+  cpuSlots: number;
+  maxConcurrentJobs: number;
+} | null = null;
 let categoryId = "";
 let airfoilId = "";
 let airfoilSlug = "";
@@ -519,19 +528,17 @@ async function cleanupRemoteRows() {
     new Set([revisionId, ...promiseRows.map((row) => row.revisionId)]),
   );
   if (promiseIds.length) {
-    await db.delete(syncRemoteHubBindingReceipts).where(
-      inArray(syncRemoteHubBindingReceipts.promiseId, promiseIds),
-    );
-    await db.delete(syncRemotePromiseCancellations).where(
-      inArray(syncRemotePromiseCancellations.promiseId, promiseIds),
-    );
+    await db
+      .delete(syncRemoteHubBindingReceipts)
+      .where(inArray(syncRemoteHubBindingReceipts.promiseId, promiseIds));
+    await db
+      .delete(syncRemotePromiseCancellations)
+      .where(inArray(syncRemotePromiseCancellations.promiseId, promiseIds));
   }
   const resultIds = await db
     .select({ id: results.id })
     .from(results)
-    .where(
-      inArray(results.simulationPresetRevisionId, fixtureRevisionIds),
-    );
+    .where(inArray(results.simulationPresetRevisionId, fixtureRevisionIds));
   const evidenceBlobIds = resultIds.length
     ? await db
         .select({ id: solverEvidenceBlobs.id })
@@ -592,9 +599,7 @@ async function cleanupRemoteRows() {
     );
   await db
     .delete(simJobs)
-    .where(
-      inArray(simJobs.simulationPresetRevisionId, fixtureRevisionIds),
-    );
+    .where(inArray(simJobs.simulationPresetRevisionId, fixtureRevisionIds));
   if (cleanupRuntimeBuildIds.size) {
     await db
       .delete(solverRuntimeBuilds)
@@ -775,6 +780,39 @@ async function seedDoneRemoteJob(
   }
 
   return job;
+}
+
+async function seedDiscardableRemoteJobWithoutResult(
+  label: string,
+  status: "failed" | "cancelled",
+  aoaDeg = 990.001,
+) {
+  const promise = await seedMirroredPromise(`${label}-promise`, [aoaDeg]);
+  const [job] = await db
+    .insert(simJobs)
+    .values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 1,
+      jobKind: "targeted",
+      status,
+      engineState: status === "cancelled" ? "cancelled" : "failed",
+      engineJobId: `${PREFIX}-${label}-engine`,
+      totalCases: 1,
+      completedCases: 0,
+      error: `${label} discarded engine fixture`,
+      finishedAt: new Date(Date.now() - 60_000),
+      requestPayload: {
+        syncPromiseId: promise.id,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        aoas: [aoaDeg],
+      },
+    })
+    .returning();
+  return { promise, job };
 }
 
 async function readJobPayload(jobId: string) {
@@ -1460,6 +1498,147 @@ async function jobsForPromise(promiseId: string) {
   );
 }
 
+/** Match the remote admission boundary's durable owner scope so this shared-DB
+ * fixture reserves two tokens beyond, rather than through, unrelated work. */
+async function activeRemoteReservationBaseline(): Promise<number> {
+  const [settings] = await db
+    .select({
+      upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
+      registeredSolverId: syncApiSettings.remoteSolverRegisteredId,
+    })
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  if (!settings?.upstreamBaseUrl) return 0;
+
+  const activeJobs = await db
+    .select({
+      admissionCpuSlots: simJobs.admissionCpuSlots,
+      requestPayload: simJobs.requestPayload,
+    })
+    .from(simJobs)
+    .where(
+      or(
+        inArray(simJobs.status, ["submitted", "running"]),
+        and(
+          eq(simJobs.status, "pending"),
+          eq(simJobs.engineState, "submitting"),
+        ),
+        and(
+          eq(simJobs.status, "cancelled"),
+          inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+        ),
+      ),
+    );
+  const payloads = activeJobs.map(
+    (job) =>
+      job.requestPayload as {
+        remoteSolver?: boolean;
+        upstreamBaseUrl?: string;
+        syncPromiseId?: string;
+        solverId?: string;
+      } | null,
+  );
+  if (!settings.registeredSolverId) {
+    return activeJobs.reduce((total, job, index) => {
+      const payload = payloads[index];
+      return payload?.remoteSolver === true &&
+        payload.upstreamBaseUrl === settings.upstreamBaseUrl
+        ? total + Math.max(Number(job.admissionCpuSlots), 1)
+        : total;
+    }, 0);
+  }
+
+  const promiseIds = payloads
+    .map((payload) => payload?.syncPromiseId)
+    .filter((id): id is string => Boolean(id));
+  const ownedPromiseIds = new Set<string>();
+  if (promiseIds.length) {
+    const promises = await db
+      .select({
+        id: syncSweepPromises.id,
+        sourceBaseUrl: syncSweepPromises.sourceBaseUrl,
+        registeredSolverId: syncSweepPromises.registeredSolverId,
+        requestPayload: syncSweepPromises.requestPayload,
+      })
+      .from(syncSweepPromises)
+      .where(inArray(syncSweepPromises.id, promiseIds));
+    for (const promise of promises) {
+      const payload = promise.requestPayload as { solverId?: string } | null;
+      if (
+        promise.sourceBaseUrl === settings.upstreamBaseUrl &&
+        (promise.registeredSolverId === settings.registeredSolverId ||
+          (!promise.registeredSolverId &&
+            payload?.solverId === settings.registeredSolverId))
+      ) {
+        ownedPromiseIds.add(promise.id);
+      }
+    }
+  }
+
+  return activeJobs.reduce((total, job, index) => {
+    const payload = payloads[index];
+    const owned = payload?.syncPromiseId
+      ? ownedPromiseIds.has(payload.syncPromiseId)
+      : payload?.solverId === settings.registeredSolverId;
+    return payload?.remoteSolver === true &&
+      payload.upstreamBaseUrl === settings.upstreamBaseUrl &&
+      owned
+      ? total + Math.max(Number(job.admissionCpuSlots), 1)
+      : total;
+  }, 0);
+}
+
+/** Give a focused admission regression deterministic headroom above unrelated
+ * shared-DB work, then let afterEach restore the exact scheduler settings. */
+async function ensureSharedAdmissionHeadroom(additionalSlots: number) {
+  const [scheduler] = await db
+    .select({
+      enabled: sweeperState.enabled,
+      cpuSlots: sweeperState.cpuSlots,
+      maxConcurrentJobs: sweeperState.maxConcurrentJobs,
+    })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .limit(1);
+  if (!scheduler?.enabled) return;
+  savedSweeperAdmission ??= {
+    cpuSlots: scheduler.cpuSlots,
+    maxConcurrentJobs: scheduler.maxConcurrentJobs,
+  };
+  const activeJobs = await db
+    .select({ admissionCpuSlots: simJobs.admissionCpuSlots })
+    .from(simJobs)
+    .where(
+      or(
+        inArray(simJobs.status, ["submitted", "running"]),
+        and(
+          eq(simJobs.status, "pending"),
+          eq(simJobs.engineState, "submitting"),
+        ),
+        and(
+          eq(simJobs.status, "cancelled"),
+          inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+        ),
+      ),
+    );
+  const reservedSlots = activeJobs.reduce(
+    (total, job) => total + Math.max(job.admissionCpuSlots ?? 1, 1),
+    0,
+  );
+  await db
+    .update(sweeperState)
+    .set({ cpuSlots: reservedSlots + additionalSlots })
+    .where(eq(sweeperState.id, 1));
+}
+
+async function restoreSharedAdmissionSettings() {
+  if (!savedSweeperAdmission) return;
+  const restore = savedSweeperAdmission;
+  savedSweeperAdmission = null;
+  await db.update(sweeperState).set(restore).where(eq(sweeperState.id, 1));
+}
+
 async function resultForAoa(aoaDeg: number) {
   const [row] = await db
     .select({
@@ -1516,13 +1695,21 @@ beforeEach(async () => {
   resetEngineBackoffForTests();
   await cleanupRemoteRows();
   await configureRemoteSolver();
+  // This file runs against the shared development database. Unrelated suites
+  // or a local scheduler may already reserve slots, so preserve their load and
+  // provide exactly the two remote-fixture slots configured above.
+  await ensureSharedAdmissionHeadroom(2);
 });
 
 afterEach(async () => {
   resetEngineBackoffForTests();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  await cleanupRemoteRows();
+  try {
+    await cleanupRemoteRows();
+  } finally {
+    await restoreSharedAdmissionSettings();
+  }
 });
 
 afterAll(async () => {
@@ -1684,11 +1871,35 @@ describe("remote solver submit lifecycle", () => {
     expect(settings?.error).toMatch(/mesh-recovery capability.*malformed/i);
   });
 
-  it("keeps reconciliation early but leaves remote RANS untouched when FAST owns the tick", async () => {
+  it("admits promised RANS when earlier FAST work has already reserved a different slot", async () => {
+    const fastPromise = await seedMirroredPromise(
+      "fast-priority-owner",
+      [900.8],
+    );
     const promise = await seedMirroredPromise("fast-priority", [900.801]);
+    await db.insert(simJobs).values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 2,
+      jobKind: "targeted",
+      methodKey: "openfoam.urans",
+      status: "submitted",
+      engineJobId: `${PREFIX}-fast-priority-reserved`,
+      admissionCpuSlots: 1,
+      totalCases: 1,
+      requestPayload: {
+        syncPromiseId: fastPromise.id,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        aoas: [900.8],
+        uransFidelity: "precalc",
+      },
+    });
     stubFetch();
     const submitPolar = vi.fn(async (_request: PolarRequest) =>
-      acceptedStatus("must-not-submit"),
+      acceptedStatus("remaining-capacity-rans"),
     );
     const engine = {
       submitPolar,
@@ -1698,13 +1909,77 @@ describe("remote solver submit lifecycle", () => {
     expect(await reconcileRemoteSolverTick(db, engine)).toBe(true);
     expect(
       await admitRemoteSolverTick(db, engine, {
-        kind: "hold",
-        reason: "higher_priority_fast_urans",
+        kind: "allow",
+        meshRecoveryVersion: 4,
       }),
-    ).toBe(false);
-    expect(submitPolar).not.toHaveBeenCalled();
-    expect(await jobsForPromise(promise.id)).toEqual([]);
-    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    ).toBe(true);
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(await jobsForPromise(promise.id)).toHaveLength(1);
+  });
+
+  it("MUST-CATCH: a watcher drain acquired after reconciliation prevents remote promise writes and engine submission", async () => {
+    const promise = await seedMirroredPromise("maintenance-race", [900.851]);
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus("must-not-submit-after-maintenance-drain"),
+    );
+    const engine = {
+      submitPolar,
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    // This is the scheduler's earlier remote phase. The watcher then acquires
+    // the durable writer boundary before the later admission phase runs.
+    expect(await reconcileRemoteSolverTick(db, engine)).toBe(true);
+    fetchMock.mockClear();
+    const [state] = await db
+      .select({
+        enabled: sweeperState.enabled,
+        admissionFenceActive: sweeperState.admissionFenceActive,
+        maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+        maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
+      })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1);
+    if (!state) throw new Error("seeded sweeper state is required");
+
+    try {
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: false,
+          admissionFenceActive: false,
+          maintenanceDrainToken: randomUUID(),
+          maintenanceDrainStartedAt: new Date(),
+        })
+        .where(eq(sweeperState.id, 1));
+
+      // Both exported writer phases repeat the drain check. The second call
+      // models a direct caller; it must not renew/release a promise or report
+      // a heartbeat after the watcher took ownership.
+      await expect(reconcileRemoteSolverTick(db, engine)).resolves.toBe(false);
+      await expect(
+        admitRemoteSolverTick(db, engine, {
+          kind: "allow",
+          meshRecoveryVersion: 0,
+        }),
+      ).resolves.toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(submitPolar).not.toHaveBeenCalled();
+      expect(await jobsForPromise(promise.id)).toEqual([]);
+      expect((await readPromise(promise.id)).promise.status).toBe("active");
+    } finally {
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: state.enabled,
+          admissionFenceActive: state.admissionFenceActive,
+          maintenanceDrainToken: state.maintenanceDrainToken,
+          maintenanceDrainStartedAt: state.maintenanceDrainStartedAt,
+        })
+        .where(eq(sweeperState.id, 1));
+    }
   });
 
   it.each([0, 17])(
@@ -1799,6 +2074,101 @@ describe("remote solver submit lifecycle", () => {
     ]);
   });
 
+  it("MUST-CATCH: a later retry-wait owner fences a fresh hub claim behind an earlier busy polar", async () => {
+    const busyAoa = 900.953;
+    const retryAoa = 900.954;
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    const busyPromise = await seedMirroredPromise("mixed-order-busy", [
+      busyAoa,
+    ]);
+    const retryPromise = await seedMirroredPromise("mixed-order-retry-wait", [
+      retryAoa,
+    ]);
+    const createdAt = Date.now();
+    await db
+      .update(syncSweepPromises)
+      .set({ createdAt: new Date(createdAt - 1_000) })
+      .where(eq(syncSweepPromises.id, busyPromise.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ createdAt: new Date(createdAt) })
+      .where(eq(syncSweepPromises.id, retryPromise.id));
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 2 })
+      .where(eq(syncApiSettings.id, 1));
+    await db.insert(simJobs).values({
+      airfoilId,
+      bcIds: [bcId],
+      simulationPresetRevisionId: revisionId,
+      referenceChordM: CHORD,
+      wave: 1,
+      jobKind: "targeted",
+      methodKey: "openfoam.rans",
+      status: "running",
+      engineState: "running",
+      engineJobId: `${PREFIX}-mixed-order-busy`,
+      admissionCpuSlots: 1,
+      totalCases: 1,
+      requestPayload: {
+        syncPromiseId: busyPromise.id,
+        remoteSolver: true,
+        upstreamBaseUrl: UPSTREAM,
+        aoas: [busyAoa],
+      },
+    });
+    const [retryResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: retryAoa,
+        status: "pending",
+        source: "queued",
+        regime: "rans",
+        fidelity: "rans",
+      })
+      .returning({ id: results.id });
+    const retryAt = new Date(Date.now() + 60_000);
+    await db.insert(simResultSubmitRetries).values({
+      resultId: retryResult.id,
+      state: "retry_wait",
+      attemptCount: 1,
+      nextAttemptAt: retryAt,
+      lastHttpStatus: 503,
+      lastError: "exact retry remains owned",
+    });
+
+    const { fetchMock } = stubFetch();
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("mixed-order-must-not-submit"),
+    );
+    expect(
+      await admitRemoteSolverTick(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 17 },
+      ),
+    ).toBe(true);
+
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+    expect(await readPromise(retryPromise.id)).toMatchObject({
+      promise: { status: "active" },
+      points: [{ aoaDeg: retryAoa, status: "active" }],
+    });
+    expect(
+      await db
+        .select({
+          state: simResultSubmitRetries.state,
+          nextAttemptAt: simResultSubmitRetries.nextAttemptAt,
+        })
+        .from(simResultSubmitRetries)
+        .where(eq(simResultSubmitRetries.resultId, retryResult.id)),
+    ).toEqual([{ state: "retry_wait", nextAttemptAt: retryAt }]);
+  });
+
   it("MUST-CATCH: a newly claimed busy polar does not stop the same tick from filling another CPU slot", async () => {
     const [revision] = await db
       .select({
@@ -1872,6 +2242,157 @@ describe("remote solver submit lifecycle", () => {
           ),
       ),
     ).toHaveLength(2);
+  });
+
+  it("MUST-CATCH: each remote RANS submission refreshes storage admission before another claim", async () => {
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 2 })
+      .where(eq(syncApiSettings.id, 1));
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("setup revision fixture required");
+    const claimPromises = [900.957, 900.958].map((aoaDeg, index) => ({
+      id: randomUUID(),
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      airfoil: {
+        slug: airfoilSlug,
+        name: `${PREFIX} disk refresh ${index + 1}`,
+        source: null,
+        pointFormat: "normalized",
+        points: contour,
+      },
+      setupRevision: {
+        signatureHash: revision.signatureHash,
+        snapshot: revision.snapshot,
+      },
+      aoas: [aoaDeg],
+    }));
+    const { fetchMock } = stubFetch({ claimPromises });
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("disk-refresh-first-rans", 1),
+    );
+    const continueAfterSubmission = vi.fn(async () => false);
+
+    await expect(
+      admitRemoteSolverTick(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 17 },
+        continueAfterSubmission,
+      ),
+    ).resolves.toBe(true);
+
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(continueAfterSubmission).toHaveBeenCalledTimes(1);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          inArray(
+            dsql<string>`${simJobs.requestPayload} ->> 'syncPromiseId'`,
+            claimPromises.map((promise) => promise.id),
+          ),
+        ),
+    ).toHaveLength(1);
+  });
+
+  it("MUST-CATCH: exact remote RANS shape enters storage exposure before engine submission", async () => {
+    await ensureSharedAdmissionHeadroom(1);
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 1 })
+      .where(eq(syncApiSettings.id, 1));
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("setup revision fixture required");
+    const claim = {
+      id: randomUUID(),
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      airfoil: {
+        slug: airfoilSlug,
+        name: `${PREFIX} exact storage candidate`,
+        source: null,
+        pointFormat: "normalized",
+        points: contour,
+      },
+      setupRevision: {
+        signatureHash: revision.signatureHash,
+        snapshot: revision.snapshot,
+      },
+      aoas: [900.959, 900.96, 900.961],
+    };
+    const { fetchMock } = stubFetch({ claimPromises: [claim] });
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("exact-storage-candidate", claim.aoas.length),
+    );
+    const storageAdmissionAllowed = vi.fn(async () => {
+      const [candidate] = await db
+        .select({
+          status: simJobs.status,
+          engineState: simJobs.engineState,
+          totalCases: simJobs.totalCases,
+          requestPayload: simJobs.requestPayload,
+        })
+        .from(simJobs)
+        .where(
+          dsql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${claim.id}`,
+        )
+        .limit(1);
+      expect(candidate).toMatchObject({
+        status: "pending",
+        engineState: "submitting",
+        totalCases: claim.aoas.length,
+        requestPayload: {
+          syncPromiseId: claim.id,
+          remoteSolver: true,
+          aoas: claim.aoas,
+        },
+      });
+      return false;
+    });
+
+    await expect(
+      admitRemoteSolverTick(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 17 },
+        undefined,
+        storageAdmissionAllowed,
+      ),
+    ).resolves.toBe(false);
+
+    expect(storageAdmissionAllowed).toHaveBeenCalledTimes(1);
+    expect(submitPolar).not.toHaveBeenCalled();
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
+    const [candidate] = await db
+      .select({ status: simJobs.status, engineState: simJobs.engineState })
+      .from(simJobs)
+      .where(dsql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${claim.id}`)
+      .limit(1);
+    expect(candidate).toEqual({ status: "cancelled", engineState: "cancelled" });
+    const retained = await readPromise(claim.id);
+    expect(retained.promise?.status).toBe("active");
+    expect(retained.points).toHaveLength(claim.aoas.length);
+    expect(retained.points.every((point) => point.status === "active")).toBe(
+      true,
+    );
   });
 
   it("MUST-CATCH: a newly claimed promise persists its registered owner before composition", async () => {
@@ -1989,7 +2510,7 @@ describe("remote solver submit lifecycle", () => {
     ]);
   });
 
-  it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
+  it("MUST-CATCH: a connection retry retains its exact promise through shared backoff", async () => {
     const aoa = 901.001;
     const promise = await seedMirroredPromise("connection", [aoa]);
     const { fetchMock } = stubFetch();
@@ -2031,10 +2552,12 @@ describe("remote solver submit lifecycle", () => {
       status: "queued",
       retryState: null,
     });
-    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+    // The exact retry now owns a submitted RANS job; only then may the
+    // multi-slot refill ask the hub for an independent promise.
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
   });
 
-  it("waits 30 seconds after the first answered 5xx, then recomposes the same promise without a new upstream claim", async () => {
+  it("MUST-CATCH: a first answered 5xx retains its exact promise until its scheduled retry", async () => {
     const aoa = 902.001;
     const promise = await seedMirroredPromise("first-5xx", [aoa]);
     const { fetchMock } = stubFetch();
@@ -2061,6 +2584,7 @@ describe("remote solver submit lifecycle", () => {
 
     await remoteSolverTick(db, engine);
     expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
 
     await db
       .update(simResultSubmitRetries)
@@ -2078,7 +2602,9 @@ describe("remote solver submit lifecycle", () => {
       retryState: null,
       retryCount: null,
     });
-    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
+    // The one downstream claim is a post-success capacity refill, never a
+    // replacement for the retry-wait promise.
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
     expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(0);
   });
 
@@ -2197,6 +2723,553 @@ describe("remote solver submit lifecycle", () => {
       ),
     ).toEqual([`${UPSTREAM}/sweeps/${promise.id}/cancel`]);
     expect(requests(fetchMock, `/sweeps/${promise.id}/heartbeat`)).toEqual([]);
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "MUST-CATCH: a failed remote %s job without a publishable generation is deleted after its cancellation is queued",
+    async (status) => {
+      const { promise, job } = await seedDiscardableRemoteJobWithoutResult(
+        `discardable-release-${status}`,
+        status,
+      );
+      const { fetchMock } = stubFetch({ failCancelCount: 1 });
+      const engine = {
+        deleteJob: vi.fn(async () => undefined),
+      } as unknown as EngineClient;
+
+      await transferRemoteSolverTick(db, engine);
+
+      expect(await deliveriesForJob(job.id)).toMatchObject([
+        {
+          promiseId: promise.id,
+          simJobId: job.id,
+          resultId: null,
+          generationKey: `job:${job.id}`,
+          state: "blocked",
+        },
+      ]);
+      const [pendingAck] = await db
+        .select()
+        .from(syncRemotePromiseCancellations)
+        .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
+      expect(pendingAck).toMatchObject({
+        state: "retry_wait",
+        attemptCount: 1,
+      });
+      expect((await readPromise(promise.id)).promise.status).toBe("cancelled");
+      expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(
+        1,
+      );
+      expect(engine.deleteJob).toHaveBeenCalledWith(job.engineJobId);
+      expect(
+        (await db.select().from(simJobs).where(eq(simJobs.id, job.id)))[0]
+          ?.strippedAt,
+      ).toBeInstanceOf(Date);
+
+      await db
+        .update(syncRemotePromiseCancellations)
+        .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+        .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
+      await transferRemoteSolverTick(db, engine);
+
+      const [acknowledged] = await db
+        .select()
+        .from(syncRemotePromiseCancellations)
+        .where(eq(syncRemotePromiseCancellations.promiseId, promise.id));
+      expect(acknowledged).toMatchObject({
+        state: "delivered",
+        attemptCount: 2,
+      });
+      expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toHaveLength(
+        2,
+      );
+      expect(
+        vi
+          .mocked(engine.deleteJob)
+          .mock.calls.filter(
+            ([engineJobId]) => engineJobId === job.engineJobId,
+          ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("MUST-CATCH: terminal reclaim deletes an explicitly rejected source only after its active promise has durable exact FAST ownership", async () => {
+    const aoaDeg = 990.021;
+    const { promise, job } = await seedDiscardableRemoteJobWithoutResult(
+      "terminal-reclaim-rejected",
+      "failed",
+      aoaDeg,
+    );
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        cl: 0.41,
+        cd: 0.031,
+        cm: -0.02,
+        simJobId: job.id,
+        engineJobId: job.engineJobId,
+        engineCaseSlug: "aoa_terminal_reclaim",
+        error: "explicit rejected terminal fixture",
+        solvedAt: new Date(),
+      })
+      .returning();
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: job.id,
+        engineJobId: job.engineJobId,
+        engineCaseSlug: result.engineCaseSlug,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        error: "explicit rejected terminal fixture",
+        evidencePayload: { fixture: "terminal-reclaim-rejected" },
+        solvedAt: new Date(),
+      })
+      .returning();
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, result.id));
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "rans",
+      classifierVersion: "terminal-reclaim-test-v1",
+      state: "rejected",
+      reasons: ["solver-failed"],
+    });
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg,
+          sourceResultId: result.id,
+          sourceResultAttemptId: attempt.id,
+        },
+      ],
+      { syncPromiseIds: [promise.id] },
+    );
+    if (!obligation) throw new Error("PRECALC obligation is required");
+
+    const engine = {
+      getJob: vi.fn(async () => ({ state: "failed" })),
+      getJobRuntimes: vi.fn(async () => ({
+        jobs: [{ job_id: job.engineJobId, exists: true, process_count: 0 }],
+      })),
+      deleteJob: vi.fn(async () => ({ bytes_freed: 12_345 })),
+    } as unknown as EngineClient;
+
+    await expect(
+      reclaimDisposableTerminalRemoteJobDirs(db, engine, 100),
+    ).resolves.toEqual({ jobs: 1, attempts: 1, bytesFreed: 12_345 });
+    expect(engine.deleteJob).toHaveBeenCalledWith(job.engineJobId);
+    expect(
+      await db
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, attempt.id)),
+    ).toEqual([]);
+    expect(
+      (await db.select().from(results).where(eq(results.id, result.id)))[0],
+    ).toMatchObject({
+      status: "failed",
+      simJobId: null,
+      engineJobId: null,
+      currentResultAttemptId: null,
+      cl: null,
+      cd: null,
+      error:
+        "unpublished terminal remote generation reclaimed after authoritative scheduling ownership ended or durable fresh-recovery ownership was established",
+    });
+    expect(
+      (await db.select().from(simJobs).where(eq(simJobs.id, job.id)))[0],
+    ).toMatchObject({
+      strippedAt: expect.any(Date),
+      stripReport: {
+        note: "discarded unpublished remote terminal generation after authoritative ownership handoff",
+        bytes_freed: 12_345,
+        discarded_attempts: 1,
+      },
+    });
+    expect((await readPromise(promise.id)).promise.status).toBe("active");
+    expect(
+      (
+        await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, obligation.id))
+      )[0],
+    ).toMatchObject({
+      state: "pending",
+      sourceResultId: null,
+      sourceResultAttemptId: null,
+    });
+  });
+
+  it("MUST-CATCH: detached terminal reclaim deletes exactly its bounded zero-owner prefix and preserves attached or cancellation-pending jobs", async () => {
+    const eligible = await Promise.all([
+      seedDiscardableRemoteJobWithoutResult(
+        "detached-reclaim-eligible-a",
+        "failed",
+        990.031,
+      ),
+      seedDiscardableRemoteJobWithoutResult(
+        "detached-reclaim-eligible-b",
+        "cancelled",
+        990.032,
+      ),
+      seedDiscardableRemoteJobWithoutResult(
+        "detached-reclaim-eligible-c",
+        "failed",
+        990.033,
+      ),
+    ]);
+    const cancellationPending = await seedDiscardableRemoteJobWithoutResult(
+      "detached-reclaim-cancellation-pending",
+      "cancelled",
+      990.034,
+    );
+    await db
+      .update(simJobs)
+      .set({ engineState: "cancel_pending" })
+      .where(eq(simJobs.id, cancellationPending.job.id));
+    const attached = await seedDiscardableRemoteJobWithoutResult(
+      "detached-reclaim-attached",
+      "failed",
+      990.035,
+    );
+    await db.insert(results).values({
+      airfoilId,
+      bcId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: 990.035,
+      status: "failed",
+      source: "queued",
+      simJobId: attached.job.id,
+      engineJobId: attached.job.engineJobId,
+      error: "attached result keeps terminal generation owned",
+    });
+    const engine = {
+      deleteJob: vi.fn(async () => ({ bytes_freed: 1_024 })),
+    } as unknown as EngineClient;
+
+    await expect(
+      deleteDiscardedTerminalRemoteJobDirs(db, engine, 2),
+    ).resolves.toEqual({ jobs: 2, bytesFreed: 2_048 });
+
+    const deletedEngineIds = new Set(
+      vi
+        .mocked(engine.deleteJob)
+        .mock.calls.map(([engineJobId]) => engineJobId),
+    );
+    expect(deletedEngineIds.size).toBe(2);
+    expect(
+      [...deletedEngineIds].every((engineJobId) =>
+        eligible.some((fixture) => fixture.job.engineJobId === engineJobId),
+      ),
+    ).toBe(true);
+    expect(deletedEngineIds.has(cancellationPending.job.engineJobId!)).toBe(
+      false,
+    );
+    expect(deletedEngineIds.has(attached.job.engineJobId!)).toBe(false);
+
+    const eligibleRows = await db
+      .select({ strippedAt: simJobs.strippedAt })
+      .from(simJobs)
+      .where(
+        inArray(
+          simJobs.id,
+          eligible.map((fixture) => fixture.job.id),
+        ),
+      );
+    expect(eligibleRows.filter((row) => row.strippedAt != null)).toHaveLength(
+      2,
+    );
+    expect(
+      (
+        await db
+          .select({ strippedAt: simJobs.strippedAt })
+          .from(simJobs)
+          .where(eq(simJobs.id, cancellationPending.job.id))
+      )[0]?.strippedAt,
+    ).toBeNull();
+    expect(
+      (
+        await db
+          .select({ strippedAt: simJobs.strippedAt })
+          .from(simJobs)
+          .where(eq(simJobs.id, attached.job.id))
+      )[0]?.strippedAt,
+    ).toBeNull();
+  });
+
+  it("FALSE-POSITIVE GUARD: terminal reclaim preserves an accepted generation without an authoritative cancellation acknowledgement", async () => {
+    const aoaDeg = 990.022;
+    const promiseId = randomUUID();
+    const job = await seedDoneRemoteJob(
+      "terminal-reclaim-accepted",
+      [aoaDeg],
+      1,
+      promiseId,
+    );
+    const promise = await seedMirroredPromise(
+      "terminal-reclaim-accepted",
+      [aoaDeg],
+      promiseId,
+    );
+    const [acceptedResult] = await db
+      .select({ id: results.id })
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    if (!acceptedResult) throw new Error("accepted result fixture is required");
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled", resultId: null, resultAttemptId: null })
+      .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promise.id));
+    const engine = {
+      getJob: vi.fn(),
+      getJobRuntimes: vi.fn(),
+      deleteJob: vi.fn(),
+    } as unknown as EngineClient;
+
+    await expect(
+      reclaimDisposableTerminalRemoteJobDirs(db, engine, 100),
+    ).resolves.toEqual({ jobs: 0, attempts: 0, bytesFreed: 0 });
+    expect(engine.getJob).not.toHaveBeenCalled();
+    expect(engine.deleteJob).not.toHaveBeenCalled();
+    expect(
+      (await db.select().from(simJobs).where(eq(simJobs.id, job.id)))[0],
+    ).toMatchObject({ strippedAt: null });
+    expect(
+      await db
+        .select({ state: resultClassifications.state })
+        .from(resultClassifications)
+        .where(eq(resultClassifications.resultId, acceptedResult.id)),
+    ).toEqual([{ state: "accepted" }]);
+  });
+
+  it("MUST-CATCH: authoritative cancellation reclaims a locally accepted generation that was never published", async () => {
+    const aoaDeg = 990.023;
+    const promiseId = randomUUID();
+    const job = await seedDoneRemoteJob(
+      "terminal-reclaim-unpublished-accepted",
+      [aoaDeg],
+      1,
+      promiseId,
+    );
+    const promise = await seedMirroredPromise(
+      "terminal-reclaim-unpublished-accepted",
+      [aoaDeg],
+      promiseId,
+    );
+    const [acceptedResult] = await db
+      .select({
+        id: results.id,
+        attemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    if (!acceptedResult?.attemptId)
+      throw new Error("accepted unpublished fixture is required");
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled", resultId: null, resultAttemptId: null })
+      .where(eq(syncSweepPromisePoints.promiseId, promise.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, promise.id));
+    await db.insert(syncRemotePromiseCancellations).values({
+      promiseId: promise.id,
+      state: "delivered",
+      deliveredAt: new Date(),
+      lastHttpStatus: 409,
+      nextAttemptAt: new Date(),
+    });
+    const engine = {
+      getJob: vi.fn(async () => ({ state: "completed" })),
+      getJobRuntimes: vi.fn(async () => ({
+        jobs: [{ job_id: job.engineJobId, exists: true, process_count: 0 }],
+      })),
+      deleteJob: vi.fn(async () => ({ bytes_freed: 54_321 })),
+    } as unknown as EngineClient;
+
+    await expect(
+      reclaimDisposableTerminalRemoteJobDirs(db, engine, 100),
+    ).resolves.toEqual({ jobs: 1, attempts: 1, bytesFreed: 54_321 });
+    expect(engine.deleteJob).toHaveBeenCalledWith(job.engineJobId);
+    expect(
+      await db
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, acceptedResult.attemptId)),
+    ).toEqual([]);
+    expect(
+      (await db.select().from(results).where(eq(results.id, acceptedResult.id)))[0],
+    ).toMatchObject({
+      status: "failed",
+      source: "queued",
+      currentResultAttemptId: null,
+      simJobId: null,
+      engineJobId: null,
+      cl: null,
+      cd: null,
+    });
+    expect(
+      await db
+        .select({ state: resultClassifications.state })
+        .from(resultClassifications)
+        .where(eq(resultClassifications.resultId, acceptedResult.id)),
+    ).toEqual([]);
+    expect(
+      (await db.select().from(simJobs).where(eq(simJobs.id, job.id)))[0],
+    ).toMatchObject({
+      strippedAt: expect.any(Date),
+      stripReport: {
+        bytes_freed: 54_321,
+        discarded_attempts: 1,
+      },
+    });
+  });
+
+  it.each([
+    { label: "pending-retry", status: "pending", engineState: null },
+    {
+      label: "cancellation-in-flight",
+      status: "cancelled",
+      engineState: "cancel_pending",
+    },
+  ] as const)(
+    "MUST-CATCH: terminal release preserves an active same-promise $label job without upstream cancellation",
+    async ({ label, status, engineState }) => {
+      const aoaDeg = label === "pending-retry" ? 990.051 : 990.052;
+      const { promise, job: oldJob } =
+        await seedDiscardableRemoteJobWithoutResult(
+          `same-promise-${label}`,
+          "failed",
+          aoaDeg,
+        );
+      const [freshJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          referenceChordM: CHORD,
+          wave: 1,
+          jobKind: "targeted",
+          status,
+          engineState,
+          engineJobId:
+            engineState === null
+              ? null
+              : `${PREFIX}-same-promise-${label}-engine`,
+          totalCases: 1,
+          completedCases: 0,
+          requestPayload: {
+            syncPromiseId: promise.id,
+            remoteSolver: true,
+            upstreamBaseUrl: UPSTREAM,
+            aoas: [aoaDeg],
+          },
+        })
+        .returning();
+      const { fetchMock } = stubFetch();
+      const engine = {
+        deleteJob: vi.fn(async () => undefined),
+      } as unknown as EngineClient;
+
+      await transferRemoteSolverTick(db, engine);
+
+      expect(requests(fetchMock, `/sweeps/${promise.id}/cancel`)).toEqual([]);
+      expect((await readPromise(promise.id)).promise.status).toBe("active");
+      expect(
+        await db
+          .select({ promiseId: syncRemotePromiseCancellations.promiseId })
+          .from(syncRemotePromiseCancellations)
+          .where(eq(syncRemotePromiseCancellations.promiseId, promise.id)),
+      ).toEqual([]);
+      expect(await deliveriesForJob(oldJob.id)).toEqual([]);
+      expect(
+        (await db.select().from(simJobs).where(eq(simJobs.id, freshJob.id)))[0],
+      ).toMatchObject({ status, strippedAt: null });
+    },
+  );
+
+  it("MUST-CATCH: terminal release never cancels an exact accepted generation that still needs normal delivery", async () => {
+    const promisedId = randomUUID();
+    const job = await seedDoneRemoteJob(
+      "terminal-release-accepted-generation",
+      [990.101],
+      2,
+      promisedId,
+    );
+    await seedMirroredPromise(
+      "terminal-release-accepted-generation",
+      [990.101],
+      promisedId,
+    );
+    const { fetchMock } = stubFetch();
+
+    await transferRemoteSolverTick(db, {} as EngineClient);
+
+    expect(requests(fetchMock, `/sweeps/${promisedId}/cancel`)).toEqual([]);
+    expect(await deliveriesForJob(job.id)).toMatchObject([
+      { resultId: expect.any(String), state: "delivered" },
+    ]);
+    expect((await readPromise(promisedId)).promise.status).toBe("fulfilled");
+  });
+
+  it("MUST-CATCH: terminal release never cancels a pointer-null accepted repair generation", async () => {
+    const promisedId = randomUUID();
+    const aoa = 990.151;
+    const job = await seedDoneRemoteJob(
+      "pointer-null-accepted-generation",
+      [aoa],
+      2,
+      promisedId,
+    );
+    await seedMirroredPromise(
+      "pointer-null-accepted-generation",
+      [aoa],
+      promisedId,
+    );
+    const result = await resultForAoa(aoa);
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: null })
+      .where(eq(results.id, result.id));
+    const { fetchMock } = stubFetch();
+
+    await transferRemoteSolverTick(db, {} as EngineClient);
+
+    expect(requests(fetchMock, `/sweeps/${promisedId}/cancel`)).toEqual([]);
+    expect(await deliveriesForJob(job.id)).toEqual([]);
+    expect((await readPromise(promisedId)).promise.status).toBe("active");
   });
 
   it("blocks an answered 4xx immediately without inventing solver evidence", async () => {
@@ -2987,6 +4060,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       {
         meshRecoveryVersion: 4,
         uransRecoveryVersion: 1,
+        archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
         cpuSlots: 1,
       },
     );
@@ -3088,8 +4162,9 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         { submitPolar } as unknown as EngineClient,
         4,
         1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
       ),
-    ).resolves.toBe(true);
+    ).resolves.toEqual({ submitted: 1, fastBacklogStillDue: false });
 
     expect(submitPolar).toHaveBeenCalledTimes(1);
     expect(submitPolar.mock.calls[0]![0]).toMatchObject({
@@ -3118,15 +4193,198 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     });
   });
 
+  it("MUST-CATCH: exhausted historical promotions do not starve a fresh replacement-owner FAST cell", async () => {
+    await ensureSharedAdmissionHeadroom(1);
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 1 })
+      .where(eq(syncApiSettings.id, 1));
+    const seedExhaustedPromotion = async (
+      label: string,
+      aoaDeg: number,
+      dueAgeMs: number,
+    ) => {
+      const seeded = await seedRemoteRejectedParent(label, aoaDeg);
+      const [obligation] = await ensurePrecalcObligations(
+        db,
+        [
+          {
+            airfoilId,
+            revisionId,
+            aoaDeg,
+            sourceResultId: seeded.result.id,
+            sourceResultAttemptId: seeded.attempt.id,
+          },
+        ],
+        { syncPromiseIds: [seeded.promise.id] },
+      );
+      if (!obligation) throw new Error("PRECALC obligation is required");
+      await db
+        .update(simPrecalcObligations)
+        .set({
+          state: "pending",
+          attemptCount: 2,
+          maxAttempts: 2,
+          latestSimJobId: null,
+          nextSubmitAt: new Date(Date.now() - dueAgeMs),
+          lastOutcome: "quality_rejected",
+          lastError: "unpublished exhausted generation",
+        })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      const [promotion] = await db
+        .insert(simRansPolarPromotions)
+        .values({
+          parentJobId: seeded.parent.id,
+          airfoilId,
+          revisionId,
+          ownerKind: "sync_promise",
+          syncPromiseId: seeded.promise.id,
+          triggerResultAttemptId: seeded.attempt.id,
+          triggerAoaDeg: aoaDeg,
+          failureDisposition: "hard_solver",
+          requestOrigin: "continuous-polar",
+        })
+        .returning();
+      await db.insert(simRansPolarPromotionPoints).values({
+        promotionId: promotion.id,
+        aoaDeg,
+        obligationId: obligation.id,
+      });
+      await db
+        .update(syncSweepPromisePoints)
+        .set({ status: "cancelled" })
+        .where(eq(syncSweepPromisePoints.promiseId, seeded.promise.id));
+      await db
+        .update(syncSweepPromises)
+        .set({ status: "cancelled", cancelledAt: new Date() })
+        .where(eq(syncSweepPromises.id, seeded.promise.id));
+      const replacement = await seedMirroredPromise(`${label}-replacement`, [
+        aoaDeg,
+      ]);
+      return { obligation, replacement };
+    };
+
+    const exhaustedA = await seedExhaustedPromotion(
+      "exhausted-promotion-a",
+      3.126,
+      30_000,
+    );
+    const exhaustedB = await seedExhaustedPromotion(
+      "exhausted-promotion-b",
+      3.127,
+      20_000,
+    );
+    const exhaustedC = await seedExhaustedPromotion(
+      "exhausted-promotion-c",
+      3.1275,
+      15_000,
+    );
+    const freshSource = await seedRemoteRejectedParent(
+      "fresh-replacement-after-exhausted-promotions",
+      3.128,
+    );
+    const [freshObligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg: 3.128,
+          sourceResultId: freshSource.result.id,
+          sourceResultAttemptId: freshSource.attempt.id,
+        },
+      ],
+      { syncPromiseIds: [freshSource.promise.id] },
+    );
+    if (!freshObligation) throw new Error("PRECALC obligation is required");
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        attemptCount: 0,
+        maxAttempts: 2,
+        latestSimJobId: null,
+        nextSubmitAt: new Date(Date.now() - 10_000),
+        lastOutcome: "fresh_recovery_pending",
+        lastError: "fresh replacement-owned FAST run is due",
+      })
+      .where(eq(simPrecalcObligations.id, freshObligation.id));
+    const [freshPromotion] = await db
+      .insert(simRansPolarPromotions)
+      .values({
+        parentJobId: freshSource.parent.id,
+        airfoilId,
+        revisionId,
+        ownerKind: "sync_promise",
+        syncPromiseId: freshSource.promise.id,
+        triggerResultAttemptId: freshSource.attempt.id,
+        triggerAoaDeg: 3.128,
+        failureDisposition: "hard_solver",
+        requestOrigin: "continuous-polar",
+      })
+      .returning();
+    await db.insert(simRansPolarPromotionPoints).values({
+      promotionId: freshPromotion.id,
+      aoaDeg: 3.128,
+      obligationId: freshObligation.id,
+    });
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled" })
+      .where(eq(syncSweepPromisePoints.promiseId, freshSource.promise.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, freshSource.promise.id));
+    const freshReplacement = await seedMirroredPromise(
+      "fresh-replacement-current-owner",
+      [3.128],
+    );
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("fresh-replacement-after-exhausted-promotions"),
+    );
+
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
+        1,
+      ),
+    ).resolves.toEqual({ submitted: 1, fastBacklogStillDue: false });
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(await jobsForPromise(freshReplacement.id)).toMatchObject([
+      {
+        parentJobId: null,
+        wave: 2,
+        status: "submitted",
+        requestPayload: {
+          syncPromiseId: freshReplacement.id,
+          retryMode: "replacement-promise-urans",
+          precalcObligationIds: [freshObligation.id],
+          historicalConditionalPromotionId: freshPromotion.id,
+        },
+      },
+    ]);
+    expect(await jobsForPromise(exhaustedA.replacement.id)).toEqual([]);
+    expect(await jobsForPromise(exhaustedB.replacement.id)).toEqual([]);
+    expect(await jobsForPromise(exhaustedC.replacement.id)).toEqual([]);
+  });
+
   it("MUST-CATCH: a pending attempt-2 PRECALC owns the remote point before any replacement RANS shell", async () => {
     const aoa = 919.001;
+    await ensureSharedAdmissionHeadroom(1);
+    const reservationBaseline = await activeRemoteReservationBaseline();
     const { promise, parent, result } = await seedRemoteRejectedParent(
       "pending-precalc-attempt-2",
       aoa,
     );
     await db
       .update(syncApiSettings)
-      .set({ remoteSolverCpuBudget: 1 })
+      .set({ remoteSolverCpuBudget: reservationBaseline + 1 })
       .where(eq(syncApiSettings.id, 1));
     const firstSubmit = vi.fn(async () =>
       acceptedStatus("pending-precalc-attempt-1"),
@@ -3138,6 +4396,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       {
         meshRecoveryVersion: 4,
         uransRecoveryVersion: 1,
+        archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
         cpuSlots: 1,
       },
     );
@@ -3184,6 +4443,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       .set({ status: "stale" })
       .where(eq(results.id, result.id));
 
+    const { fetchMock } = stubFetch();
     const forbiddenRansSubmit = vi.fn(async () =>
       acceptedStatus("forbidden-replacement-rans"),
     );
@@ -3220,6 +4480,10 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       admissionStatus: { status: "solving", error: null },
     });
     expect(forbiddenRansSubmit).not.toHaveBeenCalled();
+    // Direct admission may ask the hub for an independent lease. Production
+    // orchestration runs the explicit FAST pass first; exact-cell protection
+    // below still prevents this promise from being recomposed as RANS.
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
     expect(
       await db
         .select({ id: simJobs.id })
@@ -3242,8 +4506,9 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         { submitPolar: correctiveSubmit } as unknown as EngineClient,
         4,
         1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
       ),
-    ).resolves.toBe(true);
+    ).resolves.toEqual({ submitted: 1, fastBacklogStillDue: false });
     expect(correctiveSubmit).toHaveBeenCalledTimes(1);
     expect(correctiveSubmit.mock.calls[0]![0]).toMatchObject({
       aoa: { angles: [aoa] },
@@ -3281,6 +4546,787 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     ]);
   });
 
+  it("MUST-CATCH: an admitted remote FAST child leaves free weighted capacity for an independent hub claim", async () => {
+    const fastAoa = 919.002;
+    const independentAoa = 919.003;
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    const { promise, parent } = await seedRemoteRejectedParent(
+      "running-precalc-refill",
+      fastAoa,
+    );
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 2 })
+      .where(eq(syncApiSettings.id, 1));
+    const [fastChild] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        wave: 2,
+        jobKind: "targeted",
+        methodKey: "openfoam.urans",
+        status: "submitted",
+        engineJobId: `${PREFIX}-running-precalc-owner`,
+        admissionCpuSlots: 1,
+        totalCases: 1,
+        requestPayload: {
+          syncPromiseId: promise.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          aoas: [fastAoa],
+          uransFidelity: "precalc",
+        },
+      })
+      .returning();
+    const [obligation] = await db
+      .insert(simPrecalcObligations)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg: fastAoa,
+        state: "running",
+        attemptCount: 1,
+        latestSimJobId: fastChild.id,
+        lastOutcome: "submitted",
+      })
+      .returning();
+    await db
+      .update(simJobs)
+      .set({
+        requestPayload: {
+          syncPromiseId: promise.id,
+          remoteSolver: true,
+          upstreamBaseUrl: UPSTREAM,
+          aoas: [fastAoa],
+          uransFidelity: "precalc",
+          precalcObligationIds: [obligation.id],
+        },
+      })
+      .where(eq(simJobs.id, fastChild.id));
+    expect({ fastChild, obligation }).toMatchObject({
+      fastChild: { status: "submitted", admissionCpuSlots: 1, wave: 2 },
+      obligation: { state: "running", latestSimJobId: fastChild.id },
+    });
+
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("setup revision fixture required");
+    const independentClaim = {
+      id: randomUUID(),
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      airfoil: {
+        slug: airfoilSlug,
+        name: `${PREFIX} independent refill`,
+        source: null,
+        pointFormat: "normalized",
+        points: contour,
+      },
+      setupRevision: {
+        signatureHash: revision.signatureHash,
+        snapshot: revision.snapshot,
+      },
+      aoas: [independentAoa],
+    };
+    const { fetchMock } = stubFetch({ claimPromises: [independentClaim] });
+    const ransSubmit = vi.fn(async () =>
+      acceptedStatus("running-precalc-independent-rans"),
+    );
+
+    expect(
+      await admitRemoteSolverTick(
+        db,
+        { submitPolar: ransSubmit } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 4 },
+      ),
+    ).toBe(true);
+
+    // The running FAST child still owns its exact physical point; independent
+    // work may consume only the remaining node token.
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
+    expect(ransSubmit).toHaveBeenCalledTimes(1);
+    expect(await readPromise(promise.id)).toMatchObject({
+      promise: { id: promise.id, status: "active" },
+      points: [{ aoaDeg: fastAoa, status: "active" }],
+    });
+    expect(
+      await db
+        .select({
+          state: simPrecalcObligations.state,
+          latestSimJobId: simPrecalcObligations.latestSimJobId,
+        })
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.id, obligation.id)),
+    ).toEqual([{ state: "running", latestSimJobId: fastChild.id }]);
+    expect(
+      (await jobsForPromise(promise.id)).filter(
+        (job) => job.wave === 1 && job.id !== parent.id,
+      ),
+    ).toEqual([]);
+
+    const [independentJob] = await db
+      .select()
+      .from(simJobs)
+      .where(
+        dsql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${independentClaim.id}`,
+      );
+    expect(independentJob).toMatchObject({
+      status: "submitted",
+      wave: 1,
+      admissionCpuSlots: 1,
+      requestPayload: { syncPromiseId: independentClaim.id },
+    });
+    const reservedJobs = await db
+      .select({ id: simJobs.id, admissionCpuSlots: simJobs.admissionCpuSlots })
+      .from(simJobs)
+      .where(inArray(simJobs.id, [fastChild.id, independentJob!.id]));
+    expect(
+      reservedJobs.reduce(
+        (total, job) => total + Number(job.admissionCpuSlots),
+        0,
+      ),
+    ).toBe(2);
+  });
+
+  it("MUST-CATCH: an unroutable pending FAST point protects its promise without fencing an independent hub claim", async () => {
+    const fastAoa = 919.102;
+    const independentAoa = 919.103;
+    await ensureSharedAdmissionHeadroom(1);
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    const seeded = await seedRemoteRejectedParent(
+      "pending-precalc-independent-refill",
+      fastAoa,
+    );
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 1 })
+      .where(eq(syncApiSettings.id, 1));
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg: fastAoa,
+          sourceResultId: seeded.result.id,
+          sourceResultAttemptId: seeded.attempt.id,
+        },
+      ],
+      { syncPromiseIds: [seeded.promise.id] },
+    );
+    if (!obligation) throw new Error("PRECALC obligation is required");
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        attemptCount: 2,
+        maxAttempts: 2,
+        sourceResultId: null,
+        sourceResultAttemptId: null,
+        lastOutcome: "failed",
+        nextSubmitAt: new Date(Date.now() - 1_000),
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("setup revision fixture required");
+    const independentClaim = {
+      id: randomUUID(),
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      airfoil: {
+        slug: airfoilSlug,
+        name: `${PREFIX} pending FAST independent refill`,
+        source: null,
+        pointFormat: "normalized",
+        points: contour,
+      },
+      setupRevision: {
+        signatureHash: revision.signatureHash,
+        snapshot: revision.snapshot,
+      },
+      aoas: [independentAoa],
+    };
+    const { fetchMock } = stubFetch({ claimPromises: [independentClaim] });
+    const ransSubmit = vi.fn(async () =>
+      acceptedStatus("pending-precalc-independent-rans"),
+    );
+
+    expect(
+      await admitRemoteSolverTick(
+        db,
+        { submitPolar: ransSubmit } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 4 },
+      ),
+    ).toBe(true);
+
+    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(1);
+    expect(ransSubmit).toHaveBeenCalledTimes(1);
+    expect(await readPromise(seeded.promise.id)).toMatchObject({
+      promise: { id: seeded.promise.id, status: "active" },
+      points: [{ aoaDeg: fastAoa, status: "active" }],
+    });
+    expect(
+      (await jobsForPromise(seeded.promise.id)).filter(
+        (job) => job.wave === 1 && job.id !== seeded.parent.id,
+      ),
+    ).toEqual([]);
+    expect(
+      await db
+        .select({
+          status: simJobs.status,
+          wave: simJobs.wave,
+          requestPayload: simJobs.requestPayload,
+        })
+        .from(simJobs)
+        .where(
+          dsql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${independentClaim.id}`,
+        ),
+    ).toMatchObject([
+      {
+        status: "submitted",
+        wave: 1,
+        requestPayload: { syncPromiseId: independentClaim.id },
+      },
+    ]);
+  });
+
+  it("MUST-CATCH: weighted due FAST cells pack within remote tokens and retain FAST priority when the next cell cannot fit", async () => {
+    await ensureSharedAdmissionHeadroom(3);
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 3 })
+      .where(eq(syncApiSettings.id, 1));
+    const [revision] = await db
+      .select({ snapshot: simulationPresetRevisions.snapshot })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("setup revision fixture required");
+    const originalSnapshot =
+      revision.snapshot as unknown as SimulationSetupSnapshot;
+    const weightedSnapshot: SimulationSetupSnapshot = {
+      ...originalSnapshot,
+      scheduling: {
+        ...originalSnapshot.scheduling,
+        solverProcesses: 2,
+        caseConcurrency: 1,
+      },
+    };
+    await db
+      .update(simulationPresetRevisions)
+      .set({ snapshot: weightedSnapshot as unknown as Record<string, unknown> })
+      .where(eq(simulationPresetRevisions.id, revisionId));
+
+    try {
+      const makeDueFreshRecovery = async (label: string, aoa: number) => {
+        const seeded = await seedRemoteRejectedParent(label, aoa);
+        await submitUransRetryForJob(
+          db,
+          {
+            submitPolar: async () => acceptedStatus(`${label}-attempt-1`),
+          } as unknown as EngineClient,
+          seeded.parent,
+          {
+            meshRecoveryVersion: 4,
+            uransRecoveryVersion: 1,
+            archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+            cpuSlots: 1,
+          },
+        );
+        const [firstChild] = await db
+          .select()
+          .from(simJobs)
+          .where(
+            and(eq(simJobs.parentJobId, seeded.parent.id), eq(simJobs.wave, 2)),
+          );
+        if (!firstChild) throw new Error("first PRECALC child is required");
+        const [obligation] = await db
+          .select()
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.latestSimJobId, firstChild.id));
+        if (!obligation) throw new Error("PRECALC obligation is required");
+        await db
+          .update(simJobs)
+          .set({
+            status: "done",
+            engineState: "completed",
+            ingestedAt: new Date(),
+            finishedAt: new Date(),
+          })
+          .where(eq(simJobs.id, firstChild.id));
+        await db
+          .update(simPrecalcObligationAttempts)
+          .set({
+            state: "rejected",
+            outcome: "quality_rejected",
+            error: "preliminary observation horizon was too short",
+            completedAt: new Date(),
+          })
+          .where(eq(simPrecalcObligationAttempts.simJobId, firstChild.id));
+        await db
+          .update(simPrecalcObligations)
+          .set({
+            state: "pending",
+            attemptCount: 1,
+            nextSubmitAt: new Date(Date.now() - 1_000),
+            lastOutcome: "fresh_recovery_pending",
+            lastError: "fresh physical run is due",
+          })
+          .where(eq(simPrecalcObligations.id, obligation.id));
+        await db
+          .update(results)
+          .set({ status: "stale" })
+          .where(eq(results.id, seeded.result.id));
+        return { seeded, obligation };
+      };
+
+      const first = await makeDueFreshRecovery("parallel-fast-a", 930.001);
+      const second = await makeDueFreshRecovery("parallel-fast-b", 930.002);
+      const submitPolar = vi.fn(async (_request: PolarRequest) =>
+        acceptedStatus(`parallel-fast-${submitPolar.mock.calls.length + 1}`),
+      );
+
+      // False-positive guard: no advertised free capacity means no composition
+      // and no accidental second physical attempt.
+      await expect(
+        submitRemotePromisePrecalcRecoveries(
+          db,
+          { submitPolar } as unknown as EngineClient,
+          4,
+          1,
+          CURRENT_ARCHIVE_REDUCTION_VERSION,
+          0,
+        ),
+      ).resolves.toEqual({ submitted: 0, fastBacklogStillDue: false });
+      expect(submitPolar).not.toHaveBeenCalled();
+
+      await expect(
+        submitRemotePromisePrecalcRecoveries(
+          db,
+          { submitPolar } as unknown as EngineClient,
+          4,
+          1,
+          CURRENT_ARCHIVE_REDUCTION_VERSION,
+          3,
+        ),
+      ).resolves.toEqual({ submitted: 1, fastBacklogStillDue: true });
+      expect(submitPolar).toHaveBeenCalledTimes(1);
+      expect(
+        submitPolar.mock.calls.map(([request]) => request.continue_from),
+      ).toEqual([undefined]);
+      // The cap is aggregate admission capacity, not the resource request for
+      // each independent FAST child. The first child consumes its immutable
+      // two-token setup weight; the next two-token child cannot fit in the
+      // remaining one token, so RANS must stay behind the FAST priority fence.
+      expect(
+        submitPolar.mock.calls.map(
+          ([request]) => request.resources?.cpu_budget,
+        ),
+      ).toEqual([2]);
+      const recovered = await db
+        .select({
+          obligationId: simPrecalcObligations.id,
+          attemptCount: simPrecalcObligations.attemptCount,
+        })
+        .from(simPrecalcObligations)
+        .where(
+          inArray(simPrecalcObligations.id, [
+            first.obligation.id,
+            second.obligation.id,
+          ]),
+        )
+        .orderBy(simPrecalcObligations.id);
+      expect(recovered).toEqual(
+        [
+          { obligationId: first.obligation.id, attemptCount: 2 },
+          { obligationId: second.obligation.id, attemptCount: 1 },
+        ].sort((a, b) => a.obligationId.localeCompare(b.obligationId)),
+      );
+    } finally {
+      await db
+        .update(simulationPresetRevisions)
+        .set({
+          snapshot: originalSnapshot as unknown as Record<string, unknown>,
+        })
+        .where(eq(simulationPresetRevisions.id, revisionId));
+    }
+  }, 15_000);
+
+  it("MUST-CATCH: replacement FAST promises fill free slots but stop on a denied live storage refresh", async () => {
+    await ensureSharedAdmissionHeadroom(3);
+    const reservationBaseline = await activeRemoteReservationBaseline();
+    await db
+      .update(syncApiSettings)
+      .set({ remoteSolverCpuBudget: reservationBaseline + 3 })
+      .where(eq(syncApiSettings.id, 1));
+    const makeReplacementOwnedPrecalc = async (
+      label: string,
+      aoaDeg: number,
+      removeSource: boolean,
+    ) => {
+      const seeded = await seedRemoteRejectedParent(label, aoaDeg);
+      await submitUransRetryForJob(
+        db,
+        {
+          submitPolar: async () => acceptedStatus(`${label}-initial-precalc`),
+        } as unknown as EngineClient,
+        seeded.parent,
+        {
+          meshRecoveryVersion: 4,
+          uransRecoveryVersion: 1,
+          archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+          cpuSlots: 1,
+        },
+      );
+      const [initialChild] = await db
+        .select()
+        .from(simJobs)
+        .where(
+          and(eq(simJobs.parentJobId, seeded.parent.id), eq(simJobs.wave, 2)),
+        );
+      if (!initialChild) throw new Error("initial PRECALC child is required");
+      const [obligation] = await db
+        .select()
+        .from(simPrecalcObligations)
+        .where(eq(simPrecalcObligations.latestSimJobId, initialChild.id));
+      if (!obligation) throw new Error("PRECALC obligation is required");
+      await db
+        .update(simJobs)
+        .set({
+          status: "done",
+          engineState: "completed",
+          ingestedAt: new Date(),
+          finishedAt: new Date(),
+        })
+        .where(eq(simJobs.id, initialChild.id));
+      await db
+        .update(simPrecalcObligationAttempts)
+        .set({
+          state: "rejected",
+          outcome: "quality_rejected",
+          error: "unpublished preliminary generation",
+          completedAt: new Date(),
+        })
+        .where(eq(simPrecalcObligationAttempts.simJobId, initialChild.id));
+      await db
+        .update(simPrecalcObligations)
+        .set({
+          state: "pending",
+          attemptCount: 1,
+          nextSubmitAt: new Date(Date.now() - 1_000),
+          lastOutcome: "failed",
+          lastError: "unpublished preliminary generation",
+          ...(removeSource
+            ? { sourceResultId: null, sourceResultAttemptId: null }
+            : {}),
+        })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      await db
+        .update(syncSweepPromisePoints)
+        .set({ status: "cancelled" })
+        .where(eq(syncSweepPromisePoints.promiseId, seeded.promise.id));
+      await db
+        .update(syncSweepPromises)
+        .set({ status: "cancelled", cancelledAt: new Date() })
+        .where(eq(syncSweepPromises.id, seeded.promise.id));
+      const replacement = await seedMirroredPromise(`${label}-replacement`, [
+        aoaDeg,
+      ]);
+      return { seeded, initialChild, obligation, replacement };
+    };
+
+    const priorPromise = await makeReplacementOwnedPrecalc(
+      "replacement-fast-prior-promise",
+      931.001,
+      false,
+    );
+    const sourceLess = await makeReplacementOwnedPrecalc(
+      "replacement-fast-source-less",
+      931.002,
+      true,
+    );
+    const third = await makeReplacementOwnedPrecalc(
+      "replacement-fast-third",
+      931.003,
+      true,
+    );
+    const submitPolar = vi.fn(async (_request: PolarRequest) =>
+      acceptedStatus(`replacement-fast-${submitPolar.mock.calls.length + 1}`),
+    );
+    const continueAfterSubmission = vi
+      .fn(async () => true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
+        3,
+        continueAfterSubmission,
+      ),
+    ).resolves.toEqual({ submitted: 2, fastBacklogStillDue: true });
+    expect(submitPolar).toHaveBeenCalledTimes(2);
+    expect(continueAfterSubmission).toHaveBeenCalledTimes(2);
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
+        1,
+      ),
+    ).resolves.toEqual({ submitted: 1, fastBacklogStillDue: false });
+    expect(submitPolar).toHaveBeenCalledTimes(3);
+    expect(
+      submitPolar.mock.calls.map(([request]) => request.continue_from),
+    ).toEqual([undefined, undefined, undefined]);
+
+    for (const fixture of [priorPromise, sourceLess, third]) {
+      const jobs = await jobsForPromise(fixture.replacement.id);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]).toMatchObject({
+        parentJobId: null,
+        wave: 2,
+        status: "submitted",
+        admissionCpuSlots: 1,
+        requestPayload: {
+          syncPromiseId: fixture.replacement.id,
+          remoteSolver: true,
+          retryMode: "current-promise-precalc",
+          precalcObligationIds: [fixture.obligation.id],
+        },
+      });
+      expect(
+        (await readPromise(fixture.seeded.promise.id)).promise.status,
+      ).toBe("cancelled");
+      expect(jobs.filter((job) => job.wave === 1)).toEqual([]);
+    }
+  }, 15_000);
+
+  it("MUST-CATCH: FAST recovery ignores foreign promise owners and a misbound source cannot suppress the exact current owner", async () => {
+    await ensureSharedAdmissionHeadroom(1);
+    const current = await seedRemoteRejectedParent(
+      "replacement-fast-misbound-current",
+      4.851,
+    );
+    const foreignSource = await seedRemoteRejectedParent(
+      "replacement-fast-misbound-source",
+      4.852,
+    );
+    const [currentObligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg: 4.851,
+          sourceResultId: current.result.id,
+          sourceResultAttemptId: current.attempt.id,
+        },
+      ],
+      { syncPromiseIds: [current.promise.id] },
+    );
+    if (!currentObligation) throw new Error("PRECALC obligation is required");
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        attemptCount: 0,
+        latestSimJobId: null,
+        nextSubmitAt: new Date(Date.now() - 1_000),
+        lastOutcome: "failed",
+        // Deliberately corrupt historical provenance: this different active
+        // RANS cell must not suppress the exact current scheduling owner.
+        sourceResultId: foreignSource.result.id,
+        sourceResultAttemptId: foreignSource.attempt.id,
+      })
+      .where(eq(simPrecalcObligations.id, currentObligation.id));
+
+    const foreignOwner = await seedRemoteRejectedParent(
+      "replacement-fast-foreign-owner",
+      4.853,
+    );
+    const [foreignObligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg: 4.853,
+          sourceResultId: foreignOwner.result.id,
+          sourceResultAttemptId: foreignOwner.attempt.id,
+        },
+      ],
+      { syncPromiseIds: [foreignOwner.promise.id] },
+    );
+    if (!foreignObligation) throw new Error("PRECALC obligation is required");
+    const foreignSolverId = randomUUID();
+    await db
+      .update(syncSweepPromises)
+      .set({
+        sourceBaseUrl: "https://foreign-hub.test/api/sync/v1",
+        requestPayload: {
+          ...(foreignOwner.promise.requestPayload as Record<string, unknown>),
+          solverId: foreignSolverId,
+        },
+      })
+      .where(eq(syncSweepPromises.id, foreignOwner.promise.id));
+    const [foreignPromotion] = await db
+      .insert(simRansPolarPromotions)
+      .values({
+        parentJobId: foreignOwner.parent.id,
+        airfoilId,
+        revisionId,
+        ownerKind: "sync_promise",
+        syncPromiseId: foreignOwner.promise.id,
+        triggerResultAttemptId: foreignOwner.attempt.id,
+        triggerAoaDeg: 4.853,
+        failureDisposition: "hard_solver",
+        requestOrigin: "continuous-polar",
+      })
+      .returning();
+    await db.insert(simRansPolarPromotionPoints).values({
+      promotionId: foreignPromotion.id,
+      aoaDeg: 4.851,
+      obligationId: currentObligation.id,
+    });
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        attemptCount: 0,
+        latestSimJobId: null,
+        nextSubmitAt: new Date(Date.now() - 1_000),
+        lastOutcome: "failed",
+        sourceResultId: null,
+        sourceResultAttemptId: null,
+      })
+      .where(eq(simPrecalcObligations.id, foreignObligation.id));
+
+    const submitPolar = vi.fn(async () =>
+      acceptedStatus("replacement-fast-misbound-current"),
+    );
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
+        1,
+      ),
+    ).resolves.toEqual({ submitted: 1, fastBacklogStillDue: false });
+    expect(submitPolar).toHaveBeenCalledTimes(1);
+    expect(
+      (await jobsForPromise(current.promise.id)).filter(
+        (job) => job.wave === 2,
+      ),
+    ).toMatchObject([
+      {
+        parentJobId: null,
+        wave: 2,
+        requestPayload: {
+          retryMode: "current-promise-precalc",
+          precalcObligationIds: [currentObligation.id],
+        },
+      },
+    ]);
+    expect(
+      (await jobsForPromise(foreignOwner.promise.id)).filter(
+        (job) => job.wave === 2,
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not admit current-promise PRECALC without a live eligible point", async () => {
+    const aoaDeg = 931.101;
+    const seeded = await seedRemoteRejectedParent(
+      "replacement-fast-ineligible",
+      aoaDeg,
+    );
+    const [obligation] = await ensurePrecalcObligations(
+      db,
+      [
+        {
+          airfoilId,
+          revisionId,
+          aoaDeg,
+          sourceResultId: seeded.result.id,
+          sourceResultAttemptId: seeded.attempt.id,
+        },
+      ],
+      { syncPromiseIds: [seeded.promise.id] },
+    );
+    if (!obligation) throw new Error("PRECALC obligation is required");
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "pending",
+        lastOutcome: "deterministic_failure",
+        nextSubmitAt: new Date(Date.now() - 1_000),
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    const submitPolar = vi.fn();
+
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
+        1,
+      ),
+    ).resolves.toEqual({ submitted: 0, fastBacklogStillDue: false });
+    expect(submitPolar).not.toHaveBeenCalled();
+
+    await db
+      .update(simPrecalcObligations)
+      .set({ lastOutcome: "failed" })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await db
+      .update(syncSweepPromises)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(syncSweepPromises.id, seeded.promise.id));
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled" })
+      .where(eq(syncSweepPromisePoints.promiseId, seeded.promise.id));
+
+    await expect(
+      submitRemotePromisePrecalcRecoveries(
+        db,
+        { submitPolar } as unknown as EngineClient,
+        4,
+        1,
+        CURRENT_ARCHIVE_REDUCTION_VERSION,
+        1,
+      ),
+    ).resolves.toEqual({ submitted: 0, fastBacklogStillDue: false });
+    expect(submitPolar).not.toHaveBeenCalled();
+  });
+
   it("submits an exact promised wave-2 child with conjunctive remote provenance and no background owner", async () => {
     const aoa = 920.001;
     const { promise, parent } = await seedRemoteRejectedParent(
@@ -3293,7 +5339,9 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       cancelJob: vi.fn(),
     } as unknown as EngineClient;
 
-    await submitUransRetryForJob(db, engine, parent);
+    await submitUransRetryForJob(db, engine, parent, {
+      archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+    });
 
     expect(submitPolar).toHaveBeenCalledTimes(1);
     const [child] = await db
@@ -3381,8 +5429,12 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         cancelJob: vi.fn(),
       } as unknown as EngineClient;
 
-      await submitUransRetryForJob(db, engine, parent);
-      await submitUransRetryForJob(db, engine, parent);
+      await submitUransRetryForJob(db, engine, parent, {
+        archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+      });
+      await submitUransRetryForJob(db, engine, parent, {
+        archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+      });
 
       expect(submitPolar).not.toHaveBeenCalled();
       expect(
@@ -3432,8 +5484,12 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       });
       const engine = { submitPolar, cancelJob } as unknown as EngineClient;
 
-      await submitUransRetryForJob(db, engine, parent);
-      await submitUransRetryForJob(db, engine, parent);
+      await submitUransRetryForJob(db, engine, parent, {
+        archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+      });
+      await submitUransRetryForJob(db, engine, parent, {
+        archiveReductionVersion: CURRENT_ARCHIVE_REDUCTION_VERSION,
+      });
 
       expect(submitPolar).toHaveBeenCalledTimes(1);
       expect(cancelJob).toHaveBeenCalledTimes(1);
@@ -3498,7 +5554,7 @@ describe("remote solver push validation regressions", () => {
     expect(reusedEvidence).not.toBe(first);
   });
 
-  it("MUST-CATCH: brokers a rejected restartable PRECALC checkpoint without fulfilling the remote point", async () => {
+  it("MUST-CATCH: publishes an accepted result before brokering a rejected restartable PRECALC checkpoint", async () => {
     const aoaDeg = 89.499;
     const label = "restartable-precalc-checkpoint";
     const promise = await seedMirroredPromise(label, [aoaDeg]);
@@ -3732,21 +5788,125 @@ describe("remote solver push validation regressions", () => {
         bundledFileCount: restartMembers.length,
       },
     });
-    const { fetchMock } = stubFetch();
-    const [settings] = await db
-      .select()
-      .from(syncApiSettings)
-      .where(eq(syncApiSettings.id, 1))
-      .limit(1);
+    const baseFetchMock = stubFetch().fetchMock;
+    let checkpointBrokerFailuresRemaining = 1;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (
+        checkpointBrokerFailuresRemaining > 0 &&
+        url.endsWith("/evidence-uploads")
+      ) {
+        const body = (await parsedRequestBody(init)) as {
+          remoteResultAttemptId?: unknown;
+        };
+        if (body.remoteResultAttemptId === attempt.id) {
+          checkpointBrokerFailuresRemaining -= 1;
+          return Response.json(
+            { error: "transient checkpoint broker failure" },
+            { status: 503 },
+          );
+        }
+      }
+      return baseFetchMock(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    // The fairness counter is intentionally derived from durable delivery
+    // history after this exact pending checkpoint's timestamp. Refresh that
+    // timestamp so prior shared-database activity cannot influence the turn.
+    const fairnessBaseline = new Date(Date.now() - 2_000);
+    await db
+      .update(simPrecalcObligations)
+      .set({ updatedAt: fairnessBaseline })
+      .where(eq(simPrecalcObligations.id, obligation.id));
 
-    expect(
-      await processRestartableRemotePrecalcCheckpoint(
-        db,
-        {} as unknown as EngineClient,
-        settings,
-      ),
-    ).toBe(true);
-    expect(requests(fetchMock, "/polars")).toHaveLength(0);
+    // The checkpoint archive may take substantially longer than a normal
+    // result upload. Fulfilled-evidence upgrades do not renew upstream work,
+    // but each is still a durable accepted-result delivery. A sustained
+    // storage-only backlog must therefore neither be held behind the
+    // checkpoint nor starve it forever.
+    const deliveryJobs = [];
+    for (let index = 0; index < 12; index += 1) {
+      const deliveryAoaDeg = 89.48 + index / 1_000;
+      const deliveryJob = await seedDoneRemoteJob(
+        `restartable-precalc-checkpoint-ordinary-delivery-${index}`,
+        [deliveryAoaDeg],
+      );
+      const deliveryPromiseId = (
+        deliveryJob.requestPayload as { syncPromiseId: string }
+      ).syncPromiseId;
+      await seedMirroredPromise(
+        `restartable-precalc-checkpoint-ordinary-delivery-${index}`,
+        [deliveryAoaDeg],
+        deliveryPromiseId,
+      );
+      const [deliveryResult] = await db
+        .select()
+        .from(results)
+        .where(eq(results.simJobId, deliveryJob.id));
+      const [deliveryAttempt] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.resultId, deliveryResult.id));
+      await db
+        .update(syncSweepPromises)
+        .set({ status: "fulfilled", fulfilledAt: new Date() })
+        .where(eq(syncSweepPromises.id, deliveryPromiseId));
+      await db
+        .update(syncSweepPromisePoints)
+        .set({
+          status: "fulfilled",
+          resultId: deliveryResult.id,
+          resultAttemptId: deliveryAttempt.id,
+        })
+        .where(eq(syncSweepPromisePoints.promiseId, deliveryPromiseId));
+      await db.insert(syncRemoteResultDeliveries).values({
+        promiseId: deliveryPromiseId,
+        simJobId: deliveryJob.id,
+        resultId: deliveryResult.id,
+        resultAttemptId: deliveryAttempt.id,
+        aoaDeg: deliveryAoaDeg,
+        generationKey: deliveryAttempt.id,
+      });
+      deliveryJobs.push(deliveryJob);
+    }
+    for (let index = 0; index < deliveryJobs.length; index += 1) {
+      expect(await transferRemoteSolverTick(db, {} as never)).toBe(true);
+      expect(requests(fetchMock, "/polars")).toHaveLength(index + 1);
+      if (index < deliveryJobs.length - 1) {
+        expect(
+          await db
+            .select()
+            .from(solverEvidenceArchives)
+            .where(eq(solverEvidenceArchives.resultAttemptId, attempt.id)),
+        ).toEqual([]);
+      }
+    }
+    const transferUrls = fetchMock.mock.calls.map(([input]) => String(input));
+    const twelfthPolar = transferUrls.lastIndexOf(`${UPSTREAM}/polars`);
+    const checkpointArchive = fetchMock.mock.calls.findIndex(
+      ([input, init]) => {
+        const rawBody = (init as RequestInit | undefined)?.body;
+        const body =
+          typeof rawBody === "string"
+            ? (JSON.parse(rawBody) as { remoteResultAttemptId?: string })
+            : null;
+        return (
+          String(input).endsWith("/evidence-uploads") &&
+          body?.remoteResultAttemptId === attempt.id
+        );
+      },
+    );
+    expect(twelfthPolar).toBeGreaterThanOrEqual(0);
+    expect(checkpointArchive).toBeGreaterThan(twelfthPolar);
+    await Promise.all(
+      deliveryJobs.map(async (deliveryJob) => {
+        expect(
+          (await deliveriesForJob(deliveryJob.id)).filter(
+            (row) => row.resultId,
+          ),
+        ).toMatchObject([{ state: "delivered" }]);
+      }),
+    );
     expect(
       await db
         .select()
@@ -3764,6 +5924,44 @@ describe("remote solver push validation regressions", () => {
         .select()
         .from(solverEvidenceArchives)
         .where(eq(solverEvidenceArchives.resultAttemptId, attempt.id)),
+    ).toEqual([]);
+    expect(
+      await precalcContinuationsForObligations(db, [obligation.id]),
+    ).toEqual([]);
+    expect(manifest.id).toBeTruthy();
+    const [checkpointAfterFailedFairness] = await db
+      .select({ updatedAt: simPrecalcObligations.updatedAt })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(checkpointAfterFailedFairness.updatedAt.getTime()).toBeGreaterThan(
+      fairnessBaseline.getTime(),
+    );
+
+    // A new process-local invoker has no in-memory fairness counter. The
+    // durable timestamp above must preserve the failed turn, and the exact
+    // immutable checkpoint may retry safely on its next ordinary transfer
+    // pass once the broker recovers.
+    vi.unstubAllGlobals();
+    const recoveryFetch = stubFetch();
+    expect(await transferRemoteSolverTick(db, {} as never)).toBe(true);
+    expect(
+      recoveryFetch.fetchMock.mock.calls.some(([input, init]) => {
+        const rawBody = (init as RequestInit | undefined)?.body;
+        const body =
+          typeof rawBody === "string"
+            ? (JSON.parse(rawBody) as { remoteResultAttemptId?: string })
+            : null;
+        return (
+          String(input).endsWith("/evidence-uploads") &&
+          body?.remoteResultAttemptId === attempt.id
+        );
+      }),
+    ).toBe(true);
+    expect(
+      await db
+        .select()
+        .from(solverEvidenceArchives)
+        .where(eq(solverEvidenceArchives.resultAttemptId, attempt.id)),
     ).toHaveLength(1);
     expect(
       await precalcContinuationsForObligations(db, [obligation.id]),
@@ -3774,14 +5972,6 @@ describe("remote solver push validation regressions", () => {
         resultAttemptId: attempt.id,
       }),
     ]);
-    expect(manifest.id).toBeTruthy();
-    expect(
-      await processRestartableRemotePrecalcCheckpoint(
-        db,
-        {} as unknown as EngineClient,
-        settings,
-      ),
-    ).toBe(false);
   }, 120_000);
 
   it("preserves the application-source fingerprint in the pushed runtime identity", async () => {
@@ -4094,7 +6284,7 @@ describe("remote solver push validation regressions", () => {
     ]);
   });
 
-  it("persists a failed point delivery and retries only undelivered results", async () => {
+  it("MUST-CATCH: persists a failed point delivery and retries only undelivered results", async () => {
     const job = await seedDoneRemoteJob(
       "chunk-retry",
       [820.001, 821.001, 822.001],
@@ -4106,8 +6296,8 @@ describe("remote solver push validation regressions", () => {
     );
     const failed = stubFetch({ failPolarIndex: 2 });
 
-    await remoteSolverTick(db, {} as never);
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     expect(requests(failed.fetchMock, "/polars")).toHaveLength(2);
     expect(
@@ -4134,8 +6324,8 @@ describe("remote solver push validation regressions", () => {
 
     vi.unstubAllGlobals();
     const retried = stubFetch();
-    await remoteSolverTick(db, {} as never);
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     expect(requests(retried.fetchMock, "/polars")).toHaveLength(2);
     expect(
@@ -4313,7 +6503,7 @@ describe("remote solver push validation regressions", () => {
     );
     const firstPush = stubFetch();
 
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     expect(requests(firstPush.fetchMock, "/polars")).toHaveLength(1);
     expect(
@@ -4338,7 +6528,7 @@ describe("remote solver push validation regressions", () => {
       promiseId,
     );
     const secondPush = stubFetch();
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     expect(requests(secondPush.fetchMock, "/polars")).toHaveLength(1);
     expect(
@@ -4409,9 +6599,7 @@ describe("remote solver push validation regressions", () => {
           heartbeatBodies.push(JSON.parse(String(init?.body ?? "{}")));
           return Response.json({
             ok: true,
-            expiresAt: new Date(
-              Date.now() + 72 * 3_600_000,
-            ).toISOString(),
+            expiresAt: new Date(Date.now() + 72 * 3_600_000).toISOString(),
           });
         }),
       );
@@ -5296,6 +7484,19 @@ describe("remote solver push validation regressions", () => {
             .where(eq(simJobs.id, authoritative.job.id))
         )[0],
       ).toMatchObject({ status: "cancelled", engineState: "cancelled" });
+      const [authorityAck] = await db
+        .select()
+        .from(syncRemotePromiseCancellations)
+        .where(
+          eq(
+            syncRemotePromiseCancellations.promiseId,
+            authoritative.promise.id,
+          ),
+        );
+      expect(authorityAck).toMatchObject({
+        state: "delivered",
+        lastHttpStatus: status,
+      });
     }
   });
 
@@ -5347,7 +7548,7 @@ describe("remote solver push validation regressions", () => {
     expect((await readPromise(promiseId)).points[0]?.status).toBe("cancelled");
   });
 
-  it("uses deterministic promise-scoped keys when one delivery advances generations", async () => {
+  it("MUST-CATCH: uses deterministic promise-scoped keys when one delivery advances generations", async () => {
     const aoas = [855.201, 855.202];
     const job = await seedDoneRemoteJob("delivery-generation-advance", aoas);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
@@ -5355,7 +7556,7 @@ describe("remote solver push validation regressions", () => {
     await seedMirroredPromise("delivery-generation-advance", aoas, promiseId);
     const deliveryFetch = stubFetch();
 
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
     const [result] = await db
       .select()
       .from(results)
@@ -5485,7 +7686,7 @@ describe("remote solver push validation regressions", () => {
       source: "engine_manifest",
     });
 
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     const brokerRequests = requests(
       deliveryFetch.fetchMock,

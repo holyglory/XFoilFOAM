@@ -5,11 +5,34 @@ import {
   archiveRecoveryCorrectiveTailPeriods,
   archiveRecoveryFullRouteMode,
   archiveRecoveryPhysicalCellMatches,
+  archiveRecoveryRemediationSourceRevision,
   archiveRecoveryRouteMode,
+  archiveRecoverySourceGenerationState,
   archiveRecoveryVerifyQueueTargetReceipt,
 } from "../src/archive-interpretation-recovery";
 
 describe("archive interpretation recovery routing policy", () => {
+  it("requires an exact promoted source revision before any extra physical recovery attempt", () => {
+    const previous = process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION;
+    try {
+      delete process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION;
+      expect(archiveRecoveryRemediationSourceRevision()).toBeNull();
+      process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION = "not-a-revision";
+      expect(archiveRecoveryRemediationSourceRevision()).toBeNull();
+      process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION =
+        "15872f4cb7fd204917a38606f87e78ee4de04f3f";
+      expect(archiveRecoveryRemediationSourceRevision()).toBe(
+        "15872f4cb7fd204917a38606f87e78ee4de04f3f",
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION;
+      } else {
+        process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION = previous;
+      }
+    }
+  });
+
   it("MUST-CATCH: routes a proven FAST archive only as an exact continuation", () => {
     expect(
       archiveRecoveryRouteMode({
@@ -24,6 +47,16 @@ describe("archive interpretation recovery routing policy", () => {
       archiveRecoveryRouteMode({
         fidelity: "urans_precalc",
         exactRestartProof: false,
+      }),
+    ).toBe("fresh_rerun");
+  });
+
+  it("MUST-CATCH: immutable-provenance rerun_required stays fresh even when the old checkpoint is restartable", () => {
+    expect(
+      archiveRecoveryRouteMode({
+        fidelity: "urans_precalc",
+        exactRestartProof: true,
+        forceFreshRerun: true,
       }),
     ).toBe("fresh_rerun");
   });
@@ -213,5 +246,54 @@ describe("archive interpretation recovery routing policy", () => {
       }),
     ).toBe(false);
   });
-});
 
+  it("MUST-CATCH: released evidence never retains recovery scheduling authority, while an exact PRECALC child may remain behind its live RANS parent", () => {
+    expect(
+      archiveRecoverySourceGenerationState({
+        currentResultAttemptId: null,
+        sourceResultAttemptId: "attempt-a",
+      }),
+    ).toBe("released_historical");
+    expect(
+      archiveRecoverySourceGenerationState({
+        currentResultAttemptId: null,
+        sourceResultAttemptId: "attempt-a",
+        sourceFidelity: "urans_precalc",
+        hasExactLivePrecalcPublicationOwner: true,
+      }),
+    ).toBe("live_exact_precalc_owner");
+    expect(
+      archiveRecoverySourceGenerationState({
+        currentResultAttemptId: "attempt-b",
+        sourceResultAttemptId: "attempt-a",
+        sourceFidelity: "urans_precalc",
+        currentFidelity: "rans",
+        hasExactPrecalcRansLineage: false,
+      }),
+    ).toBe("superseded");
+    expect(
+      archiveRecoverySourceGenerationState({
+        currentResultAttemptId: "rans-parent",
+        sourceResultAttemptId: "precalc-child",
+        sourceFidelity: "urans_precalc",
+        currentFidelity: "rans",
+        hasExactPrecalcRansLineage: true,
+      }),
+    ).toBe("live_pinned_precalc_child");
+    expect(
+      archiveRecoverySourceGenerationState({
+        currentResultAttemptId: "another-urans",
+        sourceResultAttemptId: "precalc-child",
+        sourceFidelity: "urans_precalc",
+        currentFidelity: "urans_precalc",
+        hasExactPrecalcRansLineage: true,
+      }),
+    ).toBe("superseded");
+    expect(
+      archiveRecoverySourceGenerationState({
+        currentResultAttemptId: "attempt-a",
+        sourceResultAttemptId: "attempt-a",
+      }),
+    ).toBe("live_exact");
+  });
+});

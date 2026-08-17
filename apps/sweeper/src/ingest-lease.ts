@@ -1,5 +1,14 @@
 import { simJobs, type DB } from "@aerodb/db";
-import { and, eq, gt, inArray, isNull, lte, or } from "drizzle-orm";
+import {
+  and,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  lte,
+  or,
+  type SQL,
+} from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 
 /** Longer than any one bounded engine HTTP call. Long multi-point/media
@@ -12,6 +21,19 @@ export interface IngestLease {
   token: string;
   claimedAt: Date;
   expiresAt: Date;
+}
+
+/** An optional caller-owned durable guard for one ingest writer mutation.
+ * Receipt-scoped maintenance uses this to bind every lease transition to the
+ * maintenance drain that authorised it; regular ingest intentionally leaves
+ * it absent. */
+export type IngestLeaseMutationGuard = {
+  additionalWhere?: SQL;
+};
+
+function guardedWhere(base: SQL | undefined, guard?: IngestLeaseMutationGuard) {
+  if (!base) return guard?.additionalWhere;
+  return guard?.additionalWhere ? and(base, guard.additionalWhere) : base;
 }
 
 export class IngestLeaseLostError extends Error {
@@ -42,6 +64,7 @@ export async function claimJobForIngest(
     token?: string;
     now?: Date;
     leaseMs?: number;
+    additionalWhere?: SQL;
   } = {},
 ): Promise<IngestLease | null> {
   const now = opts.now ?? new Date();
@@ -59,21 +82,24 @@ export async function claimJobForIngest(
       ingestLeaseExpiresAt: expiresAt,
     })
     .where(
-      and(
-        eq(simJobs.id, jobId),
-        or(
-          inArray(simJobs.status, ["submitted", "running", "failed"]),
-          and(
-            eq(simJobs.status, "ingesting"),
-            or(
-              lte(simJobs.ingestLeaseExpiresAt, now),
-              and(
-                isNull(simJobs.ingestLeaseExpiresAt),
-                lte(simJobs.updatedAt, legacyCutoff),
+      guardedWhere(
+        and(
+          eq(simJobs.id, jobId),
+          or(
+            inArray(simJobs.status, ["submitted", "running", "failed"]),
+            and(
+              eq(simJobs.status, "ingesting"),
+              or(
+                lte(simJobs.ingestLeaseExpiresAt, now),
+                and(
+                  isNull(simJobs.ingestLeaseExpiresAt),
+                  lte(simJobs.updatedAt, legacyCutoff),
+                ),
               ),
             ),
           ),
         ),
+        { additionalWhere: opts.additionalWhere },
       ),
     )
     .returning({ id: simJobs.id });
@@ -89,7 +115,7 @@ export async function claimJobForIngest(
 export async function renewIngestLease(
   db: DB,
   lease: Pick<IngestLease, "jobId" | "token">,
-  opts: { now?: Date; leaseMs?: number } = {},
+  opts: { now?: Date; leaseMs?: number; additionalWhere?: SQL } = {},
 ): Promise<boolean> {
   const now = opts.now ?? new Date();
   const expiresAt = new Date(
@@ -99,9 +125,12 @@ export async function renewIngestLease(
     .update(simJobs)
     .set({ ingestLeaseExpiresAt: expiresAt })
     .where(
-      and(
-        ingestLeaseOwnedWhere(lease.jobId, lease.token),
-        gt(simJobs.ingestLeaseExpiresAt, now),
+      guardedWhere(
+        and(
+          ingestLeaseOwnedWhere(lease.jobId, lease.token),
+          gt(simJobs.ingestLeaseExpiresAt, now),
+        ),
+        { additionalWhere: opts.additionalWhere },
       ),
     )
     .returning({ id: simJobs.id });
@@ -111,8 +140,9 @@ export async function renewIngestLease(
 export async function renewIngestLeaseOrThrow(
   db: DB,
   lease: Pick<IngestLease, "jobId" | "token">,
+  guard?: IngestLeaseMutationGuard,
 ): Promise<void> {
-  if (!(await renewIngestLease(db, lease))) {
+  if (!(await renewIngestLease(db, lease, guard))) {
     throw new IngestLeaseLostError(lease.jobId);
   }
 }
@@ -121,6 +151,7 @@ export async function renewIngestLeaseOrThrow(
 export async function releaseIngestLeaseToRunning(
   db: DB,
   lease: Pick<IngestLease, "jobId" | "token">,
+  guard?: IngestLeaseMutationGuard,
 ): Promise<boolean> {
   const [released] = await db
     .update(simJobs)
@@ -131,7 +162,7 @@ export async function releaseIngestLeaseToRunning(
       ingestLeaseClaimedAt: null,
       ingestLeaseExpiresAt: null,
     })
-    .where(ingestLeaseOwnedWhere(lease.jobId, lease.token))
+    .where(guardedWhere(ingestLeaseOwnedWhere(lease.jobId, lease.token), guard))
     .returning({ id: simJobs.id });
   return Boolean(released);
 }

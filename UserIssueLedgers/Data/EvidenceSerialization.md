@@ -1,0 +1,5 @@
+# User Issue Ledger: Data / evidence serialization
+
+| ID | Applies to | Mistake pattern | Required behavior | Prevention and verification |
+| --- | --- | --- | --- | --- |
+| UIL-DATA-EVIDENCE-SERIALIZATION-001 | Serialized `JobResult` URANS cycle certificates, result readers, and ingestion | A non-finite cycle diagnostic serialized as JSON `null`, then later failed strict numeric decoding and stranded otherwise exact result/evidence delivery. | Legacy `null` diagnostic values must remain explicit unavailable facts: mark that cycle `hard_corrupt`, retain it as nonpublishable evidence, and never synthesize coefficients or rewrite immutable raw evidence. Current producers must serialize only JSON-safe finite diagnostics or this explicit unavailable state. | Regression coverage parses a legacy-null result, retains a clean finite certificate, proves an unavailable selected cycle cannot certify/publish, and round-trips current non-finite producer input as `null` plus hard-corrupt provenance. |

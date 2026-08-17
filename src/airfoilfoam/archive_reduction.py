@@ -23,13 +23,15 @@ from typing import Any, Iterable, Mapping, Protocol
 from .evidence_store import EvidenceObjectStore, RemoteEvidencePointer
 from .models import (
     NoSheddingCertificate,
+    NO_SHEDDING_CERTIFICATE_VERSION,
     UransCycleCertificate,
     UransCycleCertificateCycle,
     UransCycleDisposition,
 )
 from .postprocess.unsteady import (
     CLEAN_CYCLE_CERTIFICATION_VERSION,
-    NO_SHEDDING_ABS_FLOOR,
+    CLEAN_CYCLE_RECOVERY_POLICY_VERSION,
+    NO_SHEDDING_ABS_RMS_FALLBACK,
     NO_SHEDDING_MIN_SAMPLE_COUNT,
     NO_SHEDDING_REL_TOL,
     CleanCycleAudit,
@@ -205,7 +207,8 @@ def _authenticated_transient_start(
 
     A coefficient tail can prove a scientific average but cannot prove how
     much physical time the case already consumed.  Exact continuation needs
-    the latter so it never resets the FAST=9 / FINAL=12 recovery ceiling.
+    the latter so a short inspected suffix never resets the finite fidelity
+    recovery ceiling.
     The caller has already authenticated every manifest member; absence or a
     malformed marker is therefore an honest reason to choose a fresh rerun,
     not a reason to invent an origin from a trimmed coefficient suffix.
@@ -231,16 +234,19 @@ def _recovery_progress_diagnostics(
     fidelity: str,
     *,
     recommended_additional_periods: int | None = None,
-) -> dict[str, int]:
-    """Additive cross-runtime recovery budget contract.
+) -> dict[str, int | str]:
+    """Versioned cross-runtime recovery-budget contract.
 
-    `measuredPeriods` is capped because an exhausted response represents the
-    exact controller ceiling, while the immutable certificate still preserves
-    any longer observed audit for forensic inspection.
+    v2 reports the authenticated physical count truthfully, including a rare
+    overrun caused by cadence re-estimation.  The client may authorize only a
+    bounded continuation below this policy's exact fidelity ceiling; an
+    exhausted overrun remains terminal rather than being clamped into a
+    deceptively exact count.
     """
     maximum = clean_cycle_max_periods(fidelity)
-    progress: dict[str, int] = {
-        "measuredPeriods": min(audit.physical_periods, maximum),
+    progress: dict[str, int | str] = {
+        "policyVersion": CLEAN_CYCLE_RECOVERY_POLICY_VERSION,
+        "measuredPeriods": audit.physical_periods,
         "maxPeriods": maximum,
     }
     if recommended_additional_periods is not None:
@@ -400,7 +406,7 @@ def _no_shedding_certificate(
     try:
         transport_statistics = force_history_transport_statistics(history)
         return NoSheddingCertificate(
-            reducer_version="no-shedding-v1",
+            reducer_version=NO_SHEDDING_CERTIFICATE_VERSION,
             certified=True,
             required_observation_s=required,
             observation_start_time=start,
@@ -409,7 +415,10 @@ def _no_shedding_certificate(
             source_sample_count=source_count,
             transport_sample_count=transport_count,
             relative_tolerance=NO_SHEDDING_REL_TOL,
-            absolute_floor=NO_SHEDDING_ABS_FLOOR,
+            # Match the current live reducer.  The archive path replays the
+            # same coherent-period and temporal-tail gates from raw members,
+            # so this v2 allowance is never a summary-only relaxation.
+            absolute_floor=NO_SHEDDING_ABS_RMS_FALLBACK,
             cl_mean=float(history.cl_mean),
             cd_mean=float(history.cd_mean),
             cm_mean=float(history.cm_mean),
@@ -505,14 +514,39 @@ def reduce_remote_archive_clean_cycles(
             f"raw archive manifest cannot be materialized: {exc}"
         ) from exc
     manifest, entries = _manifest_from_bytes(manifest_bytes)
-    if manifest.get("unsteady") is not True:
-        raise ArchiveReductionError("raw archive is not marked as URANS evidence")
-    chord = _positive(manifest.get("chordM"), "raw archive chordM")
-    speed = _positive(manifest.get("speedMps"), "raw archive speedMps")
     aoa_deg = _finite(manifest.get("aoaDeg"), "raw archive aoaDeg")
     coefficient_paths = _coefficient_members(entries)
     frame_times = _frame_times(entries)
     signature = _manifest_signature(pointer, manifest_bytes, coefficient_paths, frame_times)
+    # Released legacy archives sometimes contain an otherwise useful force
+    # history but predate the immutable ``unsteady`` provenance contract.
+    # They cannot be classified as steady-equivalent URANS and must never be
+    # selected from their scalar summary.  Return an exact source-pinned rerun
+    # requirement instead of throwing a generic operational error: the control
+    # plane can then lease one fresh URANS generation through the normal
+    # evidence-preserving recovery ladder.
+    if manifest.get("unsteady") is not True:
+        return ArchiveCleanCycleReduction(
+            state="rerun_required",
+            input_evidence_signature=signature,
+            point=_base_point(aoa_deg=aoa_deg, certificate=None),
+            diagnostics={
+                "source": "archive_backfill",
+                "reason": (
+                    "raw archive predates immutable URANS provenance; "
+                    "a fresh URANS generation is required"
+                ),
+                "critical": False,
+                "recoveryState": "fresh_rerun",
+                "unsteadyEvidence": False,
+                "rawManifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "forceCoefficientMembers": coefficient_paths,
+                "savedFieldFrameCount": len(frame_times),
+                "fidelity": fidelity,
+            },
+        )
+    chord = _positive(manifest.get("chordM"), "raw archive chordM")
+    speed = _positive(manifest.get("speedMps"), "raw archive speedMps")
 
     # A full fresh verification binds both the raw manifest and every saved
     # field member to this exact immutable GCS generation.  It is expensive by
@@ -824,6 +858,20 @@ def reduce_remote_archive_clean_cycles(
             audit,
             fidelity=fidelity,
             required_cycles=required_cycles,
+            # `clean_periodic_tail` is stricter than a per-cycle audit: a
+            # fallback audit can find clean cycles while the exact terminal
+            # series still lacks a corroborated cadence.  That certified-but-
+            # uncorroborated case must append fresh evidence rather than emit
+            # a zero-period continuation.  Incomplete/damaged suffixes retain
+            # the normal progressive 1--3-period policy.
+            borderline=certificate.certified,
+        )
+        continuation_reason = (
+            "raw evidence has a clean cycle audit but no corroborated exact "
+            "terminal tail"
+            if certificate.certified
+            else "raw evidence has a periodic cadence but no certified terminal "
+            "clean-cycle suffix"
         )
         return ArchiveCleanCycleReduction(
             state="continuation_required",
@@ -831,7 +879,7 @@ def reduce_remote_archive_clean_cycles(
             point=point,
             diagnostics={
                 **base_diagnostics,
-                "reason": "raw evidence has a periodic cadence but no certified terminal clean-cycle suffix",
+                "reason": continuation_reason,
                 "terminalCleanCycles": certificate.terminal_clean_cycles,
                 "requiredCleanCycles": required_cycles,
                 "recommendedAdditionalPeriods": recommended,
@@ -906,6 +954,17 @@ def reduce_remote_archive_clean_cycles(
             audit,
             fidelity=fidelity,
             required_cycles=required_cycles,
+            # The per-cycle certificate can be clean while the independent
+            # exact-window stationarity test still rejects its aggregate.
+            # That is a recoverable borderline tail, not a zero-period
+            # continuation: append a bounded fresh guard window, then audit
+            # again. Three periods give the next FAST publication window wholly
+            # new physical evidence, while FINAL still advances without a blind
+            # long rerun. Without this explicit branch the helper returns zero
+            # after an already complete clean suffix, which produces an invalid
+            # ``continuation_required`` response that the control plane must
+            # reject rather than continue.
+            borderline=certificate.certified and not stats.stationary,
         )
         return ArchiveCleanCycleReduction(
             state="continuation_required",

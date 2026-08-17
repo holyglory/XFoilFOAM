@@ -234,6 +234,12 @@ export interface PolarRequest {
   /** Exact raw-archive clean-cycle recommendation for the resumed transient:
    * one to three additional whole periods. Valid only with continue_from. */
   corrective_tail_periods?: number | null;
+  /** Explicit authority for the versioned same-case clean-cycle recovery
+   * ceiling. Omitted means the immutable predecessor remains on the legacy
+   * FAST=9 / FINAL=12 contract. */
+  clean_cycle_recovery_policy_version?:
+    | "adaptive-clean-tail-v2"
+    | null;
   /** Required worker mesh-repair strategy for this submission. PRECALC callers
    * set it from a live capability probe; API and worker reject mismatches. */
   expected_mesh_recovery_version?: number | null;
@@ -267,6 +273,26 @@ export type JobState =
  *  - python: tests/test_orphan_reconcile.py::test_orphan_message_is_pinned_for_node_clients */
 export const WORKER_RESTART_ORPHAN_MESSAGE =
   "worker restarted mid-solve; task lost";
+
+/**
+ * Terminal physical-evidence boundary emitted by the engine when a same-case
+ * URANS continuation has consumed the FAST/FINAL integration cap.  A result
+ * may also retain legacy restartable-budget wording, so consumers MUST test
+ * this exact marker before classifying any generic continuation marker.
+ */
+export const URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER =
+  "same-case physical evidence cap exhausted";
+
+/** Strict recognition for result-error parsers; near-miss prose is not a
+ * protocol signal and must not suppress a restartable continuation. */
+export function isUransContinuationPhysicalCapExhausted(
+  message: string | null | undefined,
+): boolean {
+  return (
+    typeof message === "string" &&
+    message.includes(URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER)
+  );
+}
 
 export type JobPhase =
   | "pending"
@@ -390,6 +416,12 @@ export interface EngineStripJobResponse {
   bytes_freed: number;
   files_removed: number;
   kept_case_state: boolean;
+  /** A partial strip is intentionally not durable completion. The engine
+   * retains unknown entries and omits its marker so a newer classifier can
+   * retry them; the sweeper must likewise leave stripped_at unset. */
+  unknown_entries_count?: number;
+  unknown_entries?: string[];
+  no_op?: boolean;
 }
 
 export interface EngineDeleteJobResponse {
@@ -439,35 +471,61 @@ export interface VerifyRemoteEvidenceManifestResponse {
   manifestMemberCount: number;
 }
 
-/** The physical clean-cycle ceilings are part of the cross-runtime archive
- * reducer contract. A FAST trajectory ends at nine measured periods; FINAL
- * ends at twelve. They are not UI preferences and must never be silently
- * widened by a client that receives a reducer response. */
+/** Legacy v1 physical clean-cycle ceilings. A FAST trajectory ends at nine
+ * measured periods; FINAL ends at twelve. They are not UI preferences and
+ * must never be silently widened by a client that receives a reducer response. */
 export const ARCHIVE_CLEAN_CYCLE_MAX_PERIODS = {
   urans_precalc: 9,
   urans_full: 12,
 } as const;
 
-export type ArchiveCleanCycleFidelity = keyof typeof ARCHIVE_CLEAN_CYCLE_MAX_PERIODS;
+export type ArchiveCleanCycleFidelity =
+  keyof typeof ARCHIVE_CLEAN_CYCLE_MAX_PERIODS;
+
+/** The versioned emergency ceilings add three whole publication windows to
+ * the legacy FAST/FINAL limits. They are fixed physical bounds, not an
+ * instruction for a client to choose or extend a cap. */
+export const ARCHIVE_CLEAN_CYCLE_ADAPTIVE_MAX_PERIODS = {
+  urans_precalc: 18,
+  urans_full: 27,
+} as const;
+
+/** Older reducers remain on the exact FAST/FINAL ceilings above; only this
+ * explicit version may describe the separately fixed emergency ceilings. */
+export const ARCHIVE_CLEAN_CYCLE_ADAPTIVE_POLICY_VERSION =
+  "adaptive-clean-tail-v2" as const;
 
 export type ArchiveCleanCycleReductionState =
   | "accepted"
   | "continuation_required"
-  /** The exact archive reached its FAST/FINAL recovery period cap. */
+  /** The exact archive reached its legacy or versioned recovery period cap. */
   | "recovery_exhausted"
   | "rerun_required"
   | "missing_evidence";
 
-/** Additive progress proof emitted by new archive reducers. The containing
- * diagnostics object deliberately remains extensible because historical
- * archives carry free-form evidence context. This nested object is exact so a
- * producer/client version mismatch fails closed rather than minting another
- * physical continuation from ambiguous counters. */
-export interface ArchiveCleanCycleRecoveryProgress {
+/** Legacy v1 proof: the measured-period cap is the fixed fidelity ceiling. */
+export interface ArchiveCleanCycleLegacyRecoveryProgress {
   measuredPeriods: number;
   maxPeriods: number;
   recommendedAdditionalPeriods?: number;
 }
+
+/** Versioned proof that may use only the fidelity's fixed emergency ceiling. */
+export interface ArchiveCleanCycleAdaptiveRecoveryProgress {
+  policyVersion: typeof ARCHIVE_CLEAN_CYCLE_ADAPTIVE_POLICY_VERSION;
+  measuredPeriods: number;
+  maxPeriods: number;
+  recommendedAdditionalPeriods?: number;
+}
+
+/** Additive progress proof emitted by archive reducers. The containing
+ * diagnostics object deliberately remains extensible because historical
+ * archives carry free-form evidence context. This nested object is exact so a
+ * producer/client version mismatch fails closed rather than minting another
+ * physical continuation from ambiguous counters. */
+export type ArchiveCleanCycleRecoveryProgress =
+  | ArchiveCleanCycleLegacyRecoveryProgress
+  | ArchiveCleanCycleAdaptiveRecoveryProgress;
 
 export type ArchiveCleanCycleReductionDiagnostics = Record<string, unknown> & {
   recoveryProgress?: ArchiveCleanCycleRecoveryProgress;
@@ -484,11 +542,7 @@ function isArchiveCleanCycleRecord(
 }
 
 function archiveCleanCyclePositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value > 0
-  );
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function archiveCleanCycleExactKeys(
@@ -508,12 +562,14 @@ function archiveCleanCycleExactKeys(
 }
 
 /**
- * Parse the optional v1 recovery-progress proof.
+ * Parse the optional recovery-progress proof.
  *
  * Absence is intentionally valid: responses written before this contract used
  * legacy fields such as `auditedPeriods` and `maximumPeriods`. Once a producer
  * opts into `recoveryProgress`, however, all counters must agree exactly with
- * the requested FAST/FINAL tier and the reducer state. This keeps historical
+ * the requested FAST/FINAL tier and the reducer state. V1 remains fixed at
+ * that tier's cap. V2 may use only the separately fixed, finite emergency
+ * ceiling for that fidelity. This keeps historical
  * responses readable without allowing new responses to hide an over-cap or
  * unbounded continuation behind untyped diagnostics.
  */
@@ -547,11 +603,28 @@ export function parseArchiveCleanCycleRecoveryProgress(
       `${at}: only valid for continuation_required or recovery_exhausted`,
     );
   }
+  const hasPolicyVersion = Object.hasOwn(raw, "policyVersion");
+  const adaptive =
+    raw.policyVersion === ARCHIVE_CLEAN_CYCLE_ADAPTIVE_POLICY_VERSION;
+  if (hasPolicyVersion && !adaptive) {
+    errors.push(
+      `${at}.policyVersion: expected ${ARCHIVE_CLEAN_CYCLE_ADAPTIVE_POLICY_VERSION}`,
+    );
+  }
   archiveCleanCycleExactKeys(
     raw,
-    continuation
-      ? ["measuredPeriods", "maxPeriods", "recommendedAdditionalPeriods"]
-      : ["measuredPeriods", "maxPeriods"],
+    adaptive
+      ? continuation
+        ? [
+            "policyVersion",
+            "measuredPeriods",
+            "maxPeriods",
+            "recommendedAdditionalPeriods",
+          ]
+        : ["policyVersion", "measuredPeriods", "maxPeriods"]
+      : continuation
+        ? ["measuredPeriods", "maxPeriods", "recommendedAdditionalPeriods"]
+        : ["measuredPeriods", "maxPeriods"],
     at,
     errors,
   );
@@ -563,7 +636,9 @@ export function parseArchiveCleanCycleRecoveryProgress(
     errors.push(`${at}.maxPeriods: expected positive safe integer`);
   }
 
-  const expectedMaximum = ARCHIVE_CLEAN_CYCLE_MAX_PERIODS[context.fidelity];
+  const expectedMaximum = adaptive
+    ? ARCHIVE_CLEAN_CYCLE_ADAPTIVE_MAX_PERIODS[context.fidelity]
+    : ARCHIVE_CLEAN_CYCLE_MAX_PERIODS[context.fidelity];
   if (
     archiveCleanCyclePositiveInteger(raw.maxPeriods) &&
     raw.maxPeriods !== expectedMaximum
@@ -609,14 +684,36 @@ export function parseArchiveCleanCycleRecoveryProgress(
     exhausted &&
     archiveCleanCyclePositiveInteger(raw.measuredPeriods) &&
     archiveCleanCyclePositiveInteger(raw.maxPeriods) &&
-    raw.measuredPeriods !== raw.maxPeriods
+    (adaptive
+      ? raw.measuredPeriods < raw.maxPeriods
+      : raw.measuredPeriods !== raw.maxPeriods)
   ) {
     errors.push(
-      `${at}.measuredPeriods: exhausted recovery must equal maxPeriods exactly`,
+      adaptive
+        ? `${at}.measuredPeriods: adaptive exhausted recovery must reach maxPeriods`
+        : `${at}.measuredPeriods: exhausted recovery must equal maxPeriods exactly`,
     );
   }
 
   if (errors.length > 0) return { ok: false, errors };
+  if (adaptive) {
+    const adaptiveProgress = {
+      policyVersion: ARCHIVE_CLEAN_CYCLE_ADAPTIVE_POLICY_VERSION,
+      measuredPeriods: raw.measuredPeriods as number,
+      maxPeriods: raw.maxPeriods as number,
+    };
+    return {
+      ok: true,
+      value: continuation
+        ? {
+            ...adaptiveProgress,
+            recommendedAdditionalPeriods:
+              raw.recommendedAdditionalPeriods as number,
+          }
+        : adaptiveProgress,
+    };
+  }
+
   return {
     ok: true,
     value: continuation
@@ -654,9 +751,7 @@ export interface ArchiveCleanCycleReductionResponse {
 export interface PrepareBrokeredLegacyEvidenceRequest {
   caseSlug: string;
   evidenceBase: string;
-  legacyArchiveName:
-    | "openfoam_evidence.tar.gz"
-    | "engine_evidence.tar.gz";
+  legacyArchiveName: "openfoam_evidence.tar.gz" | "engine_evidence.tar.gz";
   legacyArchiveSha256: string;
   legacyArchiveByteSize: number;
   manifestSha256: string;
@@ -1047,8 +1142,8 @@ export interface JobResult {
   /** Typed terminal failure when execution ended before per-angle attempt
    * evidence existed. Null/absent on non-terminal and legacy results. */
   failure_disposition?: FailureDisposition | null;
-  /** Continuation-stage failure policy, emitted only when staging the exact
-   * saved source failed before CFD began. */
+  /** Continuation-stage failure policy, emitted when the exact saved source
+   * fails during staging or resumed CFD. */
   continuation_failure_kind?: ContinuationFailureKind | null;
   /** Exact runtime acknowledged by the worker that produced this result. */
   engine?: EngineRuntimeIdentity | null;

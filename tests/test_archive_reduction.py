@@ -11,12 +11,15 @@ from contextlib import contextmanager
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import airfoilfoam.archive_reduction as archive_reduction
 from airfoilfoam.archive_reduction import reduce_remote_archive_clean_cycles
 from airfoilfoam.evidence_store import RemoteEvidencePointer
+from airfoilfoam.models import NO_SHEDDING_CERTIFICATE_VERSION
 from airfoilfoam.postprocess.unsteady import (
     CleanCycleAudit,
     CycleAudit,
@@ -68,8 +71,10 @@ def _pointer() -> RemoteEvidencePointer:
     )
 
 
-def _write_coefficient_history(path: Path) -> tuple[float, float]:
-    """12 cycles: an intentionally corrupt prefix then a clean 60 Hz tail."""
+def _write_coefficient_history(
+    path: Path, *, cycles: int = 12
+) -> tuple[float, float]:
+    """A corrupt prefix followed by a clean 60 Hz tail."""
     frequency = 60.0
     period = 1.0 / frequency
     dt = period / 120.0
@@ -77,7 +82,7 @@ def _write_coefficient_history(path: Path) -> tuple[float, float]:
         "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
         "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
     ]
-    for index in range(12 * 120 + 1):
+    for index in range(cycles * 120 + 1):
         time_s = index * dt
         if time_s < 2.0 * period:
             # Deliberately nonphysical start-up/noise: a valid clean-tail
@@ -108,6 +113,7 @@ def _write_flat_coefficient_history(
     end_time: float = 0.4,
     corrupt_prefix: bool = False,
     cm_amplitude: float = 0.0,
+    absolute_rms_fallback: bool = False,
     terminal_nonfinite: bool = False,
 ) -> None:
     """Small raw archive trace for no-shedding contract tests.
@@ -122,12 +128,27 @@ def _write_flat_coefficient_history(
         "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) "
         "CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
     ]
+    fallback_noise = (
+        np.random.default_rng(2606).uniform(
+            -0.0024, 0.0024, size=(samples, 3)
+        )
+        if absolute_rms_fallback
+        else None
+    )
     for index in range(samples):
         time_s = end_time * index / (samples - 1)
         if corrupt_prefix and time_s < 0.12:
             cl = 0.7 + 0.2 * math.sin(2.0 * math.pi * 47.0 * time_s)
             cd = 0.035 + 0.02 * math.cos(2.0 * math.pi * 31.0 * time_s)
             cm = -0.08 + 0.1 * math.sin(2.0 * math.pi * 59.0 * time_s)
+        elif absolute_rms_fallback:
+            # Bounded channel-local numerical noise: no physical-band period
+            # is coherent across either independent half of this raw tail.
+            assert fallback_noise is not None
+            cl_noise, cd_noise, cm_noise = fallback_noise[index]
+            cl = 0.7 + cl_noise
+            cd = 0.035 + cd_noise
+            cm = -0.08 + cm_noise
         else:
             cl = 0.7
             cd = 0.035
@@ -178,6 +199,39 @@ def _manifest(
         "unsteady": True,
         "files": files,
     }
+
+
+def test_legacy_archive_without_urans_provenance_requires_fresh_rerun(
+    tmp_path: Path,
+) -> None:
+    """A legacy marker omission must schedule recovery, never publish a guess."""
+    coefficient_member = "postProcessing/forceCoeffs1/0/coefficient.dat"
+    coefficient_path = tmp_path / "legacy-coefficient.dat"
+    _write_flat_coefficient_history(coefficient_path, samples=80, end_time=0.4)
+    manifest = _manifest(coefficient_member, [], transient_start=0.0)
+    manifest.pop("unsteady")
+    manifest_path = tmp_path / "legacy-evidence_manifest.json"
+    manifest_path.write_bytes(json.dumps(manifest, sort_keys=True).encode("utf-8"))
+    store = FakeVerifiedArchiveStore(
+        {
+            "evidence_manifest.json": manifest_path,
+            coefficient_member: coefficient_path,
+        }
+    )
+
+    reduction = reduce_remote_archive_clean_cycles(
+        store,
+        _pointer(),
+        fidelity="urans_precalc",
+    )
+
+    assert reduction.state == "rerun_required"
+    assert reduction.point["converged"] is False
+    assert reduction.point["urans_cycle_certificate"] is None
+    assert reduction.diagnostics["recoveryState"] == "fresh_rerun"
+    assert reduction.diagnostics["unsteadyEvidence"] is False
+    assert reduction.diagnostics["forceCoefficientMembers"] == [coefficient_member]
+    assert store.verifications == []
 
 
 def test_raw_archive_backfill_excludes_corrupt_startup_and_records_clean_cycles(
@@ -286,10 +340,10 @@ def test_raw_archive_backfill_does_not_hide_a_terminal_nonfinite_coefficient(
         fidelity="urans_precalc",
     )
 
-    # The archive already used the full FAST recovery budget, so the failure
-    # is critical rather than a request to integrate beyond its authenticated
-    # physical interval.  Either result is preferable to a false acceptance.
-    assert reduction.state == "recovery_exhausted"
+    # The immutable NaN stays rejected, but v2 may append a bounded fresh tail
+    # below its finite emergency ceiling. Publication still requires three
+    # contiguous clean cycles; the corrupt row is never interpolated away.
+    assert reduction.state == "continuation_required"
     certificate = reduction.point["urans_cycle_certificate"]
     assert certificate is not None
     assert certificate["certified"] is False
@@ -297,6 +351,80 @@ def test_raw_archive_backfill_does_not_hide_a_terminal_nonfinite_coefficient(
         "non-finite coefficient sample" in cycle["reasons"]
         for cycle in certificate["cycles"]
     )
+    assert reduction.diagnostics["recommendedAdditionalPeriods"] == 3
+    assert reduction.diagnostics["recoveryProgress"] == {
+        "policyVersion": "adaptive-clean-tail-v2",
+        "measuredPeriods": 12,
+        "maxPeriods": 18,
+        "recommendedAdditionalPeriods": 3,
+    }
+
+
+def test_raw_archive_backfill_requests_bounded_fresh_cycles_after_a_clean_but_drifting_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean FAST suffix with failed stationarity needs 1--3 new periods.
+
+    The archive reducer previously returned ``continuation_required`` with a
+    zero-period recommendation in this branch: clean-cycle repair returned
+    zero once the three-cycle suffix existed, even though the independent
+    stationarity grade still needed new physical evidence.  The control-plane
+    contract correctly rejects a zero continuation, leaving the same case
+    stranded instead of continuing it.
+    """
+    coefficient_member = "postProcessing/forceCoeffs1/0/coefficient.dat"
+    coefficient_path = tmp_path / "coefficient.dat"
+    _frequency, period = _write_coefficient_history(coefficient_path, cycles=6)
+    # Keep this beneath FAST's nine-period physical recovery ceiling.  The
+    # branch under test is a recoverable clean-but-drifting suffix, not the
+    # separate exhausted-budget outcome.
+    field_times = [
+        period * (cycle + frame / 25.0)
+        for cycle in range(6)
+        for frame in range(25)
+    ]
+    manifest_bytes = json.dumps(
+        _manifest(coefficient_member, field_times, transient_start=0.0),
+        sort_keys=True,
+    ).encode("utf-8")
+    manifest_path = tmp_path / "evidence_manifest.json"
+    manifest_path.write_bytes(manifest_bytes)
+    transient_start_path = tmp_path / "transient_start.json"
+    transient_start_path.write_text(json.dumps({"transient_start": 0.0}))
+    store = FakeVerifiedArchiveStore(
+        {
+            "evidence_manifest.json": manifest_path,
+            coefficient_member: coefficient_path,
+            "openfoam/transient/transient_start.json": transient_start_path,
+        }
+    )
+    nonstationary = SimpleNamespace(
+        stationary=False,
+        stationary_reason="cycle means drift",
+        cl=SimpleNamespace(mean=0.70, std=0.01),
+        cd=SimpleNamespace(mean=0.035, std=0.002),
+        cm=SimpleNamespace(mean=-0.08, std=0.004),
+    )
+    monkeypatch.setattr(
+        archive_reduction,
+        "period_window_stats",
+        lambda *_args, **_kwargs: nonstationary,
+    )
+
+    reduction = reduce_remote_archive_clean_cycles(
+        store,
+        _pointer(),
+        fidelity="urans_precalc",
+    )
+
+    assert reduction.state == "continuation_required"
+    # A clean but borderline tail receives a fresh bounded guard window, never
+    # the invalid zero-period recommendation from the pre-fix path.
+    assert reduction.diagnostics["recommendedAdditionalPeriods"] == 3
+    progress = reduction.diagnostics["recoveryProgress"]
+    assert progress["recommendedAdditionalPeriods"] == 3
+    assert 1 <= progress["recommendedAdditionalPeriods"] <= 3
 
 
 def test_raw_archive_backfill_reports_missing_force_evidence_after_full_manifest_check(
@@ -439,6 +567,225 @@ def test_raw_archive_backfill_routes_a_damaged_final_cycle_to_exact_continuation
     assert store.verifications[0][2] is True
 
 
+def test_raw_archive_backfill_continues_a_clean_suffix_when_its_exact_window_is_not_stationary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean per-cycle suffix gets fresh evidence when its aggregate drifts.
+
+    The archive reducer must never label this a continuation while recommending
+    zero periods: that would fail the cross-runtime 1..3 clean-cycle handoff
+    contract and leave valid, restartable evidence permanently unpublishable.
+    """
+    coefficient_member = "postProcessing/forceCoeffs1/0/coefficient.dat"
+    coefficient_path = tmp_path / "coefficient.dat"
+    _frequency, period = _write_coefficient_history(coefficient_path)
+    manifest_path = tmp_path / "evidence_manifest.json"
+    manifest_path.write_bytes(
+        json.dumps(
+            _manifest(
+                coefficient_member,
+                [
+                    period * (6 + cycle + frame / 25.0)
+                    for cycle in range(6)
+                    for frame in range(25)
+                ],
+                transient_start=6.0 * period,
+            ),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    transient_start_path = tmp_path / "transient_start.json"
+    # The exact restart marker bounds this same-case trajectory to six physical
+    # periods even though the archive retains older immutable evidence.
+    transient_start_path.write_text(json.dumps({"transient_start": 6.0 * period}))
+    store = FakeVerifiedArchiveStore(
+        {
+            "evidence_manifest.json": manifest_path,
+            coefficient_member: coefficient_path,
+            "openfoam/transient/transient_start.json": transient_start_path,
+        }
+    )
+
+    def clean_cycle(index: int) -> CycleAudit:
+        return CycleAudit(
+            index=index,
+            start=index * period,
+            end=(index + 1) * period,
+            samples=120,
+            frames=25,
+            phase_gap=0.01,
+            phase_shift_bins=0,
+            cl_mean=0.7,
+            cd_mean=0.035,
+            cm_mean=-0.08,
+            cl_shape_error=0.01,
+            cd_shape_error=0.01,
+            cm_shape_error=0.01,
+            cl_amplitude_deviation=0.01,
+            cd_amplitude_deviation=0.01,
+            cm_amplitude_deviation=0.01,
+            cl_high_frequency=0.0,
+            cd_high_frequency=0.0,
+            cm_high_frequency=0.0,
+        )
+
+    audit = CleanCycleAudit(
+        period_s=period,
+        phase_samples=96,
+        cycles=tuple(clean_cycle(index) for index in range(3)),
+        terminal_clean_cycles=3,
+        required_clean_cycles=3,
+        template_cycles=3,
+        shape_error=0.01,
+        measured_periods=6,
+    )
+    tail = SimpleNamespace(
+        series=([], [], [], []),
+        estimate=PeriodEstimate(
+            period_s=period,
+            ambiguous=False,
+            first_half_s=period,
+            second_half_s=period,
+        ),
+        audit=audit,
+    )
+    stats = SimpleNamespace(
+        stationary=False,
+        stationary_reason="whole-window mean drift",
+        cl=SimpleNamespace(mean=0.70, std=0.02),
+        cd=SimpleNamespace(mean=0.035, std=0.001),
+        cm=SimpleNamespace(mean=-0.08, std=0.004),
+    )
+    monkeypatch.setattr(archive_reduction, "clean_periodic_tail", lambda *_a, **_k: tail)
+    monkeypatch.setattr(archive_reduction, "period_window_stats", lambda *_a, **_k: stats)
+
+    reduction = reduce_remote_archive_clean_cycles(
+        store,
+        _pointer(),
+        fidelity="urans_precalc",
+    )
+
+    assert reduction.state == "continuation_required"
+    # The three-period guard lets the next FAST publication window be wholly
+    # fresh physical evidence, rather than reusing a borderline aggregate.
+    assert reduction.diagnostics["recommendedAdditionalPeriods"] == 3
+    assert reduction.diagnostics["recoveryProgress"] == {
+        "policyVersion": "adaptive-clean-tail-v2",
+        "measuredPeriods": 6,
+        "maxPeriods": 18,
+        "recommendedAdditionalPeriods": 3,
+    }
+
+
+def test_raw_archive_backfill_guards_a_clean_fallback_audit_without_a_corroborated_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean fallback audit still needs a fresh guard if its cadence is uncorroborated.
+
+    `clean_periodic_tail` deliberately requires a stronger two-half cadence
+    proof than `audit_period_cycles`. The archive controller must not report a
+    non-executable zero-period continuation when only the fallback audit found
+    three clean FAST cycles.
+    """
+    coefficient_member = "postProcessing/forceCoeffs1/0/coefficient.dat"
+    coefficient_path = tmp_path / "coefficient.dat"
+    _frequency, period = _write_coefficient_history(coefficient_path)
+    manifest_path = tmp_path / "evidence_manifest.json"
+    manifest_path.write_bytes(
+        json.dumps(
+            _manifest(
+                coefficient_member,
+                [
+                    period * (6 + cycle + frame / 25.0)
+                    for cycle in range(6)
+                    for frame in range(25)
+                ],
+                transient_start=6.0 * period,
+            ),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    transient_start_path = tmp_path / "transient_start.json"
+    # The exact restart marker bounds this same-case trajectory to six physical
+    # periods even though older immutable evidence remains in the archive.
+    transient_start_path.write_text(json.dumps({"transient_start": 6.0 * period}))
+    store = FakeVerifiedArchiveStore(
+        {
+            "evidence_manifest.json": manifest_path,
+            coefficient_member: coefficient_path,
+            "openfoam/transient/transient_start.json": transient_start_path,
+        }
+    )
+    audit = CleanCycleAudit(
+        period_s=period,
+        phase_samples=96,
+        cycles=tuple(
+            CycleAudit(
+                index=index,
+                start=index * period,
+                end=(index + 1) * period,
+                samples=120,
+                frames=25,
+                phase_gap=0.01,
+                phase_shift_bins=0,
+                cl_mean=0.7,
+                cd_mean=0.035,
+                cm_mean=-0.08,
+                cl_shape_error=0.01,
+                cd_shape_error=0.01,
+                cm_shape_error=0.01,
+                cl_amplitude_deviation=0.01,
+                cd_amplitude_deviation=0.01,
+                cm_amplitude_deviation=0.01,
+                cl_high_frequency=0.0,
+                cd_high_frequency=0.0,
+                cm_high_frequency=0.0,
+            )
+            for index in range(3)
+        ),
+        terminal_clean_cycles=3,
+        required_clean_cycles=3,
+        template_cycles=3,
+        shape_error=0.01,
+        measured_periods=6,
+    )
+    estimate = PeriodEstimate(
+        period_s=period,
+        ambiguous=False,
+        first_half_s=period,
+        second_half_s=period,
+    )
+    monkeypatch.setattr(
+        archive_reduction, "clean_periodic_tail", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        archive_reduction, "estimate_period", lambda *_a, **_k: estimate
+    )
+    monkeypatch.setattr(
+        archive_reduction, "audit_period_cycles", lambda *_a, **_k: audit
+    )
+
+    reduction = reduce_remote_archive_clean_cycles(
+        store,
+        _pointer(),
+        fidelity="urans_precalc",
+    )
+
+    assert reduction.state == "continuation_required"
+    assert reduction.diagnostics["reason"] == (
+        "raw evidence has a clean cycle audit but no corroborated exact terminal tail"
+    )
+    assert reduction.diagnostics["recommendedAdditionalPeriods"] == 3
+    assert reduction.diagnostics["recoveryProgress"] == {
+        "policyVersion": "adaptive-clean-tail-v2",
+        "measuredPeriods": 6,
+        "maxPeriods": 18,
+        "recommendedAdditionalPeriods": 3,
+    }
+
+
 def test_raw_archive_backfill_never_continues_without_authenticated_transient_origin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -533,8 +880,8 @@ def test_raw_archive_backfill_never_continues_without_authenticated_transient_or
 @pytest.mark.parametrize(
     ("fidelity", "audited_periods", "required_cycles"),
     [
-        ("urans_precalc", 9, 3),
-        ("urans_full", 12, 5),
+        ("urans_precalc", 18, 3),
+        ("urans_full", 27, 5),
     ],
 )
 def test_raw_archive_backfill_marks_the_explicit_clean_cycle_cap_critical(
@@ -544,7 +891,7 @@ def test_raw_archive_backfill_marks_the_explicit_clean_cycle_cap_critical(
     audited_periods: int,
     required_cycles: int,
 ) -> None:
-    """FAST 9 / FINAL 12 measured periods are terminal, never requeued."""
+    """The finite v2 emergency ceilings remain terminal and non-publishing."""
 
     coefficient_member = "postProcessing/forceCoeffs1/0/coefficient.dat"
     coefficient_path = tmp_path / "coefficient.dat"
@@ -632,6 +979,11 @@ def test_raw_archive_backfill_marks_the_explicit_clean_cycle_cap_critical(
     assert reduction.diagnostics["auditedPeriods"] == audited_periods
     assert reduction.diagnostics["maximumPeriods"] == audited_periods
     assert reduction.diagnostics["requiredCleanCycles"] == required_cycles
+    assert reduction.diagnostics["recoveryProgress"] == {
+        "policyVersion": "adaptive-clean-tail-v2",
+        "measuredPeriods": audited_periods,
+        "maxPeriods": audited_periods,
+    }
     assert "recommendedAdditionalPeriods" not in reduction.diagnostics
 
 
@@ -642,6 +994,7 @@ def _flat_archive_reduction(
     end_time: float = 0.4,
     corrupt_prefix: bool = False,
     cm_amplitude: float = 0.0,
+    absolute_rms_fallback: bool = False,
     terminal_nonfinite: bool = False,
 ) -> tuple[object, Path]:
     coefficient_member = "postProcessing/forceCoeffs1/0/coefficient.dat"
@@ -652,6 +1005,7 @@ def _flat_archive_reduction(
         end_time=end_time,
         corrupt_prefix=corrupt_prefix,
         cm_amplitude=cm_amplitude,
+        absolute_rms_fallback=absolute_rms_fallback,
         terminal_nonfinite=terminal_nonfinite,
     )
     manifest_bytes = json.dumps(
@@ -705,6 +1059,23 @@ def test_archive_no_shedding_uses_only_the_clean_terminal_physical_horizon(
     assert reduction.point["cl"] == pytest.approx(0.7)
     assert reduction.point["cd"] == pytest.approx(0.035)
     assert reduction.point["cm"] == pytest.approx(-0.08)
+
+
+def test_archive_no_shedding_matches_the_live_bounded_rms_certificate(
+    tmp_path: Path,
+) -> None:
+    """The raw archive reducer must accept the same quiet tail as live URANS."""
+    reduction, _coefficient_path = _flat_archive_reduction(
+        tmp_path,
+        samples=2001,
+        absolute_rms_fallback=True,
+    )
+
+    assert reduction.state == "accepted"
+    certificate = reduction.point["no_shedding_certificate"]
+    assert certificate is not None
+    assert certificate["reducer_version"] == NO_SHEDDING_CERTIFICATE_VERSION
+    assert certificate["absolute_floor"] == pytest.approx(2e-3)
 
 
 def test_archive_no_shedding_certificate_stamps_the_bounded_transport_witness() -> None:

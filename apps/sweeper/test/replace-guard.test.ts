@@ -3140,7 +3140,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     }
   }, 120000);
 
-  it("typed continuation infrastructure retries the same source, while permanent loss becomes one stable critical incident", async () => {
+  it("legacy exact-attempt continuation evidence retries transient loss and blocks permanent loss", async () => {
     await cleanCell();
     const seeded = await seedAcceptedPrecalcCell("final-continuation-outcomes");
     const [sourceAttempt] = await db
@@ -3233,15 +3233,39 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         .update(simUransVerifyQueue)
         .set({ simJobId: transientJob.id })
         .where(eq(simUransVerifyQueue.id, item.id));
+      const transientFailure =
+        "continuation_source_transient: object storage is temporarily unavailable";
+      const [legacyTransientAttempt] = await db.insert(resultAttempts).values({
+        resultId: seeded.result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: GATE_AOA,
+        simJobId: transientJob.id,
+        engineJobId: transientEngineJobId,
+        engineCaseSlug: "a0",
+        solverImplementationId,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: false,
+        unsteady: true,
+        qualityWarnings: [],
+        evidencePayload: {
+          fidelity: "urans_full",
+          failure_disposition: "infrastructure",
+        },
+        error: `ContinuationTransientError: ${transientFailure}`,
+        solvedAt: new Date(),
+      }).returning({ id: resultAttempts.id });
       await reconcile(
         db,
         stubEngine({
           job_id: transientEngineJobId,
           state: "failed",
           polars: [],
-          message: "temporary object storage interruption",
-          failure_disposition: "infrastructure",
-          continuation_failure_kind: "transient",
+          message: transientFailure,
         }),
         { jobIds: [transientJob.id], skipFailedRecovery: true },
       );
@@ -3254,7 +3278,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         simJobId: null,
         freshAttemptCount: 1,
         continuationAttemptCount: 0,
-        latestResultAttemptId: sourceAttempt.id,
+        latestResultAttemptId: legacyTransientAttempt.id,
         lastOutcome: "continuation_retry_wait",
       });
       expect(afterTransient.nextSubmitAt!.getTime()).toBeGreaterThan(
@@ -3296,17 +3320,48 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         .set({
           state: "running",
           simJobId: permanentJob.id,
+          latestResultAttemptId: sourceAttempt.id,
+          lastOutcome: "continuation_pending",
           nextSubmitAt: null,
         })
         .where(eq(simUransVerifyQueue.id, item.id));
+      // Compatibility shape from the pre-fence engine: the top-level result
+      // lacks continuation fields, while its exact failed continuation point
+      // retains the typed permanent source reason beside generic
+      // infrastructure disposition.
+      const permanentFailure =
+        "continuation_source_permanent: immutable archive checksum mismatch";
+      const [legacyPermanentAttempt] = await db.insert(resultAttempts).values({
+        resultId: seeded.result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: GATE_AOA,
+        simJobId: permanentJob.id,
+        engineJobId: permanentEngineJobId,
+        engineCaseSlug: "a0",
+        solverImplementationId,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        validForPolar: false,
+        converged: false,
+        unsteady: true,
+        qualityWarnings: [],
+        evidencePayload: {
+          fidelity: "urans_full",
+          failure_disposition: "infrastructure",
+        },
+        error: `ContinuationPermanentError: ${permanentFailure}`,
+        solvedAt: new Date(),
+      }).returning({ id: resultAttempts.id });
       await reconcile(
         db,
         stubEngine({
           job_id: permanentEngineJobId,
           state: "failed",
           polars: [],
-          message: "continuation archive is permanently unavailable",
-          continuation_failure_kind: "permanent",
+          message: permanentFailure,
         }),
         { jobIds: [permanentJob.id], skipFailedRecovery: true },
       );
@@ -3319,7 +3374,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         simJobId: permanentJob.id,
         freshAttemptCount: 1,
         continuationAttemptCount: 1,
-        latestResultAttemptId: sourceAttempt.id,
+        latestResultAttemptId: legacyPermanentAttempt.id,
         nextSubmitAt: null,
         lastOutcome: "continuation_permanent_failure",
       });
@@ -3336,10 +3391,18 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
         incidents.map((incident) => incident.occurrenceKey).sort(),
       ).toEqual(
         [
-          `final:${item.id}:${permanentJob.id}:continuation_permanent_failure`,
-          `final:${item.id}:${transientJob.id}:continuation_retry_wait`,
+          `final:${item.id}:${legacyPermanentAttempt.id}:continuation_permanent_failure`,
+          `final:${item.id}:${legacyTransientAttempt.id}:continuation_retry_wait`,
         ].sort(),
       );
+      expect(
+        incidents.find(
+          (incident) => incident.severity === "critical",
+        )?.metadata,
+      ).toMatchObject({
+        admissionScope: "cell",
+        recoveryDisposition: "continuation_source_permanent",
+      });
     } finally {
       await db
         .delete(simUransVerifyQueue)

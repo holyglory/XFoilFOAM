@@ -40,6 +40,7 @@ from .openfoam.dialects import OPENCFD_2606_IDENTITY, get_openfoam_dialect
 from .pipeline import (
     CaseOutcome,
     ContinuationPermanentError,
+    ContinuationTransientError,
     PolarMarchResult,
     StoredCaseOutcome,
     TransientResume,
@@ -516,16 +517,15 @@ def execute_job(
             f"staging saved case {cf.case_slug} from job {cf.engine_job_id} for continuation",
             phase=JobPhase.waiting_cpu,
         )
-        try:
-            source = stage_continuation_case(
-                src_case,
-                dst_case,
-                settings=settings,
-                aoa_deg=spec.aoa_deg,
-                expected_engine=expected_engine,
-                corrective_tail_periods=request.corrective_tail_periods,
-            )
-        except OpenFOAMError as exc:
+
+        def fail_continuation(exc: OpenFOAMError) -> JobResult:
+            """Persist one typed terminal verdict for this exact source.
+
+            Staging and resumed CFD both operate on the same immutable
+            ``continue_from`` address.  A permanent source failure must not
+            masquerade as retryable infrastructure, while a transient source
+            failure remains eligible for the existing retry/backoff path.
+            """
             permanent = isinstance(exc, ContinuationPermanentError)
             failure_disposition = (
                 None if permanent else FailureDisposition.infrastructure
@@ -538,7 +538,10 @@ def execute_job(
             message = f"continuation failed: {exc}"
             logger.error(
                 "continuation: job %s cannot resume %s/%s — %s",
-                job_id, cf.engine_job_id, cf.case_slug, exc,
+                job_id,
+                cf.engine_job_id,
+                cf.case_slug,
+                exc,
             )
             result = JobResult(
                 job_id=job_id,
@@ -565,10 +568,29 @@ def execute_job(
                 continuation_failure_kind=continuation_failure_kind,
             )
             return result
+
+        try:
+            source = stage_continuation_case(
+                src_case,
+                dst_case,
+                settings=settings,
+                aoa_deg=spec.aoa_deg,
+                expected_engine=expected_engine,
+                corrective_tail_periods=request.corrective_tail_periods,
+                clean_cycle_recovery_policy_version=(
+                    request.clean_cycle_recovery_policy_version
+                ),
+            )
+        except OpenFOAMError as exc:
+            return fail_continuation(exc)
         resume = TransientResume(
             transient_start=source.transient_start,
             resume_from=source.resume_from,
             corrective_tail_periods=source.corrective_tail_periods,
+            clean_cycle_recovery_policy_version=(
+                source.clean_cycle_recovery_policy_version
+            ),
+            archive_clean_cycle_recovery=source.archive_clean_cycle_recovery,
         )
 
         def continuation_phase_progress(
@@ -592,38 +614,41 @@ def execute_job(
             f"waiting for CPU before continuation AoA {spec.aoa_deg:g}",
             case=spec,
         )
-        with cpu_tokens.acquire(
-            plan.solver_processes,
-            on_wait=lambda _snapshot: wait_for_cpu(
+        try:
+            with cpu_tokens.acquire(
                 plan.solver_processes,
-                f"waiting for CPU before continuation AoA {spec.aoa_deg:g}",
-                case=spec,
-            ),
-            on_acquired=lambda _snapshot: cpu_acquired(
-                plan.solver_processes,
-                JobPhase.solving_urans,
-                f"URANS continuation AoA {spec.aoa_deg:g} (resume from t={source.resume_from:g})",
-                solver=dialect.transient_solver_command,
-                case=spec,
-            ),
-        ):
-            outcome = run_case(
-                dst_case, airfoil, spec, request.fluid, request.roughness,
-                request.mesh, request.solver, mesher, runner,
-                n_proc=plan.solver_processes,
-                render_images=render_images,
-                solver_timeout=settings.solver_timeout,
-                rans_solver_timeout=settings.rans_solver_timeout,
-                rans_max_iterations=settings.rans_max_iterations,
-                cancel_check=ensure_not_cancelled,
-                phase_progress=continuation_phase_progress,
-                case_slug=spec.slug,
-                media_budget_s=settings.media_budget_seconds(),
-                resume=resume,
-                urans_budget_s=request.budget_override_s,
-                urans_mesh=request.urans_mesh,
-                urans_precalc_mesh=request.urans_precalc_mesh,
-            )
+                on_wait=lambda _snapshot: wait_for_cpu(
+                    plan.solver_processes,
+                    f"waiting for CPU before continuation AoA {spec.aoa_deg:g}",
+                    case=spec,
+                ),
+                on_acquired=lambda _snapshot: cpu_acquired(
+                    plan.solver_processes,
+                    JobPhase.solving_urans,
+                    f"URANS continuation AoA {spec.aoa_deg:g} (resume from t={source.resume_from:g})",
+                    solver=dialect.transient_solver_command,
+                    case=spec,
+                ),
+            ):
+                outcome = run_case(
+                    dst_case, airfoil, spec, request.fluid, request.roughness,
+                    request.mesh, request.solver, mesher, runner,
+                    n_proc=plan.solver_processes,
+                    render_images=render_images,
+                    solver_timeout=settings.solver_timeout,
+                    rans_solver_timeout=settings.rans_solver_timeout,
+                    rans_max_iterations=settings.rans_max_iterations,
+                    cancel_check=ensure_not_cancelled,
+                    phase_progress=continuation_phase_progress,
+                    case_slug=spec.slug,
+                    media_budget_s=settings.media_budget_seconds(),
+                    resume=resume,
+                    urans_budget_s=request.budget_override_s,
+                    urans_mesh=request.urans_mesh,
+                    urans_precalc_mesh=request.urans_precalc_mesh,
+                )
+        except (ContinuationPermanentError, ContinuationTransientError) as exc:
+            return fail_continuation(exc)
         record_outcome(
             spec.chord,
             spec.speed,

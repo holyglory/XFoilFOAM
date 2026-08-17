@@ -43,7 +43,7 @@ import {
   engineArchiveReductionVersion,
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
-  supportsArchiveCleanCycleReduction,
+  supportsCurrentArchiveCleanCycleReduction,
 } from "./engine-capabilities";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
@@ -52,10 +52,13 @@ import {
   markTickStarted,
   touchHeartbeat,
 } from "./heartbeat";
+import { ordinaryWriterBlockedByMaintenanceDrain } from "./maintenance-drain";
 import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
 import { reconcile, resetOrphans } from "./reconcile";
 import {
   admitRemoteSolverTick,
+  deleteDiscardedTerminalRemoteJobDirs,
+  remoteAvailableCpuSlots,
   reconcileRemoteSolverTick,
   scheduleRemoteSolverTransfer,
   type RemoteEngineAdmissionDecision,
@@ -92,7 +95,7 @@ function reportArchiveReductionCapabilityDeferred(
   lastArchiveReductionCapabilityLogAt = now;
   const observed = version == null ? "unavailable or malformed" : `v${version}`;
   console.warn(
-    `[sweeper] NEW admission deferred: engine archive-reduction capability is ${observed}; reconciliation, ingestion, and remote transfer continue while RANS/URANS remain queued`,
+    `[sweeper] NEW admission deferred: engine current archive-reduction capability is ${observed}; reconciliation, ingestion, and remote transfer continue while RANS/URANS remain queued`,
   );
 }
 
@@ -116,6 +119,29 @@ export function effectiveMaxConcurrentJobs(
   if (Number.isInteger(configuredMax) && (configuredMax ?? 0) > 0)
     return configuredMax as number;
   return Number.isInteger(workerBudget) && workerBudget > 0 ? workerBudget : 2;
+}
+
+/**
+ * Admit at most one local FAST owner per scheduler tick. Whole-polar promotion
+ * retains the first turn because it is already a recorded physical
+ * escalation; otherwise ordinary campaign PRECALC work gets the slot. Legacy
+ * archive interpretation has no physical scheduling lane.
+ */
+export async function submitOneLocalFastLane(input: {
+  promotion: () => Promise<boolean>;
+  campaignRecovery: () => Promise<boolean>;
+}): Promise<{
+  promotedSubmitted: boolean;
+  campaignTargetedSubmitted: boolean;
+}> {
+  const promotedSubmitted = await input.promotion();
+  const campaignTargetedSubmitted = promotedSubmitted
+    ? false
+    : await input.campaignRecovery();
+  return {
+    promotedSubmitted,
+    campaignTargetedSubmitted,
+  };
 }
 
 export async function getState(db: DB): Promise<SweeperConfig> {
@@ -154,30 +180,35 @@ interface AdmissionFenceGate {
   hazardPresent: boolean;
 }
 
-/** Typed NEW-remote admission precedence. Safety provenance must survive even
- * when disk pressure is also present, and a successful FAST handoff consumes
- * the only admission opportunity before any mirrored RANS can be considered. */
+/**
+ * Typed NEW-remote admission precedence. Safety provenance must survive even
+ * when disk pressure is also present. Due FAST work is admitted first by the
+ * caller. Once all due FAST work that fits in the bounded recovery pass has
+ * been admitted, remote RANS fills only the remaining independent capacity.
+ * If FAST work remains beyond the bound, it keeps its strict priority over
+ * RANS until the following pass.
+ */
 export function remoteAdmissionDecisionForTick(input: {
   admissionFenced: boolean;
   diskAllowed: boolean;
-  fastUransSubmitted: boolean;
   sharedCapacityAvailable: boolean;
   engineHealthy: boolean;
   meshRecoveryVersion: number | null;
   archiveReductionVersion: number | null;
+  fastBacklogStillDue?: boolean;
 }): RemoteEngineAdmissionDecision {
   if (input.admissionFenced) return { kind: "hold", reason: "safety_stop" };
   if (!input.diskAllowed) return { kind: "hold", reason: "storage_pressure" };
-  if (input.fastUransSubmitted)
-    return { kind: "hold", reason: "higher_priority_fast_urans" };
   if (!input.sharedCapacityAvailable)
     return { kind: "hold", reason: "shared_capacity_full" };
   if (!input.engineHealthy)
     return { kind: "hold", reason: "engine_unavailable" };
   if (input.meshRecoveryVersion == null)
     return { kind: "hold", reason: "mesh_capability_unknown" };
-  if (!supportsArchiveCleanCycleReduction(input.archiveReductionVersion))
+  if (!supportsCurrentArchiveCleanCycleReduction(input.archiveReductionVersion))
     return { kind: "hold", reason: "archive_reduction_capability_unavailable" };
+  if (input.fastBacklogStillDue)
+    return { kind: "hold", reason: "higher_priority_fast_urans" };
   return {
     kind: "allow",
     meshRecoveryVersion: input.meshRecoveryVersion,
@@ -678,16 +709,16 @@ export async function submitOneBatch(
   engine: EngineClient,
   cpuSlots = 0,
   meshRecoveryVersion: number | null = 0,
-  /** Direct callers without a live health probe retain the historical helper
+  /** Direct callers without a live health probe retain the current request
    * contract. The scheduler always passes its explicit capability result. */
-  archiveReductionVersion: number | null = 1,
+  archiveReductionVersion: number | null = 4,
 ): Promise<boolean> {
   // A malformed/unknown capability must never be coerced to legacy v0 at the
   // physical RANS boundary. Otherwise due FAST URANS is skipped while new
   // screening work consumes its capacity slot.
   if (
     meshRecoveryVersion == null ||
-    !supportsArchiveCleanCycleReduction(archiveReductionVersion)
+    !supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion)
   )
     return false;
   await ensureEnabledSimulationPresetRevisions(db);
@@ -741,6 +772,19 @@ export async function submitOneBatch(
       );
 }
 
+/**
+ * Reconciliation owns evidence ingest and durable route discovery. Physical
+ * replacement work belongs to the later scheduler admission lanes, where the
+ * current incident fence, disk reserve, engine capabilities, and aggregate
+ * capacity are all known. A caller may narrow reconciliation scope for tests
+ * or maintenance, but it cannot reopen this admission bypass.
+ */
+export function schedulerReconcileOptions(
+  options?: Parameters<typeof reconcile>[2],
+): Parameters<typeof reconcile>[2] {
+  return { ...(options ?? {}), recordRoutesOnly: true };
+}
+
 /** One scheduler tick. `reconcileOptions` exists for the integration tests
  *  (they scope reconcile to their own job ids, the established harness
  *  pattern); the production loop always runs unscoped. */
@@ -749,6 +793,10 @@ export async function tick(
   engine: EngineClient,
   reconcileOptions?: Parameters<typeof reconcile>[2],
 ): Promise<void> {
+  // This is deliberately before tick/heartbeat/admission writes: a normal
+  // scheduler process that restarts during watcher-owned maintenance must be
+  // observationally inert until the durable token is retired.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return;
   const state = await getState(db);
   // Tick PROGRESS stamp (liveness/progress split, migration 0033): started
   // here, completed at the end. The web derives the amber tick_stalled state
@@ -763,8 +811,23 @@ export async function tick(
   // rest of this tick reaches the admission lanes below, so this early,
   // workload-conservative snapshot is safe as well as user-visible.
   let diskAdmission = await refreshDiskAdmission(db, engine);
+  if (!diskAdmission.allowed) {
+    // Storage recovery must not wait behind a saturated-engine reconcile pass.
+    // These rows are already terminal and have no result/attempt owner; the
+    // engine's execution lock remains the final protection against a live
+    // directory deletion. Re-measure immediately so later gates see the freed
+    // headroom rather than the pre-reclaim snapshot.
+    const reclaimed = await deleteDiscardedTerminalRemoteJobDirs(
+      db,
+      engine,
+      250,
+    );
+    if (reclaimed.jobs > 0) {
+      diskAdmission = await refreshDiskAdmission(db, engine);
+    }
+  }
   const preReconcileFence = await checkAdmissionFence(db, "before_reconcile");
-  await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
+  await reconcile(db, engine, schedulerReconcileOptions(reconcileOptions)); // always reconcile, even when paused, but never admit replacement CFD here
   // Reconciliation can be the operation which records a blocked obligation or
   // critical incident. Re-check before any local or remote admission in this
   // same tick; waiting for the next poll would admit one job past the fence.
@@ -784,13 +847,18 @@ export async function tick(
   // disabled and use their independent remote CPU budget. In mixed mode,
   // mirrored RANS shares the visible local capacity and must wait rather than
   // queueing ahead of FAST URANS while every slot is occupied.
-  const sharedRemoteCapacityAvailable =
+  let sharedRemoteCapacityAvailable =
     !state.enabled || inFlightJobs < state.maxConcurrentJobs;
   let localCapacityOpen =
     state.enabled &&
     !admissionFenced &&
     diskAdmission.allowed &&
     inFlightJobs < state.maxConcurrentJobs;
+  const refreshDiskAfterRemoteSubmission = async () => {
+    diskAdmission = await refreshDiskAdmission(db, engine);
+    if (!diskAdmission.allowed) localCapacityOpen = false;
+    return diskAdmission.allowed;
+  };
   const remoteFastCapacityOpen =
     remoteAdmissionReady &&
     sharedRemoteCapacityAvailable &&
@@ -806,6 +874,7 @@ export async function tick(
   let uransRecoveryVersion: number | null = null;
   let archiveReductionVersion: number | null = null;
   let fastUransSubmitted = false;
+  let remoteFastBacklogStillDue = false;
 
   // One capability/health decision owns every local-engine NEW lane, including
   // work mirrored from an upstream hub. Unknown capability is never v0.
@@ -855,49 +924,85 @@ export async function tick(
         );
       } else {
         archiveReductionVersion = await engineArchiveReductionVersion(engine);
-        if (!supportsArchiveCleanCycleReduction(archiveReductionVersion)) {
+        if (
+          !supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion)
+        ) {
           reportArchiveReductionCapabilityDeferred(archiveReductionVersion);
         } else if (localCapacityOpen || remoteFastCapacityOpen) {
           uransRecoveryVersion = await engineUransRecoveryVersion(engine);
-          // A recorded whole-polar promotion and an exact targeted RANS
-          // rejection are normal automatic escalation work. Both strictly own
-          // the slot before mirrored remote RANS or any other new RANS lane.
-          const promotedSubmitted = await submitRecordedPromotionRecovery(
-            db,
-            engine,
-            state.cpuSlots,
-            {
-              meshRecoveryVersion,
-              uransRecoveryVersion,
-              ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
-            },
-          );
-          const campaignTargetedSubmitted =
-            promotedSubmitted || !localCapacityOpen
-              ? false
-              : await submitCampaignPrecalcRecoveries(
-                  db,
-                  engine,
-                  undefined,
-                  undefined,
-                  meshRecoveryVersion,
-                  uransRecoveryVersion,
-                );
-          const remoteTargetedSubmitted =
-            promotedSubmitted ||
-            campaignTargetedSubmitted ||
-            !remoteFastCapacityOpen
-              ? false
+          // Preserve the successful capability narrowing across the async lane
+          // callbacks below; the outer variables remain mutable for the rest
+          // of the scheduler tick.
+          const currentMeshRecoveryVersion = meshRecoveryVersion;
+          const currentUransRecoveryVersion = uransRecoveryVersion;
+          // A recorded whole-polar promotion remains first; otherwise normal
+          // campaign PRECALC repair gets the local FAST turn. Remote RANS may
+          // fill only independently free durable tokens after FAST work.
+          const { promotedSubmitted, campaignTargetedSubmitted } =
+            await submitOneLocalFastLane({
+            promotion: () =>
+              submitRecordedPromotionRecovery(
+                db,
+                engine,
+                state.cpuSlots,
+                {
+                  meshRecoveryVersion: currentMeshRecoveryVersion,
+                  uransRecoveryVersion: currentUransRecoveryVersion,
+                  ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
+                },
+              ),
+            campaignRecovery: () =>
+              !localCapacityOpen
+                ? Promise.resolve(false)
+                : submitCampaignPrecalcRecoveries(
+                    db,
+                    engine,
+                    undefined,
+                    undefined,
+                    currentMeshRecoveryVersion,
+                    currentUransRecoveryVersion,
+                  ),
+          });
+          // Local promotion/campaign recovery retains its one-winner-per-tick
+          // semantics, but it must not hide due remote FAST
+          // work. Re-read the shared occupancy after that local winner, then
+          // let every remaining remote token be considered by the FAST lane
+          // before ordinary mirrored RANS is even eligible.
+          inFlightJobs = await inFlight(db);
+          sharedRemoteCapacityAvailable =
+            !state.enabled || inFlightJobs < state.maxConcurrentJobs;
+          const remoteFastCapacityRemaining =
+            remoteAdmissionReady &&
+            sharedRemoteCapacityAvailable &&
+            !admissionFenced &&
+            diskAdmission.allowed;
+          const remoteFastSlotsAvailable = remoteFastCapacityRemaining
+            ? Math.min(
+                await remoteAvailableCpuSlots(db),
+                state.enabled
+                  ? Math.max(0, state.maxConcurrentJobs - inFlightJobs)
+                  : Number.MAX_SAFE_INTEGER,
+              )
+            : 0;
+          const remoteTargetedOutcome =
+            remoteFastSlotsAvailable === 0
+              ? { submitted: 0, fastBacklogStillDue: false }
               : await submitRemotePromisePrecalcRecoveries(
                   db,
                   engine,
                   meshRecoveryVersion,
                   uransRecoveryVersion,
+                  archiveReductionVersion,
+                  remoteFastSlotsAvailable,
+                  refreshDiskAfterRemoteSubmission,
+                  refreshDiskAfterRemoteSubmission,
                 );
           fastUransSubmitted =
             promotedSubmitted ||
             campaignTargetedSubmitted ||
-            remoteTargetedSubmitted;
+            remoteTargetedOutcome.submitted > 0 ||
+            remoteTargetedOutcome.fastBacklogStillDue;
+          remoteFastBacklogStillDue = remoteTargetedOutcome.fastBacklogStillDue;
         }
       }
     }
@@ -908,13 +1013,19 @@ export async function tick(
     const decision = remoteAdmissionDecisionForTick({
       admissionFenced,
       diskAllowed: diskAdmission.allowed,
-      fastUransSubmitted,
       sharedCapacityAvailable: sharedRemoteCapacityAvailable,
       engineHealthy,
       meshRecoveryVersion,
       archiveReductionVersion,
+      fastBacklogStillDue: remoteFastBacklogStillDue,
     });
-    remoteAdmissionConsumed = await admitRemoteSolverTick(db, engine, decision);
+    remoteAdmissionConsumed = await admitRemoteSolverTick(
+      db,
+      engine,
+      decision,
+      refreshDiskAfterRemoteSubmission,
+      refreshDiskAfterRemoteSubmission,
+    );
     if (remoteAdmissionConsumed) {
       inFlightJobs = await inFlight(db);
       diskAdmission = await refreshDiskAdmission(db, engine);
@@ -933,7 +1044,7 @@ export async function tick(
     localCapacityOpen &&
     engineHealthy &&
     meshRecoveryVersion != null &&
-    supportsArchiveCleanCycleReduction(archiveReductionVersion) &&
+    supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion) &&
     !fastUransSubmitted &&
     !engineBackoffActive()
   ) {
@@ -981,7 +1092,13 @@ export async function tick(
   // CPU capacity; never hold the next admission tick behind that transfer.
   // Retention has its own serial process loop and is intentionally absent from
   // this scheduler progress boundary.
-  scheduleRemoteSolverTransfer(db, engine);
+  // These are ordinary outbox/publication writers. Their own entry points
+  // re-check the durable drain to close the race with a watcher acquiring it
+  // after this tick began; avoid scheduling them at all when it is already
+  // present at this hand-off boundary.
+  if (!(await ordinaryWriterBlockedByMaintenanceDrain(db))) {
+    scheduleRemoteSolverTransfer(db, engine);
+  }
   // A completed URANS physical generation may need only its verified GCS
   // archive reduced before it becomes a polar point.  Keep this nonblocking:
   // the live queue is durable and globally deduplicated, while this tick must
@@ -994,11 +1111,13 @@ export async function tick(
   // after this tick returns rather than awaiting live engine I/O here: a slow
   // gateway must never turn normal reconciliation into a "tick stalled"
   // condition. A known legacy v0 is forwarded so it remains a quiet no-op.
-  scheduleArchiveReductionQueueDrain(
-    db,
-    engine,
-    archiveReductionVersion == null ? {} : { archiveReductionVersion },
-  );
+  if (!(await ordinaryWriterBlockedByMaintenanceDrain(db))) {
+    scheduleArchiveReductionQueueDrain(
+      db,
+      engine,
+      archiveReductionVersion == null ? {} : { archiveReductionVersion },
+    );
+  }
   await markTickCompleted(db);
 }
 
@@ -1021,7 +1140,12 @@ export async function runLoop(
   engine: EngineClient,
   signal: AbortSignal,
 ): Promise<void> {
-  await resetOrphans(db);
+  // Avoid even opening startup recovery while a private maintenance receipt
+  // owns canonical mutations. `resetOrphans` repeats and locks this guard so
+  // direct callers and a mid-startup drain transition are fenced too.
+  if (!(await ordinaryWriterBlockedByMaintenanceDrain(db))) {
+    await resetOrphans(db);
+  }
   while (!signal.aborted) {
     try {
       await tick(db, engine);

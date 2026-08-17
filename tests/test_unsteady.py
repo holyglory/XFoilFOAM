@@ -1,6 +1,7 @@
 """Unit tests for URANS force-history + Strouhal extraction (no OpenFOAM needed)."""
 import math
 import signal
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,18 +11,24 @@ import pytest
 from airfoilfoam import pipeline
 from airfoilfoam.cancellation import JobCancelled
 from airfoilfoam.postprocess.unsteady import (
+    CleanCycleAudit,
+    CycleAudit,
+    FINAL_CLEAN_CYCLE_MAX_PERIODS,
     FINAL_CLEAN_CYCLE_MINIMUM,
+    FAST_CLEAN_CYCLE_MAX_PERIODS,
     FAST_CLEAN_CYCLE_MINIMUM,
     ForceHistory,
     additional_periods_for_clean_suffix,
     audit_period_cycles,
     clean_cycle_recovery_exhausted,
+    clean_cycle_continuation_max_periods,
     clean_periodic_tail,
     required_clean_cycle_count,
     dominant_frequency,
     estimate_period,
     force_history,
     integer_period_window,
+    period_window_stats,
     shedding_frequency_band,
     stable_two_period_window,
     strouhal,
@@ -69,6 +76,33 @@ def test_strouhal_formula():
     assert strouhal(2.0, 1.0, 20.0) == 0.1
     assert strouhal(5.0, 0.5, 10.0) == 0.25
     assert strouhal(2.0, 1.0, 0.0) == 0.0  # guard against zero speed
+
+
+def test_period_window_stats_snaps_only_integer_boundary_roundoff():
+    """Producer emits exact N for arithmetic ULP noise, not a short window."""
+    period = 0.1
+    # Binary64 represents 0.3 / 0.1 a few ULPs below three on CPython.
+    times = np.linspace(0.0, 0.3, 61)
+    phase = 2.0 * np.pi * times / period
+    cl = 0.8 + 0.05 * np.sin(phase)
+    cd = 0.02 + 0.002 * np.sin(phase)
+    cm = -0.04 + 0.003 * np.sin(phase)
+    exact = period_window_stats(times, cl, cd, cm, period)
+    assert exact is not None
+    assert exact.periods_retained == 3.0
+
+    # A physically shorter span well outside four ULPs remains fractional.
+    short_times = np.linspace(0.0, 0.3 - 1e-10, 61)
+    short_phase = 2.0 * np.pi * short_times / period
+    short = period_window_stats(
+        short_times,
+        0.8 + 0.05 * np.sin(short_phase),
+        0.02 + 0.002 * np.sin(short_phase),
+        -0.04 + 0.003 * np.sin(short_phase),
+        period,
+    )
+    assert short is not None
+    assert short.periods_retained < 3.0
 
 
 def test_thick_section_wake_scale_corroborates_high_frequency_period():
@@ -379,12 +413,12 @@ def test_clean_cycle_audit_requires_a_contiguous_terminal_suffix():
     assert not audit.certified
     assert audit.terminal_clean_cycles == 0
     assert audit.cycles[-1].disposition == "hard_corrupt"
-    # This fixture already contains seven measured FAST periods.  A damaged
-    # final period normally earns a three-period repair chunk, but the
-    # physical FAST ceiling is nine, so only two more periods are admissible.
+    # This fixture already contains seven measured FAST periods. A damaged
+    # final period earns one bounded three-period repair chunk; the v2 finite
+    # ceiling leaves enough room without weakening the clean-suffix gate.
     assert additional_periods_for_clean_suffix(
         audit, fidelity="fast", required_cycles=3
-    ) == 2
+    ) == 3
 
 
 def test_clean_tail_does_not_normalise_away_a_terminal_nonfinite_sample():
@@ -608,8 +642,8 @@ def test_clean_cycle_floors_and_adaptive_guard_chunk_are_tier_specific():
     ) == 3
 
 
-def test_clean_cycle_recovery_uses_only_the_explicit_tier_caps():
-    """MUST-CATCH: seven clean periods do not prematurely stop recovery."""
+def test_clean_cycle_recovery_uses_only_the_adaptive_emergency_tier_caps():
+    """The short v1 ceilings cannot terminate otherwise progressing evidence."""
     period = 0.2
 
     def audit_for(*, cycles: int, fidelity: str):
@@ -624,16 +658,40 @@ def test_clean_cycle_recovery_uses_only_the_explicit_tier_caps():
             required_cycles=3,
         )
 
-    # The former generic seven-cycle guard would have abandoned both of these
-    # before their approved FAST/FINAL recovery ceilings.
+    assert FAST_CLEAN_CYCLE_MAX_PERIODS == 18
+    assert FINAL_CLEAN_CYCLE_MAX_PERIODS == 27
+    # The former FAST=9 / FINAL=12 contract would abandon both trajectories
+    # before the v2 controller's bounded clean-tail search completes.
     assert not clean_cycle_recovery_exhausted(audit_for(cycles=7, fidelity="fast"), fidelity="fast")
-    assert clean_cycle_recovery_exhausted(audit_for(cycles=9, fidelity="fast"), fidelity="fast")
-    assert not clean_cycle_recovery_exhausted(audit_for(cycles=9, fidelity="full"), fidelity="full")
-    assert clean_cycle_recovery_exhausted(audit_for(cycles=12, fidelity="full"), fidelity="full")
+    assert not clean_cycle_recovery_exhausted(audit_for(cycles=9, fidelity="fast"), fidelity="fast")
+    assert clean_cycle_recovery_exhausted(audit_for(cycles=18, fidelity="fast"), fidelity="fast")
+    assert not clean_cycle_recovery_exhausted(audit_for(cycles=12, fidelity="full"), fidelity="full")
+    assert clean_cycle_recovery_exhausted(audit_for(cycles=27, fidelity="full"), fidelity="full")
+
+
+def test_same_case_continuation_caps_require_explicit_v2_lineage():
+    """The current controller can collect 18/27 periods only when its exact
+    source carried the reducer's v2 authority. Missing provenance is
+    deliberately indistinguishable from the historical v1 contract."""
+
+    assert clean_cycle_continuation_max_periods("precalc") == 9
+    assert clean_cycle_continuation_max_periods("full") == 12
+    assert (
+        clean_cycle_continuation_max_periods(
+            "precalc", policy_version="adaptive-clean-tail-v2"
+        )
+        == 18
+    )
+    assert (
+        clean_cycle_continuation_max_periods(
+            "full", policy_version="adaptive-clean-tail-v2"
+        )
+        == 27
+    )
 
 
 def test_clean_cycle_recovery_cap_uses_authenticated_physical_progress_not_tail_length():
-    """A short candidate tail must not reset FINAL's 12-period ceiling."""
+    """A short candidate tail must not reset FINAL's finite emergency ceiling."""
     period = 0.2
     times, cl, cd, cm = _clean_cycle_series(period=period, cycles=3)
     tail_audit = audit_period_cycles(
@@ -653,27 +711,66 @@ def test_clean_cycle_recovery_cap_uses_authenticated_physical_progress_not_tail_
     )
     assert progressed is not None
     assert progressed.physical_periods == 12
-    assert clean_cycle_recovery_exhausted(progressed, fidelity="full")
+    assert not clean_cycle_recovery_exhausted(progressed, fidelity="full")
     assert (
         additional_periods_for_clean_suffix(
             progressed,
             fidelity="full",
             required_cycles=5,
         )
-        == 0
+        == 2
     )
+    exhausted = replace(progressed, measured_periods=27)
+    assert clean_cycle_recovery_exhausted(exhausted, fidelity="full")
+    assert additional_periods_for_clean_suffix(
+        exhausted, fidelity="full", required_cycles=5
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    ("fidelity", "required_cycles", "measured_periods", "expected"),
+    [
+        ("fast", 3, 17, 1),
+        ("full", 5, 26, 1),
+        ("fast", 3, 18, 0),
+        ("full", 5, 27, 0),
+    ],
+)
+def test_empty_cycle_audit_still_honors_authenticated_remaining_period_cap(
+    fidelity: str,
+    required_cycles: int,
+    measured_periods: int,
+    expected: int,
+):
+    """A cadence-less audit cannot bypass the physical FAST/FINAL ceiling."""
+    audit = CleanCycleAudit(
+        period_s=0.2,
+        phase_samples=96,
+        cycles=(),
+        terminal_clean_cycles=0,
+        required_clean_cycles=required_cycles,
+        template_cycles=0,
+        shape_error=math.inf,
+        measured_periods=measured_periods,
+    )
+
+    assert additional_periods_for_clean_suffix(
+        audit,
+        fidelity=fidelity,
+        required_cycles=required_cycles,
+    ) == expected
 
 
 @pytest.mark.parametrize(
     ("fidelity", "cycles", "required_cycles", "expected"),
     [
         # A newly corrupt terminal period normally earns three periods, but
-        # the cap is physical: FAST 8/9 and FINAL 11/12 have only one period
+        # the cap is physical: FAST 17/18 and FINAL 26/27 have only one period
         # left to measure before the reducer must emit a critical exhaustion.
-        ("fast", 8, 3, 1),
-        ("full", 11, 5, 1),
-        ("fast", 9, 3, 0),
-        ("full", 12, 5, 0),
+        ("fast", 17, 3, 1),
+        ("full", 26, 5, 1),
+        ("fast", 18, 3, 0),
+        ("full", 27, 5, 0),
     ],
 )
 def test_clean_cycle_recovery_chunk_never_crosses_remaining_tier_cap(
@@ -705,6 +802,75 @@ def test_clean_cycle_recovery_chunk_never_crosses_remaining_tier_cap(
         fidelity=fidelity,
         required_cycles=required_cycles,
     ) == expected
+
+
+def test_legacy_fast_boundary_continues_first_clean_cycle_one_period_at_a_time():
+    """MUST-CATCH: production reached its first clean suffix after period 9."""
+
+    def cycle(index: int, *, soft: bool = False) -> CycleAudit:
+        return CycleAudit(
+            index=index,
+            start=float(index),
+            end=float(index + 1),
+            samples=206,
+            frames=28,
+            phase_gap=0.01,
+            phase_shift_bins=0,
+            cl_mean=0.7,
+            cd_mean=0.035,
+            cm_mean=-0.08,
+            cl_shape_error=0.01,
+            cd_shape_error=0.01,
+            cm_shape_error=0.01,
+            cl_amplitude_deviation=0.01,
+            cd_amplitude_deviation=0.01,
+            cm_amplitude_deviation=0.01,
+            cl_high_frequency=0.0,
+            cd_high_frequency=0.0,
+            cm_high_frequency=0.0,
+            soft_reasons=("settling shape",) if soft else (),
+        )
+
+    audit = CleanCycleAudit(
+        period_s=1.0,
+        phase_samples=96,
+        cycles=(cycle(0, soft=True), cycle(1)),
+        terminal_clean_cycles=1,
+        required_clean_cycles=3,
+        template_cycles=1,
+        shape_error=0.01,
+        measured_periods=13,
+    )
+    assert not clean_cycle_recovery_exhausted(audit, fidelity="fast")
+    assert additional_periods_for_clean_suffix(
+        audit, fidelity="fast", required_cycles=3
+    ) == 1
+
+
+def test_legacy_fast_boundary_replaces_a_soft_terminal_outlier():
+    """MUST-CATCH: three clean cycles before one soft outlier earn a repair tail."""
+
+    clean = _clean_cycle_series(period=0.2, cycles=4)
+    audit = audit_period_cycles(
+        *clean,
+        0.2,
+        fidelity="fast",
+        required_cycles=3,
+    )
+    softened = replace(
+        audit.cycles[-1],
+        soft_reasons=("cl shape error 0.157; cd shape error 0.185",),
+    )
+    production_shape = replace(
+        audit,
+        cycles=(*audit.cycles[:-1], softened),
+        terminal_clean_cycles=0,
+        measured_periods=14,
+    )
+    assert not clean_cycle_recovery_exhausted(production_shape, fidelity="fast")
+    assert additional_periods_for_clean_suffix(
+        production_shape, fidelity="fast", required_cycles=3
+    ) == 3
 
 
 def test_clean_periodic_tail_promotes_an_alternating_half_cycle_to_its_vector_repeat():

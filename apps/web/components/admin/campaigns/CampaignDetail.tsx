@@ -49,7 +49,6 @@ import {
 import { C, MONO } from "@/lib/tokens";
 import { isProcessDead } from "@/lib/solver-state";
 import type { CampaignPointsBucket } from "@/lib/point-history";
-import { SolverIncidentPanel } from "../SolverIncidentPanel";
 import {
   campaignInstrumentStatus,
   campaignStatusLine,
@@ -407,6 +406,7 @@ export function CampaignDetail({
       !isProcessDead(scheduler.heartbeatAt) &&
       scheduler.sweeperEnabled &&
       scheduler.engineHealthy &&
+      !scheduler.maintenanceDrainActive &&
       !scheduler.diskAdmissionBlocked &&
       !scheduler.engineUnreachableSince,
   );
@@ -645,11 +645,6 @@ export function CampaignDetail({
           </button>
         )}
       </div>
-
-      <SolverIncidentPanel
-        summary={summary.solverIncidents}
-        surface="campaign"
-      />
 
       {notice && (
         <div

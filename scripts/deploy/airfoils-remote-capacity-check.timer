@@ -1,0 +1,11 @@
+[Unit]
+Description=Audit Airfoils.Pro remote solver capacity every six hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=5min
+Persistent=true
+Unit=airfoils-remote-capacity-check.service
+
+[Install]
+WantedBy=timers.target

@@ -4760,10 +4760,9 @@ describe("campaign compose→submit lifecycle boundary", () => {
         ),
       );
 
-    const exhausted = await autoRetryCrashedResultsForJob(db, secondJob.id);
-    expect(exhausted.retried).toEqual([]);
-    expect(exhausted.precalcRouted).toEqual([]);
-    expect(exhausted.escalated.map((cell) => cell.resultId)).toEqual([
+    const restarted = await autoRetryCrashedResultsForJob(db, secondJob.id);
+    expect(restarted.retried).toEqual([]);
+    expect(restarted.precalcRouted.map((cell) => cell.resultId)).toEqual([
       transientResult.id,
     ]);
     expect(
@@ -4772,15 +4771,18 @@ describe("campaign compose→submit lifecycle boundary", () => {
         .from(simSolverIncidents)
         .where(eq(simSolverIncidents.resultId, transientResult.id)),
     ).toHaveLength(0);
-    const [spentRequest] = await db
+    const [reopenedAgainRequest] = await db
       .select()
       .from(simUransRequests)
       .where(eq(simUransRequests.id, transientRequest.id));
-    expect(spentRequest.state).toBe("done");
+    expect(reopenedAgainRequest).toMatchObject({
+      state: "pending",
+      simJobId: null,
+    });
     for (const campaignId of [campaignA, campaignB]) {
       expect(await campaignOpenTierCounts(db, campaignId)).toEqual({
         ransOpen: 0,
-        precalcOpen: 0,
+        precalcOpen: 1,
         verifyOpen: 0,
       });
       await probeCampaignCompletion(db, campaignId);
@@ -4790,7 +4792,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .from(simCampaigns)
       .where(inArray(simCampaigns.id, [campaignA, campaignB]));
     expect(
-      finishedCampaigns.every((campaign) => campaign.status === "attention"),
+      finishedCampaigns.every((campaign) => campaign.status === "active"),
     ).toBe(true);
   }, 120000);
 

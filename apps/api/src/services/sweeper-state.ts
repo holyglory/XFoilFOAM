@@ -34,6 +34,9 @@ export interface SweeperStateRow {
   lastAdmissionFenceReason: string | null;
   lastAdmissionFenceTriggerKey: string | null;
   lastAdmissionFenceDetails: Record<string, unknown> | null;
+  /** Private maintenance ownership authority; never expose this token. */
+  maintenanceDrainToken: string | null;
+  maintenanceDrainStartedAt: Date | string | null;
 }
 
 export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
@@ -62,6 +65,8 @@ export const SWEEPER_STATE_DEFAULTS: SweeperStateRow = {
   lastAdmissionFenceReason: null,
   lastAdmissionFenceTriggerKey: null,
   lastAdmissionFenceDetails: null,
+  maintenanceDrainToken: null,
+  maintenanceDrainStartedAt: null,
 };
 
 let engineUnreachableColumnExists: boolean | null = null;
@@ -122,6 +127,33 @@ async function hasAdmissionFenceColumns(): Promise<boolean> {
   return present;
 }
 
+let maintenanceDrainColumnsExist: boolean | null = null;
+
+async function hasMaintenanceDrainColumns(): Promise<boolean> {
+  if (maintenanceDrainColumnsExist === true) return true;
+  const rows = (await db.execute(sql`
+    SELECT 1 AS present FROM information_schema.columns
+    WHERE table_name = 'sweeper_state'
+      AND column_name = 'maintenance_drain_token'
+    LIMIT 1
+  `)) as unknown as unknown[];
+  const present = rows.length > 0;
+  if (present) maintenanceDrainColumnsExist = true;
+  return present;
+}
+
+export class SweeperMaintenanceDrainConflictError extends Error {
+  readonly statusCode = 409;
+  readonly code = "SWEEPER_MAINTENANCE_DRAIN_ACTIVE";
+
+  constructor() {
+    super(
+      "scheduler admission is owned by active engine maintenance; wait for maintenance to finish",
+    );
+    this.name = "SweeperMaintenanceDrainConflictError";
+  }
+}
+
 type SweeperStateExecutor = Pick<typeof db, "execute">;
 
 async function readSweeperStateFrom(
@@ -131,6 +163,7 @@ async function readSweeperStateFrom(
   const withTickProgress = await hasTickProgressColumns();
   const withDiskAdmission = await hasDiskAdmissionColumns();
   const withAdmissionFence = await hasAdmissionFenceColumns();
+  const withMaintenanceDrain = await hasMaintenanceDrainColumns();
   const rows = (await source.execute(sql`
     SELECT
       id,
@@ -174,6 +207,13 @@ async function readSweeperStateFrom(
                   NULL::text AS "lastAdmissionFenceReason",
                   NULL::text AS "lastAdmissionFenceTriggerKey",
                   NULL::jsonb AS "lastAdmissionFenceDetails"`
+      }
+      ${
+        withMaintenanceDrain
+          ? sql`, maintenance_drain_token::text AS "maintenanceDrainToken",
+                  maintenance_drain_started_at AS "maintenanceDrainStartedAt"`
+          : sql`, NULL::text AS "maintenanceDrainToken",
+                  NULL::timestamptz AS "maintenanceDrainStartedAt"`
       }
     FROM sweeper_state
     WHERE id = 1
@@ -250,6 +290,12 @@ export async function writeSweeperState(
         FOR UPDATE /* writeSweeperState admission fence serialization */
       `);
       const existing = await readSweeperStateFrom(transaction);
+      if (
+        existing?.maintenanceDrainToken != null &&
+        patch.enabled !== undefined
+      ) {
+        throw new SweeperMaintenanceDrainConflictError();
+      }
       const next = {
         enabled:
           patch.enabled ?? existing?.enabled ?? SWEEPER_STATE_DEFAULTS.enabled,

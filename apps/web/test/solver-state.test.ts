@@ -127,6 +127,85 @@ describe("deriveSolverState gate precedence", () => {
     expect(d.detail).toMatch(/running jobs continue/i);
   });
 
+  it("MUST-CATCH: a cleared fence stays running when its historical reason remains for audit", () => {
+    // `lastAdmissionFenceReason` is intentionally retained as historical
+    // provenance after Resume.  It must never become a second, implicit live
+    // latch: the live boolean is the only safety-stop input.
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        admissionFenceActive: false,
+        lastAdmissionFenceReason: "critical_solver_incident",
+        lastAdmissionFenceDetails: { stage: "preliminary" },
+      },
+      NOW,
+    );
+    expect(d.state).toBe("running");
+    expect(d.tone).toBe("teal");
+    expect(solverChipText(d.state, healthy.activeJobCount)).toMatch(
+      /^scheduler · running/,
+    );
+    expect(d.headline).not.toMatch(/safety stop|recovery exhausted/i);
+  });
+
+  it("FALSE-POSITIVE GUARD: archived critical-fence detail never recreates a live safety stop", () => {
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        admissionFenceActive: false,
+        lastAdmissionFenceAt: iso(30 * 60_000),
+        lastAdmissionFenceReason: "blocked_final_urans",
+        lastAdmissionFenceDetails: { stage: "final", fidelity: "full" },
+      },
+      NOW,
+    );
+    expect(d.state).toBe("running");
+    expect(solverChipText(d.state, healthy.activeJobCount)).not.toContain(
+      "safety stop",
+    );
+    expect(`${d.headline} ${d.detail ?? ""}`).not.toMatch(
+      /critical solver outcome|final URANS exhausted/i,
+    );
+  });
+
+  it("MUST-CATCH: an active maintenance drain outranks stale fence history without offering a user resume", () => {
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        enabled: false,
+        admissionFenceActive: false,
+        maintenanceDrainActive: true,
+        maintenanceDrainStartedAt: iso(60_000),
+        lastAdmissionFenceReason: "critical_solver_incident",
+        lastAdmissionFenceDetails: { stage: "preliminary" },
+      },
+      NOW,
+    );
+    expect(d.state).toBe("maintenance_drain");
+    expect(d.tone).toBe("amber");
+    expect(solverStateLabel(d.state)).toBe("MAINTENANCE DRAIN");
+    expect(solverChipText(d.state)).toBe("scheduler · maintenance drain");
+    expect(d.headline).toBe("System maintenance is holding new submissions.");
+    expect(d.detail).toContain("Maintenance drain began 1m ago.");
+    expect(d.detail).toMatch(/Active jobs, if any, continue/i);
+    expect(`${d.headline} ${d.detail}`).not.toMatch(/safety stop|resume/i);
+  });
+
+  it("FALSE-POSITIVE GUARD: a live admission fence still outranks maintenance", () => {
+    const d = deriveSolverState(
+      {
+        ...healthy,
+        enabled: false,
+        admissionFenceActive: true,
+        maintenanceDrainActive: true,
+        lastAdmissionFenceReason: "critical_solver_incident",
+      },
+      NOW,
+    );
+    expect(d.state).toBe("admission_fenced");
+    expect(d.tone).toBe("red");
+  });
+
   it("process death still outranks the admission fence", () => {
     expect(
       deriveSolverState(
@@ -432,6 +511,9 @@ describe("helpers", () => {
       "scheduler · ready · 0 active jobs",
     );
     expect(solverChipText("paused")).toBe("scheduler · paused");
+    expect(solverChipText("maintenance_drain")).toBe(
+      "scheduler · maintenance drain",
+    );
     expect(solverChipText("process_not_running")).toBe(
       "scheduler · process not running",
     );
@@ -465,9 +547,7 @@ describe("tick_stalled (liveness/progress split)", () => {
     expect(d.state).toBe("tick_stalled");
     expect(d.tone).toBe("amber");
     expect(d.tone).not.toBe("red");
-    expect(d.headline).toBe(
-      "Scheduler cycle delayed for 6m.",
-    );
+    expect(d.headline).toBe("Scheduler cycle delayed for 6m.");
     expect(d.detail).toBe(
       "Existing solves continue; new scheduling waits for this cycle. Open Solver if the delay persists.",
     );

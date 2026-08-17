@@ -5446,15 +5446,16 @@ async function importPolarPush(
         const tx = rawTx as unknown as DB;
         const [classified] = (await tx.execute(sql`
           SELECT
+            -- Promise settlement confirms custody of the exact accepted solver
+            -- generation. It is intentionally independent of the canonical
+            -- polar verdict: a current URANS generation can legitimately
+            -- await archive reduction before it becomes a published point.
             EXISTS (
               SELECT 1
               FROM results canonical
-              JOIN result_classifications classification
-                ON classification.result_id = canonical.id
               WHERE canonical.id = ${committed.resultId}
                 AND canonical.current_result_attempt_id = ${committed.attemptId}
-                AND classification.state = 'accepted'
-            ) AS result_accepted,
+            ) AS selected_current_attempt,
             EXISTS (
               SELECT 1
               FROM result_attempts attempt
@@ -5506,14 +5507,14 @@ async function importPolarPush(
                 )
             ) AS extents_bound
         `)) as unknown as Array<{
-          result_accepted: boolean;
+          selected_current_attempt: boolean;
           attempt_accepted: boolean;
           exact_manifest: boolean;
           media_bound: boolean;
           extents_bound: boolean;
         }>;
         if (
-          !classified?.result_accepted ||
+          !classified?.selected_current_attempt ||
           !classified.attempt_accepted ||
           !classified.exact_manifest ||
           !classified.media_bound ||
@@ -7370,11 +7371,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
                     OR NOT EXISTS (
                       SELECT 1
                       FROM results canonical
-                      JOIN result_classifications classification
-                        ON classification.result_id = canonical.id
                       WHERE canonical.id = point.result_id
                         AND canonical.current_result_attempt_id = point.result_attempt_id
-                        AND classification.state = 'accepted'
                     )
                     OR NOT EXISTS (
                       SELECT 1

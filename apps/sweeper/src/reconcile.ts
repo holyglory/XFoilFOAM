@@ -3,6 +3,7 @@ import {
   autoRetryCrashedResultsForJob,
   type CampaignLaneKey,
   campaignHasOpenRansGaps,
+  CONTINUATION_SOURCE_PERMANENT,
   type DB,
   enqueuePrecalcVerifications,
   ensurePrecalcObligations,
@@ -32,6 +33,7 @@ import {
   resultClassifications,
   results,
   resolveSolverIncidentsForOwnerInTransaction,
+  settleCleanRestartPendingMarker,
   settleAcceptedRunningPrecalcPartials,
   settlePrecalcObligationsForJob,
   settlePrecalcObligationsForJobInTransaction,
@@ -43,6 +45,7 @@ import {
   simUransRequests,
   simUransVerifyQueue,
   solverIncidentReason,
+  SOLVER_INCIDENT_ADMISSION_SCOPES,
   sweeperState,
   URANS_RECOVERY_REMEDIATION_VERSION,
 } from "@aerodb/db";
@@ -61,12 +64,14 @@ import {
 } from "@aerodb/core";
 import {
   EngineError,
+  isUransContinuationPhysicalCapExhausted,
   URANS_VERIFY_DELTA_CD_LIMIT,
   URANS_VERIFY_DELTA_CL_LIMIT,
   WORKER_RESTART_ORPHAN_MESSAGE,
   classifyQueueLifecycle,
   engineQueueListsJob,
   type EngineClient,
+  type EngineCallOptions,
   type EngineQueueState,
   type JobResult,
   type JobRuntimeSummary,
@@ -86,10 +91,13 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
   type SQLWrapper,
 } from "drizzle-orm";
 
 import {
+  admissionCpuSlotsForRequest,
+  admissionCpuSlotsForSetup,
   buildPolarRequest,
   solverImplementationIdForSetup,
 } from "./build-request";
@@ -98,7 +106,7 @@ import {
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
   parsedMeshRecoveryVersion,
-  supportsArchiveCleanCycleReduction,
+  supportsCurrentArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
@@ -112,9 +120,11 @@ import {
   expectedExecutionPoolForJob,
 } from "./engine-routing";
 import { touchHeartbeat } from "./heartbeat";
+import { ordinaryWriterBlockedByMaintenanceDrain } from "./maintenance-drain";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
 import {
   type ConditionMapEntry,
+  type CanonicalIngestMutation,
   failedForPoint,
   type IngestedRansPrecalcPromotion,
   ingestResult,
@@ -125,6 +135,7 @@ import {
   claimJobForIngest,
   DEFAULT_INGEST_LEASE_MS,
   type IngestLease,
+  type IngestLeaseMutationGuard,
   IngestLeaseLostError,
   ingestLeaseOwnedWhere,
   releaseIngestLeaseToRunning,
@@ -143,10 +154,21 @@ const MISSING_JOB_REQUEUE_MS = Number(
   process.env.SWEEPER_MISSING_JOB_REQUEUE_MS ?? 10 * 60 * 1000,
 );
 type SimJobRow = typeof simJobs.$inferSelect;
-interface ReconcileOptions {
+export interface ReconcileOptions {
   jobIds?: string[];
   recoverFailedJobIds?: string[];
   skipFailedRecovery?: boolean;
+  /**
+   * A source-pinned deployment receipt may reconcile only its named engine
+   * rows while scheduler writers are stopped. This is stronger than an
+   * ordinary test `jobIds` scope: it disables global failed recovery, global
+   * queue/cancellation work, loss requeues, and campaign maintenance.
+   */
+  receiptScopedMaintenance?: ReceiptScopedMaintenanceOptions;
+  /** Persist exact RANS→URANS route/obligation state without composing or
+   * submitting a physical child. Receipt-scoped maintenance enables this
+   * automatically. */
+  recordRoutesOnly?: boolean;
   /** Deterministic crash injection for the durable-ingest regression suite.
    * Production never supplies hooks. The callback runs inside the failure
    * settlement transaction after result rows change but before campaign
@@ -154,7 +176,121 @@ interface ReconcileOptions {
    * back. */
   testHooks?: {
     afterFailedRowsMarked?: () => void | Promise<void>;
+    /** Test-only interruption after engine cancellation but before the
+     * terminal database transition. The marker must retain ownership until a
+     * later ordinary tick completes the exact clean restart. */
+    beforeLostGenerationTerminalization?: () => void | Promise<void>;
+    /** Test-only interruption after terminalization but before generation
+     * disposal/requeue. The next ordinary tick must finish the exact restart
+     * rather than stranding a cancelled job. */
+    beforeLostGenerationCleanRestart?: () => void | Promise<void>;
+    /** Test-only: swaps the durable drain after receipt preflight and before
+     * one settlement attempt. Production never supplies hooks. */
+    beforeReceiptSettlementMutation?: (
+      candidate: ReceiptScopedCandidate,
+    ) => void | Promise<void>;
+    /** Test-only receipt fence after the successful preliminary ingest
+     * renewal but before ingest's first token-locked canonical mutation. It
+     * proves that a standalone renewal cannot authorize a stale writer. */
+    beforeReceiptIngestMutation?: (
+      candidate: ReceiptScopedCandidate,
+    ) => void | Promise<void>;
+    /** Test-only receipt fence after immutable evidence staging but before
+     * canonical publication. A retired token may retain immutable history,
+     * but must not update selected points, caches, routes, or campaign state. */
+    afterReceiptEvidenceStaged?: (
+      candidate: ReceiptScopedCandidate,
+    ) => void | Promise<void>;
+    /** Test-only receipt fence before each cache/promotion/obligation write
+     * that follows ingest. This proves a retired receipt cannot hand off work
+     * after its token is replaced. */
+    beforeReceiptRouteMutation?: (
+      candidate: ReceiptScopedCandidate,
+    ) => void | Promise<void>;
   };
+}
+
+export type ReceiptSettlementAction =
+  | "ingest"
+  | "release_cancelled"
+  | "release_worker_restart_orphan";
+
+/** A deploy-watcher-authored, prevalidated terminal engine observation. The
+ * CLI verifies the full private receipt and durable drain ownership before
+ * passing these narrow candidates into reconciliation. */
+export type ReceiptScopedCandidate = {
+  jobId: string;
+  engineJobId: string;
+  databaseStatus: "running" | "ingesting";
+  engineStatus: "completed" | "failed" | "cancelled";
+  engineMessage: string | null;
+  statusSha256: string;
+  resultSha256: string;
+  settlementAction: ReceiptSettlementAction;
+};
+
+export type ReceiptScopedMaintenanceOptions = {
+  maintenanceToken: string;
+  candidates: readonly ReceiptScopedCandidate[];
+};
+
+/** The private receipt carries two independent authorities: the immutable
+ * terminal observation and the watcher-owned drain. Keep them paired all the
+ * way through an ingest claim/lease/finalization path; a preflight read alone
+ * cannot authorise a later write after another watcher swaps the token. */
+type ReceiptMaintenanceContext = {
+  candidate: ReceiptScopedCandidate;
+  maintenanceToken: string;
+};
+
+function assertReceiptScopedMaintenanceOptions(
+  options: ReconcileOptions,
+): void {
+  const receipt = options.receiptScopedMaintenance;
+  if (!receipt) return;
+  if (!options.jobIds?.length || !receipt.candidates.length) {
+    throw new Error(
+      "receipt-scoped maintenance requires one or more exact receipt candidates",
+    );
+  }
+  if (!receipt.maintenanceToken) {
+    throw new Error(
+      "receipt-scoped maintenance requires its durable drain token",
+    );
+  }
+  if (options.recoverFailedJobIds?.length) {
+    throw new Error(
+      "receipt-scoped maintenance cannot run failed-job recovery",
+    );
+  }
+  const jobIds = new Set(options.jobIds);
+  const candidateIds = receipt.candidates.map((candidate) => candidate.jobId);
+  if (
+    jobIds.size !== options.jobIds.length ||
+    new Set(candidateIds).size !== candidateIds.length ||
+    jobIds.size !== candidateIds.length ||
+    candidateIds.some((id) => !jobIds.has(id))
+  ) {
+    throw new Error(
+      "receipt-scoped maintenance job ids must exactly match unique receipt candidates",
+    );
+  }
+  for (const candidate of receipt.candidates) {
+    if (
+      (candidate.settlementAction === "ingest" &&
+        (!["completed", "failed"].includes(candidate.engineStatus) ||
+          candidate.engineMessage === WORKER_RESTART_ORPHAN_MESSAGE)) ||
+      (candidate.settlementAction === "release_cancelled" &&
+        candidate.engineStatus !== "cancelled") ||
+      (candidate.settlementAction === "release_worker_restart_orphan" &&
+        (candidate.engineStatus !== "failed" ||
+          candidate.engineMessage !== WORKER_RESTART_ORPHAN_MESSAGE))
+    ) {
+      throw new Error(
+        `receipt candidate ${candidate.jobId} has an invalid terminal settlement action`,
+      );
+    }
+  }
 }
 
 const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
@@ -310,6 +446,7 @@ async function markOwnedJobResultsFailed(
   msg: string,
   lease: Pick<IngestLease, "jobId" | "token">,
   hooks: ReconcileOptions["testHooks"] = {},
+  opts: { maintenanceToken?: string } = {},
 ): Promise<boolean> {
   // Failed evidence rows must carry WHY: without the error stamp the failures
   // endpoint classifies them 'unknown' (ERROR_CLASS_SQL treats NULL/'' as
@@ -317,12 +454,22 @@ async function markOwnedJobResultsFailed(
   // empty error). Callers guarantee msg is non-empty (nonEmptyFailureMessage).
   const outcome = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+    if (opts.maintenanceToken) {
+      await assertReceiptMaintenanceDrainLocked(tx, opts.maintenanceToken);
+    }
     const [owned] = await tx
       .update(simJobs)
       .set({
         error: msg,
       })
-      .where(ingestLeaseOwnedWhere(jobId, lease.token))
+      .where(
+        opts.maintenanceToken
+          ? and(
+              ingestLeaseOwnedWhere(jobId, lease.token),
+              receiptMaintenanceDrainWhere(opts.maintenanceToken),
+            )
+          : ingestLeaseOwnedWhere(jobId, lease.token),
+      )
       .returning({ id: simJobs.id });
     if (!owned)
       return {
@@ -465,23 +612,41 @@ async function finalizeOwnedFailedJob(
   msg: string,
   lease: Pick<IngestLease, "jobId" | "token">,
   opts: { evidenceIngested?: boolean } = {},
+  maintenanceToken?: string,
 ): Promise<boolean> {
   const now = new Date();
-  const [finished] = await db
-    .update(simJobs)
-    .set({
-      status: "failed",
-      engineState: "failed",
-      error: msg,
-      ...(opts.evidenceIngested ? { ingestedAt: now } : {}),
-      finishedAt: now,
-      ingestLeaseToken: null,
-      ingestLeaseClaimedAt: null,
-      ingestLeaseExpiresAt: null,
-    })
-    .where(ingestLeaseOwnedWhere(jobId, lease.token))
-    .returning({ id: simJobs.id });
-  return Boolean(finished);
+  const settle = async (tx: DB): Promise<boolean> => {
+    const [finished] = await tx
+      .update(simJobs)
+      .set({
+        status: "failed",
+        engineState: "failed",
+        error: msg,
+        ...(opts.evidenceIngested ? { ingestedAt: now } : {}),
+        finishedAt: now,
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeaseExpiresAt: null,
+      })
+      .where(
+        maintenanceToken
+          ? and(
+              ingestLeaseOwnedWhere(jobId, lease.token),
+              receiptMaintenanceDrainWhere(maintenanceToken),
+            )
+          : ingestLeaseOwnedWhere(jobId, lease.token),
+      )
+      .returning({ id: simJobs.id });
+    return Boolean(finished);
+  };
+  const finished = maintenanceToken
+    ? await db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as DB;
+        await assertReceiptMaintenanceDrainLocked(tx, maintenanceToken);
+        return settle(tx);
+      })
+    : await settle(db);
+  return finished;
 }
 
 function errorMessage(e: unknown): string {
@@ -587,6 +752,89 @@ function requestPayloadWithEngineAcknowledgementSql(
   return payload;
 }
 
+/** This pre-cancellation marker is a compact scheduler retry token, not
+ * evidence retention. It makes an externally successful cancellation
+ * recoverable if the following database transition is interrupted. */
+function requestPayloadWithCleanRestartPendingSql(
+  acknowledgement?: EngineRequestPayloadAcknowledgement,
+) {
+  const payload = acknowledgement
+    ? requestPayloadWithEngineAcknowledgementSql(acknowledgement)
+    : sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb)`;
+  return sql`jsonb_set(
+    ${payload},
+    '{cleanRestartPending}',
+    jsonb_build_object('requestedAt', to_jsonb(now())),
+    true
+  )`;
+}
+
+function hasCleanRestartPending(job: SimJobRow): boolean {
+  return Object.hasOwn(requestPayload(job), "cleanRestartPending");
+}
+
+/**
+ * Persist the intent before the external cancellation call. If this fails we
+ * have not touched the engine; if the engine cancellation succeeds but the
+ * later terminal DB transition fails, a following tick still knows to finish
+ * the clean restart instead of taking the generic cancelled-claim path.
+ */
+async function markCleanRestartPending(
+  db: DB,
+  job: SimJobRow,
+): Promise<boolean> {
+  const [marked] = await db
+    .update(simJobs)
+    .set({
+      requestPayload: requestPayloadWithCleanRestartPendingSql(),
+      updatedAt: new Date(),
+    })
+    .where(activeJobWhere(job.id))
+    .returning({ id: simJobs.id });
+  return Boolean(marked);
+}
+
+/** d644 terminalized a small, exact set of already-lost generations before
+ * the durable marker existed. Bootstrap only that old lost-runtime signature
+ * and only while it still owns an unpublished scheduling cell; ordinary user
+ * cancellations never enter this cleanup path. */
+const LEGACY_LOST_RUNNING_REASON_LIKE =
+  "engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, and last progress was % min ago — task lost (worker process died, was hard-killed, or restarted mid-solve)%";
+
+function legacyLostGenerationAttachmentWhere(): SQL {
+  return sql`EXISTS (
+    SELECT 1
+    FROM results legacy_result
+    WHERE legacy_result.sim_job_id = ${simJobs.id}
+      AND legacy_result.status IN ('pending', 'queued', 'running', 'failed')
+      AND legacy_result.current_result_attempt_id IS NULL
+      AND legacy_result.current_result_interpretation_id IS NULL
+      AND legacy_result.current_canonical_selection_id IS NULL
+  )`;
+}
+
+async function markCancelledCleanRestartPending(
+  db: DB,
+  job: SimJobRow,
+): Promise<boolean> {
+  const [marked] = await db
+    .update(simJobs)
+    .set({
+      requestPayload: requestPayloadWithCleanRestartPendingSql(),
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(simJobs.id, job.id),
+        eq(simJobs.status, "cancelled"),
+        eq(simJobs.engineState, "cancelled"),
+        isNull(simJobs.strippedAt),
+      ),
+    )
+    .returning({ id: simJobs.id });
+  return Boolean(marked);
+}
+
 /** Persist only an engine/worker-acknowledged strategy version. The SQL-side
  * jsonb merge preserves scheduling and any status acknowledgment written by a
  * newer poller. An absent/malformed result acknowledgment performs a read only,
@@ -597,8 +845,11 @@ async function jobWithPersistedMeshRecoveryAcknowledgement(
   rawVersion: unknown,
   rawEngine: unknown,
   lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance?: ReceiptMaintenanceContext,
 ): Promise<SimJobRow> {
-  await persistEngineRuntimeForJob(db, job.id, rawEngine);
+  await persistEngineRuntimeForJob(db, job.id, rawEngine, {
+    jobWhere: receiptLeaseOwnedWhere(lease, receiptMaintenance),
+  });
   const version = parsedExecutedMeshRecoveryVersion(rawVersion);
   const runtimeEngine = isEngineRuntimeIdentity(rawEngine) ? rawEngine : null;
   let payload = sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb)`;
@@ -623,14 +874,14 @@ async function jobWithPersistedMeshRecoveryAcknowledgement(
       ? await db
           .select({ requestPayload: simJobs.requestPayload })
           .from(simJobs)
-          .where(ingestLeaseOwnedWhere(job.id, lease.token))
+          .where(receiptLeaseOwnedWhere(lease, receiptMaintenance))
           .limit(1)
       : await db
           .update(simJobs)
           .set({
             requestPayload: payload,
           })
-          .where(ingestLeaseOwnedWhere(job.id, lease.token))
+          .where(receiptLeaseOwnedWhere(lease, receiptMaintenance))
           .returning({ requestPayload: simJobs.requestPayload });
   if (!current) throw new IngestLeaseLostError(job.id);
   return { ...job, requestPayload: current.requestPayload };
@@ -840,6 +1091,27 @@ interface VerifyJobPayload {
 const PRECALC_CONTINUATION_PERMANENT_INCIDENT_SIGNATURE =
   "precalc-continuation-permanent-v1";
 
+/** Legacy engine builds wrote typed continuation exceptions only into a failed
+ * PolarPoint attempt. Callers must additionally prove the exact same-case
+ * source authorization before treating this as a machine-readable outcome. */
+const LEGACY_CONTINUATION_PERMANENT_FAILURE =
+  /(?:^|:\s*)continuation_source_permanent:\s+\S/;
+const LEGACY_CONTINUATION_TRANSIENT_FAILURE =
+  /(?:^|:\s*)continuation_source_transient:\s+\S/;
+
+function legacyContinuationFailureKindFromExactAttemptEvidence(
+  attempt: { status: string; error: string | null } | undefined,
+): "permanent" | "transient" | null {
+  if (attempt?.status !== "failed" || !attempt.error?.trim()) return null;
+  // Permanent wins over an infrastructure disposition emitted by older
+  // run_case handling. The exact source/cell check remains at the call site.
+  if (LEGACY_CONTINUATION_PERMANENT_FAILURE.test(attempt.error))
+    return "permanent";
+  if (LEGACY_CONTINUATION_TRANSIENT_FAILURE.test(attempt.error))
+    return "transient";
+  return null;
+}
+
 function finiteOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -1019,6 +1291,9 @@ async function settleUransLadderForJob(
         continuationSource.targetSolverImplementationId &&
       continuationSource.solverImplementationId ===
         job.solverImplementationId &&
+      !(continuationSource.qualityWarnings ?? []).some(
+        isUransContinuationPhysicalCapExhausted,
+      ) &&
       (continuationSource.qualityWarnings ?? []).some(
         (warning) =>
           warning.includes(URANS_BUDGET_STOP_MARKER) ||
@@ -1186,13 +1461,15 @@ async function settleUransLadderForJob(
       WHERE q.id = ${item.id}
     `)) as unknown as Array<{ live: boolean }>;
     const continuationFailureKind = isContinuation
-      ? (opts.terminalContinuationFailureKind ?? null)
+      ? (opts.terminalContinuationFailureKind ??
+        legacyContinuationFailureKindFromExactAttemptEvidence(verified))
       : null;
     const failureDisposition =
       verified?.failureDisposition ?? opts.terminalFailureDisposition ?? null;
     const infrastructure =
-      continuationFailureKind === "transient" ||
-      failureDisposition === "infrastructure";
+      continuationFailureKind !== "permanent" &&
+      (continuationFailureKind === "transient" ||
+        failureDisposition === "infrastructure");
     const deterministic = failureDisposition === "deterministic_mesh";
     const consumesRecoveryAttempt = Boolean(
       !infrastructure &&
@@ -1229,6 +1506,9 @@ async function settleUransLadderForJob(
     const restartable = Boolean(
       verified?.engineJobId &&
       verified.engineCaseSlug &&
+      !(verified.qualityWarnings ?? []).some(
+        isUransContinuationPhysicalCapExhausted,
+      ) &&
       (verified.qualityWarnings ?? []).some(
         (warning) =>
           warning.includes(URANS_BUDGET_STOP_MARKER) ||
@@ -1262,6 +1542,11 @@ async function settleUransLadderForJob(
     } else if (mediaOnly && verified) {
       state = "pending";
       lastOutcome = FINAL_URANS_OUTCOMES.mediaRepairPending;
+    } else if (continuationFailureKind === "permanent") {
+      // Never let a legacy generic-infrastructure disposition restart an
+      // unchanged exact source that has already declared itself permanent.
+      state = "blocked";
+      lastOutcome = FINAL_URANS_OUTCOMES.continuationPermanentFailure;
     } else if (infrastructure) {
       state = "pending";
       lastOutcome = isContinuation
@@ -1271,12 +1556,6 @@ async function settleUransLadderForJob(
     } else if (deterministic) {
       state = "blocked";
       lastOutcome = FINAL_URANS_OUTCOMES.deterministicFailure;
-    } else if (continuationFailureKind === "permanent") {
-      // The exact saved trajectory is part of final-result provenance. A
-      // permanently missing source is therefore a critical evidence-loss
-      // incident, not permission to silently substitute a fresh trajectory.
-      state = "blocked";
-      lastOutcome = FINAL_URANS_OUTCOMES.continuationPermanentFailure;
     } else if (restartable && !continuationNoProgressExhausted) {
       state = "pending";
       lastOutcome = FINAL_URANS_OUTCOMES.continuationPending;
@@ -1372,6 +1651,14 @@ async function settleUransLadderForJob(
           continuationAttemptCount,
           continuationProgressed,
           continuationNoProgressCount: observedContinuationNoProgressCount,
+          ...(continuationFailureKind === "permanent"
+            ? {
+                // A source-pinned continuation is terminal only for this
+                // physical cell; do not fence unrelated fleet admission.
+                admissionScope: SOLVER_INCIDENT_ADMISSION_SCOPES.cell,
+                recoveryDisposition: CONTINUATION_SOURCE_PERMANENT,
+              }
+            : {}),
         },
       });
     }
@@ -1462,9 +1749,18 @@ async function cancelJobAndReleaseClaims(
   msg: string,
   lease?: Pick<IngestLease, "jobId" | "token">,
   acknowledgement?: EngineRequestPayloadAcknowledgement,
+  receiptMaintenanceToken?: string,
+  opts: { deferClaimReleaseForCleanRestart?: boolean } = {},
 ): Promise<boolean> {
-  const settlement = await db.transaction(async (rawTx) => {
+  const campaignIds = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+    // The predicate on the terminal job UPDATE alone is not sufficient: the
+    // dependent claim-release and precalc-obligation writes must share the
+    // same locked drain generation. Otherwise a replacement drain can race
+    // between the UPDATE and those follow-up writes.
+    if (receiptMaintenanceToken) {
+      await assertReceiptMaintenanceDrainLocked(tx, receiptMaintenanceToken);
+    }
     const [stopped] = await tx
       .update(simJobs)
       .set({
@@ -1472,25 +1768,49 @@ async function cancelJobAndReleaseClaims(
         engineState: "cancelled",
         error: msg,
         finishedAt: new Date(),
-        ...(acknowledgement
+        ...(opts.deferClaimReleaseForCleanRestart
           ? {
+              // The caller only reaches this branch after the exact engine
+              // cancellation returned successfully. Keep the claims attached
+              // until the clean-restart transaction has atomically discarded
+              // the unpublished generation and reopened its physical cells.
               requestPayload:
-                requestPayloadWithEngineAcknowledgementSql(acknowledgement),
+                requestPayloadWithCleanRestartPendingSql(acknowledgement),
             }
-          : {}),
+          : acknowledgement
+            ? {
+                requestPayload:
+                  requestPayloadWithEngineAcknowledgementSql(acknowledgement),
+              }
+            : {}),
         ingestLeaseToken: null,
         ingestLeaseClaimedAt: null,
         ingestLeaseExpiresAt: null,
       })
       .where(
-        lease
-          ? ingestLeaseOwnedWhere(job.id, lease.token)
-          : reconcilableJobWhere(job.id),
+        receiptMaintenanceToken
+          ? and(
+              lease
+                ? ingestLeaseOwnedWhere(job.id, lease.token)
+                : reconcilableJobWhere(job.id),
+              receiptMaintenanceDrainWhere(receiptMaintenanceToken),
+            )
+          : lease
+            ? ingestLeaseOwnedWhere(job.id, lease.token)
+            : reconcilableJobWhere(job.id),
       )
       .returning({ id: simJobs.id, requestPayload: simJobs.requestPayload });
     if (!stopped) return null;
-    await releaseResultClaimsForJob(tx, job.id, ["queued", "running"]);
-    return settlePrecalcObligationsForJobInTransaction(
+    if (!opts.deferClaimReleaseForCleanRestart) {
+      await releaseResultClaimsForJob(tx, job.id, ["queued", "running"]);
+    } else {
+      // Keep both result ownership and PRECALC obligation ownership fenced
+      // until the clean-restart reducer removes the old generation. Settling
+      // an obligation here would let another wave-2 child start in the gap
+      // between this transaction and generation cleanup.
+      return [];
+    }
+    const settlement = await settlePrecalcObligationsForJobInTransaction(
       tx,
       { ...job, requestPayload: stopped.requestPayload },
       {
@@ -1498,10 +1818,31 @@ async function cancelJobAndReleaseClaims(
         cancellation: "transient",
       },
     );
+    return settlement.campaignIds;
   });
-  if (!settlement) return false;
-  await refreshPrecalcSettlementCampaigns(db, settlement.campaignIds);
+  if (!campaignIds) return false;
+  // Receipt reconciliation settles only the exact terminal row and its
+  // directly-owned obligations. The post-commit campaign refresh is ordinary
+  // workflow maintenance (and can enqueue later handoffs), so defer it to the
+  // first normal tick after the drain has been deliberately released.
+  if (!receiptMaintenanceToken && campaignIds.length) {
+    await refreshPrecalcSettlementCampaigns(db, campaignIds);
+  }
   return true;
+}
+
+/** SQL predicate is attached to receipt-owned terminal writes so a writer
+ * restart or token replacement between a preflight read and the actual UPDATE
+ * cannot settle an old receipt candidate. */
+function receiptMaintenanceDrainWhere(maintenanceToken: string): SQL {
+  return sql`EXISTS (
+    SELECT 1 FROM ${sweeperState} AS receipt_drain
+    WHERE receipt_drain.id = 1
+      AND receipt_drain.enabled = false
+      AND receipt_drain.admission_fence_active = false
+      AND receipt_drain.maintenance_drain_token = ${maintenanceToken}::uuid
+      AND receipt_drain.maintenance_drain_started_at IS NOT NULL
+  )`;
 }
 
 /** Zombie auto-recovery (G3, incident 2026-07-05): 4 in-flight celery tasks
@@ -1512,15 +1853,18 @@ async function cancelJobAndReleaseClaims(
  *    - the runtime probe finds ZERO OpenFOAM processes,
  *    - the worker runtime heartbeat is stale/absent (a live celery task
  *      refreshes it even while waiting for CPU tokens),
- *    - Celery does not list the task (queue evidence required — a null queue
- *      probe never condemns a job), and
  *    - last progress is older than the grace below.
+ *
+ * Celery inspection is deliberately not part of this decision. Its gateway
+ * cache may be stale or its refresh may be in progress while the runtime
+ * status, process census, heartbeat, and progress timestamp still provide
+ * exact evidence that no worker owns the solve. A listed task is likewise not
+ * sufficient to override those direct runtime facts: stale inspector entries
+ * can outlive a killed pool child.
  *  Returns the loud reason string, or null when the job must be left alone. */
 function classifyLostRunning(
-  job: SimJobRow,
   status: JobStatus,
   runtime: JobRuntimeSummary | null,
-  queue: EngineQueueState | null,
   now = Date.now(),
 ): string | null {
   if (status.state !== "running") return null;
@@ -1530,16 +1874,6 @@ function classifyLostRunning(
     Number.isFinite(Number(runtime.runtime_heartbeat_age_sec)) &&
     Number(runtime.runtime_heartbeat_age_sec) <= 120;
   if (heartbeatAlive) return null;
-  if (
-    !queue ||
-    queue.queue_observation_state !== "fresh" ||
-    typeof queue.queue_observed_at !== "string" ||
-    !queue.queue_observed_at ||
-    queue.queue_observation_error != null ||
-    engineQueueListsJob(queue, job.engineJobId)
-  ) {
-    return null;
-  }
   const lastProgress =
     parseEngineDate(status.last_progress_at) ??
     parseEngineDate(status.started_at) ??
@@ -1548,12 +1882,12 @@ function classifyLostRunning(
   const quietMs = now - lastProgress.getTime();
   if (quietMs < LOST_RUNNING_GRACE_MS) return null;
   return (
-    `engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, Celery does not list the task, ` +
+    `engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, ` +
     // Honest cause set: this shape now also covers the engine's celery hard
     // time-limit kill (task_time_limit, 2026-07-07), where the pool child is
     // SIGKILLed without any worker restart — so the message must not assert a
     // restart it cannot prove.
-    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker process died, was hard-killed, or restarted mid-solve); cancelled and requeued`
+    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker process died, was hard-killed, or restarted mid-solve)`
   );
 }
 
@@ -1563,8 +1897,7 @@ function classifyLostRunning(
  *  (meshing + a URANS march can legitimately run 20+ min) shows no progress
  *  while perfectly healthy. 30 min comfortably exceeds those quiet gaps, and
  *  process liveness is the primary signal anyway: the lost path additionally
- *  requires process_count == 0, a stale worker heartbeat, and absence from
- *  Celery — a healthy quiet case fails all three of those guards. */
+ *  requires process_count == 0 and a stale worker heartbeat. */
 const LOST_RUNNING_GRACE_MS = Number(
   process.env.SWEEPER_LOST_RUNNING_GRACE_MS ?? 30 * 60 * 1000,
 );
@@ -1844,7 +2177,7 @@ async function composeWave2Child(
 
 /** Durable ownerless row shape for a wave-2 obligation.
  *
- * - a failed precalc retry carries its one-shot marker; or
+ * - a failed precalc generation carries its last-clean-restart marker; or
  * - a RANS result has a stored rejected/needs_urans verdict that caused the
  *   ladder escalation.
  *
@@ -2086,8 +2419,17 @@ export async function submitUransRetryForJob(
      * its independent configured budget even when the local scheduler is
      * intentionally disabled. */
     cpuSlots?: number;
+    /** Receipt-only fence checked immediately before each route/cache write.
+     * Ordinary scheduler work leaves this undefined and pays no extra probe. */
+    beforeMutation?: () => Promise<void>;
+    /** Remote high-capacity admission remeasures storage after the exact
+     * candidate is reserved but before it reaches the engine. */
+    storageAdmissionAllowed?: () => Promise<boolean>;
   } = {},
-): Promise<void> {
+): Promise<"storage_admission_hold" | void> {
+  const guardBeforeMutation = async (): Promise<void> => {
+    if (opts.beforeMutation) await opts.beforeMutation();
+  };
   if (parent.wave !== 1 || parent.bcIds.length === 0) return;
   const recordedPromotions = await inspectParentRansPolarPromotions(db, {
     parentJobId: parent.id,
@@ -2199,7 +2541,7 @@ export async function submitUransRetryForJob(
   if (conditionMap) {
     // Batched campaign parent: the retry plan is computed PER conditionMap
     // entry and each retrying condition gets its own single-revision child.
-    await submitCampaignUransRetries(
+    return submitCampaignUransRetries(
       db,
       engine,
       parent,
@@ -2212,7 +2554,6 @@ export async function submitUransRetryForJob(
         archiveReductionVersion,
       },
     );
-    return;
   }
   const revisionId = parent.simulationPresetRevisionId;
   if (!revisionId) return;
@@ -2240,6 +2581,7 @@ export async function submitUransRetryForJob(
     .limit(1);
   if (existing) return;
 
+  await guardBeforeMutation();
   await refreshPolarCacheForRevision(db, parent.airfoilId, revisionId);
   // Retry scoping is exact-attempt/job-local. Only a typed hard RANS rejection
   // in 0..5° may widen a continuous request to its pinned full polar.
@@ -2298,6 +2640,7 @@ export async function submitUransRetryForJob(
       triggerAoaDeg == null
     )
       return;
+    await guardBeforeMutation();
     const recorded = await recordRansPolarPromotion(db, {
       parentJobId: parent.id,
       ingestLeaseToken: opts.ingestLeaseToken,
@@ -2338,6 +2681,7 @@ export async function submitUransRetryForJob(
   if (!a || !setup) return;
   const bcId =
     setup.snapshot.preset.legacyBoundaryConditionId ?? parent.bcIds[0];
+  await guardBeforeMutation();
   const obligations = await ensurePrecalcObligations(
     db,
     retry.aoas.map((aoaDeg) => ({
@@ -2353,7 +2697,8 @@ export async function submitUransRetryForJob(
   );
   if (opts.recordRoutesOnly) return;
   if (campaignGated) return;
-  if (!supportsArchiveCleanCycleReduction(archiveReductionVersion)) return;
+  if (!supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion))
+    return;
   const continuations = await precalcContinuationsForObligations(
     db,
     obligations
@@ -2407,13 +2752,19 @@ export async function submitUransRetryForJob(
     );
     return;
   }
+  // Remote CPU budget is a node-wide aggregate cap. The request itself must
+  // carry this immutable setup's actual process/concurrency weight, matching
+  // mirrored remote RANS rather than reserving the entire node per FAST child.
+  const executionCpuSlots = remoteProvenance
+    ? admissionCpuSlotsForSetup(setup.snapshot)
+    : (opts.cpuSlots ?? capacity?.cpuSlots ?? 0);
   const { request, speed } = buildPolarRequest({
     airfoil: a,
     setup: setup.snapshot,
     aoaList: aoas,
     wave: 2,
     uransFidelity: "precalc",
-    cpuSlots: opts.cpuSlots ?? capacity?.cpuSlots ?? 0,
+    cpuSlots: executionCpuSlots,
   });
   request.expected_execution_pool = executionPool.routingKey;
   request.expected_mesh_recovery_version = effectiveMeshRecoveryVersion;
@@ -2424,6 +2775,10 @@ export async function submitUransRetryForJob(
       case_slug: continuation.engineCaseSlug,
     };
     request.budget_override_s = continuation.budgetOverrideS;
+    if (continuation.cleanCycleRecoveryPolicyVersion != null) {
+      request.clean_cycle_recovery_policy_version =
+        continuation.cleanCycleRecoveryPolicyVersion;
+    }
   }
   const job = await composeWave2Child(db, {
     parentJobId: parent.id,
@@ -2445,6 +2800,7 @@ export async function submitUransRetryForJob(
       referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
       wave: 2,
       status: "pending",
+      admissionCpuSlots: admissionCpuSlotsForRequest(request),
       totalCases: aoas.length,
       requestPayload: {
         ...(remoteProvenance ?? {}),
@@ -2467,6 +2823,9 @@ export async function submitUransRetryForJob(
               uransRecoveryVersion,
             }
           : {}),
+        cleanCycleRecoveryPolicyVersion: continuation
+          ? continuation.cleanCycleRecoveryPolicyVersion
+          : "adaptive-clean-tail-v2",
         uransFidelity: "precalc",
         meshRecoveryVersion: effectiveMeshRecoveryVersion,
         retryMode: retry.retryMode,
@@ -2492,6 +2851,10 @@ export async function submitUransRetryForJob(
     connectionErrorPrefix: "engine unreachable at URANS submit: ",
     submitErrorPrefix: "URANS submit failed: ",
     precalcObligationIds: obligationIds,
+    admissionLane: remoteProvenance ? "remote" : undefined,
+    ...(opts.storageAdmissionAllowed
+      ? { storageAdmissionAllowed: opts.storageAdmissionAllowed }
+      : {}),
   });
   if (submit.kind === "submitted") {
     await recordPrecalcObligationSubmission(db, job.id, obligationIds);
@@ -2520,6 +2883,12 @@ export async function submitUransRetryForJob(
   if (submit.kind === "connection_failure") {
     await recordEngineUnreachable(db);
     return;
+  }
+  if (submit.kind === "storage_admission_hold") {
+    console.log(
+      `[sweeper] URANS retry deferred by exact-candidate storage admission (sim_job ${job.id}, parent ${parent.id}): ${submit.error}`,
+    );
+    return "storage_admission_hold";
   }
   if (submit.kind === "lifecycle_stopped") {
     console.log(
@@ -2555,8 +2924,13 @@ async function submitCampaignUransRetries(
     uransRecoveryVersion?: number | null;
     archiveReductionVersion?: number | null;
     sourceResultAttemptIds?: string[];
+    beforeMutation?: () => Promise<void>;
+    storageAdmissionAllowed?: () => Promise<boolean>;
   },
-): Promise<void> {
+): Promise<"storage_admission_hold" | void> {
+  const guardBeforeMutation = async (): Promise<void> => {
+    if (opts.beforeMutation) await opts.beforeMutation();
+  };
   const parentPayload = requestPayload(parent);
   const remotePromiseHint =
     typeof (parentPayload as { syncPromiseId?: unknown }).syncPromiseId ===
@@ -2617,6 +2991,7 @@ async function submitCampaignUransRetries(
     // Invariant: no code path may run >30 s without a heartbeat touch. Each
     // retrying condition does a cache refresh + retry plan + engine submit.
     await touchHeartbeat(db);
+    await guardBeforeMutation();
     await refreshPolarCacheForRevision(db, parent.airfoilId, entry.revisionId);
     const plannedRetry = await ransRetryPlanForJobScoped(db, {
       parentJobId: parent.id,
@@ -2667,6 +3042,7 @@ async function submitCampaignUransRetries(
         triggerAoaDeg == null
       )
         continue;
+      await guardBeforeMutation();
       const recorded = await recordRansPolarPromotion(db, {
         parentJobId: parent.id,
         ingestLeaseToken: opts.ingestLeaseToken,
@@ -2693,6 +3069,7 @@ async function submitCampaignUransRetries(
       }
       continue;
     }
+    await guardBeforeMutation();
     const obligations = await ensurePrecalcObligations(
       db,
       retry.aoas.map((aoaDeg) => ({
@@ -2710,7 +3087,9 @@ async function submitCampaignUransRetries(
     );
     if (opts.recordRoutesOnly) continue;
     if (campaignGated) continue;
-    if (!supportsArchiveCleanCycleReduction(opts.archiveReductionVersion))
+    if (
+      !supportsCurrentArchiveCleanCycleReduction(opts.archiveReductionVersion)
+    )
       continue;
     const continuations = await precalcContinuationsForObligations(
       db,
@@ -2777,6 +3156,10 @@ async function submitCampaignUransRetries(
         case_slug: continuation.engineCaseSlug,
       };
       request.budget_override_s = continuation.budgetOverrideS;
+      if (continuation.cleanCycleRecoveryPolicyVersion != null) {
+        request.clean_cycle_recovery_policy_version =
+          continuation.cleanCycleRecoveryPolicyVersion;
+      }
     }
     const job = await composeWave2Child(db, {
       parentJobId: parent.id,
@@ -2819,6 +3202,9 @@ async function submitCampaignUransRetries(
                 uransRecoveryVersion: opts.uransRecoveryVersion,
               }
             : {}),
+          cleanCycleRecoveryPolicyVersion: continuation
+            ? continuation.cleanCycleRecoveryPolicyVersion
+            : "adaptive-clean-tail-v2",
           uransFidelity: "precalc",
           meshRecoveryVersion: opts.meshRecoveryVersion ?? 0,
           retryMode: retry.retryMode,
@@ -2841,6 +3227,9 @@ async function submitCampaignUransRetries(
       connectionErrorPrefix: "engine unreachable at URANS submit: ",
       submitErrorPrefix: "URANS submit failed: ",
       precalcObligationIds: obligationIds,
+      ...(opts.storageAdmissionAllowed
+        ? { storageAdmissionAllowed: opts.storageAdmissionAllowed }
+        : {}),
     });
     if (submit.kind === "submitted") {
       await recordPrecalcObligationSubmission(db, job.id, obligationIds);
@@ -2873,6 +3262,12 @@ async function submitCampaignUransRetries(
     if (submit.kind === "connection_failure") {
       await recordEngineUnreachable(db);
       return;
+    }
+    if (submit.kind === "storage_admission_hold") {
+      console.log(
+        `[sweeper] URANS retry deferred by exact-candidate storage admission (sim_job ${job.id}, parent ${parent.id}, condition ${entry.conditionId}): ${submit.error}`,
+      );
+      return "storage_admission_hold";
     }
     if (submit.kind === "lifecycle_stopped") {
       console.log(
@@ -2977,10 +3372,11 @@ export async function settleCampaignAfterRefresh(
   }
 }
 
-/** Auto-retry-once (amendment B): requeue this job's unmarked crash-class
- *  failed rows exactly once and log every terminal direction loudly — retry,
- *  output-only media repair deferral, deterministic mesh-QA suppression, and
- *  exhausted escalation. Runs AFTER
+/** Clean-restart failed rows for this job and log every terminal direction
+ *  loudly — fresh generation, output-only media repair deferral, deterministic
+ *  mesh-QA suppression, and typed continuation blocking. An unexplained
+ *  failure is not capped: its exact failed generation is discarded before the
+ *  cell returns to scheduling. Runs AFTER
  *  every polar-cache refresh of the terminal ingest path (flipping a row to
  *  pending before a refresh would overwrite its stored at-ingest
  *  classification — prod row 741db07a) and AFTER the wave-2 retry submit
@@ -2989,18 +3385,28 @@ export async function settleCampaignAfterRefresh(
  *  bookkeeping hiccup must not fail an already-ingested job. */
 async function autoRetryFailedPointsForJob(
   db: DB,
+  engine: EngineClient,
   job: SimJobRow,
-): Promise<void> {
+  opts: {
+    lostRunningGeneration?: { error: string };
+    beforeCleanRestart?: () => void | Promise<void>;
+    afterGenerationDetached?: (tx: DB) => Promise<void>;
+  } = {},
+): Promise<boolean> {
   try {
-    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+    await opts.beforeCleanRestart?.();
+    const outcome = await autoRetryCrashedResultsForJob(db, job.id, {
+      lostRunningGeneration: opts.lostRunningGeneration,
+      afterGenerationDetached: opts.afterGenerationDetached,
+    });
     for (const cell of outcome.retried) {
       console.error(
-        `[sweeper] AUTO-RETRY: crash-class failed point requeued ONCE (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — a second crash remains failed and blocked`,
+        `[sweeper] CLEAN RESTART: discarded crash-class failed generation and requeued its cell (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"}`,
       );
     }
     for (const cell of outcome.precalcRouted) {
       console.error(
-        `[sweeper] AUTO-RETRY: precalc crash routed ONCE to the wave-2 ladder (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — queued for another forced-transient precalc child; never downgraded to a wave-1 campaign gap`,
+        `[sweeper] CLEAN RESTART: discarded failed precalc generation and routed its cell to the wave-2 ladder (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — queued for another forced-transient precalc child; never downgraded to a wave-1 campaign gap`,
       );
     }
     for (const cell of outcome.mediaRepairDeferred) {
@@ -3010,56 +3416,548 @@ async function autoRetryFailedPointsForJob(
     }
     for (const cell of outcome.suppressed) {
       console.error(
-        `[sweeper] AUTO-RETRY SUPPRESSED: deterministic mesh QA blocker on immutable solver setup (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — unchanged retry would reproduce the same mesh; evidence retained, point stays blocked until automatic mesh recovery or a setup correction is available`,
+        `[sweeper] CLEAN RESTART SUPPRESSED: deterministic mesh QA blocker on immutable solver setup (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — unchanged retry would reproduce the same mesh; point stays on the typed mesh-repair/block path`,
       );
     }
     for (const cell of outcome.terminalBlocked) {
       console.error(
-        `[sweeper] PRECALC RETRY BLOCKED: no authorized retry remains (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — evidence retained as failed; cancelled owners are not reopened and bounded continuations are not repeated`,
+        `[sweeper] CLEAN RESTART DEFERRED: no live fresh owner can restart this typed PRECALC failure (result ${cell.resultId}, airfoil ${cell.airfoilId}, revision ${cell.revisionId ?? "-"}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — cancelled owners are not reopened and bounded continuations are not repeated`,
       );
     }
-    for (const cell of outcome.escalated) {
-      console.error(
-        `[sweeper] AUTO-RETRY EXHAUSTED: point failed again after its automatic retry (result ${cell.resultId}, airfoil ${cell.airfoilId}, aoa ${cell.aoaDeg}, sim_job ${job.id}, engine ${job.engineJobId ?? "-"}): ${cell.error ?? "no error text"} — stays failed and blocked; no human coefficient review is assigned`,
+    if (outcome.discardedFailedAttemptCount > 0) {
+      console.log(
+        `[sweeper] CLEAN RESTART: discarded ${outcome.discardedFailedAttemptCount} failed attempt generation(s) from sim_job ${job.id}`,
       );
     }
+    await deleteDetachedCleanRestartGeneration(db, engine, job);
+    return true;
   } catch (e) {
     console.error(
       `[sweeper] auto-retry pass FAILED (sim_job ${job.id}): ${errorMessage(e)}`,
     );
+    return false;
   }
+}
+
+/**
+ * Once the clean-restart transaction has detached every result and attempt
+ * from a terminal database generation whose engine itself is failed/cancelled,
+ * its directory is
+ * disposable. This lives next to reconciliation rather than retention so a
+ * failed solve cannot hold disk space until an unrelated periodic maintenance
+ * pass. A database row may lag the engine, so check both states: this helper
+ * must never delete a submitted/running/partial-ingest job merely because one
+ * of its points was returned to scheduling. A 404 means a concurrent cleanup
+ * already achieved the desired state.
+ */
+async function deleteDetachedCleanRestartGeneration(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+): Promise<void> {
+  if (!job.engineJobId) return;
+  const candidates = (await db.execute(sql`
+    SELECT terminal_job.id, terminal_job.engine_job_id
+    FROM sim_jobs terminal_job
+    WHERE terminal_job.id = ${job.id}
+      AND terminal_job.engine_job_id = ${job.engineJobId}
+      -- done means terminal ingestion settled, not necessarily a successful
+      -- engine outcome. The engine-state gate below admits it only when the
+      -- engine reports failed/cancelled; a completed job with intentionally
+      -- unmaterialized siblings remains intact.
+      AND terminal_job.status IN ('done', 'failed', 'cancelled')
+      AND terminal_job.stripped_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM results result
+        WHERE result.sim_job_id = terminal_job.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM result_attempts attempt
+        WHERE attempt.sim_job_id = terminal_job.id
+      )
+  `)) as unknown as Array<{ id: string; engine_job_id: string }>;
+  const candidate = candidates[0];
+  if (!candidate) return;
+
+  try {
+    const engineStatus = await engine.getJob(candidate.engine_job_id);
+    if (engineStatus.state !== "failed" && engineStatus.state !== "cancelled") {
+      console.warn(
+        `[sweeper] CLEAN RESTART: refusing detached engine deletion for ${candidate.engine_job_id}; engine still reports ${engineStatus.state}`,
+      );
+      return;
+    }
+  } catch (error) {
+    // An unavailable status endpoint is not proof that the engine has stopped.
+    // Defer cleanup to the next terminal reconciliation rather than risking a
+    // live solver directory.  The actual delete still treats 404 as idempotent.
+    console.warn(
+      `[sweeper] CLEAN RESTART: deferred detached engine deletion for ${candidate.engine_job_id}; terminal engine status could not be confirmed: ${errorMessage(error)}`,
+    );
+    return;
+  }
+
+  let bytesFreed = 0;
+  try {
+    const deleted = await engine.deleteJob(candidate.engine_job_id);
+    bytesFreed = deleted.bytes_freed;
+  } catch (error) {
+    if (!(error instanceof EngineError && error.status === 404)) {
+      console.warn(
+        `[sweeper] CLEAN RESTART: failed to delete detached engine job ${candidate.engine_job_id}: ${errorMessage(error)}`,
+      );
+      return;
+    }
+  }
+
+  const updated = await db
+    .update(simJobs)
+    .set({
+      strippedAt: new Date(),
+      stripReport: {
+        bytes_freed: bytesFreed,
+        note: "discarded failed generation after clean restart",
+      },
+    })
+    .where(
+      and(
+        eq(simJobs.id, candidate.id),
+        isNull(simJobs.strippedAt),
+        sql`NOT EXISTS (
+          SELECT 1 FROM results result
+          WHERE result.sim_job_id = ${simJobs.id}
+        )`,
+        sql`NOT EXISTS (
+          SELECT 1 FROM result_attempts attempt
+          WHERE attempt.sim_job_id = ${simJobs.id}
+        )`,
+      ),
+    )
+    .returning({ id: simJobs.id });
+  if (updated.length) {
+    console.log(
+      `[sweeper] CLEAN RESTART: deleted detached engine generation ${candidate.engine_job_id}, freed ${bytesFreed} bytes`,
+    );
+  }
+}
+
+/** Fresh runtime truth, not the queue-display cache, gates the only point at
+ * which a cancelled engine generation can lose its database ownership. */
+async function directRuntimeIsStopped(
+  engine: EngineClient,
+  engineJobId: string,
+): Promise<boolean> {
+  try {
+    const response = await engine.getJobRuntimes([engineJobId]);
+    const runtime = response.jobs.find((entry) => entry.job_id === engineJobId);
+    if (!runtime) return false;
+    // Treat a missing case directory as an idempotently stopped generation
+    // only when the same direct probe also reports no live child. An
+    // internally inconsistent `exists=false, process_count>0` response is not
+    // permission to release ownership or delete anything.
+    if (!runtime.exists) return runtime.process_count === 0;
+    return (
+      Number.isFinite(runtime.process_count) && runtime.process_count === 0
+    );
+  } catch (error) {
+    console.warn(
+      `[sweeper] CLEAN RESTART: deferred ${engineJobId}; direct runtime probe failed: ${errorMessage(error)}`,
+    );
+    return false;
+  }
+}
+
+async function settlePendingCleanRestart(
+  db: DB,
+  job: SimJobRow,
+): Promise<boolean> {
+  const settlement = await settleCleanRestartPendingMarker(db, job.id);
+  if (settlement === "stripped" || settlement === "protected_evidence") {
+    console.log(
+      `[sweeper] CLEAN RESTART: settled pending recovery for sim_job ${job.id} (${settlement})`,
+    );
+    return true;
+  }
+  // No unprotected attachment may be released until the engine directory
+  // deletion is durable. This intentionally retries an unavailable engine
+  // rather than treating a successful database route as a complete clean
+  // restart.
+  console.warn(
+    `[sweeper] CLEAN RESTART: pending recovery for sim_job ${job.id} awaits engine cleanup or protected-evidence settlement`,
+  );
+  return false;
+}
+
+/** Dispose/reopen the exact stopped generation and settle its PRECALC
+ * obligation in the same database transaction. Until that commit the old
+ * result/attempt graph and obligation both remain fenced; after it, both are
+ * released together for one clean replacement. */
+async function cleanRestartCancelledGeneration(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+  error: string,
+  beforeCleanRestart?: () => void | Promise<void>,
+): Promise<boolean> {
+  let campaignIds: string[] = [];
+  const cleaned = await autoRetryFailedPointsForJob(db, engine, job, {
+    lostRunningGeneration: { error },
+    beforeCleanRestart,
+    afterGenerationDetached: async (tx) => {
+      const settlement = await settlePrecalcObligationsForJobInTransaction(
+        tx,
+        job,
+        { terminalError: error, cancellation: "transient" },
+      );
+      campaignIds = settlement.campaignIds;
+    },
+  });
+  if (!cleaned) return false;
+  if (campaignIds.length) {
+    await refreshPrecalcSettlementCampaigns(db, campaignIds);
+  }
+  return settlePendingCleanRestart(db, job);
+}
+
+/** Finish the database half of a lost-runtime recovery only after both the
+ * cancellation acknowledgement and a fresh zero-process runtime probe. */
+async function finishLostGenerationCleanRestart(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+  error: string,
+  beforeTerminalization?: () => void | Promise<void>,
+  beforeCleanRestart?: () => void | Promise<void>,
+): Promise<boolean> {
+  if (!job.engineJobId) return false;
+  if (!(await directRuntimeIsStopped(engine, job.engineJobId))) {
+    console.warn(
+      `[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): cancellation acknowledged but runtime still has a process or cannot be read; claims remain owned`,
+    );
+    return false;
+  }
+  try {
+    await beforeTerminalization?.();
+    if (
+      !(await cancelJobAndReleaseClaims(
+        db,
+        job,
+        error,
+        undefined,
+        undefined,
+        undefined,
+        { deferClaimReleaseForCleanRestart: true },
+      ))
+    ) {
+      return false;
+    }
+  } catch (terminalizationError) {
+    console.error(
+      `[sweeper] CLEAN RESTART: terminal database transition failed for sim_job ${job.id}; retry marker remains: ${errorMessage(terminalizationError)}`,
+    );
+    return false;
+  }
+  return cleanRestartCancelledGeneration(
+    db,
+    engine,
+    job,
+    error,
+    beforeCleanRestart,
+  );
 }
 
 async function renewIngestAndHeartbeat(
   db: DB,
   lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance?: ReceiptMaintenanceContext,
 ): Promise<void> {
+  // A receipt-mode heartbeat is still a database mutation of the durable
+  // sweeper state.  Keep its lease renewal and liveness stamp under the same
+  // row lock as canonical work so it can never update a replacement drain
+  // after its standalone preflight succeeded.  Ordinary ingest keeps the
+  // original one-statement lease renewal / heartbeat path.
+  if (receiptMaintenance) {
+    await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await renewReceiptIngestAndHeartbeatLocked(tx, lease, receiptMaintenance);
+    });
+    return;
+  }
   await renewIngestLeaseOrThrow(db, lease);
   await touchHeartbeat(db);
+}
+
+/**
+ * Receipt-cache refreshes can run inside the canonical mutation transaction.
+ * Do not call the public renewal helper from that callback: with the postgres
+ * driver it would open a nested savepoint, and with other Drizzle adapters a
+ * transaction client need not expose nested transactions at all.  The caller
+ * already owns the exact sweeper-state lock; retain the token recheck and
+ * lease predicate, but issue the heartbeat on that same transaction client.
+ */
+async function renewReceiptIngestAndHeartbeatLocked(
+  tx: DB,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance: ReceiptMaintenanceContext,
+): Promise<void> {
+  try {
+    await assertReceiptMaintenanceDrainLocked(
+      tx,
+      receiptMaintenance.maintenanceToken,
+    );
+  } catch {
+    throw new IngestLeaseLostError(lease.jobId);
+  }
+  await renewIngestLeaseOrThrow(
+    tx,
+    lease,
+    receiptMaintenanceGuard(receiptMaintenance),
+  );
+  await touchHeartbeat(tx);
+}
+
+/**
+ * A receipt lease renewal is only a preliminary liveness probe.  Do not use
+ * it as the authority for a later canonical write: another watcher may retire
+ * or replace the drain after that UPDATE commits.  Receipt-owned canonical
+ * work instead enters this short transaction, locks the one durable
+ * sweeper-state row, rechecks the exact token, renews the ingest lease, and
+ * performs the mutation before releasing the lock.
+ *
+ * Immutable evidence staging remains deliberately outside this executor.  A
+ * retired receipt may retain truthful attempt history, but cannot create a
+ * result shell, publish it, refresh a cache, link campaign state, or settle
+ * the terminal job.
+ */
+async function runReceiptCanonicalMutation<T>(
+  db: DB,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance: ReceiptMaintenanceContext | undefined,
+  mutation: (tx: DB) => Promise<T>,
+): Promise<T> {
+  if (!receiptMaintenance) return mutation(db);
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    try {
+      await assertReceiptMaintenanceDrainLocked(
+        tx,
+        receiptMaintenance.maintenanceToken,
+      );
+    } catch {
+      // The receipt path exposes the same ownership-loss signal as the
+      // existing lease-protected writes.  Callers already treat this as a
+      // stale writer and must not make a compensating canonical write.
+      throw new IngestLeaseLostError(lease.jobId);
+    }
+    await renewIngestLeaseOrThrow(
+      tx,
+      lease,
+      receiptMaintenanceGuard(receiptMaintenance),
+    );
+    await touchHeartbeat(tx);
+    return mutation(tx);
+  });
+}
+
+function receiptCanonicalMutationExecutor(
+  db: DB,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance?: ReceiptMaintenanceContext,
+): CanonicalIngestMutation | undefined {
+  if (!receiptMaintenance) return undefined;
+  return (mutation) =>
+    runReceiptCanonicalMutation(db, lease, receiptMaintenance, mutation);
+}
+
+/** Receipt follow-on work is record-only, but still changes canonical cache
+ * and obligation rows.  Run every such unit under the same token-locked
+ * transaction rather than trusting a prior standalone renewal. */
+async function runReceiptFollowOnMutation<T>(
+  db: DB,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance: ReceiptMaintenanceContext | undefined,
+  hooks: ReconcileOptions["testHooks"] | undefined,
+  mutation: (tx: DB) => Promise<T>,
+): Promise<T> {
+  if (!receiptMaintenance) return mutation(db);
+  // Preserve the explicit preflight boundary for fault injection.  The
+  // authoritative check is inside runReceiptCanonicalMutation immediately
+  // before the write, so a replacement after this successful renewal is safe.
+  await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+  await hooks?.beforeReceiptRouteMutation?.(receiptMaintenance.candidate);
+  return runReceiptCanonicalMutation(db, lease, receiptMaintenance, mutation);
+}
+
+function receiptMaintenanceGuard(
+  receiptMaintenance?: ReceiptMaintenanceContext,
+): IngestLeaseMutationGuard | undefined {
+  return receiptMaintenance
+    ? {
+        additionalWhere: receiptMaintenanceDrainWhere(
+          receiptMaintenance.maintenanceToken,
+        ),
+      }
+    : undefined;
+}
+
+/**
+ * A receipt retry is valid only while the named row retains the active status
+ * captured in that exact receipt.  Restore that status under the same durable
+ * drain-row lock used by receipt canonical mutations, rather than applying the
+ * ordinary ingest fallback (`ingesting` -> `running`) unconditionally.
+ *
+ * A captured legacy `ingesting` row cannot be restored with all lease fields
+ * null: its freshly updated `updatedAt` would make the production preflight's
+ * legacy-lease predicate consider it live for another ten minutes.  Keep an
+ * explicit already-expired lease marker instead, with no owner token, so the
+ * same receipt is both immediately preflight-safe and immediately reclaimable.
+ */
+async function restoreReceiptCandidateAfterIngestFailure(
+  db: DB,
+  lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance: ReceiptMaintenanceContext,
+): Promise<void> {
+  await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    try {
+      await assertReceiptMaintenanceDrainLocked(
+        tx,
+        receiptMaintenance.maintenanceToken,
+      );
+    } catch {
+      throw new IngestLeaseLostError(lease.jobId);
+    }
+    const restoreToIngesting =
+      receiptMaintenance.candidate.databaseStatus === "ingesting";
+    const [restored] = await tx
+      .update(simJobs)
+      .set({
+        status: receiptMaintenance.candidate.databaseStatus,
+        finishedAt: null,
+        ingestLeaseToken: null,
+        ingestLeaseClaimedAt: null,
+        // Epoch is an unambiguous expired marker independent of application /
+        // database clock skew. The next exact receipt claim overwrites it.
+        ingestLeaseExpiresAt: restoreToIngesting ? new Date(0) : null,
+      })
+      .where(
+        and(
+          ingestLeaseOwnedWhere(lease.jobId, lease.token),
+          receiptMaintenanceDrainWhere(receiptMaintenance.maintenanceToken),
+        ),
+      )
+      .returning({ id: simJobs.id });
+    if (!restored) throw new IngestLeaseLostError(lease.jobId);
+  });
+}
+
+function receiptLeaseOwnedWhere(
+  lease: Pick<IngestLease, "jobId" | "token">,
+  receiptMaintenance?: ReceiptMaintenanceContext,
+) {
+  const owned = ingestLeaseOwnedWhere(lease.jobId, lease.token);
+  return receiptMaintenance
+    ? and(
+        owned,
+        receiptMaintenanceDrainWhere(receiptMaintenance.maintenanceToken),
+      )
+    : owned;
+}
+
+/** The receipt independently pins status.json and result.json by raw SHA-256.
+ * Status carries the authoritative settlement message; result intentionally
+ * leaves message null for some terminal failures (for example, all cases
+ * failed).  Identity and terminal state must agree across both documents, but
+ * their independently meaningful message fields must not be conflated. */
+function assertReceiptBoundResult(
+  result: JobResult,
+  candidate: ReceiptScopedCandidate,
+): void {
+  if (
+    result.job_id !== candidate.engineJobId ||
+    result.state !== candidate.engineStatus
+  ) {
+    throw new Error(
+      `receipt candidate ${candidate.jobId} result identity or terminal state drifted`,
+    );
+  }
+}
+
+/** Engine-client support for this option verifies the source-byte SHA-256
+ * returned in the authenticated response header. It binds the exact raw
+ * status.json/result.json that is parsed below to the watcher receipt rather
+ * than relying on matching job id/state/message alone. */
+async function receiptEngineCallOptions(
+  db: DB,
+  job: SimJobRow,
+  candidate: ReceiptScopedCandidate,
+  expectedPayloadSha256: string,
+): Promise<EngineCallOptions & { expectedPayloadSha256: string }> {
+  return {
+    expectedEngine: expectedEngineForJob(job),
+    expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+    expectedPayloadSha256,
+  };
 }
 
 async function ingestCompletedJob(
   db: DB,
   engine: EngineClient,
   job: SimJobRow,
+  opts: Pick<ReconcileOptions, "recordRoutesOnly" | "testHooks"> & {
+    receiptMaintenance?: ReceiptMaintenanceContext;
+  } = {},
 ): Promise<void> {
   if (!job.engineJobId) return;
   const engineJobId = job.engineJobId;
-  const lease = await claimJobForIngest(db, job.id);
+  const receiptMaintenance = opts.receiptMaintenance;
+  const receiptCandidate = receiptMaintenance?.candidate;
+  const lease = receiptMaintenance
+    ? await claimReceiptJobForIngest(
+        db,
+        job,
+        receiptMaintenance.maintenanceToken,
+      )
+    : await claimJobForIngest(db, job.id);
   if (!lease) return;
   try {
     const result = await engine.getResult(engineJobId, {
-      expectedEngine: expectedEngineForJob(job),
-      expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+      ...(receiptCandidate
+        ? await receiptEngineCallOptions(
+            db,
+            job,
+            receiptCandidate,
+            receiptCandidate.resultSha256,
+          )
+        : {
+            expectedEngine: expectedEngineForJob(job),
+            expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+          }),
     });
-    await renewIngestLeaseOrThrow(db, lease);
-    job = await jobWithPersistedMeshRecoveryAcknowledgement(
+    if (receiptCandidate) assertReceiptBoundResult(result, receiptCandidate);
+    if (!receiptCandidate)
+      await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+    job = await runReceiptCanonicalMutation(
       db,
-      job,
-      result.mesh_recovery_version,
-      result.engine,
       lease,
+      receiptMaintenance,
+      (tx) =>
+        jobWithPersistedMeshRecoveryAcknowledgement(
+          tx,
+          job,
+          result.mesh_recovery_version,
+          result.engine,
+          lease,
+          receiptMaintenance,
+        ),
     );
+    if (receiptCandidate) {
+      // This is intentionally a preliminary check only. The first canonical
+      // ingest mutation below rechecks the same token while holding the drain
+      // row lock, so a watcher can replace it immediately after this point.
+      await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+      await opts.testHooks?.beforeReceiptIngestMutation?.(receiptCandidate);
+    }
     const speedMap = speedMapForJob(job);
     const ingested = await ingestResult({
       db,
@@ -3073,53 +3971,110 @@ async function ingestCompletedJob(
       uransFidelity: uransFidelityForJob(job),
       result,
       ingestLeaseToken: lease.token,
-      heartbeat: () => renewIngestAndHeartbeat(db, lease),
+      heartbeat: () => renewIngestAndHeartbeat(db, lease, receiptMaintenance),
+      canonicalMutation: receiptCanonicalMutationExecutor(
+        db,
+        lease,
+        receiptMaintenance,
+      ),
+      hooks:
+        receiptCandidate && opts.testHooks?.afterReceiptEvidenceStaged
+          ? {
+              afterEvidenceStaged: async () => {
+                await opts.testHooks!.afterReceiptEvidenceStaged!(
+                  receiptCandidate,
+                );
+              },
+            }
+          : undefined,
     });
     collectDirtyLanes(ingested.dirtyLanes);
-    await renewIngestLeaseOrThrow(db, lease);
-    await refreshPolarCachesForJob(db, job, () =>
-      renewIngestAndHeartbeat(db, lease),
+    await runReceiptFollowOnMutation(
+      db,
+      lease,
+      receiptMaintenance,
+      opts.testHooks,
+      (tx) =>
+        refreshPolarCachesForJob(tx, job, () =>
+          receiptMaintenance
+            ? renewReceiptIngestAndHeartbeatLocked(
+                tx,
+                lease,
+                receiptMaintenance,
+              )
+            : renewIngestAndHeartbeat(tx, lease),
+        ),
     );
-    // Fidelity ladder: fresh verdicts exist now — enqueue verifications for
-    // accepted precalc rows and settle verify/request bookkeeping.
-    await renewIngestLeaseOrThrow(db, lease);
-    await enqueueVerificationsForJob(db, job);
-    await settleUransLadderForJob(db, job);
-    await renewIngestLeaseOrThrow(db, lease);
-    await submitUransRetryForJob(db, engine, job, {
-      ingestLeaseToken: lease.token,
-      ransPrecalcPromotions: ingested.ransPrecalcPromotions,
-    });
-    // Amendment B: a COMPLETED job can still ship individual crashed points
-    // (per-case solver error → failed rows) — same one-shot requeue.
-    await autoRetryFailedPointsForJob(db, job);
-    await settleCampaignAfterRefresh(db, job);
-    const [finished] = await db
-      .update(simJobs)
-      .set({
-        status: "done",
-        engineState: "completed",
-        // A normal completed result terminalizes every composed case. A typed
-        // conditional RANS abort intentionally omits later angles; count only
-        // attempted cases and let normalized promotion obligations own the rest.
-        completedCases:
-          job.totalCases -
-          ingested.ransPrecalcPromotions.reduce(
-            (sum, promotion) => sum + promotion.intentionallyOmittedAoas.length,
-            0,
-          ),
-        error: null,
-        ingestedAt: new Date(),
-        finishedAt: new Date(),
-        ingestLeaseToken: null,
-        ingestLeaseClaimedAt: null,
-        ingestLeaseExpiresAt: null,
-      })
-      .where(ingestLeaseOwnedWhere(job.id, lease.token))
-      .returning({ id: simJobs.id });
+    // Receipt recovery is deliberately terminal-only. It retains and
+    // classifies the exact result, and may record its directly implied
+    // RANS→FAST route below, but it must not enqueue verification work or
+    // advance unrelated request/ladder state while ordinary writers remain
+    // stopped. The first normal post-restore tick owns that workflow.
+    if (!receiptMaintenance) {
+      await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+      await enqueueVerificationsForJob(db, job);
+      await settleUransLadderForJob(db, job);
+    }
+    await runReceiptFollowOnMutation(
+      db,
+      lease,
+      receiptMaintenance,
+      opts.testHooks,
+      (tx) =>
+        submitUransRetryForJob(tx, engine, job, {
+          ingestLeaseToken: lease.token,
+          ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+          recordRoutesOnly: opts.recordRoutesOnly,
+        }),
+    );
+    // A COMPLETED job can still ship individual crashed points (per-case solver
+    // error → failed rows), each of which follows the same clean restart.
+    if (!opts.recordRoutesOnly)
+      await autoRetryFailedPointsForJob(db, engine, job);
+    if (!receiptMaintenance) await settleCampaignAfterRefresh(db, job);
+    const finished = await runReceiptCanonicalMutation(
+      db,
+      lease,
+      receiptMaintenance,
+      async (tx) => {
+        const [finished] = await tx
+          .update(simJobs)
+          .set({
+            status: "done",
+            engineState: "completed",
+            // A normal completed result terminalizes every composed case. A typed
+            // conditional RANS abort intentionally omits later angles; count only
+            // attempted cases and let normalized promotion obligations own the rest.
+            completedCases:
+              job.totalCases -
+              ingested.ransPrecalcPromotions.reduce(
+                (sum, promotion) =>
+                  sum + promotion.intentionallyOmittedAoas.length,
+                0,
+              ),
+            error: null,
+            ingestedAt: new Date(),
+            finishedAt: new Date(),
+            ingestLeaseToken: null,
+            ingestLeaseClaimedAt: null,
+            ingestLeaseExpiresAt: null,
+          })
+          .where(receiptLeaseOwnedWhere(lease, receiptMaintenance))
+          .returning({ id: simJobs.id });
+        return finished;
+      },
+    );
     if (!finished) throw new IngestLeaseLostError(job.id);
   } catch (error) {
-    await markIngestRetry(db, job.id, error, lease);
+    if (receiptMaintenance) {
+      await restoreReceiptCandidateAfterIngestFailure(
+        db,
+        lease,
+        receiptMaintenance,
+      );
+    } else {
+      await markIngestRetry(db, job.id, error, lease);
+    }
     throw error;
   }
 }
@@ -3172,6 +4127,7 @@ async function ingestRunningPartialJob(
   db: DB,
   engine: EngineClient,
   job: SimJobRow,
+  opts: Pick<ReconcileOptions, "recordRoutesOnly"> = {},
 ): Promise<boolean> {
   if (!job.engineJobId) return false;
   const engineJobId = job.engineJobId;
@@ -3231,6 +4187,7 @@ async function ingestRunningPartialJob(
         ingestLeaseToken: lease.token,
         ransPrecalcPromotions: ingested.ransPrecalcPromotions,
         recordPromotionsOnly: true,
+        recordRoutesOnly: opts.recordRoutesOnly,
       });
     }
     if (ingested.points > 0) {
@@ -3245,8 +4202,9 @@ async function ingestRunningPartialJob(
       });
       // Amendment B, live gap 2026-07-08 (campaign 495d78e0, s1223 −5°): a
       // divergence-condemned case terminalizes its point MID-RUN. The
-      // one-shot retry runs after the at-ingest classification refresh.
-      await autoRetryFailedPointsForJob(db, job);
+      // clean restart runs after the at-ingest classification refresh.
+      if (!opts.recordRoutesOnly)
+        await autoRetryFailedPointsForJob(db, engine, job);
     }
     const changed =
       ingested.points > 0 ||
@@ -3320,14 +4278,35 @@ async function releaseWorkerRestartOrphan(
   engine: EngineClient,
   job: SimJobRow,
   lease: IngestLease,
+  receiptMaintenance?: ReceiptMaintenanceContext,
+  testHooks?: ReconcileOptions["testHooks"],
 ): Promise<void> {
+  const receiptCandidate = receiptMaintenance?.candidate;
   let solvedPoints = 0;
   if (job.engineJobId) {
     try {
       const result = await engine.getResult(job.engineJobId, {
-        expectedEngine: expectedEngineForJob(job),
-        expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+        ...(receiptCandidate
+          ? await receiptEngineCallOptions(
+              db,
+              job,
+              receiptCandidate,
+              receiptCandidate.resultSha256,
+            )
+          : {
+              expectedEngine: expectedEngineForJob(job),
+              expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+            }),
       });
+      if (receiptCandidate) assertReceiptBoundResult(result, receiptCandidate);
+      if (!receiptCandidate)
+        await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+      if (receiptCandidate) {
+        // This renewal is a preliminary probe; the first canonical executor
+        // call below owns the authoritative token-locked check.
+        await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+        await testHooks?.beforeReceiptIngestMutation?.(receiptCandidate);
+      }
       const ingested = await ingestResult({
         db,
         engine,
@@ -3340,11 +4319,32 @@ async function releaseWorkerRestartOrphan(
         uransFidelity: uransFidelityForJob(job),
         result: solvedPointsOnly(result),
         ingestLeaseToken: lease.token,
-        heartbeat: () => renewIngestAndHeartbeat(db, lease),
+        heartbeat: () => renewIngestAndHeartbeat(db, lease, receiptMaintenance),
+        canonicalMutation: receiptCanonicalMutationExecutor(
+          db,
+          lease,
+          receiptMaintenance,
+        ),
+        hooks:
+          receiptCandidate && testHooks?.afterReceiptEvidenceStaged
+            ? {
+                afterEvidenceStaged: async () => {
+                  await testHooks.afterReceiptEvidenceStaged!(receiptCandidate);
+                },
+              }
+            : undefined,
       });
       collectDirtyLanes(ingested.dirtyLanes);
       solvedPoints = ingested.points;
     } catch (e) {
+      if (receiptMaintenance) {
+        await restoreReceiptCandidateAfterIngestFailure(
+          db,
+          lease,
+          receiptMaintenance,
+        );
+        throw e;
+      }
       if (e instanceof IngestLeaseLostError) {
         console.error(
           `[sweeper] ${e.message}; stale orphan-recovery owner stopped`,
@@ -3366,12 +4366,26 @@ async function releaseWorkerRestartOrphan(
     `[sweeper] WORKER RESTART orphan ${job.engineJobId ?? "(unsubmitted)"} (sim_job ${job.id}): ${solvedPoints} solved point(s) kept as evidence, remaining claims released for re-solve — nothing marked failed`,
   );
   if (solvedPoints > 0) {
-    await renewIngestLeaseOrThrow(db, lease);
-    await refreshPolarCachesForJob(db, job, () =>
-      renewIngestAndHeartbeat(db, lease),
+    await runReceiptFollowOnMutation(
+      db,
+      lease,
+      receiptMaintenance,
+      testHooks,
+      (tx) =>
+        refreshPolarCachesForJob(tx, job, () =>
+          receiptMaintenance
+            ? renewReceiptIngestAndHeartbeatLocked(
+                tx,
+                lease,
+                receiptMaintenance,
+              )
+            : renewIngestAndHeartbeat(tx, lease),
+        ),
     );
-    await enqueueVerificationsForJob(db, job);
-    await settleCampaignAfterRefresh(db, job);
+    if (!receiptMaintenance) {
+      await enqueueVerificationsForJob(db, job);
+      await settleCampaignAfterRefresh(db, job);
+    }
   }
   if (
     !(await cancelJobAndReleaseClaims(
@@ -3379,6 +4393,8 @@ async function releaseWorkerRestartOrphan(
       job,
       "worker restarted mid-solve; points released for re-solve",
       lease,
+      undefined,
+      receiptMaintenance?.maintenanceToken,
     ))
   ) {
     throw new IngestLeaseLostError(job.id);
@@ -3419,14 +4435,40 @@ async function ingestFailedEngineJob(
   hooks: ReconcileOptions["testHooks"] = {},
   statusFailureDisposition: JobStatus["failure_disposition"] = null,
   statusContinuationFailureKind: JobStatus["continuation_failure_kind"] = null,
+  opts: Pick<ReconcileOptions, "recordRoutesOnly"> & {
+    receiptMaintenance?: ReceiptMaintenanceContext;
+  } = {},
 ): Promise<void> {
-  const lease = await claimJobForIngest(db, job.id);
+  const receiptMaintenance = opts.receiptMaintenance;
+  const receiptCandidate = receiptMaintenance?.candidate;
+  const lease = receiptMaintenance
+    ? await claimReceiptJobForIngest(
+        db,
+        job,
+        receiptMaintenance.maintenanceToken,
+      )
+    : await claimJobForIngest(db, job.id);
   if (!lease) return;
   let terminalFailureDisposition = statusFailureDisposition ?? null;
   let terminalContinuationFailureKind = statusContinuationFailureKind ?? null;
   if (msg === WORKER_RESTART_ORPHAN_MESSAGE) {
+    if (
+      receiptCandidate &&
+      receiptCandidate.settlementAction !== "release_worker_restart_orphan"
+    ) {
+      throw new Error(
+        `receipt candidate ${receiptCandidate.jobId} did not authorize worker-restart claim release`,
+      );
+    }
     // Infrastructure interruption, not solver failure — release, never fail.
-    await releaseWorkerRestartOrphan(db, engine, job, lease);
+    await releaseWorkerRestartOrphan(
+      db,
+      engine,
+      job,
+      lease,
+      receiptMaintenance,
+      hooks,
+    );
     return;
   }
   if (!job.engineJobId) {
@@ -3437,27 +4479,63 @@ async function ingestFailedEngineJob(
       { points: 0, attempts: 0 },
       "never submitted to the engine; rows failed",
     );
-    if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+    if (
+      !(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks, {
+        maintenanceToken: receiptMaintenance?.maintenanceToken,
+      }))
+    )
       return;
-    await settleUransLadderForJob(db, job, {
-      terminalError: failure,
-      terminalFailureDisposition,
-      terminalContinuationFailureKind,
-    });
-    await autoRetryFailedPointsForJob(db, job);
-    if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+    if (!receiptMaintenance) {
+      await settleUransLadderForJob(db, job, {
+        terminalError: failure,
+        terminalFailureDisposition,
+        terminalContinuationFailureKind,
+      });
+    }
+    if (!opts.recordRoutesOnly)
+      await autoRetryFailedPointsForJob(db, engine, job);
+    if (
+      !(await finalizeOwnedFailedJob(
+        db,
+        job.id,
+        failure,
+        lease,
+        {},
+        receiptMaintenance?.maintenanceToken,
+      ))
+    ) {
       throw new IngestLeaseLostError(job.id);
     }
+    if (!receiptMaintenance)
+      await deleteDetachedCleanRestartGeneration(db, engine, job);
     return;
   }
   const engineJobId = job.engineJobId;
   let result: JobResult;
   try {
     result = await engine.getResult(engineJobId, {
-      expectedEngine: expectedEngineForJob(job),
-      expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+      ...(receiptCandidate
+        ? await receiptEngineCallOptions(
+            db,
+            job,
+            receiptCandidate,
+            receiptCandidate.resultSha256,
+          )
+        : {
+            expectedEngine: expectedEngineForJob(job),
+            expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+          }),
     });
+    if (receiptCandidate) assertReceiptBoundResult(result, receiptCandidate);
   } catch (e) {
+    if (receiptMaintenance) {
+      await restoreReceiptCandidateAfterIngestFailure(
+        db,
+        lease,
+        receiptMaintenance,
+      );
+      throw e;
+    }
     try {
       job = await jobWithPersistedMeshRecoveryAcknowledgement(
         db,
@@ -3465,6 +4543,7 @@ async function ingestFailedEngineJob(
         undefined,
         undefined,
         lease,
+        receiptMaintenance,
       );
     } catch (refreshError) {
       if (refreshError instanceof IngestLeaseLostError) return;
@@ -3479,15 +4558,19 @@ async function ingestFailedEngineJob(
     );
     if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
       return;
-    await settleUransLadderForJob(db, job, {
-      terminalError: failure,
-      terminalFailureDisposition,
-      terminalContinuationFailureKind,
-    });
-    await autoRetryFailedPointsForJob(db, job);
-    if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+    if (!receiptMaintenance) {
+      await settleUransLadderForJob(db, job, {
+        terminalError: failure,
+        terminalFailureDisposition,
+        terminalContinuationFailureKind,
+      });
+    }
+    if (!opts.recordRoutesOnly)
+      await autoRetryFailedPointsForJob(db, engine, job);
+    if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease, {}))) {
       throw new IngestLeaseLostError(job.id);
     }
+    await deleteDetachedCleanRestartGeneration(db, engine, job);
     return;
   }
   terminalFailureDisposition =
@@ -3506,14 +4589,29 @@ async function ingestFailedEngineJob(
       : msg,
   );
   try {
-    job = await jobWithPersistedMeshRecoveryAcknowledgement(
+    job = await runReceiptCanonicalMutation(
       db,
-      job,
-      result.mesh_recovery_version,
-      result.engine,
       lease,
+      receiptMaintenance,
+      (tx) =>
+        jobWithPersistedMeshRecoveryAcknowledgement(
+          tx,
+          job,
+          result.mesh_recovery_version,
+          result.engine,
+          lease,
+          receiptMaintenance,
+        ),
     );
-    await renewIngestLeaseOrThrow(db, lease);
+    if (receiptCandidate) {
+      // A successful renewal here is deliberately only preliminary.  The
+      // canonical executor passed into ingestResult locks and rechecks the
+      // receipt with the first actual mutation.
+      await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+      await hooks.beforeReceiptIngestMutation?.(receiptCandidate);
+    } else {
+      await renewIngestAndHeartbeat(db, lease, receiptMaintenance);
+    }
     const ingested = await ingestResult({
       db,
       engine,
@@ -3527,31 +4625,67 @@ async function ingestFailedEngineJob(
       result,
       failedPointErrorFallback: failure,
       ingestLeaseToken: lease.token,
-      heartbeat: () => renewIngestAndHeartbeat(db, lease),
+      heartbeat: () => renewIngestAndHeartbeat(db, lease, receiptMaintenance),
+      canonicalMutation: receiptCanonicalMutationExecutor(
+        db,
+        lease,
+        receiptMaintenance,
+      ),
+      hooks:
+        receiptCandidate && hooks.afterReceiptEvidenceStaged
+          ? {
+              afterEvidenceStaged: async () => {
+                await hooks.afterReceiptEvidenceStaged!(receiptCandidate);
+              },
+            }
+          : undefined,
     });
     collectDirtyLanes(ingested.dirtyLanes);
     if (ingested.points === 0) {
-      if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+      if (ingested.attempts === 0 && receiptCandidate) {
+        throw new Error(
+          `receipt candidate ${receiptCandidate.jobId} result has no durable point or attempt evidence`,
+        );
+      }
+      if (
+        !(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks, {
+          maintenanceToken: receiptMaintenance?.maintenanceToken,
+        }))
+      )
         return;
       if (ingested.attempts === 0) {
         // True crash: the payload shipped no evidence at all — current
         // terminal-fail behavior, now loud. The exact crash-class shape the
-        // auto-retry-once amendment covers.
-        await settleUransLadderForJob(db, job, {
-          terminalError: failure,
-          terminalFailureDisposition,
-          terminalContinuationFailureKind,
-        });
+        // clean-restart policy covers.
+        if (!receiptMaintenance) {
+          await settleUransLadderForJob(db, job, {
+            terminalError: failure,
+            terminalFailureDisposition,
+            terminalContinuationFailureKind,
+          });
+        }
         logEngineJobFailed(
           job,
           failure,
           ingested,
           "no shipped evidence; rows failed",
         );
-        await autoRetryFailedPointsForJob(db, job);
-        if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
+        if (!opts.recordRoutesOnly)
+          await autoRetryFailedPointsForJob(db, engine, job);
+        if (
+          !(await finalizeOwnedFailedJob(
+            db,
+            job.id,
+            failure,
+            lease,
+            {},
+            receiptMaintenance?.maintenanceToken,
+          ))
+        ) {
           throw new IngestLeaseLostError(job.id);
         }
+        if (!receiptMaintenance)
+          await deleteDetachedCleanRestartGeneration(db, engine, job);
         return;
       }
       // All-rejected job (gate incident 2026-07-07, job a2379532): points: []
@@ -3562,36 +4696,66 @@ async function ingestFailedEngineJob(
       // and keep the wave-2 gated retry reachable: before this branch existed
       // points===0 returned ABOVE submitUransRetryForJob, so a fully-rejected
       // (e.g. single-point) campaign job could never escalate to URANS.
-      await renewIngestLeaseOrThrow(db, lease);
-      await refreshPolarCachesForJob(db, job, () =>
-        renewIngestAndHeartbeat(db, lease),
+      await runReceiptFollowOnMutation(
+        db,
+        lease,
+        receiptMaintenance,
+        hooks,
+        (tx) =>
+          refreshPolarCachesForJob(tx, job, () =>
+            receiptMaintenance
+              ? renewReceiptIngestAndHeartbeatLocked(
+                  tx,
+                  lease,
+                  receiptMaintenance,
+                )
+              : renewIngestAndHeartbeat(tx, lease),
+          ),
       );
-      await settleUransLadderForJob(db, job, {
-        terminalError: failure,
-        terminalFailureDisposition,
-        terminalContinuationFailureKind,
-      });
+      if (!receiptMaintenance) {
+        await settleUransLadderForJob(db, job, {
+          terminalError: failure,
+          terminalFailureDisposition,
+          terminalContinuationFailureKind,
+        });
+      }
       logEngineJobFailed(
         job,
         failure,
         ingested,
         "attempt evidence kept on the failed rows; gated URANS retry evaluated",
       );
-      await submitUransRetryForJob(db, engine, job, {
-        ingestLeaseToken: lease.token,
-        ransPrecalcPromotions: ingested.ransPrecalcPromotions,
-      });
+      await runReceiptFollowOnMutation(
+        db,
+        lease,
+        receiptMaintenance,
+        hooks,
+        (tx) =>
+          submitUransRetryForJob(tx, engine, job, {
+            ingestLeaseToken: lease.token,
+            ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+            recordRoutesOnly: opts.recordRoutesOnly,
+          }),
+      );
       // Amendment B: rows the wave-2 retry did NOT claim get their one
       // automatic requeue (after the refresh — at-ingest verdicts preserved).
-      await autoRetryFailedPointsForJob(db, job);
-      await settleCampaignAfterRefresh(db, job);
+      if (!opts.recordRoutesOnly)
+        await autoRetryFailedPointsForJob(db, engine, job);
+      if (!receiptMaintenance) await settleCampaignAfterRefresh(db, job);
       if (
-        !(await finalizeOwnedFailedJob(db, job.id, failure, lease, {
-          evidenceIngested: true,
-        }))
+        !(await finalizeOwnedFailedJob(
+          db,
+          job.id,
+          failure,
+          lease,
+          { evidenceIngested: true },
+          receiptMaintenance?.maintenanceToken,
+        ))
       ) {
         throw new IngestLeaseLostError(job.id);
       }
+      if (!receiptMaintenance)
+        await deleteDetachedCleanRestartGeneration(db, engine, job);
       return;
     }
     // A terminal payload may re-ship only the cases that produced evidence.
@@ -3599,40 +4763,81 @@ async function ingestFailedEngineJob(
     // auto-retry so omitted sibling cases are not stranded under a dead job.
     // Published points are already done/failed, while late quarantined output
     // no longer owns its cell and is therefore excluded by simJobId.
-    if (!(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks)))
+    if (
+      !(await markOwnedJobResultsFailed(db, job.id, failure, lease, hooks, {
+        maintenanceToken: receiptMaintenance?.maintenanceToken,
+      }))
+    )
       return;
-    await renewIngestLeaseOrThrow(db, lease);
-    await refreshPolarCachesForJob(db, job, () =>
-      renewIngestAndHeartbeat(db, lease),
+    await runReceiptFollowOnMutation(
+      db,
+      lease,
+      receiptMaintenance,
+      hooks,
+      (tx) =>
+        refreshPolarCachesForJob(tx, job, () =>
+          receiptMaintenance
+            ? renewReceiptIngestAndHeartbeatLocked(
+                tx,
+                lease,
+                receiptMaintenance,
+              )
+            : renewIngestAndHeartbeat(tx, lease),
+        ),
     );
-    await enqueueVerificationsForJob(db, job);
-    await settleUransLadderForJob(db, job, {
-      terminalError: failure,
-      terminalFailureDisposition,
-      terminalContinuationFailureKind,
-    });
+    if (!receiptMaintenance) {
+      await enqueueVerificationsForJob(db, job);
+      await settleUransLadderForJob(db, job, {
+        terminalError: failure,
+        terminalFailureDisposition,
+        terminalContinuationFailureKind,
+      });
+    }
     logEngineJobFailed(
       job,
       failure,
       ingested,
       "partial evidence ingested; failed rows carry the engine message",
     );
-    await renewIngestLeaseOrThrow(db, lease);
-    await submitUransRetryForJob(db, engine, job, {
-      ingestLeaseToken: lease.token,
-      ransPrecalcPromotions: ingested.ransPrecalcPromotions,
-    });
+    await runReceiptFollowOnMutation(
+      db,
+      lease,
+      receiptMaintenance,
+      hooks,
+      (tx) =>
+        submitUransRetryForJob(tx, engine, job, {
+          ingestLeaseToken: lease.token,
+          ransPrecalcPromotions: ingested.ransPrecalcPromotions,
+          recordRoutesOnly: opts.recordRoutesOnly,
+        }),
+    );
     // Amendment B: crashed points of a partially-failed job requeue once.
-    await autoRetryFailedPointsForJob(db, job);
-    await settleCampaignAfterRefresh(db, job);
+    if (!opts.recordRoutesOnly)
+      await autoRetryFailedPointsForJob(db, engine, job);
+    if (!receiptMaintenance) await settleCampaignAfterRefresh(db, job);
     if (
-      !(await finalizeOwnedFailedJob(db, job.id, failure, lease, {
-        evidenceIngested: true,
-      }))
+      !(await finalizeOwnedFailedJob(
+        db,
+        job.id,
+        failure,
+        lease,
+        { evidenceIngested: true },
+        receiptMaintenance?.maintenanceToken,
+      ))
     ) {
       throw new IngestLeaseLostError(job.id);
     }
+    if (!receiptMaintenance)
+      await deleteDetachedCleanRestartGeneration(db, engine, job);
   } catch (e) {
+    if (receiptMaintenance) {
+      await restoreReceiptCandidateAfterIngestFailure(
+        db,
+        lease,
+        receiptMaintenance,
+      );
+      throw e;
+    }
     if (e instanceof IngestLeaseLostError) {
       console.error(
         `[sweeper] ${e.message}; stale owner stopped without changing the recovered job`,
@@ -3658,11 +4863,14 @@ async function ingestFailedEngineJob(
       terminalFailureDisposition,
       terminalContinuationFailureKind,
     });
-    await autoRetryFailedPointsForJob(db, job);
+    if (!opts.recordRoutesOnly)
+      await autoRetryFailedPointsForJob(db, engine, job);
     if (!(await finalizeOwnedFailedJob(db, job.id, failure, lease))) {
       console.error(
         `[sweeper] ingest lease lost while terminalizing failed sim_job ${job.id}`,
       );
+    } else {
+      await deleteDetachedCleanRestartGeneration(db, engine, job);
     }
   }
 }
@@ -3672,6 +4880,7 @@ async function ingestResultFileIfReady(
   engine: EngineClient,
   job: SimJobRow,
   failedMessage = "engine job failed",
+  opts: Pick<ReconcileOptions, "recordRoutesOnly"> = {},
 ): Promise<boolean> {
   if (!job.engineJobId) return false;
   let result;
@@ -3684,7 +4893,7 @@ async function ingestResultFileIfReady(
     return false;
   }
   if (result.state === "completed") {
-    await ingestCompletedJob(db, engine, job);
+    await ingestCompletedJob(db, engine, job, opts);
     return true;
   }
   if (result.state === "failed") {
@@ -3696,6 +4905,7 @@ async function ingestResultFileIfReady(
       {},
       result.failure_disposition,
       result.continuation_failure_kind,
+      opts,
     );
     return true;
   }
@@ -3870,6 +5080,60 @@ async function recoverFailedEngineJobs(
   }
 }
 
+/**
+ * The engine cancellation and the database clean restart cannot share one
+ * transaction. If the second step is interrupted, `cleanRestartPending` is
+ * left on the job and this bounded pass finishes it on later ticks. The
+ * marker is written before cancellation while claims stay live; only an
+ * engine-confirmed cancelled job can enter this terminal cleanup pass. The
+ * one d644 pre-marker signature is bootstrapped once under the same exact
+ * unpublished-cell guard.
+ */
+async function retryPendingCleanRestarts(
+  db: DB,
+  engine: EngineClient,
+  ids?: string[],
+): Promise<void> {
+  const filters = [
+    eq(simJobs.status, "cancelled"),
+    eq(simJobs.engineState, "cancelled"),
+    isNotNull(simJobs.engineJobId),
+    isNull(simJobs.strippedAt),
+    or(
+      sql`COALESCE(${simJobs.requestPayload}, '{}'::jsonb) ? 'cleanRestartPending'`,
+      and(
+        sql`${simJobs.error} LIKE ${LEGACY_LOST_RUNNING_REASON_LIKE}`,
+        legacyLostGenerationAttachmentWhere(),
+      ),
+    ),
+  ];
+  if (ids?.length) filters.push(inArray(simJobs.id, ids));
+  const jobs = await db
+    .select()
+    .from(simJobs)
+    .where(and(...filters))
+    .orderBy(asc(simJobs.updatedAt), asc(simJobs.id))
+    .limit(25);
+
+  for (const job of jobs) {
+    await touchHeartbeat(db);
+    if (
+      !job.engineJobId ||
+      !(await directRuntimeIsStopped(engine, job.engineJobId))
+    )
+      continue;
+    if (
+      !hasCleanRestartPending(job) &&
+      !(await markCancelledCleanRestartPending(db, job))
+    )
+      continue;
+    const error =
+      job.error ??
+      "engine cancellation completed; resuming pending clean restart";
+    await cleanRestartCancelledGeneration(db, engine, job, error);
+  }
+}
+
 async function keepDetachedRunning(
   db: DB,
   job: SimJobRow,
@@ -3900,13 +5164,14 @@ async function handlePollMiss(
   e: unknown,
   queue: EngineQueueState | null,
   runtime: JobRuntimeSummary | null,
+  opts: Pick<ReconcileOptions, "recordRoutesOnly"> = {},
 ): Promise<void> {
   if (!job.engineJobId) return;
   const classified = classifyQueueLifecycle(job, runtime, queue);
   if (runtime?.has_result && runtime.result_readable) {
     if (runtime.result_state === "completed") {
       try {
-        await ingestCompletedJob(db, engine, job);
+        await ingestCompletedJob(db, engine, job, opts);
       } catch (ingestError) {
         await markIngestRetry(db, job.id, ingestError);
       }
@@ -3926,6 +5191,7 @@ async function handlePollMiss(
         runtime.result_continuation_failure_kind ??
           runtime.status_continuation_failure_kind ??
           null,
+        opts,
       );
     } else if (
       runtime.result_state === "running" &&
@@ -3933,7 +5199,7 @@ async function handlePollMiss(
       runtime.status_completed_cases !== undefined &&
       runtime.status_completed_cases > job.completedCases
     ) {
-      await ingestRunningPartialJob(db, engine, job);
+      await ingestRunningPartialJob(db, engine, job, opts);
     }
     return;
   }
@@ -4025,14 +5291,333 @@ async function handlePollMiss(
   );
 }
 
+function assertReceiptBoundStatus(
+  candidate: ReceiptScopedCandidate,
+  status: JobStatus,
+): void {
+  if (
+    status.job_id !== candidate.engineJobId ||
+    status.state !== candidate.engineStatus ||
+    (status.message ?? null) !== candidate.engineMessage
+  ) {
+    throw new Error(
+      `receipt candidate ${candidate.jobId} engine identity, terminal state, or message drifted`,
+    );
+  }
+}
+
+function receiptTerminalSettlement(candidate: ReceiptScopedCandidate): {
+  status: "done" | "failed" | "cancelled";
+  engineState: string;
+} {
+  if (candidate.settlementAction === "release_cancelled") {
+    return { status: "cancelled", engineState: "cancelled" };
+  }
+  if (candidate.settlementAction === "release_worker_restart_orphan") {
+    return { status: "cancelled", engineState: "cancelled" };
+  }
+  return candidate.engineStatus === "completed"
+    ? { status: "done", engineState: "completed" }
+    : { status: "failed", engineState: "failed" };
+}
+
+async function assertReceiptMaintenanceDrainLive(
+  db: DB,
+  maintenanceToken: string,
+): Promise<void> {
+  const [state] = await db
+    .select({
+      enabled: sweeperState.enabled,
+      admissionFenceActive: sweeperState.admissionFenceActive,
+      maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+      maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
+    })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .limit(1);
+  if (
+    !state ||
+    state.enabled ||
+    state.admissionFenceActive ||
+    state.maintenanceDrainToken !== maintenanceToken ||
+    !state.maintenanceDrainStartedAt
+  ) {
+    throw new Error(
+      "receipt-scoped maintenance lost its durable maintenance drain before settlement",
+    );
+  }
+}
+
+/** Use only inside a transaction that is about to mutate receipt-owned rows.
+ * The lock serializes the durable drain token with the rest of that mutation,
+ * so another watcher cannot replace/retire the drain halfway through a failed
+ * result settlement. */
+async function assertReceiptMaintenanceDrainLocked(
+  db: DB,
+  maintenanceToken: string,
+): Promise<void> {
+  const [state] = await db
+    .select({
+      enabled: sweeperState.enabled,
+      admissionFenceActive: sweeperState.admissionFenceActive,
+      maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+      maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
+    })
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1))
+    .for("update")
+    .limit(1);
+  if (
+    !state ||
+    state.enabled ||
+    state.admissionFenceActive ||
+    state.maintenanceDrainToken !== maintenanceToken ||
+    !state.maintenanceDrainStartedAt
+  ) {
+    throw new Error(
+      "receipt-scoped maintenance lost its durable maintenance drain before mutation",
+    );
+  }
+}
+
+/** Lock the single sweeper-state row through the active→ingesting claim. This
+ * gives the claim an atomic ownership check even if the deployment watcher
+ * attempts to replace the drain token at the same moment. */
+async function claimReceiptJobForIngest(
+  db: DB,
+  job: SimJobRow,
+  maintenanceToken: string,
+): Promise<IngestLease | null> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    await assertReceiptMaintenanceDrainLocked(tx, maintenanceToken);
+    return claimJobForIngest(tx, job.id, {
+      additionalWhere: receiptMaintenanceDrainWhere(maintenanceToken),
+    });
+  });
+}
+
+async function receiptIngestHasDurableEvidence(
+  db: DB,
+  job: SimJobRow,
+  candidate: ReceiptScopedCandidate,
+): Promise<boolean> {
+  if (!job.ingestedAt) return false;
+  const [attempt] = await db
+    .select({ id: resultAttempts.id })
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.simJobId, job.id),
+        eq(resultAttempts.engineJobId, candidate.engineJobId),
+      ),
+    )
+    .limit(1);
+  return Boolean(attempt);
+}
+
+/**
+ * The deploy watcher has stopped normal writers and proved an exact terminal
+ * receipt. Reconciliation here is deliberately more restrictive than a
+ * regular `jobIds` pass: validate every named database and engine observation
+ * before changing any row, then perform only the receipt-authorized terminal
+ * settlement. There is no queue probe, cancellation, retry, or CFD admission
+ * in this path.
+ */
+async function reconcileReceiptScopedMaintenance(
+  db: DB,
+  engine: EngineClient,
+  receipt: ReceiptScopedMaintenanceOptions,
+  hooks: ReconcileOptions["testHooks"] = {},
+): Promise<void> {
+  await assertReceiptMaintenanceDrainLive(db, receipt.maintenanceToken);
+  const jobIds = receipt.candidates.map((candidate) => candidate.jobId);
+  const jobs = await db
+    .select()
+    .from(simJobs)
+    .where(inArray(simJobs.id, jobIds));
+  if (jobs.length !== receipt.candidates.length) {
+    throw new Error("receipt-scoped maintenance candidate rows are incomplete");
+  }
+  const jobById = new Map(jobs.map((job) => [job.id, job]));
+
+  const unsettledCandidates: ReceiptScopedCandidate[] = [];
+  for (const candidate of receipt.candidates) {
+    const job = jobById.get(candidate.jobId);
+    if (!job) {
+      throw new Error(
+        `receipt candidate ${candidate.jobId} database identity or status drifted`,
+      );
+    }
+    if (["done", "failed", "cancelled"].includes(job.status)) {
+      const expected = receiptTerminalSettlement(candidate);
+      if (
+        job.status !== expected.status ||
+        job.engineState !== expected.engineState ||
+        job.ingestLeaseToken !== null ||
+        job.ingestLeaseClaimedAt !== null ||
+        job.ingestLeaseExpiresAt !== null
+      ) {
+        throw new Error(
+          `receipt candidate ${candidate.jobId} terminal settlement is inconsistent`,
+        );
+      }
+      if (
+        candidate.settlementAction === "ingest" &&
+        !(await receiptIngestHasDurableEvidence(db, job, candidate))
+      ) {
+        throw new Error(
+          `receipt candidate ${candidate.jobId} is terminal without durable receipt-bound evidence`,
+        );
+      }
+      continue;
+    }
+    if (
+      job.engineJobId !== candidate.engineJobId ||
+      job.status !== candidate.databaseStatus
+    ) {
+      throw new Error(
+        `receipt candidate ${candidate.jobId} database identity or status drifted`,
+      );
+    }
+    unsettledCandidates.push(candidate);
+  }
+
+  // Preflight every status before the first terminal claim release. A stale
+  // receipt cannot partially settle an earlier row while a later candidate
+  // has changed engine state/message.
+  const statusByJobId = new Map<string, JobStatus>();
+  for (const candidate of unsettledCandidates) {
+    const job = jobById.get(candidate.jobId)!;
+    const status = await engine.getJob(candidate.engineJobId, {
+      ...(await receiptEngineCallOptions(
+        db,
+        job,
+        candidate,
+        candidate.statusSha256,
+      )),
+    });
+    assertReceiptBoundStatus(candidate, status);
+    statusByJobId.set(candidate.jobId, status);
+  }
+
+  for (const candidate of unsettledCandidates) {
+    const job = jobById.get(candidate.jobId)!;
+    const status = statusByJobId.get(candidate.jobId)!;
+    // Check again after the terminal-engine preflight and immediately before
+    // each mutable settlement. If deployment ownership changed while an HTTP
+    // probe was in flight, leave every remaining candidate untouched.
+    await assertReceiptMaintenanceDrainLive(db, receipt.maintenanceToken);
+    await hooks.beforeReceiptSettlementMutation?.(candidate);
+    if (candidate.settlementAction === "release_cancelled") {
+      if (
+        !(await cancelJobAndReleaseClaims(
+          db,
+          job,
+          status.message ?? "engine reported job cancelled; claims released",
+          undefined,
+          status,
+          receipt.maintenanceToken,
+        ))
+      ) {
+        throw new Error(
+          `receipt candidate ${candidate.jobId} could not release cancelled claims`,
+        );
+      }
+      continue;
+    }
+    if (candidate.settlementAction === "release_worker_restart_orphan") {
+      const lease = await claimReceiptJobForIngest(
+        db,
+        job,
+        receipt.maintenanceToken,
+      );
+      if (!lease) {
+        throw new Error(
+          `receipt candidate ${candidate.jobId} could not claim worker-restart settlement`,
+        );
+      }
+      await releaseWorkerRestartOrphan(
+        db,
+        engine,
+        job,
+        lease,
+        {
+          candidate,
+          maintenanceToken: receipt.maintenanceToken,
+        },
+        hooks,
+      );
+      continue;
+    }
+
+    // `ingest` is the only ordinary result path. Do not first write
+    // sim_jobs.status=failed from the status poll: a result-fetch/ingest
+    // failure must remain an active receipt candidate, never look terminal to
+    // the watcher while no evidence was persisted.
+    if (status.state === "completed") {
+      await ingestCompletedJob(db, engine, job, {
+        recordRoutesOnly: true,
+        testHooks: hooks,
+        receiptMaintenance: {
+          candidate,
+          maintenanceToken: receipt.maintenanceToken,
+        },
+      });
+    } else {
+      await ingestFailedEngineJob(
+        db,
+        engine,
+        job,
+        status.message ?? "engine job failed",
+        hooks,
+        status.failure_disposition,
+        status.continuation_failure_kind,
+        {
+          recordRoutesOnly: true,
+          receiptMaintenance: {
+            candidate,
+            maintenanceToken: receipt.maintenanceToken,
+          },
+        },
+      );
+    }
+  }
+}
+
 /** Poll in-flight engine jobs; completed jobs ingest, transient engine misses recover or requeue. */
 export async function reconcile(
   db: DB,
   engine: EngineClient,
   options: ReconcileOptions = {},
 ): Promise<void> {
-  if (!options.skipFailedRecovery) {
+  assertReceiptScopedMaintenanceOptions(options);
+  const receiptScoped = options.receiptScopedMaintenance != null;
+  // A restarted ordinary sweeper has no receipt token. Do not let it race the
+  // watcher-owned maintenance settlement merely because its process survives
+  // (or is restarted) while the durable drain is active.
+  if (!receiptScoped && (await ordinaryWriterBlockedByMaintenanceDrain(db))) {
+    return;
+  }
+  if (options.receiptScopedMaintenance) {
+    await reconcileReceiptScopedMaintenance(
+      db,
+      engine,
+      options.receiptScopedMaintenance,
+      options.testHooks,
+    );
+    return;
+  }
+  // The hard receipt mode always wins over an accidentally omitted caller
+  // flag. This is invoked only during a writer drain and must not become a
+  // general-purpose admission/recovery switch.
+  const recordRoutesOnly = receiptScoped || options.recordRoutesOnly === true;
+
+  if (!receiptScoped && !options.skipFailedRecovery) {
     await recoverFailedEngineJobs(db, engine, options.recoverFailedJobIds);
+  }
+  if (!receiptScoped) {
+    await retryPendingCleanRestarts(db, engine, options.jobIds);
   }
 
   const activeFilters = [
@@ -4052,10 +5637,12 @@ export async function reconcile(
     : await activeJobQuery.limit(MAX_ACTIVE_RECONCILE_JOB_LIMIT);
 
   let queue: EngineQueueState | null = null;
-  try {
-    queue = await engine.getQueue();
-  } catch {
-    queue = null;
+  if (!receiptScoped) {
+    try {
+      queue = await engine.getQueue();
+    } catch {
+      queue = null;
+    }
   }
   const jobs = options.jobIds?.length
     ? candidates
@@ -4070,12 +5657,10 @@ export async function reconcile(
       .map((job) => job.engineJobId)
       .filter((id): id is string => Boolean(id)),
   );
-  const compensatedEngineIds = await retryPersistedCancellationObligations(
-    db,
-    engine,
-    options.jobIds,
-  );
-  if (queue) {
+  const compensatedEngineIds = receiptScoped
+    ? new Set<string>()
+    : await retryPersistedCancellationObligations(db, engine, options.jobIds);
+  if (queue && !receiptScoped) {
     await cancelTerminalEngineTasks(
       db,
       engine,
@@ -4100,7 +5685,7 @@ export async function reconcile(
     if (runtime?.has_result && runtime.result_readable) {
       if (runtime.result_state === "completed") {
         try {
-          await ingestCompletedJob(db, engine, job);
+          await ingestCompletedJob(db, engine, job, { recordRoutesOnly });
         } catch (e) {
           await markIngestRetry(db, job.id, e);
         }
@@ -4123,6 +5708,7 @@ export async function reconcile(
           runtime.result_continuation_failure_kind ??
             runtime.status_continuation_failure_kind ??
             null,
+          { recordRoutesOnly },
         );
         return;
       } else if (
@@ -4131,7 +5717,7 @@ export async function reconcile(
         runtime.status_completed_cases !== undefined &&
         runtime.status_completed_cases > job.completedCases
       ) {
-        await ingestRunningPartialJob(db, engine, job);
+        await ingestRunningPartialJob(db, engine, job, { recordRoutesOnly });
         // The subsequent exact status poll still refreshes engine lifecycle
         // metadata, but must not fetch and ingest the same running snapshot a
         // second time using this function's stale in-memory completedCases.
@@ -4152,6 +5738,7 @@ export async function reconcile(
             engine,
             job,
             "engine poll failed but result file is ready",
+            { recordRoutesOnly },
           )
         ) {
           return;
@@ -4160,23 +5747,81 @@ export async function reconcile(
         await markIngestRetry(db, job.id, ingestError);
         return;
       }
-      await handlePollMiss(db, engine, job, e, queue, runtime);
+      // Receipt maintenance must never interpret a transient poll miss as a
+      // reason to release/requeue/cancel a physical solve. The command exits
+      // nonzero while this exact job remains active so the outer guarded
+      // maintenance watcher can wait and retry its same bounded receipt.
+      if (!receiptScoped)
+        await handlePollMiss(db, engine, job, e, queue, runtime, {
+          recordRoutesOnly,
+        });
       return;
     }
-    const lostReason = classifyLostRunning(job, status, runtime, queue);
-    if (lostReason) {
-      // G3: loud by design — this is a worker-restart zombie, not a routine state.
+    const lostReason = classifyLostRunning(status, runtime);
+    if (lostReason && !receiptScoped) {
+      // G3: loud by design — this is a lost solve, not a routine state.
       console.error(
         `[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): ${lostReason}`,
       );
       try {
-        await engine.cancelJob(job.engineJobId);
+        if (!(await markCleanRestartPending(db, job))) {
+          console.warn(
+            `[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): could not persist clean-restart intent; engine cancellation was not attempted`,
+          );
+          return;
+        }
+      } catch (markError) {
+        console.error(
+          `[sweeper] LOST engine job ${job.engineJobId} (sim_job ${job.id}): failed to persist clean-restart intent: ${errorMessage(markError)}`,
+        );
+        return;
+      }
+      try {
+        const cancellation = await engine.cancelJob(job.engineJobId);
+        if (!cancellation.cancelled) {
+          console.warn(
+            `[sweeper] engine-side cancel of lost job ${job.engineJobId} was not acknowledged; DB ownership remains live`,
+          );
+          return;
+        }
       } catch (cancelError) {
         console.error(
           `[sweeper] engine-side cancel of lost job ${job.engineJobId} failed: ${errorMessage(cancelError)}`,
         );
+        // The engine may still own physical work. Retain DB ownership so the
+        // next reconciliation tick can retry cancellation instead of letting a
+        // replacement solve start alongside it.
+        return;
       }
-      await cancelJobAndReleaseClaims(db, job, lostReason);
+      await finishLostGenerationCleanRestart(
+        db,
+        engine,
+        job,
+        lostReason,
+        options.testHooks?.beforeLostGenerationTerminalization,
+        options.testHooks?.beforeLostGenerationCleanRestart,
+      );
+      return;
+    }
+    if (
+      !receiptScoped &&
+      status.state === "cancelled" &&
+      hasCleanRestartPending(job)
+    ) {
+      // The engine cancellation succeeded on a prior tick, but the terminal
+      // database transition may have been interrupted. Keep the exact claims
+      // fenced until this same reducer completes; never fall through to the
+      // generic cancelled-job release path.
+      await finishLostGenerationCleanRestart(
+        db,
+        engine,
+        job,
+        status.message ??
+          job.error ??
+          "engine cancellation completed; resuming pending clean restart",
+        undefined,
+        options.testHooks?.beforeLostGenerationCleanRestart,
+      );
       return;
     }
     if (
@@ -4184,13 +5829,13 @@ export async function reconcile(
       status.completed_cases > job.completedCases &&
       !handledRuntimePartial
     ) {
-      await ingestRunningPartialJob(db, engine, job);
+      await ingestRunningPartialJob(db, engine, job, { recordRoutesOnly });
     }
     await updateJobFromEngineStatus(db, job, status);
 
     if (status.state === "completed") {
       try {
-        await ingestCompletedJob(db, engine, job);
+        await ingestCompletedJob(db, engine, job, { recordRoutesOnly });
       } catch (e) {
         await markIngestRetry(db, job.id, e);
       }
@@ -4203,11 +5848,12 @@ export async function reconcile(
         options.testHooks,
         status.failure_disposition,
         status.continuation_failure_kind,
+        { recordRoutesOnly },
       );
     }
   });
 
-  await drainCampaignMaintenance(db);
+  if (!receiptScoped) await drainCampaignMaintenance(db);
 }
 
 /** Per-tick cap on dirty-lane processing. A dual-objective campaign dirties
@@ -4316,17 +5962,33 @@ async function drainCampaignMaintenance(db: DB): Promise<void> {
 /** Startup recovery: `pending` sim_jobs are pre-boundary compositions owned by
  * the previous sweeper process, never live engine work. Terminalize them before
  * measuring queue pressure, release their claims, and settle their ladder work
- * items immediately. A campaign precalc one-shot retry is deliberately queued
+ * items immediately. A campaign precalc clean restart is deliberately queued
  * with no owner until the gated parent rescan composes its next wave-2 child;
  * preserve that durable routing marker or restart would demote it to RANS. */
 export async function resetOrphans(
   db: DB,
   opts: { jobIds?: string[]; resultIds?: string[] } = {},
 ): Promise<void> {
+  // A maintenance receipt has exclusive ownership of canonical recovery.
+  // `runLoop` also performs this check before startup recovery, but keep the
+  // mutation boundary closed for direct callers and for a drain acquired
+  // between process startup and this transaction.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return;
+
   const pendingFilters = [eq(simJobs.status, "pending")];
   if (opts.jobIds?.length)
     pendingFilters.push(inArray(simJobs.id, opts.jobIds));
-  const cancelledPending = await db.transaction(async (tx) => {
+  await db.transaction(async (tx) => {
+    const [state] = await tx
+      .select({
+        maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+        maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
+      })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .for("update");
+    if (state?.maintenanceDrainToken && state.maintenanceDrainStartedAt) return;
+
     const cancelled = await tx
       .update(simJobs)
       .set({
@@ -4358,15 +6020,14 @@ export async function resetOrphans(
           ),
         );
     }
-    return cancelled.map((row) => row.id);
-  });
+    const cancelledPending = cancelled.map((row) => row.id);
 
-  if (cancelledPending.length) {
-    const ids = sql`ARRAY[${sql.join(
-      cancelledPending.map((id) => sql`${id}::uuid`),
-      sql`, `,
-    )}]`;
-    await db.execute(sql`
+    if (cancelledPending.length) {
+      const ids = sql`ARRAY[${sql.join(
+        cancelledPending.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`;
+      await tx.execute(sql`
       UPDATE sim_urans_verify_queue q
       SET state = CASE
             WHEN q.background_owner THEN 'pending'
@@ -4387,8 +6048,8 @@ export async function resetOrphans(
           WHERE j.id = ANY(${ids})
             AND j.request_payload ->> 'verifyQueueItemId' = q.id::text
         )
-    `);
-    await db.execute(sql`
+      `);
+      await tx.execute(sql`
       WITH linked_request AS (
         SELECT DISTINCT ON (req.id)
           req.id AS request_id,
@@ -4420,43 +6081,44 @@ export async function resetOrphans(
           "updatedAt" = now()
       FROM linked_request
       WHERE req.id = linked_request.request_id
-    `);
-  }
+      `);
+    }
 
-  const liveFilters = [
-    inArray(simJobs.status, ["submitted", "running", "ingesting"] as const),
-  ];
-  if (opts.jobIds?.length) liveFilters.push(inArray(simJobs.id, opts.jobIds));
-  const live = await db
-    .select({ id: simJobs.id })
-    .from(simJobs)
-    .where(and(...liveFilters));
-  const liveIds = live.map((row) => row.id);
-  const claimed = inArray(results.status, ["queued", "running"]);
-  const scopedClaim = opts.resultIds?.length
-    ? and(claimed, inArray(results.id, opts.resultIds))
-    : opts.jobIds?.length
-      ? and(claimed, inArray(results.simJobId, opts.jobIds))
-      : claimed;
-  await db
-    .update(results)
-    .set({ status: "pending", source: "queued", simJobId: null })
-    .where(
-      and(
-        liveIds.length
-          ? and(
-              scopedClaim,
-              or(
-                isNull(results.simJobId),
-                notInArray(results.simJobId, liveIds),
-              ),
-            )
-          : scopedClaim,
-        sql`NOT (
-          ${results.status} = 'queued'
-          AND ${results.simJobId} IS NULL
-          AND ${EVIDENCE_BACKED_WAVE2_RESULT_SQL}
-        )`,
-      ),
-    );
+    const liveFilters = [
+      inArray(simJobs.status, ["submitted", "running", "ingesting"] as const),
+    ];
+    if (opts.jobIds?.length) liveFilters.push(inArray(simJobs.id, opts.jobIds));
+    const live = await tx
+      .select({ id: simJobs.id })
+      .from(simJobs)
+      .where(and(...liveFilters));
+    const liveIds = live.map((row) => row.id);
+    const claimed = inArray(results.status, ["queued", "running"]);
+    const scopedClaim = opts.resultIds?.length
+      ? and(claimed, inArray(results.id, opts.resultIds))
+      : opts.jobIds?.length
+        ? and(claimed, inArray(results.simJobId, opts.jobIds))
+        : claimed;
+    await tx
+      .update(results)
+      .set({ status: "pending", source: "queued", simJobId: null })
+      .where(
+        and(
+          liveIds.length
+            ? and(
+                scopedClaim,
+                or(
+                  isNull(results.simJobId),
+                  notInArray(results.simJobId, liveIds),
+                ),
+              )
+            : scopedClaim,
+          sql`NOT (
+            ${results.status} = 'queued'
+            AND ${results.simJobId} IS NULL
+            AND ${EVIDENCE_BACKED_WAVE2_RESULT_SQL}
+          )`,
+        ),
+      );
+  });
 }

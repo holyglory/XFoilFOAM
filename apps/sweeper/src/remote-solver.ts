@@ -10,6 +10,7 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  type PrecalcContinuationAddress,
   precalcCheckpointCandidatesForObligations,
   referenceGeometryProfiles,
   registerVerifiedBrokeredEvidenceArchive,
@@ -53,8 +54,8 @@ import {
   simulationSetupSignature,
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
-import type { EngineClient } from "@aerodb/engine-client";
-import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { EngineError, type EngineClient } from "@aerodb/engine-client";
+import { and, desc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import {
   createHash,
   createHmac,
@@ -87,6 +88,7 @@ import {
 } from "./engine-backoff";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { touchHeartbeat } from "./heartbeat";
+import { ordinaryWriterBlockedByMaintenanceDrain } from "./maintenance-drain";
 import { createSingleFlightBackgroundRunner } from "./single-flight";
 import { parsedMeshRecoveryVersion } from "./engine-capabilities";
 import { retryScopeForRequestedPolar } from "./retry-plan";
@@ -105,6 +107,25 @@ const REMOTE_PUSH_STALL_TIMEOUT_MS = Number(
 );
 const REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS = Number(
   process.env.REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS ?? 6 * 60 * 60_000,
+);
+// A checkpoint is a retained continuation prerequisite rather than a
+// publishable polar result.  Under sustained accepted-result traffic, give it
+// one bounded, recorded turn after this many completed normal deliveries so it
+// cannot indefinitely retain remote disk, while still keeping current polar
+// publication ahead of its potentially long broker stream.
+const REMOTE_PRECALC_CHECKPOINT_DELIVERY_QUANTUM = Math.max(
+  1,
+  Math.trunc(
+    Number(process.env.REMOTE_PRECALC_CHECKPOINT_DELIVERY_QUANTUM ?? 12),
+  ) || 12,
+);
+const REMOTE_PRECALC_CHECKPOINT_MAX_DEFERRAL_MS = Math.max(
+  60_000,
+  Math.trunc(
+    Number(
+      process.env.REMOTE_PRECALC_CHECKPOINT_MAX_DEFERRAL_MS ?? 15 * 60_000,
+    ),
+  ) || 15 * 60_000,
 );
 const DELIVERY_CLAIM_MS = Number(
   process.env.REMOTE_DELIVERY_CLAIM_MS ?? 30 * 60_000,
@@ -276,22 +297,26 @@ interface RemotePromiseWorkState {
   requestedAoas: number[];
   waitingUntil: Date | null;
   busy: boolean;
+  /** A due FAST-URANS obligation owns this exact cell, but has not yet
+   * reserved an engine child. It must stay ahead of an unrelated hub lease. */
+  precalcAdmissionPending: boolean;
   completed: boolean;
   terminal: boolean;
   activePointCount: number;
 }
 
 type RemotePromiseSubmitResult =
-  | { kind: "submitted" | "busy" | "waiting" }
+  | { kind: "submitted" | "waiting" }
+  | { kind: "busy"; state?: RemotePromiseWorkState }
   | { kind: "terminal"; error: string }
   | { kind: "stopped"; error: string };
 
 export type RemoteEngineAdmissionHoldReason =
+  | "higher_priority_fast_urans"
   | "storage_pressure"
   | "safety_stop"
   | "mesh_capability_unknown"
   | "archive_reduction_capability_unavailable"
-  | "higher_priority_fast_urans"
   | "shared_capacity_full"
   | "engine_unavailable";
 
@@ -315,7 +340,7 @@ function syncBase(settings: Settings): string {
  * same hub URL. Shared-secret compatibility mode has no registered identity
  * and intentionally remains unscoped. */
 function remotePromiseOwnerSql(
-  settings: Settings,
+  settings: Pick<Settings, "remoteSolverRegisteredId">,
   tableAlias = "sync_sweep_promises",
 ) {
   if (!settings.remoteSolverRegisteredId) return sql`TRUE`;
@@ -326,6 +351,46 @@ function remotePromiseOwnerSql(
       ${alias}.registered_solver_id IS NULL
       AND ${alias}.request_payload ->> 'solverId' = ${settings.remoteSolverRegisteredId}
     )
+  )`;
+}
+
+export type RemotePromiseOwnerScope = Readonly<{
+  upstreamBaseUrl: string;
+  remoteSolverRegisteredId: string | null;
+}>;
+
+/** Canonical scheduling authority for this exact remote node. FAST recovery
+ * and ordinary mirrored admission must use the same hub + registered-solver
+ * identity so neither can execute work that the node's capacity accounting
+ * does not own. */
+export async function configuredRemotePromiseOwnerScope(
+  db: DB,
+): Promise<RemotePromiseOwnerScope | null> {
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  if (
+    !settings?.remoteSolverEnabled ||
+    !settings.upstreamBaseUrl ||
+    configuredRemoteCpuCap(settings) === 0
+  )
+    return null;
+  return {
+    upstreamBaseUrl: syncBase(settings),
+    remoteSolverRegisteredId: settings.remoteSolverRegisteredId,
+  };
+}
+
+export function remotePromiseMatchesOwnerScopeSql(
+  scope: RemotePromiseOwnerScope,
+  tableAlias = "sync_sweep_promises",
+) {
+  const alias = sql.raw(tableAlias);
+  return sql`(
+    ${alias}.source_base_url = ${scope.upstreamBaseUrl}
+    AND ${remotePromiseOwnerSql(scope, tableAlias)}
   )`;
 }
 
@@ -1180,6 +1245,31 @@ function configuredRemoteCpuCap(settings: Settings): number {
   return Number.isInteger(cap) && cap > 0 ? cap : 0;
 }
 
+/**
+ * Return the currently unreserved remote-node token capacity. This is only a
+ * scheduler planning hint: every engine submission repeats the same durable
+ * ownership/cap check while holding the global admission permit. Keeping the
+ * inexpensive snapshot here lets the FAST lane fill independent cells before
+ * ordinary promised RANS uses the remainder of this exact tick.
+ */
+export async function remoteAvailableCpuSlots(db: DB): Promise<number> {
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  if (!settings?.remoteSolverEnabled) return 0;
+  const cap = configuredRemoteCpuCap(settings);
+  if (!cap) return 0;
+  try {
+    return Math.max(0, cap - (await remoteReservedCpuSlots(db, settings)));
+  } catch {
+    // Missing/malformed upstream identity is handled by the later explicit
+    // remote admission boundary; it must not manufacture FAST capacity here.
+    return 0;
+  }
+}
+
 function remoteWorkerCpuCapacity(settings: Settings): number {
   const detected = Number(process.env.AIRFOILFOAM_WORKER_CPU_BUDGET);
   if (Number.isInteger(detected) && detected > 0) return detected;
@@ -1235,6 +1325,7 @@ async function remotePromiseWorkState(
   const dueAoas: number[] = [];
   let waitingUntil: Date | null = null;
   let busy = false;
+  let precalcAdmissionPending = false;
   let completed = false;
   let terminal = false;
   for (const row of activeRows) {
@@ -1250,6 +1341,7 @@ async function remotePromiseWorkState(
           waitingUntil = row.precalcNextSubmitAt;
       } else {
         busy = true;
+        precalcAdmissionPending = true;
       }
       continue;
     }
@@ -1303,6 +1395,7 @@ async function remotePromiseWorkState(
     ),
     waitingUntil,
     busy,
+    precalcAdmissionPending,
     completed,
     terminal,
     activePointCount: activeRows.length,
@@ -1373,6 +1466,7 @@ async function cancelAuthoritativelyExpiredPromise(
   engine: EngineClient,
   promiseId: string,
   reason: string,
+  acknowledgedByUpstream?: { httpStatus: 404 | 409 },
 ): Promise<void> {
   const jobs = await db
     .select()
@@ -1428,6 +1522,33 @@ async function cancelAuthoritativelyExpiredPromise(
       .update(syncSweepPromisePoints)
       .set({ status: "cancelled", updatedAt: new Date() })
       .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    if (acknowledgedByUpstream) {
+      // A 404/409 came from the exact current hub while renewing this exact
+      // promise, so it is a terminal authority acknowledgement. Persist it in
+      // the same outbox-shaped receipt retention understands rather than
+      // treating a local superseded row as deletion permission.
+      await tx
+        .insert(syncRemotePromiseCancellations)
+        .values({
+          promiseId,
+          state: "delivered",
+          nextAttemptAt: sql`now()`,
+          lastHttpStatus: acknowledgedByUpstream.httpStatus,
+          lastError: null,
+          deliveredAt: new Date(),
+        })
+        .onConflictDoUpdate({
+          target: syncRemotePromiseCancellations.promiseId,
+          set: {
+            state: "delivered",
+            nextAttemptAt: sql`now()`,
+            lastHttpStatus: acknowledgedByUpstream.httpStatus,
+            lastError: null,
+            deliveredAt: new Date(),
+            updatedAt: new Date(),
+          },
+        });
+    }
     await tx
       .update(syncRemoteResultDeliveries)
       .set({
@@ -1441,6 +1562,7 @@ async function cancelAuthoritativelyExpiredPromise(
       .where(
         and(
           eq(syncRemoteResultDeliveries.promiseId, promiseId),
+          sql`${syncRemoteResultDeliveries.resultId} IS NOT NULL`,
           inArray(syncRemoteResultDeliveries.state, [
             "pending",
             "pushing",
@@ -1489,7 +1611,9 @@ async function renewExactRemotePromiseTransferLease(
   }
   if (response.status === 404 || response.status === 409) {
     const reason = `up-tier authoritatively rejected promise ${promiseId} transfer lease renewal (${response.status})`;
-    await cancelAuthoritativelyExpiredPromise(db, engine, promiseId, reason);
+    await cancelAuthoritativelyExpiredPromise(db, engine, promiseId, reason, {
+      httpStatus: response.status,
+    });
     throw new RemotePromiseTransferLeaseError(reason, true);
   }
   if (!response.ok) {
@@ -1721,6 +1845,7 @@ async function renewMirroredPromiseLeases(
         engine,
         promise.id,
         `up-tier rejected promise lease renewal (${response.status})`,
+        { httpStatus: response.status },
       );
       continue;
     }
@@ -1759,42 +1884,53 @@ async function cancelMirroredRemotePromise(
   promiseId: string,
   error: string,
   disposition: RemotePromiseCancellationDisposition,
+  options: { sendImmediately?: boolean } = {},
 ): Promise<void> {
   // Stop local ownership first, then durably enqueue the upstream release.
   // A failed HTTP attempt remains retryable in the outbox; the local heartbeat
   // loop must never keep an AoA leased after deterministic terminal rejection.
   const queued = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
-    const cancelled = await tx
-      .update(syncSweepPromises)
-      .set({
-        status: "cancelled",
-        cancelledAt: new Date(),
-        responsePayload: {
-          submitBlocked: true,
-          error,
-          remoteCancellation: { disposition, reason: error },
-        },
-        updatedAt: new Date(),
+    const [promise] = await tx
+      .select({
+        status: syncSweepPromises.status,
+        responsePayload: syncSweepPromises.responsePayload,
       })
-      .where(
-        and(
-          eq(syncSweepPromises.id, promiseId),
-          inArray(syncSweepPromises.status, ["active", "expired"]),
-        ),
-      )
-      .returning({ id: syncSweepPromises.id });
-    if (!cancelled.length) {
-      const [existing] = await tx
-        .select({ promiseId: syncRemotePromiseCancellations.promiseId })
-        .from(syncRemotePromiseCancellations)
-        .where(eq(syncRemotePromiseCancellations.promiseId, promiseId))
-        .limit(1);
-      return Boolean(existing);
+      .from(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, promiseId))
+      .for("update")
+      .limit(1);
+    // A fulfilled promise has an exact durable /complete acknowledgement. It
+    // must never be relabelled as cancelled merely because an older local job
+    // later becomes visible to terminal-job reconciliation.
+    if (!promise || promise.status === "fulfilled") return false;
+    if (!["active", "expired", "cancelled"].includes(promise.status)) {
+      return false;
     }
+    const now = new Date();
+    if (promise.status !== "cancelled") {
+      await tx
+        .update(syncSweepPromises)
+        .set({
+          status: "cancelled",
+          cancelledAt: now,
+          responsePayload: {
+            ...(promise.responsePayload ?? {}),
+            submitBlocked: true,
+            error,
+            remoteCancellation: { disposition, reason: error },
+          },
+          updatedAt: now,
+        })
+        .where(eq(syncSweepPromises.id, promiseId));
+    }
+    // Historical rows can have a local cancelled promise but active points
+    // because the original process died before writing the outbox.  Healing
+    // that mirror is safe only for still-active points; fulfilled evidence
+    // remains immutable and visible to exact completion/reclaim paths.
     await tx
       .update(syncSweepPromisePoints)
-      .set({ status: "cancelled", updatedAt: new Date() })
+      .set({ status: "cancelled", updatedAt: now })
       .where(
         and(
           eq(syncSweepPromisePoints.promiseId, promiseId),
@@ -1820,6 +1956,7 @@ async function cancelMirroredRemotePromise(
       .where(
         and(
           eq(syncRemoteResultDeliveries.promiseId, promiseId),
+          sql`${syncRemoteResultDeliveries.resultId} IS NOT NULL`,
           inArray(syncRemoteResultDeliveries.state, [
             "pending",
             "pushing",
@@ -1830,7 +1967,11 @@ async function cancelMirroredRemotePromise(
       );
     return true;
   });
-  if (queued && settings.remoteSolverAuthToken) {
+  if (
+    queued &&
+    options.sendImmediately !== false &&
+    settings.remoteSolverAuthToken
+  ) {
     await processPendingPromiseCancellations(db, settings, promiseId);
   }
 }
@@ -1975,6 +2116,916 @@ async function processPendingPromiseCancellations(
         ),
       );
   }
+}
+
+/**
+ * Terminal engine rows are not themselves an upstream acknowledgement.  Most
+ * newly-created failures pass through submitMirroredRemotePromise and enqueue
+ * their cancellation there, but an engine/reconciler terminal transition can
+ * happen after that call (or on an older release) and used to leave its raw
+ * case permanently outside both delivery and retention.
+ *
+ * This is deliberately a leaf-only, no-publishable-result reconciliation:
+ * accepted current generations stay on the evidence-delivery path, and a
+ * successor job or active preliminary obligation retains the exact promise
+ * authority.  A candidate gets a job-level blocked row plus the durable
+ * cancellation outbox. That releases the upstream scheduling lease; the
+ * terminal, noncanonical generation is then eligible for ordinary direct
+ * cleanup and a fresh retry.
+ */
+async function reconcileTerminalRemotePromiseReleases(
+  db: DB,
+  settings: Settings,
+): Promise<void> {
+  const candidates = (await db.execute(sql`
+    SELECT
+      terminal_job.id AS job_id,
+      terminal_job.status AS job_status,
+      remote_promise.id AS promise_id,
+      remote_promise.status AS promise_status
+    FROM sim_jobs terminal_job
+    JOIN sync_sweep_promises remote_promise
+      ON remote_promise.id::text =
+        terminal_job.request_payload ->> 'syncPromiseId'
+    WHERE terminal_job.status IN ('done', 'failed', 'cancelled')
+      AND NOT (
+        terminal_job.status = 'cancelled'
+        AND terminal_job.engine_state IN ('cancelling', 'cancel_pending')
+      )
+      AND terminal_job.engine_job_id IS NOT NULL
+      AND terminal_job.request_payload ->> 'remoteSolver' = 'true'
+      AND remote_promise.source_base_url = ${syncBase(settings)}
+      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+      AND ${remotePromiseOwnerSql(settings, "remote_promise")}
+      -- Any exact accepted/canonical/fulfilled attempt is a real evidence
+      -- generation that must remain on the normal remote delivery path.
+      -- Repairs can legitimately leave results.current_result_attempt_id NULL,
+      -- so do not use the mutable pointer as the ownership boundary here.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM results terminal_result
+        WHERE terminal_result.sim_job_id = terminal_job.id
+          AND EXISTS (
+            SELECT 1
+            FROM result_attempts accepted_attempt
+            WHERE accepted_attempt.result_id = terminal_result.id
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM result_classifications accepted_classification
+                  WHERE accepted_classification.result_attempt_id = accepted_attempt.id
+                    AND accepted_classification.state = 'accepted'
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM result_interpretations accepted_interpretation
+                  WHERE accepted_interpretation.result_attempt_id = accepted_attempt.id
+                    AND accepted_interpretation.state = 'accepted'
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM result_canonical_selections canonical_selection
+                  WHERE canonical_selection.result_attempt_id = accepted_attempt.id
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM sync_remote_hub_binding_receipts hub_binding
+                  WHERE hub_binding.result_attempt_id = accepted_attempt.id
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM sync_sweep_promise_points fulfilled_point
+                  WHERE fulfilled_point.result_attempt_id = accepted_attempt.id
+                    AND fulfilled_point.status = 'fulfilled'
+                )
+              )
+          )
+      )
+      -- A local retry under the still-live promise is not terminal work.  A
+      -- blocked retry, expired promise, or failed/cancelled result is instead
+      -- terminal and is eligible for the authority-release outbox.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM results recoverable_result
+        LEFT JOIN sim_result_submit_retries recoverable_retry
+          ON recoverable_retry.result_id = recoverable_result.id
+        WHERE recoverable_result.sim_job_id = terminal_job.id
+          AND (
+            recoverable_result.status IN ('queued', 'running')
+            OR (
+              recoverable_result.status IN ('pending', 'stale')
+              AND remote_promise.status = 'active'
+              AND (
+                recoverable_retry.state IS NULL
+                OR recoverable_retry.state IN ('pending', 'retry_wait')
+              )
+            )
+          )
+      )
+      -- A child owns the same physical work at a newer exact generation.  It
+      -- must settle (and, if necessary, release the shared promise) itself.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs successor_job
+        WHERE successor_job.parent_job_id = terminal_job.id
+      )
+      -- Remote retries are composed independently and intentionally do not
+      -- use parent_job_id. Promise identity is the durable ownership edge:
+      -- while any other job for this exact upstream promise is live (or its
+      -- engine cancellation is still in flight), the old terminal shell must
+      -- not release/cancel the shared upstream scheduling lease. Keep this
+      -- shape identical to composeRemotePromiseJob's active-job fence.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs promise_successor
+        WHERE promise_successor.id <> terminal_job.id
+          AND promise_successor.request_payload ->> 'syncPromiseId' =
+                remote_promise.id::text
+          AND (
+            promise_successor.status IN ('pending', 'submitted', 'running', 'ingesting')
+            OR (
+              promise_successor.status = 'cancelled'
+              AND promise_successor.engine_state IN ('cancelling', 'cancel_pending')
+            )
+          )
+      )
+      -- Likewise, an active exact preliminary-URANS obligation is a durable
+      -- successor authority before its engine child exists.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_sweep_promise_points promise_point
+        JOIN sim_precalc_obligations obligation
+          ON obligation.airfoil_id = promise_point.airfoil_id
+         AND obligation.revision_id =
+               promise_point.simulation_preset_revision_id
+         AND obligation.aoa_deg = promise_point.aoa_deg
+         AND obligation.state IN ('pending', 'running')
+        WHERE promise_point.promise_id = remote_promise.id
+      )
+      -- A delivered/superseded job row is already an exact terminal outcome.
+      -- Keep blocked rows visible until the separate cancellation ACK arrives.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sync_remote_result_deliveries terminal_delivery
+        WHERE terminal_delivery.promise_id = remote_promise.id
+          AND terminal_delivery.sim_job_id = terminal_job.id
+          AND terminal_delivery.result_id IS NULL
+          AND terminal_delivery.state IN ('delivered', 'superseded')
+      )
+    ORDER BY
+      COALESCE(
+        terminal_job."finishedAt",
+        terminal_job."ingestedAt",
+        terminal_job."updatedAt",
+        terminal_job."createdAt"
+      ),
+      terminal_job.id
+    LIMIT 100
+  `)) as unknown as Array<{
+    job_id: string;
+    job_status: "done" | "failed" | "cancelled";
+    promise_id: string;
+    promise_status: "active" | "expired" | "fulfilled" | "cancelled";
+  }>;
+
+  for (const candidate of candidates) {
+    const reason =
+      `remote engine job ${candidate.job_id} reached terminal ${candidate.job_status} ` +
+      "without a publishable current result generation";
+    if (candidate.promise_status === "fulfilled") {
+      // The exact promise already has a durable hub /complete acknowledgement
+      // from another generation.  Preserve that fact rather than issuing a
+      // cancellation that would be misleading and rejected by the hub.
+      await markRemoteJobDeliveryTerminal(
+        db,
+        candidate.promise_id,
+        candidate.job_id,
+        "superseded",
+        `${reason}; remote promise was already fulfilled by its exact terminal authority`,
+      );
+      continue;
+    }
+    await markRemoteJobDeliveryTerminal(
+      db,
+      candidate.promise_id,
+      candidate.job_id,
+      "blocked",
+      reason,
+    );
+    // Batch first, then drain once below.  A live historical backlog must not
+    // synchronously issue hundreds of serial HTTP calls from this scanner.
+    await cancelMirroredRemotePromise(
+      db,
+      settings,
+      candidate.promise_id,
+      reason,
+      "terminal_local_state",
+      { sendImmediately: false },
+    );
+  }
+}
+
+type DisposableTerminalRemoteJob = {
+  id: string;
+  engine_job_id: string;
+};
+
+/**
+ * Legacy remote jobs can predate the clean-restart reducer and therefore keep
+ * rejected/failed attempt graphs attached forever. Those attempts can never
+ * receive a hub canonical-binding receipt, so receipt-only retention strands
+ * their complete engine directories even after the promise authority has
+ * ended.
+ *
+ * Select only a terminal generation whose every attempt is explicitly
+ * classified and which has no continuation, verification, delivery, or
+ * publication owner. A locally accepted generation is still unpublished
+ * working data only after the upstream cancellation is durably acknowledged;
+ * canonical selections, hub bindings, and fulfilled points remain protected.
+ * Closed promise authority remains the ordinary case. An
+ * active promise is eligible only when every attached attempt has already
+ * handed its exact cell to a durable pending/running fresh PRECALC obligation;
+ * the obligation remains and only its obsolete source pointer is cleared. The
+ * transaction repeats the complete predicate while holding the job lock,
+ * detaches the disposable graph, and only then permits the engine directory
+ * delete. Canonical/bound/fulfilled evidence never enters this path. Runtime
+ * and engine status are read directly before mutation; a missing/ambiguous
+ * probe leaves everything intact for a later pass.
+ */
+export async function reclaimDisposableTerminalRemoteJobDirs(
+  db: DB,
+  engine: EngineClient,
+  limit = 25,
+): Promise<{ jobs: number; attempts: number; bytesFreed: number }> {
+  const boundedLimit = Math.min(100, Math.max(0, Math.trunc(limit)));
+  if (boundedLimit === 0) return { jobs: 0, attempts: 0, bytesFreed: 0 };
+
+  // A local terminal status or expired wall clock is not enough to discard a
+  // locally accepted generation. The upstream authority must have ended
+  // durably: either the promise is fulfilled, or the exact cancellation
+  // outbox has an authoritative acknowledgement. This expression is repeated
+  // under the job lock below through the same alias names.
+  const authoritativeClosedPromiseSql = sql`(
+    remote_promise.status = 'fulfilled'
+    OR (
+      remote_promise.status IN ('cancelled', 'expired')
+      AND EXISTS (
+        SELECT 1
+        FROM sync_remote_promise_cancellations cancellation_ack
+        WHERE cancellation_ack.promise_id = remote_promise.id
+          AND cancellation_ack.state = 'delivered'
+      )
+    )
+  )`;
+
+  const candidates = (await db.execute(sql`
+    SELECT terminal_job.id, terminal_job.engine_job_id
+    FROM sim_jobs terminal_job
+    JOIN sync_sweep_promises remote_promise
+      ON remote_promise.id::text =
+         terminal_job.request_payload ->> 'syncPromiseId'
+    WHERE terminal_job.status IN ('done', 'failed', 'cancelled')
+      AND NOT (
+        terminal_job.status = 'cancelled'
+        AND terminal_job.engine_state IN ('cancelling', 'cancel_pending')
+      )
+      AND terminal_job.engine_job_id IS NOT NULL
+      AND terminal_job.request_payload ->> 'remoteSolver' = 'true'
+      AND terminal_job.stripped_at IS NULL
+      -- A closed promise may release an obsolete nonpublishable generation only
+      -- after no exact PRECALC owner remains. An active promise may release
+      -- only an older failed source after EVERY attached attempt has handed
+      -- exact ownership to a pending/running fresh PRECALC obligation; an
+      -- ownerless projection keeps the generation protected.
+      AND (
+        (
+          ${authoritativeClosedPromiseSql}
+          AND NOT EXISTS (
+            SELECT 1 FROM result_attempts attempt
+            JOIN sim_precalc_obligations obligation
+              ON obligation.source_result_attempt_id = attempt.id
+             AND obligation.state IN ('pending', 'running')
+            WHERE attempt.sim_job_id = terminal_job.id
+          )
+        )
+        OR (
+          remote_promise.status = 'active'
+          AND EXISTS (
+            SELECT 1 FROM result_attempts attempt
+            JOIN sim_precalc_obligations obligation
+              ON obligation.airfoil_id = attempt.airfoil_id
+             AND obligation.revision_id = attempt.simulation_preset_revision_id
+             AND obligation.aoa_deg = attempt.aoa_deg
+             AND obligation.state IN ('pending', 'running')
+            JOIN sync_sweep_promise_points recovery_point
+              ON recovery_point.promise_id = remote_promise.id
+             AND recovery_point.airfoil_id = obligation.airfoil_id
+             AND recovery_point.simulation_preset_revision_id = obligation.revision_id
+             AND recovery_point.aoa_deg = obligation.aoa_deg
+             AND recovery_point.status = 'active'
+            WHERE attempt.sim_job_id = terminal_job.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM result_attempts attempt
+            WHERE attempt.sim_job_id = terminal_job.id
+              AND NOT EXISTS (
+                SELECT 1 FROM sim_precalc_obligations obligation
+                JOIN sync_sweep_promise_points recovery_point
+                  ON recovery_point.promise_id = remote_promise.id
+                 AND recovery_point.airfoil_id = obligation.airfoil_id
+                 AND recovery_point.simulation_preset_revision_id = obligation.revision_id
+                 AND recovery_point.aoa_deg = obligation.aoa_deg
+                 AND recovery_point.status = 'active'
+                WHERE obligation.airfoil_id = attempt.airfoil_id
+                  AND obligation.revision_id = attempt.simulation_preset_revision_id
+                  AND obligation.aoa_deg = attempt.aoa_deg
+                  AND obligation.state IN ('pending', 'running')
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM results result
+            WHERE result.sim_job_id = terminal_job.id
+              AND NOT EXISTS (
+                SELECT 1 FROM result_attempts attempt
+                WHERE attempt.result_id = result.id
+                  AND attempt.sim_job_id = terminal_job.id
+              )
+          )
+        )
+      )
+      -- A live transfer may still be establishing immutable hub authority.
+      AND NOT EXISTS (
+        SELECT 1 FROM sync_remote_result_deliveries delivery
+        WHERE delivery.sim_job_id = terminal_job.id
+          AND delivery.state IN ('pending', 'pushing', 'retry_wait')
+      )
+      -- Default-deny: every attached attempt must carry an explicit terminal
+      -- verdict. A locally accepted attempt is disposable only after exact
+      -- upstream authority ended and only while the append-only publication
+      -- guards below prove it was never canonical, bound, or fulfilled.
+      AND NOT EXISTS (
+        SELECT 1 FROM result_attempts attempt
+        WHERE attempt.sim_job_id = terminal_job.id
+          AND NOT (
+            attempt.status = 'failed'
+            OR EXISTS (
+              SELECT 1 FROM result_classifications classification
+              WHERE classification.result_attempt_id = attempt.id
+                AND classification.state IN (
+                  'rejected', 'needs_urans', 'superseded_by_urans'
+                )
+            )
+            OR (
+              ${authoritativeClosedPromiseSql}
+              AND (
+                EXISTS (
+                  SELECT 1 FROM result_classifications classification
+                  WHERE classification.result_attempt_id = attempt.id
+                    AND classification.state = 'accepted'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM result_interpretations interpretation
+                  WHERE interpretation.result_attempt_id = attempt.id
+                    AND interpretation.state = 'accepted'
+                )
+              )
+            )
+          )
+      )
+      -- Append-only relations, not mutable result pointers, own publication.
+      AND NOT EXISTS (
+        SELECT 1 FROM result_attempts attempt
+        WHERE attempt.sim_job_id = terminal_job.id
+          AND (
+            (
+              (
+                EXISTS (
+                  SELECT 1 FROM result_classifications classification
+                  WHERE classification.result_attempt_id = attempt.id
+                    AND classification.state = 'accepted'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM result_interpretations interpretation
+                  WHERE interpretation.result_attempt_id = attempt.id
+                    AND interpretation.state = 'accepted'
+                )
+              )
+              AND NOT ${authoritativeClosedPromiseSql}
+            )
+            OR EXISTS (
+              SELECT 1 FROM result_canonical_selections selection
+              WHERE selection.result_attempt_id = attempt.id
+            )
+            OR EXISTS (
+              SELECT 1 FROM sync_remote_hub_binding_receipts receipt
+              WHERE receipt.result_attempt_id = attempt.id
+            )
+            OR EXISTS (
+              SELECT 1 FROM sync_sweep_promise_points point
+              WHERE point.result_attempt_id = attempt.id
+                AND point.status = 'fulfilled'
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM result_attempts attempt
+        JOIN sim_urans_verify_queue verify
+          ON verify.latest_result_attempt_id = attempt.id
+         AND verify.state IN ('pending', 'running')
+        WHERE attempt.sim_job_id = terminal_job.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM result_attempts attempt
+        JOIN sim_urans_requests request_item
+          ON request_item.continue_from_result_id = attempt.result_id
+         AND request_item.state IN ('pending', 'submitted', 'running', 'ingesting')
+        WHERE attempt.sim_job_id = terminal_job.id
+      )
+      -- A projection with no attempt is disposable only when it is already a
+      -- failed/stale shell. A coefficient-bearing unclassified row is held.
+      AND NOT EXISTS (
+        SELECT 1 FROM results result
+        WHERE result.sim_job_id = terminal_job.id
+          AND result.status NOT IN ('failed', 'stale')
+          AND NOT EXISTS (
+            SELECT 1 FROM result_attempts attempt
+            WHERE attempt.result_id = result.id
+              AND attempt.sim_job_id = terminal_job.id
+          )
+      )
+    ORDER BY COALESCE(
+      terminal_job."finishedAt",
+      terminal_job."updatedAt",
+      terminal_job."createdAt"
+    ), terminal_job.id
+    LIMIT ${boundedLimit}
+  `)) as unknown as DisposableTerminalRemoteJob[];
+
+  let jobs = 0;
+  let attempts = 0;
+  let bytesFreed = 0;
+  for (const candidate of candidates) {
+    let runtimeStopped = false;
+    try {
+      const runtimes = await engine.getJobRuntimes([candidate.engine_job_id]);
+      const runtime = runtimes.jobs.find(
+        (entry) => entry.job_id === candidate.engine_job_id,
+      );
+      if (
+        runtime &&
+        Number.isFinite(runtime.process_count) &&
+        runtime.process_count === 0
+      ) {
+        if (!runtime.exists) {
+          // The direct runtime endpoint proves both that the case directory is
+          // absent and that no child survives. Treat that as the idempotent
+          // engine-delete state; the database half must still settle so an old
+          // 404 cannot monopolize the bounded candidate window forever.
+          runtimeStopped = true;
+        } else {
+          const status = await engine.getJob(candidate.engine_job_id);
+          runtimeStopped = ["completed", "failed", "cancelled"].includes(
+            status.state,
+          );
+        }
+      }
+    } catch (error) {
+      console.warn(
+        `[sweeper] TERMINAL RECLAIM: deferred ${candidate.engine_job_id}; direct terminal/runtime proof failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!runtimeStopped) continue;
+
+    let discardedAttempts = 0;
+    try {
+      discardedAttempts = await db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as DB;
+        const locked = (await tx.execute(sql`
+          SELECT terminal_job.id
+          FROM sim_jobs terminal_job
+          JOIN sync_sweep_promises remote_promise
+            ON remote_promise.id::text =
+               terminal_job.request_payload ->> 'syncPromiseId'
+          WHERE terminal_job.id = ${candidate.id}
+            AND terminal_job.engine_job_id = ${candidate.engine_job_id}
+            AND terminal_job.status IN ('done', 'failed', 'cancelled')
+            AND NOT (
+              terminal_job.status = 'cancelled'
+              AND terminal_job.engine_state IN ('cancelling', 'cancel_pending')
+            )
+            AND terminal_job.request_payload ->> 'remoteSolver' = 'true'
+            AND terminal_job.stripped_at IS NULL
+            AND (
+              (
+                ${authoritativeClosedPromiseSql}
+                AND NOT EXISTS (
+                  SELECT 1 FROM result_attempts attempt
+                  JOIN sim_precalc_obligations obligation
+                    ON obligation.source_result_attempt_id = attempt.id
+                   AND obligation.state IN ('pending', 'running')
+                  WHERE attempt.sim_job_id = terminal_job.id
+                )
+              )
+              OR (
+                remote_promise.status = 'active'
+                AND EXISTS (
+                  SELECT 1 FROM result_attempts attempt
+                  JOIN sim_precalc_obligations obligation
+                    ON obligation.airfoil_id = attempt.airfoil_id
+                   AND obligation.revision_id = attempt.simulation_preset_revision_id
+                   AND obligation.aoa_deg = attempt.aoa_deg
+                   AND obligation.state IN ('pending', 'running')
+                  JOIN sync_sweep_promise_points recovery_point
+                    ON recovery_point.promise_id = remote_promise.id
+                   AND recovery_point.airfoil_id = obligation.airfoil_id
+                   AND recovery_point.simulation_preset_revision_id = obligation.revision_id
+                   AND recovery_point.aoa_deg = obligation.aoa_deg
+                   AND recovery_point.status = 'active'
+                  WHERE attempt.sim_job_id = terminal_job.id
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM result_attempts attempt
+                  WHERE attempt.sim_job_id = terminal_job.id
+                    AND NOT EXISTS (
+                      SELECT 1 FROM sim_precalc_obligations obligation
+                      JOIN sync_sweep_promise_points recovery_point
+                        ON recovery_point.promise_id = remote_promise.id
+                       AND recovery_point.airfoil_id = obligation.airfoil_id
+                       AND recovery_point.simulation_preset_revision_id = obligation.revision_id
+                       AND recovery_point.aoa_deg = obligation.aoa_deg
+                       AND recovery_point.status = 'active'
+                      WHERE obligation.airfoil_id = attempt.airfoil_id
+                        AND obligation.revision_id = attempt.simulation_preset_revision_id
+                        AND obligation.aoa_deg = attempt.aoa_deg
+                        AND obligation.state IN ('pending', 'running')
+                    )
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM results result
+                  WHERE result.sim_job_id = terminal_job.id
+                    AND NOT EXISTS (
+                      SELECT 1 FROM result_attempts attempt
+                      WHERE attempt.result_id = result.id
+                        AND attempt.sim_job_id = terminal_job.id
+                    )
+                )
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM sync_remote_result_deliveries delivery
+              WHERE delivery.sim_job_id = terminal_job.id
+                AND delivery.state IN ('pending', 'pushing', 'retry_wait')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM result_attempts attempt
+              WHERE attempt.sim_job_id = terminal_job.id
+                AND NOT (
+                  attempt.status = 'failed'
+                  OR EXISTS (
+                    SELECT 1 FROM result_classifications classification
+                    WHERE classification.result_attempt_id = attempt.id
+                      AND classification.state IN (
+                        'rejected', 'needs_urans', 'superseded_by_urans'
+                      )
+                  )
+                  OR (
+                    ${authoritativeClosedPromiseSql}
+                    AND (
+                      EXISTS (
+                        SELECT 1 FROM result_classifications classification
+                        WHERE classification.result_attempt_id = attempt.id
+                          AND classification.state = 'accepted'
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM result_interpretations interpretation
+                        WHERE interpretation.result_attempt_id = attempt.id
+                          AND interpretation.state = 'accepted'
+                      )
+                    )
+                  )
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM result_attempts attempt
+              WHERE attempt.sim_job_id = terminal_job.id
+                AND (
+                  (
+                    (
+                      EXISTS (
+                        SELECT 1 FROM result_classifications classification
+                        WHERE classification.result_attempt_id = attempt.id
+                          AND classification.state = 'accepted'
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM result_interpretations interpretation
+                        WHERE interpretation.result_attempt_id = attempt.id
+                          AND interpretation.state = 'accepted'
+                      )
+                    )
+                    AND NOT ${authoritativeClosedPromiseSql}
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM result_canonical_selections selection
+                    WHERE selection.result_attempt_id = attempt.id
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM sync_remote_hub_binding_receipts receipt
+                    WHERE receipt.result_attempt_id = attempt.id
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM sync_sweep_promise_points point
+                    WHERE point.result_attempt_id = attempt.id
+                      AND point.status = 'fulfilled'
+                  )
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM result_attempts attempt
+              JOIN sim_urans_verify_queue verify
+                ON verify.latest_result_attempt_id = attempt.id
+               AND verify.state IN ('pending', 'running')
+              WHERE attempt.sim_job_id = terminal_job.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM result_attempts attempt
+              JOIN sim_urans_requests request_item
+                ON request_item.continue_from_result_id = attempt.result_id
+               AND request_item.state IN ('pending', 'submitted', 'running', 'ingesting')
+              WHERE attempt.sim_job_id = terminal_job.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM results result
+              WHERE result.sim_job_id = terminal_job.id
+                AND result.status NOT IN ('failed', 'stale')
+                AND NOT EXISTS (
+                  SELECT 1 FROM result_attempts attempt
+                  WHERE attempt.result_id = result.id
+                    AND attempt.sim_job_id = terminal_job.id
+                )
+            )
+          FOR UPDATE OF terminal_job
+        `)) as unknown as Array<{ id: string }>;
+        if (!locked.length) return -1;
+
+        const disposableAttempts = sql`
+          SELECT attempt.id, attempt.result_id
+          FROM result_attempts attempt
+          WHERE attempt.sim_job_id = ${candidate.id}::uuid
+        `;
+        await tx.execute(sql`
+          UPDATE results result
+          SET current_result_attempt_id = NULL,
+              current_result_interpretation_id = NULL,
+              current_canonical_selection_id = NULL,
+              "updatedAt" = now()
+          WHERE result.id IN (
+            SELECT disposable.result_id FROM (${disposableAttempts}) disposable
+          )
+            AND (
+              result.current_result_attempt_id IN (
+                SELECT disposable.id FROM (${disposableAttempts}) disposable
+              )
+              OR result.current_result_interpretation_id IN (
+                SELECT interpretation.id
+                FROM result_interpretations interpretation
+                JOIN (${disposableAttempts}) disposable
+                  ON disposable.id = interpretation.result_attempt_id
+              )
+              OR result.current_canonical_selection_id IN (
+                SELECT selection.id
+                FROM result_canonical_selections selection
+                JOIN (${disposableAttempts}) disposable
+                  ON disposable.id = selection.result_attempt_id
+              )
+            )
+        `);
+        await tx.execute(sql`
+          UPDATE sim_campaign_points point
+          SET result_attempt_id = NULL, "updatedAt" = now()
+          FROM (${disposableAttempts}) disposable
+          WHERE point.result_attempt_id = disposable.id
+            AND point.result_id = disposable.result_id
+        `);
+        await tx.execute(sql`
+          UPDATE sync_sweep_promise_points point
+          SET result_attempt_id = NULL, "updatedAt" = now()
+          FROM (${disposableAttempts}) disposable
+          WHERE point.result_attempt_id = disposable.id
+            AND point.result_id = disposable.result_id
+        `);
+        await tx.execute(sql`
+          UPDATE sim_precalc_obligations obligation
+          SET source_result_attempt_id = NULL, source_result_id = NULL,
+              "updatedAt" = now()
+          FROM (${disposableAttempts}) disposable
+          WHERE obligation.source_result_attempt_id = disposable.id
+            AND obligation.source_result_id = disposable.result_id
+        `);
+        await tx.execute(sql`
+          UPDATE sim_solver_incidents incident
+          SET result_attempt_id = NULL, "updatedAt" = now()
+          FROM (${disposableAttempts}) disposable
+          WHERE incident.result_attempt_id = disposable.id
+            AND incident.result_id = disposable.result_id
+        `);
+        await tx.execute(sql`
+          DELETE FROM remote_asset_references asset
+          USING (${disposableAttempts}) disposable
+          WHERE asset.result_attempt_id = disposable.id
+            AND asset.result_id = disposable.result_id
+        `);
+        const removed = (await tx.execute(sql`
+          DELETE FROM result_attempts attempt
+          USING (${disposableAttempts}) disposable
+          WHERE attempt.id = disposable.id
+          RETURNING attempt.id
+        `)) as unknown as Array<{ id: string }>;
+
+        await tx.execute(sql`
+          UPDATE results result
+          SET status = 'failed', source = 'queued', regime = NULL,
+              reynolds = NULL, speed = NULL, chord = NULL, mach = NULL,
+              cl = NULL, cd = NULL, cm = NULL, cl_cd = NULL,
+              cl_std = NULL, cd_std = NULL, cm_std = NULL,
+              stalled = false, unsteady = false, converged = false,
+              final_residual = NULL, iterations = NULL,
+              y_plus_avg = NULL, y_plus_max = NULL, n_cells = NULL,
+              first_order_fallback = false, strouhal = NULL,
+              error = 'unpublished terminal remote generation reclaimed after authoritative scheduling ownership ended or durable fresh-recovery ownership was established',
+              quality_warnings = NULL, frame_track = NULL,
+              steady_history = NULL, sim_job_id = NULL,
+              engine_job_id = NULL, engine_case_slug = NULL,
+              method_key = NULL, solver_implementation_id = NULL,
+              solver_runtime_build_id = NULL, "solvedAt" = NULL,
+              "updatedAt" = now()
+          WHERE (
+              result.sim_job_id = ${candidate.id}::uuid
+              OR result.engine_job_id = ${candidate.engine_job_id}
+            )
+            AND result.current_result_attempt_id IS NULL
+            AND result.current_result_interpretation_id IS NULL
+            AND result.current_canonical_selection_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM result_attempts remaining
+              WHERE remaining.result_id = result.id
+            )
+        `);
+        return removed.length;
+      });
+    } catch (error) {
+      console.warn(
+        `[sweeper] TERMINAL RECLAIM: failed to detach ${candidate.engine_job_id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      continue;
+    }
+    if (discardedAttempts < 0) continue;
+
+    let deletedBytes = 0;
+    try {
+      const deleted = await engine.deleteJob(candidate.engine_job_id);
+      deletedBytes = Number(deleted?.bytes_freed ?? 0);
+    } catch (error) {
+      if (!(error instanceof EngineError && error.status === 404)) {
+        console.warn(
+          `[sweeper] TERMINAL RECLAIM: detached ${candidate.engine_job_id} but engine deletion failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        continue;
+      }
+    }
+
+    const stamped = await db.execute(sql`
+      UPDATE sim_jobs terminal_job
+      SET stripped_at = now(),
+          strip_report = ${JSON.stringify({
+            note: "discarded unpublished remote terminal generation after authoritative ownership handoff",
+          })}::jsonb || jsonb_build_object(
+            'bytes_freed', ${deletedBytes}::bigint,
+            'discarded_attempts', ${discardedAttempts}::integer
+          ),
+          "updatedAt" = now()
+      WHERE terminal_job.id = ${candidate.id}
+        AND terminal_job.engine_job_id = ${candidate.engine_job_id}
+        AND terminal_job.stripped_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM results result
+          WHERE result.sim_job_id = terminal_job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM result_attempts attempt
+          WHERE attempt.sim_job_id = terminal_job.id
+        )
+      RETURNING terminal_job.id
+    `);
+    if ((stamped as unknown as Array<{ id: string }>).length) {
+      jobs += 1;
+      attempts += discardedAttempts;
+      bytesFreed += deletedBytes;
+      console.log(
+        `[sweeper] TERMINAL RECLAIM: deleted ${candidate.engine_job_id}; discarded ${discardedAttempts} unpublished attempt(s) after an authoritative ownership handoff, freed ${deletedBytes} bytes`,
+      );
+    }
+  }
+  return { jobs, attempts, bytesFreed };
+}
+
+/**
+ * The clean-restart transaction detaches failed attempts and their artifacts
+ * from the durable cell before this pass. Once nothing still owns this exact
+ * failed/cancelled engine generation, delete its case directory immediately.
+ * Accepted result generations never meet this zero-owner condition and remain
+ * on the ordinary archive/receipt lifecycle.
+ */
+export const DEFAULT_DISCARDED_REMOTE_JOB_DELETE_LIMIT = 100;
+
+export async function deleteDiscardedTerminalRemoteJobDirs(
+  db: DB,
+  engine: EngineClient,
+  limit = DEFAULT_DISCARDED_REMOTE_JOB_DELETE_LIMIT,
+): Promise<{ jobs: number; bytesFreed: number }> {
+  const boundedLimit = Math.min(1_000, Math.max(0, Math.trunc(limit)));
+  if (boundedLimit === 0) return { jobs: 0, bytesFreed: 0 };
+  const candidates = (await db.execute(sql`
+    SELECT terminal_job.id, terminal_job.engine_job_id
+    FROM sim_jobs terminal_job
+    WHERE terminal_job.status IN ('failed', 'cancelled')
+      AND NOT (
+        terminal_job.status = 'cancelled'
+        AND terminal_job.engine_state IN ('cancelling', 'cancel_pending')
+      )
+      AND terminal_job.engine_job_id IS NOT NULL
+      AND terminal_job.request_payload ->> 'remoteSolver' = 'true'
+      AND terminal_job.stripped_at IS NULL
+      -- The retry lifecycle has removed the failed generation and detached
+      -- the cell before its next job is composed. Any attached row means this
+      -- terminal job is still an owner and cannot be discarded yet.
+      AND NOT EXISTS (
+        SELECT 1 FROM results result
+        WHERE result.sim_job_id = terminal_job.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM result_attempts attempt
+        WHERE attempt.sim_job_id = terminal_job.id
+      )
+    ORDER BY COALESCE(
+      terminal_job."finishedAt",
+      terminal_job."updatedAt",
+      terminal_job."createdAt"
+    ), terminal_job.id
+    LIMIT ${boundedLimit}
+  `)) as unknown as Array<{ id: string; engine_job_id: string }>;
+
+  let deleted = 0;
+  let bytesFreed = 0;
+  for (const candidate of candidates) {
+    let candidateBytesFreed = 0;
+    try {
+      const response = await engine.deleteJob(candidate.engine_job_id);
+      candidateBytesFreed = Number(response?.bytes_freed ?? 0);
+      if (!Number.isFinite(candidateBytesFreed) || candidateBytesFreed < 0) {
+        candidateBytesFreed = 0;
+      }
+    } catch (error) {
+      // A previous pass may have deleted the directory after this pass read
+      // the candidate. That is the desired terminal state; every other error
+      // is retried on the next bounded transfer pass without blocking result
+      // delivery or new solver admissions.
+      if (!(error instanceof EngineError && error.status === 404)) {
+        console.warn(
+          `[sweeper] failed to delete discarded remote engine job ${candidate.engine_job_id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        continue;
+      }
+    }
+
+    await db
+      .update(simJobs)
+      .set({
+        strippedAt: new Date(),
+        stripReport: {
+          note: "discarded failed remote generation after clean restart",
+          bytes_freed: candidateBytesFreed,
+        },
+      })
+      .where(
+        and(eq(simJobs.id, candidate.id), sql`${simJobs.strippedAt} IS NULL`),
+      );
+    deleted += 1;
+    bytesFreed += candidateBytesFreed;
+  }
+  if (deleted > 0) {
+    console.log(
+      `[sweeper] DETACHED TERMINAL RECLAIM: deleted ${deleted} zero-owner job(s), freed ${bytesFreed} bytes`,
+    );
+  }
+  return { jobs: deleted, bytesFreed };
 }
 
 async function composeRemotePromiseJob(
@@ -2168,6 +3219,7 @@ async function submitMirroredRemotePromise(
   settings: Settings,
   promiseId: string,
   meshRecoveryVersion: number,
+  storageAdmissionAllowed?: () => Promise<boolean>,
 ): Promise<RemotePromiseSubmitResult> {
   if (engineBackoffActive()) {
     const error = `remote engine submit for promise ${promiseId} is waiting for the shared connection backoff`;
@@ -2194,7 +3246,7 @@ async function submitMirroredRemotePromise(
   }
   if (composition.kind === "busy") {
     await setStatus(db, "solving", null);
-    return { kind: "busy" };
+    return { kind: "busy", state: composition.state };
   }
   if (composition.kind === "terminal") {
     const error = `remote promise ${promiseId} has no retryable claimed cells`;
@@ -2217,6 +3269,7 @@ async function submitMirroredRemotePromise(
     request: composition.request,
     connectionErrorPrefix: "remote engine unreachable at submit: ",
     submitErrorPrefix: "remote engine submit failed: ",
+    ...(storageAdmissionAllowed ? { storageAdmissionAllowed } : {}),
   });
   if (outcome.kind === "submitted") {
     await clearEngineUnreachable(db);
@@ -2233,7 +3286,14 @@ async function submitMirroredRemotePromise(
     const error = `remote engine unreachable at submit: ${outcome.error}`;
     await recordEngineUnreachable(db);
     await setStatus(db, "error", error);
-    return { kind: "stopped", error };
+    // The promise continues to own its exact cells through the shared
+    // connection backoff. It is not terminal and must not be bypassed by a
+    // fresh upstream claim in this admission tick.
+    return { kind: "waiting" };
+  }
+  if (outcome.kind === "storage_admission_hold") {
+    await setStatus(db, "idle", outcome.error);
+    return { kind: "waiting" };
   }
   if (outcome.kind === "lifecycle_stopped") {
     await setStatus(db, "error", outcome.error);
@@ -2266,6 +3326,7 @@ async function claimRemoteWork(
   engine: EngineClient,
   settings: Settings,
   meshRecoveryVersion: number,
+  storageAdmissionAllowed?: () => Promise<boolean>,
 ): Promise<RemotePromiseSubmitResult | null> {
   const solverId =
     settings.remoteSolverRegisteredId ?? (await registerSolver(db, settings));
@@ -2310,6 +3371,7 @@ async function claimRemoteWork(
     settings,
     claim.id,
     meshRecoveryVersion,
+    storageAdmissionAllowed,
   );
 }
 
@@ -3554,6 +4616,128 @@ async function activeRemotePrecalcObligationIds(
   }));
 }
 
+interface RemotePrecalcCheckpointFairnessTurn {
+  candidate: PrecalcContinuationAddress;
+  deliveriesSinceLastTurn: number;
+  oldestCheckpointAgeMs: number;
+}
+
+/**
+ * A checkpoint archive can take hours to stream and verify. Its fairness turn
+ * is therefore derived from durable remote-delivery history and the exact
+ * candidate's persisted obligation timestamp, rather than an in-memory
+ * counter that would reset whenever the sweeper restarts. A fairness turn
+ * touches that exact obligation before archive streaming, so a failed or
+ * restarted transfer remains bounded without misrepresenting a checkpoint as
+ * a full remote-database sync.
+ */
+async function dueRemotePrecalcCheckpointFairnessTurn(
+  db: DB,
+  settings: Settings,
+): Promise<RemotePrecalcCheckpointFairnessTurn | null> {
+  const ownership = await activeRemotePrecalcObligationIds(db, settings);
+  if (!ownership.length) return null;
+  const candidates = await precalcCheckpointCandidatesForObligations(
+    db,
+    ownership.map((row) => row.obligationId),
+  );
+  if (!candidates.length) return null;
+  const candidateByObligationId = new Map(
+    candidates.map((candidate) => [candidate.obligationId, candidate]),
+  );
+  const candidateIds = Array.from(candidateByObligationId.keys());
+  const [oldest] = await db
+    .select({
+      id: simPrecalcObligations.id,
+      updatedAt: simPrecalcObligations.updatedAt,
+    })
+    .from(simPrecalcObligations)
+    .where(inArray(simPrecalcObligations.id, candidateIds))
+    .orderBy(simPrecalcObligations.updatedAt, simPrecalcObligations.id)
+    .limit(1);
+  const candidate = oldest ? candidateByObligationId.get(oldest.id) : undefined;
+  if (!oldest || !candidate) return null;
+  const watermark = oldest.updatedAt;
+  const [deliveryCount] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(syncRemoteResultDeliveries)
+    .innerJoin(
+      syncSweepPromises,
+      eq(syncSweepPromises.id, syncRemoteResultDeliveries.promiseId),
+    )
+    .where(
+      and(
+        eq(syncRemoteResultDeliveries.state, "delivered"),
+        gt(syncRemoteResultDeliveries.deliveredAt, watermark),
+        eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
+        sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+        remotePromiseOwnerSql(settings, "sync_sweep_promises"),
+      ),
+    );
+  const deliveriesSinceLastTurn = Number(deliveryCount?.count ?? 0);
+  const oldestCheckpointAgeMs = Math.max(
+    0,
+    Date.now() - oldest.updatedAt.getTime(),
+  );
+  if (
+    deliveriesSinceLastTurn < REMOTE_PRECALC_CHECKPOINT_DELIVERY_QUANTUM &&
+    oldestCheckpointAgeMs < REMOTE_PRECALC_CHECKPOINT_MAX_DEFERRAL_MS
+  ) {
+    return null;
+  }
+  return { candidate, deliveriesSinceLastTurn, oldestCheckpointAgeMs };
+}
+
+/**
+ * Run one lower-priority checkpoint only after a normal result has already
+ * been published in this tick. The exact obligation timestamp gives the
+ * checkpoint a bounded turn across sweeper restarts without letting a failed
+ * checkpoint loop monopolize later accepted-result deliveries.
+ */
+async function processFairRemotePrecalcCheckpointAfterDelivery(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+): Promise<boolean> {
+  const fairness = await dueRemotePrecalcCheckpointFairnessTurn(db, settings);
+  if (!fairness) return false;
+  const now = new Date();
+  await db
+    .update(simPrecalcObligations)
+    .set({ updatedAt: now })
+    .where(
+      and(
+        eq(simPrecalcObligations.id, fairness.candidate.obligationId),
+        eq(simPrecalcObligations.state, "pending"),
+      ),
+    );
+  await setStatus(db, "pushing", null);
+  console.info(
+    `[sweeper] remote PRECALC checkpoint fairness turn after ${fairness.deliveriesSinceLastTurn} accepted deliveries; oldest checkpoint ${Math.round(fairness.oldestCheckpointAgeMs / 1_000)}s old`,
+  );
+  try {
+    const processed = await processRestartableRemotePrecalcCheckpoint(
+      db,
+      engine,
+      settings,
+      fairness.candidate.obligationId,
+    );
+    if (!processed) await setStatus(db, "idle", null);
+    return processed;
+  } catch (error) {
+    // The checkpoint function retains its own immutable evidence and durable
+    // retry state. This recorded turn must not turn that lower-priority error
+    // into a blocker for the already-completed normal delivery or future
+    // delivery ticks.
+    await setStatus(
+      db,
+      "error",
+      error instanceof Error ? error.message : String(error),
+    );
+    return false;
+  }
+}
+
 /**
  * Broker one rejected-but-restartable PRECALC checkpoint without publishing a
  * polar point or fulfilling its remote promise. The hub authenticates every
@@ -3565,15 +4749,22 @@ export async function processRestartableRemotePrecalcCheckpoint(
   db: DB,
   engine: EngineClient,
   settings: Settings,
+  preferredObligationId?: string,
 ): Promise<boolean> {
   const ownership = await activeRemotePrecalcObligationIds(db, settings);
   if (!ownership.length) return false;
   const promisesByObligation = new Map(
     ownership.map((row) => [row.obligationId, row.promiseId]),
   );
-  const candidates = await precalcCheckpointCandidatesForObligations(
-    db,
-    ownership.map((row) => row.obligationId),
+  const candidates = (
+    await precalcCheckpointCandidatesForObligations(
+      db,
+      ownership.map((row) => row.obligationId),
+    )
+  ).filter(
+    (candidate) =>
+      !preferredObligationId ||
+      candidate.obligationId === preferredObligationId,
   );
   let firstError: unknown = null;
   for (const candidate of candidates) {
@@ -5743,6 +6934,10 @@ export async function reconcileRemoteSolverTick(
   db: DB,
   engine: EngineClient,
 ): Promise<boolean> {
+  // The scheduler's opening gate cannot cover a watcher that acquires the
+  // durable drain while this tick is progressing. Reconciliation renews and
+  // expires promise authority, so it must re-check at its own write boundary.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return false;
   const [settings] = await db
     .select()
     .from(syncApiSettings)
@@ -5802,6 +6997,11 @@ export async function transferRemoteSolverTick(
   db: DB,
   engine: EngineClient,
 ): Promise<boolean> {
+  // Delivery, cancellation and reusable-evidence transfer are all canonical
+  // writes. A watcher-owned receipt is intentionally the sole writer while
+  // its durable drain token exists; do not even inspect or claim the remote
+  // outboxes in that interval.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return false;
   const [settings] = await db
     .select()
     .from(syncApiSettings)
@@ -5818,14 +7018,28 @@ export async function transferRemoteSolverTick(
     // pass keeps its exact claim and completes normally, while no later pass
     // may claim another delivery, cancellation, or reclaim row.
     if (settings?.remoteSolverTransferPaused) return false;
-    // Reclaim is its own durable outbox, but deletion still requires the
-    // current owning solver token to read back and authenticate the exact bound
-    // hub archive first. Missing/rotated credentials therefore back off with
-    // local bytes intact instead of turning an old receipt into delete power.
-    if (settings) await processBrokeredRemoteEvidenceReclaims(db, settings);
+    // A clean retry has already detached failed/cancelled evidence from its
+    // physical cell. Remove that zero-owner engine directory before any
+    // potentially expensive legacy scan or network outbox. This path cannot
+    // touch live, attached, accepted, or cancellation-pending generations.
+    await deleteDiscardedTerminalRemoteJobDirs(db, engine);
+    // Closed remote authority is already the durable permission boundary for
+    // these explicitly nonpublishable generations. Reclaim them before the
+    // legacy terminal-promise scan: that scan can be expensive on a large
+    // history and must never head-of-line block storage recovery until disk
+    // admission has already stopped the solver.
+    await reclaimDisposableTerminalRemoteJobDirs(db, engine, 100);
+    // Terminal engine rows can arrive after their submit lifecycle call (or
+    // have been stranded by an older release). Reconstruct only the exact
+    // no-publishable-result cancellation outbox before draining it. Its hub
+    // acknowledgement releases the promise so the failed generation can be
+    // deleted and restarted normally.
+    if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
+      await reconcileTerminalRemotePromiseReleases(db, settings);
+    }
     // Cancellation is an authority-release outbox, not solver work. Drain it
-    // even while solving is disabled; a local pause must never strand an
-    // upstream lease.
+    // before every potentially long archive operation, even while solving is
+    // disabled; a local pause must never strand an upstream lease.
     if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
       await processPendingPromiseCancellations(db, settings);
       await reopenResolvedConflictDeliveries(db, settings);
@@ -5834,13 +7048,57 @@ export async function transferRemoteSolverTick(
       if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
         await cancelMirroredPromisesForDisabledSolver(db, engine, settings);
       }
+      // With normal remote publication disabled, retention still progresses
+      // only after the authority-release paths above have run.
+      const reclaimed = settings
+        ? await processBrokeredRemoteEvidenceReclaims(db, settings)
+        : 0;
+      return Boolean(reclaimed);
+    }
+    if (!settings.remoteSolverAuthToken) {
       return false;
     }
-    if (!settings.remoteSolverAuthToken) return false;
-    const processedDurableDelivery =
-      (await processRestartableRemotePrecalcCheckpoint(db, engine, settings)) ||
-      (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
-      (await processRemoteResultDeliveries(db, engine, settings));
+    // Current accepted polar deliveries and fulfilled-result upgrades are the
+    // latency-sensitive authority path. They always run before brokered
+    // reclaim or a PRECALC checkpoint stream.
+    // Once an accepted delivery succeeds, a bounded fairness turn may append
+    // one checkpoint in the same pass; the already accepted result therefore
+    // cannot be held behind that lower-priority archive.
+    const delivered = await processRemoteResultDeliveries(db, engine, settings);
+    if (delivered) {
+      // A fulfilled evidence replay is still a real accepted-result delivery,
+      // not archive housekeeping. Do not let a fairness checkpoint leapfrog
+      // it when both queues are due.
+      await processFulfilledEvidenceUpgrades(db, engine, settings);
+      await processFairRemotePrecalcCheckpointAfterDelivery(
+        db,
+        engine,
+        settings,
+      );
+      return true;
+    }
+    const upgraded = await processFulfilledEvidenceUpgrades(
+      db,
+      engine,
+      settings,
+    );
+    if (upgraded) {
+      // A storage-only replay still settles a delivered remote result row. It
+      // therefore advances the same durable fairness counter as an active
+      // promise delivery; otherwise a steady migration/upgrade backlog could
+      // starve a restartable checkpoint forever.
+      await processFairRemotePrecalcCheckpointAfterDelivery(
+        db,
+        engine,
+        settings,
+      );
+      return true;
+    }
+    const checkpointed = await processRestartableRemotePrecalcCheckpoint(
+      db,
+      engine,
+      settings,
+    );
     const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
     if (readyPromiseId) {
       await setStatus(db, "pushing", null);
@@ -5849,14 +7107,27 @@ export async function transferRemoteSolverTick(
         remoteSolverLastPushAt: new Date(),
       });
     }
+    // Checkpoint/reuse flows remain one durable action per ordinary pass. The
+    // sole deliberate exception is the bounded fairness checkpoint appended
+    // after an already completed accepted-result path above; it prevents the
+    // lower-priority continuation archive from starving without ever placing
+    // it in front of a normal publish.
+    if (checkpointed || readyPromiseId) {
+      return true;
+    }
     const reusedEvidence = await processReusablePromiseEvidence(
       db,
       engine,
       settings,
     );
-    return (
-      processedDurableDelivery || Boolean(readyPromiseId) || reusedEvidence
-    );
+    if (reusedEvidence) {
+      return true;
+    }
+
+    // Canonical result reclaim is last so readback I/O cannot head-of-line
+    // block cancellation or accepted polar delivery.
+    const reclaimed = await processBrokeredRemoteEvidenceReclaims(db, settings);
+    return Boolean(reclaimed);
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
     return false;
@@ -5890,6 +7161,8 @@ function remoteAdmissionHoldMessage(
   reason: RemoteEngineAdmissionHoldReason,
 ): string {
   switch (reason) {
+    case "higher_priority_fast_urans":
+      return "due FAST URANS recovery remains ahead of ordinary remote RANS; the next bounded recovery pass will continue it";
     case "storage_pressure":
       return "storage admission is blocked; remote reconciliation continues but no new engine job will be submitted";
     case "safety_stop":
@@ -5898,8 +7171,6 @@ function remoteAdmissionHoldMessage(
       return "engine mesh-recovery capability is unavailable or malformed; remote reconciliation continues but no new engine job will be submitted";
     case "archive_reduction_capability_unavailable":
       return "engine archive-reduction capability is absent, unavailable, or malformed; remote reconciliation and transfer continue but no new engine job will be submitted";
-    case "higher_priority_fast_urans":
-      return "higher-priority FAST URANS owns this scheduler tick; the remote promise remains active for the next admission opportunity";
     case "shared_capacity_full":
       return "shared scheduler capacity is full; the remote promise remains active while local or FAST work drains";
     case "engine_unavailable":
@@ -5914,7 +7185,13 @@ export async function admitRemoteSolverTick(
   db: DB,
   engine: EngineClient,
   decision: RemoteEngineAdmissionDecision,
+  continueAfterSubmission?: () => Promise<boolean>,
+  storageAdmissionAllowed?: () => Promise<boolean>,
 ): Promise<boolean> {
+  // This phase can create a local job and submit it to the engine. Re-check
+  // after the scheduler's earlier stages so a just-acquired watcher drain is
+  // an exclusive canonical-writer boundary, including for direct callers.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return false;
   const [settings] = await db
     .select()
     .from(syncApiSettings)
@@ -5956,9 +7233,13 @@ export async function admitRemoteSolverTick(
     // A node cap is a weighted token budget, not a singleton-job switch. One
     // polar remains serial internally (the promise composer guards that
     // promise), while independent promises fill every available token.
-    const MAX_ADMISSIONS_PER_TICK = 16;
+    // One job normally reserves one CPU slot, but the exact durable cap below
+    // also handles wider jobs. Do not retain the historical 16-job loop
+    // ceiling: a configured 40-slot remote would otherwise self-throttle even
+    // after the FAST priority inversion is fixed.
+    const maxAdmissionsThisTick = remoteCap;
     let admitted = false;
-    for (let attempt = 0; attempt < MAX_ADMISSIONS_PER_TICK; attempt++) {
+    for (let attempt = 0; attempt < maxAdmissionsThisTick; attempt++) {
       if ((await remoteReservedCpuSlots(db, settings)) >= remoteCap) break;
       if (engineBackoffActive()) {
         await setStatus(
@@ -5971,6 +7252,7 @@ export async function admitRemoteSolverTick(
       const mirrored = await mirroredRemotePromiseIds(db, settings);
       let outcome: RemotePromiseSubmitResult | null = null;
       let occupiedOutcome: RemotePromiseSubmitResult | null = null;
+      let freshHubClaimFenced = false;
       // A running polar is intentionally serial, but it must not become a
       // node-wide head-of-line block. Walk every already-mirrored promise and
       // admit the first independently runnable polar before asking the hub for
@@ -5984,7 +7266,20 @@ export async function admitRemoteSolverTick(
           settings,
           promiseId,
           meshRecoveryVersion,
+          storageAdmissionAllowed,
         );
+        // The selected occupied outcome is only a status/reporting summary.
+        // A scheduled retry retains exclusive ownership until its next exact
+        // attempt. A merely due PRECALC point protects its own promise from a
+        // RANS recomposition, but the FAST lane has already had the chance to
+        // admit it earlier in this tick; an unroutable historical point must
+        // not suppress a fresh lease for an independent physical cell.
+        if (
+          candidate.kind === "waiting" ||
+          (candidate.kind === "busy" && candidate.state?.waitingUntil)
+        ) {
+          freshHubClaimFenced = true;
+        }
         if (candidate.kind === "submitted") {
           outcome = candidate;
           break;
@@ -6007,6 +7302,17 @@ export async function admitRemoteSolverTick(
         outcome?.kind === "submitted" ? outcome : (occupiedOutcome ?? outcome);
       if (
         outcome?.kind !== "submitted" &&
+        // A retry-wait owner is deliberately different from a serially busy
+        // owner: busy work may leave capacity for another independent promise,
+        // while waiting work must retain its exact retry ownership.
+        outcome?.kind !== "waiting" &&
+        // A retry-wait owner anywhere in the mirrored set stays ahead of fresh
+        // hub work. Due FAST work is prioritized by the explicit FAST pass and
+        // `fastBacklogStillDue` admission decision; it cannot become an
+        // unbounded node-wide fence merely because an old generation is not
+        // currently restartable. A submitted/running FAST child reserves only
+        // its own weight, so it may leave capacity for an independent claim.
+        !freshHubClaimFenced &&
         (await remoteReservedCpuSlots(db, settings)) < remoteCap
       ) {
         // Busy mirrored polars are serial only within their own promise. They
@@ -6018,12 +7324,22 @@ export async function admitRemoteSolverTick(
           engine,
           settings,
           meshRecoveryVersion,
+          storageAdmissionAllowed,
         );
         if (claimed && (claimed.kind === "submitted" || !outcome))
           outcome = claimed;
       }
       if (outcome?.kind === "submitted") {
         admitted = true;
+        // A high-capacity node can consume material storage between the first
+        // and fortieth independent submission. The caller owns the live disk
+        // measurement and remaining-work reserve, so let it refresh both
+        // after every durable engine admission. A denied refresh stops only
+        // the remainder of this refill pass; the accepted job keeps running
+        // and reconciliation remains live.
+        if (continueAfterSubmission && !(await continueAfterSubmission())) {
+          break;
+        }
         continue;
       }
       // `busy` is an idempotent race on an already-composed promise. It does
@@ -6035,6 +7351,10 @@ export async function admitRemoteSolverTick(
       }
       break;
     }
+    // A later refill can see an empty hub and set status=idle after this tick
+    // has already admitted (or observed) real work. Preserve the truthful
+    // user-visible state for that owned execution.
+    if (admitted) await setStatus(db, "solving", null);
     return admitted;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));

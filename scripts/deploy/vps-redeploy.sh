@@ -88,6 +88,44 @@ verify_deployment_source() {
   echo "Verified deployment source: revision=$revision sha256=$tree_sha files=$file_count"
 }
 
+install_remote_capacity_monitor() {
+  [[ "$DEPLOYMENT_ROLE" == "remote-solver" ]] || return 0
+  APP_DIR="$APP_DIR" \
+    AIRFOILS_PRO_STATE_DIR="$AIRFOILS_PRO_STATE_DIR" \
+    ENV_FILE="$ENV_FILE" \
+    "$DEPLOY_SCRIPT_DIR/install-remote-solver-capacity-monitor.sh"
+}
+
+persist_recovery_source_revision() {
+  local temp_env
+  temp_env="$(mktemp "${ENV_FILE}.recovery-revision.XXXXXX")"
+  python3 - "$ENV_FILE" "$temp_env" "$DEPLOY_SOURCE_REVISION" <<'PY'
+import os
+import sys
+
+source, destination, revision = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    lines = handle.readlines()
+updated = False
+output = []
+for line in lines:
+    if line.startswith("AIRFOILFOAM_RECOVERY_SOURCE_REVISION="):
+        output.append(f"AIRFOILFOAM_RECOVERY_SOURCE_REVISION={revision}\n")
+        updated = True
+    else:
+        output.append(line)
+if not updated:
+    output.append(f"AIRFOILFOAM_RECOVERY_SOURCE_REVISION={revision}\n")
+with open(destination, "w", encoding="utf-8") as handle:
+    handle.writelines(output)
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(destination, 0o600)
+PY
+  mv -f "$temp_env" "$ENV_FILE"
+  echo "Pinned archive recovery grants to deployment source revision $DEPLOY_SOURCE_REVISION"
+}
+
 read_deploy_env_var() {
   local key="$1"
   awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE"
@@ -177,6 +215,64 @@ restore_sweeper_state() {
   fi
 }
 
+capture_media_repair_state() {
+  local configured_services running_ids existing_ids
+  if ! configured_services="$(compose config --services)"; then
+    echo "Could not determine whether media-repair is configured; refusing deploy." >&2
+    return 12
+  fi
+  if ! grep -Fxq media-repair <<<"$configured_services"; then
+    printf 'absent\n'
+    return 0
+  fi
+  if ! running_ids="$(compose ps --status running -q media-repair)"; then
+    echo "Could not determine whether media-repair is running; refusing deploy." >&2
+    return 12
+  fi
+  if [[ -n "$running_ids" ]]; then
+    printf 'running\n'
+    return 0
+  fi
+  if ! existing_ids="$(compose ps -a -q media-repair)"; then
+    echo "Could not determine whether a media-repair container exists; refusing deploy." >&2
+    return 12
+  fi
+  if [[ -z "$existing_ids" ]]; then
+    # First introduction: there is no deliberately stopped worker to honor.
+    # Start the newly built durable worker after the node-api migration.
+    printf 'new\n'
+  else
+    printf 'stopped\n'
+  fi
+}
+
+restore_media_repair_state() {
+  local initial_state="$1"
+  case "$initial_state" in
+    running)
+      echo "Restoring the previously running media repair worker..."
+      compose up -d --no-deps media-repair
+      ;;
+    stopped)
+      echo "Preserving the intentionally stopped media repair worker..."
+      # Keep the refreshed image/config without opening a background mutation
+      # window that the operator deliberately closed before this deploy.
+      compose up --no-start --no-deps --force-recreate media-repair
+      ;;
+    new)
+      echo "Starting newly introduced media repair worker..."
+      compose up -d --no-deps media-repair
+      ;;
+    absent)
+      echo "media-repair is not configured in this deployment source; no worker to restore."
+      ;;
+    *)
+      echo "Unknown media-repair initial state: $initial_state" >&2
+      return 12
+      ;;
+  esac
+}
+
 known_engine_worker_services() {
   compose --profile '*' config --services | awk '$0 == "worker" || $0 ~ /^worker-/'
 }
@@ -244,9 +340,32 @@ wait_for_stable_background_service() {
   return 1
 }
 
+prune_unused_docker_build_artifacts() {
+  echo "Pruning unused Docker build cache..."
+  if docker builder prune --all --force; then
+    echo "Unused Docker build cache pruned."
+  else
+    echo "WARNING: Docker build-cache cleanup failed after the deploy passed health checks; leaving services running." >&2
+  fi
+
+  echo "Pruning dangling Docker images..."
+  if docker image prune --force --filter "dangling=true"; then
+    echo "Dangling Docker images pruned."
+  else
+    echo "WARNING: Docker dangling-image cleanup failed after the deploy passed health checks; leaving services running." >&2
+  fi
+
+  return 0
+}
+
 main() {
   acquire_deploy_lock || exit $?
   verify_deployment_source || exit $?
+  # This read-only ops timer is independent of engine idleness. Install it
+  # immediately after promotion so a busy engine cannot leave the remote
+  # capacity audit broken for hours while guarded engine maintenance waits.
+  install_remote_capacity_monitor || exit $?
+  persist_recovery_source_revision
   validate_no_pending_engine_cutover || exit $?
   # This precedes scheduler inspection, image builds, migrations, and service
   # restarts. The initial pre-2606 deploy may be markerless; a completed or
@@ -260,9 +379,11 @@ main() {
     echo "Compose override: $COMPOSE_OVERRIDE_FILE"
   fi
 
-  local sweeper_initial_state
+  local sweeper_initial_state media_repair_initial_state
   sweeper_initial_state="$(capture_sweeper_state)"
   echo "Sweeper state before deploy: $sweeper_initial_state"
+  media_repair_initial_state="$(capture_media_repair_state)"
+  echo "Media repair state before deploy: $media_repair_initial_state"
 
   if [[ "${DEPLOY_OPENFOAM_SERVICES:-0}" == "1" ]]; then
     echo "Refusing DEPLOY_OPENFOAM_SERVICES=1 in the control-plane deploy." >&2
@@ -298,7 +419,7 @@ main() {
   # A missing service name is possible only while first introducing this
   # worker. Distinguish that harmless absence from a real stop failure: an old
   # media writer must never remain live across the node-api schema migration.
-  if compose config --services | grep -Fxq media-repair; then
+  if [[ "$media_repair_initial_state" != "absent" ]]; then
     compose stop media-repair
   else
     echo "media-repair is not configured in this deployment source; no writer to stop."
@@ -317,13 +438,14 @@ main() {
   echo "Restarting web..."
   compose up -d --no-deps web
   restore_sweeper_state "$sweeper_initial_state"
-  echo "Starting durable media repair worker..."
-  compose up -d --no-deps media-repair
+  restore_media_repair_state "$media_repair_initial_state"
   wait_http "web" "http://127.0.0.1:3100/health" 90
   if [[ "$sweeper_initial_state" == "running" ]]; then
     wait_for_stable_background_service sweeper "sweeper"
   fi
-  wait_for_stable_background_service media-repair "media-repair"
+  if [[ "$media_repair_initial_state" == "running" || "$media_repair_initial_state" == "new" ]]; then
+    wait_for_stable_background_service media-repair "media-repair"
+  fi
 
   echo "Skipping engine gateway/worker redeploy. Engine maintenance is available only through scripts/deploy/rebuild-engine.sh."
 
@@ -338,6 +460,11 @@ main() {
   else
     echo "Remote-solver local control-plane checks passed; no hub URL was mutated or used as a deployment health proxy."
   fi
+
+  # This runs only after the full ordinary-deploy health verification. It never
+  # prunes containers, volumes, tagged images, or solver evidence, and a local
+  # Docker cleanup failure must not turn a verified deploy into a rollback.
+  prune_unused_docker_build_artifacts
 
   echo "Airfoils.Pro deploy finished."
 }

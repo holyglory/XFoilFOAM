@@ -279,6 +279,10 @@ export interface SweeperState {
   lastAdmissionFenceReason?: string | null;
   lastAdmissionFenceTriggerKey?: string | null;
   lastAdmissionFenceDetails?: Record<string, unknown> | null;
+  /** Live system-owned maintenance state. The bearer token is never modeled
+   *  in browser DTOs. */
+  maintenanceDrainActive?: boolean;
+  maintenanceDrainStartedAt?: string | null;
 }
 export interface AdminJob {
   id: string;
@@ -1896,6 +1900,8 @@ export interface AdminCampaignSummary {
     lastAdmissionFenceAt?: string | null;
     lastAdmissionFenceReason?: string | null;
     lastAdmissionFenceDetails?: AdminAdmissionFenceContext | null;
+    maintenanceDrainActive?: boolean;
+    maintenanceDrainStartedAt?: string | null;
   };
   rate: {
     pointsLast24h: number;
@@ -2255,6 +2261,8 @@ export interface AdminCampaignsSolverState {
   lastAdmissionFenceAt?: string | null;
   lastAdmissionFenceReason?: string | null;
   lastAdmissionFenceDetails?: AdminAdmissionFenceContext | null;
+  maintenanceDrainActive?: boolean;
+  maintenanceDrainStartedAt?: string | null;
 }
 
 export const listCampaigns = (
@@ -2274,12 +2282,13 @@ export const listCampaigns = (
     items: AdminCampaignListItem[];
     total: number;
     solverState: AdminCampaignsSolverState;
-  }>(`/api/admin/campaigns${suffix}`, { signal });
+  }>(`/api/admin/campaigns${suffix}`, { signal, cache: "no-store" });
 };
 
 export const getCampaign = (id: string, signal?: AbortSignal) =>
   aj<AdminCampaignSummary>(`/api/admin/campaigns/${encodeURIComponent(id)}`, {
     signal,
+    cache: "no-store",
   });
 
 export const getCampaignAirfoils = (

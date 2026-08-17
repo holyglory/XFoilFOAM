@@ -6,7 +6,7 @@ from enum import Enum
 import math
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -725,6 +725,15 @@ class PolarRequest(BaseModel):
         "continuation. This requests one to three additional whole periods after "
         "the saved terminal evidence and is valid only with continue_from.",
     )
+    clean_cycle_recovery_policy_version: Optional[
+        Literal["adaptive-clean-tail-v2"]
+    ] = Field(
+        default=None,
+        description="Versioned authority for a same-case clean-cycle recovery "
+        "continuation. Omitted means the immutable source retains the legacy "
+        "FAST=9 / FINAL=12 cap; only adaptive-clean-tail-v2 authorises the "
+        "v2 18/27 emergency ceiling.",
+    )
     expected_mesh_recovery_version: Optional[int] = Field(
         default=None,
         ge=0,
@@ -783,9 +792,12 @@ class PolarRequest(BaseModel):
                     "continue_from targets one saved case; the request must expand to exactly one "
                     "(chord, speed, AoA) case."
                 )
-        elif self.corrective_tail_periods is not None:
+        elif (
+            self.corrective_tail_periods is not None
+            or self.clean_cycle_recovery_policy_version is not None
+        ):
             raise ValueError(
-                "corrective_tail_periods is valid only for an exact continue_from URANS request."
+                "clean-cycle continuation fields are valid only for an exact continue_from URANS request."
             )
         return self
 
@@ -928,6 +940,22 @@ class UransCycleDisposition(str, Enum):
     insufficient_frames = "insufficient_frames"
 
 
+_URANS_CYCLE_UNAVAILABLE_METRIC_FIELDS = (
+    "cl_mean",
+    "cd_mean",
+    "cm_mean",
+    "cl_shape_error",
+    "cd_shape_error",
+    "cm_shape_error",
+    "cl_amplitude_deviation",
+    "cd_amplitude_deviation",
+    "cm_amplitude_deviation",
+    "cl_high_frequency",
+    "cd_high_frequency",
+    "cm_high_frequency",
+)
+
+
 class UransCycleCertificateCycle(BaseModel):
     """One audited physical shedding cycle.
 
@@ -944,20 +972,60 @@ class UransCycleCertificateCycle(BaseModel):
     field_frames: int = Field(ge=0)
     phase_max_gap: float = Field(ge=0, le=1)
     phase_shift_bins: int = Field(ge=0)
-    cl_mean: float
-    cd_mean: float
-    cm_mean: float
-    cl_shape_error: float = Field(ge=0)
-    cd_shape_error: float = Field(ge=0)
-    cm_shape_error: float = Field(ge=0)
-    cl_amplitude_deviation: float = Field(ge=0)
-    cd_amplitude_deviation: float = Field(ge=0)
-    cm_amplitude_deviation: float = Field(ge=0)
-    cl_high_frequency: float = Field(ge=0)
-    cd_high_frequency: float = Field(ge=0)
-    cm_high_frequency: float = Field(ge=0)
+    # A rejected cycle may lack a reducer diagnostic.  This is an explicit
+    # unavailable fact, not a synthetic infinity or a zero-quality score.
+    # Older `result.json` files contain JSON null here because JSON cannot
+    # faithfully transport the producer's former math.inf sentinel.
+    cl_mean: Optional[float]
+    cd_mean: Optional[float]
+    cm_mean: Optional[float]
+    cl_shape_error: Optional[float] = Field(..., ge=0)
+    cd_shape_error: Optional[float] = Field(..., ge=0)
+    cm_shape_error: Optional[float] = Field(..., ge=0)
+    cl_amplitude_deviation: Optional[float] = Field(..., ge=0)
+    cd_amplitude_deviation: Optional[float] = Field(..., ge=0)
+    cm_amplitude_deviation: Optional[float] = Field(..., ge=0)
+    cl_high_frequency: Optional[float] = Field(..., ge=0)
+    cd_high_frequency: Optional[float] = Field(..., ge=0)
+    cm_high_frequency: Optional[float] = Field(..., ge=0)
     disposition: UransCycleDisposition
     reasons: list[str] = Field(default_factory=list)
+
+    @field_validator(*_URANS_CYCLE_UNAVAILABLE_METRIC_FIELDS, mode="before")
+    @classmethod
+    def _nonfinite_metric_is_explicitly_unavailable(cls, value: object) -> object:
+        """Keep result transport JSON-safe without turning bad data into good data.
+
+        `math.inf` was a useful reducer-local sentinel for a missing phase
+        template, but Pydantic serializes it as JSON `null`.  Normalizing both
+        the historical null and a current non-finite producer value here keeps
+        the exact job result readable while preserving the missing fact.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return value
+        return numeric if math.isfinite(numeric) else None
+
+    @model_validator(mode="after")
+    def _unavailable_metrics_are_hard_corrupt(self) -> "UransCycleCertificateCycle":
+        unavailable = [
+            field
+            for field in _URANS_CYCLE_UNAVAILABLE_METRIC_FIELDS
+            if getattr(self, field) is None
+        ]
+        if not unavailable:
+            return self
+
+        self.disposition = UransCycleDisposition.hard_corrupt
+        reason = f"unavailable cycle metrics: {', '.join(unavailable)}"
+        if reason not in self.reasons:
+            self.reasons.append(reason)
+        return self
 
 
 class UransCycleCertificate(BaseModel):
@@ -979,6 +1047,43 @@ class UransCycleCertificate(BaseModel):
     cadence_adjusted: bool = False
     cycles: list[UransCycleCertificateCycle] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _withhold_stale_selected_tail_with_unavailable_metrics(
+        self,
+    ) -> "UransCycleCertificate":
+        """Never retain a publication claim across an unavailable tail metric.
+
+        This is a decoder compatibility guard only: raw result/evidence bytes
+        stay untouched.  A legacy certificate with unavailable diagnostics in
+        its startup prefix can still prove a later clean suffix.  If the
+        claimed selected suffix itself contains an unavailable diagnostic, it
+        is no longer a certificate and must continue through normal recovery.
+        """
+        if not self.certified or self.selected_cycle_start_index is None:
+            return self
+        selected_start = self.selected_cycle_start_index
+        unavailable_selected_tail = any(
+            cycle.index >= selected_start
+            and any(
+                getattr(cycle, field) is None
+                for field in _URANS_CYCLE_UNAVAILABLE_METRIC_FIELDS
+            )
+            for cycle in self.cycles
+        )
+        if not unavailable_selected_tail:
+            return self
+
+        self.certified = False
+        self.selected_cycle_start_index = None
+        self.terminal_clean_cycles = 0
+        for cycle in self.cycles:
+            if cycle.disposition is UransCycleDisposition.selected:
+                cycle.disposition = UransCycleDisposition.startup
+                reason = "publication withheld: selected tail has unavailable cycle metrics"
+                if reason not in cycle.reasons:
+                    cycle.reasons.append(reason)
+        return self
+
 
 # --------------------------------------------------------------------------- #
 # NO-SHEDDING URANS OBSERVATION CERTIFICATE (reducer v1)
@@ -992,7 +1097,14 @@ class UransCycleCertificate(BaseModel):
 # than a bare boolean.  The control plane validates the transport against the
 # accompanying force-history before it can select the point.
 # --------------------------------------------------------------------------- #
-NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v1"
+# v2 adds the bounded absolute-RMS tail policy.  A current certificate is
+# therefore only valid when both the live engine and immutable archive reducer
+# have applied that same policy to the raw observation.
+NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v2"
+# Immutable v1 results remain transport-readable so an upgraded engine can
+# return their exact hash-pinned evidence.  Scientific selection still treats
+# v2 as the only current certificate; producers below emit v2 exclusively.
+LEGACY_NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v1"
 # The certificate is a cross-runtime proof rather than a UI summary.  Keep a
 # conservative floor on both the raw source interval and its transported
 # witness so two sparse endpoints cannot masquerade as a physical observation.
@@ -1002,7 +1114,10 @@ NO_SHEDDING_MIN_SAMPLE_COUNT = 20
 class NoSheddingCertificate(BaseModel):
     """Proof-bearing physical-observation verdict for a flat URANS wake."""
 
-    reducer_version: Literal[NO_SHEDDING_CERTIFICATE_VERSION]
+    reducer_version: Literal[
+        LEGACY_NO_SHEDDING_CERTIFICATE_VERSION,
+        NO_SHEDDING_CERTIFICATE_VERSION,
+    ]
     certified: Literal[True]
     required_observation_s: float = Field(gt=0)
     observation_start_time: float = Field(ge=0)
@@ -1456,8 +1571,9 @@ class JobStatus(BaseModel):
     )
     continuation_failure_kind: Optional[ContinuationFailureKind] = Field(
         default=None,
-        description="For continuation-stage failures, whether the same immutable "
-        "source may recover after an operational change or is permanently invalid.",
+        description="For continuation-stage failures, including resumed CFD, whether "
+        "the same immutable source may recover after an operational change or is "
+        "permanently invalid.",
     )
 
 

@@ -401,7 +401,7 @@ function enginePreflight(): ThreeStageUransEnginePreflight {
       build_id: target.expectedEngineBuildId,
       mesh_recovery_version: target.expectedMeshRecoveryVersion,
       urans_recovery_version: target.expectedUransRecoveryVersion,
-      archive_reduction_version: 1,
+      archive_reduction_version: 4,
       default_engine: OPENCFD_2606_ENGINE,
       supported_engines: [OPENCFD_2606_ENGINE],
       evidence_storage: {
@@ -1239,6 +1239,11 @@ describe("three-stage URANS engine admission preflight", () => {
       "missing immutable archive reduction",
       (p: ThreeStageUransEnginePreflight) =>
         (p.health.archive_reduction_version = 0),
+    ],
+    [
+      "stale immutable archive reduction",
+      (p: ThreeStageUransEnginePreflight) =>
+        (p.health.archive_reduction_version = 3),
     ],
     [
       "missing continuation",

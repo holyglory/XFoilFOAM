@@ -1,8 +1,10 @@
 import {
   airfoils,
+  CONTINUATION_SOURCE_PERMANENT,
   createClient,
   type DB,
   enforceSweeperAdmissionFence,
+  LEGACY_URANS_RECOVERY_REMEDIATION_VERSION,
   resultAttempts,
   resultClassifications,
   results,
@@ -13,6 +15,7 @@ import {
   simCampaigns,
   simJobs,
   simPrecalcObligationCampaigns,
+  simPrecalcObligationRemediations,
   simPrecalcObligations,
   simSolverIncidentCampaigns,
   simSolverIncidents,
@@ -22,8 +25,11 @@ import {
   simUransVerifyQueueCampaigns,
   simUransRequestCampaigns,
   simUransRequests,
+  SOLVER_INCIDENT_ADMISSION_SCOPES,
   solverIncidentSummary,
   sweeperState,
+  URANS_CLEAN_CYCLE_CAP_EXHAUSTION,
+  URANS_RECOVERY_REMEDIATION_VERSION,
 } from "@aerodb/db";
 import type {
   EngineClient,
@@ -613,7 +619,7 @@ describe("global solver admission circuit breaker", () => {
     });
   });
 
-  it("fences exact blocked/final incident owners with a legacy null pin and ignores a cancelled owner", async () => {
+  it("quarantines isolated final failures and fences only a repeated exact incident group", async () => {
     const originalState = await readState();
     const aoaDeg = AOA + 0.191;
     let createdResultId: string | null = null;
@@ -729,15 +735,11 @@ describe("global solver admission circuit breaker", () => {
           state: "active",
         });
 
-        expect(await enforceSweeperAdmissionFence(tx)).toMatchObject({
-          hazardPresent: true,
-          fencedNow: true,
-          active: true,
-          trigger: {
-            reason: "blocked_final_urans",
-            campaignId,
-            generation: 1,
-          },
+        expect(await enforceSweeperAdmissionFence(tx)).toEqual({
+          hazardPresent: false,
+          fencedNow: false,
+          active: false,
+          trigger: null,
         });
         await tx
           .update(sweeperState)
@@ -767,7 +769,7 @@ describe("global solver admission circuit breaker", () => {
             verifyQueueId: verification.id,
             solverImplementationId: solverFixture.solverImplementationId,
             occurrenceKey: `${PREFIX}:legacy-point-final-unavailable`,
-            remediationVersion: "breaker-test-v1",
+            remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
           })
           .returning({ id: simSolverIncidents.id });
         await tx.insert(simSolverIncidentCampaigns).values({
@@ -790,6 +792,31 @@ describe("global solver admission circuit breaker", () => {
             }),
           ],
         });
+        expect(await enforceSweeperAdmissionFence(tx)).toEqual({
+          hazardPresent: false,
+          fencedNow: false,
+          active: false,
+          trigger: null,
+        });
+
+        const repeated = await tx
+          .insert(simSolverIncidents)
+          .values(
+            [1, 2].map((suffix) => ({
+              stage: "final" as const,
+              reason: "legacy-point-final-unavailable",
+              severity: "critical" as const,
+              status: "open" as const,
+              verifyQueueId: verification.id,
+              solverImplementationId: solverFixture.solverImplementationId,
+              occurrenceKey: `${PREFIX}:legacy-point-final-unavailable:${suffix}`,
+              remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+            })),
+          )
+          .returning({ id: simSolverIncidents.id });
+        await tx
+          .insert(simSolverIncidentCampaigns)
+          .values(repeated.map((row) => ({ incidentId: row.id, campaignId })));
         expect(await enforceSweeperAdmissionFence(tx)).toMatchObject({
           hazardPresent: true,
           fencedNow: true,
@@ -884,13 +911,321 @@ describe("global solver admission circuit breaker", () => {
     });
   });
 
-  it("ignores old-generation hazards, atomically fences the current generation, and re-trips before a resumed tick can submit", async () => {
+  it("keeps clean-cycle cap exhaustion at its physical cells while preserving systemic and evidence-integrity fences", async () => {
+    const originalState = await readState();
+    const cellAoaDegs = [0.311, 0.312, 0.313].map((offset) => AOA + offset);
+    const qualityReason =
+      "insufficient-periods+missing-urans-video+non-stationary+not-converged+not-solved+solver-error+uncertified-urans-cycles";
+    let requestIds: string[] = [];
+    let incidentIds: string[] = [];
+
+    await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await tx.execute(drizzleSql`
+        SELECT id FROM sweeper_state WHERE id = 1 FOR UPDATE
+      `);
+      try {
+        await tx
+          .update(simCampaigns)
+          .set({ currentConditionGeneration: 1 })
+          .where(eq(simCampaigns.id, campaignId));
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: true,
+            maxConcurrentJobs: 2,
+            cpuSlots: 2,
+            admissionFenceActive: false,
+            lastAdmissionFenceAt: null,
+            lastAdmissionFenceReason: null,
+            lastAdmissionFenceTriggerKey: null,
+            lastAdmissionFenceDetails: null,
+          })
+          .where(eq(sweeperState.id, 1));
+        await tx.insert(simCampaignPoints).values(
+          cellAoaDegs.map((aoaDeg) => ({
+            campaignId,
+            conditionId,
+            airfoilId,
+            aoaDeg,
+            revisionId: solverFixture.revisionId,
+            planRevisionNumber: 1,
+            state: "requested" as const,
+          })),
+        );
+        const requests = await tx
+          .insert(simUransRequests)
+          .values(
+            cellAoaDegs.map((aoaDeg) => ({
+              airfoilId,
+              revisionId: solverFixture.revisionId,
+              aoaDeg,
+              fidelity: "precalc" as const,
+              state: "blocked" as const,
+              requestedBy: `${PREFIX}:quality-cap`,
+            })),
+          )
+          .returning({ id: simUransRequests.id });
+        requestIds = requests.map((request) => request.id);
+        await tx.insert(simUransRequestCampaigns).values(
+          requestIds.map((requestId) => ({
+            requestId,
+            campaignId,
+            state: "active" as const,
+          })),
+        );
+
+        const cleanCycleCapIncidents = await tx
+          .insert(simSolverIncidents)
+          .values(
+            requestIds.map((requestId, index) => ({
+              stage: "preliminary" as const,
+              reason: qualityReason,
+              severity: "critical" as const,
+              status: "open" as const,
+              uransRequestId: requestId,
+              solverImplementationId: solverFixture.solverImplementationId,
+              occurrenceKey: `${PREFIX}:quality-cap:${index}`,
+              remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+              metadata: {
+                // Existing v11 rows have no v12 admission marker and record
+                // quality-cap exhaustion as a completed/rejected run. The
+                // compatibility reducer must keep all three physical cells
+                // out of the systemic admission fence.
+                lastOutcome: "rejected_exhausted",
+                failureDisposition: "none",
+                classificationReasons: [
+                  "insufficient-periods",
+                  "non-stationary",
+                  "uncertified-urans-cycles",
+                ],
+              },
+            })),
+          )
+          .returning({ id: simSolverIncidents.id });
+        incidentIds = cleanCycleCapIncidents.map((incident) => incident.id);
+        await tx
+          .insert(simSolverIncidentCampaigns)
+          .values(
+            incidentIds.map((incidentId) => ({ incidentId, campaignId })),
+          );
+
+        // Three exact clean-cycle ceilings are still three independent
+        // physical cells. The durable red incidents remain visible, but do
+        // not close fleet-wide admission.
+        expect(await enforceSweeperAdmissionFence(tx)).toEqual({
+          hazardPresent: false,
+          fencedNow: false,
+          active: false,
+          trigger: null,
+        });
+
+        await tx
+          .delete(simSolverIncidents)
+          .where(inArray(simSolverIncidents.id, incidentIds));
+        incidentIds = [];
+
+        const permanentContinuationIncidents = await tx
+          .insert(simSolverIncidents)
+          .values(
+            requestIds.map((requestId, index) => ({
+              stage: "preliminary" as const,
+              reason: "continuation-source-unavailable",
+              severity: "critical" as const,
+              status: "open" as const,
+              uransRequestId: requestId,
+              solverImplementationId: solverFixture.solverImplementationId,
+              occurrenceKey: `${PREFIX}:continuation-source-permanent:${index}`,
+              remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+              metadata: {
+                admissionScope: SOLVER_INCIDENT_ADMISSION_SCOPES.cell,
+                recoveryDisposition: CONTINUATION_SOURCE_PERMANENT,
+              },
+            })),
+          )
+          .returning({ id: simSolverIncidents.id });
+        incidentIds = permanentContinuationIncidents.map(
+          (incident) => incident.id,
+        );
+        await tx.insert(simSolverIncidentCampaigns).values(
+          incidentIds.map((incidentId) => ({ incidentId, campaignId })),
+        );
+
+        // Three permanently invalid same-case sources are still three
+        // immutable cells. Their critical evidence must not idle unrelated
+        // local or remote solver capacity.
+        expect(await enforceSweeperAdmissionFence(tx)).toEqual({
+          hazardPresent: false,
+          fencedNow: false,
+          active: false,
+          trigger: null,
+        });
+
+        await tx
+          .delete(simSolverIncidents)
+          .where(inArray(simSolverIncidents.id, incidentIds));
+        incidentIds = [];
+
+        const repeatedHardFailures = await tx
+          .insert(simSolverIncidents)
+          .values(
+            requestIds.map((requestId, index) => ({
+              stage: "preliminary" as const,
+              reason: qualityReason,
+              severity: "critical" as const,
+              status: "open" as const,
+              uransRequestId: requestId,
+              solverImplementationId: solverFixture.solverImplementationId,
+              occurrenceKey: `${PREFIX}:systemic-hard:${index}`,
+              remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+              metadata: {
+                lastOutcome: "failed_exhausted",
+                failureDisposition: "hard_solver",
+                classificationReasons: ["not-solved", "solver-error"],
+              },
+            })),
+          )
+          .returning({ id: simSolverIncidents.id });
+        incidentIds = repeatedHardFailures.map((incident) => incident.id);
+        await tx
+          .insert(simSolverIncidentCampaigns)
+          .values(
+            incidentIds.map((incidentId) => ({ incidentId, campaignId })),
+          );
+        const maintenanceToken = "afe5512c-1878-48c4-b1bb-59a29204c201";
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: false,
+            admissionFenceActive: false,
+            maintenanceDrainToken: maintenanceToken,
+            maintenanceDrainStartedAt: new Date(),
+          })
+          .where(eq(sweeperState.id, 1));
+        expect(await enforceSweeperAdmissionFence(tx)).toMatchObject({
+          hazardPresent: true,
+          fencedNow: true,
+          active: true,
+          trigger: {
+            reason: "critical_solver_incident",
+            campaignId,
+            generation: 1,
+          },
+        });
+        expect(await readState(tx)).toMatchObject({
+          enabled: false,
+          admissionFenceActive: true,
+          maintenanceDrainToken: null,
+          maintenanceDrainStartedAt: null,
+        });
+
+        await tx
+          .delete(simSolverIncidents)
+          .where(inArray(simSolverIncidents.id, incidentIds));
+        incidentIds = [];
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: true,
+            maxConcurrentJobs: 2,
+            cpuSlots: 2,
+            admissionFenceActive: false,
+            lastAdmissionFenceAt: null,
+            lastAdmissionFenceReason: null,
+            lastAdmissionFenceTriggerKey: null,
+            lastAdmissionFenceDetails: null,
+          })
+          .where(eq(sweeperState.id, 1));
+
+        const [evidenceIntegrityIncident] = await tx
+          .insert(simSolverIncidents)
+          .values({
+            stage: "preliminary",
+            reason: "evidence-integrity-failure",
+            severity: "critical",
+            status: "open",
+            uransRequestId: requestIds[0]!,
+            solverImplementationId: solverFixture.solverImplementationId,
+            occurrenceKey: `${PREFIX}:direct-evidence-integrity`,
+            remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+            // A corrupted producer must never be able to bypass its direct
+            // infrastructure/evidence-integrity fence by setting a cell scope.
+            metadata: {
+              admissionScope: SOLVER_INCIDENT_ADMISSION_SCOPES.cell,
+              recoveryDisposition: URANS_CLEAN_CYCLE_CAP_EXHAUSTION,
+            },
+          })
+          .returning({ id: simSolverIncidents.id });
+        incidentIds = [evidenceIntegrityIncident!.id];
+        await tx.insert(simSolverIncidentCampaigns).values({
+          incidentId: evidenceIntegrityIncident!.id,
+          campaignId,
+        });
+        expect(await enforceSweeperAdmissionFence(tx)).toMatchObject({
+          hazardPresent: true,
+          fencedNow: true,
+          active: true,
+          trigger: {
+            reason: "critical_solver_incident",
+            campaignId,
+            generation: 1,
+          },
+        });
+      } finally {
+        if (incidentIds.length) {
+          await tx
+            .delete(simSolverIncidents)
+            .where(inArray(simSolverIncidents.id, incidentIds));
+        }
+        if (requestIds.length) {
+          await tx
+            .delete(simUransRequests)
+            .where(inArray(simUransRequests.id, requestIds));
+        }
+        await tx
+          .delete(simCampaignPoints)
+          .where(
+            and(
+              eq(simCampaignPoints.campaignId, campaignId),
+              eq(simCampaignPoints.conditionId, conditionId),
+              eq(simCampaignPoints.airfoilId, airfoilId),
+              inArray(simCampaignPoints.aoaDeg, cellAoaDegs),
+            ),
+          );
+        await tx
+          .update(simCampaigns)
+          .set({ currentConditionGeneration: 2 })
+          .where(eq(simCampaigns.id, campaignId));
+        await tx
+          .update(sweeperState)
+          .set({
+            enabled: originalState.enabled,
+            maxConcurrentJobs: originalState.maxConcurrentJobs,
+            cpuSlots: originalState.cpuSlots,
+            pollIntervalMs: originalState.pollIntervalMs,
+            submitIntervalMs: originalState.submitIntervalMs,
+            admissionFenceActive: originalState.admissionFenceActive,
+            lastAdmissionFenceAt: originalState.lastAdmissionFenceAt,
+            lastAdmissionFenceReason: originalState.lastAdmissionFenceReason,
+            lastAdmissionFenceTriggerKey:
+              originalState.lastAdmissionFenceTriggerKey,
+            lastAdmissionFenceDetails: originalState.lastAdmissionFenceDetails,
+          })
+          .where(eq(sweeperState.id, 1));
+      }
+    });
+  });
+
+  it("ignores old and isolated current hazards, then fences a repeated current incident before either lane can submit", async () => {
     // Sweeper files run in parallel and several legitimately exercise the
     // singleton. Hold its row lock for this test transaction: concurrent
     // writers wait, ordinary readers keep seeing the last committed state,
     // and this file restores the exact prior row before releasing the lock.
     await db.transaction(async (transaction) => {
       const db = transaction as unknown as DB;
+      let incidentIds: string[] = [];
+      let unownedIncidentIds: string[] = [];
+      let legacyIncidentIds: string[] = [];
       await db.execute(drizzleSql`
         SELECT id FROM sweeper_state WHERE id = 1 FOR UPDATE
       `);
@@ -923,70 +1258,93 @@ describe("global solver admission circuit breaker", () => {
           admissionFenceActive: false,
         });
 
+        // These immutable rows share the future incident identity but have no
+        // active campaign owner. They are audit history, not a live systemic
+        // pattern, and must never contribute to the breaker threshold.
+        unownedIncidentIds = (
+          await db
+            .insert(simSolverIncidents)
+            .values(
+              [0, 1].map((suffix) => ({
+                stage: "final" as const,
+                reason: "repeatable-final-urans-failure",
+                severity: "critical" as const,
+                status: "open" as const,
+                uransRequestId: requestId,
+                solverImplementationId: solverFixture.solverImplementationId,
+                occurrenceKey: `${PREFIX}:unowned-historical:${suffix}`,
+                remediationVersion: LEGACY_URANS_RECOVERY_REMEDIATION_VERSION,
+              })),
+            )
+            .returning({ id: simSolverIncidents.id })
+        ).map((incident) => incident.id);
+
         await db
           .update(simCampaigns)
           .set({ currentConditionGeneration: 1 })
           .where(eq(simCampaigns.id, campaignId));
 
-        const first = await enforceSweeperAdmissionFence(db);
-        expect(first).toMatchObject({
-          hazardPresent: true,
-          fencedNow: true,
-          active: true,
-          trigger: {
-            reason: "blocked_urans_request",
+        // The legacy version is still current-campaign forensic history, but
+        // a corrected v11 controller must not aggregate it into a fresh
+        // systemic stop. Only current remediation generations are eligible.
+        const legacyIncidents = await db
+          .insert(simSolverIncidents)
+          .values(
+            [0, 1, 2].map((suffix) => ({
+              stage: "final" as const,
+              reason: "repeatable-final-urans-failure",
+              severity: "critical" as const,
+              status: "open" as const,
+              uransRequestId: requestId,
+              solverImplementationId: solverFixture.solverImplementationId,
+              occurrenceKey: `${PREFIX}:legacy-current-owner:${suffix}`,
+              remediationVersion: LEGACY_URANS_RECOVERY_REMEDIATION_VERSION,
+            })),
+          )
+          .returning({ id: simSolverIncidents.id });
+        legacyIncidentIds = legacyIncidents.map((incident) => incident.id);
+        await db.insert(simSolverIncidentCampaigns).values(
+          legacyIncidents.map((incident) => ({
+            incidentId: incident.id,
             campaignId,
-            generation: 1,
-          },
-        });
-        const tripped = await readState(db);
-        expect(tripped).toMatchObject({
-          enabled: false,
-          maxConcurrentJobs: 0,
-          cpuSlots: 0,
-          admissionFenceActive: true,
-          lastAdmissionFenceReason: "blocked_urans_request",
-        });
-        expect(tripped.lastAdmissionFenceDetails).toMatchObject({
-          requestId,
-          previousEnabled: true,
-          previousMaxConcurrentJobs: 7,
-          previousCpuSlots: 6,
-        });
-
-        const firstTripAt = tripped.lastAdmissionFenceAt?.getTime();
-        const second = await enforceSweeperAdmissionFence(db);
-        expect(second).toMatchObject({
-          hazardPresent: true,
-          fencedNow: false,
-          active: true,
-        });
-        expect((await readState(db)).lastAdmissionFenceAt?.getTime()).toBe(
-          firstTripAt,
+          })),
         );
 
-        // Critical incident provenance outranks the coarser blocked ledger in the
-        // same current physical cell, even though the first trip remains latched.
-        const [incident] = await db
-          .insert(simSolverIncidents)
-          .values({
-            stage: "final",
-            reason: "repeatable-final-urans-failure",
-            severity: "critical",
-            status: "open",
-            uransRequestId: requestId,
-            solverImplementationId: solverFixture.solverImplementationId,
-            occurrenceKey: `${PREFIX}:critical`,
-            remediationVersion: "breaker-test-v1",
-          })
-          .returning();
-        await db.insert(simSolverIncidentCampaigns).values({
-          incidentId: incident.id,
-          campaignId,
+        expect(await enforceSweeperAdmissionFence(db)).toEqual({
+          hazardPresent: false,
+          fencedNow: false,
+          active: false,
+          trigger: null,
         });
+
+        // One failed point is an actionable, durable incident but does not idle
+        // healthy local and remote solvers. The third exact equal incident is
+        // the systemic threshold that closes admission.
+        const incidents = await db
+          .insert(simSolverIncidents)
+          .values(
+            [0, 1, 2].map((suffix) => ({
+              stage: "final" as const,
+              reason: "repeatable-final-urans-failure",
+              severity: "critical" as const,
+              status: "open" as const,
+              uransRequestId: requestId,
+              solverImplementationId: solverFixture.solverImplementationId,
+              occurrenceKey: `${PREFIX}:critical:${suffix}`,
+              remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+            })),
+          )
+          .returning({ id: simSolverIncidents.id });
+        await db.insert(simSolverIncidentCampaigns).values(
+          incidents.map((incident) => ({
+            incidentId: incident.id,
+            campaignId,
+          })),
+        );
+        incidentIds = incidents.map((incident) => incident.id);
         expect(await enforceSweeperAdmissionFence(db)).toMatchObject({
           hazardPresent: true,
-          fencedNow: false,
+          fencedNow: true,
           active: true,
           trigger: {
             reason: "critical_solver_incident",
@@ -1066,6 +1424,21 @@ describe("global solver admission circuit breaker", () => {
           .where(eq(simCampaigns.id, campaignId));
         expect(campaign.status).toBe("active");
       } finally {
+        if (incidentIds.length) {
+          await db
+            .delete(simSolverIncidents)
+            .where(inArray(simSolverIncidents.id, incidentIds));
+        }
+        if (unownedIncidentIds.length) {
+          await db
+            .delete(simSolverIncidents)
+            .where(inArray(simSolverIncidents.id, unownedIncidentIds));
+        }
+        if (legacyIncidentIds.length) {
+          await db
+            .delete(simSolverIncidents)
+            .where(inArray(simSolverIncidents.id, legacyIncidentIds));
+        }
         await db
           .update(sweeperState)
           .set({
@@ -1088,6 +1461,7 @@ describe("global solver admission circuit breaker", () => {
 
   it("catches a hazard committed after the tick check at both local and remote engine boundaries", async () => {
     const originalState = await readState();
+    let systemicIncidentId: string | null = null;
     await db
       .update(simCampaigns)
       .set({ currentConditionGeneration: 2 })
@@ -1152,6 +1526,24 @@ describe("global solver admission circuit breaker", () => {
         .update(simCampaigns)
         .set({ currentConditionGeneration: 1 })
         .where(eq(simCampaigns.id, campaignId));
+      const [systemicIncident] = await db
+        .insert(simSolverIncidents)
+        .values({
+          stage: "preliminary",
+          reason: "engine-infrastructure-failure",
+          severity: "critical",
+          status: "open",
+          uransRequestId: requestId,
+          solverImplementationId: solverFixture.solverImplementationId,
+          occurrenceKey: `${PREFIX}:boundary-infrastructure-failure`,
+          remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+        })
+        .returning({ id: simSolverIncidents.id });
+      systemicIncidentId = systemicIncident.id;
+      await db.insert(simSolverIncidentCampaigns).values({
+        incidentId: systemicIncident.id,
+        campaignId,
+      });
 
       const local = await submitPendingJobWithLifecycleGuard({
         db,
@@ -1202,6 +1594,11 @@ describe("global solver admission circuit breaker", () => {
         ]),
       );
     } finally {
+      if (systemicIncidentId) {
+        await db
+          .delete(simSolverIncidents)
+          .where(eq(simSolverIncidents.id, systemicIncidentId));
+      }
       await db.delete(simJobs).where(
         inArray(
           simJobs.id,
@@ -1212,6 +1609,168 @@ describe("global solver admission circuit breaker", () => {
         .update(simCampaigns)
         .set({ currentConditionGeneration: 2 })
         .where(eq(simCampaigns.id, campaignId));
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: originalState.enabled,
+          maxConcurrentJobs: originalState.maxConcurrentJobs,
+          cpuSlots: originalState.cpuSlots,
+          pollIntervalMs: originalState.pollIntervalMs,
+          submitIntervalMs: originalState.submitIntervalMs,
+          admissionFenceActive: originalState.admissionFenceActive,
+          lastAdmissionFenceAt: originalState.lastAdmissionFenceAt,
+          lastAdmissionFenceReason: originalState.lastAdmissionFenceReason,
+          lastAdmissionFenceTriggerKey:
+            originalState.lastAdmissionFenceTriggerKey,
+          lastAdmissionFenceDetails: originalState.lastAdmissionFenceDetails,
+        })
+        .where(eq(sweeperState.id, 1));
+    }
+  });
+
+  it("does not re-fence an audited corrective PRECALC owner when it advances from pending to running", async () => {
+    const recoveryAoa = AOA + 0.269;
+    const originalState = await readState();
+    const [originalCampaign] = await db
+      .select({ generation: simCampaigns.currentConditionGeneration })
+      .from(simCampaigns)
+      .where(eq(simCampaigns.id, campaignId))
+      .limit(1);
+    const [originalRequest] = await db
+      .select({ state: simUransRequests.state })
+      .from(simUransRequests)
+      .where(eq(simUransRequests.id, requestId))
+      .limit(1);
+    let obligationId: string | null = null;
+    let pointCreated = false;
+
+    try {
+      await db
+        .update(simCampaigns)
+        .set({ currentConditionGeneration: 1 })
+        .where(eq(simCampaigns.id, campaignId));
+      await db
+        .update(simUransRequests)
+        .set({ state: "pending" })
+        .where(eq(simUransRequests.id, requestId));
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: true,
+          maxConcurrentJobs: 2,
+          cpuSlots: 2,
+          admissionFenceActive: false,
+          lastAdmissionFenceAt: null,
+          lastAdmissionFenceReason: null,
+          lastAdmissionFenceTriggerKey: null,
+          lastAdmissionFenceDetails: null,
+        })
+        .where(eq(sweeperState.id, 1));
+      await db.insert(simCampaignPoints).values({
+        campaignId,
+        conditionId,
+        airfoilId,
+        aoaDeg: recoveryAoa,
+        revisionId: solverFixture.revisionId,
+        planRevisionNumber: 1,
+        state: "requested",
+      });
+      pointCreated = true;
+      const [obligation] = await db
+        .insert(simPrecalcObligations)
+        .values({
+          airfoilId,
+          revisionId: solverFixture.revisionId,
+          aoaDeg: recoveryAoa,
+          state: "blocked",
+          attemptCount: 2,
+          maxAttempts: 2,
+          lastOutcome: "rejected_exhausted",
+        })
+        .returning({ id: simPrecalcObligations.id });
+      obligationId = obligation.id;
+      await db.insert(simPrecalcObligationCampaigns).values({
+        obligationId: obligation.id,
+        campaignId,
+        state: "active",
+      });
+      const [incident] = await db
+        .insert(simSolverIncidents)
+        .values({
+          stage: "preliminary",
+          reason: "legacy-clean-cycle-contract",
+          severity: "critical",
+          status: "open",
+          precalcObligationId: obligation.id,
+          solverImplementationId: solverFixture.solverImplementationId,
+          occurrenceKey: `${PREFIX}:running-remediation-owner`,
+          remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+        })
+        .returning({ id: simSolverIncidents.id });
+      await db.insert(simSolverIncidentCampaigns).values({
+        incidentId: incident.id,
+        campaignId,
+      });
+
+      await db.insert(simPrecalcObligationRemediations).values({
+        obligationId: obligation.id,
+        sourceRevision: "a".repeat(40),
+        reason: "corrected clean-cycle controller",
+      });
+      expect(
+        await db
+          .select({
+            state: simPrecalcObligations.state,
+            grants: simPrecalcObligations.remediationAttemptsGranted,
+          })
+          .from(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, obligation.id)),
+      ).toEqual([{ state: "pending", grants: 1 }]);
+      expect(await enforceSweeperAdmissionFence(db)).toMatchObject({
+        hazardPresent: false,
+        fencedNow: false,
+        active: false,
+      });
+
+      await db
+        .update(simPrecalcObligations)
+        .set({ state: "running" })
+        .where(eq(simPrecalcObligations.id, obligation.id));
+      expect(await enforceSweeperAdmissionFence(db)).toMatchObject({
+        hazardPresent: false,
+        fencedNow: false,
+        active: false,
+      });
+    } finally {
+      if (obligationId) {
+        await db
+          .delete(simPrecalcObligations)
+          .where(eq(simPrecalcObligations.id, obligationId));
+      }
+      if (pointCreated) {
+        await db
+          .delete(simCampaignPoints)
+          .where(
+            and(
+              eq(simCampaignPoints.campaignId, campaignId),
+              eq(simCampaignPoints.conditionId, conditionId),
+              eq(simCampaignPoints.airfoilId, airfoilId),
+              eq(simCampaignPoints.aoaDeg, recoveryAoa),
+            ),
+          );
+      }
+      if (originalCampaign) {
+        await db
+          .update(simCampaigns)
+          .set({ currentConditionGeneration: originalCampaign.generation })
+          .where(eq(simCampaigns.id, campaignId));
+      }
+      if (originalRequest) {
+        await db
+          .update(simUransRequests)
+          .set({ state: originalRequest.state })
+          .where(eq(simUransRequests.id, requestId));
+      }
       await db
         .update(sweeperState)
         .set({
@@ -1825,6 +2384,20 @@ describe("global solver admission circuit breaker", () => {
     const [capacityJob, remoteJob] = jobs;
     if (!capacityJob || !remoteJob)
       throw new Error("shared-capacity submit fixtures missing");
+    const [attachedResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: solverFixture.bcId,
+        simulationPresetRevisionId: solverFixture.revisionId,
+        aoaDeg: AOA + 0.000_001,
+        status: "queued",
+        source: "queued",
+        simJobId: remoteJob.id,
+      })
+      .returning({ id: results.id });
+    if (!attachedResult)
+      throw new Error("shared-capacity attached result fixture missing");
 
     const capacityWriterLocked = deferred<void>();
     const releaseCapacityWriter = deferred<void>();
@@ -1878,8 +2451,19 @@ describe("global solver admission circuit breaker", () => {
           "error" in remoteOutcome
           ? String(remoteOutcome.error)
           : "",
-      ).toMatch(/shared scheduler capacity is full \(1\/1\)/i);
+      ).toMatch(/shared scheduler capacity is full \(1\+1\/1\)/i);
       expect(submitCalls).toBe(0);
+      const [stoppedJob] = await db
+        .select({ status: simJobs.status, finishedAt: simJobs.finishedAt })
+        .from(simJobs)
+        .where(eq(simJobs.id, remoteJob.id));
+      expect(stoppedJob).toMatchObject({ status: "cancelled" });
+      expect(stoppedJob?.finishedAt).toBeInstanceOf(Date);
+      const [releasedResult] = await db
+        .select({ status: results.status, simJobId: results.simJobId })
+        .from(results)
+        .where(eq(results.id, attachedResult.id));
+      expect(releasedResult).toEqual({ status: "pending", simJobId: null });
     } finally {
       releaseCapacityWriter.resolve(undefined);
       await Promise.allSettled(
@@ -1887,6 +2471,7 @@ describe("global solver admission circuit breaker", () => {
           (item): item is Promise<unknown> => item !== null,
         ),
       );
+      await db.delete(results).where(eq(results.id, attachedResult.id));
       await db.delete(simJobs).where(
         inArray(
           simJobs.id,
@@ -1916,18 +2501,128 @@ describe("global solver admission circuit breaker", () => {
     }
   }, 60_000);
 
-  it("orders hazard commit and engine acceptance in both directions across two connections", async () => {
+  it("shrinks only case concurrency to fill the exact remaining shared capacity", async () => {
     const originalState = await readState();
     await db
-      .delete(simSolverIncidents)
-      .where(eq(simSolverIncidents.occurrenceKey, `${PREFIX}:critical`));
+      .update(sweeperState)
+      .set({
+        enabled: true,
+        maxConcurrentJobs: 0,
+        cpuSlots: 8,
+        admissionFenceActive: false,
+        lastAdmissionFenceAt: null,
+        lastAdmissionFenceReason: null,
+        lastAdmissionFenceTriggerKey: null,
+        lastAdmissionFenceDetails: null,
+      })
+      .where(eq(sweeperState.id, 1));
+    const [runningJob, candidateJob] = await db
+      .insert(simJobs)
+      .values([
+        {
+          airfoilId,
+          bcIds: [solverFixture.bcId],
+          simulationPresetRevisionId: solverFixture.revisionId,
+          solverImplementationId: solverFixture.solverImplementationId,
+          jobKind: "targeted",
+          referenceChordM: 0.987654,
+          status: "running" as const,
+          admissionCpuSlots: 4,
+          totalCases: 1,
+          engineJobId: `${PREFIX}-packing-running`,
+          engineState: "running",
+          requestPayload: { aoas: [AOA + 0.1] },
+        },
+        {
+          airfoilId,
+          bcIds: [solverFixture.bcId],
+          simulationPresetRevisionId: solverFixture.revisionId,
+          solverImplementationId: solverFixture.solverImplementationId,
+          jobKind: "sweep",
+          referenceChordM: 0.987654,
+          status: "pending" as const,
+          admissionCpuSlots: 8,
+          totalCases: 8,
+          requestPayload: {
+            aoas: [AOA + 0.2],
+            resources: { solver_processes: 1, case_concurrency: 8 },
+          },
+        },
+      ])
+      .returning({ id: simJobs.id });
+    if (!runningJob || !candidateJob)
+      throw new Error("adaptive packing fixtures missing");
+    const request = {
+      resources: { solver_processes: 1, case_concurrency: 8 },
+    } as PolarRequest;
+    const submittedRequests: PolarRequest[] = [];
+    try {
+      const outcome = await submitPendingJobWithLifecycleGuard({
+        db,
+        engine: {
+          submitPolar: async (submitted: PolarRequest): Promise<JobStatus> => {
+            submittedRequests.push(structuredClone(submitted));
+            return {
+              job_id: `${PREFIX}-packing-candidate`,
+              state: "pending",
+              total_cases: 8,
+              completed_cases: 0,
+            };
+          },
+        } as unknown as EngineClient,
+        jobId: candidateJob.id,
+        admissionLane: "local",
+        campaignId: null,
+        request,
+        connectionErrorPrefix: "unreachable: ",
+        submitErrorPrefix: "failed: ",
+      });
+      expect(outcome).toMatchObject({ kind: "submitted" });
+      expect(submittedRequests[0]?.resources?.case_concurrency).toBe(4);
+      const [resized] = await db
+        .select({
+          slots: simJobs.admissionCpuSlots,
+          requestPayload: simJobs.requestPayload,
+        })
+        .from(simJobs)
+        .where(eq(simJobs.id, candidateJob.id));
+      expect(resized?.slots).toBe(4);
+      expect(
+        (resized?.requestPayload as { resources?: { case_concurrency?: number } })
+          .resources?.case_concurrency,
+      ).toBe(4);
+    } finally {
+      await db
+        .delete(simJobs)
+        .where(inArray(simJobs.id, [runningJob.id, candidateJob.id]));
+      await db
+        .update(sweeperState)
+        .set({
+          enabled: originalState.enabled,
+          maxConcurrentJobs: originalState.maxConcurrentJobs,
+          cpuSlots: originalState.cpuSlots,
+          pollIntervalMs: originalState.pollIntervalMs,
+          submitIntervalMs: originalState.submitIntervalMs,
+          admissionFenceActive: originalState.admissionFenceActive,
+          lastAdmissionFenceAt: originalState.lastAdmissionFenceAt,
+          lastAdmissionFenceReason: originalState.lastAdmissionFenceReason,
+          lastAdmissionFenceTriggerKey:
+            originalState.lastAdmissionFenceTriggerKey,
+          lastAdmissionFenceDetails: originalState.lastAdmissionFenceDetails,
+        })
+        .where(eq(sweeperState.id, 1));
+    }
+  }, 60_000);
+
+  it("orders hazard commit and engine acceptance in both directions across two connections", async () => {
+    const originalState = await readState();
     await db
       .update(simCampaigns)
       .set({ currentConditionGeneration: 1 })
       .where(eq(simCampaigns.id, campaignId));
     await db
       .update(simUransRequests)
-      .set({ state: "pending" })
+      .set({ state: "blocked" })
       .where(eq(simUransRequests.id, requestId));
     await db
       .update(sweeperState)
@@ -1993,6 +2688,7 @@ describe("global solver admission circuit breaker", () => {
     let firstHazard: Promise<unknown> | null = null;
     let secondSubmit: Promise<unknown> | null = null;
     let secondHazard: Promise<unknown> | null = null;
+    const criticalIncidentIds: string[] = [];
     const engine = {
       submitPolar: async () => {
         submitCalls += 1;
@@ -2003,9 +2699,21 @@ describe("global solver admission circuit breaker", () => {
     } as unknown as EngineClient;
 
     try {
-      // Engine acceptance owns the singleton first. The terminal writer has
-      // already updated its owner row, but its transition trigger cannot
-      // commit until the bounded submit call answers and releases the lock.
+      // An isolated blocked physical request has its own automated recovery;
+      // it must not fence unrelated local or remote capacity. This first
+      // submit therefore proves normal admission remains open before we add
+      // the genuinely systemic infrastructure incident below.
+      expect(await enforceSweeperAdmissionFence(db)).toEqual({
+        hazardPresent: false,
+        fencedNow: false,
+        active: false,
+        trigger: null,
+      });
+
+      // Engine acceptance owns the singleton first. A direct current-v11
+      // infrastructure incident must wait at its transition trigger until
+      // that already-accepted engine call returns; it cannot be retroactively
+      // cancelled or made to look like a rejected submission.
       firstSubmit = submitPendingJobWithLifecycleGuard({
         db,
         engine,
@@ -2019,18 +2727,41 @@ describe("global solver admission circuit breaker", () => {
       await engineEntered.promise;
       let firstHazardCommitted = false;
       firstHazard = db
-        .execute(
-          drizzleSql`
-          UPDATE sim_urans_requests
-          SET state = 'blocked'
-          WHERE id = ${requestId}
-          /* admission-race-submit-first-hazard */
-        `,
-        )
+        .transaction(async (rawTx) => {
+          const tx = rawTx as unknown as DB;
+          const [incident] = (await tx.execute(drizzleSql`
+            INSERT INTO sim_solver_incidents (
+              stage,
+              reason,
+              severity,
+              urans_request_id,
+              solver_implementation_id,
+              occurrence_key,
+              remediation_version
+            )
+            VALUES (
+              'preliminary',
+              'engine-infrastructure-failure',
+              'critical',
+              ${requestId},
+              ${solverFixture.solverImplementationId},
+              ${`${PREFIX}:admission-race-submit-first-critical`},
+              ${URANS_RECOVERY_REMEDIATION_VERSION}
+            )
+            RETURNING id
+            /* admission-race-submit-first-critical */
+          `)) as unknown as Array<{ id: string }>;
+          if (!incident) throw new Error("critical incident fixture missing");
+          criticalIncidentIds.push(incident.id);
+          await tx.insert(simSolverIncidentCampaigns).values({
+            incidentId: incident.id,
+            campaignId,
+          });
+        })
         .finally(() => {
           firstHazardCommitted = true;
         });
-      await waitForLockWait("admission-race-submit-first-hazard");
+      await waitForLockWait("admission-race-submit-first-critical");
       expect(firstHazardCommitted).toBe(false);
       releaseEngine.resolve(acceptedStatus);
       const firstOutcome = await firstSubmit;
@@ -2038,22 +2769,52 @@ describe("global solver admission circuit breaker", () => {
       expect(firstOutcome).toMatchObject({ kind: "submitted" });
       expect(submitCalls).toBe(1);
 
-      // Reverse the order. The hazard transition owns the singleton and stays
-      // uncommitted while the submitter reaches its real permit boundary.
-      // Once it commits, the waiter re-reads the hazard and never calls the
-      // engine for this second job.
+      // Remove the first-order fixture before exercising reverse ordering;
+      // its durable incident has served its purpose and must not make the
+      // reverse case pass merely because a previous hazard remains current.
       await db
-        .update(simUransRequests)
-        .set({ state: "pending" })
-        .where(eq(simUransRequests.id, requestId));
+        .delete(simSolverIncidents)
+        .where(
+          eq(
+            simSolverIncidents.occurrenceKey,
+            `${PREFIX}:admission-race-submit-first-critical`,
+          ),
+        );
+
+      // Reverse the order. The direct infrastructure/evidence-integrity
+      // incident owns the singleton and stays uncommitted while the submitter
+      // reaches its real permit boundary. Once it commits, the waiter
+      // re-reads the systemic hazard and never calls the engine for this job.
       secondHazard = db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as DB;
-        await tx.execute(drizzleSql`
-          UPDATE sim_urans_requests
-          SET state = 'blocked'
-          WHERE id = ${requestId}
-          /* admission-race-hazard-first-writer */
-        `);
+        const [incident] = (await tx.execute(drizzleSql`
+          INSERT INTO sim_solver_incidents (
+            stage,
+            reason,
+            severity,
+            urans_request_id,
+            solver_implementation_id,
+            occurrence_key,
+            remediation_version
+          )
+          VALUES (
+            'preliminary',
+            'engine-infrastructure-failure',
+            'critical',
+            ${requestId},
+            ${solverFixture.solverImplementationId},
+            ${`${PREFIX}:admission-race-hazard-first-critical`},
+            ${URANS_RECOVERY_REMEDIATION_VERSION}
+          )
+          RETURNING id
+          /* admission-race-hazard-first-critical */
+        `)) as unknown as Array<{ id: string }>;
+        if (!incident) throw new Error("critical incident fixture missing");
+        criticalIncidentIds.push(incident.id);
+        await tx.insert(simSolverIncidentCampaigns).values({
+          incidentId: incident.id,
+          campaignId,
+        });
         hazardWriterLocked.resolve(undefined);
         await releaseHazardWriter.promise;
       });
@@ -2073,7 +2834,10 @@ describe("global solver admission circuit breaker", () => {
       releaseHazardWriter.resolve(undefined);
       await secondHazard;
       const secondOutcome = await secondSubmit;
-      expect(secondOutcome).toMatchObject({ kind: "lifecycle_stopped" });
+      expect(secondOutcome).toMatchObject({
+        kind: "lifecycle_stopped",
+        error: expect.stringMatching(/global admission safety stop/i),
+      });
       expect(submitCalls).toBe(1);
     } finally {
       releaseEngine.resolve(acceptedStatus);
@@ -2083,6 +2847,11 @@ describe("global solver admission circuit breaker", () => {
           (item): item is Promise<unknown> => item !== null,
         ),
       );
+      if (criticalIncidentIds.length) {
+        await db
+          .delete(simSolverIncidents)
+          .where(inArray(simSolverIncidents.id, criticalIncidentIds));
+      }
       await db
         .update(simCampaigns)
         .set({ currentConditionGeneration: 2 })

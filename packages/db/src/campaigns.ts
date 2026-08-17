@@ -23,6 +23,7 @@ import {
   type MediumStateInput,
   type ViscositySpec,
 } from "@aerodb/core";
+import { URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER } from "@aerodb/engine-client";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 
 import {
@@ -1669,6 +1670,11 @@ async function reconcileLinkedCampaignLadderWork(
             <> ARRAY[${MISSING_URANS_VIDEO_REASON}]::text[]
       AND attempt.engine_job_id IS NOT NULL
       AND attempt.engine_case_slug IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+        WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+      )
       AND EXISTS (
         SELECT 1
         FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning

@@ -3,27 +3,27 @@
 ## Context
 
 Historical and current URANS trajectories can contain damaged startup or
-terminal periods even when later periods are physically repeatable.  The
+terminal periods even when later periods are physically repeatable. The
 previous outcome-oriented projection did not preserve a distinct versioned
 answer to “which exact raw samples/cycles support these coefficients?”, making
 it unsafe to repair old values without either mutating raw evidence or
-re-solving every case.  Steady RANS had a related ambiguity: final-window
+re-solving every case. Steady RANS had a related ambiguity: final-window
 means could use only a partial coefficient channel or a shorter window.
 
 ## Decision
 
 1. Solver attempts, GCS archives, raw coefficient histories, and stored media
-   are immutable evidence.  They are never overwritten to apply a newer
+   are immutable evidence. They are never overwritten to apply a newer
    reduction.
 2. A reducer writes an append-only interpretation that records its exact
    policy/build identity, raw evidence signature, selected time/iteration
    window, coefficient statistics, and every audited cycle disposition.
 3. A canonical result is an append-only selection of one accepted
-   interpretation for the still-current exact attempt.  It cannot point to a
+   interpretation for the still-current exact attempt. It cannot point to a
    different result or a continuation-required interpretation.
 4. FAST URANS accepts exactly the final 3 contiguous clean cycles; FINAL
-   accepts exactly the final 5.  Every selected cycle requires at least 20
-   raw coefficient observations and 20 real archived field-frame writes.  A
+   accepts exactly the final 5. Every selected cycle requires at least 20
+   raw coefficient observations and 20 real archived field-frame writes. A
    cycle audit rejects phase gaps, impulsive steps, high-frequency bursts,
    shape/amplitude/phase mismatch, and nonrepeatable means.
 5. A bad final cycle requests up to 3 additional physical periods, never more
@@ -40,7 +40,7 @@ means could use only a partial coefficient channel or a shorter window.
    (only the final period includes its endpoint), so a shared boundary cannot
    inflate sample floors or bias a mean.
 6. A current RANS result must prove its final 200 raw iterations for Cl, Cd,
-   and Cm.  Missing, malformed, or mismatching proof is a targeted FAST URANS
+   and Cm. Missing, malformed, or mismatching proof is a targeted FAST URANS
    handoff, not a terminal failure or a whole-polar promotion trigger.
 7. A current no-shedding URANS result is steady-equivalent only with a typed
    physical-observation certificate: a complete slow-wake horizon, at least
@@ -51,9 +51,9 @@ means could use only a partial coefficient channel or a shorter window.
    URANS. Missing, shortened, corrupt, or transport-mismatched proof follows
    the bounded FAST recovery path.
 8. Historical correction reads a fresh, generation-pinned, fully authenticated
-   GCS archive.  If exact restart state is proved, the scheduler continues the
+   GCS archive. If exact restart state is proved, the scheduler continues the
    original case; otherwise it records a durable restart-proof/fresh-rerun
-   action.  It never constructs coefficients from a render, downsampled
+   action. It never constructs coefficients from a render, downsampled
    browser payload, or partial archive. FULL continuation also proves the
    exact airfoil, revision, boundary condition, AoA, and normalized producing
    solver implementation against both the accepted FAST queue entry and the
@@ -61,6 +61,23 @@ means could use only a partial coefficient channel or a shorter window.
    under the natural-cell lock rather than creating duplicate physical work.
    One active archive action owns each request or FINAL-verify receipt; a
    replacement archive is terminalized instead of competing for that work.
+9. A legacy URANS archive without the immutable `unsteady=true` manifest fact
+   is a typed `rerun_required` outcome, never a generic reducer failure and
+   never publishable steady-equivalent evidence. Its exact live recovery
+   action is routed before the admission fence into one ordinary fresh FAST
+   owner. Only after that owner and the action receipt commit atomically may
+   the controller resolve the obsolete `missing-urans-video` incident for the
+   same obligation; all source evidence, the recovery action, unrelated
+   incidents, and any real replacement failure remain immutable and active as
+   applicable. Historical released-evidence audits remain record-only and can
+   neither schedule this recovery nor affect admission.
+10. A reducer release is prospective by default: routine discovery considers
+    the immutable archive creation time, not the attempt start time, because an
+    in-flight attempt can legitimately finish after the release. Older archive
+    generations remain visible and unchanged; they can enter the newer reducer
+    only through an explicit exact result/attempt scope or a reviewed migration.
+    A narrowly compatible prior canonical selection may satisfy routine
+    discovery without manufacturing a new reduction generation.
 
 ## Alternatives considered
 
@@ -105,3 +122,6 @@ publishable.
 - The archive backfill verifies every manifest member against the exact GCS
   generation before it stages a result interpretation or a recovery action;
   recovery exhausted at the physical-period cap creates no further action.
+- Legacy-manifest and live-owner regressions prove missing URANS provenance
+  returns `rerun_required`, creates one non-continuation FAST request/ownership
+  receipt, and retires only the exact obsolete missing-video incident.

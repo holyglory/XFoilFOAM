@@ -5,6 +5,10 @@ import {
   URANS_CONTINUATION_REQUIRED_MARKER,
   isDeterministicMeshBlockerError,
 } from "@aerodb/core";
+import {
+  URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER,
+  isUransContinuationPhysicalCapExhausted,
+} from "@aerodb/engine-client";
 
 import type { DB } from "./client";
 import {
@@ -39,9 +43,13 @@ import {
   type SimPrecalcObligation,
 } from "./schema";
 import {
+  CONTINUATION_SOURCE_PERMANENT,
+  isUransCleanCycleCapExhaustion,
   recordSolverIncidentInTransaction,
   resolveSolverIncidentsForOwnerInTransaction,
+  SOLVER_INCIDENT_ADMISSION_SCOPES,
   solverIncidentReason,
+  URANS_CLEAN_CYCLE_CAP_EXHAUSTION,
   URANS_RECOVERY_REMEDIATION_VERSION,
 } from "./solver-incidents";
 import {
@@ -423,6 +431,43 @@ function precalcContinuationPayload(
   };
 }
 
+/**
+ * Legacy engine releases serialized a typed continuation exception only on
+ * the exact failed point attempt. This parser is deliberately narrow: its
+ * caller has already proved a one-cell, source-pinned same-case continuation,
+ * and only failed evidence may supply the compatibility bridge. Do not widen
+ * this to fresh work or arbitrary historical rows.
+ */
+const LEGACY_CONTINUATION_PERMANENT_FAILURE =
+  /(?:^|:\s*)continuation_source_permanent:\s+\S/;
+const LEGACY_CONTINUATION_TRANSIENT_FAILURE =
+  /(?:^|:\s*)continuation_source_transient:\s+\S/;
+
+function legacyContinuationFailureKindFromExactAttemptEvidence(
+  evidence: Array<{ status: string; error: string | null }>,
+): "permanent" | "transient" | null {
+  const failedErrors = evidence
+    .filter((row) => row.status === "failed" && typeof row.error === "string")
+    .map((row) => row.error!.trim());
+  // Permanent wins if a broken legacy payload contains both its source
+  // verdict and a generic infrastructure wrapper.
+  if (
+    failedErrors.some((error) =>
+      LEGACY_CONTINUATION_PERMANENT_FAILURE.test(error),
+    )
+  ) {
+    return "permanent";
+  }
+  if (
+    failedErrors.some((error) =>
+      LEGACY_CONTINUATION_TRANSIENT_FAILURE.test(error),
+    )
+  ) {
+    return "transient";
+  }
+  return null;
+}
+
 /** Record only an engine-accepted submission. A cancelled composition or
  * connection failure consumes no attempt. Engine-accepted infrastructure or
  * setup work is initially reserved against the physical budget, then released
@@ -628,7 +673,11 @@ function meshRecoveryScopeSql(scope: MeshRecoveryRequeueScope) {
 }
 
 function restartablePrecalcWarningSql(warnings: SQLWrapper) {
-  return sql`EXISTS (
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM unnest(COALESCE(${warnings}, ARRAY[]::text[])) warning
+    WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+  ) AND EXISTS (
     SELECT 1
     FROM unnest(COALESCE(${warnings}, ARRAY[]::text[])) warning
     WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
@@ -637,7 +686,11 @@ function restartablePrecalcWarningSql(warnings: SQLWrapper) {
 }
 
 function restartablePrecalcBudgetWarningSql(warnings: SQLWrapper) {
-  return sql`EXISTS (
+  return sql`NOT EXISTS (
+    SELECT 1
+    FROM unnest(COALESCE(${warnings}, ARRAY[]::text[])) warning
+    WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+  ) AND EXISTS (
     SELECT 1
     FROM unnest(COALESCE(${warnings}, ARRAY[]::text[])) warning
     WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
@@ -1987,7 +2040,9 @@ export async function recordPrecalcObligationSubmitFailure(
 export function hasPrecalcContinuationWarning(
   warnings: string[] | null,
 ): boolean {
-  return (warnings ?? []).some(
+  const entries = warnings ?? [];
+  if (entries.some(isUransContinuationPhysicalCapExhausted)) return false;
+  return entries.some(
     (warning) =>
       warning.includes(URANS_BUDGET_STOP_MARKER) ||
       warning.includes(URANS_CONTINUATION_REQUIRED_MARKER),
@@ -2157,8 +2212,10 @@ export interface PrecalcTerminalSettlementOptions {
     | "infrastructure"
     | null;
   /** Typed continuation-stage failure emitted by the engine before CFD starts.
-   * Transient failures retry the same immutable source after backoff. Permanent
-   * failures block explicitly; they never silently start a fresh physical run. */
+   * Transient failures retry the same immutable source after backoff. A
+   * permanent source failure ends only that exact source generation: when the
+   * live cell still has an unused physical attempt, its distinct fresh run is
+   * requeued immediately without rewriting the source audit. */
   terminalContinuationFailureKind?: "transient" | "permanent" | null;
   /** Explicit cancellation records a cancelled attempt. A lost engine task,
    * worker restart, or stale recovery is transient infrastructure failure. */
@@ -2261,6 +2318,11 @@ export async function settlePrecalcObligationsForJobInTransaction(
   const exactContinuationSourceAttemptId = sameCaseContinuation
     ? continuation.resultAttemptId
     : null;
+  // Request-level continuation metadata is cleared only after one exact
+  // terminal source has actually handed the same live cell back to fresh work.
+  // The flag crosses the per-obligation loop because a job may own more than
+  // one payload id even though a valid same-case continuation is one-cell.
+  let requestNeedsFreshRecovery = false;
   for (const obligation of obligations) {
     if (
       obligation.airfoilId !== job.airfoilId ||
@@ -2480,8 +2542,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
     );
     const awaitingArchivePublication = Boolean(
       acceptedRaw &&
-        !acceptedRaw.canonicalArchiveSelected &&
-        acceptedRaw.archivePublicationPending,
+      !acceptedRaw.canonicalArchiveSelected &&
+      acceptedRaw.archivePublicationPending,
     );
     const accepted =
       acceptedRaw?.canonicalArchiveSelected === true ? acceptedRaw : undefined;
@@ -2497,9 +2559,12 @@ export async function settlePrecalcObligationsForJobInTransaction(
       judged?.failureDisposition ?? opts.terminalFailureDisposition ?? null;
     // This signal applies only to exact same-case continuation jobs. A malformed
     // engine response on fresh work must not manufacture a permanent checkpoint
-    // incident or bypass the ordinary physical-attempt policy.
+    // incident or bypass the ordinary physical-attempt policy. Older engines
+    // left the typed source exception only on their sole failed attempt; use it
+    // here only after the exact source/cell authorization above succeeds.
     const continuationFailureKind = sameCaseContinuation
-      ? (opts.terminalContinuationFailureKind ?? null)
+      ? (opts.terminalContinuationFailureKind ??
+        legacyContinuationFailureKindFromExactAttemptEvidence(evidence))
       : null;
     const continuationPermanent = continuationFailureKind === "permanent";
     const continuationTransient = continuationFailureKind === "transient";
@@ -2627,6 +2692,10 @@ export async function settlePrecalcObligationsForJobInTransaction(
 
     let state: "pending" | "running" | "satisfied" | "blocked" | "cancelled";
     let attemptState: "accepted" | "rejected" | "failed" | "cancelled";
+    /** Immutable submission outcome. This can intentionally differ from the
+     * live cell's next action: a terminal source continuation may free the
+     * remaining fresh physical attempt. */
+    let attemptOutcome: string | null = null;
     let lastOutcome: string;
     if (awaitingArchivePublication) {
       state = "running";
@@ -2641,9 +2710,21 @@ export async function settlePrecalcObligationsForJobInTransaction(
       attemptState = "cancelled";
       lastOutcome = "ownerless";
     } else if (continuationPermanent) {
-      state = "blocked";
       attemptState = "failed";
-      lastOutcome = "continuation_permanent_failure";
+      attemptOutcome = "continuation_permanent_failure";
+      // The immutable continuation source is permanently unusable, but that
+      // does not exhaust a distinct fresh physical solve. The continuation
+      // submission itself never consumes a solver ordinal; preserve it as
+      // failed evidence and return the live exact cell to the ordinary fresh
+      // PRECALC lane only while its own bounded budget remains.
+      if (obligation.attemptCount < obligation.maxAttempts) {
+        state = "pending";
+        lastOutcome = "fresh_recovery_pending";
+        requestNeedsFreshRecovery = true;
+      } else {
+        state = "blocked";
+        lastOutcome = "continuation_permanent_failure";
+      }
     } else if (continuationNoProgressExhausted) {
       state = "blocked";
       attemptState = infrastructure
@@ -2701,7 +2782,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
         .update(simPrecalcObligationAttempts)
         .set({
           state: attemptState,
-          outcome: lastOutcome,
+          outcome: attemptOutcome ?? lastOutcome,
           // First acknowledged execution truth wins. Submission-time desired
           // capability is not evidence; old workers therefore remain v0.
           meshRecoveryVersion: sql`CASE
@@ -2827,24 +2908,50 @@ export async function settlePrecalcObligationsForJobInTransaction(
                     ? "solver-execution-failed"
                     : "non-publishable-evidence",
               );
+      const cleanCycleCapExhausted = isUransCleanCycleCapExhaustion({
+        stage: "preliminary",
+        lastOutcome,
+        failureDisposition,
+        classificationReasons: judged?.reasons,
+      });
       await recordSolverIncidentInTransaction(tx, {
         stage: "preliminary",
         reason,
-        severity: state === "blocked" ? "critical" : "warning",
+        // A permanently unusable source is a critical cell-scoped incident
+        // even when the cell can continue with its one remaining fresh
+        // physical attempt.  "pending" describes the recovery action, not
+        // the severity of the immutable source loss.
+        severity:
+          state === "blocked" || continuationPermanent ? "critical" : "warning",
         owner: { precalcObligationId: obligation.id },
         solverImplementationId,
-        occurrenceKey: `preliminary:${obligation.id}:${judged?.id ?? job.id}:${lastOutcome}`,
+        occurrenceKey: `preliminary:${obligation.id}:${judged?.id ?? job.id}:${attemptOutcome ?? lastOutcome}`,
         remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
         simJobId: job.id,
         resultAttemptId: judged?.id ?? null,
         campaignIds: outcome.campaignIds,
         metadata: {
           lastOutcome,
+          ...(attemptOutcome ? { terminalOutcome: attemptOutcome } : {}),
           continuationSegmentCount,
           continuationNoProgressCount,
           progress: currentProgress,
           classificationReasons: judged?.reasons ?? [],
           failureDisposition,
+          ...(cleanCycleCapExhausted
+            ? {
+                admissionScope: SOLVER_INCIDENT_ADMISSION_SCOPES.cell,
+                recoveryDisposition: URANS_CLEAN_CYCLE_CAP_EXHAUSTION,
+              }
+            : {}),
+          ...(continuationPermanent
+            ? {
+                // The exact source is terminal, but its immutable failure
+                // says nothing about healthy cells or remaining fleet slots.
+                admissionScope: SOLVER_INCIDENT_ADMISSION_SCOPES.cell,
+                recoveryDisposition: CONTINUATION_SOURCE_PERMANENT,
+              }
+            : {}),
           ...(deterministic
             ? {
                 recovery: "deterministic-mesh",
@@ -2858,7 +2965,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
     // exact archive is still being reduced. It exits above after recording
     // the publication wait and therefore has no terminal settlement bucket.
     if (state !== "running") outcome[state].push(obligation.id);
-    if (continuationPermanent && state === "blocked") {
+    if (continuationPermanent) {
       outcome.continuationPermanent.push(obligation.id);
     }
   }
@@ -2888,6 +2995,19 @@ export async function settlePrecalcObligationsForJobInTransaction(
         .set({
           state: requestState,
           simJobId: requestState === "pending" ? null : job.id,
+          // A permanent continuation source cannot be reused. When this
+          // exact request remains open because its cell has fresh physical
+          // budget, make the next request composition explicitly fresh rather
+          // than silently serializing the dead checkpoint again.
+          ...(requestNeedsFreshRecovery && requestState === "pending"
+            ? {
+                continueFromResultId: null,
+                continueFromResultAttemptId: null,
+                budgetOverrideS: null,
+                correctiveTailPeriods: null,
+                cleanCycleRecoveryPolicyVersion: null,
+              }
+            : {}),
         })
         .where(
           and(
@@ -2947,6 +3067,220 @@ export interface PrecalcRepairSatisfaction {
   changed: boolean;
 }
 
+/**
+ * A result whose mutable projection was cleared is normally immutable
+ * historical evidence.  There is one deliberately narrow exception: an
+ * active, exact PRECALC owner can still be waiting for the archived result
+ * generation that it submitted.  This predicate is the durable proof for
+ * that exception.  It is intentionally stronger than a matching
+ * airfoil/revision/AoA: the attempt must be the obligation's latest one-case
+ * job, resolve the exact target boundary condition, use the exact numerical
+ * implementation, and retain a live owner.
+ *
+ * Callers must re-run it after taking the result row lock before using the
+ * exception to publish or schedule work.  It never creates/reopens an owner.
+ */
+export async function hasExactLivePrecalcPublicationOwner(
+  db: DB,
+  input: {
+    resultId: string;
+    resultAttemptId: string;
+    /**
+     * Required by a caller that is about to mutate the result projection.
+     * The caller must already hold the result-row lock; this takes the
+     * matching owner lock and re-proves its latest-job/state contract so a
+     * concurrently superseded owner cannot authorize an old archive.
+     */
+    lockForPublication?: boolean;
+  },
+): Promise<boolean> {
+  const exactOwner = () =>
+    db
+      .select({ id: simPrecalcObligations.id })
+      .from(results)
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.id, input.resultAttemptId),
+          eq(resultAttempts.resultId, results.id),
+          eq(resultAttempts.airfoilId, results.airfoilId),
+          eq(
+            resultAttempts.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(resultAttempts.bcId, results.bcId),
+          eq(resultAttempts.aoaDeg, results.aoaDeg),
+          eq(resultAttempts.status, "done"),
+          eq(resultAttempts.source, "solved"),
+          sql`(
+          ${resultAttempts.evidencePayload} ->> 'fidelity' = 'urans_precalc'
+          OR (
+            ${resultAttempts.evidencePayload} ->> 'fidelity' IS NULL
+            AND ${resultAttempts.regime} = 'urans'
+          )
+        )`,
+        ),
+      )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(simulationPresetRevisions.id, results.simulationPresetRevisionId),
+      )
+      .innerJoin(
+        simulationPresets,
+        eq(simulationPresets.id, simulationPresetRevisions.presetId),
+      )
+      .innerJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
+      .innerJoin(
+        simPrecalcObligations,
+        and(
+          eq(simPrecalcObligations.airfoilId, results.airfoilId),
+          eq(
+            simPrecalcObligations.revisionId,
+            results.simulationPresetRevisionId,
+          ),
+          eq(simPrecalcObligations.aoaDeg, results.aoaDeg),
+          eq(simPrecalcObligations.latestSimJobId, simJobs.id),
+          inArray(simPrecalcObligations.state, [
+            "pending",
+            "running",
+            "blocked",
+          ]),
+        ),
+      )
+      .where(
+        and(
+          eq(results.id, input.resultId),
+          eq(results.fidelity, "urans_precalc"),
+          eq(
+            resultAttempts.bcId,
+            revisionBoundaryConditionSql({
+              snapshot: simulationPresetRevisions.snapshot,
+              fallbackBoundaryConditionId:
+                simulationPresets.legacyBoundaryConditionId,
+            }),
+          ),
+          eq(simJobs.airfoilId, resultAttempts.airfoilId),
+          eq(simJobs.simulationPresetRevisionId, simulationPresetRevisions.id),
+          sql`jsonb_array_length(${simJobs.bcIds}) = 1`,
+          sql`${simJobs.bcIds} ->> 0 = ${resultAttempts.bcId}::text`,
+          compatiblePrecalcCheckpointImplementationSql({
+            targetSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            targetRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointRevisionSolverImplementationId:
+              simulationPresetRevisions.solverImplementationId,
+            checkpointAttemptSolverImplementationId:
+              resultAttempts.solverImplementationId,
+            checkpointJobSolverImplementationId: simJobs.solverImplementationId,
+          }),
+          liveOwnerSql(simPrecalcObligations.id),
+        ),
+      );
+  const [owner] = await exactOwner().limit(1);
+  if (!owner || !input.lockForPublication) return owner != null;
+
+  // Result -> obligation is the publication lock order. Once this row is
+  // locked, a competing latest-job/state update must either happen before
+  // the re-proof below (and be rejected) or wait until the canonical pointer
+  // update commits. The owner is deliberately re-read after the lock rather
+  // than trusting the optimistic candidate that selected its id.
+  const [lockedOwner] = await db
+    .select({ id: simPrecalcObligations.id })
+    .from(simPrecalcObligations)
+    .where(eq(simPrecalcObligations.id, owner.id))
+    .limit(1)
+    .for("update");
+  if (!lockedOwner) return false;
+  const [rechecked] = await exactOwner().limit(1);
+  return rechecked?.id === lockedOwner.id;
+}
+
+/**
+ * An exact live PRECALC owner can retain more than one immutable completed
+ * attempt while a worker restarts or two deliveries arrive out of order.  The
+ * scientific publication winner is therefore not "whoever gets a queue
+ * lease first": it is the newest archive-ready attempt generation, ordered
+ * by the immutable creation timestamp and UUID tie-breaker.  Older siblings
+ * remain durable evidence/history, but cannot replace that winner.
+ *
+ * Callers that project a result must already hold its result-row lock and set
+ * `lockForPublication`.  That preserves the result -> obligation lock order
+ * before this precedence re-proof.
+ */
+export async function hasExactLivePrecalcPublicationWinner(
+  db: DB,
+  input: {
+    resultId: string;
+    resultAttemptId: string;
+    lockForPublication?: boolean;
+  },
+): Promise<boolean> {
+  if (!(await hasExactLivePrecalcPublicationOwner(db, input))) return false;
+
+  const [candidate] = await db
+    .select({
+      id: resultAttempts.id,
+      simJobId: resultAttempts.simJobId,
+      airfoilId: resultAttempts.airfoilId,
+      bcId: resultAttempts.bcId,
+      revisionId: resultAttempts.simulationPresetRevisionId,
+      aoaDeg: resultAttempts.aoaDeg,
+    })
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.id, input.resultAttemptId),
+        eq(resultAttempts.resultId, input.resultId),
+      ),
+    )
+    .limit(1);
+  if (!candidate?.simJobId || !candidate.revisionId) return false;
+
+  const newerRows = (await db.execute(sql`
+    SELECT 1
+    FROM result_attempts newer_attempt
+    JOIN result_attempts candidate_attempt
+      ON candidate_attempt.id = ${candidate.id}::uuid
+    JOIN solver_evidence_archives newer_archive
+      ON newer_archive.result_id = newer_attempt.result_id
+     AND newer_archive.result_attempt_id = newer_attempt.id
+     AND newer_archive.state = 'current'
+    JOIN solver_evidence_blobs newer_blob
+      ON newer_blob.id = newer_archive.blob_id
+    WHERE newer_attempt.result_id = ${input.resultId}::uuid
+      AND newer_attempt.sim_job_id = ${candidate.simJobId}::uuid
+      AND newer_attempt.airfoil_id = ${candidate.airfoilId}::uuid
+      AND newer_attempt.bc_id = ${candidate.bcId}::uuid
+      AND newer_attempt.simulation_preset_revision_id = ${candidate.revisionId}::uuid
+      AND newer_attempt.aoa_deg = ${candidate.aoaDeg}
+      AND newer_attempt.status = 'done'
+      AND newer_attempt.source = 'solved'
+      AND (
+        newer_attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+        OR (
+          newer_attempt.evidence_payload ->> 'fidelity' IS NULL
+          AND newer_attempt.regime = 'urans'
+        )
+      )
+      AND newer_blob.backend = 'gcs'
+      AND newer_blob.compression = 'zstd'
+      AND newer_blob.mime_type = 'application/zstd'
+      AND btrim(COALESCE(newer_blob.bucket, '')) <> ''
+      AND newer_blob.generation ~ '^[1-9][0-9]{0,19}$'
+      AND newer_blob."verifiedAt" IS NOT NULL
+      AND (
+        newer_attempt."createdAt" > candidate_attempt."createdAt"
+        OR (
+          newer_attempt."createdAt" = candidate_attempt."createdAt"
+          AND newer_attempt.id > ${candidate.id}::uuid
+        )
+      )
+    LIMIT 1
+  `)) as unknown as Array<{ exists: number }>;
+  return newerRows.length === 0;
+}
+
 /** Cross-ledger media repair may make already-stored preliminary evidence
  * publishable. This helper only projects accepted, exact-cell CFD truth into
  * the physical obligation ledger; it never creates or reopens solver work. */
@@ -2968,25 +3302,11 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       .from(results)
       .innerJoin(
         simulationPresetRevisions,
-        eq(
-          simulationPresetRevisions.id,
-          results.simulationPresetRevisionId,
-        ),
+        eq(simulationPresetRevisions.id, results.simulationPresetRevisionId),
       )
       .innerJoin(
         simulationPresets,
         eq(simulationPresets.id, simulationPresetRevisions.presetId),
-      )
-      .innerJoin(
-        resultClassifications,
-        and(
-          eq(resultClassifications.resultId, results.id),
-          eq(
-            resultClassifications.resultAttemptId,
-            results.currentResultAttemptId,
-          ),
-          eq(resultClassifications.state, "accepted"),
-        ),
       )
       .innerJoin(
         resultAttempts,
@@ -3019,10 +3339,7 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       .innerJoin(
         resultCanonicalSelections,
         and(
-          eq(
-            resultCanonicalSelections.id,
-            results.currentCanonicalSelectionId,
-          ),
+          eq(resultCanonicalSelections.id, results.currentCanonicalSelectionId),
           eq(
             results.currentResultInterpretationId,
             resultCanonicalSelections.resultInterpretationId,
@@ -3047,10 +3364,7 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       .innerJoin(
         solverEvidenceArchives,
         and(
-          eq(
-            solverEvidenceArchives.id,
-            resultInterpretations.sourceArchiveId,
-          ),
+          eq(solverEvidenceArchives.id, resultInterpretations.sourceArchiveId),
           eq(solverEvidenceArchives.resultId, results.id),
           eq(solverEvidenceArchives.resultAttemptId, resultAttempts.id),
           eq(solverEvidenceArchives.state, "current"),
@@ -3062,23 +3376,26 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
           eq(results.id, resultId),
           eq(results.status, "done"),
           eq(results.fidelity, "urans_precalc"),
-          // A no-shedding preliminary URANS run is physically steady and is
-          // deliberately stored with `regime = rans` so downstream media does
-          // not claim unsteady fields that do not exist.  Fidelity, the exact
-          // accepted attempt, and the continuation guards above are the proof
-          // that this is still completed PRECALC evidence.
+          // Archive interpretation is the authority for a selected result.
+          // Generic raw budget/continuation markers are often copied into the
+          // mutable projection before an authenticated archive proves a clean
+          // terminal window, so they must not strand that accepted evidence.
+          // The typed physical cap is different: it is a terminal same-case
+          // stop and must never be mistaken for a resume-capable success.
           sql`NOT EXISTS (
             SELECT 1
             FROM unnest(COALESCE(${results.qualityWarnings}, ARRAY[]::text[])) warning
-            WHERE warning LIKE ${`%${URANS_BUDGET_STOP_MARKER}%`}
-               OR warning LIKE ${`%${URANS_CONTINUATION_REQUIRED_MARKER}%`}
+            WHERE warning LIKE ${`%${URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER}%`}
           )`,
-          sql`EXISTS (
-            SELECT 1
-            FROM result_classifications accepted_attempt_classification
-            WHERE accepted_attempt_classification.result_attempt_id = ${resultAttempts.id}
-              AND accepted_attempt_classification.state = 'accepted'
-          )`,
+          // Archive-reduced URANS deliberately has two distinct verdicts:
+          // the immutable raw attempt may remain rejected because its engine
+          // summary lacks authenticated tail data, while the current canonical
+          // *result* is accepted only after the exact verified archive
+          // interpretation has been selected.  PRECALC satisfaction belongs
+          // to that accepted result-level projection; requiring the raw
+          // attempt's separate classifier row to be accepted leaves a solved
+          // archive selection permanently blocked and can falsely trip the
+          // scheduler-wide incident fence.
           // A result row's revision/AoA is not sufficient to satisfy the
           // legacy obligation natural key. The immutable target revision can
           // resolve a different boundary condition or OpenFOAM implementation
@@ -3125,6 +3442,12 @@ export async function satisfyPrecalcObligationFromAcceptedResult(
       .for("update")
       .limit(1);
     if (!obligation) return null;
+    // The result was read before the owner lock. Recheck the mutable latest
+    // job under that lock so a concurrent retry cannot be satisfied by a
+    // stale selected archive from the previous job generation.
+    if (!accepted.simJobId || obligation.latestSimJobId !== accepted.simJobId) {
+      return null;
+    }
 
     const changed = !(
       obligation.state === "satisfied" &&
@@ -3211,6 +3534,12 @@ export interface PrecalcContinuationAddress {
   engineJobId: string;
   engineCaseSlug: string;
   budgetOverrideS: number;
+  /**
+   * The reducer authority belonging to the exact immutable source job. A
+   * missing value is intentionally legacy v1, not an invitation to infer the
+   * current policy at resume time.
+   */
+  cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
 }
 
 /** Select the newest restartable checkpoint whose newer immutable submissions
@@ -3237,6 +3566,12 @@ export async function precalcCheckpointCandidatesForObligations(
            checkpoint.result_attempt_id,
            checkpoint.engine_job_id,
            checkpoint.engine_case_slug,
+           CASE
+             WHEN checkpoint.clean_cycle_recovery_policy_version =
+               'adaptive-clean-tail-v2'
+             THEN 'adaptive-clean-tail-v2'
+             ELSE NULL
+           END AS clean_cycle_recovery_policy_version,
            GREATEST(
              ${AUTO_PRECALC_CONTINUATION_BUDGET_S}::int,
              COALESCE((
@@ -3260,7 +3595,10 @@ export async function precalcCheckpointCandidatesForObligations(
       SELECT owner_result.id AS result_id,
              candidate.result_attempt_id,
              result_attempt.engine_job_id,
-             result_attempt.engine_case_slug
+             result_attempt.engine_case_slug,
+             checkpoint_job.request_payload ->>
+               'cleanCycleRecoveryPolicyVersion' AS
+               clean_cycle_recovery_policy_version
       FROM sim_precalc_obligation_attempts candidate
       JOIN result_attempts result_attempt
         ON result_attempt.id = candidate.result_attempt_id
@@ -3357,6 +3695,7 @@ export async function precalcCheckpointCandidatesForObligations(
     engine_job_id: string;
     engine_case_slug: string;
     budget_override_s: number;
+    clean_cycle_recovery_policy_version: string | null;
   }>;
   return rows.map((row) => ({
     obligationId: row.obligation_id,
@@ -3371,6 +3710,10 @@ export async function precalcCheckpointCandidatesForObligations(
     // pair's larger budget here, while never retargeting a different attempt
     // and never shrinking below the automatic continuation floor.
     budgetOverrideS: Number(row.budget_override_s),
+    cleanCycleRecoveryPolicyVersion:
+      row.clean_cycle_recovery_policy_version === "adaptive-clean-tail-v2"
+        ? "adaptive-clean-tail-v2"
+        : null,
   }));
 }
 

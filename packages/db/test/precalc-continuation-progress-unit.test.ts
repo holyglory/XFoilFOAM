@@ -1,10 +1,33 @@
 import {
+  hasPrecalcContinuationWarning,
   precalcContinuationMadeProgress,
   precalcContinuationProgressFromEvidence,
 } from "@aerodb/db";
+import {
+  URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER,
+} from "@aerodb/engine-client";
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
 import { describe, expect, it } from "vitest";
 
 describe("preliminary URANS continuation progress extraction", () => {
+  it("MUST-CATCH: a terminal physical cap wins over generic restartable wording", () => {
+    expect(
+      hasPrecalcContinuationWarning([
+        `URANS ${URANS_BUDGET_STOP_MARKER}`,
+        `URANS ${URANS_CONTINUATION_REQUIRED_MARKER}`,
+        `URANS ${URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER}`,
+      ]),
+    ).toBe(false);
+    expect(
+      hasPrecalcContinuationWarning([
+        `URANS ${URANS_BUDGET_STOP_MARKER}`,
+      ]),
+    ).toBe(true);
+  });
+
   it("uses real force-history time when frame tracking is incomplete", () => {
     const baseline = precalcContinuationProgressFromEvidence({
       frame_track: {

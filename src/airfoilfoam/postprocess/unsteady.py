@@ -36,6 +36,11 @@ class ForceHistory:
     retained_cycles: int | None = None
     window_start: float | None = None
     window_end: float | None = None
+    #: A physical-band cadence independently corroborated in both halves of
+    #: the raw observation.  This is reducer-local provenance, never a
+    #: substitute for the serialized periodic certificate.  It prevents a
+    #: low-amplitude but coherent wake from taking the steady-equivalent path.
+    has_coherent_in_band_period: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,6 +105,14 @@ class StablePeriodResult:
 #: looking like the same certification.
 CLEAN_CYCLE_CERTIFICATION_VERSION = "clean-cycle-v3"
 
+#: Versioned independently from certification because this policy controls
+#: how much *additional immutable evidence* the controller may collect; it
+#: never changes which cycles are publishable.  The v1 cross-runtime contract
+#: used the short FAST=9 / FINAL=12 ceilings.  v2 keeps 1--3 period adaptive
+#: chunks but makes the real wall budget and no-progress detector authoritative
+#: before a larger finite emergency ceiling.
+CLEAN_CYCLE_RECOVERY_POLICY_VERSION = "adaptive-clean-tail-v2"
+
 #: Phase-grid resolution used for the median template and every per-cycle
 #: comparison.  This is intentionally fixed: a cycle cannot improve its score
 #: merely because a sparse write cadence happened to reduce comparison detail.
@@ -112,12 +125,21 @@ FAST_CLEAN_CYCLE_MINIMUM = 3
 FINAL_CLEAN_CYCLE_MINIMUM = 5
 
 #: Recovery limits are expressed in *measured physical periods*, not solver
-#: chunks.  A terminal corruption gets one three-period repair opportunity;
+#: chunks. A terminal corruption gets a bounded three-period repair chunk;
 #: after that, each continuation must earn one more clean period at a time.
-#: These caps prevent an unbounded retry loop while still leaving enough
-#: evidence to recover from a damaged startup tail.
-FAST_CLEAN_CYCLE_MAX_PERIODS = 9
-FINAL_CLEAN_CYCLE_MAX_PERIODS = 12
+#: The old 9/12 ceilings could terminalize the trajectory exactly when a clean
+#: suffix first appeared.  The v2 emergency ceilings add three complete
+#: publication windows (FAST 3 cycles, FINAL 5 cycles) while the fidelity wall
+#: budget and no-progress guard remain the normal resource limits.
+FAST_CLEAN_CYCLE_MAX_PERIODS = 18
+FINAL_CLEAN_CYCLE_MAX_PERIODS = 27
+
+#: Pre-v2 archive receipts did not carry a policy identity. They remain
+#: restartable evidence, but their physical authority is the exact limit in
+#: force when the receipt was made. A newer engine must not silently grant
+#: those receipts the later adaptive extension.
+LEGACY_FAST_CLEAN_CYCLE_MAX_PERIODS = 9
+LEGACY_FINAL_CLEAN_CYCLE_MAX_PERIODS = 12
 
 #: The clean-cycle rules compare all three force coefficients.  These are the
 #: existing engineering repeatability budgets, used for a cycle-mean outlier
@@ -200,9 +222,9 @@ class CleanCycleAudit:
     # ``cycles`` describes the candidate evidence suffix supplied to this
     # classifier.  It is deliberately not a runtime budget counter: the live
     # pipeline may discard a settling prefix and an archived reducer may only
-    # inspect a short terminal tail.  Keep measured same-case progress
-    # separately so an unclean tail cannot reset the 9/12-period recovery
-    # ceiling merely by shrinking the audit input.
+    # inspect a short terminal tail. Keep measured same-case progress
+    # separately so an unclean tail cannot reset the finite recovery ceiling
+    # merely by shrinking the audit input.
     measured_periods: int = 0
     recovery_origin_time: float | None = None
     recovery_latest_time: float | None = None
@@ -302,6 +324,28 @@ def clean_cycle_max_periods(fidelity: str | None = None) -> int:
     return FAST_CLEAN_CYCLE_MAX_PERIODS
 
 
+def clean_cycle_continuation_max_periods(
+    fidelity: str | None = None,
+    *,
+    policy_version: str | None = None,
+) -> int:
+    """Return the authorised ceiling for a cross-job resumed trajectory.
+
+    Fresh/in-process v2 recovery uses :func:`clean_cycle_max_periods`. A
+    cross-job continuation can begin from immutable v1 evidence, however. An
+    explicit ``adaptive-clean-tail-v2`` handoff alone authorises 18/27;
+    missing lineage preserves the historical FAST=9 / FINAL=12 ceiling.
+    Request and staging validation reject unknown policy values, so the
+    conservative default never upgrades an ambiguous receipt.
+    """
+    key = (fidelity or "").strip().lower().replace("_", "-")
+    if policy_version == CLEAN_CYCLE_RECOVERY_POLICY_VERSION:
+        return clean_cycle_max_periods(fidelity)
+    if key in {"full", "final", "urans-full", "urans-final"}:
+        return LEGACY_FINAL_CLEAN_CYCLE_MAX_PERIODS
+    return LEGACY_FAST_CLEAN_CYCLE_MAX_PERIODS
+
+
 def clean_cycle_recovery_exhausted(
     audit: CleanCycleAudit | None,
     *,
@@ -310,9 +354,9 @@ def clean_cycle_recovery_exhausted(
     """Return whether automatic recovery reached this tier's explicit cap.
 
     A long clean suffix is useful provenance, not a reason to abandon a
-    recoverable result early.  FAST may collect through nine audited periods
-    and FINAL through twelve; only those explicit ceilings make the automatic
-    recovery path terminal.
+    recoverable result early.  The fidelity wall budget and no-progress guard
+    normally terminate uneconomic or stuck work first; only the larger finite
+    emergency ceiling makes a still-uncertified trajectory terminal.
     """
     return bool(
         audit is not None
@@ -382,19 +426,27 @@ def additional_periods_for_clean_suffix(
         minimum_cycles=minimum_cycles,
     )
     cap = max(1, int(maximum_chunk_periods))
-    if audit is None or not audit.cycles:
+    if audit is None:
         return cap
-    # The FAST/FINAL ceiling is a physical-period ceiling, not merely a
+    # The FAST/FINAL emergency ceiling is a physical-period ceiling, not merely a
     # classifier threshold checked after the next pimpleFoam chunk completes.
     # A terminal impulse at FAST period 8 or FINAL period 11 therefore has
     # room for exactly one more period, even though a newly corrupted tail
     # would ordinarily earn a three-period repair chunk.  Without this clamp
-    # the runner can integrate past the advertised 9/12-period limit before
+    # the runner can integrate past the advertised finite limit before
     # the next audit has a chance to terminalize it.
     remaining = max(0, clean_cycle_max_periods(fidelity) - audit.physical_periods)
     cap = min(cap, remaining)
     if cap <= 0:
         return 0
+    # A failed cadence extraction can legitimately leave the audit without
+    # classified cycles while a trusted transient marker still records how much
+    # physical time this exact case has consumed.  That evidence must clamp the
+    # next chunk before the no-cycle fallback returns, otherwise a FAST case at
+    # final pre-cap period could be asked for three more periods and cross the
+    # advertised emergency cap.
+    if not audit.cycles:
+        return cap
     if audit.terminal_clean_cycles < target:
         final_is_clean = audit.cycles[-1].clean
         if not final_is_clean:
@@ -2768,6 +2820,28 @@ def _established_oscillation_verdict(
     return True, trend_reason
 
 
+_INTEGER_PERIOD_BOUNDARY_ULPS = 4
+
+
+def _snap_integer_period_roundoff(value: float) -> float:
+    """Snap only binary64 ULP noise around an exact integer period count.
+
+    Timestamp subtraction/division can represent an exact N-period window a
+    few ULPs below N.  This deliberately does not use a sample-sized or
+    physical tolerance: a materially short window remains fractional.
+    """
+    if not math.isfinite(value):
+        return value
+    nearest = round(value)
+    if nearest < 1:
+        return value
+    tolerance = (
+        _INTEGER_PERIOD_BOUNDARY_ULPS
+        * math.ulp(max(1.0, abs(float(nearest))))
+    )
+    return float(nearest) if abs(value - nearest) <= tolerance else value
+
+
 def period_window_stats(
     times: "np.ndarray | list[float]",
     cl: "np.ndarray | list[float]",
@@ -2806,7 +2880,7 @@ def period_window_stats(
     end = float(t[-1])
     if end <= first:
         return None
-    available = (end - first) / period_s
+    available = _snap_integer_period_roundoff((end - first) / period_s)
     k = math.floor(available + 1e-9)
     if k < 1:
         return None
@@ -2951,8 +3025,16 @@ NO_SHEDDING_REL_TOL = 5e-3
 # genuinely flat lift signal whose mean is ~0 is still classified as steady
 # rather than being judged only against its own (tiny) mean.
 NO_SHEDDING_ABS_FLOOR = 1e-3
-# A physical no-shedding verdict must observe more than a pair of points.  This
-# is deliberately the same floor carried by the cross-runtime certificate: a
+# A few weakly-loaded production cases have a quiet, physically steady tail
+# whose *Cd/Cm* numerical RMS is just above the generic near-zero floor.  They
+# need an explicitly tighter-than-meaningful-shedding absolute escape hatch,
+# not a blanket relaxation of the normal relative rule.  The fallback is only
+# admitted after the temporal-tail checks below prove that it is not a drifting,
+# impulsive, or noisy transient.
+NO_SHEDDING_ABS_RMS_FALLBACK = 2e-3
+NO_SHEDDING_ABS_RMS_FALLBACK_HALF_MEAN_DELTA = 1e-3
+NO_SHEDDING_ABS_RMS_FALLBACK_MAX_STEP_RMS = 4.0
+# A physical no-shedding verdict must observe more than a pair of points.  A
 # sparse, apparently flat trace cannot demonstrate that a slow wake is absent.
 NO_SHEDDING_MIN_SAMPLE_COUNT = 20
 # The slow edge of the physically plausible shedding band is the one a flat
@@ -3018,6 +3100,123 @@ def _no_shedding_from_stats(
     )
 
 
+def _has_coherent_in_band_period(
+    t: Sequence[float] | np.ndarray,
+    cl: Sequence[float] | np.ndarray,
+    cd: Sequence[float] | np.ndarray,
+    cm: Sequence[float] | np.ndarray,
+    *,
+    speed: float | None,
+    chord: float | None,
+    alpha_deg: float | None = None,
+    section_thickness_ratio: float | None = None,
+) -> bool:
+    """Return whether any force channel owns a stable physical-band cadence.
+
+    The no-shedding floor measures *amplitude*, not whether a coherent wake is
+    physically absent.  A very weak limit cycle can therefore fall below an
+    absolute RMS allowance while still producing a repeatable Strouhal-band
+    period.  ``estimate_period`` independently corroborates the two halves of
+    the raw observation; one such channel is enough to keep the result on the
+    periodic evidence path.  Incoherent numerical tails do not pass that
+    half-window test and may still use the bounded RMS fallback.
+    """
+    try:
+        u = float(speed) if speed is not None else math.nan
+        c = float(chord) if chord is not None else math.nan
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(u) and math.isfinite(c) and u > 0.0 and c > 0.0):
+        return False
+    for channel in (cl, cd, cm):
+        try:
+            estimate = estimate_period(
+                t,
+                channel,
+                speed=u,
+                chord=c,
+                alpha_deg=alpha_deg,
+                section_thickness_ratio=section_thickness_ratio,
+            )
+        except (TypeError, ValueError, FloatingPointError):
+            continue
+        if estimate is not None and not estimate.ambiguous:
+            return True
+    return False
+
+
+def _no_shedding_absolute_rms_tail_is_stable(
+    t: Sequence[float] | np.ndarray,
+    cl: Sequence[float] | np.ndarray,
+    cd: Sequence[float] | np.ndarray,
+    cm: Sequence[float] | np.ndarray,
+    *,
+    cl_rms: float,
+    cd_rms: float,
+    cm_rms: float,
+) -> bool:
+    """Bound the narrow absolute-RMS no-shedding fallback to a clean tail.
+
+    A larger absolute allowance alone would misclassify a slowly settling wake
+    or an isolated adaptive-step spike as steady.  The fallback therefore needs
+    all reported-channel RMS values below its small cap, two time-weighted
+    halves with mutually consistent means, and no single coefficient step that
+    is implausibly large compared with the measured tail RMS.  The normal
+    relative/amplitude verdict remains the first, less complicated path.
+    """
+    arrays = tuple(np.asarray(channel, dtype=float) for channel in (t, cl, cd, cm))
+    times, channels = arrays[0], arrays[1:]
+    if (
+        times.size < NO_SHEDDING_MIN_SAMPLE_COUNT
+        or any(channel.size != times.size for channel in channels)
+        or not all(np.all(np.isfinite(channel)) for channel in arrays)
+        or np.any(np.diff(times) <= 0.0)
+    ):
+        return False
+
+    rms_values = (float(cl_rms), float(cd_rms), float(cm_rms))
+    if not all(
+        math.isfinite(rms) and abs(rms) <= NO_SHEDDING_ABS_RMS_FALLBACK
+        for rms in rms_values
+    ):
+        return False
+
+    midpoint = 0.5 * float(times[0] + times[-1])
+    first = PeriodWindow(
+        start=float(times[0]), end=midpoint, cycles=0, period_s=0.0
+    )
+    second = PeriodWindow(
+        start=midpoint, end=float(times[-1]), cycles=0, period_s=0.0
+    )
+    try:
+        first_series = _window_series(times, *channels, first)
+        second_series = _window_series(times, *channels, second)
+    except (TypeError, ValueError, IndexError):
+        return False
+    if (
+        any(series.size < NO_SHEDDING_MIN_SAMPLE_COUNT // 2 for series in first_series)
+        or any(series.size < NO_SHEDDING_MIN_SAMPLE_COUNT // 2 for series in second_series)
+    ):
+        return False
+
+    for channel, rms, before, after in zip(
+        channels,
+        rms_values,
+        first_series[1:],
+        second_series[1:],
+        strict=True,
+    ):
+        before_mean, _ = _time_weighted_mean_std(first_series[0], before)
+        after_mean, _ = _time_weighted_mean_std(second_series[0], after)
+        if abs(after_mean - before_mean) > NO_SHEDDING_ABS_RMS_FALLBACK_HALF_MEAN_DELTA:
+            return False
+        if channel.size > 1 and np.max(np.abs(np.diff(channel))) > (
+            NO_SHEDDING_ABS_RMS_FALLBACK_MAX_STEP_RMS * max(abs(rms), 1e-12)
+        ):
+            return False
+    return True
+
+
 def is_no_shedding(
     history: "ForceHistory | None",
     rel_tol: float = NO_SHEDDING_REL_TOL,
@@ -3036,13 +3235,15 @@ def is_no_shedding(
     """
     if history is None or history.samples < NO_SHEDDING_MIN_SAMPLE_COUNT:
         return False
+    if history.has_coherent_in_band_period:
+        return False
     channels = (history.t, history.cl, history.cd, history.cm)
     if (
         len(history.t) < NO_SHEDDING_MIN_SAMPLE_COUNT
         or any(len(channel) != len(history.t) for channel in channels)
     ):
         return False
-    return _no_shedding_from_stats(
+    if _no_shedding_from_stats(
         history.cl_mean,
         history.cl_rms,
         history.cd_mean,
@@ -3051,6 +3252,16 @@ def is_no_shedding(
         history.cm_rms,
         rel_tol=rel_tol,
         abs_floor=abs_floor,
+    ):
+        return True
+    return _no_shedding_absolute_rms_tail_is_stable(
+        history.t,
+        history.cl,
+        history.cd,
+        history.cm,
+        cl_rms=history.cl_rms,
+        cd_rms=history.cd_rms,
+        cm_rms=history.cm_rms,
     )
 
 
@@ -3120,7 +3331,17 @@ def force_history(
     full_cl_mean, full_cl_rms = _time_weighted_mean_std(t_a, cl_a)
     full_cd_mean, full_cd_rms = _time_weighted_mean_std(t_a, cd_a)
     full_cm_mean, full_cm_rms = _time_weighted_mean_std(t_a, cm_a)
-    amplitude_flat = _no_shedding_from_stats(
+    coherent_in_band_period = _has_coherent_in_band_period(
+        t_a,
+        cl_a,
+        cd_a,
+        cm_a,
+        speed=speed,
+        chord=chord,
+        alpha_deg=alpha_deg,
+        section_thickness_ratio=section_thickness_ratio,
+    )
+    amplitude_flat = not coherent_in_band_period and _no_shedding_from_stats(
         full_cl_mean,
         full_cl_rms,
         full_cd_mean,
@@ -3128,6 +3349,16 @@ def force_history(
         full_cm_mean,
         full_cm_rms,
     )
+    if not amplitude_flat and not coherent_in_band_period:
+        amplitude_flat = _no_shedding_absolute_rms_tail_is_stable(
+            t_a,
+            cl_a,
+            cd_a,
+            cm_a,
+            cl_rms=full_cl_rms,
+            cd_rms=full_cd_rms,
+            cm_rms=full_cm_rms,
+        )
     # The configured discard is not evidence that an oscillating wake has
     # settled.  A high-Courant startup burst can extend beyond that elapsed-time
     # boundary and poison period detection even when the final wake owns many
@@ -3225,4 +3456,5 @@ def force_history(
         retained_cycles=window.cycles if window else None,
         window_start=window.start if window else float(wt[0]),
         window_end=window.end if window else float(wt[-1]),
+        has_coherent_in_band_period=coherent_in_band_period,
     )

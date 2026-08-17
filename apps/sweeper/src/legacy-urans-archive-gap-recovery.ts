@@ -383,7 +383,7 @@ async function claimNextLegacyArchiveGapAction(
   db: DB,
 ): Promise<ClaimedLegacyArchiveGapAction | null> {
   const token = randomUUID();
-  const leaseUntil = new Date(Date.now() + ACTION_LEASE_MS);
+  const leaseUntilIso = new Date(Date.now() + ACTION_LEASE_MS).toISOString();
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const rows = (await tx.execute(sql`
@@ -401,7 +401,7 @@ async function claimNextLegacyArchiveGapAction(
       UPDATE legacy_urans_archive_gap_recovery_actions action
       SET state = 'routing',
           claim_token = ${token}::uuid,
-          claim_expires_at = ${leaseUntil},
+          claim_expires_at = ${leaseUntilIso}::timestamptz,
           attempt_count = action.attempt_count + 1,
           "updatedAt" = now()
       FROM candidate

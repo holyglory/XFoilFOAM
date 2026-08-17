@@ -67,6 +67,24 @@ export function campaignInstrumentStatus(
   const remaining = fCount(totals.remaining);
   const evidenceProcessing = totals.awaitingArchiveReduction ?? 0;
 
+  // A live admission fence is still the primary safety state. Maintenance
+  // replaces only retained fence history after that latch is cleared.
+  if (
+    campaign.status === "active" &&
+    scheduler.maintenanceDrainActive &&
+    !scheduler.admissionFenceActive
+  ) {
+    return {
+      title: "Maintenance drain",
+      detail:
+        jobs > 0
+          ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are held for system maintenance`
+          : "New submissions are held for system maintenance",
+      tone: "amber",
+      action: null,
+    };
+  }
+
   if (campaign.status === "active" && scheduler.diskAdmissionBlocked) {
     return {
       title: "Capacity safeguard",
@@ -278,6 +296,8 @@ export function gateFromSolverState(
       return { text: "BLOCKED — solver process not running", tone: "red" };
     case "admission_fenced":
       return { text: "SAFETY STOP — critical solver outcome", tone: "red" };
+    case "maintenance_drain":
+      return { text: "DRAINING — system maintenance", tone: "amber" };
     case "engine_unreachable":
       return { text: "BLOCKED — engine unreachable", tone: "red" };
     case "engine_unhealthy":
@@ -305,6 +325,9 @@ export function campaignHubAdmissionStatusText(
   if (solverState === "admission_fenced") {
     return "Safety stop — new submissions are fenced. Running jobs continue; engineering investigation is required before Resume.";
   }
+  if (solverState === "maintenance_drain") {
+    return "Maintenance drain — system maintenance is holding new submissions while active jobs, if any, finish.";
+  }
   if (sweeperEnabled === false || solverState === "paused") {
     return "Sweeper disabled — no new points are being scheduled.";
   }
@@ -314,6 +337,8 @@ export function campaignHubAdmissionStatusText(
 export interface CampaignHubSchedulerSnapshot {
   sweeperEnabled?: boolean;
   engineUnreachableSince?: string | null;
+  maintenanceDrainActive?: boolean;
+  maintenanceDrainStartedAt?: string | null;
 }
 
 export interface CampaignAutomaticFastSnapshot {
@@ -362,6 +387,7 @@ export function campaignHubSchedulerStatusText(
 export type ReviewQueueOperationalState =
   | "process_not_running"
   | "safety_stop"
+  | "maintenance_drain"
   | "engine_unreachable"
   | "sweeper_disabled"
   | "ready";
@@ -372,11 +398,13 @@ export type ReviewQueueOperationalState =
 export function reviewQueueOperationalState(input: {
   processDead: boolean;
   admissionFenceActive: boolean;
+  maintenanceDrainActive: boolean;
   sweeperEnabled: boolean;
   engineUnreachableSince: string | null;
 }): ReviewQueueOperationalState {
   if (input.processDead) return "process_not_running";
   if (input.admissionFenceActive) return "safety_stop";
+  if (input.maintenanceDrainActive) return "maintenance_drain";
   if (input.engineUnreachableSince) return "engine_unreachable";
   if (!input.sweeperEnabled) return "sweeper_disabled";
   return "ready";
@@ -599,6 +627,20 @@ export function campaignStatusLine(
               ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are fenced pending investigation.`
               : "New submissions are fenced pending solver investigation.",
           tone: "red",
+        };
+      }
+      if (scheduler.maintenanceDrainActive) {
+        return {
+          gate: {
+            text: "DRAINING — system maintenance",
+            tone: "amber",
+          },
+          lifecycle,
+          text:
+            jobs > 0
+              ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} continue; new submissions are held for system maintenance.`
+              : "New submissions are held for system maintenance.",
+          tone: "amber",
         };
       }
       if (scheduler.engineUnreachableSince) {

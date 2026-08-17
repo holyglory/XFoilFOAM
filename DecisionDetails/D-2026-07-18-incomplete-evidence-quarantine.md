@@ -1,5 +1,10 @@
 # D-2026-07-18-incomplete-evidence-quarantine
 
+> Superseded on 2026-08-05 by
+> [D-2026-08-05-disposable-failed-generations](D-2026-08-05-disposable-failed-generations.md).
+> Incomplete unpublished generations are now deleted and recomputed rather
+> than retained as forensic material.
+
 ## Context
 
 The protected production corpus scan found one terminal AG26 `a19` evidence

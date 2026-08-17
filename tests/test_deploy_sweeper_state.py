@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -110,6 +111,7 @@ def _deploy_harness(
     probe_fails: bool = False,
     queue_active_after: int = 0,
     queue_endpoint_failure_code: int = 0,
+    health_endpoint_failure_code: int = 0,
     disabled_queue_depth: int = 0,
     queue_observability_mode: str = "complete",
     queue_observation_mode: str = "fresh",
@@ -144,7 +146,13 @@ def _deploy_harness(
     continuation_error: str = "",
     media_repair_stop_fails: bool = False,
     media_repair_running: bool = True,
+    media_repair_exists: bool = True,
+    media_repair_dies_after_restore: bool = False,
     sweeper_dies_after_restore: bool = False,
+    docker_cleanup_fails: bool = False,
+    production_legacy_gateway: bool = False,
+    production_receipt_reconcile_mode: str = "success",
+    production_receipt_second_sample_drift: bool = False,
 ) -> dict[str, str]:
     app_dir = tmp_path / "app"
     fake_bin = tmp_path / "bin"
@@ -173,10 +181,17 @@ def _deploy_harness(
     (app_dir / "docker-compose.deploy.yml").write_text("services: {}\n")
     deploy_scripts = app_dir / "scripts" / "deploy"
     deploy_scripts.mkdir(parents=True)
-    shutil.copy2(
-        ROOT / "scripts" / "deploy" / "deployment-source-manifest.py",
-        deploy_scripts / "deployment-source-manifest.py",
-    )
+    if production_legacy_gateway:
+        shutil.copytree(
+            ROOT / "scripts" / "deploy",
+            deploy_scripts,
+            dirs_exist_ok=True,
+        )
+    else:
+        shutil.copy2(
+            ROOT / "scripts" / "deploy" / "deployment-source-manifest.py",
+            deploy_scripts / "deployment-source-manifest.py",
+        )
     subprocess.run(
         [
             sys.executable,
@@ -203,8 +218,60 @@ if [[ "${1:-}" == "compose" && "${2:-}" == "version" ]]; then
   exit 0
 fi
 joined="$*"
+if [[ "$joined" == "builder prune --all --force" || "$joined" == "image prune --force --filter dangling=true" ]]; then
+  if [[ "$FAKE_DOCKER_CLEANUP_FAILS" == "1" ]]; then
+    printf 'simulated Docker cleanup failure\n' >&2
+    exit 48
+  fi
+  exit 0
+fi
+if [[ "$joined" == *"ps --filter label=com.docker.compose.project="* && "$joined" == *"--format"* ]]; then
+  printf 'fake-api-id\tapi\n'
+  printf 'fake-postgres-id\tpostgres\n'
+  printf 'fake-worker-id\tworker\n'
+  if [[ "$FAKE_SWEEPER_STATE" == "running" && ! -f "$SWEEPER_STOPPED" ]]; then
+    printf 'fake-sweeper-id\tsweeper\n'
+  fi
+  if [[ "$FAKE_MEDIA_REPAIR_RUNNING" == "1" && ! -f "$MEDIA_REPAIR_STOPPED" ]]; then
+    printf 'fake-media-repair-id\tmedia-repair\n'
+  fi
+  exit 0
+fi
+if [[ "$joined" == *" stop sweeper"* ]]; then
+  : >"$SWEEPER_STOPPED"
+fi
+if [[ "$joined" == *" stop media-repair"* ]]; then
+  : >"$MEDIA_REPAIR_STOPPED"
+fi
+if [[ "$joined" == *" up -d --no-deps media-repair"* ]]; then
+  rm -f "$MEDIA_REPAIR_STOPPED"
+  : >"$MEDIA_REPAIR_STARTED"
+  if [[ "$FAKE_MEDIA_REPAIR_DIES_AFTER_RESTORE" == "1" ]]; then
+    : >"$MEDIA_REPAIR_RESTORED"
+  fi
+fi
 if [[ "$joined" == *" up -d --no-deps --force-recreate api "* ]]; then
   : >"$ENGINE_RECREATED"
+fi
+if [[ "$joined" == *" run --rm --no-deps -T "* && "$joined" == *" sweeper pnpm "* && "$joined" == *"maintenance:reconcile-receipt"* ]]; then
+  case "$FAKE_PRODUCTION_RECEIPT_RECONCILE_MODE" in
+    success)
+      : >"$RECEIPT_RECONCILED"
+      printf '{"schemaVersion":1,"requested":2,"reconciled":2,"remaining":0}\n'
+      exit 0
+      ;;
+    unsettled)
+      printf '{"schemaVersion":1,"requested":2,"reconciled":0,"remaining":2}\n'
+      exit 0
+      ;;
+    fail)
+      printf 'simulated receipt-scoped reconciliation failure\n' >&2
+      exit 47
+      ;;
+    *)
+      exit 99
+      ;;
+  esac
 fi
 if [[ "$joined" == *" up -d --no-deps sweeper"* && "$FAKE_SWEEPER_DIES_AFTER_RESTORE" == "1" ]]; then
   : >"$SWEEPER_RESTORED"
@@ -219,7 +286,13 @@ if [[ "$joined" == *" ps --status running -q sweeper"* ]]; then
   exit 0
 fi
 if [[ "$joined" == *" ps --status running -q media-repair"* ]]; then
-  if [[ "$FAKE_MEDIA_REPAIR_RUNNING" == "1" ]]; then
+  if [[ ( "$FAKE_MEDIA_REPAIR_RUNNING" == "1" || -f "$MEDIA_REPAIR_STARTED" ) && ! -f "$MEDIA_REPAIR_STOPPED" && ! -f "$MEDIA_REPAIR_RESTORED" ]]; then
+    printf 'fake-media-repair-container\n'
+  fi
+  exit 0
+fi
+if [[ "$joined" == *" ps -a -q media-repair"* ]]; then
+  if [[ "$FAKE_MEDIA_REPAIR_EXISTS" == "1" ]]; then
     printf 'fake-media-repair-container\n'
   fi
   exit 0
@@ -258,6 +331,51 @@ if [[ "$joined" == *" exec -T worker "* && "$joined" == *"openfoam2406/etc/bashr
     exit 0
   fi
   exit 1
+fi
+if [[ "$joined" == *"exec fake-"* && "$joined" == *"AIRFOILS_PRO_PRODUCTION_MAINTENANCE_CAPABILITY_PROBE"* ]]; then
+  printf '{"build_id":"b7d9213f59f2c1c19b8890b1500b81cf168d83aa","engine_version":"2606","urans_recovery_version":12,"archive_reduction_version":4,"queue_observation_version":1}\n'
+  exit 0
+fi
+if [[ "$joined" == *"exec fake-worker-id pgrep -af "* ]]; then
+  exit 1
+fi
+if [[ "$joined" == "exec fake-worker-id hostname" ]]; then
+  printf 'production\n'
+  exit 0
+fi
+if [[ "$joined" == *"exec fake-api-id "* && "$joined" == *"AIRFOILS_PRO_PRODUCTION_MAINTENANCE_CELERY_REDIS_PROBE"* ]]; then
+  printf '{"active":{"celery@production":[]},"reserved":{"celery@production":[]},"scheduled":{"celery@production":[]},"active_queues":{"celery@production":[{"name":"openfoam-opencfd-2606"}]},"queue_depths":{"openfoam-opencfd-2606":0,"openfoam-foundation-14":0},"transport_unacked_counts":{"unacked":0,"unacked_index":0}}\n'
+  exit 0
+fi
+if [[ "$joined" == *"exec fake-postgres-id psql "* && "$joined" == *"AIRFOILS_PRO_PRODUCTION_MAINTENANCE_DATABASE_PROBE"* ]]; then
+  if [[ -f "$RECEIPT_RECONCILED" ]]; then
+    printf '{"admission":{"enabled":false,"admission_fence_active":false,"maintenance_drain_token":"11111111-1111-4111-8111-111111111111","maintenance_drain_started_at":"2026-08-02T00:00:00+00:00"},"jobs":[]}\n'
+  else
+    printf '{"admission":{"enabled":false,"admission_fence_active":false,"maintenance_drain_token":"11111111-1111-4111-8111-111111111111","maintenance_drain_started_at":"2026-08-02T00:00:00+00:00"},"jobs":[{"id":"11111111-1111-4111-8111-111111111111","status":"running","engine_state":"running","engine_job_id":"0123456789ab4def8abc0123456789ab","ingested_at":null,"ingest_lease_live":false},{"id":"22222222-2222-4222-8222-222222222222","status":"ingesting","engine_state":"completed","engine_job_id":"fedcba9876544fed8cba9876543210fe","ingested_at":null,"ingest_lease_live":false}]}\n'
+  fi
+  exit 0
+fi
+if [[ "$joined" == *"exec fake-postgres-id psql "* && "$joined" == *"AIRFOILS_PRO_PRODUCTION_MAINTENANCE_RECEIPT_DATABASE_PROBE"* ]]; then
+  if [[ -f "$RECEIPT_RECONCILED" ]]; then
+    printf '[{"id":"11111111-1111-4111-8111-111111111111","status":"failed","engine_state":"failed","engine_job_id":"0123456789ab4def8abc0123456789ab","ingested_at":"2026-08-02T00:01:00+00:00","ingest_lease_live":false},{"id":"22222222-2222-4222-8222-222222222222","status":"done","engine_state":"completed","engine_job_id":"fedcba9876544fed8cba9876543210fe","ingested_at":"2026-08-02T00:01:00+00:00","ingest_lease_live":false}]\n'
+  else
+    printf '[{"id":"11111111-1111-4111-8111-111111111111","status":"running","engine_state":"running","engine_job_id":"0123456789ab4def8abc0123456789ab","ingested_at":null,"ingest_lease_live":false},{"id":"22222222-2222-4222-8222-222222222222","status":"ingesting","engine_state":"completed","engine_job_id":"fedcba9876544fed8cba9876543210fe","ingested_at":null,"ingest_lease_live":false}]\n'
+  fi
+  exit 0
+fi
+if [[ "$joined" == *"exec -i fake-api-id "* && "$joined" == *"AIRFOILS_PRO_PRODUCTION_MAINTENANCE_STATUS_PROBE"* ]]; then
+  status_probe_count=0
+  if [[ -f "$STATUS_PROBE_COUNT" ]]; then
+    read -r status_probe_count <"$STATUS_PROBE_COUNT"
+  fi
+  status_probe_count=$((status_probe_count + 1))
+  printf '%s\n' "$status_probe_count" >"$STATUS_PROBE_COUNT"
+  first_result_sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  if [[ "$FAKE_PRODUCTION_RECEIPT_SECOND_SAMPLE_DRIFT" == "1" && "$status_probe_count" -eq 5 && ! -f "$ENGINE_RECREATED" ]]; then
+    first_result_sha='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+  fi
+  printf '{"0123456789ab4def8abc0123456789ab":{"read_error":null,"status":{"job_id":"0123456789ab4def8abc0123456789ab","state":"failed","phase":"failed","cpu_tokens_held":0,"cpu_tokens_waiting":0},"status_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","result_sha256":"%s","result_present":true},"fedcba9876544fed8cba9876543210fe":{"read_error":null,"status":{"job_id":"fedcba9876544fed8cba9876543210fe","state":"completed","phase":"completed","cpu_tokens_held":0,"cpu_tokens_waiting":0},"status_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","result_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","result_present":true}}\n' "$first_result_sha"
+  exit 0
 fi
 if [[ "$joined" == *" exec -T api "* && "$joined" == *"AIRFOILS_PRO_LEGACY_CELERY_IDLE_PROBE"* ]]; then
   case "$FAKE_LEGACY_INSPECTOR_MODE" in
@@ -344,6 +462,17 @@ set -euo pipefail
 printf 'curl %s\n' "$*" >>"$CALL_LOG"
 output_file=""
 request_body=""
+write_out=""
+response_http_status="200"
+finish_curl() {
+  rc=$?
+  trap - EXIT
+  if (( rc == 0 )) && [[ -n "$write_out" ]]; then
+    printf 'AIRFOILS_QUEUE_HTTP_STATUS:%s' "$response_http_status"
+  fi
+  exit "$rc"
+}
+trap finish_curl EXIT
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   if [[ "${args[$i]}" == "-o" ]]; then
@@ -351,6 +480,9 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   fi
   if [[ "${args[$i]}" == "-d" ]]; then
     request_body="${args[$((i + 1))]}"
+  fi
+  if [[ "${args[$i]}" == "--write-out" ]]; then
+    write_out="${args[$((i + 1))]}"
   fi
 done
 url="${!#}"
@@ -362,7 +494,7 @@ case "$url" in
     fi
     count=$((count + 1))
     printf '%s\n' "$count" >"$QUEUE_PROBE_COUNT"
-    if (( FAKE_QUEUE_ENDPOINT_FAILURE_CODE != 0 )); then
+    if (( FAKE_QUEUE_ENDPOINT_FAILURE_CODE != 0 )) && { [[ ! -f "$ENGINE_RECREATED" ]] || [[ "$FAKE_PRODUCTION_LEGACY_GATEWAY" != "1" ]]; }; then
       printf 'simulated queue endpoint failure\n' >&2
       exit "$FAKE_QUEUE_ENDPOINT_FAILURE_CODE"
     fi
@@ -373,6 +505,25 @@ case "$url" in
         ;;
       stale)
         queue_observation='"queue_observation_state":"stale","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":true,"queue_observation_error":null,'
+        ;;
+      stale-then-fresh)
+        if (( count == 1 )); then
+          queue_observation='"queue_observation_state":"stale","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":true,"queue_observation_error":null,'
+        else
+          queue_observation='"queue_observation_state":"fresh","queue_observed_at":"2026-07-30T00:00:01+00:00","queue_refresh_in_progress":false,"queue_observation_error":null,'
+        fi
+        ;;
+      stale-503-then-fresh)
+        if (( count == 1 )); then
+          response_http_status="503"
+          queue_observation='"queue_observation_state":"stale","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":true,"queue_observation_error":null,'
+        else
+          queue_observation='"queue_observation_state":"fresh","queue_observed_at":"2026-07-30T00:00:01+00:00","queue_refresh_in_progress":false,"queue_observation_error":null,'
+        fi
+        ;;
+      fresh-503)
+        response_http_status="503"
+        queue_observation='"queue_observation_state":"fresh","queue_observed_at":"2026-07-30T00:00:00+00:00","queue_refresh_in_progress":false,"queue_observation_error":null,'
         ;;
       missing-observed-at)
         queue_observation='"queue_observation_state":"fresh","queue_refresh_in_progress":false,"queue_observation_error":null,'
@@ -401,14 +552,24 @@ case "$url" in
       printf '{%s"queue_depth":0,"queue_depths":{"celery":0,"openfoam-foundation-14":0},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":null,"worker_queues_error":"inspect timed out","worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$queue_observation"
       exit 0
     fi
+    worker_queues='[]'
+    inspection_workers='{"active":[],"reserved":[],"scheduled":[]}'
+    if [[ "$FAKE_PRODUCTION_LEGACY_GATEWAY" == "1" ]]; then
+      worker_queues='[{"worker":"celery@fake-worker","queues":["celery"]}]'
+      inspection_workers='{"active":["celery@fake-worker"],"reserved":["celery@fake-worker"],"scheduled":["celery@fake-worker"]}'
+    fi
     if (( FAKE_QUEUE_ACTIVE_AFTER > 0 && count >= FAKE_QUEUE_ACTIVE_AFTER )); then
       total_depth=$((disabled_depth + 1))
-      printf '{%s"queue_depth":%s,"queue_depths":{"celery":1,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":["arrived-after-stop"],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$queue_observation" "$total_depth" "$disabled_depth"
+      printf '{%s"queue_depth":%s,"queue_depths":{"celery":1,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":["arrived-after-stop"],"worker_queues":%s,"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":%s}\n' "$queue_observation" "$total_depth" "$disabled_depth" "$worker_queues" "$inspection_workers"
     else
-      printf '{%s"queue_depth":%s,"queue_depths":{"celery":0,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":[],"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":{"active":[],"reserved":[],"scheduled":[]}}\n' "$queue_observation" "$disabled_depth" "$disabled_depth"
+      printf '{%s"queue_depth":%s,"queue_depths":{"celery":0,"openfoam-foundation-14":%s},"queue_enabled":{"celery":true,"openfoam-foundation-14":false},"active_count":0,"reserved_count":0,"scheduled_count":0,"job_ids":[],"worker_queues":%s,"worker_queues_error":null,"worker_runtime_error":null,"inspection_errors":{},"inspection_workers":%s}\n' "$queue_observation" "$disabled_depth" "$disabled_depth" "$worker_queues" "$inspection_workers"
     fi
     ;;
   *:8000/health)
+    if (( FAKE_HEALTH_ENDPOINT_FAILURE_CODE != 0 )) && [[ ! -f "$ENGINE_RECREATED" ]]; then
+      printf 'simulated health endpoint failure\n' >&2
+      exit "$FAKE_HEALTH_ENDPOINT_FAILURE_CODE"
+    fi
     engine_version="$FAKE_ENGINE_VERSION"
     if [[ -f "$ENGINE_RECREATED" ]]; then
       engine_version="$FAKE_TARGET_ENGINE_VERSION"
@@ -512,6 +673,10 @@ esac
         fake_bin / "python3",
         """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == */scripts/deploy/production_maintenance_preflight.py ]]; then
+  printf 'production-preflight %s\n' "$*" >>"$CALL_LOG"
+  exec "$REAL_PYTHON" "$@"
+fi
 if [[ "${1:-}" == */scripts/deploy/openfoam_2606_canary.py ]]; then
   if [[ "$*" == *"--verify-receipt"* ]]; then
     printf 'canary-verify %s\n' "$*" >>"$CALL_LOG"
@@ -581,6 +746,7 @@ exec "$REAL_PYTHON" "$@"
             "FAKE_STATE_PROBE_FAIL": "1" if probe_fails else "0",
             "FAKE_QUEUE_ACTIVE_AFTER": str(queue_active_after),
             "FAKE_QUEUE_ENDPOINT_FAILURE_CODE": str(queue_endpoint_failure_code),
+            "FAKE_HEALTH_ENDPOINT_FAILURE_CODE": str(health_endpoint_failure_code),
             "FAKE_DISABLED_QUEUE_DEPTH": str(disabled_queue_depth),
             "FAKE_QUEUE_OBSERVABILITY_MODE": queue_observability_mode,
             "FAKE_QUEUE_OBSERVATION_MODE": queue_observation_mode,
@@ -623,18 +789,71 @@ exec "$REAL_PYTHON" "$@"
                 "1" if media_repair_stop_fails else "0"
             ),
             "FAKE_MEDIA_REPAIR_RUNNING": "1" if media_repair_running else "0",
+            "FAKE_MEDIA_REPAIR_EXISTS": "1" if media_repair_exists else "0",
+            "FAKE_MEDIA_REPAIR_DIES_AFTER_RESTORE": (
+                "1" if media_repair_dies_after_restore else "0"
+            ),
             "FAKE_SWEEPER_DIES_AFTER_RESTORE": (
                 "1" if sweeper_dies_after_restore else "0"
             ),
+            "FAKE_DOCKER_CLEANUP_FAILS": "1" if docker_cleanup_fails else "0",
+            "FAKE_PRODUCTION_RECEIPT_RECONCILE_MODE": (
+                production_receipt_reconcile_mode
+            ),
+            "FAKE_PRODUCTION_RECEIPT_SECOND_SAMPLE_DRIFT": (
+                "1" if production_receipt_second_sample_drift else "0"
+            ),
+            "FAKE_PRODUCTION_LEGACY_GATEWAY": (
+                "1" if production_legacy_gateway else "0"
+            ),
             "SWEEPER_RESTORED": str(tmp_path / "sweeper-restored"),
+            "SWEEPER_STOPPED": str(tmp_path / "sweeper-stopped"),
+            "MEDIA_REPAIR_STOPPED": str(tmp_path / "media-repair-stopped"),
+            "MEDIA_REPAIR_STARTED": str(tmp_path / "media-repair-started"),
+            "MEDIA_REPAIR_RESTORED": str(tmp_path / "media-repair-restored"),
             "REAL_PYTHON": sys.executable,
             "ENGINE_RECREATED": str(tmp_path / "engine-recreated"),
+            "RECEIPT_RECONCILED": str(tmp_path / "receipt-reconciled"),
             "POOL_ACTIVATION_COUNT": str(tmp_path / "pool-activation-count"),
             "POOL_DISABLE_LOG": str(tmp_path / "pool-disable.log"),
             "QUEUE_PROBE_COUNT": str(tmp_path / "queue-probe-count"),
+            "STATUS_PROBE_COUNT": str(tmp_path / "status-probe-count"),
             "PATH": f"{fake_bin}:{env['PATH']}",
         }
     )
+    if production_legacy_gateway:
+        verified = subprocess.run(
+            [
+                sys.executable,
+                str(deploy_scripts / "deployment-source-manifest.py"),
+                "--verify",
+                "--root",
+                str(app_dir),
+                "--manifest",
+                str(app_dir / ".deployment-source.json"),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().split("\t")
+        verifier = deploy_scripts / "deployment-source-manifest.py"
+        env.update(
+            {
+                "PINNED_WATCHER_INVOCATION": "true",
+                "ACTIVE_APP_LINK": str(app_dir),
+                "DEPLOY_SCRIPT_DIR": str(deploy_scripts),
+                "DEPLOYMENT_MANIFEST_FILE": str(app_dir / ".deployment-source.json"),
+                "DEPLOY_SOURCE_REVISION": verified[0],
+                "DEPLOY_SOURCE_TREE_SHA256": verified[1],
+                "DEPLOY_SOURCE_VERIFIER": str(verifier),
+                "DEPLOY_SOURCE_VERIFIER_SHA256": hashlib.sha256(
+                    verifier.read_bytes()
+                ).hexdigest(),
+                "PRODUCTION_MAINTENANCE_DRAIN_TOKEN": (
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+            }
+        )
     return env
 
 
@@ -730,7 +949,14 @@ def test_engine_maintenance_refuses_tampered_promoted_source_before_mutation(
 
 @pytest.mark.parametrize(
     "unsafe_path",
-    ["state-in-app", "receipt-in-app", "state-symlink", "receipt-symlink"],
+    [
+        "state-in-app",
+        "receipt-in-app",
+        "state-symlink",
+        "receipt-symlink",
+        "production-receipt-outside-state",
+        "production-receipt-wrong-name",
+    ],
 )
 def test_engine_maintenance_rejects_replaceable_or_symlinked_recovery_paths(
     tmp_path: Path, unsafe_path: str
@@ -750,13 +976,21 @@ def test_engine_maintenance_rejects_replaceable_or_symlinked_recovery_paths(
         state_link = tmp_path / "state-link"
         state_link.symlink_to(actual_state, target_is_directory=True)
         env["AIRFOILS_PRO_STATE_DIR"] = str(state_link)
-    else:
+    elif unsafe_path == "receipt-symlink":
         state_dir.mkdir()
         actual_receipt = tmp_path / "actual-receipt.json"
         actual_receipt.write_text("{}\n")
         receipt_link = state_dir / "openfoam-2606-canary-receipt.pending.json"
         receipt_link.symlink_to(actual_receipt)
         env["OPENCFD2606_CANARY_RECEIPT_FILE"] = str(receipt_link)
+    elif unsafe_path == "production-receipt-outside-state":
+        env["PRODUCTION_MAINTENANCE_RECEIPT_FILE"] = str(
+            tmp_path / "production-legacy-gateway-reconciliation.json"
+        )
+    else:
+        env["PRODUCTION_MAINTENANCE_RECEIPT_FILE"] = str(
+            state_dir / "attacker-controlled-name.json"
+        )
 
     completed = subprocess.run(
         [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
@@ -895,6 +1129,64 @@ def test_control_plane_deploy_initializes_nested_sync_mountpoint_before_node_api
     )
     assert storage_init_index < node_api_index
     assert "Initializing the nested sync-imports mountpoint" in completed.stdout
+
+
+def test_control_plane_deploy_preserves_intentionally_stopped_media_repair(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        media_repair_running=False,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    media_stop_index = next(
+        index for index, call in enumerate(calls) if " stop media-repair" in call
+    )
+    media_preserve_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up --no-start --no-deps --force-recreate media-repair" in call
+    )
+    assert media_stop_index < media_preserve_index
+    assert not any(" up -d --no-deps media-repair" in call for call in calls)
+    assert "Preserving the intentionally stopped media repair worker" in completed.stdout
+
+
+def test_control_plane_deploy_starts_newly_introduced_media_repair(tmp_path: Path) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        media_repair_running=False,
+        media_repair_exists=False,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any(" up -d --no-deps media-repair" in call for call in calls)
+    assert not any(
+        " up --no-start --no-deps --force-recreate media-repair" in call
+        for call in calls
+    )
+    assert "Starting newly introduced media repair worker" in completed.stdout
 
 
 def test_control_plane_deploy_fails_before_migration_when_media_repair_cannot_stop(
@@ -1099,7 +1391,7 @@ def test_strict_2606_queue_guard_rejects_the_legacy_queue_shape(
     assert not any(" build api" in call for call in calls)
 
 
-def test_pre_observation_2606_timeout_uses_bounded_direct_idle_recovery(
+def test_pre_observation_2606_timeout_refuses_unpinned_direct_idle_recovery(
     tmp_path: Path,
 ) -> None:
     env = _deploy_harness(
@@ -1118,12 +1410,13 @@ def test_pre_observation_2606_timeout_uses_bounded_direct_idle_recovery(
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 12
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
-    assert any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
-    assert any(" exec -T postgres " in call for call in calls)
-    assert any(" build api" in call for call in calls)
-    assert Path(env["ENV_FILE"]).read_text().count("AIRFOILFOAM_BUILD_ID=test-build") == 1
+    assert not any(
+        "AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls
+    )
+    assert not any(" build api" in call for call in calls)
+    assert "AIRFOILFOAM_BUILD_ID=old-build" in Path(env["ENV_FILE"]).read_text()
 
 
 def test_modern_2606_timeout_never_uses_direct_idle_recovery(
@@ -1146,10 +1439,190 @@ def test_modern_2606_timeout_never_uses_direct_idle_recovery(
     )
 
     assert completed.returncode == 12
-    assert "gateway advertises queue observation; direct recovery is forbidden" in completed.stderr
+    assert "engine queue probe failed" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert not any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
     assert not any(" build api" in call for call in calls)
+
+
+def test_pinned_owned_legacy_gateway_timeout_repeats_terminal_preflight_after_writers_stop(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        queue_endpoint_failure_code=28,
+        health_endpoint_failure_code=28,
+        queue_snapshot_capability=True,
+        idle_engine_service="worker",
+        media_repair_running=True,
+        production_legacy_gateway=True,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    preflight = [
+        (index, call)
+        for index, call in enumerate(calls)
+        if call.startswith("production-preflight ")
+    ]
+    assert len(preflight) == 7
+    assert all("--phase observe" in call for _, call in preflight[:3])
+    assert all("--phase authoritative" in call for _, call in preflight[3:5])
+    assert all("--receipt-file" in call for _, call in preflight[3:])
+    assert all("--phase reconcile" in call for _, call in preflight[5:])
+    build_index = next(index for index, call in enumerate(calls) if " build api" in call)
+    sweeper_stop = next(index for index, call in enumerate(calls) if " stop sweeper" in call)
+    media_stop = next(index for index, call in enumerate(calls) if " stop media-repair" in call)
+    recreate_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up -d --no-deps --force-recreate api " in call
+    )
+    reconcile_run = next(
+        index
+        for index, call in enumerate(calls)
+        if "maintenance:reconcile-receipt" in call
+    )
+    assert "--volume" in calls[reconcile_run]
+    assert "production-legacy-gateway-reconciliation.json:/run/airfoils-maintenance/receipt.json:ro" in calls[reconcile_run]
+    assert "--receipt-file /run/airfoils-maintenance/receipt.json" in calls[reconcile_run]
+    assert "--input-file" not in calls[reconcile_run]
+    sweeper_restore = next(
+        index
+        for index, call in enumerate(calls)
+        if " up -d --no-deps --force-recreate sweeper" in call
+    )
+    assert preflight[0][0] < preflight[1][0] < preflight[2][0] < build_index
+    assert build_index < sweeper_stop < preflight[3][0]
+    assert build_index < media_stop < preflight[3][0]
+    assert preflight[3][0] < preflight[4][0] < recreate_index
+    assert recreate_index < preflight[5][0] < reconcile_run < preflight[6][0]
+    assert preflight[6][0] < sweeper_restore
+    assert sum(
+        "AIRFOILS_PRO_PRODUCTION_MAINTENANCE_DATABASE_PROBE" in call
+        for call in calls
+    ) == 7
+    assert sum(
+        "AIRFOILS_PRO_PRODUCTION_MAINTENANCE_STATUS_PROBE" in call
+        for call in calls
+    ) == 6
+    assert sum(
+        "AIRFOILS_PRO_PRODUCTION_MAINTENANCE_RECEIPT_DATABASE_PROBE" in call
+        for call in calls
+    ) == 2
+
+
+def test_manual_token_cannot_enable_legacy_gateway_timeout_recovery(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_endpoint_failure_code=28,
+        queue_snapshot_capability=True,
+        idle_engine_service="worker",
+    )
+    env["PRODUCTION_MAINTENANCE_DRAIN_TOKEN"] = (
+        "11111111-1111-4111-8111-111111111111"
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert not any(call.startswith("production-preflight ") for call in calls)
+    assert not any(" build api" in call for call in calls)
+
+
+@pytest.mark.parametrize("mode", ("fail", "unsettled"))
+def test_legacy_gateway_reconciliation_failure_keeps_writers_stopped(
+    tmp_path: Path, mode: str
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        queue_endpoint_failure_code=28,
+        health_endpoint_failure_code=28,
+        queue_snapshot_capability=True,
+        idle_engine_service="worker",
+        media_repair_running=True,
+        production_legacy_gateway=True,
+        production_receipt_reconcile_mode=mode,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    recreate_index = next(
+        index
+        for index, call in enumerate(calls)
+        if " up -d --no-deps --force-recreate api " in call
+    )
+    reconcile_index = next(
+        index
+        for index, call in enumerate(calls)
+        if "maintenance:reconcile-receipt" in call
+    )
+    assert recreate_index < reconcile_index
+    assert not any(" up -d --no-deps --force-recreate sweeper" in call for call in calls)
+    assert not any(" up -d --no-deps --force-recreate media-repair" in call for call in calls)
+    if mode == "unsettled":
+        assert "did not all reach exact terminal settlement" in completed.stderr
+    else:
+        assert "scheduler admission remains paused" in completed.stderr
+
+
+def test_legacy_gateway_candidate_drift_refuses_recreate_and_restores_writers(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        queue_endpoint_failure_code=28,
+        health_endpoint_failure_code=28,
+        queue_snapshot_capability=True,
+        idle_engine_service="worker",
+        media_repair_running=True,
+        production_legacy_gateway=True,
+        production_receipt_second_sample_drift=True,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "changed between authoritative idle samples" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert not any(" up -d --no-deps --force-recreate api " in call for call in calls)
+    assert any(" up -d --no-deps sweeper" in call for call in calls)
+    assert any(" up -d --no-deps media-repair" in call for call in calls)
 
 
 def test_non_timeout_queue_failure_never_uses_direct_idle_recovery(
@@ -1179,20 +1652,12 @@ def test_non_timeout_queue_failure_never_uses_direct_idle_recovery(
 
 
 @pytest.mark.parametrize(
-    ("direct_recovery_mode", "expected_error"),
-    [
-        ("active", "direct Celery/Redis recovery reports work"),
-        ("queued", "direct Celery/Redis recovery reports work"),
-        ("disabled", "direct Celery/Redis recovery reports work"),
-        ("transport", "direct Celery/Redis recovery reports work"),
-        ("partial", "worker coverage is incomplete for scheduled"),
-        ("unregistered", "worker bound to an unregistered route"),
-    ],
+    "direct_recovery_mode",
+    ["active", "queued", "disabled", "transport", "partial", "unregistered"],
 )
-def test_pre_observation_timeout_recovery_rejects_direct_work_or_incomplete_snapshot(
+def test_pre_observation_timeout_never_consults_unpinned_direct_snapshot(
     tmp_path: Path,
     direct_recovery_mode: str,
-    expected_error: str,
 ) -> None:
     env = _deploy_harness(
         tmp_path,
@@ -1212,14 +1677,17 @@ def test_pre_observation_timeout_recovery_rejects_direct_work_or_incomplete_snap
     )
 
     assert completed.returncode == 12
-    assert expected_error in completed.stderr
+    assert "engine queue probe failed" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
-    assert any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
+    assert not any(
+        "AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls
+    )
+    assert not any(" exec -T postgres " in call for call in calls)
     assert not any(" build api" in call for call in calls)
 
 
 @pytest.mark.parametrize("direct_database_mode", ["live", "malformed"])
-def test_pre_observation_timeout_recovery_rejects_live_or_invalid_database_state(
+def test_pre_observation_timeout_never_consults_unpinned_database_snapshot(
     tmp_path: Path,
     direct_database_mode: str,
 ) -> None:
@@ -1241,9 +1709,9 @@ def test_pre_observation_timeout_recovery_rejects_live_or_invalid_database_state
     )
 
     assert completed.returncode == 12
-    assert "direct maintenance database" in completed.stderr
+    assert "engine queue probe failed" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
-    assert any(" exec -T postgres " in call for call in calls)
+    assert not any(" exec -T postgres " in call for call in calls)
     assert not any("AIRFOILS_PRO_DIRECT_CELERY_REDIS_IDLE_PROBE" in call for call in calls)
     assert not any(" build api" in call for call in calls)
 
@@ -1390,6 +1858,75 @@ def test_engine_rebuild_rejects_nonfresh_or_incomplete_queue_observation(
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert not any(" build api" in call for call in calls)
     assert not any("up -d --no-deps --force-recreate api" in call for call in calls)
+
+
+def test_engine_rebuild_waits_for_bounded_stale_snapshot_refresh(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_observation_mode="stale-then-fresh",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert int(Path(env["QUEUE_PROBE_COUNT"]).read_text()) >= 2
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any(" build api worker" in call for call in calls)
+
+
+def test_engine_rebuild_waits_when_stale_refresh_uses_http_503(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_observation_mode="stale-503-then-fresh",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert int(Path(env["QUEUE_PROBE_COUNT"]).read_text()) >= 2
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert any(" build api worker" in call for call in calls)
+
+
+def test_engine_rebuild_rejects_http_503_without_stale_refresh_contract(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="stopped",
+        queue_observation_mode="fresh-503",
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 12
+    assert "HTTP 503 is not a bounded stale refresh" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert not any(" build api" in call for call in calls)
 
 
 def test_engine_rebuild_includes_every_worker_in_active_profiles(tmp_path: Path) -> None:
@@ -3283,7 +3820,8 @@ def test_control_plane_deploy_fails_if_required_background_service_exits_after_u
         tmp_path,
         sweeper_state="running",
         sweeper_dies_after_restore=failed_service == "sweeper",
-        media_repair_running=failed_service != "media-repair",
+        media_repair_running=True,
+        media_repair_dies_after_restore=failed_service == "media-repair",
     )
 
     completed = subprocess.run(
@@ -3302,6 +3840,8 @@ def test_control_plane_deploy_fails_if_required_background_service_exits_after_u
     assert sum(
         f" ps --status running -q {failed_service}" in call for call in calls
     ) >= 15
+    assert "builder prune --all --force" not in calls
+    assert "image prune --force --filter dangling=true" not in calls
 
 
 def test_control_plane_deploy_accepts_stably_running_background_services(
@@ -3327,3 +3867,71 @@ def test_control_plane_deploy_accepts_stably_running_background_services(
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert sum(" ps --status running -q sweeper" in call for call in calls) >= 4
     assert sum(" ps --status running -q media-repair" in call for call in calls) >= 3
+
+
+def test_control_plane_deploy_prunes_only_unused_docker_artifacts_after_health_checks(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="running")
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Unused Docker build cache pruned." in completed.stdout
+    assert "Dangling Docker images pruned." in completed.stdout
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    last_health_check = max(
+        index for index, call in enumerate(calls) if call.startswith("curl ")
+    )
+    builder_prune = calls.index("builder prune --all --force")
+    dangling_image_prune = calls.index("image prune --force --filter dangling=true")
+    assert last_health_check < builder_prune < dangling_image_prune
+
+    script = (ROOT / "scripts" / "deploy" / "vps-redeploy.sh").read_text()
+    cleanup_start = script.index("prune_unused_docker_build_artifacts()")
+    cleanup_end = script.index("\nmain() {", cleanup_start)
+    cleanup = script[cleanup_start:cleanup_end]
+    assert "docker builder prune --all --force" in cleanup
+    assert 'docker image prune --force --filter "dangling=true"' in cleanup
+    for forbidden in (
+        "docker system prune",
+        "docker container prune",
+        "docker volume prune",
+        "docker network prune",
+        "docker image prune --all",
+        "docker image rm",
+        "docker rmi",
+    ):
+        assert forbidden not in cleanup
+
+
+def test_control_plane_deploy_keeps_verified_services_running_when_docker_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    env = _deploy_harness(
+        tmp_path,
+        sweeper_state="running",
+        docker_cleanup_fails=True,
+    )
+
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Airfoils.Pro deploy finished." in completed.stdout
+    assert "Docker build-cache cleanup failed after the deploy passed health checks" in completed.stderr
+    assert "Docker dangling-image cleanup failed after the deploy passed health checks" in completed.stderr
+    calls = Path(env["CALL_LOG"]).read_text().splitlines()
+    assert "builder prune --all --force" in calls
+    assert "image prune --force --filter dangling=true" in calls

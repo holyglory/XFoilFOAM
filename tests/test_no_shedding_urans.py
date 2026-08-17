@@ -20,10 +20,22 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from airfoilfoam.models import CaseSpec, FluidProperties, RoughnessParams, SolverParams
-from airfoilfoam.postprocess.unsteady import ForceHistory, force_history, is_no_shedding
+from airfoilfoam.models import (
+    NO_SHEDDING_CERTIFICATE_VERSION,
+    CaseSpec,
+    FluidProperties,
+    RoughnessParams,
+    SolverParams,
+)
+from airfoilfoam.postprocess.unsteady import (
+    ForceHistory,
+    NO_SHEDDING_ABS_RMS_FALLBACK,
+    force_history,
+    is_no_shedding,
+)
 from airfoilfoam import pipeline
 from airfoilfoam.pipeline import (
     CaseOutcome,
@@ -156,6 +168,36 @@ def _write_low_amplitude_inband_coeff(path: Path, span_s: float) -> None:
     path.write_text("\n".join(rows) + "\n")
 
 
+def _write_absolute_rms_nearsteady_coeff(path: Path, span_s: float) -> None:
+    """Incoherent high-frequency numerical tail for the RMS fallback.
+
+    Cd/Cm fluctuations are above the generic 1e-3 near-zero floor but below
+    the 2e-3 clean-tail fallback. The channels use independent bounded
+    pseudo-random sequences, so none has a physically plausible repeatable
+    period.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dt = 0.001
+    n = int(round(span_s / dt)) + 1
+    amplitude = 0.0024  # Uniform RMS ~= 1.39e-3; every step remains bounded.
+    rows = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    noise = np.random.default_rng(2606).uniform(
+        -amplitude, amplitude, size=(n, 3)
+    )
+    for i in range(n):
+        t = min(span_s, i * dt)
+        cl_noise, cd_noise, cm_noise = noise[i]
+        cl = 0.7 + cl_noise
+        cd = 0.02 + cd_noise
+        cm = -0.05 + cm_noise
+        rows.append(
+            f"{t:.6f} {cd:.9g} 0 0 {cl:.9g} 0 0 {cm:.9g} 0 0 0 0 0"
+        )
+    path.write_text("\n".join(rows) + "\n")
+
+
 # --- detector -------------------------------------------------------------
 
 
@@ -184,6 +226,81 @@ def test_no_shedding_requires_dense_quiet_all_channel_evidence():
     assert is_no_shedding(
         _flat_history(cl_mean=0.0006, cd_mean=0.012, n=20)
     )
+
+
+def test_absolute_rms_fallback_certifies_only_an_incoherent_quiet_tail(tmp_path):
+    """MUST-CATCH: quiet numerical tails retain typed no-shedding evidence.
+
+    The generic absolute floor remains intentionally lower.  This proves the
+    narrow fallback survives the actual coefficient-file reducer and stamps a
+    certificate with its truthful allowance, rather than accepting a
+    summary-only substitute.
+    """
+    spec = CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0)
+    coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    _write_absolute_rms_nearsteady_coeff(coeff, span_s=4.3)
+    history = pipeline._force_history_for_no_shedding_horizon(
+        [coeff], spec, target_cycles=3
+    )
+
+    assert history is not None
+    assert history.cd_rms > 1e-3
+    assert history.cd_rms < NO_SHEDDING_ABS_RMS_FALLBACK
+    assert history.cm_rms > 1e-3
+    assert is_no_shedding(history)
+    assert history.period_s is None
+
+    quality = evaluate_urans_quality(
+        tmp_path,
+        history,
+        speed=spec.speed,
+        chord=spec.chord,
+        min_cycles=3.0,
+        min_no_shedding_observation_s=pipeline._no_shedding_min_observation_s(
+            spec.speed, spec.chord
+        ),
+    )
+    assert quality.ok and quality.no_shedding
+    certificate, reason = pipeline._no_shedding_observation_certificate(
+        history,
+        quality,
+        spec,
+        raw_coefficient_paths=[coeff],
+    )
+    assert reason is None
+    assert certificate is not None
+    assert certificate.reducer_version == NO_SHEDDING_CERTIFICATE_VERSION
+    assert certificate.absolute_floor == NO_SHEDDING_ABS_RMS_FALLBACK
+
+
+def test_absolute_rms_fallback_rejects_a_sharp_tail_corruption():
+    """False-positive guard: one adaptive-step impulse cannot look steady."""
+    history = _flat_history(
+        cl_mean=0.7,
+        cd_mean=0.02,
+        cm_mean=-0.05,
+        noise_rms=0.0015,
+    )
+    # Keep the reported RMS inside the fallback, then inject a byte-backed
+    # coefficient step far beyond its measured tail scale.
+    history.cd[len(history.cd) // 2] += 0.02
+    assert not is_no_shedding(history)
+
+
+def test_absolute_rms_fallback_rejects_a_slowly_drifting_tail():
+    """False-positive guard: low RMS alone cannot hide a monotonic transient."""
+    history = _flat_history(
+        cl_mean=0.7,
+        cd_mean=0.02,
+        cm_mean=-0.05,
+        noise_rms=0.0012,
+    )
+    for index in range(len(history.t)):
+        drift = 0.004 * (index / (len(history.t) - 1) - 0.5)
+        history.cl[index] += drift
+        history.cd[index] += drift
+        history.cm[index] += drift
+    assert not is_no_shedding(history)
 
 
 def test_periodic_signal_is_not_no_shedding():
@@ -271,22 +388,11 @@ def test_no_shedding_certificate_stamps_bounded_transport_statistics() -> None:
     assert certificate.transport_cl_rms != certificate.cl_rms
 
 
-@pytest.mark.parametrize(
-    ("retained_span_s", "accepted"),
-    [(4.19, False), (4.21, True)],
-)
-def test_low_amplitude_inband_ripple_uses_full_no_shedding_observation_horizon(
-    tmp_path,
-    retained_span_s,
-    accepted,
+@pytest.mark.parametrize("retained_span_s", [4.19, 4.21])
+def test_low_amplitude_inband_ripple_never_uses_the_no_shedding_path(
+    tmp_path, retained_span_s
 ):
-    """A tiny credible FFT line must not crop the physical flat-wake horizon.
-
-    At U=10 m/s and c=1 m the shared floor is exactly 4.2 s. The below-floor
-    trace remains pending physical acquisition; the above-floor trace is a
-    valid steady-equivalent mean. Both retain their full real observation and
-    expose no spurious shedding period.
-    """
+    """A coherent St=0.2 ripple is periodic even below the RMS floor."""
     coeff = tmp_path / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
     _write_low_amplitude_inband_coeff(coeff, retained_span_s)
     history = force_history(
@@ -296,13 +402,9 @@ def test_low_amplitude_inband_ripple_uses_full_no_shedding_observation_horizon(
         discard_fraction=0.0,
         target_cycles=3,
     )
-    minimum = pipeline._no_shedding_min_observation_s(10.0, 1.0)
-
-    assert minimum == pytest.approx(4.2)
-    assert is_no_shedding(history)
-    assert history.period_s is None
-    assert history.strouhal == 0.0
-    assert history.t[-1] - history.t[0] == pytest.approx(retained_span_s)
+    assert not is_no_shedding(history)
+    assert history.period_s == pytest.approx(0.5, rel=0.03)
+    assert history.strouhal == pytest.approx(0.2, rel=0.03)
 
     quality = evaluate_urans_quality(
         tmp_path,
@@ -310,32 +412,11 @@ def test_low_amplitude_inband_ripple_uses_full_no_shedding_observation_horizon(
         speed=10.0,
         chord=1.0,
         min_cycles=3.0,
-        min_no_shedding_observation_s=minimum,
-    )
-    assert quality.ok is accepted
-    assert quality.no_shedding is accepted
-    if accepted:
-        assert "no vortex shedding" in quality.reason
-    else:
-        assert "apparently flat" in quality.reason
-        assert "slow-shedding observation horizon" in quality.reason
-
-    # The mandatory precalc stationarity gate may not reinterpret a tiny FFT
-    # ripple and bypass the no-shedding observation decision above.
-    graded = pipeline._grade_precalc_established_oscillation(
-        tmp_path,
-        [coeff],
-        CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
-        SolverParams(
-            force_transient=True,
-            urans_fidelity="precalc",
-            urans_min_periods=3,
-            transient_discard_fraction=0.0,
+        min_no_shedding_observation_s=pipeline._no_shedding_min_observation_s(
+            10.0, 1.0
         ),
-        quality,
-        early_stopped=False,
     )
-    assert graded is quality
+    assert not quality.no_shedding
 
 
 def test_precalc_short_apparent_flat_signal_is_not_yet_no_shedding(tmp_path):
@@ -1059,6 +1140,56 @@ def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch
     assert result.avg.cm == pytest.approx(cm_true, abs=1e-9)
 
 
+def test_wall_budget_stop_keeps_already_certified_no_shedding_evidence(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: an accepted tail is not downgraded by its later timeout."""
+    cl_true, cd_true, cm_true = 0.0009, 0.0121, -0.0004
+
+    class TimeoutAfterEvidenceRunner:
+        def solver(self, case_dir, *_args, monitor=None, **_kwargs):
+            coeff = (
+                case_dir
+                / "postProcessing"
+                / "forceCoeffs1"
+                / "0"
+                / "coefficient.dat"
+            )
+            coeff.parent.mkdir(parents=True, exist_ok=True)
+            _write_flat_coeff(coeff, cl_true, cd_true, cm_true, n=712)
+            return SimpleNamespace(
+                ok=False,
+                returncode=124,
+                timed_out=True,
+                stdout="Time = 7.12\nCommand timed out after 120s",
+            )
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", _FakeCaseBuilder)
+    tcase = tmp_path / "transient"
+    (tcase / "0").mkdir(parents=True)
+
+    result = _run_transient_attempt(
+        tcase,
+        airfoil=None,
+        tmesh=None,
+        patches={},
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(),
+        runner=TimeoutAfterEvidenceRunner(),
+        n_proc=1,
+        timeout=120,
+        run_time=7.2,
+        delta_t=0.001,
+    )
+
+    assert result is not None
+    assert result.quality.ok and result.quality.no_shedding
+    assert pipeline.URANS_BUDGET_STOP_MARKER not in result.quality.reason
+    assert result.avg.cl == pytest.approx(cl_true, abs=1e-9)
+
+
 def test_early_stop_no_shedding_uses_trailing_physical_horizon(
     tmp_path, monkeypatch
 ):
@@ -1304,6 +1435,13 @@ def test_no_shedding_finalize_recovers_naca0012_alpha0_as_steady(tmp_path, monke
     assert outcome.no_shedding_certificate.observed_observation_s >= (
         outcome.no_shedding_certificate.required_observation_s
     )
+    manifest = json.loads(
+        (tmp_path / "evidence" / "evidence_manifest.json").read_text()
+    )
+    # The point is steady-equivalent, but the immutable archive still proves
+    # that its physical owner was URANS rather than a legacy steady summary.
+    assert manifest["unsteady"] is True
+    assert manifest["observedUnsteady"] is False
 
 
 def test_finalize_rejects_short_flat_urans_before_publishing_transient_media(

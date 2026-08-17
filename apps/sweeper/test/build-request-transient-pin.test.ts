@@ -18,6 +18,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   admissionCpuSlotsForRequest,
+  admissionCpuSlotsForSetup,
   buildPolarRequest,
   REQUIRED_ARCHIVE_REDUCTION_VERSION,
 } from "../src/build-request";
@@ -91,6 +92,8 @@ const setup = {
 
 describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)", () => {
   it("pins the immutable archive reducer on every wave before engine submission", () => {
+    expect(REQUIRED_ARCHIVE_REDUCTION_VERSION).toBe(4);
+
     for (const wave of [1, 2]) {
       const { request } = buildPolarRequest({
         airfoil,
@@ -205,5 +208,17 @@ describe("weighted scheduler admission", () => {
         resources: { solver_processes: 0, case_concurrency: null },
       }),
     ).toBe(1);
+  });
+
+  it("derives a remote FAST job's weight from its immutable setup, not a node cap", () => {
+    expect(
+      admissionCpuSlotsForSetup({
+        scheduling: {
+          ...setup.scheduling,
+          solverProcesses: 2,
+          caseConcurrency: 3,
+        },
+      }),
+    ).toBe(6);
   });
 });

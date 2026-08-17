@@ -11,10 +11,13 @@ export const MAX_MESH_RECOVERY_VERSION = 2_147_483_647;
 export const MIN_DURABLE_URANS_RECOVERY_VERSION = 2;
 export const MAX_URANS_RECOVERY_VERSION = 2_147_483_647;
 /** Version 1 is the first immutable, generation-pinned archive clean-cycle
- * reducer. A control plane that has introduced archive interpretations must
- * not send fresh physical work to an engine which cannot produce that
- * corresponding publication evidence. */
+ * reducer. It remains the historical-read/audit threshold; new physical work
+ * uses the stricter current-contract threshold below. */
 export const MIN_ARCHIVE_REDUCTION_VERSION = 1;
+/** The exact version pinned on every freshly composed physical request. Versions
+ * 1–3 remain readable for historical archive audits, but cannot produce the
+ * current adaptive clean-tail evidence contract expected at submit time. */
+export const CURRENT_ARCHIVE_REDUCTION_VERSION = 4;
 export const MAX_ARCHIVE_REDUCTION_VERSION = 2_147_483_647;
 
 export function parsedMeshRecoveryVersion(value: unknown): number | null {
@@ -141,4 +144,18 @@ export function supportsArchiveCleanCycleReduction(
   version: number | null | undefined,
 ): version is number {
   return version != null && version >= MIN_ARCHIVE_REDUCTION_VERSION;
+}
+
+/**
+ * Admission gate for every new physical request. Keep this distinct from
+ * `supportsArchiveCleanCycleReduction`: the latter intentionally permits
+ * legacy reducers to read/reduce their historical immutable archives, while
+ * a newly composed request is pinned to this exact archive contract. Do not
+ * relax this to a minimum-version test: the engine rejects an exact-version
+ * request if its reducer changed after the health probe.
+ */
+export function supportsCurrentArchiveCleanCycleReduction(
+  version: number | null | undefined,
+): version is number {
+  return version === CURRENT_ARCHIVE_REDUCTION_VERSION;
 }

@@ -45,7 +45,7 @@ import {
 import { and, asc, count, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 
 import { evaluateDiskAdmission } from "./disk-admission";
-import { supportsArchiveCleanCycleReduction } from "./engine-capabilities";
+import { supportsCurrentArchiveCleanCycleReduction } from "./engine-capabilities";
 import { submitExactUransCanaryStep } from "./urans-ladder";
 
 const OPEN_JOB_STATUSES = [
@@ -1020,9 +1020,9 @@ export function validateThreeStageUransEnginePreflight(
     throw canaryError(
       "the live URANS-recovery version differs from the explicit expectation",
     );
-  if (!supportsArchiveCleanCycleReduction(health.archive_reduction_version))
+  if (!supportsCurrentArchiveCleanCycleReduction(health.archive_reduction_version))
     throw canaryError(
-      "the live engine does not advertise immutable archive clean-cycle reduction v1",
+      "the live engine does not advertise the current immutable archive clean-cycle reduction contract",
     );
   const evidenceStorage = health.evidence_storage;
   if (

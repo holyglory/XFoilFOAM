@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 const SAMPLE_AT = "2026-07-16T12:00:00.000Z";
 
-test("Health prioritizes open solver incidents and keeps resolved recurrence as history", async ({
+test("Health ignores internal recovery history and leads with real fleet status", async ({
   page,
 }) => {
   const sample = {
@@ -45,6 +45,51 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
           memoryUsedPct: 61.2,
         },
         history: [sample],
+        fleet: {
+          local: {
+            id: "local",
+            instanceName: "Production",
+            connectivity: "online",
+            status: "running",
+            lastHeartbeatAt: SAMPLE_AT,
+            activeJobs: 1,
+            reservedCpuSlots: 8,
+            capacityCpuSlots: 8,
+            health: {
+              schemaVersion: 1,
+              sampledAt: SAMPLE_AT,
+              cpu: sample.cpu,
+              memory: sample.memory,
+              storage: {
+                usedPct: sample.storage.usedPct,
+                freeBytes: sample.storage.freeBytes,
+                requiredFreeBytes: 80 * 1024 ** 3,
+                admissionBlocked: false,
+                reason: null,
+                checkedAt: SAMPLE_AT,
+              },
+              execution: {
+                activeJobs: 1,
+                reservedCpuSlots: 8,
+                capacityCpuSlots: 8,
+                activeAoaCount: 8,
+              },
+            },
+          },
+          remotes: [],
+        },
+        performance: {
+          windowDays: 7,
+          daily: [],
+          totals24h: {
+            day: "2026-07-16",
+            rans: 0,
+            preliminary: 0,
+            final: 0,
+            total: 0,
+          },
+          sources: [],
+        },
         solverIncidents: {
           threshold: 3,
           occurrenceCount: 7,
@@ -141,43 +186,15 @@ test("Health prioritizes open solver incidents and keeps resolved recurrence as 
 
   await page.goto("/admin?section=health");
   await expect(page.getByTestId("admin-health-page")).toBeVisible();
-
-  const panel = page.getByTestId("solver-incidents-health");
-  await expect(panel).toBeVisible();
-  await expect(panel).toHaveAccessibleName(
-    /Solver reliability, 1 active recovery event, 1 critical system-owned pattern, 7 occurrences/i,
+  await expect(page.getByTestId("health-compute-fleet")).toBeVisible();
+  await expect(page.getByTestId("solver-incidents-health")).toHaveCount(0);
+  await expect(page.getByText("Solver recovery", { exact: false })).toHaveCount(
+    0,
   );
-  await expect(panel).toContainText("Solver recovery");
-  await expect(panel).toContainText("1 solver-owned");
-  await expect(panel).not.toContainText("System investigation required");
-
-  const current = panel.getByTestId("solver-incident-event-0");
-  await expect(current).not.toBeVisible();
-  await panel.locator(":scope > summary").click();
-  await expect(current).toBeVisible();
-  await expect(current).toHaveAttribute("data-stage", "preliminary");
-  await expect(current).toHaveAttribute(
-    "data-operational-state",
-    "system_attention",
-  );
-  await expect(current).toContainText("FAST URANS");
-  await expect(current).toContainText("continuation made no progress");
-  await expect(current).toContainText("solver fix");
-  await expect(current).not.toContainText("current-debug");
-  await current.locator(":scope > summary").click();
-  await expect(current).toContainText("current-debug");
-  await expect(current).toContainText("solver system · no user action");
-
-  const history = panel.getByTestId("solver-incident-event-1");
-  await expect(history).toHaveAttribute("data-status", "resolved");
-  await expect(history).toContainText("FINAL URANS");
-  await expect(history).toContainText("resolved");
-
-  await expect(panel.getByText("agent JSON ↗")).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(panel).toBeVisible();
-  expect(
-    await panel.evaluate((element) => element.scrollWidth),
-  ).toBeLessThanOrEqual(await panel.evaluate((element) => element.clientWidth));
+  await expect(page.getByTestId("health-compute-fleet")).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(
+    await page.evaluate(() => document.documentElement.clientWidth),
+  );
 });

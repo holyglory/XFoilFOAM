@@ -30,7 +30,6 @@
 set -Eeuo pipefail
 
 ACTION="${1:-}"
-DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTIFY_CONTINUATION_ONLY=false
 if [[ "$ACTION" == "--certify-opencfd-2606-continuation" ]]; then
   CERTIFY_CONTINUATION_ONLY=true
@@ -48,6 +47,15 @@ if [[ -n "$BUILD_ID" && ! "$BUILD_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 
 APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
+PINNED_WATCHER_INVOCATION="${PINNED_WATCHER_INVOCATION:-false}"
+ACTIVE_APP_LINK="${ACTIVE_APP_LINK:-}"
+EXPECTED_DEPLOY_SCRIPT_DIR="$APP_DIR/scripts/deploy"
+DEPLOY_SCRIPT_DIR_WAS_SUPPLIED=false
+if [[ -n "${DEPLOY_SCRIPT_DIR+x}" ]]; then
+  DEPLOY_SCRIPT_DIR_WAS_SUPPLIED=true
+else
+  DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
 ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"
@@ -57,6 +65,17 @@ LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
 DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-source.json}"
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
+DEPLOY_SOURCE_VERIFIER="${DEPLOY_SOURCE_VERIFIER:-}"
+DEPLOY_SOURCE_VERIFIER_SHA256="${DEPLOY_SOURCE_VERIFIER_SHA256:-}"
+PRODUCTION_MAINTENANCE_DRAIN_TOKEN="${PRODUCTION_MAINTENANCE_DRAIN_TOKEN:-}"
+PRODUCTION_MAINTENANCE_RECEIPT_FILE="${PRODUCTION_MAINTENANCE_RECEIPT_FILE:-$AIRFOILS_PRO_STATE_DIR/production-legacy-gateway-reconciliation.json}"
+# These are populated only by the source-pinned watcher when it adopts a
+# historic child exit-12 refusal. The attester is rerun under this script's
+# own deploy lock before any engine mutation; a stale JSON claim alone can
+# never reopen the preserved production admission drain.
+PRODUCTION_PREENGINE_RECOVERY_ATTESTATION="${PRODUCTION_PREENGINE_RECOVERY_ATTESTATION:-}"
+PRODUCTION_PREENGINE_RECOVERY_PREDECESSOR_BUILD_ID="${PRODUCTION_PREENGINE_RECOVERY_PREDECESSOR_BUILD_ID:-}"
+PRODUCTION_PREENGINE_RECOVERY_EXPECTED_ENGINE_BUILD_ID="${PRODUCTION_PREENGINE_RECOVERY_EXPECTED_ENGINE_BUILD_ID:-}"
 ADMIN_COOKIE="${ADMIN_COOKIE:-}"
 CUTOVER_DRAIN_TIMEOUT_SECONDS="${CUTOVER_DRAIN_TIMEOUT_SECONDS:-7200}"
 CUTOVER_CONTINUATION_TIMEOUT_SECONDS="${CUTOVER_CONTINUATION_TIMEOUT_SECONDS:-3600}"
@@ -79,6 +98,79 @@ LEGACY_2406_QUEUE_COMPATIBILITY=false
 OPENCFD2606_RETAINED_RECEIPT_REPROVED=false
 
 cd "$APP_DIR"
+
+# The guarded watcher executes a frozen copy of this script from private
+# state, so it supplies DEPLOY_SCRIPT_DIR explicitly.  Bind that explicit
+# helper directory to the exact APP_DIR whose manifest was verified; never let
+# the frozen child take helpers from the current release symlink.  The legacy
+# direct-entry path retains its script-relative helper lookup for standalone
+# deployment harnesses and manual invocation.
+if [[ "$DEPLOY_SCRIPT_DIR_WAS_SUPPLIED" == "true" ]]; then
+  if ! expected_deploy_script_dir="$(cd "$EXPECTED_DEPLOY_SCRIPT_DIR" && pwd -P)"; then
+    echo "Missing deployment script directory: $EXPECTED_DEPLOY_SCRIPT_DIR" >&2
+    exit 2
+  fi
+  if ! supplied_deploy_script_dir="$(cd "$DEPLOY_SCRIPT_DIR" && pwd -P)"; then
+    echo "Missing supplied deployment script directory: $DEPLOY_SCRIPT_DIR" >&2
+    exit 2
+  fi
+  if [[ "$supplied_deploy_script_dir" != "$expected_deploy_script_dir" ]]; then
+    echo "Deployment script directory must belong to APP_DIR; refusing mixed-release maintenance." >&2
+    exit 2
+  fi
+  DEPLOY_SCRIPT_DIR="$expected_deploy_script_dir"
+fi
+
+verify_pinned_watcher_bootstrap() {
+  local stage="$1" pinned_release active_release expected_compose_file
+  local expected_manifest_file pinned_source_fields pinned_revision
+  local pinned_tree_sha pinned_file_count
+
+  [[ "$PINNED_WATCHER_INVOCATION" == "true" ]] || return 0
+  pinned_release="$(pwd -P)"
+  if [[ -z "$ACTIVE_APP_LINK" ]] || ! active_release="$(cd "$ACTIVE_APP_LINK" && pwd -P)"; then
+    echo "Pinned watcher active application link is unavailable." >&2
+    return 2
+  fi
+  if [[ "$active_release" != "$pinned_release" ]]; then
+    echo "Active application release changed; refusing old-release engine maintenance." >&2
+    return 2
+  fi
+  expected_compose_file="$pinned_release/docker-compose.deploy.yml"
+  if [[ ! -f "$COMPOSE_FILE" || -L "$COMPOSE_FILE" ]] ||
+     [[ "$(readlink -f "$COMPOSE_FILE")" != "$expected_compose_file" ]]; then
+    echo "Pinned watcher COMPOSE_FILE must be the regular compose file from APP_DIR." >&2
+    return 2
+  fi
+  expected_manifest_file="$pinned_release/.deployment-source.json"
+  if [[ ! -f "$DEPLOYMENT_MANIFEST_FILE" || -L "$DEPLOYMENT_MANIFEST_FILE" ]] ||
+     [[ "$(readlink -f "$DEPLOYMENT_MANIFEST_FILE")" != "$expected_manifest_file" ]]; then
+    echo "Pinned watcher deployment manifest must belong to APP_DIR." >&2
+    return 2
+  fi
+  if [[ ! -f "$DEPLOY_SOURCE_VERIFIER" || -L "$DEPLOY_SOURCE_VERIFIER" ]] ||
+     [[ ! "$DEPLOY_SOURCE_VERIFIER_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+     [[ "$(sha256sum "$DEPLOY_SOURCE_VERIFIER" | awk '{print $1}')" != "$DEPLOY_SOURCE_VERIFIER_SHA256" ]]; then
+    echo "Pinned watcher source verifier is missing or failed integrity verification." >&2
+    return 2
+  fi
+  pinned_source_fields="$(python3 "$DEPLOY_SOURCE_VERIFIER" \
+    --verify --root "$pinned_release" --manifest "$expected_manifest_file")" || return 2
+  IFS=$'\t' read -r pinned_revision pinned_tree_sha pinned_file_count <<<"$pinned_source_fields"
+  if [[ -z "$DEPLOY_SOURCE_REVISION" || "$pinned_revision" != "$DEPLOY_SOURCE_REVISION" ]] ||
+     [[ -z "$DEPLOY_SOURCE_TREE_SHA256" || "$pinned_tree_sha" != "$DEPLOY_SOURCE_TREE_SHA256" ]]; then
+    echo "Pinned watcher source no longer matches the prepared revision and tree." >&2
+    return 2
+  fi
+  echo "Verified pinned watcher bootstrap ($stage): revision=$pinned_revision sha256=$pinned_tree_sha files=$pinned_file_count"
+}
+
+if [[ "$PINNED_WATCHER_INVOCATION" == "true" ]]; then
+  verify_pinned_watcher_bootstrap "pre-lock" || exit $?
+elif [[ "$PINNED_WATCHER_INVOCATION" != "false" ]]; then
+  echo "PINNED_WATCHER_INVOCATION must be true or false." >&2
+  exit 2
+fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing deployment env file: $ENV_FILE" >&2
@@ -141,7 +233,7 @@ verify_deployment_source() {
 }
 
 validate_recovery_state_paths() {
-  python3 - "$APP_DIR" "$AIRFOILS_PRO_STATE_DIR" "$OPENCFD2606_CANARY_RECEIPT_FILE" <<'PY'
+  python3 - "$APP_DIR" "$AIRFOILS_PRO_STATE_DIR" "$OPENCFD2606_CANARY_RECEIPT_FILE" "$PRODUCTION_MAINTENANCE_RECEIPT_FILE" <<'PY'
 from __future__ import annotations
 
 from pathlib import Path
@@ -156,9 +248,16 @@ def fail(message: str) -> None:
 app = Path(sys.argv[1])
 state = Path(sys.argv[2])
 receipt = Path(sys.argv[3])
-for label, path in (("AIRFOILS_PRO_STATE_DIR", state), ("OPENCFD2606_CANARY_RECEIPT_FILE", receipt)):
+production_receipt = Path(sys.argv[4])
+for label, path in (
+    ("AIRFOILS_PRO_STATE_DIR", state),
+    ("OPENCFD2606_CANARY_RECEIPT_FILE", receipt),
+    ("PRODUCTION_MAINTENANCE_RECEIPT_FILE", production_receipt),
+):
     if not path.is_absolute():
         fail(f"{label} must be absolute")
+    if ":" in str(path):
+        fail(f"{label} cannot contain ':' because it is mounted read-only into a maintenance container")
     current = Path(path.anchor)
     for component in path.parts[1:]:
         current /= component
@@ -172,6 +271,7 @@ for label, path in (("AIRFOILS_PRO_STATE_DIR", state), ("OPENCFD2606_CANARY_RECE
 app_resolved = app.resolve(strict=True)
 state_resolved = state.resolve(strict=False)
 receipt_resolved = receipt.resolve(strict=False)
+production_receipt_resolved = production_receipt.resolve(strict=False)
 
 
 def inside(candidate: Path, parent: Path) -> bool:
@@ -186,7 +286,38 @@ if inside(state_resolved, app_resolved):
     fail("AIRFOILS_PRO_STATE_DIR resolves inside the replaceable application tree")
 if inside(receipt_resolved, app_resolved):
     fail("OPENCFD2606_CANARY_RECEIPT_FILE resolves inside the replaceable application tree")
+if inside(production_receipt_resolved, app_resolved):
+    fail("PRODUCTION_MAINTENANCE_RECEIPT_FILE resolves inside the replaceable application tree")
+if production_receipt_resolved.parent != state_resolved:
+    fail("PRODUCTION_MAINTENANCE_RECEIPT_FILE must be an immediate child of AIRFOILS_PRO_STATE_DIR")
+if production_receipt_resolved.name != "production-legacy-gateway-reconciliation.json":
+    fail("PRODUCTION_MAINTENANCE_RECEIPT_FILE must use the trusted production receipt filename")
 PY
+}
+
+verify_preengine_recovery_attestation_under_lock() {
+  local configured=0
+  [[ -n "$PRODUCTION_PREENGINE_RECOVERY_ATTESTATION" ]] && configured=1
+  [[ -n "$PRODUCTION_PREENGINE_RECOVERY_PREDECESSOR_BUILD_ID" ]] && configured=1
+  [[ -n "$PRODUCTION_PREENGINE_RECOVERY_EXPECTED_ENGINE_BUILD_ID" ]] && configured=1
+  if ((configured == 0)); then
+    return 0
+  fi
+  if [[ "$PINNED_WATCHER_INVOCATION" != "true" ]] || \
+     [[ -z "$PRODUCTION_MAINTENANCE_DRAIN_TOKEN" ]] || \
+     [[ -z "$PRODUCTION_PREENGINE_RECOVERY_ATTESTATION" ]] || \
+     [[ -z "$PRODUCTION_PREENGINE_RECOVERY_PREDECESSOR_BUILD_ID" ]] || \
+     [[ -z "$PRODUCTION_PREENGINE_RECOVERY_EXPECTED_ENGINE_BUILD_ID" ]]; then
+    echo "Pre-engine recovery attestation is only valid for a complete pinned watcher adoption." >&2
+    return 2
+  fi
+  python3 "$DEPLOY_SCRIPT_DIR/attest-guarded-production-preengine-failure.py" \
+    --state-dir "$AIRFOILS_PRO_STATE_DIR" \
+    --predecessor-build-id "$PRODUCTION_PREENGINE_RECOVERY_PREDECESSOR_BUILD_ID" \
+    --maintenance-token "$PRODUCTION_MAINTENANCE_DRAIN_TOKEN" \
+    --expected-engine-build-id "$PRODUCTION_PREENGINE_RECOVERY_EXPECTED_ENGINE_BUILD_ID" \
+    --verify-existing \
+    --timeout-seconds 20 >/dev/null
 }
 
 validate_opencfd_2606_cutover_state() {
@@ -653,8 +784,150 @@ if row["live_jobs"]:
 '
 }
 
+production_legacy_gateway_preflight_payload() {
+  local phase="$1"
+  local -a receipt_args=()
+  # This exception is owned by the source-pinned watcher.  The helper verifies
+  # the exact database drain token and the one affected runtime generation,
+  # then corroborates atomic terminal status files with complete direct
+  # Celery/Redis/OpenFOAM evidence.  A manual rebuild without that ownership
+  # remains on the strict normal queue contract.
+  if [[ "$PINNED_WATCHER_INVOCATION" != "true" ]] ||
+     [[ -z "$PRODUCTION_MAINTENANCE_DRAIN_TOKEN" ]]; then
+    return 1
+  fi
+  if [[ "$phase" == "authoritative" || "$phase" == "reconcile" ]]; then
+    receipt_args=(--receipt-file "$PRODUCTION_MAINTENANCE_RECEIPT_FILE")
+  fi
+  python3 "$DEPLOY_SCRIPT_DIR/production_maintenance_preflight.py" \
+      --project "${COMPOSE_PROJECT_NAME:-app}" \
+      --maintenance-token "$PRODUCTION_MAINTENANCE_DRAIN_TOKEN" \
+      --phase "$phase" \
+      "${receipt_args[@]}" \
+      --timeout-seconds 20
+}
+
+production_legacy_gateway_reconciliation_payload() {
+  production_legacy_gateway_preflight_payload reconcile
+}
+
+production_legacy_gateway_reconciliation_field() {
+  local payload="$1" field="$2"
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+field = sys.argv[1]
+payload = json.load(sys.stdin)
+value = payload.get(field)
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif type(value) is int:
+    print(value)
+else:
+    raise SystemExit(f"maintenance reconciliation field {field!r} is missing")
+' "$field"
+}
+
+production_legacy_gateway_receipt_digest() {
+  python3 - "$PRODUCTION_MAINTENANCE_RECEIPT_FILE" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+digest = value.get("candidateDigest")
+if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    raise SystemExit("production maintenance receipt digest is invalid")
+print(digest)
+PY
+}
+
+reconcile_production_legacy_gateway_receipt() {
+  local before ready reconciled candidate_count after
+  if ! before="$(production_legacy_gateway_reconciliation_payload 2>&1)"; then
+    printf '%s\n' "$before" >&2
+    return 1
+  fi
+  ready="$(production_legacy_gateway_reconciliation_field "$before" readyForReconcile)" || return 1
+  reconciled="$(production_legacy_gateway_reconciliation_field "$before" reconciled)" || return 1
+  candidate_count="$(production_legacy_gateway_reconciliation_field "$before" candidateCount)" || return 1
+  if [[ "$ready" != "true" ]]; then
+    echo "Production maintenance receipt scope is no longer exclusive; refusing writer restoration." >&2
+    return 1
+  fi
+  if [[ "$reconciled" != "true" ]]; then
+    if ((candidate_count == 0)); then
+      echo "Production maintenance reconciliation reported no candidates but is not settled." >&2
+      return 1
+    fi
+    echo "Reconciling $candidate_count source-pinned terminal production jobs before scheduler restoration..."
+    if ! compose run --rm --no-deps -T \
+      --volume "$PRODUCTION_MAINTENANCE_RECEIPT_FILE:/run/airfoils-maintenance/receipt.json:ro" \
+      sweeper \
+      pnpm --filter @aerodb/sweeper maintenance:reconcile-receipt -- \
+      --receipt-file /run/airfoils-maintenance/receipt.json; then
+      echo "Receipt-scoped production reconciliation failed; scheduler admission remains paused." >&2
+      return 1
+    fi
+  fi
+  if ! after="$(production_legacy_gateway_reconciliation_payload 2>&1)"; then
+    printf '%s\n' "$after" >&2
+    return 1
+  fi
+  if [[ "$(production_legacy_gateway_reconciliation_field "$after" reconciled)" != "true" ]]; then
+    echo "Receipt-scoped production jobs did not all reach exact terminal settlement; scheduler admission remains paused." >&2
+    return 1
+  fi
+  require_idle_worker "after receipt-scoped terminal reconciliation" "observe"
+}
+
+production_legacy_gateway_recovery_activity() {
+  local phase="$1" payload
+  if ! payload="$(production_legacy_gateway_preflight_payload "$phase" 2>&1)"; then
+    printf '%s\n' "$payload" >&2
+    return 1
+  fi
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+if payload.get("idle") is not True:
+    print(
+        "owned production legacy-gateway proof reports work: "
+        "openfoam={} blocking_jobs={} terminal_candidates={} queue={}".format(
+            payload.get("openFoamProcessCount"),
+            payload.get("blockingJobCount"),
+            payload.get("terminalCandidateCount"),
+            payload.get("queue"),
+        )
+    )
+'
+}
+
+production_legacy_gateway_engine_version() {
+  local payload
+  if ! payload="$(production_legacy_gateway_preflight_payload observe 2>&1)"; then
+    printf '%s\n' "$payload" >&2
+    return 1
+  fi
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+runtime = payload.get("runtime")
+if not isinstance(runtime, dict) or runtime.get("engine_version") != "2606":
+    raise SystemExit("owned production legacy-gateway proof did not establish OpenCFD 2606")
+print("2606")
+'
+}
+
 engine_queue_activity() {
-  local payload services service running expected_worker_count=0 queue_probe_rc
+  local phase="${1:-observe}"
+  local payload response http_status services service running expected_worker_count=0 queue_probe_rc
   services="$(known_engine_worker_services)" || return 1
   while IFS= read -r service; do
     [[ -n "$service" ]] || continue
@@ -663,8 +936,23 @@ engine_queue_activity() {
       expected_worker_count=$((expected_worker_count + $(wc -l <<<"$running")))
     fi
   done <<<"$services"
-  if payload="$(curl -fsS --max-time "$ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS" http://127.0.0.1:8000/queue 2>/dev/null)"; then
-    :
+  if response="$(curl -sS --max-time "$ENGINE_QUEUE_PROBE_TIMEOUT_SECONDS" \
+    --write-out 'AIRFOILS_QUEUE_HTTP_STATUS:%{http_code}' \
+    http://127.0.0.1:8000/queue 2>/dev/null)"; then
+    if [[ "$response" != *"AIRFOILS_QUEUE_HTTP_STATUS:"* ]]; then
+      echo "engine queue endpoint omitted its HTTP status" >&2
+      return 1
+    fi
+    http_status="${response##*AIRFOILS_QUEUE_HTTP_STATUS:}"
+    payload="${response%AIRFOILS_QUEUE_HTTP_STATUS:*}"
+    # `/queue` uses 503 only for a complete, non-error stale snapshot while
+    # its bounded async refresh is in flight. Keep that body so the strict
+    # parser below can classify it and `require_idle_worker` can wait for the
+    # fresh successor. Every other non-200 response remains a hard refusal.
+    if [[ "$http_status" != "200" && "$http_status" != "503" ]]; then
+      echo "engine queue endpoint returned HTTP $http_status" >&2
+      return 1
+    fi
   else
     queue_probe_rc=$?
     # Only curl's precise timeout result may enter the emergency proof.  HTTP
@@ -676,20 +964,21 @@ engine_queue_activity() {
     if [[ "$LEGACY_2406_QUEUE_COMPATIBILITY" == "true" ]]; then
       return 1
     fi
-    if ! pre_queue_observation_gateway_recovery_allowed; then
-      return 1
-    fi
-    local database_activity
-    if ! database_activity="$(direct_hub_database_recovery_activity 2>&1)"; then
-      printf '%s\n' "$database_activity" >&2
-      return 1
-    fi
-    if [[ -n "$database_activity" ]]; then
-      printf '%s\n' "$database_activity"
+    # The former pre-observation version-family exception is retired. A
+    # timeout may now proceed only through the source-pinned production
+    # maintenance receipt below, whose preflight binds one exact build and
+    # capability tuple. Unknown legacy gateways remain fail-closed.
+    local production_legacy_activity=""
+    if production_legacy_activity="$(production_legacy_gateway_recovery_activity "$phase" 2>&1)"; then
+      printf '%s' "$production_legacy_activity"
       return 0
     fi
-    direct_celery_redis_recovery_activity "$expected_worker_count"
-    return $?
+    # Preserve the exact source-pinned refusal. A failed health probe must not
+    # become false "work" after the independently owned proof succeeds.
+    if [[ -n "$production_legacy_activity" ]]; then
+      printf '%s\n' "$production_legacy_activity" >&2
+    fi
+    return 1
   fi
   if [[ "$LEGACY_2406_QUEUE_COMPATIBILITY" == "true" ]]; then
     local legacy_activity
@@ -736,9 +1025,24 @@ import sys
 
 queue = json.load(sys.stdin)
 expected_worker_count = int(sys.argv[1])
+http_status = int(sys.argv[2])
 observation_state = queue.get("queue_observation_state")
 observed_at = queue.get("queue_observed_at")
 observation_error = queue.get("queue_observation_error")
+refresh_in_progress = queue.get("queue_refresh_in_progress")
+if http_status == 503 and not (
+    observation_state == "stale"
+    and isinstance(observed_at, str)
+    and observed_at
+    and observation_error is None
+    and refresh_in_progress is True
+):
+    raise SystemExit(
+        "engine queue HTTP 503 is not a bounded stale refresh: "
+        f"state={observation_state!r} observed_at={observed_at!r} "
+        f"refreshing={refresh_in_progress!r} "
+        f"error={observation_error!r}"
+    )
 if (
     observation_state != "fresh"
     or not isinstance(observed_at, str)
@@ -823,12 +1127,13 @@ if depth or any(counts.values()):
         f"queue_depth={depth} queue_depths={depths} "
         f"counts={counts} job_ids={job_ids}"
     )
-' "$expected_worker_count"
+' "$expected_worker_count" "$http_status"
 }
 
 require_idle_worker() {
   local stage="$1"
-  local active queue_activity
+  local maintenance_phase="${2:-observe}"
+  local active queue_activity queue_probe_attempt=0
   if ! active="$(openfoam_processes 2>&1)"; then
     echo "Refusing engine rebuild at $stage because the worker process probe failed:" >&2
     echo "$active" >&2
@@ -839,11 +1144,24 @@ require_idle_worker() {
     echo "$active" >&2
     return 12
   fi
-  if ! queue_activity="$(engine_queue_activity 2>&1)"; then
+  while ! queue_activity="$(engine_queue_activity "$maintenance_phase" 2>&1)"; do
+    # The queue endpoint deliberately serves the last complete snapshot while
+    # refreshing it asynchronously. A five-second snapshot TTL can expire
+    # while this script waits for writers to stop, so a single read may report
+    # the bounded, non-error `stale` state even though the refresh is healthy.
+    # Wait for that refresh and re-run the complete proof; never retry malformed
+    # payloads, inspection failures, refresh errors, or any other refusal.
+    if [[ "$queue_activity" == *"state='stale'"* \
+      && "$queue_activity" == *"error=None"* \
+      && $queue_probe_attempt -lt 15 ]]; then
+      queue_probe_attempt=$((queue_probe_attempt + 1))
+      sleep 1
+      continue
+    fi
     echo "Refusing engine rebuild at $stage because the engine queue probe failed:" >&2
     echo "$queue_activity" >&2
     return 12
-  fi
+  done
   if [[ -n "$queue_activity" ]]; then
     echo "Refusing engine rebuild at $stage because queued/reserved/active engine work exists:" >&2
     echo "$queue_activity" >&2
@@ -1283,8 +1601,21 @@ print(payload.get("openfoam_image") or "")
 }
 
 current_default_engine_version() {
-  local health version
-  health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || return 1
+  local health version health_probe_rc
+  if health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health 2>/dev/null)"; then
+    :
+  else
+    health_probe_rc=$?
+    # The source-pinned watcher can recover the one known synchronous-gateway
+    # wedge even when /health and /queue are both starved.  A transport refusal
+    # or any other runtime stays on the strict normal identity contract.
+    if ((health_probe_rc == 28)); then
+      production_legacy_gateway_engine_version
+      return $?
+    fi
+    echo "engine /health identity probe failed with curl status $health_probe_rc" >&2
+    return "$health_probe_rc"
+  fi
   version="$(printf '%s' "$health" | python3 -c '
 import json
 import sys
@@ -1624,6 +1955,7 @@ certify_opencfd_2606_continuation() {
     echo "Another Airfoils.Pro deploy is already running." >&2
     exit 9
   }
+  verify_pinned_watcher_bootstrap "post-lock" || exit $?
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
   validate_opencfd_2606_cutover_state pending-certifiable || exit $?
@@ -1876,8 +2208,10 @@ main() {
     echo "Another Airfoils.Pro deploy is already running." >&2
     exit 9
   }
+  verify_pinned_watcher_bootstrap "post-lock" || exit $?
   verify_deployment_source || exit $?
   validate_recovery_state_paths || exit $?
+  verify_preengine_recovery_attestation_under_lock || exit $?
   validate_opencfd_2606_cutover_state any || exit $?
 
   echo "Engine rebuild starting: BUILD_ID=$BUILD_ID"
@@ -1914,10 +2248,20 @@ main() {
 
   local running_engine_version cutover_pending cutover_complete cutover_attestation
   local cutover_active=false certified_contract_required=false
+  local production_legacy_reconciliation_required=false
   if ! running_engine_version="$(current_default_engine_version 2>&1)"; then
     echo "Could not establish the current executable solver identity; refusing engine maintenance:" >&2
     echo "$running_engine_version" >&2
     exit 13
+  fi
+  # Bind the reconciliation exception to the exact old runtime, not merely to
+  # a user-supplied token or a timed-out endpoint.  The helper repeats its own
+  # runtime, drain, worker, queue, process, DB, and evidence validation here.
+  # An ordinary healthy/new runtime never creates or consumes this receipt.
+  if [[ "$PINNED_WATCHER_INVOCATION" == "true" ]] &&
+     [[ -n "$PRODUCTION_MAINTENANCE_DRAIN_TOKEN" ]] &&
+     production_legacy_gateway_preflight_payload observe >/dev/null 2>&1; then
+    production_legacy_reconciliation_required=true
   fi
   cutover_pending="$(read_env_var OPENCFD2606_CUTOVER_PENDING || true)"
   cutover_complete="$(read_env_var OPENCFD2606_CUTOVER_COMPLETE || true)"
@@ -1972,7 +2316,7 @@ main() {
   # 1. Refuse maintenance while a solve is active. The check is repeated
   #    after the potentially long image build so a solve that started during
   #    that window cannot be terminated by the recreate below.
-  require_idle_worker "before image build"
+  require_idle_worker "before image build" "observe"
 
   # 2. Build with the requested id supplied as a process-level Compose
   #    override. Do not edit the persistent env file yet: if the second idle
@@ -2008,19 +2352,38 @@ main() {
       "$sweeper_restore_state" "$media_repair_initial_state"
     exit "$media_repair_stop_rc"
   fi
-  if ! require_idle_worker "before service recreate"; then
+  local production_legacy_first_receipt_digest=""
+  if ! require_idle_worker "before service recreate" "authoritative"; then
     restore_pre_migration_writers_after_refusal \
       "$sweeper_restore_state" "$media_repair_initial_state"
     exit 12
+  fi
+  if [[ "$production_legacy_reconciliation_required" == "true" ]]; then
+    if ! production_legacy_first_receipt_digest="$(production_legacy_gateway_receipt_digest)"; then
+      echo "The first authoritative production receipt is invalid; refusing service recreation." >&2
+      restore_pre_migration_writers_after_refusal \
+        "$sweeper_restore_state" "$media_repair_initial_state"
+      exit 12
+    fi
   fi
   # A submit HTTP request sent just before the sweeper stopped can finish in
   # the engine after the first sample. Require a stable second empty sample
   # before mutating env or recreating either engine service.
   sleep 2
-  if ! require_idle_worker "stabilized before service recreate"; then
+  if ! require_idle_worker "stabilized before service recreate" "authoritative"; then
     restore_pre_migration_writers_after_refusal \
       "$sweeper_restore_state" "$media_repair_initial_state"
     exit 12
+  fi
+  if [[ "$production_legacy_reconciliation_required" == "true" ]]; then
+    local production_legacy_second_receipt_digest
+    if ! production_legacy_second_receipt_digest="$(production_legacy_gateway_receipt_digest)" ||
+       [[ "$production_legacy_second_receipt_digest" != "$production_legacy_first_receipt_digest" ]]; then
+      echo "Production terminal candidate identities or evidence changed between authoritative idle samples; refusing service recreation." >&2
+      restore_pre_migration_writers_after_refusal \
+        "$sweeper_restore_state" "$media_repair_initial_state"
+      exit 12
+    fi
   fi
 
   # 3. Both build-id expectations move together, immediately BEFORE the
@@ -2084,6 +2447,16 @@ main() {
   if [[ "$cutover_active" == "true" ]]; then
     finish_opencfd_2606_cutover
   fi
+  # The legacy synchronous gateway may have left exact terminal evidence rows
+  # hidden behind a saturated API pool.  They were exempted from engine-idle
+  # proof only because the final authoritative sample bound their immutable
+  # status/result hashes into the private receipt.  Reconcile exactly that
+  # scope with all normal writers still stopped, then prove the rows terminal
+  # and the new engine physically idle.  Any mismatch exits nonzero so the
+  # watcher keeps its database-owned maintenance pause.
+  if [[ "$production_legacy_reconciliation_required" == "true" ]]; then
+    reconcile_production_legacy_gateway_receipt
+  fi
   restore_media_repair_after_rebuild "$media_repair_initial_state"
   restore_sweeper_after_rebuild "$sweeper_restore_state"
   if [[ "$cutover_active" == "true" ]]; then
@@ -2129,7 +2502,9 @@ main() {
   #    curl -X POST -H 'Content-Type: application/json' \
   #      -H "Cookie: aero_admin=<token>" \
   #      -d '{"olderThanMinutes":30}' https://airfoils.pro/api/admin/jobs/recover-stale
-  if [[ -n "$ADMIN_COOKIE" ]]; then
+  if [[ "$production_legacy_reconciliation_required" == "true" ]]; then
+    echo "Exact legacy-gateway terminal jobs were reconciled before scheduler restoration."
+  elif [[ -n "$ADMIN_COOKIE" ]]; then
     echo "Triggering stale-job recovery..."
     admin_json_request POST \
       "http://127.0.0.1:4000/api/admin/jobs/recover-stale" \

@@ -2,6 +2,7 @@ import {
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
 } from "@aerodb/core";
+import { URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER } from "@aerodb/engine-client";
 import {
   acquireSyncBlobStripeLock,
   CONTINUABLE_SQL,
@@ -17,6 +18,8 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
+import { ordinaryWriterBlockedByMaintenanceDrain } from "./maintenance-drain";
+
 export const DEFAULT_STRIP_MIN_AGE_MS = 30 * 60 * 1000;
 export const DEFAULT_RETENTION_CONTINUABLE_DAYS = 14;
 export const DEFAULT_STRIP_MAX_PER_TICK = 5;
@@ -25,6 +28,8 @@ export const DEFAULT_ORPHAN_MIN_AGE_MS = 48 * 60 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_TMP_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_BLOB_MIN_AGE_MS = 48 * 60 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_GC_MAX_PER_SWEEP = 1_000;
+const PARTIAL_STRIP_RETRY_NOTE =
+  "engine retained unknown entries; verified strip retry required";
 
 const LIVE_URANS_REQUEST_STATES = [
   "pending",
@@ -135,6 +140,7 @@ async function stampStrip(
     files_removed?: number;
     kept_case_state?: boolean;
     note?: string;
+    unknown_entries_count?: number;
   },
 ): Promise<void> {
   await db
@@ -143,14 +149,39 @@ async function stampStrip(
     .where(eq(simJobs.id, jobId));
 }
 
+async function stampPartialStripRetry(
+  db: DB,
+  jobId: string,
+  report: {
+    bytes_freed: number;
+    files_removed: number;
+    kept_case_state: boolean;
+    unknown_entries_count: number;
+  },
+): Promise<void> {
+  await db
+    .update(simJobs)
+    .set({
+      // This is an observed partial operation, not completion. Preserve its
+      // useful byte accounting while keeping stripped_at NULL so a later
+      // engine classifier must re-evaluate the retained entries.
+      stripReport: { ...report, note: PARTIAL_STRIP_RETRY_NOTE },
+    })
+    .where(eq(simJobs.id, jobId));
+}
+
 export async function stripTerminalJobs(
   db: DB,
   engine: EngineClient,
   options: RetentionTickOptions = {},
 ): Promise<number> {
+  // Retention is part of the ordinary sweeper writer. A process restarted
+  // while a watcher-owned maintenance receipt is active must not strip the
+  // exact engine evidence that receipt is about to authenticate and ingest.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return 0;
   const config = retentionConfigFromEnv(options);
-  if (config.stripMaxPerTick <= 0) return 0;
   const now = options.now ?? new Date();
+  if (config.stripMaxPerTick <= 0) return 0;
   const candidates = (await db.execute(sql`
     WITH candidates AS (
       SELECT
@@ -187,6 +218,11 @@ export async function stripTerminalJobs(
             AND attempt.engine_job_id IS NOT NULL
             AND attempt.engine_case_slug IS NOT NULL
             AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+              WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+            )
             AND EXISTS (
               SELECT 1
               FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
@@ -237,6 +273,11 @@ export async function stripTerminalJobs(
             AND attempt_revision.solver_implementation_id IS NOT NULL
             AND attempt.solver_implementation_id =
                 attempt_revision.solver_implementation_id
+            AND NOT EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+              WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+            )
             AND EXISTS (
               SELECT 1
               FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
@@ -269,22 +310,93 @@ export async function stripTerminalJobs(
               )
             )
         ) AS has_attempt_continuable
+        ,
+        EXISTS (
+          SELECT 1
+          FROM sync_sweep_promises closed_remote_promise
+          WHERE closed_remote_promise.id::text =
+                j.request_payload ->> 'syncPromiseId'
+            AND closed_remote_promise.status IN (
+              'fulfilled', 'cancelled', 'expired'
+            )
+        ) AS has_closed_remote_promise
       FROM sim_jobs j
       WHERE j.status IN ('done', 'failed', 'cancelled')
         AND j.engine_job_id IS NOT NULL
-        -- A remote-solver job owns upload source bytes until the hub has
-        -- acknowledged every exact generation and the delivery loop has
-        -- written its job-level terminal row. Generic stripping currently
-        -- retains packaged evidence too, but this explicit fence prevents a
-        -- future retention expansion from racing the federation ACK.
         AND (
           NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
-          OR EXISTS (
-            SELECT 1
-            FROM sync_remote_result_deliveries remote_delivery
-            WHERE remote_delivery.sim_job_id = j.id
-              AND remote_delivery.result_id IS NULL
-              AND remote_delivery.state IN ('delivered', 'superseded')
+          OR (
+            -- A remote job may mix one accepted point with a failed sibling.
+            -- Generic retention may strip it only after every exact result and
+            -- attempt it still owns has a reclaimed hub receipt. Failed or
+            -- pointer-null siblings have no such receipt and therefore keep
+            -- the job out of this path until clean restart detaches/deletes
+            -- them. A zero-owner remote job is deliberately absent too: the
+            -- exact clean-restart deletion helper owns that immediate cleanup.
+            (
+              EXISTS (
+                SELECT 1 FROM results owned_result
+                WHERE owned_result.sim_job_id = j.id
+              )
+              OR EXISTS (
+                SELECT 1 FROM result_attempts owned_attempt
+                WHERE owned_attempt.sim_job_id = j.id
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM results owned_result
+              WHERE owned_result.sim_job_id = j.id
+                AND NOT EXISTS (
+                  SELECT 1 FROM sync_remote_hub_binding_receipts reclaimed_receipt
+                  WHERE reclaimed_receipt.sim_job_id = j.id
+                    AND reclaimed_receipt.result_id = owned_result.id
+                    AND reclaimed_receipt.reclaim_state = 'reclaimed'
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM result_attempts owned_attempt
+              WHERE owned_attempt.sim_job_id = j.id
+                AND NOT EXISTS (
+                  SELECT 1 FROM sync_remote_hub_binding_receipts reclaimed_receipt
+                  WHERE reclaimed_receipt.sim_job_id = j.id
+                    AND reclaimed_receipt.result_attempt_id = owned_attempt.id
+                    AND reclaimed_receipt.reclaim_state = 'reclaimed'
+                )
+            )
+          )
+          OR (
+            -- A terminal upstream lease can no longer publish a local-only
+            -- generation, but accepted scientific evidence still must not be
+            -- deleted. Full engine retention is the bounded middle ground:
+            -- it authenticates every relied-on archive, keeps those archives,
+            -- manifests, result/status JSON and stored media, and removes only
+            -- reproducible OpenFOAM working state. Never race an in-flight
+            -- delivery or a signed hub-reclaim operation.
+            EXISTS (
+              SELECT 1
+              FROM sync_sweep_promises closed_remote_promise
+              WHERE closed_remote_promise.id::text =
+                    j.request_payload ->> 'syncPromiseId'
+                AND closed_remote_promise.status IN (
+                  'fulfilled', 'cancelled', 'expired'
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sync_remote_result_deliveries live_delivery
+              WHERE live_delivery.sim_job_id = j.id
+                AND live_delivery.state IN (
+                  'pending', 'pushing', 'retry_wait'
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sync_remote_hub_binding_receipts live_reclaim
+              WHERE live_reclaim.sim_job_id = j.id
+                AND live_reclaim.reclaim_state <> 'reclaimed'
+            )
           )
         )
         AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
@@ -294,6 +406,11 @@ export async function stripTerminalJobs(
       id,
       engine_job_id,
       CASE
+        WHEN has_closed_remote_promise
+          AND NOT has_live_continuation
+          AND NOT has_live_precalc_continuation
+          AND NOT has_live_final_continuation
+          THEN false
         WHEN stripped_at IS NOT NULL
           AND strip_report ->> 'kept_case_state' = 'true'
           AND NOT has_live_continuation
@@ -320,11 +437,18 @@ export async function stripTerminalJobs(
         AND NOT has_live_precalc_continuation
         AND NOT has_live_final_continuation
         AND (
-          NOT (has_continuable OR has_attempt_continuable)
+          has_closed_remote_promise
+          OR NOT (has_continuable OR has_attempt_continuable)
           OR terminal_at <= ${now.toISOString()}::timestamptz - (${config.retentionContinuableDays}::double precision * interval '1 day')
         )
       )
-    ORDER BY terminal_at ASC, id ASC
+    -- Do not let one legacy unknown entry monopolize the bounded batch. A
+    -- partial job remains retryable but rotates behind every not-yet-attempted
+    -- candidate; after a complete sweep it is considered again normally.
+    ORDER BY
+      (COALESCE(strip_report ->> 'note', '') = ${PARTIAL_STRIP_RETRY_NOTE}) ASC,
+      terminal_at ASC,
+      id ASC
     LIMIT ${config.stripMaxPerTick}
   `)) as unknown as StripCandidate[];
 
@@ -334,6 +458,18 @@ export async function stripTerminalJobs(
       const response = await engine.stripJob(candidate.engine_job_id, {
         keep_case_state: candidate.keep_case_state,
       });
+      if ((response.unknown_entries_count ?? 0) > 0) {
+        await stampPartialStripRetry(db, candidate.id, {
+          bytes_freed: response.bytes_freed,
+          files_removed: response.files_removed,
+          kept_case_state: response.kept_case_state,
+          unknown_entries_count: response.unknown_entries_count!,
+        });
+        console.warn(
+          `[sweeper] RETENTION: job ${candidate.engine_job_id} freed ${mb(response.bytes_freed)} MB but retained ${response.unknown_entries_count} unknown entr${response.unknown_entries_count === 1 ? "y" : "ies"}; leaving stripped_at unset and rotating it for a later verified pass`,
+        );
+        continue;
+      }
       await stampStrip(db, candidate.id, now, response);
       stripped++;
       console.log(
@@ -367,6 +503,7 @@ export async function runOrphanSweep(
   engine: EngineClient,
   options: RetentionTickOptions = {},
 ): Promise<number> {
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return 0;
   const config = retentionConfigFromEnv(options);
   const nowMs = (options.now ?? new Date()).getTime();
   try {
@@ -452,6 +589,7 @@ export async function sweepSyncImportOrphans(
   db: DB,
   options: SyncImportGcOptions = {},
 ): Promise<number> {
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return 0;
   const nowMs = (options.now ?? new Date()).getTime();
   const mediaDir =
     options.mediaDir ?? process.env.MEDIA_DIR ?? "/data/airfoilfoam";
@@ -594,6 +732,10 @@ export async function retentionTick(
   engine: EngineClient,
   options: RetentionTickOptions = {},
 ): Promise<void> {
+  // Keep the whole pass inert, including direct test/operations invocation.
+  // The per-mutator checks above are intentional defence in depth for callers
+  // that invoke one exported retention operation without this coordinator.
+  if (await ordinaryWriterBlockedByMaintenanceDrain(db)) return;
   try {
     await stripTerminalJobs(db, engine, options);
   } catch (error) {
@@ -681,7 +823,16 @@ export async function runRetentionLoop(
   );
   while (!signal.aborted) {
     try {
-      await (options.runPass ?? retentionTick)(db, engine, options.passOptions);
+      // Gate custom as well as production passes. This is the process-restart
+      // boundary: a newly started sweeper may enter this loop while a guarded
+      // maintenance child exclusively owns all evidence/database mutation.
+      if (!(await ordinaryWriterBlockedByMaintenanceDrain(db))) {
+        await (options.runPass ?? retentionTick)(
+          db,
+          engine,
+          options.passOptions,
+        );
+      }
     } catch (error) {
       console.error(
         "[sweeper] retention pass failed:",

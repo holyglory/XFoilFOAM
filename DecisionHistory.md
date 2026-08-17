@@ -2,6 +2,13 @@
 
 ## Direction
 
+- Confirmed intent: legacy solver evidence is never audited or restored as an
+  operational workflow. All old aerodynamic result generations and their exact
+  GCS objects are deleted, every current physical cell becomes unsolved, and
+  capacity is spent only on the ordinary RANS → FAST URANS → FULL URANS ladder.
+  Preserve the airfoil catalog, geometry, setup revisions, campaign definitions,
+  and operational canaries; do not clear unrelated product data.
+  [D-2026-08-09-metadata-only-solver-reset]
 - Confirmed intent: internal scheduler latency is one global advisory, not a
   campaign failure or an inferred engine diagnosis. Campaign progress reads
   begin from sparse owning work records, independent counters execute
@@ -53,11 +60,13 @@
   evidence. Each point is one RANS screening → fast preliminary URANS → final
   verified URANS journey; aerodynamic RANS rejection is a normal handoff. Due
   fast-URANS obligations strictly outrank unrelated new RANS from their durable
-  ledger, including after a scheduler restart. A current-generation critical or
-  exhausted preliminary/final hazard durably fences only NEW admission while
-  reconciliation, ingestion, retention, and accepted work continue; operator
-  resume clears the latch, but admission checks re-trip it before submission if
-  the hazard remains, and legacy-generation hazards are inert.
+  ledger, including after a scheduler restart. One isolated critical point is
+  quarantined and recovered without idling healthy capacity; only a repeated
+  equal implementation/remediation incident group or direct infrastructure/
+  evidence-integrity loss durably fences NEW admission while reconciliation,
+  ingestion, retention, and accepted work continue. Operator resume clears the
+  latch, but admission checks re-trip it before submission if the systemic
+  hazard remains, and legacy-generation hazards are inert.
   A mesh/runtime problem is repaired automatically before fast URANS, and only
   exhaustion of that non-aerodynamic recovery or of fast/final URANS is a
   critical system incident. A reproduced and fixed engine/controller defect
@@ -70,6 +79,7 @@
   [D-2026-07-14-campaign-capacity] [D-2026-07-14-no-shedding-preliminary-urans]
   [D-2026-07-15-disk-admission]
   [D-2026-07-27-workload-aware-disk-admission]
+  [D-2026-08-05-role-aware-remote-disk-admission]
   [D-2026-07-15-precalc-physical-attempt-budget]
   [D-2026-07-15-campaign-instrument-overview]
   [D-2026-07-16-campaign-cell-evidence-dialog]
@@ -78,6 +88,16 @@
   [D-2026-07-20-urans-continuation-wall-budget]
   [D-2026-07-24-urans-clean-tail]
   [D-2026-07-25-geometry-scale-wake]
+  [D-2026-08-02-systemic-admission-fence]
+  [D-2026-08-02-adaptive-clean-tail-recovery]
+  Clean-cycle quality exhaustion remains critical for its exact physical cell
+  but never contributes to the repeated-systemic fleet fence. A permanently
+  unusable immutable continuation source follows the same cell-scoped rule:
+  stop that unchanged source, retain one critical incident, and, when the
+  existing two-run physical budget still has one unused run, automatically
+  submit exactly one distinct continuation-free PRECALC generation. An
+  exhausted cell remains blocked while unrelated fleet admission stays open.
+  [D-2026-08-04-permanent-continuation-fresh-recovery]
   A proven controller correction may grant one immutable, source-pinned
   remediation attempt per distinct fixed source revision. Ordinary work still
   has two physical attempts; grants never reset or relabel prior evidence, and
@@ -86,34 +106,25 @@
   generation-pinned GCS archive before same-case continuation, without
   fulfilling its remote point or consuming a fresh physical-solver attempt.
   [D-2026-07-25-rejected-checkpoint-broker]
-- Confirmed intent: raw solver evidence remains immutable while scientific
-  interpretation is versioned and append-only. URANS publishes only the exact
-  final clean contiguous suffix (FAST: 3 cycles; FINAL: 5), with corrupt
-  prefixes retained as evidence. A current RANS point needs an exact
-  all-channel 200-row final-window proof or takes the normal targeted FAST
-  URANS path. Archive-backed reinterpretation selects only authenticated,
-  generation-pinned raw evidence and routes recoverable trajectories to exact
-  continuation before a fresh run.
-  [D-2026-07-28-immutable-result-interpretations]
-- Confirmed intent: historical GCS migration and URANS repair start with a
-  complete, read-only inventory of explicit FAST/FINAL attempts—including
-  failed, queued, local, malformed, and archive-free generations. Only an
-  exact completed generation with authenticated GCS evidence may enter an
-  automatic interpretation or recovery path; all other history stays visible
-  with a truthful next-state classification.
-  [D-2026-07-30-historical-urans-inventory]
-- Confirmed intent: finalized solver evidence belongs in the private GCS
-  archive as content-addressed Zstandard bundles, while the VPS retains only
-  active solve state and bounded temporary render hydration. Complete solver
-  evidence is conserved, local raw VTK is removed only after verified remote
-  restore, and production uses attached workload identity rather than exported
-  credentials. Full retention fails closed before deleting live mesh/state,
-  and incomplete terminal packaging is preserved as immutable forensic blobs,
-  never reinterpreted as canonical solver evidence. OpenCFD 2606 cutover
+- Superseded operational direction: archive-backed reinterpretation, historical
+  audit, and result-specific archive recovery are not solver workflows. Old
+  generations were deleted and their points returned to the ordinary fresh
+  ladder. Current results still require immutable stored evidence and the clean
+  URANS tail gate before publication.
+  [D-2026-08-09-metadata-only-solver-reset]
+- Confirmed intent: accepted finalized solver evidence belongs in the private
+  GCS archive as content-addressed Zstandard bundles, while solver hosts retain
+  only active solve state and bounded temporary render hydration. Accepted
+  canonical evidence is conserved and local raw VTK is removed only after its
+  verified remote acknowledgement. Failed, rejected, cancelled, incomplete,
+  or otherwise unpublished generations are disposable working data: remove
+  their noncanonical database/artifact graph and engine files, then submit a
+  clean replacement generation instead of creating a forensic package or
+  quarantine. OpenCFD 2606 cutover
   canaries remain immutable operational evidence in their exact GCS
   generations; they are neither deleted nor promoted into aerodynamic data.
   [D-2026-07-15-gcs-zstd-evidence]
-  [D-2026-07-18-incomplete-evidence-quarantine]
+  [D-2026-08-05-disposable-failed-generations]
   [D-2026-07-18-operational-canary-evidence-retention]
   Byte-identical rendered frames share one physical content-addressed object
   but retain one logical association per real frame index.
@@ -123,6 +134,11 @@
   no hub GCS credentials, and uses persistent deployment identity/capacity
   separate from numerical solver identity.
   [D-2026-07-17-hz-solver2-volume-cutover]
+  The remote solver remains GCS-credentialless; production brokers accepted
+  canonical evidence only. Terminal failed generations do not enter a separate
+  broker or receipt path and cannot hold compute capacity after their clean
+  replacement is scheduled.
+  [D-2026-08-05-disposable-failed-generations]
   A solver watchdog may judge only coefficient history directly owned by the
   live OpenFOAM process directory. Remote terminal-cell releases suppress only
   the same solver build from reclaiming the unchanged cell; another solver or
@@ -145,6 +161,22 @@
   independent remote capacity, while exact manifest inventory resolves the
   current running-result delivery deadlock without inventing field extents or
   forcing expensive rendering into the solver march.
+
+- Decision: accepted canonical evidence retains its generation-pinned GCS
+  acknowledgement. Failed, rejected, cancelled, incomplete, or otherwise
+  unpublished solver generations are disposable: remove their exact
+  noncanonical database/artifact graph and raw engine files, then schedule a
+  clean replacement for the same physical point. Keep only a compact
+  operational failure event; create no forensic package, quarantine, broker
+  upload, or terminal deletion receipt. Keep the remote solver
+  GCS-credentialless.
+  [D-2026-08-05-disposable-failed-generations](DecisionDetails/D-2026-08-05-disposable-failed-generations.md)
+- Why: the forensic path filled the remote volume, stopped its database and
+  scheduler, idled compute, and consumed more engineering time than clean
+  recomputation. Deleting accepted evidence remains forbidden, but retaining
+  reproducible failed working data no longer serves the product goal. This
+  supersedes D-2026-07-18-incomplete-evidence-quarantine and
+  D-2026-08-03-terminal-evidence-receipt-boundary for failed generations.
 
 - Decision: broker an exact rejected-but-restartable preliminary-URANS
   checkpoint through the credentialless remote evidence upload path, verify
@@ -173,7 +205,24 @@
   menus while desktop keeps the established public tabs and admin sidebar.
   [D-2026-07-24-route-owned-responsive-navigation](DecisionDetails/D-2026-07-24-route-owned-responsive-navigation.md)
 
-## D-2026-07-30-historical-urans-inventory — Exhaustive read-only evidence inventory
+## D-2026-08-09-metadata-only-solver-reset — Delete nonconforming evidence and recompute normally
+
+- Decision: use a current database-provenance predicate, without reading or
+  reducing archive bytes, to retain modern accepted solver generations. Delete
+  every nonconforming generation and its exact GCS objects, reset its physical
+  cell to unsolved, and rebuild it through RANS → FAST URANS → FULL URANS.
+  Preserve catalog, coordinates, reusable setup records, immutable preset
+  revisions, and modern accepted evidence. Disable historical audit and
+  archive-specific physical-recovery scheduling. Do not clear the whole
+  database unless the solver-domain reset itself proves impossible.
+  [detail](DecisionDetails/D-2026-08-09-metadata-only-solver-reset.md)
+- Why: metadata-only invalidation plus fresh computation is simpler and uses
+  solver capacity directly. Historical byte audit, audit-to-restore recovery,
+  and a full database wipe were considered; the former adds the complexity the
+  owner rejected, while the latter destroys valid catalog and configuration
+  data unrelated to solver quality.
+
+## D-2026-07-30-historical-urans-inventory — Exhaustive read-only evidence inventory (superseded)
 
 - Decision: inventory every explicit FAST/FINAL URANS attempt before historical
   migration or remediation, retaining execution state and archive integrity
@@ -187,6 +236,8 @@
   evidence and no-archive rows. A separate bounded reader makes the migration
   scope honest without creating solver work or weakening immutable evidence
   gates.
+  Superseded operationally by
+  [D-2026-08-09-metadata-only-solver-reset]; retained only as decision history.
 
 ## D-2026-07-28-scheduler-delay-and-campaign-polling — Honest advisory and bounded live reads
 
@@ -465,11 +516,13 @@ Detail: [DecisionDetails/D-2026-07-18-operational-canary-evidence-retention.md](
   pre-attestation cutovers, closes delayed-owner races, and safely releases
   only verified duplicate VPS bytes.
 
-## D-2026-07-18-incomplete-evidence-quarantine — Corrupt terminal packaging remains forensic, not solver evidence
+## D-2026-07-18-incomplete-evidence-quarantine — Superseded: corrupt terminal packaging was retained forensically
 
 Detail: [DecisionDetails/D-2026-07-18-incomplete-evidence-quarantine.md](DecisionDetails/D-2026-07-18-incomplete-evidence-quarantine.md)
 
-- Decision: before a full retention pass deletes any shared mesh or live case
+- Decision: superseded on 2026-08-05 by
+  [D-2026-08-05-disposable-failed-generations](DecisionDetails/D-2026-08-05-disposable-failed-generations.md).
+  The historical decision required that before a full retention pass deletes any shared mesh or live case
   state, preflight the whole job and require every protected evidence directory
   with a sidecar manifest and local gzip/Zstandard candidates to retain at
   least one candidate that streams completely and authenticates every bundled
@@ -552,7 +605,7 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   parent's provenance, and its lifecycle owns admission. Guarantee final
   verification one slot after at most eight new wave-1 RANS admissions.
   Durably latch all NEW solver admission closed when current-generation ledgers
-  expose a critical or exhausted preliminary/final hazard, without pausing
+  expose a systemic critical or exhausted preliminary/final hazard, without pausing
   reconciliation, ingestion, retention, or already-accepted engine work.
   Serialize the last permit at the actual engine-submit boundary by holding
   the singleton admission lock through the bounded engine acceptance call;
@@ -566,7 +619,9 @@ Detail: [DecisionDetails/D-2026-07-16-preliminary-urans-reliability.md](Decision
   make an already-stored hazard current—campaign resume or generation change,
   current condition/point activation, or campaign ownership/attribution—takes
   that lock too. Re-trip before submission if the hazard remains; legacy
-  generations never trip this breaker. Versioned deterministic-mesh
+  generations never trip this breaker. Exact cell-scoped clean-cycle exhaustion
+  and permanent continuation-source incidents remain critical for their own
+  cells but do not fence unrelated admission. Versioned deterministic-mesh
   remediation is reconciliation rather than NEW admission: while fenced it may
   atomically reopen only the exact older-strategy obligation and resolve only
   its matching old incident, but that maintenance tick submits zero, never
@@ -5386,3 +5441,85 @@ Detail: [DecisionDetails/D-2026-07-27-workload-aware-disk-admission.md](Decision
   the remote/GCS path. Measured p95 evidence sizes support conservative
   fidelity-specific reserves that still allocate 24.375 GiB to a fresh
   78-angle RANS sweep and fail safe for unknown work.
+
+## D-2026-08-05-role-aware-remote-disk-admission — Keep remote headroom absolute
+
+Detail: [DecisionDetails/D-2026-08-05-role-aware-remote-disk-admission.md](DecisionDetails/D-2026-08-05-role-aware-remote-disk-admission.md)
+
+- Decision: retain the 95% emergency ceiling on the production hub, and use a
+  99% emergency ceiling only on an explicitly declared dedicated remote solver.
+  Both roles keep the same 20 GiB system floor, fidelity-specific remaining
+  work reserve, and next-job reserve; malformed/unset role input retains hub
+  behavior.
+- Why: the universal percentage gate fenced the 3.3 TiB remote volume at 95.9%
+  despite 137 GiB free, before the actual capacity model ran. Removing the
+  percentage guard entirely risks repeating the full-disk outage, while a
+  remote-specific ceiling plus the unchanged absolute reservation restores
+  safely usable remote capacity without deleting or discounting evidence.
+
+## D-2026-07-30-historical-released-evidence-audit — Keep released archive interpretation non-publishing
+
+Detail: [DecisionDetails/D-2026-07-30-historical-released-evidence-audit.md](DecisionDetails/D-2026-07-30-historical-released-evidence-audit.md)
+
+- Decision: treat a released completed URANS generation with verified,
+  generation-pinned GCS/Zstandard evidence as audit-only unless an operator
+  explicitly provides its exact result, attempt, and archive ids. Persist the
+  interpretation under `historical_archive_audit` and atomically append its
+  bounded non-executable audit decision. Exclude this provenance from
+  canonical selection and normal queue admission; represent inherited queue
+  rows as dormant `historical_audit_required` work rather than a fake retry.
+  Only an exact later live reopening (or documented exact PRECALC lineage) may
+  revive ordinary publication, using a fresh child receipt. Freeze each audit
+  run's exact source and reducer identity at the database boundary; only run
+  settlement metadata may change, so a second source needs a second explicit
+  audit receipt.
+- Why: reopening released results or reusing `archive_backfill` would let
+  historical reduction alter a polar, campaign, cache, or solver schedule.
+  Purely read-only inspection cannot retain a reproducible scientific
+  interpretation. A separate exact audit receipt retains evidence while
+  preserving current-generation publication authority and makes any future
+  physical recovery an explicit operator-authorized workflow. Exact revival
+  avoids permanently stranding a deliberately reopened result, while clearing
+  a release-failed child and rejecting unrelated successor generations keeps
+  stale history from publishing or blocking the new generation.
+
+## D-2026-08-02-systemic-admission-fence — Quarantine isolated failures without idling the fleet
+
+Detail: [DecisionDetails/D-2026-08-02-systemic-admission-fence.md](DecisionDetails/D-2026-08-02-systemic-admission-fence.md)
+
+- Decision: individual current-generation PRECALC/final-URANS failures remain critical, durable, and automatically recoverable at their exact physical cell, but do not close global solver admission. Fence only direct infrastructure/evidence-integrity loss or a repeated equal `(stage, reason, solver implementation, remediation version)` group at the configured threshold. An exact current accepted archive selection settles its matching PRECALC owner, incidents, and campaign progress in both normal and replay publication paths.
+- Why: the prior one-incident/blocked-owner rule turned stale bookkeeping into a fleet-wide stop, wasting both local and remote capacity even while most work was healthy. Removing all fencing would allow systemic evidence loss to compound. Narrow, provenance-scoped repetition preserves a fast automatic response to systemic defects while allowing normal per-point URANS recovery to continue.
+
+## D-2026-08-02-adaptive-clean-tail-recovery — Continue noisy prefixes without idling the fleet
+
+Detail: [DecisionDetails/D-2026-08-02-adaptive-clean-tail-recovery.md](DecisionDetails/D-2026-08-02-adaptive-clean-tail-recovery.md)
+
+- Decision: keep FAST three-cycle and FINAL five-cycle publication gates exact,
+  but replace the short legacy 9/12 recovery ceilings with the versioned
+  `adaptive-clean-tail-v2` 18/27 finite emergency ceilings. Continue in bounded
+  one-to-three-period chunks, clamp every same-case continuation before solver
+  submission, report physical progress truthfully, and treat final
+  clean-cycle-quality exhaustion as a critical cell outcome rather than a
+  fleet-wide repeated hazard.
+- Why: two complete production archives showed recoverable clean-tail progress
+  at 13/14 periods, while the old controller both overran and then terminalized
+  them. Keeping 9/12 or suppressing the message would still discard results;
+  removing the cap would lose a finite last-resort guard; and one-off salvage
+  plumbing would not correct ordinary continuation. The selected contract uses
+  existing wall/no-progress safety, preserves immutable rejected evidence, and
+  keeps real infrastructure/evidence-integrity fencing intact.
+
+## D-2026-08-04-permanent-continuation-fresh-recovery — Spend only the remaining fresh-run budget
+
+Detail: [DecisionDetails/D-2026-08-04-permanent-continuation-fresh-recovery.md](DecisionDetails/D-2026-08-04-permanent-continuation-fresh-recovery.md)
+
+- Decision: a permanently unusable exact continuation source is terminal and
+  immutable. If that physical cell has consumed only one of its two permitted
+  physical PRECALC runs, reopen its live obligation once as a distinct fresh,
+  continuation-free run. If the budget is exhausted, keep the exact cell
+  blocked and critical without fencing unrelated fleet admission.
+- Why: resubmitting the unchanged continuation is deterministically futile;
+  blocking after only one physical run wastes the already-approved recovery
+  budget; and resetting the counter or replacing old evidence would falsify
+  attempt history. A source-terminal/fresh-generation transition preserves the
+  evidence trail while spending no more than the existing bounded allowance.

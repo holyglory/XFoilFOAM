@@ -1,5 +1,7 @@
 import type { DB } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -7,16 +9,55 @@ import {
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
   supportsArchiveCleanCycleReduction,
+  supportsCurrentArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "../src/engine-capabilities";
 import { drainArchiveReductionQueue } from "../src/archive-reduction-queue";
-import { remoteAdmissionDecisionForTick, submitOneBatch } from "../src/loop";
+import {
+  remoteAdmissionDecisionForTick,
+  schedulerReconcileOptions,
+  submitOneBatch,
+} from "../src/loop";
 import {
   submitExactUransCanaryStep,
   uransLadderTick,
 } from "../src/urans-ladder";
 
 describe("engine mesh-recovery capability handshake", () => {
+  it("MUST-CATCH: scheduler reconciliation records routes but cannot submit replacement CFD before admission gates", () => {
+    expect(schedulerReconcileOptions()).toEqual({ recordRoutesOnly: true });
+    expect(
+      schedulerReconcileOptions({
+        jobIds: ["11111111-1111-4111-8111-111111111111"],
+        recoverFailedJobIds: ["22222222-2222-4222-8222-222222222222"],
+        skipFailedRecovery: true,
+        recordRoutesOnly: false,
+      }),
+    ).toEqual({
+      jobIds: ["11111111-1111-4111-8111-111111111111"],
+      recoverFailedJobIds: ["22222222-2222-4222-8222-222222222222"],
+      skipFailedRecovery: true,
+      recordRoutesOnly: true,
+    });
+  });
+
+  it("MUST-CATCH: disk-blocked scheduler cleanup runs before saturated-engine reconciliation", () => {
+    const loopSource = readFileSync(
+      fileURLToPath(new URL("../src/loop.ts", import.meta.url)),
+      "utf8",
+    );
+    const tickStart = loopSource.indexOf("export async function tick(");
+    const earlyReclaim = loopSource.indexOf(
+      "await deleteDiscardedTerminalRemoteJobDirs(",
+      tickStart,
+    );
+    const reconcile = loopSource.indexOf("await reconcile(", tickStart);
+
+    expect(tickStart).toBeGreaterThanOrEqual(0);
+    expect(earlyReclaim).toBeGreaterThan(tickStart);
+    expect(reconcile).toBeGreaterThan(earlyReclaim);
+  });
+
   it("accepts a monotonic non-negative integer advertised by live health", async () => {
     const engine = {
       healthDetails: async () => ({
@@ -104,6 +145,20 @@ describe("engine mesh-recovery capability handshake", () => {
     );
     expect(submissions).toBe(0);
   });
+
+  it("holds ordinary RANS admission on a legacy reducer before submit", async () => {
+    let submissions = 0;
+    const engine = {
+      submitPolar: async () => {
+        submissions += 1;
+        throw new Error("legacy reducer must not receive a physical request");
+      },
+    } as unknown as EngineClient;
+    await expect(submitOneBatch({} as DB, engine, 0, 0, 3)).resolves.toBe(
+      false,
+    );
+    expect(submissions).toBe(0);
+  });
 });
 
 describe("engine immutable archive-reduction capability handshake", () => {
@@ -117,6 +172,13 @@ describe("engine immutable archive-reduction capability handshake", () => {
     } as unknown as EngineClient;
     await expect(engineArchiveReductionVersion(engine)).resolves.toBe(1);
     expect(supportsArchiveCleanCycleReduction(1)).toBe(true);
+    expect(supportsCurrentArchiveCleanCycleReduction(1)).toBe(false);
+  });
+
+  it("admits only the current archive reducer for new physical work", () => {
+    expect(supportsCurrentArchiveCleanCycleReduction(3)).toBe(false);
+    expect(supportsCurrentArchiveCleanCycleReduction(4)).toBe(true);
+    expect(supportsCurrentArchiveCleanCycleReduction(5)).toBe(false);
   });
 
   it("treats a health response without an explicit reducer as legacy and closes new work", async () => {
@@ -188,6 +250,35 @@ describe("engine immutable archive-reduction capability handshake", () => {
     ).resolves.toBe(false);
     expect(submissions).toBe(0);
   });
+
+  it("holds direct ladder and canary entry points on a v3 reducer", async () => {
+    let submissions = 0;
+    const v3CanaryEngine = {
+      healthDetails: async () => ({
+        status: "ok",
+        version: "archive-reducer-v3",
+        archive_reduction_version: 3,
+      }),
+      submitPolar: async () => {
+        submissions += 1;
+        throw new Error("v3 reducer must not receive a physical request");
+      },
+    } as unknown as EngineClient;
+
+    await expect(
+      uransLadderTick({} as DB, v3CanaryEngine, 0, {
+        archiveReductionVersion: 3,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      submitExactUransCanaryStep({} as DB, v3CanaryEngine, {
+        requestId: "v3-canary-request",
+        meshRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
+      }),
+    ).resolves.toBe(false);
+    expect(submissions).toBe(0);
+  });
 });
 
 describe("engine durable URANS-recovery capability handshake", () => {
@@ -248,11 +339,10 @@ describe("remote NEW-admission lane precedence", () => {
   const open = {
     admissionFenced: false,
     diskAllowed: true,
-    fastUransSubmitted: false,
     sharedCapacityAvailable: true,
     engineHealthy: true,
     meshRecoveryVersion: 4,
-    archiveReductionVersion: 1,
+    archiveReductionVersion: 4,
   };
 
   it("keeps safety-stop provenance ahead of simultaneous storage pressure", () => {
@@ -265,13 +355,47 @@ describe("remote NEW-admission lane precedence", () => {
     ).toEqual({ kind: "hold", reason: "safety_stop" });
   });
 
-  it("holds mirrored RANS after FAST consumes the one admission opportunity", () => {
+  it("allows mirrored RANS after FAST priority has reserved its own slots", () => {
+    expect(remoteAdmissionDecisionForTick(open)).toEqual({
+      kind: "allow",
+      meshRecoveryVersion: 4,
+    });
+  });
+
+  it("keeps ordinary remote RANS behind FAST work beyond the bounded recovery pass", () => {
     expect(
       remoteAdmissionDecisionForTick({
         ...open,
-        fastUransSubmitted: true,
+        fastBacklogStillDue: true,
       }),
     ).toEqual({ kind: "hold", reason: "higher_priority_fast_urans" });
+  });
+
+  it("MUST-CATCH: a local FAST winner cannot suppress remote FAST discovery before RANS", () => {
+    const loopSource = readFileSync(
+      fileURLToPath(new URL("../src/loop.ts", import.meta.url)),
+      "utf8",
+    );
+    const remoteFastStart = loopSource.indexOf(
+      "const remoteFastCapacityRemaining =",
+    );
+    const remoteAdmissionStart = loopSource.indexOf(
+      "let remoteAdmissionConsumed = false;",
+      remoteFastStart,
+    );
+    const remoteFastBlock = loopSource.slice(
+      remoteFastStart,
+      remoteAdmissionStart,
+    );
+
+    expect(remoteFastStart).toBeGreaterThanOrEqual(0);
+    expect(remoteAdmissionStart).toBeGreaterThan(remoteFastStart);
+    expect(remoteFastBlock).toContain(
+      "await submitRemotePromisePrecalcRecoveries(",
+    );
+    expect(remoteFastBlock).not.toMatch(
+      /promotedSubmitted\s*\|\|\s*campaignTargetedSubmitted\s*\|\|\s*remoteFastSlotsAvailable/,
+    );
   });
 
   it("holds mixed-mode remote RANS while shared capacity is full", () => {
@@ -296,11 +420,20 @@ describe("remote NEW-admission lane precedence", () => {
     });
   });
 
-  it("holds remote RANS when the immutable archive reducer is absent or malformed", () => {
+  it("holds remote RANS when the current archive reducer is absent, stale, or malformed", () => {
     expect(
       remoteAdmissionDecisionForTick({
         ...open,
         archiveReductionVersion: 0,
+      }),
+    ).toEqual({
+      kind: "hold",
+      reason: "archive_reduction_capability_unavailable",
+    });
+    expect(
+      remoteAdmissionDecisionForTick({
+        ...open,
+        archiveReductionVersion: 3,
       }),
     ).toEqual({
       kind: "hold",

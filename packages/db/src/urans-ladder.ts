@@ -18,6 +18,7 @@ import {
   URANS_VERIFY_DELTA_CD_LIMIT,
   URANS_VERIFY_DELTA_CL_LIMIT,
 } from "@aerodb/core";
+import { URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER } from "@aerodb/engine-client";
 import {
   and,
   asc,
@@ -633,6 +634,11 @@ async function enqueueAutomaticPrecalcContinuations(
               <> ARRAY[${MISSING_URANS_VIDEO_REASON}]::text[]
         AND attempt.engine_job_id IS NOT NULL
         AND attempt.engine_case_slug IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+          WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+        )
         AND EXISTS (
           SELECT 1
           FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
@@ -914,6 +920,11 @@ async function seedFinalContinuationFromRequestInTransaction(
             = target_queue.precalc_result_attempt_id::text
         )
         OR target_queue.latest_result_attempt_id = attempt.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+        WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
       )
       AND EXISTS (
         SELECT 1
@@ -3806,6 +3817,9 @@ export interface PendingUransRequestScope {
   /** Capability-aware lane selection. Undefined keeps the ordinary mixed
    * oldest-first queue; `full` lets full work proceed while PRECALC is gated. */
   fidelity?: "precalc" | "full";
+  /** Admit only a request currently owned by one active, exact archive
+   * recovery action. This is a physical scheduler lane, not audit authority. */
+  recoveryOwnedOnly?: boolean;
 }
 
 /** Atomically claim one request before composition or external submit.
@@ -3830,12 +3844,44 @@ export async function claimNextPendingUransRequest(
     const fidelityScope = scope.fidelity
       ? sql`AND req.fidelity = ${scope.fidelity}`
       : sql``;
+    const activeArchiveRecoveryOwner = sql`(
+      EXISTS (
+        SELECT 1
+        FROM result_interpretation_recovery_actions recovery_action
+        WHERE recovery_action.target_urans_request_id = req.id
+          AND recovery_action.state IN (
+            'waiting_for_precalc',
+            'continuation_routed',
+            'fresh_rerun_routed'
+          )
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM legacy_urans_archive_gap_recovery_actions gap_action
+        WHERE gap_action.target_urans_request_id = req.id
+          AND gap_action.state = 'fresh_rerun_routed'
+      )
+    )`;
+    const recoveryOwnerScope = scope.recoveryOwnedOnly
+      ? sql`AND ${activeArchiveRecoveryOwner}`
+      : sql``;
+    const openCriticalRecoveryIncidentOwner = sql`EXISTS (
+      SELECT 1
+      FROM sim_precalc_obligation_requests recovery_ownership
+      JOIN sim_solver_incidents recovery_incident
+        ON recovery_incident.precalc_obligation_id =
+          recovery_ownership.obligation_id
+      WHERE recovery_ownership.request_id = req.id
+        AND recovery_incident.status = 'open'
+        AND recovery_incident.severity = 'critical'
+    )`;
     const [candidate] = (await tx.execute(sql`
       SELECT req.id, req.background_owner
       FROM sim_urans_requests req
       WHERE req.state = 'pending'
         ${requestScope}
         ${fidelityScope}
+        ${recoveryOwnerScope}
         AND (
           req.fidelity = 'full'
           OR NOT EXISTS (
@@ -3858,7 +3904,15 @@ export async function claimNextPendingUransRequest(
               AND campaign.status IN ('active', 'attention')
           )
         )
-      ORDER BY req."createdAt" ASC
+      -- A routed archive-recovery request is the one normal physical owner of
+      -- an already authenticated, exact provenance defect.  Repair a live
+      -- critical incident before noncritical historical recovery backlog,
+      -- then preserve FIFO within each class. The audit itself never reaches
+      -- this queue; only its separately durable routed action does.
+      ORDER BY (
+        ${activeArchiveRecoveryOwner}
+        AND ${openCriticalRecoveryIncidentOwner}
+      ) DESC, ${activeArchiveRecoveryOwner} DESC, req."createdAt" ASC
       LIMIT 1
     `)) as unknown as Array<{ id: string; background_owner: boolean }>;
     if (!candidate) return null;
@@ -4618,6 +4672,7 @@ export type FinalUransRecoveryPlan =
       engineCaseSlug: string;
       solverImplementationId: string | null;
       budgetOverrideS: number;
+      cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
     }
   | { mode: "media_repair" }
   | { mode: "exhausted"; reason: string };
@@ -4793,6 +4848,14 @@ export async function finalUransRecoveryPlanForVerifyItem(
         engineCaseSlug: resultAttempts.engineCaseSlug,
         solverImplementationId: resultAttempts.solverImplementationId,
         qualityWarnings: resultAttempts.qualityWarnings,
+        cleanCycleRecoveryPolicyVersion: sql<string | null>`
+          CASE
+            WHEN ${simJobs.requestPayload} ->>
+              'cleanCycleRecoveryPolicyVersion' = 'adaptive-clean-tail-v2'
+            THEN 'adaptive-clean-tail-v2'
+            ELSE NULL
+          END
+        `,
         classification: resultClassifications.state,
         fidelity: sql<
           string | null
@@ -4803,6 +4866,7 @@ export async function finalUransRecoveryPlanForVerifyItem(
         resultClassifications,
         eq(resultClassifications.resultAttemptId, resultAttempts.id),
       )
+      .leftJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
       .where(eq(resultAttempts.id, item.latestResultAttemptId))
       .limit(1);
     if (
@@ -4835,6 +4899,10 @@ export async function finalUransRecoveryPlanForVerifyItem(
         solverImplementationId: source.solverImplementationId,
         budgetOverrideS:
           item.continuationBudgetOverrideS ?? FINAL_URANS_CONTINUATION_BUDGET_S,
+        cleanCycleRecoveryPolicyVersion:
+          source.cleanCycleRecoveryPolicyVersion === "adaptive-clean-tail-v2"
+            ? "adaptive-clean-tail-v2"
+            : null,
       };
     }
     return {

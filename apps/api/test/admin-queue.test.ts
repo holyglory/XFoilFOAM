@@ -83,20 +83,24 @@ function engineResponseBody(url: string): string | null {
           job_id: `${PREFIX}-engine-1`,
           exists: true,
           cancelled: false,
-          process_count: 1,
-          processes: [
-            {
-              pid: 4101,
-              command: "pimpleFoam",
-              case_slug: "c0p05_u30_a19",
-              solver_mode: "urans",
-            },
-          ],
+          // The API container itself sees no child PIDs. The worker heartbeat
+          // is authoritative and carries eight distinct case children, while
+          // status.json has only the most recent single-case token callback.
+          process_count: 8,
+          direct_process_count: 0,
+          heartbeat_process_count: 8,
+          processes: Array.from({ length: 8 }, (_, index) => ({
+            pid: 4101 + index,
+            command: "pimpleFoam",
+            case_slug: `c0p05_u30_a${12 + index}`,
+            solver_mode: "urans",
+          })),
           runtime_heartbeat_age_sec: 1,
           runtime_phase: "solving_urans",
           runtime_active_solver: "pimpleFoam",
           runtime_active_case_slug: "c0p05_u30_a19",
           runtime_active_aoa_deg: 19,
+          runtime_cpu_tokens_held: 1,
           runtime_last_progress_at: "2026-07-18T04:47:30.000Z",
           status_readable: true,
           status_state: "running",
@@ -106,6 +110,7 @@ function engineResponseBody(url: string): string | null {
           status_active_solver: null,
           status_active_case_slug: "c0p05_u30_a13",
           status_active_aoa_deg: 13,
+          status_cpu_tokens_held: 1,
           status_last_progress_at: "2026-07-18T04:18:00.000Z",
           result_readable: false,
           has_result: false,
@@ -235,6 +240,13 @@ beforeAll(async () => {
         solverRuntimeBuildId: runtimeBuildId,
         solverExecutionPoolId: FOUNDATION_14_EXECUTION_POOL_ID,
         totalCases: 3,
+        requestPayload: {
+          scheduling: {
+            resolved_cpu_budget: 8,
+            resolved_case_concurrency: 8,
+            solver_processes: 1,
+          },
+        },
         submittedAt: new Date(),
       },
       {
@@ -370,6 +382,11 @@ describe("queue payload with a saturated (3 s) engine", () => {
       activeCaseSlug: "c0p05_u30_a19",
       activeAoaDeg: 19,
       lastProgressAt: "2026-07-18T04:47:30.000Z",
+      processCount: 8,
+      cpuTokensHeld: 8,
+      cpuBudget: 8,
+      caseConcurrency: 8,
+      solverProcesses: 1,
     });
 
     // Backwards compatibility: runtimes from an older/quiet worker may carry

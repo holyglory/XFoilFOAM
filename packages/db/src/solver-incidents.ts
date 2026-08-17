@@ -10,6 +10,18 @@ import {
 /** Bump when the recovery decision itself changes. Incident summaries keep
  * versions separate so recurrence before and after a correction is visible. */
 export const URANS_RECOVERY_REMEDIATION_VERSION =
+  "urans-recovery-2026-08-02-v12";
+/** Immutable historical provenance only. New incidents must use the current
+ * recovery contract above so recurrence summaries never merge older outcomes
+ * with the v12 clean-cycle cap correction. */
+export const PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION =
+  "urans-recovery-2026-08-02-v11";
+/** v10 remains recoverable legacy evidence after v11 becomes the immediate
+ * predecessor. Keep the distinct identity explicit rather than reusing a
+ * broad version prefix in recovery or admission predicates. */
+export const OBSOLETE_URANS_RECOVERY_REMEDIATION_VERSION =
+  "urans-recovery-2026-08-02-v10";
+export const LEGACY_URANS_RECOVERY_REMEDIATION_VERSION =
   "urans-recovery-2026-07-25-v9";
 export const RANS_RECOVERY_REMEDIATION_VERSION = "rans-recovery-2026-07-16-v1";
 
@@ -26,6 +38,79 @@ export function ransMeshRecoveryRemediationVersion(version: number): string {
  * stage, reason, and remediation are an algorithm/runtime pattern rather than
  * an isolated point anomaly. */
 export const REPEATED_SOLVER_INCIDENT_THRESHOLD = 3;
+
+/**
+ * Admission scope describes the blast radius of an incident, independently of
+ * its severity. A cell-scoped incident is still critical evidence for its
+ * exact physical point; it is not evidence that healthy fleet capacity should
+ * be idled.
+ */
+export const SOLVER_INCIDENT_ADMISSION_SCOPES = {
+  cell: "cell",
+  systemic: "systemic",
+} as const;
+
+export type SolverIncidentAdmissionScope =
+  (typeof SOLVER_INCIDENT_ADMISSION_SCOPES)[keyof typeof SOLVER_INCIDENT_ADMISSION_SCOPES];
+
+/** Stable machine classification for a physical URANS trajectory that reached
+ * its bounded clean-cycle recovery ceiling. Keep this separate from the
+ * human-readable incident reason, which may also contain generic solver-error
+ * evidence and must never decide fleet admission. */
+export const URANS_CLEAN_CYCLE_CAP_EXHAUSTION =
+  "urans_clean_cycle_cap_exhausted";
+
+/** A continuation source that cannot be repaired by retrying its exact
+ * immutable generation. This remains a critical physical-cell outcome, not
+ * evidence of a fleet-wide execution outage. */
+export const CONTINUATION_SOURCE_PERMANENT =
+  "continuation_source_permanent";
+
+const CLEAN_CYCLE_CAP_CLASSIFICATION_REASONS = [
+  "insufficient-periods",
+  "non-stationary",
+  "uncertified-urans-cycles",
+] as const;
+
+/**
+ * A nonrepeatable/settling URANS trajectory which exhausted its recovery cap
+ * remains a critical exact-cell outcome. It is not an infrastructure or
+ * evidence-integrity incident and therefore must not contribute to the global
+ * repeated-incident admission threshold.
+ */
+export function isUransCleanCycleCapExhaustion(input: {
+  stage: SolverIncidentStage;
+  lastOutcome: string;
+  failureDisposition: string | null | undefined;
+  classificationReasons: string[] | null | undefined;
+}): boolean {
+  if (input.stage !== "preliminary" && input.stage !== "final") {
+    return false;
+  }
+  if (
+    input.lastOutcome !== "failed_exhausted" &&
+    input.lastOutcome !== "rejected_exhausted"
+  ) {
+    return false;
+  }
+  // `none` is the normal disposition for a completed physical URANS run whose
+  // stored evidence failed only the clean-cycle publication gate.  Early v11
+  // rows used that value, while later controller paths may use `hard_solver`.
+  // Both are exact-cell quality-cap outcomes only when the complete structured
+  // clean-cycle reason set is present; neither may become a fleet fence.
+  if (
+    input.failureDisposition !== "hard_solver" &&
+    input.failureDisposition !== "none"
+  ) {
+    return false;
+  }
+  const reasons = new Set(
+    (input.classificationReasons ?? []).map((reason) => reason.trim()),
+  );
+  return CLEAN_CYCLE_CAP_CLASSIFICATION_REASONS.every((reason) =>
+    reasons.has(reason),
+  );
+}
 
 export type SolverIncidentStage = "rans" | "preliminary" | "final";
 export type SolverIncidentSeverity = "warning" | "critical";
@@ -223,6 +308,42 @@ export async function resolveSolverIncidentsForOwnerInTransaction(
       resolvedAt: new Date(),
     })
     .where(and(ownerPredicate(owner), eq(simSolverIncidents.status, "open")))
+    .returning({ id: simSolverIncidents.id });
+  return resolved.length;
+}
+
+/**
+ * A legacy archive which predates immutable URANS provenance cannot be
+ * published, but it is not a fresh physical solver failure.  Once an exact,
+ * ordinary PRECALC recovery owner has been durably created, retire only the
+ * obsolete v9/v10/v11 "missing video" incident so that it cannot fence
+ * unrelated new work. The original rejected attempt and immutable recovery
+ * action are retained; any failure recorded under the current remediation
+ * version stays open and remains eligible for the normal safety fence.
+ */
+export async function resolveLegacyUransEvidenceIncidentForRecoveryInTransaction(
+  tx: DB,
+  owner: { precalcObligationId: string },
+): Promise<number> {
+  const resolved = await tx
+    .update(simSolverIncidents)
+    .set({
+      status: "resolved",
+      resolvedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(simSolverIncidents.precalcObligationId, owner.precalcObligationId),
+        eq(simSolverIncidents.stage, "preliminary"),
+        eq(simSolverIncidents.reason, "missing-urans-video"),
+        eq(simSolverIncidents.status, "open"),
+        inArray(simSolverIncidents.remediationVersion, [
+          LEGACY_URANS_RECOVERY_REMEDIATION_VERSION,
+          OBSOLETE_URANS_RECOVERY_REMEDIATION_VERSION,
+          PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION,
+        ]),
+      ),
+    )
     .returning({ id: simSolverIncidents.id });
   return resolved.length;
 }

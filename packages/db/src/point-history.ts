@@ -19,6 +19,7 @@ import {
   URANS_CONTINUATION_REQUIRED_MARKER,
   isDeterministicMeshBlockerError,
 } from "@aerodb/core";
+import { URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 
 import {
@@ -291,6 +292,13 @@ export const CONTINUABLE_SQL = sql`(
       AND continuation_revision.solver_implementation_id IS NOT NULL
       AND continuation_attempt.solver_implementation_id =
           continuation_revision.solver_implementation_id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(
+          COALESCE(continuation_attempt.quality_warnings, ARRAY[]::text[])
+        ) warning
+        WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+      )
       AND EXISTS (
         SELECT 1
         FROM unnest(
@@ -1529,6 +1537,11 @@ export async function listContinuableNeedsReview(
       AND attempt.solver_implementation_id IS NOT NULL
       AND revision.solver_implementation_id IS NOT NULL
       AND attempt.solver_implementation_id = revision.solver_implementation_id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+        WHERE warning LIKE ${"%" + URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER + "%"}
+      )
       AND EXISTS (
         SELECT 1
         FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning

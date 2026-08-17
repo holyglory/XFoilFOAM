@@ -17,11 +17,20 @@ import {
   type UransFidelity,
 } from "@aerodb/engine-client";
 
+import { CURRENT_ARCHIVE_REDUCTION_VERSION } from "./engine-capabilities";
+
 /** First immutable GCS archive clean-cycle reducer. This is intentionally
  * attached to every newly built physical request—not just scheduler-owned
  * calls—so an engine gateway swap after a health probe fails at the submit
  * boundary rather than producing evidence the old engine cannot interpret. */
-export const REQUIRED_ARCHIVE_REDUCTION_VERSION = 1;
+// v4 admits only engines which can emit and replay the versioned adaptive
+// clean-tail proof with truthful measured periods and finite 18/27 ceilings.
+// v3 aligns archive-backed no-shedding certificates with the current bounded
+// RMS reducer.  v2 is the first engine contract that returns typed
+// `rerun_required` for a readable legacy URANS archive lacking immutable
+// unsteady provenance.
+export const REQUIRED_ARCHIVE_REDUCTION_VERSION =
+  CURRENT_ARCHIVE_REDUCTION_VERSION;
 
 export function engineIdentityForSetup(
   setup: SimulationSetupSnapshot,
@@ -203,4 +212,20 @@ export function admissionCpuSlotsForRequest(
       ? (resources?.case_concurrency as number)
       : 1;
   return Math.max(1, solverProcesses * caseConcurrency);
+}
+
+/**
+ * Immutable per-job execution weight. A remote node's configured CPU budget
+ * limits the aggregate of these weights; it is never a substitute for the
+ * resource request of an individual polar.
+ */
+export function admissionCpuSlotsForSetup(
+  setup: Pick<SimulationSetupSnapshot, "scheduling">,
+): number {
+  return admissionCpuSlotsForRequest({
+    resources: {
+      solver_processes: setup.scheduling.solverProcesses ?? undefined,
+      case_concurrency: setup.scheduling.caseConcurrency ?? undefined,
+    },
+  });
 }

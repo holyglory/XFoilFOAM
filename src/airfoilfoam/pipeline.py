@@ -62,6 +62,7 @@ from .models import (
     JobPhase,
     MeshParams,
     NoSheddingCertificate,
+    NO_SHEDDING_CERTIFICATE_VERSION,
     RansFailurePolicy,
     RansHoldCertificate,
     RansHoldChannel,
@@ -120,6 +121,7 @@ from .postprocess.images import (
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
     CLEAN_CYCLE_CERTIFICATION_VERSION,
+    CLEAN_CYCLE_RECOVERY_POLICY_VERSION,
     DRIFT_ABS_FLOOR,
     ESTABLISHED_MIN_CYCLES,
     PERIOD_AMBIGUITY_TOLERANCE,
@@ -133,6 +135,8 @@ from .postprocess.unsteady import (
     StablePeriodResult,
     additional_periods_for_clean_suffix,
     audit_period_cycles,
+    clean_cycle_continuation_max_periods,
+    clean_cycle_max_periods,
     clean_cycle_recovery_exhausted,
     clean_cycle_minimum,
     clean_periodic_tail,
@@ -145,7 +149,7 @@ from .postprocess.unsteady import (
     frame_coefficients,
     frame_target_times,
     is_no_shedding,
-    NO_SHEDDING_ABS_FLOOR,
+    NO_SHEDDING_ABS_RMS_FALLBACK,
     NO_SHEDDING_MIN_SAMPLE_COUNT,
     NO_SHEDDING_REL_TOL,
     no_shedding_min_observation_s,
@@ -322,7 +326,11 @@ def _transient_coeff_selection(case_dir: Path, since: Optional[float]) -> list:
         return []
     if since is None:
         return [files[-1]]
-    return [f for f in files if _time_of(f) >= since - 1e-9] or [files[-1]]
+    # Do not fall back to a pre-transient segment here.  In particular, a
+    # fresh pimpleFoam handoff that has not yet emitted any coefficients must
+    # remain an honest pending/timeout outcome rather than selecting a steady
+    # RANS warm-up trace as URANS evidence.
+    return [f for f in files if _time_of(f) >= since - 1e-9]
 
 
 def _coeff_last_time(coeff_path: Path) -> Optional[float]:
@@ -1511,7 +1519,7 @@ def _no_shedding_observation_certificate(
     try:
         transport_statistics = force_history_transport_statistics(history)
         certificate = NoSheddingCertificate(
-            reducer_version="no-shedding-v1",
+            reducer_version=NO_SHEDDING_CERTIFICATE_VERSION,
             certified=True,
             required_observation_s=required,
             observation_start_time=start,
@@ -1520,7 +1528,11 @@ def _no_shedding_observation_certificate(
             source_sample_count=source_count,
             transport_sample_count=transport_count,
             relative_tolerance=NO_SHEDDING_REL_TOL,
-            absolute_floor=NO_SHEDDING_ABS_FLOOR,
+            # The initial absolute floor remains the normal fast path.  A
+            # tail admitted by the bounded absolute-RMS fallback is still
+            # certified against its truthful maximum RMS allowance; temporal
+            # clean-tail checks were already applied in the reducer.
+            absolute_floor=NO_SHEDDING_ABS_RMS_FALLBACK,
             cl_mean=float(history.cl_mean),
             cd_mean=float(history.cd_mean),
             cm_mean=float(history.cm_mean),
@@ -2040,12 +2052,22 @@ def _write_early_stop_marker(
 #: here; the node fixtures pin it there).
 URANS_BUDGET_STOP_MARKER = "stopped by the wall-clock budget guard"
 
-#: A different restartable outcome from a wall-budget stop: the bounded
-#: in-process controller used all of its same-case chunks, but the measured
-#: window still needs more integration.  The control plane matches this exact
-#: marker so the saved state remains continuable; it must never be conflated
-#: with ``URANS_BUDGET_STOP_MARKER`` because no wall-clock claim is being made.
+#: Typed restartable outcome for the control plane.  It accompanies a
+#: wall-budget stop whenever the immutable cycle audit still has physical
+#: evidence allowance, and it also marks the distinct in-process emergency
+#: chunk-cap outcome.  ``URANS_BUDGET_STOP_MARKER`` explains *why this chunk
+#: stopped*; this marker states whether the saved same-case trajectory is
+#: eligible for another promised continuation.
 URANS_CONTINUATION_REQUIRED_MARKER = "requires further same-case integration"
+
+#: Typed terminal counterpart to ``URANS_CONTINUATION_REQUIRED_MARKER``.  A
+#: wall-clock stop is ordinarily restartable, but not after the exact immutable
+#: audit has consumed FAST9/FINAL12 physical periods.  Control-plane predicates
+#: must test this marker before either restartable marker so capped evidence is
+#: retained as terminal evidence rather than resubmitted.
+URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER = (
+    "same-case physical evidence cap exhausted"
+)
 
 #: Stable machine-readable prefixes for failures before continuation CFD starts.
 #: ``permanent`` means the same immutable source address cannot become valid by
@@ -2100,6 +2122,15 @@ class TransientResume:
     #: Ordinary shortfall/budget continuation stays at one period; a source
     #: that explicitly failed stationarity or field cadence requires three.
     corrective_tail_periods: float = 1.0
+    #: Exact policy authority carried through the durable continuation route.
+    #: ``None`` preserves a legacy v1 receipt's FAST=9 / FINAL=12 cap.
+    clean_cycle_recovery_policy_version: str | None = None
+    #: True only when ``corrective_tail_periods`` is the exact recommendation
+    #: emitted by the immutable archive clean-cycle reducer.  That path owns
+    #: an explicit 1--3-period corrective request. Every continuation still
+    #: shares the same fidelity emergency ceiling, so an ordinary budget path
+    #: cannot overrun it before the archive reducer sees the evidence.
+    archive_clean_cycle_recovery: bool = False
 
 
 @dataclass
@@ -2110,6 +2141,8 @@ class ContinuationSource:
     transient_start: float
     resume_from: float
     corrective_tail_periods: float = 1.0
+    clean_cycle_recovery_policy_version: str | None = None
+    archive_clean_cycle_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -2505,6 +2538,57 @@ def _continuation_corrective_tail_periods(
     ):
         return URANS_NONSTATIONARY_EXTENSION_PERIODS
     return 1.0
+
+
+def _continuation_clean_cycle_recovery_policy_version(
+    requested_policy_version: str | None,
+) -> str | None:
+    """Validate the only authority that can widen a resumed v1 trajectory.
+
+    Absence deliberately means legacy v1 rather than the current engine
+    default. A controller that wants the v2 ceiling must carry the exact
+    reducer policy through its durable recovery action and request.
+    """
+    if requested_policy_version is None:
+        return None
+    if requested_policy_version != CLEAN_CYCLE_RECOVERY_POLICY_VERSION:
+        raise _continuation_permanent(
+            "continuation clean-cycle recovery policy is not the supported "
+            f"{CLEAN_CYCLE_RECOVERY_POLICY_VERSION!r} authority"
+        )
+    return requested_policy_version
+
+
+def _archive_clean_cycle_remaining_periods(
+    transient_start: float,
+    latest_time: float,
+    period_s: float,
+    *,
+    maximum_periods: int,
+) -> float:
+    """Return the exact physical-period budget left for archive recovery.
+
+    The archive reducer's ceiling applies to elapsed physical time from the
+    immutable transient-origin marker.  Do not round that duration down to
+    whole cycles: at FINAL 11.5/12 periods, treating the remaining half period
+    as a whole one would integrate past the immutable ceiling.  The generic
+    retained-window target includes startup discard and a safety margin, so it
+    is intentionally *not* a safe proxy for this cap.  This helper is used
+    only by a request that carries the reducer's explicit 1--3-period
+    recommendation.
+    """
+
+    values = (transient_start, latest_time, period_s)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("archive clean-cycle progress is not finite")
+    if period_s <= 0.0:
+        raise ValueError("archive clean-cycle period is not positive")
+    if latest_time < transient_start:
+        raise ValueError("archive clean-cycle latest time precedes transient start")
+    if not isinstance(maximum_periods, int) or maximum_periods < 1:
+        raise ValueError("archive clean-cycle maximum period count is invalid")
+    measured = max(0.0, (latest_time - transient_start) / period_s)
+    return max(0.0, float(maximum_periods) - measured)
 
 
 def _restored_manifest_payload(restored: Path) -> dict[str, object]:
@@ -3055,6 +3139,8 @@ def _finish_staged_continuation(
     *,
     source_description: str,
     corrective_tail_periods: float = 1.0,
+    clean_cycle_recovery_policy_version: str | None = None,
+    archive_clean_cycle_recovery: bool = False,
 ) -> ContinuationSource:
     dst_t = dst_case / transient_subdir
     transient_start = read_transient_start_marker(dst_t)
@@ -3084,6 +3170,8 @@ def _finish_staged_continuation(
         transient_start=transient_start,
         resume_from=resume_from,
         corrective_tail_periods=corrective_tail_periods,
+        clean_cycle_recovery_policy_version=clean_cycle_recovery_policy_version,
+        archive_clean_cycle_recovery=archive_clean_cycle_recovery,
     )
 
 
@@ -3095,6 +3183,7 @@ def stage_continuation_case(
     aoa_deg: float | None = None,
     expected_engine: EngineIdentity | None = None,
     corrective_tail_periods: int | None = None,
+    clean_cycle_recovery_policy_version: str | None = None,
 ) -> ContinuationSource:
     """Stage a prior trajectory from live state or exact immutable evidence.
 
@@ -3135,9 +3224,19 @@ def stage_continuation_case(
                 f"case and AoA {aoa_deg:g}"
             )
     source_result = _require_exact_source_result_point(metadata, aoa_deg)
+    # This optional request field is produced only by the archive reducer.
+    # Keep its provenance distinct from the legacy source-evidence heuristic:
+    # both may ask for one to three periods, but only the former is bounded by
+    # the reducer's immutable FAST/FINAL physical-period ceiling.
+    archive_clean_cycle_recovery = corrective_tail_periods is not None
     corrective_tail_periods = _continuation_corrective_tail_periods(
         source_result,
         corrective_tail_periods,
+    )
+    clean_cycle_recovery_policy_version = (
+        _continuation_clean_cycle_recovery_policy_version(
+            clean_cycle_recovery_policy_version
+        )
     )
     selected_transient_subdir = None
     if source_result is not None:
@@ -3171,6 +3270,8 @@ def stage_continuation_case(
                 transient_subdir,
                 source_description="live saved case",
                 corrective_tail_periods=corrective_tail_periods,
+                clean_cycle_recovery_policy_version=clean_cycle_recovery_policy_version,
+                archive_clean_cycle_recovery=archive_clean_cycle_recovery,
             )
     else:
         live_error = InfrastructureError(
@@ -3241,6 +3342,8 @@ def stage_continuation_case(
         transient_subdir,
         source_description=source_description,
         corrective_tail_periods=corrective_tail_periods,
+        clean_cycle_recovery_policy_version=clean_cycle_recovery_policy_version,
+        archive_clean_cycle_recovery=archive_clean_cycle_recovery,
     )
 
 
@@ -5191,10 +5294,12 @@ def _run_transient_attempt(
             retained_end_time=quality.retained_end_time,
             clean_cycle_audit=quality.clean_cycle_audit,
         )
-    if timed_out:
-        # Honest partial grade: the requested span was NOT simulated, so the
-        # point can never claim full quality, and refining a run that already
-        # exhausted its wall-clock budget would deterministically time out too.
+    if timed_out and not quality.ok:
+        # A budget-limited partial is not a physical terminal verdict.  Its
+        # saved case can be continued unless the exact clean-cycle audit has
+        # already reached the explicit FAST/FINAL physical cap.  Conversely,
+        # do not discard a real accepted no-shedding or clean-tail certificate
+        # merely because pimpleFoam stopped after that evidence was written.
         reached = _coeff_last_time(files[-1])
         if reached is None:
             reached = _latest_time(tcase)
@@ -5214,7 +5319,8 @@ def _run_transient_attempt(
                 f"graded partial window; "
                 f"URANS integration {URANS_BUDGET_STOP_MARKER} mid-chunk — the saved "
                 f"case state resumes from the last written time step with a bigger "
-                f"budget; {quality.reason}"
+                f"budget;{_restartable_budget_continuation_note(quality, fidelity=solver_params.urans_fidelity.value)} "
+                f"{quality.reason}"
             ),
             measured_period_s=quality.measured_period_s,
             retained_cycles=quality.retained_cycles,
@@ -5307,6 +5413,33 @@ def _quality_with(quality: UransQuality, **updates) -> UransQuality:
     )
     base.update(updates)
     return UransQuality(**base)
+
+
+def _restartable_budget_continuation_note(
+    quality: UransQuality,
+    *,
+    fidelity: str,
+) -> str:
+    """Return the typed continuation marker unless physics exhausted its cap.
+
+    A wall-clock limit says nothing about the physical recoverability of a
+    saved transient.  It is terminal only when the immutable same-case cycle
+    audit has already consumed the explicit FAST/FINAL physical ceiling.  All
+    shorter clean tails must be returned to the control plane as restartable
+    work; otherwise a normal chunk timeout masquerades as a solver failure.
+    """
+    if clean_cycle_recovery_exhausted(
+        quality.clean_cycle_audit,
+        fidelity=fidelity,
+    ):
+        return (
+            f" URANS {URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER}: "
+            "the saved same-case state cannot receive more automatic integration."
+        )
+    return (
+        f" URANS {URANS_CONTINUATION_REQUIRED_MARKER}: the saved same-case "
+        "state has remaining physical evidence allowance."
+    )
 
 
 def _quality_allows_more_integration(quality: UransQuality, target_cycles: float) -> bool:
@@ -5560,6 +5693,8 @@ def _extend_transient_until_periods(
     cancel_check: CancelCheck = None,
     rate_origin: Optional[float] = None,
     deadline: Optional[float] = None,
+    archive_clean_cycle_max_periods: Optional[int] = None,
+    archive_clean_cycle_period_s: Optional[float] = None,
 ) -> TransientResult:
     """Integrate until ``urans_min_periods`` WHOLE shedding periods are retained
     after startup discard, extending the SAME transient case in continuation
@@ -5576,6 +5711,20 @@ def _extend_transient_until_periods(
     A physically long-enough no-shedding observation and a tier-certified
     stable early stop break the loop immediately.
     """
+    if (archive_clean_cycle_max_periods is None) != (
+        archive_clean_cycle_period_s is None
+    ):
+        raise ValueError(
+            "archive clean-cycle continuation requires both its period and ceiling"
+        )
+    if archive_clean_cycle_max_periods is not None and (
+        archive_clean_cycle_max_periods < 1
+        or archive_clean_cycle_period_s is None
+        or not math.isfinite(archive_clean_cycle_period_s)
+        or archive_clean_cycle_period_s <= 0.0
+    ):
+        raise ValueError("archive clean-cycle continuation inputs are invalid")
+
     target = float(solver_params.urans_min_periods)
     discard = min(max(solver_params.transient_discard_fraction, 0.0), 0.95)
     result = first
@@ -5606,6 +5755,35 @@ def _extend_transient_until_periods(
         )
         if span <= 0.0:
             break
+        archive_remaining_periods: Optional[float] = None
+        if archive_clean_cycle_max_periods is not None:
+            # The paired-argument validation above makes this a real period;
+            # keep the local name non-optional so a future edit cannot pass a
+            # missing cadence into the physical-cap calculation.
+            assert archive_clean_cycle_period_s is not None
+            try:
+                archive_remaining_periods = _archive_clean_cycle_remaining_periods(
+                    transient_start,
+                    transient_start + span,
+                    archive_clean_cycle_period_s,
+                    maximum_periods=archive_clean_cycle_max_periods,
+                )
+            except ValueError as exc:
+                raise _continuation_permanent(
+                    f"archive clean-cycle continuation progress is invalid: {exc}"
+                ) from exc
+            if archive_remaining_periods <= 1e-9:
+                result.quality = _quality_with(
+                    result.quality,
+                    ok=False,
+                    can_refine=False,
+                    reason=(
+                        "URANS clean-cycle recovery exhausted: archive-tail continuation "
+                        f"reached the {archive_clean_cycle_max_periods}-period physical cap; "
+                        f"{result.quality.reason}"
+                    ),
+                )
+                break
         if acquiring_period:
             guessed_period = initial_delta_t * 5000.0
             guessed_cycles = span / guessed_period
@@ -5713,9 +5891,10 @@ def _extend_transient_until_periods(
             if audit is not None and not result.quality.ok:
                 # A terminal interpretation cannot be abandoned merely
                 # because it already has a long clean suffix: the explicit
-                # tier ceilings are FAST=9 and FINAL=12 physical periods. This
-                # lets the controller collect the approved additional clean
-                # physical cycles after a corrupt terminal period.
+                # finite tier emergency ceilings are measured physical
+                # periods. This lets the controller collect approved clean
+                # evidence after a corrupt terminal period while the wall and
+                # no-progress limits remain authoritative.
                 if clean_cycle_recovery_exhausted(audit, fidelity=fidelity):
                     result.quality = _quality_with(
                         result.quality,
@@ -5771,6 +5950,15 @@ def _extend_transient_until_periods(
                 else:
                     chunk_sim = max(chunk_sim, repair_span)
             write_interval = period / URANS_FRAME_WRITE_PER_CYCLE
+        if archive_remaining_periods is not None:
+            # The normal retained-window deficit and repair-span calculations
+            # include startup discard and stationarity safety margin.  They can
+            # legitimately exceed one physical period at FINAL 11/12, but an
+            # exact archive recovery has only the reducer-proven remainder.
+            chunk_sim = min(
+                chunk_sim,
+                archive_remaining_periods * archive_clean_cycle_period_s,
+            )
         # Prod naca-4412 -15deg precalc retained 2.00/3.00 cycles at 19.5
         # frames/cycle and was not yet stationary, but still had a measurable
         # period and hours of budget. Those blockers are solved by more
@@ -5793,7 +5981,9 @@ def _extend_transient_until_periods(
                     f"retained {retained:.1f} of {target:g} periods (budget); "
                     f"projected {projected_wall_s / 3600.0:.1f}h continuation exceeds "
                     f"{URANS_REFINE_BUDGET_FRACTION:.0%} of the {timeout / 3600.0:.1f}h "
-                    f"solver timeout{period_note}; {result.quality.reason}"
+                    f"solver timeout{period_note};"
+                    f"{_restartable_budget_continuation_note(result.quality, fidelity=solver_params.urans_fidelity.value)} "
+                    f"{result.quality.reason}"
                 )
                 logger.warning(reason)
                 result.quality = _quality_with(
@@ -5824,7 +6014,8 @@ def _extend_transient_until_periods(
             reason = (
                 f"URANS integration {URANS_BUDGET_STOP_MARKER}: exhausted the "
                 f"{timeout / 3600.0:.1f}h tier budget before the next same-case "
-                f"chunk; {result.quality.reason}"
+                f"chunk;{_restartable_budget_continuation_note(result.quality, fidelity=solver_params.urans_fidelity.value)} "
+                f"{result.quality.reason}"
             )
             result.quality = _quality_with(
                 result.quality,
@@ -5855,7 +6046,8 @@ def _extend_transient_until_periods(
             # continuable marker.
             budget_note = (
                 f" URANS integration {URANS_BUDGET_STOP_MARKER} mid-continuation — "
-                f"the saved case state resumes from the last written time step;"
+                "the saved case state resumes from the last written time step;"
+                f"{_restartable_budget_continuation_note(result.quality, fidelity=solver_params.urans_fidelity.value)}"
             )
             result.quality = _quality_with(
                 result.quality,
@@ -5983,6 +6175,8 @@ def _run_transient(
     initial_period = physics.shedding_period(spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL)
     initial_delta_t = initial_period / 5000.0
     tier_deadline: Optional[float] = None
+    continuation_clean_cycle_max_periods: Optional[int] = None
+    continuation_clean_cycle_period_s: Optional[float] = None
     if resume is not None:
         # Staged continuation: the saved state IS the case — never wipe or
         # re-prepare it. The shared mesh already sits in constant/polyMesh.
@@ -5995,11 +6189,27 @@ def _run_transient(
         # (same math as the in-run extension loop); fall back to the Strouhal
         # guess horizon when no period is measurable yet.
         period: Optional[float] = None
-        span = max(0.0, resume.resume_from - transient_start)
+        # `latestTime` is the restart boundary, not necessarily the final raw
+        # force sample. A monitor can write coefficients after the last field
+        # directory (the original defect that made a clean-cycle cap look one
+        # whole period larger than it was), so archive recovery must account
+        # for the farthest authenticated physical observation before it sizes
+        # the first continuation chunk.
+        initial_physical_progress_time = resume.resume_from
+        span = max(0.0, initial_physical_progress_time - transient_start)
         try:
             saved_paths = _transient_coeff_selection(tcase, transient_start)
             if saved_paths:
                 t_all, cl_all, _cd_all, _cm_all = coefficient_series(saved_paths)
+                if t_all.size:
+                    initial_physical_progress_time = max(
+                        initial_physical_progress_time,
+                        float(t_all[-1]),
+                    )
+                    span = max(
+                        0.0,
+                        initial_physical_progress_time - transient_start,
+                    )
                 estimate = estimate_period(
                     t_all,
                     cl_all,
@@ -6034,15 +6244,51 @@ def _run_transient(
                 minimum_corrective_periods * period,
                 (target - retained) * period / max(1e-6, 1.0 - discard),
             )
+            # Every exact same-case continuation is bounded before pimpleFoam
+            # starts. Previously this guard was applied only when the archive
+            # reducer supplied ``corrective_tail_periods``; an ordinary budget
+            # continuation could therefore jump beyond the advertised cap and
+            # become a misleading critical failure only during final audit.
+            continuation_clean_cycle_max_periods = (
+                clean_cycle_continuation_max_periods(
+                    solver_params.urans_fidelity.value,
+                    policy_version=resume.clean_cycle_recovery_policy_version,
+                )
+            )
+            try:
+                archive_remaining_periods = _archive_clean_cycle_remaining_periods(
+                    transient_start,
+                    initial_physical_progress_time,
+                    period,
+                    maximum_periods=continuation_clean_cycle_max_periods,
+                )
+            except ValueError as exc:
+                raise _continuation_permanent(
+                    f"clean-cycle continuation progress is invalid: {exc}"
+                ) from exc
+            if archive_remaining_periods <= 1e-9:
+                raise _continuation_permanent(
+                    "clean-cycle continuation source already reached the "
+                    f"{continuation_clean_cycle_max_periods}-period physical cap"
+                )
+            continuation_clean_cycle_period_s = period
+            chunk_sim = min(
+                chunk_sim,
+                archive_remaining_periods * continuation_clean_cycle_period_s,
+            )
             write_interval: Optional[float] = period / URANS_FRAME_WRITE_PER_CYCLE
             delta_t = min(initial_delta_t, period / 5000.0)
         else:
-            chunk_sim = max(
-                2.0 * initial_period,
-                solver_params.transient_cycles * initial_period - span,
+            # A same-case continuation cannot establish its own cadence by
+            # adding a new CFD segment: that would turn unreadable immutable
+            # evidence into an unbounded physical experiment. Fail before
+            # pimpleFoam. The controller retains this typed permanent outcome;
+            # archive ``rerun_required`` receipts use their separate bounded
+            # fresh-generation route rather than retrying this unsafe resume.
+            raise _continuation_permanent(
+                "same-case continuation cannot recover a finite shedding period "
+                "from its authenticated saved trajectory"
             )
-            write_interval = None
-            delta_t = initial_delta_t
         logger.warning(
             "continuation: resuming transient %s from t=%g (merged history start t=%g) "
             "with wall budget %gs",
@@ -6111,6 +6357,8 @@ def _run_transient(
         solver_params, runner, n_proc, timeout, initial_delta_t, cancel_check=cancel_check,
         rate_origin=rate_origin,
         deadline=tier_deadline,
+        archive_clean_cycle_max_periods=continuation_clean_cycle_max_periods,
+        archive_clean_cycle_period_s=continuation_clean_cycle_period_s,
     )
     if resume is not None:
         # The result grades the WHOLE merged transient window across jobs.
@@ -6220,6 +6468,7 @@ def _run_transient(
             reason=(
                 f"URANS refinement not started: integration {URANS_BUDGET_STOP_MARKER}; "
                 f"the {timeout / 3600.0:.1f}h tier budget is exhausted; "
+                f"{_restartable_budget_continuation_note(first.quality, fidelity=solver_params.urans_fidelity.value)} "
                 f"{first.quality.reason}"
             ),
         )
@@ -6645,7 +6894,12 @@ def _archive_case_evidence(
         "aoaDeg": outcome.spec.aoa_deg,
         "speedMps": outcome.spec.speed,
         "chordM": outcome.spec.chord,
-        "unsteady": outcome.unsteady,
+        # This field is immutable solver-mode provenance, not the observed
+        # flow classification.  A URANS solve that certifies a steady-
+        # equivalent/no-shedding result still must retain ``unsteady=true`` so
+        # archive reduction can distinguish it from a legacy scalar summary.
+        "unsteady": outcome.method_key == "openfoam.urans",
+        "observedUnsteady": outcome.unsteady,
         "uransRecoveryVersion": (
             URANS_RECOVERY_VERSION if outcome.method_key == "openfoam.urans" else None
         ),
@@ -7610,6 +7864,13 @@ def run_case(
                 urans_precalc_mesh=urans_precalc_mesh,
             )
         except JobCancelled:
+            raise
+        except (ContinuationPermanentError, ContinuationTransientError):
+            # A resumed case is one exact continuation source, not an
+            # independent cold-case failure.  Let the job boundary publish
+            # the typed source verdict on JobResult and JobStatus so Node can
+            # terminalize an immutable permanent source (or retry a transient
+            # one) without reclassifying it as generic infrastructure.
             raise
         except (OpenFOAMError, Exception) as exc:  # noqa: BLE001 - report, don't crash the batch
             _record_outcome_failure(outcome, exc)

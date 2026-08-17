@@ -99,16 +99,6 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
     archived_frame = _write(evidence / "frames" / "vorticity" / "f0000.png", b"\x89PNG archived-frame")
     redundant_openfoam = _write(evidence / "openfoam" / "system" / "controlDict", b"redundant-control")
     redundant_time = _write(evidence / "time_directories" / "141" / "U", b"redundant-time")
-    incomplete_quarantine_controls = [
-        _write(evidence / name, f"retained-{name}".encode("utf-8"))
-        for name in (
-            "incomplete_evidence_quarantine.tar.zst",
-            "incomplete_evidence_quarantine.remote.json",
-            "incomplete_evidence_quarantine.manifest.json",
-            "incomplete_evidence_quarantine.receipt.json",
-            "incomplete_evidence_quarantine.database.json",
-        )
-    ]
     archive_members = {
         "VTK/window.vtu": rerender_vtk.read_bytes(),
         "VTK/window.series": rerender_series.read_bytes(),
@@ -155,7 +145,6 @@ def _make_realistic_job(job_root: Path, *, unknown: bool = False) -> dict[str, P
         "archived_frame": archived_frame,
         "redundant_openfoam": redundant_openfoam,
         "redundant_time": redundant_time,
-        "incomplete_quarantine_controls": incomplete_quarantine_controls,
         "mesh_evidence": mesh_evidence,
         "unknown": unknown_path,
     }
@@ -225,8 +214,6 @@ def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
         "archived_frame",
     ):
         assert paths[key].is_file(), key
-    for control in paths["incomplete_quarantine_controls"]:
-        assert control.is_file(), control
 
 
 def test_finished_urans_archives_immutable_transient_markers_before_full_strip(

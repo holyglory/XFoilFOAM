@@ -24,7 +24,10 @@ export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
   const evidenceUploadReconciler = createBrokeredEvidenceUploadReconciler(db, {
     onError: (error) =>
-      app.log.error({ err: error }, "brokered evidence upload reconciliation failed"),
+      app.log.error(
+        { err: error },
+        "brokered evidence upload reconciliation failed",
+      ),
   });
   app.addHook("onReady", async () => evidenceUploadReconciler.start());
   app.addHook("onClose", async () => evidenceUploadReconciler.stop());
@@ -56,7 +59,12 @@ export async function buildServer(): Promise<FastifyInstance> {
         err.code === "FST_REQ_FILE_TOO_LARGE";
       const status = multipartLimit ? 413 : (err.statusCode ?? 500);
       if (status >= 500) app.log.error(err);
-      reply.code(status >= 400 ? status : 500).send({ error: err.message });
+      reply.code(status >= 400 ? status : 500).send({
+        error: err.message,
+        ...(err.code === "SWEEPER_MAINTENANCE_DRAIN_ACTIVE"
+          ? { code: err.code }
+          : {}),
+      });
     },
   );
   return app;

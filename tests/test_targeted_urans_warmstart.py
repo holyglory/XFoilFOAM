@@ -1177,6 +1177,24 @@ def test_timed_out_transient_with_coefficient_window_is_graded_partial(tmp_path,
     assert "graded partial window" in result.quality.reason
     assert "of 3s" in result.quality.reason
     assert "coefficient.dat" not in result.quality.reason
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER in result.quality.reason
+
+
+def test_transient_coeff_selection_never_falls_back_to_steady_warmup(tmp_path):
+    """MUST-CATCH: a new URANS handoff cannot publish RANS warm-up evidence."""
+    tcase = tmp_path / "transient"
+    warmup = tcase / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    warmup.parent.mkdir(parents=True)
+    _write_shedding_coeff(warmup)
+
+    assert pipeline._transient_coeff_selection(tcase, since=0.1) == []
+
+    transient = (
+        tcase / "postProcessing" / "forceCoeffs1" / "0.1" / "coefficient.dat"
+    )
+    transient.parent.mkdir(parents=True)
+    _write_shedding_coeff(transient)
+    assert pipeline._transient_coeff_selection(tcase, since=0.1) == [transient]
 
 
 def test_timed_out_transient_without_data_raises_truthful_timeout_message(tmp_path, monkeypatch):

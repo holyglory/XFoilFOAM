@@ -570,6 +570,9 @@ widen its identifiers from an open-work query.
   incompatible source records a stable
   `continuation_permanent_failure` incident and stops unchanged continuation;
   it cannot silently become a fresh physical run or an infinite retry loop.
+  That outcome is critical for the exact immutable source and physical cell,
+  but it is not evidence of a fleet-wide execution hazard and therefore never
+  closes unrelated local or remote admission.
 - Non-stationary preliminary evidence extends the same case by a meaningful
   measured-period window so both half-window and final gates can settle. The
   deadline remains bounded, but a fixed small chunk count or blanket percentage
@@ -697,11 +700,13 @@ Regression coverage must prove:
   without stopping reconciliation or coercing the engine to legacy version 0;
 - a pending final-verification point is admitted after no more than eight new
   wave-1 RANS admissions, and the fairness proof survives a sweeper restart;
-- a current-generation critical or exhausted preliminary/final ledger
+- a current-generation systemic critical or exhausted preliminary/final ledger
   atomically latches NEW admission closed while reconciliation, ingestion, and
-  retention continue; an operator resume restores saved capacity but re-trips
-  before submission when the hazard remains, while an otherwise identical
-  legacy-generation hazard does not trip the latch;
+  retention continue; exact cell-scoped clean-cycle exhaustion and permanent
+  continuation-source incidents stay critical without fencing unrelated work;
+  an operator resume restores saved capacity but re-trips before submission
+  when a systemic hazard remains, while an otherwise identical legacy-generation
+  hazard does not trip the latch;
 - the same hazard is caught at the actual local and remote engine-submit
   boundary even when it commits after the tick-level check; a concurrent
   capacity edit cannot clear the row-locked latch, and only explicit Resume

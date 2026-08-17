@@ -197,68 +197,83 @@ export async function registerCampaignRoutes(
     },
   );
 
-  app.get("/api/admin/campaigns", { preHandler: requireAdmin }, async (req) => {
-    const q = z
-      .object({
-        status: z
-          .string()
-          .optional()
-          .transform((v) =>
-            v
-              ?.split(",")
-              .map((x) => x.trim())
-              .filter(Boolean),
-          ),
-        limit: z.coerce.number().int().min(1).max(100).default(25),
-        offset: z.coerce.number().int().min(0).default(0),
-      })
-      .parse(req.query);
-    // Cheap solver-state block (pinned contract): sweeper_state row + active
-    // sim_jobs count + the SAME cached engine-health probe the queue endpoint
-    // uses — no new probe paths.
-    const jobsRowsPromise = db.execute(sql`
+  app.get(
+    "/api/admin/campaigns",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const q = z
+        .object({
+          status: z
+            .string()
+            .optional()
+            .transform((v) =>
+              v
+                ?.split(",")
+                .map((x) => x.trim())
+                .filter(Boolean),
+            ),
+          limit: z.coerce.number().int().min(1).max(100).default(25),
+          offset: z.coerce.number().int().min(0).default(0),
+        })
+        .parse(req.query);
+      // Scheduler state is an operational latch, never a cacheable campaign
+      // summary. Retaining an old `admissionFenceActive=true` response after the
+      // sweeper clears the latch leaves the admin UI showing a false safety stop.
+      reply.header("cache-control", "private, no-store");
+      // Cheap solver-state block (pinned contract): sweeper_state row + active
+      // sim_jobs count + the SAME cached engine-health probe the queue endpoint
+      // uses — no new probe paths.
+      const jobsRowsPromise = db.execute(sql`
       SELECT count(*)::int AS n FROM sim_jobs WHERE status IN ('submitted', 'running', 'ingesting')
     `) as unknown as Promise<Array<{ n: number }>>;
-    const [listing, sweeper, engineHealth, jobsRows] = await Promise.all([
-      listCampaigns(db, {
-        statuses: q.status,
-        limit: q.limit,
-        offset: q.offset,
-      }),
-      readSweeperState(),
-      getCachedEngineHealth(makeEngineClient()),
-      jobsRowsPromise,
-    ]);
-    const { health, error: engineError } = engineHealth;
-    const [jobsRow] = jobsRows;
-    return {
-      ...listing,
-      solverState: {
-        heartbeatAt: isoOrNull(sweeper?.heartbeatAt),
-        enabled: Boolean(sweeper?.enabled),
-        engineUnreachableSince: isoOrNull(sweeper?.engineUnreachableSince),
-        engineHealthy: Boolean(health) && !engineError,
-        activeJobCount: Number(jobsRow?.n ?? 0),
-        // Tick-progress pair (liveness/progress split, migration 0033) —
-        // lets every solverState consumer derive the amber tick_stalled
-        // state instead of a false red while a tick crawls on a slow engine.
-        lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
-        lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
-        diskAdmissionBlocked: Boolean(sweeper?.diskAdmissionBlocked),
-        diskAdmissionReason: sweeper?.diskAdmissionReason ?? null,
-        diskUsedPct: sweeper?.diskUsedPct ?? null,
-        diskFreeBytes: sweeper?.diskFreeBytes ?? null,
-        diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
-        diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
-        admissionFenceActive: Boolean(sweeper?.admissionFenceActive),
-        lastAdmissionFenceAt: isoOrNull(sweeper?.lastAdmissionFenceAt),
-        lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
-        lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
-          sweeper?.lastAdmissionFenceDetails,
-        ),
-      },
-    };
-  });
+      const [listing, sweeper, engineHealth, jobsRows] = await Promise.all([
+        listCampaigns(db, {
+          statuses: q.status,
+          limit: q.limit,
+          offset: q.offset,
+        }),
+        readSweeperState(),
+        getCachedEngineHealth(makeEngineClient()),
+        jobsRowsPromise,
+      ]);
+      const { health, error: engineError } = engineHealth;
+      const [jobsRow] = jobsRows;
+      return {
+        ...listing,
+        solverState: {
+          heartbeatAt: isoOrNull(sweeper?.heartbeatAt),
+          enabled: Boolean(sweeper?.enabled),
+          engineUnreachableSince: isoOrNull(sweeper?.engineUnreachableSince),
+          engineHealthy: Boolean(health) && !engineError,
+          activeJobCount: Number(jobsRow?.n ?? 0),
+          // Tick-progress pair (liveness/progress split, migration 0033) —
+          // lets every solverState consumer derive the amber tick_stalled
+          // state instead of a false red while a tick crawls on a slow engine.
+          lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
+          lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
+          diskAdmissionBlocked: Boolean(sweeper?.diskAdmissionBlocked),
+          diskAdmissionReason: sweeper?.diskAdmissionReason ?? null,
+          diskUsedPct: sweeper?.diskUsedPct ?? null,
+          diskFreeBytes: sweeper?.diskFreeBytes ?? null,
+          diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
+          diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
+          admissionFenceActive: Boolean(sweeper?.admissionFenceActive),
+          lastAdmissionFenceAt: isoOrNull(sweeper?.lastAdmissionFenceAt),
+          lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
+          lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
+            sweeper?.lastAdmissionFenceDetails,
+          ),
+          // Maintenance ownership is a live, system-owned scheduler state.
+          // Carry its safe boolean/timestamp through the polling DTO without
+          // exposing the drain bearer token.
+          maintenanceDrainActive: sweeper?.maintenanceDrainToken != null,
+          maintenanceDrainStartedAt: isoOrNull(
+            sweeper?.maintenanceDrainStartedAt,
+          ),
+        },
+      };
+    },
+  );
 
   // ---- wizard reuse preview (§5.4; read-only, POST body) ----
   app.post(
@@ -288,6 +303,10 @@ export async function registerCampaignRoutes(
     { preHandler: requireAdmin },
     async (req, reply) => {
       const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+      // See the list endpoint: the same live scheduler latch is embedded in
+      // this response and must not survive a successful fence clear in any
+      // browser or intermediary cache.
+      reply.header("cache-control", "private, no-store");
       try {
         const summary = await campaignSummary(db, id);
         const engine = makeEngineClient();
@@ -340,6 +359,13 @@ export async function registerCampaignRoutes(
             lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
             lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
               sweeper?.lastAdmissionFenceDetails,
+            ),
+            // A maintenance drain is distinct from the historical admission
+            // fence reason: the UI must be able to show the current
+            // system-owned drain without receiving its bearer token.
+            maintenanceDrainActive: sweeper?.maintenanceDrainToken != null,
+            maintenanceDrainStartedAt: isoOrNull(
+              sweeper?.maintenanceDrainStartedAt,
             ),
           },
           rate,

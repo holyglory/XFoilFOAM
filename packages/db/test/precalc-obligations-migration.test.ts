@@ -778,9 +778,11 @@ describe("0084/0089 PRECALC engine-remediation grants", () => {
   it("MUST-CATCH: permits one immutable grant per distinct fixed source without resetting prior evidence", async () => {
     await client!.unsafe(`
       INSERT INTO sim_precalc_obligations
-        (id, airfoil_id, revision_id, aoa_deg, state, attempt_count, max_attempts)
+        (id, airfoil_id, revision_id, aoa_deg, state, attempt_count, max_attempts,
+         latest_sim_job_id)
       VALUES
-        ('${obligationId}', '${ID.airfoil}', '${ID.revision}', 84, 'blocked', 2, 2)
+        ('${obligationId}', '${ID.airfoil}', '${ID.revision}', 84, 'blocked', 2, 2,
+         '20000000-0000-0000-0000-000000000100')
     `);
     try {
       await expect(
@@ -820,6 +822,7 @@ describe("0084/0089 PRECALC engine-remediation grants", () => {
           attempt_count: number;
           max_attempts: number;
           remediation_attempts_granted: number;
+          latest_sim_job_id: string | null;
           remediation_reason: string;
           remediation_source_revision: string;
           remediation_granted_at: string;
@@ -827,7 +830,7 @@ describe("0084/0089 PRECALC engine-remediation grants", () => {
       >(`
         SELECT attempt_count, max_attempts, remediation_attempts_granted,
                remediation_reason, remediation_source_revision,
-               remediation_granted_at
+               remediation_granted_at, latest_sim_job_id
         FROM sim_precalc_obligations
         WHERE id = '${obligationId}'
       `);
@@ -835,6 +838,7 @@ describe("0084/0089 PRECALC engine-remediation grants", () => {
         attempt_count: 3,
         max_attempts: 4,
         remediation_attempts_granted: 2,
+        latest_sim_job_id: null,
         remediation_source_revision: "15872f4cb7fd204917a38606f87e78ee4de04f3f",
       });
       expect(row?.remediation_reason).toContain("restart-seam");

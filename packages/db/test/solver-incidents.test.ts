@@ -1,11 +1,15 @@
 import {
   REPEATED_SOLVER_INCIDENT_THRESHOLD,
+  LEGACY_URANS_RECOVERY_REMEDIATION_VERSION,
+  PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION,
   RANS_RECOVERY_REMEDIATION_VERSION,
   URANS_RECOVERY_REMEDIATION_VERSION,
   airfoils,
   createClient,
+  isUransCleanCycleCapExhaustion,
   recordSolverIncident,
   refreshPolarCacheForRevision,
+  resolveLegacyUransEvidenceIncidentForRecoveryInTransaction,
   resolveOlderRansMeshIncidentsInTransaction,
   resolveSolverIncidentsForOwner,
   resultAttempts,
@@ -15,6 +19,7 @@ import {
   simCampaignPlanRevisions,
   simCampaignPoints,
   simCampaigns,
+  simPrecalcObligations,
   simSolverIncidents,
   simUransRequestCampaigns,
   simUransRequests,
@@ -37,6 +42,7 @@ const PREFIX = `solver-incidents-${process.pid}-${Date.now().toString(36)}`;
 const requestIds: string[] = [];
 const resultIds: string[] = [];
 const scopedCampaignIds: string[] = [];
+const precalcObligationIds: string[] = [];
 let campaignId = "";
 let airfoilId = "";
 let fixture: MinimalSolverFixture;
@@ -98,6 +104,11 @@ afterAll(async () => {
       .delete(simUransRequests)
       .where(inArray(simUransRequests.id, requestIds));
   }
+  if (precalcObligationIds.length) {
+    await db
+      .delete(simPrecalcObligations)
+      .where(inArray(simPrecalcObligations.id, precalcObligationIds));
+  }
   if (campaignId) {
     await db.delete(simCampaigns).where(eq(simCampaigns.id, campaignId));
   }
@@ -111,6 +122,159 @@ afterAll(async () => {
 });
 
 describe("durable solver incident recurrence", () => {
+  it("classifies only exhausted hard-solver clean-cycle quality outcomes as cell-scoped", () => {
+    expect(
+      isUransCleanCycleCapExhaustion({
+        stage: "preliminary",
+        lastOutcome: "failed_exhausted",
+        failureDisposition: "hard_solver",
+        classificationReasons: [
+          "insufficient-periods",
+          "non-stationary",
+          "uncertified-urans-cycles",
+          "solver-error",
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      isUransCleanCycleCapExhaustion({
+        stage: "preliminary",
+        lastOutcome: "failed_exhausted",
+        failureDisposition: "hard_solver",
+        classificationReasons: ["not-solved", "solver-error"],
+      }),
+    ).toBe(false);
+    // v11 persisted a completed but non-publishable clean-cycle run with
+    // `none`: it is still an exact physical-cell quality ceiling, never a
+    // systemic solver incident.
+    expect(
+      isUransCleanCycleCapExhaustion({
+        stage: "preliminary",
+        lastOutcome: "rejected_exhausted",
+        failureDisposition: "none",
+        classificationReasons: [
+          "insufficient-periods",
+          "non-stationary",
+          "uncertified-urans-cycles",
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      isUransCleanCycleCapExhaustion({
+        stage: "rans",
+        lastOutcome: "failed_exhausted",
+        failureDisposition: "hard_solver",
+        classificationReasons: [
+          "insufficient-periods",
+          "non-stationary",
+          "uncertified-urans-cycles",
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("MUST-CATCH: a durable legacy rerun owner resolves only its exact obsolete missing-video incident", async () => {
+    const aoaBase = 85 + (process.pid % 1000) / 100_000;
+    const [exactOwner, unrelatedOwner] = await db
+      .insert(simPrecalcObligations)
+      .values([
+        {
+          airfoilId,
+          revisionId: fixture.revisionId,
+          aoaDeg: aoaBase,
+          state: "pending",
+          backgroundOwner: true,
+          lastOutcome: "archive_clean_cycle_fresh_rerun_pending",
+        },
+        {
+          airfoilId,
+          revisionId: fixture.revisionId,
+          aoaDeg: aoaBase + 0.25,
+          state: "pending",
+          backgroundOwner: true,
+          lastOutcome: "archive_clean_cycle_fresh_rerun_pending",
+        },
+      ])
+      .returning({ id: simPrecalcObligations.id });
+    precalcObligationIds.push(exactOwner!.id, unrelatedOwner!.id);
+
+    const exactMissingVideo = await recordSolverIncident(db, {
+      stage: "preliminary",
+      reason: "missing-urans-video",
+      severity: "critical",
+      owner: { precalcObligationId: exactOwner!.id },
+      solverImplementationId: fixture.solverImplementationId,
+      occurrenceKey: `${PREFIX}:legacy-video:exact`,
+      remediationVersion: PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION,
+    });
+    const exactPhysicalFailure = await recordSolverIncident(db, {
+      stage: "preliminary",
+      reason: "solver-execution-failed",
+      severity: "critical",
+      owner: { precalcObligationId: exactOwner!.id },
+      solverImplementationId: fixture.solverImplementationId,
+      occurrenceKey: `${PREFIX}:legacy-video:physical-failure`,
+      remediationVersion: PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION,
+    });
+    const unrelatedMissingVideo = await recordSolverIncident(db, {
+      stage: "preliminary",
+      reason: "missing-urans-video",
+      severity: "critical",
+      owner: { precalcObligationId: unrelatedOwner!.id },
+      solverImplementationId: fixture.solverImplementationId,
+      occurrenceKey: `${PREFIX}:legacy-video:unrelated`,
+      remediationVersion: PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION,
+    });
+    const exactCurrentFailure = await recordSolverIncident(db, {
+      stage: "preliminary",
+      reason: "missing-urans-video",
+      severity: "critical",
+      owner: { precalcObligationId: exactOwner!.id },
+      solverImplementationId: fixture.solverImplementationId,
+      occurrenceKey: `${PREFIX}:legacy-video:current-failure`,
+      remediationVersion: URANS_RECOVERY_REMEDIATION_VERSION,
+    });
+
+    expect(
+      await resolveLegacyUransEvidenceIncidentForRecoveryInTransaction(db, {
+        precalcObligationId: exactOwner!.id,
+      }),
+    ).toBe(1);
+
+    const incidents = await db
+      .select({
+        id: simSolverIncidents.id,
+        status: simSolverIncidents.status,
+        resolvedAt: simSolverIncidents.resolvedAt,
+      })
+      .from(simSolverIncidents)
+      .where(
+        inArray(simSolverIncidents.id, [
+          exactMissingVideo.id,
+          exactPhysicalFailure.id,
+          unrelatedMissingVideo.id,
+          exactCurrentFailure.id,
+        ]),
+      );
+    const byId = new Map(incidents.map((incident) => [incident.id, incident]));
+    expect(byId.get(exactMissingVideo.id)).toMatchObject({
+      status: "resolved",
+      resolvedAt: expect.any(Date),
+    });
+    expect(byId.get(exactPhysicalFailure.id)).toMatchObject({
+      status: "open",
+      resolvedAt: null,
+    });
+    expect(byId.get(unrelatedMissingVideo.id)).toMatchObject({
+      status: "open",
+      resolvedAt: null,
+    });
+    expect(byId.get(exactCurrentFailure.id)).toMatchObject({
+      status: "open",
+      resolvedAt: null,
+    });
+  });
+
   it("MUST-CATCH: exposes immutable events newest-first with machine ownership and debug evidence", async () => {
     const events = await solverIncidentEventLog(db, { limit: 500 });
     const ours = events.filter((event) =>
@@ -689,5 +853,46 @@ describe("durable solver incident recurrence", () => {
       .from(simSolverIncidents)
       .where(eq(simSolverIncidents.occurrenceKey, `${PREFIX}:mesh:v2`));
     expect(incidents[0]).toMatchObject({ status: "open" });
+  });
+
+  it("keeps legacy v9, prior v11, and the current v12 URANS recovery incidents in separate recurrence groups", async () => {
+    const versions = [
+      LEGACY_URANS_RECOVERY_REMEDIATION_VERSION,
+      PREVIOUS_URANS_RECOVERY_REMEDIATION_VERSION,
+      URANS_RECOVERY_REMEDIATION_VERSION,
+    ];
+    expect(URANS_RECOVERY_REMEDIATION_VERSION).toContain("v12");
+    expect(versions).toHaveLength(new Set(versions).size);
+
+    for (const [index, remediationVersion] of versions.entries()) {
+      await recordSolverIncident(db, {
+        stage: "preliminary",
+        reason: "clean-cycle-version-isolation",
+        severity: "critical",
+        owner: { uransRequestId: requestIds[index]! },
+        solverImplementationId: fixture.solverImplementationId,
+        occurrenceKey: `${PREFIX}:clean-cycle-version:${index}`,
+        remediationVersion,
+      });
+    }
+
+    const summary = await solverIncidentSummary(db, { campaignId });
+    const groups = summary.groups
+      .filter((group) => group.reason === "clean-cycle-version-isolation")
+      .map((group) => ({
+        remediationVersion: group.remediationVersion,
+        occurrenceCount: group.occurrenceCount,
+      }))
+      .sort((left, right) =>
+        left.remediationVersion.localeCompare(right.remediationVersion),
+      );
+    expect(groups).toEqual(
+      [...versions]
+        .sort((left, right) => left.localeCompare(right))
+        .map((remediationVersion) => ({
+          remediationVersion,
+          occurrenceCount: 1,
+        })),
+    );
   });
 });

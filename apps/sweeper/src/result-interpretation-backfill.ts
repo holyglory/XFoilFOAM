@@ -17,7 +17,10 @@
  */
 import {
   type DB,
+  hasExactLivePrecalcPublicationWinner,
   refreshCampaignProgressForResultIds,
+  satisfyPrecalcObligationFromAcceptedResult,
+  historicalArchiveAuditDecisions,
   type SolverEvidenceBlob,
   refreshPolarCacheForRevision,
   resultAttempts,
@@ -27,7 +30,9 @@ import {
   resultInterpretationRecoveryActions,
   resultInterpretations,
   results,
+  simJobs,
   solverEvidenceArchives,
+  solverEvidenceArtifacts,
   solverEvidenceBlobs,
 } from "@aerodb/db";
 import {
@@ -41,16 +46,34 @@ import {
   type PointFidelity,
   type RemoteEvidencePointerPayload,
 } from "@aerodb/engine-client";
-import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 
 import {
   ArchivePublicationClaimLostError,
+  HistoricalArchiveAuditClaimLostError,
+  HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+  historicalReleasedArchiveAuditScopeMatchesExactSource,
   type ArchivePublicationClaimFence,
+  type ArchiveInterpretationStageAuthority,
+  type HistoricalArchiveAuditDecisionDraft,
   ensureResultInterpretationReducerVersion,
   selectAcceptedArchiveInterpretation,
   stageArchiveResultInterpretation,
+  validateHistoricalReleasedArchiveAuditExactSource,
+  validateHistoricalReleasedArchiveAuditScope,
 } from "./result-interpretations";
+import { isEngineConnectionFailure } from "./engine-backoff";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const GCS_GENERATION = /^[1-9][0-9]{0,19}$/;
@@ -66,6 +89,13 @@ export const ARCHIVE_INTERPRETATION_LEASE_RENEW_MS = Math.max(
 );
 export const ARCHIVE_INTERPRETATION_MAX_ATTEMPTS = 3;
 export const DEFAULT_ARCHIVE_INTERPRETATION_BACKFILL_LIMIT = 1_000;
+/**
+ * A backfill child may be leased only by an actively running parent.  This is
+ * deliberately narrower than summary refresh (which may observe a completed
+ * parent): a cancellation or source-owner failure must stop new archive I/O
+ * before the child changes from pending to hydrating.
+ */
+export const ARCHIVE_INTERPRETATION_CLAIMABLE_RUN_STATES = ["running"];
 
 export type ArchiveInterpretationBackfillScope = {
   resultIds?: string[];
@@ -107,6 +137,17 @@ export type ArchiveInterpretationBackfillRun = {
   state: "running" | "completed";
 };
 
+/**
+ * One released result generation may be inspected only by this explicit,
+ * exact-source route.  It deliberately is not a queue candidate: the result
+ * has no live canonical pointer and the audit can never restore one.
+ */
+export type HistoricalReleasedArchiveAuditRun = {
+  runId: string;
+  reducerVersionId: string;
+  enqueued: number;
+};
+
 export type ArchiveInterpretationBackfillReport = {
   runId: string;
   state: "running" | "completed" | "failed" | "cancelled";
@@ -119,16 +160,31 @@ export type ArchiveInterpretationBackfillReport = {
 };
 
 /**
+ * A summary is observational, never an authority to resurrect a terminal
+ * operator decision. Keep this small policy explicit so cancellation remains
+ * testable independently of aggregate database counts.
+ */
+export function archiveInterpretationBackfillSummaryState(input: {
+  terminalState?: "failed" | "cancelled";
+  auditIncomplete: boolean;
+  openItems: number;
+}): ArchiveInterpretationBackfillReport["state"] {
+  if (input.terminalState) return input.terminalState;
+  if (input.auditIncomplete) return "failed";
+  return input.openItems === 0 ? "completed" : "running";
+}
+
+/**
  * A deliberately non-executing, durable handoff for work discovered while
  * reducing historical evidence.  The archive worker must never submit CFD
  * itself: it has no authority to turn an older attempt into a new physical
  * generation.  Instead it leaves this exact, machine-readable instruction on
  * the immutable-scope work receipt for the URANS-ladder recovery consumer.
  *
- * `rerun_required` does not mean "start a fresh solve now".  The consumer
- * must first prove whether the exact archive/case can restart; it may create a
- * fresh generation only when that proof is absent.  This keeps a recoverable
- * case on the same-case path and makes the fresh-rerun exception auditable.
+ * `rerun_required` means the retained generation lacks immutable publication
+ * provenance. The consumer may inspect restart proof for diagnosis, but must
+ * allocate one ordinary fresh generation rather than continuing that source.
+ * `continuation_required` remains the only same-case continuation instruction.
  */
 export type ArchiveBackfillRecoveryHandoff = {
   contract: "archive-clean-cycle-recovery-handoff-v1";
@@ -144,6 +200,9 @@ export type ArchiveBackfillRecoveryHandoff = {
    * NULL means the archive had no recoverable cadence and must first prove a
    * restart or fall back to the separately-budgeted fresh path. */
   correctiveTailPeriods: number | null;
+  /** Explicit v2 policy emitted by the authenticated reducer. NULL preserves
+   * the original legacy FAST=9 / FINAL=12 authority. */
+  cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
 };
 
 type ArchiveBlobIdentity = Pick<
@@ -172,6 +231,16 @@ type BackfillItemState =
   | "rerun_required"
   | "terminal_failure"
   | "failed";
+
+export type ArchiveInterpretationRunMode =
+  | "queue_publication"
+  | "historical_released_audit";
+
+type HistoricalArchiveAuditDecisionInput =
+  HistoricalArchiveAuditDecisionDraft & {
+    reducerVersionId: string;
+    resultInterpretationId: string | null;
+  };
 
 type ClaimedBackfillItem = {
   id: string;
@@ -221,6 +290,76 @@ export function normaliseArchiveInterpretationBackfillScope(
     resultAttemptIds: normaliseIds(scope.resultAttemptIds, "resultAttemptIds"),
     limit,
   };
+}
+
+/**
+ * The production queue and a released-evidence audit share bounded GCS
+ * reduction mechanics, but not authority.  Persisted scope is the source of
+ * truth: a caller cannot opt a normal publication run into audit behaviour by
+ * passing a flag at resume time.
+ */
+export function archiveInterpretationBackfillRunMode(
+  scope: unknown,
+): ArchiveInterpretationRunMode {
+  if (!isRecord(scope)) return "queue_publication";
+  if (scope.contract !== HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT) {
+    return "queue_publication";
+  }
+  validateHistoricalReleasedArchiveAuditScope(scope);
+  return "historical_released_audit";
+}
+
+/**
+ * A historical released-evidence receipt is not a resumable background queue
+ * item.  The caller must repeat the exact three immutable identities that
+ * created it before it may spend another GCS/engine read.  Persisted scope is
+ * still authoritative; this execution authority merely proves the caller is
+ * the explicit audit path rather than a generic scheduler retry.
+ */
+export function requireHistoricalReleasedArchiveAuditExecutionAuthority(input: {
+  scope: unknown;
+  exactSource: ExactArchiveInterpretationSource | undefined;
+}): ExactArchiveInterpretationSource {
+  const persistedExactSource = validateHistoricalReleasedArchiveAuditScope(
+    input.scope,
+  );
+  if (!input.exactSource) {
+    throw new Error(
+      "historical released-evidence audit execution requires the exact resultId, resultAttemptId, and sourceArchiveId authority",
+    );
+  }
+  const executionExactSource =
+    validateHistoricalReleasedArchiveAuditExactSource(input.exactSource);
+  if (
+    persistedExactSource.resultId !== executionExactSource.resultId ||
+    persistedExactSource.resultAttemptId !==
+      executionExactSource.resultAttemptId ||
+    persistedExactSource.sourceArchiveId !==
+      executionExactSource.sourceArchiveId
+  ) {
+    throw new Error(
+      "historical released-evidence audit execution authority does not match the persisted audit source",
+    );
+  }
+  return persistedExactSource;
+}
+
+/**
+ * Publication work may retry a transient reducer/store failure.  An explicit
+ * released-history audit is deliberately different: retrying it later without
+ * a fresh three-ID invocation would turn an operator audit into background
+ * discovery, so its reducer failure is terminal on that receipt.
+ */
+export function archiveInterpretationMayRetry(input: {
+  mode: ArchiveInterpretationRunMode;
+  transient: boolean;
+  attemptCount: number;
+}): boolean {
+  return (
+    input.mode === "queue_publication" &&
+    input.transient &&
+    input.attemptCount < ARCHIVE_INTERPRETATION_MAX_ATTEMPTS
+  );
 }
 
 /** Only explicit URANS provenance is eligible.  A legacy/unknown attempt is
@@ -285,7 +424,8 @@ export function archivePointerForBackfill(blob: ArchiveBlobIdentity | null): {
     !bucket ||
     !objectKey ||
     objectKey.startsWith("/") ||
-    objectKey.includes("\\")
+    objectKey.includes("\\") ||
+    /(^|\/)\.{1,2}(\/|$)/.test(objectKey)
   ) {
     return {
       pointer: null,
@@ -351,6 +491,7 @@ export async function discoverArchiveInterpretationBackfill(
     .select({
       resultId: results.id,
       resultAttemptId: resultAttempts.id,
+      currentResultAttemptId: results.currentResultAttemptId,
       evidencePayload: resultAttempts.evidencePayload,
       regime: resultAttempts.regime,
       unsteady: resultAttempts.unsteady,
@@ -376,6 +517,11 @@ export async function discoverArchiveInterpretationBackfill(
     .where(
       and(
         sql`${resultAttempts.resultId} IS NOT NULL`,
+        // This is the normal publication/recovery discovery path. A released
+        // result's archive is historical evidence, even if its attempt and
+        // GCS bundle are otherwise complete; only the explicit audit route
+        // may read it.
+        isNotNull(results.currentResultAttemptId),
         eq(resultAttempts.status, "done"),
         eq(resultAttempts.source, "solved"),
         sql`${resultAttempts.evidencePayload} ->> 'fidelity' IN ('urans_precalc', 'urans_full')`,
@@ -435,6 +581,11 @@ export async function discoverArchiveInterpretationBackfill(
         and(
           eq(resultInterpretations.reducerVersionId, opts.reducerVersionId),
           inArray(resultInterpretations.sourceArchiveId, sourceArchiveIds),
+          // A released-history audit deliberately records a distinct source.
+          // It cannot satisfy a later live publication receipt if this cell is
+          // subsequently reopened: only a queue-authorized reduction may
+          // suppress normal backfill discovery for its archive.
+          eq(resultInterpretations.source, "archive_backfill"),
         ),
       );
     for (const row of existing) {
@@ -466,6 +617,7 @@ export async function discoverExactArchiveInterpretationBackfillCandidate(
     .select({
       resultId: results.id,
       resultAttemptId: resultAttempts.id,
+      currentResultAttemptId: results.currentResultAttemptId,
       evidencePayload: resultAttempts.evidencePayload,
       status: resultAttempts.status,
       attemptSource: resultAttempts.source,
@@ -502,6 +654,212 @@ export async function discoverExactArchiveInterpretationBackfillCandidate(
   const fidelity = archiveBackfillFidelity(row?.evidencePayload);
   if (
     !row ||
+    !row.resultId ||
+    !row.resultAttemptId ||
+    !row.sourceArchiveId ||
+    !fidelity ||
+    !(
+      row.regime === "urans" ||
+      (row.regime === "rans" && row.unsteady === false)
+    )
+  ) {
+    return null;
+  }
+  if (
+    row.currentResultAttemptId == null &&
+    !(await hasExactLivePrecalcPublicationWinner(db, {
+      resultId: row.resultId,
+      resultAttemptId: row.resultAttemptId,
+    }))
+  ) {
+    return null;
+  }
+  const pointer = archivePointerForBackfill(row.blob);
+  if (!pointer.pointer) return null;
+  return {
+    resultId: row.resultId,
+    resultAttemptId: row.resultAttemptId,
+    fidelity,
+    sourceArchiveId: row.sourceArchiveId,
+    archivePointer: pointer.pointer,
+    unavailableReason: null,
+  };
+}
+
+/**
+ * Resolve one immutable archive from a *released* result for audit only.  A
+ * normal queue source requires a current result generation; this inverse
+ * proof makes the audit safe even when its raw interpretation is accepted:
+ * there is no live projection it could legitimately replace.
+ */
+export async function discoverHistoricalReleasedArchiveAuditCandidate(
+  db: DB,
+  source: ExactArchiveInterpretationSource,
+): Promise<ArchiveInterpretationBackfillCandidate | null> {
+  for (const [label, value] of Object.entries(source)) {
+    if (!UUID.test(value)) {
+      throw new Error(
+        `historical released-evidence audit ${label} must be a UUID`,
+      );
+    }
+  }
+  const [row] = await db
+    .select({
+      resultId: results.id,
+      resultAttemptId: resultAttempts.id,
+      evidencePayload: resultAttempts.evidencePayload,
+      status: resultAttempts.status,
+      attemptSource: resultAttempts.source,
+      regime: resultAttempts.regime,
+      unsteady: resultAttempts.unsteady,
+      sourceArchiveId: solverEvidenceArchives.id,
+      blob: solverEvidenceBlobs,
+    })
+    .from(resultAttempts)
+    .innerJoin(results, eq(results.id, resultAttempts.resultId))
+    .innerJoin(
+      solverEvidenceArchives,
+      and(
+        eq(solverEvidenceArchives.id, source.sourceArchiveId),
+        eq(solverEvidenceArchives.resultId, source.resultId),
+        eq(solverEvidenceArchives.resultAttemptId, source.resultAttemptId),
+        eq(solverEvidenceArchives.state, "current"),
+      ),
+    )
+    .innerJoin(
+      solverEvidenceArtifacts,
+      and(
+        eq(solverEvidenceArtifacts.id, solverEvidenceArchives.sourceArtifactId),
+        eq(solverEvidenceArtifacts.resultId, results.id),
+        eq(solverEvidenceArtifacts.resultAttemptId, resultAttempts.id),
+      ),
+    )
+    .innerJoin(
+      solverEvidenceBlobs,
+      eq(solverEvidenceBlobs.id, solverEvidenceArchives.blobId),
+    )
+    .where(
+      and(
+        eq(results.id, source.resultId),
+        isNull(results.currentResultAttemptId),
+        isNull(results.currentResultInterpretationId),
+        isNull(results.currentCanonicalSelectionId),
+        eq(results.status, "done"),
+        eq(results.source, "solved"),
+        eq(resultAttempts.id, source.resultAttemptId),
+        eq(resultAttempts.resultId, source.resultId),
+        eq(resultAttempts.status, "done"),
+        eq(resultAttempts.source, "solved"),
+        inArray(solverEvidenceArtifacts.kind, [
+          "engine_bundle",
+          "openfoam_bundle",
+        ]),
+      ),
+    )
+    .limit(1);
+  const fidelity = archiveBackfillFidelity(row?.evidencePayload);
+  if (
+    !row ||
+    !fidelity ||
+    !(
+      row.regime === "urans" ||
+      (row.regime === "rans" && row.unsteady === false)
+    )
+  ) {
+    return null;
+  }
+  const pointer = archivePointerForBackfill(row.blob);
+  if (!pointer.pointer) return null;
+  return {
+    resultId: row.resultId,
+    resultAttemptId: row.resultAttemptId,
+    fidelity,
+    sourceArchiveId: row.sourceArchiveId,
+    archivePointer: pointer.pointer,
+    unavailableReason: null,
+  };
+}
+
+/**
+ * Re-prove one released audit source while the caller already owns the result
+ * row.  Discovery intentionally happens without locks so a CLI can explain a
+ * missing source cheaply; admission/settlement cannot rely on that snapshot.
+ *
+ * Lock order is deliberately caller child (when one exists) -> result ->
+ * attempt/archive/source-artifact/blob.  Do not call this from a normal
+ * publication path: a live archive must use its separate current-generation
+ * fence.
+ */
+async function lockHistoricalReleasedArchiveAuditCandidate(
+  db: DB,
+  source: ExactArchiveInterpretationSource,
+): Promise<ArchiveInterpretationBackfillCandidate | null> {
+  for (const [label, value] of Object.entries(source)) {
+    if (!UUID.test(value)) {
+      throw new Error(
+        `historical released-evidence audit ${label} must be a UUID`,
+      );
+    }
+  }
+  const [row] = await db
+    .select({
+      resultId: results.id,
+      resultAttemptId: resultAttempts.id,
+      evidencePayload: resultAttempts.evidencePayload,
+      regime: resultAttempts.regime,
+      unsteady: resultAttempts.unsteady,
+      sourceArchiveId: solverEvidenceArchives.id,
+      blob: solverEvidenceBlobs,
+    })
+    .from(results)
+    .innerJoin(resultAttempts, eq(resultAttempts.resultId, results.id))
+    .innerJoin(
+      solverEvidenceArchives,
+      and(
+        eq(solverEvidenceArchives.id, source.sourceArchiveId),
+        eq(solverEvidenceArchives.resultId, source.resultId),
+        eq(solverEvidenceArchives.resultAttemptId, source.resultAttemptId),
+        eq(solverEvidenceArchives.state, "current"),
+      ),
+    )
+    .innerJoin(
+      solverEvidenceArtifacts,
+      and(
+        eq(solverEvidenceArtifacts.id, solverEvidenceArchives.sourceArtifactId),
+        eq(solverEvidenceArtifacts.resultId, results.id),
+        eq(solverEvidenceArtifacts.resultAttemptId, resultAttempts.id),
+      ),
+    )
+    .innerJoin(
+      solverEvidenceBlobs,
+      eq(solverEvidenceBlobs.id, solverEvidenceArchives.blobId),
+    )
+    .where(
+      and(
+        eq(results.id, source.resultId),
+        isNull(results.currentResultAttemptId),
+        isNull(results.currentResultInterpretationId),
+        isNull(results.currentCanonicalSelectionId),
+        eq(results.status, "done"),
+        eq(results.source, "solved"),
+        eq(resultAttempts.id, source.resultAttemptId),
+        eq(resultAttempts.resultId, source.resultId),
+        eq(resultAttempts.status, "done"),
+        eq(resultAttempts.source, "solved"),
+        inArray(solverEvidenceArtifacts.kind, [
+          "engine_bundle",
+          "openfoam_bundle",
+        ]),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const fidelity = archiveBackfillFidelity(row?.evidencePayload);
+  if (
+    !row ||
+    !row.resultId ||
+    !row.resultAttemptId ||
+    !row.sourceArchiveId ||
     !fidelity ||
     !(
       row.regime === "urans" ||
@@ -616,6 +974,195 @@ export async function createArchiveInterpretationBackfillRun(opts: {
   };
 }
 
+/**
+ * Create one audit receipt for a historical result that has deliberately been
+ * released from canonical publication.  This is an exact three-ID operation;
+ * broad discovery and automatic scheduling are intentionally impossible.
+ */
+export async function createHistoricalReleasedArchiveAuditRun(opts: {
+  db: DB;
+  exactSource: ExactArchiveInterpretationSource;
+  reducerVersionId?: string;
+  requestedBy?: string;
+}): Promise<HistoricalReleasedArchiveAuditRun> {
+  // Historical audit receipts deliberately do not publish a result, but they
+  // still consume the same archive/worker path as live reductions. There are
+  // no live receipts to preserve, so disable this obsolete forensic workflow
+  // at its sole creation boundary rather than letting it reserve solver work.
+  void opts;
+  throw new Error(
+    "historical released-evidence audits are disabled; discard unpublished generations and use accepted-current archive reduction only",
+  );
+
+  const exactSource = validateHistoricalReleasedArchiveAuditExactSource(
+    opts.exactSource,
+  );
+  const reducerVersionId =
+    opts.reducerVersionId ??
+    (await ensureResultInterpretationReducerVersion(opts.db));
+  return opts.db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    // Serialize exact audit admission on the released result.  This does not
+    // hold a transaction through GCS/engine I/O; it only prevents two CLI
+    // invocations from creating competing durable receipts before either can
+    // claim the one immutable archive.
+    const [lockedResult] = await tx
+      .select({ id: results.id })
+      .from(results)
+      .where(
+        and(
+          eq(results.id, exactSource.resultId),
+          isNull(results.currentResultAttemptId),
+          isNull(results.currentResultInterpretationId),
+          isNull(results.currentCanonicalSelectionId),
+          eq(results.status, "done"),
+          eq(results.source, "solved"),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!lockedResult) {
+      throw new Error(
+        "historical released-evidence audit source is no longer a released completed solved result",
+      );
+    }
+
+    // The initial CLI discovery is intentionally not an admission proof. An
+    // archive can be superseded or its GCS metadata corrected between the
+    // operator's request and this transaction. Re-read the exact source only
+    // after the released result is locked, then lock its
+    // attempt/archive/source-artifact/blob before any durable audit receipt
+    // is created.
+    const candidate = await lockHistoricalReleasedArchiveAuditCandidate(
+      tx,
+      exactSource,
+    );
+    if (!candidate || !candidate.sourceArchiveId) {
+      throw new Error(
+        "historical released-evidence audit requires one exact current GCS archive owned by a released completed URANS-compatible attempt",
+      );
+    }
+    const sourceArchiveId = candidate.sourceArchiveId;
+
+    const [existingDecision] = await tx
+      .select({ auditRunId: historicalArchiveAuditDecisions.auditRunId })
+      .from(historicalArchiveAuditDecisions)
+      .where(
+        and(
+          eq(
+            historicalArchiveAuditDecisions.resultAttemptId,
+            candidate.resultAttemptId,
+          ),
+          eq(historicalArchiveAuditDecisions.sourceArchiveId, sourceArchiveId),
+          eq(
+            historicalArchiveAuditDecisions.reducerVersionId,
+            reducerVersionId,
+          ),
+        ),
+      )
+      .orderBy(asc(historicalArchiveAuditDecisions.createdAt))
+      .limit(1);
+    if (existingDecision) {
+      return {
+        runId: existingDecision.auditRunId,
+        reducerVersionId,
+        enqueued: 0,
+      };
+    }
+
+    const [activeReceipt] = await tx
+      .select({ runId: resultInterpretationBackfillItems.runId })
+      .from(resultInterpretationBackfillItems)
+      .innerJoin(
+        resultInterpretationBackfillRuns,
+        eq(
+          resultInterpretationBackfillRuns.id,
+          resultInterpretationBackfillItems.runId,
+        ),
+      )
+      .where(
+        and(
+          eq(
+            resultInterpretationBackfillItems.resultAttemptId,
+            candidate.resultAttemptId,
+          ),
+          eq(
+            resultInterpretationBackfillItems.sourceArchiveId,
+            sourceArchiveId,
+          ),
+          inArray(resultInterpretationBackfillItems.state, [
+            "pending",
+            "hydrating",
+          ]),
+          // A stale child left by a cancelled/failed audit is not an active
+          // execution receipt.  A later explicit three-ID invocation must be
+          // able to create its own receipt rather than returning a run that
+          // cannot legally drain it.
+          eq(resultInterpretationBackfillRuns.state, "running"),
+          eq(
+            resultInterpretationBackfillRuns.reducerVersionId,
+            reducerVersionId,
+          ),
+          sql`${resultInterpretationBackfillRuns.scope} ->> 'contract' = ${HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT}`,
+          sql`${resultInterpretationBackfillRuns.scope} ->> 'canonicalSelection' = 'forbidden'`,
+          sql`${resultInterpretationBackfillRuns.scope} ->> 'physicalRecovery' = 'record-only'`,
+          sql`${resultInterpretationBackfillRuns.scope} ->> 'campaignMutation' = 'forbidden'`,
+          sql`${resultInterpretationBackfillRuns.scope} ->> 'rawEvidenceImmutable' = 'true'`,
+          sql`${resultInterpretationBackfillRuns.scope} #>> '{exactSource,resultId}' = ${exactSource.resultId}`,
+          sql`${resultInterpretationBackfillRuns.scope} #>> '{exactSource,resultAttemptId}' = ${exactSource.resultAttemptId}`,
+          sql`${resultInterpretationBackfillRuns.scope} #>> '{exactSource,sourceArchiveId}' = ${sourceArchiveId}`,
+        ),
+      )
+      .limit(1);
+    if (activeReceipt) {
+      return { runId: activeReceipt.runId, reducerVersionId, enqueued: 1 };
+    }
+
+    const now = new Date();
+    const [run] = await tx
+      .insert(resultInterpretationBackfillRuns)
+      .values({
+        reducerVersionId,
+        state: "running",
+        scope: {
+          contract: HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+          exactSource,
+          rawEvidenceImmutable: true,
+          canonicalSelection: "forbidden",
+          physicalRecovery: "record-only",
+          campaignMutation: "forbidden",
+        },
+        summary: {
+          discovered: 1,
+          enqueued: 1,
+          canonicalSelectionsCreated: 0,
+          resultProjectionsUpdated: 0,
+          physicalRecoveryActionsCreated: 0,
+          campaignMutations: 0,
+        },
+        requestedBy:
+          opts.requestedBy?.trim() ||
+          "system:historical-released-evidence-audit",
+        startedAt: now,
+      })
+      .returning({ id: resultInterpretationBackfillRuns.id });
+    if (!run) {
+      throw new Error(
+        "historical released-evidence audit run was not persisted",
+      );
+    }
+    await tx.insert(resultInterpretationBackfillItems).values({
+      runId: run.id,
+      resultId: candidate.resultId,
+      resultAttemptId: candidate.resultAttemptId,
+      sourceArchiveId,
+      state: "pending",
+      nextAttemptAt: now,
+    });
+    return { runId: run.id, reducerVersionId, enqueued: 1 };
+  });
+}
+
 async function claimNextArchiveInterpretationItem(
   db: DB,
   runId: string,
@@ -658,6 +1205,31 @@ async function claimNextArchiveInterpretationItem(
       // skip it and claim another independent immutable archive instead.
       .for("update", { skipLocked: true });
     if (!item) return null;
+
+    // Preserve the audit lifecycle lock order (child -> parent run).  The
+    // runner activation CAS prevents a terminal parent from being revived,
+    // but a cancellation/source-owner cascade can still land after activation
+    // and before this child is leased.  Lock and re-prove the parent here so
+    // that transition leaves the child pending rather than starting reducer
+    // I/O under a terminal run.  `withArchiveInterpretationClaimLease` repeats
+    // the audit-specific proof immediately before engine I/O for the narrow
+    // post-commit race with a later cancellation.
+    const [runnableRun] = await tx
+      .select({ id: resultInterpretationBackfillRuns.id })
+      .from(resultInterpretationBackfillRuns)
+      .where(
+        and(
+          eq(resultInterpretationBackfillRuns.id, item.runId),
+          inArray(
+            resultInterpretationBackfillRuns.state,
+            ARCHIVE_INTERPRETATION_CLAIMABLE_RUN_STATES,
+          ),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!runnableRun) return null;
+
     const claimToken = randomUUID();
     const [claimed] = await tx
       .update(resultInterpretationBackfillItems)
@@ -684,10 +1256,25 @@ async function archivePointerForClaim(
   fidelity: "urans_precalc" | "urans_full" | null;
   pointer: RemoteEvidencePointerPayload | null;
   reason: string | null;
+  /** The exact physical source job, not the currently deployed reducer,
+   * authorizes a v2 cross-job continuation.  A missing marker is immutable
+   * legacy v1 provenance. */
+  cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
 }> {
   const [attempt] = await db
-    .select({ evidencePayload: resultAttempts.evidencePayload })
+    .select({
+      evidencePayload: resultAttempts.evidencePayload,
+      cleanCycleRecoveryPolicyVersion: sql<string | null>`
+        CASE
+          WHEN ${simJobs.requestPayload} ->>
+            'cleanCycleRecoveryPolicyVersion' = 'adaptive-clean-tail-v2'
+          THEN 'adaptive-clean-tail-v2'
+          ELSE NULL
+        END
+      `,
+    })
     .from(resultAttempts)
+    .leftJoin(simJobs, eq(simJobs.id, resultAttempts.simJobId))
     .where(
       and(
         eq(resultAttempts.id, item.resultAttemptId),
@@ -696,11 +1283,16 @@ async function archivePointerForClaim(
     )
     .limit(1);
   const fidelity = archiveBackfillFidelity(attempt?.evidencePayload);
+  const cleanCycleRecoveryPolicyVersion =
+    attempt?.cleanCycleRecoveryPolicyVersion === "adaptive-clean-tail-v2"
+      ? "adaptive-clean-tail-v2"
+      : null;
   if (!fidelity) {
     return {
       fidelity: null,
       pointer: null,
       reason: "attempt no longer has explicit URANS fidelity provenance",
+      cleanCycleRecoveryPolicyVersion,
     };
   }
   if (!item.sourceArchiveId) {
@@ -708,6 +1300,7 @@ async function archivePointerForClaim(
       fidelity,
       pointer: null,
       reason: "attempt has no immutable raw evidence archive",
+      cleanCycleRecoveryPolicyVersion,
     };
   }
   const [archive] = await db
@@ -735,10 +1328,16 @@ async function archivePointerForClaim(
       fidelity,
       pointer: null,
       reason: "the planned immutable archive is no longer available",
+      cleanCycleRecoveryPolicyVersion,
     };
   }
   const pointer = archivePointerForBackfill(archive.blob);
-  return { fidelity, pointer: pointer.pointer, reason: pointer.reason };
+  return {
+    fidelity,
+    pointer: pointer.pointer,
+    reason: pointer.reason,
+    cleanCycleRecoveryPolicyVersion,
+  };
 }
 
 function limitedError(value: unknown): string {
@@ -775,6 +1374,82 @@ async function renewArchiveInterpretationClaim(
   return renewed != null;
 }
 
+/**
+ * A historical audit may renew its lease only while its persisted run still
+ * names this one exact immutable source. The generic receipt renewal is safe
+ * for the live publication queue; it is intentionally not sufficient for an
+ * audit because a malformed/broadened JSON scope must not keep GCS reduction
+ * work alive after the initial check.
+ */
+async function renewHistoricalArchiveInterpretationClaim(
+  db: DB,
+  input: {
+    item: ClaimedBackfillItem;
+    exactSource: ExactArchiveInterpretationSource;
+    reducerVersionId: string;
+  },
+): Promise<boolean> {
+  const sourceArchiveId = input.item.sourceArchiveId;
+  if (
+    sourceArchiveId == null ||
+    sourceArchiveId !== input.exactSource.sourceArchiveId
+  ) {
+    return false;
+  }
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [ownedChild] = await tx
+      .select({ runId: resultInterpretationBackfillItems.runId })
+      .from(resultInterpretationBackfillItems)
+      .where(
+        and(
+          eq(resultInterpretationBackfillItems.id, input.item.id),
+          eq(resultInterpretationBackfillItems.runId, input.item.runId),
+          eq(resultInterpretationBackfillItems.resultId, input.item.resultId),
+          eq(
+            resultInterpretationBackfillItems.resultAttemptId,
+            input.item.resultAttemptId,
+          ),
+          eq(
+            resultInterpretationBackfillItems.sourceArchiveId,
+            sourceArchiveId,
+          ),
+          eq(resultInterpretationBackfillItems.state, "hydrating"),
+          eq(
+            resultInterpretationBackfillItems.claimToken,
+            input.item.claimToken,
+          ),
+          sql`${resultInterpretationBackfillItems.claimExpiresAt} > clock_timestamp()`,
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!ownedChild) return false;
+    const [auditRun] = await tx
+      .select({
+        reducerVersionId: resultInterpretationBackfillRuns.reducerVersionId,
+        state: resultInterpretationBackfillRuns.state,
+        scope: resultInterpretationBackfillRuns.scope,
+      })
+      .from(resultInterpretationBackfillRuns)
+      .where(eq(resultInterpretationBackfillRuns.id, ownedChild.runId))
+      .limit(1)
+      .for("update");
+    if (
+      !auditRun ||
+      auditRun.state !== "running" ||
+      auditRun.reducerVersionId !== input.reducerVersionId ||
+      !historicalReleasedArchiveAuditScopeMatchesExactSource({
+        scope: auditRun.scope,
+        exactSource: input.exactSource,
+      })
+    ) {
+      return false;
+    }
+    return renewArchiveInterpretationClaim(tx, input.item);
+  });
+}
+
 class ArchiveInterpretationClaimLostError extends Error {
   constructor() {
     super("archive interpretation claim was lost while reducer I/O was active");
@@ -788,6 +1463,8 @@ async function withArchiveInterpretationClaimLease<T>(
   db: DB,
   item: ClaimedBackfillItem,
   work: () => Promise<T>,
+  renewClaim: () => Promise<boolean> = () =>
+    renewArchiveInterpretationClaim(db, item),
 ): Promise<T> {
   let lost = false;
   let renewing = false;
@@ -795,7 +1472,7 @@ async function withArchiveInterpretationClaimLease<T>(
     if (lost || renewing) return;
     renewing = true;
     try {
-      if (!(await renewArchiveInterpretationClaim(db, item))) lost = true;
+      if (!(await renewClaim())) lost = true;
     } catch {
       lost = true;
     } finally {
@@ -817,35 +1494,93 @@ async function withArchiveInterpretationClaimLease<T>(
   }
 }
 
-async function settleClaim(
-  db: DB,
+type SettleClaimValues = {
+  state: Exclude<BackfillItemState, "hydrating">;
+  lastError?: string | null;
+  resultInterpretationId?: string | null;
+  nextAttemptAt?: Date;
+  /**
+   * A machine-readable handoff is persisted in the separate mutable
+   * scheduler ledger atomically with this receipt. It is deliberately not
+   * encoded in `lastError`: text is diagnostic; the action row is the only
+   * executable source of recovery intent.
+   */
+  recoveryHandoff?: ArchiveBackfillRecoveryHandoff | null;
+  /** Historical released-evidence audits append a decision receipt instead
+   * of creating a scheduler recovery action. */
+  historicalAuditDecision?: HistoricalArchiveAuditDecisionInput | null;
+};
+
+/**
+ * Settle a claimed child inside an existing transaction. Historical audit
+ * staging calls this directly so the staged interpretation, final child
+ * lifecycle, and immutable decision commit as one forensic fact. The public
+ * wrapper below retains the ordinary single-call transaction boundary.
+ */
+async function settleClaimInTransaction(
+  tx: DB,
   item: ClaimedBackfillItem,
-  values: {
-    state: Exclude<BackfillItemState, "hydrating">;
-    lastError?: string | null;
-    resultInterpretationId?: string | null;
-    nextAttemptAt?: Date;
-    /**
-     * A machine-readable handoff is persisted in the separate mutable
-     * scheduler ledger atomically with this receipt.  It is deliberately not
-     * encoded in `lastError`: text is diagnostic; the action row is the only
-     * executable source of recovery intent.
-     */
-    recoveryHandoff?: ArchiveBackfillRecoveryHandoff | null;
-  },
+  values: SettleClaimValues,
 ): Promise<boolean> {
-  return db.transaction(async (rawTx) => {
-    const tx = rawTx as unknown as DB;
-    const [settled] = await tx
-      .update(resultInterpretationBackfillItems)
-      .set({
-        state: values.state,
-        claimToken: null,
-        claimExpiresAt: null,
-        lastError: values.lastError ?? null,
-        resultInterpretationId: values.resultInterpretationId ?? null,
-        nextAttemptAt: values.nextAttemptAt ?? new Date(),
-      })
+  if (values.recoveryHandoff && values.historicalAuditDecision) {
+    throw new Error(
+      "one archive receipt cannot create both a live recovery action and a historical audit decision",
+    );
+  }
+  let state = values.state;
+  let lastError = values.lastError ?? null;
+  let resultInterpretationId = values.resultInterpretationId ?? null;
+  let recoveryHandoff = values.recoveryHandoff ?? null;
+  let historicalAuditDecision = values.historicalAuditDecision ?? null;
+
+  if (recoveryHandoff) {
+    if (
+      recoveryHandoff.resultId !== item.resultId ||
+      recoveryHandoff.resultAttemptId !== item.resultAttemptId ||
+      recoveryHandoff.sourceArchiveId !== item.sourceArchiveId
+    ) {
+      throw new Error(
+        "archive recovery handoff must be pinned to the receipt's exact result, attempt, and source archive",
+      );
+    }
+    // Normal recovery work may continue across a RANS → preliminary-URANS
+    // generation change, but never after the result has been deliberately
+    // released from publication. Lock the result before the child receipt
+    // to match publication stage/selection order and make the handoff
+    // insertion an all-or-nothing live-generation decision.
+    const [liveResult] = await tx
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, item.resultId))
+      .limit(1)
+      .for("update");
+    const exactLivePrecalcOwner =
+      liveResult?.currentResultAttemptId == null &&
+      liveResult != null &&
+      (await hasExactLivePrecalcPublicationWinner(tx, {
+        resultId: item.resultId,
+        resultAttemptId: item.resultAttemptId,
+        lockForPublication: true,
+      }));
+    if (
+      !liveResult ||
+      (!liveResult.currentResultAttemptId && !exactLivePrecalcOwner)
+    ) {
+      state = "terminal_failure";
+      lastError =
+        "archive publication source was released before its recovery handoff could be recorded; no solver work was scheduled from historical evidence";
+      recoveryHandoff = null;
+    }
+  }
+
+  if (historicalAuditDecision) {
+    // Historical audit settlement owns the child first. Its no-publication
+    // proof must cover the exact attempt/archive/blob at the same time as
+    // the decision insert; otherwise a corrected/superseded GCS source
+    // could receive a durable verdict for bytes no longer being audited.
+    const [ownedChild] = await tx
+      .select({ id: resultInterpretationBackfillItems.id })
+      .from(resultInterpretationBackfillItems)
       .where(
         and(
           eq(resultInterpretationBackfillItems.id, item.id),
@@ -854,18 +1589,160 @@ async function settleClaim(
           sql`${resultInterpretationBackfillItems.claimExpiresAt} > clock_timestamp()`,
         ),
       )
-      .returning({ id: resultInterpretationBackfillItems.id });
-    if (!settled) return false;
+      .limit(1)
+      .for("update");
+    if (!ownedChild) return false;
 
-    if (values.recoveryHandoff) {
-      const handoff = values.recoveryHandoff;
-      // The recovery identity is the immutable physical generation plus
-      // source archive and fidelity. A later backfill pass must never reset a
-      // claimed/routed action or create another CFD generation. The one safe
-      // legacy upgrade is a still-pending, target-less action that predates
-      // corrective_tail_periods: it can adopt the authenticated reducer's
-      // bounded instruction before any scheduler ownership exists.
-      await tx.execute(sql`
+    const [releasedResult] = await tx
+      .select({
+        id: results.id,
+        currentResultAttemptId: results.currentResultAttemptId,
+        currentResultInterpretationId: results.currentResultInterpretationId,
+        currentCanonicalSelectionId: results.currentCanonicalSelectionId,
+      })
+      .from(results)
+      .where(eq(results.id, item.resultId))
+      .limit(1)
+      .for("update");
+
+    const lockedSource =
+      releasedResult &&
+      releasedResult.currentResultAttemptId == null &&
+      releasedResult.currentResultInterpretationId == null &&
+      releasedResult.currentCanonicalSelectionId == null &&
+      item.sourceArchiveId
+        ? await lockHistoricalReleasedArchiveAuditCandidate(tx, {
+            resultId: item.resultId,
+            resultAttemptId: item.resultAttemptId,
+            sourceArchiveId: item.sourceArchiveId,
+          })
+        : null;
+    const [auditRun] = lockedSource
+      ? await tx
+          .select({
+            reducerVersionId: resultInterpretationBackfillRuns.reducerVersionId,
+            scope: resultInterpretationBackfillRuns.scope,
+          })
+          .from(resultInterpretationBackfillRuns)
+          .where(eq(resultInterpretationBackfillRuns.id, item.runId))
+          .limit(1)
+          .for("update")
+      : [undefined];
+    const auditAuthorityValid =
+      auditRun != null &&
+      auditRun.reducerVersionId === historicalAuditDecision.reducerVersionId &&
+      historicalReleasedArchiveAuditScopeMatchesExactSource({
+        scope: auditRun.scope,
+        exactSource: {
+          resultId: item.resultId,
+          resultAttemptId: item.resultAttemptId,
+          sourceArchiveId: item.sourceArchiveId!,
+        },
+      });
+    if (!lockedSource || !auditAuthorityValid) {
+      // An authority/source change is not a scientific terminal reducer
+      // outcome. Keep the child in the operational failed state so the
+      // audit-receipt fence can reserve terminal scientific states for a
+      // real immutable decision.
+      state = "failed";
+      lastError =
+        "historical audit incomplete: its exact released GCS source or no-publication authority changed before decision settlement";
+      resultInterpretationId = null;
+      historicalAuditDecision = null;
+    }
+  }
+
+  const historicalAuditDecisionId = historicalAuditDecision
+    ? randomUUID()
+    : null;
+  if (
+    historicalAuditDecision &&
+    historicalAuditDecision.resultInterpretationId !== resultInterpretationId
+  ) {
+    throw new Error(
+      "historical audit decision must reference the exact interpretation staged by its child receipt",
+    );
+  }
+
+  const [settled] = await tx
+    .update(resultInterpretationBackfillItems)
+    .set({
+      state,
+      claimToken: null,
+      claimExpiresAt: null,
+      lastError,
+      resultInterpretationId,
+      historicalAuditDecisionId,
+      historicalAuditReducerState:
+        historicalAuditDecision?.reducerState ?? null,
+      historicalAuditInputEvidenceSignature:
+        historicalAuditDecision?.inputEvidenceSignature ?? null,
+      nextAttemptAt: values.nextAttemptAt ?? new Date(),
+    })
+    .where(
+      and(
+        eq(resultInterpretationBackfillItems.id, item.id),
+        eq(resultInterpretationBackfillItems.state, "hydrating"),
+        eq(resultInterpretationBackfillItems.claimToken, item.claimToken),
+        sql`${resultInterpretationBackfillItems.claimExpiresAt} > clock_timestamp()`,
+      ),
+    )
+    .returning({ id: resultInterpretationBackfillItems.id });
+  if (!settled) return false;
+
+  if (recoveryHandoff) {
+    await upsertArchiveBackfillRecoveryAction(tx, recoveryHandoff);
+  }
+  if (historicalAuditDecision) {
+    const [insertedDecision] = await tx
+      .insert(historicalArchiveAuditDecisions)
+      .values({
+        id: historicalAuditDecisionId!,
+        auditRunId: item.runId,
+        resultId: item.resultId,
+        resultAttemptId: item.resultAttemptId,
+        sourceArchiveId: item.sourceArchiveId!,
+        reducerVersionId: historicalAuditDecision.reducerVersionId,
+        inputEvidenceSignature: historicalAuditDecision.inputEvidenceSignature,
+        reducerState: historicalAuditDecision.reducerState,
+        resultInterpretationId: historicalAuditDecision.resultInterpretationId,
+        advisoryContinuationAction:
+          historicalAuditDecision.advisoryContinuationAction,
+        advisoryTailPeriods: historicalAuditDecision.advisoryTailPeriods,
+        diagnostics: historicalAuditDecision.diagnostics,
+      })
+      .onConflictDoNothing()
+      .returning({ id: historicalArchiveAuditDecisions.id });
+    if (!insertedDecision) {
+      // The reverse child pointer now names a freshly allocated UUID. Never
+      // point it at an unrelated pre-existing decision just to make a replay
+      // look successful: rolling back this transaction preserves the exact
+      // claim for an explicit operator retry instead.
+      throw new Error(
+        "historical audit decision conflicts with an existing immutable receipt",
+      );
+    }
+  }
+  return true;
+}
+
+/**
+ * Persist one exact archive-recovery instruction. Conflict updates are a
+ * narrowly-defined migration enrichment only: an inert action may fill an
+ * absent authenticated tail and/or v2 policy marker, but can never replace a
+ * field once it has been recorded or alter an action owned by the scheduler.
+ */
+export async function upsertArchiveBackfillRecoveryAction(
+  tx: DB,
+  handoff: ArchiveBackfillRecoveryHandoff,
+): Promise<void> {
+  // The recovery identity is the immutable physical generation plus source
+  // archive and fidelity. A later backfill pass must never reset a
+  // claimed/routed action or create another CFD generation. The one safe
+  // legacy upgrade is a still-pending, target-less action that predates
+  // either field: it can adopt the authenticated reducer instruction before
+  // any scheduler ownership exists.
+  await tx.execute(sql`
         INSERT INTO result_interpretation_recovery_actions (
           result_id,
           result_attempt_id,
@@ -874,6 +1751,7 @@ async function settleClaim(
           fidelity,
           requested_action,
           corrective_tail_periods,
+          clean_cycle_recovery_policy_version,
           state,
           decision_reason
         ) VALUES (
@@ -884,23 +1762,141 @@ async function settleClaim(
           ${handoff.fidelity},
           ${handoff.action},
           ${handoff.correctiveTailPeriods},
+          ${handoff.cleanCycleRecoveryPolicyVersion},
           'pending',
           ${`archive reducer ${handoff.reducerState}`}
         )
         ON CONFLICT (result_attempt_id, source_archive_id, fidelity) DO UPDATE
-        SET corrective_tail_periods = EXCLUDED.corrective_tail_periods,
+        SET corrective_tail_periods = CASE
+              WHEN result_interpretation_recovery_actions.corrective_tail_periods IS NULL
+                AND EXCLUDED.corrective_tail_periods IS NOT NULL
+              THEN EXCLUDED.corrective_tail_periods
+              ELSE result_interpretation_recovery_actions.corrective_tail_periods
+            END,
+            clean_cycle_recovery_policy_version = CASE
+              WHEN result_interpretation_recovery_actions.clean_cycle_recovery_policy_version IS NULL
+                AND EXCLUDED.clean_cycle_recovery_policy_version = 'adaptive-clean-tail-v2'
+              THEN EXCLUDED.clean_cycle_recovery_policy_version
+              ELSE result_interpretation_recovery_actions.clean_cycle_recovery_policy_version
+            END,
             decision_reason = EXCLUDED.decision_reason,
             "updatedAt" = now()
         WHERE result_interpretation_recovery_actions.state = 'pending'
-          AND result_interpretation_recovery_actions.corrective_tail_periods IS NULL
           AND result_interpretation_recovery_actions.target_urans_request_id IS NULL
           AND result_interpretation_recovery_actions.target_verify_queue_id IS NULL
           AND result_interpretation_recovery_actions.requested_action = EXCLUDED.requested_action
-          AND EXCLUDED.corrective_tail_periods IS NOT NULL
-      `);
-    }
-    return true;
+          AND (
+            (
+              result_interpretation_recovery_actions.corrective_tail_periods IS NULL
+              AND EXCLUDED.corrective_tail_periods IS NOT NULL
+            )
+            OR (
+              result_interpretation_recovery_actions.clean_cycle_recovery_policy_version IS NULL
+              AND EXCLUDED.clean_cycle_recovery_policy_version = 'adaptive-clean-tail-v2'
+            )
+          )
+  `);
+}
+
+async function settleClaim(
+  db: DB,
+  item: ClaimedBackfillItem,
+  values: SettleClaimValues,
+): Promise<boolean> {
+  return db.transaction(async (rawTx) =>
+    settleClaimInTransaction(rawTx as unknown as DB, item, values),
+  );
+}
+
+/**
+ * An explicit released-history audit has no generic background retry owner.
+ * If its exact released-source authority disappears after reducer I/O, leave
+ * no hydrating receipt behind. This deliberately locks and settles only the
+ * original token holder; a reclaimed successor is never overwritten. Unlike
+ * ordinary settlement, an expired-but-unreclaimed audit lease can still be
+ * closed here because the row lock serializes that decision with a new claim.
+ */
+async function failHistoricalAuditClaimIfStillOwned(
+  db: DB,
+  item: ClaimedBackfillItem,
+  lastError: string,
+): Promise<boolean> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const sourcePredicate = item.sourceArchiveId
+      ? eq(
+          resultInterpretationBackfillItems.sourceArchiveId,
+          item.sourceArchiveId,
+        )
+      : isNull(resultInterpretationBackfillItems.sourceArchiveId);
+    const [ownedChild] = await tx
+      .select({ id: resultInterpretationBackfillItems.id })
+      .from(resultInterpretationBackfillItems)
+      .where(
+        and(
+          eq(resultInterpretationBackfillItems.id, item.id),
+          eq(resultInterpretationBackfillItems.runId, item.runId),
+          eq(resultInterpretationBackfillItems.resultId, item.resultId),
+          eq(
+            resultInterpretationBackfillItems.resultAttemptId,
+            item.resultAttemptId,
+          ),
+          sourcePredicate,
+          eq(resultInterpretationBackfillItems.state, "hydrating"),
+          eq(resultInterpretationBackfillItems.claimToken, item.claimToken),
+          isNull(resultInterpretationBackfillItems.historicalAuditDecisionId),
+          isNull(resultInterpretationBackfillItems.historicalAuditReducerState),
+          isNull(
+            resultInterpretationBackfillItems.historicalAuditInputEvidenceSignature,
+          ),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!ownedChild) return false;
+
+    const [settled] = await tx
+      .update(resultInterpretationBackfillItems)
+      .set({
+        state: "failed",
+        claimToken: null,
+        claimExpiresAt: null,
+        lastError,
+        nextAttemptAt: new Date(),
+      })
+      .where(
+        and(
+          eq(resultInterpretationBackfillItems.id, item.id),
+          eq(resultInterpretationBackfillItems.state, "hydrating"),
+          eq(resultInterpretationBackfillItems.claimToken, item.claimToken),
+          isNull(resultInterpretationBackfillItems.historicalAuditDecisionId),
+        ),
+      )
+      .returning({ id: resultInterpretationBackfillItems.id });
+    return settled != null;
   });
+}
+
+/**
+ * A released-history audit is deliberately a single explicit execution, not a
+ * queue item that a generic drainer can later revive.  Its operational failure
+ * path must therefore be able to close the original claimed receipt even when
+ * the lease elapsed during an engine/GCS read.  A different claimant is still
+ * protected by `failHistoricalAuditClaimIfStillOwned`'s exact-token lock.
+ */
+async function settleHistoricalAuditDecisionOrFail(
+  db: DB,
+  item: ClaimedBackfillItem,
+  values: SettleClaimValues,
+): Promise<boolean> {
+  const settled = await settleClaim(db, item, values);
+  if (settled) return true;
+  await failHistoricalAuditClaimIfStillOwned(
+    db,
+    item,
+    "historical audit authority or lease was lost before immutable decision settlement; no audit decision recorded",
+  );
+  return false;
 }
 
 function reducerSummary(
@@ -932,6 +1928,11 @@ export function archiveBackfillRecoveryHandoff(input: {
   sourceArchiveId: string;
   inputEvidenceSignature: string;
   recommendedAdditionalPeriods?: unknown;
+  recoveryProgress?: ArchiveCleanCycleRecoveryProgress | null;
+  /** Exact source-job provenance. The reducer response alone cannot widen a
+   * historical continuation because reducer code is deliberately replayable
+   * against legacy archives. */
+  sourceCleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
 }): ArchiveBackfillRecoveryHandoff {
   if (!UUID.test(input.resultId) || !UUID.test(input.resultAttemptId)) {
     throw new Error(
@@ -952,6 +1953,13 @@ export function archiveBackfillRecoveryHandoff(input: {
     input.state === "continuation_required"
       ? archiveRecommendedAdditionalPeriods(input.recommendedAdditionalPeriods)
       : null;
+  const cleanCycleRecoveryPolicyVersion =
+    input.state === "continuation_required" &&
+    input.recoveryProgress != null &&
+    "policyVersion" in input.recoveryProgress &&
+    input.sourceCleanCycleRecoveryPolicyVersion === "adaptive-clean-tail-v2"
+      ? input.recoveryProgress.policyVersion
+      : null;
   return {
     contract: "archive-clean-cycle-recovery-handoff-v1",
     action:
@@ -966,6 +1974,7 @@ export function archiveBackfillRecoveryHandoff(input: {
     sourceArchiveId: input.sourceArchiveId,
     inputEvidenceSignature: input.inputEvidenceSignature,
     correctiveTailPeriods,
+    cleanCycleRecoveryPolicyVersion,
   };
 }
 
@@ -987,6 +1996,48 @@ export function archiveRecommendedAdditionalPeriods(value: unknown): number {
     );
   }
   return value;
+}
+
+/**
+ * Historical released-evidence audit decisions deliberately preserve the
+ * reducer's actual outcome without turning it into a scheduler command.  The
+ * only action-shaped field is a bounded advisory for the exact saved case;
+ * it is not a request, queue item, or promise and a later explicit promotion
+ * must re-authorize it through the normal recovery controller.
+ */
+function historicalArchiveAuditDecisionForReduction(input: {
+  reduction: ArchiveCleanCycleReductionResponse;
+  recoveryProgress: ArchiveCleanCycleRecoveryProgress | null;
+}): HistoricalArchiveAuditDecisionDraft {
+  if (!SHA256.test(input.reduction.inputEvidenceSignature)) {
+    throw new EngineError(
+      "archive reducer returned an invalid historical-audit evidence signature",
+      undefined,
+      "archive_reduction_contract_drift",
+    );
+  }
+  const continuation = input.reduction.state === "continuation_required";
+  const advisoryTailPeriods = continuation
+    ? archiveRecommendedAdditionalPeriods(
+        input.recoveryProgress?.recommendedAdditionalPeriods ??
+          input.reduction.diagnostics.recommendedAdditionalPeriods,
+      )
+    : null;
+  return {
+    inputEvidenceSignature: input.reduction.inputEvidenceSignature,
+    reducerState: input.reduction.state,
+    advisoryContinuationAction: continuation ? "continue_exact_case" : null,
+    advisoryTailPeriods,
+    diagnostics: {
+      ...input.reduction.diagnostics,
+      historicalAudit: {
+        contract: HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+        canonicalSelection: "forbidden",
+        physicalRecovery: "record-only",
+        campaignMutation: "forbidden",
+      },
+    },
+  };
 }
 
 /**
@@ -1067,24 +2118,129 @@ async function processClaimedArchiveInterpretationItem(opts: {
   db: DB;
   engine: EngineClient;
   item: ClaimedBackfillItem;
+  mode: ArchiveInterpretationRunMode;
+  /** Persisted audit scope, parsed once before claiming so a malformed or
+   * broad run cannot spend GCS/engine I/O. */
+  historicalAuditExactSource?: ExactArchiveInterpretationSource;
   /** Parent publication receipt pinned by the queue claim. The child token is
    * added below immediately before any durable reducer mutation. */
-  publicationClaim: ArchivePublicationClaimFence;
+  publicationClaim?: ArchivePublicationClaimFence;
   /** Pinned at queue admission; never resolve the currently deployed reducer
    * while draining historical work. */
   reducerVersionId: string;
 }): Promise<void> {
-  const publicationClaim: ArchivePublicationClaimFence = {
-    ...opts.publicationClaim,
-    backfillItemId: opts.item.id,
-    backfillClaimToken: opts.item.claimToken,
-  };
-  const source = await archivePointerForClaim(opts.db, opts.item);
+  if (opts.mode === "queue_publication" && !opts.publicationClaim) {
+    throw new ArchivePublicationClaimLostError();
+  }
+  const authority: ArchiveInterpretationStageAuthority =
+    opts.mode === "queue_publication"
+      ? {
+          kind: "queue_publication",
+          publicationClaim: {
+            ...opts.publicationClaim!,
+            backfillItemId: opts.item.id,
+            backfillClaimToken: opts.item.claimToken,
+          },
+        }
+      : {
+          kind: "historical_released_audit",
+          auditClaim: {
+            backfillItemId: opts.item.id,
+            backfillClaimToken: opts.item.claimToken,
+          },
+        };
+  if (
+    authority.kind === "queue_publication" &&
+    (!authority.publicationClaim.queueItemId ||
+      !authority.publicationClaim.queueClaimToken)
+  ) {
+    throw new ArchivePublicationClaimLostError();
+  }
+  if (authority.kind === "historical_released_audit") {
+    const exactSource = opts.historicalAuditExactSource;
+    if (
+      !exactSource ||
+      exactSource.resultId !== opts.item.resultId ||
+      exactSource.resultAttemptId !== opts.item.resultAttemptId ||
+      exactSource.sourceArchiveId !== opts.item.sourceArchiveId
+    ) {
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        "historical audit receipt does not match its exact persisted source; no archive reduction was performed",
+      );
+      return;
+    }
+    // Avoid even a read-only GCS reduction if an operator/canonical workflow
+    // has made this result live again since this receipt was admitted.  The
+    // stage boundary repeats the proof under the result lock; this early gate
+    // is merely an I/O and clarity guard and never changes the result.
+    if (!opts.item.sourceArchiveId) {
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        "historical audit receipt has no immutable source archive; no archive reduction was performed",
+      );
+      return;
+    }
+    let stillReleased: ArchiveInterpretationBackfillCandidate | null;
+    try {
+      stillReleased = await discoverHistoricalReleasedArchiveAuditCandidate(
+        opts.db,
+        {
+          resultId: opts.item.resultId,
+          resultAttemptId: opts.item.resultAttemptId,
+          sourceArchiveId: opts.item.sourceArchiveId,
+        },
+      );
+    } catch (error) {
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        `historical audit source proof failed before reducer I/O; no audit decision recorded: ${limitedError(error)}`,
+      );
+      return;
+    }
+    if (!stillReleased) {
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        "historical audit source is no longer an exact released, verified GCS result; no archive reduction was performed",
+      );
+      return;
+    }
+  }
+  let source: Awaited<ReturnType<typeof archivePointerForClaim>>;
+  try {
+    source = await archivePointerForClaim(opts.db, opts.item);
+  } catch (error) {
+    if (opts.mode === "historical_released_audit") {
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        `historical audit immutable archive lookup failed before reducer I/O; no audit decision recorded: ${limitedError(error)}`,
+      );
+      return;
+    }
+    throw error;
+  }
   if (!source.fidelity || !source.pointer) {
-    await settleClaim(opts.db, opts.item, {
-      state: "missing_evidence",
-      lastError: source.reason ?? "raw archive evidence is unavailable",
-    });
+    // The reducer never produced an authenticated missing-evidence response,
+    // so a released-history audit cannot turn this local pointer failure into
+    // a scientific immutable verdict. Record an operationally failed audit;
+    // the live publication queue retains its normal missing-evidence state.
+    if (opts.mode === "historical_released_audit") {
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        `historical audit immutable archive pointer is unavailable; no audit decision recorded: ${source.reason ?? "raw archive evidence is unavailable"}`,
+      );
+    } else {
+      await settleClaim(opts.db, opts.item, {
+        state: "missing_evidence",
+        lastError: source.reason ?? "raw archive evidence is unavailable",
+      });
+    }
     return;
   }
   try {
@@ -1096,6 +2252,14 @@ async function processClaimedArchiveInterpretationItem(opts: {
           remote: source.pointer!,
           fidelity: source.fidelity!,
         }),
+      authority.kind === "historical_released_audit"
+        ? () =>
+            renewHistoricalArchiveInterpretationClaim(opts.db, {
+              item: opts.item,
+              exactSource: opts.historicalAuditExactSource!,
+              reducerVersionId: opts.reducerVersionId,
+            })
+        : undefined,
     );
     const recoveryProgress = archiveBackfillRecoveryProgress({
       state: reduction.state,
@@ -1120,10 +2284,33 @@ async function processClaimedArchiveInterpretationItem(opts: {
       );
     }
     if (reduction.state === "missing_evidence") {
-      await settleClaim(opts.db, opts.item, {
+      const historicalAuditDecisionDraft =
+        authority.kind === "historical_released_audit"
+          ? historicalArchiveAuditDecisionForReduction({
+              reduction,
+              recoveryProgress,
+            })
+          : null;
+      const missingEvidenceSettlement = {
         state: "missing_evidence",
         lastError: reducerSummary(reduction.state, reduction.diagnostics),
-      });
+        historicalAuditDecision: historicalAuditDecisionDraft
+          ? {
+              ...historicalAuditDecisionDraft,
+              reducerVersionId: opts.reducerVersionId,
+              resultInterpretationId: null,
+            }
+          : null,
+      } as const;
+      if (authority.kind === "historical_released_audit") {
+        await settleHistoricalAuditDecisionOrFail(
+          opts.db,
+          opts.item,
+          missingEvidenceSettlement,
+        );
+      } else {
+        await settleClaim(opts.db, opts.item, missingEvidenceSettlement);
+      }
       return;
     }
 
@@ -1134,6 +2321,51 @@ async function processClaimedArchiveInterpretationItem(opts: {
     const stageable =
       reduction.state !== "rerun_required" ||
       hasCycleCertificate(reduction.point);
+    const historicalAuditDecisionDraft =
+      authority.kind === "historical_released_audit"
+        ? historicalArchiveAuditDecisionForReduction({
+            reduction,
+            recoveryProgress,
+          })
+        : null;
+    const state: Exclude<
+      BackfillItemState,
+      "pending" | "hydrating" | "failed"
+    > =
+      reduction.state === "accepted"
+        ? "reduced"
+        : reduction.state === "continuation_required"
+          ? "continuation_required"
+          : reduction.state === "recovery_exhausted"
+            ? "terminal_failure"
+            : "rerun_required";
+    const historicalAuditFinalize =
+      authority.kind === "historical_released_audit" && stageable
+        ? async ({
+            db,
+            interpretation,
+          }: {
+            db: DB;
+            interpretation: {
+              id: string;
+              state: string;
+              regime: string;
+            };
+          }) =>
+            settleClaimInTransaction(db, opts.item, {
+              state,
+              resultInterpretationId: interpretation.id,
+              lastError:
+                state === "reduced"
+                  ? null
+                  : reducerSummary(reduction.state, reduction.diagnostics),
+              historicalAuditDecision: {
+                ...historicalAuditDecisionDraft!,
+                reducerVersionId: opts.reducerVersionId,
+                resultInterpretationId: interpretation.id,
+              },
+            })
+        : undefined;
     const staged = stageable
       ? await stageArchiveResultInterpretation({
           db: opts.db,
@@ -1142,8 +2374,10 @@ async function processClaimedArchiveInterpretationItem(opts: {
           sourceArchiveId: opts.item.sourceArchiveId!,
           reducerVersionId: opts.reducerVersionId,
           backfillRunId: opts.item.runId,
-          publicationClaim,
+          authority,
           inputEvidenceSignature: reduction.inputEvidenceSignature,
+          historicalAuditDecision: historicalAuditDecisionDraft ?? undefined,
+          historicalAuditFinalize,
           point: reduction.point,
           fidelity: source.fidelity,
           diagnostics: reduction.diagnostics,
@@ -1178,17 +2412,12 @@ async function processClaimedArchiveInterpretationItem(opts: {
       );
     }
 
-    const state: Exclude<
-      BackfillItemState,
-      "pending" | "hydrating" | "failed"
-    > =
-      reduction.state === "accepted"
-        ? "reduced"
-        : reduction.state === "continuation_required"
-          ? "continuation_required"
-          : reduction.state === "recovery_exhausted"
-            ? "terminal_failure"
-            : "rerun_required";
+    if (authority.kind === "historical_released_audit" && stageable) {
+      // `stageArchiveResultInterpretation` just committed the interpretation,
+      // terminal claimed child, and immutable decision as one transaction.
+      // Never run a second generic settlement against that final child.
+      return;
+    }
     // An accepted reduction may now become the canonical coefficient
     // interpretation, but only through the selector's exact-current-attempt
     // and current-archive proof.  No raw attempt/result scalar is updated.
@@ -1196,7 +2425,7 @@ async function processClaimedArchiveInterpretationItem(opts: {
     // interpretation stays useful historical evidence and this receipt still
     // settles as reduced without retargeting the newer solve.
     const selectionOutcome =
-      state === "reduced"
+      state === "reduced" && authority.kind === "queue_publication"
         ? await selectAcceptedArchiveInterpretation({
             db: opts.db,
             resultId: opts.item.resultId,
@@ -1205,7 +2434,7 @@ async function processClaimedArchiveInterpretationItem(opts: {
             interpretationId: staged?.id ?? null,
             backfillRunId: opts.item.runId,
             reducerVersionId: opts.reducerVersionId,
-            publicationClaim,
+            publicationClaim: authority.publicationClaim,
           })
         : null;
     if (
@@ -1221,38 +2450,64 @@ async function processClaimedArchiveInterpretationItem(opts: {
         .where(eq(results.id, opts.item.resultId))
         .limit(1);
       if (resultScope?.simulationPresetRevisionId) {
-        // Rebuild immediately so a successful historical reduction becomes
-        // visible through the same fit cache used by public/admin views.
+        // Rebuild immediately so a successful archive-publication reduction
+        // becomes visible through the same fit cache used by public/admin
+        // views. Historical audits never enter this branch.
         await refreshPolarCacheForRevision(
           opts.db,
           resultScope.airfoilId,
           resultScope.simulationPresetRevisionId,
         );
       }
+      // The archive pointer is now the current, accepted PRECALC scientific
+      // interpretation.  Close the exact physical recovery owner before the
+      // next admission check observes its stale blocked/critical ledger.
+      // This helper re-proves exact attempt/archive ownership and resolves
+      // only incidents owned by that obligation.
+      await satisfyPrecalcObligationFromAcceptedResult(
+        opts.db,
+        opts.item.resultId,
+      );
       // Publication is a non-solver state transition. Recompute only the
       // campaign cells that reference this result so a raw archive-pending
       // counter cannot linger as rejected/blocked after an accepted selection.
       await refreshCampaignProgressForResultIds(opts.db, [opts.item.resultId]);
     }
-    const recoveryHandoff = archiveReducerNeedsRecoveryHandoff(reduction.state)
-      ? archiveBackfillRecoveryHandoff({
-          state:
-            reduction.state === "continuation_required"
-              ? "continuation_required"
-              : "rerun_required",
-          fidelity: source.fidelity,
-          resultId: opts.item.resultId,
-          resultAttemptId: opts.item.resultAttemptId,
-          sourceArchiveId: opts.item.sourceArchiveId!,
-          inputEvidenceSignature: reduction.inputEvidenceSignature,
-          recommendedAdditionalPeriods:
-            reduction.state === "continuation_required"
-              ? (recoveryProgress?.recommendedAdditionalPeriods ??
-                reduction.diagnostics.recommendedAdditionalPeriods)
-              : undefined,
-        })
-      : null;
-    await settleClaim(opts.db, opts.item, {
+    const recoveryHandoff =
+      authority.kind === "queue_publication" &&
+      archiveReducerNeedsRecoveryHandoff(reduction.state)
+        ? archiveBackfillRecoveryHandoff({
+            state:
+              reduction.state === "continuation_required"
+                ? "continuation_required"
+                : "rerun_required",
+            fidelity: source.fidelity,
+            resultId: opts.item.resultId,
+            resultAttemptId: opts.item.resultAttemptId,
+            sourceArchiveId: opts.item.sourceArchiveId!,
+            inputEvidenceSignature: reduction.inputEvidenceSignature,
+            recommendedAdditionalPeriods:
+              reduction.state === "continuation_required"
+                ? (recoveryProgress?.recommendedAdditionalPeriods ??
+                  reduction.diagnostics.recommendedAdditionalPeriods)
+                : undefined,
+            recoveryProgress,
+            sourceCleanCycleRecoveryPolicyVersion:
+              source.cleanCycleRecoveryPolicyVersion,
+          })
+        : null;
+    // Stageable audit outcomes persist their immutable decision in the same
+    // transaction as the interpretation.  Only a cadence-free rerun has no
+    // interpretation to stage, so it settles its record-only receipt here.
+    const historicalAuditDecision =
+      authority.kind === "historical_released_audit" && !stageable
+        ? {
+            ...historicalAuditDecisionDraft!,
+            reducerVersionId: opts.reducerVersionId,
+            resultInterpretationId: null,
+          }
+        : null;
+    const terminalSettlement = {
       // The historical child receipt remains a completed reduction even when
       // a later reducer release owns canonical publication. The parent queue
       // records the operational supersession; this table's enum deliberately
@@ -1267,11 +2522,40 @@ async function processClaimedArchiveInterpretationItem(opts: {
             ? "archive reduction completed under an older reducer release"
             : reducerSummary(reduction.state, reduction.diagnostics),
       recoveryHandoff,
-    });
+      historicalAuditDecision,
+    } as const;
+    if (authority.kind === "historical_released_audit") {
+      await settleHistoricalAuditDecisionOrFail(
+        opts.db,
+        opts.item,
+        terminalSettlement,
+      );
+    } else {
+      await settleClaim(opts.db, opts.item, terminalSettlement);
+    }
   } catch (error) {
     if (
+      opts.mode === "historical_released_audit" &&
+      (error instanceof ArchiveInterpretationClaimLostError ||
+        error instanceof ArchivePublicationClaimLostError ||
+        error instanceof HistoricalArchiveAuditClaimLostError)
+    ) {
+      // A lost audit lease often means that its exact source was promoted live
+      // or the audit scope changed while reducer I/O was in flight. If another
+      // claimant really took over, the token fence leaves it untouched. If not,
+      // close this one-shot audit as an operational failure rather than leaving
+      // a permanent hydrating receipt with no decision.
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        `historical audit authority or lease was lost after reducer I/O; no audit decision recorded: ${limitedError(error)}`,
+      );
+      return;
+    }
+    if (
       error instanceof ArchiveInterpretationClaimLostError ||
-      error instanceof ArchivePublicationClaimLostError
+      error instanceof ArchivePublicationClaimLostError ||
+      error instanceof HistoricalArchiveAuditClaimLostError
     ) {
       // The successor owns the receipt now. Do not overwrite its lease or
       // settle it based on this stale reducer response.
@@ -1284,22 +2568,61 @@ async function processClaimedArchiveInterpretationItem(opts: {
     const contractDrift =
       error instanceof EngineError &&
       error.code === "archive_reduction_contract_drift";
+    // `EngineClient.json` deliberately leaves native fetch failures as their
+    // original TypeError so submit lifecycle can distinguish an engine that
+    // never answered from one that returned an HTTP error.  This archive
+    // reader needs the same connection-failure contract: a plain `fetch
+    // failed` must not turn its first exact child into permanent evidence
+    // history. Restrict the helper to native transport-shaped errors here so
+    // a local programming TypeError cannot masquerade as an engine outage.
+    const nativeFetchConnectionFailure =
+      isEngineConnectionFailure(error) &&
+      error instanceof TypeError &&
+      /(?:fetch failed|network(?:\s+error)?|load failed)/i.test(error.message);
     const transient =
       error instanceof EngineTimeoutError ||
+      nativeFetchConnectionFailure ||
       (error instanceof EngineError &&
         !answeredArchiveProblem &&
         !contractDrift &&
         (error.status == null || error.status >= 500));
     if (answeredArchiveProblem) {
-      await settleClaim(opts.db, opts.item, {
-        state: "missing_evidence",
-        lastError: message,
-      });
+      // A 409/422 transport response is an engine/API diagnosis, not an
+      // authenticated reducer fact with an evidence signature. A live queue
+      // may record it as missing evidence, but a released-history audit must
+      // not manufacture a scientific `missing_evidence` decision from that
+      // response.
+      if (opts.mode === "historical_released_audit") {
+        await failHistoricalAuditClaimIfStillOwned(
+          opts.db,
+          opts.item,
+          `historical audit reducer returned an unauthenticated archive problem; no audit decision recorded: ${message}`,
+        );
+      } else {
+        await settleClaim(opts.db, opts.item, {
+          state: "missing_evidence",
+          lastError: message,
+        });
+      }
+      return;
+    }
+    if (opts.mode === "historical_released_audit" && transient) {
+      // A released-history audit may only be started through an explicit,
+      // three-ID operator invocation.  Do not turn a temporary engine/GCS
+      // error into a pending item that a generic scheduler can resume later.
+      await failHistoricalAuditClaimIfStillOwned(
+        opts.db,
+        opts.item,
+        `historical audit reducer failed; no automatic retry: ${message}`,
+      );
       return;
     }
     if (
-      transient &&
-      opts.item.attemptCount < ARCHIVE_INTERPRETATION_MAX_ATTEMPTS
+      archiveInterpretationMayRetry({
+        mode: opts.mode,
+        transient,
+        attemptCount: opts.item.attemptCount,
+      })
     ) {
       await settleClaim(opts.db, opts.item, {
         state: "pending",
@@ -1310,10 +2633,14 @@ async function processClaimedArchiveInterpretationItem(opts: {
       });
       return;
     }
-    await settleClaim(opts.db, opts.item, {
-      state: "failed",
-      lastError: message,
-    });
+    if (opts.mode === "historical_released_audit") {
+      await failHistoricalAuditClaimIfStillOwned(opts.db, opts.item, message);
+    } else {
+      await settleClaim(opts.db, opts.item, {
+        state: "failed",
+        lastError: message,
+      });
+    }
   }
 }
 
@@ -1324,12 +2651,14 @@ async function readRun(
   id: string;
   reducerVersionId: string;
   state: "planned" | "running" | "completed" | "failed" | "cancelled";
+  scope: Record<string, unknown>;
 } | null> {
   const [run] = await db
     .select({
       id: resultInterpretationBackfillRuns.id,
       reducerVersionId: resultInterpretationBackfillRuns.reducerVersionId,
       state: resultInterpretationBackfillRuns.state,
+      scope: resultInterpretationBackfillRuns.scope,
     })
     .from(resultInterpretationBackfillRuns)
     .where(eq(resultInterpretationBackfillRuns.id, runId))
@@ -1352,6 +2681,7 @@ async function readRun(
       | "completed"
       | "failed"
       | "cancelled",
+    scope: isRecord(run.scope) ? run.scope : {},
   };
 }
 
@@ -1394,51 +2724,181 @@ async function countRunCanonicalSelections(
   };
 }
 
+async function countHistoricalAuditDecisionsForRun(
+  db: DB,
+  runId: string,
+): Promise<number> {
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(historicalArchiveAuditDecisions)
+    .where(eq(historicalArchiveAuditDecisions.auditRunId, runId));
+  return row?.count ?? 0;
+}
+
 async function refreshRunSummary(
   db: DB,
   runId: string,
-  opts: { processed: number; forceFailed?: boolean } = { processed: 0 },
+  opts: {
+    processed: number;
+    /** A cancelled/failed run must remain terminal even if its retained child
+     * counters would otherwise look drained. */
+    forceTerminalState?: "failed" | "cancelled";
+  } = { processed: 0 },
 ): Promise<ArchiveInterpretationBackfillReport> {
-  const [counts, selections] = await Promise.all([
+  const [counts, selections, run, historicalDecisionCount] = await Promise.all([
     countRunItems(db, runId),
     countRunCanonicalSelections(db, runId),
+    db
+      .select({
+        scope: resultInterpretationBackfillRuns.scope,
+        state: resultInterpretationBackfillRuns.state,
+      })
+      .from(resultInterpretationBackfillRuns)
+      .where(eq(resultInterpretationBackfillRuns.id, runId))
+      .limit(1)
+      .then(([row]) => row ?? null),
+    countHistoricalAuditDecisionsForRun(db, runId),
   ]);
   const open = (counts.pending ?? 0) + (counts.hydrating ?? 0);
-  const state = opts.forceFailed
-    ? "failed"
-    : open === 0
-      ? "completed"
-      : "running";
+  const itemCount = Object.values(counts).reduce(
+    (total, count) => total + count,
+    0,
+  );
+  let historicalAudit = false;
+  let historicalAuditContractMalformed = false;
+  try {
+    historicalAudit =
+      run != null &&
+      archiveInterpretationBackfillRunMode(run.scope) ===
+        "historical_released_audit";
+  } catch {
+    // A malformed historical contract is incomplete by definition. Do not
+    // report a drained mutable receipt as a successful immutable audit.
+    historicalAudit = true;
+    historicalAuditContractMalformed = true;
+  }
+  // 0106 permits a source-owner cascade to retain the audit run after its
+  // exact child and immutable decision disappear. That run is useful forensic
+  // history, but it did not complete an audit. Treat it as non-executable
+  // failure rather than letting the otherwise-equal 0 decisions / 0 children
+  // counters look like a successful no-op.
+  const historicalAuditHasNoChildReceipt = historicalAudit && itemCount === 0;
+  const auditIncomplete =
+    historicalAudit &&
+    open === 0 &&
+    (historicalAuditContractMalformed ||
+      historicalAuditHasNoChildReceipt ||
+      historicalDecisionCount !== itemCount);
+  const historicalAuditIncompleteReason = !historicalAudit
+    ? null
+    : historicalAuditContractMalformed
+      ? "historical audit contract is malformed; no completed immutable audit can be reported"
+      : historicalAuditHasNoChildReceipt
+        ? "historical audit has no child execution receipt; its exact source may have been owner-cascaded before an immutable decision was recorded"
+        : historicalDecisionCount !== itemCount
+          ? "historical audit child receipts and immutable decisions do not have one-to-one completion"
+          : null;
+  const state = archiveInterpretationBackfillSummaryState({
+    // A concurrent cancellation/failure is authoritative even if this
+    // caller reached summary refresh through a stale runnable read.
+    terminalState:
+      opts.forceTerminalState ??
+      (run?.state === "failed" || run?.state === "cancelled"
+        ? run.state
+        : undefined),
+    auditIncomplete,
+    openItems: open,
+  });
+  const report = (
+    persistedState: ArchiveInterpretationBackfillReport["state"],
+  ): ArchiveInterpretationBackfillReport => ({
+    runId,
+    state: persistedState,
+    processed: opts.processed,
+    counts,
+    canonicalSelectionsCreated: selections.events,
+    resultProjectionsUpdated: selections.currentProjections,
+  });
+
+  // A terminal run is forensic history. In particular, an owner-cascade
+  // trigger writes the exact reason that its source disappeared; a later
+  // observer must not replace that summary with its own generic zero-count
+  // explanation or move `completedAt` forward.
+  const alreadyTerminal =
+    opts.forceTerminalState ??
+    (run?.state === "failed" || run?.state === "cancelled"
+      ? run.state
+      : undefined);
+  if (alreadyTerminal) return report(alreadyTerminal);
+
   const now = new Date();
-  await db
+  // Do not trust the state observed above as a write authority. A source-owner
+  // cascade or operator cancellation can acquire the row between the summary
+  // reads and this update. PostgreSQL re-checks this non-terminal predicate
+  // after any row lock wait, so a terminal writer either wins before us (we do
+  // no write) or after us (it becomes the final terminal state). `completed`
+  // remains eligible so a malformed audit can self-correct to failed; only
+  // failed/cancelled forensic records are immutable to this observer.
+  const [updated] = await db
     .update(resultInterpretationBackfillRuns)
     .set({
       state,
-      completedAt: state === "completed" || state === "failed" ? now : null,
+      completedAt:
+        state === "completed" || state === "failed" || state === "cancelled"
+          ? now
+          : null,
       summary: {
         counts,
         processedThisInvocation: opts.processed,
         canonicalSelectionsCreated: selections.events,
         resultProjectionsUpdated: selections.currentProjections,
         rawEvidenceImmutable: true,
+        ...(historicalAudit
+          ? {
+              historicalAuditDecisions: historicalDecisionCount,
+              historicalAuditIncomplete: auditIncomplete,
+              ...(historicalAuditIncompleteReason
+                ? { historicalAuditIncompleteReason }
+                : {}),
+            }
+          : {}),
       },
     })
-    .where(eq(resultInterpretationBackfillRuns.id, runId));
-  return {
-    runId,
-    state,
-    processed: opts.processed,
-    counts,
-    canonicalSelectionsCreated: selections.events,
-    resultProjectionsUpdated: selections.currentProjections,
-  };
+    .where(
+      and(
+        eq(resultInterpretationBackfillRuns.id, runId),
+        inArray(resultInterpretationBackfillRuns.state, [
+          "planned",
+          "running",
+          "completed",
+        ]),
+      ),
+    )
+    .returning({ id: resultInterpretationBackfillRuns.id });
+  if (updated) return report(state);
+
+  // The CAS missed a terminal transition. Read it once for a truthful report;
+  // never write a freshly derived summary over that terminal fact.
+  const current = await readRun(db, runId);
+  return report(
+    current?.state === "failed" || current?.state === "cancelled"
+      ? current.state
+      : state,
+  );
+}
+
+function historicalArchiveAuditExecutionIsDisabled(
+  mode: ArchiveInterpretationRunMode,
+): boolean {
+  return mode === "historical_released_audit";
 }
 
 /**
- * Resume one durable backfill run.  A bounded invocation is deliberate: a
- * scheduler/CLI can invoke it repeatedly, and a transient remote-store error
- * remains pending with a timestamped retry rather than blocking the rest of
- * the historical evidence set.
+ * Resume one durable backfill run. Queue-publication receipts may be invoked
+ * repeatedly, and their transient remote-store failures remain pending with a
+ * timestamped retry. A released-history audit is intentionally not a generic
+ * retry target: every execution must present the same exact three-ID source
+ * authority as the explicit audit command that created its receipt.
  */
 export async function runArchiveInterpretationBackfill(opts: {
   db: DB;
@@ -1449,10 +2909,13 @@ export async function runArchiveInterpretationBackfill(opts: {
    * not compare against the newly deployed policy: old queue items must stay
    * scientifically reproducible after a reducer rollout. */
   expectedReducerVersionId?: string;
-  /** Exact parent queue claim. The producer may read/reduce without it, but
-   * no archive interpretation can stage or publish unless this live token is
-   * revalidated inside each database mutation transaction. */
-  publicationClaim: ArchivePublicationClaimFence;
+  /** Exact parent queue claim. It is mandatory for a persisted publication
+   * run, and rejected for a persisted released-evidence audit run. */
+  publicationClaim?: ArchivePublicationClaimFence;
+  /** Required only for a persisted released-evidence audit run. Repeating
+   * this exact immutable source prevents a generic worker from retrying an
+   * operator audit after a transient reducer failure. */
+  historicalAuditExactSource?: ExactArchiveInterpretationSource;
 }): Promise<ArchiveInterpretationBackfillReport> {
   const maxItems =
     opts.maxItems ?? DEFAULT_ARCHIVE_INTERPRETATION_BACKFILL_LIMIT;
@@ -1466,10 +2929,28 @@ export async function runArchiveInterpretationBackfill(opts: {
     throw new Error(
       `archive interpretation backfill run ${opts.runId} was not found`,
     );
+  const mode = archiveInterpretationBackfillRunMode(run.scope);
+  if (historicalArchiveAuditExecutionIsDisabled(mode)) {
+    throw new Error(
+      "historical released-evidence audits are disabled and cannot execute; only accepted-current archive reduction may run",
+    );
+  }
+  const historicalAuditExactSource =
+    mode === "historical_released_audit"
+      ? requireHistoricalReleasedArchiveAuditExecutionAuthority({
+          scope: run.scope,
+          exactSource: opts.historicalAuditExactSource,
+        })
+      : undefined;
+  if (mode === "queue_publication" && opts.historicalAuditExactSource != null) {
+    throw new Error(
+      "queue-publication backfill must not carry released-evidence audit execution authority",
+    );
+  }
   if (run.state === "cancelled" || run.state === "failed") {
     return refreshRunSummary(opts.db, run.id, {
       processed: 0,
-      forceFailed: run.state === "failed",
+      forceTerminalState: run.state,
     });
   }
   if (
@@ -1480,12 +2961,35 @@ export async function runArchiveInterpretationBackfill(opts: {
       `archive interpretation backfill run ${run.id} is pinned to reducer ${run.reducerVersionId}, not queue reducer ${opts.expectedReducerVersionId}`,
     );
   }
+  if (mode === "queue_publication" && !opts.publicationClaim) {
+    throw new Error(
+      "archive publication backfill requires an exact active queue claim",
+    );
+  }
+  if (mode === "historical_released_audit" && opts.publicationClaim) {
+    throw new Error(
+      "historical released-evidence audit must not carry a publication claim",
+    );
+  }
   if (run.state === "completed")
     return refreshRunSummary(opts.db, run.id, { processed: 0 });
-  await opts.db
+  // A source-owner cascade can mark a retained audit run failed after this
+  // initial read but before execution begins. Do not resurrect that terminal
+  // forensic state merely to discover its missing child on the next summary
+  // refresh; activation is a compare-and-swap over runnable states only.
+  const [activated] = await opts.db
     .update(resultInterpretationBackfillRuns)
     .set({ state: "running", startedAt: new Date(), completedAt: null })
-    .where(eq(resultInterpretationBackfillRuns.id, run.id));
+    .where(
+      and(
+        eq(resultInterpretationBackfillRuns.id, run.id),
+        inArray(resultInterpretationBackfillRuns.state, ["planned", "running"]),
+      ),
+    )
+    .returning({ id: resultInterpretationBackfillRuns.id });
+  if (!activated) {
+    return refreshRunSummary(opts.db, run.id, { processed: 0 });
+  }
 
   let processed = 0;
   while (processed < maxItems) {
@@ -1495,6 +2999,8 @@ export async function runArchiveInterpretationBackfill(opts: {
       db: opts.db,
       engine: opts.engine,
       item,
+      mode,
+      historicalAuditExactSource,
       publicationClaim: opts.publicationClaim,
       reducerVersionId: run.reducerVersionId,
     });

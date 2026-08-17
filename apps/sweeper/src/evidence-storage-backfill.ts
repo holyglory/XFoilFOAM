@@ -9,7 +9,6 @@ import {
   solverEvidenceArtifactMembers,
   solverEvidenceArtifacts,
   solverEvidenceBlobs,
-  solverEvidenceOrphanQuarantines,
 } from "@aerodb/db";
 import type {
   EngineClient,
@@ -116,38 +115,9 @@ export interface RegisteredEvidenceStorageDatabaseAck {
   sourceArtifactId: string;
   archiveId: string;
   registeredAt: string;
-  quarantineId?: never;
-  blobId?: never;
 }
 
-export interface OrphanEvidenceStorageDatabaseAck {
-  schemaVersion: 1;
-  state: "quarantined";
-  registrationKind: "orphan_evidence_quarantine";
-  quarantineReason: "terminal_engine_evidence_not_ingested";
-  jobId: string;
-  evidencePath: string;
-  storedSha256: string;
-  generation: string;
-  quarantineId: string;
-  sourceArtifactId: string;
-  blobId: string;
-  manifestSha256: string;
-  manifestByteSize: number;
-  archiveMemberSetSha256: string;
-  archiveMemberCount: number;
-  migrationReceiptSha256: string;
-  migrationReceiptByteSize: number;
-  quarantinedAt: string;
-  resultId?: never;
-  resultAttemptId?: never;
-  archiveId?: never;
-  registeredAt?: never;
-}
-
-export type EvidenceStorageDatabaseAck =
-  | RegisteredEvidenceStorageDatabaseAck
-  | OrphanEvidenceStorageDatabaseAck;
+export type EvidenceStorageDatabaseAck = RegisteredEvidenceStorageDatabaseAck;
 
 interface MigrationReceiptDocument {
   receipt: MigrationReceipt;
@@ -1297,429 +1267,6 @@ async function findExactSource(db: DB, receipt: MigrationReceipt) {
   return source;
 }
 
-function exactEvidencePathIdentity(receipt: MigrationReceipt): {
-  engineCaseSlug: string;
-  evidenceBase: string;
-} {
-  const parts = receipt.evidencePath.split("/");
-  if (parts[0] !== "cases" || parts.length < 3) {
-    throw new Error(
-      "orphan evidence path must be cases/<exact-case-slug>/<evidence-base>",
-    );
-  }
-  const engineCaseSlug = safeRelative(parts[1], "engine case slug");
-  if (engineCaseSlug.includes("/")) {
-    throw new Error("engine case slug must be one path segment");
-  }
-  const evidenceBase = safeRelative(
-    parts.slice(2).join("/"),
-    "orphan evidence base",
-  );
-  return { engineCaseSlug, evidenceBase };
-}
-
-interface OrphanManifestProvenance {
-  manifestSha256: string;
-  manifestByteSize: number;
-  archiveMembers: Array<{ path: string; sha256: string; byteSize: number }>;
-  archiveMemberSetSha256: string;
-}
-
-async function orphanManifestProvenance(
-  receipt: MigrationReceipt,
-  receiptPath: string,
-): Promise<OrphanManifestProvenance> {
-  if (!receipt.sourceArchives.length) {
-    throw new Error(
-      "orphan quarantine requires exact retained source archive provenance",
-    );
-  }
-  const manifestBytes = await readFile(
-    join(dirname(receiptPath), "evidence_manifest.json"),
-  );
-  const parsed = parseEvidenceManifest(manifestBytes);
-  const expectedVerification = `archive+manifest+all-members-restore:${parsed.bundled.length}`;
-  if (receipt.verificationMode !== expectedVerification) {
-    throw new Error(
-      `orphan receipt must prove ${expectedVerification}; got ${receipt.verificationMode ?? "none"}`,
-    );
-  }
-  if (!receipt.verifiedAt) {
-    throw new Error(
-      "orphan receipt lacks the remote all-member verification time",
-    );
-  }
-  return {
-    manifestSha256: createHash("sha256").update(manifestBytes).digest("hex"),
-    manifestByteSize: manifestBytes.byteLength,
-    archiveMembers: parsed.memberSet,
-    archiveMemberSetSha256: manifestMemberSetSha256(parsed.memberSet),
-  };
-}
-
-function orphanAckFromRow(
-  row: typeof solverEvidenceOrphanQuarantines.$inferSelect,
-  receipt: MigrationReceipt,
-): OrphanEvidenceStorageDatabaseAck {
-  return {
-    schemaVersion: 1,
-    state: "quarantined",
-    registrationKind: "orphan_evidence_quarantine",
-    quarantineReason: "terminal_engine_evidence_not_ingested",
-    jobId: receipt.jobId,
-    evidencePath: receipt.evidencePath,
-    storedSha256: receipt.remote.storedSha256,
-    generation: receipt.remote.generation,
-    quarantineId: row.id,
-    sourceArtifactId: row.sourceArtifactId,
-    blobId: row.blobId,
-    manifestSha256: row.manifestSha256,
-    manifestByteSize: row.manifestByteSize,
-    archiveMemberSetSha256: row.archiveMemberSetSha256,
-    archiveMemberCount: row.archiveMemberCount,
-    migrationReceiptSha256: row.migrationReceiptSha256,
-    migrationReceiptByteSize: row.migrationReceiptByteSize,
-    quarantinedAt: row.createdAt.toISOString(),
-  };
-}
-
-function requireOrphanRowMatchesReceipt(
-  row: typeof solverEvidenceOrphanQuarantines.$inferSelect,
-  receipt: MigrationReceipt,
-  provenance: OrphanManifestProvenance,
-): void {
-  if (
-    row.engineJobId !== receipt.jobId ||
-    row.evidencePath !== receipt.evidencePath ||
-    row.manifestSha256 !== provenance.manifestSha256 ||
-    row.manifestByteSize !== provenance.manifestByteSize ||
-    row.archiveMemberSetSha256 !== provenance.archiveMemberSetSha256 ||
-    row.archiveMemberCount !== provenance.archiveMembers.length ||
-    manifestMemberSetSha256(row.archiveMembers) !==
-      provenance.archiveMemberSetSha256
-  ) {
-    throw new Error(
-      "existing orphan quarantine conflicts with migration receipt",
-    );
-  }
-}
-
-async function exactOrphanOwnerContext(
-  db: DB,
-  receipt: MigrationReceipt,
-): Promise<{
-  simJob: typeof simJobs.$inferSelect;
-  engineCaseSlug: string;
-  evidenceBase: string;
-}> {
-  const { engineCaseSlug, evidenceBase } = exactEvidencePathIdentity(receipt);
-  const jobs = await db
-    .select()
-    .from(simJobs)
-    .where(eq(simJobs.engineJobId, receipt.jobId));
-  if (jobs.length !== 1) {
-    throw new Error(
-      `orphan receipt must resolve to one exact sim job; found ${jobs.length}`,
-    );
-  }
-  const simJob = jobs[0]!;
-  if (!new Set<string>(["done", "failed", "cancelled"]).has(simJob.status)) {
-    throw new Error(`orphan sim job is ${simJob.status}, not terminal`);
-  }
-
-  const [attemptOwner, resultOwner] = await Promise.all([
-    db
-      .select({ id: resultAttempts.id })
-      .from(resultAttempts)
-      .where(
-        and(
-          eq(resultAttempts.simJobId, simJob.id),
-          eq(resultAttempts.engineJobId, receipt.jobId),
-          eq(resultAttempts.engineCaseSlug, engineCaseSlug),
-        ),
-      )
-      .limit(1),
-    db
-      .select({ id: results.id })
-      .from(results)
-      .where(
-        and(
-          eq(results.simJobId, simJob.id),
-          eq(results.engineJobId, receipt.jobId),
-          eq(results.engineCaseSlug, engineCaseSlug),
-        ),
-      )
-      .limit(1),
-  ]);
-  if (attemptOwner.length || resultOwner.length) {
-    throw new Error(
-      "exact result ownership exists; receipt cannot use orphan quarantine",
-    );
-  }
-  return { simJob, engineCaseSlug, evidenceBase };
-}
-
-function requireOrphanBlobMatches(
-  blob: typeof solverEvidenceBlobs.$inferSelect,
-  receipt: MigrationReceipt,
-): void {
-  if (
-    blob.backend !== "gcs" ||
-    blob.bucket !== receipt.remote.bucket ||
-    blob.objectKey !== receipt.remote.objectKey ||
-    blob.generation !== receipt.remote.generation ||
-    blob.compression !== "zstd" ||
-    blob.mimeType !== "application/zstd" ||
-    blob.sha256 !== receipt.remote.storedSha256 ||
-    blob.byteSize !== receipt.remote.storedSize ||
-    blob.crc32c !== receipt.remote.crc32c ||
-    blob.uncompressedTarSha256 !== receipt.remote.tarSha256 ||
-    blob.uncompressedTarByteSize !== receipt.remote.tarSize
-  ) {
-    throw new Error(
-      "orphan quarantine GCS blob conflicts with migration receipt",
-    );
-  }
-}
-
-function requireOrphanArtifactMatches(
-  artifact: typeof solverEvidenceArtifacts.$inferSelect,
-  receipt: MigrationReceipt,
-  context: Awaited<ReturnType<typeof exactOrphanOwnerContext>>,
-  blob: typeof solverEvidenceBlobs.$inferSelect,
-): void {
-  const metadata = artifact.metadata ?? {};
-  if (
-    artifact.resultId !== null ||
-    artifact.resultAttemptId !== null ||
-    artifact.aoaDeg !== null ||
-    artifact.airfoilId !== context.simJob.airfoilId ||
-    artifact.simJobId !== context.simJob.id ||
-    artifact.engineJobId !== receipt.jobId ||
-    artifact.engineCaseSlug !== context.engineCaseSlug ||
-    artifact.methodKey !== context.simJob.methodKey ||
-    artifact.solverImplementationId !== context.simJob.solverImplementationId ||
-    artifact.solverRuntimeBuildId !== context.simJob.solverRuntimeBuildId ||
-    artifact.kind !== "engine_bundle" ||
-    artifact.storageKey !== sourceKeys(receipt)[0] ||
-    artifact.mimeType !== "application/zstd" ||
-    artifact.sha256 !== blob.sha256 ||
-    artifact.byteSize !== blob.byteSize ||
-    metadata.evidenceBase !== context.evidenceBase ||
-    metadata.storageBackend !== "gcs" ||
-    metadata.bucket !== receipt.remote.bucket ||
-    metadata.objectKey !== receipt.remote.objectKey ||
-    metadata.generation !== receipt.remote.generation ||
-    metadata.crc32c !== receipt.remote.crc32c ||
-    metadata.uncompressedTarSha256 !== receipt.remote.tarSha256 ||
-    metadata.uncompressedTarByteSize !== receipt.remote.tarSize
-  ) {
-    throw new Error(
-      "orphan quarantine source artifact conflicts with exact job/path/blob provenance",
-    );
-  }
-}
-
-async function registerOrphanEvidenceQuarantine(opts: {
-  db: DB;
-  engine: EngineClient;
-  document: MigrationReceiptDocument;
-  receiptPath: string;
-}): Promise<OrphanEvidenceStorageDatabaseAck> {
-  const { receipt } = opts.document;
-  const provenance = await orphanManifestProvenance(receipt, opts.receiptPath);
-  return opts.db.transaction(async (rawTx) => {
-    const tx = rawTx as unknown as DB;
-    // This one-time backfill takes a short table-level writer fence so a
-    // concurrent delayed ingest cannot create an exact result owner between
-    // the zero-owner check and quarantine insert.  No aerodynamic lookup or
-    // rounded AoA participates in the decision.
-    await tx.execute(
-      sql.raw(`
-      LOCK TABLE sim_jobs, results, result_attempts,
-        solver_evidence_artifacts, solver_evidence_blobs,
-        solver_evidence_orphan_quarantines
-      IN SHARE ROW EXCLUSIVE MODE
-    `),
-    );
-
-    const sourceRows = await exactSourceRows(tx, receipt);
-    const owned = sourceRows.filter(
-      (row) => row.resultId || row.resultAttemptId,
-    );
-    if (owned.length) {
-      throw new Error(
-        `orphan fallback requires zero exact source owners; found ${owned.length}`,
-      );
-    }
-    const context = await exactOrphanOwnerContext(tx, receipt);
-    const [existing] = await tx
-      .select()
-      .from(solverEvidenceOrphanQuarantines)
-      .where(
-        and(
-          eq(solverEvidenceOrphanQuarantines.engineJobId, receipt.jobId),
-          eq(
-            solverEvidenceOrphanQuarantines.evidencePath,
-            receipt.evidencePath,
-          ),
-        ),
-      )
-      .limit(1);
-    if (existing) {
-      requireOrphanRowMatchesReceipt(existing, receipt, provenance);
-      const [[blob], [artifact]] = await Promise.all([
-        tx
-          .select()
-          .from(solverEvidenceBlobs)
-          .where(eq(solverEvidenceBlobs.id, existing.blobId))
-          .limit(1),
-        tx
-          .select()
-          .from(solverEvidenceArtifacts)
-          .where(eq(solverEvidenceArtifacts.id, existing.sourceArtifactId))
-          .limit(1),
-      ]);
-      if (!blob || !artifact) {
-        throw new Error("existing orphan quarantine lost its blob or artifact");
-      }
-      requireOrphanBlobMatches(blob, receipt);
-      requireOrphanArtifactMatches(artifact, receipt, context, blob);
-      return orphanAckFromRow(existing, receipt);
-    }
-
-    const blobValues = {
-      backend: "gcs" as const,
-      bucket: receipt.remote.bucket,
-      objectKey: receipt.remote.objectKey,
-      generation: receipt.remote.generation,
-      compression: "zstd" as const,
-      mimeType: "application/zstd",
-      sha256: receipt.remote.storedSha256,
-      byteSize: receipt.remote.storedSize,
-      crc32c: receipt.remote.crc32c,
-      uncompressedTarSha256: receipt.remote.tarSha256,
-      uncompressedTarByteSize: receipt.remote.tarSize,
-      verifiedAt: new Date(receipt.verifiedAt!),
-      metadata: {
-        preservationKind: "orphan_evidence_quarantine",
-        engineJobId: receipt.jobId,
-        evidencePath: receipt.evidencePath,
-        manifestSha256: provenance.manifestSha256,
-        archiveMemberSetSha256: provenance.archiveMemberSetSha256,
-      },
-    };
-    const [insertedBlob] = await tx
-      .insert(solverEvidenceBlobs)
-      .values(blobValues)
-      .onConflictDoNothing()
-      .returning();
-    let blob = insertedBlob;
-    if (!blob) {
-      [blob] = await tx
-        .select()
-        .from(solverEvidenceBlobs)
-        .where(
-          and(
-            eq(solverEvidenceBlobs.backend, "gcs"),
-            eq(solverEvidenceBlobs.bucket, receipt.remote.bucket),
-            eq(solverEvidenceBlobs.objectKey, receipt.remote.objectKey),
-            eq(solverEvidenceBlobs.generation, receipt.remote.generation),
-          ),
-        )
-        .limit(1);
-    }
-    if (!blob) throw new Error("failed to register orphan GCS blob");
-    requireOrphanBlobMatches(blob, receipt);
-
-    const canonicalStorageKey = sourceKeys(receipt)[0]!;
-    const existingCanonicalArtifacts = sourceRows.filter(
-      (row) =>
-        row.storageKey === canonicalStorageKey && row.kind === "engine_bundle",
-    );
-    if (existingCanonicalArtifacts.length > 1) {
-      throw new Error(
-        "orphan receipt has ambiguous unbound canonical bundle artifacts",
-      );
-    }
-    let artifact = existingCanonicalArtifacts[0];
-    if (!artifact) {
-      [artifact] = await tx
-        .insert(solverEvidenceArtifacts)
-        .values({
-          resultId: null,
-          resultAttemptId: null,
-          airfoilId: context.simJob.airfoilId,
-          simJobId: context.simJob.id,
-          engineJobId: receipt.jobId,
-          engineCaseSlug: context.engineCaseSlug,
-          methodKey: context.simJob.methodKey,
-          solverImplementationId: context.simJob.solverImplementationId,
-          solverRuntimeBuildId: context.simJob.solverRuntimeBuildId,
-          aoaDeg: null,
-          kind: "engine_bundle",
-          field: null,
-          role: "evidence",
-          storageKey: canonicalStorageKey,
-          mimeType: "application/zstd",
-          sha256: receipt.remote.storedSha256,
-          byteSize: receipt.remote.storedSize,
-          engineUrl: `${opts.engine.baseUrl.replace(/\/$/, "")}/jobs/${encodeURIComponent(receipt.jobId)}/files/${receipt.evidencePath}/engine_evidence.tar.zst`,
-          metadata: {
-            evidenceBase: context.evidenceBase,
-            preservationKind: "orphan_evidence_quarantine",
-            storageBackend: "gcs",
-            bucket: receipt.remote.bucket,
-            objectKey: receipt.remote.objectKey,
-            generation: receipt.remote.generation,
-            crc32c: receipt.remote.crc32c,
-            compression: "zstd",
-            archiveFormat: "tar+zstd",
-            zstdLevel: receipt.remote.zstdLevel,
-            uncompressedTarSha256: receipt.remote.tarSha256,
-            uncompressedTarByteSize: receipt.remote.tarSize,
-            verifiedAt: receipt.verifiedAt,
-            pointerPath: "engine_evidence.remote.json",
-            migrationReceipt: MIGRATION_RECEIPT_NAME,
-            manifestSha256: provenance.manifestSha256,
-            archiveMemberSetSha256: provenance.archiveMemberSetSha256,
-            archiveMemberCount: provenance.archiveMembers.length,
-          },
-        })
-        .returning();
-    }
-    if (!artifact) throw new Error("failed to register orphan bundle artifact");
-    requireOrphanArtifactMatches(artifact, receipt, context, blob);
-
-    const [quarantine] = await tx
-      .insert(solverEvidenceOrphanQuarantines)
-      .values({
-        simJobId: context.simJob.id,
-        engineJobId: receipt.jobId,
-        engineCaseSlug: context.engineCaseSlug,
-        evidencePath: receipt.evidencePath,
-        quarantineReason: "terminal_engine_evidence_not_ingested",
-        sourceArtifactId: artifact.id,
-        blobId: blob.id,
-        manifestSha256: provenance.manifestSha256,
-        manifestByteSize: provenance.manifestByteSize,
-        archiveMemberSetSha256: provenance.archiveMemberSetSha256,
-        archiveMemberCount: provenance.archiveMembers.length,
-        archiveMembers: provenance.archiveMembers,
-        sourceArchives: receipt.sourceArchives,
-        migrationReceiptSha256: opts.document.sha256,
-        migrationReceiptByteSize: opts.document.bytes.byteLength,
-        verificationMode: receipt.verificationMode!,
-        remoteVerifiedAt: new Date(receipt.verifiedAt!),
-      })
-      .returning();
-    if (!quarantine) {
-      throw new Error("failed to register immutable orphan quarantine");
-    }
-    return orphanAckFromRow(quarantine, receipt);
-  });
-}
-
 function artifactForReceipt(
   receipt: MigrationReceipt,
   source: typeof solverEvidenceArtifacts.$inferSelect,
@@ -1858,8 +1405,10 @@ export async function planEvidenceMigrationReceipt(opts: {
   receiptPath: string;
   mediaRoot: string;
 }): Promise<Record<string, unknown>> {
-  const document = await readReceiptDocument(opts.receiptPath, opts.mediaRoot);
-  const { receipt } = document;
+  const { receipt } = await readReceiptDocument(
+    opts.receiptPath,
+    opts.mediaRoot,
+  );
   const sourceRows = await exactSourceRows(opts.db, receipt);
   const ownerKeys = new Set(
     sourceRows
@@ -1867,20 +1416,9 @@ export async function planEvidenceMigrationReceipt(opts: {
       .map((row) => `${row.resultId}:${row.resultAttemptId}:${row.simJobId}`),
   );
   if (ownerKeys.size === 0) {
-    const context = await exactOrphanOwnerContext(opts.db, receipt);
-    const provenance = await orphanManifestProvenance(
-      receipt,
-      opts.receiptPath,
+    throw new Error(
+      "receipt has no exact canonical result attempt; discard the failed generation and rerun it",
     );
-    return {
-      status: "planned-quarantine",
-      jobId: receipt.jobId,
-      simJobId: context.simJob.id,
-      engineCaseSlug: context.engineCaseSlug,
-      evidencePath: receipt.evidencePath,
-      manifestSha256: provenance.manifestSha256,
-      archiveMemberCount: provenance.archiveMembers.length,
-    };
   }
   if (ownerKeys.size !== 1) {
     throw new Error(
@@ -1912,8 +1450,10 @@ export async function registerEvidenceMigrationReceipt(opts: {
   mediaRoot: string;
   writeAck?: boolean;
 }): Promise<EvidenceStorageDatabaseAck> {
-  const document = await readReceiptDocument(opts.receiptPath, opts.mediaRoot);
-  const { receipt } = document;
+  const { receipt } = await readReceiptDocument(
+    opts.receiptPath,
+    opts.mediaRoot,
+  );
   const ackPath = join(dirname(opts.receiptPath), DATABASE_ACK_NAME);
   try {
     const existing = JSON.parse(await readFile(ackPath, "utf8"));
@@ -1927,39 +1467,6 @@ export async function registerEvidenceMigrationReceipt(opts: {
       throw new Error(
         "existing database acknowledgement conflicts with receipt",
       );
-    }
-    if (parsed.state === "quarantined") {
-      if (parsed.registrationKind !== "orphan_evidence_quarantine") {
-        throw new Error("existing orphan acknowledgement has the wrong kind");
-      }
-      if (parsed.quarantineReason !== "terminal_engine_evidence_not_ingested") {
-        throw new Error("existing orphan acknowledgement has the wrong reason");
-      }
-      const current = await registerOrphanEvidenceQuarantine({
-        db: opts.db,
-        engine: opts.engine,
-        document,
-        receiptPath: opts.receiptPath,
-      });
-      for (const key of [
-        "quarantineId",
-        "sourceArtifactId",
-        "blobId",
-        "manifestSha256",
-        "manifestByteSize",
-        "archiveMemberSetSha256",
-        "archiveMemberCount",
-        "migrationReceiptSha256",
-        "migrationReceiptByteSize",
-        "quarantinedAt",
-      ] as const) {
-        if (parsed[key] !== current[key]) {
-          throw new Error(
-            `existing orphan acknowledgement no longer matches ${key}`,
-          );
-        }
-      }
-      return existing as OrphanEvidenceStorageDatabaseAck;
     }
     if (parsed.state !== "registered") {
       throw new Error("existing database acknowledgement has an unknown state");
@@ -1998,14 +1505,9 @@ export async function registerEvidenceMigrationReceipt(opts: {
       .map((row) => `${row.resultId}:${row.resultAttemptId}:${row.simJobId}`),
   );
   if (ownerKeys.size === 0) {
-    const ack = await registerOrphanEvidenceQuarantine({
-      db: opts.db,
-      engine: opts.engine,
-      document,
-      receiptPath: opts.receiptPath,
-    });
-    if (opts.writeAck !== false) await atomicWriteJson(ackPath, ack);
-    return ack;
+    throw new Error(
+      "receipt has no exact canonical result attempt; discard the failed generation and rerun it",
+    );
   }
   if (ownerKeys.size !== 1) {
     throw new Error(

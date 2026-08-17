@@ -28,8 +28,6 @@ export interface CanaryCleanupOwnership {
   blobCount: number;
   artifactCount: number;
   archiveCount: number;
-  orphanQuarantineCount: number;
-  incompleteQuarantineCount: number;
 }
 
 export interface CanaryCleanupReservationDocument {
@@ -295,28 +293,16 @@ async function ownershipFor(
         SELECT count(*) FROM solver_evidence_archives archive
         WHERE archive.blob_id IN (SELECT id FROM matching_blobs)
       )::int AS archive_count,
-      (
-        SELECT count(*) FROM solver_evidence_orphan_quarantines quarantine
-        WHERE quarantine.blob_id IN (SELECT id FROM matching_blobs)
-      )::int AS orphan_quarantine_count,
-      (
-        SELECT count(*) FROM solver_evidence_incomplete_quarantines quarantine
-        WHERE quarantine.blob_id IN (SELECT id FROM matching_blobs)
-      )::int AS incomplete_quarantine_count
   `)) as unknown as Array<{
     blob_count: number;
     artifact_count: number;
     archive_count: number;
-    orphan_quarantine_count: number;
-    incomplete_quarantine_count: number;
   }>;
   if (!row) throw new Error("canary cleanup ownership query returned no row");
   return {
     blobCount: Number(row.blob_count),
     artifactCount: Number(row.artifact_count),
     archiveCount: Number(row.archive_count),
-    orphanQuarantineCount: Number(row.orphan_quarantine_count),
-    incompleteQuarantineCount: Number(row.incomplete_quarantine_count),
   };
 }
 
@@ -416,8 +402,6 @@ function reservationDocument(
       blobCount: 0,
       artifactCount: 0,
       archiveCount: 0,
-      orphanQuarantineCount: 0,
-      incompleteQuarantineCount: 0,
     },
   };
 }

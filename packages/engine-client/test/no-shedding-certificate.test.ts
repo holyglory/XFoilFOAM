@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  LEGACY_NO_SHEDDING_CERTIFICATE_VERSION,
   NO_SHEDDING_CERTIFICATE_VERSION,
   NO_SHEDDING_MIN_SAMPLE_COUNT,
   parseNoSheddingCertificate,
 } from "../src/no-shedding-certificate";
+import {
+  isUransContinuationPhysicalCapExhausted,
+  URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER,
+} from "../src/types";
 
 function certificate() {
   return {
@@ -34,6 +39,22 @@ function certificate() {
 }
 
 describe("no-shedding URANS observation certificate parser", () => {
+  it("recognizes the terminal physical-cap marker before generic continuation parsing", () => {
+    const mixedLegacyReason =
+      "URANS budget stopped before required physical integration window; " +
+      `${URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER}; ` +
+      "saved same-case state cannot receive more automatic integration";
+
+    expect(isUransContinuationPhysicalCapExhausted(mixedLegacyReason)).toBe(
+      true,
+    );
+    expect(
+      isUransContinuationPhysicalCapExhausted(
+        "URANS budget stopped before required physical integration window",
+      ),
+    ).toBe(false);
+  });
+
   it("accepts a complete slow-wake physical observation proof", () => {
     const parsed = parseNoSheddingCertificate(certificate());
 
@@ -45,6 +66,15 @@ describe("no-shedding URANS observation certificate parser", () => {
         observed_observation_s: 4.2,
       });
     }
+  });
+
+  it("keeps immutable v1 archive certificates readable after the v2 cutover", () => {
+    const parsed = parseNoSheddingCertificate({
+      ...certificate(),
+      reducer_version: LEGACY_NO_SHEDDING_CERTIFICATE_VERSION,
+    });
+
+    expect(parsed).toMatchObject({ ok: true });
   });
 
   it("fails closed when an apparently flat run is shorter than the slow-wake horizon", () => {
@@ -172,4 +202,3 @@ describe("no-shedding URANS observation certificate parser", () => {
     }
   });
 });
-

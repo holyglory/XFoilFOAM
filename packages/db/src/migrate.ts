@@ -7,9 +7,9 @@ import { migrateWithResultInterpretationLedgerPreflight } from "./result-interpr
 const here = dirname(fileURLToPath(import.meta.url));
 const { db, sql } = createClient({ max: 1 });
 
-// Refuse an interrupted 0096–0099 footprint before Drizzle executes its one
+// Refuse an interrupted 0096–0106 footprint before Drizzle executes its one
 // transaction. A clean pre-ledger production restore and a fully converged
-// post-0099 database are both explicitly accepted.
+// post-0106 database are both explicitly accepted.
 await migrateWithResultInterpretationLedgerPreflight(
   db,
   resolve(here, "../migrations"),

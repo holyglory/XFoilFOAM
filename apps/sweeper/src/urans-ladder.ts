@@ -4,8 +4,10 @@
 // free slot; targeted terminal-parent PRECALC takes the next free slot ahead
 // of unrelated new RANS. Final verification receives one bounded interleave
 // after at most eight newly admitted wave-1 RANS jobs; otherwise new RANS work
-// outranks admin-request PRECALC and verification. At most ONE submission wins
-// each scheduler tick.
+// outranks admin-request PRECALC and verification. Local and campaign lanes
+// admit one winner per tick; remote PRECALC instead admits independent due
+// cells up to its currently free durable CPU tokens before remote RANS fills
+// any remainder.
 //
 // Tier 2 (precalc rank):
 //   a) campaign wave-2 URANS retries — a rejected RANS attempt is normal
@@ -53,7 +55,6 @@ import {
   simLadderSubmitRetries,
   simulationPresetRevisions,
   simulationPresets,
-  syncApiSettings,
   simUransRequests,
   simUransVerifyQueue,
   type VerifyInterleaveScope,
@@ -81,6 +82,7 @@ import {
 import { alias } from "drizzle-orm/pg-core";
 
 import {
+  admissionCpuSlotsForSetup,
   admissionCpuSlotsForRequest,
   buildPolarRequest,
   solverImplementationIdForSetup,
@@ -89,7 +91,7 @@ import {
   engineArchiveReductionVersion,
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
-  supportsArchiveCleanCycleReduction,
+  supportsCurrentArchiveCleanCycleReduction,
   supportsDurableUransRecovery,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
@@ -112,9 +114,12 @@ import {
   archiveBackfillFinalVerifyQueueRequiresActionProof,
   blockArchiveBackfillFinalContinuationAtSubmit,
   blockArchiveBackfillPrecalcContinuationAtSubmit,
-  routeArchiveInterpretationRecoveryActions,
 } from "./archive-interpretation-recovery";
-import { routeLegacyUransArchiveGapRecoveryActions } from "./legacy-urans-archive-gap-recovery";
+import {
+  configuredRemotePromiseOwnerScope,
+  remotePromiseMatchesOwnerScopeSql,
+  type RemotePromiseOwnerScope,
+} from "./remote-solver";
 
 /** Parents whose recovery was already re-attempted this process lifetime —
  *  a parent whose retry plan is empty must not be re-planned every tick
@@ -137,6 +142,26 @@ function normalizedContinuationImplementationId(
 
 const RECOVERY_PARENTS_PER_TICK = 3;
 const PROMOTION_RECOVERIES_PER_TICK = 16;
+// A remote cap may be deliberately much larger than a single scheduler pass.
+// Keep an expensive recovery discovery/compose pass bounded, and return an
+// explicit priority signal so ordinary RANS cannot overtake the remaining
+// FAST work on the next lane.
+const REMOTE_PRECALC_CPU_TOKENS_PER_TICK = 64;
+
+export interface RemotePrecalcRecoverySubmissionOutcome {
+  submitted: number;
+  fastBacklogStillDue: boolean;
+}
+
+function boundedRemotePrecalcCpuTokenBudget(requested: number | undefined) {
+  if (requested == null) return 1;
+  if (!Number.isSafeInteger(requested) || requested <= 0) return 0;
+  // The caller derives this from the declared remote CPU token capacity. The
+  // 64-token per-pass bound controls tick duration, while the returned
+  // fastBacklogStillDue signal preserves strict FAST-over-RANS priority when
+  // a configured node has more than 64 free tokens.
+  return Math.min(requested, REMOTE_PRECALC_CPU_TOKENS_PER_TICK);
+}
 
 interface CampaignPrecalcRecoveryParent {
   /** Immutable physical job which produced the pinned RANS attempt. */
@@ -988,6 +1013,7 @@ export async function submitRecordedPromotionRecovery(
       : undefined;
     let continueFrom: { engineJobId: string; caseSlug: string } | null = null;
     let budgetOverrideS: number | null = null;
+    let cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null = null;
     let continuationResultId: string | null = null;
     let continuationResultAttemptId: string | null = null;
     if (continuation) {
@@ -1000,6 +1026,8 @@ export async function submitRecordedPromotionRecovery(
         caseSlug: continuation.engineCaseSlug,
       };
       budgetOverrideS = continuation.budgetOverrideS;
+      cleanCycleRecoveryPolicyVersion =
+        continuation.cleanCycleRecoveryPolicyVersion;
       continuationResultId = continuation.resultId;
       continuationResultAttemptId = continuation.resultAttemptId;
     }
@@ -1009,17 +1037,14 @@ export async function submitRecordedPromotionRecovery(
       event,
     );
     if (remote.required && "unavailable" in remote) continue;
-    let executionCpuSlots = cpuSlots;
-    if (remote.required) {
-      const [settings] = await db
-        .select({ cpuBudget: syncApiSettings.remoteSolverCpuBudget })
-        .from(syncApiSettings)
-        .where(eq(syncApiSettings.id, 1))
-        .limit(1);
-      executionCpuSlots = settings?.cpuBudget || 1;
-    }
     const target = await resolveTarget(db, event.airfoilId, event.revisionId);
     if (!target) continue;
+    // `remoteSolverCpuBudget` is the node-wide admission ceiling. Each FAST
+    // request must retain its own immutable process/concurrency weight or one
+    // 40-token node job would falsely reserve all 40 tokens by itself.
+    const executionCpuSlots = remote.required
+      ? admissionCpuSlotsForSetup(target.snapshot)
+      : cpuSlots;
     const aoas = schedulable.map((point) => point.aoaDeg);
     const outcome = await submitLadderJob(db, engine, {
       target,
@@ -1046,14 +1071,19 @@ export async function submitRecordedPromotionRecovery(
               continueFromResultId: continuationResultId,
               continueFromResultAttemptId: continuationResultAttemptId,
               budgetOverrideS,
+              ...(cleanCycleRecoveryPolicyVersion != null
+                ? { cleanCycleRecoveryPolicyVersion }
+                : {}),
             }
           : {}),
       },
       cpuSlots: executionCpuSlots,
       continueFrom,
       budgetOverrideS,
+      cleanCycleRecoveryPolicyVersion,
       meshRecoveryVersion,
       uransRecoveryVersion: continuation ? uransRecoveryVersion! : undefined,
+      admissionLane: remote.required ? "remote" : undefined,
       recordedPromotion: {
         promotionId: event.promotionId,
         parentJobId: event.parentJobId,
@@ -1360,6 +1390,15 @@ interface ReplacementPromisePromotionPoint {
   upstreamBaseUrl: string;
 }
 
+interface CurrentPromisePrecalcPoint {
+  obligationId: string;
+  airfoilId: string;
+  revisionId: string;
+  aoaDeg: number;
+  syncPromiseId: string;
+  upstreamBaseUrl: string;
+}
+
 /** A conditional-promotion event is immutable evidence of why URANS became
  * necessary, but its remote promise is only a lease. When that lease closes,
  * a newer exact promise may continue one shared physical obligation without
@@ -1373,7 +1412,13 @@ interface ReplacementPromisePromotionPoint {
  */
 async function dueReplacementPromisePromotionPoints(
   db: DB,
+  scope: RemotePromiseOwnerScope,
+  uransRecoveryVersion: number | null | undefined,
+  limit = RECOVERY_PARENTS_PER_TICK,
 ): Promise<ReplacementPromisePromotionPoint[]> {
+  const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
+    ? restartablePrecalcCheckpointSql(sql`obligation.id`)
+    : sql`false`;
   const rows = (await db.execute(sql`
     SELECT obligation.id AS obligation_id,
            obligation.airfoil_id,
@@ -1395,6 +1440,9 @@ async function dueReplacementPromisePromotionPoints(
      AND promotion.owner_kind = 'sync_promise'
      AND promotion.airfoil_id = obligation.airfoil_id
      AND promotion.revision_id = obligation.revision_id
+    JOIN sync_sweep_promises promotion_owner
+      ON promotion_owner.id = promotion.sync_promise_id
+     AND ${remotePromiseMatchesOwnerScopeSql(scope, "promotion_owner")}
     JOIN LATERAL (
       SELECT current_promise.id AS promise_id,
              current_promise.source_base_url
@@ -1408,7 +1456,7 @@ async function dueReplacementPromisePromotionPoints(
       WHERE current_promise.status = 'active'
         AND current_promise."expiresAt" > now()
         AND current_promise.request_payload ->> 'remoteSolver' = 'true'
-        AND current_promise.source_base_url IS NOT NULL
+        AND ${remotePromiseMatchesOwnerScopeSql(scope, "current_promise")}
         AND current_promise.id IS DISTINCT FROM promotion.sync_promise_id
       ORDER BY current_promise."createdAt", current_promise.id
       LIMIT 1
@@ -1419,11 +1467,14 @@ async function dueReplacementPromisePromotionPoints(
         OR obligation.next_submit_at <= now()
       )
       -- A deterministic mesh failure belongs to automatic mesh repair, never
-      -- this solver-continuation lane. Exact restartability is intentionally
-      -- evaluated only after this small candidate query: embedding the full
-      -- authenticated-archive predicate here made the scheduler scan artifact
-      -- storage for every historical point before LIMIT.
+      -- this solver-continuation lane.
       AND obligation.last_outcome IS DISTINCT FROM 'deterministic_failure'
+      -- Filter physical eligibility before LIMIT. Otherwise the same oldest
+      -- exhausted histories can permanently hide a later runnable promotion.
+      AND (
+        obligation.attempt_count < obligation.max_attempts
+        OR (${restartableScope})
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM sync_sweep_promises original_promise
@@ -1437,6 +1488,7 @@ async function dueReplacementPromisePromotionPoints(
           AND original_promise.status = 'active'
           AND original_promise."expiresAt" > now()
           AND original_promise.request_payload ->> 'remoteSolver' = 'true'
+          AND ${remotePromiseMatchesOwnerScopeSql(scope, "original_promise")}
       )
       AND NOT EXISTS (
         SELECT 1
@@ -1448,7 +1500,7 @@ async function dueReplacementPromisePromotionPoints(
              obligation.id,
              promotion."createdAt",
              promotion.id
-    LIMIT ${RECOVERY_PARENTS_PER_TICK}
+    LIMIT ${limit}
   `)) as unknown as Array<{
     obligation_id: string;
     airfoil_id: string;
@@ -1477,6 +1529,128 @@ async function dueReplacementPromisePromotionPoints(
   }));
 }
 
+/**
+ * Discover the physical PRECALC cell from its current scheduling lease.
+ *
+ * A sync promise is replaceable scheduling ownership, while the obligation is
+ * the durable fidelity requirement. Requiring the original RANS promise (or
+ * even its disposable source attempt) strands the cell after that lease is
+ * cancelled and production issues an exact replacement. The current active
+ * promise point is sufficient authority to launch one fresh FAST URANS run
+ * while physical attempt budget remains. Continuation and whole-polar
+ * promotion provenance stay in their dedicated recovery lanes.
+ */
+async function dueCurrentPromisePrecalcPoints(
+  db: DB,
+  scope: RemotePromiseOwnerScope,
+  limit: number,
+): Promise<CurrentPromisePrecalcPoint[]> {
+  if (limit <= 0) return [];
+  const rows = (await db.execute(sql`
+    SELECT obligation.id AS obligation_id,
+           obligation.airfoil_id,
+           obligation.revision_id,
+           obligation.aoa_deg,
+           current_owner.promise_id AS sync_promise_id,
+           current_owner.source_base_url
+    FROM sim_precalc_obligations obligation
+    JOIN LATERAL (
+      SELECT current_promise.id AS promise_id,
+             current_promise.source_base_url
+      FROM sync_sweep_promises current_promise
+      JOIN sync_sweep_promise_points current_point
+        ON current_point.promise_id = current_promise.id
+       AND current_point.status = 'active'
+       AND current_point.airfoil_id = obligation.airfoil_id
+       AND current_point.simulation_preset_revision_id = obligation.revision_id
+       AND current_point.aoa_deg = obligation.aoa_deg
+      WHERE current_promise.status = 'active'
+        AND current_promise."expiresAt" > now()
+        AND current_promise.request_payload ->> 'remoteSolver' = 'true'
+        AND ${remotePromiseMatchesOwnerScopeSql(scope, "current_promise")}
+      ORDER BY current_promise."createdAt", current_promise.id
+      LIMIT 1
+    ) current_owner ON true
+    WHERE obligation.state = 'pending'
+      AND (
+        obligation.next_submit_at IS NULL
+        OR obligation.next_submit_at <= now()
+      )
+      AND obligation.last_outcome IS DISTINCT FROM 'deterministic_failure'
+      -- This lane is deliberately a fresh replacement-owner run. Exhausted
+      -- obligations need a separately verified continuation or a generation
+      -- reset; neither may be inferred merely from a new scheduling lease.
+      AND obligation.attempt_count < obligation.max_attempts
+      -- Conditional whole-polar promotions retain their immutable promotion
+      -- provenance and are handled by the dedicated replacement lane above.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_rans_polar_promotion_points promotion_point
+        JOIN sim_rans_polar_promotions historical_promotion
+          ON historical_promotion.id = promotion_point.promotion_id
+         AND historical_promotion.owner_kind = 'sync_promise'
+        JOIN sync_sweep_promises historical_promotion_owner
+          ON historical_promotion_owner.id = historical_promotion.sync_promise_id
+         AND ${remotePromiseMatchesOwnerScopeSql(scope, "historical_promotion_owner")}
+        WHERE promotion_point.obligation_id = obligation.id
+      )
+      -- When the original exact promise is still active, preserve the direct
+      -- parent/child evidence chain used by the targeted recovery lane below.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM result_attempts source_attempt
+        JOIN sim_jobs source_parent
+          ON source_parent.id = source_attempt.sim_job_id
+         AND source_parent.wave = 1
+         AND source_parent.request_payload ->> 'remoteSolver' = 'true'
+        JOIN sync_sweep_promises source_promise
+          ON source_promise.id::text =
+             source_parent.request_payload ->> 'syncPromiseId'
+         AND source_promise.status = 'active'
+         AND source_promise."expiresAt" > now()
+         AND source_promise.request_payload ->> 'remoteSolver' = 'true'
+         AND ${remotePromiseMatchesOwnerScopeSql(scope, "source_promise")}
+        JOIN sync_sweep_promise_points source_point
+          ON source_point.promise_id = source_promise.id
+         AND source_point.status = 'active'
+         AND source_point.airfoil_id = obligation.airfoil_id
+         AND source_point.simulation_preset_revision_id = obligation.revision_id
+         AND source_point.aoa_deg = obligation.aoa_deg
+        WHERE source_attempt.id = obligation.source_result_attempt_id
+          AND source_attempt.regime = 'rans'
+          AND source_attempt.airfoil_id = obligation.airfoil_id
+          AND source_attempt.simulation_preset_revision_id = obligation.revision_id
+          AND source_attempt.aoa_deg = obligation.aoa_deg
+          AND source_parent.airfoil_id = obligation.airfoil_id
+          AND source_parent.simulation_preset_revision_id = obligation.revision_id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs latest_job
+        WHERE latest_job.id = obligation.latest_sim_job_id
+          AND latest_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+    ORDER BY COALESCE(obligation.next_submit_at, obligation."createdAt"),
+             obligation.id
+    LIMIT ${limit}
+  `)) as unknown as Array<{
+    obligation_id: string;
+    airfoil_id: string;
+    revision_id: string;
+    aoa_deg: number | string;
+    sync_promise_id: string;
+    source_base_url: string;
+  }>;
+  return rows.map((row) => ({
+    obligationId: row.obligation_id,
+    airfoilId: row.airfoil_id,
+    revisionId: row.revision_id,
+    aoaDeg: Number(row.aoa_deg),
+    syncPromiseId: row.sync_promise_id,
+    upstreamBaseUrl: row.source_base_url,
+  }));
+}
+
 /** Discover exact targeted PRECALC work owned by an active remote promise.
  * Remote-only solver instances deliberately keep sweeper_state.enabled=false,
  * so campaign-owned recovery cannot be their scheduling authority. The
@@ -1485,7 +1659,9 @@ async function dueReplacementPromisePromotionPoints(
  * this higher-fidelity obligation is pending. */
 async function dueRemotePromisePrecalcRecoveryParents(
   db: DB,
+  scope: RemotePromiseOwnerScope,
   uransRecoveryVersion: number | null | undefined,
+  limit = RECOVERY_PARENTS_PER_TICK,
 ): Promise<RemotePromisePrecalcRecoveryParent[]> {
   const restartableScope = supportsDurableUransRecovery(uransRecoveryVersion)
     ? restartablePrecalcCheckpointSql(sql`obligation.id`)
@@ -1512,6 +1688,7 @@ async function dueRemotePromisePrecalcRecoveryParents(
      AND remote_promise.status = 'active'
      AND remote_promise."expiresAt" > now()
      AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
+     AND ${remotePromiseMatchesOwnerScopeSql(scope, "remote_promise")}
     JOIN sync_sweep_promise_points promise_point
       ON promise_point.promise_id = remote_promise.id
      AND promise_point.status = 'active'
@@ -1523,6 +1700,9 @@ async function dueRemotePromisePrecalcRecoveryParents(
         obligation.next_submit_at IS NULL
         OR obligation.next_submit_at <= now()
       )
+      -- Deterministic mesh failures belong to automatic mesh repair and must
+      -- never be reinterpreted as a solver-continuation opportunity.
+      AND obligation.last_outcome IS DISTINCT FROM 'deterministic_failure'
       AND (
         obligation.attempt_count < obligation.max_attempts
         OR (${restartableScope})
@@ -1562,6 +1742,7 @@ async function dueRemotePromisePrecalcRecoveryParents(
          AND promotion_promise.status = 'active'
          AND promotion_promise."expiresAt" > now()
          AND promotion_promise.request_payload ->> 'remoteSolver' = 'true'
+         AND ${remotePromiseMatchesOwnerScopeSql(scope, "promotion_promise")}
         JOIN sync_sweep_promise_points promotion_promise_point
           ON promotion_promise_point.promise_id = promotion_promise.id
          AND promotion_promise_point.status = 'active'
@@ -1573,7 +1754,7 @@ async function dueRemotePromisePrecalcRecoveryParents(
       )
     GROUP BY parent.id
     ORDER BY due_at, parent.id
-    LIMIT ${RECOVERY_PARENTS_PER_TICK}
+    LIMIT ${limit}
   `)) as unknown as Array<{
     parent_job_id: string;
     source_attempt_ids: string[];
@@ -1603,30 +1784,70 @@ async function dueRemotePromisePrecalcRecoveryParents(
   });
 }
 
-/** Submit at most one targeted PRECALC child for active remote-promise work.
- * The configured remote CPU budget owns this child exactly like it owns the
- * mirrored RANS parent; a disabled local scheduler must not silently widen
- * the canary's resource envelope. */
+/**
+ * Submit due, independent PRECALC children for active remote-promise work.
+ *
+ * FAST remains the first remote admission lane, but the old boolean result
+ * accidentally converted one accepted child into a node-wide tick fence. A
+ * high-capacity remote node therefore idled every other token while a serial
+ * historical continuation backlog drained one item per tick. The caller
+ * supplies the number of currently free remote tokens; this function admits
+ * at most that many independent cells, and the serialized global permit
+ * remains the authoritative final cap under concurrent ticks.
+ *
+ * A permanently unusable continuation source never appears in
+ * `precalcContinuationsForObligations`: that helper rejects it from the exact
+ * restart set, so a cell with unused physical budget composes one fresh run
+ * and an exhausted cell remains blocked. Do not reintroduce an unchanged
+ * continuation fallback here.
+ */
 export async function submitRemotePromisePrecalcRecoveries(
   db: DB,
   engine: EngineClient,
   meshRecoveryVersion: number,
   uransRecoveryVersion: number | null | undefined,
-): Promise<boolean> {
-  const [settings] = await db
-    .select({ cpuBudget: syncApiSettings.remoteSolverCpuBudget })
-    .from(syncApiSettings)
-    .where(eq(syncApiSettings.id, 1))
-    .limit(1);
-  const replacementPoints = await dueReplacementPromisePromotionPoints(db);
+  archiveReductionVersion: number | null | undefined,
+  availableCpuSlots?: number,
+  continueAfterSubmission?: () => Promise<boolean>,
+  storageAdmissionAllowed?: () => Promise<boolean>,
+): Promise<RemotePrecalcRecoverySubmissionOutcome> {
+  // Remote PRECALC is physical work, so it needs the same live archive
+  // capability proof as ordinary ladder submission before composing a child.
+  if (!supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion))
+    return { submitted: 0, fastBacklogStillDue: false };
+  const cpuTokenBudget = boundedRemotePrecalcCpuTokenBudget(availableCpuSlots);
+  if (cpuTokenBudget === 0) return { submitted: 0, fastBacklogStillDue: false };
+  const promiseScope = await configuredRemotePromiseOwnerScope(db);
+  if (!promiseScope) return { submitted: 0, fastBacklogStillDue: false };
+  let submitted = 0;
+  let reservedCpuSlots = 0;
+  const remainingCpuSlots = () => cpuTokenBudget - reservedCpuSlots;
+  const admissionStillAllowed = async () =>
+    !continueAfterSubmission || (await continueAfterSubmission());
+  const replacementPoints = await dueReplacementPromisePromotionPoints(
+    db,
+    promiseScope,
+    uransRecoveryVersion,
+    cpuTokenBudget + 1,
+  );
   for (const point of replacementPoints) {
     await touchHeartbeat(db);
     const [continuation] = supportsDurableUransRecovery(uransRecoveryVersion)
       ? await precalcContinuationsForObligations(db, [point.obligationId])
       : [];
+    // An exhausted historical row without authenticated continuation evidence
+    // is not runnable work. It must not consume a capacity index or fence a
+    // different exact cell that can execute now.
     if (!continuation && point.attemptCount >= point.maxAttempts) continue;
     const target = await resolveTarget(db, point.airfoilId, point.revisionId);
     if (!target) continue;
+    const cpuSlots = admissionCpuSlotsForSetup(target.snapshot);
+    if (cpuSlots > remainingCpuSlots()) {
+      // Do not submit a too-wide FAST child and then allow lower-priority
+      // RANS into the remainder. The next scheduler pass will remeasure the
+      // durable permit pool and retry this exact physical obligation first.
+      return { submitted, fastBacklogStillDue: true };
+    }
     const outcome = await submitLadderJob(db, engine, {
       target,
       aoas: [point.aoaDeg],
@@ -1647,10 +1868,16 @@ export async function submitRemotePromisePrecalcRecoveries(
               continueFromResultId: continuation.resultId,
               continueFromResultAttemptId: continuation.resultAttemptId,
               budgetOverrideS: continuation.budgetOverrideS,
+              ...(continuation.cleanCycleRecoveryPolicyVersion != null
+                ? {
+                    cleanCycleRecoveryPolicyVersion:
+                      continuation.cleanCycleRecoveryPolicyVersion,
+                  }
+                : {}),
             }
           : {}),
       },
-      cpuSlots: settings?.cpuBudget || 1,
+      cpuSlots,
       continueFrom: continuation
         ? {
             engineJobId: continuation.engineJobId,
@@ -1658,10 +1885,15 @@ export async function submitRemotePromisePrecalcRecoveries(
           }
         : null,
       budgetOverrideS: continuation?.budgetOverrideS ?? null,
+      cleanCycleRecoveryPolicyVersion:
+        continuation?.cleanCycleRecoveryPolicyVersion ?? null,
       meshRecoveryVersion,
       uransRecoveryVersion: continuation ? uransRecoveryVersion! : undefined,
       admissionLane: "remote",
+      ...(storageAdmissionAllowed ? { storageAdmissionAllowed } : {}),
     });
+    if (outcome.storageAdmissionHeld)
+      return { submitted, fastBacklogStillDue: true };
     if (outcome.submitted) {
       await recordPrecalcObligationSubmission(db, outcome.jobId, [
         point.obligationId,
@@ -1669,25 +1901,111 @@ export async function submitRemotePromisePrecalcRecoveries(
       console.log(
         `[sweeper] current remote promise ${point.syncPromiseId} resumed exact historical promotion point ${point.promotionId}/${point.obligationId} at α ${point.aoaDeg}° through PRECALC job ${outcome.jobId}`,
       );
-      return true;
+      submitted += 1;
+      reservedCpuSlots += cpuSlots;
+      if (!(await admissionStillAllowed()))
+        return { submitted, fastBacklogStillDue: true };
+      continue;
     }
-    if (outcome.submissionInProgress) return true;
+    // An independently-owned submission race may already reserve a token,
+    // but it must not serialize other due FAST cells behind that one cell.
+    // The later remote RANS refill re-reads durable reservations.
+  }
+  // The active promise is the current execution lease for an exact physical
+  // cell. It may differ from the promise that produced the original RANS
+  // rejection, and failed-generation cleanup may already have removed that
+  // disposable source attempt. Submit directly from the obligation so these
+  // valid replacement leases cannot fence RANS while leaving the node idle.
+  const currentPromisePoints = await dueCurrentPromisePrecalcPoints(
+    db,
+    promiseScope,
+    cpuTokenBudget + 1,
+  );
+  for (const point of currentPromisePoints) {
+    if (remainingCpuSlots() <= 0)
+      return { submitted, fastBacklogStillDue: true };
+    await touchHeartbeat(db);
+    const target = await resolveTarget(db, point.airfoilId, point.revisionId);
+    if (!target) continue;
+    const cpuSlots = admissionCpuSlotsForSetup(target.snapshot);
+    if (cpuSlots > remainingCpuSlots())
+      return { submitted, fastBacklogStillDue: true };
+    const outcome = await submitLadderJob(db, engine, {
+      target,
+      aoas: [point.aoaDeg],
+      fidelity: "precalc",
+      jobKind: "targeted",
+      campaignId: null,
+      payloadExtras: {
+        syncPromiseId: point.syncPromiseId,
+        remoteSolver: true,
+        upstreamBaseUrl: point.upstreamBaseUrl,
+        precalcObligationIds: [point.obligationId],
+        retryMode: "current-promise-precalc",
+      },
+      cpuSlots,
+      continueFrom: null,
+      budgetOverrideS: null,
+      cleanCycleRecoveryPolicyVersion: null,
+      meshRecoveryVersion,
+      admissionLane: "remote",
+      ...(storageAdmissionAllowed ? { storageAdmissionAllowed } : {}),
+    });
+    if (outcome.storageAdmissionHeld)
+      return { submitted, fastBacklogStillDue: true };
+    if (!outcome.submitted) continue;
+    await recordPrecalcObligationSubmission(db, outcome.jobId, [
+      point.obligationId,
+    ]);
+    console.log(
+      `[sweeper] active remote promise ${point.syncPromiseId} claimed exact PRECALC obligation ${point.obligationId} at α ${point.aoaDeg}° through job ${outcome.jobId}`,
+    );
+    submitted += 1;
+    reservedCpuSlots += cpuSlots;
+    if (!(await admissionStillAllowed()))
+      return { submitted, fastBacklogStillDue: true };
   }
   const candidates = await dueRemotePromisePrecalcRecoveryParents(
     db,
+    promiseScope,
     uransRecoveryVersion,
+    cpuTokenBudget + 1,
   );
-  for (const candidate of candidates) {
+  for (const [index, candidate] of candidates.entries()) {
+    if (index >= cpuTokenBudget)
+      return { submitted, fastBacklogStillDue: true };
     await touchHeartbeat(db);
-    await submitUransRetryForJob(db, engine, candidate.sourceParent, {
-      meshRecoveryVersion,
-      uransRecoveryVersion,
-      capacityScheduledEscalation: true,
-      sourceResultAttemptIds: candidate.sourceResultAttemptIds,
-      cpuSlots: settings?.cpuBudget ?? 1,
-    });
+    const revisionId = candidate.sourceParent.simulationPresetRevisionId;
+    if (!revisionId) continue;
+    const target = await resolveTarget(
+      db,
+      candidate.sourceParent.airfoilId,
+      revisionId,
+    );
+    if (!target) continue;
+    const cpuSlots = admissionCpuSlotsForSetup(target.snapshot);
+    if (cpuSlots > remainingCpuSlots())
+      return { submitted, fastBacklogStillDue: true };
+    const retryOutcome = await submitUransRetryForJob(
+      db,
+      engine,
+      candidate.sourceParent,
+      {
+        meshRecoveryVersion,
+        uransRecoveryVersion,
+        archiveReductionVersion,
+        capacityScheduledEscalation: true,
+        sourceResultAttemptIds: candidate.sourceResultAttemptIds,
+        ...(storageAdmissionAllowed ? { storageAdmissionAllowed } : {}),
+      },
+    );
+    if (retryOutcome === "storage_admission_hold")
+      return { submitted, fastBacklogStillDue: true };
     const [activeChild] = await db
-      .select({ id: simJobs.id })
+      .select({
+        id: simJobs.id,
+        admissionCpuSlots: simJobs.admissionCpuSlots,
+      })
       .from(simJobs)
       .where(
         and(
@@ -1704,9 +2022,23 @@ export async function submitRemotePromisePrecalcRecoveries(
         ),
       )
       .limit(1);
-    if (activeChild) return true;
+    if (activeChild) {
+      submitted += 1;
+      // This is normally cpuSlots. Reading the durable child makes a
+      // concurrent winner authoritative, while the global permit remains the
+      // final concurrent admission fence.
+      reservedCpuSlots += Math.max(
+        1,
+        activeChild.admissionCpuSlots ?? cpuSlots,
+      );
+      if (!(await admissionStillAllowed()))
+        return { submitted, fastBacklogStillDue: true };
+    }
   }
-  return false;
+  return {
+    submitted,
+    fastBacklogStillDue: candidates.length > cpuTokenBudget,
+  };
 }
 
 interface ComposedTarget {
@@ -1769,6 +2101,9 @@ async function submitLadderJob(
     /** Exact archive-reducer instruction for the resumed transient's clean
      * tail. Only archive-authorized same-case continuations may set this. */
     correctiveTailPeriods?: number | null;
+    /** Explicit archive reducer policy authority for the resumed transient.
+     * Omission preserves the legacy v1 physical cap. */
+    cleanCycleRecoveryPolicyVersion?: "adaptive-clean-tail-v2" | null;
     /** Live engine capability stamped into PRECALC execution provenance. */
     meshRecoveryVersion?: number;
     /** Exact live durable URANS recovery contract. Required only when this
@@ -1781,6 +2116,10 @@ async function submitLadderJob(
     /** Explicit only for the one-shot operator canary. Ordinary ladder work
      * remains local and therefore requires the scheduler switch to be on. */
     admissionLane?: SubmissionAdmissionLane;
+    /** Re-measure storage after this exact pending job becomes a submitting
+     * reservation and before the engine receives it. Remote high-capacity
+     * refill supplies this guard; ordinary direct/test callers may omit it. */
+    storageAdmissionAllowed?: () => Promise<boolean>;
     /** Crash recovery for one normalized whole-polar event. The exact event
      * and selected obligation ids are revalidated by the child composer in
      * the same transaction as insertion. */
@@ -1798,6 +2137,7 @@ async function submitLadderJob(
   lifecycleStopped: boolean;
   submissionInProgress: boolean;
   capabilityMismatch?: boolean;
+  storageAdmissionHeld?: boolean;
   error?: string;
   httpStatus?: number | null;
   ladderDisposition?: "retry_wait" | "blocked" | null;
@@ -1812,6 +2152,19 @@ async function submitLadderJob(
       "corrective tail periods are valid only for an exact same-case continuation",
     );
   }
+  if (opts.cleanCycleRecoveryPolicyVersion != null && !opts.continueFrom) {
+    throw new Error(
+      "clean-cycle recovery policy is valid only for an exact same-case continuation",
+    );
+  }
+  // This is provenance for a *future* same-case continuation, not an engine
+  // knob for the fresh solve being submitted now. A fresh v2 trajectory earns
+  // explicit v2 authority only after it later produces a checkpoint; an
+  // inherited legacy continuation remains NULL so the next segment is still
+  // capped by the historical 9/12 contract.
+  const sourceCleanCycleRecoveryPolicyVersion = opts.continueFrom
+    ? (opts.cleanCycleRecoveryPolicyVersion ?? null)
+    : "adaptive-clean-tail-v2";
   const {
     target,
     aoas,
@@ -1919,6 +2272,10 @@ async function submitLadderJob(
       }
       request.corrective_tail_periods = opts.correctiveTailPeriods;
     }
+    if (opts.cleanCycleRecoveryPolicyVersion != null) {
+      request.clean_cycle_recovery_policy_version =
+        opts.cleanCycleRecoveryPolicyVersion;
+    }
   }
   const jobValues: typeof simJobs.$inferInsert = {
     parentJobId: opts.recordedPromotion?.parentJobId ?? null,
@@ -1956,6 +2313,13 @@ async function submitLadderJob(
       ...(opts.correctiveTailPeriods != null
         ? { correctiveTailPeriods: opts.correctiveTailPeriods }
         : {}),
+      ...(opts.cleanCycleRecoveryPolicyVersion != null
+        ? {
+            cleanCycleRecoveryPolicyVersion:
+              opts.cleanCycleRecoveryPolicyVersion,
+          }
+        : {}),
+      cleanCycleRecoveryPolicyVersion: sourceCleanCycleRecoveryPolicyVersion,
       resources: request.resources,
       setupSnapshot: target.snapshot,
     },
@@ -2108,6 +2472,9 @@ async function submitLadderJob(
     ...(fidelity === "full" && opts.verifyQueueId
       ? { ladderSubmitOwner: { verifyQueueId: opts.verifyQueueId } }
       : {}),
+    ...(opts.storageAdmissionAllowed
+      ? { storageAdmissionAllowed: opts.storageAdmissionAllowed }
+      : {}),
   });
   if (submit.kind === "submitted") {
     return {
@@ -2160,6 +2527,17 @@ async function submitLadderJob(
       connectionFailure: false,
       lifecycleStopped: false,
       submissionInProgress: true,
+    };
+  }
+  if (submit.kind === "storage_admission_hold") {
+    return {
+      jobId: job.id,
+      submitted: false,
+      connectionFailure: false,
+      lifecycleStopped: false,
+      submissionInProgress: false,
+      storageAdmissionHeld: true,
+      error: submit.error,
     };
   }
   return {
@@ -2231,10 +2609,12 @@ async function consumeUransRequest(
   uransRecoveryVersion?: number | null,
   requiredFidelity?: UransFidelity,
   admissionLane?: SubmissionAdmissionLane,
+  recoveryOwnedOnly = false,
 ): Promise<boolean> {
   const request = await claimNextPendingUransRequest(db, {
     requestIds,
     fidelity: requiredFidelity,
+    recoveryOwnedOnly,
   });
   if (!request) return false;
   const requestedFidelity: UransFidelity =
@@ -2283,6 +2663,9 @@ async function consumeUransRequest(
   let effectiveBudgetOverrideS =
     requestedFidelity === "precalc" ? (request.budgetOverrideS ?? null) : null;
   let effectiveCorrectiveTailPeriods: number | null = null;
+  let effectiveCleanCycleRecoveryPolicyVersion:
+    | "adaptive-clean-tail-v2"
+    | null = null;
   let aoas: number[];
   if (requestedFidelity === "precalc" && request.continueFromResultId) {
     if (!request.continueFromResultAttemptId) {
@@ -2347,6 +2730,10 @@ async function consumeUransRequest(
         bcId: target.bcId,
         aoaDeg: request.aoaDeg ?? Number.NaN,
         correctiveTailPeriods: request.correctiveTailPeriods ?? null,
+        cleanCycleRecoveryPolicyVersion:
+          request.cleanCycleRecoveryPolicyVersion === "adaptive-clean-tail-v2"
+            ? "adaptive-clean-tail-v2"
+            : null,
       });
     const archiveBackfillRequiresActionProof =
       await archiveBackfillPrecalcRequestRequiresActionProof(db, request.id);
@@ -2355,6 +2742,10 @@ async function consumeUransRequest(
     // legacy continuation keeps the established source-derived heuristic.
     if (archiveBackfillContinuation) {
       effectiveCorrectiveTailPeriods = request.correctiveTailPeriods ?? null;
+      effectiveCleanCycleRecoveryPolicyVersion =
+        request.cleanCycleRecoveryPolicyVersion === "adaptive-clean-tail-v2"
+          ? "adaptive-clean-tail-v2"
+          : null;
     }
     if (
       !source ||
@@ -2616,6 +3007,8 @@ async function consumeUransRequest(
         latestContinuation.resultAttemptId;
       effectiveBudgetOverrideS = latestContinuation.budgetOverrideS;
       effectiveCorrectiveTailPeriods = null;
+      effectiveCleanCycleRecoveryPolicyVersion =
+        latestContinuation.cleanCycleRecoveryPolicyVersion;
     }
   }
   const outcome = await submitLadderJob(db, engine, {
@@ -2635,6 +3028,12 @@ async function consumeUransRequest(
             continueFromResultId: obligationContinuationResultId,
             continueFromResultAttemptId: obligationContinuationResultAttemptId,
             budgetOverrideS: effectiveBudgetOverrideS,
+            ...(effectiveCleanCycleRecoveryPolicyVersion != null
+              ? {
+                  cleanCycleRecoveryPolicyVersion:
+                    effectiveCleanCycleRecoveryPolicyVersion,
+                }
+              : {}),
           }
         : {}),
       ...(requestedFidelity === "precalc" && request.continueFromResultId
@@ -2645,6 +3044,12 @@ async function consumeUransRequest(
             ...(effectiveCorrectiveTailPeriods != null
               ? { correctiveTailPeriods: effectiveCorrectiveTailPeriods }
               : {}),
+            ...(effectiveCleanCycleRecoveryPolicyVersion != null
+              ? {
+                  cleanCycleRecoveryPolicyVersion:
+                    effectiveCleanCycleRecoveryPolicyVersion,
+                }
+              : {}),
           }
         : {}),
     },
@@ -2652,6 +3057,7 @@ async function consumeUransRequest(
     continueFrom,
     budgetOverrideS: effectiveBudgetOverrideS,
     correctiveTailPeriods: effectiveCorrectiveTailPeriods,
+    cleanCycleRecoveryPolicyVersion: effectiveCleanCycleRecoveryPolicyVersion,
     meshRecoveryVersion,
     uransRecoveryVersion: continueFrom
       ? (uransRecoveryVersion ?? undefined)
@@ -2681,7 +3087,11 @@ async function consumeUransRequest(
     await releaseClaimedUransRequest(db, request.id);
     return false;
   }
-  if (outcome.connectionFailure || outcome.lifecycleStopped) {
+  if (
+    outcome.connectionFailure ||
+    outcome.lifecycleStopped ||
+    outcome.storageAdmissionHeld
+  ) {
     await releaseClaimedUransRequest(db, request.id);
     return false;
   }
@@ -2707,6 +3117,32 @@ async function consumeUransRequest(
   // failed sim_job. Never rewrite accepted result evidence or downgrade this
   // machine-terminal outcome into a review/cancel placeholder here.
   return false;
+}
+
+/** Admit one normal URANS request only when an active exact archive-recovery
+ * action owns it. The audit remains admission-free; this consumes the durable
+ * physical owner produced by the routing step and obeys every ordinary submit
+ * lifecycle, disk, capability, and capacity guard at its caller. */
+export async function submitRoutedArchiveRecoveryRequest(
+  db: DB,
+  engine: EngineClient,
+  cpuSlots: number,
+  input: {
+    meshRecoveryVersion: number;
+    uransRecoveryVersion: number | null;
+  },
+): Promise<boolean> {
+  return consumeUransRequest(
+    db,
+    engine,
+    cpuSlots,
+    undefined,
+    input.meshRecoveryVersion,
+    input.uransRecoveryVersion,
+    undefined,
+    undefined,
+    true,
+  );
 }
 
 /** Consume ONE pending verify-queue item (contract 4). The caller owns whether
@@ -2790,6 +3226,8 @@ async function consumeVerifyItem(
         solverImplementationId: archiveBackfillRecovery.solverImplementationId,
         budgetOverrideS:
           item.continuationBudgetOverrideS ?? FINAL_URANS_CONTINUATION_BUDGET_S,
+        cleanCycleRecoveryPolicyVersion:
+          archiveBackfillRecovery.cleanCycleRecoveryPolicyVersion,
       }
     : await finalUransRecoveryPlanForVerifyItem(db, item);
   if (recovery.mode === "media_repair") {
@@ -2873,6 +3311,10 @@ async function consumeVerifyItem(
     recovery.resultAttemptId === archiveBackfillRecovery.resultAttemptId
       ? archiveBackfillRecovery.correctiveTailPeriods
       : null;
+  const cleanCycleRecoveryPolicyVersion =
+    recovery.mode === "continuation"
+      ? recovery.cleanCycleRecoveryPolicyVersion
+      : null;
   const usesAutomaticRecoveryContract =
     recovery.mode === "continuation" ||
     item.freshAttemptCount > 0 ||
@@ -2903,6 +3345,9 @@ async function consumeVerifyItem(
             continueFromResultAttemptId: recovery.resultAttemptId,
             budgetOverrideS,
             ...(correctiveTailPeriods != null ? { correctiveTailPeriods } : {}),
+            ...(cleanCycleRecoveryPolicyVersion != null
+              ? { cleanCycleRecoveryPolicyVersion }
+              : {}),
           }
         : {}),
     },
@@ -2910,6 +3355,7 @@ async function consumeVerifyItem(
     continueFrom: continuation,
     budgetOverrideS,
     correctiveTailPeriods,
+    cleanCycleRecoveryPolicyVersion,
     uransRecoveryVersion: usesAutomaticRecoveryContract
       ? (scope.uransRecoveryVersion ?? undefined)
       : undefined,
@@ -2922,7 +3368,11 @@ async function consumeVerifyItem(
     );
     return true;
   }
-  if (outcome.connectionFailure || outcome.lifecycleStopped) {
+  if (
+    outcome.connectionFailure ||
+    outcome.lifecycleStopped ||
+    outcome.storageAdmissionHeld
+  ) {
     await releaseClaimedVerifyItem(db, item.id);
     return false; // pending for a live/paused campaign; backoff/compensation recorded
   }
@@ -2963,7 +3413,7 @@ export async function submitExactUransCanaryStep(
   // gateway which cannot reduce that generation's immutable archive back into
   // a publishable interpretation.
   const archiveReductionVersion = await engineArchiveReductionVersion(engine);
-  if (!supportsArchiveCleanCycleReduction(archiveReductionVersion))
+  if (!supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion))
     return false;
 
   await healOrphanedUransRequests(db, { requestIds: [input.requestId] });
@@ -3076,7 +3526,7 @@ export async function uransLadderTick(
         : undefined;
   if (
     archiveReductionVersion !== undefined &&
-    !supportsArchiveCleanCycleReduction(archiveReductionVersion)
+    !supportsCurrentArchiveCleanCycleReduction(archiveReductionVersion)
   )
     return false;
 
@@ -3114,27 +3564,6 @@ export async function uransLadderTick(
       : await engineUransRecoveryVersion(engine);
   const durableRecoveryAvailable =
     supportsDurableUransRecovery(uransRecoveryVersion);
-
-  // Archive clean-cycle reduction never submits CFD itself. It creates exact
-  // action records; materialize their normal ladder owners before any request
-  // or verify item can be claimed in this tick. A source archive is re-proven
-  // again by the consuming path immediately before engine composition.
-  if (durableRecoveryAvailable) {
-    const routedArchiveRecoveryActions =
-      await routeArchiveInterpretationRecoveryActions(db);
-    if (routedArchiveRecoveryActions > 0) {
-      console.log(
-        `[sweeper] archive interpretation recovery: routed ${routedArchiveRecoveryActions} durable action(s) into the URANS ladder`,
-      );
-    }
-    const routedLegacyArchiveGapActions =
-      await routeLegacyUransArchiveGapRecoveryActions(db);
-    if (routedLegacyArchiveGapActions > 0) {
-      console.log(
-        `[sweeper] legacy archive-gap recovery: routed or reconciled ${routedLegacyArchiveGapActions} bounded FAST action(s) into the URANS ladder`,
-      );
-    }
-  }
 
   if (meshRecoveryVersion != null) {
     const continuationRecoveryScope = opts.requestIds?.length

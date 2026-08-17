@@ -64,6 +64,7 @@ from airfoilfoam.openfoam.dialects import (
     OPENCFD_2606_IDENTITY,
 )
 from airfoilfoam.openfoam.runner import InfrastructureError, OpenFOAMError
+from airfoilfoam.postprocess.unsteady import CleanCycleAudit
 from airfoilfoam.pipeline import (
     CaseOutcome,
     ContinuationPermanentError,
@@ -382,6 +383,14 @@ def test_continue_from_request_contract(naca0012_selig_text):
             naca0012_selig_text,
             continue_from=None,
             corrective_tail_periods=1,
+        )
+    with pytest.raises(ValueError, match="valid only for an exact continue_from"):
+        _continuation_request(
+            naca0012_selig_text,
+            continue_from=None,
+            clean_cycle_recovery_policy_version=(
+                pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+            ),
         )
 
 
@@ -1189,6 +1198,7 @@ def test_continuation_source_carries_only_evidence_backed_corrective_tail(tmp_pa
     assert nonstationary_source.corrective_tail_periods == pytest.approx(
         pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS
     )
+    assert not nonstationary_source.archive_clean_cycle_recovery
 
     # An authenticated archive reducer is more precise than collapsed source
     # warnings. A damaged terminal period needs the full bounded replacement,
@@ -1201,6 +1211,7 @@ def test_continuation_source_carries_only_evidence_backed_corrective_tail(tmp_pa
         corrective_tail_periods=3,
     )
     assert archive_corrupt_tail.corrective_tail_periods == pytest.approx(3.0)
+    assert archive_corrupt_tail.archive_clean_cycle_recovery
     archive_clean_suffix = stage_continuation_case(
         nonstationary,
         tmp_path / "continued-nonstationary-archive-clean-suffix",
@@ -1209,6 +1220,7 @@ def test_continuation_source_carries_only_evidence_backed_corrective_tail(tmp_pa
         corrective_tail_periods=1,
     )
     assert archive_clean_suffix.corrective_tail_periods == pytest.approx(1.0)
+    assert archive_clean_suffix.archive_clean_cycle_recovery
 
     budget_only = tmp_path / "jobs" / ("c2" * 16) / "cases" / "budget-only"
     _make_saved_case(budget_only)
@@ -1227,6 +1239,7 @@ def test_continuation_source_carries_only_evidence_backed_corrective_tail(tmp_pa
         expected_engine=OPENCFD_2606_IDENTITY,
     )
     assert budget_source.corrective_tail_periods == pytest.approx(1.0)
+    assert not budget_source.archive_clean_cycle_recovery
 
 
 def test_stage_continuation_rejects_archive_that_disagrees_with_manifest(tmp_path):
@@ -1512,6 +1525,9 @@ def test_resume_first_chunk_uses_evidence_backed_corrective_tail_for_both_tiers(
         resume_from: float,
         corrective_tail_periods: float,
         fidelity: str = "precalc",
+        *,
+        archive_clean_cycle_recovery: bool = False,
+        clean_cycle_recovery_policy_version: str | None = None,
     ):
         return pipeline._run_transient(
             target_case,
@@ -1534,6 +1550,8 @@ def test_resume_first_chunk_uses_evidence_backed_corrective_tail_for_both_tiers(
                 transient_start=0.0,
                 resume_from=resume_from,
                 corrective_tail_periods=corrective_tail_periods,
+                archive_clean_cycle_recovery=archive_clean_cycle_recovery,
+                clean_cycle_recovery_policy_version=clean_cycle_recovery_policy_version,
             ),
         )
 
@@ -1564,6 +1582,9 @@ def test_resume_first_chunk_uses_evidence_backed_corrective_tail_for_both_tiers(
             0.3,
             pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS,
             "full",
+            clean_cycle_recovery_policy_version=(
+                pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+            ),
         )
         is not None
     )
@@ -1587,6 +1608,127 @@ def test_resume_first_chunk_uses_evidence_backed_corrective_tail_for_both_tiers(
         is not None
     )
     assert captured[-1] == pytest.approx(PERIOD_S, rel=0.08)
+
+    # An archive-backed FINAL continuation at 26.5/27 physical periods has
+    # only half a period left. The ordinary retained-window target is a full
+    # period at this point; rounding progress down to 26 would therefore
+    # consume 27.5 periods and violate the immutable archive cap.
+    fractional_cap_case = tmp_path / "full-archive-fractional-cap"
+    # The restartable field state is at 26 periods, but the authenticated
+    # coefficient history reached 26.5. The cap must use the latter rather
+    # than pretending the final half period never happened.
+    fractional_tcase = _make_saved_case(fractional_cap_case, latest="0.52")
+    (
+        fractional_tcase
+        / "postProcessing"
+        / "forceCoeffs1"
+        / "0"
+        / "coefficient.dat"
+    ).write_text(_coeff_rows(0.001, 0.53))
+    assert (
+        run(
+            fractional_cap_case,
+            0.52,
+            1.0,
+            "full",
+            archive_clean_cycle_recovery=True,
+            clean_cycle_recovery_policy_version=(
+                pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+            ),
+        )
+        is not None
+    )
+    assert captured[-1] == pytest.approx(0.5 * PERIOD_S, rel=0.05)
+
+    # At the precise final cap, recovery must reject before pimpleFoam is
+    # invoked. A normal scheduler should never route this source, but the
+    # engine guard prevents an unsafe direct/replayed request from crossing it.
+    exhausted_cap_case = tmp_path / "full-archive-exhausted-cap"
+    _make_saved_case(exhausted_cap_case, latest="0.54")
+    prior_attempts = len(captured)
+    with pytest.raises(ContinuationPermanentError, match="physical cap"):
+        run(
+            exhausted_cap_case,
+            0.54,
+            1.0,
+            "full",
+            # Only an explicit v2 authority may use the adaptive 27-period
+            # ceiling. Historical / unproven requests remain v1-capped.
+            archive_clean_cycle_recovery=False,
+            clean_cycle_recovery_policy_version=(
+                pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+            ),
+        )
+    assert len(captured) == prior_attempts
+
+    # A legacy/unproven FAST checkpoint preserves the v1 physical budget:
+    # 8/9 can take exactly its last period, while 9/9 does not start another
+    # pimpleFoam segment.
+    legacy_near_cap = tmp_path / "legacy-fast-near-cap"
+    _make_saved_case(legacy_near_cap, latest="0.16")
+    assert run(legacy_near_cap, 0.16, 1.0) is not None
+    assert captured[-1] == pytest.approx(PERIOD_S, rel=0.05)
+    legacy_at_cap = tmp_path / "legacy-fast-at-cap"
+    _make_saved_case(legacy_at_cap, latest="0.18")
+    prior_attempts = len(captured)
+    with pytest.raises(ContinuationPermanentError, match="9-period physical cap"):
+        run(legacy_at_cap, 0.18, 1.0)
+    assert len(captured) == prior_attempts
+
+
+def test_resume_with_unreadable_authenticated_cadence_never_starts_cfd(
+    tmp_path, monkeypatch
+):
+    """An exact restart archive without recoverable cadence must become a
+    typed permanent continuation outcome before `pimpleFoam`, leaving the
+    caller free to take its separate bounded fresh-rerun route."""
+
+    case_dir = tmp_path / "unreadable-cadence"
+    tcase = _make_saved_case(case_dir, latest="0.1")
+    coeff = tcase / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    coeff.write_text("# no finite force samples\n")
+    started = []
+
+    def forbid_attempt(*_args, **_kwargs):
+        started.append(True)
+        raise AssertionError("pimpleFoam must not start without saved cadence")
+
+    monkeypatch.setattr(pipeline, "_run_transient_attempt", forbid_attempt)
+    monkeypatch.setattr(
+        pipeline,
+        "get_mesher",
+        lambda _name: SimpleNamespace(patches=lambda _mesh: {}),
+    )
+
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="cannot recover a finite shedding period",
+    ):
+        pipeline._run_transient(
+            case_dir,
+            airfoil=None,
+            resolved=MeshParams(),
+            spec=SPEC,
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(
+                force_transient=True,
+                urans_fidelity="precalc",
+                urans_min_periods=3,
+                transient_auto_refine=False,
+            ),
+            runner=None,
+            n_proc=1,
+            timeout=7200,
+            resume=TransientResume(
+                transient_start=0.0,
+                resume_from=0.1,
+                clean_cycle_recovery_policy_version=(
+                    pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+                ),
+            ),
+        )
+    assert started == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1679,6 +1821,43 @@ def test_run_case_resume_skips_mesh_and_steady_stages(tmp_path, monkeypatch):
     assert captured["urans_budget_s"] == 13337
 
 
+def test_run_case_resume_propagates_typed_continuation_source_failure(
+    tmp_path,
+    monkeypatch,
+):
+    """A resumed same-case failure is a job-level source verdict, not a
+    generic per-angle infrastructure outcome."""
+
+    def fail_finalize(*_args, **_kwargs):
+        raise ContinuationPermanentError(
+            "continuation_source_permanent: same-case continuation cannot "
+            "recover a finite shedding period"
+        )
+
+    monkeypatch.setattr(pipeline, "_finalize_outcome", fail_finalize)
+
+    class MinimalMesher:
+        def cell_count(self, _resolved):
+            return 1
+
+    with pytest.raises(
+        ContinuationPermanentError,
+        match="continuation_source_permanent",
+    ):
+        run_case(
+            tmp_path / "case",
+            airfoil=SimpleNamespace(name="n0012", contour=[]),
+            spec=SPEC,
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            mesh_params=MeshParams(),
+            solver_params=SolverParams(force_transient=True, write_images=[]),
+            mesher=MinimalMesher(),
+            runner=SimpleNamespace(),
+            resume=TransientResume(transient_start=0.0, resume_from=0.1),
+        )
+
+
 def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     captured = {}
     completed_count_observations: list[bool] = []
@@ -1687,6 +1866,10 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
         transient_start=0.42,
         resume_from=1.1,
         corrective_tail_periods=pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS,
+        clean_cycle_recovery_policy_version=(
+            pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+        ),
+        archive_clean_cycle_recovery=True,
     )
 
     def fake_stage(
@@ -1697,6 +1880,7 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
         aoa_deg=None,
         expected_engine=None,
         corrective_tail_periods=None,
+        clean_cycle_recovery_policy_version=None,
     ):
         captured["src_case"] = src_case
         captured["dst_case"] = dst_case
@@ -1704,6 +1888,9 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
         captured["aoa_deg"] = aoa_deg
         captured["expected_engine"] = expected_engine
         captured["corrective_tail_periods"] = corrective_tail_periods
+        captured["clean_cycle_recovery_policy_version"] = (
+            clean_cycle_recovery_policy_version
+        )
         return source
 
     def fake_run_case(case_dir, airfoil, spec, fluid, roughness, mesh_params, solver_params,
@@ -1744,6 +1931,9 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     request = _continuation_request(
         naca0012_selig_text,
         corrective_tail_periods=3,
+        clean_cycle_recovery_policy_version=(
+            pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+        ),
     )
     settings = get_settings()
     store = ObservingStore(settings)
@@ -1757,12 +1947,19 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     assert captured["aoa_deg"] == SPEC.aoa_deg
     assert captured["expected_engine"] == OPENCFD_2606_IDENTITY
     assert captured["corrective_tail_periods"] == 3
+    assert captured["clean_cycle_recovery_policy_version"] == (
+        pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
+    )
     assert captured["case_dir"] == captured["dst_case"]
     resume = captured["resume"]
     assert isinstance(resume, TransientResume)
     assert resume.transient_start == 0.42 and resume.resume_from == 1.1
     assert resume.corrective_tail_periods == pytest.approx(
         pipeline.URANS_NONSTATIONARY_EXTENSION_PERIODS
+    )
+    assert resume.archive_clean_cycle_recovery
+    assert resume.clean_cycle_recovery_policy_version == (
+        pipeline.CLEAN_CYCLE_RECOVERY_POLICY_VERSION
     )
     assert captured["urans_budget_s"] == 21600
     # The continuation point ingests as a NORMAL polar point (same cell).
@@ -1839,6 +2036,67 @@ def test_execute_job_continuation_transient_storage_failure_is_typed(
     assert "insufficient safe free space" in (result.message or "")
 
 
+@pytest.mark.parametrize(
+    ("error_type", "marker", "kind", "disposition"),
+    [
+        (
+            ContinuationPermanentError,
+            "continuation_source_permanent",
+            ContinuationFailureKind.permanent,
+            None,
+        ),
+        (
+            ContinuationTransientError,
+            "continuation_source_transient",
+            ContinuationFailureKind.transient,
+            FailureDisposition.infrastructure,
+        ),
+    ],
+)
+def test_execute_job_resumed_continuation_failure_is_typed_at_job_boundary(
+    monkeypatch,
+    naca0012_selig_text,
+    error_type,
+    marker,
+    kind,
+    disposition,
+):
+    """MUST-CATCH: failures raised by resumed ``run_case`` retain their typed
+    source policy on both durable job surfaces."""
+
+    source = ContinuationSource(
+        transient_subdir="transient",
+        transient_start=0.0,
+        resume_from=0.1,
+    )
+
+    def fake_stage(*_args, **_kwargs):
+        return source
+
+    def fail_run_case(*_args, **_kwargs):
+        raise error_type(f"{marker}: resumed source failure")
+
+    monkeypatch.setattr(jobs, "stage_continuation_case", fake_stage)
+    monkeypatch.setattr(jobs, "run_case", fail_run_case)
+    request = _continuation_request(naca0012_selig_text)
+    settings = get_settings()
+    store = JobStore(settings)
+    job_id = f"resumed-continuation-{kind.value}"
+
+    result = jobs.execute_job(job_id, request, store=store, settings=settings)
+
+    assert result.state == JobState.failed
+    assert result.failure_disposition == disposition
+    assert result.continuation_failure_kind == kind
+    assert marker in (result.message or "")
+    status = store.read_status(job_id)
+    assert status is not None
+    assert status.state == JobState.failed
+    assert status.failure_disposition == disposition
+    assert status.continuation_failure_kind == kind
+    assert marker in (status.message or "")
+
+
 # --------------------------------------------------------------------------- #
 # MUST-CATCH: a timed-out transient leaves restartable state (continuable)
 # --------------------------------------------------------------------------- #
@@ -1911,6 +2169,7 @@ def test_timed_out_transient_leaves_restartable_state_for_continuation(tmp_path,
     # continuable marker, so the node predicate offers CONTINUE — not only a
     # from-scratch requeue — for a solve killed mid-chunk by the wall clock.
     assert pipeline.URANS_BUDGET_STOP_MARKER in result.quality.reason
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER in result.quality.reason
     assert dirs_before <= {d.name for d in tcase.iterdir()}
     latest = tcase / "0.05"
     assert (latest / "U").is_file() and (latest / "p").is_file()
@@ -2076,3 +2335,50 @@ def test_budget_stop_marker_literal_is_pinned_on_the_engine_side():
     literal: rewording the engine phrasing must fail HERE, loudly, instead of
     silently zeroing the node continuable predicate (recall guardrail)."""
     assert pipeline.URANS_BUDGET_STOP_MARKER == "stopped by the wall-clock budget guard"
+    assert (
+        pipeline.URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER
+        == "same-case physical evidence cap exhausted"
+    )
+
+
+@pytest.mark.parametrize(("fidelity", "physical_periods"), [("precalc", 17), ("full", 26)])
+def test_budget_stopped_clean_tail_is_restartable_until_its_actual_physical_cap(
+    fidelity, physical_periods
+):
+    """A short clean tail is not terminal merely because the wall chunk ended."""
+    audit = CleanCycleAudit(
+        period_s=PERIOD_S,
+        phase_samples=96,
+        cycles=(),
+        terminal_clean_cycles=0,
+        required_clean_cycles=3 if fidelity == "precalc" else 5,
+        template_cycles=0,
+        shape_error=0.0,
+        measured_periods=physical_periods,
+    )
+    quality = pipeline.UransQuality(
+        ok=False,
+        can_refine=False,
+        reason="clean-cycle certification has fewer clean terminal periods",
+        clean_cycle_audit=audit,
+    )
+    assert pipeline.URANS_CONTINUATION_REQUIRED_MARKER in (
+        pipeline._restartable_budget_continuation_note(quality, fidelity=fidelity)
+    )
+
+    at_cap = pipeline._quality_with(
+        quality,
+        clean_cycle_audit=CleanCycleAudit(
+            period_s=PERIOD_S,
+            phase_samples=96,
+            cycles=(),
+            terminal_clean_cycles=0,
+            required_clean_cycles=audit.required_clean_cycles,
+            template_cycles=0,
+            shape_error=0.0,
+            measured_periods=physical_periods + 1,
+        ),
+    )
+    assert pipeline.URANS_CONTINUATION_PHYSICAL_CAP_EXHAUSTED_MARKER in (
+        pipeline._restartable_budget_continuation_note(at_cap, fidelity=fidelity)
+    )

@@ -398,4 +398,71 @@ describe("current RANS interpretation reducer", () => {
     });
     expect(draft.continuationReason).toContain("stationary statistics");
   });
+
+  it("MUST-CATCH: periodic URANS cannot publish coefficients outside its exact selected-cycle means", () => {
+    const archived = certifiedFastUransPoint();
+    archived.cl = 0.82;
+    archived.cl_cd = archived.cl / archived.cd!;
+
+    const { draft } = draftResultInterpretationForPoint(
+      archived,
+      "urans_precalc",
+    );
+
+    expect(draft).toMatchObject({
+      state: "terminal_failure",
+      regime: "trending_unresolved",
+      cl: null,
+      cd: null,
+      cm: null,
+    });
+    expect(draft.terminalReason).toContain("exact selected-cycle means");
+  });
+
+  it("MUST-CATCH: a null selected-cycle diagnostic remains nonpublishable", () => {
+    const archived = certifiedFastUransPoint();
+    const certificate = archived.urans_cycle_certificate!;
+    certificate.cycles[1] = {
+      ...certificate.cycles[1]!,
+      cl_amplitude_deviation: null,
+    };
+
+    const { draft } = draftResultInterpretationForPoint(
+      archived,
+      "urans_precalc",
+    );
+
+    expect(draft).toMatchObject({
+      state: "terminal_failure",
+      regime: "trending_unresolved",
+      cl: null,
+      cd: null,
+      cm: null,
+    });
+    expect(draft.terminalReason).toContain("unavailable cycle metrics");
+  });
+
+  it("MUST-CATCH: periodic URANS cannot certify a gapped selected time window", () => {
+    const archived = certifiedFastUransPoint();
+    const middle = archived.urans_cycle_certificate!.cycles[1]!;
+    middle.t_start = 0.021;
+    middle.t_end = 0.041;
+    const final = archived.urans_cycle_certificate!.cycles[2]!;
+    final.t_start = 0.041;
+    final.t_end = 0.061;
+
+    const { draft } = draftResultInterpretationForPoint(
+      archived,
+      "urans_precalc",
+    );
+
+    expect(draft).toMatchObject({
+      state: "terminal_failure",
+      regime: "trending_unresolved",
+      cl: null,
+      cd: null,
+      cm: null,
+    });
+    expect(draft.terminalReason).toContain("contiguous physical window");
+  });
 });

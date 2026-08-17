@@ -122,11 +122,6 @@ _EVIDENCE_KEEP_NAMES = {
     "engine_evidence.remote.json",
     "storage_migration.json",
     "storage_migration.database.json",
-    "incomplete_evidence_quarantine.tar.zst",
-    "incomplete_evidence_quarantine.remote.json",
-    "incomplete_evidence_quarantine.manifest.json",
-    "incomplete_evidence_quarantine.receipt.json",
-    "incomplete_evidence_quarantine.database.json",
     "VTK",
     "openfoam",
     "time_directories",
@@ -248,15 +243,29 @@ def delete_job_dir(job_root: Path) -> DeleteReport:
     job_root = Path(job_root)
     if not job_root.is_dir():
         raise FileNotFoundError(job_root)
-    with _job_retention_guard(job_root):
-        measured = _measure_path(job_root)
-        _remove_tree_unchecked(job_root)
-        return DeleteReport(
-            job_id=job_root.name,
-            bytes_freed=measured["bytes"],
-            files_removed=measured["files"],
-            dirs_removed=measured["dirs"],
-        )
+    with job_execution_guard(job_root):
+        return _delete_job_dir_locked(job_root)
+
+
+def _delete_job_dir_locked(job_root: Path) -> DeleteReport:
+    """Delete one root while the caller owns ``job_execution_guard``.
+
+    This private primitive lets a deletion boundary authenticate a source
+    snapshot and remove it under one uninterrupted worker-lock hold. Public
+    retention callers must use :func:`delete_job_dir` instead.
+    """
+
+    job_root = Path(job_root)
+    if not job_root.is_dir():
+        raise FileNotFoundError(job_root)
+    measured = _measure_path(job_root)
+    _remove_tree_unchecked(job_root)
+    return DeleteReport(
+        job_id=job_root.name,
+        bytes_freed=measured["bytes"],
+        files_removed=measured["files"],
+        dirs_removed=measured["dirs"],
+    )
 
 
 def _mode_strength(keep_case_state: bool) -> int:
@@ -380,7 +389,7 @@ def _relative_retention_path(job_root: Path, path: Path) -> str:
 
 
 @contextmanager
-def _job_retention_guard(job_root: Path):
+def job_execution_guard(job_root: Path):
     """Hold the same advisory lock as ``run_polar`` during retention.
 
     A lock file's mtime records when a long batch started, not whether its
@@ -420,6 +429,11 @@ def _job_retention_guard(job_root: Path):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         finally:
             lock_file.close()
+
+
+# Keep the existing internal spelling stable for retention callers. Other
+# boundaries should use the explicit execution-lock name above.
+_job_retention_guard = job_execution_guard
 
 
 def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep_case_state: bool) -> None:

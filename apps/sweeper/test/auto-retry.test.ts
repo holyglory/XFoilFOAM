@@ -1,19 +1,20 @@
-// MUST-CATCH suite for auto-retry-once (approved design c19fd74a, amendment
-// B): a crash-class failed point (results.status='failed') gets exactly ONE
-// automatic requeue before it counts as needs_review.
+// MUST-CATCH suite for clean failed-generation restart: an unexplained
+// crash-class point is discarded and returned to ordinary scheduling. A later
+// independent crash follows the same path; deterministic mesh, continuation,
+// and accepted canonical cases stay on their explicit typed paths.
 //
 // Shaped like the real-world breakage class it guards: an engine job that
 // dies with "All cases failed" and an EMPTY result payload (no points, no
 // attempt evidence) — the true-crash branch of ingestFailedEngineJob — driven
 // through the same reconcile() surface production runs.
 //
-//   1. FIRST crash  → every claimed cell auto-requeues (result → pending with
-//      the auto_retried_at marker, campaign point → requested, failed counter
-//      0) — and the pass is idempotent (a second sweep retries nothing).
-//   2. SECOND crash → the marker escalates: rows STAY failed, points terminal,
-//      needs_review counts them, awaiting_urans does not.
-//   3. RE-INGEST of the same failed job (natural-key upsert) must NOT clear
-//      the marker — a re-ingested crash never earns a second silent retry.
+//   1. FIRST crash  → every claimed cell is cleanly requeued (result → pending
+//      with a last-restart marker, campaign point → requested, failed counter
+//      0) — and the same job replay is idempotent.
+//   2. SECOND crash → exactly the same clean restart; no cell/fleet incident
+//      is created just because a prior generation also failed.
+//   3. RE-INGEST of an abandoned failed job must not recreate its discarded
+//      attempt/artifacts or re-claim the restarted cell.
 //
 // Live shared-DB pattern (worker-restart-orphan.test.ts harness): scoped rows,
 // file-unique chord, shared guarded cleanup.
@@ -34,6 +35,7 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  remoteAssetReferences,
   resultAttempts,
   resultClassifications,
   results,
@@ -49,6 +51,10 @@ import {
   solverProfiles,
   solverIncidentSummary,
   sweeperState,
+  syncRemoteHubBindingReceipts,
+  syncRemoteResultDeliveries,
+  syncSweepPromisePoints,
+  syncSweepPromises,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import type {
@@ -58,6 +64,7 @@ import type {
   PolarRequest,
 } from "@aerodb/engine-client";
 import { and, asc, eq, inArray } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { ConditionMapEntry } from "../src/ingest";
@@ -90,8 +97,22 @@ let bcId = "";
 let firstJobId = "";
 let secondJobId = "";
 let crashCellIds: string[] = [];
+const deletedEngineJobIds: string[] = [];
 const profileIds = { boundary: "", mesh: "", solver: "", output: "" };
-let restoreSweeperEnabled: boolean | null = null;
+let restoreSweeperState:
+  | {
+      enabled: boolean;
+      maxConcurrentJobs: number;
+      cpuSlots: number;
+      admissionFenceActive: boolean;
+      lastAdmissionFenceAt: Date | null;
+      lastAdmissionFenceReason: string | null;
+      lastAdmissionFenceTriggerKey: string | null;
+      lastAdmissionFenceDetails: Record<string, unknown> | null;
+      maintenanceDrainToken: string | null;
+      maintenanceDrainStartedAt: Date | null;
+    }
+  | undefined;
 
 const camberedPoints = [
   { x: 1, y: 0 },
@@ -101,24 +122,48 @@ const camberedPoints = [
   { x: 1, y: 0 },
 ];
 
-function crashEngine(engineJobId: string): EngineClient {
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const source = value as Record<string, unknown>;
+  return `{${Object.keys(source)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+    .join(",")}}`;
+}
+
+function crashEngine(
+  engineJobId: string,
+  reportedStatus: "failed" | "running" | Array<"failed" | "running"> = "failed",
+): EngineClient {
+  let statusCalls = 0;
   return {
     getQueue: async () => {
       throw new Error("queue unavailable in test");
     },
-    getJob: async (): Promise<JobStatus> => ({
-      job_id: engineJobId,
-      state: "failed",
-      total_cases: ANGLES.length,
-      completed_cases: 0,
-      message: CRASH_MESSAGE,
-    }),
+    getJob: async (): Promise<JobStatus> => {
+      const state = Array.isArray(reportedStatus)
+        ? reportedStatus[Math.min(statusCalls++, reportedStatus.length - 1)]
+        : reportedStatus;
+      return {
+        job_id: engineJobId,
+        state,
+        total_cases: ANGLES.length,
+        completed_cases: 0,
+        message: CRASH_MESSAGE,
+      };
+    },
     getResult: async (): Promise<JobResult> => ({
       job_id: engineJobId,
       state: "failed",
       message: CRASH_MESSAGE,
       polars: [],
     }),
+    deleteJob: async (jobId: string) => {
+      deletedEngineJobIds.push(jobId);
+      return { bytes_freed: 4_096 };
+    },
   } as unknown as EngineClient;
 }
 
@@ -194,15 +239,46 @@ async function crashCellRows() {
 
 beforeAll(async () => {
   const [state] = await db
-    .select({ enabled: sweeperState.enabled })
+    .select({
+      enabled: sweeperState.enabled,
+      maxConcurrentJobs: sweeperState.maxConcurrentJobs,
+      cpuSlots: sweeperState.cpuSlots,
+      admissionFenceActive: sweeperState.admissionFenceActive,
+      lastAdmissionFenceAt: sweeperState.lastAdmissionFenceAt,
+      lastAdmissionFenceReason: sweeperState.lastAdmissionFenceReason,
+      lastAdmissionFenceTriggerKey: sweeperState.lastAdmissionFenceTriggerKey,
+      lastAdmissionFenceDetails: sweeperState.lastAdmissionFenceDetails,
+      maintenanceDrainToken: sweeperState.maintenanceDrainToken,
+      maintenanceDrainStartedAt: sweeperState.maintenanceDrainStartedAt,
+    })
     .from(sweeperState)
     .where(eq(sweeperState.id, 1))
     .limit(1);
-  restoreSweeperEnabled = state?.enabled ?? false;
+  restoreSweeperState = state;
   await db
     .insert(sweeperState)
-    .values({ id: 1, enabled: true })
-    .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
+    .values({
+      id: 1,
+      enabled: true,
+      maxConcurrentJobs: 64,
+      cpuSlots: 64,
+      admissionFenceActive: false,
+    })
+    .onConflictDoUpdate({
+      target: sweeperState.id,
+      set: {
+        enabled: true,
+        maxConcurrentJobs: 64,
+        cpuSlots: 64,
+        admissionFenceActive: false,
+        lastAdmissionFenceAt: null,
+        lastAdmissionFenceReason: null,
+        lastAdmissionFenceTriggerKey: null,
+        lastAdmissionFenceDetails: null,
+        maintenanceDrainToken: null,
+        maintenanceDrainStartedAt: null,
+      },
+    });
 
   const [cat] = await db
     .insert(categories)
@@ -313,20 +389,20 @@ afterAll(async () => {
   if (airfoilId) await db.delete(airfoils).where(eq(airfoils.id, airfoilId));
   if (categoryId)
     await db.delete(categories).where(eq(categories.id, categoryId));
-  if (restoreSweeperEnabled !== null) {
+  if (restoreSweeperState) {
     await db
       .insert(sweeperState)
-      .values({ id: 1, enabled: restoreSweeperEnabled })
+      .values({ id: 1, ...restoreSweeperState })
       .onConflictDoUpdate({
         target: sweeperState.id,
-        set: { enabled: restoreSweeperEnabled },
+        set: restoreSweeperState,
       });
   }
   await sql.end();
 });
 
-describe("auto-retry-once for crash-class failed points (amendment B)", () => {
-  it("MUST-CATCH: the first crash auto-requeues every cell exactly once (marker stamped, points reopen, failed counter 0)", async () => {
+describe("clean restart for crash-class failed points", () => {
+  it("MUST-CATCH: the first crash discards its generation and requeues every cell (marker stamped, points reopen, failed counter 0)", async () => {
     firstJobId = await composeAndSubmit(`${PREFIX}-engine-1`);
     const claimedBeforeCrash = await cellRows();
     await db.insert(simResultSubmitRetries).values(
@@ -348,9 +424,9 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
     crashCellIds = rows.map((row) => row.id);
     for (const row of rows) {
       expect(row.status).toBe("pending"); // re-claimable, NOT failed
-      expect(row.autoRetriedAt).not.toBeNull(); // the one-shot marker
+      expect(row.autoRetriedAt).not.toBeNull(); // last clean-restart marker
       expect(row.simJobId).toBeNull();
-      expect(row.error).toBe(CRASH_MESSAGE); // crash evidence kept
+      expect(row.error).toBeNull(); // failed generation projection discarded
     }
     expect(
       await db
@@ -372,16 +448,54 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
 
     const totals = await campaignProgressTotals(db, campaignId);
     expect(totals.failed).toBe(0);
+    expect(deletedEngineJobIds).toContain(`${PREFIX}-engine-1`);
+    const [stripped] = await db
+      .select({
+        strippedAt: simJobs.strippedAt,
+        stripReport: simJobs.stripReport,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, firstJobId));
+    expect(stripped.strippedAt).not.toBeNull();
+    expect(stripped.stripReport).toMatchObject({
+      bytes_freed: 4_096,
+      note: "discarded failed generation after clean restart",
+    });
 
-    // Idempotence: a second pass over the same job retries NOTHING (the rows
-    // are pending now) and escalates nothing.
+    // Idempotence: a second pass over the same job retries NOTHING because its
+    // cells are already pending under the fresh scheduler lifecycle.
     const again = await autoRetryCrashedResultsForJob(db, firstJobId);
     expect(again.retried).toEqual([]);
     expect(again.escalated).toEqual([]);
   }, 240000);
 
+  it("MUST-CATCH: a terminal database retry never deletes an engine directory that still reports running", async () => {
+    const engineJobId = `${PREFIX}-engine-still-running`;
+    const jobId = await composeAndSubmit(engineJobId);
+
+    // The failed result payload may have been published before the engine's
+    // status endpoint catches up. The cells can be safely requeued, but the
+    // directory must remain until both sources say terminal.
+    await reconcile(db, crashEngine(engineJobId, ["failed", "running"]), {
+      jobIds: [jobId],
+      skipFailedRecovery: true,
+    });
+
+    const [job] = await db
+      .select({ status: simJobs.status, strippedAt: simJobs.strippedAt })
+      .from(simJobs)
+      .where(eq(simJobs.id, jobId));
+    expect(job.status).toBe("failed");
+    expect(job.strippedAt).toBeNull();
+    expect(deletedEngineJobIds).not.toContain(engineJobId);
+    for (const row of await crashCellRows()) {
+      expect(row.status).toBe("pending");
+      expect(row.simJobId).toBeNull();
+    }
+  }, 240000);
+
   const registerTerminalSecondCrash = () =>
-    it("MUST-CATCH: the second crash escalates to unavailable without assigning human review", async () => {
+    it("MUST-CATCH: a second unexplained crash discards that generation too and reopens the cells", async () => {
       // The pending rows are ordinary gaps again: the next tick re-claims them.
       secondJobId = await composeAndSubmit(`${PREFIX}-engine-2`);
       expect(secondJobId).not.toBe(firstJobId);
@@ -392,18 +506,19 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
 
       const rows = await crashCellRows();
       for (const row of rows) {
-        expect(row.status).toBe("failed"); // escalated, no second silent retry
+        expect(row.status).toBe("pending");
         expect(row.autoRetriedAt).not.toBeNull();
+        expect(row.error).toBeNull();
       }
       const points = await db
         .select({ state: simCampaignPoints.state })
         .from(simCampaignPoints)
         .where(eq(simCampaignPoints.campaignId, campaignId));
-      expect(points.every((p) => p.state === "terminal")).toBe(true);
+      expect(points.every((p) => p.state === "requested")).toBe(true);
 
       const totals = await campaignProgressTotals(db, campaignId);
       expect(totals.failed).toBe(0);
-      expect(totals.blocked).toBe(ANGLES.length);
+      expect(totals.blocked).toBe(0);
       const buckets = await campaignReviewBuckets(db, campaignId);
       expect(buckets.needsReview).toBe(0);
       expect(buckets.awaitingUrans).toBe(0);
@@ -417,41 +532,18 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
             rows.map((row) => row.id),
           ),
         );
-      expect(incidents).toHaveLength(ANGLES.length);
-      for (const incident of incidents) {
-        expect(incident).toMatchObject({
-          stage: "rans",
-          reason: "solver-execution-failed",
-          severity: "critical",
-          status: "open",
-          remediationVersion: RANS_RECOVERY_REMEDIATION_VERSION,
-          simJobId: secondJobId,
-          resultAttemptId: null,
-        });
-        expect(incident.resultId).not.toBeNull();
-        expect(incident.occurrenceKey).toBe(
-          `rans:${incident.resultId}:${secondJobId}:auto-retry-exhausted`,
-        );
-      }
+      expect(incidents).toHaveLength(0);
       const incidentSummary = await solverIncidentSummary(db, { campaignId });
       expect(incidentSummary).toMatchObject({
-        occurrenceCount: ANGLES.length,
-        openCount: ANGLES.length,
-        criticalGroupCount: 1,
+        occurrenceCount: 0,
+        openCount: 0,
+        criticalGroupCount: 0,
       });
-      expect(incidentSummary.groups).toEqual([
-        expect.objectContaining({
-          stage: "rans",
-          reason: "solver-execution-failed",
-          occurrenceCount: ANGLES.length,
-          openCriticalCount: ANGLES.length,
-          requiresInvestigation: true,
-        }),
-      ]);
+      expect(incidentSummary.groups).toEqual([]);
     }, 240000);
 
   const registerTerminalReingest = () =>
-    it("MUST-CATCH: re-ingesting the same failed job preserves the marker (no second retry from an ingest replay)", async () => {
+    it("MUST-CATCH: re-ingesting an abandoned failed job cannot recreate the discarded generation", async () => {
       const before = await crashCellRows();
       const markerBefore = before[0].autoRetriedAt;
       expect(markerBefore).not.toBeNull();
@@ -494,29 +586,20 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
 
       const after = await crashCellRows();
       for (const row of after) {
-        expect(row.status).toBe("failed");
-        expect(row.autoRetriedAt).not.toBeNull(); // marker SURVIVED the upsert
+        expect(row.status).toBe("pending");
+        expect(row.autoRetriedAt).not.toBeNull();
+        expect(row.error).toBeNull();
       }
       const replayAttempts = await db
         .select({ evidencePayload: resultAttempts.evidencePayload })
         .from(resultAttempts)
         .where(eq(resultAttempts.simJobId, secondJobId));
-      expect(replayAttempts).toHaveLength(ANGLES.length);
-      expect(
-        replayAttempts.every(
-          (attempt) =>
-            (
-              attempt.evidencePayload as {
-                mesh_recovery_version?: number;
-              } | null
-            )?.mesh_recovery_version === 3,
-        ),
-      ).toBe(true);
-      // And the auto-retry pass still refuses a second retry: everything
-      // escalates, nothing requeues.
+      expect(replayAttempts).toHaveLength(0);
+      // The stale payload is ignored: it cannot turn a cleanly restarted cell
+      // back into a terminal result or create replacement forensic attempts.
       const outcome = await autoRetryCrashedResultsForJob(db, secondJobId);
       expect(outcome.retried).toEqual([]);
-      expect(outcome.escalated.length).toBe(ANGLES.length);
+      expect(outcome.escalated).toEqual([]);
       expect(
         await db
           .select({ id: simSolverIncidents.id })
@@ -527,7 +610,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
               after.map((row) => row.id),
             ),
           ),
-      ).toHaveLength(ANGLES.length);
+      ).toHaveLength(0);
     }, 240000);
 
   const registerTerminalTypedRecovery = () =>
@@ -647,10 +730,18 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
       const pointerNullHard = seeded.find(
         (row) => row.disposition === "hard_solver",
       )!;
+      const pointerNullInfrastructure = seeded.find(
+        (row) => row.disposition === "infrastructure",
+      )!;
       await db
         .update(results)
         .set({ currentResultAttemptId: null })
-        .where(eq(results.id, pointerNullHard.resultId));
+        .where(
+          inArray(results.id, [
+            pointerNullHard.resultId,
+            pointerNullInfrastructure.resultId,
+          ]),
+        );
 
       const outcome = await autoRetryCrashedResultsForJob(db, job.id);
       const after = await db
@@ -696,23 +787,8 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
         simJobId: job.id,
         autoRetriedAt: null,
       });
-      const [meshIncident] = await db
-        .select()
-        .from(simSolverIncidents)
-        .where(eq(simSolverIncidents.resultId, deterministic.resultId));
-      expect(meshIncident).toMatchObject({
-        stage: "rans",
-        reason: "mesh-quality-failure",
-        severity: "critical",
-        status: "open",
-        simJobId: job.id,
-        resultAttemptId: expect.any(String),
-        remediationVersion: "rans-mesh-recovery-v7",
-      });
-      expect(meshIncident.occurrenceKey).toBe(
-        `rans:${deterministic.resultId}:${job.id}:deterministic-mesh:v7`,
-      );
-      expect(meshIncident.metadata).toMatchObject({ meshRecoveryVersion: 7 });
+      // A deterministic mesh/configuration failure remains on its typed block
+      // path; it does not manufacture a generic crash-retry incident.
       expect(
         await db
           .select({ id: simSolverIncidents.id })
@@ -725,6 +801,373 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
           ),
       ).toHaveLength(0);
     }, 240000);
+
+  it("MUST-CATCH: an accepted canonical generation is never discarded or requeued with a later failed job", async () => {
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        campaignId: null,
+        jobKind: "sweep",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "failed",
+        totalCases: 1,
+      })
+      .returning();
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: 0.875,
+        // The failed outer job must never destroy an already selected exact
+        // generation, even if an inconsistent legacy projection says failed.
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        cl: 0.41,
+        cd: 0.018,
+        simJobId: job.id,
+        error: "later correction job crashed",
+      })
+      .returning();
+    const [acceptedAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: 0.875,
+        simJobId: job.id,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: true,
+        cl: 0.41,
+        cd: 0.018,
+        converged: true,
+        evidencePayload: { fidelity: "rans" },
+      })
+      .returning();
+    // A historical repair may have cleared mutable result pointers while the
+    // append-only classification still declares the exact attempt accepted.
+    // The clean-restart candidate must read this direct ownership relation,
+    // rather than treating pointer-null as disposable.
+    await db.insert(resultClassifications).values({
+      resultId: result.id,
+      resultAttemptId: acceptedAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg: 0.875,
+      regime: "rans",
+      classifierVersion: "auto-retry-pointer-null-accepted",
+      state: "accepted",
+      reasons: [],
+    });
+
+    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+    expect(outcome.retried).toEqual([]);
+    expect(outcome.precalcRouted).toEqual([]);
+    expect(outcome.discardedFailedAttemptCount).toBe(0);
+
+    const [preserved] = await db
+      .select({
+        status: results.status,
+        simJobId: results.simJobId,
+        currentResultAttemptId: results.currentResultAttemptId,
+        cl: results.cl,
+        cd: results.cd,
+      })
+      .from(results)
+      .where(eq(results.id, result.id));
+    expect(preserved).toEqual({
+      status: "failed",
+      simJobId: job.id,
+      currentResultAttemptId: null,
+      cl: 0.41,
+      cd: 0.018,
+    });
+    expect(
+      await db
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, acceptedAttempt.id)),
+    ).toHaveLength(1);
+  }, 240000);
+
+  it("MUST-CATCH: clean restart unlinks only disposable campaign/precalc/promise references before deleting the failed attempt", async () => {
+    const aoaDeg = 301.337;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "sweep",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "failed",
+        totalCases: 1,
+      })
+      .returning();
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        simJobId: job.id,
+        error: "unexplained clean-restart fixture",
+      })
+      .returning();
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: job.id,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        error: "unexplained clean-restart fixture",
+        evidencePayload: { fixture: "clean-restart-disposable-owners" },
+      })
+      .returning();
+    const [obligation] = await db
+      .insert(simPrecalcObligations)
+      .values({
+        airfoilId,
+        revisionId,
+        aoaDeg,
+        // A cancelled, unspent obligation is not a precalc route fence; it
+        // simply models stale scheduling metadata that names this attempt.
+        state: "cancelled",
+        sourceResultId: result.id,
+        sourceResultAttemptId: attempt.id,
+      })
+      .returning();
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: "clean-restart-fixture",
+        sourceInstanceName: "Clean restart fixture",
+        sourceBaseUrl: "https://fixture.invalid/sync",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+      })
+      .returning();
+    const [promisePoint] = await db
+      .insert(syncSweepPromisePoints)
+      .values({
+        promiseId: promise.id,
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+      })
+      .returning();
+    await db.insert(remoteAssetReferences).values({
+      localKind: "solver_evidence",
+      localStorageKey: `${PREFIX}-discard-${attempt.id}`,
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+      remoteDownloadUrl: "https://fixture.invalid/evidence.tar.zst",
+      mimeType: "application/zstd",
+    });
+
+    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+    expect(outcome.retried.map((cell) => cell.resultId)).toEqual([result.id]);
+    expect(outcome.discardedFailedAttemptCount).toBe(1);
+
+    const [reopened] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, result.id));
+    expect(reopened).toEqual({ status: "pending", simJobId: null });
+    expect(
+      await db
+        .select({ id: resultAttempts.id })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, attempt.id)),
+    ).toEqual([]);
+    const [unlinkedObligation] = await db
+      .select({
+        sourceResultId: simPrecalcObligations.sourceResultId,
+        sourceResultAttemptId: simPrecalcObligations.sourceResultAttemptId,
+      })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    expect(unlinkedObligation).toEqual({
+      sourceResultId: null,
+      sourceResultAttemptId: null,
+    });
+    const [unlinkedPromise] = await db
+      .select({
+        resultId: syncSweepPromisePoints.resultId,
+        resultAttemptId: syncSweepPromisePoints.resultAttemptId,
+      })
+      .from(syncSweepPromisePoints)
+      .where(eq(syncSweepPromisePoints.id, promisePoint.id));
+    expect(unlinkedPromise).toEqual({
+      resultId: result.id,
+      resultAttemptId: null,
+    });
+    expect(
+      await db
+        .select({ id: remoteAssetReferences.id })
+        .from(remoteAssetReferences)
+        .where(eq(remoteAssetReferences.resultId, result.id)),
+    ).toEqual([]);
+  }, 240000);
+
+  it("MUST-CATCH: a pointer-null hub-bound remote generation is refused, not unlinked or discarded", async () => {
+    const aoaDeg = 302.337;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "sweep",
+        referenceChordM: CHORD,
+        wave: 1,
+        status: "failed",
+        totalCases: 1,
+      })
+      .returning();
+    const [result] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        simJobId: job.id,
+        error: "legacy pointer-null hub fixture",
+      })
+      .returning();
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: result.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        simJobId: job.id,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        evidencePayload: { fixture: "hub-binding-owner" },
+      })
+      .returning();
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: "hub-binding-fixture",
+        sourceInstanceName: "Hub binding fixture",
+        sourceBaseUrl: "https://fixture.invalid/sync",
+        status: "cancelled",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+        cancelledAt: new Date(),
+      })
+      .returning();
+    await db.insert(syncSweepPromisePoints).values({
+      promiseId: promise.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      status: "fulfilled",
+      resultId: result.id,
+      resultAttemptId: attempt.id,
+    });
+    const [delivery] = await db
+      .insert(syncRemoteResultDeliveries)
+      .values({
+        promiseId: promise.id,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg,
+        generationKey: attempt.id,
+        state: "delivered",
+      })
+      .returning();
+    const brokeredUploadId = randomUUID();
+    const receipt = {
+      schemaVersion: 1,
+      kind: "hub-canonical-evidence-binding",
+      promiseId: promise.id,
+      remoteResultId: result.id,
+      remoteResultAttemptId: attempt.id,
+      brokeredUploadId,
+      aoaDeg,
+      bindingState: "bound",
+      promisePointState: "fulfilled",
+    };
+    const [binding] = await db
+      .insert(syncRemoteHubBindingReceipts)
+      .values({
+        deliveryId: delivery.id,
+        promiseId: promise.id,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg,
+        brokeredUploadId,
+        receiptCanonical: canonicalJson(receipt),
+        receipt,
+        receiptHmac: "a".repeat(64),
+      })
+      .returning();
+
+    const outcome = await autoRetryCrashedResultsForJob(db, job.id);
+    expect(outcome.retried).toEqual([]);
+    expect(outcome.discardedFailedAttemptCount).toBe(0);
+    const [preserved] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, result.id));
+    expect(preserved).toEqual({ status: "failed", simJobId: job.id });
+    expect(
+      await db
+        .select({ id: syncRemoteHubBindingReceipts.id })
+        .from(syncRemoteHubBindingReceipts)
+        .where(eq(syncRemoteHubBindingReceipts.id, binding.id)),
+    ).toHaveLength(1);
+
+    // This leaves no restrict-owned fixture behind for the shared cleanup.
+    await db
+      .delete(syncRemoteHubBindingReceipts)
+      .where(eq(syncRemoteHubBindingReceipts.id, binding.id));
+    await db
+      .delete(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, delivery.id));
+    await db
+      .delete(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, promise.id));
+  }, 240000);
 
   it("MUST-CATCH: completed physical RANS rejection is normal URANS handoff evidence, never a critical preflight incident", async () => {
     const [job] = await db
@@ -1345,6 +1788,7 @@ describe("auto-retry-once for crash-class failed points (amendment B)", () => {
         status: "ok",
         version: "test",
         mesh_recovery_version: 1,
+        archive_reduction_version: 4,
       }),
       submitPolar: async (request: PolarRequest): Promise<JobStatus> => {
         submitted.push(request);

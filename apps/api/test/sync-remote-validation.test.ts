@@ -54,8 +54,8 @@ const { buildServer } = await import("../src/server");
 const {
   assertMultipartDiskReserveAvailableBytes,
   lockAndFilterRemoteClaimAoas,
-} =
-  await import("../src/sync-routes");
+} = await import("../src/sync-routes");
+const { env } = await import("../src/env");
 
 const {
   airfoils,
@@ -2399,9 +2399,7 @@ describe("remote solver sync validation regressions", () => {
         ),
       )
       .orderBy(syncImportConflicts.id);
-    const byId = new Map(
-      conflictStates.map((row) => [row.id, row] as const),
-    );
+    const byId = new Map(conflictStates.map((row) => [row.id, row] as const));
     expect(byId.get(inserted[0]!.id)).toMatchObject({
       status: "archived",
       resolutionNote: expect.stringContaining("exact promised generation"),
@@ -3014,7 +3012,7 @@ describe("remote solver sync validation regressions", () => {
     },
   );
 
-  it("round-trips accepted URANS classification evidence and fulfills only after result and attempt classify accepted", async () => {
+  it("fulfills an accepted URANS attempt while its canonical polar awaits archive reduction", async () => {
     const aoaDeg = 712.001;
     const promiseId = await createPromise("active", aoaDeg);
     const evidence = uransEvidencePatch("accepted-round-trip");
@@ -3068,10 +3066,15 @@ describe("remote solver sync validation regressions", () => {
     expect(history).toMatchObject(evidence.forceHistory);
     expect(
       await db
-        .select({ state: resultClassifications.state })
+        .select({
+          state: resultClassifications.state,
+          reasons: resultClassifications.reasons,
+        })
         .from(resultClassifications)
         .where(eq(resultClassifications.resultId, canonical!.id)),
-    ).toEqual([{ state: "accepted" }]);
+    ).toEqual([
+      { state: "rejected", reasons: ["archive-reduction-pending"] },
+    ]);
     expect(
       await db
         .select({ state: resultClassifications.state })
@@ -4075,11 +4078,7 @@ describe("remote solver sync validation regressions", () => {
     const parts: MultipartTestPart[] = [
       multipartManifestPart(payload),
       ...frames.map((frame) =>
-        multipartFilePart(
-          String(frame.uploadField),
-          frameBytes,
-          "image/png",
-        ),
+        multipartFilePart(String(frame.uploadField), frameBytes, "image/png"),
       ),
     ];
 

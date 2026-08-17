@@ -12,11 +12,16 @@ import {
   type DB,
   hasExactValidSolverManifest,
   hasExactVerifiedRestartableEvidenceArchiveForArchive,
+  hasExactLivePrecalcPublicationWinner,
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  refreshCampaignProgressForResultIds,
+  resultAttempts,
   resultInterpretationRecoveryActions,
+  resolveLegacyUransEvidenceIncidentForRecoveryInTransaction,
   simPrecalcObligationRequests,
   simPrecalcObligations,
+  simPrecalcObligationRemediations,
   simUransRequests,
   simUransVerifyQueue,
   simUransVerifyQueueRequests,
@@ -24,16 +29,31 @@ import {
   simulationPresets,
   type SimUransVerifyQueueItem,
 } from "@aerodb/db";
+import { isUransContinuationPhysicalCapExhausted } from "@aerodb/engine-client";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 
 import { solverImplementationIdForSetup } from "./build-request";
 import { supersedeArchiveReductionQueueForRecoveredAction } from "./archive-reduction-queue";
+import { hasExactPrecalcUransPromotionLineage } from "./result-interpretations";
 
 const ACTION_LEASE_MS = 5 * 60_000;
 const ACTION_RETRY_MS = 60_000;
 const MAX_ACTIONS_PER_TICK = 8;
+const RECOVERY_SOURCE_REVISION = /^[0-9a-f]{40}$/;
+const ARCHIVE_RECOVERY_REMEDIATION_REASON =
+  "legacy URANS archive lacked immutable provenance; corrected recovery controller granted one fresh physical generation";
+
+/**
+ * A remediation grant is tied to the promoted application source revision,
+ * not to a human-readable build label.  An unset or malformed value is a
+ * deliberate stop: a recovery must never gain an un-auditable extra attempt.
+ */
+export function archiveRecoveryRemediationSourceRevision(): string | null {
+  const value = process.env.AIRFOILFOAM_RECOVERY_SOURCE_REVISION?.trim() ?? "";
+  return RECOVERY_SOURCE_REVISION.test(value) ? value : null;
+}
 
 /** These are internal scheduler outcomes, never user-entered request flags. */
 export const ARCHIVE_BACKFILL_PRECALC_CONTINUATION_OUTCOME =
@@ -47,8 +67,12 @@ export const ARCHIVE_BACKFILL_FINAL_CONTINUATION_OUTCOME =
 export function archiveRecoveryRouteMode(input: {
   fidelity: "urans_precalc" | "urans_full";
   exactRestartProof: boolean;
+  /** A reducer-level rerun requirement is an immutable provenance failure,
+   * not a request to reuse an otherwise restartable checkpoint. */
+  forceFreshRerun?: boolean;
   hasAcceptedPrecalcBaseline?: boolean;
 }): "continue_exact_case" | "fresh_rerun" | "wait_for_precalc" {
+  if (input.forceFreshRerun) return "fresh_rerun";
   if (input.fidelity === "urans_precalc") {
     return input.exactRestartProof ? "continue_exact_case" : "fresh_rerun";
   }
@@ -189,13 +213,13 @@ export function archiveRecoveryImplementationMatchesTarget(input: {
   );
   return Boolean(
     target &&
-      attempt &&
-      job &&
-      target === attempt &&
-      target === job &&
-      Array.isArray(input.sourceJobBoundaryConditionIds) &&
-      input.sourceJobBoundaryConditionIds.length === 1 &&
-      input.sourceJobBoundaryConditionIds[0] === input.sourceBcId,
+    attempt &&
+    job &&
+    target === attempt &&
+    target === job &&
+    Array.isArray(input.sourceJobBoundaryConditionIds) &&
+    input.sourceJobBoundaryConditionIds.length === 1 &&
+    input.sourceJobBoundaryConditionIds[0] === input.sourceBcId,
   );
 }
 
@@ -232,7 +256,7 @@ type RecoveryActionState =
   | "blocked"
   | "cancelled";
 
-type ClaimedRecoveryAction = {
+export type ClaimedRecoveryAction = {
   id: string;
   resultId: string;
   resultAttemptId: string;
@@ -244,6 +268,7 @@ type ClaimedRecoveryAction = {
   targetUransRequestId: string | null;
   targetVerifyQueueId: string | null;
   correctiveTailPeriods: number | null;
+  cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
   claimToken: string;
 };
 
@@ -262,7 +287,191 @@ type ActionSource = {
   solverImplementationId: string | null;
   jobSolverImplementationId: string | null;
   jobBoundaryConditionIds: string[] | null;
+  qualityWarnings: string[] | null;
 };
+
+/**
+ * Archive recovery is normally owned by its exact live source attempt.  The
+ * one deliberate non-current case is a PRECALC URANS child whose current
+ * result projection remains its exact source-pinned RANS parent while the
+ * archive reducer is still deciding whether to promote the child.  A result
+ * with no current generation is historical by default. The sole additional
+ * exception is an exact live PRECALC owner for that archived child: it may
+ * complete its already-durable recovery route, but cannot create a broad
+ * historical replay. Every other non-current relation is stale unless a
+ * separate durable lineage proof is added here.
+ */
+export function archiveRecoverySourceGenerationState(input: {
+  currentResultAttemptId: string | null;
+  sourceResultAttemptId: string;
+  sourceFidelity?: "urans_precalc" | "urans_full" | null;
+  currentFidelity?: string | null;
+  hasExactPrecalcRansLineage?: boolean;
+  hasExactLivePrecalcPublicationOwner?: boolean;
+}):
+  | "live_exact"
+  | "live_pinned_precalc_child"
+  | "live_exact_precalc_owner"
+  | "released_historical"
+  | "superseded" {
+  if (!input.currentResultAttemptId) {
+    return input.hasExactLivePrecalcPublicationOwner === true
+      ? "live_exact_precalc_owner"
+      : "released_historical";
+  }
+  if (input.currentResultAttemptId === input.sourceResultAttemptId) {
+    return "live_exact";
+  }
+  return input.sourceFidelity === "urans_precalc" &&
+    input.currentFidelity === "rans" &&
+    input.hasExactPrecalcRansLineage === true
+    ? "live_pinned_precalc_child"
+    : "superseded";
+}
+
+type ArchiveRecoveryLiveSourceCheck = {
+  state:
+    | "live_exact"
+    | "live_pinned_precalc_child"
+    | "live_exact_precalc_owner"
+    | "released_historical"
+    | "superseded"
+    | "missing";
+  reason: string;
+};
+
+function archiveRecoverySourceHasLiveSchedulingAuthority(
+  state: ArchiveRecoveryLiveSourceCheck["state"],
+): boolean {
+  return (
+    state === "live_exact" ||
+    state === "live_pinned_precalc_child" ||
+    state === "live_exact_precalc_owner"
+  );
+}
+
+function archiveRecoveryLiveSourceReason(
+  state: ArchiveRecoveryLiveSourceCheck["state"],
+): string {
+  switch (state) {
+    case "released_historical":
+      return "source result was released from live publication; its archive is historical evidence and cannot schedule solver or verification work";
+    case "superseded":
+      return "source result selects a different live generation without a durable exact source-pinned lineage; this archive cannot schedule solver or verification work";
+    case "missing":
+      return "source result no longer exists; archive recovery cannot schedule solver or verification work";
+    case "live_pinned_precalc_child":
+      return "source remains live through the exact source-pinned preliminary-URANS lineage of the current RANS generation";
+    case "live_exact_precalc_owner":
+      return "source projection is cleared, but its exact active PRECALC owner still proves one pending recovery route";
+    case "live_exact":
+      return "source result remains the exact live generation";
+  }
+}
+
+/**
+ * A non-current preliminary URANS attempt has scheduling authority only when
+ * the durable PRECALC obligation proves it was produced from the exact live
+ * RANS parent.  This is intentionally narrower than mere matching timestamps,
+ * AoA, or a shared result row: those do not prove that replaying an old
+ * archive belongs to the current physical workflow.
+ */
+async function archiveRecoverySourceGenerationStateForResult(
+  db: DB,
+  input: {
+    resultId: string;
+    currentResultAttemptId: string | null;
+    sourceResultAttemptId: string;
+    sourceFidelity: "urans_precalc" | "urans_full" | null;
+    /** The caller holds the result row and is about to allocate recovery
+     * work, so the exact owner must be locked and re-proved as well. */
+    lockForPublication?: boolean;
+  },
+): Promise<Exclude<ArchiveRecoveryLiveSourceCheck["state"], "missing">> {
+  const direct = archiveRecoverySourceGenerationState(input);
+  if (
+    direct === "released_historical" &&
+    input.sourceFidelity === "urans_precalc"
+  ) {
+    return archiveRecoverySourceGenerationState({
+      ...input,
+      hasExactLivePrecalcPublicationOwner:
+        await hasExactLivePrecalcPublicationWinner(db, {
+          resultId: input.resultId,
+          resultAttemptId: input.sourceResultAttemptId,
+          lockForPublication: input.lockForPublication,
+        }),
+    });
+  }
+  if (direct !== "superseded" || input.sourceFidelity !== "urans_precalc") {
+    return direct;
+  }
+
+  const [currentAttempt] = await db
+    .select({
+      fidelity: sql<unknown>`COALESCE(
+        ${resultAttempts.evidencePayload} ->> 'fidelity',
+        ${resultAttempts.evidencePayload} ->> 'fidelityTier'
+      )`,
+    })
+    .from(resultAttempts)
+    .where(
+      and(
+        eq(resultAttempts.id, input.currentResultAttemptId!),
+        eq(resultAttempts.resultId, input.resultId),
+      ),
+    )
+    .limit(1);
+  const currentFidelity =
+    typeof currentAttempt?.fidelity === "string"
+      ? currentAttempt.fidelity
+      : null;
+  const hasExactPrecalcRansLineage =
+    currentFidelity === "rans" &&
+    (await hasExactPrecalcUransPromotionLineage({
+      db,
+      resultId: input.resultId,
+      currentRansAttemptId: input.currentResultAttemptId!,
+      targetUransAttemptId: input.sourceResultAttemptId,
+    }));
+  return archiveRecoverySourceGenerationState({
+    ...input,
+    currentFidelity,
+    hasExactPrecalcRansLineage,
+  });
+}
+
+/**
+ * Recheck and lock the result immediately before an archive action mutates a
+ * solver request, obligation, or FINAL verification queue.  The early source
+ * read is intentionally not trusted across that scheduling boundary.
+ */
+async function lockLiveArchiveRecoverySource(
+  tx: DB,
+  source: Pick<ActionSource, "resultId" | "resultAttemptId" | "fidelity">,
+): Promise<ArchiveRecoveryLiveSourceCheck> {
+  const rows = (await tx.execute(sql`
+    SELECT result.current_result_attempt_id
+    FROM results result
+    WHERE result.id = ${source.resultId}
+    FOR UPDATE
+  `)) as unknown as Array<{ current_result_attempt_id: string | null }>;
+  const row = rows[0];
+  if (!row) {
+    return {
+      state: "missing",
+      reason: archiveRecoveryLiveSourceReason("missing"),
+    };
+  }
+  const state = await archiveRecoverySourceGenerationStateForResult(tx, {
+    resultId: source.resultId,
+    currentResultAttemptId: row.current_result_attempt_id,
+    sourceResultAttemptId: source.resultAttemptId,
+    sourceFidelity: source.fidelity,
+    lockForPublication: true,
+  });
+  return { state, reason: archiveRecoveryLiveSourceReason(state) };
+}
 
 function normalizedArchiveContinuationImplementationId(
   implementationId: string | null | undefined,
@@ -305,7 +514,9 @@ async function archiveRecoveryTargetCompatibility(
   let targetBcId = snapshot.preset.legacyBoundaryConditionId ?? null;
   if (!targetBcId) {
     const [preset] = await db
-      .select({ legacyBoundaryConditionId: simulationPresets.legacyBoundaryConditionId })
+      .select({
+        legacyBoundaryConditionId: simulationPresets.legacyBoundaryConditionId,
+      })
       .from(simulationPresets)
       .where(eq(simulationPresets.id, revision.presetId))
       .limit(1);
@@ -373,13 +584,27 @@ export function archiveRecoveryCorrectiveTailPeriods(
   return value;
 }
 
+/** NULL is the durable legacy v1 contract. Do not accept any inferred or
+ * future label as authority to widen a same-case physical continuation. */
+export function archiveRecoveryPolicyVersion(
+  value: unknown,
+): "adaptive-clean-tail-v2" | null {
+  if (value == null) return null;
+  if (value !== "adaptive-clean-tail-v2") {
+    throw new Error(
+      "archive recovery clean-cycle policy must be adaptive-clean-tail-v2 or null",
+    );
+  }
+  return value;
+}
+
 /** Claim exactly one durable action. `routing` is leased so a crashed
  * sweeper never turns an archive result into a lost, invisible task. */
 async function claimNextArchiveRecoveryAction(
   db: DB,
 ): Promise<ClaimedRecoveryAction | null> {
   const token = randomUUID();
-  const leaseUntil = new Date(Date.now() + ACTION_LEASE_MS);
+  const leaseUntilIso = new Date(Date.now() + ACTION_LEASE_MS).toISOString();
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const rows = (await tx.execute(sql`
@@ -398,7 +623,7 @@ async function claimNextArchiveRecoveryAction(
       UPDATE result_interpretation_recovery_actions action
       SET state = 'routing',
           claim_token = ${token}::uuid,
-          claim_expires_at = ${leaseUntil},
+          claim_expires_at = ${leaseUntilIso}::timestamptz,
           attempt_count = action.attempt_count +
             CASE WHEN candidate.state = 'waiting_for_precalc' THEN 0 ELSE 1 END,
           "updatedAt" = now()
@@ -415,7 +640,8 @@ async function claimNextArchiveRecoveryAction(
         candidate.state AS prior_state,
         action.target_urans_request_id,
         action.target_verify_queue_id,
-        action.corrective_tail_periods
+        action.corrective_tail_periods,
+        action.clean_cycle_recovery_policy_version
     `)) as unknown as Array<{
       id: string;
       result_id: string;
@@ -428,6 +654,7 @@ async function claimNextArchiveRecoveryAction(
       target_urans_request_id: string | null;
       target_verify_queue_id: string | null;
       corrective_tail_periods: number | null;
+      clean_cycle_recovery_policy_version: string | null;
     }>;
     const row = rows[0];
     if (
@@ -454,6 +681,9 @@ async function claimNextArchiveRecoveryAction(
       targetVerifyQueueId: row.target_verify_queue_id,
       correctiveTailPeriods: archiveRecoveryCorrectiveTailPeriods(
         row.corrective_tail_periods,
+      ),
+      cleanCycleRecoveryPolicyVersion: archiveRecoveryPolicyVersion(
+        row.clean_cycle_recovery_policy_version,
       ),
       claimToken: token,
     };
@@ -516,7 +746,11 @@ async function settleArchiveRecoveryAction(
     nextAttemptAt?: Date;
   },
 ): Promise<boolean> {
-  const settled = await settleArchiveRecoveryActionInTransaction(db, action, values);
+  const settled = await settleArchiveRecoveryActionInTransaction(
+    db,
+    action,
+    values,
+  );
   if (settled && values.state === "satisfied") {
     await supersedeArchiveReductionQueueForRecoveredAction(db, {
       resultId: action.resultId,
@@ -542,9 +776,15 @@ async function sourceForArchiveRecoveryAction(
     ClaimedRecoveryAction,
     "id" | "resultId" | "resultAttemptId" | "sourceArchiveId" | "fidelity"
   >,
-): Promise<{ source: ActionSource | null; restartable: boolean }> {
+): Promise<{
+  source: ActionSource | null;
+  restartable: boolean;
+  /** True only when the source result has no current live generation. */
+  released: boolean;
+}> {
   const rows = (await db.execute(sql`
     SELECT
+      result.current_result_attempt_id,
       attempt.result_id,
       attempt.id AS result_attempt_id,
       attempt.airfoil_id,
@@ -556,6 +796,7 @@ async function sourceForArchiveRecoveryAction(
       attempt.engine_job_id,
       attempt.engine_case_slug,
       attempt.solver_implementation_id,
+      attempt.quality_warnings,
       source_job.solver_implementation_id AS job_solver_implementation_id,
       source_job.bc_ids AS job_boundary_condition_ids,
       attempt.evidence_payload ->> 'fidelity' AS fidelity,
@@ -590,6 +831,7 @@ async function sourceForArchiveRecoveryAction(
       AND action.fidelity = ${action.fidelity}
     LIMIT 1
   `)) as unknown as Array<{
+    current_result_attempt_id: string | null;
     result_id: string;
     result_attempt_id: string;
     airfoil_id: string;
@@ -601,6 +843,7 @@ async function sourceForArchiveRecoveryAction(
     engine_job_id: string | null;
     engine_case_slug: string | null;
     solver_implementation_id: string | null;
+    quality_warnings: string[] | null;
     job_solver_implementation_id: string | null;
     job_boundary_condition_ids: string[] | null;
     fidelity: string | null;
@@ -612,14 +855,38 @@ async function sourceForArchiveRecoveryAction(
     blob_verified_at: Date | null;
   }>;
   const row = rows[0];
+  if (!row) {
+    return { source: null, restartable: false, released: false };
+  }
+  // A recovery action is scheduling metadata, not an ownership claim over
+  // released archival evidence. Replaying a non-current source is allowed
+  // only for the durable source-pinned PRECALC child of the live RANS parent;
+  // a matching AoA or newer timestamp alone does not establish that lineage.
+  // Do this before checking the remainder of the source shape so release gets
+  // the truthful historical-evidence outcome rather than a generic
+  // provenance error.
+  const actualSourceFidelity = sourceFidelity(row.fidelity);
+  const sourceGenerationState =
+    await archiveRecoverySourceGenerationStateForResult(db, {
+      resultId: row.result_id,
+      currentResultAttemptId: row.current_result_attempt_id,
+      sourceResultAttemptId: row.result_attempt_id,
+      sourceFidelity: actualSourceFidelity,
+    });
+  if (!archiveRecoverySourceHasLiveSchedulingAuthority(sourceGenerationState)) {
+    return {
+      source: null,
+      restartable: false,
+      released: sourceGenerationState === "released_historical",
+    };
+  }
   if (
-    !row ||
     !row.revision_id ||
     !row.bc_id ||
     row.aoa_deg == null ||
     !Number.isFinite(Number(row.aoa_deg))
   ) {
-    return { source: null, restartable: false };
+    return { source: null, restartable: false, released: false };
   }
   const source: ActionSource = {
     resultId: row.result_id,
@@ -628,7 +895,7 @@ async function sourceForArchiveRecoveryAction(
     revisionId: row.revision_id,
     bcId: row.bc_id,
     aoaDeg: Number(row.aoa_deg),
-    fidelity: sourceFidelity(row.fidelity),
+    fidelity: actualSourceFidelity,
     status: row.status,
     source: row.source,
     engineJobId: row.engine_job_id,
@@ -636,6 +903,7 @@ async function sourceForArchiveRecoveryAction(
     solverImplementationId: row.solver_implementation_id,
     jobSolverImplementationId: row.job_solver_implementation_id,
     jobBoundaryConditionIds: row.job_boundary_condition_ids,
+    qualityWarnings: row.quality_warnings,
   };
   const exactCurrentArchive =
     row.current_archive_id === action.sourceArchiveId &&
@@ -652,6 +920,7 @@ async function sourceForArchiveRecoveryAction(
   const restartable =
     exactCurrentArchive &&
     sourceShape &&
+    !source.qualityWarnings?.some(isUransContinuationPhysicalCapExhausted) &&
     (await hasExactValidSolverManifest(
       db,
       source.resultId,
@@ -663,24 +932,29 @@ async function sourceForArchiveRecoveryAction(
       source.resultAttemptId,
       action.sourceArchiveId,
     ));
-  return { source, restartable };
+  return { source, restartable, released: false };
 }
 
 async function activeExactRequest(
   tx: DB,
   source: ActionSource,
-  input: { continuation: boolean },
+  input: {
+    continuation: boolean;
+    cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
+  },
 ): Promise<{
   id: string;
   state: "pending" | "running";
   correctiveTailPeriods: number | null;
+  cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
 } | null> {
   const rows = (await tx.execute(sql`
     SELECT request.id,
            request.state,
            request.continue_from_result_id,
            request.continue_from_result_attempt_id,
-           request.corrective_tail_periods
+           request.corrective_tail_periods,
+           request.clean_cycle_recovery_policy_version
     FROM sim_urans_requests request
     WHERE request.airfoil_id = ${source.airfoilId}
       AND request.revision_id = ${source.revisionId}
@@ -695,11 +969,15 @@ async function activeExactRequest(
     continue_from_result_id: string | null;
     continue_from_result_attempt_id: string | null;
     corrective_tail_periods: number | null;
+    clean_cycle_recovery_policy_version: string | null;
   }>;
   const exact = rows.find((row) =>
     input.continuation
       ? row.continue_from_result_id === source.resultId &&
-        row.continue_from_result_attempt_id === source.resultAttemptId
+        row.continue_from_result_attempt_id === source.resultAttemptId &&
+        archiveRecoveryPolicyVersion(
+          row.clean_cycle_recovery_policy_version,
+        ) === input.cleanCycleRecoveryPolicyVersion
       : row.continue_from_result_id == null &&
         row.continue_from_result_attempt_id == null,
   );
@@ -710,8 +988,61 @@ async function activeExactRequest(
         correctiveTailPeriods: archiveRecoveryCorrectiveTailPeriods(
           exact.corrective_tail_periods,
         ),
+        cleanCycleRecoveryPolicyVersion: archiveRecoveryPolicyVersion(
+          exact.clean_cycle_recovery_policy_version,
+        ),
       }
     : null;
+}
+
+/**
+ * The ordinary PRECALC ladder has a two-attempt physical budget.  An archive
+ * interpretation action is allowed to consume one additional attempt only
+ * when the deployed controller identifies itself with a new immutable source
+ * revision.  The database trigger validates that the obligation is exhausted
+ * and reopens it atomically; the unique obligation/revision key makes retries
+ * idempotent and prevents an accidental infinite retry loop.
+ */
+async function grantArchiveRecoveryRemediationIfExhausted(
+  tx: DB,
+  action: ClaimedRecoveryAction,
+  obligation: {
+    id: string;
+    state: string;
+    attemptCount: number;
+    maxAttempts: number;
+    lastOutcome: string | null;
+  },
+): Promise<"granted" | "already_granted" | "unavailable"> {
+  const legacyTerminalOutcome =
+    obligation.lastOutcome === "rejected_exhausted" ||
+    obligation.lastOutcome === "failed_exhausted" ||
+    obligation.lastOutcome === "cancelled_exhausted";
+  if (
+    action.fidelity !== "urans_precalc" ||
+    action.requestedAction !== "verify_restart_proof_then_rerun" ||
+    obligation.state !== "blocked" ||
+    (obligation.attemptCount < obligation.maxAttempts && !legacyTerminalOutcome)
+  ) {
+    return "unavailable";
+  }
+  const sourceRevision = archiveRecoveryRemediationSourceRevision();
+  if (!sourceRevision) return "unavailable";
+  const [grant] = await tx
+    .insert(simPrecalcObligationRemediations)
+    .values({
+      obligationId: obligation.id,
+      sourceRevision,
+      reason: ARCHIVE_RECOVERY_REMEDIATION_REASON,
+    })
+    .onConflictDoNothing({
+      target: [
+        simPrecalcObligationRemediations.obligationId,
+        simPrecalcObligationRemediations.sourceRevision,
+      ],
+    })
+    .returning({ id: simPrecalcObligationRemediations.id });
+  return grant ? "granted" : "already_granted";
 }
 
 async function ensureArchiveRecoveryPrecalcRoute(
@@ -721,7 +1052,11 @@ async function ensureArchiveRecoveryPrecalcRoute(
   input: {
     continuation: boolean;
     targetImplementationId: string | null;
-    onRouted?: (tx: DB, requestId: string) => Promise<void>;
+    onRouted?: (
+      tx: DB,
+      requestId: string,
+      obligationId: string,
+    ) => Promise<void>;
   },
 ): Promise<
   | { kind: "routed"; requestId: string }
@@ -741,6 +1076,14 @@ async function ensureArchiveRecoveryPrecalcRoute(
         )
       )
     `);
+    // `sourceForArchiveRecoveryAction` is only an optimistic read. Lock and
+    // prove either the exact live generation or the one durable
+    // source-pinned PRECALC-child/RANS-parent relation before this transaction
+    // creates or reopens any request/obligation ownership.
+    const liveSource = await lockLiveArchiveRecoverySource(tx, source);
+    if (!archiveRecoverySourceHasLiveSchedulingAuthority(liveSource.state)) {
+      return { kind: "blocked" as const, reason: liveSource.reason };
+    }
     const [obligation] = await tx
       .select()
       .from(simPrecalcObligations)
@@ -831,15 +1174,28 @@ async function ensureArchiveRecoveryPrecalcRoute(
       obligation.state === "blocked" &&
       obligation.attemptCount >= obligation.maxAttempts
     ) {
-      return {
-        kind: "blocked" as const,
-        reason:
-          "fresh preliminary rerun would exceed this cell's existing physical-attempt budget",
-      };
+      const remediation = await grantArchiveRecoveryRemediationIfExhausted(
+        tx,
+        action,
+        obligation,
+      );
+      if (remediation !== "granted") {
+        return {
+          kind: "blocked" as const,
+          reason:
+            remediation === "already_granted"
+              ? "this exact corrected archive-recovery revision already consumed its one additional physical attempt"
+              : "fresh preliminary rerun requires a valid promoted recovery source revision and would otherwise exceed this cell's physical-attempt budget",
+        };
+      }
     }
 
+    const requestedCleanCycleRecoveryPolicyVersion = input.continuation
+      ? action.cleanCycleRecoveryPolicyVersion
+      : null;
     const existingRequest = await activeExactRequest(tx, source, {
       continuation: input.continuation,
+      cleanCycleRecoveryPolicyVersion: requestedCleanCycleRecoveryPolicyVersion,
     });
     const conflictingOpenRequest = !existingRequest
       ? ((await tx.execute(sql`
@@ -917,6 +1273,8 @@ async function ensureArchiveRecoveryPrecalcRoute(
             ? source.resultAttemptId
             : null,
           correctiveTailPeriods: requestedCorrectiveTailPeriods,
+          cleanCycleRecoveryPolicyVersion:
+            requestedCleanCycleRecoveryPolicyVersion,
         })
         .returning({ id: simUransRequests.id });
       requestId = request?.id;
@@ -971,7 +1329,7 @@ async function ensureArchiveRecoveryPrecalcRoute(
     // crashes before the commit, neither the request/obligation mutation nor
     // the action transition survives; a later lease holder cannot consume an
     // orphaned continuation as ordinary work.
-    await input.onRouted?.(tx, requestId);
+    await input.onRouted?.(tx, requestId, obligationId);
     return { kind: "routed" as const, requestId };
   });
 }
@@ -979,6 +1337,7 @@ async function ensureArchiveRecoveryPrecalcRoute(
 type ArchiveFullRequestOutcome =
   | { kind: "satisfied"; resultAttemptId: string }
   | { kind: "active" | "created"; id: string }
+  | { kind: "blocked"; reason: string }
   | {
       kind:
         | "target_terminal"
@@ -1081,6 +1440,12 @@ async function fullRequestForArchiveAction(
         )
       )
     `);
+    // Use the same live-generation fence as FAST recovery before this
+    // transaction can attach or create a FULL owner.
+    const liveSource = await lockLiveArchiveRecoverySource(tx, source);
+    if (!archiveRecoverySourceHasLiveSchedulingAuthority(liveSource.state)) {
+      return { kind: "blocked" as const, reason: liveSource.reason };
+    }
     const accepted = await acceptedUransForArchiveAction(tx, source, {
       fidelity: "urans_full",
       targetImplementationId: input.targetImplementationId,
@@ -1231,10 +1596,25 @@ async function attachArchiveFullContinuationToVerifyQueue(
   db: DB,
   action: ClaimedRecoveryAction,
   source: ActionSource,
-): Promise<{ queueId: string | null; reason?: string }> {
+): Promise<{
+  queueId: string | null;
+  reason?: string;
+  sourceNoLongerLive?: boolean;
+}> {
   if (!action.targetUransRequestId) return { queueId: null };
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+    // Queue attachment is a scheduler mutation too.  The result lock makes a
+    // concurrent release happen before or after the atomic attachment, never
+    // invisibly between its source read and the verify-queue write.
+    const liveSource = await lockLiveArchiveRecoverySource(tx, source);
+    if (!archiveRecoverySourceHasLiveSchedulingAuthority(liveSource.state)) {
+      return {
+        queueId: null,
+        reason: liveSource.reason,
+        sourceNoLongerLive: true,
+      };
+    }
     const rows = (await tx.execute(sql`
       SELECT queue.id, queue.state, queue.latest_result_attempt_id
       FROM sim_urans_verify_queue queue
@@ -1275,7 +1655,8 @@ async function attachArchiveFullContinuationToVerifyQueue(
     ) {
       return {
         queueId: null,
-        reason: "verify queue already belongs to a different immutable FULL checkpoint",
+        reason:
+          "verify queue already belongs to a different immutable FULL checkpoint",
       };
     }
     const [attached] = await tx
@@ -1321,14 +1702,23 @@ async function attachArchiveFullContinuationToVerifyQueue(
   });
 }
 
-async function routeOneArchiveRecoveryAction(
+/** @internal Single leased-action router. Exported for exact controller
+ * regression coverage; normal scheduling uses the bounded claim loop below. */
+export async function routeOneArchiveRecoveryAction(
   db: DB,
   action: ClaimedRecoveryAction,
 ): Promise<void> {
-  const { source, restartable } = await sourceForArchiveRecoveryAction(
-    db,
-    action,
-  );
+  const { source, restartable, released } =
+    await sourceForArchiveRecoveryAction(db, action);
+  if (released) {
+    await settleArchiveRecoveryAction(db, action, {
+      state: "blocked",
+      decisionReason:
+        "source result was released from live publication; historical evidence audit is non-scheduling",
+      lastError: archiveRecoveryLiveSourceReason("released_historical"),
+    });
+    return;
+  }
   if (!source || source.fidelity !== action.fidelity) {
     await settleArchiveRecoveryAction(db, action, {
       state: "blocked",
@@ -1338,7 +1728,10 @@ async function routeOneArchiveRecoveryAction(
     });
     return;
   }
-  const targetCompatibility = await archiveRecoveryTargetCompatibility(db, source);
+  const targetCompatibility = await archiveRecoveryTargetCompatibility(
+    db,
+    source,
+  );
   if (!targetCompatibility.physicalCell) {
     await settleArchiveRecoveryAction(db, action, {
       state: "blocked",
@@ -1360,41 +1753,51 @@ async function routeOneArchiveRecoveryAction(
     const routeMode = archiveRecoveryRouteMode({
       fidelity: action.fidelity,
       exactRestartProof: exactContinuationRestartProof,
+      forceFreshRerun:
+        action.requestedAction === "verify_restart_proof_then_rerun",
     });
-    const route = await ensureArchiveRecoveryPrecalcRoute(
-      db,
-      action,
-      source,
-      {
-        continuation: routeMode === "continue_exact_case",
-        targetImplementationId: targetCompatibility.targetImplementationId,
-        onRouted: async (tx, requestId) => {
-          const settled = await settleArchiveRecoveryActionInTransaction(
-            tx,
-            action,
-            {
-              state:
-                routeMode === "continue_exact_case"
-                  ? "continuation_routed"
-                  : "fresh_rerun_routed",
-              targetUransRequestId: requestId,
-              decisionReason:
-                routeMode === "continue_exact_case"
-                  ? "exact source archive, boundary, implementation, and restart checkpoint proved; same case queued"
-                  : restartable
-                    ? "archive checkpoint is incompatible with the current solver or boundary contract; one budgeted fresh preliminary generation queued"
-                    : "exact restart proof unavailable; one budgeted fresh preliminary generation queued",
-            },
+    const route = await ensureArchiveRecoveryPrecalcRoute(db, action, source, {
+      continuation: routeMode === "continue_exact_case",
+      targetImplementationId: targetCompatibility.targetImplementationId,
+      onRouted: async (tx, requestId, obligationId) => {
+        const settled = await settleArchiveRecoveryActionInTransaction(
+          tx,
+          action,
+          {
+            state:
+              routeMode === "continue_exact_case"
+                ? "continuation_routed"
+                : "fresh_rerun_routed",
+            targetUransRequestId: requestId,
+            decisionReason:
+              routeMode === "continue_exact_case"
+                ? "exact source archive, boundary, implementation, and restart checkpoint proved; same case queued"
+                : restartable
+                  ? "archive checkpoint is incompatible with the current solver or boundary contract; one budgeted fresh preliminary generation queued"
+                  : "exact restart proof unavailable; one budgeted fresh preliminary generation queued",
+          },
+        );
+        if (!settled) {
+          throw new Error(
+            "archive recovery lost its lease while recording a PRECALC request owner",
           );
-          if (!settled) {
-            throw new Error(
-              "archive recovery lost its lease while recording a PRECALC request owner",
-            );
-          }
-        },
+        }
+        // The old incident means only that its immutable archive did not
+        // carry the provenance needed to republish it.  It ceases to be a
+        // global safety hazard only after this exact source has a durable
+        // replacement owner in the ordinary ladder.  Do not generalize this
+        // to a physical solver failure: a failed replacement creates and
+        // retains its own incident.
+        await resolveLegacyUransEvidenceIncidentForRecoveryInTransaction(tx, {
+          precalcObligationId: obligationId,
+        });
       },
-    );
+    });
     if (route.kind === "routed") {
+      // Reopening a formerly blocked exact obligation changes the campaign's
+      // admission-hazard projection. Publish that transition only after the
+      // owner/action/incident transaction is durable.
+      await refreshCampaignProgressForResultIds(db, [source.resultId]);
       return;
     }
     if (route.kind === "satisfied") {
@@ -1440,6 +1843,16 @@ async function routeOneArchiveRecoveryAction(
       action,
       source,
     );
+    if (attached.sourceNoLongerLive) {
+      await settleArchiveRecoveryAction(db, action, {
+        state: "blocked",
+        decisionReason:
+          "source result left live publication before its FINAL continuation could attach",
+        lastError:
+          attached.reason ?? archiveRecoveryLiveSourceReason("missing"),
+      });
+      return;
+    }
     if (attached.queueId) {
       // The queue attachment and this action's immutable target receipt
       // committed in one transaction. Do not perform a second settle here:
@@ -1484,6 +1897,15 @@ async function routeOneArchiveRecoveryAction(
       }
     },
   });
+  if (request.kind === "blocked") {
+    await settleArchiveRecoveryAction(db, action, {
+      state: "blocked",
+      decisionReason:
+        "source result left live publication before archive recovery could route a FULL owner",
+      lastError: request.reason,
+    });
+    return;
+  }
   if (request.kind === "satisfied") {
     await settleArchiveRecoveryAction(db, action, {
       state: "satisfied",
@@ -1522,6 +1944,8 @@ export async function routeArchiveInterpretationRecoveryActions(
   opts: { maxActions?: number } = {},
 ): Promise<number> {
   const maxActions = opts.maxActions ?? MAX_ACTIONS_PER_TICK;
+  await repairTerminalProvenanceRerunOwners(db, { maxActions });
+  await repairPendingProvenanceRerunOwners(db, { maxActions });
   let routed = 0;
   for (let index = 0; index < maxActions; index += 1) {
     const action = await claimNextArchiveRecoveryAction(db);
@@ -1544,6 +1968,183 @@ export async function routeArchiveInterpretationRecoveryActions(
 }
 
 /**
+ * Return one source-pinned provenance rerun to the ordinary router after its
+ * exact prior request became terminal without accepted evidence.
+ *
+ * The terminal request and job remain immutable history. This transition
+ * changes only the existing recovery action back to `pending`; the normal
+ * leased router then repeats the live-source/archive/physical-cell gates and
+ * atomically attaches one fresh request to the same obligation. A remaining
+ * physical-attempt budget and the absence of every competing live owner are
+ * mandatory, so this cannot become an unbounded retry or duplicate solver
+ * submission.
+ */
+export async function repairTerminalProvenanceRerunOwners(
+  db: DB,
+  opts: { maxActions?: number } = {},
+): Promise<number> {
+  const maxActions = opts.maxActions ?? MAX_ACTIONS_PER_TICK;
+  const repaired = (await db.execute(sql`
+    WITH candidates AS (
+      SELECT
+        action.id AS action_id,
+        action.target_urans_request_id AS terminal_request_id
+      FROM result_interpretation_recovery_actions action
+      JOIN sim_urans_requests request
+        ON request.id = action.target_urans_request_id
+      JOIN sim_precalc_obligation_requests ownership
+        ON ownership.request_id = request.id
+      JOIN sim_precalc_obligations obligation
+        ON obligation.id = ownership.obligation_id
+       AND obligation.airfoil_id = request.airfoil_id
+       AND obligation.revision_id = request.revision_id
+       AND obligation.aoa_deg = request.aoa_deg
+       AND obligation.source_result_id = action.result_id
+       AND obligation.source_result_attempt_id = action.result_attempt_id
+      LEFT JOIN sim_jobs terminal_job ON terminal_job.id = request.sim_job_id
+      WHERE action.requested_action = 'verify_restart_proof_then_rerun'
+        AND action.state = 'fresh_rerun_routed'
+        AND action.fidelity = 'urans_precalc'
+        AND action.target_verify_queue_id IS NULL
+        AND request.fidelity = 'precalc'
+        AND request.state IN ('blocked', 'cancelled')
+        AND request.continue_from_result_id IS NULL
+        AND request.continue_from_result_attempt_id IS NULL
+        AND (
+          request.sim_job_id IS NULL
+          OR (
+            terminal_job.status IN ('done', 'failed', 'cancelled')
+            AND COALESCE(terminal_job.engine_state, '') NOT IN (
+              'submitting', 'submitted', 'running', 'ingesting',
+              'cancelling', 'cancel_pending'
+            )
+          )
+        )
+        AND obligation.state = 'pending'
+        AND obligation.attempt_count < obligation.max_attempts
+        AND obligation.latest_sim_job_id IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_urans_requests live_request
+          WHERE live_request.airfoil_id = request.airfoil_id
+            AND live_request.revision_id = request.revision_id
+            AND live_request.aoa_deg = request.aoa_deg
+            AND live_request.fidelity = 'precalc'
+            AND live_request.state IN ('pending', 'running')
+        )
+      ORDER BY action."createdAt" ASC, action.id
+      FOR UPDATE OF action, request, obligation
+      LIMIT ${maxActions}
+    )
+    UPDATE result_interpretation_recovery_actions action
+    SET state = 'pending',
+        next_attempt_at = now(),
+        decision_reason =
+          'the exact fresh provenance-rerun owner became terminal without publication; routing will allocate one remaining budgeted normal PRECALC owner',
+        last_error = NULL,
+        "updatedAt" = now()
+    FROM candidates candidate
+    WHERE action.id = candidate.action_id
+      AND action.state = 'fresh_rerun_routed'
+      AND action.target_urans_request_id = candidate.terminal_request_id
+    RETURNING action.id
+  `)) as unknown as Array<{ id: string }>;
+  return repaired.length;
+}
+
+/**
+ * Repair the narrow pre-v2 routing defect without allocating a second owner.
+ * A request is mutable here only while it is still pending, has never acquired
+ * a solver job, and its continuation pointers identify the action's exact
+ * immutable source. The existing request/obligation/action identities remain
+ * durable; only the unexecuted request mode is corrected to an ordinary fresh
+ * FAST generation.
+ */
+export async function repairPendingProvenanceRerunOwners(
+  db: DB,
+  opts: { maxActions?: number } = {},
+): Promise<number> {
+  const maxActions = opts.maxActions ?? MAX_ACTIONS_PER_TICK;
+  const repairedResultIds = await db.transaction(async (tx) => {
+    const rows = (await tx.execute(sql`
+      SELECT
+        action.id AS action_id,
+        action.result_id,
+        request.id AS request_id,
+        ownership.obligation_id
+      FROM result_interpretation_recovery_actions action
+      JOIN sim_urans_requests request
+        ON request.id = action.target_urans_request_id
+      JOIN sim_precalc_obligation_requests ownership
+        ON ownership.request_id = request.id
+      WHERE action.requested_action = 'verify_restart_proof_then_rerun'
+        AND action.state = 'continuation_routed'
+        AND action.fidelity = 'urans_precalc'
+        AND request.state = 'pending'
+        AND request.sim_job_id IS NULL
+        AND request.continue_from_result_id = action.result_id
+        AND request.continue_from_result_attempt_id = action.result_attempt_id
+      ORDER BY action."createdAt" ASC
+      FOR UPDATE OF action, request
+      LIMIT ${maxActions}
+    `)) as unknown as Array<{
+      action_id: string;
+      result_id: string;
+      request_id: string;
+      obligation_id: string;
+    }>;
+    for (const row of rows) {
+      const [request] = await tx
+        .update(simUransRequests)
+        .set({
+          continueFromResultId: null,
+          continueFromResultAttemptId: null,
+          correctiveTailPeriods: null,
+          cleanCycleRecoveryPolicyVersion: null,
+        })
+        .where(
+          and(
+            eq(simUransRequests.id, row.request_id),
+            eq(simUransRequests.state, "pending"),
+            isNull(simUransRequests.simJobId),
+          ),
+        )
+        .returning({ id: simUransRequests.id });
+      if (!request) continue;
+      await tx
+        .update(simPrecalcObligations)
+        .set({
+          lastOutcome: "archive_clean_cycle_fresh_rerun_pending",
+          lastError: null,
+        })
+        .where(eq(simPrecalcObligations.id, row.obligation_id));
+      await tx
+        .update(resultInterpretationRecoveryActions)
+        .set({
+          state: "fresh_rerun_routed",
+          decisionReason:
+            "immutable URANS provenance is absent; the durable unexecuted owner was corrected to one normal fresh preliminary generation",
+          lastError: null,
+        })
+        .where(
+          and(
+            eq(resultInterpretationRecoveryActions.id, row.action_id),
+            eq(
+              resultInterpretationRecoveryActions.state,
+              "continuation_routed",
+            ),
+          ),
+        );
+    }
+    return rows.map((row) => row.result_id);
+  });
+  if (repairedResultIds.length) {
+    await refreshCampaignProgressForResultIds(db, repairedResultIds);
+  }
+  return repairedResultIds.length;
+}
+
+/**
  * Strict authorization for the special PRECALC continuation path. An ordinary
  * request cannot opt into this; it must be pointed to by a durable action
  * whose source archive remains exact/current/verified at submit time.
@@ -1559,6 +2160,7 @@ export async function archiveBackfillPrecalcContinuationForRequest(
     bcId: string;
     aoaDeg: number;
     correctiveTailPeriods: number | null;
+    cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
   },
 ): Promise<boolean> {
   const [action] = await db
@@ -1570,6 +2172,8 @@ export async function archiveBackfillPrecalcContinuationForRequest(
       fidelity: resultInterpretationRecoveryActions.fidelity,
       correctiveTailPeriods:
         resultInterpretationRecoveryActions.correctiveTailPeriods,
+      cleanCycleRecoveryPolicyVersion:
+        resultInterpretationRecoveryActions.cleanCycleRecoveryPolicyVersion,
     })
     .from(resultInterpretationRecoveryActions)
     .where(
@@ -1592,6 +2196,12 @@ export async function archiveBackfillPrecalcContinuationForRequest(
   if (
     archiveRecoveryCorrectiveTailPeriods(action.correctiveTailPeriods) !==
     archiveRecoveryCorrectiveTailPeriods(input.correctiveTailPeriods)
+  ) {
+    return false;
+  }
+  if (
+    archiveRecoveryPolicyVersion(action.cleanCycleRecoveryPolicyVersion) !==
+    input.cleanCycleRecoveryPolicyVersion
   ) {
     return false;
   }
@@ -1637,10 +2247,7 @@ export async function archiveBackfillPrecalcRequestRequiresActionProof(
       and(
         eq(resultInterpretationRecoveryActions.targetUransRequestId, requestId),
         eq(resultInterpretationRecoveryActions.fidelity, "urans_precalc"),
-        eq(
-          resultInterpretationRecoveryActions.state,
-          "continuation_routed",
-        ),
+        eq(resultInterpretationRecoveryActions.state, "continuation_routed"),
       ),
     )
     .limit(1);
@@ -1673,12 +2280,12 @@ export async function blockArchiveBackfillPrecalcContinuationAtSubmit(
       })
       .where(
         and(
-          eq(resultInterpretationRecoveryActions.targetUransRequestId, input.requestId),
-          eq(resultInterpretationRecoveryActions.fidelity, "urans_precalc"),
           eq(
-            resultInterpretationRecoveryActions.state,
-            "continuation_routed",
+            resultInterpretationRecoveryActions.targetUransRequestId,
+            input.requestId,
           ),
+          eq(resultInterpretationRecoveryActions.fidelity, "urans_precalc"),
+          eq(resultInterpretationRecoveryActions.state, "continuation_routed"),
         ),
       )
       .returning({ id: resultInterpretationRecoveryActions.id });
@@ -1704,6 +2311,7 @@ export type ArchiveBackfillFinalContinuation = {
   engineCaseSlug: string;
   solverImplementationId: string | null;
   correctiveTailPeriods: number | null;
+  cleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2" | null;
 };
 
 /** Exact, action-owned FINAL continuation authorization. The verify queue
@@ -1727,6 +2335,8 @@ export async function archiveBackfillFinalContinuationForVerifyItem(
       fidelity: resultInterpretationRecoveryActions.fidelity,
       correctiveTailPeriods:
         resultInterpretationRecoveryActions.correctiveTailPeriods,
+      cleanCycleRecoveryPolicyVersion:
+        resultInterpretationRecoveryActions.cleanCycleRecoveryPolicyVersion,
     })
     .from(resultInterpretationRecoveryActions)
     .where(
@@ -1816,6 +2426,9 @@ export async function archiveBackfillFinalContinuationForVerifyItem(
     correctiveTailPeriods: archiveRecoveryCorrectiveTailPeriods(
       action.correctiveTailPeriods,
     ),
+    cleanCycleRecoveryPolicyVersion: archiveRecoveryPolicyVersion(
+      action.cleanCycleRecoveryPolicyVersion,
+    ),
   };
 }
 
@@ -1832,12 +2445,12 @@ export async function archiveBackfillFinalVerifyQueueRequiresActionProof(
     .from(resultInterpretationRecoveryActions)
     .where(
       and(
-        eq(resultInterpretationRecoveryActions.targetVerifyQueueId, verifyQueueId),
-        eq(resultInterpretationRecoveryActions.fidelity, "urans_full"),
         eq(
-          resultInterpretationRecoveryActions.state,
-          "continuation_routed",
+          resultInterpretationRecoveryActions.targetVerifyQueueId,
+          verifyQueueId,
         ),
+        eq(resultInterpretationRecoveryActions.fidelity, "urans_full"),
+        eq(resultInterpretationRecoveryActions.state, "continuation_routed"),
       ),
     )
     .limit(1);
@@ -1915,10 +2528,7 @@ export async function blockArchiveBackfillFinalContinuationAtSubmit(
             input.verifyQueueId,
           ),
           eq(resultInterpretationRecoveryActions.fidelity, "urans_full"),
-          eq(
-            resultInterpretationRecoveryActions.state,
-            "continuation_routed",
-          ),
+          eq(resultInterpretationRecoveryActions.state, "continuation_routed"),
         ),
       )
       .returning({ id: resultInterpretationRecoveryActions.id });

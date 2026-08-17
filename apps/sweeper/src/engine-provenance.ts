@@ -11,7 +11,7 @@ import {
   isEngineRuntimeIdentity,
   type EngineRuntimeIdentity,
 } from "@aerodb/engine-client";
-import { and, eq } from "drizzle-orm";
+import { and, eq, type SQL } from "drizzle-orm";
 
 export interface ResolvedEngineRuntime {
   solverImplementationId: string;
@@ -96,6 +96,7 @@ export async function persistEngineRuntimeForJob(
   db: DB,
   jobId: string,
   value: unknown,
+  opts: { jobWhere?: SQL } = {},
 ): Promise<ResolvedEngineRuntime | null> {
   const runtime = await resolveEngineRuntimeBuild(db, value);
   if (!runtime) return null;
@@ -105,7 +106,7 @@ export async function persistEngineRuntimeForJob(
       solverRuntimeBuildId: simJobs.solverRuntimeBuildId,
     })
     .from(simJobs)
-    .where(eq(simJobs.id, jobId))
+    .where(opts.jobWhere ?? eq(simJobs.id, jobId))
     .limit(1);
   if (!job)
     throw new Error(`sim job ${jobId} disappeared during provenance write`);
@@ -136,6 +137,6 @@ export async function persistEngineRuntimeForJob(
         job.solverImplementationId ?? runtime.solverImplementationId,
       solverRuntimeBuildId: runtime.solverRuntimeBuildId,
     })
-    .where(eq(simJobs.id, jobId));
+    .where(opts.jobWhere ?? eq(simJobs.id, jobId));
   return runtime;
 }

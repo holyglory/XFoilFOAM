@@ -20,4 +20,5 @@ processor*/
 postProcessing/
 .codex-artifacts/
 .codex-db-backups/
+.cold-logs/
 test-results/

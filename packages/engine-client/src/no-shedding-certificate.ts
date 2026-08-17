@@ -7,12 +7,18 @@
  * and amplitude threshold that make the absence of a period meaningful.
  */
 
-export const NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v1";
+/** Current certificate semantics include the bounded absolute-RMS tail. */
+export const NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v2";
+/** Immutable v1 archive interpretations remain readable as legacy evidence. */
+export const LEGACY_NO_SHEDDING_CERTIFICATE_VERSION = "no-shedding-v1";
+export type NoSheddingCertificateVersion =
+  | typeof NO_SHEDDING_CERTIFICATE_VERSION
+  | typeof LEGACY_NO_SHEDDING_CERTIFICATE_VERSION;
 /** A physical no-shedding proof needs a dense raw interval and dense witness. */
 export const NO_SHEDDING_MIN_SAMPLE_COUNT = 20;
 
 export interface NoSheddingCertificate {
-  reducer_version: typeof NO_SHEDDING_CERTIFICATE_VERSION;
+  reducer_version: NoSheddingCertificateVersion;
   certified: true;
   required_observation_s: number;
   observation_start_time: number;
@@ -123,9 +129,12 @@ export function parseNoSheddingCertificate(
     };
   }
   exactKeys(value, CERTIFICATE_KEYS, "no_shedding_certificate", errors);
-  if (value.reducer_version !== NO_SHEDDING_CERTIFICATE_VERSION) {
+  if (
+    value.reducer_version !== NO_SHEDDING_CERTIFICATE_VERSION &&
+    value.reducer_version !== LEGACY_NO_SHEDDING_CERTIFICATE_VERSION
+  ) {
     errors.push(
-      `no_shedding_certificate.reducer_version: expected ${NO_SHEDDING_CERTIFICATE_VERSION}`,
+      `no_shedding_certificate.reducer_version: expected ${LEGACY_NO_SHEDDING_CERTIFICATE_VERSION} or ${NO_SHEDDING_CERTIFICATE_VERSION}`,
     );
   }
   if (value.certified !== true) {
@@ -254,4 +263,3 @@ export function parseNoSheddingCertificate(
     ? { ok: false, errors }
     : { ok: true, value: value as unknown as NoSheddingCertificate };
 }
-

@@ -111,6 +111,23 @@ describe("production worker capacity wiring", () => {
   );
 });
 
+describe("role-aware sweeper admission wiring", () => {
+  const production = readFileSync(
+    resolve(repoRoot, "docker-compose.deploy.yml"),
+    "utf8",
+  );
+
+  it("passes the deployment-owned role to the sweeper without loosening the hub default", () => {
+    const sweeper = serviceBlock(production, "sweeper");
+    expect(sweeper).toContain(
+      "AIRFOILFOAM_DEPLOYMENT_ROLE: ${AIRFOILFOAM_DEPLOYMENT_ROLE:-hub}",
+    );
+    expect(sweeper).toContain(
+      "SWEEPER_DISK_MAX_USED_PCT: ${SWEEPER_DISK_MAX_USED_PCT:-}",
+    );
+  });
+});
+
 describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
   "%s solver engine isolation",
   (filename) => {

@@ -4,6 +4,7 @@ import {
   URANS_CONTINUATION_REQUIRED_MARKER,
   canonicalAoa,
   frameTrackMinPeriodsFor,
+  meetsFrameTrackPeriodMinimum,
   type SimulationWorkItem,
 } from "@aerodb/core";
 import { airfoils, simulationPresetRevisions } from "@aerodb/db";
@@ -637,7 +638,7 @@ function gateChecksFromPoint(row: {
     });
     const periods = Number(frameTrack.periods_retained);
     const minPeriods = frameTrackMinPeriodsFor(row.fidelity);
-    const periodPass = Number.isFinite(periods) && periods >= minPeriods;
+    const periodPass = meetsFrameTrackPeriodMinimum(periods, minPeriods);
     put({
       name: "period detector",
       detail: Number.isFinite(periods)

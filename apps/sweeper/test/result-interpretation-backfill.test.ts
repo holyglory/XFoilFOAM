@@ -1,15 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   archiveBackfillFidelity,
   archiveBackfillRecoveryProgress,
   archiveBackfillRecoveryHandoff,
+  ARCHIVE_INTERPRETATION_CLAIMABLE_RUN_STATES,
+  archiveInterpretationBackfillSummaryState,
+  archiveInterpretationBackfillRunMode,
+  createHistoricalReleasedArchiveAuditRun,
   archiveRecoveryMayAdoptCorrectiveTail,
   archiveRecommendedAdditionalPeriods,
   archivePointerForBackfill,
   archiveReducerNeedsRecoveryHandoff,
   normaliseArchiveInterpretationBackfillScope,
+  runArchiveInterpretationBackfill,
 } from "../src/result-interpretation-backfill";
+import {
+  HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+  RESULT_INTERPRETATION_REDUCER_BUILD_ID,
+  RESULT_INTERPRETATION_REDUCER_POLICY,
+} from "../src/result-interpretations";
 import { parseArchiveInterpretationBackfillArgs } from "../src/result-interpretation-backfill-cli";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
@@ -35,6 +45,93 @@ function gcsBlob(overrides: Record<string, unknown> = {}) {
 }
 
 describe("archive clean-cycle interpretation backfill", () => {
+  it("MUST-CATCH: historical released-evidence audits cannot create new runtime work", async () => {
+    await expect(
+      createHistoricalReleasedArchiveAuditRun({
+        db: {} as never,
+        exactSource: {
+          resultId: UUID_A,
+          resultAttemptId: UUID_B,
+          sourceArchiveId: "33333333-3333-4333-8333-333333333333",
+        },
+      }),
+    ).rejects.toThrow(/audits are disabled/i);
+  });
+
+  it("MUST-CATCH: a persisted historical audit cannot execute reducer work", async () => {
+    const reduceRemoteEvidenceCleanCycles = vi.fn();
+    const historicalRun = {
+      id: UUID_A,
+      state: "running",
+      reducerVersionId: UUID_B,
+      scope: {
+        contract: HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+        canonicalSelection: "forbidden",
+        physicalRecovery: "record-only",
+        campaignMutation: "forbidden",
+        rawEvidenceImmutable: true,
+        exactSource: {
+          resultId: UUID_A,
+          resultAttemptId: UUID_B,
+          sourceArchiveId: "33333333-3333-4333-8333-333333333333",
+        },
+      },
+    };
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: async () => [historicalRun],
+          }),
+        }),
+      }),
+    };
+
+    await expect(
+      runArchiveInterpretationBackfill({
+        db: db as never,
+        engine: { reduceRemoteEvidenceCleanCycles } as never,
+        runId: UUID_A,
+        historicalAuditExactSource: historicalRun.scope.exactSource,
+      }),
+    ).rejects.toThrow(/audits are disabled and cannot execute/i);
+    expect(reduceRemoteEvidenceCleanCycles).not.toHaveBeenCalled();
+  });
+
+  it("pins integer-period boundary reductions to a new append-only build generation", () => {
+    expect(RESULT_INTERPRETATION_REDUCER_BUILD_ID).toBe("clean-cycle-v6");
+    expect(RESULT_INTERPRETATION_REDUCER_POLICY.urans.periodBoundaryUlps).toBe(
+      4,
+    );
+  });
+
+  it("MUST-CATCH: only a running parent may lease another archive receipt", () => {
+    expect(ARCHIVE_INTERPRETATION_CLAIMABLE_RUN_STATES).toEqual(["running"]);
+  });
+
+  it("MUST-CATCH: summary refresh never resurrects a cancelled or failed audit run", () => {
+    expect(
+      archiveInterpretationBackfillSummaryState({
+        terminalState: "cancelled",
+        auditIncomplete: false,
+        openItems: 0,
+      }),
+    ).toBe("cancelled");
+    expect(
+      archiveInterpretationBackfillSummaryState({
+        terminalState: "failed",
+        auditIncomplete: false,
+        openItems: 3,
+      }),
+    ).toBe("failed");
+    expect(
+      archiveInterpretationBackfillSummaryState({
+        auditIncomplete: true,
+        openItems: 0,
+      }),
+    ).toBe("failed");
+  });
+
   it("accepts only explicit FAST/FINAL provenance", () => {
     expect(archiveBackfillFidelity({ fidelity: "urans_precalc" })).toBe(
       "urans_precalc",
@@ -80,6 +177,14 @@ describe("archive clean-cycle interpretation backfill", () => {
       pointer: null,
       reason: expect.stringContaining("Zstandard"),
     });
+    expect(
+      archivePointerForBackfill(
+        gcsBlob({ objectKey: "solver-evidence/../other/evidence.tar.zst" }),
+      ),
+    ).toMatchObject({
+      pointer: null,
+      reason: expect.stringContaining("object key"),
+    });
   });
 
   it("normalizes a bounded immutable scope and refuses unsafe identifiers", () => {
@@ -99,6 +204,45 @@ describe("archive clean-cycle interpretation backfill", () => {
         resultIds: ["not-a-uuid"],
       }),
     ).toThrow(/UUID/);
+  });
+
+  it("MUST-CATCH: a released-evidence audit needs all persisted no-publication fences", () => {
+    expect(
+      archiveInterpretationBackfillRunMode({
+        contract: HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+        canonicalSelection: "forbidden",
+        physicalRecovery: "record-only",
+        campaignMutation: "forbidden",
+        rawEvidenceImmutable: true,
+        exactSource: {
+          resultId: UUID_A,
+          resultAttemptId: UUID_B,
+          sourceArchiveId: "33333333-3333-4333-8333-333333333333",
+        },
+      }),
+    ).toBe("historical_released_audit");
+    expect(
+      archiveInterpretationBackfillRunMode({
+        contract: "archive-clean-cycle-backfill-v1",
+      }),
+    ).toBe("queue_publication");
+    expect(() =>
+      archiveInterpretationBackfillRunMode({
+        contract: HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+        canonicalSelection: "forbidden",
+        physicalRecovery: "record-only",
+        campaignMutation: "forbidden",
+      }),
+    ).toThrow(/no-publication authority fence/);
+    expect(() =>
+      archiveInterpretationBackfillRunMode({
+        contract: HISTORICAL_RELEASED_ARCHIVE_AUDIT_CONTRACT,
+        canonicalSelection: "forbidden",
+        physicalRecovery: "record-only",
+        campaignMutation: "forbidden",
+        rawEvidenceImmutable: true,
+      }),
+    ).toThrow(/exactSource/);
   });
 
   it("keeps planning read-only and refuses standalone run resumption", () => {
@@ -185,6 +329,7 @@ describe("archive clean-cycle interpretation backfill", () => {
       sourceArchiveId: "33333333-3333-4333-8333-333333333333",
       inputEvidenceSignature: "c".repeat(64),
       recommendedAdditionalPeriods: 3,
+      sourceCleanCycleRecoveryPolicyVersion: null,
     });
     expect(handoff).toEqual({
       contract: "archive-clean-cycle-recovery-handoff-v1",
@@ -197,6 +342,7 @@ describe("archive clean-cycle interpretation backfill", () => {
       sourceArchiveId: "33333333-3333-4333-8333-333333333333",
       inputEvidenceSignature: "c".repeat(64),
       correctiveTailPeriods: 3,
+      cleanCycleRecoveryPolicyVersion: null,
     });
     expect(
       archiveBackfillRecoveryHandoff({
@@ -206,6 +352,7 @@ describe("archive clean-cycle interpretation backfill", () => {
         resultAttemptId: UUID_B,
         sourceArchiveId: "33333333-3333-4333-8333-333333333333",
         inputEvidenceSignature: "c".repeat(64),
+        sourceCleanCycleRecoveryPolicyVersion: null,
       }),
     ).toMatchObject({
       action: "verify_restart_proof_then_rerun",
@@ -230,8 +377,41 @@ describe("archive clean-cycle interpretation backfill", () => {
         resultAttemptId: UUID_B,
         sourceArchiveId: "33333333-3333-4333-8333-333333333333",
         inputEvidenceSignature: "c".repeat(64),
+        sourceCleanCycleRecoveryPolicyVersion: null,
       }),
     ).toThrow(/recommendedAdditionalPeriods/);
+  });
+
+  it("MUST-CATCH: an adaptive reducer replay cannot widen a legacy source job", () => {
+    const base = {
+      state: "continuation_required" as const,
+      fidelity: "urans_precalc" as const,
+      resultId: UUID_A,
+      resultAttemptId: UUID_B,
+      sourceArchiveId: "33333333-3333-4333-8333-333333333333",
+      inputEvidenceSignature: "c".repeat(64),
+      recommendedAdditionalPeriods: 3,
+      recoveryProgress: {
+        policyVersion: "adaptive-clean-tail-v2" as const,
+        measuredPeriods: 13,
+        maxPeriods: 18,
+        recommendedAdditionalPeriods: 3,
+      },
+    };
+    // A v4 engine can replay a v1 archive, but the replay itself is not
+    // authority to change that source's immutable cross-job cap.
+    expect(
+      archiveBackfillRecoveryHandoff({
+        ...base,
+        sourceCleanCycleRecoveryPolicyVersion: null,
+      }).cleanCycleRecoveryPolicyVersion,
+    ).toBeNull();
+    expect(
+      archiveBackfillRecoveryHandoff({
+        ...base,
+        sourceCleanCycleRecoveryPolicyVersion: "adaptive-clean-tail-v2",
+      }).cleanCycleRecoveryPolicyVersion,
+    ).toBe("adaptive-clean-tail-v2");
   });
 
   it("accepts legacy reducer diagnostics but strictly fences an opted-in recovery progress proof", () => {
@@ -273,6 +453,44 @@ describe("archive clean-cycle interpretation backfill", () => {
         },
       }),
     ).toEqual({ measuredPeriods: 12, maxPeriods: 12 });
+
+    expect(
+      archiveBackfillRecoveryProgress({
+        state: "continuation_required",
+        fidelity: "urans_precalc",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 13,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 3,
+          },
+        },
+      }),
+    ).toEqual({
+      policyVersion: "adaptive-clean-tail-v2",
+      measuredPeriods: 13,
+      maxPeriods: 18,
+      recommendedAdditionalPeriods: 3,
+    });
+
+    expect(
+      archiveBackfillRecoveryProgress({
+        state: "recovery_exhausted",
+        fidelity: "urans_full",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 29,
+            maxPeriods: 27,
+          },
+        },
+      }),
+    ).toEqual({
+      policyVersion: "adaptive-clean-tail-v2",
+      measuredPeriods: 29,
+      maxPeriods: 27,
+    });
   });
 
   it("MUST-CATCH: refuses an over-cap or post-cap recovery handoff before it reaches the scheduler", () => {
@@ -315,6 +533,60 @@ describe("archive clean-cycle interpretation backfill", () => {
         },
       }),
     ).toThrow(/exceeds remaining physical-period budget/);
+    expect(() =>
+      archiveBackfillRecoveryProgress({
+        state: "continuation_required",
+        fidelity: "urans_precalc",
+        diagnostics: {
+          recoveryProgress: {
+            measuredPeriods: 13,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      }),
+    ).toThrow(/expected 9 for urans_precalc/);
+    expect(() =>
+      archiveBackfillRecoveryProgress({
+        state: "continuation_required",
+        fidelity: "urans_precalc",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 13,
+            maxPeriods: 21,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      }),
+    ).toThrow(/expected 18 for urans_precalc/);
+    expect(() =>
+      archiveBackfillRecoveryProgress({
+        state: "recovery_exhausted",
+        fidelity: "urans_precalc",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 17,
+            maxPeriods: 18,
+          },
+        },
+      }),
+    ).toThrow(/adaptive exhausted recovery must reach maxPeriods/);
+    expect(() =>
+      archiveBackfillRecoveryProgress({
+        state: "recovery_exhausted",
+        fidelity: "urans_precalc",
+        diagnostics: {
+          recoveryProgress: {
+            policyVersion: "adaptive-clean-tail-v2",
+            measuredPeriods: 18,
+            maxPeriods: 18,
+            recommendedAdditionalPeriods: 1,
+          },
+        },
+      }),
+    ).toThrow(/unexpected key "recommendedAdditionalPeriods"/);
   });
 
   it("MUST-CATCH: a legacy pending recovery action may adopt an authenticated clean-tail instruction exactly once before routing", () => {

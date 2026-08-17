@@ -4,6 +4,8 @@ import {
   DEFAULT_DISK_JOB_RESERVE_BYTES,
   DEFAULT_DISK_MAX_USED_PCT,
   DEFAULT_DISK_MIN_FREE_BYTES,
+  DEFAULT_REMOTE_DISK_MAX_USED_PCT,
+  diskAdmissionConfigFromEnv,
   diskAdmissionExposureForJobs,
   diskMeasurementFromStatfs,
   evaluateDiskAdmission,
@@ -17,6 +19,29 @@ const config = {
 };
 
 describe("disk admission", () => {
+  it("uses the remote emergency ceiling only for the explicit remote role", () => {
+    expect(
+      diskAdmissionConfigFromEnv({
+        AIRFOILFOAM_DEPLOYMENT_ROLE: "remote-solver",
+      }),
+    ).toMatchObject({
+      deploymentRole: "remote-solver",
+      maxUsedPct: DEFAULT_REMOTE_DISK_MAX_USED_PCT,
+    });
+    expect(diskAdmissionConfigFromEnv({})).toMatchObject({
+      deploymentRole: "hub",
+      maxUsedPct: DEFAULT_DISK_MAX_USED_PCT,
+    });
+    expect(
+      diskAdmissionConfigFromEnv({
+        AIRFOILFOAM_DEPLOYMENT_ROLE: "unexpected-role",
+      }),
+    ).toMatchObject({
+      deploymentRole: "hub",
+      maxUsedPct: DEFAULT_DISK_MAX_USED_PCT,
+    });
+  });
+
   it("admits a new job when measured use and reserved headroom are safe", () => {
     expect(
       evaluateDiskAdmission(
@@ -45,6 +70,53 @@ describe("disk admission", () => {
     );
     expect(decision.allowed).toBe(false);
     expect(decision.reason).toContain("95.1% used");
+  });
+
+  it("admits the remote node at 95.9% only when its absolute reserve is safe", () => {
+    const remoteConfig = diskAdmissionConfigFromEnv({
+      AIRFOILFOAM_DEPLOYMENT_ROLE: "remote-solver",
+    });
+    const safeExposure = {
+      activeLocalJobCount: 0,
+      activeLocalReservedBytes: 0,
+    };
+    expect(
+      evaluateDiskAdmission(
+        {
+          total_bytes: 3.3 * 1024 * GIB,
+          free_bytes: 137.3 * GIB,
+          used_pct: 95.9,
+        },
+        safeExposure,
+        remoteConfig,
+      ),
+    ).toMatchObject({
+      allowed: true,
+      requiredFreeBytes: 44 * GIB,
+    });
+
+    expect(
+      evaluateDiskAdmission(
+        {
+          total_bytes: 3.3 * 1024 * GIB,
+          free_bytes: 43.9 * GIB,
+          used_pct: 95.9,
+        },
+        safeExposure,
+        remoteConfig,
+      ),
+    ).toMatchObject({ allowed: false, usedPct: 95.9 });
+    expect(
+      evaluateDiskAdmission(
+        {
+          total_bytes: 3.3 * 1024 * GIB,
+          free_bytes: 137.3 * GIB,
+          used_pct: 99,
+        },
+        safeExposure,
+        remoteConfig,
+      ),
+    ).toMatchObject({ allowed: false, usedPct: 99 });
   });
 
   it("reserves worst-case growth for active jobs and the next admission", () => {

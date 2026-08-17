@@ -5,6 +5,7 @@ import {
   historicalUransArchiveState,
   historicalUransExecutionState,
   historicalUransInventoryPlan,
+  historicalUransPublicationState,
   historicalUransProvenanceState,
   historicalUransStage,
   normaliseHistoricalUransInventoryScope,
@@ -61,6 +62,7 @@ function candidate(input: {
     provenanceState: "eligible_for_existing_handoffs",
     archiveState: input.archiveState,
     archiveReason: null,
+    publicationState: "current_attempt",
     plan: input.plan,
   };
 }
@@ -145,6 +147,7 @@ describe("historical URANS inventory", () => {
         provenanceState: "eligible_for_existing_handoffs",
         archiveState: "no_current_archive",
         executionState: "completed_solved",
+        publicationState: "current_attempt",
       }),
     ).toBe("final_archive_gap_manual_review");
   });
@@ -170,6 +173,7 @@ describe("historical URANS inventory", () => {
         provenanceState: "missing_result_owner",
         archiveState: "no_current_archive",
         executionState: "completed_solved",
+        publicationState: "no_result_owner",
       }),
     ).toBe("investigate_attempt_provenance");
   });
@@ -194,6 +198,7 @@ describe("historical URANS inventory", () => {
         provenanceState: "non_publishable_execution",
         archiveState: "verified_gcs_archive",
         executionState: failed,
+        publicationState: "current_attempt",
       }),
     ).toBe("investigate_terminal_failure");
 
@@ -208,6 +213,7 @@ describe("historical URANS inventory", () => {
         provenanceState: "non_publishable_execution",
         archiveState: "no_current_archive",
         executionState: queued,
+        publicationState: "current_attempt",
       }),
     ).toBe("await_execution");
     expect(
@@ -216,6 +222,7 @@ describe("historical URANS inventory", () => {
         provenanceState: "non_publishable_execution",
         archiveState: "no_current_archive",
         executionState: "awaiting_result_publication",
+        publicationState: "current_attempt",
       }),
     ).toBe("await_result_publication");
     expect(
@@ -227,8 +234,61 @@ describe("historical URANS inventory", () => {
         provenanceState: "non_publishable_execution",
         archiveState: "verified_gcs_archive",
         executionState: "stale_execution",
+        publicationState: "current_attempt",
       }),
     ).toBe("investigate_stale_execution");
+  });
+
+  it("MUST-CATCH: a completed authenticated GCS source with no current result generation is historical evidence, never automatic publication work", () => {
+    expect(
+      historicalUransPublicationState({
+        resultId: RESULT_A,
+        resultAttemptId: ATTEMPT_A,
+        currentResultAttemptId: null,
+      }),
+    ).toBe("historical_released");
+    expect(
+      historicalUransInventoryPlan({
+        fidelity: "urans_precalc",
+        provenanceState: "eligible_for_existing_handoffs",
+        archiveState: "verified_gcs_archive",
+        executionState: "completed_solved",
+        publicationState: "historical_released",
+      }),
+    ).toBe("ineligible_released_evidence");
+    expect(
+      historicalUransPublicationState({
+        resultId: RESULT_A,
+        resultAttemptId: ATTEMPT_A,
+        currentResultAttemptId: ATTEMPT_A,
+      }),
+    ).toBe("current_attempt");
+    expect(
+      historicalUransPublicationState({
+        resultId: RESULT_A,
+        resultAttemptId: ATTEMPT_A,
+        currentResultAttemptId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).toBe("other_current_attempt");
+    expect(
+      historicalUransPublicationState({
+        resultId: null,
+        resultAttemptId: ATTEMPT_A,
+        currentResultAttemptId: null,
+      }),
+    ).toBe("no_result_owner");
+    expect(
+      historicalUransInventoryPlan({
+        fidelity: "urans_precalc",
+        // Defend the planner itself as well as the normal query mapper: a
+        // malformed caller cannot turn ownerless GCS bytes into an audit or
+        // automatic publication candidate by mislabelling provenance.
+        provenanceState: "eligible_for_existing_handoffs",
+        archiveState: "verified_gcs_archive",
+        executionState: "completed_solved",
+        publicationState: "no_result_owner",
+      }),
+    ).toBe("investigate_attempt_provenance");
   });
 
   it("preserves microsecond keysets and rejects invalid scopes", () => {

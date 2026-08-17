@@ -15,8 +15,16 @@ if [[ "$ACTION" != "--rollback" && ! "$ACTION" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 
-DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
+PINNED_WATCHER_INVOCATION="${PINNED_WATCHER_INVOCATION:-false}"
+ACTIVE_APP_LINK="${ACTIVE_APP_LINK:-}"
+EXPECTED_DEPLOY_SCRIPT_DIR="$APP_DIR/scripts/deploy"
+DEPLOY_SCRIPT_DIR_WAS_SUPPLIED=false
+if [[ -n "${DEPLOY_SCRIPT_DIR+x}" ]]; then
+  DEPLOY_SCRIPT_DIR_WAS_SUPPLIED=true
+else
+  DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
 ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"
@@ -26,6 +34,8 @@ LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
 DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-source.json}"
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
+DEPLOY_SOURCE_VERIFIER="${DEPLOY_SOURCE_VERIFIER:-}"
+DEPLOY_SOURCE_VERIFIER_SHA256="${DEPLOY_SOURCE_VERIFIER_SHA256:-}"
 RECEIPT_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-canary-receipt.json"
 ATTESTATION_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-attestation.json"
 BACKUP_MANIFEST_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-backup-manifest.json"
@@ -44,8 +54,77 @@ PREPARE_SWEEPER_WAS_RUNNING=0
 PREPARE_MEDIA_WAS_RUNNING=0
 CANARY_TEMP_FILE=""
 REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS="${REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS:-21900}"
+QUEUE_STALE_REFRESH_WARMUP_MILLISECONDS=45000
+QUEUE_STALE_REFRESH_HTTP_TIMEOUT_SECONDS=20
+QUEUE_STALE_REFRESH_REPROBE_SECONDS=1
+QUEUE_STALE_REFRESH_MAX_REPROBES=45
 
 cd "$APP_DIR"
+if [[ "$DEPLOY_SCRIPT_DIR_WAS_SUPPLIED" == "true" ]]; then
+  if ! expected_deploy_script_dir="$(cd "$EXPECTED_DEPLOY_SCRIPT_DIR" && pwd -P)"; then
+    echo "Missing deployment script directory: $EXPECTED_DEPLOY_SCRIPT_DIR" >&2
+    exit 2
+  fi
+  if ! supplied_deploy_script_dir="$(cd "$DEPLOY_SCRIPT_DIR" && pwd -P)"; then
+    echo "Missing supplied deployment script directory: $DEPLOY_SCRIPT_DIR" >&2
+    exit 2
+  fi
+  if [[ "$supplied_deploy_script_dir" != "$expected_deploy_script_dir" ]]; then
+    echo "Deployment script directory must belong to APP_DIR; refusing mixed-release maintenance." >&2
+    exit 2
+  fi
+  DEPLOY_SCRIPT_DIR="$expected_deploy_script_dir"
+fi
+verify_pinned_watcher_bootstrap() {
+  local stage="$1" pinned_release active_release expected_compose_file
+  local expected_manifest_file pinned_source_fields pinned_revision
+  local pinned_tree_sha pinned_file_count
+
+  [[ "$PINNED_WATCHER_INVOCATION" == "true" ]] || return 0
+  pinned_release="$(pwd -P)"
+  if [[ -z "$ACTIVE_APP_LINK" ]] || ! active_release="$(cd "$ACTIVE_APP_LINK" && pwd -P)"; then
+    echo "Pinned watcher active application link is unavailable." >&2
+    return 2
+  fi
+  if [[ "$active_release" != "$pinned_release" ]]; then
+    echo "Active application release changed; refusing old-release engine maintenance." >&2
+    return 2
+  fi
+  expected_compose_file="$pinned_release/docker-compose.deploy.yml"
+  if [[ ! -f "$COMPOSE_FILE" || -L "$COMPOSE_FILE" ]] ||
+     [[ "$(readlink -f "$COMPOSE_FILE")" != "$expected_compose_file" ]]; then
+    echo "Pinned watcher COMPOSE_FILE must be the regular compose file from APP_DIR." >&2
+    return 2
+  fi
+  expected_manifest_file="$pinned_release/.deployment-source.json"
+  if [[ ! -f "$DEPLOYMENT_MANIFEST_FILE" || -L "$DEPLOYMENT_MANIFEST_FILE" ]] ||
+     [[ "$(readlink -f "$DEPLOYMENT_MANIFEST_FILE")" != "$expected_manifest_file" ]]; then
+    echo "Pinned watcher deployment manifest must belong to APP_DIR." >&2
+    return 2
+  fi
+  if [[ ! -f "$DEPLOY_SOURCE_VERIFIER" || -L "$DEPLOY_SOURCE_VERIFIER" ]] ||
+     [[ ! "$DEPLOY_SOURCE_VERIFIER_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+     [[ "$(sha256sum "$DEPLOY_SOURCE_VERIFIER" | awk '{print $1}')" != "$DEPLOY_SOURCE_VERIFIER_SHA256" ]]; then
+    echo "Pinned watcher source verifier is missing or failed integrity verification." >&2
+    return 2
+  fi
+  pinned_source_fields="$(python3 "$DEPLOY_SOURCE_VERIFIER" \
+    --verify --root "$pinned_release" --manifest "$expected_manifest_file")" || return 2
+  IFS=$'\t' read -r pinned_revision pinned_tree_sha pinned_file_count <<<"$pinned_source_fields"
+  if [[ -z "$DEPLOY_SOURCE_REVISION" || "$pinned_revision" != "$DEPLOY_SOURCE_REVISION" ]] ||
+     [[ -z "$DEPLOY_SOURCE_TREE_SHA256" || "$pinned_tree_sha" != "$DEPLOY_SOURCE_TREE_SHA256" ]]; then
+    echo "Pinned watcher source no longer matches the prepared revision and tree." >&2
+    return 2
+  fi
+  echo "Verified pinned watcher bootstrap ($stage): revision=$pinned_revision sha256=$pinned_tree_sha files=$pinned_file_count"
+}
+
+if [[ "$PINNED_WATCHER_INVOCATION" == "true" ]]; then
+  verify_pinned_watcher_bootstrap "pre-lock" || exit $?
+elif [[ "$PINNED_WATCHER_INVOCATION" != "false" ]]; then
+  echo "PINNED_WATCHER_INVOCATION must be true or false." >&2
+  exit 2
+fi
 python3 "$DEPLOY_SCRIPT_DIR/deployment-env-preflight.py" \
   --app-dir "$APP_DIR" --state-dir "$AIRFOILS_PRO_STATE_DIR" --env-file "$ENV_FILE" \
   >/dev/null || exit 2
@@ -81,11 +160,23 @@ file_sha256() {
 }
 
 verify_deployment_source() {
-  local fields file_count
+  local fields file_count revision tree_sha expected_revision expected_tree_sha
+  expected_revision="$DEPLOY_SOURCE_REVISION"
+  expected_tree_sha="$DEPLOY_SOURCE_TREE_SHA256"
   fields="$(python3 "$DEPLOY_SCRIPT_DIR/deployment-source-manifest.py" \
     --verify --root "$APP_DIR" --manifest "$DEPLOYMENT_MANIFEST_FILE")" || return 2
-  IFS=$'\t' read -r DEPLOY_SOURCE_REVISION DEPLOY_SOURCE_TREE_SHA256 file_count <<<"$fields"
-  echo "Verified remote-solver source: revision=$DEPLOY_SOURCE_REVISION sha256=$DEPLOY_SOURCE_TREE_SHA256 files=$file_count"
+  IFS=$'\t' read -r revision tree_sha file_count <<<"$fields"
+  if [[ -n "$expected_revision" && "$revision" != "$expected_revision" ]]; then
+    echo "Promoted source revision changed before remote engine maintenance: expected $expected_revision, found $revision" >&2
+    return 2
+  fi
+  if [[ -n "$expected_tree_sha" && "$tree_sha" != "$expected_tree_sha" ]]; then
+    echo "Promoted source hash changed before remote engine maintenance: expected $expected_tree_sha, found $tree_sha" >&2
+    return 2
+  fi
+  DEPLOY_SOURCE_REVISION="$revision"
+  DEPLOY_SOURCE_TREE_SHA256="$tree_sha"
+  echo "Verified remote-solver source: revision=$revision sha256=$tree_sha files=$file_count"
 }
 
 validate_compose_profile() {
@@ -102,6 +193,13 @@ validate_compose_profile() {
   fi
   rm -f "$temporary"
   echo "Merged Compose profile preserves the 40-CPU volume-backed hz-solver2 contract."
+}
+
+install_remote_capacity_monitor() {
+  APP_DIR="$APP_DIR" \
+    AIRFOILS_PRO_STATE_DIR="$AIRFOILS_PRO_STATE_DIR" \
+    ENV_FILE="$ENV_FILE" \
+    "$DEPLOY_SCRIPT_DIR/install-remote-solver-capacity-monitor.sh"
 }
 
 set_env_vars_atomic() {
@@ -184,44 +282,231 @@ openfoam_processes() {
     'pgrep -af "[s]impleFoam|[p]impleFoam|[p]otentialFoam|[s]nappyHexMesh|[s]urfaceFeatureExtract|[b]lockMesh|[c]heckMesh|[d]ecomposePar|[r]econstructPar|[r]enumberMesh|[m]apFields|[p]ostProcess|[f]oamToVTK|[f]oamRun|[f]oamJob" || true'
 }
 
-queue_activity() {
-  curl -fsS --max-time 15 http://127.0.0.1:8000/queue | python3 -c '
-import json, sys
-queue = json.load(sys.stdin)
+monotonic_milliseconds() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+}
+
+queue_activity() (
+  local started_ms deadline_ms now_ms completed_ms remaining_ms timeout http_status classification reprobes=0 response_file=""
+  clear_queue_response() {
+    if [[ -n "$response_file" ]]; then
+      rm -f "$response_file" || true
+      response_file=""
+    fi
+  }
+  trap clear_queue_response EXIT
+  started_ms="$(monotonic_milliseconds)" || return 12
+  [[ "$started_ms" =~ ^[0-9]+$ ]] || {
+    echo "engine queue monotonic clock returned an invalid value: $started_ms" >&2
+    return 12
+  }
+  deadline_ms=$((started_ms + QUEUE_STALE_REFRESH_WARMUP_MILLISECONDS))
+  while true; do
+    now_ms="$(monotonic_milliseconds)" || return 12
+    [[ "$now_ms" =~ ^[0-9]+$ ]] || {
+      echo "engine queue monotonic clock returned an invalid value: $now_ms" >&2
+      return 12
+    }
+    remaining_ms=$((deadline_ms - now_ms))
+    if (( remaining_ms <= 0 || reprobes >= QUEUE_STALE_REFRESH_MAX_REPROBES )); then
+      echo "engine queue refresh did not publish a fresh exact-zero snapshot within 45s" >&2
+      return 12
+    fi
+    if (( remaining_ms >= QUEUE_STALE_REFRESH_HTTP_TIMEOUT_SECONDS * 1000 )); then
+      timeout="$QUEUE_STALE_REFRESH_HTTP_TIMEOUT_SECONDS"
+    else
+      printf -v timeout '%d.%03d' "$((remaining_ms / 1000))" "$((remaining_ms % 1000))"
+    fi
+    response_file="$(mktemp "${TMPDIR:-/tmp}/airfoils-queue-observation.XXXXXX")" || return 12
+    if ! http_status="$(curl -sS --max-time "$timeout" -o "$response_file" -w '%{http_code}' http://127.0.0.1:8000/queue)"; then
+      cat "$response_file" >&2 || true
+      clear_queue_response
+      return 12
+    fi
+    completed_ms="$(monotonic_milliseconds)" || return 12
+    [[ "$completed_ms" =~ ^[0-9]+$ ]] || {
+      echo "engine queue monotonic clock returned an invalid value: $completed_ms" >&2
+      return 12
+    }
+    if (( completed_ms >= deadline_ms )); then
+      clear_queue_response
+      echo "engine queue refresh did not publish a fresh exact-zero snapshot within 45s" >&2
+      return 12
+    fi
+    if [[ "$http_status" != "200" && "$http_status" != "503" ]]; then
+      cat "$response_file" >&2 || true
+      clear_queue_response
+      echo "engine queue probe returned unexpected HTTP status: $http_status" >&2
+      return 12
+    fi
+    if ! classification="$(python3 - "$http_status" "$response_file" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+http_status, response_path = sys.argv[1:]
+try:
+    queue = json.loads(Path(response_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"engine queue response is invalid: {error}") from error
+if not isinstance(queue, dict):
+    raise SystemExit("engine queue response is not an object")
+
 observation_state = queue.get("queue_observation_state")
 observed_at = queue.get("queue_observed_at")
 observation_error = queue.get("queue_observation_error")
-if (
-    observation_state != "fresh"
-    or not isinstance(observed_at, str)
-    or not observed_at
-    or observation_error is not None
-):
-    raise SystemExit(
-        "engine queue observation is not fresh and complete: "
-        f"state={observation_state!r} observed_at={observed_at!r} "
-        f"error={observation_error!r}"
+legacy_empty_snapshot = (
+    observation_state is None
+    and observed_at is None
+    and observation_error is None
+    and (
+        queue.get("queue_refresh_in_progress") is None
+        or queue.get("queue_refresh_in_progress") is False
     )
-modern = "worker_queues_error" in queue
-if modern:
+    and "worker_queues_error" in queue
+    and "worker_runtime_error" in queue
+)
+
+def exact_zero_shape() -> bool:
+    count_keys = ("active_count", "reserved_count", "scheduled_count")
+    counts = {key: queue.get(key) for key in count_keys}
+    depth = queue.get("queue_depth")
+    default_depth = queue.get("default_queue_depth")
+    depths = queue.get("queue_depths")
+    enabled = queue.get("queue_enabled")
+    errors = queue.get("inspection_errors")
+    worker_queues = queue.get("worker_queues")
+    if (
+        queue.get("worker_queues_error") is not None
+        or queue.get("worker_runtime_error") is not None
+        or not isinstance(errors, dict)
+        or errors
+        or type(depth) is not int
+        or depth != 0
+        or type(default_depth) is not int
+        or default_depth != 0
+        or not all(type(value) is int and value == 0 for value in counts.values())
+        or not isinstance(depths, dict)
+        or not depths
+        or not all(type(value) is int and value == 0 for value in depths.values())
+        or sum(depths.values()) != depth
+        or not isinstance(enabled, dict)
+        or set(enabled) != set(depths)
+        or not all(type(value) is bool for value in enabled.values())
+        or queue.get("active") != []
+        or queue.get("reserved") != []
+        or queue.get("scheduled") != []
+        or queue.get("job_ids") != []
+        or not isinstance(worker_queues, list)
+        or not worker_queues
+    ):
+        return False
+    names = []
+    for binding in worker_queues:
+        if (
+            not isinstance(binding, dict)
+            or not isinstance(binding.get("worker"), str)
+            or not binding["worker"]
+            or not isinstance(binding.get("queues"), list)
+            or any(not isinstance(route, str) or not route for route in binding["queues"])
+        ):
+            return False
+        names.append(binding["worker"])
+    if len(set(names)) != len(names):
+        return False
+    inspection_workers = queue.get("inspection_workers")
+    if not isinstance(inspection_workers, dict):
+        return False
+    expected = set(names)
+    for kind in ("active", "reserved", "scheduled"):
+        observed = inspection_workers.get(kind)
+        if (
+            not isinstance(observed, list)
+            or any(not isinstance(worker, str) or not worker for worker in observed)
+            or set(observed) != expected
+        ):
+            return False
+    return True
+
+if legacy_empty_snapshot:
+    if http_status != "200":
+        raise SystemExit(
+            f"legacy fresh queue observation requires HTTP 200, got {http_status!r}"
+        )
     for key in ("worker_queues_error", "worker_runtime_error"):
         if queue.get(key) is not None:
             raise SystemExit(f"{key}={queue.get(key)!r}")
     errors = queue.get("inspection_errors")
     if not isinstance(errors, dict) or errors:
         raise SystemExit(f"inspection_errors={errors!r}")
-counts = {key: queue.get(key) for key in ("queue_depth", "active_count", "reserved_count", "scheduled_count")}
-if any(type(value) is not int for value in counts.values()):
-    raise SystemExit(f"incomplete queue counters: {counts!r}")
-if not modern:
+    counts = {
+        key: queue.get(key)
+        for key in ("queue_depth", "active_count", "reserved_count", "scheduled_count")
+    }
+    if any(type(value) is not int for value in counts.values()):
+        raise SystemExit(f"incomplete legacy queue counters: {counts!r}")
     for name in ("active", "reserved", "scheduled"):
         rows = queue.get(name)
         if not isinstance(rows, list) or len(rows) != counts[f"{name}_count"]:
             raise SystemExit(f"legacy queue {name} snapshot is incomplete")
-if any(counts.values()):
-    print(json.dumps(counts, sort_keys=True))
-'
-}
+    if any(counts.values()):
+        print("busy=" + json.dumps(counts, sort_keys=True))
+    else:
+        print("fresh")
+elif (
+    observation_state == "stale"
+    and queue.get("queue_refresh_in_progress") is True
+    and isinstance(observed_at, str)
+    and observed_at
+    and observation_error is None
+    and exact_zero_shape()
+):
+    if http_status not in {"200", "503"}:
+        raise SystemExit(f"stale refresh HTTP status is invalid: {http_status!r}")
+    print("stale-refreshing")
+elif (
+    observation_state != "fresh"
+    or queue.get("queue_refresh_in_progress") is not False
+    or not isinstance(observed_at, str)
+    or not observed_at
+    or observation_error is not None
+    or not exact_zero_shape()
+):
+    raise SystemExit(
+        "engine queue observation is not fresh and complete: "
+        f"state={observation_state!r} observed_at={observed_at!r} "
+        f"error={observation_error!r}"
+    )
+elif http_status != "200":
+    raise SystemExit(f"fresh queue observation requires HTTP 200, got {http_status!r}")
+else:
+    print("fresh")
+PY
+)"; then
+      clear_queue_response
+      echo "${classification:-engine queue classifier failed}" >&2
+      return 12
+    fi
+    clear_queue_response
+    case "$classification" in
+      fresh)
+        return 0
+        ;;
+      stale-refreshing)
+        reprobes=$((reprobes + 1))
+        sleep "$QUEUE_STALE_REFRESH_REPROBE_SECONDS"
+        ;;
+      busy=*)
+        printf '%s\n' "${classification#busy=}"
+        return 0
+        ;;
+      *)
+        echo "engine queue classifier returned an invalid state: $classification" >&2
+        return 12
+        ;;
+    esac
+  done
+)
 
 database_activity() {
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
@@ -246,14 +531,33 @@ if any(row.values()):
 maintenance_database_activity() {
   # An active remote promise is a durable scheduling lease, not executable
   # work. Once both writers are stopped it remains inert and must survive an
-  # ordinary engine maintenance window unchanged. Live jobs, retryable or
-  # claimed deliveries, unsettled cancellations, and active media repair still
-  # fail closed. A blocked delivery is already terminal in the remote writer
-  # state machine; its reviewable hub conflict ids remain durable and inert.
+  # ordinary engine maintenance window unchanged. A legacy ingest row whose
+  # engine result is already terminal and has a durable engine identity is also
+  # read-only at this boundary: the writer that could decode/publish it is
+  # stopped above, and upgrading that decoder must not deadlock behind its own
+  # unfinished ingest state. Every other pending/submitted/running/ingesting
+  # row, retryable or claimed delivery, unsettled cancellation, and active
+  # media repair still fails closed. A blocked delivery is already terminal in
+  # the remote writer state machine; its reviewable hub conflict ids remain
+  # durable and inert.
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
 WITH activity AS (
   SELECT
-    (SELECT count(*) FROM sim_jobs WHERE status IN ('pending','submitted','running','ingesting'))::int AS live_jobs,
+    (SELECT count(*) FROM sim_jobs
+      WHERE status IN ('pending','submitted','running')
+         OR (
+           status = 'ingesting'
+           AND (
+             engine_state IS DISTINCT FROM 'completed'
+             OR engine_job_id IS NULL
+             OR btrim(engine_job_id) = ''
+           )
+         ))::int AS live_jobs,
+    (SELECT count(*) FROM sim_jobs
+      WHERE status = 'ingesting'
+        AND engine_state = 'completed'
+        AND engine_job_id IS NOT NULL
+        AND btrim(engine_job_id) <> '')::int AS terminal_completed_ingests,
     (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations WHERE state <> 'delivered')::int AS unsettled_cancellations,
     (SELECT count(*) FROM result_media_repairs WHERE state = 'running')::int AS running_media_repairs
@@ -263,7 +567,8 @@ import json, sys
 row = json.loads(sys.stdin.read())
 if any(type(value) is not int for value in row.values()):
     raise SystemExit(f"invalid maintenance database idle snapshot: {row!r}")
-if any(row.values()):
+hazards = {key: value for key, value in row.items() if key != "terminal_completed_ingests"}
+if any(hazards.values()):
     print(json.dumps(row, sort_keys=True))
 '
 }
@@ -1111,8 +1416,10 @@ if limits.get("nofile") != (65536, 524288):
 
 main() {
   exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Another deployment is running." >&2; exit 9; }
+  verify_pinned_watcher_bootstrap "post-lock" || exit $?
   verify_deployment_source
   validate_compose_profile
+  install_remote_capacity_monitor
   if [[ "$ACTION" == "--rollback" ]]; then perform_rollback; return; fi
 
   local state version phase target_build sweeper_was_running media_was_running previous_build backup_sha rollback_sha

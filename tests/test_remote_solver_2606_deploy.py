@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -20,12 +21,254 @@ ROLLBACK_SHA = "d" * 64
 BUILD_ID = "hz-solver2-opencfd2606-test"
 
 
+def _fresh_remote_queue() -> dict[str, object]:
+    return {
+        "queue_observation_state": "fresh",
+        "queue_observed_at": "2026-08-04T18:00:00+00:00",
+        "queue_refresh_in_progress": False,
+        "queue_observation_error": None,
+        "worker_queues_error": None,
+        "worker_runtime_error": None,
+        "inspection_errors": {},
+        "queue_depth": 0,
+        "default_queue_depth": 0,
+        "queue_depths": {"openfoam-opencfd-2606": 0},
+        "queue_enabled": {"openfoam-opencfd-2606": True},
+        "active_count": 0,
+        "reserved_count": 0,
+        "scheduled_count": 0,
+        "active": [],
+        "reserved": [],
+        "scheduled": [],
+        "job_ids": [],
+        "worker_queues": [
+            {"worker": "celery@worker", "queues": ["openfoam-opencfd-2606"]}
+        ],
+        "inspection_workers": {
+            "active": ["celery@worker"],
+            "reserved": ["celery@worker"],
+            "scheduled": ["celery@worker"],
+        },
+    }
+
+
+def _run_remote_queue_gate(
+    tmp_path: Path,
+    responses: list[tuple[int, dict[str, object]]],
+    *,
+    curl_advance_milliseconds: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+    start = source.index("queue_activity() (")
+    end = source.index("\n\ndatabase_activity()", start)
+    queue_activity = source[start:end]
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    response_dir = tmp_path / "responses"
+    response_dir.mkdir()
+    for index, (status, payload) in enumerate(responses):
+        (response_dir / f"{index}.status").write_text(str(status), encoding="utf-8")
+        (response_dir / f"{index}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    index_path = tmp_path / "response-index"
+    index_path.write_text("0", encoding="utf-8")
+    monotonic_path = tmp_path / "monotonic-state"
+    monotonic_path.write_text("100000", encoding="utf-8")
+
+    def write_executable(path: Path, text: str) -> None:
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o755)
+
+    write_executable(
+        fake_bin / "curl",
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+output=""
+while (($#)); do
+  case "$1" in
+    -o) output="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+index="$(cat "$FAKE_QUEUE_INDEX")"
+cp "$FAKE_QUEUE_RESPONSES/$index.json" "$output"
+cat "$FAKE_QUEUE_RESPONSES/$index.status"
+printf '%s' "$((index + 1))" >"$FAKE_QUEUE_INDEX"
+if (( FAKE_CURL_ADVANCE_MILLISECONDS > 0 )); then
+  value="$(cat "$FAKE_MONOTONIC_STATE")"
+  printf '%s' "$((value + FAKE_CURL_ADVANCE_MILLISECONDS))" >"$FAKE_MONOTONIC_STATE"
+fi
+""",
+    )
+    write_executable(
+        fake_bin / "sleep",
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+value="$(cat "$FAKE_MONOTONIC_STATE")"
+printf '%s' "$((value + $1 * 1000))" >"$FAKE_MONOTONIC_STATE"
+""",
+    )
+    driver = tmp_path / "queue-gate.sh"
+    write_executable(
+        driver,
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        "QUEUE_STALE_REFRESH_WARMUP_MILLISECONDS=45000\n"
+        "QUEUE_STALE_REFRESH_HTTP_TIMEOUT_SECONDS=20\n"
+        "QUEUE_STALE_REFRESH_REPROBE_SECONDS=1\n"
+        "QUEUE_STALE_REFRESH_MAX_REPROBES=45\n\n"
+        f"{queue_activity}\n\n"
+        "monotonic_milliseconds() {\n"
+        "  local value\n"
+        "  value=\"$(cat \"$FAKE_MONOTONIC_STATE\")\"\n"
+        "  printf '%s\\n' \"$value\"\n"
+        "}\n\n"
+        "queue_activity\n",
+    )
+    environment = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_QUEUE_RESPONSES": str(response_dir),
+        "FAKE_QUEUE_INDEX": str(index_path),
+        "FAKE_MONOTONIC_STATE": str(monotonic_path),
+        "FAKE_CURL_ADVANCE_MILLISECONDS": str(curl_advance_milliseconds),
+    }
+    return subprocess.run(
+        [str(driver)], text=True, capture_output=True, check=False, env=environment
+    )
+
+
 def _module(name: str, filename: str):
     spec = importlib.util.spec_from_file_location(name, DEPLOY / filename)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_pinned_watcher_revalidates_active_release_after_shared_lock_before_mutation() -> None:
+    production = (DEPLOY / "rebuild-engine.sh").read_text(encoding="utf-8")
+    remote = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+
+    for source in (production, remote):
+        verifier_start = source.index("verify_pinned_watcher_bootstrap()")
+        verifier_end = source.index("\n}\n", verifier_start)
+        verifier = source[verifier_start:verifier_end]
+        assert 'active_release="$(cd "$ACTIVE_APP_LINK" && pwd -P)"' in verifier
+        assert '[[ "$active_release" != "$pinned_release" ]]' in verifier
+        assert 'verify_pinned_watcher_bootstrap "pre-lock"' in source
+
+    production_main_start = production.rindex("\nmain() {") + 1
+    production_main_end = production.index(
+        '\n}\n\nif [[ "$CERTIFY_CONTINUATION_ONLY"', production_main_start
+    )
+    production_main = production[production_main_start:production_main_end]
+    production_lock = production_main.index("flock -n 9")
+    production_post_lock = production_main.index(
+        'verify_pinned_watcher_bootstrap "post-lock"'
+    )
+    production_source = production_main.index("verify_deployment_source")
+    production_first_mutation = production_main.index("capture_sweeper_state")
+    assert (
+        production_lock
+        < production_post_lock
+        < production_source
+        < production_first_mutation
+    )
+
+    remote_main_start = remote.rindex("\nmain() {") + 1
+    remote_main_end = remote.rindex("\n}\n\nmain")
+    remote_main = remote[remote_main_start:remote_main_end]
+    remote_lock = remote_main.index("flock -n 9")
+    remote_post_lock = remote_main.index(
+        'verify_pinned_watcher_bootstrap "post-lock"'
+    )
+    remote_source = remote_main.index("verify_deployment_source")
+    remote_validate = remote_main.index("validate_compose_profile")
+    remote_first_mutation = remote_main.index("install_remote_capacity_monitor")
+    assert (
+        remote_lock
+        < remote_post_lock
+        < remote_source
+        < remote_validate
+        < remote_first_mutation
+    )
+
+
+@pytest.mark.parametrize(
+    "script_name", ["rebuild-engine.sh", "rebuild-remote-solver-engine.sh"]
+)
+def test_pinned_bootstrap_refuses_active_link_switch_between_pre_and_post_lock_checks(
+    tmp_path: Path, script_name: str
+) -> None:
+    source = (DEPLOY / script_name).read_text(encoding="utf-8")
+    verifier_start = source.index("verify_pinned_watcher_bootstrap()")
+    verifier_end = source.index("\n}\n", verifier_start) + 2
+    verifier_function = source[verifier_start:verifier_end]
+    release = tmp_path / "release"
+    alternate = tmp_path / "alternate"
+    release.mkdir()
+    alternate.mkdir()
+    compose = release / "docker-compose.deploy.yml"
+    compose.write_text("services: {}\n", encoding="utf-8")
+    manifest = release / ".deployment-source.json"
+    revision = "4" * 40
+    created = subprocess.run(
+        [
+            sys.executable,
+            str(DEPLOY / "deployment-source-manifest.py"),
+            "--create",
+            "--root",
+            str(release),
+            "--manifest",
+            str(manifest),
+            "--revision",
+            revision,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    created_revision, tree_sha, _file_count = created.stdout.strip().split("\t")
+    assert created_revision == revision
+    active = tmp_path / "app"
+    active.symlink_to(release, target_is_directory=True)
+    marker = tmp_path / "mutation-marker"
+    verifier = DEPLOY / "deployment-source-manifest.py"
+    verifier_sha = hashlib.sha256(verifier.read_bytes()).hexdigest()
+    harness = f"""set -Eeuo pipefail
+cd \"$APP_DIR\"
+{verifier_function}
+verify_pinned_watcher_bootstrap \"pre-lock\"
+ln -sfn \"$ALTERNATE_RELEASE\" \"$ACTIVE_APP_LINK\"
+verify_pinned_watcher_bootstrap \"post-lock\"
+touch \"$MUTATION_MARKER\"
+"""
+    completed = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "APP_DIR": str(release),
+            "PINNED_WATCHER_INVOCATION": "true",
+            "ACTIVE_APP_LINK": str(active),
+            "ALTERNATE_RELEASE": str(alternate),
+            "COMPOSE_FILE": str(compose),
+            "DEPLOYMENT_MANIFEST_FILE": str(manifest),
+            "DEPLOY_SOURCE_REVISION": revision,
+            "DEPLOY_SOURCE_TREE_SHA256": tree_sha,
+            "DEPLOY_SOURCE_VERIFIER": str(verifier),
+            "DEPLOY_SOURCE_VERIFIER_SHA256": verifier_sha,
+            "MUTATION_MARKER": str(marker),
+        },
+    )
+
+    assert completed.returncode == 2
+    assert "Active application release changed" in completed.stderr
+    assert not marker.exists()
 
 
 def _compose_config() -> dict[str, object]:
@@ -41,9 +284,11 @@ def _compose_config() -> dict[str, object]:
     services.update(
         {
             "api": {
-                "environment": dict(evidence),
+                "environment": {
+                    **evidence,
+                },
                 "volumes": [
-                    {"type": "volume", "source": "results", "target": "/data"}
+                    {"type": "volume", "source": "results", "target": "/data"},
                 ],
             },
             "worker": {
@@ -263,11 +508,15 @@ def test_remote_environment_preflight_requires_external_override_and_explicit_vo
         str(env_file),
     ]
 
-    accepted = subprocess.run(command, text=True, capture_output=True, check=False)
+    accepted = subprocess.run(
+        command, text=True, capture_output=True, check=False
+    )
     assert accepted.returncode == 0, accepted.stderr
 
     env_file.write_text(_remote_env(state, remote_only=""), encoding="utf-8")
-    rejected = subprocess.run(command, text=True, capture_output=True, check=False)
+    rejected = subprocess.run(
+        command, text=True, capture_output=True, check=False
+    )
     assert rejected.returncode == 2
     assert "explicit remote-only=false" in rejected.stderr
 
@@ -338,6 +587,173 @@ def test_remote_engine_maintenance_rejects_stale_or_incomplete_queue_observation
     assert 'not isinstance(observed_at, str)' in queue_guard
     assert 'observation_error is not None' in queue_guard
     assert "engine queue observation is not fresh and complete" in queue_guard
+    assert "QUEUE_STALE_REFRESH_WARMUP_MILLISECONDS=45000" in source
+    assert "QUEUE_STALE_REFRESH_HTTP_TIMEOUT_SECONDS=20" in source
+    assert "curl -sS --max-time" in queue_guard
+    assert "curl -fsS" not in queue_guard
+    assert '"$http_status" != "200" && "$http_status" != "503"' in queue_guard
+    assert 'queue.get("queue_refresh_in_progress") is True' in queue_guard
+    assert 'queue.get("queue_refresh_in_progress") is not False' in queue_guard
+    assert 'elif http_status != "200"' in queue_guard
+    assert source.count('queue_activity 2>&1') >= 3
+    assert "time.monotonic_ns()" in source
+    assert "trap clear_queue_response EXIT" in queue_guard
+
+
+def test_remote_queue_gate_retries_only_a_503_stale_refresh_until_a_fresh_200(
+    tmp_path: Path,
+) -> None:
+    stale = _fresh_remote_queue()
+    stale["queue_observation_state"] = "stale"
+    stale["queue_refresh_in_progress"] = True
+
+    completed = _run_remote_queue_gate(
+        tmp_path, [(503, stale), (200, _fresh_remote_queue())]
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert (tmp_path / "response-index").read_text(encoding="utf-8") == "2"
+
+
+def test_remote_queue_gate_accepts_a_fresh_successor_after_35_stale_seconds(
+    tmp_path: Path,
+) -> None:
+    stale = _fresh_remote_queue()
+    stale["queue_observation_state"] = "stale"
+    stale["queue_refresh_in_progress"] = True
+
+    completed = _run_remote_queue_gate(
+        tmp_path,
+        [(200, stale)] * 35 + [(200, _fresh_remote_queue())],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert (tmp_path / "response-index").read_text(encoding="utf-8") == "36"
+
+
+def test_remote_queue_gate_rejects_503_false_positives_without_retry(
+    tmp_path: Path,
+) -> None:
+    fresh_503 = _fresh_remote_queue()
+    stale_with_error = _fresh_remote_queue()
+    stale_with_error["queue_observation_state"] = "stale"
+    stale_with_error["queue_refresh_in_progress"] = True
+    stale_with_error["queue_observation_error"] = "refresh failed"
+    stale_incomplete = _fresh_remote_queue()
+    stale_incomplete["queue_observation_state"] = "stale"
+    stale_incomplete["queue_refresh_in_progress"] = True
+    stale_incomplete.pop("inspection_workers")
+    legacy_empty_503 = {
+        "queue_depth": 0,
+        "active_count": 0,
+        "reserved_count": 0,
+        "scheduled_count": 0,
+        "active": [],
+        "reserved": [],
+        "scheduled": [],
+        "worker_queues_error": None,
+        "worker_runtime_error": None,
+    }
+
+    for name, payload in (
+        ("fresh", fresh_503),
+        ("errored", stale_with_error),
+        ("incomplete", stale_incomplete),
+        ("legacy", legacy_empty_503),
+    ):
+        completed = _run_remote_queue_gate(tmp_path / name, [(503, payload)])
+        assert completed.returncode == 12
+        assert (tmp_path / name / "response-index").read_text(encoding="utf-8") == "1"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("worker_queues_error", "worker discovery failed"),
+        ("worker_runtime_error", "worker runtime failed"),
+        ("inspection_errors", {"active": "inspect failed"}),
+    ),
+)
+def test_remote_queue_gate_keeps_legacy_worker_errors_fail_closed(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    legacy = {
+        "queue_depth": 0,
+        "active_count": 0,
+        "reserved_count": 0,
+        "scheduled_count": 0,
+        "active": [],
+        "reserved": [],
+        "scheduled": [],
+        "worker_queues_error": None,
+        "worker_runtime_error": None,
+        "inspection_errors": {},
+    }
+    legacy[field] = value
+
+    completed = _run_remote_queue_gate(tmp_path, [(200, legacy)])
+
+    assert completed.returncode == 12
+    assert (tmp_path / "response-index").read_text(encoding="utf-8") == "1"
+
+
+@pytest.mark.parametrize("refresh_flag", (True, 0, "false"))
+def test_remote_queue_gate_rejects_a_refreshing_or_mistyped_legacy_null_state(
+    tmp_path: Path, refresh_flag: object
+) -> None:
+    legacy_refreshing = {
+        "queue_observation_state": None,
+        "queue_observed_at": None,
+        "queue_refresh_in_progress": refresh_flag,
+        "queue_observation_error": None,
+        "queue_depth": 0,
+        "active_count": 0,
+        "reserved_count": 0,
+        "scheduled_count": 0,
+        "active": [],
+        "reserved": [],
+        "scheduled": [],
+        "worker_queues_error": None,
+        "worker_runtime_error": None,
+        "inspection_errors": {},
+    }
+
+    completed = _run_remote_queue_gate(tmp_path, [(200, legacy_refreshing)])
+
+    assert completed.returncode == 12
+    assert (tmp_path / "response-index").read_text(encoding="utf-8") == "1"
+
+
+def test_remote_queue_gate_exhausts_its_stale_refresh_window_fail_closed(
+    tmp_path: Path,
+) -> None:
+    stale = _fresh_remote_queue()
+    stale["queue_observation_state"] = "stale"
+    stale["queue_refresh_in_progress"] = True
+    responses = [(200, stale)] * 50
+
+    completed = _run_remote_queue_gate(tmp_path, responses)
+
+    assert completed.returncode == 12
+    assert "did not publish a fresh exact-zero snapshot" in completed.stderr
+    consumed = int((tmp_path / "response-index").read_text(encoding="utf-8"))
+    assert 0 < consumed < len(responses)
+
+
+def test_remote_queue_gate_rejects_a_fresh_response_completed_after_deadline(
+    tmp_path: Path,
+) -> None:
+    completed = _run_remote_queue_gate(
+        tmp_path,
+        [(200, _fresh_remote_queue())],
+        curl_advance_milliseconds=45001,
+    )
+
+    assert completed.returncode == 12
+    assert "did not publish a fresh exact-zero snapshot within 45s" in completed.stderr
+    assert (tmp_path / "response-index").read_text(encoding="utf-8") == "1"
 
 
 def test_remote_rollback_returns_containers_to_normal_compose_references() -> None:
@@ -600,6 +1016,33 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     )
     assert "unsettled_cancellations" in maintenance_db
     assert "running_media_repairs" in maintenance_db
+    assert "terminal_completed_ingests" in maintenance_db
+    assert "engine_state IS DISTINCT FROM 'completed'" in maintenance_db
+    assert "OR engine_job_id IS NULL" in maintenance_db
+    assert "OR btrim(engine_job_id) = ''" in maintenance_db
+    assert "engine_state = 'completed'" in maintenance_db
+    assert "engine_job_id IS NOT NULL" in maintenance_db
+    assert "btrim(engine_job_id) <> ''" in maintenance_db
+    assert (
+        'key != "terminal_completed_ingests"'
+        in maintenance_db
+    )
+
+    strict_db_start = source.index("database_activity()")
+    strict_db_end = source.index(
+        "\nmaintenance_database_activity()", strict_db_start
+    )
+    strict_db = source[strict_db_start:strict_db_end]
+    assert "status IN ('pending','submitted','running','ingesting')" in strict_db
+    assert "terminal_completed_ingests" not in strict_db
+
+    gate_start = source.index("require_maintenance_safe()")
+    gate_end = source.index("\nwait_http()", gate_start)
+    gate = source[gate_start:gate_end]
+    writer_check = gate.index('writer_state sweeper')
+    writer_stopped = gate.index('control-plane writers are not stopped', writer_check)
+    maintenance_probe = gate.index('maintenance_database_activity', writer_stopped)
+    assert writer_check < writer_stopped < maintenance_probe
     assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
 
 

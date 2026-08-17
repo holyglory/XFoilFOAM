@@ -6232,10 +6232,228 @@ describe("sweeper: gap → claim → ingest", () => {
   // celery tasks, but the engine's persisted status store kept returning
   // state=running (active_pids [], last_progress_at hours stale) — zombies the
   // sweeper polled for ~2.3 h. Shape: running + zero processes + stale worker
-  // heartbeat + absent from Celery + last progress beyond the 30 min grace.
-  it("cancels and requeues a lost engine job that reports running with no processes and stale progress", async () => {
+  // heartbeat + last progress beyond the 30 min grace. Its partial done/failed
+  // rows must use the same protected clean-restart reducer before the engine
+  // directory can be deleted.
+  it("cleans a lost job's noncanonical partial generation before deleting it", async () => {
     const { a, bc, presetRevisionId } = await firstAirfoilBc();
     const aoa = 129.456;
+    const failedAoa = 129.457;
+    const engineJobId = `${testRunSlug}-zombie-after-worker-restart`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          inArray(results.aoaDeg, [aoa, failedAoa]),
+        ),
+      );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+        totalCases: 4,
+        completedCases: 1,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+    const [failedRow] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: failedAoa,
+        status: "failed",
+        source: "queued",
+        error: "partial worker-side failure before the task died",
+        simJobId: job.id,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(failedRow.id);
+    const [doneAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: row.id,
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        simJobId: job.id,
+        engineJobId,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        cl: 0.42,
+        cd: 0.021,
+        cm: -0.03,
+        converged: false,
+        unsteady: false,
+        stalled: false,
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    const [failedAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: failedRow.id,
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: failedAoa,
+        simJobId: job.id,
+        engineJobId,
+        status: "failed",
+        source: "solved",
+        regime: "rans",
+        validForPolar: false,
+        converged: false,
+        unsteady: false,
+        stalled: false,
+        error: "partial worker-side failure before the task died",
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    cleanupAttemptIds.add(doneAttempt.id);
+    cleanupAttemptIds.add(failedAttempt.id);
+    await db
+      .update(results)
+      .set({
+        status: "done",
+        source: "solved",
+        cl: 0.42,
+        cd: 0.021,
+        cm: -0.03,
+        currentResultAttemptId: doneAttempt.id,
+      })
+      .where(eq(results.id, row.id));
+
+    const engineCancels: string[] = [];
+    const engineDeletes: string[] = [];
+    let engineCancelled = false;
+    const zombieEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: 9000,
+            status_readable: true,
+            status_error: null,
+            status_state: "running",
+            status_total_cases: 4,
+            status_completed_cases: 1,
+            result_readable: false,
+            result_error: null,
+            has_result: false,
+            result_state: null,
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: engineCancelled ? "cancelled" : "running",
+        phase: engineCancelled ? undefined : "solving_urans",
+        total_cases: 4,
+        completed_cases: 1,
+        active_pids: [],
+        last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+      }),
+      cancelJob: async (jobId: string) => {
+        engineCancels.push(jobId);
+        engineCancelled = true;
+        return { job_id: jobId, cancelled: true };
+      },
+      deleteJob: async (jobId: string) => {
+        engineDeletes.push(jobId);
+        return { bytes_freed: 4096 };
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, zombieEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const [gotJob] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        error: simJobs.error,
+        finishedAt: simJobs.finishedAt,
+        strippedAt: simJobs.strippedAt,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const gotResults = await db
+      .select({
+        id: results.id,
+        status: results.status,
+        simJobId: results.simJobId,
+        cl: results.cl,
+        currentAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(inArray(results.id, [row.id, failedRow.id]));
+    const remainingAttempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id));
+    expect(engineCancels).toEqual([engineJobId]);
+    expect(engineDeletes).toEqual([engineJobId]);
+    expect(gotJob.status).toBe("cancelled");
+    expect(gotJob.engineState).toBe("cancelled");
+    expect(gotJob.error).toContain("task lost");
+    expect(gotJob.finishedAt).not.toBeNull();
+    expect(gotJob.strippedAt).not.toBeNull();
+    expect(gotResults).toHaveLength(2);
+    expect(
+      gotResults.every(
+        (result) =>
+          result.status === "pending" &&
+          result.simJobId === null &&
+          result.cl === null &&
+          result.currentAttemptId === null,
+      ),
+    ).toBe(true);
+    expect(remainingAttempts).toEqual([]);
+    await db.delete(results).where(inArray(results.id, [row.id, failedRow.id]));
+  }, 60000);
+
+  // FALSE-POSITIVE GUARD (2026-08-05): an accepted immutable attempt is not
+  // disposable merely because its producer's runtime later looks lost. Keep
+  // the evidence attached and defer directory deletion for normal evidence
+  // retention/delivery rather than clearing a mutable pointer by accident.
+  it("retains accepted evidence and defers deletion for a lost job", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 129.5;
+    const engineJobId = `${testRunSlug}-zombie-accepted-evidence`;
     await db
       .delete(results)
       .where(
@@ -6254,7 +6472,309 @@ describe("sweeper: gap → claim → ingest", () => {
         referenceChordM: bc.referenceChordM,
         wave: 1,
         status: "running",
-        engineJobId: "zombie-after-worker-restart",
+        engineJobId,
+        submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+        totalCases: 1,
+        completedCases: 1,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "done",
+        source: "solved",
+        cl: 0.42,
+        cd: 0.021,
+        cm: -0.03,
+        simJobId: job.id,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: row.id,
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        simJobId: job.id,
+        engineJobId,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        validForPolar: true,
+        cl: 0.42,
+        cd: 0.021,
+        cm: -0.03,
+        converged: true,
+        unsteady: false,
+        stalled: false,
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    cleanupAttemptIds.add(attempt.id);
+    await db.insert(resultClassifications).values({
+      resultAttemptId: attempt.id,
+      airfoilId: a.id,
+      simulationPresetRevisionId: presetRevisionId,
+      aoaDeg: aoa,
+      regime: "rans",
+      classifierVersion: "lost-job-evidence-protection-v1",
+      state: "accepted",
+      confidence: 1,
+      reasons: [],
+    });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, row.id));
+
+    let cancelled = false;
+    const deletes: string[] = [];
+    const protectedEngine = {
+      getQueue: async () => null,
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: true,
+            cancelled: false,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: 9000,
+            status_readable: true,
+            status_error: null,
+            status_state: "running",
+            status_total_cases: 1,
+            status_completed_cases: 1,
+            result_readable: true,
+            result_error: null,
+            has_result: true,
+            result_state: "running",
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: cancelled ? "cancelled" : "running",
+        phase: cancelled ? undefined : "solving_urans",
+        total_cases: 1,
+        completed_cases: 1,
+        active_pids: [],
+        last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+      }),
+      cancelJob: async (jobId: string) => {
+        cancelled = true;
+        return { job_id: jobId, cancelled: true };
+      },
+      deleteJob: async (jobId: string) => {
+        deletes.push(jobId);
+        return { bytes_freed: 1 };
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, protectedEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const [gotJob] = await db
+      .select({ status: simJobs.status, strippedAt: simJobs.strippedAt })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [gotResult] = await db
+      .select({
+        status: results.status,
+        simJobId: results.simJobId,
+        cl: results.cl,
+        currentAttemptId: results.currentResultAttemptId,
+      })
+      .from(results)
+      .where(eq(results.id, row.id));
+    expect(gotJob).toMatchObject({ status: "cancelled", strippedAt: null });
+    expect(deletes).toEqual([]);
+    expect(gotResult).toEqual({
+      status: "done",
+      simJobId: job.id,
+      cl: 0.42,
+      currentAttemptId: attempt.id,
+    });
+    await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
+
+  // MUST-CATCH (2026-08-05): queue inspection is a display cache, not a
+  // liveness authority. Its stale refresh can omit a dead task, fail entirely,
+  // or still list an inspector entry after the pool child has disappeared.
+  it("recovers exact lost-runtime evidence with null, stale, and listed queue snapshots", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const queueCases: Array<{
+      label: string;
+      queue: (engineJobId: string) => EngineQueueState | null;
+    }> = [
+      { label: "null", queue: () => null },
+      {
+        label: "stale",
+        queue: () => ({
+          ...emptyQueue(),
+          queue_observation_state: "stale",
+          queue_observed_at: new Date(Date.now() - 60_000).toISOString(),
+          queue_refresh_in_progress: true,
+          queue_observation_error: "Celery refresh still running",
+        }),
+      },
+      {
+        label: "listed",
+        queue: (engineJobId) => ({
+          ...emptyQueue([engineJobId]),
+          queue_observation_state: "fresh",
+          queue_observed_at: new Date().toISOString(),
+          queue_observation_error: null,
+        }),
+      },
+    ];
+
+    for (const [index, queueCase] of queueCases.entries()) {
+      const aoa = 129.6 + index / 1000;
+      const engineJobId = `${testRunSlug}-zombie-queue-${queueCase.label}`;
+      await db
+        .delete(results)
+        .where(
+          and(
+            eq(results.airfoilId, a.id),
+            eq(results.simulationPresetRevisionId, presetRevisionId),
+            eq(results.aoaDeg, aoa),
+          ),
+        );
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId: a.id,
+          bcIds: [bc.id],
+          simulationPresetRevisionId: presetRevisionId,
+          referenceChordM: bc.referenceChordM,
+          wave: 1,
+          status: "running",
+          engineJobId,
+          submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+          totalCases: 4,
+          completedCases: 1,
+        })
+        .returning({ id: simJobs.id });
+      cleanupJobIds.add(job.id);
+      const [row] = await db
+        .insert(results)
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "running",
+          source: "queued",
+          simJobId: job.id,
+        })
+        .returning({ id: results.id });
+      cleanupResultIds.add(row.id);
+
+      const cancels: string[] = [];
+      const deletes: string[] = [];
+      let cancelled = false;
+      const lostEngine = {
+        getQueue: async () => queueCase.queue(engineJobId),
+        getJobRuntimes: async () => ({
+          jobs: [
+            {
+              job_id: engineJobId,
+              exists: true,
+              cancelled: false,
+              process_count: 0,
+              active_pids: [],
+              runtime_heartbeat_age_sec: 9000,
+              status_readable: true,
+              status_error: null,
+              status_state: "running",
+              status_total_cases: 4,
+              status_completed_cases: 1,
+              result_readable: false,
+              result_error: null,
+              has_result: false,
+              result_state: null,
+            },
+          ],
+        }),
+        getJob: async (): Promise<JobStatus> => ({
+          job_id: engineJobId,
+          state: cancelled ? "cancelled" : "running",
+          phase: cancelled ? undefined : "solving_urans",
+          total_cases: 4,
+          completed_cases: 1,
+          active_pids: [],
+          last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+        }),
+        cancelJob: async (jobId: string) => {
+          cancels.push(jobId);
+          cancelled = true;
+          return { job_id: jobId, cancelled: true };
+        },
+        deleteJob: async (jobId: string) => {
+          deletes.push(jobId);
+          return { bytes_freed: 1 };
+        },
+      } as unknown as EngineClient;
+
+      await reconcile(db, lostEngine, {
+        jobIds: [job.id],
+        skipFailedRecovery: true,
+      });
+
+      const [gotJob] = await db
+        .select({ status: simJobs.status, strippedAt: simJobs.strippedAt })
+        .from(simJobs)
+        .where(eq(simJobs.id, job.id));
+      const [gotResult] = await db
+        .select({ status: results.status, simJobId: results.simJobId })
+        .from(results)
+        .where(eq(results.id, row.id));
+      expect(cancels).toEqual([engineJobId]);
+      expect(deletes).toEqual([engineJobId]);
+      expect(gotJob).toMatchObject({ status: "cancelled" });
+      expect(gotJob.strippedAt).not.toBeNull();
+      expect(gotResult).toEqual({ status: "pending", simJobId: null });
+      await db.delete(results).where(eq(results.id, row.id));
+    }
+  }, 60000);
+
+  // FALSE-POSITIVE GUARD (2026-08-05): a detected loss is not permission to
+  // release DB ownership unless the engine has confirmed cancellation. A
+  // transient cancel failure must leave the exact claim for the next tick.
+  it("retains lost-job claims when engine cancellation fails", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 129.7;
+    const engineJobId = `${testRunSlug}-zombie-cancel-fails`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId,
         submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
         totalCases: 4,
         completedCases: 1,
@@ -6275,13 +6795,14 @@ describe("sweeper: gap → claim → ingest", () => {
       .returning({ id: results.id });
     cleanupResultIds.add(row.id);
 
-    const engineCancels: string[] = [];
-    const zombieEngine = {
-      getQueue: async () => emptyQueue(),
+    const cancels: string[] = [];
+    let cancelMode: "throw" | "negative-ack" = "throw";
+    const cancelFailureEngine = {
+      getQueue: async () => null,
       getJobRuntimes: async () => ({
         jobs: [
           {
-            job_id: "zombie-after-worker-restart",
+            job_id: engineJobId,
             exists: true,
             cancelled: false,
             process_count: 0,
@@ -6300,44 +6821,542 @@ describe("sweeper: gap → claim → ingest", () => {
         ],
       }),
       getJob: async (): Promise<JobStatus> => ({
-        job_id: "zombie-after-worker-restart",
+        job_id: engineJobId,
         state: "running",
+        phase: "solving_urans",
         total_cases: 4,
         completed_cases: 1,
         active_pids: [],
         last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
       }),
       cancelJob: async (jobId: string) => {
-        engineCancels.push(jobId);
-        return { job_id: jobId, cancelled: true };
+        cancels.push(jobId);
+        if (cancelMode === "throw") {
+          throw new Error("engine cancel transport timeout");
+        }
+        return { job_id: jobId, cancelled: false };
       },
     } as unknown as EngineClient;
 
-    await reconcile(db, zombieEngine, {
-      jobIds: [job.id],
-      skipFailedRecovery: true,
-    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await reconcile(db, cancelFailureEngine, {
+        jobIds: [job.id],
+        skipFailedRecovery: true,
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
 
     const [gotJob] = await db
-      .select({
-        status: simJobs.status,
-        engineState: simJobs.engineState,
-        error: simJobs.error,
-        finishedAt: simJobs.finishedAt,
-      })
+      .select({ status: simJobs.status, engineState: simJobs.engineState })
       .from(simJobs)
       .where(eq(simJobs.id, job.id));
     const [gotResult] = await db
       .select({ status: results.status, simJobId: results.simJobId })
       .from(results)
       .where(eq(results.id, row.id));
-    expect(engineCancels).toEqual(["zombie-after-worker-restart"]);
-    expect(gotJob.status).toBe("cancelled");
-    expect(gotJob.engineState).toBe("cancelled");
-    expect(gotJob.error).toContain("task lost");
-    expect(gotJob.finishedAt).not.toBeNull();
-    expect(gotResult.status).toBe("pending");
-    expect(gotResult.simJobId).toBeNull();
+    expect(cancels).toEqual([engineJobId]);
+    expect(gotJob).toMatchObject({ status: "running" });
+    expect(gotResult).toEqual({ status: "running", simJobId: job.id });
+
+    cancelMode = "negative-ack";
+    await reconcile(db, cancelFailureEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+    const [afterNegativeAckJob] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [afterNegativeAckResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
+    expect(cancels).toEqual([engineJobId, engineJobId]);
+    expect(afterNegativeAckJob).toMatchObject({
+      status: "running",
+      requestPayload: {
+        cleanRestartPending: { requestedAt: expect.any(String) },
+      },
+    });
+    expect(afterNegativeAckResult).toEqual({
+      status: "running",
+      simJobId: job.id,
+    });
+    await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
+
+  // MUST-CATCH (2026-08-05): engine cancellation is external. Failures before
+  // terminalization and during database disposal must leave the exact job
+  // fenced by a durable marker; later ticks discard every noncanonical shell,
+  // reopen the cell, and strip the dead engine directory without re-cancelling.
+  it("retries interrupted lost-generation terminalization and cleanup", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 129.78;
+    const engineJobId = `${testRunSlug}-zombie-clean-restart-retry`;
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "running",
+        engineJobId,
+        submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+        totalCases: 1,
+        completedCases: 0,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: row.id,
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        simJobId: job.id,
+        engineJobId,
+        status: "running",
+        source: "queued",
+        regime: "rans",
+        validForPolar: false,
+      })
+      .returning({ id: resultAttempts.id });
+    cleanupAttemptIds.add(attempt.id);
+
+    const cancels: string[] = [];
+    const deletes: string[] = [];
+    let engineCancelled = false;
+    const retryEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: !engineCancelled,
+            cancelled: engineCancelled,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: 9000,
+            status_readable: true,
+            status_error: null,
+            status_state: engineCancelled ? "cancelled" : "running",
+            status_total_cases: 1,
+            status_completed_cases: 0,
+            result_readable: false,
+            result_error: null,
+            has_result: false,
+            result_state: null,
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: engineCancelled ? "cancelled" : "running",
+        phase: engineCancelled ? undefined : "solving_rans",
+        total_cases: 1,
+        completed_cases: 0,
+        active_pids: [],
+        last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+      }),
+      cancelJob: async (jobId: string) => {
+        cancels.push(jobId);
+        engineCancelled = true;
+        return { job_id: jobId, cancelled: true };
+      },
+      deleteJob: async (jobId: string) => {
+        deletes.push(jobId);
+        return { bytes_freed: 2048 };
+      },
+    } as unknown as EngineClient;
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await reconcile(db, retryEngine, {
+        jobIds: [job.id],
+        skipFailedRecovery: true,
+        testHooks: {
+          beforeLostGenerationTerminalization: () => {
+            throw new Error("transient terminalization database failure");
+          },
+        },
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    const [afterInterruptedJob] = await db
+      .select({
+        status: simJobs.status,
+        strippedAt: simJobs.strippedAt,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [afterInterruptedResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
+    expect(cancels).toEqual([engineJobId]);
+    expect(deletes).toEqual([]);
+    expect(afterInterruptedJob.status).toBe("running");
+    expect(afterInterruptedJob.strippedAt).toBeNull();
+    expect(afterInterruptedJob.requestPayload).toMatchObject({
+      cleanRestartPending: { requestedAt: expect.any(String) },
+    });
+    expect(afterInterruptedResult).toEqual({
+      status: "running",
+      simJobId: job.id,
+    });
+
+    await reconcile(db, retryEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+      testHooks: {
+        beforeLostGenerationCleanRestart: () => {
+          throw new Error("transient cleanup database failure");
+        },
+      },
+    });
+
+    const [afterCleanupInterruptedJob] = await db
+      .select({
+        status: simJobs.status,
+        strippedAt: simJobs.strippedAt,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    expect(afterCleanupInterruptedJob.status).toBe("cancelled");
+    expect(afterCleanupInterruptedJob.strippedAt).toBeNull();
+    expect(afterCleanupInterruptedJob.requestPayload).toMatchObject({
+      cleanRestartPending: { requestedAt: expect.any(String) },
+    });
+
+    await reconcile(db, retryEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const [settledJob] = await db
+      .select({
+        status: simJobs.status,
+        strippedAt: simJobs.strippedAt,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [settledResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
+    const attempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id));
+    expect(cancels).toEqual([engineJobId]);
+    expect(deletes).toEqual([engineJobId]);
+    expect(settledJob.status).toBe("cancelled");
+    expect(settledJob.strippedAt).not.toBeNull();
+    expect(settledJob.requestPayload).not.toMatchObject({
+      cleanRestartPending: expect.anything(),
+    });
+    expect(settledResult).toEqual({ status: "pending", simJobId: null });
+    expect(attempts).toEqual([]);
+    await db.delete(results).where(eq(results.id, row.id));
+  }, 60000);
+
+  // MUST-CATCH (2026-08-05): terminalizing the dead child must not reopen its
+  // PRECALC obligation before the old generation is detached. If cleanup is
+  // interrupted, both owners stay fenced; the next tick releases them in one
+  // transaction.
+  it("settles a lost PRECALC obligation atomically with generation cleanup", async () => {
+    const fixture = await evidenceBackedWave2Fixture(
+      `${testRunSlug}-lost-precalc-atomic`,
+      129.785,
+      "running",
+    );
+    const engineJobId = fixture.child.engineJobId!;
+    let cancelled = false;
+    const deletes: string[] = [];
+    const lostPrecalcEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: !cancelled,
+            cancelled,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: 9000,
+            status_readable: true,
+            status_error: null,
+            status_state: cancelled ? "cancelled" : "running",
+            status_total_cases: 1,
+            status_completed_cases: 0,
+            result_readable: false,
+            result_error: null,
+            has_result: false,
+            result_state: null,
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: cancelled ? "cancelled" : "running",
+        phase: cancelled ? undefined : "solving_urans",
+        total_cases: 1,
+        completed_cases: 0,
+        active_pids: [],
+        last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+      }),
+      cancelJob: async (jobId: string) => {
+        cancelled = true;
+        return { job_id: jobId, cancelled: true };
+      },
+      deleteJob: async (jobId: string) => {
+        deletes.push(jobId);
+        return { bytes_freed: 1024 };
+      },
+    } as unknown as EngineClient;
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await reconcile(db, lostPrecalcEngine, {
+        jobIds: [fixture.child.id],
+        skipFailedRecovery: true,
+        testHooks: {
+          beforeLostGenerationCleanRestart: () => {
+            throw new Error("interrupt atomic PRECALC cleanup");
+          },
+        },
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    const [fencedJob] = await db
+      .select({
+        status: simJobs.status,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.child.id));
+    const [fencedResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, fixture.row.id));
+    const [fencedObligation] = await db
+      .select({
+        state: simPrecalcObligations.state,
+        latestSimJobId: simPrecalcObligations.latestSimJobId,
+      })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    expect(fencedJob).toMatchObject({
+      status: "cancelled",
+      requestPayload: {
+        cleanRestartPending: { requestedAt: expect.any(String) },
+      },
+    });
+    expect(fencedResult).toEqual({
+      status: "running",
+      simJobId: fixture.child.id,
+    });
+    expect(fencedObligation).toEqual({
+      state: "running",
+      latestSimJobId: fixture.child.id,
+    });
+    expect(deletes).toEqual([]);
+
+    await reconcile(db, lostPrecalcEngine, {
+      jobIds: [fixture.child.id],
+      skipFailedRecovery: true,
+    });
+
+    const [releasedResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, fixture.row.id));
+    const [releasedObligation] = await db
+      .select({
+        state: simPrecalcObligations.state,
+        latestSimJobId: simPrecalcObligations.latestSimJobId,
+      })
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, fixture.obligation.id));
+    expect(releasedResult).toEqual({ status: "queued", simJobId: null });
+    expect(releasedObligation).toEqual({
+      state: "pending",
+      latestSimJobId: null,
+    });
+    expect(deletes).toEqual([engineJobId]);
+  }, 60000);
+
+  it("bootstraps only the d644 lost-runtime rows that still own unpublished cells", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const aoa = 129.79;
+    const engineJobId = `${testRunSlug}-legacy-lost-clean-restart`;
+    const lostReason =
+      "engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, and last progress was 45 min ago — task lost (worker process died, was hard-killed, or restarted mid-solve)";
+    await db
+      .delete(results)
+      .where(
+        and(
+          eq(results.airfoilId, a.id),
+          eq(results.simulationPresetRevisionId, presetRevisionId),
+          eq(results.aoaDeg, aoa),
+        ),
+      );
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId: a.id,
+        bcIds: [bc.id],
+        simulationPresetRevisionId: presetRevisionId,
+        referenceChordM: bc.referenceChordM,
+        wave: 1,
+        status: "cancelled",
+        engineState: "cancelled",
+        engineJobId,
+        error: lostReason,
+        submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+        finishedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        totalCases: 1,
+        completedCases: 0,
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [row] = await db
+      .insert(results)
+      .values({
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        status: "running",
+        source: "queued",
+        simJobId: job.id,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(row.id);
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: row.id,
+        airfoilId: a.id,
+        bcId: bc.id,
+        simulationPresetRevisionId: presetRevisionId,
+        aoaDeg: aoa,
+        simJobId: job.id,
+        engineJobId,
+        status: "running",
+        source: "queued",
+        regime: "rans",
+        validForPolar: false,
+      })
+      .returning({ id: resultAttempts.id });
+    cleanupAttemptIds.add(attempt.id);
+
+    const deletes: string[] = [];
+    const legacyEngine = {
+      getQueue: async () => emptyQueue(),
+      getJobRuntimes: async () => ({
+        jobs: [
+          {
+            job_id: engineJobId,
+            exists: false,
+            cancelled: true,
+            process_count: 0,
+            active_pids: [],
+            runtime_heartbeat_age_sec: null,
+            status_readable: true,
+            status_error: null,
+            status_state: "cancelled",
+            status_total_cases: 1,
+            status_completed_cases: 0,
+            result_readable: false,
+            result_error: null,
+            has_result: false,
+            result_state: null,
+          },
+        ],
+      }),
+      getJob: async (): Promise<JobStatus> => ({
+        job_id: engineJobId,
+        state: "cancelled",
+        total_cases: 1,
+        completed_cases: 0,
+        active_pids: [],
+      }),
+      cancelJob: async () => {
+        throw new Error("legacy bootstrap must not re-cancel the engine");
+      },
+      deleteJob: async (jobId: string) => {
+        deletes.push(jobId);
+        return { bytes_freed: 4096 };
+      },
+    } as unknown as EngineClient;
+
+    await reconcile(db, legacyEngine, {
+      jobIds: [job.id],
+      skipFailedRecovery: true,
+    });
+
+    const [settledJob] = await db
+      .select({
+        strippedAt: simJobs.strippedAt,
+        requestPayload: simJobs.requestPayload,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, job.id));
+    const [settledResult] = await db
+      .select({ status: results.status, simJobId: results.simJobId })
+      .from(results)
+      .where(eq(results.id, row.id));
+    const attempts = await db
+      .select({ id: resultAttempts.id })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, job.id));
+    expect(deletes).toEqual([engineJobId]);
+    expect(settledJob.strippedAt).not.toBeNull();
+    expect(settledJob.requestPayload).not.toMatchObject({
+      cleanRestartPending: expect.anything(),
+    });
+    expect(settledResult).toEqual({ status: "pending", simJobId: null });
+    expect(attempts).toEqual([]);
     await db.delete(results).where(eq(results.id, row.id));
   }, 60000);
 
@@ -6445,6 +7464,119 @@ describe("sweeper: gap → claim → ingest", () => {
     await db.delete(results).where(eq(results.id, row.id));
   }, 60000);
 
+  // FALSE-POSITIVE GUARD (2026-08-05): each direct liveness signal is
+  // independently authoritative even when queue observation is unavailable.
+  it("keeps running jobs with a fresh heartbeat or live process untouched", async () => {
+    const { a, bc, presetRevisionId } = await firstAirfoilBc();
+    const liveCases = [
+      { label: "fresh-heartbeat", processCount: 0, heartbeatAge: 5 },
+      { label: "live-process", processCount: 1, heartbeatAge: 9000 },
+    ];
+
+    for (const [index, liveCase] of liveCases.entries()) {
+      const aoa = 129.8 + index / 1000;
+      const engineJobId = `${testRunSlug}-${liveCase.label}`;
+      await db
+        .delete(results)
+        .where(
+          and(
+            eq(results.airfoilId, a.id),
+            eq(results.simulationPresetRevisionId, presetRevisionId),
+            eq(results.aoaDeg, aoa),
+          ),
+        );
+      const [job] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId: a.id,
+          bcIds: [bc.id],
+          simulationPresetRevisionId: presetRevisionId,
+          referenceChordM: bc.referenceChordM,
+          wave: 1,
+          status: "running",
+          engineJobId,
+          submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+          totalCases: 4,
+          completedCases: 1,
+        })
+        .returning({ id: simJobs.id });
+      cleanupJobIds.add(job.id);
+      const [row] = await db
+        .insert(results)
+        .values({
+          airfoilId: a.id,
+          bcId: bc.id,
+          simulationPresetRevisionId: presetRevisionId,
+          aoaDeg: aoa,
+          status: "running",
+          source: "queued",
+          simJobId: job.id,
+        })
+        .returning({ id: results.id });
+      cleanupResultIds.add(row.id);
+
+      const cancels: string[] = [];
+      const liveEngine = {
+        getQueue: async () => null,
+        getJobRuntimes: async () => ({
+          jobs: [
+            {
+              job_id: engineJobId,
+              exists: true,
+              cancelled: false,
+              process_count: liveCase.processCount,
+              active_pids: liveCase.processCount ? [12345] : [],
+              runtime_heartbeat_age_sec: liveCase.heartbeatAge,
+              status_readable: true,
+              status_error: null,
+              status_state: "running",
+              status_total_cases: 4,
+              status_completed_cases: 1,
+              result_readable: false,
+              result_error: null,
+              has_result: false,
+              result_state: null,
+            },
+          ],
+        }),
+        getJob: async (): Promise<JobStatus> => ({
+          job_id: engineJobId,
+          state: "running",
+          phase: "solving_urans",
+          total_cases: 4,
+          completed_cases: 1,
+          active_pids: liveCase.processCount ? [12345] : [],
+          last_progress_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+        }),
+        cancelJob: async (jobId: string) => {
+          cancels.push(jobId);
+          return { job_id: jobId, cancelled: true };
+        },
+      } as unknown as EngineClient;
+
+      await reconcile(db, liveEngine, {
+        jobIds: [job.id],
+        skipFailedRecovery: true,
+      });
+
+      const [gotJob] = await db
+        .select({ status: simJobs.status, engineState: simJobs.engineState })
+        .from(simJobs)
+        .where(eq(simJobs.id, job.id));
+      const [gotResult] = await db
+        .select({ status: results.status, simJobId: results.simJobId })
+        .from(results)
+        .where(eq(results.id, row.id));
+      expect(cancels).toEqual([]);
+      expect(gotJob).toMatchObject({
+        status: "running",
+        engineState: "running",
+      });
+      expect(gotResult).toEqual({ status: "running", simJobId: job.id });
+      await db.delete(results).where(eq(results.id, row.id));
+    }
+  }, 60000);
+
   // MUST-CATCH (incident 2026-07-04, empty-error class): a genuinely failed
   // engine job (total failure — the engine writes a failed result with a
   // message and NO polars, exactly tasks.py's exception path) must stamp the
@@ -6531,13 +7663,11 @@ describe("sweeper: gap → claim → ingest", () => {
       .where(inArray(results.id, rowIds));
     expect(rows.length).toBe(aoas.length);
     for (const row of rows) {
-      // Amendment B (auto-retry-once): a first crash requeues the cell — the
-      // row returns to pending WITH the marker and the exact engine message
-      // kept as crash evidence (never empty, never 'unknown'-classed).
+      // A crash generation is disposable: the cell returns to pending with a
+      // restart marker but no stale solver payload or error projection.
       expect(row.status).toBe("pending");
       expect(row.autoRetriedAt).not.toBeNull();
-      expect(row.error).toBe(MSG);
-      expect((row.error ?? "").trim().length).toBeGreaterThan(0);
+      expect(row.error).toBeNull();
     }
     const [gotJob] = await db
       .select({ status: simJobs.status, error: simJobs.error })
