@@ -49,7 +49,6 @@ import {
 import { C, MONO } from "@/lib/tokens";
 import { isProcessDead } from "@/lib/solver-state";
 import type { CampaignPointsBucket } from "@/lib/point-history";
-import { SolverIncidentPanel } from "../SolverIncidentPanel";
 import {
   campaignInstrumentStatus,
   campaignStatusLine,
@@ -642,11 +641,6 @@ export function CampaignDetail({
           </button>
         )}
       </div>
-
-      <SolverIncidentPanel
-        summary={summary.solverIncidents}
-        surface="campaign"
-      />
 
       {notice && (
         <div

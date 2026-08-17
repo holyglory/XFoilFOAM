@@ -210,28 +210,13 @@ describe("solver terminology contract", () => {
     );
   });
 
-  it("MUST-CATCH: incident UI keeps solver-owned quality follow-up calm and progressively discloses diagnostics", () => {
-    const incidentPanel = source("components/admin/SolverIncidentPanel.tsx");
-    const incidentModel = source("lib/solver-incidents.ts");
+  it("MUST-CATCH: admin status surfaces omit the internal solver-recovery rail", () => {
+    const health = source("components/admin/HealthPanel.tsx");
+    const campaign = source("components/admin/campaigns/CampaignDetail.tsx");
 
-    expect(incidentModel).toContain('return "PRE-SOLVER REPAIR"');
-    expect(incidentModel).toContain('"RECOVERING"');
-    expect(incidentModel).toContain('"AUTOMATIC"');
-    expect(incidentModel).toContain('"SYSTEM OWNED"');
-    expect(incidentModel).not.toContain('"INVESTIGATE"');
-    expect(incidentModel).not.toContain('"SCREENING RECOVERY"');
-    expect(incidentPanel).toContain(
-      'const title = hasOpen ? "Solver quality log"',
-    );
-    expect(incidentPanel).toContain("<details");
-    expect(incidentPanel).toContain("publication checks and");
-    expect(incidentPanel).toContain("solver system · no user action");
-    expect(incidentPanel).toContain("agent JSON ↗");
-    expect(incidentPanel).toContain("DEBUG EVIDENCE");
-    expect(incidentPanel).not.toContain("System investigation required");
-    expect(incidentPanel).not.toContain("same cause → critical");
-    expect(incidentPanel).not.toContain("has-critical");
-    expect(incidentPanel).not.toContain('return { label: "solver fix"');
-    expect(incidentPanel).not.toContain("view.remediationLabel");
+    expect(health).not.toContain("SolverIncidentPanel");
+    expect(campaign).not.toContain("SolverIncidentPanel");
+    expect(health).toContain('data-testid="health-compute-fleet"');
+    expect(campaign).toContain('data-testid="campaign-instrument-hero"');
   });
 });

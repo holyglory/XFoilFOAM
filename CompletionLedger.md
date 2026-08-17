@@ -1,5 +1,19 @@
 # Completion Ledger
 
+- **Solver capacity packing and tick-progress recovery:** Live production on
+  2026-08-17 proved the hub had four real progressing 1-slot OpenFOAM jobs but
+  rejected every next 8-slot batch as `4+8/8`; hz-solver2 was progressing near
+  its 64-slot cap. Both sweepers also repeated a postgres-js Date/string bind
+  error, leaving `lastTickCompletedAt` stale despite fresh heartbeats. `master`
+  now atomically shrinks only case concurrency to the exact positive remainder,
+  persists the reduced job weight/resources before engine submission, and uses
+  database `now()` in capacity-denial cleanup. Pure packing regressions and the
+  sweeper typecheck pass; DB-backed attached-result/serialized-admission
+  regressions are authored. Remaining work: run the governed change suite,
+  deploy the Node control plane from pushed `master` without recreating engine
+  services, and verify hub 8/8, fresh completed ticks, no bind-error recurrence,
+  remote progress, and storage headroom.
+
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with
   a full mocked interaction regression. Unit tests, web/DB typechecks, and the

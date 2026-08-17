@@ -20,7 +20,6 @@ import {
   getAdminHealth,
 } from "@/lib/admin";
 import { C, MONO } from "@/lib/tokens";
-import { SolverIncidentPanel } from "./SolverIncidentPanel";
 import { usePoll } from "./campaigns/usePoll";
 
 const EMPTY = "--";
@@ -636,9 +635,6 @@ export function HealthPanel() {
           font-size: 11px;
           color: ${C.red};
         }
-        .health-incidents {
-          margin-bottom: 12px;
-        }
         .health-section {
           margin-bottom: 12px;
           padding: 14px;
@@ -1028,17 +1024,6 @@ export function HealthPanel() {
       </div>
 
       {err && <div className="health-error">{err}</div>}
-
-      {health && (
-        <div className="health-incidents">
-          <SolverIncidentPanel
-            summary={health.solverIncidents}
-            events={health.solverIncidentEvents}
-            surface="health"
-            showClear
-          />
-        </div>
-      )}
 
       {health && (
         <section className="health-section" data-testid="health-compute-fleet">
