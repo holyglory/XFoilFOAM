@@ -1976,6 +1976,8 @@ async function submitLadderJob(
       request.corrective_tail_periods = opts.correctiveTailPeriods;
     }
   }
+  const admissionCpuSlots = pinAdmissionCpuSlotsForRequest(request);
+  const pinnedAdmissionResources = request.resources;
   const jobValues: typeof simJobs.$inferInsert = {
     parentJobId: opts.recordedPromotion?.parentJobId ?? null,
     airfoilId: a.id,
@@ -1989,7 +1991,7 @@ async function submitLadderJob(
     referenceChordM: target.snapshot.referenceGeometry.referenceLengthM,
     wave: 2,
     status: "pending",
-    admissionCpuSlots: pinAdmissionCpuSlotsForRequest(request),
+    admissionCpuSlots,
     totalCases: aoas.length,
     requestPayload: {
       ...payloadExtras,
@@ -2015,7 +2017,7 @@ async function submitLadderJob(
       ...(opts.correctiveTailPeriods != null
         ? { correctiveTailPeriods: opts.correctiveTailPeriods }
         : {}),
-      resources: request.resources,
+      resources: pinnedAdmissionResources,
       setupSnapshot: target.snapshot,
     },
   };

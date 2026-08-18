@@ -47,16 +47,19 @@
   over-admission. Tail shrink then reduced that owner to four and admitted one
   local FAST job, but remaining local ladder requests still omitted explicit
   `case_concurrency`, preventing the existing fitter from using the last three
-  slots. The local ladder now pins the same durable resource shape already
-  required on remote jobs. Pure packing/tail/request-pin regressions and the
+  slots. The direct ladder now pins the same durable resource shape already
+  required on remote jobs; live `cab4314` then proved campaign retry
+  composition uses two separate reconcile-owned constructors, which are now
+  pinned before their job objects are built as well. Pure
+  packing/tail/request-pin regressions and the
   sweeper typecheck pass; DB-backed persistence/serialized-admission
   regressions are authored. Production also proves fresh completed ticks, no
   bind-error recurrence, about 215 GB hub free, and about 1.86 TB remote
   solver-volume free; hz-solver2 is capped at 64 reserved slots with about 61
-  real solver processes plus postprocessing. Remaining work: deploy the local
-  ladder pin, verify the hub refills to 8 and both roles remain at or below
-  their caps, and run the DB-backed regressions when the governed database is
-  available.
+  real solver processes plus postprocessing. Remaining work: deploy the two
+  reconcile-owned local pins, verify the hub refills to 8 and both roles remain
+  at or below their caps, and run the DB-backed regressions when the governed
+  database is available.
 
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with

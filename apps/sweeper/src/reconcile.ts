@@ -91,7 +91,6 @@ import {
 } from "drizzle-orm";
 
 import {
-  admissionCpuSlotsForRequest,
   buildPolarRequest,
   pinAdmissionCpuSlotsForRequest,
   solverImplementationIdForSetup,
@@ -2480,6 +2479,8 @@ export async function submitUransRetryForJob(
     };
     request.budget_override_s = continuation.budgetOverrideS;
   }
+  const admissionCpuSlots = pinAdmissionCpuSlotsForRequest(request);
+  const pinnedAdmissionResources = request.resources;
   const job = await composeWave2Child(db, {
     parentJobId: parent.id,
     revisionId: setup.revisionId,
@@ -2500,9 +2501,7 @@ export async function submitUransRetryForJob(
       referenceChordM: setup.snapshot.referenceGeometry.referenceLengthM,
       wave: 2,
       status: "pending",
-      admissionCpuSlots: remoteProvenance
-        ? pinAdmissionCpuSlotsForRequest(request)
-        : admissionCpuSlotsForRequest(request),
+      admissionCpuSlots,
       totalCases: aoas.length,
       requestPayload: {
         ...(remoteProvenance ?? {}),
@@ -2537,7 +2536,7 @@ export async function submitUransRetryForJob(
         validRansPointCount: retry.validRansPointCount,
         needsUransCount: retry.needsUransCount,
         hardRejectedCount: retry.hardRejectedCount,
-        resources: request.resources,
+        resources: pinnedAdmissionResources,
         setupSnapshot: setup.snapshot,
       },
     },
@@ -2857,6 +2856,8 @@ async function submitCampaignUransRetries(
       };
       request.budget_override_s = continuation.budgetOverrideS;
     }
+    const admissionCpuSlots = pinAdmissionCpuSlotsForRequest(request);
+    const pinnedAdmissionResources = request.resources;
     const job = await composeWave2Child(db, {
       parentJobId: parent.id,
       revisionId: entry.revisionId,
@@ -2875,9 +2876,7 @@ async function submitCampaignUransRetries(
         referenceChordM: snapshot.referenceGeometry.referenceLengthM,
         wave: 2,
         status: "pending",
-        admissionCpuSlots: remoteProvenance
-          ? pinAdmissionCpuSlotsForRequest(request)
-          : admissionCpuSlotsForRequest(request),
+        admissionCpuSlots,
         totalCases: retryAoas.length,
         requestPayload: {
           ...(remoteProvenance ?? {}),
@@ -2913,7 +2912,7 @@ async function submitCampaignUransRetries(
           validRansPointCount: retry.validRansPointCount,
           needsUransCount: retry.needsUransCount,
           hardRejectedCount: retry.hardRejectedCount,
-          resources: request.resources,
+          resources: pinnedAdmissionResources,
           setupSnapshot: snapshot,
         },
       },
