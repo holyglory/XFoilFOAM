@@ -830,44 +830,63 @@ export async function tick(
       } else if (localCapacityOpen || remoteFastCapacityOpen) {
         uransRecoveryVersion = await engineUransRecoveryVersion(engine);
         // A recorded whole-polar promotion and an exact targeted RANS
-        // rejection are normal automatic escalation work. Both strictly own
-        // the slot before mirrored remote RANS or any other new RANS lane.
-        const promotedSubmitted = await submitRecordedPromotionRecovery(
-          db,
-          engine,
-          state.cpuSlots,
-          {
-            meshRecoveryVersion,
-            uransRecoveryVersion,
-            ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
-          },
-        );
-        const campaignTargetedSubmitted =
-          promotedSubmitted || !localCapacityOpen
-            ? false
-            : await submitCampaignPrecalcRecoveries(
-                db,
-                engine,
-                undefined,
-                undefined,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              );
-        const remoteTargetedSubmitted =
-          promotedSubmitted ||
-          campaignTargetedSubmitted ||
-          !remoteFastCapacityOpen
-            ? false
-            : await submitRemotePromisePrecalcRecoveries(
-                db,
-                engine,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              );
-        fastUransSubmitted =
-          promotedSubmitted ||
-          campaignTargetedSubmitted ||
-          remoteTargetedSubmitted;
+        // rejection are normal automatic escalation work. They own every
+        // available slot before mirrored remote RANS or any other new RANS
+        // lane. One-at-a-time submission left a 64-slot remote node half empty
+        // while a long batch tail released many one-angle obligations at once,
+        // so refill the independently fenced lane in this tick. Every composer
+        // still crosses the serialized submit lifecycle, and disk/capacity are
+        // re-measured after each accepted job.
+        const MAX_FAST_URANS_ADMISSIONS_PER_TICK = 16;
+        for (let i = 0; i < MAX_FAST_URANS_ADMISSIONS_PER_TICK; i++) {
+          if (engineBackoffActive()) break;
+          diskAdmission = await refreshDiskAdmission(db, engine);
+          if (!diskAdmission.allowed) break;
+          if (
+            localCapacityOpen &&
+            (await inFlight(db)) >= state.maxConcurrentJobs
+          ) {
+            localCapacityOpen = false;
+          }
+          const promotedSubmitted = await submitRecordedPromotionRecovery(
+            db,
+            engine,
+            state.cpuSlots,
+            {
+              meshRecoveryVersion,
+              uransRecoveryVersion,
+              ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
+            },
+          );
+          const campaignTargetedSubmitted =
+            promotedSubmitted || !localCapacityOpen
+              ? false
+              : await submitCampaignPrecalcRecoveries(
+                  db,
+                  engine,
+                  undefined,
+                  undefined,
+                  meshRecoveryVersion,
+                  uransRecoveryVersion,
+                );
+          const remoteTargetedSubmitted =
+            promotedSubmitted ||
+            campaignTargetedSubmitted ||
+            !remoteFastCapacityOpen
+              ? false
+              : await submitRemotePromisePrecalcRecoveries(
+                  db,
+                  engine,
+                  meshRecoveryVersion,
+                  uransRecoveryVersion,
+                );
+          const submitted =
+            promotedSubmitted ||
+            campaignTargetedSubmitted ||
+            remoteTargetedSubmitted;
+          if (!submitted) break;
+          fastUransSubmitted = true;
+        }
       }
     }
   }

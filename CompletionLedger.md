@@ -36,15 +36,18 @@
   database `now()` in capacity-denial cleanup. The running-batch tail fix also
   releases only fully completed cases after the unfinished count falls below
   the engine's resolved concurrency; a database `LEAST` keeps stale pollers
-  from growing the weight back. Pure packing/tail regressions and the sweeper
-  typecheck pass; DB-backed persistence/serialized-admission regressions are
-  authored. Both sealed `9fb3025` control planes are deployed without
+  from growing the weight back. The priority FAST lane now refills up to 16
+  independently fenced jobs in one tick, rechecking capacity and disk after
+  every accepted submission instead of leaving one-angle tail gaps idle. Pure
+  packing/tail regressions and the sweeper typecheck pass; DB-backed
+  persistence/serialized-admission regressions are authored. Both sealed
+  `3bd406d` control planes are deployed without
   recreating an engine worker; production proved 8 real hub processes and
   63–64 real remote processes before the tail drained, fresh completed ticks,
   no bind-error recurrence, about 233 GB hub free, and about 1.88 TB remote
-  solver-volume free. Remaining work: deploy the tail release, verify it
-  backfills completed-case capacity to 64 real processes, and run the DB-backed
-  regressions when the governed database is available.
+  solver-volume free. Remaining work: deploy the multi-FAST refill, verify the
+  combined tail release/refill returns the remote node to 64 real processes,
+  and run the DB-backed regressions when the governed database is available.
 
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with
