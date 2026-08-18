@@ -90,6 +90,7 @@ export interface SolverWorkPointStateRow {
   precalcObligationState?: string | null;
   precalcObligationAttemptCount?: number | null;
   precalcObligationMaxAttempts?: number | null;
+  precalcObligationLastOutcome?: string | null;
   precalcObligationLastError?: string | null;
   reviewVerdict?: "waive" | "exclude" | string | null;
   autoRetriedAt?: Date | string | null;
@@ -237,6 +238,7 @@ type ResultPointRow = {
   precalc_obligation_state: string | null;
   precalc_obligation_attempt_count: number | string | null;
   precalc_obligation_max_attempts: number | string | null;
+  precalc_obligation_last_outcome: string | null;
   precalc_obligation_last_error: string | null;
 };
 
@@ -570,6 +572,7 @@ function gateChecksFromPoint(row: {
 function plainForPoint(
   state: SolverWorkState,
   gate: SolverWorkGate | null,
+  recoveryOutcome?: string | null,
 ): string {
   if (gate?.detail === UNCLASSIFIED_EVIDENCE_DETAIL) {
     return "Classification missing; excluded from the polar. Engineering action required.";
@@ -581,6 +584,24 @@ function plainForPoint(
     return state === "blocked"
       ? "Automatic media repair exhausted; engineering action required."
       : "Stored media repair is automatic.";
+  }
+  if (recoveryOutcome?.startsWith("aperiodic_contract_retry_")) {
+    return state === "blocked"
+      ? "The previous FAST evidence is unpublished; a statistical-mean contract rerun is required."
+      : "FAST URANS is rerunning under the statistical-mean evidence contract.";
+  }
+  if (recoveryOutcome?.startsWith("numerical_recovery_")) {
+    return state === "blocked"
+      ? "The previous FAST trajectory was numerically unstable; a changed conservative execution is required."
+      : "FAST URANS is retrying with conservative numerical controls.";
+  }
+  if (recoveryOutcome?.startsWith("observation_continuation_")) {
+    return state === "blocked"
+      ? "The exact FAST trajectory still lacks enough physical observation."
+      : "FAST URANS is extending the exact saved physical trajectory.";
+  }
+  if (recoveryOutcome?.startsWith("infrastructure_retry")) {
+    return "The interrupted submission is retrying without spending a physical solver attempt.";
   }
   switch (state) {
     case "verified":
@@ -609,8 +630,8 @@ function plainForPoint(
         : "This point was excluded after review and is not used in the stored polar.";
     case "blocked":
       return gate
-        ? `Automatic recovery exhausted at the ${gate.name}; engineering action required.`
-        : "Automatic recovery exhausted; engineering action required.";
+        ? `FAST evidence is unavailable because the ${gate.name} did not pass.`
+        : "FAST evidence is unavailable and remains unpublished.";
     case "superseded":
       return "A higher-fidelity result replaced this point, and the replacement is used instead.";
   }
@@ -662,6 +683,37 @@ function chainForPoint(
   attempts: AttemptRow[],
   state: SolverWorkState,
 ): Array<{ label: string; tone: SolverWorkTone }> {
+  const typedRecovery = row.precalcObligationLastOutcome;
+  if (typedRecovery?.startsWith("aperiodic_contract_retry_")) {
+    return [
+      {
+        label:
+          state === "blocked"
+            ? "FAST statistical rerun required"
+            : "FAST statistical rerun",
+        tone: state === "blocked" ? "blocked" : "ladder",
+      },
+    ];
+  }
+  if (typedRecovery?.startsWith("numerical_recovery_")) {
+    return [
+      {
+        label:
+          state === "blocked"
+            ? "FAST numerical recovery required"
+            : "FAST conservative rerun",
+        tone: state === "blocked" ? "blocked" : "ladder",
+      },
+    ];
+  }
+  if (typedRecovery?.startsWith("observation_continuation_")) {
+    return [
+      {
+        label: "FAST extending evidence",
+        tone: state === "blocked" ? "blocked" : "ladder",
+      },
+    ];
+  }
   if (
     ["pending", "running", "retry_wait"].includes(row.mediaRepairState ?? "")
   ) {
@@ -697,7 +749,7 @@ function chainForPoint(
 
       const isLast = index === attempts.length - 1;
       if (state === "blocked" && isLast) {
-        return { label: `${labelBase} exhausted`, tone: "blocked" };
+        return { label: `${labelBase} unavailable`, tone: "blocked" };
       }
       return { label: `${labelBase} retry`, tone: "ladder" };
     });
@@ -763,6 +815,7 @@ function makePoint(
     precalcObligationMaxAttempts: numberOrNull(
       row.precalc_obligation_max_attempts,
     ),
+    precalcObligationLastOutcome: row.precalc_obligation_last_outcome,
     precalcObligationLastError: row.precalc_obligation_last_error,
     reviewVerdict: row.review_verdict,
     autoRetriedAt: row.auto_retried_at,
@@ -825,7 +878,7 @@ function makePoint(
     cl: opts.derivedBySymmetry ? negated(cl) : cl,
     cd,
     cm: opts.derivedBySymmetry ? negated(cm) : cm,
-    plain: plainForPoint(state, gate),
+    plain: plainForPoint(state, gate, row.precalc_obligation_last_outcome),
     gate,
     gates,
     reviewed: row.review_verdict === "exclude",
@@ -862,7 +915,7 @@ function queuedPoint(aoaDeg: number): SolverWorkPoint {
     cl: null,
     cd: null,
     cm: null,
-    plain: plainForPoint(state, null),
+    plain: plainForPoint(state, null, null),
     gate: null,
     gates: [],
     reviewed: false,
@@ -970,6 +1023,7 @@ async function loadResultRows(
       precalc_obligation.state AS precalc_obligation_state,
       precalc_obligation.attempt_count AS precalc_obligation_attempt_count,
       precalc_obligation.max_attempts AS precalc_obligation_max_attempts,
+      precalc_obligation.last_outcome AS precalc_obligation_last_outcome,
       precalc_obligation.last_error AS precalc_obligation_last_error,
       rrv.id AS review_id,
       rrv.verdict AS review_verdict,
@@ -1064,6 +1118,7 @@ async function loadCampaignPointRows(
       precalc_obligation.state AS precalc_obligation_state,
       precalc_obligation.attempt_count AS precalc_obligation_attempt_count,
       precalc_obligation.max_attempts AS precalc_obligation_max_attempts,
+      precalc_obligation.last_outcome AS precalc_obligation_last_outcome,
       precalc_obligation.last_error AS precalc_obligation_last_error,
       rrv.id AS review_id,
       rrv.verdict AS review_verdict,

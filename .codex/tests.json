@@ -96,6 +96,50 @@
         "retry_on": ["lease_expired_before_launch"]
       },
       "network": "external"
+    },
+    "urans-recovery-regression": {
+      "driver": "automation",
+      "reporter": "automation-events",
+      "cwd": ".",
+      "environment": {
+        "DATABASE_URL": "postgres://aerodb:aerodb@127.0.0.1:5544/aerodb"
+      },
+      "argv": [
+        "{python}",
+        ".codex/devcoordinator_test_harness.py",
+        "urans-recovery-regression"
+      ],
+      "inputs": [
+        ".codex/devcoordinator_test_harness.py",
+        "apps/api/src/services/solver-work.ts",
+        "apps/api/test/solver-work.test.ts",
+        "apps/sweeper/src/**",
+        "apps/sweeper/test/build-request-transient-pin.test.ts",
+        "apps/sweeper/test/fidelity-contract-pin.test.ts",
+        "apps/sweeper/test/urans-quality-recovery.test.ts",
+        "apps/sweeper/test/urans-ladder.test.ts",
+        "apps/web/lib/solver-state.ts",
+        "apps/web/components/admin/campaigns/campaign-status.ts",
+        "apps/web/test/solver-state.test.ts",
+        "apps/web/test/campaign-status-line.test.ts",
+        "packages/core/src/**",
+        "packages/core/test/aperiodic-mean-certificate.test.ts",
+        "packages/core/test/aperiodic-mean-classifier.test.ts",
+        "packages/core/test/precalc-recovery-policy.test.ts",
+        "packages/db/src/**",
+        "packages/db/test/precalc-contract-remediation.test.ts",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "tsconfig.base.json"
+      ],
+      "depends_on": [],
+      "intents": ["change", "checkpoint", "handoff", "release", "manual"],
+      "retry": {
+        "max_attempts": 2,
+        "retry_on": ["lease_expired_before_launch"]
+      },
+      "network": "external"
     }
   },
   "evidence_policies": {

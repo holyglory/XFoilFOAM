@@ -3,6 +3,7 @@
 
 import type { PointFidelity, SteadyHistory, UransFidelity } from "./fidelity";
 import type { FrameTrack } from "./frame-track";
+import type { AperiodicMeanCertificate } from "./aperiodic-mean-certificate";
 import type { NoSheddingCertificate } from "./no-shedding-certificate";
 import type { RansHoldCertificate } from "./rans-hold-certificate";
 import type { UransCycleCertificate } from "./urans-cycle-certificate";
@@ -442,7 +443,8 @@ export const ARCHIVE_CLEAN_CYCLE_MAX_PERIODS = {
   urans_full: 12,
 } as const;
 
-export type ArchiveCleanCycleFidelity = keyof typeof ARCHIVE_CLEAN_CYCLE_MAX_PERIODS;
+export type ArchiveCleanCycleFidelity =
+  keyof typeof ARCHIVE_CLEAN_CYCLE_MAX_PERIODS;
 
 export type ArchiveCleanCycleReductionState =
   | "accepted"
@@ -478,11 +480,7 @@ function isArchiveCleanCycleRecord(
 }
 
 function archiveCleanCyclePositiveInteger(value: unknown): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value > 0
-  );
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function archiveCleanCycleExactKeys(
@@ -648,9 +646,7 @@ export interface ArchiveCleanCycleReductionResponse {
 export interface PrepareBrokeredLegacyEvidenceRequest {
   caseSlug: string;
   evidenceBase: string;
-  legacyArchiveName:
-    | "openfoam_evidence.tar.gz"
-    | "engine_evidence.tar.gz";
+  legacyArchiveName: "openfoam_evidence.tar.gz" | "engine_evidence.tar.gz";
   legacyArchiveSha256: string;
   legacyArchiveByteSize: number;
   manifestSha256: string;
@@ -845,6 +841,9 @@ export interface PolarPoint {
    * frame_track shape so reducer policy can evolve without breaking media
    * transport. Null for steady/no-shedding points; absent on legacy runs. */
   urans_cycle_certificate?: UransCycleCertificate | null;
+  /** Statistically stationary, explicitly non-periodic URANS mean. Undefined
+   * is legacy evidence; null means a current producer did not certify it. */
+  aperiodic_mean_certificate?: AperiodicMeanCertificate | null;
   /** Proof-bearing current-engine no-shedding observation. `undefined` is
    * legacy omission; explicit `null` means the engine could not certify the
    * physical slow-wake horizon and must fail closed downstream. */

@@ -1076,7 +1076,7 @@ describe("GET /api/airfoils/:slug/solver-work", () => {
     expect(byAoa.get(9)).toMatchObject({
       state: "blocked",
       plain:
-        "Automatic recovery exhausted at the mesh QA gate; engineering action required.",
+        "FAST evidence is unavailable because the mesh QA gate did not pass.",
       chain: [{ label: "RANS system issue", tone: "blocked" }],
       actions: [],
     });

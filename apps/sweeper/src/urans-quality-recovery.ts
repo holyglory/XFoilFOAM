@@ -1,8 +1,11 @@
 import type { PolarRequest } from "@aerodb/engine-client";
 
-/** Engine v12 is the first contract that starts controller-selected repeated
- * PRECALC work on the conservative numerical rung before pimpleFoam. */
-export const MIN_CONSERVATIVE_URANS_RETRY_VERSION = 12;
+import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
+
+/** The conservative rung first appeared in v12. New submissions also require
+ * the v13 evidence contract, so recovery must satisfy the stronger bound. */
+export const MIN_CONSERVATIVE_URANS_RETRY_VERSION =
+  REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION;
 
 export type ConservativeUransRetryPlan =
   | { kind: "not_required" }

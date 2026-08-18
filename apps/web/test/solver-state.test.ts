@@ -144,12 +144,12 @@ describe("deriveSolverState gate precedence", () => {
         RegExp,
       ]
     > = [
-      ["blocked_preliminary_urans", null, /fast URANS exhausted/i],
+      ["blocked_preliminary_urans", null, /fast URANS evidence unavailable/i],
       ["blocked_final_urans", null, /final URANS exhausted/i],
       [
         "critical_solver_incident",
         { stage: "preliminary" },
-        /fast URANS recovery exhausted/i,
+        /fast URANS system fault/i,
       ],
       [
         "critical_solver_incident",
@@ -205,7 +205,7 @@ describe("deriveSolverState gate precedence", () => {
       },
       NOW,
     );
-    expect(derived.headline).toMatch(/fast URANS recovery exhausted/i);
+    expect(derived.headline).toMatch(/fast URANS system fault/i);
   });
 
   it("alive + disabled -> paused (amber), with the honest running-jobs detail", () => {

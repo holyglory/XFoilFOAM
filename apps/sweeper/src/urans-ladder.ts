@@ -85,6 +85,7 @@ import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
   pinAdmissionCpuSlotsForRequest,
+  REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
   solverImplementationIdForSetup,
 } from "./build-request";
 import {
@@ -112,9 +113,7 @@ import {
   archiveBackfillFinalVerifyQueueRequiresActionProof,
   blockArchiveBackfillFinalContinuationAtSubmit,
   blockArchiveBackfillPrecalcContinuationAtSubmit,
-  routeArchiveInterpretationRecoveryActions,
 } from "./archive-interpretation-recovery";
-import { routeLegacyUransArchiveGapRecoveryActions } from "./legacy-urans-archive-gap-recovery";
 import {
   applyConservativeUransRetryPlan,
   conservativeUransRetryPlan,
@@ -1058,7 +1057,7 @@ export async function submitRecordedPromotionRecovery(
       continueFrom,
       budgetOverrideS,
       meshRecoveryVersion,
-      uransRecoveryVersion: continuation ? uransRecoveryVersion! : undefined,
+      uransRecoveryVersion,
       recordedPromotion: {
         promotionId: event.promotionId,
         parentJobId: event.parentJobId,
@@ -1664,7 +1663,7 @@ export async function submitRemotePromisePrecalcRecoveries(
         : null,
       budgetOverrideS: continuation?.budgetOverrideS ?? null,
       meshRecoveryVersion,
-      uransRecoveryVersion: continuation ? uransRecoveryVersion! : undefined,
+      uransRecoveryVersion,
       admissionLane: "remote",
     });
     if (outcome.submitted) {
@@ -1778,7 +1777,7 @@ async function submitLadderJob(
     meshRecoveryVersion?: number;
     /** Exact live durable URANS recovery contract. Required only when this
      * composition resumes/retries physical work unavailable to legacy engines. */
-    uransRecoveryVersion?: number;
+    uransRecoveryVersion?: number | null;
     /** Claimed admin request linked to the composed job before submit. */
     uransRequestId?: string;
     /** Claimed automatic full-verification item. */
@@ -1841,6 +1840,24 @@ async function submitLadderJob(
         "engine mesh-recovery capability is unavailable or malformed; PRECALC submission deferred",
     };
   }
+  const liveUransRecoveryVersion =
+    opts.uransRecoveryVersion !== undefined
+      ? opts.uransRecoveryVersion
+      : await engineUransRecoveryVersion(engine);
+  if (liveUransRecoveryVersion !== REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION) {
+    return {
+      jobId: "",
+      submitted: false,
+      connectionFailure: false,
+      lifecycleStopped: false,
+      submissionInProgress: false,
+      capabilityMismatch: true,
+      error:
+        `URANS evidence contract requires engine recovery ` +
+        `v${REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION}; live version is ` +
+        `${liveUransRecoveryVersion ?? "unavailable"}`,
+    };
+  }
   assertNoReservedLadderPayloadKeys(payloadExtras);
   const payloadObligationIds = Array.isArray(
     (payloadExtras as { precalcObligationIds?: unknown }).precalcObligationIds,
@@ -1858,9 +1875,7 @@ async function submitLadderJob(
           payloadObligationIds,
         )
       : false;
-  const conservativeRetryVersion = conservativeRetryRequired
-    ? (opts.uransRecoveryVersion ?? (await engineUransRecoveryVersion(engine)))
-    : opts.uransRecoveryVersion;
+  const conservativeRetryVersion = liveUransRecoveryVersion;
   const conservativeRetry = conservativeUransRetryPlan(
     conservativeRetryRequired,
     conservativeRetryVersion,
@@ -2394,8 +2409,7 @@ async function consumeUransRequest(
     // the exact action/source/archive proof above; otherwise a manual or
     // legacy continuation keeps the established source-derived heuristic.
     if (archiveBackfillContinuation) {
-      effectiveCorrectiveTailPeriods =
-        request.correctiveTailPeriods ?? null;
+      effectiveCorrectiveTailPeriods = request.correctiveTailPeriods ?? null;
     }
     if (
       !source ||
@@ -2405,9 +2419,9 @@ async function consumeUransRequest(
         archiveBackfillContinuation ||
         (!archiveBackfillRequiresActionProof &&
           (await isExactRestartablePrecalcAttempt(
-          db,
-          request.continueFromResultId,
-          request.continueFromResultAttemptId,
+            db,
+            request.continueFromResultId,
+            request.continueFromResultAttemptId,
           )))
       )
     ) {
@@ -2680,9 +2694,7 @@ async function consumeUransRequest(
     budgetOverrideS: effectiveBudgetOverrideS,
     correctiveTailPeriods: effectiveCorrectiveTailPeriods,
     meshRecoveryVersion,
-    uransRecoveryVersion: continueFrom
-      ? (uransRecoveryVersion ?? undefined)
-      : undefined,
+    uransRecoveryVersion,
     uransRequestId: request.id,
     admissionLane,
   });
@@ -2900,13 +2912,6 @@ async function consumeVerifyItem(
     recovery.resultAttemptId === archiveBackfillRecovery.resultAttemptId
       ? archiveBackfillRecovery.correctiveTailPeriods
       : null;
-  const usesAutomaticRecoveryContract =
-    recovery.mode === "continuation" ||
-    item.freshAttemptCount > 0 ||
-    item.continuationAttemptCount > 0 ||
-    item.lastOutcome === FINAL_URANS_OUTCOMES.continuationPending ||
-    item.lastOutcome === FINAL_URANS_OUTCOMES.continuationRetryWait ||
-    item.lastOutcome === FINAL_URANS_OUTCOMES.freshRetryPending;
   const outcome = await submitLadderJob(db, engine, {
     target,
     aoas: [item.aoaDeg],
@@ -2929,9 +2934,7 @@ async function consumeVerifyItem(
             continueFromResultId: recovery.resultId,
             continueFromResultAttemptId: recovery.resultAttemptId,
             budgetOverrideS,
-            ...(correctiveTailPeriods != null
-              ? { correctiveTailPeriods }
-              : {}),
+            ...(correctiveTailPeriods != null ? { correctiveTailPeriods } : {}),
           }
         : {}),
     },
@@ -2939,9 +2942,7 @@ async function consumeVerifyItem(
     continueFrom: continuation,
     budgetOverrideS,
     correctiveTailPeriods,
-    uransRecoveryVersion: usesAutomaticRecoveryContract
-      ? (scope.uransRecoveryVersion ?? undefined)
-      : undefined,
+    uransRecoveryVersion: scope.uransRecoveryVersion,
     verifyQueueId: item.id,
     admissionLane: scope.admissionLane,
   });
@@ -2955,7 +2956,10 @@ async function consumeVerifyItem(
     await releaseClaimedVerifyItem(db, item.id);
     return false; // pending for a live/paused campaign; backoff/compensation recorded
   }
-  if (outcome.capabilityMismatch) return false;
+  if (outcome.capabilityMismatch) {
+    await releaseClaimedVerifyItem(db, item.id);
+    return false;
+  }
   if (outcome.submissionInProgress) return true;
   console.error(
     `[sweeper] verify item ${item.id} ${outcome.ladderDisposition === "retry_wait" ? "waiting for its one automatic submit retry" : "blocked"}: engine rejected the submit (${outcome.error})`,
@@ -3114,27 +3118,6 @@ export async function uransLadderTick(
       : await engineUransRecoveryVersion(engine);
   const durableRecoveryAvailable =
     supportsDurableUransRecovery(uransRecoveryVersion);
-
-  // Archive clean-cycle reduction never submits CFD itself. It creates exact
-  // action records; materialize their normal ladder owners before any request
-  // or verify item can be claimed in this tick. A source archive is re-proven
-  // again by the consuming path immediately before engine composition.
-  if (durableRecoveryAvailable) {
-    const routedArchiveRecoveryActions =
-      await routeArchiveInterpretationRecoveryActions(db);
-    if (routedArchiveRecoveryActions > 0) {
-      console.log(
-        `[sweeper] archive interpretation recovery: routed ${routedArchiveRecoveryActions} durable action(s) into the URANS ladder`,
-      );
-    }
-    const routedLegacyArchiveGapActions =
-      await routeLegacyUransArchiveGapRecoveryActions(db);
-    if (routedLegacyArchiveGapActions > 0) {
-      console.log(
-        `[sweeper] legacy archive-gap recovery: routed or reconciled ${routedLegacyArchiveGapActions} bounded FAST action(s) into the URANS ladder`,
-      );
-    }
-  }
 
   if (meshRecoveryVersion != null) {
     const continuationRecoveryScope = opts.requestIds?.length

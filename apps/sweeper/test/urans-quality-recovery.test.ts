@@ -25,8 +25,8 @@ describe("repeated preliminary URANS quality recovery", () => {
     ).toBe(true);
   });
 
-  it.each([null, 0, 11])(
-    "defers a repeated attempt on pre-v12 engine capability %p",
+  it.each([null, 0, 11, 12])(
+    "defers a repeated attempt on pre-v13 engine capability %p",
     (version) => {
       const plan = conservativeUransRetryPlan(true, version);
       expect(plan.kind).toBe("deferred");
@@ -38,24 +38,24 @@ describe("repeated preliminary URANS quality recovery", () => {
     },
   );
 
-  it("pins v12 and selects recovery in both engine and durable job payloads", () => {
+  it("pins v13 and selects recovery in both engine and durable job payloads", () => {
     const request = {
       solver: {
         force_transient: true,
         urans_fidelity: "precalc",
       },
     } as PolarRequest;
-    const plan = conservativeUransRetryPlan(true, 12);
-    expect(plan).toEqual({ kind: "required", recoveryVersion: 12 });
+    const plan = conservativeUransRetryPlan(true, 13);
+    expect(plan).toEqual({ kind: "required", recoveryVersion: 13 });
     if (plan.kind !== "required") throw new Error("expected required plan");
 
     applyConservativeUransRetryPlan(request, plan);
 
     expect(request.solver?.urans_quality_recovery).toBe(true);
-    expect(request.expected_urans_recovery_version).toBe(12);
+    expect(request.expected_urans_recovery_version).toBe(13);
     expect({
       uransQualityRecovery: true,
       uransRecoveryVersion: plan.recoveryVersion,
-    }).toEqual({ uransQualityRecovery: true, uransRecoveryVersion: 12 });
+    }).toEqual({ uransQualityRecovery: true, uransRecoveryVersion: 13 });
   });
 });

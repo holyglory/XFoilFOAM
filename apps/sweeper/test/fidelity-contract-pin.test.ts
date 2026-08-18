@@ -31,7 +31,10 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildPolarRequest } from "../src/build-request";
+import {
+  buildPolarRequest,
+  REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+} from "../src/build-request";
 import {
   fidelityForPoint,
   incomingRejectionReasons,
@@ -173,6 +176,9 @@ describe("build-request: solver.urans_fidelity (contract 1 — node sends ONLY t
     });
     expect(request.solver?.urans_fidelity).toBe("precalc");
     expect(request.solver?.force_transient).toBe(true);
+    expect(request.expected_urans_recovery_version).toBe(
+      REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+    );
     // The node must NOT ship derived values — the engine owns the derivation.
     expect(request.solver).not.toHaveProperty("urans_min_periods");
     expect(request.mesh).not.toHaveProperty("mesh_scale");
@@ -187,6 +193,9 @@ describe("build-request: solver.urans_fidelity (contract 1 — node sends ONLY t
       uransFidelity: "full",
     });
     expect(request.solver?.urans_fidelity).toBe("full");
+    expect(request.expected_urans_recovery_version).toBe(
+      REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+    );
   });
 
   it("wave 1 (steady) never carries a urans_fidelity", () => {
@@ -198,6 +207,7 @@ describe("build-request: solver.urans_fidelity (contract 1 — node sends ONLY t
       uransFidelity: "full",
     });
     expect(request.solver).not.toHaveProperty("urans_fidelity");
+    expect(request.expected_urans_recovery_version).toBeUndefined();
   });
 });
 

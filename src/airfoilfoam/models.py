@@ -1099,6 +1099,117 @@ class NoSheddingCertificate(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# APERIODIC STATISTICAL-MEAN URANS CERTIFICATE (reducer v1)
+# --------------------------------------------------------------------------- #
+APERIODIC_MEAN_CERTIFICATE_VERSION = "aperiodic-mean-v1"
+
+
+class AperiodicMeanChannelCertificate(BaseModel):
+    mean: float
+    standard_deviation: float = Field(ge=0)
+    scale: float = Field(gt=0)
+    ci95_half_width: float = Field(ge=0)
+    ci95_fraction: float = Field(ge=0)
+    trend_fraction: float = Field(ge=0)
+    half_drift_fraction: float = Field(ge=0)
+    block_range_fraction: float = Field(ge=0)
+    effective_blocks: float = Field(ge=1)
+    amplitude_growth: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _finite_values(self) -> "AperiodicMeanChannelCertificate":
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.mean,
+                self.standard_deviation,
+                self.scale,
+                self.ci95_half_width,
+                self.ci95_fraction,
+                self.trend_fraction,
+                self.half_drift_fraction,
+                self.block_range_fraction,
+                self.effective_blocks,
+                self.amplitude_growth,
+            )
+        ):
+            raise ValueError("aperiodic mean channel values must be finite")
+        return self
+
+
+class AperiodicMeanThresholds(BaseModel):
+    minimum_source_samples: int = Field(ge=1)
+    minimum_field_frames: int = Field(ge=1)
+    minimum_convective_times: float = Field(gt=0)
+    minimum_periodicity_cycles: int = Field(ge=3)
+    minimum_nonrepeatable_fraction: float = Field(gt=0, le=1)
+    maximum_source_gap_fraction: float = Field(gt=0, lt=1)
+    block_count: int = Field(ge=4)
+    minimum_effective_blocks: float = Field(ge=1)
+    maximum_ci95_fraction: float = Field(gt=0)
+    maximum_trend_fraction: float = Field(gt=0)
+    maximum_half_drift_fraction: float = Field(gt=0)
+    maximum_amplitude_growth: float = Field(gt=1)
+    cm_tolerance_multiplier: float = Field(ge=1)
+
+
+class AperiodicMeanPeriodicityAssessment(BaseModel):
+    candidate_period_s: float = Field(gt=0)
+    structurally_valid_cycles: int = Field(ge=1)
+    nonrepeatable_cycles: int = Field(ge=1)
+    nonrepeatable_fraction: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def _validate_assessment(self) -> "AperiodicMeanPeriodicityAssessment":
+        if not math.isfinite(self.candidate_period_s):
+            raise ValueError("aperiodic periodicity candidate period must be finite")
+        if self.nonrepeatable_cycles > self.structurally_valid_cycles:
+            raise ValueError("nonrepeatable cycles exceed structurally valid cycles")
+        expected = self.nonrepeatable_cycles / self.structurally_valid_cycles
+        if abs(expected - self.nonrepeatable_fraction) > 1e-12:
+            raise ValueError("aperiodic periodicity fraction is inconsistent")
+        return self
+
+
+class AperiodicMeanCertificate(BaseModel):
+    """Immutable evidence that an unsteady, non-periodic mean is stationary."""
+
+    reducer_version: Literal[APERIODIC_MEAN_CERTIFICATE_VERSION]
+    certified: Literal[True]
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_sample_count: int = Field(ge=1)
+    resampled_sample_count: int = Field(ge=1)
+    field_frame_count: int = Field(ge=1)
+    observation_start_time: float = Field(ge=0)
+    observation_end_time: float = Field(gt=0)
+    observed_duration_s: float = Field(gt=0)
+    convective_times: float = Field(gt=0)
+    thresholds: AperiodicMeanThresholds
+    periodicity: AperiodicMeanPeriodicityAssessment
+    cl: AperiodicMeanChannelCertificate
+    cd: AperiodicMeanChannelCertificate
+    cm: AperiodicMeanChannelCertificate
+
+    @model_validator(mode="after")
+    def _validate_certificate(self) -> "AperiodicMeanCertificate":
+        scalar_values = (
+            self.observation_start_time,
+            self.observation_end_time,
+            self.observed_duration_s,
+            self.convective_times,
+        )
+        if not all(math.isfinite(value) for value in scalar_values):
+            raise ValueError("aperiodic mean certificate values must be finite")
+        if self.observation_end_time <= self.observation_start_time:
+            raise ValueError("aperiodic mean observation window is reversed")
+        span = self.observation_end_time - self.observation_start_time
+        tolerance = 1e-10 * max(1.0, abs(span), abs(self.observed_duration_s))
+        if abs(span - self.observed_duration_s) > tolerance:
+            raise ValueError("aperiodic mean duration does not match its time window")
+        return self
+
+
+# --------------------------------------------------------------------------- #
 # RANS ALL-CHANNEL HOLD CERTIFICATE (reducer v1)
 # --------------------------------------------------------------------------- #
 #
@@ -1301,6 +1412,11 @@ class PolarPoint(BaseModel):
         default=None,
         description="Versioned clean-cycle certification beside the frozen frame_track contract. "
         "Present for new shedding URANS evidence; null for steady/no-shedding or legacy evidence.",
+    )
+    aperiodic_mean_certificate: Optional[AperiodicMeanCertificate] = Field(
+        default=None,
+        description="Versioned proof for a statistically stationary, explicitly non-periodic "
+        "URANS mean. Null means the current producer did not certify this path.",
     )
     no_shedding_certificate: Optional[NoSheddingCertificate] = Field(
         default=None,

@@ -20,6 +20,7 @@ import {
   admissionCpuSlotsForRequest,
   buildPolarRequest,
   pinAdmissionCpuSlotsForRequest,
+  REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
 } from "../src/build-request";
 
 const airfoil = {
@@ -169,6 +170,9 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
     expect(request.solver?.force_transient).toBe(true);
     expect(request.solver?.rans_failure_policy).toBe("continue");
     expect(request.solver?.urans_fidelity).toBe("precalc");
+    expect(request.expected_urans_recovery_version).toBe(
+      REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+    );
   });
 });
 

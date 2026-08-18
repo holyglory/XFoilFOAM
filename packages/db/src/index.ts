@@ -14,6 +14,7 @@ export * from "./review-verdicts";
 export * from "./job-lifecycle";
 export * from "./media-repair";
 export * from "./precalc-obligations";
+export * from "./precalc-contract-remediation";
 export * from "./solver-incidents";
 export * from "./rans-polar-promotions";
 export * from "./precalc-cell-lock";

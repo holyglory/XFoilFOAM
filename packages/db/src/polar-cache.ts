@@ -147,6 +147,8 @@ function toEvidence(row: {
   uransCycleCertificatePresent?: boolean;
   noSheddingCertificate?: unknown;
   noSheddingCertificatePresent?: boolean;
+  aperiodicMeanCertificate?: unknown;
+  aperiodicMeanCertificatePresent?: boolean;
   ransHoldCertificate?: unknown;
   ransHoldCertificatePresent?: boolean;
   selectedArchiveInterpretationCurrent?: boolean;
@@ -205,6 +207,9 @@ function toEvidence(row: {
       : undefined,
     noSheddingCertificate: row.noSheddingCertificatePresent
       ? row.noSheddingCertificate
+      : undefined,
+    aperiodicMeanCertificate: row.aperiodicMeanCertificatePresent
+      ? row.aperiodicMeanCertificate
       : undefined,
     // RANS hold proof uses the same three-way distinction: absent is legacy;
     // explicit JSON null is a current engine's deliberate lack of proof and
@@ -410,6 +415,20 @@ async function loadResultEvidence(
         )
         ELSE NULL
       END`,
+      aperiodicMeanCertificatePresent: sql<boolean>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN (
+          ${resultAttempts.evidencePayload} ? 'aperiodic_mean_certificate'
+          OR ${resultAttempts.evidencePayload} ? 'aperiodicMeanCertificate'
+        )
+        ELSE FALSE
+      END`,
+      aperiodicMeanCertificate: sql<unknown>`CASE
+        WHEN ${results.currentResultAttemptId} IS NOT NULL THEN COALESCE(
+          ${resultAttempts.evidencePayload} -> 'aperiodic_mean_certificate',
+          ${resultAttempts.evidencePayload} -> 'aperiodicMeanCertificate'
+        )
+        ELSE NULL
+      END`,
       ransHoldCertificatePresent: sql<boolean>`CASE
         WHEN ${results.currentResultAttemptId} IS NOT NULL THEN (
           ${resultAttempts.evidencePayload} ? 'rans_hold_certificate'
@@ -572,6 +591,14 @@ async function loadAttemptEvidence(
       noSheddingCertificate: sql<unknown>`COALESCE(
         "result_attempts"."evidence_payload" -> 'no_shedding_certificate',
         "result_attempts"."evidence_payload" -> 'noSheddingCertificate'
+      )`,
+      aperiodicMeanCertificatePresent: sql<boolean>`(
+        "result_attempts"."evidence_payload" ? 'aperiodic_mean_certificate'
+        OR "result_attempts"."evidence_payload" ? 'aperiodicMeanCertificate'
+      )`,
+      aperiodicMeanCertificate: sql<unknown>`COALESCE(
+        "result_attempts"."evidence_payload" -> 'aperiodic_mean_certificate',
+        "result_attempts"."evidence_payload" -> 'aperiodicMeanCertificate'
       )`,
       ransHoldCertificatePresent: sql<boolean>`(
         "result_attempts"."evidence_payload" ? 'rans_hold_certificate'

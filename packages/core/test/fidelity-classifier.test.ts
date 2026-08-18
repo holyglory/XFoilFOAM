@@ -106,7 +106,7 @@ const oscillatingSteadyRow: PolarEvidencePoint = {
 
 describe("fidelity-aware frame-track period bar (v6)", () => {
   it("pins the version stamp and the per-tier bars", () => {
-    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v7");
+    expect(POLAR_CLASSIFIER_VERSION).toBe("fidelity-ladder-v8");
     expect(FRAME_TRACK_MIN_PERIODS_PRECALC).toBe(3);
     expect(FRAME_TRACK_MIN_PERIODS_FULL).toBe(5);
     expect(FRAME_TRACK_MIN_PERIODS).toBe(FRAME_TRACK_MIN_PERIODS_FULL);

@@ -100,7 +100,7 @@ export function campaignInstrumentStatus(
       const fidelity = scheduler.lastAdmissionFenceDetails?.fidelity;
       const title =
         stage === "preliminary" || fidelity === "precalc"
-          ? "Fast URANS retries exhausted"
+          ? "Fast URANS evidence unavailable"
           : stage === "final" || fidelity === "full"
             ? "Final URANS retries exhausted"
             : "Solver retries exhausted";
@@ -590,7 +590,7 @@ export function campaignStatusLine(
         const fidelity = scheduler.lastAdmissionFenceDetails?.fidelity;
         const subject =
           stage === "preliminary" || fidelity === "precalc"
-            ? "fast URANS retries exhausted"
+            ? "fast URANS evidence unavailable"
             : stage === "final" || fidelity === "full"
               ? "final URANS retries exhausted"
               : "solver retries exhausted";

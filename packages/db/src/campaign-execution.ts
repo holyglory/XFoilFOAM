@@ -940,7 +940,11 @@ const PRECALC_BLOCKED_EXHAUSTED_SQL = sql`(
     'cancelled_exhausted',
     'continuation_permanent_failure',
     'continuation_no_progress_exhausted',
-    'continuation_segment_exhausted'
+    'continuation_segment_exhausted',
+    'observation_continuation_exhausted',
+    'aperiodic_contract_retry_exhausted',
+    'numerical_recovery_exhausted',
+    'fresh_physical_retry_exhausted'
   )
 )`;
 

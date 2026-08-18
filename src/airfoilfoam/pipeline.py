@@ -50,6 +50,7 @@ from .evidence_store import (
 )
 from .meshing.base import Mesher, MeshResult, get_mesher
 from .models import (
+    AperiodicMeanCertificate,
     FRAME_IMAGE_ARTIFACT_KIND,
     PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     CaseSpec,
@@ -121,6 +122,7 @@ from .postprocess.images import (
     render_mean_contours,
     select_vtus,
 )
+from .postprocess.aperiodic import reduce_aperiodic_mean
 from .postprocess.residuals import parse_convergence
 from .postprocess.unsteady import (
     CLEAN_CYCLE_CERTIFICATION_VERSION,
@@ -210,6 +212,9 @@ class CaseOutcome:
     #: transport. Emitted for every new shedding URANS attempt, including a
     #: non-certified attempt which must be continued rather than published.
     urans_cycle_certificate: Optional[UransCycleCertificate] = None
+    #: Versioned statistically stationary mean for explicitly non-periodic
+    #: preliminary URANS. It never claims phase-repeatable shedding.
+    aperiodic_mean_certificate: Optional[AperiodicMeanCertificate] = None
     #: Versioned physical-observation proof for a URANS result whose wake is
     #: genuinely steady.  This is intentionally separate from the periodic
     #: clean-cycle certificate: no-shedding has no meaningful period, but it
@@ -1800,6 +1805,11 @@ class UransQuality:
     #: Versioned per-cycle evidence audit.  It remains a runtime object here;
     #: finalization serializes it beside the immutable force/field artifacts.
     clean_cycle_audit: Optional[CleanCycleAudit] = None
+    #: Successful non-periodic mean proof, or typed reducer diagnostics while
+    #: the same physical case may still collect useful evidence.
+    aperiodic_mean_certificate: Optional[AperiodicMeanCertificate] = None
+    aperiodic_reasons: tuple[str, ...] = ()
+    aperiodic_additional_convective_times: Optional[float] = None
 
 
 @dataclass
@@ -4524,6 +4534,153 @@ def _grade_precalc_established_oscillation(
     )
 
 
+APERIODIC_MEAN_RECOVERY_MARKER = "aperiodic-mean-v1"
+
+
+def _aperiodic_periodicity_assessment(
+    audit: Optional[CleanCycleAudit],
+) -> tuple[Optional[float], int, int, bool]:
+    """Prove that a candidate period was observed but did not repeat cleanly."""
+
+    if audit is None:
+        return None, 0, 0, False
+    numerical_markers = (
+        "high-frequency",
+        "impulsive",
+        "non-finite",
+    )
+    contaminated = any(
+        any(marker in reason.lower() for marker in numerical_markers)
+        for cycle in audit.cycles
+        for reason in cycle.hard_reasons
+    )
+    structurally_valid = [cycle for cycle in audit.cycles if not cycle.hard_reasons]
+    nonrepeatable = [cycle for cycle in structurally_valid if cycle.soft_reasons]
+    return (
+        audit.period_s,
+        len(structurally_valid),
+        len(nonrepeatable),
+        contaminated,
+    )
+
+
+def _grade_precalc_aperiodic_mean(
+    case_dir: Path,
+    coeff_paths: list[Path],
+    spec: CaseSpec,
+    solver_params: SolverParams,
+    quality: UransQuality,
+    *,
+    early_stopped: bool,
+) -> UransQuality:
+    """Certify a non-periodic FAST mean or retain typed continuation reasons."""
+
+    if (
+        solver_params.urans_fidelity != UransFidelity.precalc
+        or quality.ok
+        or quality.no_shedding
+        or not coeff_paths
+    ):
+        return quality
+    try:
+        t_all, cl_all, cd_all, cm_all = coefficient_series(coeff_paths)
+        if early_stopped:
+            t, cl, cd, cm = _early_stop_retained_series(
+                case_dir,
+                t_all,
+                cl_all,
+                cd_all,
+                cm_all,
+            )
+        else:
+            t, cl, cd, cm = discard_startup(
+                t_all,
+                cl_all,
+                cd_all,
+                cm_all,
+                fraction=solver_params.transient_discard_fraction,
+            )
+        frame_count = _field_frame_count(case_dir, float(t[0]), float(t[-1]))
+        (
+            candidate_period_s,
+            periodicity_cycles_observed,
+            periodicity_nonrepeatable_cycles,
+            periodicity_contaminated,
+        ) = _aperiodic_periodicity_assessment(quality.clean_cycle_audit)
+        reduction = reduce_aperiodic_mean(
+            t=t,
+            cl=cl,
+            cd=cd,
+            cm=cm,
+            speed=spec.speed,
+            chord=spec.chord,
+            field_frame_count=frame_count,
+            prior_diagnostic=quality.reason,
+            candidate_period_s=candidate_period_s,
+            periodicity_cycles_observed=periodicity_cycles_observed,
+            periodicity_nonrepeatable_cycles=periodicity_nonrepeatable_cycles,
+            periodicity_contaminated=periodicity_contaminated,
+        )
+    except Exception as exc:  # noqa: BLE001 - retain periodic failure evidence
+        logger.warning(
+            "aperiodic mean grading failed for %s",
+            case_dir,
+            exc_info=True,
+        )
+        return _quality_with(
+            quality,
+            aperiodic_reasons=("reducer-error",),
+            aperiodic_additional_convective_times=None,
+            reason=(
+                f"{quality.reason}; {APERIODIC_MEAN_RECOVERY_MARKER} reducer "
+                f"error ({type(exc).__name__})"
+            ),
+        )
+
+    if reduction.certificate is not None:
+        certificate = reduction.certificate
+        return _quality_with(
+            quality,
+            ok=True,
+            can_refine=False,
+            reason=(
+                "URANS aperiodic statistical-mean target met; phase-periodic "
+                "clean-cycle certification was not claimed"
+            ),
+            retained_frame_count=certificate.field_frame_count,
+            retained_start_time=certificate.observation_start_time,
+            retained_end_time=certificate.observation_end_time,
+            aperiodic_mean_certificate=certificate,
+            aperiodic_reasons=(),
+            aperiodic_additional_convective_times=0.0,
+        )
+
+    fatal_reasons = {
+        "invalid-input-shape",
+        "mismatched-channel-lengths",
+        "non-finite-evidence",
+        "non-monotonic-time",
+        "invalid-speed",
+        "invalid-chord",
+        "non-positive-instantaneous-drag",
+        "non-physical-coefficients",
+        "invalid-nonrepeatable-cycle-count",
+        "periodicity-assessment-contaminated",
+        "reducer-error",
+    }
+    can_refine = not any(reason in fatal_reasons for reason in reduction.reasons)
+    detail = ",".join(reduction.reasons) if reduction.reasons else "uncertified"
+    return _quality_with(
+        quality,
+        can_refine=quality.can_refine or can_refine,
+        reason=f"{quality.reason}; {APERIODIC_MEAN_RECOVERY_MARKER}: {detail}",
+        aperiodic_reasons=reduction.reasons,
+        aperiodic_additional_convective_times=(
+            reduction.additional_convective_times
+        ),
+    )
+
+
 def _full_strict_stationarity_reason(
     stats: PeriodWindowStats,
     drift_tolerance: float,
@@ -5423,6 +5580,14 @@ def _run_transient_attempt(
         quality,
         early_stopped=bool(early_stop),
     )
+    quality = _grade_precalc_aperiodic_mean(
+        tcase,
+        list(coeff_paths),
+        spec,
+        solver_params,
+        quality,
+        early_stopped=bool(early_stop),
+    )
     quality = _grade_full_strict_stationarity(
         tcase,
         list(coeff_paths),
@@ -5446,6 +5611,11 @@ def _run_transient_attempt(
             retained_start_time=quality.retained_start_time,
             retained_end_time=quality.retained_end_time,
             clean_cycle_audit=quality.clean_cycle_audit,
+            aperiodic_mean_certificate=quality.aperiodic_mean_certificate,
+            aperiodic_reasons=quality.aperiodic_reasons,
+            aperiodic_additional_convective_times=(
+                quality.aperiodic_additional_convective_times
+            ),
         )
     if timed_out:
         # Honest partial grade: the requested span was NOT simulated, so the
@@ -5480,6 +5650,11 @@ def _run_transient_attempt(
             retained_end_time=quality.retained_end_time,
             no_shedding=quality.no_shedding,
             clean_cycle_audit=quality.clean_cycle_audit,
+            aperiodic_mean_certificate=quality.aperiodic_mean_certificate,
+            aperiodic_reasons=quality.aperiodic_reasons,
+            aperiodic_additional_convective_times=(
+                quality.aperiodic_additional_convective_times
+            ),
         )
     return TransientResult(
         avg=avg,
@@ -5560,6 +5735,11 @@ def _quality_with(quality: UransQuality, **updates) -> UransQuality:
         retained_end_time=quality.retained_end_time,
         no_shedding=quality.no_shedding,
         clean_cycle_audit=quality.clean_cycle_audit,
+        aperiodic_mean_certificate=quality.aperiodic_mean_certificate,
+        aperiodic_reasons=quality.aperiodic_reasons,
+        aperiodic_additional_convective_times=(
+            quality.aperiodic_additional_convective_times
+        ),
     )
     base.update(updates)
     return UransQuality(**base)
@@ -5568,6 +5748,8 @@ def _quality_with(quality: UransQuality, **updates) -> UransQuality:
 def _quality_allows_more_integration(quality: UransQuality, target_cycles: float) -> bool:
     if quality.ok or quality.no_shedding:
         return False
+    if quality.can_refine and quality.aperiodic_reasons:
+        return True
     period = quality.measured_period_s
     if period is None or not math.isfinite(period) or period <= 0:
         return False
@@ -7296,6 +7478,10 @@ def _finalize_outcome(
                 outcome.urans_cycle_certificate = _evidence_backed_cycle_certificate(
                     transient.quality.clean_cycle_audit
                 )
+            outcome.aperiodic_mean_certificate = (
+                transient.quality.aperiodic_mean_certificate
+            )
+            aperiodic_certified = outcome.aperiodic_mean_certificate is not None
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)
                 if urans_rejection is None:
@@ -7327,7 +7513,7 @@ def _finalize_outcome(
                             clean_audit
                         )
                     if clean_tail is None:
-                        if strict_cycle_evidence:
+                        if strict_cycle_evidence and not aperiodic_certified:
                             certification_warning = (
                                 "URANS clean-cycle certification window unavailable "
                                 "during finalization"
@@ -7370,7 +7556,7 @@ def _finalize_outcome(
                                 f"during finalization: {exc.detail}"
                             )
                             outcome.quality_warnings.append(certification_warning)
-                            if transient.quality.ok:
+                            if transient.quality.ok and not aperiodic_certified:
                                 # Live acceptance and finalization read the same
                                 # immutable coefficient bytes.  If the exact
                                 # certified view can no longer be reproduced,
@@ -7489,8 +7675,25 @@ def _finalize_outcome(
                         f"cycle means scatter ±{stationarity_stats.cycle_mean_std:.3g} over "
                         f"{stationarity_stats.whole_periods} cycles (precalc)"
                     )
+            if outcome.aperiodic_mean_certificate is not None:
+                certificate = outcome.aperiodic_mean_certificate
+                outcome.cl = certificate.cl.mean
+                outcome.cd = certificate.cd.mean
+                outcome.cm = certificate.cm.mean
+                outcome.cl_cd = (
+                    certificate.cl.mean / certificate.cd.mean
+                    if certificate.cd.mean
+                    else None
+                )
+                outcome.cl_std = certificate.cl.standard_deviation
+                outcome.cd_std = certificate.cd.standard_deviation
+                outcome.cm_std = certificate.cm.standard_deviation
+                outcome.quality_warnings.append(
+                    "aperiodic statistical mean certified; no phase-periodic "
+                    "clean-cycle claim"
+                )
             if not transient.quality.no_shedding and urans_rejection is None:
-                if frame_stats is None:
+                if frame_stats is None and not aperiodic_certified:
                     urans_rejection = HardSolverError(
                         "URANS evidence rejected: no integer-period frame track "
                         "could be measured from the retained force history"

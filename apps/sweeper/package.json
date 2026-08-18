@@ -17,6 +17,8 @@
     "canary-evidence-ownership": "tsx src/canary-evidence-ownership-cli.ts",
     "successor:admit-once": "tsx src/successor-continuation-once-cli.ts",
     "urans-canary:admit-once": "tsx src/three-stage-urans-canary-once-cli.ts",
+    "precalc-failures:export": "tsx src/precalc-failure-evaluation-export.ts",
+    "precalc-failures:remediate": "tsx src/precalc-failure-remediation-cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "verify:queue": "tsx src/verify-queue.ts"

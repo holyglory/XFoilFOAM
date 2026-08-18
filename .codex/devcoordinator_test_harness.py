@@ -156,14 +156,111 @@ def _node_suite() -> int:
     return result
 
 
+def _urans_recovery_regression() -> int:
+    install = _run(
+        "node-dependencies",
+        "locked Node dependencies",
+        ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile"],
+    )
+    if install != 0:
+        return install
+    commands = [
+        (
+            "core-urans-recovery",
+            "aperiodic certificate and typed recovery policy",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/core",
+                "exec",
+                "vitest",
+                "run",
+                "test/aperiodic-mean-certificate.test.ts",
+                "test/aperiodic-mean-classifier.test.ts",
+                "test/precalc-recovery-policy.test.ts",
+            ],
+        ),
+        (
+            "db-precalc-contract-remediation",
+            "exact PRECALC contract remediation ownership",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/db",
+                "exec",
+                "vitest",
+                "run",
+                "test/precalc-contract-remediation.test.ts",
+            ],
+        ),
+        (
+            "sweeper-urans-recovery",
+            "sweeper URANS v13 payload and ladder recovery",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/sweeper",
+                "exec",
+                "vitest",
+                "run",
+                "test/build-request-transient-pin.test.ts",
+                "test/fidelity-contract-pin.test.ts",
+                "test/urans-quality-recovery.test.ts",
+                "test/urans-ladder.test.ts",
+            ],
+        ),
+        (
+            "api-solver-work-recovery-copy",
+            "typed solver-work recovery presentation",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/api",
+                "exec",
+                "vitest",
+                "run",
+                "test/solver-work.test.ts",
+            ],
+        ),
+        (
+            "web-solver-recovery-copy",
+            "typed campaign and solver recovery copy",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/web",
+                "exec",
+                "vitest",
+                "run",
+                "test/solver-state.test.ts",
+                "test/campaign-status-line.test.ts",
+            ],
+        ),
+    ]
+    result = 0
+    for case_id, name, argv in commands:
+        result = max(result, _run(case_id, name, argv))
+    return result
+
+
 def main() -> int:
     _events_path().unlink(missing_ok=True)
     if len(sys.argv) != 2:
-        raise SystemExit("usage: devcoordinator_test_harness.py python-suite|node-suite")
+        raise SystemExit(
+            "usage: devcoordinator_test_harness.py "
+            "python-suite|node-suite|urans-recovery-regression"
+        )
     if sys.argv[1] == "python-suite":
         return _python_suite()
     if sys.argv[1] == "node-suite":
         return _node_suite()
+    if sys.argv[1] == "urans-recovery-regression":
+        return _urans_recovery_regression()
     raise SystemExit(f"unknown suite: {sys.argv[1]}")
 
 

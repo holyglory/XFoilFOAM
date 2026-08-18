@@ -1,5 +1,24 @@
 # Completion Ledger
 
+- **FAST-URANS v13 quality and typed recovery rollout:** The separate
+  aperiodic statistical-mean certificate, exact coefficient binding, v13
+  engine/controller pin, evidence-driven recovery types, non-publishing
+  evaluator, exact source-pinned remediation command, and typed operator copy
+  are implemented. Automatic archive audit/discovery and audit-to-recovery
+  routing are removed from normal sweeper startup/admission. Focused Python
+  and core tests pass; the governed Node suite (workspace typechecks, web
+  tests, and production build) passes. DB-backed recovery regressions are
+  authored but remain unexecuted because DevCoordinator cannot start its
+  declared `aerodb-pg` dependency (`repository_adoption_store_failed`: the
+  authority adoption store is read-only; bug
+  `bug-218972fac15b4b2f93d01be60333caef`). Remaining work: run those DB/sweeper
+  regressions after the coordinator dependency is available, commit/push main,
+  make a verified production backup, deploy v13 through the guarded engine
+  rebuild scripts, run the read-only evaluator across both solver databases,
+  requeue every exact failed cell, measure accepted points and CPU-hours, and
+  delete only failed generations proven replaced by exact accepted immutable
+  URANS evidence.
+
 - **Solver capacity packing and tick-progress recovery:** Live production on
   2026-08-17 proved the hub had four real progressing 1-slot OpenFOAM jobs but
   rejected every next 8-slot batch as `4+8/8`; hz-solver2 was progressing near

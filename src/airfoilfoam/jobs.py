@@ -117,6 +117,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
         force_history=history,
         frame_track=outcome.frame_track,
         urans_cycle_certificate=outcome.urans_cycle_certificate,
+        aperiodic_mean_certificate=outcome.aperiodic_mean_certificate,
         no_shedding_certificate=outcome.no_shedding_certificate,
         rans_hold_certificate=outcome.rans_hold_certificate,
         fidelity=outcome.fidelity,

@@ -88,12 +88,12 @@ function admissionFenceHeadline(input: SolverStateInput): string {
   const fidelity = input.lastAdmissionFenceDetails?.fidelity;
   switch (input.lastAdmissionFenceReason) {
     case "blocked_preliminary_urans":
-      return "Safety stop — fast URANS exhausted.";
+      return "Safety stop — fast URANS evidence unavailable.";
     case "blocked_final_urans":
       return "Safety stop — final URANS exhausted.";
     case "blocked_urans_request":
       if (fidelity === "precalc")
-        return "Safety stop — fast URANS request exhausted.";
+        return "Safety stop — fast URANS request unavailable.";
       if (fidelity === "full")
         return "Safety stop — final URANS request exhausted.";
       return "Safety stop — URANS recovery exhausted.";
@@ -101,7 +101,7 @@ function admissionFenceHeadline(input: SolverStateInput): string {
       return "Safety stop — campaign recovery exhausted.";
     case "critical_solver_incident":
       if (stage === "preliminary")
-        return "Safety stop — fast URANS recovery exhausted.";
+        return "Safety stop — fast URANS system fault.";
       if (stage === "final")
         return "Safety stop — final URANS recovery exhausted.";
       return "Safety stop — solver recovery exhausted.";

@@ -2200,9 +2200,8 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     } as unknown as EngineClient;
     const submitted = await uransLadderTick(db, engine, 0, {
       ...(await ladderScope()),
-      // A known version-1 engine remains eligible for ordinary first-pass
-      // PRECALC work. Only continuation/corrective recovery requires v2.
-      uransRecoveryVersion: 1,
+      // Every new PRECALC generation is pinned to the v13 evidence contract.
+      uransRecoveryVersion: 13,
     });
     expect(submitted).toBe(true);
     expect(captured.length).toBe(1);
@@ -2221,7 +2220,7 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       urans_fidelity: "precalc",
     });
     expect(captured[0].expected_mesh_recovery_version).toBe(0);
-    expect(captured[0].expected_urans_recovery_version).toBeUndefined();
+    expect(captured[0].expected_urans_recovery_version).toBe(13);
     expect(captured[0].aoa?.angles).toEqual([REJECTED_AOA]);
     expect(captured[0].speeds).toEqual([SPEED]);
     // The node NEVER downscales the mesh: the composed request carries the
@@ -3733,13 +3732,13 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: null,
-            uransRecoveryVersion: 2,
+            uransRecoveryVersion: 13,
           },
         ),
       ).toBe(true);
       expect(captured).toHaveLength(1);
       expect(captured[0].continue_from).toBeUndefined();
-      expect(captured[0].expected_urans_recovery_version).toBe(2);
+      expect(captured[0].expected_urans_recovery_version).toBe(13);
       const [running] = await db
         .select()
         .from(simUransVerifyQueue)
@@ -3758,7 +3757,7 @@ describe("final/full URANS automatic recovery", () => {
       expect(submittedJob.requestPayload).toMatchObject({
         verifyQueueItemId: queue.id,
         finalRecoveryMode: "fresh",
-        uransRecoveryVersion: 2,
+        uransRecoveryVersion: 13,
       });
     } finally {
       await db
@@ -3976,7 +3975,7 @@ describe("final/full URANS automatic recovery", () => {
             requestIds: [],
             verifyIds: [queue.id],
             meshRecoveryVersion: null,
-            uransRecoveryVersion: 2,
+            uransRecoveryVersion: 13,
           },
         ),
       ).toBe(true);
@@ -3986,7 +3985,7 @@ describe("final/full URANS automatic recovery", () => {
         case_slug: "aoa_63.88",
       });
       expect(captured[0].budget_override_s).toBe(21_600);
-      expect(captured[0].expected_urans_recovery_version).toBe(2);
+      expect(captured[0].expected_urans_recovery_version).toBe(13);
       const [claimed] = await db
         .select()
         .from(simUransVerifyQueue)
@@ -4007,7 +4006,7 @@ describe("final/full URANS automatic recovery", () => {
         finalRecoveryMode: "continuation",
         continueFromResultAttemptId: sourceAttempt.id,
         budgetOverrideS: 21_600,
-        uransRecoveryVersion: 2,
+        uransRecoveryVersion: 13,
       });
     } finally {
       await db
@@ -5251,14 +5250,14 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
           requestIds: [request.id],
           verifyIds: [],
           meshRecoveryVersion: 0,
-          uransRecoveryVersion: 2,
+          uransRecoveryVersion: 13,
         }),
       ).toBe(true);
       expect(captured[0].continue_from).toEqual({
         engine_job_id: checkpointJob.engineJobId,
         case_slug: checkpoint.engineCaseSlug,
       });
-      expect(captured[0].expected_urans_recovery_version).toBe(2);
+      expect(captured[0].expected_urans_recovery_version).toBe(13);
 
       const [runningRequest] = await db
         .select()
@@ -5491,7 +5490,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
         parentJobIds: [],
         promotionIds: [],
         meshRecoveryVersion: 2,
-        uransRecoveryVersion: 2,
+        uransRecoveryVersion: 13,
       },
     );
     expect(submitted).toBe(true);
@@ -5504,7 +5503,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
       case_slug: "aoa_12.00",
     });
     expect(captured[0].budget_override_s).toBe(21600);
-    expect(captured[0].expected_urans_recovery_version).toBe(2);
+    expect(captured[0].expected_urans_recovery_version).toBe(13);
     // Still URANS-by-definition (prod job e89be2bb class).
     expect(captured[0].solver).toMatchObject({
       force_transient: true,
@@ -6153,7 +6152,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
             requestIds: [request.id],
             verifyIds: [],
             meshRecoveryVersion: 0,
-            uransRecoveryVersion: 2,
+            uransRecoveryVersion: 13,
           },
         ),
       ).toBe(true);
@@ -6352,7 +6351,7 @@ describe("continuation work items (amendment C): budget-stopped URANS resumes fr
         requestIds: [request.id],
         verifyIds: [],
         meshRecoveryVersion: 0,
-        uransRecoveryVersion: 2,
+        uransRecoveryVersion: 13,
       };
 
       resetUransLadderMemory();

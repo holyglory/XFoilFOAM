@@ -13,6 +13,7 @@ import {
 } from "./urans-quality";
 import { selectedCleanCycleQualityReasons } from "./urans-cycle-policy";
 import { parseNoSheddingCertificate } from "./no-shedding-certificate";
+import { parseAperiodicMeanCertificate } from "./aperiodic-mean-certificate";
 
 // v2: solver-stalled applies only to non-converged STEADY points; unsteady
 // rows are judged on the URANS evidence gate (converged + force history +
@@ -51,7 +52,10 @@ import { parseNoSheddingCertificate } from "./no-shedding-certificate";
 // remains URANS for numerical provenance, but its strict physical observation
 // certificate replaces periodic video/frame/cycle requirements. The shared
 // certificate parser fails closed on malformed or contradictory payloads.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v7";
+// v8 (aperiodic statistical mean): a strict current certificate may replace
+// phase-periodic frame/cycle stationarity, but never solved/media/identity or
+// finite-coefficient gates.
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v8";
 
 /** A derived-media absence, not an aerodynamic verdict. The point remains
  * rejected until real stored video exists, but it belongs to automatic media
@@ -255,6 +259,9 @@ export interface PolarEvidencePoint {
    * did not certify a non-shedding wake, and a strict valid object proves a
    * physical steady-equivalent observation without periodic media. */
   noSheddingCertificate?: unknown;
+  /** Undefined is legacy omission; null means the current producer did not
+   * certify a statistically stationary non-periodic mean. */
+  aperiodicMeanCertificate?: unknown;
   /** Undefined is pre-hold legacy evidence.  Explicit null is a current
    * steady-RANS producer that could not prove its exact raw final window;
    * that is an ordinary targeted URANS handoff, not a terminal result. */
@@ -454,11 +461,40 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
         : parseNoSheddingCertificate(p.noSheddingCertificate);
     const certifiedNoShedding =
       p.unsteady === false && noSheddingParse?.ok === true;
+    const aperiodicParse =
+      p.aperiodicMeanCertificate === undefined ||
+      p.aperiodicMeanCertificate === null
+        ? null
+        : parseAperiodicMeanCertificate(p.aperiodicMeanCertificate);
+    const aperiodicCoefficientsMatch =
+      aperiodicParse?.ok === true &&
+      finite(p.cl) &&
+      finite(p.cd) &&
+      finite(p.cm) &&
+      approximatelyEqual(p.cl, aperiodicParse.value.cl.mean) &&
+      approximatelyEqual(p.cd, aperiodicParse.value.cd.mean) &&
+      approximatelyEqual(p.cm, aperiodicParse.value.cm.mean);
+    const certifiedAperiodic =
+      p.unsteady === true &&
+      p.fidelity === "urans_precalc" &&
+      aperiodicParse?.ok === true &&
+      aperiodicCoefficientsMatch;
     if (
       noSheddingParse != null &&
       (!noSheddingParse.ok || p.unsteady !== false)
     ) {
       reasons.push("invalid-no-shedding-certificate");
+    }
+    if (
+      aperiodicParse != null &&
+      (!aperiodicParse.ok ||
+        p.unsteady !== true ||
+        p.fidelity !== "urans_precalc")
+    ) {
+      reasons.push("invalid-aperiodic-mean-certificate");
+    }
+    if (aperiodicParse?.ok === true && !aperiodicCoefficientsMatch) {
+      reasons.push("aperiodic-mean-coefficient-mismatch");
     }
     // A current accepted archive interpretation is a fresh raw-evidence
     // reduction, not a reinterpretation of the attempt's old summary
@@ -470,11 +506,19 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     if (
       !archiveBacked &&
       !certifiedNoShedding &&
+      !certifiedAperiodic &&
       hasIncompleteUransIntegrationWarning(p.qualityWarnings)
     ) {
       reasons.push(INCOMPLETE_URANS_INTEGRATION_REASON);
     }
-    if (!archiveBacked && !certifiedNoShedding && !p.hasForceHistory)
+    if (
+      !archiveBacked &&
+      !certifiedNoShedding &&
+      !certifiedAperiodic &&
+      !p.hasForceHistory
+    )
+      reasons.push("missing-force-history");
+    if (certifiedAperiodic && !p.hasForceHistory)
       reasons.push("missing-force-history");
     // A selected steady-equivalent archive proves that the transient wake is
     // physically non-shedding. It owns stored static fields, not a fabricated
@@ -494,6 +538,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     if (
       !archiveBacked &&
       !certifiedNoShedding &&
+      !certifiedAperiodic &&
       p.frameTrack !== null &&
       p.frameTrack !== undefined
     ) {
@@ -520,6 +565,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     if (
       !archiveBacked &&
       !certifiedNoShedding &&
+      !certifiedAperiodic &&
       p.uransCycleCertificate !== undefined
     ) {
       const certificate = p.uransCycleCertificate;

@@ -1199,6 +1199,10 @@ export function incomingPointEvidence(
       p.urans_cycle_certificate === undefined
         ? undefined
         : (p.urans_cycle_certificate as PolarEvidencePoint["uransCycleCertificate"]),
+    aperiodicMeanCertificate:
+      p.aperiodic_mean_certificate === undefined
+        ? undefined
+        : p.aperiodic_mean_certificate,
     // A physically non-shedding URANS point retains URANS provenance while
     // carrying this independent steady-equivalent proof.  Preserve absent vs
     // explicit null so the shared classifier can fail closed on current

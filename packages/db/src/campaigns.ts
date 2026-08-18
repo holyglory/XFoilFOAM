@@ -6522,12 +6522,16 @@ export async function campaignPreliminaryOutcomes(
       // A mutable obligation flag alone cannot invent a publishable fast
       // result. Exact accepted/superseded attempt evidence is mandatory.
       outcome = "evidence_unavailable";
-    } else if (row.last_outcome === "rejected_exhausted") {
+    } else if (
+      row.last_outcome === "rejected_exhausted" ||
+      row.last_outcome === "aperiodic_contract_retry_exhausted"
+    ) {
       outcome = "evidence_unavailable";
     } else if (
       row.last_outcome === "continuation_permanent_failure" ||
       row.last_outcome === "continuation_no_progress_exhausted" ||
       row.last_outcome === "continuation_segment_exhausted" ||
+      row.last_outcome === "observation_continuation_exhausted" ||
       (row.last_outcome === "failed_exhausted" &&
         Boolean(row.continuation_interrupted))
     ) {

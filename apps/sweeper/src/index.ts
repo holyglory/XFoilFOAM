@@ -8,7 +8,6 @@ import {
 import { startHeartbeatTimer } from "./heartbeat";
 import { runLoop } from "./loop";
 import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
-import { startArchiveInterpretationMaintenanceTimer } from "./result-interpretation-backfill";
 
 const { db, sql, engine } = makeContext();
 try {
@@ -40,14 +39,9 @@ console.log(
 // the loop (lastTickStartedAt/lastTickCompletedAt).
 const stopHeartbeat = startHeartbeatTimer(db);
 const stopRemoteFleetHeartbeat = startRemoteSolverFleetHeartbeatTimer(db);
-const stopArchiveMaintenance = startArchiveInterpretationMaintenanceTimer(
-  db,
-  engine,
-);
 try {
   await runLoop(db, engine, ac.signal);
 } finally {
-  stopArchiveMaintenance();
   stopRemoteFleetHeartbeat();
   stopHeartbeat();
 }

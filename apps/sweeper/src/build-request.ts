@@ -17,6 +17,12 @@ import {
   type UransFidelity,
 } from "@aerodb/engine-client";
 
+/** Engine v13 is the first immutable preliminary-URANS evidence contract that
+ * can publish a separately certified stationary aperiodic statistical mean.
+ * Pin every new wave-2 request so a rolling deployment fails closed instead of
+ * silently producing evidence under the older contract. */
+export const REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION = 13;
+
 export function engineIdentityForSetup(
   setup: SimulationSetupSnapshot,
 ): EngineIdentity {
@@ -114,6 +120,12 @@ export function buildPolarRequest(opts: {
     expected_engine: {
       ...(engineIdentity ?? engineIdentityForSetup(setup)),
     },
+    ...(wave === 2
+      ? {
+          expected_urans_recovery_version:
+            REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+        }
+      : {}),
     airfoil: {
       name: airfoil.name,
       format: airfoil.pointFormat as AirfoilFormat,

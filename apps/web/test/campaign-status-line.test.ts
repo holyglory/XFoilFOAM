@@ -251,7 +251,7 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       }),
     );
     expect(line.gate).toEqual({
-      text: "FAST URANS RETRIES EXHAUSTED — NEW SUBMISSIONS PAUSED",
+      text: "FAST URANS EVIDENCE UNAVAILABLE — NEW SUBMISSIONS PAUSED",
       tone: "red",
     });
     expect(line.text).toMatch(/2 active jobs continue/i);
@@ -267,7 +267,7 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
       }),
     );
     expect(hero).toMatchObject({
-      title: "Fast URANS retries exhausted",
+      title: "Fast URANS evidence unavailable",
       detail: "2 active jobs continue; only new submissions are paused",
       tone: "red",
       action: null,
@@ -283,7 +283,7 @@ describe("campaignStatusLine — composite gate badge (mockup fec7b453 screen 3)
     [
       "fast request",
       { fidelity: "precalc" as const },
-      "Fast URANS retries exhausted",
+      "Fast URANS evidence unavailable",
     ],
     ["generic fallback", null, "Solver retries exhausted"],
   ])("names %s without vague investigation copy", (_name, details, title) => {

@@ -4,6 +4,8 @@ import {
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
   isDeterministicMeshBlockerError,
+  planPrecalcRecovery,
+  precalcRecoveryOutcome,
 } from "@aerodb/core";
 
 import type { DB } from "./client";
@@ -2393,6 +2395,16 @@ export async function settlePrecalcObligationsForJobInTransaction(
         engineCaseSlug: resultAttempts.engineCaseSlug,
         qualityWarnings: resultAttempts.qualityWarnings,
         evidencePayload: resultAttempts.evidencePayload,
+        forceSampleCount: sql<number | null>`CASE
+          WHEN jsonb_typeof(${resultAttempts.evidencePayload} -> 'force_history' -> 't') = 'array'
+          THEN jsonb_array_length(${resultAttempts.evidencePayload} -> 'force_history' -> 't')
+          ELSE NULL
+        END`,
+        fieldFrameCount: sql<number | null>`CASE
+          WHEN jsonb_typeof(${resultAttempts.evidencePayload} -> 'frame_track' -> 'frames') = 'array'
+          THEN jsonb_array_length(${resultAttempts.evidencePayload} -> 'frame_track' -> 'frames')
+          ELSE NULL
+        END`,
         solverImplementationId: resultAttempts.solverImplementationId,
         fidelity: sql<
           string | null
@@ -2628,6 +2640,20 @@ export async function settlePrecalcObligationsForJobInTransaction(
       restartable &&
       continuationNoProgressCount >= MAX_PRECALC_NO_PROGRESS_SEGMENTS,
     );
+    const recoveryPlan = planPrecalcRecovery({
+      status: judged?.status ?? (opts.cancellation ? "cancelled" : "failed"),
+      failureDisposition,
+      classificationReasons: judged?.reasons ?? [],
+      qualityWarnings: judged?.qualityWarnings ?? [],
+      error,
+      hasRestartableEvidence: restartable,
+      forceSampleCount: judged?.forceSampleCount ?? null,
+      fieldFrameCount: judged?.fieldFrameCount ?? null,
+      observationProgress:
+        currentProgress.periodsRetained == null
+          ? null
+          : currentProgress.periodsRetained / 3,
+    });
     // Engine acceptance proves a submission happened, not that a physical CFD
     // attempt happened. Release the reserved solver ordinal only for typed
     // continuation-stage, infrastructure, or deterministic setup/mesh
@@ -2691,33 +2717,24 @@ export async function settlePrecalcObligationsForJobInTransaction(
           : "blocked";
       attemptState = "cancelled";
       lastOutcome = state === "pending" ? "cancelled" : "cancelled_exhausted";
-    } else if (
-      restartable ||
-      (obligation.attemptCount < obligation.maxAttempts && transientFailure)
-    ) {
-      state = "pending";
-      attemptState = transientFailure
-        ? "failed"
-        : judged?.classification
-          ? "rejected"
-          : "failed";
-      lastOutcome = transientFailure
-        ? "failed"
-        : judged?.classification
-          ? "rejected"
-          : "failed";
-    } else {
+    } else if (recoveryPlan.action === "repair_media") {
       state = "blocked";
+      attemptState = judged?.classification ? "rejected" : "failed";
+      lastOutcome = precalcRecoveryOutcome(recoveryPlan, false);
+    } else {
+      const exactContinuation =
+        recoveryPlan.action === "continue_exact_case" && restartable;
+      const physicalRetryAvailable =
+        recoveryPlan.consumesSolverAttempt &&
+        obligation.attemptCount < obligation.maxAttempts;
+      state =
+        exactContinuation || physicalRetryAvailable ? "pending" : "blocked";
       attemptState = transientFailure
         ? "failed"
         : judged?.classification
           ? "rejected"
           : "failed";
-      lastOutcome = transientFailure
-        ? "failed_exhausted"
-        : judged?.classification
-          ? "rejected_exhausted"
-          : "failed_exhausted";
+      lastOutcome = precalcRecoveryOutcome(recoveryPlan, state === "blocked");
     }
 
     if (submission) {
@@ -2851,6 +2868,13 @@ export async function settlePrecalcObligationsForJobInTransaction(
           progress: currentProgress,
           classificationReasons: judged?.reasons ?? [],
           failureDisposition,
+          failureType: recoveryPlan.failureType,
+          recoveryAction: recoveryPlan.action,
+          recoveryFeatures: {
+            evidenceCompleteness: recoveryPlan.evidenceCompleteness,
+            statisticalMeanScore: recoveryPlan.statisticalMeanScore,
+            numericalNoiseScore: recoveryPlan.numericalNoiseScore,
+          },
           ...(deterministic
             ? {
                 recovery: "deterministic-mesh",
@@ -3325,6 +3349,11 @@ export async function precalcCheckpointCandidatesForObligations(
       sql`, `,
     )}]`})
       AND obligation.state = 'pending'
+      AND COALESCE(obligation.last_outcome, '') NOT IN (
+        'aperiodic_contract_retry_pending',
+        'numerical_recovery_pending',
+        'fresh_physical_retry_pending'
+      )
       AND obligation.continuation_no_progress_count <
         ${MAX_PRECALC_NO_PROGRESS_SEGMENTS}
     ORDER BY obligation.aoa_deg
