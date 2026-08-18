@@ -8,22 +8,28 @@
   routing are removed from normal sweeper startup/admission. The finite cycle
   diagnostic, legacy-null reader, and omission-preserving legacy result replay
   are committed on pushed `master`; focused Python tests, the pure replay
-  regression, sweeper typecheck, and the prior governed Node suite pass. Both
-  production engines report recovery v14, both control planes run sealed
-  `9fb3025`, and exact remediation reopened 79 hub plus 179 remote obligations
+  regression and direct typechecks pass; governed Node run
+  `run-3b3a39cce8740f5a0f009e89a929d4a1` passed all six checks. Both production
+  engines report recovery v14, both control planes run sealed `fb76178`, and
+  exact remediation reopened 79 hub plus 179 remote obligations
   (29 remote cells were skipped by the exact eligibility guard). All five
   preserved remote terminal results completed normal ingestion after the
-  transport correction. The first six new remote v14 points include one exact
-  accepted and selected `aperiodic-mean-v1` generation; the sample is still too
-  small for a final efficiency claim. DB-backed
-  recovery regressions remain unexecuted because DevCoordinator cannot start
-  its declared `aerodb-pg` dependency (`repository_adoption_store_failed`; bug
-  `bug-218972fac15b4b2f93d01be60333caef`), and the latest governed scheduler
-  request also returned `immutable_snapshot_broker_pending`. Remaining work:
-  measure accepted replacements and CPU-hours across a meaningful terminal
-  sample, deploy the unset-preserving Python endpoint at the next guarded
-  verified-idle engine rebuild, create a fresh strongly verified cloud backup,
-  and delete only failed generations proven replaced by exact accepted
+  transport correction. The first 29 new v14 points contain one exact accepted
+  and selected `aperiodic-mean-v1` generation; 3.4% is not a substantial
+  improvement, while 251 cohort obligations remain pending/running and exact
+  budget-stop continuations have not settled. The stale remote-transfer
+  maintenance fence is cleared. Incremental delivery reached the hub but
+  conflicted before upload because modern revision snapshots omit the legacy
+  BC UUID even though the hub preset column owns it; the authoritative preset
+  fallback and regression are implemented. Governed recovery run
+  `run-5a2f1c614bb60e04a9f193bf74e8cf96` passed three non-DB groups; its three
+  DB/API/sweeper groups failed before assertions with `ECONNREFUSED
+  127.0.0.1:5544` (the declared DB dependency remains unavailable). Remaining
+  work: deploy the BC fallback, replay the exact accepted generation through
+  normal GCS binding/canonical publication, measure a meaningful terminal
+  sample and CPU-hours, deploy the unset-preserving Python endpoint at the next
+  guarded verified-idle engine rebuild, create a fresh strongly verified cloud
+  backup, and delete only failed generations proven replaced by exact accepted
   immutable URANS evidence.
 
 - **Solver capacity packing and tick-progress recovery:** Live production on
@@ -41,27 +47,18 @@
   every accepted submission instead of leaving one-angle tail gaps idle. A
   running partial's temporary `ingesting` lease remains part of shared/remote
   admission, queue pressure, and disk-growth exposure; excluding it allowed
-  three hub jobs beyond the 8-slot cap. Sealed `45502ca` is deployed on both
-  control planes; those three exact zero-result jobs were cancelled and
-  released, and the corrected hub returned to one 8-slot owner without further
-  over-admission. Tail shrink then reduced that owner to four and admitted one
-  local FAST job, but remaining local ladder requests still omitted explicit
-  `case_concurrency`, preventing the existing fitter from using the last three
-  slots. The direct ladder now pins the same durable resource shape already
-  required on remote jobs; live `cab4314` then proved campaign retry
-  composition uses two separate reconcile-owned constructors, which are now
-  pinned before their job objects are built as well. The pin helper now also
-  updates the original resources object in place so a constructor that already
-  retained that reference cannot persist the pre-pin CPU budget. Pure
-  packing/tail/request-pin regressions and the
-  sweeper typecheck pass; DB-backed persistence/serialized-admission
-  regressions are authored. Production also proves fresh completed ticks, no
-  bind-error recurrence, about 215 GB hub free, and about 1.86 TB remote
-  solver-volume free; hz-solver2 is capped at 64 reserved slots with about 61
-  real solver processes plus postprocessing. Remaining work: deploy the two
-  reconcile-owned local pins, verify the hub refills to 8 and both roles remain
-  at or below their caps, and run the DB-backed regressions when the governed
-  database is available.
+  three hub jobs beyond the 8-slot cap. Those exact zero-result jobs were
+  cancelled and released. Direct and reconcile-owned FAST constructors now pin
+  the same durable resource shape, and the helper updates the captured resource
+  object in place. Sealed `fb76178` is deployed on both control planes. Pure
+  packing/tail/request-pin regressions, direct typechecks, and the governed
+  Node suite pass; DB-backed persistence/serialized-admission regressions are
+  authored. Production proves the hub at exactly 8 reserved / 8 real solver
+  processes without renewed over-admission, hz-solver2 capped at 64 reserved
+  slots with about 59--63 CPU cores busy across solver/postprocessing work,
+  fresh completed ticks, no bind-error recurrence, about 227 GB hub free, and
+  about 1.83 TB remote solver-volume free. Remaining work is the externally
+  blocked DB-backed run when the governed database becomes available.
 
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with

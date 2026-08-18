@@ -1917,6 +1917,42 @@ describe("remote solver sync validation regressions", () => {
     expect(validLocalRow?.bcId).toBe(validLocalBcId);
   });
 
+  it("uses the hub preset boundary condition when a modern snapshot omits its legacy id", async () => {
+    const [revision] = await db
+      .select({ snapshot: simulationPresetRevisions.snapshot })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    if (!revision) throw new Error("test revision required");
+    const modernSnapshot = structuredClone(revision.snapshot) as Record<
+      string,
+      unknown
+    >;
+    const snapshotPreset = {
+      ...((modernSnapshot.preset as Record<string, unknown> | undefined) ?? {}),
+      legacyBoundaryConditionId: null,
+    };
+    modernSnapshot.preset = snapshotPreset;
+    await db
+      .update(simulationPresetRevisions)
+      .set({ snapshot: modernSnapshot })
+      .where(eq(simulationPresetRevisions.id, revisionId));
+    try {
+      const pushed = await postPolars(
+        polarPayload([makePoint(702.501)], { bcId: randomUUID() }),
+      );
+      expect(pushed.statusCode).toBe(200);
+      expect(pushed.json()).toMatchObject({ imported: 1, conflictIds: [] });
+      const row = await resultAt(702.501);
+      expect(row?.bcId).toBe(legacyBcId);
+    } finally {
+      await db
+        .update(simulationPresetRevisions)
+        .set({ snapshot: revision.snapshot })
+        .where(eq(simulationPresetRevisions.id, revisionId));
+    }
+  });
+
   it("strips media and evidence artifact contentBase64 from result_attempts.evidence_payload while retaining hashes and metadata", async () => {
     const artifact = artifactItem("attempt-sanitize");
     const media = mediaItem("attempt-sanitize");

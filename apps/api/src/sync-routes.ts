@@ -4209,6 +4209,16 @@ async function importPolarPush(
     .from(simulationPresetRevisions)
     .where(eq(simulationPresetRevisions.id, revisionId))
     .limit(1);
+  const [revisionPreset] = revision
+    ? await db
+        .select({
+          legacyBoundaryConditionId:
+            simulationPresets.legacyBoundaryConditionId,
+        })
+        .from(simulationPresets)
+        .where(eq(simulationPresets.id, revision.presetId))
+        .limit(1)
+    : [];
   const snapshot = jsonObject(revision?.snapshot);
   const snapshotPreset = jsonObject(snapshot.preset);
   // Never trust a pushing instance's bc id blindly: remote solvers send THEIR
@@ -4224,7 +4234,11 @@ async function importPolarPush(
       .limit(1);
     if (!localBc) bcId = null;
   }
-  bcId = bcId ?? nullableText(snapshotPreset.legacyBoundaryConditionId);
+  bcId =
+    bcId ??
+    nullableText(snapshotPreset.legacyBoundaryConditionId) ??
+    revisionPreset?.legacyBoundaryConditionId ??
+    null;
   if (!bcId) {
     conflictIds.push(
       await createConflict({
