@@ -150,6 +150,67 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert csv.text.count("\n") >= 4  # header + 3 rows
 
 
+def test_result_transport_preserves_absent_legacy_certificate():
+    """Serving a legacy result must not turn field absence into explicit null.
+
+    ``aperiodic_mean_certificate`` distinguishes an old producer that did not
+    know the contract (absent) from a current producer that declined to
+    certify it (null).  Pydantic may read both, but the HTTP transport must
+    preserve that immutable producer distinction for idempotent ingestion.
+    """
+
+    job_id = "legacy-absent-aperiodic-certificate"
+    store = JobStore()
+    job_dir = store.job_dir(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "result.json").write_text(
+        """{
+  "job_id": "legacy-absent-aperiodic-certificate",
+  "state": "completed",
+  "polars": [{
+    "speed": 30.0,
+    "chord": 0.05,
+    "reynolds": 100000.0,
+    "points": [{
+      "aoa_deg": -5.0,
+      "cl": -0.3,
+      "cd": 0.04,
+      "unsteady": false,
+      "converged": true,
+      "first_order_fallback": false,
+      "images": {},
+      "video": {},
+      "mean_images": {},
+      "urans_cycle_certificate": null,
+      "no_shedding_certificate": null,
+      "fidelity": "urans_precalc",
+      "quality_warnings": [],
+      "evidence_artifacts": [],
+      "failure_disposition": "none"
+    }],
+    "attempts": []
+  }]
+}
+"""
+    )
+
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/jobs/{job_id}/result"
+    )
+    assert route.response_model_exclude_unset is True
+    result = route.endpoint(job_id)
+    payload = result.model_dump(
+        mode="json",
+        exclude_unset=route.response_model_exclude_unset,
+    )
+    point = payload["polars"][0]["points"][0]
+    assert "aperiodic_mean_certificate" not in point
+    assert point["urans_cycle_certificate"] is None
+    assert point["no_shedding_certificate"] is None
+
+
 def test_polar_submit_rejects_capability_cutover_before_queueing(
     client, naca0012_selig_text
 ):

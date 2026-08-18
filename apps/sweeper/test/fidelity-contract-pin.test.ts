@@ -38,6 +38,7 @@ import {
 import {
   fidelityForPoint,
   incomingRejectionReasons,
+  isLegacyAperiodicCertificateTransportReplay,
   qualityWarningsForPoint,
   solverRegimeForPoint,
   STEADY_OSCILLATING_MARKER,
@@ -295,6 +296,41 @@ describe("ingest fidelity/steady-history persistence helpers", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("accepts only the one-way legacy absent-to-null aperiodic transport replay", () => {
+    const stored = {
+      aoa_deg: 12,
+      fidelity: "urans_precalc",
+      cl: 0.8,
+      cd: 0.04,
+    };
+
+    expect(
+      isLegacyAperiodicCertificateTransportReplay(stored, {
+        ...stored,
+        aperiodic_mean_certificate: null,
+      }),
+    ).toBe(true);
+    expect(
+      isLegacyAperiodicCertificateTransportReplay(
+        { ...stored, aperiodic_mean_certificate: null },
+        stored,
+      ),
+    ).toBe(false);
+    expect(
+      isLegacyAperiodicCertificateTransportReplay(stored, {
+        ...stored,
+        aperiodic_mean_certificate: { certified: true },
+      }),
+    ).toBe(false);
+    expect(
+      isLegacyAperiodicCertificateTransportReplay(stored, {
+        ...stored,
+        cd: 0.05,
+        aperiodic_mean_certificate: null,
+      }),
+    ).toBe(false);
   });
 
   it("fidelityForPoint: a valid engine echo always wins", () => {

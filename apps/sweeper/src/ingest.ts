@@ -1470,6 +1470,11 @@ async function insertResultAttempt(opts: {
     unacknowledgedMeshRecoveryVersion(evidencePayload) &&
     stableAttemptEvidenceHashWithoutMeshRecoveryVersion(existingPayload) ===
       stableAttemptEvidenceHashWithoutMeshRecoveryVersion(evidencePayload);
+  const sameLegacyAperiodicTransportReplay =
+    isLegacyAperiodicCertificateTransportReplay(
+      existingPayload,
+      evidencePayload,
+    );
   const incomingMeshRecoveryVersion =
     acknowledgedMeshRecoveryVersion(evidencePayload);
   const enrichLegacyMeshRecoveryVersion =
@@ -1481,6 +1486,7 @@ async function insertResultAttempt(opts: {
     existing.resultId !== resultId ||
     (!exactReplay &&
       !sameLegacyUnacknowledgedVersion &&
+      !sameLegacyAperiodicTransportReplay &&
       !enrichLegacyMeshRecoveryVersion)
   ) {
     throw new Error(
@@ -2340,6 +2346,33 @@ function stableAttemptEvidenceHashWithoutMeshRecoveryVersion(
   const normalized = { ...record };
   delete normalized.mesh_recovery_version;
   return stableHash(normalized);
+}
+
+/** A pre-contract producer omitted ``aperiodic_mean_certificate`` entirely.
+ * Pydantic versions before the result endpoint enabled exclude-unset could
+ * deserialize that legacy file and re-emit the model default as explicit
+ * null. Those values are not semantically interchangeable in new evidence:
+ * absence identifies the legacy producer while null is a current producer's
+ * fail-closed assertion. Accept only the one-way, otherwise exact replay
+ * caused by that transport default, and retain the stored omission unchanged.
+ */
+export function isLegacyAperiodicCertificateTransportReplay(
+  stored: unknown,
+  incoming: unknown,
+): boolean {
+  const storedRecord = attemptEvidenceRecord(stored);
+  const incomingRecord = attemptEvidenceRecord(incoming);
+  if (!storedRecord || !incomingRecord) return false;
+  if (Object.hasOwn(storedRecord, "aperiodic_mean_certificate")) return false;
+  if (
+    !Object.hasOwn(incomingRecord, "aperiodic_mean_certificate") ||
+    incomingRecord.aperiodic_mean_certificate !== null
+  ) {
+    return false;
+  }
+  const normalizedIncoming = { ...incomingRecord };
+  delete normalizedIncoming.aperiodic_mean_certificate;
+  return stableHash(storedRecord) === stableHash(normalizedIncoming);
 }
 
 function mergePendingRemoteEvidenceCleanup(

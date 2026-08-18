@@ -1877,7 +1877,11 @@ def create_app() -> FastAPI:
         except JobRetentionRefused as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
-    @app.get("/jobs/{job_id}/result", response_model=JobResult)
+    @app.get(
+        "/jobs/{job_id}/result",
+        response_model=JobResult,
+        response_model_exclude_unset=True,
+    )
     def job_result(job_id: str) -> JobResult:
         if not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
