@@ -14,8 +14,8 @@
   exact remediation reopened 79 hub plus 179 remote obligations
   (29 remote cells were skipped by the exact eligibility guard). All five
   preserved remote terminal results completed normal ingestion after the
-  transport correction. The first 29 new v14 points contain one exact accepted
-  and selected `aperiodic-mean-v1` generation; 3.4% is not a substantial
+  transport correction. The first 42 new v14 points contain one exact accepted
+  and selected `aperiodic-mean-v1` generation; 2.4% is not a substantial
   improvement, while 251 cohort obligations remain pending/running and exact
   budget-stop continuations have not settled. The stale remote-transfer
   maintenance fence is cleared. Incremental delivery reached the hub but
