@@ -132,7 +132,7 @@ export async function solverQueuePressure(
 ): Promise<number> {
   const filters = [
     sql`(
-      ${simJobs.status} IN ('submitted', 'running')
+      ${simJobs.status} IN ('submitted', 'running', 'ingesting')
       OR (${simJobs.status} = 'pending' AND ${simJobs.engineState} = 'submitting')
       OR (
         ${simJobs.status} = 'cancelled'
@@ -823,7 +823,7 @@ async function submitWithGlobalAdmissionPermit(
         return true;
       };
       const activeReservationPredicate = sql`(
-        job.status IN ('submitted', 'running')
+        job.status IN ('submitted', 'running', 'ingesting')
         OR (
           job.status = 'pending'
           AND job.engine_state = ${SUBMITTING_ENGINE_STATE}

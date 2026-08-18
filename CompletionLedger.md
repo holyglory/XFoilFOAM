@@ -38,16 +38,22 @@
   the engine's resolved concurrency; a database `LEAST` keeps stale pollers
   from growing the weight back. The priority FAST lane now refills up to 16
   independently fenced jobs in one tick, rechecking capacity and disk after
-  every accepted submission instead of leaving one-angle tail gaps idle. Pure
-  packing/tail regressions and the sweeper typecheck pass; DB-backed
+  every accepted submission instead of leaving one-angle tail gaps idle. A
+  running partial's temporary `ingesting` lease remains part of shared/remote
+  admission, queue pressure, and disk-growth exposure; excluding it allowed
+  three hub jobs beyond the 8-slot cap, so the hub sweeper is stopped until the
+  corrected predicate is deployed and those exact excess jobs are cancelled.
+  Pure packing/tail regressions and the sweeper typecheck pass; DB-backed
   persistence/serialized-admission regressions are authored. Both sealed
   `3bd406d` control planes are deployed without
   recreating an engine worker; production proved 8 real hub processes and
   63–64 real remote processes before the tail drained, fresh completed ticks,
   no bind-error recurrence, about 233 GB hub free, and about 1.88 TB remote
-  solver-volume free. Remaining work: deploy the multi-FAST refill, verify the
-  combined tail release/refill returns the remote node to 64 real processes,
-  and run the DB-backed regressions when the governed database is available.
+  solver-volume free. Remaining work: deploy the `ingesting` predicate,
+  cancel/requeue only the three excess hub jobs, restore hub admission at 8,
+  verify the combined tail release/refill returns the remote node to 64 real
+  processes without exceeding either cap, and run the DB-backed regressions
+  when the governed database is available.
 
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with

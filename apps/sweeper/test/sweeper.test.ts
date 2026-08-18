@@ -3648,6 +3648,15 @@ describe("sweeper: gap → claim → ingest", () => {
     cleanupResultIds.add(claim.id);
 
     expect(await solverQueuePressure(db, { jobIds: [job.id] })).toBe(1);
+    await db
+      .update(simJobs)
+      .set({ status: "ingesting", engineState: "running" })
+      .where(eq(simJobs.id, job.id));
+    expect(await solverQueuePressure(db, { jobIds: [job.id] })).toBe(1);
+    await db
+      .update(simJobs)
+      .set({ status: "pending", engineState: "submitting" })
+      .where(eq(simJobs.id, job.id));
     await resetOrphans(db, { jobIds: [job.id] });
     expect(await solverQueuePressure(db, { jobIds: [job.id] })).toBe(0);
     const [afterJob] = await db

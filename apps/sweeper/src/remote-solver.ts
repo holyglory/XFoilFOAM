@@ -1244,7 +1244,7 @@ async function remoteReservedCpuSlots(
     FROM sim_jobs job
     WHERE ${remoteJobOwnerSql(settings, "job")}
       AND (
-        job.status IN ('submitted', 'running')
+        job.status IN ('submitted', 'running', 'ingesting')
         OR (
           job.status = 'pending'
           AND job.engine_state = 'submitting'

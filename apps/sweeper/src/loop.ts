@@ -65,7 +65,10 @@ import {
 } from "./remote-solver";
 import { retentionTick } from "./retention";
 import { retryScopeForRequestedPolar } from "./retry-plan";
-import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
+import {
+  solverQueuePressure,
+  submitPendingJobWithLifecycleGuard,
+} from "./submit-lifecycle";
 
 interface SweeperConfig {
   enabled: boolean;
@@ -194,22 +197,7 @@ async function checkAdmissionFence(
 }
 
 async function inFlight(db: DB): Promise<number> {
-  const [r] = await db
-    .select({
-      n: sql<number>`coalesce(sum(${simJobs.admissionCpuSlots}), 0)`,
-    })
-    .from(simJobs)
-    .where(
-      sql`(
-        ${simJobs.status} IN ('submitted', 'running')
-        OR (${simJobs.status} = 'pending' AND ${simJobs.engineState} = 'submitting')
-        OR (
-          ${simJobs.status} = 'cancelled'
-          AND ${simJobs.engineState} IN ('cancelling', 'cancel_pending')
-        )
-      )`,
-    );
-  return Number(r?.n ?? 0);
+  return solverQueuePressure(db);
 }
 
 async function submitComposedJob(

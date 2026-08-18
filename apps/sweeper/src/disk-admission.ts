@@ -194,7 +194,7 @@ export async function loadDiskAdmissionExposure(
     .from(simJobs)
     .where(
       or(
-        inArray(simJobs.status, ["submitted", "running"]),
+        inArray(simJobs.status, ["submitted", "running", "ingesting"]),
         and(
           eq(simJobs.status, "pending"),
           eq(simJobs.engineState, "submitting"),
