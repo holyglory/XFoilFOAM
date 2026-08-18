@@ -2930,10 +2930,15 @@ describe("sweeper: gap → claim → ingest", () => {
     const submittedCpuBudget = (
       submittedRequest as { resources?: { cpu_budget?: number } }
     )?.resources?.cpu_budget;
+    const submittedCaseConcurrency = (
+      submittedRequest as { resources?: { case_concurrency?: number } }
+    )?.resources?.case_concurrency;
     expect(submittedCpuBudget).toBeGreaterThan(0);
+    expect(submittedCaseConcurrency).toBeGreaterThan(0);
     expect(child.admissionCpuSlots).toBe(
       Math.min(rejectedAoas.length, submittedCpuBudget!),
     );
+    expect(child.admissionCpuSlots).toBe(submittedCaseConcurrency);
     await expectBackgroundPrecalcSubmission(child, rejectedAoas);
 
     const retained = await db

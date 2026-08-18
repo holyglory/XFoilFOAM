@@ -41,19 +41,22 @@
   every accepted submission instead of leaving one-angle tail gaps idle. A
   running partial's temporary `ingesting` lease remains part of shared/remote
   admission, queue pressure, and disk-growth exposure; excluding it allowed
-  three hub jobs beyond the 8-slot cap, so the hub sweeper is stopped until the
-  corrected predicate is deployed and those exact excess jobs are cancelled.
-  Pure packing/tail regressions and the sweeper typecheck pass; DB-backed
-  persistence/serialized-admission regressions are authored. Both sealed
-  `3bd406d` control planes are deployed without
-  recreating an engine worker; production proved 8 real hub processes and
-  63–64 real remote processes before the tail drained, fresh completed ticks,
-  no bind-error recurrence, about 233 GB hub free, and about 1.88 TB remote
-  solver-volume free. Remaining work: deploy the `ingesting` predicate,
-  cancel/requeue only the three excess hub jobs, restore hub admission at 8,
-  verify the combined tail release/refill returns the remote node to 64 real
-  processes without exceeding either cap, and run the DB-backed regressions
-  when the governed database is available.
+  three hub jobs beyond the 8-slot cap. Sealed `45502ca` is deployed on both
+  control planes; those three exact zero-result jobs were cancelled and
+  released, and the corrected hub returned to one 8-slot owner without further
+  over-admission. Tail shrink then reduced that owner to four and admitted one
+  local FAST job, but remaining local ladder requests still omitted explicit
+  `case_concurrency`, preventing the existing fitter from using the last three
+  slots. The local ladder now pins the same durable resource shape already
+  required on remote jobs. Pure packing/tail/request-pin regressions and the
+  sweeper typecheck pass; DB-backed persistence/serialized-admission
+  regressions are authored. Production also proves fresh completed ticks, no
+  bind-error recurrence, about 215 GB hub free, and about 1.86 TB remote
+  solver-volume free; hz-solver2 is capped at 64 reserved slots with about 61
+  real solver processes plus postprocessing. Remaining work: deploy the local
+  ladder pin, verify the hub refills to 8 and both roles remain at or below
+  their caps, and run the DB-backed regressions when the governed database is
+  available.
 
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with

@@ -82,7 +82,6 @@ import {
 import { alias } from "drizzle-orm/pg-core";
 
 import {
-  admissionCpuSlotsForRequest,
   buildPolarRequest,
   pinAdmissionCpuSlotsForRequest,
   REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
@@ -1990,11 +1989,7 @@ async function submitLadderJob(
     referenceChordM: target.snapshot.referenceGeometry.referenceLengthM,
     wave: 2,
     status: "pending",
-    admissionCpuSlots:
-      typeof (payloadExtras as { syncPromiseId?: unknown }).syncPromiseId ===
-      "string"
-        ? pinAdmissionCpuSlotsForRequest(request)
-        : admissionCpuSlotsForRequest(request),
+    admissionCpuSlots: pinAdmissionCpuSlotsForRequest(request),
     totalCases: aoas.length,
     requestPayload: {
       ...payloadExtras,
