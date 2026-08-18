@@ -218,7 +218,13 @@ describe("weighted scheduler admission", () => {
       aoa: { angles: Array.from({ length: 25 }, (_, index) => index - 4) },
       speeds: [30],
     };
+    const originalResources = request.resources;
     expect(pinAdmissionCpuSlotsForRequest(request, 14)).toBe(14);
+    expect(request.resources).toBe(originalResources);
+    expect(originalResources).toMatchObject({
+      cpu_budget: 14,
+      case_concurrency: 14,
+    });
     expect(request.resources).toMatchObject({
       policy: "auto",
       cpu_budget: 14,

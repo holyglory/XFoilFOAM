@@ -273,10 +273,20 @@ export function pinAdmissionCpuSlotsForRequest(
     Math.floor(boundedSlots / solverProcesses),
   );
   const admissionCpuSlots = caseConcurrency * solverProcesses;
-  request.resources = {
+  const pinnedResources = {
     ...(resources ?? {}),
     cpu_budget: admissionCpuSlots,
     case_concurrency: caseConcurrency,
   };
+  if (resources) {
+    // Several composition paths retain the original resources object while
+    // assembling the durable job payload. Mutate that exact object as well as
+    // assigning it back so no captured reference can keep the pre-pin
+    // cpu_budget/case_concurrency pair.
+    Object.assign(resources, pinnedResources);
+    request.resources = resources;
+  } else {
+    request.resources = pinnedResources;
+  }
   return admissionCpuSlots;
 }

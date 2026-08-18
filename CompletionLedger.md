@@ -50,7 +50,9 @@
   slots. The direct ladder now pins the same durable resource shape already
   required on remote jobs; live `cab4314` then proved campaign retry
   composition uses two separate reconcile-owned constructors, which are now
-  pinned before their job objects are built as well. Pure
+  pinned before their job objects are built as well. The pin helper now also
+  updates the original resources object in place so a constructor that already
+  retained that reference cannot persist the pre-pin CPU budget. Pure
   packing/tail/request-pin regressions and the
   sweeper typecheck pass; DB-backed persistence/serialized-admission
   regressions are authored. Production also proves fresh completed ticks, no
