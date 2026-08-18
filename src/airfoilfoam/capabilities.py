@@ -26,6 +26,9 @@ MESH_IDENTITY_VERSION = 1
 # recovery: immutable evidence archives could hydrate a saved case after local
 # retention, continuations used the adaptive extension budget, and requests
 # were rejected before CFD when controller and worker disagreed.
+# Version 14 makes every clean-cycle diagnostic JSON-finite and reads the v12
+# null encoding only as unjudgeable rejected evidence.  This prevents one
+# rejected cycle from making an otherwise complete multi-point result unreadable.
 # Version 13 adds an immutable statistical-mean certificate for preliminary
 # URANS trajectories that are demonstrably stationary but aperiodic.  It is a
 # separate evidence contract: it does not relax the phase-repeatable periodic
@@ -64,4 +67,4 @@ MESH_IDENTITY_VERSION = 1
 # Keep this separate from mesh recovery: the legacy OpenCFD 2406 engine already
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
-URANS_RECOVERY_VERSION = 13
+URANS_RECOVERY_VERSION = 14

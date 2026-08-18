@@ -1,7 +1,7 @@
 # Completion Ledger
 
-- **FAST-URANS v13 quality and typed recovery rollout:** The separate
-  aperiodic statistical-mean certificate, exact coefficient binding, v13
+- **FAST-URANS v14 quality and typed recovery rollout:** The separate
+  aperiodic statistical-mean certificate, exact coefficient binding, v14
   engine/controller pin, evidence-driven recovery types, non-publishing
   evaluator, exact source-pinned remediation command, and typed operator copy
   are implemented. Automatic archive audit/discovery and audit-to-recovery
@@ -13,11 +13,15 @@
   authority adoption store is read-only; bug
   `bug-218972fac15b4b2f93d01be60333caef`). Remaining work: run those DB/sweeper
   regressions after the coordinator dependency is available, commit/push main,
-  make a verified production backup, deploy v13 through the guarded engine
+  make a verified production backup, deploy v14 through the guarded engine
   rebuild scripts, run the read-only evaluator across both solver databases,
   requeue every exact failed cell, measure accepted points and CPU-hours, and
   delete only failed generations proven replaced by exact accepted immutable
-  URANS evidence.
+  URANS evidence. Production additionally exposed legacy/current cycle
+  diagnostics that encoded an internal infinity as JSON `null`, making whole
+  result documents unreadable; the finite-sentinel producer fix and
+  reject-only legacy-null reader are implemented and locally verified but must
+  be deployed to both engines before this item can close.
 
 - **Solver capacity packing and tick-progress recovery:** Live production on
   2026-08-17 proved the hub had four real progressing 1-slot OpenFOAM jobs but

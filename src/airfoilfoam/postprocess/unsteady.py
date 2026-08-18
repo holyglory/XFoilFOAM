@@ -132,6 +132,10 @@ CLEAN_CYCLE_MAX_SHAPE_NRMSE = 0.12
 CLEAN_CYCLE_MAX_AMPLITUDE_DEVIATION = 0.30
 CLEAN_CYCLE_HIGH_FREQUENCY_START_BIN = 9
 CLEAN_CYCLE_HIGH_FREQUENCY_FRACTION = 0.05
+# JSON has no representation for infinity.  An unjudgeable diagnostic remains
+# far beyond every acceptance threshold, but must stay finite so result.json
+# is readable and the rejected attempt can be ingested/recomputed normally.
+CLEAN_CYCLE_UNBOUNDED_METRIC = 1.0e12
 
 
 @dataclass(frozen=True)
@@ -1894,7 +1898,11 @@ def _phase_aligned_errors(
         _actual_scale, actual_amplitude, _actual_mean = _channel_scale(actual)
         _expected_scale, expected_amplitude, _expected_mean = _channel_scale(expected)
         if expected_amplitude <= max(1e-8, 0.01 * _expected_scale):
-            amplitude_deviation.append(0.0 if actual_amplitude <= 1e-8 else float("inf"))
+            amplitude_deviation.append(
+                0.0
+                if actual_amplitude <= 1e-8
+                else CLEAN_CYCLE_UNBOUNDED_METRIC
+            )
         else:
             amplitude_deviation.append(
                 abs(actual_amplitude - expected_amplitude) / expected_amplitude
@@ -2116,12 +2124,12 @@ def audit_period_cycles(
                 cl_mean=0.0,
                 cd_mean=0.0,
                 cm_mean=0.0,
-                cl_shape_error=math.inf,
-                cd_shape_error=math.inf,
-                cm_shape_error=math.inf,
-                cl_amplitude_deviation=math.inf,
-                cd_amplitude_deviation=math.inf,
-                cm_amplitude_deviation=math.inf,
+                cl_shape_error=CLEAN_CYCLE_UNBOUNDED_METRIC,
+                cd_shape_error=CLEAN_CYCLE_UNBOUNDED_METRIC,
+                cm_shape_error=CLEAN_CYCLE_UNBOUNDED_METRIC,
+                cl_amplitude_deviation=CLEAN_CYCLE_UNBOUNDED_METRIC,
+                cd_amplitude_deviation=CLEAN_CYCLE_UNBOUNDED_METRIC,
+                cm_amplitude_deviation=CLEAN_CYCLE_UNBOUNDED_METRIC,
                 cl_high_frequency=0.0,
                 cd_high_frequency=0.0,
                 cm_high_frequency=0.0,

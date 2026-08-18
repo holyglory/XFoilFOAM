@@ -17,11 +17,12 @@ import {
   type UransFidelity,
 } from "@aerodb/engine-client";
 
-/** Engine v13 is the first immutable preliminary-URANS evidence contract that
+/** Engine v14 includes the immutable preliminary-URANS statistical contract
+ * plus JSON-finite cycle diagnostics required for readable terminal results.
  * can publish a separately certified stationary aperiodic statistical mean.
  * Pin every new wave-2 request so a rolling deployment fails closed instead of
  * silently producing evidence under the older contract. */
-export const REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION = 13;
+export const REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION = 14;
 
 export function engineIdentityForSetup(
   setup: SimulationSetupSnapshot,

@@ -267,7 +267,7 @@ export async function remediatePrecalcEvidenceContract(
         obligationId: candidate.id,
         sourceRevision: input.sourceRevision,
         reason:
-          `URANS evidence contract v13: ${candidate.recovery_action}; ` +
+          `URANS evidence contract v14: ${candidate.recovery_action}; ` +
           `retrospective statistical score=${Number(candidate.statistical_mean_score).toFixed(6)}`,
       });
       await tx.execute(sql`

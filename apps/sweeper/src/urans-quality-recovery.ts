@@ -3,7 +3,7 @@ import type { PolarRequest } from "@aerodb/engine-client";
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 
 /** The conservative rung first appeared in v12. New submissions also require
- * the v13 evidence contract, so recovery must satisfy the stronger bound. */
+ * the v14 readable-evidence contract, so recovery satisfies the stronger bound. */
 export const MIN_CONSERVATIVE_URANS_RETRY_VERSION =
   REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION;
 

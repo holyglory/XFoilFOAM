@@ -957,17 +957,37 @@ class UransCycleCertificateCycle(BaseModel):
     cl_mean: float
     cd_mean: float
     cm_mean: float
-    cl_shape_error: float = Field(ge=0)
-    cd_shape_error: float = Field(ge=0)
-    cm_shape_error: float = Field(ge=0)
-    cl_amplitude_deviation: float = Field(ge=0)
-    cd_amplitude_deviation: float = Field(ge=0)
-    cm_amplitude_deviation: float = Field(ge=0)
-    cl_high_frequency: float = Field(ge=0)
-    cd_high_frequency: float = Field(ge=0)
-    cm_high_frequency: float = Field(ge=0)
+    # Legacy v12 serialized an internal infinity as JSON null.  Null remains
+    # an unjudgeable/rejected diagnostic; current producers emit a finite
+    # out-of-policy sentinel so new result documents round-trip exactly.
+    cl_shape_error: Optional[float] = Field(default=None, ge=0)
+    cd_shape_error: Optional[float] = Field(default=None, ge=0)
+    cm_shape_error: Optional[float] = Field(default=None, ge=0)
+    cl_amplitude_deviation: Optional[float] = Field(default=None, ge=0)
+    cd_amplitude_deviation: Optional[float] = Field(default=None, ge=0)
+    cm_amplitude_deviation: Optional[float] = Field(default=None, ge=0)
+    cl_high_frequency: Optional[float] = Field(default=None, ge=0)
+    cd_high_frequency: Optional[float] = Field(default=None, ge=0)
+    cm_high_frequency: Optional[float] = Field(default=None, ge=0)
     disposition: UransCycleDisposition
     reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _finite_diagnostics(self) -> "UransCycleCertificateCycle":
+        diagnostics = (
+            self.cl_shape_error,
+            self.cd_shape_error,
+            self.cm_shape_error,
+            self.cl_amplitude_deviation,
+            self.cd_amplitude_deviation,
+            self.cm_amplitude_deviation,
+            self.cl_high_frequency,
+            self.cd_high_frequency,
+            self.cm_high_frequency,
+        )
+        if any(value is not None and not math.isfinite(value) for value in diagnostics):
+            raise ValueError("URANS cycle diagnostics must be finite or null")
+        return self
 
 
 class UransCycleCertificate(BaseModel):
