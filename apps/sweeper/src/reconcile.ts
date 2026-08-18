@@ -1595,6 +1595,10 @@ export async function updateJobFromEngineStatus(
       engineState: status.state,
       completedCases: status.completed_cases,
       totalCases: status.total_cases,
+      admissionCpuSlots: sql`LEAST(
+        ${simJobs.admissionCpuSlots},
+        ${remainingAdmissionCpuSlotsForStatus(job.admissionCpuSlots, status)}
+      )`,
       polledAt: new Date(),
       error: status.state === "failed" ? (status.message ?? job.error) : null,
       finishedAt: null,
@@ -1615,6 +1619,52 @@ export async function updateJobFromEngineStatus(
       ingestLeaseExpiresAt: null,
     })
     .where(reconcilableJobWhere(job.id));
+}
+
+/** Release only the tail capacity that a running engine batch can no longer
+ * consume. A ThreadPool immediately backfills completed futures while
+ * remaining cases exceed its resolved concurrency, so the reservation stays
+ * unchanged until the unfinished case count drops below that concurrency.
+ * The engine increments ``completed_cases`` only after the case—including
+ * postprocessing—has fully returned, making the decrease monotonic and safe.
+ * Keep one slot until the control-plane row becomes terminal so every active
+ * lifecycle owner retains a positive schema-valid weight. */
+export function remainingAdmissionCpuSlotsForStatus(
+  currentSlots: number,
+  status: JobStatus,
+): number {
+  const scheduling = status.scheduling;
+  const totalCases = status.total_cases;
+  const completedCases = status.completed_cases;
+  const caseConcurrency = scheduling?.resolved_case_concurrency;
+  const solverProcesses = scheduling?.solver_processes;
+  if (
+    !Number.isSafeInteger(currentSlots) ||
+    currentSlots < 1 ||
+    !Number.isSafeInteger(totalCases) ||
+    totalCases < 1 ||
+    !Number.isSafeInteger(completedCases) ||
+    completedCases < 0 ||
+    completedCases > totalCases ||
+    typeof caseConcurrency !== "number" ||
+    !Number.isSafeInteger(caseConcurrency) ||
+    caseConcurrency < 1 ||
+    typeof solverProcesses !== "number" ||
+    !Number.isSafeInteger(solverProcesses) ||
+    solverProcesses < 1
+  ) {
+    return Math.max(1, currentSlots);
+  }
+  const unfinishedCases = totalCases - completedCases;
+  const remainingConcurrentCases = Math.min(
+    caseConcurrency,
+    unfinishedCases,
+  );
+  const remainingSlots = Math.max(
+    1,
+    remainingConcurrentCases * solverProcesses,
+  );
+  return Math.min(currentSlots, remainingSlots);
 }
 
 async function markIngestRetry(

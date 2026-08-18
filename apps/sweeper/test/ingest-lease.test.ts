@@ -204,6 +204,56 @@ describe("durable sim-job ingest lease", () => {
     });
   });
 
+  it("shrinks a running batch tail reservation monotonically from worker progress", async () => {
+    await db
+      .update(simJobs)
+      .set({ admissionCpuSlots: 16, totalCases: 16, completedCases: 0 })
+      .where(eq(simJobs.id, jobId));
+    const [staleSnapshot] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, jobId));
+    const scheduling = {
+      requested_policy: "auto" as const,
+      resolved_policy: "auto" as const,
+      worker_cpu_budget: 64,
+      resolved_cpu_budget: 64,
+      resolved_case_concurrency: 16,
+      solver_processes: 1,
+      mesh_build_count: 1,
+      aoa_case_count: 16,
+      mesh_reuse_mode: "symlink" as const,
+    };
+
+    await updateJobFromEngineStatus(db, staleSnapshot, {
+      ...engineStatus("running"),
+      total_cases: 16,
+      completed_cases: 5,
+      scheduling,
+    });
+    let [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.admissionCpuSlots).toBe(11);
+
+    // A late poller carrying less progress must not grow the reservation back.
+    await updateJobFromEngineStatus(db, staleSnapshot, {
+      ...engineStatus("running"),
+      total_cases: 16,
+      completed_cases: 3,
+      scheduling,
+    });
+    [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.admissionCpuSlots).toBe(11);
+
+    await updateJobFromEngineStatus(db, after, {
+      ...engineStatus("completed"),
+      total_cases: 16,
+      completed_cases: 16,
+      scheduling,
+    });
+    [after] = await db.select().from(simJobs).where(eq(simJobs.id, jobId));
+    expect(after.admissionCpuSlots).toBe(1);
+  });
+
   it("allows exactly one of two concurrent sweepers to claim ingestion", async () => {
     const now = new Date("2026-07-11T12:00:00.000Z");
     const [a, b] = await Promise.all([

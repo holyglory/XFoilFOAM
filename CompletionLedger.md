@@ -5,23 +5,26 @@
   engine/controller pin, evidence-driven recovery types, non-publishing
   evaluator, exact source-pinned remediation command, and typed operator copy
   are implemented. Automatic archive audit/discovery and audit-to-recovery
-  routing are removed from normal sweeper startup/admission. Focused Python
-  and core tests pass; the governed Node suite (workspace typechecks, web
-  tests, and production build) passes. DB-backed recovery regressions are
-  authored but remain unexecuted because DevCoordinator cannot start its
-  declared `aerodb-pg` dependency (`repository_adoption_store_failed`: the
-  authority adoption store is read-only; bug
-  `bug-218972fac15b4b2f93d01be60333caef`). Remaining work: run those DB/sweeper
-  regressions after the coordinator dependency is available, commit/push main,
-  make a verified production backup, deploy v14 through the guarded engine
-  rebuild scripts, run the read-only evaluator across both solver databases,
-  requeue every exact failed cell, measure accepted points and CPU-hours, and
-  delete only failed generations proven replaced by exact accepted immutable
-  URANS evidence. Production additionally exposed legacy/current cycle
-  diagnostics that encoded an internal infinity as JSON `null`, making whole
-  result documents unreadable; the finite-sentinel producer fix and
-  reject-only legacy-null reader are implemented and locally verified but must
-  be deployed to both engines before this item can close.
+  routing are removed from normal sweeper startup/admission. The finite cycle
+  diagnostic, legacy-null reader, and omission-preserving legacy result replay
+  are committed on pushed `master`; focused Python tests, the pure replay
+  regression, sweeper typecheck, and the prior governed Node suite pass. Both
+  production engines report recovery v14, both control planes run sealed
+  `9fb3025`, and exact remediation reopened 79 hub plus 179 remote obligations
+  (29 remote cells were skipped by the exact eligibility guard). All five
+  preserved remote terminal results completed normal ingestion after the
+  transport correction. The first six new remote v14 points include one exact
+  accepted and selected `aperiodic-mean-v1` generation; the sample is still too
+  small for a final efficiency claim. DB-backed
+  recovery regressions remain unexecuted because DevCoordinator cannot start
+  its declared `aerodb-pg` dependency (`repository_adoption_store_failed`; bug
+  `bug-218972fac15b4b2f93d01be60333caef`), and the latest governed scheduler
+  request also returned `immutable_snapshot_broker_pending`. Remaining work:
+  measure accepted replacements and CPU-hours across a meaningful terminal
+  sample, deploy the unset-preserving Python endpoint at the next guarded
+  verified-idle engine rebuild, create a fresh strongly verified cloud backup,
+  and delete only failed generations proven replaced by exact accepted
+  immutable URANS evidence.
 
 - **Solver capacity packing and tick-progress recovery:** Live production on
   2026-08-17 proved the hub had four real progressing 1-slot OpenFOAM jobs but
@@ -30,12 +33,18 @@
   error, leaving `lastTickCompletedAt` stale despite fresh heartbeats. `master`
   now atomically shrinks only case concurrency to the exact positive remainder,
   persists the reduced job weight/resources before engine submission, and uses
-  database `now()` in capacity-denial cleanup. Pure packing regressions and the
-  sweeper typecheck pass; DB-backed attached-result/serialized-admission
-  regressions are authored. Remaining work: run the governed change suite,
-  deploy the Node control plane from pushed `master` without recreating engine
-  services, and verify hub 8/8, fresh completed ticks, no bind-error recurrence,
-  remote progress, and storage headroom.
+  database `now()` in capacity-denial cleanup. The running-batch tail fix also
+  releases only fully completed cases after the unfinished count falls below
+  the engine's resolved concurrency; a database `LEAST` keeps stale pollers
+  from growing the weight back. Pure packing/tail regressions and the sweeper
+  typecheck pass; DB-backed persistence/serialized-admission regressions are
+  authored. Both sealed `9fb3025` control planes are deployed without
+  recreating an engine worker; production proved 8 real hub processes and
+  63–64 real remote processes before the tail drained, fresh completed ticks,
+  no bind-error recurrence, about 233 GB hub free, and about 1.88 TB remote
+  solver-volume free. Remaining work: deploy the tail release, verify it
+  backfills completed-case capacity to 64 real processes, and run the DB-backed
+  regressions when the governed database is available.
 
 - **Fresh point recalculation rendered proof:** The pointer-null continuation
   explanation and from-zero, pre-filled recalculation UI are implemented with
@@ -49,13 +58,6 @@
   preset, reset, parameter validation, tier selection, confirm
   cancellation/success, and verify the exact source attempt in the queued
   request, then remove this item.
-
-- **Conservative preliminary-URANS retry burn-in:** Both production roles run
-  engine/controller v12, and repeated hub PRECALC work carries the controller
-  recovery flag and the persisted time-zero conservative-numerics marker. No
-  repeated v12 job has reached terminal evidence yet. Keep the scientific
-  gates unchanged and verify one real repeated attempt publishes immutable
-  evidence and receives its normal classification before removing this item.
 
 - **Remote rejected-result post-terminal strip:** The disposable remote reset,
   credential restoration, 64-slot refill, and fresh valid-result delivery are
