@@ -41,6 +41,11 @@
   deleted. The first two eligible failed attempts and their exact case
   directories were removed (~972 MB) while the mixed parent jobs, accepted
   pointer, GCS archive, and resolved incident metadata remain.
+  A controlled outcome-blind recovery experiment is now registered in
+  `docs/urans-recovery-experiment-2026-08-19.md`: four authoritative hub-owned
+  fresh v14 controls are pending through ordinary point-correction requests,
+  four graph-verified held-out cells remain untouched, and only a typed exact
+  restartable control may receive the predeclared 8-hour continuation.
 
 - **Solver capacity packing and tick-progress recovery:** Live production on
   2026-08-17 proved the hub had four real progressing 1-slot OpenFOAM jobs but
