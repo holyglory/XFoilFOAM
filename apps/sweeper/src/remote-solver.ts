@@ -5330,16 +5330,21 @@ export async function processBrokeredRemoteEvidenceReclaims(
         string,
         unknown
       > | null;
+      const localBytesAlreadyAbsent = response.status === 404;
       if (
-        !response.ok ||
-        !payload ||
-        !["complete", "no_local_bytes"].includes(String(payload.state)) ||
-        typeof payload.bytes_freed !== "number" ||
-        payload.bytes_freed < 0
+        !localBytesAlreadyAbsent &&
+        (!response.ok ||
+          !payload ||
+          !["complete", "no_local_bytes"].includes(String(payload.state)) ||
+          typeof payload.bytes_freed !== "number" ||
+          payload.bytes_freed < 0)
       )
         throw new Error(
           `engine brokered evidence reclaim failed (${response.status})`,
         );
+      const reclaimedBytes = localBytesAlreadyAbsent
+        ? 0
+        : (payload!.bytes_freed as number);
       const reclaimLeaseFailure = await reclaimLease.stop();
       reclaimLease = null;
       if (reclaimLeaseFailure) throw reclaimLeaseFailure;
@@ -5350,7 +5355,7 @@ export async function processBrokeredRemoteEvidenceReclaims(
           reclaimClaimToken: null,
           reclaimClaimExpiresAt: null,
           reclaimedAt: new Date(),
-          reclaimedBytes: payload.bytes_freed,
+          reclaimedBytes,
           reclaimLastError: null,
           updatedAt: new Date(),
         })

@@ -5578,6 +5578,51 @@ describe("remote solver push validation regressions", () => {
       reclaimedBytes: 128,
       reclaimLastError: null,
     });
+
+    const absent = await seedPendingReclaim(
+      "reclaim-already-absent",
+      889.101,
+    );
+    const absentEvents: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = String(input);
+        if (url.endsWith(`/${absent.receipt.brokeredUploadId}/download`)) {
+          absentEvents.push("download");
+          return new Response(absent.archive.bytes, {
+            status: 200,
+            headers: {
+              "content-type": "application/zstd",
+              "content-length": String(absent.archive.byteSize),
+              "x-content-sha256": absent.archive.sha256,
+              "x-gcs-generation": "9007199254740993123",
+            },
+          });
+        }
+        if (url.endsWith("/internal/evidence-uploads/reclaim")) {
+          absentEvents.push("reclaim");
+          return Response.json({ error: "job not found" }, { status: 404 });
+        }
+        throw new Error(`unexpected already-absent reclaim request ${url}`);
+      }),
+    );
+    expect(
+      await processBrokeredRemoteEvidenceReclaims(db, absent.settings, 1),
+    ).toBe(1);
+    expect(absentEvents).toEqual(["download", "reclaim"]);
+    expect(
+      (
+        await db
+          .select()
+          .from(syncRemoteHubBindingReceipts)
+          .where(eq(syncRemoteHubBindingReceipts.id, absent.receipt.id))
+      )[0],
+    ).toMatchObject({
+      reclaimState: "reclaimed",
+      reclaimedBytes: 0,
+      reclaimLastError: null,
+    });
   });
 
   it("claims only the one reclaim row a sequential worker can actively renew", async () => {
