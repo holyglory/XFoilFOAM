@@ -20,7 +20,9 @@
   its 48-core/96-thread host. Worker budget, case concurrency, Celery
   concurrency, and container quota must agree; throughput and host headroom,
   not the displayed logical-CPU percentage alone, decide later tuning.
-  [D-2026-08-11-hz-solver2-64-slots]
+  Warm-start RANS reserves real independent polar units while serial AoAs keep
+  mesh/warm-march reuse. [D-2026-08-11-hz-solver2-64-slots]
+  [D-2026-08-22-warm-march-capacity-units]
 - Confirmed intent: solver filesystems keep a bounded working set. A remote
   case is reclaimed as soon as the hub has authenticated and bound its exact
   archive, and a settled or cancelled remote job relinquishes its whole local
@@ -170,6 +172,16 @@
   memory-bandwidth contention. Sixty-four adds useful parallelism while
   retaining control-plane headroom and is directly reversible after measured
   throughput comparison.
+
+- Decision: reserve warm-start steady RANS by concurrently executable
+  chord×speed polar units, not by the AoA count marched serially inside each
+  polar; keep cold/transient AoA cases weighted by their real concurrency.
+  [D-2026-08-22-warm-march-capacity-units](DecisionDetails/D-2026-08-22-warm-march-capacity-units.md)
+- Why: pinning a 26-angle warm RANS promise to 26 slots made the control plane
+  report 64/64 while the engine held about 26 real tokens. Parallelizing those
+  AoAs would discard required warm marching and mesh reuse, while lowering the
+  node cap would preserve false accounting. Weighting real execution units
+  lets independent promises fill the unchanged 64-slot node truthfully.
 
 - Decision: issue remote promises from active current-generation campaign
   gaps before considering globally enabled preset gaps.
