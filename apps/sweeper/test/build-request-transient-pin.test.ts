@@ -212,6 +212,30 @@ describe("weighted scheduler admission", () => {
     ).toBe(64);
   });
 
+  it("reserves warm-start RANS by independent polar units instead of serial AoAs", () => {
+    const request = {
+      resources: { policy: "auto" as const, cpu_budget: 64 },
+      aoa: { angles: Array.from({ length: 25 }, (_, index) => index - 4) },
+      speeds: [30],
+      chord_lengths: [1],
+      solver: { warm_start: true, force_transient: false },
+    };
+    expect(admissionCpuSlotsForRequest(request)).toBe(1);
+    expect(pinAdmissionCpuSlotsForRequest(request, 64)).toBe(1);
+    expect(request.resources).toMatchObject({
+      cpu_budget: 1,
+      case_concurrency: 1,
+    });
+
+    expect(
+      admissionCpuSlotsForRequest({
+        ...request,
+        resources: { cpu_budget: 64 },
+        solver: { warm_start: false, force_transient: true },
+      }),
+    ).toBe(25);
+  });
+
   it("pins the submitted CPU budget and concurrency to the durable reservation", () => {
     const request = {
       resources: { policy: "auto" as const, cpu_budget: 64 },

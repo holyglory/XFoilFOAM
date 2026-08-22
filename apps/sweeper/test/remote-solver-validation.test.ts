@@ -1834,7 +1834,7 @@ describe("remote solver submit lifecycle", () => {
     },
   );
 
-  it("resolves automatic multi-angle jobs against the 64-slot node and gives the last promise only the remaining slots", async () => {
+  it("reserves each warm-start multi-angle promise as one real polar slot and refills sixteen per tick", async () => {
     const [schedulerBefore] = await db
       .select({ enabled: sweeperState.enabled })
       .from(sweeperState)
@@ -1852,7 +1852,7 @@ describe("remote solver submit lifecycle", () => {
       .update(syncApiSettings)
       .set({ remoteSolverCpuBudget: 64 })
       .where(eq(syncApiSettings.id, 1));
-    const promiseAoas = Array.from({ length: 3 }, (_, promiseIndex) =>
+    const promiseAoas = Array.from({ length: 16 }, (_, promiseIndex) =>
       Array.from(
         { length: 25 },
         (_, angleIndex) => 901.1 + promiseIndex + angleIndex / 1_000,
@@ -1880,20 +1880,18 @@ describe("remote solver submit lifecycle", () => {
         submitPolar.mock.calls.map(
           ([request]) => request.resources?.cpu_budget,
         ),
-      ).toEqual([25, 25, 14]);
+      ).toEqual(Array.from({ length: 16 }, () => 1));
       expect(
         submitPolar.mock.calls.map(
           ([request]) => request.resources?.case_concurrency,
         ),
-      ).toEqual([25, 25, 14]);
+      ).toEqual(Array.from({ length: 16 }, () => 1));
       const jobs = (
         await Promise.all(promises.map((promise) => jobsForPromise(promise.id)))
       ).flat();
-      expect(
-        jobs
-          .map((job) => job.admissionCpuSlots)
-          .sort((left, right) => right - left),
-      ).toEqual([25, 25, 14]);
+      expect(jobs.map((job) => job.admissionCpuSlots)).toEqual(
+        Array.from({ length: 16 }, () => 1),
+      );
     } finally {
       await db
         .update(sweeperState)

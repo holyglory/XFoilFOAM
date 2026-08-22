@@ -197,7 +197,7 @@ export function buildPolarRequest(opts: {
  * resolution instead of persisting a fictional one-slot reservation. */
 export function admissionCpuSlotsForRequest(
   request: Pick<PolarRequest, "resources"> &
-    Partial<Pick<PolarRequest, "aoa" | "speeds">>,
+    Partial<Pick<PolarRequest, "aoa" | "speeds" | "chord_lengths" | "solver">>,
 ): number {
   const resources = request.resources;
   const solverProcesses =
@@ -210,16 +210,25 @@ export function admissionCpuSlotsForRequest(
     (resources?.case_concurrency ?? 0) > 0
       ? (resources?.case_concurrency as number)
       : null;
-  if (caseConcurrency != null)
-    return Math.max(1, solverProcesses * caseConcurrency);
+  const angleCount = request.aoa?.angles?.length ?? 0;
+  const speedCount = request.speeds?.length ?? 0;
+  const chordCount = request.chord_lengths?.length ?? 0;
+  const warmStartedRans =
+    request.solver?.warm_start === true &&
+    request.solver?.force_transient !== true;
+  const caseCount = warmStartedRans
+    ? Math.max(1, speedCount) * Math.max(1, chordCount)
+    : angleCount * Math.max(1, speedCount) * Math.max(1, chordCount);
+  if (caseConcurrency != null) {
+    const effectiveConcurrency =
+      caseCount > 0 ? Math.min(caseConcurrency, caseCount) : caseConcurrency;
+    return Math.max(1, solverProcesses * effectiveConcurrency);
+  }
 
   const cpuBudget =
     Number.isInteger(resources?.cpu_budget) && (resources?.cpu_budget ?? 0) > 0
       ? (resources?.cpu_budget as number)
       : null;
-  const angleCount = request.aoa?.angles?.length ?? 0;
-  const speedCount = request.speeds?.length ?? 0;
-  const caseCount = angleCount * speedCount;
   if (cpuBudget != null && caseCount > 0) {
     return Math.max(1, Math.min(cpuBudget, caseCount * solverProcesses));
   }
@@ -241,7 +250,7 @@ export function admissionCpuSlotsForRequest(
  */
 export function pinAdmissionCpuSlotsForRequest(
   request: Pick<PolarRequest, "resources"> &
-    Partial<Pick<PolarRequest, "aoa" | "speeds">>,
+    Partial<Pick<PolarRequest, "aoa" | "speeds" | "chord_lengths" | "solver">>,
   maxCpuSlots = Number.POSITIVE_INFINITY,
 ): number {
   const resources = request.resources;
