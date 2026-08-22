@@ -5153,6 +5153,16 @@ describe("remote solver push validation regressions", () => {
       state: "delivered",
       deliveredAt: new Date(),
     });
+    await db
+      .update(simJobs)
+      .set({
+        strippedAt: new Date(),
+        stripReport: {
+          kept_case_state: false,
+          note: "legacy archive-preserving strip marker",
+        },
+      })
+      .where(eq(simJobs.id, job.id));
     stubFetch();
 
     await transferRemoteSolverTick(db, {} as EngineClient);
@@ -5166,6 +5176,17 @@ describe("remote solver push validation regressions", () => {
         lastError: "legacy cancellation before terminal ack",
       },
     ]);
+    expect(
+      (
+        await db
+          .select({
+            strippedAt: simJobs.strippedAt,
+            stripReport: simJobs.stripReport,
+          })
+          .from(simJobs)
+          .where(eq(simJobs.id, job.id))
+      )[0],
+    ).toEqual({ strippedAt: null, stripReport: null });
   });
 
   it("MUST-CATCH: legacy migration selects only an exact unbound fulfilled point", async () => {

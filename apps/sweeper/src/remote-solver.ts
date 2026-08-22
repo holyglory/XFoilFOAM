@@ -3352,6 +3352,14 @@ async function markRemoteJobDeliveryTerminal(
         updatedAt: new Date(),
       },
     });
+  // Older archive-preserving retention may already have stamped this job
+  // while leaving its directory in place. A new terminal remote
+  // acknowledgement changes the required action to whole-directory deletion,
+  // so reopen that exact retention marker once.
+  await db
+    .update(simJobs)
+    .set({ strippedAt: null, stripReport: null })
+    .where(eq(simJobs.id, jobId));
 }
 
 /** Repair the pre-transactional-cancellation gap. A cancelled mirrored
