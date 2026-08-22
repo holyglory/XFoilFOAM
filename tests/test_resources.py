@@ -11,6 +11,7 @@ from airfoilfoam.models import ResourceParams, ResourcePolicy
 from airfoilfoam.resources import (
     CpuTokenBudgetMismatch,
     CpuTokenPool,
+    execution_unit_count,
     queue_depth,
     resolve_resources,
 )
@@ -38,6 +39,21 @@ def test_resource_resolver_clamps_case_concurrency_to_cpu_budget(tmp_path):
     assert resolved.solver_processes == 2
     assert resolved.resolved_cpu_budget == 4
     assert resolved.resolved_case_concurrency == 2
+
+
+def test_execution_units_keep_warm_aoas_serial_but_transient_cases_parallel():
+    assert execution_unit_count(
+        chord_count=1,
+        speed_count=1,
+        aoa_count=25,
+        warm_start=True,
+    ) == 1
+    assert execution_unit_count(
+        chord_count=1,
+        speed_count=1,
+        aoa_count=25,
+        warm_start=False,
+    ) == 25
 
 
 def test_auto_high_backlog_favors_airfoil_parallel(tmp_path):

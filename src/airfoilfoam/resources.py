@@ -83,6 +83,22 @@ def cpu_token_pressure(settings: Settings) -> Optional[int]:
         return None
 
 
+def execution_unit_count(
+    *,
+    chord_count: int,
+    speed_count: int,
+    aoa_count: int,
+    warm_start: bool,
+) -> int:
+    """Return the cases this request can actually execute concurrently.
+
+    Warm-start steady polars march AoAs serially inside each chord×speed unit.
+    Cold/transient requests execute independent chord×speed×AoA cases.
+    """
+    polar_units = max(1, chord_count) * max(1, speed_count)
+    return polar_units if warm_start else polar_units * max(1, aoa_count)
+
+
 def resolve_resources(
     resources: ResourceParams,
     settings: Settings,

@@ -45,7 +45,7 @@ from .pipeline import (
     stage_continuation_case,
     validate_shared_mesh,
 )
-from .resources import CpuTokenPool, resolve_resources
+from .resources import CpuTokenPool, execution_unit_count, resolve_resources
 from .storage import JobStore
 
 logger = logging.getLogger(__name__)
@@ -201,7 +201,13 @@ def execute_job(
     aoas = request.aoa.expand()
     chords, speeds = request.chord_lengths, request.speeds
     total = len(chords) * len(speeds) * len(aoas)
-    plan = resolve_resources(request.resources, settings, total)
+    executable_units = execution_unit_count(
+        chord_count=len(chords),
+        speed_count=len(speeds),
+        aoa_count=len(aoas),
+        warm_start=request.solver.warm_start,
+    )
+    plan = resolve_resources(request.resources, settings, executable_units)
     cpu_tokens = CpuTokenPool(
         settings.cpu_token_state_path,
         plan.worker_cpu_budget,
