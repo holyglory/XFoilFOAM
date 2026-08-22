@@ -743,6 +743,12 @@ export async function tick(
   // Remote authority/evidence reconciliation remains early and admission-free.
   // Its NEW RANS lane is considered only after durable FAST URANS below.
   const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
+  // Artifact publication, cancellation delivery, and brokered-evidence
+  // reclaim run in one process-local single flight. Start that background
+  // drain before the potentially long multi-slot refill scan; it is not
+  // awaited, so valid CPU admission continues in this tick while durable
+  // transfer and storage release can no longer be starved behind it.
+  scheduleRemoteSolverTransfer(db, engine);
   // Dedicated remote-solver instances intentionally leave the local scheduler
   // disabled and use their independent remote CPU budget. In mixed mode,
   // mirrored RANS shares the visible local capacity and must wait rather than
@@ -953,11 +959,6 @@ export async function tick(
       if (!ladderSubmitted) break;
     }
   }
-  // Artifact publication, cancellation delivery, and brokered evidence
-  // reclaim can involve minutes of upstream I/O. Start one single-flight
-  // background drain only after all NEW-work lanes had a chance to occupy free
-  // CPU capacity; never hold the next admission tick behind that transfer.
-  scheduleRemoteSolverTransfer(db, engine);
   await markTickCompleted(db);
 }
 
