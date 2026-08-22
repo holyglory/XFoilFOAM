@@ -248,12 +248,56 @@ def _urans_recovery_regression() -> int:
     return result
 
 
+def _sync_remote_validation_regression() -> int:
+    install = _run(
+        "node-dependencies",
+        "locked Node dependencies",
+        ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile"],
+    )
+    if install != 0:
+        return install
+    result = 0
+    for case_id, name, package, test_file in (
+        (
+            "api-sync-remote-validation",
+            "hub remote solver sync validation regressions",
+            "@aerodb/api",
+            "test/sync-remote-validation.test.ts",
+        ),
+        (
+            "sweeper-sync-remote-validation",
+            "remote solver delivery lifecycle regressions",
+            "@aerodb/sweeper",
+            "test/remote-solver-validation.test.ts",
+        ),
+    ):
+        result = max(
+            result,
+            _run(
+                case_id,
+                name,
+                [
+                    "/usr/bin/corepack",
+                    "pnpm",
+                    "--filter",
+                    package,
+                    "exec",
+                    "vitest",
+                    "run",
+                    test_file,
+                ],
+            ),
+        )
+    return result
+
+
 def main() -> int:
     _events_path().unlink(missing_ok=True)
     if len(sys.argv) != 2:
         raise SystemExit(
             "usage: devcoordinator_test_harness.py "
-            "python-suite|node-suite|urans-recovery-regression"
+            "python-suite|node-suite|urans-recovery-regression|"
+            "sync-remote-validation-regression"
         )
     if sys.argv[1] == "python-suite":
         return _python_suite()
@@ -261,6 +305,8 @@ def main() -> int:
         return _node_suite()
     if sys.argv[1] == "urans-recovery-regression":
         return _urans_recovery_regression()
+    if sys.argv[1] == "sync-remote-validation-regression":
+        return _sync_remote_validation_regression()
     raise SystemExit(f"unknown suite: {sys.argv[1]}")
 
 

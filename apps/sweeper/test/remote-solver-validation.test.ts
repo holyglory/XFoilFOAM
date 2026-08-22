@@ -5881,6 +5881,33 @@ describe("remote solver push validation regressions", () => {
     expect((await readPromise(promiseId)).points[0]?.status).toBe("cancelled");
   });
 
+  it.each(["failed", "cancelled"] as const)(
+    "delivers accepted immutable evidence after its producing job becomes %s",
+    async (terminalStatus) => {
+      const aoa = terminalStatus === "failed" ? 854.101 : 854.201;
+      const label = `terminal-accepted-${terminalStatus}`;
+      const job = await seedDoneRemoteJob(label, [aoa]);
+      const promiseId = (job.requestPayload as { syncPromiseId: string })
+        .syncPromiseId;
+      await seedMirroredPromise(label, [aoa], promiseId);
+      await db
+        .update(simJobs)
+        .set({ status: terminalStatus })
+        .where(eq(simJobs.id, job.id));
+      const deliveryFetch = stubFetch();
+
+      await transferRemoteSolverTick(db, {} as unknown as EngineClient);
+
+      expect(requests(deliveryFetch.fetchMock, "/polars")).toHaveLength(1);
+      expect(
+        (await deliveriesForJob(job.id)).find((row) => row.resultId),
+      ).toMatchObject({ state: "delivered" });
+      expect((await readPromise(promiseId)).points).toMatchObject([
+        { aoaDeg: aoa, status: "fulfilled" },
+      ]);
+    },
+  );
+
   it("uses deterministic promise-scoped keys when one delivery advances generations", async () => {
     const aoas = [855.201, 855.202];
     const job = await seedDoneRemoteJob("delivery-generation-advance", aoas);

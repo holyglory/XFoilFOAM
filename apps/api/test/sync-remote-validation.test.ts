@@ -1918,6 +1918,8 @@ describe("remote solver sync validation regressions", () => {
   });
 
   it("uses the hub preset boundary condition when a modern snapshot omits its legacy id", async () => {
+    const aoaDeg = 702.501;
+    const promiseId = await createPromise("active", aoaDeg);
     const [revision] = await db
       .select({ snapshot: simulationPresetRevisions.snapshot })
       .from(simulationPresetRevisions)
@@ -1939,12 +1941,39 @@ describe("remote solver sync validation regressions", () => {
       .where(eq(simulationPresetRevisions.id, revisionId));
     try {
       const pushed = await postPolars(
-        polarPayload([makePoint(702.501)], { bcId: randomUUID() }),
+        polarPayload([makePoint(aoaDeg)], {
+          promiseId,
+          bcId: randomUUID(),
+        }),
       );
       expect(pushed.statusCode).toBe(200);
       expect(pushed.json()).toMatchObject({ imported: 1, conflictIds: [] });
-      const row = await resultAt(702.501);
+      const row = await resultAt(aoaDeg);
       expect(row?.bcId).toBe(legacyBcId);
+      expect((await readPromise(promiseId)).points).toMatchObject([
+        {
+          aoaDeg,
+          status: "fulfilled",
+          resultId: row?.id,
+          resultAttemptId: row?.currentResultAttemptId,
+        },
+      ]);
+      const boundaryResolutionConflicts = await db
+        .select({
+          id: syncImportConflicts.id,
+          incomingPayload: syncImportConflicts.incomingPayload,
+        })
+        .from(syncImportConflicts)
+        .where(
+          eq(syncImportConflicts.naturalKey, `${airfoilId}:${revisionId}`),
+        );
+      expect(
+        boundaryResolutionConflicts.filter(
+          (conflict) =>
+            (conflict.incomingPayload as Record<string, unknown> | null)
+              ?.promiseId === promiseId,
+        ),
+      ).toHaveLength(0);
     } finally {
       await db
         .update(simulationPresetRevisions)

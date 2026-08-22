@@ -140,6 +140,40 @@
         "retry_on": ["lease_expired_before_launch"]
       },
       "network": "external"
+    },
+    "sync-remote-validation-regression": {
+      "driver": "automation",
+      "reporter": "automation-events",
+      "cwd": ".",
+      "environment": {
+        "DATABASE_URL": "postgres://aerodb:aerodb@127.0.0.1:5544/aerodb"
+      },
+      "argv": [
+        "{python}",
+        ".codex/devcoordinator_test_harness.py",
+        "sync-remote-validation-regression"
+      ],
+      "inputs": [
+        ".codex/devcoordinator_test_harness.py",
+        "apps/api/src/sync-routes.ts",
+        "apps/api/test/sync-remote-validation.test.ts",
+        "apps/sweeper/src/remote-solver.ts",
+        "apps/sweeper/test/remote-solver-validation.test.ts",
+        "packages/core/src/**",
+        "packages/db/src/**",
+        "packages/engine-client/src/**",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "tsconfig.base.json"
+      ],
+      "depends_on": [],
+      "intents": ["change", "checkpoint", "handoff", "release", "manual"],
+      "retry": {
+        "max_attempts": 2,
+        "retry_on": ["lease_expired_before_launch"]
+      },
+      "network": "external"
     }
   },
   "evidence_policies": {

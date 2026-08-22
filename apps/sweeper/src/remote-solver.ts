@@ -5670,7 +5670,17 @@ async function processRemoteResultDeliveries(
     .from(simJobs)
     .where(
       and(
-        inArray(simJobs.status, ["submitted", "running", "ingesting", "done"]),
+        // Multi-case jobs can become terminal after earlier cases have
+        // already produced accepted immutable evidence. Job cancellation or
+        // failure stops execution; it does not revoke those completed cases.
+        inArray(simJobs.status, [
+          "submitted",
+          "running",
+          "ingesting",
+          "done",
+          "failed",
+          "cancelled",
+        ]),
         sql`${simJobs.requestPayload} ? 'syncPromiseId'`,
         sql`${simJobs.requestPayload} ->> 'remoteSolver' = 'true'`,
         // Ordinary result publication is allowed only while the mirrored work
