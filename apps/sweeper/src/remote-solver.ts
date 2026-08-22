@@ -5904,7 +5904,7 @@ async function processRemoteResultDeliveries(
         return true;
       }
     }
-    if (job.status !== "done") continue;
+    if (!["done", "failed", "cancelled"].includes(job.status)) continue;
     if (!resultRows.length) {
       const [child] = await db
         .select({ id: simJobs.id })
@@ -6265,9 +6265,12 @@ export async function transferRemoteSolverTick(
     const processedDurableDelivery =
       Boolean(repairedCancelledJobs) ||
       Boolean(await settlePromotedRemoteParentDeliveries(db, settings)) ||
-      (await processRestartableRemotePrecalcCheckpoint(db, engine, settings)) ||
+      // Accepted current generations release authoritative promise points and
+      // local storage. A missing rejected checkpoint must not starve every
+      // unrelated valid result behind it.
+      (await processRemoteResultDeliveries(db, engine, settings)) ||
       (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
-      (await processRemoteResultDeliveries(db, engine, settings));
+      (await processRestartableRemotePrecalcCheckpoint(db, engine, settings));
     const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
     if (readyPromiseId) {
       await setStatus(db, "pushing", null);

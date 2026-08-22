@@ -5897,10 +5897,14 @@ describe("remote solver push validation regressions", () => {
       const deliveryFetch = stubFetch();
 
       await transferRemoteSolverTick(db, {} as unknown as EngineClient);
+      await transferRemoteSolverTick(db, {} as unknown as EngineClient);
 
       expect(requests(deliveryFetch.fetchMock, "/polars")).toHaveLength(1);
       expect(
         (await deliveriesForJob(job.id)).find((row) => row.resultId),
+      ).toMatchObject({ state: "delivered" });
+      expect(
+        (await deliveriesForJob(job.id)).find((row) => row.resultId === null),
       ).toMatchObject({ state: "delivered" });
       expect((await readPromise(promiseId)).points).toMatchObject([
         { aoaDeg: aoa, status: "fulfilled" },
