@@ -137,8 +137,8 @@ interface AdmissionFenceGate {
 }
 
 /** Typed NEW-remote admission precedence. Safety provenance must survive even
- * when disk pressure is also present, and a successful FAST handoff consumes
- * the only admission opportunity before any mirrored RANS can be considered. */
+ * when disk pressure is also present, and due FAST work owns admission until
+ * its bounded refill lane proves no further candidate is currently ready. */
 export function remoteAdmissionDecisionForTick(input: {
   admissionFenced: boolean;
   diskAllowed: boolean;
@@ -161,6 +161,13 @@ export function remoteAdmissionDecisionForTick(input: {
     kind: "allow",
     meshRecoveryVersion: input.meshRecoveryVersion,
   };
+}
+
+export function fastUransOwnsRemainingAdmission(input: {
+  submitted: boolean;
+  exhausted: boolean;
+}): boolean {
+  return input.submitted && !input.exhausted;
 }
 
 /**
@@ -774,6 +781,7 @@ export async function tick(
   let meshRecoveryVersion: number | null = null;
   let uransRecoveryVersion: number | null = null;
   let fastUransSubmitted = false;
+  let fastUransExhausted = false;
 
   // One capability/health decision owns every local-engine NEW lane, including
   // work mirrored from an upstream hub. Unknown capability is never v0.
@@ -878,7 +886,10 @@ export async function tick(
             promotedSubmitted ||
             campaignTargetedSubmitted ||
             remoteTargetedSubmitted;
-          if (!submitted) break;
+          if (!submitted) {
+            fastUransExhausted = true;
+            break;
+          }
           fastUransSubmitted = true;
         }
       }
@@ -890,7 +901,10 @@ export async function tick(
     const decision = remoteAdmissionDecisionForTick({
       admissionFenced,
       diskAllowed: diskAdmission.allowed,
-      fastUransSubmitted,
+      fastUransSubmitted: fastUransOwnsRemainingAdmission({
+        submitted: fastUransSubmitted,
+        exhausted: fastUransExhausted,
+      }),
       sharedCapacityAvailable: sharedRemoteCapacityAvailable,
       engineHealthy,
       meshRecoveryVersion,
@@ -914,7 +928,10 @@ export async function tick(
     localCapacityOpen &&
     engineHealthy &&
     meshRecoveryVersion != null &&
-    !fastUransSubmitted &&
+    !fastUransOwnsRemainingAdmission({
+      submitted: fastUransSubmitted,
+      exhausted: fastUransExhausted,
+    }) &&
     !engineBackoffActive()
   ) {
     // Fill every remaining weighted slot in this tick. Each composer still

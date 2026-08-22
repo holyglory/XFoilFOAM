@@ -7,7 +7,11 @@ import {
   engineUransRecoveryVersion,
   supportsDurableUransRecovery,
 } from "../src/engine-capabilities";
-import { remoteAdmissionDecisionForTick, submitOneBatch } from "../src/loop";
+import {
+  fastUransOwnsRemainingAdmission,
+  remoteAdmissionDecisionForTick,
+  submitOneBatch,
+} from "../src/loop";
 
 describe("engine mesh-recovery capability handshake", () => {
   it("accepts a monotonic non-negative integer advertised by live health", async () => {
@@ -159,13 +163,25 @@ describe("remote NEW-admission lane precedence", () => {
     ).toEqual({ kind: "hold", reason: "safety_stop" });
   });
 
-  it("holds mirrored RANS after FAST consumes the one admission opportunity", () => {
+  it("holds mirrored RANS while FAST still owns remaining capacity", () => {
     expect(
       remoteAdmissionDecisionForTick({
         ...open,
         fastUransSubmitted: true,
       }),
     ).toEqual({ kind: "hold", reason: "higher_priority_fast_urans" });
+  });
+
+  it("releases remaining capacity only after the FAST refill lane is exhausted", () => {
+    expect(
+      fastUransOwnsRemainingAdmission({ submitted: true, exhausted: false }),
+    ).toBe(true);
+    expect(
+      fastUransOwnsRemainingAdmission({ submitted: true, exhausted: true }),
+    ).toBe(false);
+    expect(
+      fastUransOwnsRemainingAdmission({ submitted: false, exhausted: false }),
+    ).toBe(false);
   });
 
   it("holds mixed-mode remote RANS while shared capacity is full", () => {
