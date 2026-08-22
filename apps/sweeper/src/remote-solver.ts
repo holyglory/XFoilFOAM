@@ -1944,6 +1944,79 @@ async function cancelMirroredRemotePromise(
   }
 }
 
+async function releaseSourceUnavailableRemotePromises(
+  db: DB,
+  settings: Settings,
+): Promise<number> {
+  const candidates = (await db.execute(sql`
+    SELECT promise.id
+    FROM sync_sweep_promises promise
+    WHERE promise.status IN ('active', 'expired')
+      AND promise.request_payload ->> 'remoteSolver' = 'true'
+      AND promise.source_base_url = ${syncBase(settings)}
+      AND ${remotePromiseOwnerSql(settings, "promise")}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs live_job
+        WHERE COALESCE(live_job.request_payload, '{}'::jsonb)
+                ->> 'syncPromiseId' = promise.id::text
+          AND live_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM sync_remote_result_deliveries unavailable_delivery
+        WHERE unavailable_delivery.promise_id = promise.id
+          AND unavailable_delivery.result_id IS NOT NULL
+          AND unavailable_delivery.state = 'retry_wait'
+          AND unavailable_delivery.last_error LIKE
+              ${REMOTE_REQUIRED_SOURCE_UNAVAILABLE_PREFIX + "%"}
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs result_job
+        JOIN results accepted_result
+          ON accepted_result.sim_job_id = result_job.id
+        JOIN result_attempts accepted_attempt
+          ON accepted_attempt.id = accepted_result.current_result_attempt_id
+         AND accepted_attempt.result_id = accepted_result.id
+        JOIN result_classifications accepted_classification
+          ON accepted_classification.result_attempt_id = accepted_attempt.id
+         AND accepted_classification.state = 'accepted'
+        WHERE COALESCE(result_job.request_payload, '{}'::jsonb)
+                ->> 'syncPromiseId' = promise.id::text
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sync_remote_result_deliveries accounted_delivery
+            WHERE accounted_delivery.promise_id = promise.id
+              AND accounted_delivery.result_id = accepted_result.id
+              AND accounted_delivery.generation_key = accepted_attempt.id::text
+              AND (
+                accounted_delivery.state IN ('delivered', 'superseded')
+                OR (
+                  accounted_delivery.state = 'retry_wait'
+                  AND accounted_delivery.last_error LIKE
+                      ${REMOTE_REQUIRED_SOURCE_UNAVAILABLE_PREFIX + "%"}
+                )
+              )
+          )
+      )
+    ORDER BY promise."createdAt", promise.id
+    LIMIT 25
+  `)) as unknown as Array<{ id: string }>;
+  const reason =
+    "local exact delivery source is unavailable; unfulfilled points released for a fresh solve";
+  for (const candidate of candidates) {
+    await cancelMirroredRemotePromise(
+      db,
+      settings,
+      candidate.id,
+      reason,
+      "terminal_local_state",
+    );
+  }
+  return candidates.length;
+}
+
 async function cancelMirroredPromisesForDisabledSolver(
   db: DB,
   engine: EngineClient,
@@ -2607,6 +2680,10 @@ interface StreamUpload {
 }
 
 class RemoteMultipartSourceError extends Error {}
+class RemoteRequiredEvidenceSourceError extends RemoteMultipartSourceError {}
+
+const REMOTE_REQUIRED_SOURCE_UNAVAILABLE_PREFIX =
+  "remote local delivery source unavailable:";
 
 function localMultipartSourcePath(storageKey: string): string {
   const root = resolve(MEDIA_DIR);
@@ -2647,6 +2724,27 @@ async function preflightMultipartUploads(
         `remote multipart source checksum mismatch for ${upload.storageKey}`,
       );
     }
+  }
+}
+
+async function preflightRequiredEvidenceSource(
+  upload: Pick<StreamUpload, "storageKey" | "byteSize">,
+): Promise<void> {
+  const sourcePath = localMultipartSourcePath(upload.storageKey);
+  let source;
+  try {
+    source = await stat(sourcePath);
+  } catch {
+    throw new RemoteRequiredEvidenceSourceError(
+      `required remote evidence source is unavailable: ${upload.storageKey}`,
+    );
+  }
+  if (!source.isFile() || source.size !== upload.byteSize) {
+    throw new RemoteRequiredEvidenceSourceError(
+      `required remote evidence source byte-size mismatch for ${upload.storageKey}: expected ${upload.byteSize}, found ${
+        source.isFile() ? source.size : "non-file"
+      }`,
+    );
   }
 }
 
@@ -4332,6 +4430,7 @@ async function pushOneRemoteResult(
       throw new Error(error);
     }
     const evidenceSha256 = manifests[0].sha256;
+    await preflightRequiredEvidenceSource(manifests[0]);
     const media = await db
       .select()
       .from(resultMedia)
@@ -4529,6 +4628,7 @@ async function pushOneRemoteResult(
           `solver-evidence/v1/sha256/${brokerRequest.storedSha256.slice(0, 2)}/${brokerRequest.storedSha256}.tar.zst`
       )
         throw new Error("remote evidence broker omitted its upload capability");
+      await preflightRequiredEvidenceSource(bundle);
       const generation = await uploadBrokeredEvidenceFile(
         brokerResponse.uploadUrl,
         {
@@ -4928,6 +5028,12 @@ async function pushOneRemoteResult(
     await setStatus(db, "idle", null, { remoteSolverLastPushAt: new Date() });
     return true;
   } catch (error) {
+    const retryError =
+      error instanceof RemoteRequiredEvidenceSourceError
+        ? `${REMOTE_REQUIRED_SOURCE_UNAVAILABLE_PREFIX} ${error.message}`
+        : error instanceof Error
+          ? error.message
+          : String(error);
     const stillClaimed = await db
       .select({ id: syncRemoteResultDeliveries.id })
       .from(syncRemoteResultDeliveries)
@@ -4942,7 +5048,7 @@ async function pushOneRemoteResult(
     if (stillClaimed.length > 0) {
       await settleResultDelivery(db, claim, {
         kind: "retry",
-        error: error instanceof Error ? error.message : String(error),
+        error: retryError,
       });
     } else {
       const [superseded] = await db
@@ -6257,6 +6363,9 @@ export async function transferRemoteSolverTick(
       await processPendingPromiseCancellations(db, settings);
       await reopenResolvedConflictDeliveries(db, settings);
     }
+    const releasedUnavailablePromises = settings?.upstreamBaseUrl
+      ? await releaseSourceUnavailableRemotePromises(db, settings)
+      : 0;
     const repairedCancelledJobs = settings?.upstreamBaseUrl
       ? await settleCancelledRemoteJobDeliveries(db, settings)
       : 0;
@@ -6268,6 +6377,7 @@ export async function transferRemoteSolverTick(
     }
     if (!settings.remoteSolverAuthToken) return false;
     const processedDurableDelivery =
+      Boolean(releasedUnavailablePromises) ||
       Boolean(repairedCancelledJobs) ||
       Boolean(await settlePromotedRemoteParentDeliveries(db, settings)) ||
       // Accepted current generations release authoritative promise points and

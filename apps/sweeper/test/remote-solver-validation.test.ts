@@ -4508,6 +4508,56 @@ describe("remote solver push validation regressions", () => {
     ).toHaveLength(0);
   });
 
+  it("releases a promise only after every accepted generation is delivered or lacks mandatory source evidence", async () => {
+    const aoa = 822.10255;
+    const job = await seedDoneRemoteJob("required-source-unavailable", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise(
+      "required-source-unavailable",
+      [aoa],
+      promiseId,
+    );
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [manifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, result.id),
+          eq(solverEvidenceArtifacts.kind, "manifest"),
+        ),
+      );
+    unlinkSync(join(MEDIA_DIR, manifest.storageKey));
+    const transport = stubFetch();
+
+    await transferRemoteSolverTick(db, {} as unknown as EngineClient);
+
+    expect(requests(transport.fetchMock, "/polars")).toHaveLength(0);
+    expect(
+      (await deliveriesForJob(job.id)).find((row) => row.resultId),
+    ).toMatchObject({
+      state: "retry_wait",
+      lastError: expect.stringContaining(
+        "remote local delivery source unavailable",
+      ),
+    });
+    expect((await readPromise(promiseId)).promise.status).toBe("active");
+
+    await transferRemoteSolverTick(db, {} as unknown as EngineClient);
+
+    expect((await readPromise(promiseId)).promise.status).toBe("cancelled");
+    expect(
+      requests(transport.fetchMock, `/sweeps/${promiseId}/cancel`),
+    ).toHaveLength(1);
+    expect(
+      (await deliveriesForJob(job.id)).find((row) => row.resultId === null),
+    ).toMatchObject({ state: "superseded" });
+  });
+
   it("MUST-CATCH: an incomplete multipart response retries transport without cancelling valid solver evidence", async () => {
     const aoa = 822.1026;
     const job = await seedDoneRemoteJob("multipart-response-incomplete", [aoa]);
