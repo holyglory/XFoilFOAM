@@ -52,6 +52,11 @@ export interface PointCorrectionInput extends PointCorrectionSettings {
   resultId: string;
   resultAttemptId: string;
   fidelity: "precalc" | "full";
+  /** Operator experiment only: replace the normal FAST wall budget for this
+   * fresh-from-zero corrected run. Ordinary campaign/admin requests cannot
+   * set this field, and the sweeper revalidates the immutable correction
+   * owner before it forwards the override to the engine. */
+  freshBudgetOverrideS?: number | null;
   requestedBy?: string | null;
 }
 
@@ -76,6 +81,23 @@ export async function createPointCorrection(
   db: DB,
   input: PointCorrectionInput,
 ) {
+  if (
+    input.freshBudgetOverrideS != null &&
+    (!Number.isSafeInteger(input.freshBudgetOverrideS) ||
+      input.freshBudgetOverrideS < 4 * 60 * 60 ||
+      input.freshBudgetOverrideS > 24 * 60 * 60)
+  ) {
+    throw new CampaignError(
+      "validation",
+      "fresh FAST duration must be an integer from 14400 through 86400 seconds",
+    );
+  }
+  if (input.fidelity !== "precalc" && input.freshBudgetOverrideS != null) {
+    throw new CampaignError(
+      "validation",
+      "fresh duration override is valid only for a FAST URANS correction",
+    );
+  }
   const [source] = await db
     .select({
       resultId: results.id,
@@ -190,6 +212,7 @@ export async function createPointCorrection(
       stableStringify({
         sourceResultAttemptId: input.resultAttemptId,
         fidelity: input.fidelity,
+        freshBudgetOverrideS: input.freshBudgetOverrideS ?? null,
         mesh: input.mesh,
         solver: input.solver,
       }),
@@ -228,6 +251,7 @@ export async function createPointCorrection(
         slug: slugs.solver,
         name: `${nameBase} solver`,
         solverImplementationId: implementationId,
+        uransPrecalcBudgetS: input.freshBudgetOverrideS ?? null,
         ...input.solver,
       })
       .onConflictDoNothing({ target: solverProfiles.slug });
@@ -316,6 +340,7 @@ export async function createPointCorrection(
     aoaDeg: Number(source.aoaDeg),
     fidelity: input.fidelity,
     requestedBy: input.requestedBy ?? null,
+    budgetOverrideS: input.freshBudgetOverrideS ?? null,
   });
   await db
     .insert(pointCorrectionRuns)
@@ -330,6 +355,9 @@ export async function createPointCorrection(
       settings: {
         mesh: input.mesh,
         solver: input.solver,
+        execution: {
+          freshBudgetOverrideS: input.freshBudgetOverrideS ?? null,
+        },
       },
       requestedBy: input.requestedBy ?? null,
     })

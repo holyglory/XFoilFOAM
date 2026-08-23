@@ -3281,6 +3281,19 @@ async function importAirfoil(
   return { imported: true };
 }
 
+export function mirroredSolverProfileValues(snapshot: SimulationSetupSnapshot) {
+  return {
+    turbulenceModel: snapshot.solver.turbulenceModel,
+    nIterations: snapshot.solver.nIterations,
+    convergenceTolerance: snapshot.solver.convergenceTolerance,
+    momentumScheme: snapshot.solver.momentumScheme,
+    transientCycles: snapshot.solver.transientCycles,
+    transientDiscardFraction: snapshot.solver.transientDiscardFraction,
+    transientMaxCourant: snapshot.solver.transientMaxCourant,
+    uransPrecalcBudgetS: snapshot.solver.uransPrecalcBudgetS,
+  };
+}
+
 async function importSimulationSetupRevision(
   data: Record<string, unknown>,
   source: {
@@ -3307,6 +3320,7 @@ async function importSimulationSetupRevision(
     };
   }
   const snapshot = snapshotRaw as unknown as SimulationSetupSnapshot;
+  const mirroredSolver = mirroredSolverProfileValues(snapshot);
   const [solverImplementation] = await db
     .select()
     .from(solverImplementations)
@@ -3488,25 +3502,13 @@ async function importSimulationSetupRevision(
       slug: `${prefix}-solver`,
       name: `Remote solver ${signatureHash.slice(0, 8)}`,
       solverImplementationId: solverImplementation.id,
-      turbulenceModel: snapshot.solver.turbulenceModel,
-      nIterations: snapshot.solver.nIterations,
-      convergenceTolerance: snapshot.solver.convergenceTolerance,
-      momentumScheme: snapshot.solver.momentumScheme,
-      transientCycles: snapshot.solver.transientCycles,
-      transientDiscardFraction: snapshot.solver.transientDiscardFraction,
-      transientMaxCourant: snapshot.solver.transientMaxCourant,
+      ...mirroredSolver,
     })
     .onConflictDoUpdate({
       target: solverProfiles.slug,
       set: {
         solverImplementationId: solverImplementation.id,
-        turbulenceModel: snapshot.solver.turbulenceModel,
-        nIterations: snapshot.solver.nIterations,
-        convergenceTolerance: snapshot.solver.convergenceTolerance,
-        momentumScheme: snapshot.solver.momentumScheme,
-        transientCycles: snapshot.solver.transientCycles,
-        transientDiscardFraction: snapshot.solver.transientDiscardFraction,
-        transientMaxCourant: snapshot.solver.transientMaxCourant,
+        ...mirroredSolver,
         updatedAt: new Date(),
       },
     })

@@ -715,6 +715,13 @@
       "when": 1791936000000,
       "tag": "0101_point_correction_disposable_cascade",
       "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1792022400000,
+      "tag": "0102_point_correction_fast_budget",
+      "breakpoints": true
     }
   ]
 }

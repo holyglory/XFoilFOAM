@@ -29,6 +29,7 @@ import {
   simPrecalcObligations,
   simResultSubmitRetries,
   simUransRequests,
+  simulationPresetRevisions,
   simulationPresets,
   solverProfiles,
   sweepDefinitions,
@@ -1077,6 +1078,7 @@ describe("point-history story endpoint", () => {
       const payload = {
         resultAttemptId: story.point.resultAttemptId,
         fidelity: "precalc",
+        freshBudgetOverrideS: 28_800,
         mesh: {
           ...story.point.correctionSetup.mesh,
           nSurface: story.point.correctionSetup.mesh.nSurface + 20,
@@ -1119,7 +1121,22 @@ describe("point-history story endpoint", () => {
         aoaDeg: -1,
         fidelity: "precalc",
         state: "pending",
+        budgetOverrideS: 28_800,
       });
+
+      const [correctedRevision] = await db
+        .select({ snapshot: simulationPresetRevisions.snapshot })
+        .from(simulationPresetRevisions)
+        .where(eq(simulationPresetRevisions.id, firstBody.revisionId));
+      expect(
+        (correctedRevision.snapshot as { solver: Record<string, unknown> })
+          .solver.uransPrecalcBudgetS,
+      ).toBe(28_800);
+      const [correctedSolver] = await db
+        .select({ budget: solverProfiles.uransPrecalcBudgetS })
+        .from(solverProfiles)
+        .where(eq(solverProfiles.id, correctedPreset.solverProfileId));
+      expect(correctedSolver.budget).toBe(28_800);
 
       const replay = await app.inject({
         method: "POST",
@@ -1189,6 +1206,22 @@ describe("point-history story endpoint", () => {
           state: "pending",
         }),
       ]);
+
+      const [correctionProvenance] = await db
+        .select({ settings: pointCorrectionRuns.settings })
+        .from(pointCorrectionRuns)
+        .where(eq(pointCorrectionRuns.id, firstBody.correctionRunId));
+      expect(correctionProvenance.settings).toMatchObject({
+        execution: { freshBudgetOverrideS: 28_800 },
+      });
+
+      const invalidFullBudget = await app.inject({
+        method: "POST",
+        url: `/api/admin/point-history/${resultId}/corrected-run`,
+        payload: { ...payload, fidelity: "full" },
+      });
+      expect(invalidFullBudget.statusCode).toBe(422);
+      expect(invalidFullBudget.json().error).toContain("only for a FAST");
 
       const stale = await app.inject({
         method: "POST",

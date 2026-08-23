@@ -183,7 +183,7 @@ def _urans_recovery_regression() -> int:
         ),
         (
             "db-precalc-contract-remediation",
-            "exact PRECALC contract remediation ownership",
+            "exact PRECALC remediation and point-correction FAST budget schema",
             [
                 "/usr/bin/corepack",
                 "pnpm",
@@ -193,6 +193,7 @@ def _urans_recovery_regression() -> int:
                 "vitest",
                 "run",
                 "test/precalc-contract-remediation.test.ts",
+                "test/point-correction-fast-budget-migration.test.ts",
             ],
         ),
         (
@@ -210,6 +211,38 @@ def _urans_recovery_regression() -> int:
                 "test/fidelity-contract-pin.test.ts",
                 "test/urans-quality-recovery.test.ts",
                 "test/urans-ladder.test.ts",
+            ],
+        ),
+        (
+            "sweeper-point-correction-fast-budget-pure",
+            "fresh FAST budget owner and engine payload boundary",
+            [
+                "/usr/bin/env",
+                "VITEST_PURE_REDUCER_TEST=1",
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/sweeper",
+                "exec",
+                "vitest",
+                "run",
+                "test/point-correction-fast-budget.test.ts",
+                "test/point-correction-fairness.test.ts",
+            ],
+        ),
+        (
+            "api-point-correction-fast-budget",
+            "point-correction revision capture and sync preservation",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/api",
+                "exec",
+                "vitest",
+                "run",
+                "test/point-history.test.ts",
+                "test/sync-fast-budget.test.ts",
             ],
         ),
         (

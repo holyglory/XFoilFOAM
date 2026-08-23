@@ -43,6 +43,15 @@ const listQuerySchema = z.object({
 const correctionBodySchema = z.object({
   resultAttemptId: z.string().uuid(),
   fidelity: z.enum(["precalc", "full"]),
+  // Deliberately absent from the normal request-URANS endpoint. This narrow
+  // operator experiment stays bound to an immutable point-correction row,
+  // and the sweeper revalidates that provenance before engine submission.
+  freshBudgetOverrideS: z
+    .number()
+    .int()
+    .min(4 * 60 * 60)
+    .max(24 * 60 * 60)
+    .optional(),
   mesh: z.object({
     mesher: z.string().trim().min(1).max(80),
     farfieldRadiusChords: z.number().finite().positive().max(500),

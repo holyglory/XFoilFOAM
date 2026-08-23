@@ -35,6 +35,7 @@ import {
   meshProfiles,
   onResultIngestedWithAutomaticPrecalcHandoff,
   outputProfiles,
+  pointCorrectionRuns,
   precalcContinuationsForObligations,
   precalcSnapshotForVerifyItem,
   probeCampaignCompletion,
@@ -87,6 +88,7 @@ import {
   resetUransLadderMemory,
   submitCampaignPrecalcRecoveries,
   submitInterleavedVerifyIfDue,
+  submitPendingPointCorrectionFastRequest,
   uransLadderTick,
 } from "../src/urans-ladder";
 import { withExactManifestEvidence } from "./exact-result-fixture";
@@ -2606,6 +2608,135 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       .delete(simUransRequests)
       .where(eq(simUransRequests.id, claimed.id));
   }, 60000);
+
+  it("admits one ownerless point correction exactly once under concurrent fairness ticks", async () => {
+    const aoaDeg = 47.125;
+    const [sourceResult] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        fidelity: "urans_precalc",
+        error: "test rejected FAST evidence",
+      })
+      .returning({ id: results.id });
+    const [sourceAttempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: sourceResult.id,
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "failed",
+        source: "solved",
+        regime: "urans",
+        unsteady: true,
+        converged: false,
+        error: "test rejected FAST evidence",
+      })
+      .returning({ id: resultAttempts.id });
+    await db.insert(resultClassifications).values({
+      resultId: sourceResult.id,
+      resultAttemptId: sourceAttempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "urans",
+      classifierVersion: "point-correction-fairness-test-v1",
+      state: "rejected",
+      region: "unknown",
+      reasons: ["not-converged"],
+    });
+    const [revision] = await db
+      .select({ presetId: simulationPresetRevisions.presetId })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId));
+    const { request } = await createUransRequest(db, {
+      airfoilId,
+      revisionId,
+      aoaDeg,
+      fidelity: "precalc",
+      requestedBy: `${PREFIX}-point-correction-fairness`,
+    });
+    await db.insert(pointCorrectionRuns).values({
+      sourceResultId: sourceResult.id,
+      sourceResultAttemptId: sourceAttempt.id,
+      correctedPresetId: revision.presetId,
+      correctedRevisionId: revisionId,
+      uransRequestId: request.id,
+      fidelity: "precalc",
+      settingsSha256: "a".repeat(64),
+      settings: {
+        mesh: {},
+        solver: {},
+        execution: { freshBudgetOverrideS: null },
+      },
+      requestedBy: `${PREFIX}-point-correction-fairness`,
+    });
+
+    const captured: PolarRequest[] = [];
+    let createdJobId: string | null = null;
+    try {
+      const outcomes = await Promise.all([
+        submitPendingPointCorrectionFastRequest(
+          db,
+          stubEngine(captured, `${PREFIX}-point-correction-engine`),
+          0,
+          2,
+          14,
+        ),
+        submitPendingPointCorrectionFastRequest(
+          db,
+          stubEngine(captured, `${PREFIX}-point-correction-engine`),
+          0,
+          2,
+          14,
+        ),
+      ]);
+      expect(outcomes.filter((outcome) => outcome.submitted)).toHaveLength(1);
+      expect(captured).toHaveLength(1);
+      const [owned] = await db
+        .select({
+          state: simUransRequests.state,
+          simJobId: simUransRequests.simJobId,
+        })
+        .from(simUransRequests)
+        .where(eq(simUransRequests.id, request.id));
+      expect(owned.state).toBe("running");
+      expect(owned.simJobId).toBeTruthy();
+      createdJobId = owned.simJobId;
+      const duplicateOwners = await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          dsql`${simJobs.requestPayload} ->> 'uransRequestId' = ${request.id}`,
+        );
+      expect(duplicateOwners).toHaveLength(1);
+    } finally {
+      await db
+        .delete(simUransRequests)
+        .where(eq(simUransRequests.id, request.id));
+      if (createdJobId) {
+        await db.delete(simJobs).where(eq(simJobs.id, createdJobId));
+      }
+      await db
+        .delete(simPrecalcObligations)
+        .where(
+          and(
+            eq(simPrecalcObligations.airfoilId, airfoilId),
+            eq(simPrecalcObligations.revisionId, revisionId),
+            eq(simPrecalcObligations.aoaDeg, aoaDeg),
+          ),
+        );
+      await db.delete(results).where(eq(results.id, sourceResult.id));
+    }
+  }, 120000);
 
   it("settles a request when the process dies after a terminal submit/job boundary", async () => {
     const rejectedAoa = 46.125;

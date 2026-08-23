@@ -865,6 +865,10 @@ export async function pointHistoryPage(
 // ---------------------------------------------------------------------------
 export interface PointStoryAttempt {
   id: string;
+  revisionId: string | null;
+  /** Immutable numerical setup value resolved through this exact attempt's
+   * preset revision; null is the ordinary tier-default FAST policy. */
+  uransPrecalcBudgetS: number | null;
   regime: "rans" | "urans" | null;
   status: string;
   validForPolar: boolean;
@@ -1208,7 +1212,10 @@ export async function pointStory(
 
   const attemptRows = (await db.execute(sql`
     SELECT
-      ra.id, ra.regime, ra.status::text AS status, ra.valid_for_polar, ra.converged, ra.stalled,
+      ra.id, ra.simulation_preset_revision_id AS revision_id,
+      NULLIF(attempt_revision.snapshot -> 'solver' ->> 'uransPrecalcBudgetS', '')::integer
+        AS urans_precalc_budget_s,
+      ra.regime, ra.status::text AS status, ra.valid_for_polar, ra.converged, ra.stalled,
       ra.unsteady, ra.first_order_fallback, ra.cl, ra.cd, ra.cl_cd, ra.strouhal,
       left(ra.error, 500) AS error, ra.quality_warnings, ra.engine_case_slug,
       ra."createdAt" AS created_at, ra."solvedAt" AS solved_at,
@@ -1217,12 +1224,16 @@ export async function pointStory(
       rca.state::text AS cls_state, rca.reasons AS cls_reasons, rca.confidence AS cls_confidence
     FROM result_attempts ra
     LEFT JOIN sim_jobs j ON j.id = ra.sim_job_id
+    LEFT JOIN simulation_preset_revisions attempt_revision
+      ON attempt_revision.id = ra.simulation_preset_revision_id
     LEFT JOIN result_classifications rca ON rca.result_attempt_id = ra.id
     WHERE ra.result_id = ${resultId}
     ORDER BY ra."createdAt" ASC
     LIMIT 50
   `)) as unknown as Array<{
     id: string;
+    revision_id: string | null;
+    urans_precalc_budget_s: number | null;
     regime: "rans" | "urans" | null;
     status: string;
     valid_for_polar: boolean;
@@ -1408,6 +1419,11 @@ export async function pointStory(
     },
     attempts: attemptRows.map((a) => ({
       id: a.id,
+      revisionId: a.revision_id,
+      uransPrecalcBudgetS:
+        a.urans_precalc_budget_s == null
+          ? null
+          : Number(a.urans_precalc_budget_s),
       regime: a.regime,
       status: a.status,
       validForPolar: a.valid_for_polar,

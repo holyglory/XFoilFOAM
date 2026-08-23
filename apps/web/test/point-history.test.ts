@@ -316,6 +316,8 @@ describe("buildStoryDigest", () => {
 // ---------------------------------------------------------------------------
 const attempt = (over: Partial<PointStoryAttempt>): PointStoryAttempt => ({
   id: "a1",
+  revisionId: "rev1",
+  uransPrecalcBudgetS: null,
   regime: "rans",
   status: "done",
   validForPolar: false,

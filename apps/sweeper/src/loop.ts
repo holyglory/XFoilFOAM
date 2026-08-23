@@ -35,6 +35,7 @@ import { configuredAdmissionFencePolicy } from "./config";
 import {
   submitCampaignPrecalcRecoveries,
   submitInterleavedVerifyIfDue,
+  submitPendingPointCorrectionFastRequest,
   submitRemotePromisePrecalcRecoveries,
   submitRecordedPromotionRecovery,
   uransLadderTick,
@@ -168,6 +169,30 @@ export function fastUransOwnsRemainingAdmission(input: {
   exhausted: boolean;
 }): boolean {
   return input.submitted && !input.exhausted;
+}
+
+export function shouldAttemptPointCorrectionFast(input: {
+  promotionSubmitted: boolean;
+  localCapacityOpen: boolean;
+  consideredThisTick: boolean;
+}): boolean {
+  return (
+    !input.promotionSubmitted &&
+    input.localCapacityOpen &&
+    !input.consideredThisTick
+  );
+}
+
+export function campaignFastMayUseThisIteration(input: {
+  promotionSubmitted: boolean;
+  pointCorrectionSubmitted: boolean;
+  localCapacityOpen: boolean;
+}): boolean {
+  return (
+    !input.promotionSubmitted &&
+    !input.pointCorrectionSubmitted &&
+    input.localCapacityOpen
+  );
 }
 
 /**
@@ -840,6 +865,7 @@ export async function tick(
         // still crosses the serialized submit lifecycle, and disk/capacity are
         // re-measured after each accepted job.
         const MAX_FAST_URANS_ADMISSIONS_PER_TICK = 16;
+        let pointCorrectionConsideredThisTick = false;
         for (let i = 0; i < MAX_FAST_URANS_ADMISSIONS_PER_TICK; i++) {
           if (engineBackoffActive()) break;
           diskAdmission = await refreshDiskAdmission(db, engine);
@@ -860,19 +886,43 @@ export async function tick(
               ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
             },
           );
-          const campaignTargetedSubmitted =
-            promotedSubmitted || !localCapacityOpen
-              ? false
-              : await submitCampaignPrecalcRecoveries(
-                  db,
-                  engine,
-                  undefined,
-                  undefined,
-                  meshRecoveryVersion,
-                  uransRecoveryVersion,
-                );
+          const pointCorrectionAdmission: {
+            attempted: boolean;
+            submitted: boolean;
+          } = shouldAttemptPointCorrectionFast({
+            promotionSubmitted: promotedSubmitted,
+            localCapacityOpen,
+            consideredThisTick: pointCorrectionConsideredThisTick,
+          })
+            ? await submitPendingPointCorrectionFastRequest(
+                db,
+                engine,
+                state.cpuSlots,
+                meshRecoveryVersion,
+                uransRecoveryVersion,
+              )
+            : { attempted: false, submitted: false };
+          pointCorrectionConsideredThisTick =
+            pointCorrectionConsideredThisTick ||
+            pointCorrectionAdmission.attempted;
+          const pointCorrectionSubmitted = pointCorrectionAdmission.submitted;
+          const campaignTargetedSubmitted = campaignFastMayUseThisIteration({
+            promotionSubmitted: promotedSubmitted,
+            pointCorrectionSubmitted,
+            localCapacityOpen,
+          })
+            ? await submitCampaignPrecalcRecoveries(
+                db,
+                engine,
+                undefined,
+                undefined,
+                meshRecoveryVersion,
+                uransRecoveryVersion,
+              )
+            : false;
           const remoteTargetedSubmitted =
             promotedSubmitted ||
+            pointCorrectionSubmitted ||
             campaignTargetedSubmitted ||
             !remoteFastCapacityOpen
               ? false
@@ -884,6 +934,7 @@ export async function tick(
                 );
           const submitted =
             promotedSubmitted ||
+            pointCorrectionSubmitted ||
             campaignTargetedSubmitted ||
             remoteTargetedSubmitted;
           if (!submitted) {

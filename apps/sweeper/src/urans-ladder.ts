@@ -34,6 +34,7 @@ import {
   finalVerifyInterleaveDecision,
   FullUransRequestCoverageIncompleteError,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  pointCorrectionRuns,
   precalcContinuationsForObligations,
   precalcObligationsRequireConservativeRetry,
   precalcRequestStateFromObligations,
@@ -1748,6 +1749,46 @@ async function resolveTarget(
   return { airfoilId, revisionId, snapshot, bcId };
 }
 
+export function freshPointCorrectionBudgetInvariant(input: {
+  fidelity: UransFidelity;
+  continuation: boolean;
+  configuredBudgetS: number | null;
+  requestedBudgetS: number | null;
+  correctionRunId: string | null;
+  recordedBudgetS: number | null;
+}): string | null {
+  // Continuations own their duration through an exact checkpoint. This guard
+  // governs only the fresh-from-zero experiment boundary.
+  if (input.continuation) return null;
+  const hasAnyFreshBudget =
+    input.configuredBudgetS != null || input.requestedBudgetS != null;
+  if (!hasAnyFreshBudget) return null;
+  if (input.fidelity !== "precalc") {
+    return "fresh duration override is valid only for FAST URANS";
+  }
+  if (!input.correctionRunId) {
+    return "fresh URANS budget override requires an immutable point-correction owner";
+  }
+  if (input.recordedBudgetS !== input.requestedBudgetS) {
+    return "point-correction FAST budget differs from its immutable correction provenance";
+  }
+  if (input.configuredBudgetS !== input.requestedBudgetS) {
+    return "point-correction FAST budget differs from its immutable setup revision";
+  }
+  return null;
+}
+
+export function applyUransBudgetOverrideToEngineRequest(
+  request: { budget_override_s?: number | null },
+  input: Parameters<typeof freshPointCorrectionBudgetInvariant>[0],
+): void {
+  const error = freshPointCorrectionBudgetInvariant(input);
+  if (error) throw new Error(error);
+  if (input.requestedBudgetS != null) {
+    request.budget_override_s = input.requestedBudgetS;
+  }
+}
+
 /** Compose + submit one wave-2 URANS ladder job (admin request or verify
  *  item). NO claim flips: existing done rows keep their evidence — a failed
  *  ladder solve must never destroy previously-good coefficients; success
@@ -1767,8 +1808,13 @@ async function submitLadderJob(
      *  instead of a fresh solve. Composed into the request as
      *  { continue_from: { engine_job_id, case_slug } }. */
     continueFrom?: { engineJobId: string; caseSlug: string } | null;
-    /** Continuation budget override [s] — replaces the tier-derived budget. */
+    /** Per-job budget override [s] — replaces the tier-derived budget. */
     budgetOverrideS?: number | null;
+    /** A fresh budget override is legal only for one immutable operator point
+     * correction whose stored settings carry the identical duration. */
+    freshBudgetPointCorrectionRunId?: string | null;
+    /** Budget value copied from the immutable point-correction row. */
+    freshBudgetRecordedS?: number | null;
     /** Exact archive-reducer instruction for the resumed transient's clean
      * tail. Only archive-authorized same-case continuations may set this. */
     correctiveTailPeriods?: number | null;
@@ -1815,6 +1861,14 @@ async function submitLadderJob(
       "corrective tail periods are valid only for an exact same-case continuation",
     );
   }
+  const freshBudgetInput = {
+    fidelity: opts.fidelity,
+    continuation: Boolean(opts.continueFrom),
+    configuredBudgetS: opts.target.snapshot.solver.uransPrecalcBudgetS ?? null,
+    requestedBudgetS: opts.budgetOverrideS ?? null,
+    correctionRunId: opts.freshBudgetPointCorrectionRunId ?? null,
+    recordedBudgetS: opts.freshBudgetRecordedS ?? null,
+  };
   const {
     target,
     aoas,
@@ -1952,6 +2006,7 @@ async function submitLadderJob(
   if (conservativeRetryVersion != null) {
     request.expected_urans_recovery_version = conservativeRetryVersion;
   }
+  applyUransBudgetOverrideToEngineRequest(request, freshBudgetInput);
   if (opts.continueFrom) {
     // Amendment C: the engine copies/links the saved case dir into the new
     // job and restarts the transient from latestTime, merging coefficient
@@ -1961,8 +2016,6 @@ async function submitLadderJob(
       engine_job_id: opts.continueFrom.engineJobId,
       case_slug: opts.continueFrom.caseSlug,
     };
-    if (opts.budgetOverrideS != null)
-      request.budget_override_s = opts.budgetOverrideS;
     if (opts.correctiveTailPeriods != null) {
       if (
         !Number.isSafeInteger(opts.correctiveTailPeriods) ||
@@ -2016,6 +2069,13 @@ async function submitLadderJob(
         : {}),
       ...(opts.correctiveTailPeriods != null
         ? { correctiveTailPeriods: opts.correctiveTailPeriods }
+        : {}),
+      ...(opts.freshBudgetPointCorrectionRunId
+        ? {
+            freshBudgetPointCorrectionRunId:
+              opts.freshBudgetPointCorrectionRunId,
+            freshBudgetOverrideS: opts.budgetOverrideS,
+          }
         : {}),
       resources: pinnedAdmissionResources,
       setupSnapshot: target.snapshot,
@@ -2334,6 +2394,72 @@ async function consumeUransRequest(
   let archiveBackfillContinuation = false;
   let effectiveBudgetOverrideS =
     requestedFidelity === "precalc" ? (request.budgetOverrideS ?? null) : null;
+  let freshBudgetPointCorrectionRunId: string | null = null;
+  let freshBudgetRecordedS: number | null = null;
+  if (
+    requestedFidelity === "precalc" &&
+    request.continueFromResultId == null &&
+    effectiveBudgetOverrideS != null
+  ) {
+    const [correction] = await db
+      .select({
+        id: pointCorrectionRuns.id,
+        settings: pointCorrectionRuns.settings,
+      })
+      .from(pointCorrectionRuns)
+      .where(eq(pointCorrectionRuns.uransRequestId, request.id))
+      .limit(1);
+    const execution =
+      correction?.settings &&
+      typeof correction.settings === "object" &&
+      !Array.isArray(correction.settings)
+        ? (correction.settings as Record<string, unknown>).execution
+        : null;
+    const recordedBudget =
+      execution && typeof execution === "object" && !Array.isArray(execution)
+        ? (execution as Record<string, unknown>).freshBudgetOverrideS
+        : null;
+    const freshBudgetError = freshPointCorrectionBudgetInvariant({
+      fidelity: requestedFidelity,
+      continuation: false,
+      configuredBudgetS: target.snapshot.solver.uransPrecalcBudgetS ?? null,
+      requestedBudgetS: effectiveBudgetOverrideS,
+      correctionRunId: correction?.id ?? null,
+      recordedBudgetS:
+        typeof recordedBudget === "number" ? recordedBudget : null,
+    });
+    if (freshBudgetError) {
+      // createPointCorrection writes the request immediately before its
+      // immutable owner. A poll inside that short transaction handoff waits;
+      // a durable orphan or any value/revision mismatch blocks so it cannot
+      // consume the correction-fairness opportunity forever.
+      const creationAgeMs =
+        Date.now() - new Date(request.createdAt).getTime();
+      if (!correction && creationAgeMs < 30_000) {
+        await releaseClaimedUransRequest(db, request.id);
+        console.error(
+          `[sweeper] fresh FAST duration request ${request.id} waiting for its exact point-correction provenance`,
+        );
+      } else {
+        await db
+          .update(simUransRequests)
+          .set({ state: "blocked", simJobId: null })
+          .where(
+            and(
+              eq(simUransRequests.id, request.id),
+              eq(simUransRequests.state, "running"),
+            ),
+          );
+        console.error(
+          `[sweeper] fresh FAST duration request ${request.id} blocked: ${freshBudgetError}`,
+        );
+      }
+      return false;
+    }
+    freshBudgetPointCorrectionRunId = correction.id;
+    freshBudgetRecordedS =
+      typeof recordedBudget === "number" ? recordedBudget : null;
+  }
   let effectiveCorrectiveTailPeriods: number | null = null;
   let aoas: number[];
   if (requestedFidelity === "precalc" && request.continueFromResultId) {
@@ -2685,10 +2811,18 @@ async function consumeUransRequest(
               : {}),
           }
         : {}),
+      ...(freshBudgetPointCorrectionRunId
+        ? {
+            freshBudgetPointCorrectionRunId,
+            freshBudgetOverrideS: effectiveBudgetOverrideS,
+          }
+        : {}),
     },
     cpuSlots,
     continueFrom,
     budgetOverrideS: effectiveBudgetOverrideS,
+    freshBudgetPointCorrectionRunId,
+    freshBudgetRecordedS,
     correctiveTailPeriods: effectiveCorrectiveTailPeriods,
     meshRecoveryVersion,
     uransRecoveryVersion,
@@ -2743,6 +2877,50 @@ async function consumeUransRequest(
   // failed sim_job. Never rewrite accepted result evidence or downgrade this
   // machine-terminal outcome into a review/cancel placeholder here.
   return false;
+}
+
+/** Admit one explicitly owned point correction ahead of the unbounded
+ * campaign-PRECALC backlog. The caller invokes this at most once per refill
+ * tick, after recorded promotions, so operator experiments cannot monopolize
+ * a multi-slot turnover while they also cannot starve forever behind normal
+ * automatic recovery. Every request still crosses the ordinary serialized
+ * admission and immutable composition path. */
+export async function submitPendingPointCorrectionFastRequest(
+  db: DB,
+  engine: EngineClient,
+  cpuSlots: number,
+  meshRecoveryVersion: number,
+  uransRecoveryVersion: number | null,
+): Promise<{ attempted: boolean; submitted: boolean }> {
+  const [candidate] = await db
+    .select({ id: simUransRequests.id })
+    .from(simUransRequests)
+    .innerJoin(
+      pointCorrectionRuns,
+      eq(pointCorrectionRuns.uransRequestId, simUransRequests.id),
+    )
+    .where(
+      and(
+        eq(simUransRequests.state, "pending"),
+        eq(simUransRequests.fidelity, "precalc"),
+        isNull(simUransRequests.simJobId),
+      ),
+    )
+    .orderBy(simUransRequests.createdAt, simUransRequests.id)
+    .limit(1);
+  if (!candidate) return { attempted: false, submitted: false };
+  return {
+    attempted: true,
+    submitted: await consumeUransRequest(
+      db,
+      engine,
+      cpuSlots,
+      [candidate.id],
+      meshRecoveryVersion,
+      uransRecoveryVersion,
+      "precalc",
+    ),
+  };
 }
 
 /** Consume ONE pending verify-queue item (contract 4). The caller owns whether

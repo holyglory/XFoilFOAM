@@ -781,6 +781,11 @@ export const solverProfiles = pgTable(
     transientMaxCourant: doublePrecision("transient_max_courant")
       .notNull()
       .default(DEFAULT_TRANSIENT_MAX_COURANT),
+    /** Experimental FAST wall budget, resolved as immutable solver/numerical
+     * configuration. Ordinary profile APIs never accept it; only a
+     * point-correction owner can submit a non-null value until a later
+     * evidence-backed policy decision promotes it. */
+    uransPrecalcBudgetS: integer("urans_precalc_budget_s"),
     isSeeded: boolean("is_seeded").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
@@ -791,6 +796,10 @@ export const solverProfiles = pgTable(
   (t) => ({
     implementationIdx: index("solver_profiles_implementation_idx").on(
       t.solverImplementationId,
+    ),
+    uransPrecalcBudgetCheck: check(
+      "solver_profiles_urans_precalc_budget_s_check",
+      sql`${t.uransPrecalcBudgetS} IS NULL OR ${t.uransPrecalcBudgetS} BETWEEN 14400 AND 86400`,
     ),
   }),
 );
@@ -4883,8 +4892,10 @@ export const simUransRequests = pgTable(
      * rows remain nullable and must prove an exact retained queue/job link
      * before the controller may reuse them. */
     continueFromResultAttemptId: uuid("continue_from_result_attempt_id"),
-    /** Continuation budget override [s]: replaces the fidelity-derived solver
-     *  budget for the resumed run (+2h / +6h UI choices). NULL = tier default. */
+    /** Per-job URANS budget override [s]. Continuations bind it to their exact
+     * checkpoint; a fresh request may use it only when an immutable
+     * point_correction_runs owner records the same value and the sweeper
+     * revalidates that owner before submission. NULL = tier default. */
     budgetOverrideS: integer("budget_override_s"),
     /** Exact archive reducer recommendation for a continuation's additional
      * whole-period tail. NULL preserves legacy/source-heuristic continuations

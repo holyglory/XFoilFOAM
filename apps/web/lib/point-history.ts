@@ -126,6 +126,8 @@ export interface PointHistoryPagePayload {
 
 export interface PointStoryAttempt {
   id: string;
+  revisionId: string | null;
+  uransPrecalcBudgetS: number | null;
   regime: "rans" | "urans" | null;
   status: string;
   validForPolar: boolean;

@@ -2,9 +2,9 @@
 
 This is the outcome-blind cohort registration for the v14 recovery experiment.
 The quality gates are unchanged. Every control starts from time zero through
-the existing point-correction transaction and ordinary scheduler. An 8-hour
-continuation is permitted only from that control's typed, exact restartable
-budget-stop generation and verified restart archive.
+the existing point-correction transaction and ordinary scheduler. The primary
+metric is first-attempt FAST validity; continuation is retained only as an
+exceptional diagnostic comparison.
 
 ## Ineligible original discovery sources
 
@@ -38,8 +38,8 @@ half-resolution derived mesh and 4-hour budget.
 | D3 | periodicity contamination | `59a5f1eb-9d45-40e5-a434-198d102e67f6` / `576585f4-358b-43d6-8564-fbcb1e21ba81` | AG03, Re 102347, M 0.088129, alpha 18 | `d3b1f92b-3023-46f7-8fe7-f5911a66c621` / `35a72d94-4b3b-4349-8ba1-a6928f9dd461` / `cdaae2de-b3e1-463b-837b-6ad3cfac5641` |
 | D4 | cycle exhaustion at distinct Re/Mach | `06a25c20-85de-4364-9066-83aa666762bb` / `615deb5f-08ab-4b00-81b9-941029cf978a` | AG04, Re 307041, M 0.264387, alpha 20 | `dc56abce-8ffe-40d6-ac22-aad1d5cdde76` / `4e3c0c12-b570-4bd2-8c06-9fc0752efd6c` / `9c604d73-ec5a-4b80-a1ff-228858bc1eff` |
 
-Predeclared replacements, used only if fewer than two discovery controls
-produce a legitimate restartable budget stop:
+Predeclared replacements, used only if a discovery source becomes ineligible
+before its fresh matrix starts:
 
 - R1 low-angle budget stop: result `ecb8be1e-810c-4175-97a3-6e96b201272e`,
   attempt `6f107bb4-cf76-4147-95ee-cc6129e7a9f3` (AG03, alpha -3).
@@ -60,16 +60,26 @@ until the discovery strategy and pass/fail rules are frozen.
 | V3 | periodicity contamination | `391f3abb-a190-4e0c-b043-1bc06f1744cc` / `165fe767-f27a-4431-bd35-572a933b72a4` | A18, Re 102347, alpha 18 |
 | V4 | cycle exhaustion at distinct Re/Mach | `e14487ab-f8b6-40c0-8e89-c6fec9d9ff03` / `93e9982c-e4b8-428f-8ceb-5aa06fdc43b4` | AG04, Re 307041, alpha 19 |
 
-## Paired lineage and decision rule
+## Fresh discovery matrix and decision rule
 
-For each discovery key, retain:
+Every variant starts from time zero and changes one interpretable dimension
+where practical. Initialization, physical conditions, evidence cadence, and
+all unlisted settings remain fixed.
 
-`source attempt -> fresh control request/job/attempt -> exact restartable
-checkpoint/archive -> 8-hour continuation request/job/attempt`.
+- D1: unchanged 4-hour control; fresh 8-hour FAST duration.
+- D2: unchanged 4-hour control; fresh 8-hour duration; separate max Courant
+  4-to-1 variant.
+- D3: unchanged control; separate max Courant 4-to-1 and
+  linearUpwind-to-upwind variants. Upwind is not successful merely because it
+  passes: spectra, phase behavior, and Cl/Cd/Cm bias must remain credible.
+- D4: unchanged control; separate max Courant 4-to-1, 1.5x C-grid resolution,
+  and fresh 8-hour variants. The resolution run retains topology/domain and
+  compares mesh-quality and y+ evidence.
 
-The continuation changes only the per-job wall budget to 28,800 seconds and
-resumes the same case. Accepted, corrupt, exhausted, non-restartable, or
-differently configured controls receive no continuation. Outcomes are compared
-on accepted immutable evidence, retained simulated/convective time, force
-samples, real field frames, exact gate reason, and CPU-hours. No result is
-manually accepted and no held-out result is used to choose the strategy.
+The 8-hour value is immutable solver/numerical configuration in the corrected
+preset revision, not mutable queue metadata. Outcomes are compared on
+first-attempt accepted immutable evidence, retained simulated/convective time,
+force samples, real field frames, spectra/phase behavior, exact gate reason,
+coefficients, and CPU-hours. Recovery-assisted success is reported separately.
+No result is manually accepted and no held-out result is used to choose the
+strategy.
