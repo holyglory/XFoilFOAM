@@ -61,6 +61,7 @@ import { reconcile, resetOrphans } from "./reconcile";
 import {
   admitRemoteSolverTick,
   reconcileRemoteSolverTick,
+  scheduleRemoteSolverReclaims,
   scheduleRemoteSolverTransfer,
   type RemoteEngineAdmissionDecision,
 } from "./remote-solver";
@@ -752,6 +753,14 @@ export async function tick(
   // critical incident. Re-check before any local or remote admission in this
   // same tick; waiting for the next poll would admit one job past the fence.
   const postReconcileFence = await checkAdmissionFence(db, "after_reconcile");
+  // Remote authority/evidence reconciliation remains admission-free. Start
+  // its bounded transfer/reclaim drain before terminal filesystem cleanup:
+  // deleting an OpenFOAM tree with millions of small files can take minutes,
+  // and must not starve the independent per-case reclaim outbox during that
+  // entire interval.
+  const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
+  scheduleRemoteSolverReclaims(db, engine);
+  scheduleRemoteSolverTransfer(db, engine);
   await retentionTick(db, engine);
   let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;
   const admissionFenceGuardFailed =
@@ -772,15 +781,7 @@ export async function tick(
       diskAdmission = await refreshDiskAdmission(db, engine);
     }
   }
-  // Remote authority/evidence reconciliation remains early and admission-free.
   // Its NEW RANS lane is considered only after durable FAST URANS below.
-  const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
-  // Artifact publication, cancellation delivery, and brokered-evidence
-  // reclaim run in one process-local single flight. Start that background
-  // drain before the potentially long multi-slot refill scan; it is not
-  // awaited, so valid CPU admission continues in this tick while durable
-  // transfer and storage release can no longer be starved behind it.
-  scheduleRemoteSolverTransfer(db, engine);
   // Dedicated remote-solver instances intentionally leave the local scheduler
   // disabled and use their independent remote CPU budget. In mixed mode,
   // mirrored RANS shares the visible local capacity and must wait rather than

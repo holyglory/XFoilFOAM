@@ -36,6 +36,7 @@ next-env.d.ts
 Airfoil Database and Simulation Portal-handoff.zip
 
 # --- local Codex/test artifacts ---
+.devcoordinator/
 .claude/
 .codex/*
 !.codex/dev-runtime.json

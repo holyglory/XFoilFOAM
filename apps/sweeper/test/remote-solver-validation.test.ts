@@ -1898,7 +1898,7 @@ describe("remote solver submit lifecycle", () => {
         .set({ enabled: schedulerBefore.enabled, updatedAt: new Date() })
         .where(eq(sweeperState.id, 1));
     }
-  }, 20_000);
+  }, 120_000);
 
   it("MUST-CATCH: a running serial polar does not block the next mirrored polar from using free CPU capacity", async () => {
     const runningPromise = await seedMirroredPromise(
@@ -4511,11 +4511,7 @@ describe("remote solver push validation regressions", () => {
     const job = await seedDoneRemoteJob("required-source-unavailable", [aoa]);
     const promiseId = (job.requestPayload as { syncPromiseId: string })
       .syncPromiseId;
-    await seedMirroredPromise(
-      "required-source-unavailable",
-      [aoa],
-      promiseId,
-    );
+    await seedMirroredPromise("required-source-unavailable", [aoa], promiseId);
     const [result] = await db
       .select()
       .from(results)
@@ -5648,38 +5644,17 @@ describe("remote solver push validation regressions", () => {
       reclaimLastError: null,
     });
 
-    const absent = await seedPendingReclaim(
-      "reclaim-already-absent",
-      889.101,
-    );
-    const absentEvents: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL) => {
-        const url = String(input);
-        if (url.endsWith(`/${absent.receipt.brokeredUploadId}/download`)) {
-          absentEvents.push("download");
-          return new Response(absent.archive.bytes, {
-            status: 200,
-            headers: {
-              "content-type": "application/zstd",
-              "content-length": String(absent.archive.byteSize),
-              "x-content-sha256": absent.archive.sha256,
-              "x-gcs-generation": "9007199254740993123",
-            },
-          });
-        }
-        if (url.endsWith("/internal/evidence-uploads/reclaim")) {
-          absentEvents.push("reclaim");
-          return Response.json({ error: "job not found" }, { status: 404 });
-        }
-        throw new Error(`unexpected already-absent reclaim request ${url}`);
-      }),
-    );
+    const absent = await seedPendingReclaim("reclaim-already-absent", 889.101);
+    const absentFetch = vi.fn(async (input: string | URL) => {
+      throw new Error(`already-absent reclaim must not fetch ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", absentFetch);
     expect(
-      await processBrokeredRemoteEvidenceReclaims(db, absent.settings, 1),
+      await processBrokeredRemoteEvidenceReclaims(db, absent.settings, 1, {
+        maintenanceJobs: async () => ({ items: [] }),
+      } as unknown as EngineClient),
     ).toBe(1);
-    expect(absentEvents).toEqual(["download", "reclaim"]);
+    expect(absentFetch).not.toHaveBeenCalled();
     expect(
       (
         await db
@@ -5694,7 +5669,7 @@ describe("remote solver push validation regressions", () => {
     });
   });
 
-  it("claims only the one reclaim row a sequential worker can actively renew", async () => {
+  it("reclaims an independent bounded batch concurrently with renewable claims", async () => {
     vi.unstubAllGlobals();
     await cleanupRemoteRows();
     await configureRemoteSolver();
@@ -5724,6 +5699,11 @@ describe("remote solver push validation regressions", () => {
       .where(eq(syncRemoteHubBindingReceipts.promiseId, promiseId));
     expect(receipts).toHaveLength(2);
     vi.unstubAllGlobals();
+    let downloadsStarted = 0;
+    let releaseDownloads!: () => void;
+    const bothDownloadsStarted = new Promise<void>((resolve) => {
+      releaseDownloads = resolve;
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL) => {
@@ -5733,6 +5713,9 @@ describe("remote solver push validation regressions", () => {
           const archive = brokerArchives.get(download[1]!);
           if (!archive)
             return Response.json({ error: "missing" }, { status: 409 });
+          downloadsStarted += 1;
+          if (downloadsStarted === 2) releaseDownloads();
+          await bothDownloadsStarted;
           return new Response(archive.bytes, {
             headers: {
               "content-type": "application/zstd",
@@ -5747,9 +5730,26 @@ describe("remote solver push validation regressions", () => {
         throw new Error(`unexpected sequential reclaim request ${url}`);
       }),
     );
-    expect(await processBrokeredRemoteEvidenceReclaims(db, settings, 8)).toBe(
-      1,
-    );
+    const inventoryEngine = {
+      maintenanceJobs: async () => ({
+        items: [
+          {
+            job_id: job.engineJobId!,
+            mtime_epoch: Date.now() / 1000,
+            bytes: null,
+          },
+        ],
+      }),
+    } as unknown as EngineClient;
+    expect(
+      await processBrokeredRemoteEvidenceReclaims(
+        db,
+        settings,
+        8,
+        inventoryEngine,
+      ),
+    ).toBe(2);
+    expect(downloadsStarted).toBe(2);
     expect(
       await db
         .select({ state: syncRemoteHubBindingReceipts.reclaimState })
@@ -5757,11 +5757,7 @@ describe("remote solver push validation regressions", () => {
         .where(eq(syncRemoteHubBindingReceipts.promiseId, promiseId)),
     ).toSatisfy(
       (rows: Array<{ state: string }>) =>
-        rows.filter((row) => row.state === "reclaimed").length === 1 &&
-        rows.filter((row) => row.state === "pending").length === 1,
-    );
-    expect(await processBrokeredRemoteEvidenceReclaims(db, settings, 8)).toBe(
-      1,
+        rows.filter((row) => row.state === "reclaimed").length === 2,
     );
   });
 

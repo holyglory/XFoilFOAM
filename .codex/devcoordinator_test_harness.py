@@ -12,17 +12,30 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UV = Path(
-    "/opt/devcoordinator/toolchains/uv/"
-    "ac1d09115324ddc785f49a597106cfa83da4033a21d28d915414973ec55aea96/uv"
+UV = next(
+    (
+        candidate
+        for candidate in (
+            Path(
+                "/opt/devcoordinator/toolchains/uv/"
+                "ac1d09115324ddc785f49a597106cfa83da4033a21d28d915414973ec55aea96/uv"
+            ),
+            Path.home() / ".local/bin/uv",
+        )
+        if candidate.is_file()
+    ),
+    Path("/opt/devcoordinator/toolchains/uv/unavailable"),
 )
 MAX_DIAGNOSTIC_BYTES = 512 * 1024
 
 
-def _events_path() -> Path:
+def _events_path() -> Path | None:
     raw = os.environ.get("DEVCOORDINATOR_TEST_EVENTS")
     if not raw:
-        raise RuntimeError("DEVCOORDINATOR_TEST_EVENTS is unavailable")
+        # DevCoordinator2 owns the authoritative run summary and bounded logs.
+        # Retain compatibility with the older optional case-event stream
+        # without making its absence fail an otherwise valid coordinated run.
+        return None
     path = Path(raw)
     if not path.is_absolute():
         raise RuntimeError("DEVCOORDINATOR_TEST_EVENTS must be absolute")
@@ -59,9 +72,31 @@ def _run(case_id: str, name: str, argv: list[str]) -> int:
     }
     if completed.returncode != 0:
         event["message"] = output[-8192:] or f"exit {completed.returncode}"
-    with _events_path().open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(event, sort_keys=True) + "\n")
+    events_path = _events_path()
+    if events_path is not None:
+        with events_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, sort_keys=True) + "\n")
     return completed.returncode
+
+
+def _migrate_ephemeral_database() -> int:
+    if not os.environ.get("DATABASE_URL"):
+        return 0
+    return _run(
+        "database-migrations",
+        "ephemeral PostgreSQL migrations",
+        ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"],
+    )
+
+
+def _seed_ephemeral_database() -> int:
+    if not os.environ.get("DATABASE_URL"):
+        return 0
+    return _run(
+        "database-seed",
+        "ephemeral PostgreSQL seed",
+        ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"],
+    )
 
 
 def _python_suite() -> int:
@@ -74,7 +109,11 @@ def _python_suite() -> int:
             "location": str(UV),
             "message": "the pinned server-wide uv toolchain is unavailable",
         }
-        _events_path().write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+        events_path = _events_path()
+        if events_path is not None:
+            events_path.write_text(
+                json.dumps(event, sort_keys=True) + "\n", encoding="utf-8"
+            )
         return 1
     sync = _run(
         "python-dependencies",
@@ -164,6 +203,12 @@ def _urans_recovery_regression() -> int:
     )
     if install != 0:
         return install
+    migrated = _migrate_ephemeral_database()
+    if migrated != 0:
+        return migrated
+    seeded = _seed_ephemeral_database()
+    if seeded != 0:
+        return seeded
     commands = [
         (
             "core-urans-recovery",
@@ -289,6 +334,12 @@ def _sync_remote_validation_regression() -> int:
     )
     if install != 0:
         return install
+    migrated = _migrate_ephemeral_database()
+    if migrated != 0:
+        return migrated
+    seeded = _seed_ephemeral_database()
+    if seeded != 0:
+        return seeded
     result = 0
     for case_id, name, package, test_file in (
         (
@@ -324,13 +375,99 @@ def _sync_remote_validation_regression() -> int:
     return result
 
 
+def _storage_retention_regression() -> int:
+    if not UV.is_file():
+        return _run(
+            "python-toolchain",
+            "pinned uv toolchain",
+            ["/usr/bin/test", "-f", str(UV)],
+        )
+    sync = _run(
+        "python-dependencies",
+        "locked Python dependencies",
+        [
+            str(UV),
+            "sync",
+            "--frozen",
+            "--extra",
+            "dev",
+            "--python",
+            "/usr/bin/python3",
+        ],
+    )
+    if sync != 0:
+        return sync
+    install = _run(
+        "node-dependencies",
+        "locked Node dependencies",
+        ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile"],
+    )
+    if install != 0:
+        return install
+    migrated = _migrate_ephemeral_database()
+    if migrated != 0:
+        return migrated
+    seeded = _seed_ephemeral_database()
+    if seeded != 0:
+        return seeded
+    commands = [
+        (
+            "python-storage-retention",
+            "engine evidence and job retention regressions",
+            [
+                str(ROOT / ".venv/bin/python"),
+                "-m",
+                "pytest",
+                "tests/test_retention.py",
+            ],
+        ),
+        (
+            "sweeper-storage-retention",
+            "control-plane storage retention regressions",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/sweeper",
+                "exec",
+                "vitest",
+                "run",
+                "test/retention.test.ts",
+                "test/sync-import-retention.test.ts",
+            ],
+        ),
+        (
+            "sweeper-remote-reclaim",
+            "remote evidence reclaim safety and concurrency regressions",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/sweeper",
+                "exec",
+                "vitest",
+                "run",
+                "test/remote-solver-validation.test.ts",
+                "-t",
+                "reclaim",
+            ],
+        ),
+    ]
+    result = 0
+    for case_id, name, argv in commands:
+        result = max(result, _run(case_id, name, argv))
+    return result
+
+
 def main() -> int:
-    _events_path().unlink(missing_ok=True)
+    events_path = _events_path()
+    if events_path is not None:
+        events_path.unlink(missing_ok=True)
     if len(sys.argv) != 2:
         raise SystemExit(
             "usage: devcoordinator_test_harness.py "
             "python-suite|node-suite|urans-recovery-regression|"
-            "sync-remote-validation-regression"
+            "sync-remote-validation-regression|storage-retention-regression"
         )
     if sys.argv[1] == "python-suite":
         return _python_suite()
@@ -340,6 +477,8 @@ def main() -> int:
         return _urans_recovery_regression()
     if sys.argv[1] == "sync-remote-validation-regression":
         return _sync_remote_validation_regression()
+    if sys.argv[1] == "storage-retention-regression":
+        return _storage_retention_regression()
     raise SystemExit(f"unknown suite: {sys.argv[1]}")
 
 

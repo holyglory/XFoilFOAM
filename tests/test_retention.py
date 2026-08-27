@@ -19,7 +19,7 @@ from airfoilfoam.evidence_store import (
     extract_verified_evidence_archive,
     transcode_gzip_tar_to_zst,
 )
-from airfoilfoam.models import CaseSpec
+from airfoilfoam.models import CaseSpec, ForceHistory
 from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.retention import JobRetentionRefused, delete_job_dir, strip_job_dir
 
@@ -796,6 +796,103 @@ def test_full_strip_retains_immutable_markers_without_exact_archive_members(
         "cases/c0p05_u166_a0/transient/urans_early_stop.json",
     ]
     assert not (job_root / ".stripped.json").exists()
+
+
+def test_windowless_evidence_keeps_only_the_latest_real_field_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = tmp_path / "case"
+    transient = case / "transient"
+    _write(case / "system" / "controlDict", b"application simpleFoam;\n")
+    _write(transient / "system" / "controlDict", b"application pimpleFoam;\n")
+    for time_name in ("0.1", "0.2", "0.3"):
+        _write(transient / time_name / "U", time_name.encode("ascii"))
+        _write(transient / time_name / "p", time_name.encode("ascii"))
+    monkeypatch.setattr(
+        pipeline,
+        "get_settings",
+        lambda: Settings(
+            data_dir=tmp_path,
+            evidence_bucket=None,
+            evidence_remote_only=False,
+        ),
+    )
+
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=0.05, speed=90.0, aoa_deg=14.0),
+        reynolds=300_000,
+        unsteady=True,
+        converged=False,
+    )
+    pipeline._archive_case_evidence(case, transient, outcome)
+
+    manifest = json.loads(
+        (case / "evidence" / "evidence_manifest.json").read_text()
+    )
+    time_members = sorted(
+        entry["path"]
+        for entry in manifest["files"]
+        if entry["role"] == "time_directory"
+    )
+    assert time_members == [
+        "time_directories/0.3/U",
+        "time_directories/0.3/p",
+    ]
+
+
+def test_exact_evidence_window_is_independent_of_media_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = tmp_path / "case"
+    transient = case / "transient"
+    _write(case / "system" / "controlDict", b"application simpleFoam;\n")
+    _write(transient / "system" / "controlDict", b"application pimpleFoam;\n")
+    for time_name in ("0.1", "0.2", "0.3", "0.4"):
+        _write(transient / time_name / "U", time_name.encode("ascii"))
+    monkeypatch.setattr(
+        pipeline,
+        "get_settings",
+        lambda: Settings(
+            data_dir=tmp_path,
+            evidence_bucket=None,
+            evidence_remote_only=False,
+        ),
+    )
+
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=0.05, speed=90.0, aoa_deg=14.0),
+        reynolds=300_000,
+        # Certified no-shedding URANS is displayed as steady-equivalent, but
+        # its field evidence still belongs to the real retained URANS window.
+        unsteady=False,
+        converged=True,
+        force_history=ForceHistory(
+            t=[0.1, 0.2, 0.3, 0.4],
+            cl=[0.1, 0.1, 0.1, 0.1],
+            cd=[0.01, 0.01, 0.01, 0.01],
+            cm=[0.0, 0.0, 0.0, 0.0],
+            window_start=0.2,
+            window_end=0.3,
+        ),
+    )
+    start, end = pipeline._retained_field_evidence_window(outcome, None)
+    pipeline._archive_case_evidence(
+        case,
+        transient,
+        outcome,
+        start_time=start,
+        end_time=end,
+        requested_fields=[],
+    )
+
+    manifest = json.loads(
+        (case / "evidence" / "evidence_manifest.json").read_text()
+    )
+    assert sorted(
+        entry["path"]
+        for entry in manifest["files"]
+        if entry["role"] == "time_directory"
+    ) == ["time_directories/0.2/U", "time_directories/0.3/U"]
 
 
 def test_running_guard_refuses_strip_and_delete(tmp_path: Path):

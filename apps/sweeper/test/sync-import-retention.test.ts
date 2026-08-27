@@ -19,7 +19,7 @@ import { describe, expect, it } from "vitest";
 
 import { sweepSyncImportOrphans } from "../src/retention";
 
-function fakeDb(referenced: Set<string>): DB {
+function fakeDb(referenced: Set<string>, beforeTransaction?: () => void): DB {
   const conditionMentionsReference = (
     value: unknown,
     seen = new Set<unknown>(),
@@ -60,8 +60,10 @@ function fakeDb(referenced: Set<string>): DB {
   };
   return {
     ...fake,
-    transaction: async <T>(callback: (tx: DB) => Promise<T>) =>
-      callback(fake as unknown as DB),
+    transaction: async <T>(callback: (tx: DB) => Promise<T>) => {
+      beforeTransaction?.();
+      return callback(fake as unknown as DB);
+    },
   } as unknown as DB;
 }
 
@@ -126,6 +128,65 @@ describe("sync import crash recovery", () => {
         }),
       ).toBe(1);
       expect(readdirSync(tempDir)).toHaveLength(1);
+    } finally {
+      rmSync(mediaDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rechecks a concurrently published reference under the stripe lock without consuming deletion quota", async () => {
+    const mediaDir = mkdtempSync(join(tmpdir(), "xff-sync-gc-race-"));
+    const now = new Date("2026-07-12T00:00:00.000Z");
+    const old = new Date(now.getTime() - 72 * 60 * 60 * 1000);
+    const raced = join(mediaDir, "sync-imports/aa/raced.bin");
+    const orphan = join(mediaDir, "sync-imports/bb/orphan.bin");
+    writeAt(raced, "published during cleanup", old);
+    writeAt(orphan, "orphan", old);
+    const referenced = new Set<string>();
+    let publicationCommitted = false;
+    try {
+      expect(
+        await sweepSyncImportOrphans(
+          fakeDb(referenced, () => {
+            if (publicationCommitted) return;
+            publicationCommitted = true;
+            referenced.add("sync-imports/aa/raced.bin");
+          }),
+          {
+            now,
+            mediaDir,
+            tmpMinAgeMs: 1,
+            blobMinAgeMs: 1,
+            maxPerSweep: 1,
+            deleteBatchSize: 1,
+          },
+        ),
+      ).toBe(1);
+      expect(existsSync(raced)).toBe(true);
+      expect(existsSync(orphan)).toBe(false);
+    } finally {
+      rmSync(mediaDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drains a large orphan set in bounded lock-safe delete batches", async () => {
+    const mediaDir = mkdtempSync(join(tmpdir(), "xff-sync-gc-batch-"));
+    const now = new Date("2026-07-12T00:00:00.000Z");
+    const old = new Date(now.getTime() - 72 * 60 * 60 * 1000);
+    const bucket = join(mediaDir, "sync-imports/cc");
+    for (let index = 0; index < 9; index += 1)
+      writeAt(join(bucket, `${index}.bin`), `orphan-${index}`, old);
+    try {
+      expect(
+        await sweepSyncImportOrphans(fakeDb(new Set()), {
+          now,
+          mediaDir,
+          tmpMinAgeMs: 1,
+          blobMinAgeMs: 1,
+          maxPerSweep: 7,
+          deleteBatchSize: 2,
+        }),
+      ).toBe(7);
+      expect(readdirSync(bucket)).toHaveLength(2);
     } finally {
       rmSync(mediaDir, { recursive: true, force: true });
     }

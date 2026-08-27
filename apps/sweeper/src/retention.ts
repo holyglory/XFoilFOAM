@@ -9,6 +9,7 @@ import {
   remoteAssetReferences,
   resultMedia,
   simJobs,
+  syncBlobLockStripe,
   solverEvidenceArtifacts,
 } from "@aerodb/db";
 import { EngineError, type EngineClient } from "@aerodb/engine-client";
@@ -25,7 +26,9 @@ export const DEFAULT_ORPHAN_SWEEP_MS = 60 * 60 * 1000;
 export const DEFAULT_ORPHAN_MIN_AGE_MS = 48 * 60 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_TMP_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_BLOB_MIN_AGE_MS = 48 * 60 * 60 * 1000;
-export const DEFAULT_SYNC_IMPORT_GC_MAX_PER_SWEEP = 1_000;
+export const DEFAULT_SYNC_IMPORT_GC_MAX_PER_SWEEP = 20_000;
+export const DEFAULT_SYNC_IMPORT_GC_INTERVAL_MS = 5 * 60 * 1000;
+export const DEFAULT_SYNC_IMPORT_GC_DELETE_BATCH_SIZE = 250;
 
 const LIVE_URANS_REQUEST_STATES = [
   "pending",
@@ -55,6 +58,7 @@ interface StripCandidate {
 }
 
 let lastOrphanSweepAtMs = 0;
+let lastSyncImportGcAtMs = 0;
 
 export interface SyncImportGcOptions {
   now?: Date;
@@ -62,6 +66,7 @@ export interface SyncImportGcOptions {
   tmpMinAgeMs?: number;
   blobMinAgeMs?: number;
   maxPerSweep?: number;
+  deleteBatchSize?: number;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -99,6 +104,7 @@ export function retentionConfigFromEnv(
 
 export function resetRetentionMemory(): void {
   lastOrphanSweepAtMs = 0;
+  lastSyncImportGcAtMs = 0;
 }
 
 function mb(bytes: number): string {
@@ -510,6 +516,16 @@ export async function sweepSyncImportOrphans(
     ),
   );
   if (!maxPerSweep) return 0;
+  const deleteBatchSize = Math.max(
+    1,
+    Math.floor(
+      options.deleteBatchSize ??
+        envNumber(
+          "SYNC_IMPORT_GC_DELETE_BATCH_SIZE",
+          DEFAULT_SYNC_IMPORT_GC_DELETE_BATCH_SIZE,
+        ),
+    ),
+  );
   const tmpMinAgeMs =
     options.tmpMinAgeMs ??
     envNumber("SYNC_IMPORT_TMP_MIN_AGE_MS", DEFAULT_SYNC_IMPORT_TMP_MIN_AGE_MS);
@@ -568,10 +584,13 @@ export async function sweepSyncImportOrphans(
   // Referenced candidates do not consume the deletion quota. Continue
   // through deterministic batches until the quota is actually filled, so a
   // stable prefix of referenced blobs cannot starve a later orphan forever.
+  // Delete candidates in lock-safe set-based transactions: the former one
+  // transaction plus four queries per file could remove only 1,000 files per
+  // hour while production accumulated more than 560,000 stale files.
   for (let offset = 0; offset < candidates.length; offset += 1_000) {
     if (removed >= maxPerSweep) break;
-    const batch = candidates.slice(offset, offset + 1_000);
-    const keys = batch.map((candidate) => candidate.storageKey);
+    const scanBatch = candidates.slice(offset, offset + 1_000);
+    const keys = scanBatch.map((candidate) => candidate.storageKey);
     const [artifacts, media, remote] = await Promise.all([
       db
         .select({ storageKey: solverEvidenceArtifacts.storageKey })
@@ -589,38 +608,65 @@ export async function sweepSyncImportOrphans(
     const referenced = new Set(
       [...artifacts, ...media, ...remote].map((row) => row.storageKey),
     );
-    for (const candidate of batch) {
-      if (removed >= maxPerSweep) break;
-      if (referenced.has(candidate.storageKey)) continue;
-      const deleted = await db.transaction(async (rawTx) => {
+    const eligible = scanBatch.filter(
+      (candidate) => !referenced.has(candidate.storageKey),
+    );
+    for (
+      let batchOffset = 0;
+      batchOffset < eligible.length && removed < maxPerSweep;
+      batchOffset += deleteBatchSize
+    ) {
+      const deleteBatch = eligible.slice(
+        batchOffset,
+        batchOffset + Math.min(deleteBatchSize, maxPerSweep - removed),
+      );
+      if (!deleteBatch.length) continue;
+      const deletedCount = await db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as DB;
-        // Same stripe as API publication. Recheck references only after the
-        // importer/cleanup lock is held, then keep it through unlink.
-        await acquireSyncBlobStripeLock(tx, candidate.sha256);
-        const [artifactRef] = await tx
-          .select({ id: solverEvidenceArtifacts.id })
+        // Importers acquire exactly one of these stripes. Cleanup can own
+        // several only in globally sorted order, so concurrent cleanup passes
+        // cannot deadlock and publication always gets a final reference
+        // recheck before unlink.
+        const stripeRepresentatives = new Map<number, string>();
+        for (const candidate of deleteBatch) {
+          const stripe = syncBlobLockStripe(candidate.sha256);
+          if (!stripeRepresentatives.has(stripe))
+            stripeRepresentatives.set(stripe, candidate.sha256);
+        }
+        for (const [, sha256] of [...stripeRepresentatives.entries()].sort(
+          ([left], [right]) => left - right,
+        )) {
+          await acquireSyncBlobStripeLock(tx, sha256);
+        }
+        const lockedKeys = deleteBatch.map((candidate) => candidate.storageKey);
+        const lockedArtifacts = await tx
+          .select({ storageKey: solverEvidenceArtifacts.storageKey })
           .from(solverEvidenceArtifacts)
-          .where(eq(solverEvidenceArtifacts.storageKey, candidate.storageKey))
-          .limit(1);
-        const [mediaRef] = await tx
-          .select({ id: resultMedia.id })
+          .where(inArray(solverEvidenceArtifacts.storageKey, lockedKeys));
+        const lockedMedia = await tx
+          .select({ storageKey: resultMedia.storageKey })
           .from(resultMedia)
-          .where(eq(resultMedia.storageKey, candidate.storageKey))
-          .limit(1);
-        const [remoteRef] = await tx
-          .select({ id: remoteAssetReferences.id })
+          .where(inArray(resultMedia.storageKey, lockedKeys));
+        const lockedRemote = await tx
+          .select({ storageKey: remoteAssetReferences.localStorageKey })
           .from(remoteAssetReferences)
-          .where(
-            eq(remoteAssetReferences.localStorageKey, candidate.storageKey),
-          )
-          .limit(1);
-        if (artifactRef || mediaRef || remoteRef) return false;
-        await unlink(candidate.full).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-        });
-        return true;
+          .where(inArray(remoteAssetReferences.localStorageKey, lockedKeys));
+        const lockedReferences = new Set(
+          [...lockedArtifacts, ...lockedMedia, ...lockedRemote].map(
+            (row) => row.storageKey,
+          ),
+        );
+        let batchRemoved = 0;
+        for (const candidate of deleteBatch) {
+          if (lockedReferences.has(candidate.storageKey)) continue;
+          await unlink(candidate.full).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+          });
+          batchRemoved += 1;
+        }
+        return batchRemoved;
       });
-      if (deleted) removed += 1;
+      removed += deletedCount;
     }
   }
   if (removed) {
@@ -658,6 +704,17 @@ export async function retentionTick(
         `[sweeper] RETENTION: orphan sweep failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  const syncImportGcIntervalMs = envNumber(
+    "SYNC_IMPORT_GC_INTERVAL_MS",
+    DEFAULT_SYNC_IMPORT_GC_INTERVAL_MS,
+  );
+  if (
+    options.forceOrphanSweep ||
+    nowMs - lastSyncImportGcAtMs >= syncImportGcIntervalMs
+  ) {
+    lastSyncImportGcAtMs = nowMs;
     try {
       await sweepSyncImportOrphans(db, { now: options.now });
     } catch (error) {

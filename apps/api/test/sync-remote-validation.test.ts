@@ -54,8 +54,7 @@ const { buildServer } = await import("../src/server");
 const {
   assertMultipartDiskReserveAvailableBytes,
   lockAndFilterRemoteClaimAoas,
-} =
-  await import("../src/sync-routes");
+} = await import("../src/sync-routes");
 
 const {
   airfoils,
@@ -78,6 +77,7 @@ const {
   results,
   schedulingProfiles,
   simJobs,
+  simulationPresetRevisions,
   simulationPresets,
   solverEvidenceArtifacts,
   solverEvidenceArchives,
@@ -2464,9 +2464,7 @@ describe("remote solver sync validation regressions", () => {
         ),
       )
       .orderBy(syncImportConflicts.id);
-    const byId = new Map(
-      conflictStates.map((row) => [row.id, row] as const),
-    );
+    const byId = new Map(conflictStates.map((row) => [row.id, row] as const));
     expect(byId.get(inserted[0]!.id)).toMatchObject({
       status: "archived",
       resolutionNote: expect.stringContaining("exact promised generation"),
@@ -4140,11 +4138,7 @@ describe("remote solver sync validation regressions", () => {
     const parts: MultipartTestPart[] = [
       multipartManifestPart(payload),
       ...frames.map((frame) =>
-        multipartFilePart(
-          String(frame.uploadField),
-          frameBytes,
-          "image/png",
-        ),
+        multipartFilePart(String(frame.uploadField), frameBytes, "image/png"),
       ),
     ];
 

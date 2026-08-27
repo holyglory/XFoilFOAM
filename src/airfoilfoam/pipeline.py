@@ -6892,6 +6892,15 @@ def _artifact_kind_for_role(role: str) -> str:
 
 
 def _numeric_dirs_in_window(case_dir: Path, start_time: float | None, end_time: float | None) -> list[Path]:
+    # A missing exact averaging window is not permission to retain the whole
+    # transient history.  Failed, RANS, and otherwise windowless attempts keep
+    # the latest real field as diagnostic/restart evidence; copying every
+    # saved timestep made one failed FAST-URANS attempt create thousands of
+    # artifact rows and an unbounded local archive.  Periodic/aperiodic URANS
+    # callers pass their independently certified evidence window below.
+    if start_time is None or end_time is None:
+        latest = _latest_time_dir(case_dir)
+        return [latest] if latest is not None else []
     dirs: list[tuple[float, Path]] = []
     for child in case_dir.iterdir() if case_dir.exists() else []:
         if not child.is_dir():
@@ -6909,6 +6918,40 @@ def _numeric_dirs_in_window(case_dir: Path, start_time: float | None, end_time: 
         latest = _latest_time_dir(case_dir)
         return [latest] if latest is not None else []
     return [path for _, path in sorted(dirs)]
+
+
+def _retained_field_evidence_window(
+    outcome: CaseOutcome,
+    frame_stats: PeriodWindowStats | None,
+) -> tuple[float | None, float | None]:
+    """Return the scientific field window independently of media rendering.
+
+    Media can be disabled or a periodic animation can degrade without changing
+    which real OpenFOAM fields support the result.  Prefer the exact
+    integer-period reduction, then the exact aperiodic observation window,
+    then the stored force-history window (including certified no-shedding
+    URANS).  A missing complete pair deliberately falls back to the latest
+    field through ``_numeric_dirs_in_window``.
+    """
+
+    if frame_stats is not None:
+        return frame_stats.window_start, frame_stats.window_end
+    if outcome.aperiodic_mean_certificate is not None:
+        certificate = outcome.aperiodic_mean_certificate
+        return (
+            certificate.observation_start_time,
+            certificate.observation_end_time,
+        )
+    history = outcome.force_history
+    if history is None:
+        return None, None
+    start = history.window_start
+    end = history.window_end
+    if start is None and history.t:
+        start = history.t[0]
+    if end is None and history.t:
+        end = history.t[-1]
+    return start, end
 
 
 def _archive_case_evidence(
@@ -7967,13 +8010,17 @@ def _finalize_outcome(
             ),
         )
 
+    evidence_start_time, evidence_end_time = _retained_field_evidence_window(
+        outcome,
+        frame_stats,
+    )
     _archive_case_evidence(
         case_dir,
         post_dir,
         outcome,
         image_subdir=image_subdir,
-        start_time=media_start_time if outcome.unsteady else None,
-        end_time=media_end_time if outcome.unsteady else None,
+        start_time=evidence_start_time,
+        end_time=evidence_end_time,
         requested_fields=requested_fields if render_images else [],
     )
     if urans_rejection is not None:

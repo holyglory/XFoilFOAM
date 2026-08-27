@@ -140,6 +140,7 @@ const REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS = Math.min(
     Number(process.env.REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS ?? 2 * 60_000),
   ),
 );
+const REMOTE_RECLAIM_MAX_CONCURRENCY = 8;
 const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
   "xfoilfoam-hub-canonical-evidence-binding-v1\n";
 const BROKER_UPLOAD_IDEMPOTENCY_DOMAIN = "xfoilfoam:broker-upload:v1\0";
@@ -5297,19 +5298,25 @@ async function preflightBoundRemoteEvidenceArchive(
 /** Drain the local-reclaim outbox independently from result delivery. The
  * signed receipt and exact remote reference are immutable before this claim
  * exists. Every attempt first authenticates to the current hub as the owning
- * solver and reads the generation-pinned archive to EOF. Only that successful
- * complete generation-pinned readback proof permits the local engine deletion
- * call; any preflight error is
- * persisted with backoff and leaves all local bytes intact. */
+ * solver and reads the generation-pinned archive to EOF before any local
+ * engine deletion. A receipt whose unique engine job directory is already
+ * absent settles as a no-op without inventing delete authority. Any preflight
+ * error is persisted with backoff and leaves all local bytes intact. */
 export async function processBrokeredRemoteEvidenceReclaims(
   db: DB,
   settings: Settings,
   limit = 8,
+  engine?: EngineClient,
 ): Promise<number> {
-  // This worker drains sequentially. Claim exactly one row so later rows do
-  // not spend their entire 10-minute claim waiting behind a multi-hour
-  // readback. Horizontal workers remain safe through SKIP LOCKED.
-  const sequentialClaimLimit = Math.min(1, Math.max(0, Math.trunc(limit)));
+  // Each claimed receipt owns an independently renewed lease and an immutable
+  // archive generation.  Run a small bounded set concurrently so a 64-slot
+  // solver cannot produce delivered cases faster than the single-file
+  // readback path can release them.  Horizontal workers remain safe through
+  // SKIP LOCKED and the exact claim-token settlement below.
+  const claimLimit = Math.min(
+    REMOTE_RECLAIM_MAX_CONCURRENCY,
+    Math.max(0, Math.trunc(limit)),
+  );
   const claimedIds = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     await tx.execute(sql`
@@ -5327,7 +5334,7 @@ export async function processBrokeredRemoteEvidenceReclaims(
       WHERE reclaim_state = 'pending' AND reclaim_next_attempt_at <= now()
       ORDER BY reclaim_next_attempt_at, id
       FOR UPDATE SKIP LOCKED
-      LIMIT ${sequentialClaimLimit}
+      LIMIT ${claimLimit}
     `)) as unknown as Array<{ id: string }>;
     const claims: Array<{ id: string; token: string }> = [];
     for (const row of rows) {
@@ -5355,11 +5362,66 @@ export async function processBrokeredRemoteEvidenceReclaims(
   });
   if (!claimedIds.length) return 0;
 
+  // A terminal whole-job retention pass may already have removed every local
+  // byte for many receipts.  That is an absence proof, not delete authority:
+  // settle those no-op rows without streaming their immutable hub archive
+  // again.  If the inventory is unavailable, preserve the existing stronger
+  // readback-before-delete path for every claim.
+  let presentEngineJobIds: Set<string> | null = null;
+  if (
+    engine &&
+    typeof (engine as Partial<EngineClient>).maintenanceJobs === "function"
+  ) {
+    try {
+      const inventory = await engine.maintenanceJobs();
+      presentEngineJobIds = new Set(inventory.items.map((item) => item.job_id));
+    } catch (error) {
+      console.warn(
+        `[sweeper] brokered evidence reclaim could not inventory local jobs; retaining authenticated readback path: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   const engineBase = (
     process.env.ENGINE_URL ?? "http://localhost:8000"
   ).replace(/\/+$/, "");
-  let completed = 0;
-  for (const claim of claimedIds) {
+
+  const settleReclaim = async (
+    rowId: string,
+    claimToken: string,
+    reclaimedBytes: number,
+  ): Promise<void> => {
+    const settled = await db
+      .update(syncRemoteHubBindingReceipts)
+      .set({
+        reclaimState: "reclaimed",
+        reclaimClaimToken: null,
+        reclaimClaimExpiresAt: null,
+        reclaimedAt: new Date(),
+        reclaimedBytes,
+        reclaimLastError: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(syncRemoteHubBindingReceipts.id, rowId),
+          eq(syncRemoteHubBindingReceipts.reclaimState, "claiming"),
+          eq(syncRemoteHubBindingReceipts.reclaimClaimToken, claimToken),
+        ),
+      )
+      .returning({ id: syncRemoteHubBindingReceipts.id });
+    if (settled.length !== 1)
+      throw new Error(
+        "brokered evidence reclaim claim changed before settlement",
+      );
+  };
+
+  const processClaim = async (claim: {
+    id: string;
+    token: string;
+  }): Promise<number> => {
     let reclaimLease: RemoteReclaimClaimLease | null = null;
     try {
       const [row] = await db
@@ -5373,7 +5435,7 @@ export async function processBrokeredRemoteEvidenceReclaims(
           ),
         )
         .limit(1);
-      if (!row) continue;
+      if (!row) return 0;
       reclaimLease = startRemoteReclaimClaimLease(db, claim);
       const [attempt] = await db
         .select()
@@ -5401,6 +5463,18 @@ export async function processBrokeredRemoteEvidenceReclaims(
         bundles.length !== 1
       )
         throw new Error("reclaim cannot resolve one exact local engine bundle");
+
+      if (
+        presentEngineJobIds !== null &&
+        !presentEngineJobIds.has(attempt.engineJobId)
+      ) {
+        const reclaimLeaseFailure = await reclaimLease.stop();
+        reclaimLease = null;
+        if (reclaimLeaseFailure) throw reclaimLeaseFailure;
+        await settleReclaim(row.id, claim.token, 0);
+        return 1;
+      }
+
       const bundle = bundles[0]!;
       await preflightBoundRemoteEvidenceArchive(
         db,
@@ -5462,30 +5536,8 @@ export async function processBrokeredRemoteEvidenceReclaims(
       const reclaimLeaseFailure = await reclaimLease.stop();
       reclaimLease = null;
       if (reclaimLeaseFailure) throw reclaimLeaseFailure;
-      const settled = await db
-        .update(syncRemoteHubBindingReceipts)
-        .set({
-          reclaimState: "reclaimed",
-          reclaimClaimToken: null,
-          reclaimClaimExpiresAt: null,
-          reclaimedAt: new Date(),
-          reclaimedBytes,
-          reclaimLastError: null,
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(syncRemoteHubBindingReceipts.id, row.id),
-            eq(syncRemoteHubBindingReceipts.reclaimState, "claiming"),
-            eq(syncRemoteHubBindingReceipts.reclaimClaimToken, claim.token),
-          ),
-        )
-        .returning({ id: syncRemoteHubBindingReceipts.id });
-      if (settled.length !== 1)
-        throw new Error(
-          "brokered evidence reclaim claim changed before settlement",
-        );
-      completed += 1;
+      await settleReclaim(row.id, claim.token, reclaimedBytes);
+      return 1;
     } catch (error) {
       const [current] = await db
         .select({
@@ -5522,8 +5574,11 @@ export async function processBrokeredRemoteEvidenceReclaims(
     } finally {
       if (reclaimLease) await reclaimLease.stop();
     }
-  }
-  return completed;
+    return 0;
+  };
+
+  const completed = await Promise.all(claimedIds.map(processClaim));
+  return completed.reduce((sum, value) => sum + value, 0);
 }
 
 async function processReusablePromiseEvidence(
@@ -6334,10 +6389,12 @@ export async function reconcileRemoteSolverTick(
 }
 
 /**
- * Drain remote evidence/cancellation/reclaim outboxes after NEW-work
- * admission. These operations may stream archives or wait on the hub, so they
- * must never stand in front of free CPU capacity. The outboxes remain durable
- * and bounded to one publish/reuse operation per tick.
+ * Drain remote evidence/cancellation outboxes after NEW-work admission. These
+ * operations may stream archives or wait on the hub, so they must never stand
+ * in front of free CPU capacity. The outboxes remain durable and bounded to
+ * one publish/reuse operation per tick. Local evidence reclaim has its own
+ * bounded single flight below so a deep reclaim backlog cannot delay result
+ * delivery or consume its mocked/real transport sequence.
  */
 export async function transferRemoteSolverTick(
   db: DB,
@@ -6359,11 +6416,6 @@ export async function transferRemoteSolverTick(
     // pass keeps its exact claim and completes normally, while no later pass
     // may claim another delivery, cancellation, or reclaim row.
     if (settings?.remoteSolverTransferPaused) return false;
-    // Reclaim is its own durable outbox, but deletion still requires the
-    // current owning solver token to read back and authenticate the exact bound
-    // hub archive first. Missing/rotated credentials therefore back off with
-    // local bytes intact instead of turning an old receipt into delete power.
-    if (settings) await processBrokeredRemoteEvidenceReclaims(db, settings);
     // Cancellation is an authority-release outbox, not solver work. Drain it
     // even while solving is disabled; a local pause must never strand an
     // upstream lease.
@@ -6437,6 +6489,46 @@ export function scheduleRemoteSolverTransfer(
   engine: EngineClient,
 ): void {
   scheduleRemoteTransferOnce(() => transferRemoteSolverTick(db, engine));
+}
+
+export async function reclaimRemoteSolverEvidenceTick(
+  db: DB,
+  engine: EngineClient,
+): Promise<number> {
+  const [settings] = await db
+    .select()
+    .from(syncApiSettings)
+    .where(eq(syncApiSettings.id, 1))
+    .limit(1);
+  if (
+    !settings ||
+    settings.remoteSolverTransferPaused ||
+    !settings.upstreamBaseUrl ||
+    !settings.remoteSolverAuthToken
+  )
+    return 0;
+  assertRemoteSolverHubUrlContract(settings.upstreamBaseUrl);
+  // Deletion still requires the current owning solver token to read back and
+  // authenticate each exact bound hub archive. Missing/rotated credentials
+  // leave the durable outbox and all local bytes intact.
+  return processBrokeredRemoteEvidenceReclaims(db, settings, 8, engine);
+}
+
+const scheduleRemoteReclaimOnce = createSingleFlightBackgroundRunner(
+  (error) => {
+    console.error(
+      "[sweeper] remote evidence reclaim pass failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  },
+);
+
+/** Keep storage release independent from result publication and scheduling. */
+export function scheduleRemoteSolverReclaims(
+  db: DB,
+  engine: EngineClient,
+): void {
+  scheduleRemoteReclaimOnce(() => reclaimRemoteSolverEvidenceTick(db, engine));
 }
 
 function remoteAdmissionHoldMessage(

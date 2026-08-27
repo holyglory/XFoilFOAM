@@ -1,0 +1,43 @@
+schema = 1
+
+[test]
+default = "python"
+
+[test.python]
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "python-suite"]
+timeout_seconds = 7200
+
+[test.node]
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "node-suite"]
+timeout_seconds = 7200
+
+[test.types]
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+timeout_seconds = 1800
+
+[test.urans]
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "urans-recovery-regression"]
+timeout_seconds = 7200
+
+[test.urans.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[test.sync]
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "sync-remote-validation-regression"]
+timeout_seconds = 7200
+
+[test.sync.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[test.storage]
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "storage-retention-regression"]
+timeout_seconds = 7200
+
+[test.storage.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
