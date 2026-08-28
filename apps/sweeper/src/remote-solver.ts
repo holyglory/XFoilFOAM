@@ -1345,6 +1345,14 @@ async function remotePromiseWorkState(
       terminal = true;
       continue;
     }
+    // Cancellation is terminal ownership, not permission to recreate a RANS
+    // shell. claimAoas deliberately rejects every cell that has any PRECALC
+    // obligation, so falling through here made one unclaimable job row per
+    // scheduler tick until PostgreSQL itself became the storage leak.
+    if (row.precalcState === "cancelled") {
+      terminal = true;
+      continue;
+    }
     if (row.precalcState === "satisfied") {
       completed = true;
       continue;

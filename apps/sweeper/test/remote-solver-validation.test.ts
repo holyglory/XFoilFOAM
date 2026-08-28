@@ -3119,6 +3119,93 @@ describe("remote-owned whole-polar promotion scope", () => {
 });
 
 describe("remote-owned derived PRECALC lifecycle", () => {
+  it("MUST-CATCH: a cancelled PRECALC owner terminalizes its promise without creating RANS shells", async () => {
+    const aoa = 918.501;
+    const { promise, parent, result } = await seedRemoteRejectedParent(
+      "cancelled-precalc-owner",
+      aoa,
+    );
+    const firstSubmit = vi.fn(async () =>
+      acceptedStatus("cancelled-precalc-child"),
+    );
+    await submitUransRetryForJob(
+      db,
+      { submitPolar: firstSubmit } as unknown as EngineClient,
+      parent,
+      {
+        meshRecoveryVersion: 4,
+        uransRecoveryVersion: 1,
+        cpuSlots: 1,
+      },
+    );
+    const [child] = await db
+      .select()
+      .from(simJobs)
+      .where(and(eq(simJobs.parentJobId, parent.id), eq(simJobs.wave, 2)));
+    const [obligation] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.latestSimJobId, child.id));
+    await db
+      .update(simJobs)
+      .set({
+        status: "cancelled",
+        engineState: "cancelled",
+        finishedAt: new Date(),
+      })
+      .where(eq(simJobs.id, child.id));
+    await db
+      .update(simPrecalcObligations)
+      .set({
+        state: "cancelled",
+        lastOutcome: "cancelled",
+        lastError: "owner was intentionally cancelled",
+      })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await db
+      .update(results)
+      .set({ status: "stale" })
+      .where(eq(results.id, result.id));
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = String(input);
+        if (url.endsWith("/sweeps/claim"))
+          return Response.json({
+            admission: { state: "at_cap", active: 1, cap: 1 },
+            promise: null,
+          });
+        throw new Error(`unexpected cancelled-owner request ${url}`);
+      }),
+    );
+    const forbiddenRansSubmit = vi.fn(async () =>
+      acceptedStatus("forbidden-cancelled-owner-rans"),
+    );
+    await expect(
+      admitRemoteSolverTick(
+        db,
+        { submitPolar: forbiddenRansSubmit } as unknown as EngineClient,
+        { kind: "allow", meshRecoveryVersion: 4 },
+      ),
+    ).resolves.toBe(false);
+
+    expect(forbiddenRansSubmit).not.toHaveBeenCalled();
+    expect((await readPromise(promise.id)).promise.status).toBe("cancelled");
+    expect(
+      await db
+        .select({ id: simJobs.id })
+        .from(simJobs)
+        .where(
+          and(
+            eq(simJobs.wave, 1),
+            dsql`${simJobs.requestPayload} ->> 'syncPromiseId' = ${promise.id}`,
+            dsql`${simJobs.id} <> ${parent.id}`,
+          ),
+        ),
+    ).toHaveLength(0);
+  });
+
   it("MUST-CATCH: a stale promotion owner cannot strand a point owned by a newer active promise", async () => {
     const aoa = 3.125;
     const stalePromise = await seedMirroredPromise("stale-promotion-owner", [
