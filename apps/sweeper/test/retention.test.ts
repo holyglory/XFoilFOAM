@@ -1128,6 +1128,54 @@ describe("terminal strip reaper", () => {
     expect((await readJob(precalcJob.id)).stripReport).toMatchObject({
       kept_case_state: true,
     });
+
+    // A continuation that is actually running still owns the saved case even
+    // during forecast pressure.
+    await db
+      .update(simPrecalcObligations)
+      .set({ state: "running", completedAt: null })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await stripTerminalJobs(db, engine, {
+      now: new Date(NOW.getTime() + 120_000),
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+      reclaimOptionalCaseState: true,
+    });
+    expect(
+      own(engine.stripCalls).filter(
+        (call) => call.jobId === `${PREFIX}-replace-guard-precalc`,
+      ),
+    ).toHaveLength(1);
+
+    // A merely pending obligation can deterministically fall back to a fresh
+    // solve, so its optional restart cache yields to the full-slot reserve.
+    await db
+      .update(simPrecalcObligations)
+      .set({ state: "pending" })
+      .where(eq(simPrecalcObligations.id, obligation.id));
+    await stripTerminalJobs(db, engine, {
+      now: new Date(NOW.getTime() + 180_000),
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+      reclaimOptionalCaseState: true,
+    });
+    expect(
+      own(engine.stripCalls).filter(
+        (call) => call.jobId === `${PREFIX}-replace-guard-precalc`,
+      ),
+    ).toEqual([
+      {
+        jobId: `${PREFIX}-replace-guard-precalc`,
+        keepCaseState: true,
+      },
+      {
+        jobId: `${PREFIX}-replace-guard-precalc`,
+        keepCaseState: false,
+      },
+    ]);
+    expect((await readJob(precalcJob.id)).stripReport).toMatchObject({
+      kept_case_state: false,
+    });
   });
 
   it("leaves 409 jobs unstamped for retry and stamps 404 jobs as no-op", async () => {

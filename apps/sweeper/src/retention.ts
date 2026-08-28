@@ -200,6 +200,29 @@ export async function stripTerminalJobs(
         ,
         EXISTS (
           SELECT 1
+          FROM sim_precalc_obligation_attempts obligation_attempt
+          JOIN sim_precalc_obligations obligation
+            ON obligation.id = obligation_attempt.obligation_id
+          JOIN result_attempts attempt
+            ON attempt.id = obligation_attempt.result_attempt_id
+          WHERE obligation.state = 'running'
+            AND attempt.engine_job_id IS NOT NULL
+            AND attempt.engine_case_slug IS NOT NULL
+            AND attempt.evidence_payload ->> 'fidelity' = 'urans_precalc'
+            AND EXISTS (
+              SELECT 1
+              FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
+              WHERE warning LIKE ${"%" + URANS_BUDGET_STOP_MARKER + "%"}
+                 OR warning LIKE ${"%" + URANS_CONTINUATION_REQUIRED_MARKER + "%"}
+            )
+            AND (
+              attempt.sim_job_id = j.id
+              OR (j.engine_job_id IS NOT NULL AND attempt.engine_job_id = j.engine_job_id)
+            )
+        ) AS has_running_precalc_continuation
+        ,
+        EXISTS (
+          SELECT 1
           FROM sim_urans_verify_queue verify
           JOIN result_attempts attempt
             ON attempt.id = verify.latest_result_attempt_id
@@ -333,7 +356,7 @@ export async function stripTerminalJobs(
         WHEN ${reclaimOptionalCaseState}
           THEN (
             has_live_continuation
-            OR has_live_precalc_continuation
+            OR has_running_precalc_continuation
             OR has_live_final_continuation
           )
         WHEN stripped_at IS NOT NULL
@@ -361,7 +384,13 @@ export async function stripTerminalJobs(
       OR (
         strip_report ->> 'kept_case_state' = 'true'
         AND NOT has_live_continuation
-        AND NOT has_live_precalc_continuation
+        AND (
+          NOT has_live_precalc_continuation
+          OR (
+            ${reclaimOptionalCaseState}
+            AND NOT has_running_precalc_continuation
+          )
+        )
         AND NOT has_live_final_continuation
         AND (
           ${reclaimOptionalCaseState}
