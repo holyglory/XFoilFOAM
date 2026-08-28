@@ -46,6 +46,11 @@ export interface DiskAdmissionExposure {
   activeLocalJobCount: number;
   /** Future local growth only; bytes already present are in free_bytes. */
   activeLocalReservedBytes: number;
+  /** Present only for the full configured-capacity forecast. */
+  configuredLocalCpuSlots?: number;
+  activeLocalCpuSlots?: number;
+  idleLocalCpuSlots?: number;
+  idleLocalReservedBytes?: number;
 }
 
 export interface DiskAdmissionDecision {
@@ -139,9 +144,16 @@ function objectPayload(value: unknown): Record<string, unknown> | null {
 export function diskAdmissionExposureForJobs(
   jobs: readonly LocalDiskJob[],
   config: DiskAdmissionConfig = diskAdmissionConfigFromEnv(),
+  configuredCpuSlots?: number,
 ): DiskAdmissionExposure {
   let activeLocalReservedBytes = 0;
+  let activeLocalCpuSlots = 0;
   for (const job of jobs) {
+    activeLocalCpuSlots +=
+      Number.isInteger(job.admissionCpuSlots) &&
+      (job.admissionCpuSlots ?? 0) > 0
+        ? (job.admissionCpuSlots as number)
+        : 1;
     if (
       !Number.isInteger(job.totalCases) ||
       job.totalCases < 1 ||
@@ -174,38 +186,82 @@ export function diskAdmissionExposureForJobs(
     }
     activeLocalReservedBytes += Math.ceil(remainingCases * perCaseBytes);
   }
-  return {
+  const exposure: DiskAdmissionExposure = {
     activeLocalJobCount: jobs.length,
     activeLocalReservedBytes,
   };
+  if (Number.isInteger(configuredCpuSlots) && (configuredCpuSlots ?? 0) > 0) {
+    const capacity = configuredCpuSlots as number;
+    const idleLocalCpuSlots = Math.max(0, capacity - activeLocalCpuSlots);
+    return {
+      ...exposure,
+      configuredLocalCpuSlots: capacity,
+      activeLocalCpuSlots,
+      idleLocalCpuSlots,
+      // One safe ordinary-job envelope per idle execution unit. This makes a
+      // healthy forecast mean the whole configured pool can fill, not merely
+      // that one additional submission fits.
+      idleLocalReservedBytes: idleLocalCpuSlots * config.jobReserveBytes,
+    };
+  }
+  return exposure;
+}
+
+export function configuredDiskCapacitySlots(
+  state: { cpuSlots: number | null; maxConcurrentJobs: number | null } | null,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (Number.isInteger(state?.cpuSlots) && (state?.cpuSlots ?? 0) > 0)
+    return state!.cpuSlots as number;
+  if (
+    Number.isInteger(state?.maxConcurrentJobs) &&
+    (state?.maxConcurrentJobs ?? 0) > 0
+  )
+    return state!.maxConcurrentJobs as number;
+  const workerBudget = Number(env.AIRFOILFOAM_WORKER_CPU_BUDGET);
+  return Number.isInteger(workerBudget) && workerBudget > 0 ? workerBudget : 2;
 }
 
 export async function loadDiskAdmissionExposure(
   db: DB,
   config: DiskAdmissionConfig = diskAdmissionConfigFromEnv(),
 ): Promise<DiskAdmissionExposure> {
-  const jobs = await db
-    .select({
-      totalCases: simJobs.totalCases,
-      completedCases: simJobs.completedCases,
-      requestPayload: simJobs.requestPayload,
-      admissionCpuSlots: simJobs.admissionCpuSlots,
-    })
-    .from(simJobs)
-    .where(
-      or(
-        inArray(simJobs.status, ["submitted", "running", "ingesting"]),
-        and(
-          eq(simJobs.status, "pending"),
-          eq(simJobs.engineState, "submitting"),
-        ),
-        and(
-          eq(simJobs.status, "cancelled"),
-          inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+  const [jobs, [capacityState]] = await Promise.all([
+    db
+      .select({
+        totalCases: simJobs.totalCases,
+        completedCases: simJobs.completedCases,
+        requestPayload: simJobs.requestPayload,
+        admissionCpuSlots: simJobs.admissionCpuSlots,
+      })
+      .from(simJobs)
+      .where(
+        or(
+          inArray(simJobs.status, ["submitted", "running", "ingesting"]),
+          and(
+            eq(simJobs.status, "pending"),
+            eq(simJobs.engineState, "submitting"),
+          ),
+          and(
+            eq(simJobs.status, "cancelled"),
+            inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+          ),
         ),
       ),
-    );
-  return diskAdmissionExposureForJobs(jobs, config);
+    db
+      .select({
+        cpuSlots: sweeperState.cpuSlots,
+        maxConcurrentJobs: sweeperState.maxConcurrentJobs,
+      })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1))
+      .limit(1),
+  ]);
+  return diskAdmissionExposureForJobs(
+    jobs,
+    config,
+    configuredDiskCapacitySlots(capacityState ?? null),
+  );
 }
 
 /**
@@ -270,10 +326,11 @@ export async function cancelDisposableJobsForDiskPressure(
 }
 
 /**
- * Reserve measured future growth of local engine work plus one unknown new
- * local batch. Upstream promises computed on another solver are intentionally
- * absent: their durable archive uploads directly to GCS, while the fixed
- * system floor covers the hub's bounded fresh-generation verification.
+ * Reserve measured future growth of local engine work plus one safe ordinary
+ * job envelope for every idle configured execution unit. Upstream promises
+ * computed on another solver are intentionally absent: their durable archive
+ * uploads directly to GCS, while the fixed system floor covers the hub's
+ * bounded fresh-generation verification.
  */
 export function evaluateDiskAdmission(
   disk: EngineMaintenanceDiskResponse,
@@ -291,7 +348,10 @@ export function evaluateDiskAdmission(
     Number.isInteger(exposure.activeLocalJobCount) &&
     exposure.activeLocalJobCount >= 0 &&
     Number.isFinite(exposure.activeLocalReservedBytes) &&
-    exposure.activeLocalReservedBytes >= 0;
+    exposure.activeLocalReservedBytes >= 0 &&
+    (exposure.idleLocalReservedBytes == null ||
+      (Number.isFinite(exposure.idleLocalReservedBytes) &&
+        exposure.idleLocalReservedBytes >= 0));
   if (!valid) {
     return {
       allowed: false,
@@ -303,10 +363,10 @@ export function evaluateDiskAdmission(
     };
   }
 
+  const idleReserveBytes =
+    exposure.idleLocalReservedBytes ?? config.jobReserveBytes;
   const requiredFreeBytes =
-    config.minFreeBytes +
-    exposure.activeLocalReservedBytes +
-    config.jobReserveBytes;
+    config.minFreeBytes + exposure.activeLocalReservedBytes + idleReserveBytes;
   const reasons: string[] = [];
   if (disk.used_pct >= config.maxUsedPct) {
     reasons.push(
@@ -314,8 +374,13 @@ export function evaluateDiskAdmission(
     );
   }
   if (disk.free_bytes < requiredFreeBytes) {
+    const idleReserveDescription =
+      exposure.configuredLocalCpuSlots != null &&
+      exposure.idleLocalCpuSlots != null
+        ? `${gib(idleReserveBytes)} GiB for ${exposure.idleLocalCpuSlots} idle of ${exposure.configuredLocalCpuSlots} configured CPU slots`
+        : `${gib(idleReserveBytes)} GiB for the next local job`;
     reasons.push(
-      `${gib(disk.free_bytes)} GiB free; ${gib(requiredFreeBytes)} GiB required (${gib(config.minFreeBytes)} GiB system floor + ${gib(exposure.activeLocalReservedBytes)} GiB remaining local work across ${exposure.activeLocalJobCount} job${exposure.activeLocalJobCount === 1 ? "" : "s"} + ${gib(config.jobReserveBytes)} GiB for the next local job)`,
+      `${gib(disk.free_bytes)} GiB free; ${gib(requiredFreeBytes)} GiB required (${gib(config.minFreeBytes)} GiB system floor + ${gib(exposure.activeLocalReservedBytes)} GiB remaining local work across ${exposure.activeLocalJobCount} job${exposure.activeLocalJobCount === 1 ? "" : "s"} + ${idleReserveDescription})`,
     );
   }
   return {

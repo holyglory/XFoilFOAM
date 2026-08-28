@@ -5,6 +5,7 @@ import {
   DEFAULT_DISK_JOB_RESERVE_BYTES,
   DEFAULT_DISK_MAX_USED_PCT,
   DEFAULT_DISK_MIN_FREE_BYTES,
+  configuredDiskCapacitySlots,
   diskAdmissionExposureForJobs,
   diskMeasurementFromStatfs,
   evaluateDiskAdmission,
@@ -99,6 +100,78 @@ describe("disk admission", () => {
     expect(decision.reason).toContain(
       "72.0 GiB remaining local work across 3 jobs",
     );
+  });
+
+  it("keeps every configured CPU slot inside the forecast before the pool fills", () => {
+    const empty = diskAdmissionExposureForJobs([], config, 8);
+    expect(empty).toEqual({
+      activeLocalJobCount: 0,
+      activeLocalReservedBytes: 0,
+      configuredLocalCpuSlots: 8,
+      activeLocalCpuSlots: 0,
+      idleLocalCpuSlots: 8,
+      idleLocalReservedBytes: 320 * GIB,
+    });
+    expect(
+      evaluateDiskAdmission(
+        { total_bytes: 492 * GIB, free_bytes: 339 * GIB, used_pct: 31.1 },
+        empty,
+        config,
+      ),
+    ).toMatchObject({
+      allowed: false,
+      requiredFreeBytes: 340 * GIB,
+    });
+    const allowed = evaluateDiskAdmission(
+      { total_bytes: 492 * GIB, free_bytes: 341 * GIB, used_pct: 30.7 },
+      empty,
+      config,
+    );
+    expect(allowed).toMatchObject({ allowed: true, reason: null });
+  });
+
+  it("uses CPU reservations only to count occupied capacity, never to multiply active job bytes", () => {
+    const exposure = diskAdmissionExposureForJobs(
+      [
+        {
+          totalCases: 2,
+          completedCases: 1,
+          admissionCpuSlots: 3,
+          requestPayload: { uransFidelity: "precalc" },
+        },
+      ],
+      config,
+      8,
+    );
+    expect(exposure).toMatchObject({
+      activeLocalJobCount: 1,
+      activeLocalReservedBytes: 1.5 * GIB,
+      configuredLocalCpuSlots: 8,
+      activeLocalCpuSlots: 3,
+      idleLocalCpuSlots: 5,
+      idleLocalReservedBytes: 200 * GIB,
+    });
+  });
+
+  it("resolves the disk-capacity contract from persisted slots before deployment fallback", () => {
+    expect(
+      configuredDiskCapacitySlots(
+        { cpuSlots: 8, maxConcurrentJobs: 3 },
+        { AIRFOILFOAM_WORKER_CPU_BUDGET: "64" },
+      ),
+    ).toBe(8);
+    expect(
+      configuredDiskCapacitySlots(
+        { cpuSlots: 0, maxConcurrentJobs: 6 },
+        { AIRFOILFOAM_WORKER_CPU_BUDGET: "64" },
+      ),
+    ).toBe(6);
+    expect(
+      configuredDiskCapacitySlots(
+        { cpuSlots: 0, maxConcurrentJobs: 0 },
+        { AIRFOILFOAM_WORKER_CPU_BUDGET: "64" },
+      ),
+    ).toBe(64);
   });
 
   it("fails closed on an invalid measurement", () => {
@@ -244,6 +317,7 @@ describe("disk admission", () => {
         requestPayload: { uransFidelity: "precalc" },
       })),
       config,
+      8,
     );
     const decision = evaluateDiskAdmission(
       { total_bytes: 492 * GIB, free_bytes: 252 * GIB, used_pct: 49 },
@@ -255,7 +329,7 @@ describe("disk admission", () => {
     expect(decision).toMatchObject({
       allowed: true,
       reason: null,
-      requiredFreeBytes: 228 * GIB,
+      requiredFreeBytes: 188 * GIB,
     });
   });
 
@@ -268,7 +342,7 @@ describe("disk admission", () => {
       "for (let i = 0; i < MAX_LOCAL_ADMISSIONS_PER_TICK; i++)",
     );
     const refillEnd = loopSource.indexOf(
-      "// Artifact publication",
+      "  await markTickCompleted(db);",
       refillStart,
     );
     const refillLoop = loopSource.slice(refillStart, refillEnd);
