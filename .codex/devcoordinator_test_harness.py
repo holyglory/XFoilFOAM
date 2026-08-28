@@ -449,7 +449,7 @@ def _storage_retention_regression() -> int:
                 "run",
                 "test/remote-solver-validation.test.ts",
                 "-t",
-                "reclaim|cancelled PRECALC owner",
+                "reclaim|PRECALC owner",
             ],
         ),
     ]

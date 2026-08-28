@@ -1283,6 +1283,8 @@ async function remotePromiseWorkState(
       retryState: simResultSubmitRetries.state,
       retryAt: simResultSubmitRetries.nextAttemptAt,
       precalcState: simPrecalcObligations.state,
+      precalcAttemptCount: simPrecalcObligations.attemptCount,
+      precalcMaxAttempts: simPrecalcObligations.maxAttempts,
       precalcNextSubmitAt: simPrecalcObligations.nextSubmitAt,
     })
     .from(syncSweepPromisePoints)
@@ -1326,6 +1328,14 @@ async function remotePromiseWorkState(
     // natural cell. Never downgrade it back into a mirrored wave-1 RANS shell;
     // the FAST lane either submits it now or keeps the promise waiting.
     if (row.precalcState === "pending") {
+      if (
+        row.precalcAttemptCount != null &&
+        row.precalcMaxAttempts != null &&
+        row.precalcAttemptCount >= row.precalcMaxAttempts
+      ) {
+        terminal = true;
+        continue;
+      }
       if (row.precalcNextSubmitAt && row.precalcNextSubmitAt.getTime() > now) {
         if (
           !waitingUntil ||
