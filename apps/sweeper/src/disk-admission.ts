@@ -17,6 +17,11 @@ export const DEFAULT_DISK_MIN_FREE_BYTES = 20 * GIB;
 // One ordinary 26-case FAST-URANS batch at the calibrated per-case reserve.
 // This is intentionally larger than the 24.375 GiB full RANS batch reserve.
 export const DEFAULT_DISK_JOB_RESERVE_BYTES = 40 * GIB;
+// Production on 2026-08-28 measured 8.69 GiB p99 reclaimed working data per
+// execution slot. Thirty GiB retains over 3x that observation, covers the
+// supported 24.375 GiB full RANS batch with explicit headroom, and avoids
+// pretending that every CPU slot owns a separate maximum-shaped job.
+export const DEFAULT_DISK_IDLE_SLOT_RESERVE_BYTES = 30 * GIB;
 export const DEFAULT_DISK_RANS_CASE_RESERVE_BYTES = 320 * MIB;
 export const DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES = 1.5 * GIB;
 export const DEFAULT_DISK_FULL_CASE_RESERVE_BYTES = 6 * GIB;
@@ -29,6 +34,8 @@ export interface DiskAdmissionConfig {
   minFreeBytes: number;
   /** Conservative reserve for the next job before its exact shape is known. */
   jobReserveBytes: number;
+  /** Measured working-set reserve for one idle execution slot. */
+  idleSlotReserveBytes: number;
   ransCaseReserveBytes?: number;
   precalcCaseReserveBytes?: number;
   fullCaseReserveBytes?: number;
@@ -104,6 +111,11 @@ export function diskAdmissionConfigFromEnv(): DiskAdmissionConfig {
       positiveEnv(
         "SWEEPER_DISK_JOB_RESERVE_GIB",
         DEFAULT_DISK_JOB_RESERVE_BYTES / GIB,
+      ) * GIB,
+    idleSlotReserveBytes:
+      positiveEnv(
+        "SWEEPER_DISK_IDLE_SLOT_RESERVE_GIB",
+        DEFAULT_DISK_IDLE_SLOT_RESERVE_BYTES / GIB,
       ) * GIB,
     ransCaseReserveBytes:
       positiveEnv(
@@ -198,10 +210,10 @@ export function diskAdmissionExposureForJobs(
       configuredLocalCpuSlots: capacity,
       activeLocalCpuSlots,
       idleLocalCpuSlots,
-      // One safe ordinary-job envelope per idle execution unit. This makes a
-      // healthy forecast mean the whole configured pool can fill, not merely
-      // that one additional submission fits.
-      idleLocalReservedBytes: idleLocalCpuSlots * config.jobReserveBytes,
+      // Reserve measured per-slot working growth, not a maximum-shaped job
+      // for every CPU slot. The separate job reserve remains the fail-closed
+      // fallback for one unresolved/malformed active job.
+      idleLocalReservedBytes: idleLocalCpuSlots * config.idleSlotReserveBytes,
     };
   }
   return exposure;
@@ -326,11 +338,11 @@ export async function cancelDisposableJobsForDiskPressure(
 }
 
 /**
- * Reserve measured future growth of local engine work plus one safe ordinary
- * job envelope for every idle configured execution unit. Upstream promises
- * computed on another solver are intentionally absent: their durable archive
- * uploads directly to GCS, while the fixed system floor covers the hub's
- * bounded fresh-generation verification.
+ * Reserve measured future growth of local engine work plus a calibrated
+ * working-set envelope for every idle configured execution unit. Upstream
+ * promises computed on another solver are intentionally absent: their durable
+ * archive uploads directly to GCS, while the fixed system floor covers the
+ * hub's bounded fresh-generation verification.
  */
 export function evaluateDiskAdmission(
   disk: EngineMaintenanceDiskResponse,

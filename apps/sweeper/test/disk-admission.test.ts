@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_DISK_IDLE_SLOT_RESERVE_BYTES,
   DEFAULT_DISK_JOB_RESERVE_BYTES,
   DEFAULT_DISK_MAX_USED_PCT,
   DEFAULT_DISK_MIN_FREE_BYTES,
@@ -17,6 +18,7 @@ const config = {
   maxUsedPct: DEFAULT_DISK_MAX_USED_PCT,
   minFreeBytes: DEFAULT_DISK_MIN_FREE_BYTES,
   jobReserveBytes: DEFAULT_DISK_JOB_RESERVE_BYTES,
+  idleSlotReserveBytes: DEFAULT_DISK_IDLE_SLOT_RESERVE_BYTES,
 };
 
 describe("disk admission", () => {
@@ -102,7 +104,7 @@ describe("disk admission", () => {
     );
   });
 
-  it("keeps every configured CPU slot inside the forecast before the pool fills", () => {
+  it("keeps every configured CPU slot inside a measured per-slot forecast before the pool fills", () => {
     const empty = diskAdmissionExposureForJobs([], config, 8);
     expect(empty).toEqual({
       activeLocalJobCount: 0,
@@ -110,24 +112,28 @@ describe("disk admission", () => {
       configuredLocalCpuSlots: 8,
       activeLocalCpuSlots: 0,
       idleLocalCpuSlots: 8,
-      idleLocalReservedBytes: 320 * GIB,
+      idleLocalReservedBytes: 240 * GIB,
     });
     expect(
       evaluateDiskAdmission(
-        { total_bytes: 492 * GIB, free_bytes: 339 * GIB, used_pct: 31.1 },
+        { total_bytes: 492 * GIB, free_bytes: 259 * GIB, used_pct: 47.4 },
         empty,
         config,
       ),
     ).toMatchObject({
       allowed: false,
-      requiredFreeBytes: 340 * GIB,
+      requiredFreeBytes: 260 * GIB,
     });
     const allowed = evaluateDiskAdmission(
-      { total_bytes: 492 * GIB, free_bytes: 341 * GIB, used_pct: 30.7 },
+      { total_bytes: 492 * GIB, free_bytes: 300 * GIB, used_pct: 39 },
       empty,
       config,
     );
-    expect(allowed).toMatchObject({ allowed: true, reason: null });
+    expect(allowed).toMatchObject({
+      allowed: true,
+      reason: null,
+      requiredFreeBytes: 260 * GIB,
+    });
   });
 
   it("uses CPU reservations only to count occupied capacity, never to multiply active job bytes", () => {
@@ -149,7 +155,7 @@ describe("disk admission", () => {
       configuredLocalCpuSlots: 8,
       activeLocalCpuSlots: 3,
       idleLocalCpuSlots: 5,
-      idleLocalReservedBytes: 200 * GIB,
+      idleLocalReservedBytes: 150 * GIB,
     });
   });
 
