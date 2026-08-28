@@ -421,6 +421,7 @@ def _storage_retention_regression() -> int:
                 "tests/test_retention.py",
                 "tests/test_evidence_cache_maintenance.py",
                 "tests/test_evidence_store.py",
+                "tests/test_storage_capacity_contract.py",
             ],
         ),
         (
