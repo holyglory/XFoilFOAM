@@ -27,6 +27,7 @@
     "@aerodb/core": "workspace:*",
     "@aerodb/db": "workspace:*",
     "@aerodb/engine-client": "workspace:*",
+    "@google-cloud/storage": "7.16.0",
     "drizzle-orm": "^0.38.3"
   }
 }

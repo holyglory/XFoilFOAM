@@ -1,6 +1,8 @@
+import { Storage } from "@google-cloud/storage";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -17,7 +19,9 @@ async function store() {
 
 afterEach(async () => {
   vi.unstubAllGlobals();
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true })));
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true })),
+  );
 });
 
 describe("archived evidence media proxy", () => {
@@ -43,8 +47,9 @@ describe("archived evidence media proxy", () => {
   it("preserves an upstream checksum failure as 502", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response('{"detail":"checksum mismatch"}', { status: 502 }),
+      vi.fn(
+        async () =>
+          new Response('{"detail":"checksum mismatch"}', { status: 502 }),
       ),
     );
     const media = await store();
@@ -105,5 +110,87 @@ describe("archived evidence media proxy", () => {
     } finally {
       await app.close();
     }
+  });
+});
+
+describe("immutable result media objects", () => {
+  it("streams only the exact database-pinned GCS generation", async () => {
+    const bytes = Buffer.from("stored result media");
+    const metadata = {
+      generation: "123456789",
+      size: String(bytes.byteLength),
+      crc32c: "AAAAAA==",
+      contentType: "image/png",
+      metadata: {
+        sha256: "a".repeat(64),
+        byteSize: String(bytes.byteLength),
+      },
+    };
+    const fakeStorage = {
+      bucket: () => ({
+        file: (_key: string, options: { generation: string }) => {
+          expect(options.generation).toBe(metadata.generation);
+          return {
+            getMetadata: async () => [metadata],
+            createReadStream: () => Readable.from(bytes),
+          };
+        },
+      }),
+    } as unknown as Storage;
+    const root = await mkdtemp(join(tmpdir(), "aerodb-media-store-gcs-"));
+    roots.push(root);
+    const media = new VolumeMediaStore(root, () => fakeStorage);
+
+    const stored = await media.streamStoredMedia({
+      bucket: "media-bucket",
+      objectKey: "solver-media/v1/sha256/aa/" + "a".repeat(64),
+      generation: metadata.generation,
+      mimeType: metadata.contentType,
+      sha256: "a".repeat(64),
+      byteSize: bytes.byteLength,
+      crc32c: metadata.crc32c,
+    });
+    const chunks: Buffer[] = [];
+    for await (const chunk of stored.stream) chunks.push(Buffer.from(chunk));
+
+    expect(Buffer.concat(chunks)).toEqual(bytes);
+    expect(stored.mime).toBe("image/png");
+  });
+
+  it("rejects metadata drift before returning a stream", async () => {
+    const fakeStorage = {
+      bucket: () => ({
+        file: () => ({
+          getMetadata: async () => [
+            {
+              generation: "123456789",
+              size: "99",
+              crc32c: "AAAAAA==",
+              contentType: "image/png",
+              metadata: {
+                sha256: "b".repeat(64),
+                byteSize: "99",
+              },
+            },
+          ],
+          createReadStream: () => Readable.from("must not stream"),
+        }),
+      }),
+    } as unknown as Storage;
+    const root = await mkdtemp(join(tmpdir(), "aerodb-media-store-gcs-"));
+    roots.push(root);
+    const media = new VolumeMediaStore(root, () => fakeStorage);
+
+    await expect(
+      media.streamStoredMedia({
+        bucket: "media-bucket",
+        objectKey: "solver-media/v1/sha256/aa/" + "a".repeat(64),
+        generation: "123456789",
+        mimeType: "image/png",
+        sha256: "a".repeat(64),
+        byteSize: 10,
+        crc32c: "AAAAAA==",
+      }),
+    ).rejects.toMatchObject<Partial<MediaUpstreamError>>({ statusCode: 502 });
   });
 });

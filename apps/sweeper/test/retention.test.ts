@@ -12,6 +12,10 @@ import {
   referenceGeometryProfiles,
   resultClassifications,
   resultAttempts,
+  resultMedia,
+  resultMediaBlobs,
+  resultMediaStorageBindings,
+  resultMediaStorageUploads,
   results,
   simCampaignConditions,
   simJobs,
@@ -29,8 +33,25 @@ import {
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import { EngineError, type EngineClient } from "@aerodb/engine-client";
 import { and, eq, inArray, like, sql as dsql } from "drizzle-orm";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  bindResultMediaObject,
+  enqueueResultMediaStorageUpload,
+  ensureResultMediaObject,
+  processResultMediaLocalReclaims,
+  type ResultMediaObjectStore,
+} from "../src/media-object-store";
 import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
 import { DISK_PRESSURE_CANCELLATION_MARKER } from "../src/disk-admission";
 
@@ -459,6 +480,178 @@ describe("retention schema", () => {
       "stripped_at",
     ]);
   });
+
+  it("binds exact media before reclaiming its local bytes", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-media-object-reclaim`);
+    const result = await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "urans_precalc",
+    });
+    const [selected] = await db
+      .select({ id: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id))
+      .limit(1);
+    if (!selected?.id) throw new Error("media fixture has no selected attempt");
+
+    const mediaRoot = mkdtempSync(join(tmpdir(), "xff-media-reclaim-"));
+    const storageKey = `jobs/${job.engineJobId}/cases/case/evidence/scaled_media/pressure.png`;
+    const path = join(mediaRoot, storageKey);
+    const bytes = Buffer.from(`${PREFIX}-immutable-media`);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes);
+    const blobIds: string[] = [];
+    try {
+      const [media] = await db
+        .insert(resultMedia)
+        .values({
+          resultId: result.id,
+          resultAttemptId: selected.id,
+          kind: "image",
+          field: "pressure",
+          role: "instantaneous",
+          storageKey,
+          mimeType: "image/png",
+          sha256,
+          byteSize: bytes.byteLength,
+        })
+        .returning({ id: resultMedia.id });
+      await enqueueResultMediaStorageUpload(db, media.id);
+      await bindResultMediaObject(
+        db,
+        {
+          resultMediaId: media.id,
+          localStorageKey: storageKey,
+          localPath: path,
+          mimeType: "image/png",
+          sha256,
+          byteSize: bytes.byteLength,
+        },
+        {
+          backend: "gcs",
+          bucket: "retention-test-bucket",
+          objectKey: `solver-media/v1/sha256/${sha256.slice(0, 2)}/${sha256}`,
+          generation: "123456789",
+          mimeType: "image/png",
+          sha256,
+          byteSize: bytes.byteLength,
+          crc32c: "AAAAAA==",
+          verifiedAt: NOW,
+        },
+      );
+      const [binding] = await db
+        .select({
+          state: resultMediaStorageBindings.state,
+          blobId: resultMediaStorageBindings.blobId,
+        })
+        .from(resultMediaStorageBindings)
+        .where(eq(resultMediaStorageBindings.resultMediaId, media.id))
+        .limit(1);
+      blobIds.push(binding.blobId);
+      expect(binding.state).toBe("pending");
+      const [upload] = await db
+        .select({ state: resultMediaStorageUploads.state })
+        .from(resultMediaStorageUploads)
+        .where(eq(resultMediaStorageUploads.resultMediaId, media.id))
+        .limit(1);
+      expect(upload.state).toBe("bound");
+
+      expect(
+        await processResultMediaLocalReclaims(db, {
+          limit: 10,
+          concurrency: 2,
+          mediaRoot,
+        }),
+      ).toBe(1);
+      expect(existsSync(path)).toBe(false);
+      const [reclaimed] = await db
+        .select({ state: resultMediaStorageBindings.state })
+        .from(resultMediaStorageBindings)
+        .where(eq(resultMediaStorageBindings.resultMediaId, media.id))
+        .limit(1);
+      expect(reclaimed.state).toBe("reclaimed");
+      await expect(
+        ensureResultMediaObject(db, {} as ResultMediaObjectStore, {
+          resultMediaId: media.id,
+          localStorageKey: storageKey,
+          localPath: path,
+          mimeType: "image/png",
+          sha256,
+          byteSize: bytes.byteLength,
+        }),
+      ).resolves.toBeUndefined();
+
+      const replacementKey = `jobs/${job.engineJobId}/cases/case/evidence/scaled_media/pressure-v2.png`;
+      const replacementPath = join(mediaRoot, replacementKey);
+      const replacementBytes = Buffer.from(`${PREFIX}-replacement-media`);
+      const replacementSha256 = createHash("sha256")
+        .update(replacementBytes)
+        .digest("hex");
+      mkdirSync(dirname(replacementPath), { recursive: true });
+      writeFileSync(replacementPath, replacementBytes);
+      await db
+        .update(resultMedia)
+        .set({
+          storageKey: replacementKey,
+          sha256: replacementSha256,
+          byteSize: replacementBytes.byteLength,
+        })
+        .where(eq(resultMedia.id, media.id));
+      await bindResultMediaObject(
+        db,
+        {
+          resultMediaId: media.id,
+          localStorageKey: replacementKey,
+          localPath: replacementPath,
+          mimeType: "image/png",
+          sha256: replacementSha256,
+          byteSize: replacementBytes.byteLength,
+        },
+        {
+          backend: "gcs",
+          bucket: "retention-test-bucket",
+          objectKey: `solver-media/v1/sha256/${replacementSha256.slice(0, 2)}/${replacementSha256}`,
+          generation: "123456790",
+          mimeType: "image/png",
+          sha256: replacementSha256,
+          byteSize: replacementBytes.byteLength,
+          crc32c: "AAAAAA==",
+          verifiedAt: NOW,
+        },
+      );
+      const [replacementBinding] = await db
+        .select({
+          state: resultMediaStorageBindings.state,
+          blobId: resultMediaStorageBindings.blobId,
+          localStorageKey: resultMediaStorageBindings.localStorageKey,
+        })
+        .from(resultMediaStorageBindings)
+        .where(eq(resultMediaStorageBindings.resultMediaId, media.id))
+        .limit(1);
+      blobIds.push(replacementBinding.blobId);
+      expect(replacementBinding).toMatchObject({
+        state: "pending",
+        localStorageKey: replacementKey,
+      });
+      expect(
+        await processResultMediaLocalReclaims(db, {
+          limit: 10,
+          concurrency: 2,
+          mediaRoot,
+        }),
+      ).toBe(1);
+      expect(existsSync(replacementPath)).toBe(false);
+    } finally {
+      await db.delete(results).where(eq(results.id, result.id));
+      await db.delete(simJobs).where(eq(simJobs.id, job.id));
+      if (blobIds.length)
+        await db
+          .delete(resultMediaBlobs)
+          .where(inArray(resultMediaBlobs.id, blobIds));
+      rmSync(mediaRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("terminal strip reaper", () => {
@@ -693,6 +886,30 @@ describe("terminal strip reaper", () => {
     expect(after.stripReport).toMatchObject({ kept_case_state: false });
   });
 
+  it("reclaims an unrequested continuation cache immediately during forecast pressure", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-continuable-pressure`);
+    await insertClassifiedResult(job, {
+      state: "rejected",
+      qualityWarnings: [`${URANS_BUDGET_STOP_MARKER}: continuation candidate`],
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      retentionContinuableDays: 14,
+      stripMaxPerTick: 500,
+      reclaimOptionalCaseState: true,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: `${PREFIX}-continuable-pressure`, keepCaseState: false },
+    ]);
+    expect((await readJob(job.id)).stripReport).toMatchObject({
+      kept_case_state: false,
+    });
+  });
+
   it("keeps case state when a live continuation request points at a result of the job", async () => {
     const job = await insertTerminalJob(`${PREFIX}-live-continuation`);
     const source = await insertClassifiedResult(job, {
@@ -717,6 +934,37 @@ describe("terminal strip reaper", () => {
 
     expect(own(engine.stripCalls)).toEqual([
       { jobId: `${PREFIX}-live-continuation`, keepCaseState: true },
+    ]);
+  });
+
+  it("protects a live continuation owner even during forecast pressure", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-live-continuation-pressure`);
+    const source = await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "urans_full",
+    });
+    await db.insert(simUransRequests).values({
+      airfoilId,
+      revisionId,
+      aoaDeg: source.aoaDeg,
+      fidelity: "precalc",
+      state: "pending",
+      continueFromResultId: source.id,
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+      reclaimOptionalCaseState: true,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([
+      {
+        jobId: `${PREFIX}-live-continuation-pressure`,
+        keepCaseState: true,
+      },
     ]);
   });
 

@@ -57,6 +57,7 @@ import {
   touchHeartbeat,
 } from "./heartbeat";
 import { prepareAutomaticMeshRecovery } from "./mesh-recovery";
+import { scheduleResultMediaStorageMaintenance } from "./media-object-store";
 import { reconcile, resetOrphans } from "./reconcile";
 import {
   admitRemoteSolverTick,
@@ -78,6 +79,7 @@ interface SweeperConfig {
   cpuSlots: number;
   pollIntervalMs: number;
   submitIntervalMs: number;
+  diskAdmissionBlocked: boolean;
 }
 
 /**
@@ -112,6 +114,7 @@ export async function getState(db: DB): Promise<SweeperConfig> {
       cpuSlots: sweeperState.cpuSlots,
       pollIntervalMs: sweeperState.pollIntervalMs,
       submitIntervalMs: sweeperState.submitIntervalMs,
+      diskAdmissionBlocked: sweeperState.diskAdmissionBlocked,
     })
     .from(sweeperState)
     .where(eq(sweeperState.id, 1))
@@ -129,6 +132,7 @@ export async function getState(db: DB): Promise<SweeperConfig> {
     cpuSlots: s?.cpuSlots ?? 0,
     pollIntervalMs: s?.pollIntervalMs ?? 5000,
     submitIntervalMs: s?.submitIntervalMs ?? 15000,
+    diskAdmissionBlocked: s?.diskAdmissionBlocked ?? false,
   };
 }
 
@@ -761,7 +765,13 @@ export async function tick(
   const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
   scheduleRemoteSolverReclaims(db, engine);
   scheduleRemoteSolverTransfer(db, engine);
-  await retentionTick(db, engine);
+  scheduleResultMediaStorageMaintenance(db);
+  await retentionTick(db, engine, {
+    // A forecast-only pause is an abnormal capacity state. Optional saved
+    // restart caches yield on the next tick; exact active continuation owners
+    // remain protected by retention's live-owner predicates.
+    reclaimOptionalCaseState: state.diskAdmissionBlocked,
+  });
   let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;
   const admissionFenceGuardFailed =
     preReconcileFence.guardFailed || postReconcileFence.guardFailed;

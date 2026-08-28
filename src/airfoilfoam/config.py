@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         description="Temporary render hydration cache. Defaults to <data_dir>/evidence-hydration-cache.",
     )
     evidence_hydration_cache_max_gb: float = Field(
-        default=50.0,
+        default=10.0,
         gt=0,
         description="Hard size target [GiB] for temporary hydrated archives and VTK trees.",
     )
@@ -78,6 +78,11 @@ class Settings(BaseSettings):
         default=24 * 60 * 60,
         ge=60,
         description="Idle age after which temporary evidence hydration may be evicted.",
+    )
+    evidence_hydration_cache_cleanup_interval_seconds: int = Field(
+        default=5 * 60,
+        ge=10,
+        description="Interval for cleanup that runs independently of evidence reads.",
     )
     evidence_gcs_timeout_seconds: int = Field(
         default=900,

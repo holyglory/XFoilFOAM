@@ -70,6 +70,12 @@ import {
   selectEngineInterpretation,
   stageEngineResultInterpretation,
 } from "./result-interpretations";
+import {
+  configuredResultMediaObjectStore,
+  enqueueResultMediaStorageUpload,
+  ensureResultMediaObject,
+  resultMediaLocalPath,
+} from "./media-object-store";
 import type { RansRetryScope } from "./retry-plan";
 
 const execFileAsync = promisify(execFile);
@@ -780,49 +786,106 @@ async function registerMedia(
       .onConflictDoNothing()
       .returning({ id: resultMedia.id });
     if (!inserted) {
-      if (evidence?.preserveExistingAttemptMedia) return;
-      await writeDb
-        .update(resultMedia)
-        .set({
-          storageKey,
-          mimeType,
-          width: video.width ? Math.round(video.width) : null,
-          height: video.height ? Math.round(video.height) : null,
-          frameCount: video.frameCount ? Math.round(video.frameCount) : null,
-          durationS: video.durationS ?? null,
-          colorScaleId: scale?.colorScaleId ?? null,
-          colorScaleVersion: scale?.colorScaleVersion ?? null,
-          scaleVmin: scale?.vmin ?? null,
-          scaleVmax: scale?.vmax ?? null,
-          scalePolicy: scale?.policy ?? null,
-          renderProfileKey:
-            scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
-          evidenceSha256: evidence?.evidenceSha256 ?? null,
-          sha256: evidence?.expectedSha256 ?? null,
-          byteSize: evidence?.expectedByteSize ?? null,
-          engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
-        })
-        .where(
-          and(
-            eq(resultMedia.resultAttemptId, resultAttemptId),
-            eq(resultMedia.kind, kind),
-            sql`${resultMedia.field} IS NOT DISTINCT FROM ${field}`,
-            eq(resultMedia.role, role),
-            eq(
-              resultMedia.renderProfileKey,
+      if (!evidence?.preserveExistingAttemptMedia) {
+        await writeDb
+          .update(resultMedia)
+          .set({
+            storageKey,
+            mimeType,
+            width: video.width ? Math.round(video.width) : null,
+            height: video.height ? Math.round(video.height) : null,
+            frameCount: video.frameCount ? Math.round(video.frameCount) : null,
+            durationS: video.durationS ?? null,
+            colorScaleId: scale?.colorScaleId ?? null,
+            colorScaleVersion: scale?.colorScaleVersion ?? null,
+            scaleVmin: scale?.vmin ?? null,
+            scaleVmax: scale?.vmax ?? null,
+            scalePolicy: scale?.policy ?? null,
+            renderProfileKey:
               scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
+            evidenceSha256: evidence?.evidenceSha256 ?? null,
+            sha256: evidence?.expectedSha256 ?? null,
+            byteSize: evidence?.expectedByteSize ?? null,
+            engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
+          })
+          .where(
+            and(
+              eq(resultMedia.resultAttemptId, resultAttemptId),
+              eq(resultMedia.kind, kind),
+              sql`${resultMedia.field} IS NOT DISTINCT FROM ${field}`,
+              eq(resultMedia.role, role),
+              eq(
+                resultMedia.renderProfileKey,
+                scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
+              ),
+              sql`NOT EXISTS (
+                SELECT 1
+                FROM result_media_storage_bindings binding
+                WHERE binding.result_media_id = ${resultMedia.id}
+                  AND binding.state <> 'reclaimed'
+              )`,
             ),
-          ),
-        );
+          );
+      }
     }
+    const [stored] = await writeDb
+      .select({
+        id: resultMedia.id,
+        storageKey: resultMedia.storageKey,
+        mimeType: resultMedia.mimeType,
+        sha256: resultMedia.sha256,
+        byteSize: resultMedia.byteSize,
+      })
+      .from(resultMedia)
+      .where(
+        and(
+          eq(resultMedia.resultAttemptId, resultAttemptId),
+          eq(resultMedia.kind, kind),
+          sql`${resultMedia.field} IS NOT DISTINCT FROM ${field}`,
+          eq(resultMedia.role, role),
+          eq(
+            resultMedia.renderProfileKey,
+            scale?.renderProfileKey ?? DEFAULT_RENDER_PROFILE_KEY,
+          ),
+        ),
+      )
+      .limit(1);
+    if (!stored) throw new Error("registered result media row was not found");
+    return stored;
+  };
+
+  const persistObject = async (stored: Awaited<ReturnType<typeof write>>) => {
+    const objectStore = configuredResultMediaObjectStore();
+    if (!objectStore) return;
+    if (
+      !stored.sha256 ||
+      !SHA256_PATTERN.test(stored.sha256.toLowerCase()) ||
+      stored.byteSize == null ||
+      !Number.isSafeInteger(stored.byteSize) ||
+      stored.byteSize <= 0
+    ) {
+      // Legacy/unverified rows remain on the volume until a repair produces
+      // exact bytes. Current producers always provide SHA-256 + byte size.
+      return;
+    }
+    await enqueueResultMediaStorageUpload(db, stored.id);
+    await ensureResultMediaObject(db, objectStore, {
+      resultMediaId: stored.id,
+      localStorageKey: stored.storageKey,
+      localPath: resultMediaLocalPath(stored.storageKey),
+      mimeType: stored.mimeType,
+      sha256: stored.sha256,
+      byteSize: stored.byteSize,
+    });
   };
   if (!evidence?.repairFence) {
-    await write(db);
+    const stored = await write(db);
+    await persistObject(stored);
     return;
   }
 
   const fence = evidence.repairFence;
-  await db.transaction(async (rawTx) => {
+  const stored = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     await requireMediaRepairWriteFence(
       tx,
@@ -830,8 +893,9 @@ async function registerMedia(
       resultId,
       evidence.evidenceSha256,
     );
-    await write(tx);
+    return write(tx);
   });
+  await persistObject(stored);
 }
 
 function finiteNumber(value: unknown): value is number {

@@ -145,6 +145,14 @@ export const solverEvidenceArchiveStateEnum = pgEnum(
   "solver_evidence_archive_state",
   ["current", "superseded"],
 );
+export const resultMediaLocalReclaimStateEnum = pgEnum(
+  "result_media_local_reclaim_state",
+  ["pending", "running", "retry_wait", "reclaimed"],
+);
+export const resultMediaStorageUploadStateEnum = pgEnum(
+  "result_media_storage_upload_state",
+  ["pending", "running", "retry_wait", "bound"],
+);
 /**
  * The interpretation is the versioned scientific reduction of immutable raw
  * solver evidence.  It deliberately has a different lifecycle from the
@@ -1650,6 +1658,7 @@ export const resultMedia = pgTable(
     }).onDelete("cascade"),
     resultIdx: index("result_media_result_idx").on(t.resultId),
     attemptIdx: index("result_media_attempt_idx").on(t.resultAttemptId),
+    storageKeyUq: uniqueIndex("result_media_storage_key_uq").on(t.storageKey),
     resultProfileEvidenceIdx: index(
       "result_media_result_profile_evidence_idx",
     ).on(t.resultId, t.renderProfileKey, t.evidenceSha256),
@@ -1665,6 +1674,157 @@ export const resultMedia = pgTable(
     legacyResultIdx: index("result_media_legacy_result_role_idx")
       .on(t.resultId, t.kind, t.field, t.role, t.renderProfileKey)
       .where(sql`${t.resultAttemptId} IS NULL`),
+  }),
+);
+
+/** One immutable content-addressed media object shared by one or more exact
+ * result-media rows. The GCS generation is stored explicitly so a later
+ * object with the same name can never masquerade as the acknowledged bytes. */
+export const resultMediaBlobs = pgTable(
+  "result_media_blobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    backend: solverEvidenceBlobBackendEnum("backend").notNull().default("gcs"),
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    generation: text("generation").notNull(),
+    mimeType: text("mime_type").notNull(),
+    sha256: text("sha256").notNull(),
+    byteSize: bigint("byte_size", { mode: "number" }).notNull(),
+    crc32c: text("crc32c").notNull(),
+    verifiedAt: ts().notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    gcsIdentityUq: unique("result_media_blobs_gcs_identity_uq").on(
+      t.bucket,
+      t.objectKey,
+      t.generation,
+    ),
+    contentUq: unique("result_media_blobs_content_uq").on(t.sha256, t.byteSize),
+    backendCheck: check(
+      "result_media_blobs_backend_check",
+      sql`${t.backend} = 'gcs'`,
+    ),
+    bucketCheck: check(
+      "result_media_blobs_bucket_check",
+      sql`btrim(${t.bucket}) <> ''`,
+    ),
+    objectKeyCheck: check(
+      "result_media_blobs_object_key_check",
+      sql`btrim(${t.objectKey}) <> '' AND ${t.objectKey} NOT LIKE '/%' AND ${t.objectKey} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.objectKey}) = 0`,
+    ),
+    generationCheck: check(
+      "result_media_blobs_generation_check",
+      sql`${t.generation} ~ '^[1-9][0-9]{0,19}$'`,
+    ),
+    mimeTypeCheck: check(
+      "result_media_blobs_mime_type_check",
+      sql`btrim(${t.mimeType}) <> ''`,
+    ),
+    sha256Check: check(
+      "result_media_blobs_sha256_check",
+      sql`${t.sha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    byteSizeCheck: check(
+      "result_media_blobs_byte_size_check",
+      sql`${t.byteSize} > 0`,
+    ),
+    crc32cCheck: check(
+      "result_media_blobs_crc32c_check",
+      sql`${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$'`,
+    ),
+  }),
+);
+
+/** Durable acknowledgement and local-byte reclaim state for one exact media
+ * row. Upload/binding commits before local deletion; retries never weaken the
+ * immutable object identity. */
+export const resultMediaStorageBindings = pgTable(
+  "result_media_storage_bindings",
+  {
+    resultMediaId: uuid("result_media_id")
+      .primaryKey()
+      .references(() => resultMedia.id, { onDelete: "cascade" }),
+    blobId: uuid("blob_id")
+      .notNull()
+      .references(() => resultMediaBlobs.id, { onDelete: "restrict" }),
+    localStorageKey: text("local_storage_key").notNull(),
+    state: resultMediaLocalReclaimStateEnum("state")
+      .notNull()
+      .default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    error: text("error"),
+    reclaimedAt: timestamp("reclaimed_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    blobIdx: index("result_media_storage_bindings_blob_idx").on(t.blobId),
+    readyIdx: index("result_media_storage_bindings_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    localStorageKeyCheck: check(
+      "result_media_storage_bindings_local_key_check",
+      sql`btrim(${t.localStorageKey}) <> '' AND ${t.localStorageKey} NOT LIKE '/%' AND ${t.localStorageKey} !~ '(^|/)[.]{1,2}(/|$)' AND position(E'\\\\' in ${t.localStorageKey}) = 0`,
+    ),
+    attemptCountCheck: check(
+      "result_media_storage_bindings_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    stateShapeCheck: check(
+      "result_media_storage_bindings_state_shape_check",
+      sql`(
+        (${t.state} = 'running' AND ${t.claimToken} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL AND ${t.reclaimedAt} IS NULL)
+        OR (${t.state} IN ('pending', 'retry_wait') AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL AND ${t.reclaimedAt} IS NULL)
+        OR (${t.state} = 'reclaimed' AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL AND ${t.reclaimedAt} IS NOT NULL)
+      )`,
+    ),
+  }),
+);
+
+/** Durable upload discovery/retry state. It is deliberately separate from the
+ * immutable blob/binding rows: transport attempts are mutable operations, not
+ * stored result evidence. */
+export const resultMediaStorageUploads = pgTable(
+  "result_media_storage_uploads",
+  {
+    resultMediaId: uuid("result_media_id")
+      .primaryKey()
+      .references(() => resultMedia.id, { onDelete: "cascade" }),
+    state: resultMediaStorageUploadStateEnum("state")
+      .notNull()
+      .default("pending"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    error: text("error"),
+    boundAt: timestamp("bound_at", { withTimezone: true }),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts().notNull().defaultNow(),
+  },
+  (t) => ({
+    readyIdx: index("result_media_storage_uploads_ready_idx").on(
+      t.state,
+      t.nextAttemptAt,
+    ),
+    attemptCountCheck: check(
+      "result_media_storage_uploads_attempt_count_check",
+      sql`${t.attemptCount} >= 0`,
+    ),
+    stateShapeCheck: check(
+      "result_media_storage_uploads_state_shape_check",
+      sql`(
+        (${t.state} = 'running' AND ${t.claimToken} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL AND ${t.boundAt} IS NULL)
+        OR (${t.state} IN ('pending', 'retry_wait') AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL AND ${t.boundAt} IS NULL)
+        OR (${t.state} = 'bound' AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL AND ${t.boundAt} IS NOT NULL)
+      )`,
+    ),
   }),
 );
 
@@ -6551,6 +6711,11 @@ export type ResultInterpretationRecoveryAction =
 export type ResultCanonicalSelection =
   typeof resultCanonicalSelections.$inferSelect;
 export type ResultMedia = typeof resultMedia.$inferSelect;
+export type ResultMediaBlob = typeof resultMediaBlobs.$inferSelect;
+export type ResultMediaStorageBinding =
+  typeof resultMediaStorageBindings.$inferSelect;
+export type ResultMediaStorageUpload =
+  typeof resultMediaStorageUploads.$inferSelect;
 export type ResultEvidenceFieldInventory =
   typeof resultEvidenceFieldInventory.$inferSelect;
 export type SolverEvidenceArtifact =

@@ -20,6 +20,8 @@ import {
   remoteAssetReferences,
   resultAttempts,
   resultMedia,
+  resultMediaBlobs,
+  resultMediaStorageBindings,
   RETIRED_REVIEW_WAIVER_ERROR,
   revokeActiveReviewVerdict,
   reviewVerdictHistory,
@@ -66,7 +68,7 @@ import { db } from "./db";
 import { selectVisibleEvidenceArtifacts } from "./evidence-artifacts";
 import { env } from "./env";
 import { makeEngineClient } from "./engine-client";
-import { MediaUpstreamError, mediaStore } from "./media-store";
+import { MediaUpstreamError, mediaStore, resultMediaUrl } from "./media-store";
 import { createAirfoil, createAirfoilsBulk } from "./services/airfoils";
 import { assembleDetail } from "./services/detail";
 import { categoriesTree, listAirfoils } from "./services/catalog";
@@ -328,6 +330,62 @@ async function proxyRemoteAsset(storageKey: string) {
     size: Number(res.headers.get("content-length") ?? ref.byteSize ?? 0),
     mime: res.headers.get("content-type") ?? ref.mimeType,
   };
+}
+
+async function storedResultMediaForKey(storageKey: string) {
+  const [row] = await db
+    .select({
+      mediaSha256: resultMedia.sha256,
+      mediaByteSize: resultMedia.byteSize,
+      mediaMimeType: resultMedia.mimeType,
+      backend: resultMediaBlobs.backend,
+      bucket: resultMediaBlobs.bucket,
+      objectKey: resultMediaBlobs.objectKey,
+      generation: resultMediaBlobs.generation,
+      blobMimeType: resultMediaBlobs.mimeType,
+      blobSha256: resultMediaBlobs.sha256,
+      blobByteSize: resultMediaBlobs.byteSize,
+      crc32c: resultMediaBlobs.crc32c,
+    })
+    .from(resultMedia)
+    .innerJoin(
+      resultMediaStorageBindings,
+      eq(resultMediaStorageBindings.resultMediaId, resultMedia.id),
+    )
+    .innerJoin(
+      resultMediaBlobs,
+      eq(resultMediaBlobs.id, resultMediaStorageBindings.blobId),
+    )
+    .where(eq(resultMedia.storageKey, storageKey))
+    .limit(1);
+  if (!row) return null;
+  if (
+    row.backend !== "gcs" ||
+    !row.bucket ||
+    !row.objectKey ||
+    !row.generation ||
+    !row.blobMimeType ||
+    !row.blobSha256 ||
+    row.blobByteSize == null ||
+    !row.crc32c ||
+    row.mediaSha256 !== row.blobSha256 ||
+    row.mediaByteSize !== row.blobByteSize ||
+    row.mediaMimeType !== row.blobMimeType
+  ) {
+    throw new MediaUpstreamError(
+      502,
+      "stored media binding failed integrity validation",
+    );
+  }
+  return mediaStore.streamStoredMedia({
+    bucket: row.bucket,
+    objectKey: row.objectKey,
+    generation: row.generation,
+    mimeType: row.blobMimeType,
+    sha256: row.blobSha256,
+    byteSize: row.blobByteSize,
+    crc32c: row.crc32c,
+  });
 }
 
 class RemoteRenderIntegrityError extends Error {
@@ -1116,7 +1174,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         kind: row.kind,
         field: row.field,
         role: row.role,
-        url: mediaStore.url(row.storageKey),
+        url: resultMediaUrl(row.id),
         mimeType: row.mimeType,
         width: row.width,
         height: row.height,
@@ -1211,7 +1269,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       ).map(artifactDTO),
       media: media.map((row) => ({
         ...row,
-        url: mediaStore.url(row.storageKey),
+        url: resultMediaUrl(row.id),
       })),
       customRenders: renders.map((row) => ({
         ...row,
@@ -1981,7 +2039,85 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  // ---- media (served from the shared CFD data volume) ----
+  // ---- exact result media (GCS-backed after durable binding) ----
+  app.get("/api/result-media/:mediaId", async (req, reply) => {
+    const parsed = z
+      .string()
+      .uuid()
+      .safeParse((req.params as { mediaId?: string }).mediaId);
+    if (!parsed.success)
+      return reply.code(400).send({ error: "invalid result media id" });
+    const [row] = await db
+      .select({
+        id: resultMedia.id,
+        storageKey: resultMedia.storageKey,
+        mimeType: resultMedia.mimeType,
+        sha256: resultMedia.sha256,
+        byteSize: resultMedia.byteSize,
+        bindingMediaId: resultMediaStorageBindings.resultMediaId,
+        backend: resultMediaBlobs.backend,
+        bucket: resultMediaBlobs.bucket,
+        objectKey: resultMediaBlobs.objectKey,
+        generation: resultMediaBlobs.generation,
+        blobMimeType: resultMediaBlobs.mimeType,
+        blobSha256: resultMediaBlobs.sha256,
+        blobByteSize: resultMediaBlobs.byteSize,
+        crc32c: resultMediaBlobs.crc32c,
+      })
+      .from(resultMedia)
+      .leftJoin(
+        resultMediaStorageBindings,
+        eq(resultMediaStorageBindings.resultMediaId, resultMedia.id),
+      )
+      .leftJoin(
+        resultMediaBlobs,
+        eq(resultMediaBlobs.id, resultMediaStorageBindings.blobId),
+      )
+      .where(eq(resultMedia.id, parsed.data))
+      .limit(1);
+    if (!row) return reply.code(404).send({ error: "media not found" });
+    try {
+      const stored = row.bindingMediaId
+        ? row.backend === "gcs" &&
+          row.bucket &&
+          row.objectKey &&
+          row.generation &&
+          row.blobMimeType &&
+          row.blobSha256 &&
+          row.blobByteSize != null &&
+          row.crc32c &&
+          row.sha256 === row.blobSha256 &&
+          row.byteSize === row.blobByteSize &&
+          row.mimeType === row.blobMimeType
+          ? await mediaStore.streamStoredMedia({
+              bucket: row.bucket,
+              objectKey: row.objectKey,
+              generation: row.generation,
+              mimeType: row.blobMimeType,
+              sha256: row.blobSha256,
+              byteSize: row.blobByteSize,
+              crc32c: row.crc32c,
+            })
+          : null
+        : await mediaStore.stream(row.storageKey);
+      if (!stored) {
+        return reply
+          .code(502)
+          .send({ error: "stored media binding failed integrity validation" });
+      }
+      reply
+        .header("content-type", stored.mime)
+        .header("content-length", stored.size)
+        .header("cache-control", "public, max-age=31536000, immutable");
+      return reply.send(stored.stream);
+    } catch (error) {
+      if (error instanceof MediaUpstreamError)
+        return reply.code(error.statusCode).send({ error: error.message });
+      return reply.code(404).send({ error: "media not found" });
+    }
+  });
+
+  // ---- legacy/local artifacts and remote references ----
   app.get("/api/media/*", async (req, reply) => {
     const key = (req.params as Record<string, string>)["*"];
     try {
@@ -1993,6 +2129,14 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(stream);
     } catch (error) {
       try {
+        const stored = await storedResultMediaForKey(key);
+        if (stored) {
+          reply
+            .header("content-type", stored.mime)
+            .header("content-length", stored.size)
+            .header("cache-control", "public, max-age=31536000, immutable");
+          return reply.send(stored.stream);
+        }
         const proxied = await proxyRemoteAsset(key);
         if (!proxied) {
           if (error instanceof MediaUpstreamError)

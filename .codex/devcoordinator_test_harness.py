@@ -419,6 +419,8 @@ def _storage_retention_regression() -> int:
                 "-m",
                 "pytest",
                 "tests/test_retention.py",
+                "tests/test_evidence_cache_maintenance.py",
+                "tests/test_evidence_store.py",
             ],
         ),
         (
@@ -434,6 +436,21 @@ def _storage_retention_regression() -> int:
                 "run",
                 "test/retention.test.ts",
                 "test/sync-import-retention.test.ts",
+                "test/media-object-store.test.ts",
+            ],
+        ),
+        (
+            "api-media-storage",
+            "immutable result media read regressions",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/api",
+                "exec",
+                "vitest",
+                "run",
+                "test/media-store.test.ts",
             ],
         ),
         (

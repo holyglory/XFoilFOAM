@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { normalize, resolve } from "node:path";
 import { Readable } from "node:stream";
+import { Storage } from "@google-cloud/storage";
 
 import { env } from "./env";
 
@@ -39,7 +40,20 @@ export interface MediaStore {
     key: string,
     expected: VerifiedEvidenceIdentity,
   ): Promise<{ stream: NodeJS.ReadableStream; size: number; mime: string }>;
+  streamStoredMedia(
+    expected: StoredMediaIdentity,
+  ): Promise<{ stream: NodeJS.ReadableStream; size: number; mime: string }>;
   url(key: string): string;
+}
+
+export interface StoredMediaIdentity {
+  bucket: string;
+  objectKey: string;
+  generation: string;
+  mimeType: string;
+  sha256: string;
+  byteSize: number;
+  crc32c: string;
 }
 
 export interface VerifiedEvidenceIdentity {
@@ -62,7 +76,12 @@ export class MediaUpstreamError extends Error {
 }
 
 export class VolumeMediaStore implements MediaStore {
-  constructor(private baseDir: string = env.mediaDir) {}
+  private gcs: Storage | null = null;
+
+  constructor(
+    private baseDir: string = env.mediaDir,
+    private readonly storageFactory: () => Storage = () => new Storage(),
+  ) {}
 
   private resolveKey(key: string): string {
     const clean = normalize(key).replace(/^(\.\.(\/|\\|$))+/, "");
@@ -107,6 +126,57 @@ export class VolumeMediaStore implements MediaStore {
       "archived solver evidence is temporarily unavailable",
       404,
     );
+  }
+
+  async streamStoredMedia(expected: StoredMediaIdentity) {
+    if (
+      !expected.bucket.trim() ||
+      !expected.objectKey.trim() ||
+      !/^[1-9][0-9]{0,19}$/.test(expected.generation) ||
+      !/^[0-9a-f]{64}$/.test(expected.sha256) ||
+      !Number.isSafeInteger(expected.byteSize) ||
+      expected.byteSize <= 0 ||
+      !/^[A-Za-z0-9+/]{6}==$/.test(expected.crc32c) ||
+      !expected.mimeType.trim()
+    ) {
+      throw new MediaUpstreamError(502, "stored media identity is invalid");
+    }
+    try {
+      this.gcs ??= this.storageFactory();
+      const file = this.gcs
+        .bucket(expected.bucket)
+        .file(expected.objectKey, { generation: expected.generation });
+      const [metadata] = await file.getMetadata();
+      const custom = (metadata.metadata ?? {}) as Record<string, unknown>;
+      if (
+        metadata.generation !== expected.generation ||
+        Number(metadata.size) !== expected.byteSize ||
+        metadata.crc32c !== expected.crc32c ||
+        metadata.contentType !== expected.mimeType ||
+        custom.sha256 !== expected.sha256 ||
+        custom.byteSize !== String(expected.byteSize)
+      ) {
+        throw new MediaUpstreamError(
+          502,
+          "stored media object does not match its immutable identity",
+        );
+      }
+      return {
+        stream: file.createReadStream({ validation: true }),
+        size: expected.byteSize,
+        mime: expected.mimeType,
+      };
+    } catch (error) {
+      if (error instanceof MediaUpstreamError) throw error;
+      const code = Number((error as { code?: unknown })?.code);
+      throw new MediaUpstreamError(
+        code === 404 || code === 412 ? 502 : 503,
+        code === 404 || code === 412
+          ? "stored media object is missing or changed"
+          : `stored media is temporarily unavailable: ${(error as Error).message}`,
+        Number.isFinite(code) ? code : undefined,
+      );
+    }
   }
 
   url(key: string): string {
@@ -189,3 +259,7 @@ export class VolumeMediaStore implements MediaStore {
 }
 
 export const mediaStore: MediaStore = new VolumeMediaStore();
+
+export function resultMediaUrl(resultMediaId: string): string {
+  return `/api/result-media/${encodeURIComponent(resultMediaId)}`;
+}

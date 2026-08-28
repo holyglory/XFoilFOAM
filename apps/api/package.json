@@ -13,6 +13,7 @@
     "@aerodb/core": "workspace:*",
     "@aerodb/db": "workspace:*",
     "@aerodb/engine-client": "workspace:*",
+    "@google-cloud/storage": "7.16.0",
     "@fastify/cookie": "^11.0.2",
     "@fastify/cors": "^10.0.2",
     "@fastify/multipart": "^9.0.3",

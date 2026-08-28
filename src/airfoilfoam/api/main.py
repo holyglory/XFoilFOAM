@@ -11,10 +11,10 @@ import mimetypes
 import os
 import uuid
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import ContextManager, Iterator, Literal
 
 import numpy as np
@@ -30,7 +30,7 @@ from ..archive_reduction import (
 )
 from ..cache import EngineCache
 from ..capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
-from ..config import get_settings
+from ..config import Settings, get_settings
 from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
     EVIDENCE_ARCHIVE_NAME,
@@ -801,13 +801,62 @@ def _summarize_tasks(tasks_by_worker: dict | None) -> list[dict]:
     return rows
 
 
+def run_evidence_hydration_cache_maintenance_once(settings: Settings):
+    """Reclaim expired/LRU hydration entries without requiring a media read."""
+
+    remote_store = evidence_object_store(settings)
+    if remote_store is None:
+        return None
+    return remote_store.cleanup_cache()
+
+
+def _evidence_hydration_cache_maintenance_loop(
+    settings: Settings, stop: Event
+) -> None:
+    while not stop.is_set():
+        try:
+            report = run_evidence_hydration_cache_maintenance_once(settings)
+            if report is not None and report.entries_removed:
+                print(
+                    "[api] EVIDENCE CACHE: removed "
+                    f"{report.entries_removed} entr{'y' if report.entries_removed == 1 else 'ies'}, "
+                    f"freed {report.bytes_removed / 1024**3:.1f} GiB, "
+                    f"{report.bytes_remaining / 1024**3:.1f} GiB remains",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Hydration is a disposable cache. A failed pass must not prevent
+            # the engine gateway from serving health or retrying later.
+            print(f"[api] EVIDENCE CACHE: cleanup failed: {exc}", flush=True)
+        if stop.wait(settings.evidence_hydration_cache_cleanup_interval_seconds):
+            break
+
+
 def create_app() -> FastAPI:
+    settings = get_settings()
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        cache_maintenance_stop = Event()
+        cache_maintenance_thread = Thread(
+            target=_evidence_hydration_cache_maintenance_loop,
+            args=(settings, cache_maintenance_stop),
+            name="evidence-hydration-cache-maintenance",
+            daemon=True,
+        )
+        cache_maintenance_thread.start()
+        try:
+            yield
+        finally:
+            cache_maintenance_stop.set()
+            cache_maintenance_thread.join(timeout=5)
+
     app = FastAPI(
         title="XFoilFOAM",
         version=__version__,
         description="Compute airfoil angle-of-attack polars with 2D RANS CFD in OpenFOAM.",
+        lifespan=lifespan,
     )
-    settings = get_settings()
     store = JobStore(settings)
     # Worker runtime identity is immutable for the lifetime of one exact
     # worker/queue binding. Celery's `inspect.conf()` handler creates a Kombu

@@ -48,6 +48,8 @@ export interface RetentionConfig {
 export interface RetentionTickOptions extends Partial<RetentionConfig> {
   now?: Date;
   forceOrphanSweep?: boolean;
+  /** Forecast pressure evicts unrequested restart caches, never live owners. */
+  reclaimOptionalCaseState?: boolean;
 }
 
 interface StripCandidate {
@@ -146,6 +148,7 @@ export async function stripTerminalJobs(
   const config = retentionConfigFromEnv(options);
   if (config.stripMaxPerTick <= 0) return 0;
   const now = options.now ?? new Date();
+  const reclaimOptionalCaseState = options.reclaimOptionalCaseState === true;
   const candidates = (await db.execute(sql`
     WITH candidates AS (
       SELECT
@@ -327,6 +330,12 @@ export async function stripTerminalJobs(
       CASE
         WHEN error = ${DISK_PRESSURE_CANCELLATION_MARKER}
           THEN false
+        WHEN ${reclaimOptionalCaseState}
+          THEN (
+            has_live_continuation
+            OR has_live_precalc_continuation
+            OR has_live_final_continuation
+          )
         WHEN stripped_at IS NOT NULL
           AND strip_report ->> 'kept_case_state' = 'true'
           AND NOT has_live_continuation
@@ -355,7 +364,8 @@ export async function stripTerminalJobs(
         AND NOT has_live_precalc_continuation
         AND NOT has_live_final_continuation
         AND (
-          NOT (has_continuable OR has_attempt_continuable)
+          ${reclaimOptionalCaseState}
+          OR NOT (has_continuable OR has_attempt_continuable)
           OR terminal_at <= ${now.toISOString()}::timestamptz - (${config.retentionContinuableDays}::double precision * interval '1 day')
         )
       )

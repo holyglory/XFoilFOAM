@@ -35,7 +35,7 @@ import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 
 import { db } from "../db";
-import { mediaStore } from "../media-store";
+import { mediaStore, resultMediaUrl } from "../media-store";
 
 type ReviewDisclosure = {
   verdict: "exclude";
@@ -320,19 +320,19 @@ async function solvedDetail(
       };
     }
     if (mrow.role === "mean") {
-      entry.meanUrl = mediaStore.url(mrow.storageKey);
+      entry.meanUrl = resultMediaUrl(mrow.id);
     } else if (mrow.kind === "video") {
       // URANS stores both an instantaneous PNG and an MP4 for the same field.
       // The live pane must prefer the animation; the PNG remains a fallback.
       entry.kind = mrow.kind;
-      entry.url = mediaStore.url(mrow.storageKey);
+      entry.url = resultMediaUrl(mrow.id);
       entry.videoUrl = entry.url;
     } else if (!entry.url) {
       entry.kind = mrow.kind;
-      entry.url = mediaStore.url(mrow.storageKey);
+      entry.url = resultMediaUrl(mrow.id);
       entry.imageUrl = entry.url;
     } else if (!entry.imageUrl) {
-      entry.imageUrl = mediaStore.url(mrow.storageKey);
+      entry.imageUrl = resultMediaUrl(mrow.id);
     }
   }
   const allEvidenceRows = await db
