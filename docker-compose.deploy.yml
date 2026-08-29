@@ -276,7 +276,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile.node
     restart: unless-stopped
-    command: sh -c "pnpm --filter @aerodb/sweeper media-repair"
+    init: true
+    command:
+      ["node", "--import", "tsx", "apps/sweeper/src/media-repair-worker.ts"]
     environment:
       DATABASE_URL: ${DATABASE_URL}
       ENGINE_URL: ${ENGINE_URL}

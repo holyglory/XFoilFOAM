@@ -1,8 +1,14 @@
 import { makeContext } from "./config";
-import { resultMediaRepairBatch } from "./media-repair";
+import {
+  prepareResultMediaRepairPass,
+  repairNextResultMediaClaim,
+} from "./media-repair";
 import {
   configuredMediaRepairConcurrency,
-  nextMediaRepairDelayMs,
+  MEDIA_REPAIR_ACTIVE_DELAY_MS,
+  MEDIA_REPAIR_IDLE_DELAY_MS,
+  MEDIA_REPAIR_MAINTENANCE_DELAY_MS,
+  runUntilAborted,
 } from "./media-repair-worker-policy";
 
 const { db, sql, engine } = makeContext();
@@ -34,32 +40,61 @@ console.log(
   `[media-repair] starting — engine=${engine.baseUrl}, concurrency=${concurrency}. Durable rendering is isolated from scheduler ticks.`,
 );
 try {
-  while (!ac.signal.aborted) {
-    let delayMs = 30_000;
+  const maintenance = runUntilAborted(ac.signal, async () => {
     try {
-      const outcome = await resultMediaRepairBatch(db, engine, {
-        concurrency,
+      const outcome = await prepareResultMediaRepairPass(db, {
         discoveryLimit: 1_000,
       });
-      delayMs = nextMediaRepairDelayMs(outcome);
       if (
         outcome.discovered ||
         outcome.finalized ||
-        outcome.claimed ||
+        outcome.retrying ||
         outcome.blocked
       ) {
         console.log(
-          `[media-repair] pass: discovered ${outcome.discovered}, ` +
-            `claimed ${outcome.claimedCount}, finalized ${outcome.finalized}, ` +
-            `rendered ${outcome.repairedMedia}, ` +
+          `[media-repair] maintenance: discovered ${outcome.discovered}, ` +
+            `finalized ${outcome.finalized}, ` +
             `retrying ${outcome.retrying}, blocked ${outcome.blocked}`,
         );
       }
     } catch (error) {
-      console.error("[media-repair] pass failed:", errorMessage(error));
+      console.error("[media-repair] maintenance failed:", errorMessage(error));
     }
-    await delay(delayMs, ac.signal);
-  }
+    await delay(MEDIA_REPAIR_MAINTENANCE_DELAY_MS, ac.signal);
+  });
+  const lanes = Array.from({ length: concurrency }, (_, index) =>
+    runUntilAborted(ac.signal, async () => {
+      let claimed = false;
+      try {
+        const outcome = await repairNextResultMediaClaim(db, engine, {
+          preferNewestLive: index === 0,
+        });
+        claimed = outcome.claimed;
+        if (
+          outcome.claimed ||
+          outcome.finalized ||
+          outcome.retrying ||
+          outcome.blocked
+        ) {
+          console.log(
+            `[media-repair] lane ${index + 1}: claimed ${Number(outcome.claimed)}, ` +
+              `finalized ${outcome.finalized}, rendered ${outcome.repairedMedia}, ` +
+              `retrying ${outcome.retrying}, blocked ${outcome.blocked}`,
+          );
+        }
+      } catch (error) {
+        console.error(
+          `[media-repair] lane ${index + 1} failed:`,
+          errorMessage(error),
+        );
+      }
+      await delay(
+        claimed ? MEDIA_REPAIR_ACTIVE_DELAY_MS : MEDIA_REPAIR_IDLE_DELAY_MS,
+        ac.signal,
+      );
+    }),
+  );
+  await Promise.all([maintenance, ...lanes]);
 } finally {
   await sql.end();
 }

@@ -3,7 +3,8 @@ import type { ResultMediaRepairBatchOutcome } from "./media-repair";
 export const DEFAULT_MEDIA_REPAIR_CONCURRENCY = 2;
 export const MAX_MEDIA_REPAIR_CONCURRENCY = 4;
 export const MEDIA_REPAIR_ACTIVE_DELAY_MS = 100;
-export const MEDIA_REPAIR_IDLE_DELAY_MS = 30_000;
+export const MEDIA_REPAIR_IDLE_DELAY_MS = 5_000;
+export const MEDIA_REPAIR_MAINTENANCE_DELAY_MS = 30_000;
 
 export function configuredMediaRepairConcurrency(
   raw = process.env.AIRFOILFOAM_MEDIA_REPAIR_CONCURRENCY,
@@ -32,4 +33,14 @@ export function nextMediaRepairDelayMs(
   return outcome.claimedCount > 0
     ? MEDIA_REPAIR_ACTIVE_DELAY_MS
     : MEDIA_REPAIR_IDLE_DELAY_MS;
+}
+
+/** A lane owns at most one fenced repair at a time and refills independently
+ * of slower peers. The step itself owns its bounded delay, making shutdown
+ * wait for the current claim and preventing a batch barrier. */
+export async function runUntilAborted(
+  signal: AbortSignal,
+  step: () => Promise<void>,
+): Promise<void> {
+  while (!signal.aborted) await step();
 }

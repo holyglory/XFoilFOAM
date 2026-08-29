@@ -51,6 +51,7 @@ export interface ResultMediaRepairTickOptions {
   discoveryLimit?: number;
   finalizeLimit?: number;
   resultId?: string;
+  preferNewestLive?: boolean;
   /** The scheduler owns sweeper liveness. A dedicated media-repair process
    * deliberately leaves it untouched, while still renewing its own durable
    * repair lease around each expensive engine operation. */
@@ -234,7 +235,7 @@ export async function finalizeSatisfiedResultMediaRepairs(
   return { finalized, dirtyLanes: [...dirty.values()] };
 }
 
-async function prepareResultMediaRepairPass(
+export async function prepareResultMediaRepairPass(
   db: DB,
   opts: ResultMediaRepairTickOptions,
 ): Promise<ResultMediaRepairTickOutcome> {
@@ -365,13 +366,14 @@ async function repairClaimedResultMedia(
   }
 }
 
-async function repairNextResultMediaClaim(
+export async function repairNextResultMediaClaim(
   db: DB,
   engine: EngineClient,
   opts: ResultMediaRepairTickOptions,
 ): Promise<ResultMediaRepairTickOutcome> {
   const claim = await claimNextResultMediaRepair(db, {
     resultId: opts.resultId,
+    preferNewestLive: opts.preferNewestLive,
   });
   if (!claim) {
     return {

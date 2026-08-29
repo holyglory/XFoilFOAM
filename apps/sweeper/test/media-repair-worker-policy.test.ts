@@ -6,6 +6,7 @@ import {
   MEDIA_REPAIR_ACTIVE_DELAY_MS,
   MEDIA_REPAIR_IDLE_DELAY_MS,
   nextMediaRepairDelayMs,
+  runUntilAborted,
 } from "../src/media-repair-worker-policy";
 
 describe("durable media repair worker policy", () => {
@@ -66,5 +67,36 @@ describe("durable media repair worker policy", () => {
         "must be an integer from 1 through 4",
       );
     }
+  });
+
+  it("refills a fast lane without waiting for a slow peer", async () => {
+    const ac = new AbortController();
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    let fastRuns = 0;
+    let secondFastRun!: () => void;
+    const fastRefilled = new Promise<void>((resolve) => {
+      secondFastRun = resolve;
+    });
+    const slowLane = runUntilAborted(ac.signal, async () => {
+      await slowGate;
+    });
+    const fastLane = runUntilAborted(ac.signal, async () => {
+      fastRuns += 1;
+      if (fastRuns === 2) {
+        secondFastRun();
+        ac.abort();
+      }
+    });
+
+    await fastRefilled;
+    expect(fastRuns).toBe(2);
+    releaseSlow();
+    await expect(Promise.all([slowLane, fastLane])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
   });
 });
