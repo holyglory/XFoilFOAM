@@ -29,6 +29,7 @@ import {
   recomputeProgressForCampaign,
   USER_TERMINAL_CAMPAIGN_RESULT_SQL,
 } from "./campaign-execution";
+import { readCampaignDerivedSummaryMetrics } from "./campaign-summary-metrics";
 import type { DB } from "./client";
 import {
   exactValidSolverManifestSql,
@@ -7442,6 +7443,14 @@ export interface CampaignSummary {
    *  old clients but has an empty canonical predicate; it must not promise a
    *  routine human adjudication workflow. */
   reviewBuckets: CampaignReviewBuckets;
+  /** Expensive stage/review analytics are prewarmed and served stale-while-
+   * refresh. Headline totals and scheduler state remain fresh on every poll. */
+  derivedMetrics: {
+    asOf: string;
+    stale: boolean;
+    refreshing: boolean;
+    error: string | null;
+  };
   /** Fidelity ladder per-tier open counts (contract 7). */
   tierCounts: CampaignTierCounts;
   /** Derived ladder phase (contract 7): running_rans → running_precalc →
@@ -7519,7 +7528,9 @@ async function campaignCompletionSources(
   };
 }
 
-/** Bounded summary for the 10 s poll: O(conditions), counters only. */
+/** Bounded summary for the 10 s poll. Persisted headline counters and source
+ * attribution remain fresh; the full-matrix stage model is prewarmed and
+ * stale-while-refresh so it never holds the primary campaign instrument. */
 export async function campaignSummary(
   db: DB,
   campaignId: string,
@@ -7530,56 +7541,43 @@ export async function campaignSummary(
   );
   const progress = await campaignProgressSnapshot(db, campaignId);
   const totals = progress.totals;
-  const completionSources = await campaignCompletionSources(
+  const completionSourcesPromise = campaignCompletionSources(
     db,
     campaignId,
     totals,
   );
-  const tierCounts = await campaignOpenTierCounts(db, campaignId);
-  const solverIncidents = await solverIncidentSummary(db, {
+  const derivedMetricsPromise = readCampaignDerivedSummaryMetrics(
+    db,
+    campaignId,
+    campaign.currentConditionGeneration,
+  );
+  const solverIncidentsPromise = solverIncidentSummary(db, {
     campaignId,
     currentGenerationOnly: true,
   });
-  const reviewBucketRows = await campaignReviewBucketRows(db, campaignId);
-  const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
-    (acc, row) => ({
-      awaitingUrans: acc.awaitingUrans + row.awaitingUrans,
-      needsReview: acc.needsReview + row.needsReview,
-    }),
-    { awaitingUrans: 0, needsReview: 0 },
-  );
-  const reviewByCondition = new Map<string, CampaignReviewBuckets>();
-  for (const row of reviewBucketRows) {
-    const prev = reviewByCondition.get(row.conditionId) ?? {
-      awaitingUrans: 0,
-      needsReview: 0,
-    };
-    reviewByCondition.set(row.conditionId, {
-      awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
-      needsReview: prev.needsReview + row.needsReview,
-    });
-  }
-  const [scopeRow] = (await db.execute(sql`
+  const scopeRowsPromise = db.execute(sql`
     SELECT
       count(*) FILTER (WHERE airfoil."archivedAt" IS NULL AND airfoil."deletedAt" IS NULL)::int AS active,
       count(*) FILTER (WHERE airfoil."archivedAt" IS NOT NULL OR airfoil."deletedAt" IS NOT NULL)::int AS excluded
     FROM sim_campaign_airfoils scope
     JOIN airfoils airfoil ON airfoil.id = scope.airfoil_id
     WHERE scope.campaign_id = ${campaignId}
-  `)) as unknown as Array<{ active: number; excluded: number }>;
-  const [lifecycleRow] = (await db.execute(sql`
+  `) as unknown as Promise<Array<{ active: number; excluded: number }>>;
+  const lifecycleRowsPromise = db.execute(sql`
     SELECT action, actor, reason, "createdAt" AS created_at
     FROM sim_campaign_lifecycle_events
     WHERE campaign_id = ${campaignId}
     ORDER BY "createdAt" DESC, id DESC
     LIMIT 1
-  `)) as unknown as Array<{
-    action: string;
-    actor: string | null;
-    reason: string | null;
-    created_at: Date | string;
-  }>;
-  const conditionRows = (await db.execute(sql`
+  `) as unknown as Promise<
+    Array<{
+      action: string;
+      actor: string | null;
+      reason: string | null;
+      created_at: Date | string;
+    }>
+  >;
+  const conditionRowsPromise = db.execute(sql`
     SELECT
       cc.id, cc.ord, cc.status,
       cc.flow_condition_id, cc.reference_geometry_profile_id, cc.preset_id, cc.simulation_preset_revision_id,
@@ -7620,15 +7618,55 @@ export async function campaignSummary(
     WHERE cc.campaign_id = ${campaignId}
       AND cc.generation = ${campaign.currentConditionGeneration}
     ORDER BY cc.ord ASC
-  `)) as unknown as Array<Record<string, unknown>>;
-  const laneRows = (await db.execute(sql`
+  `) as unknown as Promise<Array<Record<string, unknown>>>;
+  const laneRowsPromise = db.execute(sql`
     SELECT lane.objective, lane.state, count(*)::int AS n
     FROM sim_campaign_lanes lane
     JOIN sim_campaign_conditions condition ON condition.id = lane.condition_id
     WHERE lane.campaign_id = ${campaignId}
       AND condition.generation = ${campaign.currentConditionGeneration}
     GROUP BY lane.objective, lane.state
-  `)) as unknown as Array<{ objective: string; state: string; n: number }>;
+  `) as unknown as Promise<
+    Array<{ objective: string; state: string; n: number }>
+  >;
+  const [
+    completionSources,
+    derivedMetricsSnapshot,
+    solverIncidents,
+    scopeRows,
+    lifecycleRows,
+    conditionRows,
+    laneRows,
+  ] = await Promise.all([
+    completionSourcesPromise,
+    derivedMetricsPromise,
+    solverIncidentsPromise,
+    scopeRowsPromise,
+    lifecycleRowsPromise,
+    conditionRowsPromise,
+    laneRowsPromise,
+  ]);
+  const { tierCounts, reviewBucketRows } = derivedMetricsSnapshot.value;
+  const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
+    (acc, row) => ({
+      awaitingUrans: acc.awaitingUrans + row.awaitingUrans,
+      needsReview: acc.needsReview + row.needsReview,
+    }),
+    { awaitingUrans: 0, needsReview: 0 },
+  );
+  const reviewByCondition = new Map<string, CampaignReviewBuckets>();
+  for (const row of reviewBucketRows) {
+    const prev = reviewByCondition.get(row.conditionId) ?? {
+      awaitingUrans: 0,
+      needsReview: 0,
+    };
+    reviewByCondition.set(row.conditionId, {
+      awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
+      needsReview: prev.needsReview + row.needsReview,
+    });
+  }
+  const scopeRow = scopeRows[0];
+  const lifecycleRow = lifecycleRows[0];
   const lanesSummary: Record<string, Record<string, number>> = {};
   for (const row of laneRows) {
     lanesSummary[row.objective] = {
@@ -7664,6 +7702,12 @@ export async function campaignSummary(
     completionSources,
     remediation: progress.remediation,
     reviewBuckets,
+    derivedMetrics: {
+      asOf: derivedMetricsSnapshot.asOf.toISOString(),
+      stale: derivedMetricsSnapshot.stale,
+      refreshing: derivedMetricsSnapshot.refreshing,
+      error: derivedMetricsSnapshot.lastError,
+    },
     tierCounts,
     phase: deriveCampaignPhase(campaign.status, tierCounts),
     solverIncidents,
@@ -8031,15 +8075,23 @@ export async function campaignActiveJobCount(
           SELECT 1 FROM sim_urans_request_campaigns ownership
           WHERE ownership.campaign_id = ${campaignId}
             AND ownership.state = 'active'
-            AND ownership.request_id::text =
-              job.request_payload ->> 'uransRequestId'
+            AND ownership.request_id = CASE
+              WHEN job.request_payload ->> 'uransRequestId' ~
+                   '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+              THEN (job.request_payload ->> 'uransRequestId')::uuid
+              ELSE NULL
+            END
         )
         OR EXISTS (
           SELECT 1 FROM sim_urans_verify_queue_campaigns ownership
           WHERE ownership.campaign_id = ${campaignId}
             AND ownership.state = 'active'
-            AND ownership.queue_id::text =
-              job.request_payload ->> 'verifyQueueItemId'
+            AND ownership.queue_id = CASE
+              WHEN job.request_payload ->> 'verifyQueueItemId' ~
+                   '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+              THEN (job.request_payload ->> 'verifyQueueItemId')::uuid
+              ELSE NULL
+            END
         )
         OR EXISTS (
           SELECT 1
@@ -8048,8 +8100,12 @@ export async function campaignActiveJobCount(
             ON ownership.request_id = coverage.request_id
            AND ownership.state = 'active'
           WHERE ownership.campaign_id = ${campaignId}
-            AND coverage.queue_id::text =
-              job.request_payload ->> 'verifyQueueItemId'
+            AND coverage.queue_id = CASE
+              WHEN job.request_payload ->> 'verifyQueueItemId' ~
+                   '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+              THEN (job.request_payload ->> 'verifyQueueItemId')::uuid
+              ELSE NULL
+            END
         )
         OR EXISTS (
           SELECT 1

@@ -1875,6 +1875,12 @@ export interface AdminCampaignSummary {
     remoteSolved: number;
     derived: number;
   };
+  derivedMetrics: {
+    asOf: string;
+    stale: boolean;
+    refreshing: boolean;
+    error: string | null;
+  };
   remediation: CampaignRemediationSummary;
   /** Rolling-compatibility ladder split. Optional: older APIs omit it. */
   reviewBuckets?: CampaignReviewBuckets;

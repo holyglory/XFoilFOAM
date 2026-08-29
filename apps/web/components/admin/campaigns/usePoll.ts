@@ -5,13 +5,28 @@
 
 import { useCallback, useEffect, useRef } from "react";
 
-export function usePoll(fn: () => void | Promise<void>, intervalMs: number, enabled = true): void {
+export function usePoll(
+  fn: () => void | Promise<void>,
+  intervalMs: number,
+  enabled = true,
+): void {
   const fnRef = useRef(fn);
+  const inFlightRef = useRef<Promise<void> | null>(null);
   fnRef.current = fn;
 
   const tick = useCallback(() => {
     if (typeof document !== "undefined" && document.hidden) return;
-    void fnRef.current();
+    if (inFlightRef.current) return;
+    const run = Promise.resolve()
+      .then(() => fnRef.current())
+      .then(
+        () => undefined,
+        () => undefined,
+      );
+    inFlightRef.current = run;
+    void run.finally(() => {
+      if (inFlightRef.current === run) inFlightRef.current = null;
+    });
   }, []);
 
   useEffect(() => {

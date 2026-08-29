@@ -484,6 +484,72 @@ def _storage_retention_regression() -> int:
     return result
 
 
+def _campaign_performance_regression() -> int:
+    install = _run(
+        "node-dependencies",
+        "locked Node dependencies",
+        ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile"],
+    )
+    if install != 0:
+        return install
+    migrated = _migrate_ephemeral_database()
+    if migrated != 0:
+        return migrated
+    seeded = _seed_ephemeral_database()
+    if seeded != 0:
+        return seeded
+    commands = [
+        (
+            "db-campaign-summary-performance",
+            "campaign cache, attribution, and summary regressions",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/db",
+                "exec",
+                "vitest",
+                "run",
+                "test/campaign-summary-metrics-cache.test.ts",
+                "test/campaign-remediation-summary.test.ts",
+            ],
+        ),
+        (
+            "api-campaign-summary-performance",
+            "campaign API, tier, review, and ownership regressions",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/api",
+                "exec",
+                "vitest",
+                "run",
+                "test/campaigns.test.ts",
+                "test/review-buckets.test.ts",
+            ],
+        ),
+        (
+            "web-campaign-polling",
+            "campaign non-overlapping poll contract",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/web",
+                "exec",
+                "vitest",
+                "run",
+                "test/campaign-polling.test.ts",
+            ],
+        ),
+    ]
+    result = 0
+    for case_id, name, argv in commands:
+        result = max(result, _run(case_id, name, argv))
+    return result
+
+
 def main() -> int:
     events_path = _events_path()
     if events_path is not None:
@@ -492,7 +558,8 @@ def main() -> int:
         raise SystemExit(
             "usage: devcoordinator_test_harness.py "
             "python-suite|node-suite|urans-recovery-regression|"
-            "sync-remote-validation-regression|storage-retention-regression"
+            "sync-remote-validation-regression|storage-retention-regression|"
+            "campaign-performance-regression"
         )
     if sys.argv[1] == "python-suite":
         return _python_suite()
@@ -504,6 +571,8 @@ def main() -> int:
         return _sync_remote_validation_regression()
     if sys.argv[1] == "storage-retention-regression":
         return _storage_retention_regression()
+    if sys.argv[1] == "campaign-performance-regression":
+        return _campaign_performance_regression()
     raise SystemExit(f"unknown suite: {sys.argv[1]}")
 
 

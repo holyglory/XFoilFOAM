@@ -316,6 +316,17 @@ afterAll(async () => {
 });
 
 describe("campaign remediation summary", () => {
+  it("pins the covering shared-job ownership index used by the hot campaign poll", async () => {
+    const [index] = await pg<[{ indexdef: string }]>`
+      SELECT indexdef
+      FROM pg_indexes
+      WHERE indexname = 'sim_urans_verify_queue_campaigns_campaign_state_queue_idx'
+    `;
+    expect(index?.indexdef).toContain("campaign_id");
+    expect(index?.indexdef).toContain("state");
+    expect(index?.indexdef).toContain("queue_id");
+  });
+
   it("MUST-CATCH + FALSE-POSITIVE GUARD: pause/resume provenance is append-only and never invents an actor or reason", async () => {
     const { campaignId } = await launchCampaign({
       label: "lifecycle-provenance",

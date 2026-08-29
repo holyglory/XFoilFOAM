@@ -3134,12 +3134,17 @@ export async function campaignReviewBucketRows(
     SELECT p.condition_id, p.airfoil_id,
       COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
       COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
-    FROM sim_campaign_points p
+    FROM sim_precalc_obligations open_obligation
+    JOIN sim_campaign_points p
+      ON p.airfoil_id = open_obligation.airfoil_id
+     AND p.revision_id = open_obligation.revision_id
+     AND p.aoa_deg = open_obligation.aoa_deg
     JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
     JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    WHERE p.campaign_id = ${campaignId}
+    WHERE open_obligation.state IN ('pending', 'running')
+      AND p.campaign_id = ${campaignId}
       AND condition.generation = campaign.current_condition_generation
       AND condition.status IN ('active', 'kept')
       ${airfoilFilter}
@@ -3164,12 +3169,17 @@ export async function campaignReviewBuckets(
     SELECT
       COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
       COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
-    FROM sim_campaign_points p
+    FROM sim_precalc_obligations open_obligation
+    JOIN sim_campaign_points p
+      ON p.airfoil_id = open_obligation.airfoil_id
+     AND p.revision_id = open_obligation.revision_id
+     AND p.aoa_deg = open_obligation.aoa_deg
     JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
     JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    WHERE p.campaign_id = ${campaignId}
+    WHERE open_obligation.state IN ('pending', 'running')
+      AND p.campaign_id = ${campaignId}
       AND condition.generation = campaign.current_condition_generation
       AND condition.status IN ('active', 'kept')
   `)) as unknown as Array<{ awaiting_urans: number; needs_review: number }>;
@@ -3190,15 +3200,20 @@ export async function reviewBucketsByCampaign(
     SELECT p.campaign_id,
       COUNT(*) FILTER (WHERE ${AWAITING_URANS_POINT_SQL})::int AS awaiting_urans,
       COUNT(*) FILTER (WHERE ${NEEDS_REVIEW_POINT_SQL})::int AS needs_review
-    FROM sim_campaign_points p
+    FROM sim_precalc_obligations open_obligation
+    JOIN sim_campaign_points p
+      ON p.airfoil_id = open_obligation.airfoil_id
+     AND p.revision_id = open_obligation.revision_id
+     AND p.aoa_deg = open_obligation.aoa_deg
     JOIN sim_campaign_conditions condition ON condition.id = p.condition_id
     JOIN sim_campaigns campaign ON campaign.id = p.campaign_id
     LEFT JOIN results r ON r.id = p.result_id
     LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    WHERE p.campaign_id = ANY(${sql`ARRAY[${sql.join(
-      campaignIds.map((id) => sql`${id}::uuid`),
-      sql`, `,
-    )}]`})
+    WHERE open_obligation.state IN ('pending', 'running')
+      AND p.campaign_id = ANY(${sql`ARRAY[${sql.join(
+        campaignIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`})
       AND condition.generation = campaign.current_condition_generation
       AND condition.status IN ('active', 'kept')
     GROUP BY p.campaign_id

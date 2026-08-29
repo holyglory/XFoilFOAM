@@ -180,6 +180,47 @@
         "retry_on": ["lease_expired_before_launch"]
       },
       "network": "external"
+    },
+    "campaign-performance-regression": {
+      "driver": "automation",
+      "reporter": "automation-events",
+      "cwd": ".",
+      "environment": {
+        "DATABASE_URL": "postgres://aerodb:aerodb@127.0.0.1:5544/aerodb"
+      },
+      "argv": [
+        "{python}",
+        ".codex/devcoordinator_test_harness.py",
+        "campaign-performance-regression"
+      ],
+      "inputs": [
+        ".codex/devcoordinator_test_harness.py",
+        ".devcoordinator.toml",
+        "apps/api/src/campaign-routes.ts",
+        "apps/api/src/server.ts",
+        "apps/api/test/campaigns.test.ts",
+        "apps/api/test/review-buckets.test.ts",
+        "apps/web/components/admin/campaigns/usePoll.ts",
+        "apps/web/test/campaign-polling.test.ts",
+        "packages/db/migrations/**",
+        "packages/db/src/campaign-summary-metrics.ts",
+        "packages/db/src/campaigns.ts",
+        "packages/db/src/schema.ts",
+        "packages/db/src/urans-ladder.ts",
+        "packages/db/test/campaign-remediation-summary.test.ts",
+        "packages/db/test/campaign-summary-metrics-cache.test.ts",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "tsconfig.base.json"
+      ],
+      "depends_on": [],
+      "intents": ["change", "checkpoint", "handoff", "release", "manual"],
+      "retry": {
+        "max_attempts": 2,
+        "retry_on": ["lease_expired_before_launch"]
+      },
+      "network": "external"
     }
   },
   "evidence_policies": {

@@ -1,6 +1,7 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
+import { warmActiveCampaignDerivedSummaryMetrics } from "@aerodb/db";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerAdminRoutes } from "./admin-routes";
@@ -24,9 +25,25 @@ export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
   const evidenceUploadReconciler = createBrokeredEvidenceUploadReconciler(db, {
     onError: (error) =>
-      app.log.error({ err: error }, "brokered evidence upload reconciliation failed"),
+      app.log.error(
+        { err: error },
+        "brokered evidence upload reconciliation failed",
+      ),
   });
-  app.addHook("onReady", async () => evidenceUploadReconciler.start());
+  app.addHook("onReady", async () => {
+    evidenceUploadReconciler.start();
+    if (process.env.NODE_ENV === "production") {
+      try {
+        const warmed = await warmActiveCampaignDerivedSummaryMetrics(db);
+        app.log.info(
+          { campaigns: warmed },
+          "prewarmed active campaign summary analytics",
+        );
+      } catch (error) {
+        app.log.error({ err: error }, "active campaign summary prewarm failed");
+      }
+    }
+  });
   app.addHook("onClose", async () => evidenceUploadReconciler.stop());
   // credentials:true + reflected origin so the admin session cookie works cross-port in dev.
   await app.register(cors, { origin: true, credentials: true });

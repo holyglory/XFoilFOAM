@@ -5011,6 +5011,9 @@ export const simUransVerifyQueueCampaigns = pgTable(
     campaignStateIdx: index(
       "sim_urans_verify_queue_campaigns_campaign_state_idx",
     ).on(t.campaignId, t.state),
+    campaignStateQueueIdx: index(
+      "sim_urans_verify_queue_campaigns_campaign_state_queue_idx",
+    ).on(t.campaignId, t.state, t.queueId),
     queueStateIdx: index("sim_urans_verify_queue_campaigns_queue_state_idx").on(
       t.queueId,
       t.state,

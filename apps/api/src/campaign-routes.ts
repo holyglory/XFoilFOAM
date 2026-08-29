@@ -286,12 +286,15 @@ export async function registerCampaignRoutes(
     async (req, reply) => {
       const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
       try {
-        const summary = await campaignSummary(db, id);
-        const sweeper = await readSweeperState();
         const engine = makeEngineClient();
-        const { health, error: engineError } =
-          await getCachedEngineHealth(engine);
-        const campaignJobsRunning = await campaignActiveJobCount(db, id);
+        const [summary, sweeper, engineSnapshot, campaignJobsRunning] =
+          await Promise.all([
+            campaignSummary(db, id),
+            readSweeperState(),
+            getCachedEngineHealth(engine),
+            campaignActiveJobCount(db, id),
+          ]);
+        const { health, error: engineError } = engineSnapshot;
         // engineUnreachableSince lands with the sweeper phase (migration 0026);
         // readSweeperState() reads it defensively while the column may be absent.
         const engineUnreachableSince = sweeper?.engineUnreachableSince ?? null;

@@ -4,6 +4,7 @@ export * from "./solver-runtime-provenance";
 export * from "./solver-cutover-attestation";
 export * from "./polar-cache";
 export * from "./campaigns";
+export * from "./campaign-summary-metrics";
 export * from "./campaign-solver-cutover";
 export * from "./campaign-execution";
 export * from "./campaign-result-handoff";

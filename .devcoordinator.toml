@@ -41,3 +41,12 @@ timeout_seconds = 7200
 image = "postgres:16-alpine"
 database = "aerodb"
 user = "aerodb"
+
+[test.campaign]
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "campaign-performance-regression"]
+timeout_seconds = 7200
+
+[test.campaign.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
