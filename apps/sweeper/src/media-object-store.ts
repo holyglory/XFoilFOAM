@@ -570,8 +570,12 @@ export async function auditResultMediaStorageSources(
     JOIN result_media media ON media.id = upload.result_media_id
     LEFT JOIN result_media_storage_bindings binding
       ON binding.result_media_id = upload.result_media_id
-    WHERE upload.state = 'pending'
+    WHERE upload.state IN ('pending', 'retry_wait')
       AND binding.result_media_id IS NULL
+      AND NOT (
+        upload.state = 'retry_wait'
+        AND upload.error LIKE ${RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER + "%"}
+      )
       AND (${cursorId}::uuid IS NULL OR upload.result_media_id > ${cursorId}::uuid)
       ${scopedIds}
     ORDER BY upload.result_media_id ASC
@@ -614,7 +618,7 @@ export async function auditResultMediaStorageSources(
       .where(
         and(
           inArray(resultMediaStorageUploads.resultMediaId, missingIds),
-          eq(resultMediaStorageUploads.state, "pending"),
+          inArray(resultMediaStorageUploads.state, ["pending", "retry_wait"]),
         ),
       );
   }

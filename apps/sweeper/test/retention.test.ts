@@ -704,8 +704,19 @@ describe("retention schema", () => {
       .returning({ id: resultMedia.id });
     await enqueueResultMediaStorageUpload(db, missingMedia.id);
     await enqueueResultMediaStorageUpload(db, presentMedia.id);
-
     const auditNow = new Date();
+    await db
+      .update(resultMediaStorageUploads)
+      .set({
+        state: "retry_wait",
+        attemptCount: 29,
+        nextAttemptAt: new Date(auditNow.getTime() - 60_000),
+        error: `ENOENT: no such file or directory, stat '${join(
+          mediaRoot,
+          `jobs/${job.engineJobId}/missing/pressure.png`,
+        )}'`,
+      })
+      .where(eq(resultMediaStorageUploads.resultMediaId, missingMedia.id));
     const audit = await auditResultMediaStorageSourcePass(db, {
       resultMediaIds: [missingMedia.id, presentMedia.id],
       mediaRoot,
@@ -732,7 +743,7 @@ describe("retention schema", () => {
     );
     expect(byId.get(missingMedia.id)).toMatchObject({
       state: "retry_wait",
-      attemptCount: 0,
+      attemptCount: 29,
       error: RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
     });
     expect(byId.get(missingMedia.id)!.nextAttemptAt!.getTime()).toBeGreaterThan(
@@ -753,7 +764,7 @@ describe("retention schema", () => {
       .select({ attemptCount: resultMediaStorageUploads.attemptCount })
       .from(resultMediaStorageUploads)
       .where(eq(resultMediaStorageUploads.resultMediaId, missingMedia.id));
-    expect(unchanged.attemptCount).toBe(0);
+    expect(unchanged.attemptCount).toBe(29);
     await db.delete(results).where(eq(results.id, result.id));
     await db.delete(simJobs).where(eq(simJobs.id, job.id));
     rmSync(mediaRoot, { recursive: true, force: true });
