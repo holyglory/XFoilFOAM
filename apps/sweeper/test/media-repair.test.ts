@@ -15,11 +15,15 @@ import {
   healExpiredResultMediaRepairClaims,
   mediums,
   renewResultMediaRepairClaim,
+  RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
   resultClassifications,
   resultAttempts,
   resultFieldExtents,
   resultMedia,
+  resultMediaBlobs,
   resultMediaRepairs,
+  resultMediaStorageBindings,
+  resultMediaStorageUploads,
   referenceGeometryProfiles,
   results,
   schedulingProfiles,
@@ -70,6 +74,7 @@ import {
   resultMediaRepairTick,
 } from "../src/media-repair";
 import { repairDefaultMediaForStoredResult } from "../src/ingest";
+import { bindResultMediaObject } from "../src/media-object-store";
 
 const { db, sql } = createClient({ max: 4 });
 const PREFIX = `media-repair-${process.pid}-${Date.now().toString(36)}`;
@@ -100,6 +105,7 @@ const airfoilIds: string[] = [];
 const categoryIds: string[] = [];
 const campaignIds: string[] = [];
 const evidenceBlobIds: string[] = [];
+const mediaBlobIds: string[] = [];
 
 interface Fixture {
   airfoilId: string;
@@ -694,6 +700,11 @@ afterAll(async () => {
     await db
       .delete(solverEvidenceBlobs)
       .where(inArray(solverEvidenceBlobs.id, evidenceBlobIds));
+  }
+  if (mediaBlobIds.length) {
+    await db
+      .delete(resultMediaBlobs)
+      .where(inArray(resultMediaBlobs.id, mediaBlobIds));
   }
   if (airfoilIds.length)
     await db.delete(airfoils).where(inArray(airfoils.id, airfoilIds));
@@ -1576,6 +1587,114 @@ describe("durable result media repair", () => {
       .from(simUransVerifyQueue)
       .where(eq(simUransVerifyQueue.precalcResultId, fixture.resultId));
     expect(verifyRows).toHaveLength(1);
+  });
+
+  it("MUST-CATCH: reopens row-complete media after migration proves its local source absent", async () => {
+    const fixture = await createSolvedResult("missing-migration-source");
+    expect(
+      (
+        await resultMediaRepairTick(db, engineWith(), {
+          resultId: fixture.resultId,
+        })
+      ).finalized,
+    ).toBe(1);
+    const [media] = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, fixture.resultId))
+      .limit(1);
+    rmSync(resolve(MEDIA_ROOT, media.storageKey), { force: true });
+    await db.insert(resultMediaStorageUploads).values({
+      resultMediaId: media.id,
+      state: "retry_wait",
+      attemptCount: 1,
+      nextAttemptAt: new Date(Date.now() + 6 * 60 * 60_000),
+      error: `${RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER}: ${media.storageKey}`,
+    });
+
+    expect(
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      }),
+    ).toBe(1);
+    const [reopened] = await db
+      .select()
+      .from(resultMediaRepairs)
+      .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+    expect(reopened).toMatchObject({ state: "pending", attemptCount: 0 });
+  });
+
+  it("MUST-CATCH: finalizes repaired media from verified objects after local reclaim", async () => {
+    const fixture = await createSolvedResult("object-bound-finalization");
+    await discoverMissingResultMediaRepairs(db, { resultId: fixture.resultId });
+    const claim = await claimNextResultMediaRepair(db, {
+      resultId: fixture.resultId,
+    });
+    expect(claim).not.toBeNull();
+    await repairDefaultMediaForStoredResult({
+      db,
+      engine: engineWith(),
+      resultId: fixture.resultId,
+      resultAttemptId: fixture.resultAttemptId,
+      heartbeat: async () => undefined,
+      repairFence: {
+        repairId: claim!.id,
+        resultAttemptId: fixture.resultAttemptId,
+        claimToken: claim!.claimToken!,
+        evidenceSignature: claim!.evidenceSignature,
+      },
+    });
+    const mediaRows = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultId, fixture.resultId));
+    for (const [index, media] of mediaRows.entries()) {
+      const full = resolve(MEDIA_ROOT, media.storageKey);
+      await bindResultMediaObject(
+        db,
+        {
+          resultMediaId: media.id,
+          localStorageKey: media.storageKey,
+          localPath: full,
+          mimeType: media.mimeType,
+          sha256: media.sha256!,
+          byteSize: media.byteSize!,
+        },
+        {
+          backend: "gcs",
+          bucket: "media-repair-test-bucket",
+          objectKey: `solver-media/v1/sha256/${media.sha256!.slice(0, 2)}/${media.sha256}`,
+          generation: String(123456800 + index),
+          mimeType: media.mimeType,
+          sha256: media.sha256!,
+          byteSize: media.byteSize!,
+          crc32c: "AAAAAA==",
+          verifiedAt: new Date(),
+        },
+      );
+      rmSync(full, { force: true });
+    }
+    const bindings = await db
+      .select({ blobId: resultMediaStorageBindings.blobId })
+      .from(resultMediaStorageBindings)
+      .where(
+        inArray(
+          resultMediaStorageBindings.resultMediaId,
+          mediaRows.map((media) => media.id),
+        ),
+      );
+    mediaBlobIds.push(...bindings.map((binding) => binding.blobId));
+
+    expect(
+      await finalizeSatisfiedResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      }),
+    ).toMatchObject({ finalized: 1 });
+    const [settled] = await db
+      .select()
+      .from(resultMediaRepairs)
+      .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+    expect(settled.state).toBe("done");
   });
 
   it("MUST-CATCH: late trusted media publishes the exact blocked FULL attempt behind the PRECALC replace guard", async () => {

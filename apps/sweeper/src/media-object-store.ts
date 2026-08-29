@@ -1,4 +1,5 @@
 import {
+  RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
   type DB,
   resultMedia,
   resultMediaBlobs,
@@ -16,6 +17,14 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GENERATION_PATTERN = /^[1-9][0-9]{0,19}$/;
 const CRC32C_PATTERN = /^[A-Za-z0-9+/]{6}==$/;
 const TEN_MIB = 10 * 1024 * 1024;
+const MISSING_LOCAL_RETRY_MS = 6 * 60 * 60_000;
+
+export class ResultMediaLocalBytesUnavailableError extends Error {
+  constructor(storageKey: string) {
+    super(`${RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER}: ${storageKey}`);
+    this.name = "ResultMediaLocalBytesUnavailableError";
+  }
+}
 
 export interface StoredResultMediaObject {
   backend: "gcs";
@@ -424,7 +433,15 @@ export async function ensureResultMediaObject(
       throw new Error("result media already has a conflicting object binding");
     }
   }
-  const local = await stat(input.localPath);
+  let local;
+  try {
+    local = await stat(input.localPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new ResultMediaLocalBytesUnavailableError(input.localStorageKey);
+    }
+    throw error;
+  }
   if (!local.isFile() || local.size !== input.byteSize) {
     throw new Error(
       "result media local bytes are unavailable for object upload",
@@ -506,19 +523,30 @@ export async function discoverResultMediaStorageUploads(
 async function claimResultMediaStorageUploads(
   db: DB,
   limit: number,
+  resultMediaIds?: readonly string[],
 ): Promise<ClaimedUpload[]> {
+  if (resultMediaIds?.length === 0) return [];
   const claimToken = randomUUID();
+  const scopedIds = resultMediaIds
+    ? sql`AND upload.result_media_id IN (${sql.join(
+        resultMediaIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )})`
+    : sql``;
   return (await db.execute(sql`
     WITH candidates AS (
       SELECT upload.result_media_id
       FROM result_media_storage_uploads upload
       WHERE (
-        upload.state IN ('pending', 'retry_wait')
-        AND (upload.next_attempt_at IS NULL OR upload.next_attempt_at <= now())
-      ) OR (
-        upload.state = 'running'
-        AND upload.claim_expires_at <= now()
+        (
+          upload.state IN ('pending', 'retry_wait')
+          AND (upload.next_attempt_at IS NULL OR upload.next_attempt_at <= now())
+        ) OR (
+          upload.state = 'running'
+          AND upload.claim_expires_at <= now()
+        )
       )
+      ${scopedIds}
       ORDER BY upload."createdAt" ASC, upload.result_media_id ASC
       FOR UPDATE SKIP LOCKED
       LIMIT ${Math.max(0, Math.trunc(limit))}
@@ -542,13 +570,17 @@ async function failResultMediaStorageUpload(
   claim: ClaimedUpload,
   error: unknown,
 ): Promise<void> {
+  const localBytesMissing =
+    error instanceof ResultMediaLocalBytesUnavailableError;
   await db
     .update(resultMediaStorageUploads)
     .set({
       state: "retry_wait",
       claimToken: null,
       claimExpiresAt: null,
-      nextAttemptAt: retryAt(claim.attempt_count),
+      nextAttemptAt: localBytesMissing
+        ? new Date(Date.now() + MISSING_LOCAL_RETRY_MS)
+        : retryAt(claim.attempt_count),
       error: boundedError(error),
       updatedAt: new Date(),
     })
@@ -587,12 +619,17 @@ export async function processResultMediaStorageUploads(
     discoverLimit?: number;
     processLimit?: number;
     concurrency?: number;
+    /** Deterministic maintenance/repair scope. Omit for the ordinary queue. */
+    resultMediaIds?: readonly string[];
   } = {},
 ): Promise<number> {
-  await discoverResultMediaStorageUploads(db, options.discoverLimit ?? 64);
+  if (!options.resultMediaIds) {
+    await discoverResultMediaStorageUploads(db, options.discoverLimit ?? 64);
+  }
   const claims = await claimResultMediaStorageUploads(
     db,
     options.processLimit ?? 32,
+    options.resultMediaIds,
   );
   if (!claims.length) return 0;
   const rows = await db

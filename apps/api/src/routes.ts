@@ -21,7 +21,9 @@ import {
   resultAttempts,
   resultMedia,
   resultMediaBlobs,
+  RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
   resultMediaStorageBindings,
+  resultMediaStorageUploads,
   RETIRED_REVIEW_WAIVER_ERROR,
   revokeActiveReviewVerdict,
   reviewVerdictHistory,
@@ -2054,6 +2056,8 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         mimeType: resultMedia.mimeType,
         sha256: resultMedia.sha256,
         byteSize: resultMedia.byteSize,
+        uploadState: resultMediaStorageUploads.state,
+        uploadError: resultMediaStorageUploads.error,
         bindingMediaId: resultMediaStorageBindings.resultMediaId,
         backend: resultMediaBlobs.backend,
         bucket: resultMediaBlobs.bucket,
@@ -2065,6 +2069,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         crc32c: resultMediaBlobs.crc32c,
       })
       .from(resultMedia)
+      .leftJoin(
+        resultMediaStorageUploads,
+        eq(resultMediaStorageUploads.resultMediaId, resultMedia.id),
+      )
       .leftJoin(
         resultMediaStorageBindings,
         eq(resultMediaStorageBindings.resultMediaId, resultMedia.id),
@@ -2113,6 +2121,15 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     } catch (error) {
       if (error instanceof MediaUpstreamError)
         return reply.code(error.statusCode).send({ error: error.message });
+      if (
+        row.uploadState === "retry_wait" &&
+        row.uploadError?.startsWith(RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER)
+      ) {
+        return reply
+          .code(503)
+          .header("cache-control", "no-store")
+          .send({ error: "stored media recovery is pending" });
+      }
       return reply.code(404).send({ error: "media not found" });
     }
   });

@@ -22,6 +22,8 @@ import { refreshFullUransRequestsForVerifyQueueInTransaction } from "./urans-lad
 export const MAX_RESULT_MEDIA_REPAIR_ATTEMPTS = 3;
 export const RESULT_MEDIA_REPAIR_LEASE_MS = 10 * 60_000;
 export const RESULT_MEDIA_REPAIR_BACKOFF_MS = [30_000, 2 * 60_000] as const;
+export const RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER =
+  "result-media-local-bytes-unavailable";
 
 export type ResultMediaRepair = typeof resultMediaRepairs.$inferSelect;
 
@@ -36,6 +38,19 @@ export interface SatisfiedResultMediaRepair extends ResultMediaRepair {
 
 const FINAL_MEDIA_REPAIR_PENDING_OUTCOME = "media_repair_pending";
 const FINAL_MEDIA_REPAIR_EXHAUSTED_OUTCOME = "final_recovery_exhausted";
+
+/** A row whose migration worker proved the local source absent is metadata,
+ * not available media. The retained evidence archive may rebuild it, but it
+ * must not satisfy repair discovery while that reconstruction is pending. */
+const mediaStorageSourceAvailable = sql`
+  NOT EXISTS (
+    SELECT 1
+    FROM result_media_storage_uploads storage_upload
+    WHERE storage_upload.result_media_id = media.id
+      AND storage_upload.state = 'retry_wait'
+      AND storage_upload.error LIKE ${RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER + "%"}
+  )
+`;
 
 /**
  * Atomically project an exhausted exact-attempt media repair into the final
@@ -220,6 +235,7 @@ const exactAttemptMediaComplete = sql`
                 )
                 AND media.storage_key <> ''
                 AND media.mime_type LIKE 'image/%'
+                AND ${mediaStorageSourceAvailable}
             )
             OR (
               attempt.unsteady = true
@@ -246,6 +262,7 @@ const exactAttemptMediaComplete = sql`
                     )
                     AND media.storage_key <> ''
                     AND media.mime_type LIKE 'image/%'
+                    AND ${mediaStorageSourceAvailable}
                 )
                 OR NOT EXISTS (
                   SELECT 1 FROM result_media media
@@ -269,6 +286,7 @@ const exactAttemptMediaComplete = sql`
                     )
                     AND media.storage_key <> ''
                     AND media.mime_type LIKE 'video/%'
+                    AND ${mediaStorageSourceAvailable}
                 )
               )
             )
@@ -470,6 +488,7 @@ export async function discoverMissingResultMediaRepairs(
                     )
                     AND media.storage_key <> ''
                     AND media.mime_type LIKE 'image/%'
+                    AND ${mediaStorageSourceAvailable}
                 )
                 OR (
                   candidate.unsteady = true
@@ -496,6 +515,7 @@ export async function discoverMissingResultMediaRepairs(
                         )
                         AND media.storage_key <> ''
                         AND media.mime_type LIKE 'image/%'
+                        AND ${mediaStorageSourceAvailable}
                     )
                     OR NOT EXISTS (
                       SELECT 1 FROM result_media media
@@ -519,6 +539,7 @@ export async function discoverMissingResultMediaRepairs(
                         )
                         AND media.storage_key <> ''
                         AND media.mime_type LIKE 'video/%'
+                        AND ${mediaStorageSourceAvailable}
                     )
                   )
                 )

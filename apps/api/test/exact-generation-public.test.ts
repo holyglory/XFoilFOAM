@@ -11,9 +11,11 @@ import {
   outputProfiles,
   referenceGeometryProfiles,
   remoteAssetReferences,
+  RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
   resultAttempts,
   resultClassifications,
   resultMedia,
+  resultMediaStorageUploads,
   results,
   schedulingProfiles,
   simulationPresets,
@@ -476,6 +478,36 @@ describe("public exact-generation reads", () => {
     });
   });
 
+  it("returns a truthful temporary failure while missing local media is queued for reconstruction", async () => {
+    const [media] = await db
+      .select()
+      .from(resultMedia)
+      .where(eq(resultMedia.resultAttemptId, currentAttemptId))
+      .limit(1);
+    await db.insert(resultMediaStorageUploads).values({
+      resultMediaId: media.id,
+      state: "retry_wait",
+      attemptCount: 1,
+      nextAttemptAt: new Date(Date.now() + 6 * 60 * 60_000),
+      error: `${RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER}: ${media.storageKey}`,
+    });
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/result-media/${media.id}`,
+      });
+      expect(response.statusCode).toBe(503);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.json()).toEqual({
+        error: "stored media recovery is pending",
+      });
+    } finally {
+      await db
+        .delete(resultMediaStorageUploads)
+        .where(eq(resultMediaStorageUploads.resultMediaId, media.id));
+    }
+  });
+
   it("fails pointer-null public reads closed and exposes no historical fallback", async () => {
     await db
       .update(results)
@@ -580,11 +612,12 @@ describe("public exact-generation reads", () => {
     async (status) => {
       vi.stubGlobal(
         "fetch",
-        vi.fn(async () =>
-          new Response('{"detail":"remote evidence unavailable"}', {
-            status,
-            headers: { "content-type": "application/json" },
-          }),
+        vi.fn(
+          async () =>
+            new Response('{"detail":"remote evidence unavailable"}', {
+              status,
+              headers: { "content-type": "application/json" },
+            }),
         ),
       );
       try {

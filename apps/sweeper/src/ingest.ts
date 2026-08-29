@@ -74,6 +74,7 @@ import {
   configuredResultMediaObjectStore,
   enqueueResultMediaStorageUpload,
   ensureResultMediaObject,
+  loadResultMediaObjectBinding,
   resultMediaLocalPath,
 } from "./media-object-store";
 import type { RansRetryScope } from "./retry-plan";
@@ -3732,10 +3733,10 @@ export async function repairDefaultMediaForStoredResult(opts: {
   return { mediaCount, expectedFields: [...freshFields].sort() };
 }
 
-/** Re-prove crash-recovered default media against the actual shared-volume
- * bytes before classification or verification can settle. DB metadata alone
- * is not artifact evidence: a removed/truncated file invalidates its mutable
- * presentation row and reopens the bounded repair obligation. */
+/** Re-prove crash-recovered default media against either its immutable,
+ * readback-verified object binding or the actual shared-volume bytes. DB row
+ * metadata alone is not artifact evidence: an unbound removed/truncated file
+ * invalidates its mutable presentation row and reopens bounded repair. */
 export async function verifyStoredDefaultMediaForResult(
   db: DB,
   resultId: string,
@@ -3859,11 +3860,28 @@ export async function verifyStoredDefaultMediaForResult(
       const verifiedSha256 = media.sha256;
       const verifiedByteSize = media.byteSize;
       try {
-        await verifyRenderedMediaBytes(
-          media.storageKey,
-          verifiedSha256,
-          verifiedByteSize,
-        );
+        const binding = await loadResultMediaObjectBinding(db, media.id);
+        if (binding) {
+          const { blob } = binding;
+          if (
+            binding.localStorageKey !== media.storageKey ||
+            blob.mimeType !== media.mimeType ||
+            blob.sha256.toLowerCase() !== verifiedSha256.toLowerCase() ||
+            blob.byteSize !== verifiedByteSize ||
+            !GCS_GENERATION_PATTERN.test(blob.generation) ||
+            !GCS_CRC32C_PATTERN.test(blob.crc32c)
+          ) {
+            throw new Error(
+              `durable media binding identity mismatch for ${media.storageKey}`,
+            );
+          }
+        } else {
+          await verifyRenderedMediaBytes(
+            media.storageKey,
+            verifiedSha256,
+            verifiedByteSize,
+          );
+        }
       } catch (error) {
         // Mutable presentation metadata must not keep pointing at corrupt or
         // absent bytes. Delete this exact observed media identity inside the

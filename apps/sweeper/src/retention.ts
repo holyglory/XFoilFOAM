@@ -50,6 +50,8 @@ export interface RetentionTickOptions extends Partial<RetentionConfig> {
   forceOrphanSweep?: boolean;
   /** Forecast pressure evicts unrequested restart caches, never live owners. */
   reclaimOptionalCaseState?: boolean;
+  /** Exact media must be durably bound before its producing directory moves. */
+  requireDurableMediaBinding?: boolean;
 }
 
 interface StripCandidate {
@@ -149,6 +151,9 @@ export async function stripTerminalJobs(
   if (config.stripMaxPerTick <= 0) return 0;
   const now = options.now ?? new Date();
   const reclaimOptionalCaseState = options.reclaimOptionalCaseState === true;
+  const requireDurableMediaBinding =
+    options.requireDurableMediaBinding ??
+    Boolean(process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim());
   const candidates = (await db.execute(sql`
     WITH candidates AS (
       SELECT
@@ -292,6 +297,26 @@ export async function stripTerminalJobs(
             )
         ) AS has_attempt_continuable
         ,
+        EXISTS (
+          SELECT 1
+          FROM result_attempts media_attempt
+          JOIN result_media media
+            ON media.result_attempt_id = media_attempt.id
+           AND media.result_id = media_attempt.result_id
+          LEFT JOIN result_media_storage_bindings media_binding
+            ON media_binding.result_media_id = media.id
+          WHERE (
+              media_attempt.sim_job_id = j.id
+              OR (
+                j.engine_job_id IS NOT NULL
+                AND media_attempt.engine_job_id = j.engine_job_id
+              )
+            )
+            AND media.sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND media.byte_size > 0
+            AND media_binding.result_media_id IS NULL
+        ) AS has_unbound_result_media
+        ,
         (
           j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
           OR (
@@ -380,23 +405,30 @@ export async function stripTerminalJobs(
       ,
       delete_job_dir
     FROM candidates
-    WHERE stripped_at IS NULL
-      OR (
-        strip_report ->> 'kept_case_state' = 'true'
-        AND NOT has_live_continuation
-        AND (
-          NOT has_live_precalc_continuation
-          OR (
+    WHERE (
+        stripped_at IS NULL
+        OR (
+          strip_report ->> 'kept_case_state' = 'true'
+          AND NOT has_live_continuation
+          AND (
+            NOT has_live_precalc_continuation
+            OR (
+              ${reclaimOptionalCaseState}
+              AND NOT has_running_precalc_continuation
+            )
+          )
+          AND NOT has_live_final_continuation
+          AND (
             ${reclaimOptionalCaseState}
-            AND NOT has_running_precalc_continuation
+            OR NOT (has_continuable OR has_attempt_continuable)
+            OR terminal_at <= ${now.toISOString()}::timestamptz - (${config.retentionContinuableDays}::double precision * interval '1 day')
           )
         )
-        AND NOT has_live_final_continuation
-        AND (
-          ${reclaimOptionalCaseState}
-          OR NOT (has_continuable OR has_attempt_continuable)
-          OR terminal_at <= ${now.toISOString()}::timestamptz - (${config.retentionContinuableDays}::double precision * interval '1 day')
-        )
+      )
+      AND (
+        NOT ${requireDurableMediaBinding}
+        OR NOT has_unbound_result_media
+        OR error = ${DISK_PRESSURE_CANCELLATION_MARKER}
       )
     ORDER BY terminal_at ASC, id ASC
     LIMIT ${config.stripMaxPerTick}

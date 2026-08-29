@@ -10,6 +10,7 @@ import {
   meshProfiles,
   outputProfiles,
   referenceGeometryProfiles,
+  RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
   resultClassifications,
   resultAttempts,
   resultMedia,
@@ -49,6 +50,7 @@ import {
   bindResultMediaObject,
   enqueueResultMediaStorageUpload,
   ensureResultMediaObject,
+  processResultMediaStorageUploads,
   processResultMediaLocalReclaims,
   type ResultMediaObjectStore,
 } from "../src/media-object-store";
@@ -652,9 +654,149 @@ describe("retention schema", () => {
       rmSync(mediaRoot, { recursive: true, force: true });
     }
   });
+
+  it("MUST-CATCH: moves an absent legacy source out of the hot upload loop", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-missing-media-upload`);
+    const result = await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "urans_precalc",
+    });
+    const [selected] = await db
+      .select({ id: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id))
+      .limit(1);
+    if (!selected?.id) throw new Error("missing upload fixture has no attempt");
+    const [media] = await db
+      .insert(resultMedia)
+      .values({
+        resultId: result.id,
+        resultAttemptId: selected.id,
+        kind: "image",
+        field: "pressure",
+        role: "instantaneous",
+        storageKey: `jobs/${job.engineJobId}/missing/pressure.png`,
+        mimeType: "image/png",
+        sha256: createHash("sha256").update("missing-media").digest("hex"),
+        byteSize: 13,
+      })
+      .returning({ id: resultMedia.id });
+    await enqueueResultMediaStorageUpload(db, media.id);
+
+    expect(
+      await processResultMediaStorageUploads(db, {} as ResultMediaObjectStore, {
+        resultMediaIds: [media.id],
+        processLimit: 1,
+      }),
+    ).toBe(0);
+    const [failed] = await db
+      .select()
+      .from(resultMediaStorageUploads)
+      .where(eq(resultMediaStorageUploads.resultMediaId, media.id));
+    expect(failed).toMatchObject({ state: "retry_wait", attemptCount: 1 });
+    expect(failed.error).toContain(RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER);
+    expect(failed.nextAttemptAt!.getTime()).toBeGreaterThan(
+      Date.now() + 5 * 60 * 60_000,
+    );
+    expect(
+      await processResultMediaStorageUploads(db, {} as ResultMediaObjectStore, {
+        resultMediaIds: [media.id],
+        processLimit: 1,
+      }),
+    ).toBe(0);
+    const [unchanged] = await db
+      .select({ attemptCount: resultMediaStorageUploads.attemptCount })
+      .from(resultMediaStorageUploads)
+      .where(eq(resultMediaStorageUploads.resultMediaId, media.id));
+    expect(unchanged.attemptCount).toBe(1);
+    await db.delete(results).where(eq(results.id, result.id));
+    await db.delete(simJobs).where(eq(simJobs.id, job.id));
+  });
 });
 
 describe("terminal strip reaper", () => {
+  it("MUST-CATCH: waits for exact result media to bind before normal terminal stripping", async () => {
+    const job = await insertTerminalJob(`${PREFIX}-unbound-media-strip`);
+    const result = await insertClassifiedResult(job, {
+      state: "accepted",
+      fidelity: "urans_full",
+    });
+    const [selected] = await db
+      .select({ id: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, result.id))
+      .limit(1);
+    if (!selected?.id) throw new Error("strip media fixture has no attempt");
+    const bytes = Buffer.from(`${PREFIX}-strip-media`);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const storageKey = `jobs/${job.engineJobId}/cases/case/media.png`;
+    const [media] = await db
+      .insert(resultMedia)
+      .values({
+        resultId: result.id,
+        resultAttemptId: selected.id,
+        kind: "image",
+        field: "pressure",
+        role: "instantaneous",
+        storageKey,
+        mimeType: "image/png",
+        sha256,
+        byteSize: bytes.byteLength,
+      })
+      .returning({ id: resultMedia.id });
+    const engine = fakeEngine();
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+      requireDurableMediaBinding: true,
+    });
+    expect(own(engine.stripCalls)).toEqual([]);
+
+    await bindResultMediaObject(
+      db,
+      {
+        resultMediaId: media.id,
+        localStorageKey: storageKey,
+        localPath: "/not-read-by-binding",
+        mimeType: "image/png",
+        sha256,
+        byteSize: bytes.byteLength,
+      },
+      {
+        backend: "gcs",
+        bucket: "retention-test-bucket",
+        objectKey: `solver-media/v1/sha256/${sha256.slice(0, 2)}/${sha256}`,
+        generation: "123456791",
+        mimeType: "image/png",
+        sha256,
+        byteSize: bytes.byteLength,
+        crc32c: "AAAAAA==",
+        verifiedAt: NOW,
+      },
+    );
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+      requireDurableMediaBinding: true,
+    });
+    expect(own(engine.stripCalls)).toEqual([
+      { jobId: job.engineJobId!, keepCaseState: false },
+    ]);
+    const [binding] = await db
+      .select({ blobId: resultMediaStorageBindings.blobId })
+      .from(resultMediaStorageBindings)
+      .where(eq(resultMediaStorageBindings.resultMediaId, media.id));
+    await db.delete(results).where(eq(results.id, result.id));
+    await db.delete(simJobs).where(eq(simJobs.id, job.id));
+    if (binding?.blobId) {
+      await db
+        .delete(resultMediaBlobs)
+        .where(eq(resultMediaBlobs.id, binding.blobId));
+    }
+  });
+
   it("strips terminal accepted jobs without keeping case state and persists the report", async () => {
     const job = await insertTerminalJob(`${PREFIX}-accepted-strip`);
     await insertClassifiedResult(job, {

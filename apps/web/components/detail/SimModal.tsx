@@ -1880,7 +1880,7 @@ export function SimModal(props: {
       const frameUrl = frameImageUrl(playerModel, frameIdx, activeField);
       if (frameUrl) {
         return (
-          <img
+          <EvidenceMediaImage
             data-testid="sim-frame-image"
             src={browserUrl(frameUrl)}
             alt={`${activeField ?? "frame"} f${String(currentFrame.i).padStart(4, "0")}`}
@@ -1892,7 +1892,7 @@ export function SimModal(props: {
     const staticUrl = selectedStaticUrl();
     if (staticUrl)
       return (
-        <img
+        <EvidenceMediaImage
           data-testid="sim-frame-image"
           src={browserUrl(staticUrl)}
           alt={`${fieldLabel} static`}
@@ -2727,9 +2727,49 @@ function ConditionGroup({
   );
 }
 
-function MediaEmpty({ text }: { text: string }) {
+function EvidenceMediaImage({
+  src,
+  alt,
+  style,
+  "data-testid": testId,
+}: {
+  src: string;
+  alt: string;
+  style: CSSProperties;
+  "data-testid": string;
+}) {
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (failedSrc !== src) return;
+    const retry = window.setTimeout(() => setFailedSrc(null), 30_000);
+    return () => window.clearTimeout(retry);
+  }, [failedSrc, src]);
+
+  if (failedSrc === src) {
+    return (
+      <MediaEmpty
+        testId="sim-media-unavailable"
+        text="Stored media is temporarily unavailable. This frame will retry automatically."
+      />
+    );
+  }
+  return (
+    <img
+      data-testid={testId}
+      src={src}
+      alt={alt}
+      style={style}
+      onError={() => setFailedSrc(src)}
+    />
+  );
+}
+
+function MediaEmpty({ text, testId }: { text: string; testId?: string }) {
   return (
     <div
+      data-testid={testId}
+      role="status"
       style={{
         minHeight: 260,
         display: "grid",

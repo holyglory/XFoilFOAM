@@ -10,6 +10,16 @@ const source = (relativePath: string) =>
   );
 
 describe("solver terminology contract", () => {
+  it("MUST-CATCH: a failed stored image becomes an honest retrying state, never native broken-image chrome", () => {
+    const simModal = source("components/detail/SimModal.tsx");
+    expect(simModal).toContain("function EvidenceMediaImage");
+    expect(simModal).toContain("onError={() => setFailedSrc(src)}");
+    expect(simModal).toContain('testId="sim-media-unavailable"');
+    expect(simModal).toContain(
+      "Stored media is temporarily unavailable. This frame will retry automatically.",
+    );
+  });
+
   it("MUST-CATCH: unpublished point evidence stays calm and links to exact point tools", () => {
     const adminConsole = source("components/admin/AdminConsole.tsx");
     const pointHistory = source("components/admin/PointHistoryPanel.tsx");
