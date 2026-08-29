@@ -2712,19 +2712,31 @@ describe("durable result media repair", () => {
       airfoilId,
       aoa: 2,
     });
+    const renderRequests: RenderDefaultMediaRequest[] = [];
     const secondOutcome = await resultMediaRepairTick(
       db,
       engineWith({
         extents: async () => ({
           fields: {
-            velocity_magnitude: { min: 0, max: 100, finite_count: 500 },
+            // Velocity keeps v1 while pressure advances to v2. The repair
+            // must still hydrate and read the archive once for both fields.
+            velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
             pressure: { min: -8, max: 6, finite_count: 500 },
           },
         }),
+        render: async (jobId, request) => {
+          renderRequests.push(request);
+          return completeMediaResponse(jobId, request);
+        },
       }),
       { resultId: second.resultId },
     );
     expect(secondOutcome.finalized).toBe(1);
+    expect(renderRequests).toHaveLength(1);
+    expect(renderRequests[0]?.fields).toEqual([
+      "velocity_magnitude",
+      "pressure",
+    ]);
     const [secondRepair] = await db
       .select()
       .from(resultMediaRepairs)

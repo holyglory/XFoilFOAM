@@ -2949,10 +2949,10 @@ async function withPeriodicMediaRepairHeartbeat<T>(
   }
 }
 
-/** Render every field that shares one scale-version directory in one engine
- * call. The Python renderer deliberately reads each VTK frame once for all
- * requested fields; issuing one request per field throws that optimization
- * away and makes a legacy repair backlog take days. */
+/** Render every requested field into one immutable batch directory. The
+ * Python renderer deliberately reads each VTK frame once for all requested
+ * fields; issuing one request per field throws that optimization away and
+ * makes a legacy repair backlog take days. */
 async function renderScaledMediaRowsForFields(opts: {
   db: DB;
   engine: EngineClient;
@@ -2965,9 +2965,6 @@ async function renderScaledMediaRowsForFields(opts: {
   remote?: RemoteEvidencePointerPayload;
 }): Promise<RenderedMediaRow[]> {
   if (!opts.fields.length) return [];
-  if (opts.fields.some(({ scale }) => scale.version !== opts.renderVersion)) {
-    throw new Error("default-media render batch mixed scale versions");
-  }
   const rendered: RenderedMediaRow[] = [];
   for (const result of opts.resultRows) {
     if (
@@ -3145,11 +3142,69 @@ interface RepairFieldScalePlan {
   evidenceSha256: string;
 }
 
+/** Allocate one deterministic output directory for a multi-field batch.
+ * Independent field-scale versions are monotone for an immutable attempt, so
+ * their sum advances whenever the render changes. Existing DB ownership is
+ * still checked and the next free number is chosen on a legacy-path collision. */
+async function repairRenderBatchVersion(
+  db: DB,
+  resultAttemptId: string,
+  plans: RepairFieldScalePlan[],
+): Promise<number> {
+  const signature = plans
+    .map((plan) => ({
+      field: plan.group.field,
+      scaleId: plan.scale.id,
+      scaleVersion: plan.scale.version,
+      vmin: plan.scale.vmin,
+      vmax: plan.scale.vmax,
+      policy: plan.scale.policy,
+      evidenceSha256: plan.evidenceSha256,
+    }))
+    .sort((a, b) => a.field.localeCompare(b.field));
+  const expected = new Map<string, (typeof signature)[number]>(
+    signature.map((item) => [item.field, item]),
+  );
+  const baseVersion = Math.max(
+    1,
+    signature.reduce((sum, item) => sum + item.scaleVersion, 0),
+  );
+  for (let offset = 0; offset < 1_000; offset++) {
+    const candidate = baseVersion + offset;
+    const existing = await db
+      .select({
+        field: resultMedia.field,
+        colorScaleId: resultMedia.colorScaleId,
+        colorScaleVersion: resultMedia.colorScaleVersion,
+        evidenceSha256: resultMedia.evidenceSha256,
+      })
+      .from(resultMedia)
+      .where(
+        and(
+          eq(resultMedia.resultAttemptId, resultAttemptId),
+          eq(resultMedia.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+          sql`${resultMedia.storageKey} LIKE ${`%/v${candidate}/%`}`,
+        ),
+      );
+    if (!existing.length) return candidate;
+    const sameRender = existing.every((row) => {
+      const planned = row.field ? expected.get(row.field) : null;
+      return Boolean(
+        planned &&
+        row.colorScaleId === planned.scaleId &&
+        row.colorScaleVersion === planned.scaleVersion &&
+        row.evidenceSha256 === planned.evidenceSha256,
+      );
+    });
+    if (sameRender) return candidate;
+  }
+  throw new Error("could not allocate a collision-free media render batch");
+}
+
 /** A durable repair owns one result, so its evidence can be rendered in
- * multi-field batches without crossing the repair fence. Fields are grouped
- * by their independent scale version because the engine's immutable output
- * directory is version-addressed; within each group it reads every VTK frame
- * once and produces all requested fields. */
+ * one multi-field batch without crossing the repair fence. The output
+ * directory is content-addressed from all field-scale identities, while each
+ * result_media row still retains its own exact scale id and version. */
 async function rebalanceRepairFieldScales(
   opts: RebalanceFieldScaleOptions & {
     repairFence: MediaRepairWriteFence;
@@ -3309,60 +3364,55 @@ async function rebalanceRepairFieldScales(
     });
   }
 
-  const plansByVersion = new Map<number, RepairFieldScalePlan[]>();
-  for (const plan of plans) {
-    const versionPlans = plansByVersion.get(plan.scale.version) ?? [];
-    versionPlans.push(plan);
-    plansByVersion.set(plan.scale.version, versionPlans);
-  }
   const renderedByField = new Map<ImageFieldName, RenderedMediaRow[]>();
-  for (const [version, versionPlans] of plansByVersion) {
-    try {
-      const rendered = await renderScaledMediaRowsForFields({
-        db: opts.db,
-        engine: opts.engine,
-        resultRows: [opts.repairSource],
-        fields: versionPlans.map((plan) => ({
-          field: plan.group.field,
-          scale: plan.scale,
+  try {
+    const renderVersion = await repairRenderBatchVersion(
+      opts.db,
+      opts.repairSource.currentResultAttemptId!,
+      plans,
+    );
+    const rendered = await renderScaledMediaRowsForFields({
+      db: opts.db,
+      engine: opts.engine,
+      resultRows: [opts.repairSource],
+      fields: plans.map((plan) => ({
+        field: plan.group.field,
+        scale: plan.scale,
+      })),
+      renderVersion,
+      airfoilPoints: opts.airfoilPoints,
+      heartbeat: opts.heartbeat,
+      sourceMode: opts.sourceMode,
+      remote: opts.remote,
+    });
+    for (const plan of plans) {
+      renderedByField.set(
+        plan.group.field,
+        rendered.map((row) => ({
+          ...row,
+          media: row.media.filter((media) => media.field === plan.group.field),
         })),
-        renderVersion: version,
-        airfoilPoints: opts.airfoilPoints,
-        heartbeat: opts.heartbeat,
-        sourceMode: opts.sourceMode,
-        remote: opts.remote,
-      });
-      for (const plan of versionPlans) {
-        renderedByField.set(
-          plan.group.field,
-          rendered.map((row) => ({
-            ...row,
-            media: row.media.filter(
-              (media) => media.field === plan.group.field,
-            ),
-          })),
-        );
-      }
-    } catch (error) {
-      const reason =
-        error instanceof Error
-          ? error.message.slice(0, 500)
-          : String(error).slice(0, 500);
-      const createdScaleIds = versionPlans
-        .filter((plan) => plan.created)
-        .map((plan) => plan.scale.id);
-      if (createdScaleIds.length) {
-        await opts.db
-          .update(fieldColorScales)
-          .set({
-            status: "failed",
-            failureReason: reason,
-            renderAttempts: sql`${fieldColorScales.renderAttempts} + 1`,
-          })
-          .where(inArray(fieldColorScales.id, createdScaleIds));
-      }
-      throw error;
+      );
     }
+  } catch (error) {
+    const reason =
+      error instanceof Error
+        ? error.message.slice(0, 500)
+        : String(error).slice(0, 500);
+    const createdScaleIds = plans
+      .filter((plan) => plan.created)
+      .map((plan) => plan.scale.id);
+    if (createdScaleIds.length) {
+      await opts.db
+        .update(fieldColorScales)
+        .set({
+          status: "failed",
+          failureReason: reason,
+          renderAttempts: sql`${fieldColorScales.renderAttempts} + 1`,
+        })
+        .where(inArray(fieldColorScales.id, createdScaleIds));
+    }
+    throw error;
   }
 
   let mediaCount = 0;
