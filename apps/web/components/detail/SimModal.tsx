@@ -2773,7 +2773,8 @@ function MediaEmpty({ text, testId }: { text: string; testId?: string }) {
       style={{
         minHeight: 260,
         display: "grid",
-        placeItems: "center",
+        alignItems: "start",
+        justifyItems: "center",
         background: "#070b10",
         color: C.muted,
         fontFamily: MONO,
