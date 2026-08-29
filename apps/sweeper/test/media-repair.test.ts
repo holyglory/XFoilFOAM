@@ -2598,6 +2598,49 @@ describe("durable result media repair", () => {
     expect(backlogClaim?.resultId).toBe(campaignOlder.resultId);
   });
 
+  it("prioritizes a result with no loadable media ahead of available rescaling work", async () => {
+    const available = await createSolvedResult("claim-priority-available", {
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    const unavailable = await createSolvedResult("claim-priority-unavailable", {
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    await db.insert(resultMedia).values({
+      resultId: available.resultId,
+      resultAttemptId: available.resultAttemptId,
+      kind: "image",
+      field: "velocity_magnitude",
+      role: "instantaneous",
+      storageKey: `${PREFIX}/claim-priority-available/velocity.png`,
+      mimeType: "image/png",
+      evidenceSha256: available.manifestSha,
+      sha256: "a".repeat(64),
+      byteSize: 1024,
+    });
+    const now = new Date();
+    for (const fixture of [available, unavailable]) {
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+        now,
+      });
+    }
+    await db
+      .update(resultMediaRepairs)
+      .set({ nextAttemptAt: new Date(now.getTime() - 60 * 60_000) })
+      .where(eq(resultMediaRepairs.resultId, available.resultId));
+
+    const claimed = await claimNextResultMediaRepair(db, {
+      resultIds: [available.resultId, unavailable.resultId],
+      preferUnavailable: true,
+      now,
+    });
+    expect(claimed?.resultId).toBe(unavailable.resultId);
+  });
+
   it("serializes claims that would mutate one shared scale scope", async () => {
     const airfoilId = await createAirfoil("parallel-scale-scope");
     const first = await createSolvedResult("parallel-scale-scope-a", {

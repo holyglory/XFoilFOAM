@@ -671,6 +671,7 @@ export async function claimNextResultMediaRepair(
     resultId?: string;
     resultIds?: string[];
     preferNewestLive?: boolean;
+    preferUnavailable?: boolean;
   } = {},
 ): Promise<ResultMediaRepair | null> {
   if (opts.resultId && opts.resultIds) {
@@ -739,6 +740,25 @@ export async function claimNextResultMediaRepair(
       ORDER BY
         (live_campaign.priority IS NOT NULL) DESC,
         live_campaign.priority DESC NULLS LAST,
+        CASE
+          WHEN ${Boolean(opts.preferUnavailable)} THEN EXISTS (
+            SELECT 1
+            FROM result_media media
+            LEFT JOIN result_media_storage_bindings binding
+              ON binding.result_media_id = media.id
+            LEFT JOIN result_media_storage_uploads storage_upload
+              ON storage_upload.result_media_id = media.id
+            WHERE media.result_id = repair.result_id
+              AND media.result_attempt_id = repair.result_attempt_id
+              AND (
+                binding.result_media_id IS NOT NULL
+                OR storage_upload.result_media_id IS NULL
+                OR storage_upload.state <> 'retry_wait'
+                OR storage_upload.error NOT LIKE ${RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER + "%"}
+              )
+          )
+          ELSE false
+        END ASC,
         CASE
           WHEN ${Boolean(opts.preferNewestLive)} AND live_campaign.priority IS NOT NULL
             THEN COALESCE(attempt."solvedAt", attempt."createdAt")

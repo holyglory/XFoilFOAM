@@ -53,6 +53,7 @@ export interface ResultMediaRepairTickOptions {
   finalizeLimit?: number;
   resultId?: string;
   preferNewestLive?: boolean;
+  preferUnavailable?: boolean;
   /** The scheduler owns sweeper liveness. A dedicated media-repair process
    * deliberately leaves it untouched, while still renewing its own durable
    * repair lease around each expensive engine operation. */
@@ -379,6 +380,7 @@ export async function repairNextResultMediaClaim(
   const claim = await claimNextResultMediaRepair(db, {
     resultId: opts.resultId,
     preferNewestLive: opts.preferNewestLive,
+    preferUnavailable: opts.preferUnavailable,
   });
   if (!claim) {
     return {

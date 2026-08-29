@@ -68,6 +68,7 @@ try {
       try {
         const outcome = await repairNextResultMediaClaim(db, engine, {
           preferNewestLive: index === 0,
+          preferUnavailable: index > 0,
         });
         claimed = outcome.claimed;
         if (
