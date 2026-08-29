@@ -13,6 +13,7 @@ import {
   onResultIngested,
   probeCampaignCompletion,
   reconcileBlockedFinalMediaRepairVerifications,
+  requeueLegacyResultMediaRenderTimeouts,
   resultMediaRepairs,
   renewResultMediaRepairClaim,
   settleFinalUransVerificationAfterMediaRepair,
@@ -240,6 +241,10 @@ export async function prepareResultMediaRepairPass(
   opts: ResultMediaRepairTickOptions,
 ): Promise<ResultMediaRepairTickOutcome> {
   const dirty = new Map<string, CampaignLaneKey>();
+  const legacyTimeoutsRequeued = await requeueLegacyResultMediaRenderTimeouts(
+    db,
+    { limit: opts.discoveryLimit },
+  );
   const discovered = await discoverMissingResultMediaRepairs(db, {
     limit: opts.discoveryLimit,
     resultId: opts.resultId,
@@ -270,7 +275,7 @@ export async function prepareResultMediaRepairPass(
     finalized: pre.finalized,
     claimed: false,
     repairedMedia: 0,
-    retrying: healed.retrying,
+    retrying: healed.retrying + legacyTimeoutsRequeued,
     blocked: reconciledBlocked + healed.blocked,
     dirtyLanes: [...dirty.values()],
   };

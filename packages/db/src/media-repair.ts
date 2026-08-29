@@ -24,8 +24,48 @@ export const RESULT_MEDIA_REPAIR_LEASE_MS = 10 * 60_000;
 export const RESULT_MEDIA_REPAIR_BACKOFF_MS = [30_000, 2 * 60_000] as const;
 export const RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER =
   "result-media-local-bytes-unavailable";
+export const LEGACY_RESULT_MEDIA_RENDER_TIMEOUT_MARKER =
+  "timed out after 120000 ms";
 
 export type ResultMediaRepair = typeof resultMediaRepairs.$inferSelect;
+
+/** One-time policy supersession for repairs exhausted by the former two-minute
+ * default-media deadline. The new renderer uses the authenticated 15-minute
+ * evidence budget; every other blocked cause remains terminal and unchanged. */
+export async function requeueLegacyResultMediaRenderTimeouts(
+  db: DB,
+  opts: { limit?: number; now?: Date } = {},
+): Promise<number> {
+  const limit = Math.max(1, Math.min(opts.limit ?? 100, 1_000));
+  const nowIso = (opts.now ?? new Date()).toISOString();
+  const rows = (await db.execute(sql`
+    WITH candidate AS (
+      SELECT repair.id
+      FROM result_media_repairs repair
+      WHERE repair.state = 'blocked'
+        AND repair.last_error LIKE ${`%${LEGACY_RESULT_MEDIA_RENDER_TIMEOUT_MARKER}%`}
+      ORDER BY repair."updatedAt", repair.id
+      FOR UPDATE OF repair SKIP LOCKED
+      LIMIT ${limit}
+    )
+    UPDATE result_media_repairs repair
+    SET state = 'pending',
+        attempt_count = 0,
+        max_attempts = ${MAX_RESULT_MEDIA_REPAIR_ATTEMPTS},
+        claim_token = NULL,
+        claimed_at = NULL,
+        claim_expires_at = NULL,
+        next_attempt_at = ${nowIso}::timestamptz,
+        last_error = NULL,
+        completed_at = NULL,
+        downstream_finalized_at = NULL,
+        "updatedAt" = ${nowIso}::timestamptz
+    FROM candidate
+    WHERE repair.id = candidate.id
+    RETURNING repair.id
+  `)) as unknown as Array<{ id: string }>;
+  return rows.length;
+}
 
 export interface SatisfiedResultMediaRepair extends ResultMediaRepair {
   airfoilId: string;

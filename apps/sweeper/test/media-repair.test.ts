@@ -48,6 +48,7 @@ import {
   sweepDefinitions,
   type DB,
   refreshPolarCacheForRevision,
+  requeueLegacyResultMediaRenderTimeouts,
   satisfyPrecalcObligationFromAcceptedResult,
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
@@ -55,6 +56,7 @@ import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
 import type {
   EngineClient,
+  EngineCallOptions,
   FieldExtentsRequest,
   FieldExtentsResponse,
   ImageFieldName,
@@ -523,29 +525,39 @@ function engineWith(
     extents?: (
       jobId: string,
       request: FieldExtentsRequest,
+      callOptions?: EngineCallOptions,
     ) => Promise<FieldExtentsResponse>;
     render?: (
       jobId: string,
       request: RenderDefaultMediaRequest,
+      callOptions?: EngineCallOptions,
     ) => Promise<RenderDefaultMediaResponse>;
   } = {},
 ): EngineClient {
   return {
     baseUrl: "http://engine.test",
-    computeFieldExtents:
-      opts.extents ??
-      (async () => ({
-        fields: {
-          velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
-          pressure: { min: -3, max: 2, finite_count: 500 },
-        },
-        window_start: 1,
-        window_end: 2,
-      })),
-    renderDefaultMedia:
-      opts.render ??
-      (async (jobId: string, request: RenderDefaultMediaRequest) =>
-        completeMediaResponse(jobId, request)),
+    computeFieldExtents: opts.extents
+      ? (
+          jobId: string,
+          request: FieldExtentsRequest,
+          callOptions?: EngineCallOptions,
+        ) => opts.extents!(jobId, request, callOptions)
+      : async () => ({
+          fields: {
+            velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+            pressure: { min: -3, max: 2, finite_count: 500 },
+          },
+          window_start: 1,
+          window_end: 2,
+        }),
+    renderDefaultMedia: opts.render
+      ? (
+          jobId: string,
+          request: RenderDefaultMediaRequest,
+          callOptions?: EngineCallOptions,
+        ) => opts.render!(jobId, request, callOptions)
+      : async (jobId: string, request: RenderDefaultMediaRequest) =>
+          completeMediaResponse(jobId, request),
   } as unknown as EngineClient;
 }
 
@@ -761,10 +773,21 @@ describe("durable result media repair", () => {
       regime: "rans",
     });
     const requests: RenderDefaultMediaRequest[] = [];
+    const timeoutBudgets: number[] = [];
     const outcome = await resultMediaRepairTick(
       db,
       engineWith({
-        render: async (jobId, request) => {
+        extents: async (_jobId, _request, callOptions) => {
+          timeoutBudgets.push(callOptions?.timeoutMs ?? 0);
+          return {
+            fields: {
+              velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+              pressure: { min: -3, max: 2, finite_count: 500 },
+            },
+          };
+        },
+        render: async (jobId, request, callOptions) => {
+          timeoutBudgets.push(callOptions?.timeoutMs ?? 0);
           requests.push(request);
           return completeMediaResponse(jobId, request);
         },
@@ -774,6 +797,7 @@ describe("durable result media repair", () => {
 
     expect(outcome.finalized).toBe(1);
     expect(requests).toHaveLength(1);
+    expect(timeoutBudgets).toEqual([15 * 60_000, 15 * 60_000]);
     expect(requests[0]?.fields).toEqual(["velocity_magnitude", "pressure"]);
     expect(
       await db
@@ -2405,6 +2429,53 @@ describe("durable result media repair", () => {
     expect(blocked.state).toBe("blocked");
     expect(blocked.attemptCount).toBe(3);
     expect(blocked.lastError).toContain("raw evidence unavailable");
+  });
+
+  it("reopens only repairs exhausted by the retired two-minute render deadline", async () => {
+    const timedOut = await createSolvedResult("legacy-render-timeout");
+    const genuineFailure = await createSolvedResult("genuine-render-failure");
+    for (const fixture of [timedOut, genuineFailure]) {
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      });
+      await db
+        .update(resultMediaRepairs)
+        .set({
+          state: "blocked",
+          attemptCount: 3,
+          lastError:
+            fixture.resultId === timedOut.resultId
+              ? "render-default-media timed out after 120000 ms"
+              : "evidence manifest contains no VTK files",
+        })
+        .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+    }
+
+    expect(await requeueLegacyResultMediaRenderTimeouts(db)).toBe(1);
+    const rows = await db
+      .select({
+        resultId: resultMediaRepairs.resultId,
+        state: resultMediaRepairs.state,
+        attemptCount: resultMediaRepairs.attemptCount,
+        lastError: resultMediaRepairs.lastError,
+      })
+      .from(resultMediaRepairs)
+      .where(
+        inArray(resultMediaRepairs.resultId, [
+          timedOut.resultId,
+          genuineFailure.resultId,
+        ]),
+      );
+    expect(
+      rows.find((row) => row.resultId === timedOut.resultId),
+    ).toMatchObject({ state: "pending", attemptCount: 0, lastError: null });
+    expect(
+      rows.find((row) => row.resultId === genuineFailure.resultId),
+    ).toMatchObject({
+      state: "blocked",
+      attemptCount: 3,
+      lastError: "evidence manifest contains no VTK files",
+    });
   });
 
   it("keeps one live-campaign lane fresh while backlog order remains available", async () => {

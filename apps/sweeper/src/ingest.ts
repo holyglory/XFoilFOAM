@@ -32,6 +32,7 @@ import {
 } from "@aerodb/core";
 import {
   ALL_IMAGE_FIELDS,
+  ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS,
   type EngineClient,
   type EngineEvidenceArtifact,
   type FinalizeRemoteEvidenceRequest,
@@ -3013,21 +3014,25 @@ async function renderScaledMediaRowsForFields(opts: {
     ) as Record<ImageFieldName, { vmin: number; vmax: number }>;
     const response = await withPeriodicMediaRepairHeartbeat(
       () =>
-        opts.engine.renderDefaultMedia(result.engineJobId!, {
-          case_slug: result.engineCaseSlug!,
-          evidence_base: manifest.evidenceBase,
-          airfoil_points: opts.airfoilPoints,
-          chord: result.chord!,
-          speed: result.speed!,
-          fields,
-          scales,
-          unsteady: requiresTransientMedia,
-          zoom_chords: 2,
-          scale_version: opts.renderVersion,
-          render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
-          source_mode: opts.sourceMode ?? "auto",
-          remote: opts.remote,
-        }),
+        opts.engine.renderDefaultMedia(
+          result.engineJobId!,
+          {
+            case_slug: result.engineCaseSlug!,
+            evidence_base: manifest.evidenceBase,
+            airfoil_points: opts.airfoilPoints,
+            chord: result.chord!,
+            speed: result.speed!,
+            fields,
+            scales,
+            unsteady: requiresTransientMedia,
+            zoom_chords: 2,
+            scale_version: opts.renderVersion,
+            render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
+            source_mode: opts.sourceMode ?? "auto",
+            remote: opts.remote,
+          },
+          { timeoutMs: ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS },
+        ),
       opts.heartbeat,
     );
     rendered.push({
@@ -3870,18 +3875,22 @@ export async function repairDefaultMediaForStoredResult(opts: {
   await heartbeat();
   const response = await withPeriodicMediaRepairHeartbeat(
     () =>
-      opts.engine.computeFieldExtents(attempt.engineJobId!, {
-        case_slug: attempt.engineCaseSlug!,
-        evidence_base: manifest.evidenceBase,
-        airfoil_points: contour,
-        chord: result.chord!,
-        speed: result.speed!,
-        fields: ALL_IMAGE_FIELDS,
-        zoom_chords: 2,
-        max_frames: 220,
-        source_mode: "archive",
-        remote: remote ?? undefined,
-      }),
+      opts.engine.computeFieldExtents(
+        attempt.engineJobId!,
+        {
+          case_slug: attempt.engineCaseSlug!,
+          evidence_base: manifest.evidenceBase,
+          airfoil_points: contour,
+          chord: result.chord!,
+          speed: result.speed!,
+          fields: ALL_IMAGE_FIELDS,
+          zoom_chords: 2,
+          max_frames: 220,
+          source_mode: "archive",
+          remote: remote ?? undefined,
+        },
+        { timeoutMs: ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS },
+      ),
     heartbeat,
   );
   // The engine round-trip may be slow. Revalidate ownership immediately
