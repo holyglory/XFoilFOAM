@@ -334,12 +334,56 @@ a {
   font-weight: 500;
 }
 
+.campaign-completion-sources {
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 7px 18px;
+  max-width: min(535px, 100%);
+  margin-top: 16px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--aero-stroke);
+  border-bottom: 1px solid var(--aero-stroke);
+  color: var(--aero-text2);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.campaign-completion-sources > span:not(.campaign-completion-scope) {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.campaign-completion-sources strong {
+  color: var(--aero-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.campaign-completion-sources .is-remote strong {
+  color: var(--aero-teal);
+}
+
+.campaign-completion-sources .is-derived strong {
+  color: var(--aero-violet);
+}
+
+.campaign-completion-scope {
+  flex-basis: 100%;
+  color: var(--aero-dim);
+  text-align: center;
+}
+
 .campaign-instrument-stage-rail {
   position: relative;
   width: min(1010px, 100%);
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin: 90px 0 0;
+  margin: 48px 0 0;
   padding: 0;
   list-style: none;
 }
@@ -660,7 +704,7 @@ button.campaign-instrument-exception-action:focus-visible {
   }
 
   .campaign-instrument-stage-rail {
-    margin-top: 62px;
+    margin-top: 38px;
   }
 
   .campaign-instrument-stage-connector {

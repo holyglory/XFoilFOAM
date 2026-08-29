@@ -166,6 +166,7 @@
         "apps/sweeper/test/remote-solver-validation.test.ts",
         "packages/core/src/**",
         "packages/db/src/**",
+        "packages/db/test/campaign-remediation-summary.test.ts",
         "packages/engine-client/src/**",
         "package.json",
         "pnpm-lock.yaml",

@@ -687,6 +687,104 @@ export function AdminConsole() {
           grid-template-columns: minmax(0, 1fr) minmax(280px, 0.7fr);
           gap: 14px;
         }
+        .sync-promise-card {
+          display: grid;
+          gap: 14px;
+          min-width: 0;
+        }
+        .sync-promise-scope {
+          margin-top: 3px;
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 9.5px;
+          line-height: 1.45;
+        }
+        .sync-promise-live {
+          display: grid;
+          gap: 5px;
+          padding: 12px;
+          border: 1px solid ${C.tealBorder};
+          border-radius: 8px;
+          background: ${C.tealFill};
+          font-family: ${MONO};
+        }
+        .sync-promise-live-heading {
+          display: flex;
+          align-items: baseline;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .sync-promise-live-heading strong {
+          color: ${C.teal};
+          font-size: 26px;
+          font-weight: 500;
+          line-height: 1;
+        }
+        .sync-promise-live-heading span {
+          color: ${C.text};
+          font-size: 11px;
+        }
+        .sync-promise-live-detail {
+          color: ${C.text2};
+          font-size: 10px;
+          line-height: 1.5;
+        }
+        .sync-promise-section {
+          display: grid;
+          gap: 7px;
+          font-family: ${MONO};
+        }
+        .sync-promise-section-title {
+          color: ${C.dim};
+          font-size: 9px;
+          letter-spacing: 0.1em;
+        }
+        .sync-promise-row {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          gap: 10px;
+          align-items: baseline;
+          padding-bottom: 7px;
+          border-bottom: 1px solid ${C.borderSoft};
+          color: ${C.text2};
+          font-size: 11px;
+          line-height: 1.35;
+        }
+        .sync-promise-row strong {
+          color: ${C.text};
+          font-size: 12px;
+          font-weight: 500;
+          white-space: nowrap;
+        }
+        .sync-promise-row.is-accepted strong {
+          color: ${C.teal};
+        }
+        .sync-promise-scope-breakdown {
+          display: grid;
+          gap: 5px;
+          margin: -1px 0 3px 10px;
+          padding-left: 10px;
+          border-left: 1px solid ${C.stroke};
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 9.5px;
+        }
+        .sync-promise-scope-breakdown span {
+          display: flex;
+          justify-content: space-between;
+          gap: 10px;
+        }
+        .sync-promise-scope-breakdown b {
+          color: ${C.text2};
+          font-weight: 500;
+          white-space: nowrap;
+        }
+        .sync-promise-note {
+          color: ${C.dim};
+          font-family: ${MONO};
+          font-size: 9.5px;
+          line-height: 1.5;
+        }
         .registered-remote-solver {
           display: grid;
           gap: 9px;
@@ -4877,38 +4975,117 @@ function SyncApiPanel() {
               </div>
             </div>
 
-            <div style={card}>
-              <div style={label}>PROMISES</div>
-              <div
-                style={{
-                  display: "grid",
-                  gap: 8,
-                  fontFamily: MONO,
-                  fontSize: 12,
-                }}
+            <div
+              style={card}
+              className="sync-promise-card"
+              data-testid="sync-promise-summary"
+              data-ui-region="sync-promise-summary"
+              data-ui-verify-min-content-inset="12"
+            >
+              <div>
+                <div style={label}>REMOTE SOLVER WORK</div>
+                <div className="sync-promise-scope">
+                  Live leases and all-time outcomes across campaign and
+                  background work
+                </div>
+              </div>
+
+              <section
+                className="sync-promise-live"
+                aria-label="Current remote promise leases"
               >
-                {["active", "fulfilled", "expired", "cancelled"].map(
-                  (status) => (
-                    <div
-                      key={status}
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        gap: 10,
-                        borderBottom: `1px solid ${C.borderSoft}`,
-                        paddingBottom: 7,
-                      }}
-                    >
-                      <span style={{ color: C.dim }}>{status}</span>
-                      <span
-                        style={{ color: status === "active" ? C.teal : C.text }}
-                      >
-                        {state.promises.byStatus[status] ?? 0} ·{" "}
-                        {state.promises.pointsByStatus[status] ?? 0} AoAs
-                      </span>
-                    </div>
-                  ),
-                )}
+                <div className="sync-promise-live-heading">
+                  <strong>
+                    {state.promises.live.activeBundles.toLocaleString()}
+                  </strong>
+                  <span>active promise bundles</span>
+                </div>
+                <div className="sync-promise-live-detail">
+                  {state.promises.live.remainingAoas.toLocaleString()} AoAs
+                  remaining ·{" "}
+                  {state.promises.live.acceptedAoas.toLocaleString()} accepted
+                  within these bundles
+                </div>
+              </section>
+
+              <section
+                className="sync-promise-section"
+                aria-label="Individual AoA outcomes"
+              >
+                <div className="sync-promise-section-title">
+                  INDIVIDUAL AOA OUTCOMES · ALL TIME
+                </div>
+                <div className="sync-promise-row is-accepted">
+                  <span>Accepted remote results</span>
+                  <strong>
+                    {(
+                      state.promises.pointsByStatus.fulfilled ?? 0
+                    ).toLocaleString()}
+                  </strong>
+                </div>
+                <div className="sync-promise-scope-breakdown">
+                  <span>
+                    Current campaign plans
+                    <b>
+                      {state.promises.acceptedScope.currentCampaignAoas.toLocaleString()}
+                    </b>
+                  </span>
+                  <span>
+                    Background solves
+                    <b>
+                      {state.promises.acceptedScope.backgroundAoas.toLocaleString()}
+                    </b>
+                  </span>
+                </div>
+                <div className="sync-promise-row">
+                  <span>Released for another solve</span>
+                  <strong>
+                    {(
+                      state.promises.pointsByStatus.cancelled ?? 0
+                    ).toLocaleString()}
+                  </strong>
+                </div>
+                <div className="sync-promise-row">
+                  <span>Expired before completion</span>
+                  <strong>
+                    {(
+                      state.promises.pointsByStatus.expired ?? 0
+                    ).toLocaleString()}
+                  </strong>
+                </div>
+              </section>
+
+              <section
+                className="sync-promise-section"
+                aria-label="Promise bundle outcomes"
+              >
+                <div className="sync-promise-section-title">
+                  PROMISE BUNDLE OUTCOMES · ALL TIME
+                </div>
+                <div className="sync-promise-row">
+                  <span>Fully completed</span>
+                  <strong>
+                    {(state.promises.byStatus.fulfilled ?? 0).toLocaleString()}
+                  </strong>
+                </div>
+                <div className="sync-promise-row">
+                  <span>Closed with unfinished AoAs</span>
+                  <strong>
+                    {(state.promises.byStatus.cancelled ?? 0).toLocaleString()}
+                  </strong>
+                </div>
+                <div className="sync-promise-row">
+                  <span>Expired</span>
+                  <strong>
+                    {(state.promises.byStatus.expired ?? 0).toLocaleString()}
+                  </strong>
+                </div>
+              </section>
+
+              <div className="sync-promise-note">
+                A bundle is fully completed only when every claimed AoA is
+                accepted. Accepted AoAs remain stored if unfinished AoAs are
+                later released.
               </div>
             </div>
           </div>

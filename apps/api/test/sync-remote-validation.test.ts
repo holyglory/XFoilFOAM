@@ -1005,6 +1005,78 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("separates live promise bundles, individual AoA states, and accepted-result scope", async () => {
+    type PromiseSummary = {
+      byStatus: Record<string, number>;
+      pointsByStatus: Record<string, number>;
+      live: {
+        activeBundles: number;
+        remainingAoas: number;
+        acceptedAoas: number;
+      };
+      acceptedScope: {
+        currentCampaignAoas: number;
+        backgroundAoas: number;
+      };
+    };
+    const read = async (): Promise<PromiseSummary> => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/admin/sync",
+        headers: { "x-xfoilfoam-sync-secret": SECRET },
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      return (response.json() as { promises: PromiseSummary }).promises;
+    };
+    const before = await read();
+    const activePromiseId = await createPromise("active", [798.101, 798.201]);
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "fulfilled", updatedAt: new Date() })
+      .where(
+        and(
+          eq(syncSweepPromisePoints.promiseId, activePromiseId),
+          eq(syncSweepPromisePoints.aoaDeg, 798.101),
+        ),
+      );
+    const cancelledPromiseId = await createPromise(
+      "cancelled",
+      [798.301, 798.401],
+    );
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "fulfilled", updatedAt: new Date() })
+      .where(
+        and(
+          eq(syncSweepPromisePoints.promiseId, cancelledPromiseId),
+          eq(syncSweepPromisePoints.aoaDeg, 798.301),
+        ),
+      );
+
+    const after = await read();
+    expect(after.byStatus.active - (before.byStatus.active ?? 0)).toBe(1);
+    expect(after.byStatus.cancelled - (before.byStatus.cancelled ?? 0)).toBe(1);
+    expect(
+      after.pointsByStatus.fulfilled - (before.pointsByStatus.fulfilled ?? 0),
+    ).toBe(2);
+    expect(
+      after.pointsByStatus.active - (before.pointsByStatus.active ?? 0),
+    ).toBe(1);
+    expect(
+      after.pointsByStatus.cancelled - (before.pointsByStatus.cancelled ?? 0),
+    ).toBe(1);
+    expect(after.live.activeBundles - before.live.activeBundles).toBe(1);
+    expect(after.live.remainingAoas - before.live.remainingAoas).toBe(1);
+    expect(after.live.acceptedAoas - before.live.acceptedAoas).toBe(1);
+    expect(
+      after.acceptedScope.currentCampaignAoas -
+        before.acceptedScope.currentCampaignAoas,
+    ).toBe(0);
+    expect(
+      after.acceptedScope.backgroundAoas - before.acceptedScope.backgroundAoas,
+    ).toBe(2);
+  });
+
   it("rechecks remote claim candidates under the shared cell lock", async () => {
     const aoaDeg = 699.951;
     const promiseId = await createPromise("active", aoaDeg);

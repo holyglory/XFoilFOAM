@@ -667,10 +667,36 @@ export function CampaignDetail({
           value={barSegments.doneCount}
           max={totals.requested}
           valueLabel={fCount(barSegments.doneCount)}
-          stateLabel={totals.derived > 0 ? "points complete" : "solved"}
+          stateLabel="current-plan points complete"
           totalLabel={fCount(totals.requested)}
           percentLabel={completionPercentLabel}
         />
+
+        <div
+          data-testid="campaign-completion-sources"
+          data-ui-region="campaign-completion-sources"
+          data-ui-verify-min-content-inset="10"
+          className="campaign-completion-sources"
+          aria-label={`${fCount(summary.completionSources.remoteSolved)} completed by the remote solver, ${fCount(summary.completionSources.hubSolved)} completed by the hub solver${summary.completionSources.derived > 0 ? `, ${fCount(summary.completionSources.derived)} derived by symmetry` : ""}`}
+        >
+          <span className="campaign-completion-scope">
+            Current campaign plan · all solver sources
+          </span>
+          <span className="is-remote">
+            <strong>{fCount(summary.completionSources.remoteSolved)}</strong>
+            remote solver
+          </span>
+          <span>
+            <strong>{fCount(summary.completionSources.hubSolved)}</strong>
+            hub solver
+          </span>
+          {summary.completionSources.derived > 0 && (
+            <span className="is-derived">
+              <strong>{fCount(summary.completionSources.derived)}</strong>
+              symmetry-derived
+            </span>
+          )}
+        </div>
 
         {pipeline && (
           <ol

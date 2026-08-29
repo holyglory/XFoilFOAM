@@ -692,6 +692,15 @@ export interface AdminSyncState {
   promises: {
     byStatus: Record<string, number>;
     pointsByStatus: Record<string, number>;
+    live: {
+      activeBundles: number;
+      remainingAoas: number;
+      acceptedAoas: number;
+    };
+    acceptedScope: {
+      currentCampaignAoas: number;
+      backgroundAoas: number;
+    };
   };
   registeredSolvers: AdminRegisteredSolver[];
   remoteAssets: {
@@ -1861,6 +1870,11 @@ export interface AdminCampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  completionSources: {
+    hubSolved: number;
+    remoteSolved: number;
+    derived: number;
+  };
   remediation: CampaignRemediationSummary;
   /** Rolling-compatibility ladder split. Optional: older APIs omit it. */
   reviewBuckets?: CampaignReviewBuckets;

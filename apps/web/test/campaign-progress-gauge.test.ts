@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -50,5 +53,17 @@ describe("campaign completion dial geometry", () => {
       campaignDialGeometry(535, 277, 10, Number.POSITIVE_INFINITY)
         .progressEndAngle,
     ).toBe(Math.PI);
+  });
+
+  it("labels the headline as current-plan completion and conserves solver sources", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "components/admin/campaigns/CampaignDetail.tsx"),
+      "utf8",
+    );
+    expect(source).toContain('stateLabel="current-plan points complete"');
+    expect(source).toContain("Current campaign plan · all solver sources");
+    expect(source).toContain("summary.completionSources.remoteSolved");
+    expect(source).toContain("summary.completionSources.hubSolved");
+    expect(source).toContain('data-ui-region="campaign-completion-sources"');
   });
 });

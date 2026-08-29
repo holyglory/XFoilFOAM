@@ -7427,6 +7427,16 @@ export interface CampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  /** Exact source split for the same completed physical points in `totals`.
+   * Remote ownership requires the selected campaign attempt to be bound to a
+   * fulfilled Sync promise point; every other solved point was produced by
+   * the hub. Derived symmetry points are kept separate because no solver ran
+   * them. */
+  completionSources: {
+    hubSolved: number;
+    remoteSolved: number;
+    derived: number;
+  };
   remediation: CampaignRemediationSummary;
   /** Rolling-compatibility ladder split. `needsReview` remains on the wire for
    *  old clients but has an empty canonical predicate; it must not promise a
@@ -7447,6 +7457,68 @@ export interface CampaignSummary {
   lanesSummary: Record<string, Record<string, number>>;
 }
 
+/** Source attribution for the polled campaign headline.
+ *
+ * Start from the compact fulfilled-Sync set and probe campaign points through
+ * their result/attempt indexes. This remains bounded by delivered remote
+ * evidence instead of rescanning the campaign's 600k+ point matrix every ten
+ * seconds. The predicate mirrors the canonical solved counter and therefore
+ * must conserve `totals.solved` exactly with the hub remainder. */
+async function campaignCompletionSources(
+  db: DB,
+  campaignId: string,
+  totals: CampaignProgressTotals,
+): Promise<CampaignSummary["completionSources"]> {
+  const [row] = (await db.execute(sql`
+    SELECT count(DISTINCT remote_point.result_id)::int AS remote_solved
+    FROM sync_sweep_promise_points remote_point
+    WHERE remote_point.status = 'fulfilled'
+      AND remote_point.result_id IS NOT NULL
+      AND remote_point.result_attempt_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM sim_campaign_points point
+        JOIN sim_campaign_conditions condition ON condition.id = point.condition_id
+        JOIN sim_campaigns campaign
+          ON campaign.id = point.campaign_id
+         AND condition.generation = campaign.current_condition_generation
+        JOIN results result ON result.id = point.result_id
+        JOIN result_classifications classification
+          ON classification.result_id = point.result_id
+        WHERE point.campaign_id = ${campaignId}
+          AND point.result_id = remote_point.result_id
+          AND point.result_attempt_id = remote_point.result_attempt_id
+          AND point.state = 'terminal'
+          AND point.derived_by_symmetry = false
+          AND result.status = 'done'
+          AND classification.state IN (
+            'accepted',
+            'needs_urans',
+            'superseded_by_urans'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_precalc_obligations blocked_obligation
+            WHERE blocked_obligation.airfoil_id = point.airfoil_id
+              AND blocked_obligation.revision_id = point.revision_id
+              AND blocked_obligation.aoa_deg = point.aoa_deg
+              AND blocked_obligation.state = 'blocked'
+          )
+      )
+  `)) as unknown as Array<{ remote_solved: number }>;
+  const remoteSolved = Number(row?.remote_solved ?? 0);
+  if (remoteSolved > totals.solved) {
+    throw new Error(
+      `campaign ${campaignId} remote completion source exceeds canonical solved total`,
+    );
+  }
+  return {
+    hubSolved: totals.solved - remoteSolved,
+    remoteSolved,
+    derived: totals.derived,
+  };
+}
+
 /** Bounded summary for the 10 s poll: O(conditions), counters only. */
 export async function campaignSummary(
   db: DB,
@@ -7458,6 +7530,11 @@ export async function campaignSummary(
   );
   const progress = await campaignProgressSnapshot(db, campaignId);
   const totals = progress.totals;
+  const completionSources = await campaignCompletionSources(
+    db,
+    campaignId,
+    totals,
+  );
   const tierCounts = await campaignOpenTierCounts(db, campaignId);
   const solverIncidents = await solverIncidentSummary(db, {
     campaignId,
@@ -7584,6 +7661,7 @@ export async function campaignSummary(
           : isoOf(revision.createdAt),
     },
     totals,
+    completionSources,
     remediation: progress.remediation,
     reviewBuckets,
     tierCounts,

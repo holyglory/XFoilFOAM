@@ -354,6 +354,12 @@ def _sync_remote_validation_regression() -> int:
             "@aerodb/sweeper",
             "test/remote-solver-validation.test.ts",
         ),
+        (
+            "db-campaign-completion-sources",
+            "campaign completion source attribution regressions",
+            "@aerodb/db",
+            "test/campaign-remediation-summary.test.ts",
+        ),
     ):
         result = max(
             result,

@@ -1389,6 +1389,75 @@ async function syncAdminPayload(req: FastifyRequest) {
     })
     .from(syncSweepPromisePoints)
     .groupBy(syncSweepPromisePoints.status);
+  const [promisePointContext] = (await db.execute(sql`
+    SELECT
+      count(*) FILTER (
+        WHERE promise.status = 'active' AND point.status = 'active'
+      )::int AS active_remaining_aoas,
+      count(*) FILTER (
+        WHERE promise.status = 'active' AND point.status = 'fulfilled'
+      )::int AS active_accepted_aoas,
+      count(*) FILTER (
+        WHERE point.status = 'fulfilled'
+          AND point.result_id IS NOT NULL
+          AND point.result_attempt_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM sim_campaign_points campaign_point
+            JOIN sim_campaign_conditions campaign_condition
+              ON campaign_condition.id = campaign_point.condition_id
+            JOIN sim_campaigns campaign
+              ON campaign.id = campaign_point.campaign_id
+             AND campaign_condition.generation =
+                 campaign.current_condition_generation
+            JOIN results campaign_result
+              ON campaign_result.id = campaign_point.result_id
+            JOIN result_classifications campaign_classification
+              ON campaign_classification.result_id = campaign_point.result_id
+            WHERE campaign_point.result_id = point.result_id
+              AND campaign_point.result_attempt_id = point.result_attempt_id
+              AND campaign_point.state = 'terminal'
+              AND campaign_point.derived_by_symmetry = false
+              AND campaign_result.status = 'done'
+              AND campaign_classification.state IN (
+                'accepted',
+                'needs_urans',
+                'superseded_by_urans'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM sim_precalc_obligations blocked_obligation
+                WHERE blocked_obligation.airfoil_id =
+                      campaign_point.airfoil_id
+                  AND blocked_obligation.revision_id =
+                      campaign_point.revision_id
+                  AND blocked_obligation.aoa_deg = campaign_point.aoa_deg
+                  AND blocked_obligation.state = 'blocked'
+              )
+          )
+      )::int AS accepted_current_campaign_aoas
+    FROM sync_sweep_promise_points point
+    JOIN sync_sweep_promises promise ON promise.id = point.promise_id
+  `)) as unknown as Array<{
+    active_remaining_aoas: number;
+    active_accepted_aoas: number;
+    accepted_current_campaign_aoas: number;
+  }>;
+  const promiseCounts = Object.fromEntries(
+    promiseRows.map((row) => [row.status, Number(row.n)]),
+  );
+  const pointCounts = Object.fromEntries(
+    pointRows.map((row) => [row.status, Number(row.n)]),
+  );
+  const acceptedAoas = Number(pointCounts.fulfilled ?? 0);
+  const acceptedCurrentCampaignAoas = Number(
+    promisePointContext?.accepted_current_campaign_aoas ?? 0,
+  );
+  if (acceptedCurrentCampaignAoas > acceptedAoas) {
+    throw new Error(
+      "current-campaign remote AoA count exceeds the accepted remote total",
+    );
+  }
   const conflicts = await db
     .select()
     .from(syncImportConflicts)
@@ -1482,12 +1551,17 @@ async function syncAdminPayload(req: FastifyRequest) {
     },
     permissions: permissionRowsForAdmin(permissions),
     promises: {
-      byStatus: Object.fromEntries(
-        promiseRows.map((row) => [row.status, Number(row.n)]),
-      ),
-      pointsByStatus: Object.fromEntries(
-        pointRows.map((row) => [row.status, Number(row.n)]),
-      ),
+      byStatus: promiseCounts,
+      pointsByStatus: pointCounts,
+      live: {
+        activeBundles: Number(promiseCounts.active ?? 0),
+        remainingAoas: Number(promisePointContext?.active_remaining_aoas ?? 0),
+        acceptedAoas: Number(promisePointContext?.active_accepted_aoas ?? 0),
+      },
+      acceptedScope: {
+        currentCampaignAoas: acceptedCurrentCampaignAoas,
+        backgroundAoas: acceptedAoas - acceptedCurrentCampaignAoas,
+      },
     },
     registeredSolvers: solvers.map((row) => ({
       id: row.id,

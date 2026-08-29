@@ -31,6 +31,8 @@ import {
   mediums,
   meshProfiles,
   outputProfiles,
+  resultAttempts,
+  resultClassifications,
   results,
   simCampaignPoints,
   simJobs,
@@ -397,6 +399,127 @@ describe("campaign remediation summary", () => {
         },
       ],
     });
+  });
+
+  it("attributes the exact campaign completion total between hub and remote solver evidence", async () => {
+    const { campaignId, conditions } = await launchCampaign({
+      label: "completion-source-attribution",
+      airfoilId: asymId,
+      speeds: [28.888],
+      from: 0,
+      to: 1,
+    });
+    const condition = conditions[0]!;
+    const solvedRows = await db
+      .insert(results)
+      .values(
+        [0, 1].map((aoaDeg) => ({
+          airfoilId: asymId,
+          bcId: condition.bcId,
+          simulationPresetRevisionId: condition.revisionId,
+          aoaDeg,
+          status: "done" as const,
+          source: "solved" as const,
+          regime: "rans" as const,
+          validForPolar: true,
+          converged: true,
+          stalled: false,
+          solvedAt: new Date(),
+        })),
+      )
+      .returning({ id: results.id, aoaDeg: results.aoaDeg });
+    const attempts: Array<{
+      id: string;
+      aoaDeg: number;
+      attemptId: string;
+    }> = [];
+    for (const result of solvedRows) {
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: result.id,
+          airfoilId: asymId,
+          bcId: condition.bcId,
+          simulationPresetRevisionId: condition.revisionId,
+          aoaDeg: result.aoaDeg,
+          status: "done",
+          source: "solved",
+          regime: "rans",
+          validForPolar: true,
+          converged: true,
+          stalled: false,
+          solvedAt: new Date(),
+        })
+        .returning({ id: resultAttempts.id });
+      attempts.push({ ...result, attemptId: attempt.id });
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attempt.id })
+        .where(eq(results.id, result.id));
+      await db.insert(resultClassifications).values({
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        airfoilId: asymId,
+        simulationPresetRevisionId: condition.revisionId,
+        aoaDeg: result.aoaDeg,
+        regime: "rans",
+        classifierVersion: `${PREFIX}-completion-source-v1`,
+        state: "accepted",
+        reasons: ["fixture-accepted"],
+      });
+      await db
+        .update(simCampaignPoints)
+        .set({
+          state: "terminal",
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+        })
+        .where(
+          and(
+            eq(simCampaignPoints.campaignId, campaignId),
+            eq(simCampaignPoints.conditionId, condition.id),
+            eq(simCampaignPoints.airfoilId, asymId),
+            eq(simCampaignPoints.aoaDeg, result.aoaDeg),
+          ),
+        );
+    }
+    const remote = attempts[0]!;
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        status: "fulfilled",
+        airfoilId: asymId,
+        simulationPresetRevisionId: condition.revisionId,
+        aoaCount: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+        fulfilledAt: new Date(),
+        requestPayload: { remoteSolver: true },
+      })
+      .returning({ id: syncSweepPromises.id });
+    syncPromiseIds.push(promise.id);
+    await db.insert(syncSweepPromisePoints).values({
+      promiseId: promise.id,
+      airfoilId: asymId,
+      simulationPresetRevisionId: condition.revisionId,
+      aoaDeg: remote.aoaDeg,
+      status: "fulfilled",
+      resultId: remote.id,
+      resultAttemptId: remote.attemptId,
+    });
+
+    await recompute(campaignId);
+    const summary = await campaignSummary(db, campaignId);
+    expect(summary.totals).toMatchObject({ solved: 2, derived: 0 });
+    expect(summary.completionSources).toEqual({
+      hubSolved: 1,
+      remoteSolved: 1,
+      derived: 0,
+    });
+    expect(
+      summary.completionSources.hubSolved +
+        summary.completionSources.remoteSolved +
+        summary.completionSources.derived,
+    ).toBe(summary.totals.solved + summary.totals.derived);
   });
 
   it("MUST-CATCH + FALSE-POSITIVE GUARD: only queued results owned by an active job count as running", async () => {

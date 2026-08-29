@@ -47,4 +47,29 @@ describe("registered remote solver responsive layout", () => {
       '["remote_only", "cached", "missing", "failed"]',
     );
   });
+
+  it("separates live promise bundles from all-time individual AoA outcomes", () => {
+    expect(source).toContain("REMOTE SOLVER WORK");
+    expect(source).toContain("active promise bundles");
+    expect(source).toContain("INDIVIDUAL AOA OUTCOMES · ALL TIME");
+    expect(source).toContain("PROMISE BUNDLE OUTCOMES · ALL TIME");
+    expect(source).toContain("Current campaign plans");
+    expect(source).toContain("Background solves");
+    expect(source).toContain("Released for another solve");
+    expect(source).toContain(
+      "Accepted AoAs remain stored if unfinished AoAs are",
+    );
+    expect(source).not.toContain(
+      '{["active", "fulfilled", "expired", "cancelled"].map(',
+    );
+  });
+
+  it("gives the promise summary responsive named regions and readable insets", () => {
+    expect(source).toContain('className="sync-promise-card"');
+    expect(source).toContain('data-ui-region="sync-promise-summary"');
+    expect(source).toContain('data-ui-verify-min-content-inset="12"');
+    expect(source).toMatch(
+      /\.sync-promise-row\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\) auto/,
+    );
+  });
 });
