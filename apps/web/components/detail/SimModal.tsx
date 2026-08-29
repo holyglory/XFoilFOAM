@@ -2739,6 +2739,7 @@ function EvidenceMediaImage({
   "data-testid": string;
 }) {
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
 
   useEffect(() => {
     if (failedSrc !== src) return;
@@ -2754,14 +2755,24 @@ function EvidenceMediaImage({
       />
     );
   }
+  const loaded = loadedSrc === src;
   return (
-    <img
-      data-testid={testId}
-      src={src}
-      alt={alt}
-      style={style}
-      onError={() => setFailedSrc(src)}
-    />
+    <>
+      {!loaded && (
+        <MediaEmpty
+          testId="sim-media-loading"
+          text="Loading the selected stored media…"
+        />
+      )}
+      <img
+        data-testid={testId}
+        src={src}
+        alt={alt}
+        style={{ ...style, display: loaded ? style.display : "none" }}
+        onLoad={() => setLoadedSrc(src)}
+        onError={() => setFailedSrc(src)}
+      />
+    </>
   );
 }
 

@@ -15,6 +15,9 @@ describe("solver terminology contract", () => {
     expect(simModal).toContain("function EvidenceMediaImage");
     expect(simModal).toContain("onError={() => setFailedSrc(src)}");
     expect(simModal).toContain('testId="sim-media-unavailable"');
+    expect(simModal).toContain('testId="sim-media-loading"');
+    expect(simModal).toContain("onLoad={() => setLoadedSrc(src)}");
+    expect(simModal).toContain('display: loaded ? style.display : "none"');
     expect(simModal).toContain(
       "Stored media is temporarily unavailable. This frame will retry automatically.",
     );
