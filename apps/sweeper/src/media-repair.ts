@@ -423,10 +423,13 @@ export async function resultMediaRepairBatch(
       "result media repair concurrency must be a positive integer",
     );
   }
-  const prepared = await prepareResultMediaRepairPass(db, opts);
+  // Discovery/finalization scans are independent of already-ready claims.
+  // Run them beside the expensive engine work: waiting for a full campaign
+  // scan before every two-result batch added ~15 idle seconds in production.
+  const preparedPromise = prepareResultMediaRepairPass(db, opts);
   // Claim sequentially so each committed running owner is visible to the next
   // selector's same-scale-scope exclusion. Rendering remains parallel.
-  const repaired = await runBoundedClaimBatch({
+  const repairedPromise = runBoundedClaimBatch({
     concurrency: opts.concurrency,
     // One lane keeps newly completed live-campaign evidence close to real
     // time; the remaining lanes start at the oldest debt and drain it.
@@ -438,6 +441,10 @@ export async function resultMediaRepairBatch(
     run: (claim: ClaimedResultMediaRepair) =>
       repairClaimedResultMedia(db, engine, opts, claim),
   });
+  const [prepared, repaired] = await Promise.all([
+    preparedPromise,
+    repairedPromise,
+  ]);
   const dirty = new Map<string, CampaignLaneKey>();
   for (const lane of prepared.dirtyLanes) dirty.set(laneKeyId(lane), lane);
   for (const outcome of repaired) {

@@ -465,6 +465,22 @@ def _storage_retention_regression() -> int:
             ],
         ),
         (
+            "api-sim-detail",
+            "bounded simulation-detail evidence payload regression",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/api",
+                "exec",
+                "vitest",
+                "run",
+                "test/catalog.test.ts",
+                "-t",
+                "exposes the URANS frame track",
+            ],
+        ),
+        (
             "web-media-fallback",
             "stored media failure presentation regression",
             [

@@ -363,25 +363,50 @@ async function solvedDetail(
       entry.imageUrl = resultMediaUrl(mrow.id);
     }
   }
-  const allEvidenceRows = await db
-    .select()
-    .from(solverEvidenceArtifacts)
-    .where(
-      and(
-        eq(solverEvidenceArtifacts.resultId, r.id),
-        eq(solverEvidenceArtifacts.resultAttemptId, r.currentResultAttemptId!),
-      ),
-    )
-    .orderBy(desc(solverEvidenceArtifacts.createdAt));
-  // Per-frame URANS PNGs feed frameTrack.frames[].imageUrls; keeping their
-  // <=240 rows out of the generic evidenceArtifacts list keeps the payload
-  // bounded and the evidence panel readable.
-  const frameArtifacts = allEvidenceRows.filter(
-    (row) => row.kind === FRAME_IMAGE_ARTIFACT_KIND,
-  );
-  const evidenceRows = allEvidenceRows.filter(
-    (row) => row.kind !== FRAME_IMAGE_ARTIFACT_KIND,
-  );
+  // The modal needs the immutable archive and a concise scientific evidence
+  // index, not thousands of individual tar members. A legacy result can own
+  // 2,000+ time-directory rows; serializing those made the browser spend tens
+  // of seconds parsing/rendering a multi-megabyte payload before media controls
+  // appeared. The aggregate engine/openfoam bundle remains a lossless download
+  // of every omitted mesh, dictionary, and time-directory member.
+  const [frameArtifacts, evidenceRows] = await Promise.all([
+    db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, r.id),
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            r.currentResultAttemptId!,
+          ),
+          eq(solverEvidenceArtifacts.kind, FRAME_IMAGE_ARTIFACT_KIND),
+        ),
+      )
+      .orderBy(desc(solverEvidenceArtifacts.createdAt)),
+    db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, r.id),
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            r.currentResultAttemptId!,
+          ),
+          inArray(solverEvidenceArtifacts.kind, [
+            "manifest",
+            "engine_bundle",
+            "openfoam_bundle",
+            "vtk_window",
+            "log",
+            "force_coefficients",
+            "field_data",
+          ]),
+        ),
+      )
+      .orderBy(desc(solverEvidenceArtifacts.createdAt)),
+  ]);
   const [hist] = await db
     .select()
     .from(forceHistory)

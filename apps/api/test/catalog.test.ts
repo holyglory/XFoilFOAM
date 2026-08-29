@@ -1437,9 +1437,43 @@ describe("simulation media evidence", () => {
         metadata: { frameIndex: index },
       })),
     );
-    await createExactResultAttemptFixture(db, tracked.id, {
-      publication: "selected-eligible",
-    });
+    const trackedAttemptId = await createExactResultAttemptFixture(
+      db,
+      tracked.id,
+      {
+        publication: "selected-eligible",
+      },
+    );
+    await db.insert(solverEvidenceArtifacts).values([
+      ...Array.from({ length: 250 }, (_, index) => ({
+        resultId: tracked.id,
+        resultAttemptId: trackedAttemptId,
+        airfoilId: airfoil.id,
+        engineJobId: "ft-job",
+        engineCaseSlug: "ft-case",
+        aoaDeg: 18,
+        kind: "time_directory" as const,
+        storageKey: `jobs/ft-job/cases/ft-case/evidence/time/${index}/U`,
+        mimeType: "application/octet-stream",
+        sha256: fixtureSha256(`time-directory:${index}`),
+        byteSize: 2048 + index,
+        metadata: { timeIndex: index },
+      })),
+      {
+        resultId: tracked.id,
+        resultAttemptId: trackedAttemptId,
+        airfoilId: airfoil.id,
+        engineJobId: "ft-job",
+        engineCaseSlug: "ft-case",
+        aoaDeg: 18,
+        kind: "log" as const,
+        storageKey: "jobs/ft-job/cases/ft-case/evidence/log.solver",
+        mimeType: "text/plain",
+        sha256: fixtureSha256("bounded-detail-log"),
+        byteSize: 4096,
+        metadata: { role: "solver-log" },
+      },
+    ]);
     const trackedRefresh = await refreshPolarCacheForRevision(
       db,
       airfoil.id,
@@ -1477,6 +1511,15 @@ describe("simulation media evidence", () => {
         (artifact) => artifact.kind === "frame_image",
       ),
     ).toBe(false);
+    expect(
+      sim?.evidenceArtifacts?.some(
+        (artifact) => artifact.kind === "time_directory",
+      ),
+    ).toBe(false);
+    expect(
+      sim?.evidenceArtifacts?.some((artifact) => artifact.kind === "log"),
+    ).toBe(true);
+    expect(sim?.evidenceArtifacts?.length).toBeLessThan(20);
   });
 });
 
