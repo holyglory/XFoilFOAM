@@ -754,6 +754,35 @@ afterAll(async () => {
 });
 
 describe("durable result media repair", () => {
+  it("renders every evidence-backed field in one engine pass per shared scale version", async () => {
+    const fixture = await createSolvedResult("batched-field-render", {
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    const requests: RenderDefaultMediaRequest[] = [];
+    const outcome = await resultMediaRepairTick(
+      db,
+      engineWith({
+        render: async (jobId, request) => {
+          requests.push(request);
+          return completeMediaResponse(jobId, request);
+        },
+      }),
+      { resultId: fixture.resultId },
+    );
+
+    expect(outcome.finalized).toBe(1);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.fields).toEqual(["velocity_magnitude", "pressure"]);
+    expect(
+      await db
+        .select()
+        .from(resultMedia)
+        .where(eq(resultMedia.resultId, fixture.resultId)),
+    ).toHaveLength(2);
+  });
+
   it("MUST-CATCH: defers default-media rendering while its producing CFD job is still running", async () => {
     const airfoilId = await createAirfoil("active-producer");
     const [job] = await db
@@ -2376,6 +2405,175 @@ describe("durable result media repair", () => {
     expect(blocked.state).toBe("blocked");
     expect(blocked.attemptCount).toBe(3);
     expect(blocked.lastError).toContain("raw evidence unavailable");
+  });
+
+  it("keeps one live-campaign lane fresh while backlog order remains available", async () => {
+    const background = await createSolvedResult("claim-priority-background", {
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    const campaignOlder = await createSolvedResult(
+      "claim-priority-campaign-older",
+      {
+        unsteady: false,
+        fidelity: "rans",
+        regime: "rans",
+      },
+    );
+    const campaignNewest = await createSolvedResult(
+      "claim-priority-campaign-newest",
+      {
+        unsteady: false,
+        fidelity: "rans",
+        regime: "rans",
+      },
+    );
+    const [campaign] = await db
+      .insert(simCampaigns)
+      .values({
+        slug: `${PREFIX}-media-claim-priority`,
+        name: `${PREFIX} media claim priority`,
+        idempotencyKey: `${PREFIX}-media-claim-priority-key`,
+        priority: 9,
+        status: "active",
+      })
+      .returning();
+    campaignIds.push(campaign.id);
+    const [plan] = await db
+      .insert(simCampaignPlanRevisions)
+      .values({
+        campaignId: campaign.id,
+        revisionNumber: 1,
+        kind: "initial",
+        plan: {},
+        summary: {},
+      })
+      .returning();
+    await db
+      .update(simCampaigns)
+      .set({ currentPlanRevisionId: plan.id })
+      .where(eq(simCampaigns.id, campaign.id));
+    await db.insert(simCampaignAirfoils).values([
+      {
+        campaignId: campaign.id,
+        airfoilId: campaignOlder.airfoilId,
+      },
+      {
+        campaignId: campaign.id,
+        airfoilId: campaignNewest.airfoilId,
+      },
+    ]);
+    const [condition] = await db
+      .insert(simCampaignConditions)
+      .values({
+        campaignId: campaign.id,
+        ord: 1,
+        flowConditionId: flowId,
+        referenceGeometryProfileId: referenceGeometryId,
+        presetId,
+        simulationPresetRevisionId: revisionId,
+        reynolds: 250_000,
+        mach: 0.07,
+        introducedInPlanRevisionId: plan.id,
+      })
+      .returning();
+    await db.insert(simCampaignPoints).values(
+      [campaignOlder, campaignNewest].map((fixture) => ({
+        campaignId: campaign.id,
+        conditionId: condition.id,
+        airfoilId: fixture.airfoilId,
+        aoaDeg: 6,
+        revisionId,
+        planRevisionNumber: 1,
+        state: "terminal" as const,
+        resultId: fixture.resultId,
+        resultAttemptId: fixture.resultAttemptId,
+      })),
+    );
+
+    const now = new Date();
+    await db
+      .update(resultAttempts)
+      .set({ solvedAt: new Date(now.getTime() - 2 * 60 * 60_000) })
+      .where(eq(resultAttempts.id, campaignOlder.resultAttemptId));
+    for (const fixture of [background, campaignOlder, campaignNewest]) {
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+        now,
+      });
+    }
+    await db
+      .update(resultMediaRepairs)
+      .set({ nextAttemptAt: new Date(now.getTime() - 60 * 60_000) })
+      .where(eq(resultMediaRepairs.resultId, background.resultId));
+
+    const candidates = [
+      background.resultId,
+      campaignOlder.resultId,
+      campaignNewest.resultId,
+    ];
+    const newestClaim = await claimNextResultMediaRepair(db, {
+      resultIds: candidates,
+      now,
+      preferNewestLive: true,
+    });
+    expect(newestClaim?.resultId).toBe(campaignNewest.resultId);
+
+    const backlogClaim = await claimNextResultMediaRepair(db, {
+      resultIds: candidates,
+      now,
+    });
+    expect(backlogClaim?.resultId).toBe(campaignOlder.resultId);
+  });
+
+  it("serializes claims that would mutate one shared scale scope", async () => {
+    const airfoilId = await createAirfoil("parallel-scale-scope");
+    const first = await createSolvedResult("parallel-scale-scope-a", {
+      airfoilId,
+      aoa: 1,
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    const sameScope = await createSolvedResult("parallel-scale-scope-b", {
+      airfoilId,
+      aoa: 2,
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    const independent = await createSolvedResult("parallel-scale-scope-c", {
+      aoa: 3,
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    for (const fixture of [first, sameScope, independent]) {
+      await discoverMissingResultMediaRepairs(db, {
+        resultId: fixture.resultId,
+      });
+    }
+    const candidates = [
+      first.resultId,
+      sameScope.resultId,
+      independent.resultId,
+    ];
+    const claimedFirst = await claimNextResultMediaRepair(db, {
+      resultIds: candidates,
+    });
+    expect([first.resultId, sameScope.resultId]).toContain(
+      claimedFirst?.resultId,
+    );
+    const claimedSecond = await claimNextResultMediaRepair(db, {
+      resultIds: candidates,
+    });
+    expect(claimedSecond?.resultId).toBe(independent.resultId);
+    expect(
+      await claimNextResultMediaRepair(db, {
+        resultIds: [first.resultId, sameScope.resultId],
+      }),
+    ).toBeNull();
   });
 
   it("does not let an unchanged blocked prefix consume the discovery limit", async () => {

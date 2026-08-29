@@ -625,8 +625,26 @@ export async function discoverMissingResultMediaRepairs(
 /** One atomic claim; safe across multiple sweeper instances. */
 export async function claimNextResultMediaRepair(
   db: DB,
-  opts: { now?: Date; leaseMs?: number; resultId?: string } = {},
+  opts: {
+    now?: Date;
+    leaseMs?: number;
+    resultId?: string;
+    resultIds?: string[];
+    preferNewestLive?: boolean;
+  } = {},
 ): Promise<ResultMediaRepair | null> {
+  if (opts.resultId && opts.resultIds) {
+    throw new Error(
+      "media repair claim accepts resultId or resultIds, not both",
+    );
+  }
+  if (opts.resultIds?.length === 0) return null;
+  const resultFilter = opts.resultIds
+    ? sql`repair.result_id = ANY(${sql`ARRAY[${sql.join(
+        opts.resultIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`})`
+    : sql`true`;
   const now = opts.now ?? new Date();
   const leaseMs = Math.max(
     30_000,
@@ -640,9 +658,18 @@ export async function claimNextResultMediaRepair(
       SELECT repair.id
       FROM result_media_repairs repair
       JOIN result_attempts attempt ON attempt.id = repair.result_attempt_id
+      JOIN results repair_result ON repair_result.id = repair.result_id
       LEFT JOIN sim_jobs producing_job ON producing_job.id = attempt.sim_job_id
+      LEFT JOIN LATERAL (
+        SELECT max(campaign.priority)::int AS priority
+        FROM sim_campaign_points point
+        JOIN sim_campaigns campaign ON campaign.id = point.campaign_id
+        WHERE point.result_id = repair.result_id
+          AND campaign.status IN ('active', 'attention', 'paused')
+      ) live_campaign ON true
       WHERE repair.state IN ('pending', 'retry_wait')
         AND (${opts.resultId ?? null}::uuid IS NULL OR repair.result_id = ${opts.resultId ?? null}::uuid)
+        AND ${resultFilter}
         AND (
           producing_job.id IS NULL
           OR producing_job.status IN ('done', 'failed', 'cancelled')
@@ -656,7 +683,30 @@ export async function claimNextResultMediaRepair(
             AND delivered_generation.result_attempt_id = repair.result_attempt_id
             AND delivered_generation.state IN ('delivered', 'superseded')
         )
-      ORDER BY repair.next_attempt_at, repair."createdAt", repair.id
+        -- Shared color scales are owned by airfoil + immutable setup + field.
+        -- Let different airfoils render in parallel, but never let two AoAs
+        -- in the same scale scope create competing versions concurrently.
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_media_repairs active_repair
+          JOIN results active_result ON active_result.id = active_repair.result_id
+          WHERE active_repair.state = 'running'
+            AND active_repair.id <> repair.id
+            AND active_result.airfoil_id = repair_result.airfoil_id
+            AND active_result.simulation_preset_revision_id
+              IS NOT DISTINCT FROM repair_result.simulation_preset_revision_id
+        )
+      ORDER BY
+        (live_campaign.priority IS NOT NULL) DESC,
+        live_campaign.priority DESC NULLS LAST,
+        CASE
+          WHEN ${Boolean(opts.preferNewestLive)} AND live_campaign.priority IS NOT NULL
+            THEN COALESCE(attempt."solvedAt", attempt."createdAt")
+          ELSE NULL
+        END DESC NULLS LAST,
+        repair.next_attempt_at,
+        repair."createdAt",
+        repair.id
       FOR UPDATE OF repair SKIP LOCKED
       LIMIT 1
     )

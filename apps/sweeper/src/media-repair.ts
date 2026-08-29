@@ -43,6 +43,40 @@ export interface ResultMediaRepairTickOutcome {
   dirtyLanes: CampaignLaneKey[];
 }
 
+export interface ResultMediaRepairBatchOutcome extends ResultMediaRepairTickOutcome {
+  claimedCount: number;
+}
+
+export interface ResultMediaRepairTickOptions {
+  discoveryLimit?: number;
+  finalizeLimit?: number;
+  resultId?: string;
+  /** The scheduler owns sweeper liveness. A dedicated media-repair process
+   * deliberately leaves it untouched, while still renewing its own durable
+   * repair lease around each expensive engine operation. */
+  heartbeat?: () => Promise<void>;
+}
+
+/** Resolve ownership one row at a time, then run only those fenced owners in
+ * parallel. Sequential claiming makes each committed running scale scope
+ * visible to the next selector while preserving bounded render concurrency. */
+export async function runBoundedClaimBatch<Claim, Outcome>(opts: {
+  concurrency: number;
+  claim: (index: number) => Promise<Claim | null>;
+  run: (claim: Claim) => Promise<Outcome>;
+}): Promise<Outcome[]> {
+  if (!Number.isInteger(opts.concurrency) || opts.concurrency < 1) {
+    throw new Error("claim batch concurrency must be a positive integer");
+  }
+  const claims: Claim[] = [];
+  for (let index = 0; index < opts.concurrency; index++) {
+    const claim = await opts.claim(index);
+    if (claim == null) break;
+    claims.push(claim);
+  }
+  return Promise.all(claims.map((claim) => opts.run(claim)));
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -200,19 +234,9 @@ export async function finalizeSatisfiedResultMediaRepairs(
   return { finalized, dirtyLanes: [...dirty.values()] };
 }
 
-/** One bounded production repair pass (at most one expensive render claim). */
-export async function resultMediaRepairTick(
+async function prepareResultMediaRepairPass(
   db: DB,
-  engine: EngineClient,
-  opts: {
-    discoveryLimit?: number;
-    finalizeLimit?: number;
-    resultId?: string;
-    /** The scheduler owns sweeper liveness. A dedicated media-repair process
-     * deliberately leaves it untouched, while still renewing its own durable
-     * repair lease around each expensive engine operation. */
-    heartbeat?: () => Promise<void>;
-  } = {},
+  opts: ResultMediaRepairTickOptions,
 ): Promise<ResultMediaRepairTickOutcome> {
   const dirty = new Map<string, CampaignLaneKey>();
   const discovered = await discoverMissingResultMediaRepairs(db, {
@@ -240,24 +264,31 @@ export async function resultMediaRepairTick(
   // A media-complete running row was finalized above; only genuinely
   // incomplete expired owners consume another bounded attempt here.
   const healed = await healExpiredResultMediaRepairClaims(db);
-  const claim = await claimNextResultMediaRepair(db, {
-    resultId: opts.resultId,
-  });
-  if (!claim) {
-    return {
-      discovered,
-      finalized: pre.finalized,
-      claimed: false,
-      repairedMedia: 0,
-      retrying: healed.retrying,
-      blocked: reconciledBlocked + healed.blocked,
-      dirtyLanes: [...dirty.values()],
-    };
-  }
+  return {
+    discovered,
+    finalized: pre.finalized,
+    claimed: false,
+    repairedMedia: 0,
+    retrying: healed.retrying,
+    blocked: reconciledBlocked + healed.blocked,
+    dirtyLanes: [...dirty.values()],
+  };
+}
 
+type ClaimedResultMediaRepair = NonNullable<
+  Awaited<ReturnType<typeof claimNextResultMediaRepair>>
+>;
+
+async function repairClaimedResultMedia(
+  db: DB,
+  engine: EngineClient,
+  opts: ResultMediaRepairTickOptions,
+  claim: ClaimedResultMediaRepair,
+): Promise<ResultMediaRepairTickOutcome> {
+  const dirty = new Map<string, CampaignLaneKey>();
   let repairedMedia = 0;
-  let retrying = healed.retrying;
-  let blocked = reconciledBlocked + healed.blocked;
+  let retrying = 0;
+  let blocked = 0;
   try {
     if (!claim.claimToken) {
       throw new Error("claimed result media repair has no ownership token");
@@ -284,7 +315,9 @@ export async function resultMediaRepairTick(
     repairedMedia = repaired.mediaCount;
     const post = await finalizeSatisfiedResultMediaRepairs(db, {
       limit: opts.finalizeLimit,
-      resultId: opts.resultId,
+      // Parallel workers finalize only their own result. This prevents two
+      // otherwise independent claims from racing the same downstream hooks.
+      resultId: claim.resultId,
     });
     for (const lane of post.dirtyLanes) dirty.set(laneKeyId(lane), lane);
     const [settled] = await db
@@ -298,8 +331,8 @@ export async function resultMediaRepairTick(
       );
     }
     return {
-      discovered,
-      finalized: pre.finalized + post.finalized,
+      discovered: 0,
+      finalized: post.finalized,
       claimed: true,
       repairedMedia,
       retrying,
@@ -321,8 +354,8 @@ export async function resultMediaRepairTick(
         `(repair ${claim.id}, result ${claim.resultId}, attempt ${claim.attemptCount}/${claim.maxAttempts}): ${errorMessage(error)}`,
     );
     return {
-      discovered,
-      finalized: pre.finalized,
+      discovered: 0,
+      finalized: 0,
       claimed: true,
       repairedMedia,
       retrying,
@@ -330,4 +363,103 @@ export async function resultMediaRepairTick(
       dirtyLanes: [...dirty.values()],
     };
   }
+}
+
+async function repairNextResultMediaClaim(
+  db: DB,
+  engine: EngineClient,
+  opts: ResultMediaRepairTickOptions,
+): Promise<ResultMediaRepairTickOutcome> {
+  const claim = await claimNextResultMediaRepair(db, {
+    resultId: opts.resultId,
+  });
+  if (!claim) {
+    return {
+      discovered: 0,
+      finalized: 0,
+      claimed: false,
+      repairedMedia: 0,
+      retrying: 0,
+      blocked: 0,
+      dirtyLanes: [],
+    };
+  }
+  return repairClaimedResultMedia(db, engine, opts, claim);
+}
+
+/** One bounded production repair pass (at most one expensive render claim). */
+export async function resultMediaRepairTick(
+  db: DB,
+  engine: EngineClient,
+  opts: ResultMediaRepairTickOptions = {},
+): Promise<ResultMediaRepairTickOutcome> {
+  const prepared = await prepareResultMediaRepairPass(db, opts);
+  const repaired = await repairNextResultMediaClaim(db, engine, opts);
+  const dirty = new Map<string, CampaignLaneKey>();
+  for (const lane of [...prepared.dirtyLanes, ...repaired.dirtyLanes]) {
+    dirty.set(laneKeyId(lane), lane);
+  }
+  return {
+    discovered: prepared.discovered,
+    finalized: prepared.finalized + repaired.finalized,
+    claimed: repaired.claimed,
+    repairedMedia: repaired.repairedMedia,
+    retrying: prepared.retrying + repaired.retrying,
+    blocked: prepared.blocked + repaired.blocked,
+    dirtyLanes: [...dirty.values()],
+  };
+}
+
+/** One maintenance pass plus a bounded set of independent expensive claims.
+ * Database SKIP LOCKED ownership and per-result repair fences remain the
+ * authority; callers never share a claim token across renderers. */
+export async function resultMediaRepairBatch(
+  db: DB,
+  engine: EngineClient,
+  opts: ResultMediaRepairTickOptions & { concurrency: number },
+): Promise<ResultMediaRepairBatchOutcome> {
+  if (!Number.isInteger(opts.concurrency) || opts.concurrency < 1) {
+    throw new Error(
+      "result media repair concurrency must be a positive integer",
+    );
+  }
+  const prepared = await prepareResultMediaRepairPass(db, opts);
+  // Claim sequentially so each committed running owner is visible to the next
+  // selector's same-scale-scope exclusion. Rendering remains parallel.
+  const repaired = await runBoundedClaimBatch({
+    concurrency: opts.concurrency,
+    // One lane keeps newly completed live-campaign evidence close to real
+    // time; the remaining lanes start at the oldest debt and drain it.
+    claim: (index) =>
+      claimNextResultMediaRepair(db, {
+        resultId: opts.resultId,
+        preferNewestLive: index === 0 && !opts.resultId,
+      }),
+    run: (claim: ClaimedResultMediaRepair) =>
+      repairClaimedResultMedia(db, engine, opts, claim),
+  });
+  const dirty = new Map<string, CampaignLaneKey>();
+  for (const lane of prepared.dirtyLanes) dirty.set(laneKeyId(lane), lane);
+  for (const outcome of repaired) {
+    for (const lane of outcome.dirtyLanes) dirty.set(laneKeyId(lane), lane);
+  }
+  return {
+    discovered: prepared.discovered,
+    finalized:
+      prepared.finalized +
+      repaired.reduce((sum, outcome) => sum + outcome.finalized, 0),
+    claimed: repaired.some((outcome) => outcome.claimed),
+    claimedCount: repaired.filter((outcome) => outcome.claimed).length,
+    repairedMedia: repaired.reduce(
+      (sum, outcome) => sum + outcome.repairedMedia,
+      0,
+    ),
+    retrying:
+      prepared.retrying +
+      repaired.reduce((sum, outcome) => sum + outcome.retrying, 0),
+    blocked:
+      prepared.blocked +
+      repaired.reduce((sum, outcome) => sum + outcome.blocked, 0),
+    dirtyLanes: [...dirty.values()],
+  };
 }

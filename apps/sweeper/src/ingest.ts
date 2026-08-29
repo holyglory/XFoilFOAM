@@ -2904,36 +2904,71 @@ function completeRenderedMediaForField(
   return accepted;
 }
 
-async function renderScaledMediaRows(opts: {
+interface SelectedFieldScale {
+  id: string;
+  version: number;
+  vmin: number;
+  vmax: number;
+  policy: string;
+}
+
+interface RenderedMediaRow {
+  resultId: string;
+  resultAttemptId: string;
+  evidenceSha256: string;
+  media: RenderedDefaultMedia[];
+}
+
+/** Long archive hydration and video encoding must not silently outlive the
+ * exact repair lease. Keep renewal single-flight while the engine request is
+ * pending; a lost fence fails the caller even if the engine later finishes
+ * writing unregistered local presentation bytes. */
+async function withPeriodicMediaRepairHeartbeat<T>(
+  operation: () => Promise<T>,
+  heartbeat: () => Promise<void>,
+): Promise<T> {
+  let heartbeatInFlight = false;
+  let rejectHeartbeat!: (reason: unknown) => void;
+  const heartbeatFailure = new Promise<never>((_resolve, reject) => {
+    rejectHeartbeat = reject;
+  });
+  const timer = setInterval(() => {
+    if (heartbeatInFlight) return;
+    heartbeatInFlight = true;
+    void heartbeat()
+      .catch(rejectHeartbeat)
+      .finally(() => {
+        heartbeatInFlight = false;
+      });
+  }, 20_000);
+  timer.unref();
+  try {
+    return await Promise.race([operation(), heartbeatFailure]);
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+/** Render every field that shares one scale-version directory in one engine
+ * call. The Python renderer deliberately reads each VTK frame once for all
+ * requested fields; issuing one request per field throws that optimization
+ * away and makes a legacy repair backlog take days. */
+async function renderScaledMediaRowsForFields(opts: {
   db: DB;
   engine: EngineClient;
   resultRows: (typeof results.$inferSelect)[];
-  field: ImageFieldName;
-  scale: {
-    id: string;
-    version: number;
-    vmin: number;
-    vmax: number;
-    policy: string;
-  };
+  fields: Array<{ field: ImageFieldName; scale: SelectedFieldScale }>;
+  renderVersion: number;
   airfoilPoints: [number, number][];
   heartbeat: () => Promise<void>;
   sourceMode?: "auto" | "archive";
   remote?: RemoteEvidencePointerPayload;
-}): Promise<
-  {
-    resultId: string;
-    resultAttemptId: string;
-    evidenceSha256: string;
-    media: RenderedDefaultMedia[];
-  }[]
-> {
-  const rendered: {
-    resultId: string;
-    resultAttemptId: string;
-    evidenceSha256: string;
-    media: RenderedDefaultMedia[];
-  }[] = [];
+}): Promise<RenderedMediaRow[]> {
+  if (!opts.fields.length) return [];
+  if (opts.fields.some(({ scale }) => scale.version !== opts.renderVersion)) {
+    throw new Error("default-media render batch mixed scale versions");
+  }
+  const rendered: RenderedMediaRow[] = [];
   for (const result of opts.resultRows) {
     if (
       !result.engineJobId ||
@@ -2972,35 +3007,60 @@ async function renderScaledMediaRows(opts: {
     // VTK window creates an impossible repair obligation. Truly unsteady
     // evidence remains fail-closed on mean fields and real videos.
     const requiresTransientMedia = result.unsteady;
-    const response = await opts.engine.renderDefaultMedia(result.engineJobId, {
-      case_slug: result.engineCaseSlug,
-      evidence_base: manifest.evidenceBase,
-      airfoil_points: opts.airfoilPoints,
-      chord: result.chord,
-      speed: result.speed,
-      fields: [opts.field],
-      scales: {
-        [opts.field]: { vmin: opts.scale.vmin, vmax: opts.scale.vmax },
-      },
-      unsteady: requiresTransientMedia,
-      zoom_chords: 2,
-      scale_version: opts.scale.version,
-      render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
-      source_mode: opts.sourceMode ?? "auto",
-      remote: opts.remote,
-    });
+    const fields = opts.fields.map(({ field }) => field);
+    const scales = Object.fromEntries(
+      opts.fields.map(({ field, scale }) => [
+        field,
+        { vmin: scale.vmin, vmax: scale.vmax },
+      ]),
+    ) as Record<ImageFieldName, { vmin: number; vmax: number }>;
+    const response = await withPeriodicMediaRepairHeartbeat(
+      () =>
+        opts.engine.renderDefaultMedia(result.engineJobId!, {
+          case_slug: result.engineCaseSlug!,
+          evidence_base: manifest.evidenceBase,
+          airfoil_points: opts.airfoilPoints,
+          chord: result.chord!,
+          speed: result.speed!,
+          fields,
+          scales,
+          unsteady: requiresTransientMedia,
+          zoom_chords: 2,
+          scale_version: opts.renderVersion,
+          render_profile_key: DEFAULT_RENDER_PROFILE_KEY,
+          source_mode: opts.sourceMode ?? "auto",
+          remote: opts.remote,
+        }),
+      opts.heartbeat,
+    );
     rendered.push({
       resultId: result.id,
       resultAttemptId: result.currentResultAttemptId,
       evidenceSha256: manifest.sha256,
-      media: completeRenderedMediaForField(
-        response,
-        opts.field,
-        requiresTransientMedia,
+      media: fields.flatMap((field) =>
+        completeRenderedMediaForField(response, field, requiresTransientMedia),
       ),
     });
   }
   return rendered;
+}
+
+async function renderScaledMediaRows(opts: {
+  db: DB;
+  engine: EngineClient;
+  resultRows: (typeof results.$inferSelect)[];
+  field: ImageFieldName;
+  scale: SelectedFieldScale;
+  airfoilPoints: [number, number][];
+  heartbeat: () => Promise<void>;
+  sourceMode?: "auto" | "archive";
+  remote?: RemoteEvidencePointerPayload;
+}): Promise<RenderedMediaRow[]> {
+  return renderScaledMediaRowsForFields({
+    ...opts,
+    fields: [{ field: opts.field, scale: opts.scale }],
+    renderVersion: opts.scale.version,
+  });
 }
 
 async function registerRenderedMediaSet(
@@ -3056,7 +3116,7 @@ async function registerRenderedMediaSet(
   return count;
 }
 
-async function rebalanceFieldScales(opts: {
+interface RebalanceFieldScaleOptions {
   db: DB;
   engine: EngineClient;
   groups: Map<ScaleGroupKey, ScaleGroup>;
@@ -3076,7 +3136,288 @@ async function rebalanceFieldScales(opts: {
   /** Exact GCS generation for a brokered result whose engine job is not
    * present on this node. Only durable single-result archive repairs set it. */
   remote?: RemoteEvidencePointerPayload;
-}): Promise<number> {
+}
+
+interface RepairFieldScalePlan {
+  group: ScaleGroup;
+  scale: SelectedFieldScale;
+  created: boolean;
+  evidenceSha256: string;
+}
+
+/** A durable repair owns one result, so its evidence can be rendered in
+ * multi-field batches without crossing the repair fence. Fields are grouped
+ * by their independent scale version because the engine's immutable output
+ * directory is version-addressed; within each group it reads every VTK frame
+ * once and produces all requested fields. */
+async function rebalanceRepairFieldScales(
+  opts: RebalanceFieldScaleOptions & {
+    repairFence: MediaRepairWriteFence;
+    repairSource: typeof results.$inferSelect;
+  },
+): Promise<number> {
+  const plans: RepairFieldScalePlan[] = [];
+  for (const group of opts.groups.values()) {
+    if (
+      group.changedResultIds.size !== 1 ||
+      !group.changedResultIds.has(opts.repairSource.id)
+    ) {
+      throw new Error(
+        "durable media repair scale batch must own exactly one result",
+      );
+    }
+    await opts.heartbeat();
+    const extents = await opts.db
+      .select()
+      .from(resultFieldExtents)
+      .where(
+        and(
+          eq(resultFieldExtents.airfoilId, group.airfoilId),
+          eq(
+            resultFieldExtents.simulationPresetRevisionId,
+            group.presetRevisionId,
+          ),
+          eq(resultFieldExtents.field, group.field),
+          eq(resultFieldExtents.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+          sql`(
+            EXISTS (
+              SELECT 1 FROM results current_result
+              WHERE current_result.id = ${resultFieldExtents.resultId}
+                AND current_result.current_result_attempt_id = ${resultFieldExtents.resultAttemptId}
+            )
+            OR (
+              ${resultFieldExtents.resultId} = ${opts.repairSource.id}::uuid
+              AND ${resultFieldExtents.resultAttemptId} = ${opts.repairSource.currentResultAttemptId}::uuid
+            )
+          )`,
+        ),
+      );
+    if (!extents.length) continue;
+    const ownedExtent = extents.find(
+      (extent) => extent.resultId === opts.repairSource.id,
+    );
+    if (!ownedExtent) {
+      throw new Error(
+        `durable media repair has no owned ${group.field} extent`,
+      );
+    }
+    const normalized = normalizeScale(
+      group.field,
+      Math.min(...extents.map((row) => row.vmin)),
+      Math.max(...extents.map((row) => row.vmax)),
+    );
+    const evidenceSignature = stableHash(
+      extents
+        .map((row) => ({
+          resultId: row.resultId,
+          field: row.field,
+          min: row.vmin,
+          max: row.vmax,
+          evidenceSha256: row.evidenceSha256,
+        }))
+        .sort((a, b) => a.resultId.localeCompare(b.resultId)),
+    );
+    const [active] = await opts.db
+      .select()
+      .from(fieldColorScales)
+      .where(
+        and(
+          eq(fieldColorScales.airfoilId, group.airfoilId),
+          eq(
+            fieldColorScales.simulationPresetRevisionId,
+            group.presetRevisionId,
+          ),
+          eq(fieldColorScales.field, group.field),
+          eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+          eq(fieldColorScales.active, true),
+        ),
+      )
+      .limit(1);
+    if (
+      active &&
+      nearlyEqual(active.vmin, normalized.vmin) &&
+      nearlyEqual(active.vmax, normalized.vmax)
+    ) {
+      plans.push({
+        group,
+        created: false,
+        evidenceSha256: ownedExtent.evidenceSha256,
+        scale: {
+          id: active.id,
+          version: active.version,
+          vmin: active.vmin,
+          vmax: active.vmax,
+          policy: active.scalePolicy,
+        },
+      });
+      continue;
+    }
+    const [latest] = await opts.db
+      .select()
+      .from(fieldColorScales)
+      .where(
+        and(
+          eq(fieldColorScales.airfoilId, group.airfoilId),
+          eq(
+            fieldColorScales.simulationPresetRevisionId,
+            group.presetRevisionId,
+          ),
+          eq(fieldColorScales.field, group.field),
+          eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+        ),
+      )
+      .orderBy(desc(fieldColorScales.version))
+      .limit(1);
+    const nextVersion = (latest?.version ?? 0) + 1;
+    const [created] = await opts.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await requireMediaRepairWriteFence(
+        tx,
+        opts.repairFence,
+        opts.repairSource.id,
+        ownedExtent.evidenceSha256,
+      );
+      return tx
+        .insert(fieldColorScales)
+        .values({
+          airfoilId: group.airfoilId,
+          simulationPresetRevisionId: group.presetRevisionId,
+          field: group.field,
+          renderProfileKey: DEFAULT_RENDER_PROFILE_KEY,
+          scalePolicy: normalized.policy,
+          vmin: normalized.vmin,
+          vmax: normalized.vmax,
+          evidenceSignature,
+          status: "rebalancing",
+          version: nextVersion,
+          active: false,
+        })
+        .returning();
+    });
+    if (!created) throw new Error("failed to create field color scale");
+    plans.push({
+      group,
+      created: true,
+      evidenceSha256: ownedExtent.evidenceSha256,
+      scale: {
+        id: created.id,
+        version: created.version,
+        vmin: created.vmin,
+        vmax: created.vmax,
+        policy: created.scalePolicy,
+      },
+    });
+  }
+
+  const plansByVersion = new Map<number, RepairFieldScalePlan[]>();
+  for (const plan of plans) {
+    const versionPlans = plansByVersion.get(plan.scale.version) ?? [];
+    versionPlans.push(plan);
+    plansByVersion.set(plan.scale.version, versionPlans);
+  }
+  const renderedByField = new Map<ImageFieldName, RenderedMediaRow[]>();
+  for (const [version, versionPlans] of plansByVersion) {
+    try {
+      const rendered = await renderScaledMediaRowsForFields({
+        db: opts.db,
+        engine: opts.engine,
+        resultRows: [opts.repairSource],
+        fields: versionPlans.map((plan) => ({
+          field: plan.group.field,
+          scale: plan.scale,
+        })),
+        renderVersion: version,
+        airfoilPoints: opts.airfoilPoints,
+        heartbeat: opts.heartbeat,
+        sourceMode: opts.sourceMode,
+        remote: opts.remote,
+      });
+      for (const plan of versionPlans) {
+        renderedByField.set(
+          plan.group.field,
+          rendered.map((row) => ({
+            ...row,
+            media: row.media.filter(
+              (media) => media.field === plan.group.field,
+            ),
+          })),
+        );
+      }
+    } catch (error) {
+      const reason =
+        error instanceof Error
+          ? error.message.slice(0, 500)
+          : String(error).slice(0, 500);
+      const createdScaleIds = versionPlans
+        .filter((plan) => plan.created)
+        .map((plan) => plan.scale.id);
+      if (createdScaleIds.length) {
+        await opts.db
+          .update(fieldColorScales)
+          .set({
+            status: "failed",
+            failureReason: reason,
+            renderAttempts: sql`${fieldColorScales.renderAttempts} + 1`,
+          })
+          .where(inArray(fieldColorScales.id, createdScaleIds));
+      }
+      throw error;
+    }
+  }
+
+  let mediaCount = 0;
+  for (const plan of plans) {
+    if (plan.created) {
+      await opts.db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as DB;
+        await requireMediaRepairWriteFence(
+          tx,
+          opts.repairFence,
+          opts.repairSource.id,
+          plan.evidenceSha256,
+        );
+        await tx
+          .update(fieldColorScales)
+          .set({ active: false })
+          .where(
+            and(
+              eq(fieldColorScales.airfoilId, plan.group.airfoilId),
+              eq(
+                fieldColorScales.simulationPresetRevisionId,
+                plan.group.presetRevisionId,
+              ),
+              eq(fieldColorScales.field, plan.group.field),
+              eq(fieldColorScales.renderProfileKey, DEFAULT_RENDER_PROFILE_KEY),
+              eq(fieldColorScales.active, true),
+            ),
+          );
+        await tx
+          .update(fieldColorScales)
+          .set({ active: true, status: "active", activatedAt: new Date() })
+          .where(eq(fieldColorScales.id, plan.scale.id));
+      });
+    }
+    mediaCount += await registerRenderedMediaSet(
+      opts.db,
+      opts.engine,
+      renderedByField.get(plan.group.field) ?? [],
+      plan.scale,
+      opts.repairFence,
+    );
+  }
+  return mediaCount;
+}
+
+async function rebalanceFieldScales(
+  opts: RebalanceFieldScaleOptions,
+): Promise<number> {
+  if (opts.repairFence && opts.repairSource) {
+    return rebalanceRepairFieldScales({
+      ...opts,
+      repairFence: opts.repairFence,
+      repairSource: opts.repairSource,
+    });
+  }
   let mediaCount = 0;
   for (const group of opts.groups.values()) {
     // Invariant: no ingest code path may run >30 s without a heartbeat touch.
@@ -3477,18 +3818,22 @@ export async function repairDefaultMediaForStoredResult(opts: {
       ),
     );
   await heartbeat();
-  const response = await opts.engine.computeFieldExtents(attempt.engineJobId, {
-    case_slug: attempt.engineCaseSlug,
-    evidence_base: manifest.evidenceBase,
-    airfoil_points: contour,
-    chord: result.chord,
-    speed: result.speed,
-    fields: ALL_IMAGE_FIELDS,
-    zoom_chords: 2,
-    max_frames: 220,
-    source_mode: "archive",
-    remote: remote ?? undefined,
-  });
+  const response = await withPeriodicMediaRepairHeartbeat(
+    () =>
+      opts.engine.computeFieldExtents(attempt.engineJobId!, {
+        case_slug: attempt.engineCaseSlug!,
+        evidence_base: manifest.evidenceBase,
+        airfoil_points: contour,
+        chord: result.chord!,
+        speed: result.speed!,
+        fields: ALL_IMAGE_FIELDS,
+        zoom_chords: 2,
+        max_frames: 220,
+        source_mode: "archive",
+        remote: remote ?? undefined,
+      }),
+    heartbeat,
+  );
   // The engine round-trip may be slow. Revalidate ownership immediately
   // before any destructive presentation write; a stale renderer may inspect
   // its response, but cannot delete media or replace current extents.

@@ -445,6 +445,7 @@ def _storage_retention_regression() -> int:
                 "test/sync-import-retention.test.ts",
                 "test/media-object-store.test.ts",
                 "test/media-repair.test.ts",
+                "test/media-repair-worker-policy.test.ts",
                 "test/disk-admission.test.ts",
             ],
         ),

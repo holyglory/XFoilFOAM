@@ -285,6 +285,9 @@ services:
       AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
       AIRFOILFOAM_EVIDENCE_REMOTE_ONLY: ${AIRFOILFOAM_EVIDENCE_REMOTE_ONLY:-false}
       ENGINE_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}
+      # Two archive renderers keep the durable-media drain ahead of normal
+      # result arrival without taking the eight-slot CFD worker off full load.
+      AIRFOILFOAM_MEDIA_REPAIR_CONCURRENCY: ${AIRFOILFOAM_MEDIA_REPAIR_CONCURRENCY:-2}
     volumes:
       - results:/data/airfoilfoam
       - sync_imports:/data/airfoilfoam/sync-imports
