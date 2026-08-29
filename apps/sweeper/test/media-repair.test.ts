@@ -1590,7 +1590,11 @@ describe("durable result media repair", () => {
   });
 
   it("MUST-CATCH: reopens row-complete media after migration proves its local source absent", async () => {
-    const fixture = await createSolvedResult("missing-migration-source");
+    const fixture = await createSolvedResult("missing-migration-source", {
+      unsteady: false,
+      fidelity: "urans_precalc",
+      regime: "rans",
+    });
     expect(
       (
         await resultMediaRepairTick(db, engineWith(), {

@@ -501,6 +501,15 @@ describe("public exact-generation reads", () => {
       expect(response.json()).toEqual({
         error: "stored media recovery is pending",
       });
+      const detail = await app.inject({
+        method: "GET",
+        url: `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}`,
+      });
+      expect(detail.statusCode).toBe(200);
+      expect(detail.json()).toMatchObject({
+        availableFields: [],
+        media: null,
+      });
     } finally {
       await db
         .delete(resultMediaStorageUploads)

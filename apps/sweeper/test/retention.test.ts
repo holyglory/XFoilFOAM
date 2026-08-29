@@ -47,11 +47,13 @@ import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  auditResultMediaStorageSources,
   bindResultMediaObject,
   enqueueResultMediaStorageUpload,
   ensureResultMediaObject,
   processResultMediaStorageUploads,
   processResultMediaLocalReclaims,
+  type ResultMediaStorageSourceAuditCursor,
   type ResultMediaObjectStore,
 } from "../src/media-object-store";
 import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
@@ -667,7 +669,8 @@ describe("retention schema", () => {
       .where(eq(results.id, result.id))
       .limit(1);
     if (!selected?.id) throw new Error("missing upload fixture has no attempt");
-    const [media] = await db
+    const mediaRoot = mkdtempSync(join(tmpdir(), "xff-media-source-audit-"));
+    const [missingMedia] = await db
       .insert(resultMedia)
       .values({
         resultId: result.id,
@@ -681,36 +684,90 @@ describe("retention schema", () => {
         byteSize: 13,
       })
       .returning({ id: resultMedia.id });
-    await enqueueResultMediaStorageUpload(db, media.id);
+    const presentBytes = Buffer.from("present-media");
+    const presentStorageKey = `jobs/${job.engineJobId}/present/velocity.png`;
+    const presentPath = join(mediaRoot, presentStorageKey);
+    mkdirSync(dirname(presentPath), { recursive: true });
+    writeFileSync(presentPath, presentBytes);
+    const [presentMedia] = await db
+      .insert(resultMedia)
+      .values({
+        resultId: result.id,
+        resultAttemptId: selected.id,
+        kind: "image",
+        field: "velocity_magnitude",
+        role: "instantaneous",
+        storageKey: presentStorageKey,
+        mimeType: "image/png",
+        sha256: createHash("sha256").update(presentBytes).digest("hex"),
+        byteSize: presentBytes.byteLength,
+      })
+      .returning({ id: resultMedia.id });
+    await enqueueResultMediaStorageUpload(db, missingMedia.id);
+    await enqueueResultMediaStorageUpload(db, presentMedia.id);
 
-    expect(
-      await processResultMediaStorageUploads(db, {} as ResultMediaObjectStore, {
-        resultMediaIds: [media.id],
-        processLimit: 1,
-      }),
-    ).toBe(0);
-    const [failed] = await db
+    const auditNow = new Date();
+    let auditCursor: ResultMediaStorageSourceAuditCursor | null = null;
+    let scanned = 0;
+    let missing = 0;
+    let complete = false;
+    for (let pass = 0; pass < 4 && !complete; pass += 1) {
+      const audit = await auditResultMediaStorageSources(db, {
+        resultMediaIds: [missingMedia.id, presentMedia.id],
+        mediaRoot,
+        now: auditNow,
+        limit: 1,
+        cursor: auditCursor,
+      });
+      scanned += audit.scanned;
+      missing += audit.missing;
+      complete = audit.complete;
+      auditCursor = audit.nextCursor;
+    }
+    expect({ scanned, missing, complete }).toEqual({
+      scanned: 2,
+      missing: 1,
+      complete: true,
+    });
+    const uploads = await db
       .select()
       .from(resultMediaStorageUploads)
-      .where(eq(resultMediaStorageUploads.resultMediaId, media.id));
-    expect(failed).toMatchObject({ state: "retry_wait", attemptCount: 1 });
-    expect(failed.error).toContain(RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER);
-    expect(failed.nextAttemptAt!.getTime()).toBeGreaterThan(
-      Date.now() + 5 * 60 * 60_000,
+      .where(
+        inArray(resultMediaStorageUploads.resultMediaId, [
+          missingMedia.id,
+          presentMedia.id,
+        ]),
+      );
+    const byId = new Map(
+      uploads.map((upload) => [upload.resultMediaId, upload]),
     );
+    expect(byId.get(missingMedia.id)).toMatchObject({
+      state: "retry_wait",
+      attemptCount: 0,
+      error: RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
+    });
+    expect(byId.get(missingMedia.id)!.nextAttemptAt!.getTime()).toBeGreaterThan(
+      auditNow.getTime() + 5 * 60 * 60_000,
+    );
+    expect(byId.get(presentMedia.id)).toMatchObject({
+      state: "pending",
+      attemptCount: 0,
+      error: null,
+    });
     expect(
       await processResultMediaStorageUploads(db, {} as ResultMediaObjectStore, {
-        resultMediaIds: [media.id],
+        resultMediaIds: [missingMedia.id],
         processLimit: 1,
       }),
     ).toBe(0);
     const [unchanged] = await db
       .select({ attemptCount: resultMediaStorageUploads.attemptCount })
       .from(resultMediaStorageUploads)
-      .where(eq(resultMediaStorageUploads.resultMediaId, media.id));
-    expect(unchanged.attemptCount).toBe(1);
+      .where(eq(resultMediaStorageUploads.resultMediaId, missingMedia.id));
+    expect(unchanged.attemptCount).toBe(0);
     await db.delete(results).where(eq(results.id, result.id));
     await db.delete(simJobs).where(eq(simJobs.id, job.id));
+    rmSync(mediaRoot, { recursive: true, force: true });
   });
 });
 

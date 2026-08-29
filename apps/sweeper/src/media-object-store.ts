@@ -18,6 +18,8 @@ const GENERATION_PATTERN = /^[1-9][0-9]{0,19}$/;
 const CRC32C_PATTERN = /^[A-Za-z0-9+/]{6}==$/;
 const TEN_MIB = 10 * 1024 * 1024;
 const MISSING_LOCAL_RETRY_MS = 6 * 60 * 60_000;
+const SOURCE_AUDIT_REPEAT_MS = 60 * 60_000;
+const SOURCE_AUDIT_LIMIT = 2_048;
 
 export class ResultMediaLocalBytesUnavailableError extends Error {
   constructor(storageKey: string) {
@@ -520,6 +522,116 @@ export async function discoverResultMediaStorageUploads(
   return rows.length;
 }
 
+export interface ResultMediaStorageSourceAuditCursor {
+  resultMediaId: string;
+}
+
+/** Walk unbound upload rows independently of the slower GCS upload queue.
+ * Missing/truncated legacy sources become repairable immediately instead of
+ * waiting behind every present file that still needs object upload. */
+export async function auditResultMediaStorageSources(
+  db: DB,
+  options: {
+    limit?: number;
+    concurrency?: number;
+    cursor?: ResultMediaStorageSourceAuditCursor | null;
+    mediaRoot?: string;
+    now?: Date;
+    /** Deterministic test/operator scope. Omit for the migration-wide walk. */
+    resultMediaIds?: readonly string[];
+  } = {},
+): Promise<{
+  scanned: number;
+  missing: number;
+  complete: boolean;
+  nextCursor: ResultMediaStorageSourceAuditCursor | null;
+}> {
+  if (options.resultMediaIds?.length === 0) {
+    return { scanned: 0, missing: 0, complete: true, nextCursor: null };
+  }
+  const limit = Math.max(
+    1,
+    Math.min(options.limit ?? SOURCE_AUDIT_LIMIT, 10_000),
+  );
+  const cursorId = options.cursor?.resultMediaId ?? null;
+  const scopedIds = options.resultMediaIds
+    ? sql`AND upload.result_media_id IN (${sql.join(
+        options.resultMediaIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )})`
+    : sql``;
+  const rows = (await db.execute(sql`
+    SELECT
+      upload.result_media_id,
+      media.storage_key,
+      media.byte_size::double precision AS byte_size
+    FROM result_media_storage_uploads upload
+    JOIN result_media media ON media.id = upload.result_media_id
+    LEFT JOIN result_media_storage_bindings binding
+      ON binding.result_media_id = upload.result_media_id
+    WHERE upload.state = 'pending'
+      AND binding.result_media_id IS NULL
+      AND (${cursorId}::uuid IS NULL OR upload.result_media_id > ${cursorId}::uuid)
+      ${scopedIds}
+    ORDER BY upload.result_media_id ASC
+    LIMIT ${limit}
+  `)) as unknown as Array<{
+    result_media_id: string;
+    storage_key: string;
+    byte_size: number | null;
+  }>;
+  const missingIds: string[] = [];
+  await mapConcurrent(rows, options.concurrency ?? 64, async (row) => {
+    try {
+      const info = await stat(
+        resultMediaLocalPath(row.storage_key, options.mediaRoot),
+      );
+      if (
+        !info.isFile() ||
+        row.byte_size == null ||
+        !Number.isSafeInteger(row.byte_size) ||
+        row.byte_size <= 0 ||
+        info.size !== row.byte_size
+      ) {
+        missingIds.push(row.result_media_id);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      missingIds.push(row.result_media_id);
+    }
+  });
+  if (missingIds.length) {
+    const now = options.now ?? new Date();
+    await db
+      .update(resultMediaStorageUploads)
+      .set({
+        state: "retry_wait",
+        nextAttemptAt: new Date(now.getTime() + MISSING_LOCAL_RETRY_MS),
+        error: RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          inArray(resultMediaStorageUploads.resultMediaId, missingIds),
+          eq(resultMediaStorageUploads.state, "pending"),
+        ),
+      );
+  }
+  const complete = rows.length < limit;
+  const last = rows.at(-1);
+  return {
+    scanned: rows.length,
+    missing: missingIds.length,
+    complete,
+    nextCursor:
+      complete || !last
+        ? null
+        : {
+            resultMediaId: last.result_media_id,
+          },
+  };
+}
+
 async function claimResultMediaStorageUploads(
   db: DB,
   limit: number,
@@ -901,16 +1013,33 @@ export async function processResultMediaLocalReclaims(
 }
 
 let scheduledMaintenance: Promise<void> | null = null;
+let sourceAuditCursor: ResultMediaStorageSourceAuditCursor | null = null;
+let nextSourceAuditAt = 0;
 
 export function scheduleResultMediaStorageMaintenance(db: DB): void {
   const store = configuredResultMediaObjectStore();
   if (!store || scheduledMaintenance) return;
   scheduledMaintenance = (async () => {
+    let audit: Awaited<ReturnType<typeof auditResultMediaStorageSources>> = {
+      scanned: 0,
+      missing: 0,
+      complete: false,
+      nextCursor: sourceAuditCursor,
+    };
+    if (sourceAuditCursor || Date.now() >= nextSourceAuditAt) {
+      audit = await auditResultMediaStorageSources(db, {
+        cursor: sourceAuditCursor,
+      });
+      sourceAuditCursor = audit.nextCursor;
+      if (audit.complete)
+        nextSourceAuditAt = Date.now() + SOURCE_AUDIT_REPEAT_MS;
+    }
     const bound = await processResultMediaStorageUploads(db, store);
     const reclaimed = await processResultMediaLocalReclaims(db);
-    if (bound || reclaimed) {
+    if (audit.scanned || bound || reclaimed) {
       console.log(
-        `[sweeper] MEDIA STORAGE: bound ${bound} object(s), reclaimed ${reclaimed} local file(s)`,
+        `[sweeper] MEDIA STORAGE: audited ${audit.scanned} source(s), missing ${audit.missing}; ` +
+          `bound ${bound} object(s), reclaimed ${reclaimed} local file(s)`,
       );
     }
   })()

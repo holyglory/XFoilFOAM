@@ -24,6 +24,9 @@ import {
   resultAttempts,
   resultClassifications,
   resultMedia,
+  RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
+  resultMediaStorageBindings,
+  resultMediaStorageUploads,
   results,
   simulationPresetRevisions,
   simulationPresets,
@@ -281,15 +284,40 @@ async function solvedDetail(
   const cd = r.cd;
   const review = await activeReviewVerdict(db, r.id);
   const media: Partial<Record<FieldId, FieldMedia>> = {};
-  const rows = await db
-    .select()
+  const mediaCandidates = await db
+    .select({
+      media: resultMedia,
+      bindingId: resultMediaStorageBindings.resultMediaId,
+      uploadState: resultMediaStorageUploads.state,
+      uploadError: resultMediaStorageUploads.error,
+    })
     .from(resultMedia)
+    .leftJoin(
+      resultMediaStorageBindings,
+      eq(resultMediaStorageBindings.resultMediaId, resultMedia.id),
+    )
+    .leftJoin(
+      resultMediaStorageUploads,
+      eq(resultMediaStorageUploads.resultMediaId, resultMedia.id),
+    )
     .where(
       and(
         eq(resultMedia.resultId, r.id),
         eq(resultMedia.resultAttemptId, r.currentResultAttemptId!),
       ),
     );
+  const rows = mediaCandidates
+    .filter(
+      (row) =>
+        row.bindingId ||
+        !(
+          row.uploadState === "retry_wait" &&
+          row.uploadError?.startsWith(
+            RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
+          )
+        ),
+    )
+    .map((row) => row.media);
   const scaleIds = Array.from(
     new Set(
       rows
