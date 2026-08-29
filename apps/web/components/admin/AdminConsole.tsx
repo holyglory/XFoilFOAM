@@ -694,7 +694,7 @@ export function AdminConsole() {
         }
         .sync-promise-scope {
           margin-top: 3px;
-          color: ${C.dim};
+          color: ${C.text2};
           font-family: ${MONO};
           font-size: 9.5px;
           line-height: 1.45;
@@ -735,7 +735,7 @@ export function AdminConsole() {
           font-family: ${MONO};
         }
         .sync-promise-section-title {
-          color: ${C.dim};
+          color: ${C.text2};
           font-size: 9px;
           letter-spacing: 0.1em;
         }
@@ -765,7 +765,7 @@ export function AdminConsole() {
           margin: -1px 0 3px 10px;
           padding-left: 10px;
           border-left: 1px solid ${C.stroke};
-          color: ${C.dim};
+          color: ${C.text2};
           font-family: ${MONO};
           font-size: 9.5px;
         }
@@ -780,7 +780,7 @@ export function AdminConsole() {
           white-space: nowrap;
         }
         .sync-promise-note {
-          color: ${C.dim};
+          color: ${C.text2};
           font-family: ${MONO};
           font-size: 9.5px;
           line-height: 1.5;
