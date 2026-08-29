@@ -20,6 +20,7 @@ const TEN_MIB = 10 * 1024 * 1024;
 const MISSING_LOCAL_RETRY_MS = 6 * 60 * 60_000;
 const SOURCE_AUDIT_REPEAT_MS = 60 * 60_000;
 const SOURCE_AUDIT_LIMIT = 2_048;
+const SOURCE_AUDIT_MAX_PAGES_PER_MAINTENANCE = 32;
 
 export class ResultMediaLocalBytesUnavailableError extends Error {
   constructor(storageKey: string) {
@@ -632,6 +633,49 @@ export async function auditResultMediaStorageSources(
   };
 }
 
+export async function auditResultMediaStorageSourcePass(
+  db: DB,
+  options: {
+    limit?: number;
+    maxPages?: number;
+    concurrency?: number;
+    cursor?: ResultMediaStorageSourceAuditCursor | null;
+    mediaRoot?: string;
+    now?: Date;
+    resultMediaIds?: readonly string[];
+  } = {},
+): Promise<{
+  scanned: number;
+  missing: number;
+  complete: boolean;
+  nextCursor: ResultMediaStorageSourceAuditCursor | null;
+}> {
+  const maxPages = Math.max(1, Math.min(options.maxPages ?? 1, 1_000));
+  const auditOptions = {
+    limit: options.limit,
+    concurrency: options.concurrency,
+    mediaRoot: options.mediaRoot,
+    now: options.now,
+    resultMediaIds: options.resultMediaIds,
+  };
+  let cursor = options.cursor ?? null;
+  let scanned = 0;
+  let missing = 0;
+  let complete = false;
+  for (let page = 0; page < maxPages; page += 1) {
+    const pageAudit = await auditResultMediaStorageSources(db, {
+      ...auditOptions,
+      cursor,
+    });
+    scanned += pageAudit.scanned;
+    missing += pageAudit.missing;
+    complete = pageAudit.complete;
+    cursor = pageAudit.nextCursor;
+    if (complete) break;
+  }
+  return { scanned, missing, complete, nextCursor: cursor };
+}
+
 async function claimResultMediaStorageUploads(
   db: DB,
   limit: number,
@@ -1027,8 +1071,9 @@ export function scheduleResultMediaStorageMaintenance(db: DB): void {
       nextCursor: sourceAuditCursor,
     };
     if (sourceAuditCursor || Date.now() >= nextSourceAuditAt) {
-      audit = await auditResultMediaStorageSources(db, {
+      audit = await auditResultMediaStorageSourcePass(db, {
         cursor: sourceAuditCursor,
+        maxPages: SOURCE_AUDIT_MAX_PAGES_PER_MAINTENANCE,
       });
       sourceAuditCursor = audit.nextCursor;
       if (audit.complete)

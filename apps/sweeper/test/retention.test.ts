@@ -47,13 +47,12 @@ import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
-  auditResultMediaStorageSources,
+  auditResultMediaStorageSourcePass,
   bindResultMediaObject,
   enqueueResultMediaStorageUpload,
   ensureResultMediaObject,
   processResultMediaStorageUploads,
   processResultMediaLocalReclaims,
-  type ResultMediaStorageSourceAuditCursor,
   type ResultMediaObjectStore,
 } from "../src/media-object-store";
 import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
@@ -707,24 +706,14 @@ describe("retention schema", () => {
     await enqueueResultMediaStorageUpload(db, presentMedia.id);
 
     const auditNow = new Date();
-    let auditCursor: ResultMediaStorageSourceAuditCursor | null = null;
-    let scanned = 0;
-    let missing = 0;
-    let complete = false;
-    for (let pass = 0; pass < 4 && !complete; pass += 1) {
-      const audit = await auditResultMediaStorageSources(db, {
-        resultMediaIds: [missingMedia.id, presentMedia.id],
-        mediaRoot,
-        now: auditNow,
-        limit: 1,
-        cursor: auditCursor,
-      });
-      scanned += audit.scanned;
-      missing += audit.missing;
-      complete = audit.complete;
-      auditCursor = audit.nextCursor;
-    }
-    expect({ scanned, missing, complete }).toEqual({
+    const audit = await auditResultMediaStorageSourcePass(db, {
+      resultMediaIds: [missingMedia.id, presentMedia.id],
+      mediaRoot,
+      now: auditNow,
+      limit: 1,
+      maxPages: 4,
+    });
+    expect(audit).toMatchObject({
       scanned: 2,
       missing: 1,
       complete: true,
