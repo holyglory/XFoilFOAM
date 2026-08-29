@@ -4983,7 +4983,9 @@ function SyncApiPanel() {
               data-ui-verify-min-content-inset="12"
             >
               <div>
-                <div style={label}>REMOTE SOLVER WORK</div>
+                <div style={{ ...label, color: C.text2, fontWeight: 600 }}>
+                  REMOTE SOLVER WORK
+                </div>
                 <div className="sync-promise-scope">
                   Live leases and all-time outcomes across campaign and
                   background work
