@@ -18,6 +18,7 @@ describe("solver terminology contract", () => {
     expect(simModal).toContain(
       "Stored media is temporarily unavailable. This frame will retry automatically.",
     );
+    expect(simModal).toContain("color: C.muted");
   });
 
   it("MUST-CATCH: unpublished point evidence stays calm and links to exact point tools", () => {

@@ -2775,7 +2775,7 @@ function MediaEmpty({ text, testId }: { text: string; testId?: string }) {
         display: "grid",
         placeItems: "center",
         background: "#070b10",
-        color: C.dim,
+        color: C.muted,
         fontFamily: MONO,
         fontSize: 11,
         textAlign: "center",
