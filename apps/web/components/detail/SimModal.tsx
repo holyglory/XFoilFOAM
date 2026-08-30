@@ -41,6 +41,7 @@ import {
   windowPeriodCount,
 } from "@/lib/frame-player";
 import { fidelityChipView } from "@/lib/point-history";
+import { simEvidencePresentation } from "@/lib/sim-evidence-presentation";
 import {
   gateChecklistView,
   latestResultReviewLine,
@@ -340,6 +341,15 @@ export function SimModal(props: {
   const transportActive = Boolean(
     framesMode && playerModel && currentFrame && isAnimatedField,
   );
+  const evidencePresentation = sim
+    ? simEvidencePresentation({
+        fidelity: sim.fidelity,
+        regime: sim.regime,
+        turbulenceModel: sim.condition?.turbulenceModel,
+        transportActive,
+        hasRecordedFrames: Boolean(playerModel),
+      })
+    : null;
   const sortedTrack = useMemo(
     () => track.slice().sort((a, b) => a.aoa - b.aoa),
     [track],
@@ -1567,6 +1577,7 @@ export function SimModal(props: {
           {renderTools()}
         </div>
         <div
+          data-testid="sim-provenance"
           style={{
             fontFamily: MONO,
             fontSize: 10,
@@ -1916,9 +1927,7 @@ export function SimModal(props: {
   };
 
   const imageTag = () => {
-    if (transportActive) return "RECORDED FRAMES · URANS";
-    if (stalled) return "x̄ static";
-    return "RANS · steady static";
+    return evidencePresentation?.mediaTag ?? "loading";
   };
 
   const overlayReadout = () => {
@@ -2083,10 +2092,10 @@ export function SimModal(props: {
           }}
         >
           <div style={{ color: C.teal, marginBottom: 4 }}>
-            Final coefficients recorded
+            {evidencePresentation?.historyTitle ?? "Result history unavailable"}
           </div>
-          This pointwise-converged RANS solve records its final coefficients and
-          convergence summary, not an iteration-by-iteration coefficient series.
+          {evidencePresentation?.historyText ??
+            "No iteration-by-iteration coefficient series is available."}
         </div>
       );
     }
@@ -2154,6 +2163,7 @@ export function SimModal(props: {
         >
           {heroImage()}
           <span
+            data-testid="sim-media-method-tag"
             style={{
               position: "absolute",
               top: 9,
@@ -2252,11 +2262,7 @@ export function SimModal(props: {
   );
 
   const provenanceText = () => {
-    if (!sim) return "";
-    if (stalled) {
-      return `URANS k-ω SST · frames = ${playerModel ? "engine-recorded period-locked window" : "unavailable"} · stored media/evidence only`;
-    }
-    return `RANS ${sim.condition?.turbulenceModel ?? "solver"} · steady result evidence · stored media/evidence only`;
+    return evidencePresentation?.provenance ?? "";
   };
 
   return (
@@ -2346,13 +2352,12 @@ export function SimModal(props: {
             }}
           >
             <HeaderChip
+              testId="sim-method-chip"
               color={sim?.regime === "stalled" ? C.violet : C.teal}
               border={sim?.regime === "stalled" ? C.violetBorder : C.tealBorder}
               text={
                 sim
-                  ? stalled
-                    ? "URANS · vortex shedding"
-                    : "RANS · steady"
+                  ? (evidencePresentation?.methodChip ?? "OpenFOAM result")
                   : unavailableMessage
                     ? "OpenFOAM result"
                     : "loading"
