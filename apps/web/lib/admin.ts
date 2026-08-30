@@ -2312,11 +2312,18 @@ export const getCampaignAirfoils = (
   id: string,
   cursor?: string | null,
   limit = 25,
+  opts?: { search?: string; signal?: AbortSignal },
 ) => {
   const qs = new URLSearchParams({ limit: String(limit) });
   if (cursor) qs.set("cursor", cursor);
-  return aj<{ items: AdminCampaignAirfoilRow[]; nextCursor: string | null }>(
+  if (opts?.search?.trim()) qs.set("q", opts.search.trim());
+  return aj<{
+    items: AdminCampaignAirfoilRow[];
+    nextCursor: string | null;
+    matchedTotal: number | null;
+  }>(
     `/api/admin/campaigns/${encodeURIComponent(id)}/airfoils?${qs.toString()}`,
+    { signal: opts?.signal },
   );
 };
 

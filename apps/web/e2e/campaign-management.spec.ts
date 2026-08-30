@@ -398,6 +398,156 @@ test.describe
     expect(preview.totalSolverRuns).toBe(10);
   });
 
+  test("campaign quick search uses the complete server scope and rejects stale responses", async ({
+    page,
+    request,
+  }) => {
+    type MatrixRow = {
+      airfoilId: string;
+      slug: string;
+      name: string;
+      isSymmetric: boolean;
+      perCondition: Array<Record<string, unknown> & { conditionId: string }>;
+    };
+    const realPage = await json<{
+      items: MatrixRow[];
+      nextCursor: string | null;
+      matchedTotal: number | null;
+    }>(
+      request,
+      "get",
+      `/api/admin/campaigns/${state.wizardCampaignId}/airfoils?limit=50`,
+    );
+    expect(realPage.items).toHaveLength(2);
+    const [initialRow, targetRow] = realPage.items;
+    expect(initialRow).toBeTruthy();
+    expect(targetRow).toBeTruthy();
+
+    let slowRequests = 0;
+    let brokenRequests = 0;
+    const staleRow: MatrixRow = {
+      ...targetRow!,
+      slug: `${state.stamp}-stale-only`,
+      name: `${state.stamp} stale only`,
+    };
+    await page.route(
+      `**/api/admin/campaigns/${state.wizardCampaignId}/airfoils*`,
+      async (route) => {
+        const query =
+          new URL(route.request().url()).searchParams.get("q") ?? "";
+        if (!query) {
+          await route.fulfill({
+            json: {
+              items: [initialRow],
+              nextCursor: null,
+              matchedTotal: null,
+            },
+          });
+          return;
+        }
+        if (query === "slow-target") {
+          slowRequests += 1;
+          await new Promise((resolve) => setTimeout(resolve, 700));
+          await route
+            .fulfill({
+              json: {
+                items: [staleRow],
+                nextCursor: null,
+                matchedTotal: 1,
+              },
+            })
+            .catch(() => undefined);
+          return;
+        }
+        if (query === "broken-target") {
+          brokenRequests += 1;
+          if (brokenRequests === 1) {
+            await route.fulfill({
+              status: 503,
+              json: { error: "search offline" },
+            });
+            return;
+          }
+        }
+        if (query === "no-target") {
+          await route.fulfill({
+            json: { items: [], nextCursor: null, matchedTotal: 0 },
+          });
+          return;
+        }
+        await route.fulfill({
+          json: {
+            items: [targetRow],
+            nextCursor: null,
+            matchedTotal: 1,
+          },
+        });
+      },
+    );
+
+    await page.goto(`/admin?campaign=${state.wizardCampaignId}`);
+    await expect(
+      page.getByTestId(`matrix-row-${initialRow!.slug}`),
+    ).toBeVisible();
+    await expect(page.getByTestId(`matrix-row-${targetRow!.slug}`)).toHaveCount(
+      0,
+    );
+
+    const search = page.getByTestId("matrix-search");
+    await search.fill("slow-target");
+    await expect.poll(() => slowRequests).toBe(1);
+    await search.fill("fast-target");
+    await expect(
+      page.getByTestId(`matrix-row-${targetRow!.slug}`),
+    ).toBeVisible();
+    await expect(page.getByTestId("matrix-search-scope")).toContainText(
+      "1 match across all 2 campaign airfoils",
+    );
+    await page.waitForTimeout(800);
+    await expect(page.getByTestId(`matrix-row-${staleRow.slug}`)).toHaveCount(
+      0,
+    );
+
+    await search.fill("no-target");
+    await expect(page.getByTestId("matrix-search-empty")).toContainText(
+      "No campaign airfoils match",
+    );
+
+    await search.fill("broken-target");
+    await expect(page.getByTestId("matrix-search-error")).toContainText(
+      "search offline",
+    );
+    await page.getByTestId("matrix-search-retry").click();
+    await expect(
+      page.getByTestId(`matrix-row-${targetRow!.slug}`),
+    ).toBeVisible();
+    await expect(page.getByTestId("matrix-search-error")).toHaveCount(0);
+
+    await search.fill("");
+    await expect(
+      page.getByTestId(`matrix-row-${initialRow!.slug}`),
+    ).toBeVisible();
+    await expect(page.getByTestId(`matrix-row-${targetRow!.slug}`)).toHaveCount(
+      0,
+    );
+    await expect(page.getByTestId("matrix-search-status")).toContainText(
+      "1/2 airfoils loaded",
+    );
+
+    await search.fill(targetRow!.name);
+    await expect(
+      page.getByTestId(`matrix-row-${targetRow!.slug}`),
+    ).toBeVisible();
+    await page.getByTestId(`matrix-cell-${targetRow!.slug}-0`).click();
+    const panel = page.getByTestId("cell-side-panel");
+    await expect(panel).toBeVisible();
+    await expect(panel.locator("#cell-side-panel-title")).toContainText(
+      targetRow!.name,
+    );
+    await panel.getByRole("button", { name: "Close cell panel" }).click();
+    await expect(panel).toHaveCount(0);
+  });
+
   test("campaign cell modal locks the page and exposes the real airfoil profile", async ({
     page,
     request,

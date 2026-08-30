@@ -10,12 +10,13 @@
 // gone: a slim AIRFOIL | DONE | CONDITIONS legend row sits above and the
 // hover tooltip + cell side panel carry the identification. Click on a
 // segment opens the existing cell side panel (same onCellClick contract).
-// Search, failed-first sort, "Show released (N)" and keyset paging/poll
-// refresh are unchanged. The bar flexes inside the row, so there is NO
-// horizontal overflow at any condition count or viewport; when segments
-// would drop under MIN_SEGMENT_PX the matrix groups conditions by chord
-// behind selector chips (see coverage-segments.ts). All counts are real
-// counters from sim_campaign_progress — nothing is invented.
+// Search runs against the complete campaign scope on the server and owns its
+// own keyset pages; failed-first sort, "Show released (N)" and bounded poll
+// refresh remain local to the currently loaded page set. The bar flexes inside
+// the row, so there is NO horizontal overflow at any condition count or
+// viewport; when segments would drop under MIN_SEGMENT_PX the matrix groups
+// conditions by chord behind selector chips (see coverage-segments.ts). All
+// counts are real counters from sim_campaign_progress — nothing is invented.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -93,6 +94,10 @@ export function CoverageMatrix({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [activeSearch, setActiveSearch] = useState("");
+  const [loadedSearch, setLoadedSearch] = useState<string | null>(null);
+  const [matchedTotal, setMatchedTotal] = useState<number | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [blockedFirst, setBlockedFirst] = useState(true);
   const [showReleased, setShowReleased] = useState(false);
   const [scrollTop, setScrollTop] = useState(0);
@@ -100,7 +105,10 @@ export function CoverageMatrix({
   const [selectedChordKey, setSelectedChordKey] = useState<string | null>(null);
   const [hover, setHover] = useState<HoverTip | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const loadingRef = useRef(false);
+  const requestEpochRef = useRef(0);
+  const normalizedSearch = search.trim();
 
   // Measured root width drives the fixed name column (170–220px) and the
   // chord-grouping threshold — no matchMedia, no horizontal overflow. The
@@ -120,27 +128,67 @@ export function CoverageMatrix({
     };
   }, []);
 
-  const loadFirst = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const page = await getCampaignAirfoils(campaignId, null, PAGE_LIMIT);
-      setPages([{ cursor: null, rows: page.items }]);
-      setNextCursor(page.nextCursor);
-      setExhausted(page.nextCursor == null);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setLoading(false);
+  useEffect(() => {
+    if (!normalizedSearch) {
+      setActiveSearch("");
+      return;
     }
-  }, [campaignId]);
+    const timeout = window.setTimeout(
+      () => setActiveSearch(normalizedSearch),
+      250,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [normalizedSearch]);
 
   useEffect(() => {
-    void loadFirst();
-  }, [loadFirst]);
+    const controller = new AbortController();
+    const epoch = ++requestEpochRef.current;
+    loadingRef.current = true;
+    setLoading(true);
+    setError(null);
+    setPages([]);
+    setLoadedSearch(null);
+    setMatchedTotal(null);
+    setNextCursor(null);
+    setExhausted(false);
+    setScrollTop(0);
+    scrollRef.current?.scrollTo({ top: 0 });
+    void getCampaignAirfoils(campaignId, null, PAGE_LIMIT, {
+      search: activeSearch,
+      signal: controller.signal,
+    })
+      .then((page) => {
+        if (epoch !== requestEpochRef.current) return;
+        setPages([{ cursor: null, rows: page.items }]);
+        setLoadedSearch(activeSearch);
+        setMatchedTotal(page.matchedTotal);
+        setNextCursor(page.nextCursor);
+        setExhausted(page.nextCursor == null);
+      })
+      .catch((e: unknown) => {
+        if (
+          epoch === requestEpochRef.current &&
+          (e as Error).name !== "AbortError"
+        )
+          setError((e as Error).message);
+      })
+      .finally(() => {
+        if (epoch !== requestEpochRef.current) return;
+        loadingRef.current = false;
+        setLoading(false);
+      });
+    return () => controller.abort();
+  }, [activeSearch, campaignId, reloadKey]);
 
   const loadMore = useCallback(async () => {
-    if (loadingRef.current || nextCursor == null) return;
+    if (
+      loadingRef.current ||
+      nextCursor == null ||
+      loadedSearch !== activeSearch ||
+      normalizedSearch !== activeSearch
+    )
+      return;
+    const epoch = requestEpochRef.current;
     loadingRef.current = true;
     setLoading(true);
     try {
@@ -148,24 +196,35 @@ export function CoverageMatrix({
         campaignId,
         nextCursor,
         PAGE_LIMIT,
+        { search: activeSearch },
       );
+      if (epoch !== requestEpochRef.current) return;
       setPages((prev) => [...prev, { cursor: nextCursor, rows: page.items }]);
+      setMatchedTotal((current) => current ?? page.matchedTotal);
       setNextCursor(page.nextCursor);
       setExhausted(page.nextCursor == null);
       setError(null);
     } catch (e) {
-      setError((e as Error).message);
+      if (epoch === requestEpochRef.current) setError((e as Error).message);
     } finally {
+      if (epoch !== requestEpochRef.current) return;
       loadingRef.current = false;
       setLoading(false);
     }
-  }, [campaignId, nextCursor]);
+  }, [activeSearch, campaignId, loadedSearch, nextCursor, normalizedSearch]);
 
   // Poll refresh (spec §10): refetch only the pages intersecting the current
   // viewport, using their original keyset cursors.
   const visiblePagesRef = useRef<Set<number>>(new Set([0]));
   useEffect(() => {
-    if (pollKey === 0 || pages.length === 0) return;
+    if (
+      pollKey === 0 ||
+      pages.length === 0 ||
+      loadedSearch !== activeSearch ||
+      normalizedSearch !== activeSearch
+    )
+      return;
+    const epoch = requestEpochRef.current;
     const targets = [...visiblePagesRef.current].filter(
       (i) => i < pages.length,
     );
@@ -177,11 +236,12 @@ export function CoverageMatrix({
           campaignId,
           pages[i].cursor,
           PAGE_LIMIT,
+          { search: activeSearch },
         ).catch(() => null);
         return { i, refreshed };
       }),
     ).then((updates) => {
-      if (cancelled) return;
+      if (cancelled || epoch !== requestEpochRef.current) return;
       setPages((prev) => {
         const next = [...prev];
         for (const { i, refreshed } of updates) {
@@ -204,6 +264,8 @@ export function CoverageMatrix({
   }, [pages]);
 
   const loadedRows = useMemo(() => pages.flatMap((p) => p.rows), [pages]);
+  const resultsCurrent =
+    loadedSearch === activeSearch && normalizedSearch === activeSearch;
 
   const releasedConditions = conditions.filter((c) => c.status === "released");
   const visibleConditions = useMemo(
@@ -212,13 +274,7 @@ export function CoverageMatrix({
   );
 
   const rows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    let out = loadedRows;
-    if (q)
-      out = out.filter(
-        (r) =>
-          r.slug.toLowerCase().includes(q) || r.name.toLowerCase().includes(q),
-      );
+    let out = resultsCurrent ? loadedRows : [];
     if (blockedFirst) {
       out = [...out].sort(
         (a, b) =>
@@ -227,7 +283,7 @@ export function CoverageMatrix({
       );
     }
     return out;
-  }, [loadedRows, search, blockedFirst]);
+  }, [blockedFirst, loadedRows, resultsCurrent]);
 
   const cellByCondition = useCallback((row: AdminCampaignAirfoilRow) => {
     const map = new Map<
@@ -269,6 +325,7 @@ export function CoverageMatrix({
 
   // ---- windowing (constant-height rows) ----
   const totalHeight = rows.length * ROW_H;
+  const scrollContentHeight = Math.max(ROW_H, totalHeight);
   const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
   const visibleCount = Math.ceil(VIEWPORT_H / ROW_H) + OVERSCAN * 2;
   const end = Math.min(rows.length, start + visibleCount);
@@ -285,8 +342,9 @@ export function CoverageMatrix({
 
   // fetch the next keyset page as the window approaches the loaded tail
   useEffect(() => {
-    if (!exhausted && end >= loadedRows.length - OVERSCAN) void loadMore();
-  }, [end, loadedRows.length, exhausted, loadMore]);
+    if (resultsCurrent && !exhausted && end >= rows.length - OVERSCAN)
+      void loadMore();
+  }, [end, rows.length, exhausted, loadMore, resultsCurrent]);
 
   const showTip = useCallback(
     (el: HTMLElement, key: string, label: string, failed: boolean) => {
@@ -331,7 +389,11 @@ export function CoverageMatrix({
         <input
           data-testid="matrix-search"
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          maxLength={120}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setError(null);
+          }}
           placeholder="search airfoils…"
           aria-label="search airfoils"
           style={{
@@ -374,6 +436,9 @@ export function CoverageMatrix({
           </button>
         )}
         <span
+          data-testid="matrix-search-status"
+          role="status"
+          aria-live="polite"
           style={{
             marginLeft: "auto",
             fontFamily: MONO,
@@ -381,33 +446,54 @@ export function CoverageMatrix({
             color: C.dim,
           }}
         >
-          {fCount(loadedRows.length)}/{fCount(airfoilCount)} airfoils loaded
+          {normalizedSearch
+            ? resultsCurrent && matchedTotal != null
+              ? `${fCount(loadedRows.length)}/${fCount(matchedTotal)} matches`
+              : `searching ${fCount(airfoilCount)} airfoils…`
+            : `${fCount(loadedRows.length)}/${fCount(airfoilCount)} airfoils loaded`}
         </span>
       </div>
 
       {error && (
         <div
+          data-testid="matrix-search-error"
           style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
             fontFamily: MONO,
             fontSize: 11,
             color: C.red,
             padding: "8px 12px",
           }}
         >
-          {error}
+          <span>{error}</span>
+          <button
+            type="button"
+            data-testid="matrix-search-retry"
+            onClick={() => setReloadKey((value) => value + 1)}
+            style={{ ...ghostBtn, color: C.redText, padding: "4px 9px" }}
+          >
+            retry
+          </button>
         </div>
       )}
-      {search.trim() && !exhausted && (
+      {normalizedSearch && (
         <div
+          data-testid="matrix-search-scope"
           style={{
             fontFamily: MONO,
             fontSize: 10,
-            color: C.amber,
+            color: error ? C.redText : resultsCurrent ? C.teal : C.muted,
             padding: "6px 12px",
           }}
         >
-          search covers the {fCount(loadedRows.length)} loaded rows — scroll the
-          matrix to load the rest
+          {error
+            ? "complete campaign search unavailable"
+            : resultsCurrent && matchedTotal != null
+              ? `${fCount(matchedTotal)} ${matchedTotal === 1 ? "match" : "matches"} across all ${fCount(airfoilCount)} campaign airfoils`
+              : `searching all ${fCount(airfoilCount)} campaign airfoils…`}
         </div>
       )}
 
@@ -482,18 +568,41 @@ export function CoverageMatrix({
       </div>
 
       <div
+        ref={scrollRef}
         data-testid="matrix-scroll"
         onScroll={(e) => {
           setScrollTop(e.currentTarget.scrollTop);
           setHover(null);
         }}
         style={{
-          height: Math.min(VIEWPORT_H, Math.max(ROW_H, totalHeight)),
+          height: Math.min(VIEWPORT_H, scrollContentHeight),
           overflowY: "auto",
           position: "relative",
         }}
       >
-        <div style={{ height: totalHeight, position: "relative" }}>
+        <div style={{ height: scrollContentHeight, position: "relative" }}>
+          {normalizedSearch &&
+            resultsCurrent &&
+            !loading &&
+            matchedTotal === 0 && (
+              <div
+                data-testid="matrix-search-empty"
+                role="status"
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  display: "grid",
+                  placeItems: "center",
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: C.muted,
+                  padding: 12,
+                  textAlign: "center",
+                }}
+              >
+                No campaign airfoils match this search.
+              </div>
+            )}
           {rows.slice(start, end).map((row, sliceIdx) => {
             const i = start + sliceIdx;
             const byId = cellByCondition(row);

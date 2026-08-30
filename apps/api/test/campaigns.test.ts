@@ -167,9 +167,19 @@ beforeAll(async () => {
       isSymmetric: true,
     })
     .returning();
+  const [outside] = await db
+    .insert(airfoils)
+    .values({
+      slug: `${PREFIX}-outside-search-scope`,
+      name: `${PREFIX} outside search scope`,
+      categoryId: cat.id,
+      points: camberedPoints,
+      isSymmetric: false,
+    })
+    .returning();
   asymId = asym.id;
   symId = symm.id;
-  cleanupAirfoilIds.push(asym.id, symm.id);
+  cleanupAirfoilIds.push(asym.id, symm.id, outside.id);
   const [medium] = await db
     .insert(mediums)
     .values({
@@ -546,6 +556,59 @@ describe("campaign launch (§5)", () => {
     });
     expect(matrix.statusCode).toBe(200);
     expect(matrix.json().items.length).toBe(2);
+    expect(matrix.json().matchedTotal).toBeNull();
+
+    const firstPage = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/airfoils?limit=1`,
+    });
+    expect(firstPage.statusCode).toBe(200);
+    expect(
+      firstPage.json().items.map((row: { slug: string }) => row.slug),
+    ).toEqual([`${PREFIX}-cambered`]);
+    expect(firstPage.json().nextCursor).toBe(`${PREFIX}-cambered`);
+
+    const nameSearch = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/airfoils?limit=1&q=${encodeURIComponent(`${PREFIX.toUpperCase()} SYMMETRIC`)}`,
+    });
+    expect(nameSearch.statusCode).toBe(200);
+    expect(nameSearch.json()).toMatchObject({
+      matchedTotal: 1,
+      nextCursor: null,
+    });
+    expect(
+      nameSearch.json().items.map((row: { slug: string }) => row.slug),
+    ).toEqual([`${PREFIX}-symmetric`]);
+
+    const broadSearch = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/airfoils?limit=1&q=${encodeURIComponent(PREFIX)}`,
+    });
+    expect(broadSearch.statusCode).toBe(200);
+    expect(broadSearch.json().matchedTotal).toBe(2);
+    expect(broadSearch.json().items).toHaveLength(1);
+    const secondSearchPage = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/airfoils?limit=1&q=${encodeURIComponent(PREFIX)}&cursor=${encodeURIComponent(broadSearch.json().nextCursor)}`,
+    });
+    expect(secondSearchPage.statusCode).toBe(200);
+    expect(secondSearchPage.json().matchedTotal).toBe(2);
+    expect(secondSearchPage.json().items).toHaveLength(1);
+    expect(secondSearchPage.json().items[0].slug).not.toBe(
+      broadSearch.json().items[0].slug,
+    );
+
+    const outsideScope = await app.inject({
+      method: "GET",
+      url: `/api/admin/campaigns/${campaignId}/airfoils?q=outside-search-scope`,
+    });
+    expect(outsideScope.statusCode).toBe(200);
+    expect(outsideScope.json()).toMatchObject({
+      items: [],
+      nextCursor: null,
+      matchedTotal: 0,
+    });
   });
 
   it("counts shared campaign-owned PRECALC jobs without a scalar campaign id", async () => {

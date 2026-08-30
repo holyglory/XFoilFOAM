@@ -7783,33 +7783,63 @@ export interface CampaignAirfoilRow {
 export async function campaignAirfoilRows(
   db: DB,
   campaignId: string,
-  opts: { cursor?: string | null; limit?: number } = {},
-): Promise<{ items: CampaignAirfoilRow[]; nextCursor: string | null }> {
+  opts: { cursor?: string | null; limit?: number; search?: string | null } = {},
+): Promise<{
+  items: CampaignAirfoilRow[];
+  nextCursor: string | null;
+  matchedTotal: number | null;
+}> {
   const campaign = await requireCampaign(db, campaignId);
   const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
+  const search = opts.search?.trim() || null;
   const cursorFilter = opts.cursor ? sql`AND af.slug > ${opts.cursor}` : sql``;
-  const airfoilRowsPage = (await db.execute(sql`
-    SELECT af.id, af.slug, af.name, af.is_symmetric
-    FROM sim_campaign_airfoils ca
-    JOIN airfoils af ON af.id = ca.airfoil_id
-    WHERE ca.campaign_id = ${campaignId}
-      AND af."archivedAt" IS NULL
-      AND af."deletedAt" IS NULL
-      ${cursorFilter}
-    ORDER BY af.slug ASC
-    LIMIT ${limit + 1}
-  `)) as unknown as Array<{
-    id: string;
-    slug: string;
-    name: string;
-    is_symmetric: boolean;
-  }>;
+  const searchFilter = search
+    ? sql`AND (
+        strpos(lower(af.slug), lower(${search})) > 0
+        OR strpos(lower(af.name), lower(${search})) > 0
+      )`
+    : sql``;
+  const pagePromise = db.execute(sql`
+      SELECT af.id, af.slug, af.name, af.is_symmetric
+      FROM sim_campaign_airfoils ca
+      JOIN airfoils af ON af.id = ca.airfoil_id
+      WHERE ca.campaign_id = ${campaignId}
+        AND af."archivedAt" IS NULL
+        AND af."deletedAt" IS NULL
+        ${searchFilter}
+        ${cursorFilter}
+      ORDER BY af.slug ASC
+      LIMIT ${limit + 1}
+    `) as unknown as Promise<
+    Array<{
+      id: string;
+      slug: string;
+      name: string;
+      is_symmetric: boolean;
+    }>
+  >;
+  const matchedTotalPromise = search
+    ? (db.execute(sql`
+        SELECT count(*)::int AS n
+        FROM sim_campaign_airfoils ca
+        JOIN airfoils af ON af.id = ca.airfoil_id
+        WHERE ca.campaign_id = ${campaignId}
+          AND af."archivedAt" IS NULL
+          AND af."deletedAt" IS NULL
+          ${searchFilter}
+      `) as unknown as Promise<Array<{ n: number }>>)
+    : Promise.resolve([] as Array<{ n: number }>);
+  const [airfoilRowsPage, matchedTotalRows] = await Promise.all([
+    pagePromise,
+    matchedTotalPromise,
+  ]);
+  const matchedTotal = search ? Number(matchedTotalRows[0]?.n ?? 0) : null;
   const page = airfoilRowsPage.slice(0, limit);
   const nextCursor =
     airfoilRowsPage.length > limit
       ? (page[page.length - 1]?.slug ?? null)
       : null;
-  if (page.length === 0) return { items: [], nextCursor: null };
+  if (page.length === 0) return { items: [], nextCursor: null, matchedTotal };
   const ids = page.map((r) => r.id);
   const currentConditions = await db
     .select({ id: simCampaignConditions.id })
@@ -7834,6 +7864,7 @@ export async function campaignAirfoilRows(
         perCondition: [],
       })),
       nextCursor,
+      matchedTotal,
     };
   }
   const progressRows = await db
@@ -7898,6 +7929,7 @@ export async function campaignAirfoilRows(
       perCondition: byAirfoil.get(r.id) ?? [],
     })),
     nextCursor,
+    matchedTotal,
   };
 }
 
