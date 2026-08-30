@@ -54,15 +54,16 @@ import {
 } from "@aerodb/db";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
-import type {
-  EngineClient,
-  EngineCallOptions,
-  FieldExtentsRequest,
-  FieldExtentsResponse,
-  ImageFieldName,
-  RemoteEvidencePointerPayload,
-  RenderDefaultMediaRequest,
-  RenderDefaultMediaResponse,
+import {
+  ALL_IMAGE_FIELDS,
+  type EngineClient,
+  type EngineCallOptions,
+  type FieldExtentsRequest,
+  type FieldExtentsResponse,
+  type ImageFieldName,
+  type RemoteEvidencePointerPayload,
+  type RenderDefaultMediaRequest,
+  type RenderDefaultMediaResponse,
 } from "@aerodb/engine-client";
 import { and, eq, inArray } from "drizzle-orm";
 import { createHash } from "node:crypto";
@@ -805,6 +806,45 @@ describe("durable result media repair", () => {
         .from(resultMedia)
         .where(eq(resultMedia.resultId, fixture.resultId)),
     ).toHaveLength(2);
+  });
+
+  it("reuses a complete exact-manifest extent set without rereading archived VTK frames", async () => {
+    const fixture = await createSolvedResult("stored-exact-extents", {
+      unsteady: false,
+      fidelity: "rans",
+      regime: "rans",
+    });
+    await db.insert(resultFieldExtents).values(
+      ALL_IMAGE_FIELDS.map((field, index) => ({
+        resultId: fixture.resultId,
+        resultAttemptId: fixture.resultAttemptId,
+        airfoilId: fixture.airfoilId,
+        simulationPresetRevisionId: revisionId,
+        field,
+        renderProfileKey: "default:v1:zoom2",
+        vmin: field === "velocity_magnitude" ? 0 : -(index + 1),
+        vmax: index + 2,
+        finiteCount: 500 + index,
+        sourceTimeStart: 1,
+        sourceTimeEnd: 2,
+        evidenceSha256: fixture.manifestSha,
+      })),
+    );
+    let extentCalls = 0;
+    const outcome = await resultMediaRepairTick(
+      db,
+      engineWith({
+        extents: async () => {
+          extentCalls += 1;
+          throw new Error("exact stored extents should have been reused");
+        },
+      }),
+      { resultId: fixture.resultId },
+    );
+
+    expect(extentCalls).toBe(0);
+    expect(outcome.finalized).toBe(1);
+    expect(outcome.repairedMedia).toBe(8);
   });
 
   it("MUST-CATCH: defers default-media rendering while its producing CFD job is still running", async () => {

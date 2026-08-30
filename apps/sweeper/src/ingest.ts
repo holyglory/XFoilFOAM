@@ -3768,10 +3768,13 @@ export interface StoredResultMediaRepairOutcome {
  * Rebuild complete default media for one already-solved preliminary/unsteady
  * result without touching its immutable coefficients or raw evidence.
  *
- * Extents are recomputed from the stored manifest. A partial extent response
- * may not silently forget a field that prior evidence already exposed. Every
- * valid returned field is fed through the shared track-scale renderer, whose
- * response is fail-closed by `completeRenderedMediaForField`.
+ * A complete eight-field extent set already bound to the exact manifest is
+ * reused; it is immutable evidence-derived presentation metadata, and reading
+ * every archived VTK frame again only delays recovery. Missing/partial or
+ * mismatched extents are recomputed from the stored manifest. A fresh partial
+ * response may not silently forget a field that prior evidence already
+ * exposed. Every valid field is fed through the shared track-scale renderer,
+ * whose response is fail-closed by `completeRenderedMediaForField`.
  */
 export async function repairDefaultMediaForStoredResult(opts: {
   db: DB;
@@ -3862,7 +3865,14 @@ export async function repairDefaultMediaForStoredResult(opts: {
   );
 
   const priorExtents = await opts.db
-    .select({ field: resultFieldExtents.field })
+    .select({
+      field: resultFieldExtents.field,
+      vmin: resultFieldExtents.vmin,
+      vmax: resultFieldExtents.vmax,
+      finiteCount: resultFieldExtents.finiteCount,
+      sourceTimeStart: resultFieldExtents.sourceTimeStart,
+      sourceTimeEnd: resultFieldExtents.sourceTimeEnd,
+    })
     .from(resultFieldExtents)
     .where(
       and(
@@ -3872,27 +3882,68 @@ export async function repairDefaultMediaForStoredResult(opts: {
         eq(resultFieldExtents.evidenceSha256, manifest.sha256),
       ),
     );
-  await heartbeat();
-  const response = await withPeriodicMediaRepairHeartbeat(
-    () =>
-      opts.engine.computeFieldExtents(
-        attempt.engineJobId!,
-        {
-          case_slug: attempt.engineCaseSlug!,
-          evidence_base: manifest.evidenceBase,
-          airfoil_points: contour,
-          chord: result.chord!,
-          speed: result.speed!,
-          fields: ALL_IMAGE_FIELDS,
-          zoom_chords: 2,
-          max_frames: 220,
-          source_mode: "archive",
-          remote: remote ?? undefined,
-        },
-        { timeoutMs: ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS },
-      ),
-    heartbeat,
+  const priorByField = new Map(
+    priorExtents
+      .filter((row) => isImageFieldName(row.field))
+      .map((row) => [row.field as ImageFieldName, row]),
   );
+  const reusablePriorExtents =
+    priorExtents.length === ALL_IMAGE_FIELDS.length &&
+    ALL_IMAGE_FIELDS.every((field) => {
+      const row = priorByField.get(field);
+      return Boolean(
+        row &&
+        Number.isFinite(row.vmin) &&
+        Number.isFinite(row.vmax) &&
+        Number.isInteger(row.finiteCount) &&
+        row.finiteCount > 0,
+      );
+    });
+  const priorStarts = priorExtents
+    .map((row) => row.sourceTimeStart)
+    .filter((value): value is number => Number.isFinite(value));
+  const priorEnds = priorExtents
+    .map((row) => row.sourceTimeEnd)
+    .filter((value): value is number => Number.isFinite(value));
+  await heartbeat();
+  const response = reusablePriorExtents
+    ? {
+        fields: Object.fromEntries(
+          ALL_IMAGE_FIELDS.map((field) => {
+            const row = priorByField.get(field)!;
+            return [
+              field,
+              {
+                min: row.vmin,
+                max: row.vmax,
+                finite_count: row.finiteCount,
+              },
+            ];
+          }),
+        ),
+        window_start: priorStarts.length ? Math.min(...priorStarts) : null,
+        window_end: priorEnds.length ? Math.max(...priorEnds) : null,
+      }
+    : await withPeriodicMediaRepairHeartbeat(
+        () =>
+          opts.engine.computeFieldExtents(
+            attempt.engineJobId!,
+            {
+              case_slug: attempt.engineCaseSlug!,
+              evidence_base: manifest.evidenceBase,
+              airfoil_points: contour,
+              chord: result.chord!,
+              speed: result.speed!,
+              fields: ALL_IMAGE_FIELDS,
+              zoom_chords: 2,
+              max_frames: 220,
+              source_mode: "archive",
+              remote: remote ?? undefined,
+            },
+            { timeoutMs: ENGINE_EVIDENCE_VERIFY_TIMEOUT_MS },
+          ),
+        heartbeat,
+      );
   // The engine round-trip may be slow. Revalidate ownership immediately
   // before any destructive presentation write; a stale renderer may inspect
   // its response, but cannot delete media or replace current extents.
