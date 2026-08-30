@@ -3421,8 +3421,19 @@ async function rebalanceRepairFieldScales(
   }
 
   let mediaCount = 0;
-  for (const plan of plans) {
-    if (plan.created) {
+  // GCS create-only upload + generation metadata + pinned readback are
+  // independent per field. Serializing eight small stills added several
+  // network round trips to every blank RANS repair. Four-way batches match the
+  // DB pool bound while preserving each row's own repair fence and checksum.
+  const registrationConcurrency = 4;
+  for (
+    let offset = 0;
+    offset < plans.length;
+    offset += registrationConcurrency
+  ) {
+    const batch = plans.slice(offset, offset + registrationConcurrency);
+    for (const plan of batch) {
+      if (!plan.created) continue;
       await opts.db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as DB;
         await requireMediaRepairWriteFence(
@@ -3452,13 +3463,18 @@ async function rebalanceRepairFieldScales(
           .where(eq(fieldColorScales.id, plan.scale.id));
       });
     }
-    mediaCount += await registerRenderedMediaSet(
-      opts.db,
-      opts.engine,
-      renderedByField.get(plan.group.field) ?? [],
-      plan.scale,
-      opts.repairFence,
+    const registered = await Promise.all(
+      batch.map((plan) =>
+        registerRenderedMediaSet(
+          opts.db,
+          opts.engine,
+          renderedByField.get(plan.group.field) ?? [],
+          plan.scale,
+          opts.repairFence,
+        ),
+      ),
     );
+    mediaCount += registered.reduce((sum, count) => sum + count, 0);
   }
   return mediaCount;
 }
