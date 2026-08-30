@@ -443,7 +443,7 @@ export function CoverageMatrix({
             marginLeft: "auto",
             fontFamily: MONO,
             fontSize: 10,
-            color: C.dim,
+            color: C.muted,
           }}
         >
           {normalizedSearch
