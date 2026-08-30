@@ -32,6 +32,41 @@ const ACTIONS = new Set<PrecalcContractPhysicalAction>([
   "rerun_fresh",
 ]);
 
+/**
+ * A live classifier verdict is not publication authority.  Suppress a fresh
+ * PRECALC recovery only when the result projection selects an accepted
+ * immutable interpretation and its append-only canonical-selection event for
+ * the exact URANS attempt.  Both callers use the SQL alias `obligation`.
+ */
+export const hasCanonicalAcceptedUransForObligationSql = sql`EXISTS (
+  SELECT 1
+  FROM results accepted_result
+  JOIN result_attempts accepted_attempt
+    ON accepted_attempt.id = accepted_result.current_result_attempt_id
+   AND accepted_attempt.result_id = accepted_result.id
+  JOIN result_interpretations accepted_interpretation
+    ON accepted_interpretation.id = accepted_result.current_result_interpretation_id
+   AND accepted_interpretation.result_id = accepted_result.id
+   AND accepted_interpretation.result_attempt_id = accepted_attempt.id
+   AND accepted_interpretation.state = 'accepted'
+  JOIN result_canonical_selections accepted_selection
+    ON accepted_selection.id = accepted_result.current_canonical_selection_id
+   AND accepted_selection.result_id = accepted_result.id
+   AND accepted_selection.result_attempt_id = accepted_attempt.id
+   AND accepted_selection.result_interpretation_id = accepted_interpretation.id
+  WHERE accepted_result.airfoil_id = obligation.airfoil_id
+    AND accepted_result.simulation_preset_revision_id = obligation.revision_id
+    AND accepted_result.aoa_deg = obligation.aoa_deg
+    AND accepted_attempt.status = 'done'
+    AND accepted_attempt.source = 'solved'
+    AND (
+      accepted_attempt.regime = 'urans'
+      OR accepted_attempt.evidence_payload ->> 'fidelity' IN (
+        'urans_precalc', 'urans_full'
+      )
+    )
+)`;
+
 function validateEvaluations(
   evaluations: readonly PrecalcContractEvaluation[],
 ): PrecalcContractEvaluation[] {
@@ -176,24 +211,7 @@ export async function remediatePrecalcEvidenceContract(
           WHERE active_owner.id = obligation.id::text
             AND active_job.status IN ('pending', 'submitted', 'running', 'ingesting')
         )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM result_attempts accepted_attempt
-          JOIN result_classifications accepted_classification
-            ON accepted_classification.result_attempt_id = accepted_attempt.id
-           AND accepted_classification.state = 'accepted'
-          WHERE accepted_attempt.airfoil_id = obligation.airfoil_id
-            AND accepted_attempt.simulation_preset_revision_id = obligation.revision_id
-            AND accepted_attempt.aoa_deg = obligation.aoa_deg
-            AND accepted_attempt.status = 'done'
-            AND accepted_attempt.source = 'solved'
-            AND (
-              accepted_attempt.regime = 'urans'
-              OR accepted_attempt.evidence_payload ->> 'fidelity' IN (
-                'urans_precalc', 'urans_full'
-              )
-            )
-        )
+        AND NOT (${hasCanonicalAcceptedUransForObligationSql})
         AND (
           obligation.background_owner
           OR EXISTS (

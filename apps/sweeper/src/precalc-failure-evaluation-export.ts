@@ -1,4 +1,8 @@
-import { createClient, databaseUrl } from "@aerodb/db";
+import {
+  createClient,
+  databaseUrl,
+  hasCanonicalAcceptedUransForObligationSql,
+} from "@aerodb/db";
 import { sql } from "drizzle-orm";
 
 const parsedLimit = Number.parseInt(
@@ -71,24 +75,7 @@ try {
     LEFT JOIN sim_jobs job ON job.id = latest.sim_job_id
     WHERE obligation.state = 'blocked'
       AND COALESCE(obligation.last_outcome, '') <> 'deterministic_failure'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM result_attempts accepted_attempt
-        JOIN result_classifications accepted_classification
-          ON accepted_classification.result_attempt_id = accepted_attempt.id
-         AND accepted_classification.state = 'accepted'
-        WHERE accepted_attempt.airfoil_id = obligation.airfoil_id
-          AND accepted_attempt.simulation_preset_revision_id = obligation.revision_id
-          AND accepted_attempt.aoa_deg = obligation.aoa_deg
-          AND accepted_attempt.status = 'done'
-          AND accepted_attempt.source = 'solved'
-          AND (
-            accepted_attempt.regime = 'urans'
-            OR accepted_attempt.evidence_payload ->> 'fidelity' IN (
-              'urans_precalc', 'urans_full'
-            )
-          )
-      )
+      AND NOT (${hasCanonicalAcceptedUransForObligationSql})
     ORDER BY obligation.id
     LIMIT ${parsedLimit}
   `)) as unknown as Array<Record<string, unknown>>;
