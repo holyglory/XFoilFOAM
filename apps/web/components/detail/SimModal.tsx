@@ -960,6 +960,7 @@ export function SimModal(props: {
         }}
       >
         <span
+          data-testid="sim-active-scale"
           style={{
             fontFamily: MONO,
             fontSize: 10,
@@ -1581,7 +1582,7 @@ export function SimModal(props: {
           style={{
             fontFamily: MONO,
             fontSize: 10,
-            color: C.dimmest,
+            color: C.muted,
             lineHeight: 1.5,
           }}
         >
