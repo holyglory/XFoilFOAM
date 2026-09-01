@@ -1456,6 +1456,173 @@ def test_force_transient_rejects_missing_frame_track(tmp_path, monkeypatch):
     assert outcome.cd == pytest.approx(0.08)
 
 
+def test_final_clean_cycle_certificate_supersedes_stale_exhaustion(
+    tmp_path, monkeypatch
+):
+    """MUST-CATCH: final raw clean cycles outrank an in-flight exhaustion.
+
+    Production A63A108C alpha 12 stored a certified four-cycle suffix while
+    retaining the earlier recovery-exhausted error.  Reproduce that ordering
+    with real coefficient rows and real frame times: finalization may clear
+    only the provisional quality rejection and must publish the certified
+    periodic evidence.
+    """
+
+    from airfoilfoam.models import (
+        FluidProperties,
+        MeshParams,
+        RoughnessParams,
+        SolverParams,
+    )
+
+    class FakeRunner:
+        def application(self, *_args, **_kwargs):
+            return SimpleNamespace(ok=True, check=lambda: None)
+
+    period = 0.2
+    # Nine raw periods leave 5.4 periods after the normal 40% startup discard,
+    # enough for the independent 4.5-cycle cadence corroboration as well as
+    # the final three-cycle publication suffix.
+    times, cl, cd, cm = _clean_cycle_series(period=period, cycles=9)
+    tcase = tmp_path / "transient"
+    coeff = tcase / "postProcessing" / "forceCoeffs1" / "0" / "coefficient.dat"
+    coeff.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        "# Time Cd Cd(f) Cd(r) Cl Cl(f) Cl(r) CmPitch CmRoll CmYaw Cs Cs(f) Cs(r)"
+    ]
+    for t, cl_value, cd_value, cm_value in zip(times, cl, cd, cm):
+        rows.append(
+            f"{t:.12g} {cd_value:.12g} 0 0 {cl_value:.12g} 0 0 "
+            f"{cm_value:.12g} 0 0 0 0 0"
+        )
+    coeff.write_text("\n".join(rows) + "\n")
+    (tcase / "system").mkdir(parents=True)
+    (tcase / "system" / "controlDict").write_text("application pimpleFoam;\n")
+    frame_times = np.arange(0.0, 9 * period + 1e-9, period / 30.0)
+    for frame_time in frame_times:
+        (tcase / f"{float(frame_time):.12g}").mkdir(exist_ok=True)
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+        frame_times=frame_times,
+    )
+    assert audit.certified
+    history = ForceHistory(
+        t=times.tolist(),
+        cl=cl.tolist(),
+        cd=cd.tolist(),
+        cm=cm.tolist(),
+        cl_mean=float(np.mean(cl)),
+        cl_rms=float(np.std(cl)),
+        cd_mean=float(np.mean(cd)),
+        cd_rms=float(np.std(cd)),
+        cm_mean=float(np.mean(cm)),
+        cm_rms=float(np.std(cm)),
+        shedding_freq_hz=1.0 / period,
+        strouhal=1.0 / (period * 10.0),
+        samples=len(times),
+        period_s=period,
+        retained_cycles=9,
+        window_start=float(times[0]),
+        window_end=float(times[-1]),
+    )
+    stale_reason = (
+        "URANS clean-cycle recovery exhausted: 4 terminal clean cycles across "
+        "9 measured periods; automatic publication is withheld for solver recovery."
+    )
+    transient = TransientResult(
+        avg=SimpleNamespace(
+            cl=history.cl_mean,
+            cd=history.cd_mean,
+            cm=history.cm_mean,
+            cl_cd=history.cl_mean / history.cd_mean,
+            cl_std=history.cl_rms,
+            cd_std=history.cd_rms,
+            cm_std=history.cm_rms,
+        ),
+        case_dir=tcase,
+        force_history=history,
+        quality=UransQuality(
+            ok=False,
+            can_refine=False,
+            reason=stale_reason,
+            measured_period_s=period,
+            retained_cycles=9,
+            clean_cycle_audit=audit,
+        ),
+        start_time=0.0,
+        end_time=float(times[-1]),
+        run_time=float(times[-1]),
+        coeff_paths=[coeff],
+    )
+    monkeypatch.setattr(pipeline, "_run_transient", lambda *_args, **_kwargs: transient)
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=12.0),
+        reynolds=666_666,
+    )
+
+    _finalize_outcome(
+        tmp_path,
+        outcome,
+        airfoil=SimpleNamespace(name="unit airfoil", contour=[]),
+        resolved=MeshParams(),
+        spec=outcome.spec,
+        fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(
+            force_transient=True,
+            urans_fidelity="precalc",
+            write_images=[],
+        ),
+        runner=FakeRunner(),
+        n_proc=1,
+        render_images=False,
+        solver_timeout=7200,
+    )
+
+    assert outcome.converged
+    assert outcome.urans_cycle_certificate is not None
+    assert outcome.urans_cycle_certificate.certified
+    assert outcome.urans_cycle_certificate.terminal_clean_cycles >= 3
+    assert stale_reason not in outcome.quality_warnings
+
+
+def test_diagnostic_clean_cycles_are_not_serialized_as_certified():
+    """A cycle audit without corroborated cadence remains diagnostic only."""
+
+    period = 0.2
+    times, cl, cd, cm = _clean_cycle_series(period=period, cycles=4)
+    frame_times = np.arange(0.0, 4 * period + 1e-9, period / 30.0)
+    audit = audit_period_cycles(
+        times,
+        cl,
+        cd,
+        cm,
+        period,
+        fidelity="fast",
+        required_cycles=3,
+        frame_times=frame_times,
+    )
+    assert audit.certified
+
+    certificate = pipeline._evidence_backed_cycle_certificate(
+        audit,
+        publishable=False,
+    )
+
+    assert certificate is not None
+    assert not certificate.certified
+    assert certificate.selected_cycle_start_index is None
+    assert not any(
+        cycle.disposition.value == "selected" for cycle in certificate.cycles
+    )
+
+
 def test_transient_attempt_accepts_force_coefficients_under_zero_folder(tmp_path, monkeypatch):
     from airfoilfoam import pipeline
     from airfoilfoam.models import FluidProperties, RoughnessParams, SolverParams

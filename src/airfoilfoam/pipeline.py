@@ -3890,9 +3890,14 @@ def _cycle_certificate_disposition(
     return UransCycleDisposition.settling_outlier
 
 
-def _urans_cycle_certificate(audit: CleanCycleAudit) -> UransCycleCertificate:
+def _urans_cycle_certificate(
+    audit: CleanCycleAudit,
+    *,
+    publishable: bool | None = None,
+) -> UransCycleCertificate:
     """Build the transport certificate without mutating raw solver evidence."""
-    selected_start = audit.selected_start
+    certified = audit.certified and publishable is not False
+    selected_start = audit.selected_start if certified else None
     selected_cycles = [
         cycle
         for cycle in audit.cycles
@@ -3909,7 +3914,7 @@ def _urans_cycle_certificate(audit: CleanCycleAudit) -> UransCycleCertificate:
         selected_cycle_start_index=(
             selected_cycles[0].index if selected_cycles else None
         ),
-        certified=audit.certified,
+        certified=certified,
         cadence_adjusted=audit.cadence_adjusted,
         cycles=[
             UransCycleCertificateCycle(
@@ -3945,6 +3950,8 @@ def _urans_cycle_certificate(audit: CleanCycleAudit) -> UransCycleCertificate:
 
 def _evidence_backed_cycle_certificate(
     audit: CleanCycleAudit | None,
+    *,
+    publishable: bool | None = None,
 ) -> UransCycleCertificate | None:
     """Return a transport certificate only when actual field times were seen.
 
@@ -3956,7 +3963,7 @@ def _evidence_backed_cycle_certificate(
     """
     if audit is None or any(cycle.frames is None for cycle in audit.cycles):
         return None
-    return _urans_cycle_certificate(audit)
+    return _urans_cycle_certificate(audit, publishable=publishable)
 
 
 def _clean_cycle_tail_for_case(
@@ -7408,6 +7415,12 @@ def _finalize_outcome(
     frame_stationarity_stats: Optional[PeriodWindowStats] = None
     frame_series: Optional[tuple] = None  # merged (t, cl, cd, cm) coefficient arrays
     urans_rejection: Optional[HardSolverError] = None
+    # The in-flight grader may stop at its physical recovery ceiling before
+    # finalization re-reads the complete last-written coefficient/frame set.
+    # Track only that provisional quality rejection so a later authenticated
+    # clean-cycle certificate can supersede it without clearing an unrelated
+    # no-shedding, evidence-integrity, or frame-finalization failure.
+    provisional_quality_rejection: Optional[HardSolverError] = None
     if solver_params.force_transient or (not outcome.converged and solver_params.transient_fallback):
         outcome.method_key = "openfoam.urans"
         # Fidelity tier: the tier owns the retained-period target and the
@@ -7519,7 +7532,8 @@ def _finalize_outcome(
                 # is an interpretation record, not a replacement for the
                 # original coefficient or field artifacts.
                 outcome.urans_cycle_certificate = _evidence_backed_cycle_certificate(
-                    transient.quality.clean_cycle_audit
+                    transient.quality.clean_cycle_audit,
+                    publishable=transient.quality.ok,
                 )
             outcome.aperiodic_mean_certificate = (
                 transient.quality.aperiodic_mean_certificate
@@ -7528,9 +7542,10 @@ def _finalize_outcome(
             if not transient.quality.ok:
                 outcome.quality_warnings.append(transient.quality.reason)
                 if urans_rejection is None:
-                    urans_rejection = HardSolverError(
+                    provisional_quality_rejection = HardSolverError(
                         "URANS evidence rejected: " + transient.quality.reason
                     )
+                    urans_rejection = provisional_quality_rejection
             # Frame-track recording contract: integer-period time-weighted stats
             # become the SINGLE SOURCE OF TRUTH for the point coefficients and
             # the measured Strouhal number. No-shedding points stay on the plain
@@ -7553,8 +7568,37 @@ def _finalize_outcome(
                     )
                     if clean_audit is not None:
                         outcome.urans_cycle_certificate = _evidence_backed_cycle_certificate(
-                            clean_audit
+                            clean_audit,
+                            publishable=clean_tail is not None,
                         )
+                    if (
+                        precalc_tier
+                        and clean_tail is not None
+                        and clean_audit is not None
+                        and clean_audit.certified
+                        and provisional_quality_rejection is not None
+                        and urans_rejection is provisional_quality_rejection
+                    ):
+                        # Finalization owns the last immutable raw bytes.  A
+                        # complete FAST clean-cycle suffix is therefore newer,
+                        # stronger evidence than the provisional in-flight
+                        # exhaustion verdict.  Clear only that exact provisional
+                        # rejection; every independent evidence failure remains
+                        # fail-closed below.
+                        outcome.converged = True
+                        outcome.quality_warnings = [
+                            warning
+                            for warning in outcome.quality_warnings
+                            if warning != transient.quality.reason
+                        ]
+                        transient.quality = _quality_with(
+                            transient.quality,
+                            ok=True,
+                            can_refine=False,
+                            reason="URANS quality target met.",
+                            clean_cycle_audit=clean_audit,
+                        )
+                        urans_rejection = None
                     if clean_tail is None:
                         if strict_cycle_evidence and not aperiodic_certified:
                             certification_warning = (
