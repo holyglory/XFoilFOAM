@@ -43,6 +43,39 @@ describe("preliminary URANS recovery policy", () => {
     });
   });
 
+  it("MUST-CATCH: changes execution after a complete horizon with no clean terminal cycle", () => {
+    const plan = planPrecalcRecovery({
+      ...base,
+      status: "failed",
+      classificationReasons: [
+        "incomplete-urans-integration",
+        "insufficient-periods",
+        "non-stationary",
+      ],
+      observationProgress: 1,
+      continuationProgressed: false,
+    });
+    expect(plan).toMatchObject({
+      failureType: "numerical_instability",
+      action: "rerun_conservative_numerics",
+      consumesSolverAttempt: true,
+    });
+  });
+
+  it("continues a complete horizon while its terminal clean suffix is forming", () => {
+    const plan = planPrecalcRecovery({
+      ...base,
+      classificationReasons: ["insufficient-clean-cycle-evidence"],
+      observationProgress: 1,
+      continuationProgressed: true,
+    });
+    expect(plan).toMatchObject({
+      failureType: "incomplete_observation",
+      action: "continue_exact_case",
+      consumesSolverAttempt: false,
+    });
+  });
+
   it("routes a retrospective aperiodic candidate to the new contract", () => {
     const plan = planPrecalcRecovery({ ...base, statisticalMeanScore: 0.83 });
     expect(plan).toMatchObject({
@@ -53,6 +86,20 @@ describe("preliminary URANS recovery policy", () => {
     expect(precalcRecoveryOutcome(plan, false)).toBe(
       "aperiodic_contract_retry_pending",
     );
+  });
+
+  it("routes a complete statistical certificate before generic continuation markers", () => {
+    const plan = planPrecalcRecovery({
+      ...base,
+      classificationReasons: ["insufficient-periods"],
+      observationProgress: 0.8,
+      statisticalMeanScore: 0.9,
+    });
+    expect(plan).toMatchObject({
+      failureType: "stationary_aperiodic_candidate",
+      action: "rerun_statistical_mean_contract",
+      consumesSolverAttempt: true,
+    });
   });
 
   it("changes execution for numerical contamination", () => {

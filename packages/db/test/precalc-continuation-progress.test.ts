@@ -46,7 +46,6 @@ const resultIds: string[] = [];
 const evidenceBlobIds: string[] = [];
 const obligationIds: string[] = [];
 const backfillRunIds: string[] = [];
-const reducerVersionIds: string[] = [];
 let airfoilId = "";
 let otherAirfoilId = "";
 let createdOtherAirfoilId: string | null = null;
@@ -298,11 +297,6 @@ afterAll(async () => {
   }
   if (jobIds.length) {
     await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
-  }
-  if (reducerVersionIds.length) {
-    await db
-      .delete(resultReducerVersions)
-      .where(inArray(resultReducerVersions.id, reducerVersionIds));
   }
   await fixture?.cleanup();
   await legacyFixture?.cleanup();
@@ -1087,18 +1081,37 @@ describe("cross-segment preliminary URANS progress", () => {
     expect(
       await precalcContinuationsForObligations(db, [abandoned.obligation.id]),
     ).toHaveLength(1);
-    const [reducerVersion] = await db
+    const reducerIdentity = {
+      reducerKey: "test:precalc-continuation-progress",
+      reducerVersion: "1",
+      buildId: "stable-test-fixture",
+      policySha256: "a".repeat(64),
+    };
+    await db
       .insert(resultReducerVersions)
       .values({
-        reducerKey: `${PREFIX}-abandoned`,
-        reducerVersion: "1",
-        buildId: PREFIX,
-        policySha256: "a".repeat(64),
+        ...reducerIdentity,
         policy: {},
         source: "test",
       })
-      .returning({ id: resultReducerVersions.id });
-    reducerVersionIds.push(reducerVersion.id);
+      .onConflictDoNothing();
+    const [reducerVersion] = await db
+      .select({ id: resultReducerVersions.id })
+      .from(resultReducerVersions)
+      .where(
+        and(
+          eq(resultReducerVersions.reducerKey, reducerIdentity.reducerKey),
+          eq(
+            resultReducerVersions.reducerVersion,
+            reducerIdentity.reducerVersion,
+          ),
+          eq(resultReducerVersions.buildId, reducerIdentity.buildId),
+          eq(resultReducerVersions.policySha256, reducerIdentity.policySha256),
+        ),
+      )
+      .limit(1);
+    if (!reducerVersion)
+      throw new Error("stable reducer-version fixture was not created");
     const [cancelledRun] = await db
       .insert(resultInterpretationBackfillRuns)
       .values({
@@ -1529,7 +1542,7 @@ describe("cross-segment preliminary URANS progress", () => {
     ).toHaveLength(1);
   }, 120_000);
 
-  it("keeps a measurably productive trajectory schedulable beyond the former fixed continuation cap", async () => {
+  it("keeps a physically incomplete trajectory schedulable beyond the former fixed continuation cap", async () => {
     const cappedAoaDeg = aoaDeg + 0.1;
     const [cappedObligation] = await ensurePrecalcObligations(
       db,
@@ -1544,7 +1557,7 @@ describe("cross-segment preliminary URANS progress", () => {
       targetObligationId: cappedObligation.id,
       targetAoaDeg: cappedAoaDeg,
     });
-    const productiveSegments = 7;
+    const productiveSegments = 6;
     for (let segment = 1; segment <= productiveSegments; segment += 1) {
       checkpoint = await completeRejectedSegment({
         suffix: `productive-continuation-${segment}`,
@@ -1568,7 +1581,7 @@ describe("cross-segment preliminary URANS progress", () => {
       .where(eq(simPrecalcObligations.id, cappedObligation.id));
     expect(settled).toMatchObject({
       state: "pending",
-      lastOutcome: "rejected",
+      lastOutcome: "observation_continuation_pending",
       continuationSegmentCount: productiveSegments,
       continuationNoProgressCount: 0,
     });
@@ -1679,5 +1692,47 @@ describe("cross-segment preliminary URANS progress", () => {
       continuationSegmentCount: productiveSegments,
       continuationNoProgressCount: 0,
     });
+  }, 120_000);
+
+  it("MUST-CATCH: stops exact continuation after excess time without quality progress", async () => {
+    const targetAoaDeg = aoaDeg + 0.2;
+    const [target] = await ensurePrecalcObligations(
+      db,
+      [{ airfoilId, revisionId, aoaDeg: targetAoaDeg }],
+      { backgroundOwner: true },
+    );
+    if (!target) throw new Error("quality-aware obligation was not created");
+    obligationIds.push(target.id);
+
+    const initial = await completeRejectedSegment({
+      suffix: "quality-aware-initial",
+      targetObligationId: target.id,
+      targetAoaDeg,
+    });
+    await completeRejectedSegment({
+      suffix: "quality-aware-excess-horizon",
+      continueFromResultAttemptId: initial.id,
+      targetObligationId: target.id,
+      targetAoaDeg,
+      track: {
+        ...frameTrack,
+        periods_retained: 24,
+        window: { ...frameTrack.window, t_end: 58 },
+      },
+    });
+
+    const [settled] = await db
+      .select()
+      .from(simPrecalcObligations)
+      .where(eq(simPrecalcObligations.id, target.id));
+    expect(settled).toMatchObject({
+      state: "blocked",
+      lastOutcome: "fresh_physical_retry_exhausted",
+      continuationSegmentCount: 1,
+      continuationNoProgressCount: 1,
+    });
+    expect(await precalcContinuationsForObligations(db, [target.id])).toEqual(
+      [],
+    );
   }, 120_000);
 });

@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, sql, type SQLWrapper } from "drizzle-orm";
 import {
   AUTO_PRECALC_CONTINUATION_BUDGET_S,
+  FRAME_TRACK_MIN_PERIODS_PRECALC,
   URANS_BUDGET_STOP_MARKER,
   URANS_CONTINUATION_REQUIRED_MARKER,
   isDeterministicMeshBlockerError,
@@ -70,8 +71,9 @@ export interface PrecalcObligationOwnership {
 }
 
 /** Same-case continuation remains open while immutable physical measurements
- * advance. Only repeated measured no-progress is terminal; a fixed segment
- * count cannot discard a slowly settling trajectory. */
+ * advance toward the required horizon, then only while evidence quality
+ * improves. Repeated measured no-progress is terminal; a fixed segment count
+ * cannot discard a slowly settling trajectory. */
 export const MAX_PRECALC_NO_PROGRESS_SEGMENTS = 2;
 
 export function requiresConservativePrecalcRetry(
@@ -2062,6 +2064,9 @@ export interface PrecalcContinuationProgress {
   periodS: number | null;
   driftFrac: number | null;
   stationary: boolean | null;
+  terminalCleanCycles?: number | null;
+  requiredCleanCycles?: number | null;
+  cleanCycleCount?: number | null;
 }
 
 const finiteMetric = (value: unknown): number | null =>
@@ -2103,6 +2108,46 @@ export function precalcContinuationProgressFromEvidence(
     !Array.isArray(payload.force_history)
       ? (payload.force_history as Record<string, unknown>)
       : null;
+  const cycleCertificate =
+    payload?.urans_cycle_certificate != null &&
+    typeof payload.urans_cycle_certificate === "object" &&
+    !Array.isArray(payload.urans_cycle_certificate)
+      ? (payload.urans_cycle_certificate as Record<string, unknown>)
+      : null;
+  const cycles = Array.isArray(cycleCertificate?.cycles)
+    ? cycleCertificate.cycles
+    : null;
+  const terminalCleanCyclesCandidate = finiteMetric(
+    cycleCertificate?.terminal_clean_cycles,
+  );
+  const terminalCleanCycles =
+    terminalCleanCyclesCandidate != null &&
+    Number.isInteger(terminalCleanCyclesCandidate) &&
+    terminalCleanCyclesCandidate >= 0
+      ? terminalCleanCyclesCandidate
+      : null;
+  const requiredCleanCyclesCandidate = positiveMetric(
+    cycleCertificate?.required_clean_cycles,
+  );
+  const requiredCleanCycles =
+    requiredCleanCyclesCandidate != null &&
+    Number.isInteger(requiredCleanCyclesCandidate)
+      ? requiredCleanCyclesCandidate
+      : null;
+  const cleanCycleCount =
+    cycles == null || terminalCleanCycles == null || requiredCleanCycles == null
+      ? null
+      : cycles.filter((cycle) => {
+          if (
+            cycle == null ||
+            typeof cycle !== "object" ||
+            Array.isArray(cycle)
+          ) {
+            return false;
+          }
+          const reasons = (cycle as Record<string, unknown>).reasons;
+          return Array.isArray(reasons) && reasons.length === 0;
+        }).length;
   // Field-frame tracking is the strongest phase-repeatability evidence, but
   // it can legitimately be incomplete while the immutable force history has
   // advanced.  Use those physical force measurements only as per-field
@@ -2122,6 +2167,9 @@ export function precalcContinuationProgressFromEvidence(
       typeof frameTrack?.stationary === "boolean"
         ? frameTrack.stationary
         : null,
+    ...(terminalCleanCycles != null ? { terminalCleanCycles } : {}),
+    ...(requiredCleanCycles != null ? { requiredCleanCycles } : {}),
+    ...(cleanCycleCount != null ? { cleanCycleCount } : {}),
   };
 }
 
@@ -2161,6 +2209,33 @@ export function precalcContinuationMadeProgress(
       periodScale != null &&
       Math.abs(current.periodS! - previous.periodS!) / periodScale <= 0.05,
     );
+    const terminalCleanImproved = Boolean(
+      current.terminalCleanCycles != null &&
+      current.terminalCleanCycles > (previous.terminalCleanCycles ?? 0),
+    );
+    const anyCleanImproved = Boolean(
+      current.cleanCycleCount != null &&
+      current.cleanCycleCount > (previous.cleanCycleCount ?? 0),
+    );
+    const stationarityImproved = Boolean(
+      current.stationary === true && previous.stationary !== true,
+    );
+    const driftImproved = Boolean(
+      current.driftFrac != null &&
+      previous.driftFrac != null &&
+      previous.driftFrac > 0 &&
+      current.driftFrac <= previous.driftFrac * 0.9,
+    );
+    const qualityImproved =
+      terminalCleanImproved ||
+      anyCleanImproved ||
+      stationarityImproved ||
+      driftImproved;
+    const observationHorizonComplete = Boolean(
+      current.periodsRetained != null &&
+      current.periodsRetained >= FRAME_TRACK_MIN_PERIODS_PRECALC,
+    );
+    if (observationHorizonComplete) return periodCompatible && qualityImproved;
     if (periodCompatible) return true;
 
     // A missing or materially changed period estimate is weaker evidence.
@@ -2175,16 +2250,7 @@ export function precalcContinuationMadeProgress(
         ? Math.max(1e-6, measuredPeriod * 0.25)
         : Math.max(1e-4, Math.abs(previousTime) * 0.01);
     if (delta >= requiredDelta) return true;
-    if (current.stationary === true && previous.stationary !== true)
-      return true;
-    if (
-      current.driftFrac != null &&
-      previous.driftFrac != null &&
-      previous.driftFrac > 0 &&
-      current.driftFrac <= previous.driftFrac * 0.9
-    ) {
-      return true;
-    }
+    if (qualityImproved) return true;
     return false;
   }
 
@@ -2202,9 +2268,20 @@ export function precalcContinuationMadeProgress(
   const periodScale = Math.max(current.periodS, previous.periodS);
   const periodCompatible =
     Math.abs(current.periodS - previous.periodS) / periodScale <= 0.05;
+  const retainedGrowth =
+    current.periodsRetained - previous.periodsRetained >= 0.25;
+  if (!periodCompatible || !retainedGrowth) return false;
+  if (current.periodsRetained < FRAME_TRACK_MIN_PERIODS_PRECALC) return true;
   return Boolean(
-    periodCompatible &&
-    current.periodsRetained - previous.periodsRetained >= 0.25,
+    (current.terminalCleanCycles != null &&
+      current.terminalCleanCycles > (previous.terminalCleanCycles ?? 0)) ||
+    (current.cleanCycleCount != null &&
+      current.cleanCycleCount > (previous.cleanCycleCount ?? 0)) ||
+    (current.stationary === true && previous.stationary !== true) ||
+    (current.driftFrac != null &&
+      previous.driftFrac != null &&
+      previous.driftFrac > 0 &&
+      current.driftFrac <= previous.driftFrac * 0.9),
   );
 }
 
@@ -2622,6 +2699,9 @@ export async function settlePrecalcObligationsForJobInTransaction(
             driftFrac: priorRow.progress_drift_frac ?? fallbackPrior.driftFrac,
             stationary:
               priorRow.progress_stationary ?? fallbackPrior.stationary,
+            terminalCleanCycles: fallbackPrior.terminalCleanCycles,
+            requiredCleanCycles: fallbackPrior.requiredCleanCycles,
+            cleanCycleCount: fallbackPrior.cleanCycleCount,
           }
         : null;
       continuationSegmentNumber = obligation.continuationSegmentCount + 1;
@@ -2652,7 +2732,8 @@ export async function settlePrecalcObligationsForJobInTransaction(
       observationProgress:
         currentProgress.periodsRetained == null
           ? null
-          : currentProgress.periodsRetained / 3,
+          : currentProgress.periodsRetained / FRAME_TRACK_MIN_PERIODS_PRECALC,
+      continuationProgressed,
     });
     // Engine acceptance proves a submission happened, not that a physical CFD
     // attempt happened. Release the reserved solver ordinal only for typed

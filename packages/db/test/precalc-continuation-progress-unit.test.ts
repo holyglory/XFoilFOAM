@@ -16,7 +16,7 @@ describe("preliminary URANS continuation progress extraction", () => {
       },
       force_history: {
         period_s: 0.004,
-        retained_cycles: 3,
+        retained_cycles: 2,
         window_end: 0.06,
       },
     });
@@ -30,18 +30,67 @@ describe("preliminary URANS continuation progress extraction", () => {
       },
       force_history: {
         period_s: 0.004,
-        retained_cycles: 3,
+        retained_cycles: 2,
         window_end: 0.064,
       },
     });
 
     expect(baseline).toMatchObject({
-      periodsRetained: 3,
+      periodsRetained: 2,
       simulatedTimeS: 0.06,
       periodS: 0.004,
     });
     expect(precalcContinuationMadeProgress(baseline, continued)).toBe(true);
     expect(precalcContinuationMadeProgress(baseline, baseline)).toBe(false);
+  });
+
+  it("MUST-CATCH: requires quality progress after the physical horizon is complete", () => {
+    const previous = {
+      periodsRetained: 3,
+      simulatedTimeS: 0.06,
+      periodS: 0.004,
+      driftFrac: 0.2,
+      stationary: false,
+      terminalCleanCycles: 0,
+      requiredCleanCycles: 3,
+      cleanCycleCount: 0,
+    };
+    const timeOnly = {
+      ...previous,
+      periodsRetained: 24,
+      simulatedTimeS: 0.064,
+    };
+    expect(precalcContinuationMadeProgress(previous, timeOnly)).toBe(false);
+    expect(
+      precalcContinuationMadeProgress(previous, {
+        ...timeOnly,
+        terminalCleanCycles: 1,
+        cleanCycleCount: 1,
+      }),
+    ).toBe(true);
+  });
+
+  it("extracts clean-cycle progress without treating it as acceptance", () => {
+    expect(
+      precalcContinuationProgressFromEvidence({
+        frame_track: {
+          period_s: 0.01,
+          periods_retained: 3,
+          stationary: false,
+          drift_frac: 0.2,
+          window: { t_start: 0.08, t_end: 0.11 },
+        },
+        urans_cycle_certificate: {
+          terminal_clean_cycles: 1,
+          required_clean_cycles: 3,
+          cycles: [{ reasons: [] }, { reasons: ["phase shift"] }],
+        },
+      }),
+    ).toMatchObject({
+      terminalCleanCycles: 1,
+      requiredCleanCycles: 3,
+      cleanCycleCount: 1,
+    });
   });
 
   it("keeps frame-track measurements authoritative", () => {
@@ -173,7 +222,7 @@ describe("preliminary URANS continuation progress extraction", () => {
 
   it("uses compatible retained-cycle growth only when both window ends are absent", () => {
     const previous = {
-      periodsRetained: 3,
+      periodsRetained: 2,
       simulatedTimeS: null,
       periodS: 0.01,
       driftFrac: null,
@@ -182,7 +231,7 @@ describe("preliminary URANS continuation progress extraction", () => {
     expect(
       precalcContinuationMadeProgress(previous, {
         ...previous,
-        periodsRetained: 3.3,
+        periodsRetained: 2.3,
         periodS: 0.0102,
       }),
     ).toBe(true);

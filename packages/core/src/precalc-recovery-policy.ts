@@ -1,5 +1,10 @@
 /** Evidence-driven recovery policy for rejected preliminary URANS attempts. */
 
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "./urans-quality";
+
 export type PrecalcFailureType =
   | "infrastructure_interruption"
   | "deterministic_setup_failure"
@@ -34,6 +39,9 @@ export interface PrecalcRecoveryPolicyInput {
   numericalNoiseScore?: number | null;
   /** Continuous fraction of the required physical observation already held. */
   observationProgress?: number | null;
+  /** Whether this exact continuation improved horizon or quality versus its
+   * immutable predecessor. Null means this is not a continuation segment. */
+  continuationProgressed?: boolean | null;
 }
 
 export interface PrecalcRecoveryPlan {
@@ -193,21 +201,14 @@ export function planPrecalcRecovery(
     text.includes("insufficient-field-frames") ||
     text.includes("missing-periodicity-assessment") ||
     text.includes("insufficient-periodicity-cycles") ||
+    text.includes(
+      "period acquisition exhausted the physical slow-shedding horizon",
+    ) ||
     text.includes("source-cadence-gap") ||
     text.includes("budget-stop") ||
-    text.includes("continuation-required");
-  if (input.hasRestartableEvidence && incomplete) {
-    return {
-      failureType: "incomplete_observation",
-      action: "continue_exact_case",
-      consumesSolverAttempt: false,
-      evidenceCompleteness,
-      statisticalMeanScore,
-      numericalNoiseScore,
-      reason: "the exact saved trajectory needs more physical observation",
-    };
-  }
-
+    text.includes("continuation-required") ||
+    text.includes(URANS_BUDGET_STOP_MARKER.toLowerCase()) ||
+    text.includes(URANS_CONTINUATION_REQUIRED_MARKER.toLowerCase());
   if (statisticalMeanScore > 0) {
     return {
       failureType: "stationary_aperiodic_candidate",
@@ -218,6 +219,26 @@ export function planPrecalcRecovery(
       numericalNoiseScore,
       reason:
         "retrospective evidence supports the separate aperiodic statistical-mean contract",
+    };
+  }
+
+  // Initial restartable evidence and genuinely improving continuation
+  // segments retain the exact trajectory. A completed continuation that
+  // added time without improving horizon or quality must change execution.
+  if (
+    input.hasRestartableEvidence &&
+    incomplete &&
+    input.continuationProgressed !== false
+  ) {
+    return {
+      failureType: "incomplete_observation",
+      action: "continue_exact_case",
+      consumesSolverAttempt: false,
+      evidenceCompleteness,
+      statisticalMeanScore,
+      numericalNoiseScore,
+      reason:
+        "the exact saved trajectory still has measurable recovery progress",
     };
   }
 
