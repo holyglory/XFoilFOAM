@@ -23,7 +23,11 @@ export const URANS_CONTINUATION_REQUIRED_MARKER =
 /** Durable owner marker for the one-shot campaign precalc continuation. */
 export const AUTO_PRECALC_CONTINUATION_REQUESTED_BY =
   "system:precalc-continuation-v1";
-export const AUTO_PRECALC_CONTINUATION_BUDGET_S = 2 * 60 * 60;
+/** One exact continuation gets enough uninterrupted wall time to cover the
+ * measured 3.3–4.9 h remaining-horizon projections. The quality-aware
+ * continuation breaker prevents this larger bound from extending a complete
+ * but non-improving trajectory again. */
+export const AUTO_PRECALC_CONTINUATION_BUDGET_S = 8 * 60 * 60;
 
 /** Final-vs-preliminary coefficient disagreement bounds. These are domain
  * policy, not an engine transport detail: every producer and presenter of a

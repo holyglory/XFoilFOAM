@@ -4,6 +4,7 @@ import {
   planPrecalcRecovery,
   precalcRecoveryOutcome,
 } from "../src/precalc-recovery-policy";
+import { AUTO_PRECALC_CONTINUATION_BUDGET_S } from "../src/urans-quality";
 
 const base = {
   status: "done",
@@ -16,6 +17,10 @@ const base = {
 };
 
 describe("preliminary URANS recovery policy", () => {
+  it("pins one quality-gated exact continuation to eight hours", () => {
+    expect(AUTO_PRECALC_CONTINUATION_BUDGET_S).toBe(8 * 60 * 60);
+  });
+
   it("does not spend a physical attempt on infrastructure", () => {
     const plan = planPrecalcRecovery({
       ...base,
