@@ -1,10 +1,31 @@
 import {
+  hasPrecalcContinuationWarning,
   precalcContinuationMadeProgress,
   precalcContinuationProgressFromEvidence,
 } from "@aerodb/db";
+import {
+  URANS_BUDGET_STOP_MARKER,
+  URANS_CONTINUATION_REQUIRED_MARKER,
+} from "@aerodb/core";
 import { describe, expect, it } from "vitest";
 
 describe("preliminary URANS continuation progress extraction", () => {
+  it("uses only the canonical cross-runtime continuation markers", () => {
+    expect(
+      hasPrecalcContinuationWarning([
+        `measured trajectory ${URANS_BUDGET_STOP_MARKER}: retained state`,
+      ]),
+    ).toBe(true);
+    expect(
+      hasPrecalcContinuationWarning([
+        `measured trajectory ${URANS_CONTINUATION_REQUIRED_MARKER}`,
+      ]),
+    ).toBe(true);
+    expect(
+      hasPrecalcContinuationWarning(["budget-stop", "continuation-required"]),
+    ).toBe(false);
+  });
+
   it("uses real force-history time when frame tracking is incomplete", () => {
     const baseline = precalcContinuationProgressFromEvidence({
       frame_track: {

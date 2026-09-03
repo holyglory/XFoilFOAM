@@ -2,6 +2,7 @@ import {
   createClient,
   databaseUrl,
   hasCanonicalAcceptedUransForObligationSql,
+  restartablePrecalcWarningSql,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 
@@ -42,12 +43,7 @@ try {
       COALESCE(
         attempt.engine_job_id IS NOT NULL
         AND attempt.engine_case_slug IS NOT NULL
-        AND EXISTS (
-          SELECT 1
-          FROM unnest(COALESCE(attempt.quality_warnings, ARRAY[]::text[])) warning
-          WHERE warning LIKE '%continuation-required%'
-             OR warning LIKE '%budget-stop%'
-        ),
+        AND ${restartablePrecalcWarningSql(sql`attempt.quality_warnings`)},
         false
       ) AS restartable,
       CASE

@@ -663,7 +663,7 @@ function meshRecoveryScopeSql(scope: MeshRecoveryRequeueScope) {
   return sql`true`;
 }
 
-function restartablePrecalcWarningSql(warnings: SQLWrapper) {
+export function restartablePrecalcWarningSql(warnings: SQLWrapper) {
   return sql`EXISTS (
     SELECT 1
     FROM unnest(COALESCE(${warnings}, ARRAY[]::text[])) warning
