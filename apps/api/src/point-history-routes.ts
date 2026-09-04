@@ -65,6 +65,13 @@ const correctionBodySchema = z.object({
   solver: z.object({
     turbulenceModel: z.string().trim().min(1).max(80),
     nIterations: z.number().int().min(100).max(1_000_000),
+    uransInitializationIterations: z
+      .number()
+      .int()
+      .min(50)
+      .max(20_000)
+      .nullable()
+      .optional(),
     convergenceTolerance: z.number().finite().positive().max(1),
     momentumScheme: z.string().trim().min(1).max(80),
     transientCycles: z.number().finite().positive().max(10_000),

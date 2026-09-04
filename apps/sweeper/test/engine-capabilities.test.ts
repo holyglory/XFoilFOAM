@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
+  engineUransInitializationVersion,
   supportsDurableUransRecovery,
 } from "../src/engine-capabilities";
 import {
@@ -14,6 +15,42 @@ import {
 } from "../src/loop";
 
 describe("engine mesh-recovery capability handshake", () => {
+  it.each([
+    [undefined, 0],
+    [1, 1],
+    [0, 0],
+    [null, null],
+    ["1", null],
+    [1.5, null],
+    [-1, null],
+  ])(
+    "reads the separate initializer capability %s as %s",
+    async (version, expected) => {
+      const engine = {
+        healthDetails: async () => ({
+          status: "ok",
+          version: "test",
+          urans_recovery_version: 14,
+          ...(version !== undefined
+            ? { urans_initialization_version: version }
+            : {}),
+        }),
+      } as unknown as EngineClient;
+      await expect(engineUransInitializationVersion(engine)).resolves.toBe(
+        expected,
+      );
+      await expect(engineUransRecoveryVersion(engine)).resolves.toBe(14);
+    },
+  );
+
+  it("does not claim an initializer capability when health is unavailable", async () => {
+    const engine = {
+      healthDetails: async () => {
+        throw new Error("unavailable");
+      },
+    } as unknown as EngineClient;
+    await expect(engineUransInitializationVersion(engine)).resolves.toBeNull();
+  });
   it("accepts a monotonic non-negative integer advertised by live health", async () => {
     const engine = {
       healthDetails: async () => ({

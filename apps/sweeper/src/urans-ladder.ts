@@ -87,11 +87,13 @@ import {
   buildPolarRequest,
   pinAdmissionCpuSlotsForRequest,
   REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+  REQUIRED_URANS_INITIALIZATION_VERSION,
   solverImplementationIdForSetup,
 } from "./build-request";
 import {
   engineMeshRecoveryVersion,
   engineUransRecoveryVersion,
+  engineUransInitializationVersion,
   supportsDurableUransRecovery,
 } from "./engine-capabilities";
 import { recordEngineUnreachable } from "./engine-backoff";
@@ -1913,6 +1915,21 @@ async function submitLadderJob(
     };
   }
   assertNoReservedLadderPayloadKeys(payloadExtras);
+  if (target.snapshot.solver.uransInitializationIterations != null) {
+    const initializationVersion =
+      await engineUransInitializationVersion(engine);
+    if (initializationVersion !== REQUIRED_URANS_INITIALIZATION_VERSION) {
+      return {
+        jobId: "",
+        submitted: false,
+        connectionFailure: false,
+        lifecycleStopped: false,
+        submissionInProgress: false,
+        capabilityMismatch: true,
+        error: `URANS initialization requires engine capability v${REQUIRED_URANS_INITIALIZATION_VERSION}; live version is ${initializationVersion ?? "unavailable"}`,
+      };
+    }
+  }
   const payloadObligationIds = Array.isArray(
     (payloadExtras as { precalcObligationIds?: unknown }).precalcObligationIds,
   )

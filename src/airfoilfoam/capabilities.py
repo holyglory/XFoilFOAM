@@ -68,3 +68,4 @@ MESH_IDENTITY_VERSION = 1
 # advertises mesh strategy v1, but must not receive newly reopened URANS
 # recovery work during a rolling deployment.
 URANS_RECOVERY_VERSION = 14
+URANS_INITIALIZATION_VERSION = 1

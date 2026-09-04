@@ -405,6 +405,13 @@ ALL_IMAGE_FIELDS: tuple[ImageField, ...] = tuple(ImageField)
 class SolverParams(BaseModel):
     turbulence: TurbulenceParams = Field(default_factory=TurbulenceParams)
     n_iterations: int = Field(default=3000, ge=50, le=20000, description="Max SIMPLE iterations.")
+    urans_initialization_iterations: Optional[int] = Field(
+        default=None,
+        strict=True,
+        ge=50,
+        le=20000,
+        description="Explicit steady initialization limit for URANS only. Omission keeps legacy initialization limits.",
+    )
     convergence_tolerance: float = Field(
         default=1.0e-5, gt=0, description="Residual control for early convergence."
     )
@@ -747,6 +754,7 @@ class PolarRequest(BaseModel):
         "reject a mismatch before CFD so a legacy engine cannot consume newly "
         "reopened recovery work during a rolling deployment.",
     )
+    expected_urans_initialization_version: Optional[int] = Field(default=None, strict=True, ge=0)
     expected_engine: Optional[EngineIdentity] = Field(
         default=None,
         description="Exact logical solver implementation required by the controller. "
@@ -763,6 +771,13 @@ class PolarRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "PolarRequest":
+        if (
+            self.solver.urans_initialization_iterations is not None
+            and self.expected_urans_initialization_version is None
+        ):
+            raise ValueError(
+                "Explicit URANS initialization requires expected_urans_initialization_version."
+            )
         if any(c <= 0 for c in self.chord_lengths):
             raise ValueError("chord_lengths must be positive.")
         if any(s <= 0 for s in self.speeds):

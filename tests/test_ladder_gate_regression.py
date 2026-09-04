@@ -267,6 +267,35 @@ def test_urans_init_steady_stays_capped():
     assert _steady_rans_params(urans, None).n_iterations == 3000
 
 
+@pytest.mark.parametrize("worker_cap", [None, 50, 600, 3000])
+def test_explicit_urans_initializer_is_independent_of_primary_and_worker_limits(worker_cap):
+    profile = SolverParams(
+        n_iterations=3000, force_transient=True, urans_initialization_iterations=1200
+    )
+    assert _steady_rans_params(profile, worker_cap).n_iterations == 1200
+    assert profile.n_iterations == 3000
+    primary = profile.model_copy(update={"force_transient": False})
+    assert _steady_rans_params(primary, worker_cap).n_iterations == 3000
+
+
+@pytest.mark.parametrize("iterations,expected", [(None, 600), (1200, 1200)])
+def test_urans_initializer_writes_actual_control_dictionary(tmp_path, monkeypatch, iterations, expected):
+    from airfoilfoam.case.builder import CaseBuilder
+    from airfoilfoam.openfoam.dialects import OPENCFD_2606
+
+    builder = CaseBuilder.__new__(CaseBuilder)
+    builder._case_dir = tmp_path
+    builder.dialect = OPENCFD_2606
+    builder.solver = _steady_rans_params(SolverParams(
+        n_iterations=3000, force_transient=True, urans_initialization_iterations=iterations,
+    ), 600)
+    monkeypatch.setattr(builder, "_force_coeffs_dict", lambda: {})
+    builder._write_control_dict()
+    dictionary = (tmp_path / "system" / "controlDict").read_text()
+    assert f"endTime {expected};" in " ".join(dictionary.split())
+    assert f"writeInterval {expected};" in " ".join(dictionary.split())
+
+
 def test_steady_controldict_endtime_follows_uncapped_profile(tmp_path):
     """The 600 in prod came from CaseBuilder writing endTime=n_iterations off
     the capped params (case/builder.py). With the cap scoped away from primary

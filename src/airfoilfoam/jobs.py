@@ -12,7 +12,7 @@ from . import physics
 from .airfoil import load_airfoil
 from .cache import EngineCache
 from .cancellation import JobCancelled
-from .capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
+from .capabilities import MESH_RECOVERY_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from .config import Settings, get_settings
 from .meshing.base import Mesher, get_mesher
 from .models import (
@@ -192,6 +192,14 @@ def execute_job(
             f"requested v{request.expected_urans_recovery_version}, "
             f"worker is v{URANS_RECOVERY_VERSION}"
         )
+    if (
+        request.solver.urans_initialization_iterations is not None
+        and request.expected_urans_initialization_version != URANS_INITIALIZATION_VERSION
+    ) or (
+        request.expected_urans_initialization_version is not None
+        and request.expected_urans_initialization_version != URANS_INITIALIZATION_VERSION
+    ):
+        raise RuntimeError("worker URANS-initialization capability mismatch before staging or CFD")
     airfoil = load_airfoil(
         request.airfoil.name, request.airfoil.coordinates, request.airfoil.points,
         request.airfoil.format,

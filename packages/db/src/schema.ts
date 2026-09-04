@@ -794,6 +794,7 @@ export const solverProfiles = pgTable(
      * point-correction owner can submit a non-null value until a later
      * evidence-backed policy decision promotes it. */
     uransPrecalcBudgetS: integer("urans_precalc_budget_s"),
+    uransInitializationIterations: integer("urans_initialization_iterations"),
     isSeeded: boolean("is_seeded").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
@@ -808,6 +809,10 @@ export const solverProfiles = pgTable(
     uransPrecalcBudgetCheck: check(
       "solver_profiles_urans_precalc_budget_s_check",
       sql`${t.uransPrecalcBudgetS} IS NULL OR ${t.uransPrecalcBudgetS} BETWEEN 14400 AND 86400`,
+    ),
+    uransInitializationIterationsCheck: check(
+      "solver_profiles_urans_initialization_iterations_check",
+      sql`${t.uransInitializationIterations} IS NULL OR ${t.uransInitializationIterations} BETWEEN 50 AND 20000`,
     ),
   }),
 );

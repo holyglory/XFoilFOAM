@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from airfoilfoam import jobs
-from airfoilfoam.capabilities import URANS_RECOVERY_VERSION
+from airfoilfoam.capabilities import URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
@@ -251,6 +251,39 @@ def test_worker_rejects_capability_mismatch_before_geometry_or_solver(tmp_path):
             request,
             store=JobStore(),
         )
+
+
+def test_initializer_health_is_separate_from_scientific_recovery_version(client):
+    health = client.get("/health").json()
+    assert health["urans_initialization_version"] == URANS_INITIALIZATION_VERSION == 1
+    assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION == 14
+
+
+def test_polar_submit_rejects_urans_initialization_mismatch_before_queueing(client, naca0012_selig_text):
+    response = client.post("/polars", json={
+        "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
+        "aoa": {"angles": [12]},
+        "solver": {"force_transient": True, "urans_initialization_iterations": 1200},
+        "expected_urans_initialization_version": 2,
+    })
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "urans_initialization_version_mismatch",
+        "requested_version": 2,
+        "actual_version": 1,
+    }
+
+
+@pytest.mark.parametrize("version", [None, 0, 2])
+def test_worker_rejects_urans_initialization_mismatch_before_geometry(version):
+    request = PolarRequest.model_validate({
+        "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
+        "aoa": {"angles": [12]},
+        "solver": {"force_transient": True, "urans_initialization_iterations": 1200},
+        "expected_urans_initialization_version": 1,
+    }).model_copy(update={"expected_urans_initialization_version": version})
+    with pytest.raises(RuntimeError, match="URANS-initialization capability mismatch"):
+        jobs.execute_job("initialization-mismatch", request, store=JobStore())
 
 
 def test_polar_submit_rejects_urans_recovery_cutover_before_queueing(

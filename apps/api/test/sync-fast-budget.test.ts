@@ -31,6 +31,7 @@ describe("mirrored experimental FAST solver configuration", () => {
       transientDiscardFraction: 0.4,
       transientMaxCourant: 4,
       uransPrecalcBudgetS: 28_800,
+      uransInitializationIterations: null,
     });
   });
 
@@ -39,5 +40,14 @@ describe("mirrored experimental FAST solver configuration", () => {
       solver: { ...solver, uransPrecalcBudgetS: undefined },
     } as unknown as SimulationSetupSnapshot);
     expect(values.uransPrecalcBudgetS).toBeUndefined();
+    expect(values.uransInitializationIterations).toBeNull();
+  });
+
+  it("preserves an explicitly pinned URANS initializer without changing primary RANS", () => {
+    const values = mirroredSolverProfileValues({
+      solver: { ...solver, uransInitializationIterations: 1200 },
+    } as unknown as SimulationSetupSnapshot);
+    expect(values.uransInitializationIterations).toBe(1200);
+    expect(values.nIterations).toBe(3000);
   });
 });

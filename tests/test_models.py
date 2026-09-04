@@ -7,6 +7,26 @@ def test_aoa_explicit_list():
     assert AoASpec(angles=[0, 5, 10]).expand() == [0, 5, 10]
 
 
+@pytest.mark.parametrize("iterations", [49, 20001, 1200.5, "1200", True])
+def test_urans_initialization_rejects_invalid_limits(iterations):
+    with pytest.raises(ValueError):
+        SolverParams(urans_initialization_iterations=iterations)
+
+
+def test_explicit_urans_initializer_requires_separate_capability(naca0012_selig_text):
+    payload = {
+        "airfoil": {"name": "naca0012", "coordinates": naca0012_selig_text},
+        "aoa": {"angles": [12]},
+        "solver": {"force_transient": True, "urans_initialization_iterations": 1200},
+    }
+    with pytest.raises(ValueError, match="expected_urans_initialization_version"):
+        PolarRequest.model_validate(payload)
+    request = PolarRequest.model_validate({**payload, "expected_urans_initialization_version": 1})
+    assert request.solver.urans_initialization_iterations == 1200
+    assert request.solver.n_iterations == 3000
+    assert SolverParams().urans_initialization_iterations is None
+
+
 def test_aoa_range_inclusive():
     assert AoASpec(start=-2, stop=4, step=2).expand() == [-2, 0, 2, 4]
 

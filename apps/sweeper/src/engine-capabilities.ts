@@ -104,3 +104,12 @@ export function supportsDurableUransRecovery(
 ): version is number {
   return version != null && version >= MIN_DURABLE_URANS_RECOVERY_VERSION;
 }
+
+export async function engineUransInitializationVersion(
+  engine: EngineClient,
+): Promise<number | null> {
+  const health = await engineHealthDetails(engine);
+  if (!health) return null;
+  if (!("urans_initialization_version" in health)) return 0;
+  return parsedUransRecoveryVersion(health.urans_initialization_version);
+}

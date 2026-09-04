@@ -1103,6 +1103,7 @@ describe("point-history story endpoint", () => {
         },
         solver: {
           ...story.point.correctionSetup.solver,
+          uransInitializationIterations: 1200,
           transientCycles:
             story.point.correctionSetup.solver.transientCycles + 4,
           transientMaxCourant: Math.min(
@@ -1155,6 +1156,25 @@ describe("point-history story endpoint", () => {
         .from(solverProfiles)
         .where(eq(solverProfiles.id, correctedPreset.solverProfileId));
       expect(correctedSolver.budget).toBe(28_800);
+      expect(
+        (correctedRevision.snapshot as { solver: Record<string, unknown> })
+          .solver.uransInitializationIterations,
+      ).toBe(1200);
+
+      for (const invalidIterations of [49, 20_001, 1200.5, "1200"]) {
+        const invalid = await app.inject({
+          method: "POST",
+          url: `/api/admin/point-history/${resultId}/corrected-run`,
+          payload: {
+            ...payload,
+            solver: {
+              ...payload.solver,
+              uransInitializationIterations: invalidIterations,
+            },
+          },
+        });
+        expect(invalid.statusCode).toBe(400);
+      }
 
       const replay = await app.inject({
         method: "POST",

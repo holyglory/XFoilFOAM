@@ -21,6 +21,7 @@ import {
   buildPolarRequest,
   pinAdmissionCpuSlotsForRequest,
   REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+  REQUIRED_URANS_INITIALIZATION_VERSION,
 } from "../src/build-request";
 
 const airfoil = {
@@ -91,6 +92,37 @@ const setup = {
 } as unknown as SimulationSetupSnapshot;
 
 describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)", () => {
+  it.each([null, undefined, 1200])(
+    "pins only explicit wave-2 initialization %s",
+    (iterations) => {
+      for (const wave of [1, 2] as const) {
+        const { request } = buildPolarRequest({
+          airfoil,
+          setup: {
+            ...setup,
+            solver: {
+              ...setup.solver,
+              uransInitializationIterations: iterations,
+            },
+          },
+          aoaList: [12],
+          wave,
+        });
+        expect(request.solver?.n_iterations).toBe(3000);
+        expect(request.solver?.urans_initialization_iterations).toBe(
+          wave === 2 && iterations != null ? 1200 : undefined,
+        );
+        expect(request.expected_urans_initialization_version).toBe(
+          wave === 2 && iterations != null
+            ? REQUIRED_URANS_INITIALIZATION_VERSION
+            : undefined,
+        );
+        expect(request.expected_urans_recovery_version).toBe(
+          wave === 2 ? 14 : undefined,
+        );
+      }
+    },
+  );
   it("batched CAMPAIGN wave-1 job (speeds[] + cpuSlots, the loop.ts submitCampaignBatch shape) ships transient_fallback:false and force_transient:false as present keys", () => {
     const { request } = buildPolarRequest({
       airfoil,

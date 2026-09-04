@@ -891,6 +891,23 @@ def test_engine_build_id_expectations_are_one_atomic_env_update(tmp_path: Path) 
     persisted = Path(env["ENV_FILE"]).read_text()
     assert "AIRFOILFOAM_BUILD_ID=old-build" in persisted
     assert "ENGINE_EXPECTED_BUILD_ID=old-build" in persisted
+    assert "OPENCFD2606_ENGINE_SOURCE_REVISION=" not in persisted
+
+
+def test_engine_rebuild_binds_opencfd_source_label_to_verified_export(tmp_path: Path) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+    completed = subprocess.run(
+        [str(ROOT / "scripts" / "deploy" / "rebuild-engine.sh"), "test-build"],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    persisted = Path(env["ENV_FILE"]).read_text()
+    assert f"OPENCFD2606_ENGINE_SOURCE_REVISION={'a' * 40}" in persisted
+    assert "AIRFOILFOAM_BUILD_ID=test-build" in persisted
+    assert "ENGINE_EXPECTED_BUILD_ID=test-build" in persisted
+    compose = (ROOT / "docker-compose.deploy.yml").read_text()
+    assert "AIRFOILFOAM_ENGINE_SOURCE_REVISION: ${OPENCFD2606_ENGINE_SOURCE_REVISION:-" in compose
+    assert "AIRFOILFOAM_ENGINE_SOURCE_REVISION: b4f91ad8bbbab628441562fc419f040cc4796f11" in compose
 
 
 def test_opencfd_cutover_updates_build_ids_and_engine_allow_list_atomically(

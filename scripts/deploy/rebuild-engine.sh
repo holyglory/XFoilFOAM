@@ -2352,6 +2352,7 @@ main() {
   local -a engine_identity_updates=(
     "AIRFOILFOAM_BUILD_ID=$BUILD_ID"
     "ENGINE_EXPECTED_BUILD_ID=$BUILD_ID"
+    "OPENCFD2606_ENGINE_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION"
   )
   if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]]; then
     # The service DNS name is owned by the reviewed Compose `api` service.

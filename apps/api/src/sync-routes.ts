@@ -1292,14 +1292,23 @@ function conflictReviewNumber(
 function conflictAoALabel(value: number | null): string {
   if (value == null) return "unknown angle";
   const rounded = Math.round(value * 1000) / 1000;
-  return `α ${rounded.toFixed(Number.isInteger(rounded) ? 1 : 3).replace(/0+$/, "").replace(/[.]$/, "")}°`;
+  return `α ${rounded
+    .toFixed(Number.isInteger(rounded) ? 1 : 3)
+    .replace(/0+$/, "")
+    .replace(/[.]$/, "")}°`;
 }
 
 function conflictReynoldsLabel(value: number): string {
   if (value >= 1_000_000)
-    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 2).replace(/0+$/, "").replace(/[.]$/, "")}M`;
+    return `${(value / 1_000_000)
+      .toFixed(value >= 10_000_000 ? 0 : 2)
+      .replace(/0+$/, "")
+      .replace(/[.]$/, "")}M`;
   if (value >= 1_000)
-    return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1).replace(/0$/, "").replace(/[.]$/, "")}k`;
+    return `${(value / 1_000)
+      .toFixed(value >= 100_000 ? 0 : 1)
+      .replace(/0$/, "")
+      .replace(/[.]$/, "")}k`;
   return String(Math.round(value));
 }
 
@@ -1605,8 +1614,7 @@ async function syncAdminPayload(req: FastifyRequest) {
       naturalKey: row.naturalKey,
       sourceInstanceId: row.sourceInstanceId,
       sourceInstanceName: row.sourceInstanceName,
-      canPromote:
-        row.dataType === "airfoils" || row.dataType === "mediums",
+      canPromote: row.dataType === "airfoils" || row.dataType === "mediums",
       review: conflictReview(
         row,
         row.dataType === "polars"
@@ -3365,6 +3373,8 @@ export function mirroredSolverProfileValues(snapshot: SimulationSetupSnapshot) {
     transientDiscardFraction: snapshot.solver.transientDiscardFraction,
     transientMaxCourant: snapshot.solver.transientMaxCourant,
     uransPrecalcBudgetS: snapshot.solver.uransPrecalcBudgetS,
+    uransInitializationIterations:
+      snapshot.solver.uransInitializationIterations ?? null,
   };
 }
 

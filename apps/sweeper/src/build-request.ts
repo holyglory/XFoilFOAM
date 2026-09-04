@@ -23,6 +23,7 @@ import {
  * Pin every new wave-2 request so a rolling deployment fails closed instead of
  * silently producing evidence under the older contract. */
 export const REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION = 14;
+export const REQUIRED_URANS_INITIALIZATION_VERSION = 1;
 
 export function engineIdentityForSetup(
   setup: SimulationSetupSnapshot,
@@ -118,6 +119,12 @@ export function buildPolarRequest(opts: {
     span_chords: mesh.spanChords,
   });
   const request: PolarRequest = {
+    ...(wave === 2 && setup.solver.uransInitializationIterations != null
+      ? {
+          expected_urans_initialization_version:
+            REQUIRED_URANS_INITIALIZATION_VERSION,
+        }
+      : {}),
     expected_engine: {
       ...(engineIdentity ?? engineIdentityForSetup(setup)),
     },
@@ -152,6 +159,12 @@ export function buildPolarRequest(opts: {
         viscosity_ratio: setup.boundary.viscosityRatio,
       },
       n_iterations: setup.solver.nIterations,
+      ...(wave === 2 && setup.solver.uransInitializationIterations != null
+        ? {
+            urans_initialization_iterations:
+              setup.solver.uransInitializationIterations,
+          }
+        : {}),
       convergence_tolerance: setup.solver.convergenceTolerance,
       momentum_scheme: setup.solver.momentumScheme,
       // Wave-1 jobs (campaign RANS batches AND continuous/public sweeps) must

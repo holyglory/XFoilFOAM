@@ -977,6 +977,7 @@ export interface PointStory {
         transientCycles: number;
         transientDiscardFraction: number;
         transientMaxCourant: number;
+        uransInitializationIterations?: number;
       };
     } | null;
     /** Latest verify-queue item for this cell+angle; null = never queued. */
@@ -1206,6 +1207,14 @@ export async function pointStory(
               "transientDiscardFraction",
             )!,
             transientMaxCourant: numberField(solver, "transientMaxCourant")!,
+            ...(numberField(solver, "uransInitializationIterations") != null
+              ? {
+                  uransInitializationIterations: numberField(
+                    solver,
+                    "uransInitializationIterations",
+                  )!,
+                }
+              : {}),
           },
         }
       : null;

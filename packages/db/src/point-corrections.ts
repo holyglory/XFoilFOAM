@@ -42,6 +42,7 @@ export interface PointCorrectionSettings {
   solver: {
     turbulenceModel: string;
     nIterations: number;
+    uransInitializationIterations?: number | null;
     convergenceTolerance: number;
     momentumScheme: string;
     transientCycles: number;
@@ -83,6 +84,18 @@ export async function createPointCorrection(
   db: DB,
   input: PointCorrectionInput,
 ) {
+  const initializationIterations = input.solver.uransInitializationIterations;
+  if (
+    initializationIterations != null &&
+    (!Number.isSafeInteger(initializationIterations) ||
+      initializationIterations < 50 ||
+      initializationIterations > 20_000)
+  ) {
+    throw new CampaignError(
+      "validation",
+      "URANS initialization must be an integer from 50 through 20000 iterations",
+    );
+  }
   if (
     input.freshBudgetOverrideS != null &&
     (!Number.isSafeInteger(input.freshBudgetOverrideS) ||

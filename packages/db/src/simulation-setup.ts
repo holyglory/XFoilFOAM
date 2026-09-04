@@ -91,8 +91,12 @@ export interface SimulationSetupSnapshot {
   uransPrecalcMesh: SimulationSetupSnapshot["mesh"] | null;
   solver: Omit<
     InferSelectModel<typeof solverProfiles>,
-    "createdAt" | "updatedAt" | "isSeeded" | "solverImplementationId"
-  >;
+    | "createdAt"
+    | "updatedAt"
+    | "isSeeded"
+    | "solverImplementationId"
+    | "uransInitializationIterations"
+  > & { uransInitializationIterations?: number | null };
   scheduling: Omit<
     InferSelectModel<typeof schedulingProfiles>,
     "createdAt" | "updatedAt" | "isSeeded"
@@ -176,8 +180,15 @@ export function physicsHashForSnapshot(
     id: _solverId,
     slug: _solverSlug,
     name: _solverName,
+    uransInitializationIterations,
     ...solverPhysics
   } = solver;
+  const resolvedSolverPhysics = {
+    ...solverPhysics,
+    ...(uransInitializationIterations != null
+      ? { uransInitializationIterations }
+      : {}),
+  };
   const subset = {
     flowState: {
       mediumId: flowState.mediumId,
@@ -207,7 +218,7 @@ export function physicsHashForSnapshot(
     ...(uransPrecalcMeshPhysics
       ? { uransPrecalcMesh: uransPrecalcMeshPhysics }
       : {}),
-    solver: solverPhysics,
+    solver: resolvedSolverPhysics,
     derived: { reynolds: derived.reynolds, mach: derived.mach },
   };
   return createHash("sha256").update(stableStringify(subset)).digest("hex");
@@ -437,8 +448,15 @@ export async function resolveSimulationPresetSnapshot(
     updatedAt: _solUpdated,
     isSeeded: _solSeeded,
     solverImplementationId: _solverImplementationId,
-    ...solverPayload
+    uransInitializationIterations,
+    ...legacySolverPayload
   } = solver;
+  const solverPayload = {
+    ...legacySolverPayload,
+    ...(uransInitializationIterations != null
+      ? { uransInitializationIterations }
+      : {}),
+  };
   const {
     createdAt: _schedCreated,
     updatedAt: _schedUpdated,

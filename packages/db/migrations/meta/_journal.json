@@ -736,6 +736,13 @@
       "when": 1792195200000,
       "tag": "0104_campaign_summary_hot_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1792281600000,
+      "tag": "0105_point_urans_initialization",
+      "breakpoints": true
     }
   ]
 }

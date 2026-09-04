@@ -5109,7 +5109,13 @@ def _prepare_transient_case(
     # A short steady initialisation gives the transient a developed,
     # already-separated field to continue from.
     init_solver = solver_params.model_copy(
-        update={"n_iterations": min(solver_params.n_iterations, TRANSIENT_INIT_ITERS)}
+        update={
+            "n_iterations": (
+                solver_params.urans_initialization_iterations
+                if solver_params.urans_initialization_iterations is not None
+                else min(solver_params.n_iterations, TRANSIENT_INIT_ITERS)
+            )
+        }
     )
     CaseBuilder(
         airfoil,
@@ -8787,7 +8793,13 @@ def _steady_rans_params(solver_params: SolverParams, rans_max_iterations: Option
     cap was applied unconditionally (jobs.py passes
     settings.rans_max_iterations to every job; CaseBuilder writes
     endTime=self.solver.n_iterations), starving moderate-AoA convergence."""
-    if rans_max_iterations is None or not solver_params.force_transient:
+    if not solver_params.force_transient:
+        return solver_params
+    if solver_params.urans_initialization_iterations is not None:
+        return solver_params.model_copy(
+            update={"n_iterations": solver_params.urans_initialization_iterations}
+        )
+    if rans_max_iterations is None:
         return solver_params
     cap = max(50, int(rans_max_iterations))
     if solver_params.n_iterations <= cap:

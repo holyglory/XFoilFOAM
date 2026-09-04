@@ -155,6 +155,7 @@ export const ALL_IMAGE_FIELDS: ImageFieldName[] = [
 export interface SolverParams {
   turbulence?: TurbulenceParams;
   n_iterations?: number;
+  urans_initialization_iterations?: number;
   convergence_tolerance?: number;
   momentum_scheme?: string;
   transient_fallback?: boolean;
@@ -213,6 +214,7 @@ export interface ContinueFrom {
 }
 
 export interface PolarRequest {
+  expected_urans_initialization_version?: number;
   /** Exact logical implementation requested by the control plane. New clients
    * always send this field; omission remains accepted only for legacy callers. */
   expected_engine?: EngineIdentity;
@@ -346,6 +348,7 @@ export interface EngineHealth {
   /** Durable cross-job URANS recovery contract. Missing means legacy version
    * zero and must not authorize continuation or corrective final recovery. */
   urans_recovery_version?: number;
+  urans_initialization_version?: number;
   /** Structured engine/runtime identity. Top-level version/build_id remain for
    * legacy control-plane and operator compatibility during rollout. */
   engine?: EngineRuntimeIdentity | null;

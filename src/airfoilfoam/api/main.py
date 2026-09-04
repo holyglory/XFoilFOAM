@@ -29,7 +29,7 @@ from ..archive_reduction import (
     reduce_remote_archive_clean_cycles,
 )
 from ..cache import EngineCache
-from ..capabilities import MESH_RECOVERY_VERSION, URANS_RECOVERY_VERSION
+from ..capabilities import MESH_RECOVERY_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from ..config import Settings, get_settings
 from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
@@ -906,6 +906,7 @@ def create_app() -> FastAPI:
             "build_id": settings.build_id,
             "mesh_recovery_version": MESH_RECOVERY_VERSION,
             "urans_recovery_version": URANS_RECOVERY_VERSION,
+            "urans_initialization_version": URANS_INITIALIZATION_VERSION,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
             # provenance appears solely on worker-acknowledged status/results.
@@ -1037,6 +1038,18 @@ def create_app() -> FastAPI:
                         f"requested v{request.expected_mesh_recovery_version}, "
                         f"API is v{MESH_RECOVERY_VERSION}. Refresh capability and retry."
                     ),
+                },
+            )
+        if (
+            request.expected_urans_initialization_version is not None
+            and request.expected_urans_initialization_version != URANS_INITIALIZATION_VERSION
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "urans_initialization_version_mismatch",
+                    "requested_version": request.expected_urans_initialization_version,
+                    "actual_version": URANS_INITIALIZATION_VERSION,
                 },
             )
         if (

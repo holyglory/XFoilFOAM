@@ -2654,7 +2654,10 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
       reasons: ["not-converged"],
     });
     const [revision] = await db
-      .select({ presetId: simulationPresetRevisions.presetId })
+      .select({
+        presetId: simulationPresetRevisions.presetId,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
       .from(simulationPresetRevisions)
       .where(eq(simulationPresetRevisions.id, revisionId));
     const { request } = await createUransRequest(db, {
@@ -2683,24 +2686,54 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
     const captured: PolarRequest[] = [];
     let createdJobId: string | null = null;
     try {
+      const snapshot = revision.snapshot as { solver: Record<string, unknown> };
+      await db
+        .update(simulationPresetRevisions)
+        .set({
+          snapshot: {
+            ...snapshot,
+            solver: { ...snapshot.solver, uransInitializationIterations: 1200 },
+          },
+        })
+        .where(eq(simulationPresetRevisions.id, revisionId));
+      const oldEngine = stubEngine(
+        captured,
+        `${PREFIX}-old-initializer-engine`,
+      );
+      const deferred = await submitPendingPointCorrectionFastRequest(
+        db,
+        oldEngine,
+        0,
+        2,
+        14,
+      );
+      expect(deferred.submitted).toBe(false);
+      expect(captured).toHaveLength(0);
+      const [deferredRequest] = await db
+        .select({
+          state: simUransRequests.state,
+          simJobId: simUransRequests.simJobId,
+        })
+        .from(simUransRequests)
+        .where(eq(simUransRequests.id, request.id));
+      expect(deferredRequest).toEqual({ state: "pending", simJobId: null });
+      const capableEngine = {
+        ...stubEngine(captured, `${PREFIX}-point-correction-engine`),
+        healthDetails: async () => ({
+          status: "ok",
+          version: "test",
+          urans_recovery_version: 14,
+          urans_initialization_version: 1,
+        }),
+      } as unknown as EngineClient;
       const outcomes = await Promise.all([
-        submitPendingPointCorrectionFastRequest(
-          db,
-          stubEngine(captured, `${PREFIX}-point-correction-engine`),
-          0,
-          2,
-          14,
-        ),
-        submitPendingPointCorrectionFastRequest(
-          db,
-          stubEngine(captured, `${PREFIX}-point-correction-engine`),
-          0,
-          2,
-          14,
-        ),
+        submitPendingPointCorrectionFastRequest(db, capableEngine, 0, 2, 14),
+        submitPendingPointCorrectionFastRequest(db, capableEngine, 0, 2, 14),
       ]);
       expect(outcomes.filter((outcome) => outcome.submitted)).toHaveLength(1);
       expect(captured).toHaveLength(1);
+      expect(captured[0].solver?.urans_initialization_iterations).toBe(1200);
+      expect(captured[0].expected_urans_initialization_version).toBe(1);
       const [owned] = await db
         .select({
           state: simUransRequests.state,
@@ -2719,6 +2752,10 @@ describe("fidelity ladder end-to-end (gating → precalc retry → verify queue 
         );
       expect(duplicateOwners).toHaveLength(1);
     } finally {
+      await db
+        .update(simulationPresetRevisions)
+        .set({ snapshot: revision.snapshot })
+        .where(eq(simulationPresetRevisions.id, revisionId));
       await db
         .delete(simUransRequests)
         .where(eq(simUransRequests.id, request.id));

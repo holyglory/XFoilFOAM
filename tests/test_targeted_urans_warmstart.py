@@ -561,7 +561,8 @@ def test_prepare_transient_case_warm_starts_from_steady_field(tmp_path, monkeypa
     assert calls == ["checkMesh"]  # no potentialFoam cold start, no extra init solve
 
 
-def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_init(tmp_path, monkeypatch):
+@pytest.mark.parametrize("initialization_iterations,expected", [(None, 600), (1200, 1200)])
+def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_init(tmp_path, monkeypatch, initialization_iterations, expected):
     """Without a usable steady field, a URANS-only transient must STILL run the
     steady initialisation stage (potentialFoam + short simpleFoam) — the exact
     cold-start skip that produced the prod dt collapse."""
@@ -583,7 +584,12 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
             )
             return SimpleNamespace(ok=True, stdout="init ok")
 
-    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    class InitializationBuilder(FakeCaseBuilder):
+        def __init__(self, *args, **kwargs):
+            assert args[6].n_iterations == expected
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", InitializationBuilder)
     monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
 
     tcase = tmp_path / "case" / "transient"
@@ -594,7 +600,7 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
         spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=4.0),
         fluid=FLUID,
         roughness=RoughnessParams(),
-        solver_params=SolverParams(force_transient=True),
+        solver_params=SolverParams(force_transient=True, urans_initialization_iterations=initialization_iterations),
         runner=FakeRunner(),
         n_proc=1,
         timeout=60,
@@ -616,7 +622,8 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
     ).is_file()
 
 
-def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_path, monkeypatch):
+@pytest.mark.parametrize("initialization_iterations,expected", [(None, 600), (1200, 1200)])
+def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_path, monkeypatch, initialization_iterations, expected):
     """False-positive guard: a standalone transient with no shared mesh has no
     rejected steady seed, so it keeps the potentialFoam + short SIMPLE init."""
     calls: list[str] = []
@@ -641,7 +648,12 @@ def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_pa
             calls.append(app)
             return SimpleNamespace(ok=True, stdout="standalone init ok")
 
-    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    class InitializationBuilder(FakeCaseBuilder):
+        def __init__(self, *args, **kwargs):
+            assert args[6].n_iterations == expected
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", InitializationBuilder)
     monkeypatch.setattr(pipeline, "get_mesher", lambda _name: FakeMesher())
 
     tcase = tmp_path / "case" / "transient"
@@ -652,7 +664,7 @@ def test_prepare_transient_case_standalone_no_shared_mesh_still_runs_init(tmp_pa
         spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=4.0),
         fluid=FLUID,
         roughness=RoughnessParams(),
-        solver_params=SolverParams(force_transient=True),
+        solver_params=SolverParams(force_transient=True, urans_initialization_iterations=initialization_iterations),
         runner=FakeRunner(),
         n_proc=1,
         timeout=60,

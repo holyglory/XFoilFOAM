@@ -273,6 +273,19 @@ const snapshot: SimulationSetupSnapshot = {
 };
 
 describe("physics compatibility hash contract", () => {
+  it("preserves legacy hashes for absent initialization and separates explicit limits", () => {
+    const withLimit = (iterations: number | null | undefined) => ({
+      ...snapshot,
+      solver: { ...snapshot.solver, uransInitializationIterations: iterations },
+    });
+    const legacyHash = physicsHashForSnapshot(snapshot);
+    expect(physicsHashForSnapshot(withLimit(null))).toBe(legacyHash);
+    expect(physicsHashForSnapshot(withLimit(undefined))).toBe(legacyHash);
+    expect(physicsHashForSnapshot(withLimit(1200))).not.toBe(legacyHash);
+    expect(physicsHashForSnapshot(withLimit(600))).not.toBe(
+      physicsHashForSnapshot(withLimit(1200)),
+    );
+  });
   it("ignores batch/preset metadata, sweep, scheduling, and output policy", () => {
     const changed: SimulationSetupSnapshot = {
       ...snapshot,

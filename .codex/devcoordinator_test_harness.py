@@ -196,6 +196,13 @@ def _node_suite() -> int:
 
 
 def _urans_recovery_regression() -> int:
+    sync = _run(
+        "python-dependencies",
+        "locked Python dependencies",
+        [str(UV), "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"],
+    )
+    if sync != 0:
+        return sync
     install = _run(
         "node-dependencies",
         "locked Node dependencies",
@@ -210,6 +217,21 @@ def _urans_recovery_regression() -> int:
     if seeded != 0:
         return seeded
     commands = [
+        (
+            "python-urans-initialization",
+            "point-scoped initializer and legacy scientific gates",
+            [
+                str(ROOT / ".venv/bin/python"), "-m", "pytest", "-q",
+                "tests/test_models.py", "tests/test_api.py",
+                "tests/test_ladder_gate_regression.py",
+                "tests/test_targeted_urans_warmstart.py",
+            ],
+        ),
+        (
+            "python-guarded-engine-provenance",
+            "guarded engine source and build identity binding",
+            [str(ROOT / ".venv/bin/python"), "-m", "pytest", "-q", "tests/test_deploy_sweeper_state.py"],
+        ),
         (
             "core-urans-recovery",
             "aperiodic certificate and typed recovery policy",
@@ -239,6 +261,8 @@ def _urans_recovery_regression() -> int:
                 "run",
                 "test/precalc-contract-remediation.test.ts",
                 "test/point-correction-fast-budget-migration.test.ts",
+                "test/point-urans-initialization-migration.test.ts",
+                "test/polar-compatibility-cache.test.ts",
                 "test/campaign-remediation-summary.test.ts",
             ],
         ),
@@ -254,6 +278,7 @@ def _urans_recovery_regression() -> int:
                 "vitest",
                 "run",
                 "test/build-request-transient-pin.test.ts",
+                "test/engine-capabilities.test.ts",
                 "test/fidelity-contract-pin.test.ts",
                 "test/urans-quality-recovery.test.ts",
                 "test/urans-ladder.test.ts",
