@@ -35,6 +35,7 @@ import {
   FullUransRequestCoverageIncompleteError,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   pointCorrectionRuns,
+  nextRunnablePointCorrectionRequestId,
   precalcContinuationsForObligations,
   precalcObligationsRequireConservativeRetry,
   precalcRequestStateFromObligations,
@@ -2433,8 +2434,7 @@ async function consumeUransRequest(
       // immutable owner. A poll inside that short transaction handoff waits;
       // a durable orphan or any value/revision mismatch blocks so it cannot
       // consume the correction-fairness opportunity forever.
-      const creationAgeMs =
-        Date.now() - new Date(request.createdAt).getTime();
+      const creationAgeMs = Date.now() - new Date(request.createdAt).getTime();
       if (!correction && creationAgeMs < 30_000) {
         await releaseClaimedUransRequest(db, request.id);
         console.error(
@@ -2892,30 +2892,17 @@ export async function submitPendingPointCorrectionFastRequest(
   meshRecoveryVersion: number,
   uransRecoveryVersion: number | null,
 ): Promise<{ attempted: boolean; submitted: boolean }> {
-  const [candidate] = await db
-    .select({ id: simUransRequests.id })
-    .from(simUransRequests)
-    .innerJoin(
-      pointCorrectionRuns,
-      eq(pointCorrectionRuns.uransRequestId, simUransRequests.id),
-    )
-    .where(
-      and(
-        eq(simUransRequests.state, "pending"),
-        eq(simUransRequests.fidelity, "precalc"),
-        isNull(simUransRequests.simJobId),
-      ),
-    )
-    .orderBy(simUransRequests.createdAt, simUransRequests.id)
-    .limit(1);
-  if (!candidate) return { attempted: false, submitted: false };
+  const requestId = await nextRunnablePointCorrectionRequestId(db, {
+    allowContinuations: supportsDurableUransRecovery(uransRecoveryVersion),
+  });
+  if (!requestId) return { attempted: false, submitted: false };
   return {
     attempted: true,
     submitted: await consumeUransRequest(
       db,
       engine,
       cpuSlots,
-      [candidate.id],
+      [requestId],
       meshRecoveryVersion,
       uransRecoveryVersion,
       "precalc",

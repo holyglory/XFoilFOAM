@@ -22,6 +22,7 @@ import {
   onResultIngested,
   outputProfiles,
   pointCorrectionRuns,
+  nextRunnablePointCorrectionRequestId,
   pointCorrectionProjectionSql,
   type PointCorrectionProjection,
   campaignPreliminaryOutcomes,
@@ -79,16 +80,14 @@ let bcId = "";
 let presetId = "";
 let rejectedCurrentAttemptId = "";
 let rejectedOlderAttemptId = "";
-let correctionCleanup:
-  | {
-      presetId: string;
-      requestId: string;
-      meshProfileId: string;
-      solverProfileId: string;
-      sweepDefinitionId: string;
-      boundaryConditionId: string | null;
-    }
-  | undefined;
+const correctionCleanups: {
+  presetId: string;
+  requestId: string;
+  meshProfileId: string;
+  solverProfileId: string;
+  sweepDefinitionId: string;
+  boundaryConditionId: string | null;
+}[] = [];
 const numerics = {
   boundaryProfileId: "",
   meshProfileId: "",
@@ -520,7 +519,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
-  if (correctionCleanup) {
+  for (const correctionCleanup of correctionCleanups) {
     await db
       .delete(simUransRequests)
       .where(eq(simUransRequests.id, correctionCleanup.requestId));
@@ -1122,14 +1121,14 @@ describe("point-history story endpoint", () => {
         .select()
         .from(simulationPresets)
         .where(eq(simulationPresets.id, firstBody.presetId));
-      correctionCleanup = {
+      correctionCleanups.push({
         presetId: correctedPreset.id,
         requestId: firstBody.request.id,
         meshProfileId: correctedPreset.meshProfileId,
         solverProfileId: correctedPreset.solverProfileId,
         sweepDefinitionId: correctedPreset.sweepDefinitionId,
         boundaryConditionId: correctedPreset.legacyBoundaryConditionId,
-      };
+      });
       expect(firstBody.created).toBe(true);
       expect(firstBody.resultAttemptId).toBe(rejectedCurrentAttemptId);
       expect(firstBody.revisionId).not.toBe(revisionId);
@@ -1446,6 +1445,110 @@ describe("point-history story endpoint", () => {
           .from(resultAttempts)
           .where(eq(resultAttempts.id, rejectedCurrentAttemptId));
         expect(retainedSource.id).toBe(rejectedCurrentAttemptId);
+        const nextCorrection = await app.inject({
+          method: "POST",
+          url: `/api/admin/point-history/${resultId}/corrected-run`,
+          payload: {
+            ...payload,
+            mesh: { ...payload.mesh, nSurface: payload.mesh.nSurface + 1 },
+          },
+        });
+        expect(
+          nextCorrection.statusCode,
+          JSON.stringify(nextCorrection.json()),
+        ).toBe(201);
+        const nextBody = nextCorrection.json();
+        const [nextPreset] = await db
+          .select()
+          .from(simulationPresets)
+          .where(eq(simulationPresets.id, nextBody.presetId));
+        correctionCleanups.push({
+          presetId: nextPreset.id,
+          requestId: nextBody.request.id,
+          meshProfileId: nextPreset.meshProfileId,
+          solverProfileId: nextPreset.solverProfileId,
+          sweepDefinitionId: nextPreset.sweepDefinitionId,
+          boundaryConditionId: nextPreset.legacyBoundaryConditionId,
+        });
+        await db
+          .update(simUransRequests)
+          .set({
+            state: "pending",
+            simJobId: null,
+            createdAt: new Date(Date.now() - 60_000),
+          })
+          .where(eq(simUransRequests.id, firstBody.request.id));
+        const [exhausted] = await ensurePrecalcObligations(
+          db,
+          [
+            {
+              airfoilId,
+              revisionId: firstBody.revisionId,
+              aoaDeg: -1,
+            },
+          ],
+          { requestIds: [firstBody.request.id] },
+        );
+        expect(exhausted).toBeDefined();
+        const requestIds = [firstBody.request.id, nextBody.request.id];
+        const nextRunnable = (allowContinuations = true) =>
+          nextRunnablePointCorrectionRequestId(db, {
+            requestIds,
+            allowContinuations,
+          });
+        try {
+          await db
+            .update(simPrecalcObligations)
+            .set({
+              state: "pending",
+              attemptCount: 2,
+              maxAttempts: 2,
+              nextSubmitAt: null,
+            })
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+          expect(await nextRunnable()).toBe(nextBody.request.id);
+          expect(await nextRunnable(false)).toBe(nextBody.request.id);
+          const [unchanged] = await db
+            .select()
+            .from(simPrecalcObligations)
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+          expect(unchanged).toMatchObject({
+            state: "pending",
+            attemptCount: 2,
+            maxAttempts: 2,
+          });
+          await db
+            .update(simPrecalcObligations)
+            .set({
+              attemptCount: 0,
+              nextSubmitAt: new Date(Date.now() + 60_000),
+            })
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+          expect(await nextRunnable()).toBe(nextBody.request.id);
+          await db
+            .update(simPrecalcObligations)
+            .set({ nextSubmitAt: null })
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+          expect(await nextRunnable()).toBe(firstBody.request.id);
+          await db
+            .update(simPrecalcObligations)
+            .set({ state: "running" })
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+          expect(await nextRunnable()).toBe(nextBody.request.id);
+          await db
+            .update(simPrecalcObligations)
+            .set({ state: "pending" })
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+          await db
+            .update(simUransRequests)
+            .set({ backgroundOwner: false })
+            .where(inArray(simUransRequests.id, requestIds));
+          expect(await nextRunnable()).toBeNull();
+        } finally {
+          await db
+            .delete(simPrecalcObligations)
+            .where(eq(simPrecalcObligations.id, exhausted.id));
+        }
       } finally {
         await db.delete(results).where(eq(results.id, correctedResult.id));
         await db.delete(simJobs).where(eq(simJobs.id, correctedJob.id));

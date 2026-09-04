@@ -26,6 +26,7 @@ import {
   type SimulationSetupSnapshot,
 } from "./simulation-setup";
 import { createUransRequest } from "./urans-ladder";
+import { precalcContinuationsForObligations } from "./precalc-obligations";
 
 export interface PointCorrectionSettings {
   mesh: {
@@ -396,4 +397,81 @@ export async function createPointCorrection(
     request: outcome.request,
     created: outcome.created,
   };
+}
+
+export async function nextRunnablePointCorrectionRequestId(
+  db: DB,
+  options: { allowContinuations: boolean; requestIds?: string[] },
+): Promise<string | null> {
+  type Candidate = {
+    id: string;
+    created_at: Date | string;
+    obligation_id: string | null;
+    requires_continuation: boolean;
+  };
+  let cursor: Candidate | undefined;
+  const requestScope =
+    options.requestIds === undefined
+      ? sql`true`
+      : options.requestIds.length
+        ? sql`request.id IN (${sql.join(
+            options.requestIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )})`
+        : sql`false`;
+  for (;;) {
+    const cursorScope = cursor
+      ? sql`(request."createdAt", request.id) > (${new Date(cursor.created_at).toISOString()}::timestamptz, ${cursor.id}::uuid)`
+      : sql`true`;
+    const candidates = (await db.execute(sql`
+      SELECT request.id, request."createdAt" AS created_at,
+             obligation.id AS obligation_id,
+             COALESCE(obligation.attempt_count >= obligation.max_attempts, false) AS requires_continuation
+      FROM sim_urans_requests request
+      JOIN point_correction_runs correction ON correction.urans_request_id = request.id
+      LEFT JOIN sim_precalc_obligations obligation
+        ON obligation.airfoil_id = request.airfoil_id
+       AND obligation.revision_id = request.revision_id
+       AND obligation.aoa_deg = request.aoa_deg
+      WHERE request.state = 'pending' AND request.fidelity = 'precalc'
+        AND request.sim_job_id IS NULL
+        AND (${requestScope}) AND (${cursorScope})
+        AND NOT EXISTS (
+          SELECT 1 FROM sim_ladder_submit_retries retry
+          WHERE retry.urans_request_id = request.id
+            AND (retry.state = 'blocked' OR retry.next_attempt_at > now())
+        )
+        AND (request.background_owner OR EXISTS (
+          SELECT 1 FROM sim_urans_request_campaigns ownership
+          JOIN sim_campaigns campaign ON campaign.id = ownership.campaign_id
+          WHERE ownership.request_id = request.id AND ownership.state = 'active'
+            AND campaign.status IN ('active', 'attention')
+        ))
+        AND (obligation.id IS NULL OR (
+          obligation.state = 'pending'
+          AND (obligation.next_submit_at IS NULL OR obligation.next_submit_at <= now())
+          AND (obligation.attempt_count < obligation.max_attempts OR ${options.allowContinuations})
+        ))
+      ORDER BY request."createdAt", request.id
+      LIMIT 64
+    `)) as unknown as Candidate[];
+    if (!candidates.length) return null;
+    const continuationIds = candidates
+      .filter((candidate) => candidate.requires_continuation)
+      .map((candidate) => candidate.obligation_id!);
+    const continuations = continuationIds.length
+      ? await precalcContinuationsForObligations(db, continuationIds)
+      : [];
+    const allowed = new Set(
+      continuations.map((continuation) => continuation.obligationId),
+    );
+    const ready = candidates.find(
+      (candidate) =>
+        !candidate.requires_continuation ||
+        allowed.has(candidate.obligation_id!),
+    );
+    if (ready) return ready.id;
+    if (candidates.length < 64) return null;
+    cursor = candidates[candidates.length - 1];
+  }
 }
