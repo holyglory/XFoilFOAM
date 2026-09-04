@@ -19,6 +19,8 @@ import {
   polarCompatibilityFitMembers,
   polarCompatibilityFitPoints,
   polarCompatibilityFitSets,
+  pointCorrectionProjectionSql,
+  type PointCorrectionProjection,
   type Result,
   resultClassifications,
   resultReviewVerdicts,
@@ -876,6 +878,38 @@ export async function assembleDetail(
     }
 
     if (anchorsByHash.size > 0) {
+      const publicRoots = [...revisionById.keys()];
+      const corrections = (await db.execute(
+        pointCorrectionProjectionSql(sql`
+        source.airfoil_id = ${a.id}::uuid
+        AND source.simulation_preset_revision_id IN (
+          ${sql.join(
+            publicRoots.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )}
+        )
+      `),
+      )) as unknown as PointCorrectionProjection[];
+      const correctedIds = [
+        ...new Set(
+          corrections
+            .filter((correction) => correction.accepted)
+            .map((correction) => correction.corrected_revision_id),
+        ),
+      ];
+      if (correctedIds.length) {
+        const correctedAnchors = await db
+          .select(revisionSelection)
+          .from(simulationPresetRevisions)
+          .where(inArray(simulationPresetRevisions.id, correctedIds));
+        for (const row of correctedAnchors) {
+          const hash = effectiveCompatibilityHash(row);
+          const anchors = anchorsByHash.get(hash) ?? [];
+          anchors.push(row);
+          anchorsByHash.set(hash, anchors);
+          revisionById.set(row.id, row);
+        }
+      }
       // Result-bearing revisions are the bounded rollout fallback for legacy
       // NULL physics_hash rows. Compatibility cache members cover this same
       // set after the production backfill, but the public page must not lose

@@ -37,6 +37,10 @@ import {
 } from "./evidence-manifest";
 import { lockPrecalcCells } from "./precalc-cell-lock";
 import {
+  pointCorrectionProjectionSql,
+  type PointCorrectionProjection,
+} from "./point-correction-evidence";
+import {
   solverIncidentSummary,
   type SolverIncidentSummary,
 } from "./solver-incidents";
@@ -6977,6 +6981,76 @@ export async function campaignPreliminaryOutcomes(
   );
   for (const machineItem of machineJourneyItems) {
     pointItems.set(machineItem.aoaDeg, machineItem);
+  }
+  const corrections = (await db.execute(
+    pointCorrectionProjectionSql(sql`
+    source.airfoil_id = ${scope.airfoilId}::uuid
+    AND source.simulation_preset_revision_id = (
+      SELECT simulation_preset_revision_id FROM sim_campaign_conditions
+      WHERE id = ${scope.conditionId}::uuid AND campaign_id = ${campaignId}::uuid
+    )
+  `),
+  )) as unknown as PointCorrectionProjection[];
+  for (const correction of corrections) {
+    for (const item of pointItems.values()) {
+      if (
+        item.sourceAoaDeg !== Number(correction.aoa_deg) ||
+        item.finalState === "accepted"
+      )
+        continue;
+      const active =
+        correction.request_state === "pending" ||
+        (correction.request_state === "running" &&
+          ["submitted", "running", "ingesting"].includes(
+            correction.job_status ?? "",
+          ));
+      if (!correction.accepted && !active) continue;
+      if (correction.fidelity === "precalc" && item.fastState === "accepted")
+        continue;
+      const stage = correction.fidelity === "precalc" ? "fast" : "final";
+      const correctedState = correction.accepted
+        ? "accepted"
+        : correction.request_state === "running"
+          ? "running"
+          : "queued";
+      if (stage === "fast") {
+        item.fastState = correctedState;
+        item.fastResultId = correction.accepted ? correction.result_id : null;
+        item.fastResultAttemptId = correction.accepted
+          ? correction.result_attempt_id
+          : null;
+        item.finalState = "not_started";
+        item.finalActivityState = null;
+        item.finalComparison = null;
+        item.finalDeltaCl = null;
+        item.finalDeltaCd = null;
+        item.finalDeltaCm = null;
+        item.finalResultId = null;
+        item.finalResultAttemptId = null;
+        item.finalSource = null;
+        item.finalEvidenceReasons = [];
+        item.finalSubmitError = null;
+        item.finalSubmitHttpStatus = null;
+      } else {
+        item.finalState = correctedState;
+        item.finalResultId = correction.accepted ? correction.result_id : null;
+        item.finalResultAttemptId = correction.accepted
+          ? correction.result_attempt_id
+          : null;
+        item.finalSource = "full_request";
+      }
+      item.state = correction.accepted
+        ? "satisfied"
+        : correction.request_state === "running"
+          ? "running"
+          : "pending";
+      item.outcome = correction.accepted ? "accepted" : "recovering";
+      item.criticalStage = null;
+      item.managementResultId = correction.root_result_id;
+      item.managementResultAttemptId = correction.root_result_attempt_id;
+      item.managementStage = stage;
+      item.updatedAt = isoOf(correction.created_at)!;
+    }
   }
   const items = [...pointItems.values()].sort((left, right) => {
     const aoaOrder = left.aoaDeg - right.aoaDeg;

@@ -14,11 +14,20 @@ import {
   DETERMINISTIC_MESH_BLOCKER_NONORTHO_MARKER,
   POLAR_FIT_VERSION,
 } from "@aerodb/core";
-import { and, asc, desc, eq, sql, type SQLWrapper } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  sql,
+  type SQL,
+  type SQLWrapper,
+} from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
 import { lockPrecalcCells } from "./precalc-cell-lock";
+import { pointCorrectionProjectionSql } from "./point-correction-evidence";
 import {
   RANS_RECOVERY_REMEDIATION_VERSION,
   ransMeshRecoveryRemediationVersion,
@@ -1000,6 +1009,65 @@ const PRECALC_BLOCKED_OTHER_SQL = sql`(
   AND NOT COALESCE((${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}), false)
 )`;
 
+function campaignProgressProjectionSql(pointScope: SQL): SQL {
+  const correctionOwnsPoint = sql`COALESCE(
+    correction.accepted OR correction.request_state IN ('pending', 'running'), false
+  )`;
+  const originalTerminal = sql`NOT (${correctionOwnsPoint})`;
+  const correctedOrOriginalSolved = sql`(
+    correction.accepted OR (
+      p.state = 'terminal' AND r.status = 'done'
+      AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans')
+      AND precalc_obligation.state IS DISTINCT FROM 'blocked'
+      AND (${originalTerminal})
+    )
+  )`;
+  return sql`
+    WITH point_corrections AS (
+      ${pointCorrectionProjectionSql(sql`EXISTS (
+        SELECT 1 FROM sim_campaign_points p
+        WHERE p.airfoil_id = source.airfoil_id
+          AND p.revision_id = source.simulation_preset_revision_id
+          AND source.aoa_deg = CASE WHEN p.derived_by_symmetry THEN -p.aoa_deg ELSE p.aoa_deg END
+          AND p.state <> 'released' AND (${pointScope})
+      )`)}
+    )
+    SELECT p.campaign_id, p.condition_id, p.airfoil_id,
+      COUNT(*) FILTER (WHERE p.state <> 'released')::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND NOT p.derived_by_symmetry AND (${correctedOrOriginalSolved}))::int,
+      COUNT(*) FILTER (WHERE p.state = 'terminal' AND NOT p.derived_by_symmetry AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (
+        (correction.request_state = 'running' AND correction.job_status IN ('submitted', 'running', 'ingesting') AND NOT correction.accepted)
+        OR (p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}) AND (${originalTerminal}))
+      ))::int,
+      COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans' AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND p.derived_by_symmetry AND (${correctedOrOriginalSolved}))::int,
+      COUNT(*) FILTER (WHERE p.state = 'terminal' AND NOT p.derived_by_symmetry AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}) AND (${originalTerminal}))::int,
+      COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_BLOCKED_OTHER_SQL}) AND (${originalTerminal}))::int
+    FROM sim_campaign_points p
+    LEFT JOIN point_corrections correction
+      ON correction.root_revision_id = p.revision_id
+     AND correction.airfoil_id = p.airfoil_id
+     AND correction.aoa_deg = CASE WHEN p.derived_by_symmetry THEN -p.aoa_deg ELSE p.aoa_deg END
+    LEFT JOIN results r ON r.id = p.result_id
+    LEFT JOIN results live
+      ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
+    LEFT JOIN sim_jobs live_job ON live_job.id = live.sim_job_id
+    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
+    LEFT JOIN sim_precalc_obligations precalc_obligation
+      ON precalc_obligation.airfoil_id = p.airfoil_id
+     AND precalc_obligation.revision_id = p.revision_id
+     AND precalc_obligation.aoa_deg = CASE WHEN p.derived_by_symmetry THEN r.aoa_deg ELSE p.aoa_deg END
+    WHERE ${pointScope}
+    GROUP BY p.campaign_id, p.condition_id, p.airfoil_id
+  `;
+}
+
 async function recomputeProgressForKeys(
   db: DB,
   keys: ProgressKeyRow[],
@@ -1025,32 +1093,7 @@ async function recomputeProgressForKeys(
       precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
       blocked_engine_submit, blocked_other
     )
-    SELECT p.campaign_id, p.condition_id, p.airfoil_id,
-           COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
-           COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_BLOCKED_OTHER_SQL}))::int
-    FROM sim_campaign_points p
-    LEFT JOIN results r ON r.id = p.result_id
-    LEFT JOIN results live
-      ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
-    LEFT JOIN sim_jobs live_job ON live_job.id = live.sim_job_id
-    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    LEFT JOIN sim_precalc_obligations precalc_obligation
-      ON precalc_obligation.airfoil_id = p.airfoil_id
-     AND precalc_obligation.revision_id = p.revision_id
-     AND precalc_obligation.aoa_deg = CASE WHEN p.derived_by_symmetry THEN r.aoa_deg ELSE p.aoa_deg END
-    WHERE (p.campaign_id, p.condition_id, p.airfoil_id) IN (${tuples})
-    GROUP BY p.campaign_id, p.condition_id, p.airfoil_id
+    ${campaignProgressProjectionSql(sql`(p.campaign_id, p.condition_id, p.airfoil_id) IN (${tuples})`)}
     ON CONFLICT (campaign_id, condition_id, airfoil_id) DO UPDATE SET
       requested = excluded.requested,
       solved = excluded.solved,
@@ -1105,6 +1148,32 @@ export async function recomputeProgressForPrecalcObligations(
   return [...new Set(deduped.map((row) => row.campaign_id))].sort();
 }
 
+export async function recomputeProgressForPointCorrections(
+  db: DB,
+  airfoilId: string,
+  revisionId: string,
+): Promise<void> {
+  const keys = (await db.execute(sql`
+    WITH corrections AS (
+      ${pointCorrectionProjectionSql(sql`source.airfoil_id = ${airfoilId}::uuid`)}
+    )
+    SELECT DISTINCT point.campaign_id, point.condition_id, point.airfoil_id
+    FROM corrections correction
+    JOIN sim_campaign_points point
+      ON point.airfoil_id = correction.airfoil_id
+     AND point.revision_id = correction.root_revision_id
+     AND correction.aoa_deg = CASE WHEN point.derived_by_symmetry THEN -point.aoa_deg ELSE point.aoa_deg END
+    WHERE correction.corrected_revision_id = ${revisionId}::uuid
+      AND point.state <> 'released'
+  `)) as unknown as ProgressKeyRow[];
+  await recomputeProgressForKeys(db, keys);
+  await Promise.all(
+    [...new Set(keys.map((key) => key.campaign_id))].map((campaignId) =>
+      probeCampaignCompletion(db, campaignId),
+    ),
+  );
+}
+
 /** Whole-campaign counter recompute, fully set-based (no key enumeration):
  *  the reconciler's heal path for campaigns whose key count can reach 10^5. */
 export async function recomputeProgressForCampaign(
@@ -1118,32 +1187,7 @@ export async function recomputeProgressForCampaign(
       precalc_mesh_repairing, blocked_mesh_quality, blocked_precalc_exhausted,
       blocked_engine_submit, blocked_other
     )
-    SELECT p.campaign_id, p.condition_id, p.airfoil_id,
-           COUNT(*) FILTER (WHERE p.state <> 'released')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'failed' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state = 'requested' AND (${ACTIVE_LIVE_RESULT_SQL}))::int,
-           COUNT(*) FILTER (WHERE rc.state = 'superseded_by_urans')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = true AND r.status = 'done' AND rc.state IN ('accepted', 'needs_urans', 'superseded_by_urans') AND precalc_obligation.state IS DISTINCT FROM 'blocked')::int,
-           COUNT(*) FILTER (WHERE p.state = 'terminal' AND p.derived_by_symmetry = false AND r.status = 'done' AND rc.state = 'rejected' AND (${USER_TERMINAL_CAMPAIGN_RESULT_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_MESH_REPAIRING_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_MESH_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_EXHAUSTED_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${CANONICAL_BLOCKED_SQL}) AND (${PRECALC_BLOCKED_ENGINE_SUBMIT_SQL}))::int,
-           COUNT(*) FILTER (WHERE p.state <> 'released' AND (${PRECALC_BLOCKED_OTHER_SQL}))::int
-    FROM sim_campaign_points p
-    LEFT JOIN results r ON r.id = p.result_id
-    LEFT JOIN results live
-      ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
-    LEFT JOIN sim_jobs live_job ON live_job.id = live.sim_job_id
-    LEFT JOIN result_classifications rc ON rc.result_id = p.result_id
-    LEFT JOIN sim_precalc_obligations precalc_obligation
-      ON precalc_obligation.airfoil_id = p.airfoil_id
-     AND precalc_obligation.revision_id = p.revision_id
-     AND precalc_obligation.aoa_deg = CASE WHEN p.derived_by_symmetry THEN r.aoa_deg ELSE p.aoa_deg END
-    WHERE p.campaign_id = ${campaignId}
-    GROUP BY p.campaign_id, p.condition_id, p.airfoil_id
+    ${campaignProgressProjectionSql(sql`p.campaign_id = ${campaignId}`)}
     ON CONFLICT (campaign_id, condition_id, airfoil_id) DO UPDATE SET
       requested = excluded.requested,
       solved = excluded.solved,
@@ -1180,9 +1224,33 @@ export async function probeCampaignCompletion(
   campaignId: string,
 ): Promise<void> {
   const [probe] = (await db.execute(sql`
+    WITH correction_projection AS (
+      ${pointCorrectionProjectionSql(sql`EXISTS (
+        SELECT 1 FROM sim_campaign_points scoped_point
+        JOIN sim_campaign_conditions scoped_condition ON scoped_condition.id = scoped_point.condition_id
+        JOIN sim_campaigns scoped_campaign ON scoped_campaign.id = scoped_point.campaign_id
+        WHERE scoped_point.campaign_id = ${campaignId}
+          AND scoped_point.airfoil_id = source.airfoil_id
+          AND scoped_point.revision_id = source.simulation_preset_revision_id
+          AND source.aoa_deg = CASE WHEN scoped_point.derived_by_symmetry THEN -scoped_point.aoa_deg ELSE scoped_point.aoa_deg END
+          AND scoped_point.state <> 'released'
+          AND scoped_condition.status IN ('active', 'kept')
+          AND scoped_condition.generation = scoped_campaign.current_condition_generation
+      )`)}
+    ), uncorrected_points AS (
+      SELECT point.* FROM sim_campaign_points point
+      WHERE point.campaign_id = ${campaignId}
+        AND NOT EXISTS (
+          SELECT 1 FROM correction_projection correction
+          WHERE correction.root_revision_id = point.revision_id
+            AND correction.airfoil_id = point.airfoil_id
+            AND correction.aoa_deg = CASE WHEN point.derived_by_symmetry THEN -point.aoa_deg ELSE point.aoa_deg END
+            AND (correction.accepted OR correction.request_state IN ('pending', 'running'))
+        )
+    )
     SELECT
       EXISTS (
-        SELECT 1 FROM sim_campaign_points p
+        SELECT 1 FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'requested' AND c.status IN ('active', 'kept')
           AND c.generation = (SELECT current_condition_generation FROM sim_campaigns WHERE id = ${campaignId})
@@ -1207,7 +1275,7 @@ export async function probeCampaignCompletion(
           AND l.state IN ('awaiting_seed', 'iterating')
       ) AS lanes_open,
       EXISTS (
-        SELECT 1 FROM sim_campaign_points p
+        SELECT 1 FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results live
           ON live.airfoil_id = p.airfoil_id AND live.simulation_preset_revision_id = p.revision_id AND live.aoa_deg = p.aoa_deg
@@ -1221,7 +1289,7 @@ export async function probeCampaignCompletion(
         -- derived mirror can only be terminal-linked to a failed results row
         -- alongside its +α source — mirror-exclusion in the counter can never
         -- hide a failure from this attention gate.
-        SELECT 1 FROM sim_campaign_points p
+        SELECT 1 FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
@@ -1237,7 +1305,7 @@ export async function probeCampaignCompletion(
         -- canonical critical blockers instead of an infinite "remaining"
         -- fallback.
         SELECT 1
-        FROM sim_campaign_points p
+        FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
         LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -1260,7 +1328,7 @@ export async function probeCampaignCompletion(
           )
       ) AS automatic_recovery_open,
       EXISTS (
-        SELECT 1 FROM sim_campaign_points p
+        SELECT 1 FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         LEFT JOIN results r ON r.id = p.result_id
         LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -1284,7 +1352,7 @@ export async function probeCampaignCompletion(
       ) AS has_rejected,
       EXISTS (
         SELECT 1
-        FROM sim_campaign_points p
+        FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
         LEFT JOIN result_classifications rc ON rc.result_id = r.id
@@ -1304,7 +1372,7 @@ export async function probeCampaignCompletion(
         -- Fidelity ladder tier 2: exact immutable aerodynamic RANS evidence
         -- owns the preliminary handoff. The exact-evidence predicate excludes
         -- queued/failed legacy shells and non-aerodynamic dispositions.
-        SELECT 1 FROM sim_campaign_points p
+        SELECT 1 FROM uncorrected_points p
         JOIN sim_campaign_conditions c ON c.id = p.condition_id
         JOIN results r ON r.id = p.result_id
         WHERE p.campaign_id = ${campaignId} AND p.state = 'terminal' AND c.status IN ('active', 'kept')
@@ -1353,6 +1421,10 @@ export async function probeCampaignCompletion(
           AND media_condition.status IN ('active', 'kept')
           AND NOT media_point.derived_by_symmetry
           AND repair.state IN ('pending', 'running', 'retry_wait')
+      ) OR EXISTS (
+        SELECT 1 FROM correction_projection correction
+        WHERE NOT correction.accepted
+          AND correction.request_state IN ('pending', 'running')
       )) AS precalc_open,
       EXISTS (
         -- Fidelity ladder tier 3 (contract 7): open verify-queue items block
@@ -1446,6 +1518,11 @@ export async function onResultIngested(
   signal: ResultIngestSignal,
 ): Promise<CampaignLaneKey[]> {
   if (!signal.revisionId) return [];
+  await recomputeProgressForPointCorrections(
+    db,
+    signal.airfoilId,
+    signal.revisionId,
+  );
   const aoa = canonicalAoa(signal.aoaDeg);
   const terminal = signal.status === "done" || signal.status === "failed";
   const affected: ProgressKeyRow[] = [];

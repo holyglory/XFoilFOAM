@@ -239,6 +239,7 @@ def _urans_recovery_regression() -> int:
                 "run",
                 "test/precalc-contract-remediation.test.ts",
                 "test/point-correction-fast-budget-migration.test.ts",
+                "test/campaign-remediation-summary.test.ts",
             ],
         ),
         (
@@ -288,6 +289,7 @@ def _urans_recovery_regression() -> int:
                 "run",
                 "test/point-history.test.ts",
                 "test/sync-fast-budget.test.ts",
+                "test/detail-polar-compatibility.test.ts",
             ],
         ),
         (

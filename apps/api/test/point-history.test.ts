@@ -22,6 +22,13 @@ import {
   onResultIngested,
   outputProfiles,
   pointCorrectionRuns,
+  pointCorrectionProjectionSql,
+  type PointCorrectionProjection,
+  campaignPreliminaryOutcomes,
+  recomputeProgressForCampaign,
+  probeCampaignCompletion,
+  simCampaignProgress,
+  solverEvidenceArtifacts,
   resultAttempts,
   resultClassifications,
   results,
@@ -436,6 +443,17 @@ beforeAll(async () => {
     .returning({ id: resultAttempts.id });
   rejectedCurrentAttemptId = rejectedAttempts[1]!.id;
   rejectedOlderAttemptId = rejectedAttempts[0]!.id;
+  await db.insert(resultClassifications).values({
+    resultAttemptId: rejectedCurrentAttemptId,
+    airfoilId,
+    simulationPresetRevisionId: revisionId,
+    aoaDeg: -1,
+    regime: "urans",
+    classifierVersion: "test-v1",
+    state: "rejected",
+    reasons: ["urans_unmeasurable_shedding"],
+    confidence: 0.9,
+  });
   await db
     .update(results)
     .set({ currentResultAttemptId: rejectedCurrentAttemptId })
@@ -1230,6 +1248,208 @@ describe("point-history story endpoint", () => {
       });
       expect(stale.statusCode).toBe(409);
       expect(stale.json().error).toContain("newer stored evidence");
+
+      const readCorrections = async () =>
+        (await db.execute(
+          pointCorrectionProjectionSql(sql`source.id = ${resultId}::uuid`),
+        )) as unknown as PointCorrectionProjection[];
+      const expectIsolatedCompletion = async (expected: string) => {
+        const rollback = new Error("rollback isolated campaign probe");
+        try {
+          await db.transaction(async (transaction) => {
+            for (const command of [
+              sql`DELETE FROM sim_precalc_obligation_campaigns WHERE campaign_id = ${campaignId}`,
+              sql`DELETE FROM sim_urans_request_campaigns WHERE campaign_id = ${campaignId}`,
+              sql`DELETE FROM sim_urans_verify_queue_campaigns WHERE campaign_id = ${campaignId}`,
+              sql`DELETE FROM sim_campaign_lanes WHERE campaign_id = ${campaignId}`,
+              sql`UPDATE sim_campaign_points SET state = 'released' WHERE campaign_id = ${campaignId}`,
+              sql`UPDATE sim_campaign_points
+              SET state = 'terminal', result_id = ${resultId}, result_attempt_id = ${rejectedCurrentAttemptId}
+              WHERE campaign_id = ${campaignId} AND condition_id = ${conditionId}
+                AND airfoil_id = ${airfoilId} AND aoa_deg = -1`,
+              sql`UPDATE sim_campaigns SET status = 'active', "completedAt" = NULL WHERE id = ${campaignId}`,
+            ]) {
+              await transaction.execute(command);
+            }
+            await probeCampaignCompletion(
+              transaction as unknown as typeof db,
+              campaignId,
+            );
+            const [observed] = (await transaction.execute(sql`
+              SELECT status FROM sim_campaigns WHERE id = ${campaignId}
+            `)) as unknown as { status: string }[];
+            expect(observed.status).toBe(expected);
+            throw rollback;
+          });
+        } catch (error) {
+          if (error !== rollback) throw error;
+        }
+      };
+      const readCampaignPoint = async () =>
+        (
+          await campaignPreliminaryOutcomes(db, campaignId, {
+            conditionId,
+            airfoilId,
+          })
+        ).items.find((item) => item.aoaDeg === -1);
+      expect(await readCorrections()).toEqual([
+        expect.objectContaining({
+          correction_id: firstBody.correctionRunId,
+          root_result_attempt_id: rejectedCurrentAttemptId,
+          request_state: "pending",
+          accepted: false,
+          result_id: null,
+        }),
+      ]);
+      expect(await readCampaignPoint()).toMatchObject({
+        state: "pending",
+        fastState: "queued",
+        criticalStage: null,
+        fastResultId: null,
+        managementResultAttemptId: rejectedCurrentAttemptId,
+      });
+      await expectIsolatedCompletion("active");
+      await recomputeProgressForCampaign(db, campaignId);
+      const [beforeCorrection] = await db.select().from(simCampaignProgress)
+        .where(sql`
+        ${simCampaignProgress.campaignId} = ${campaignId}
+        AND ${simCampaignProgress.conditionId} = ${conditionId}
+        AND ${simCampaignProgress.airfoilId} = ${airfoilId}
+      `);
+      const [correctedJob] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [correctedPreset.legacyBoundaryConditionId!],
+          simulationPresetRevisionId: firstBody.revisionId,
+          referenceChordM: CHORD,
+          wave: 2,
+          status: "done",
+          totalCases: 1,
+          completedCases: 1,
+          requestPayload: { aoas: [-1], uransFidelity: "precalc" },
+        })
+        .returning({ id: simJobs.id });
+      const [correctedResult] = await db
+        .insert(results)
+        .values({
+          airfoilId,
+          bcId: correctedPreset.legacyBoundaryConditionId!,
+          simulationPresetRevisionId: firstBody.revisionId,
+          simJobId: correctedJob.id,
+          engineJobId: `${PREFIX}-correction`,
+          engineCaseSlug: "alpha-minus-one",
+          aoaDeg: -1,
+          reynolds: 200_000,
+          chord: CHORD,
+          speed: speedMps,
+          status: "done",
+          source: "solved",
+          regime: "urans",
+          fidelity: "urans_precalc",
+          converged: true,
+          unsteady: true,
+          cl: -0.07,
+          cd: 0.026,
+          cm: -0.04,
+          clCd: -0.07 / 0.026,
+        })
+        .returning({ id: results.id });
+      try {
+        const correctedAttemptId = await createAcceptedPrecalcAttemptFixture(
+          db,
+          correctedResult.id,
+        );
+        await db
+          .update(simUransRequests)
+          .set({
+            state: "done",
+            simJobId: correctedJob.id,
+          })
+          .where(eq(simUransRequests.id, firstBody.request.id));
+        expect((await readCorrections())[0].accepted).toBe(false);
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: correctedAttemptId })
+          .where(eq(results.id, correctedResult.id));
+        expect((await readCorrections())[0]).toMatchObject({
+          accepted: true,
+          result_id: correctedResult.id,
+          result_attempt_id: correctedAttemptId,
+        });
+        await expectIsolatedCompletion("completed");
+        expect(await readCampaignPoint()).toMatchObject({
+          state: "satisfied",
+          outcome: "accepted",
+          fastState: "accepted",
+          finalState: "not_started",
+          criticalStage: null,
+          fastResultId: correctedResult.id,
+          fastResultAttemptId: correctedAttemptId,
+        });
+        const publicDetail = await app.inject({
+          method: "GET",
+          url: `/api/airfoils/${PREFIX}-af`,
+        });
+        expect(publicDetail.statusCode).toBe(200);
+        expect(
+          publicDetail
+            .json()
+            .polars.flatMap(
+              (polar: { points: { resultId: string }[] }) => polar.points,
+            ),
+        ).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ resultId: correctedResult.id }),
+          ]),
+        );
+        await recomputeProgressForCampaign(db, campaignId);
+        const [progress] = await db.select().from(simCampaignProgress)
+          .where(sql`
+          ${simCampaignProgress.campaignId} = ${campaignId}
+          AND ${simCampaignProgress.conditionId} = ${conditionId}
+          AND ${simCampaignProgress.airfoilId} = ${airfoilId}
+        `);
+        expect(progress.solved).toBe(beforeCorrection.solved + 1);
+        expect(progress.requested).toBe(beforeCorrection.requested);
+        await db
+          .update(resultClassifications)
+          .set({ state: "rejected" })
+          .where(eq(resultClassifications.resultAttemptId, correctedAttemptId));
+        expect((await readCorrections())[0].accepted).toBe(false);
+        expect((await readCampaignPoint())?.fastResultId).not.toBe(
+          correctedResult.id,
+        );
+        await expectIsolatedCompletion("attention");
+        await db
+          .update(resultClassifications)
+          .set({ state: "accepted" })
+          .where(eq(resultClassifications.resultAttemptId, correctedAttemptId));
+        await db
+          .update(simUransRequests)
+          .set({ aoaDeg: 0 })
+          .where(eq(simUransRequests.id, firstBody.request.id));
+        expect(await readCorrections()).toEqual([]);
+        await db
+          .update(simUransRequests)
+          .set({ aoaDeg: -1 })
+          .where(eq(simUransRequests.id, firstBody.request.id));
+        await db
+          .update(solverEvidenceArtifacts)
+          .set({ sha256: "invalid" })
+          .where(
+            eq(solverEvidenceArtifacts.resultAttemptId, correctedAttemptId),
+          );
+        expect((await readCorrections())[0].accepted).toBe(false);
+        const [retainedSource] = await db
+          .select({ id: resultAttempts.id })
+          .from(resultAttempts)
+          .where(eq(resultAttempts.id, rejectedCurrentAttemptId));
+        expect(retainedSource.id).toBe(rejectedCurrentAttemptId);
+      } finally {
+        await db.delete(results).where(eq(results.id, correctedResult.id));
+        await db.delete(simJobs).where(eq(simJobs.id, correctedJob.id));
+      }
 
       await db
         .delete(simUransRequests)

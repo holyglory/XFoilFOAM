@@ -11,6 +11,7 @@ export * from "./campaign-result-handoff";
 export * from "./urans-ladder";
 export * from "./point-history";
 export * from "./point-corrections";
+export * from "./point-correction-evidence";
 export * from "./review-verdicts";
 export * from "./job-lifecycle";
 export * from "./media-repair";

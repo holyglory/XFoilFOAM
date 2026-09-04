@@ -7,6 +7,7 @@ import {
   syncLegacyBoundaryConditionForPreset,
 } from "./campaigns";
 import type { DB } from "./client";
+import { recomputeProgressForPointCorrections } from "./campaign-execution";
 import {
   airfoils,
   meshProfiles,
@@ -382,6 +383,11 @@ export async function createPointCorrection(
       "conflict",
       "fresh recalculation provenance could not be recorded",
     );
+  await recomputeProgressForPointCorrections(
+    db,
+    source.airfoilId,
+    resolved.revision.id,
+  );
   return {
     correctionRunId: correction.id,
     presetId: created.presetId,
