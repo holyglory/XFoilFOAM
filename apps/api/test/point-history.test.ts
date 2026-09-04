@@ -22,6 +22,7 @@ import {
   onResultIngested,
   outputProfiles,
   pointCorrectionRuns,
+  createPointCorrection,
   nextRunnablePointCorrectionRequestId,
   pointCorrectionProjectionSql,
   type PointCorrectionProjection,
@@ -1544,6 +1545,74 @@ describe("point-history story endpoint", () => {
             .set({ backgroundOwner: false })
             .where(inArray(simUransRequests.id, requestIds));
           expect(await nextRunnable()).toBeNull();
+          const pageRequestIds: string[] = [];
+          const pageObligationIds: string[] = [];
+          try {
+            await db
+              .update(simUransRequests)
+              .set({ backgroundOwner: true })
+              .where(eq(simUransRequests.id, nextBody.request.id));
+            for (let index = 0; index < 64; index += 1) {
+              const correction = await createPointCorrection(db, {
+                ...payload,
+                resultId,
+                fidelity: "precalc",
+                mesh: {
+                  ...payload.mesh,
+                  nSurface: payload.mesh.nSurface + index + 2,
+                },
+              });
+              const [pagePreset] = await db
+                .select()
+                .from(simulationPresets)
+                .where(eq(simulationPresets.id, correction.presetId));
+              correctionCleanups.push({
+                presetId: pagePreset.id,
+                requestId: correction.request.id,
+                meshProfileId: pagePreset.meshProfileId,
+                solverProfileId: pagePreset.solverProfileId,
+                sweepDefinitionId: pagePreset.sweepDefinitionId,
+                boundaryConditionId: pagePreset.legacyBoundaryConditionId,
+              });
+              pageRequestIds.push(correction.request.id);
+              const [pageObligation] = await ensurePrecalcObligations(
+                db,
+                [
+                  {
+                    airfoilId,
+                    revisionId: correction.revisionId,
+                    aoaDeg: -1,
+                  },
+                ],
+                { requestIds: [correction.request.id] },
+              );
+              expect(pageObligation).toBeDefined();
+              pageObligationIds.push(pageObligation.id);
+            }
+            await db
+              .update(simPrecalcObligations)
+              .set({ attemptCount: 2, maxAttempts: 2 })
+              .where(inArray(simPrecalcObligations.id, pageObligationIds));
+            await db.execute(sql`
+              UPDATE sim_urans_requests SET "createdAt" = '2026-09-04 00:00:00.123456+00'::timestamptz
+              WHERE id IN (${sql.join(
+                pageRequestIds.map((id) => sql`${id}::uuid`),
+                sql`, `,
+              )})
+            `);
+            expect(
+              await nextRunnablePointCorrectionRequestId(db, {
+                requestIds: [...pageRequestIds, nextBody.request.id],
+                allowContinuations: true,
+              }),
+            ).toBe(nextBody.request.id);
+          } finally {
+            if (pageObligationIds.length) {
+              await db
+                .delete(simPrecalcObligations)
+                .where(inArray(simPrecalcObligations.id, pageObligationIds));
+            }
+          }
         } finally {
           await db
             .delete(simPrecalcObligations)
@@ -1568,7 +1637,7 @@ describe("point-history story endpoint", () => {
         .set({ currentResultAttemptId: rejectedCurrentAttemptId })
         .where(eq(results.id, resultId));
     }
-  });
+  }, 30_000);
 
   it("does NOT attribute the interruption to points outside the cancelled job's aoa list", async () => {
     const res = await app.inject({

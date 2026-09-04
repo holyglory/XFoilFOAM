@@ -405,7 +405,7 @@ export async function nextRunnablePointCorrectionRequestId(
 ): Promise<string | null> {
   type Candidate = {
     id: string;
-    created_at: Date | string;
+    created_at: string;
     obligation_id: string | null;
     requires_continuation: boolean;
   };
@@ -421,10 +421,10 @@ export async function nextRunnablePointCorrectionRequestId(
         : sql`false`;
   for (;;) {
     const cursorScope = cursor
-      ? sql`(request."createdAt", request.id) > (${new Date(cursor.created_at).toISOString()}::timestamptz, ${cursor.id}::uuid)`
+      ? sql`(request."createdAt", request.id) > (${cursor.created_at}::timestamptz, ${cursor.id}::uuid)`
       : sql`true`;
     const candidates = (await db.execute(sql`
-      SELECT request.id, request."createdAt" AS created_at,
+      SELECT request.id, request."createdAt"::text AS created_at,
              obligation.id AS obligation_id,
              COALESCE(obligation.attempt_count >= obligation.max_attempts, false) AS requires_continuation
       FROM sim_urans_requests request
