@@ -2066,10 +2066,13 @@ def test_live_monitor_releases_startup_courant_only_after_repeatable_periods(
         "candidate periods contain a Cl high-frequency burst",
     ],
 )
+@pytest.mark.parametrize("configured_courant,expected_courant", [(4.0, 1.0), (0.5, 0.5)])
 def test_live_monitor_recovers_noisy_tail_with_tight_numerics(
     tmp_path,
     monkeypatch,
     trigger_reason,
+    configured_courant,
+    expected_courant,
 ):
     """MUST-CATCH: a transient numerical-noise tail triggers clean-tail retry.
 
@@ -2153,7 +2156,7 @@ PIMPLE
     solver = SolverParams(
         force_transient=True,
         urans_fidelity="precalc",
-        transient_max_courant=4.0,
+        transient_max_courant=configured_courant,
     )
     monitor = pipeline._make_urans_monitor(
         tcase,
@@ -2164,11 +2167,11 @@ PIMPLE
     )
 
     monitor()
-    assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
+    assert f"maxCo {configured_courant:g};" in (tcase / "system" / "controlDict").read_text()
 
     monitor()
     control = (tcase / "system" / "controlDict").read_text()
-    assert "maxCo 1;" in control
+    assert f"maxCo {expected_courant:g};" in control
     assert "maxDeltaT 0.01;" in control
     solution = (tcase / "system" / "fvSolution").read_text()
     assert "nOuterCorrectors 4;" in solution
@@ -2180,10 +2183,11 @@ PIMPLE
     )
     assert marker["trigger_reason"] == trigger_reason
     assert marker["trigger_time"] == pytest.approx(1.0)
+    assert marker["max_courant"] == expected_courant
 
     monitor()
     control = (tcase / "system" / "controlDict").read_text()
-    assert "maxCo 1;" in control
+    assert f"maxCo {expected_courant:g};" in control
     assert "maxCo 4;" not in control
     assert "maxDeltaT 0.01;" in control
     assert "maxDeltaT 0.2;" not in control
@@ -2206,10 +2210,44 @@ PIMPLE
     )
     restarted_monitor()
     control = (tcase / "system" / "controlDict").read_text()
-    assert "maxCo 1;" in control
+    assert f"maxCo {expected_courant:g};" in control
     assert "maxCo 4;" not in control
     assert "maxDeltaT 0.01;" in control
     assert "maxDeltaT 0.2;" not in control
+
+
+@pytest.mark.parametrize(
+    "stored_courant,configured_courant,expected_courant",
+    [(0.25, 0.5, 0.25), (1.0, 0.5, 0.5), (0.5, 4.0, 0.5),
+     (None, 0.5, 0.5), (True, 0.5, 0.5), (-1, 0.5, 0.5),
+     (float("nan"), 0.5, 0.5), ("0.25", 0.5, 0.5)],
+)
+def test_recovery_marker_restores_the_stricter_courant_ceiling(
+    tmp_path, stored_courant, configured_courant, expected_courant
+):
+    system = tmp_path / "system"
+    system.mkdir()
+    (system / "controlDict").write_text("maxCo 4;\nrunTimeModifiable true;\n")
+    (system / "fvSolution").write_text(
+        "solvers\n{\n"
+        "p\n{\ntolerance 1e-6;\nrelTol 0.1;\n}\n"
+        "pFinal\n{\ntolerance 1e-6;\nrelTol 0;\n}\n"
+        '"(k|omega|U).*"\n{\ntolerance 1e-7;\nrelTol 0.1;\n}\n'
+        "}\nPIMPLE\n{\nnOuterCorrectors 2;\nnCorrectors 2;\n}\n"
+    )
+    (tmp_path / pipeline.URANS_IMPULSE_RECOVERY_MARKER).write_text(
+        json.dumps({"max_courant": stored_courant, "max_delta_t": 0.001})
+    )
+    pipeline._make_urans_monitor(
+        tmp_path,
+        CaseSpec(chord=1.0, speed=10.0, aoa_deg=13.0),
+        solver_params=SolverParams(transient_max_courant=configured_courant),
+        settled_max_courant=configured_courant,
+        startup_max_delta_t=0.01,
+    )
+    control = (system / "controlDict").read_text()
+    assert f"maxCo {expected_courant:g};" in control
+    assert "maxDeltaT 0.001;" in " ".join(control.split())
 
 
 def test_live_monitor_keeps_startup_courant_until_period_frames_are_publishable(

@@ -733,8 +733,9 @@ def test_stale_recovery_checkpoint_is_never_overwritten(tmp_path, monkeypatch):
     assert sentinel.read_text() == "last known good"
 
 
+@pytest.mark.parametrize("configured_courant,expected_courant", [(4.0, 1.0), (0.5, 0.5), (0.25, 0.25)])
 def test_controller_retry_installs_conservative_rung_before_solver(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, configured_courant, expected_courant
 ):
     """MUST-CATCH: a repeated PRECALC starts tight, not after two noisy periods."""
 
@@ -788,13 +789,14 @@ PIMPLE
             marker = json.loads(
                 (case_dir / pipeline.URANS_IMPULSE_RECOVERY_MARKER).read_text()
             )
-            assert "maxCo 1;" in control
+            assert f"maxCo {expected_courant:g};" in control
             assert "maxDeltaT 0.01;" in control
             assert "nOuterCorrectors 4;" in solution
             assert "nCorrectors 3;" in solution
             assert "tolerance 1e-08;" in solution
             assert "relTol 0.01;" in solution
             assert marker["trigger_source"] == "controller_retry"
+            assert marker["max_courant"] == expected_courant
             raise RuntimeError("inspection complete")
 
     monkeypatch.setattr(pipeline, "CaseBuilder", RetryCaseBuilder)
@@ -816,6 +818,7 @@ PIMPLE
                 force_transient=True,
                 urans_fidelity="precalc",
                 urans_quality_recovery=True,
+                transient_max_courant=configured_courant,
             ),
             runner=InspectingRunner(),
             n_proc=1,

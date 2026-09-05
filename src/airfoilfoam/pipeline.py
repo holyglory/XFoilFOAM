@@ -1999,12 +1999,27 @@ def _write_urans_quality_recovery_marker(
         tmp.unlink(missing_ok=True)
 
 
+def _urans_quality_recovery_max_courant(*ceilings: object) -> float:
+    return min(
+        [URANS_STARTUP_MAX_COURANT]
+        + [
+            float(ceiling)
+            for ceiling in ceilings
+            if isinstance(ceiling, (int, float))
+            and not isinstance(ceiling, bool)
+            and math.isfinite(float(ceiling))
+            and float(ceiling) > 0
+        ]
+    )
+
+
 def _urans_quality_recovery_marker(
     *,
     trigger_source: str,
     trigger_reason: str,
     trigger_time: float,
     startup_max_delta_t: float | None,
+    configured_max_courant: float | None = None,
     period_s: float | None = None,
     window_start: float | None = None,
     window_end: float | None = None,
@@ -2016,7 +2031,7 @@ def _urans_quality_recovery_marker(
         "period_s": period_s,
         "window_start": window_start,
         "window_end": window_end,
-        "max_courant": URANS_STARTUP_MAX_COURANT,
+        "max_courant": _urans_quality_recovery_max_courant(configured_max_courant),
         "max_delta_t": startup_max_delta_t,
         "pressure_tolerance": URANS_IMPULSE_PRESSURE_TOLERANCE,
         "pressure_rel_tolerance": URANS_IMPULSE_PRESSURE_REL_TOL,
@@ -2031,6 +2046,7 @@ def _arm_controller_urans_quality_recovery(
     tcase: Path,
     *,
     startup_max_delta_t: float | None,
+    configured_max_courant: float | None = None,
 ) -> None:
     """Persist the controller-selected retry rung before dictionaries exist.
 
@@ -2051,6 +2067,7 @@ def _arm_controller_urans_quality_recovery(
             ),
             trigger_time=_latest_time(tcase),
             startup_max_delta_t=startup_max_delta_t,
+            configured_max_courant=configured_max_courant,
         ),
     )
 
@@ -2060,11 +2077,12 @@ def _arm_urans_impulse_recovery(
     result: StablePeriodResult,
     *,
     startup_max_delta_t: float | None,
+    configured_max_courant: float | None = None,
 ) -> None:
     """Tighten live PIMPLE numerics after an impulsive candidate is observed."""
     _apply_urans_impulse_solution_entries(tcase)
     control_entries: dict[str, object] = {
-        "maxCo": URANS_STARTUP_MAX_COURANT,
+        "maxCo": _urans_quality_recovery_max_courant(configured_max_courant),
         "runTimeModifiable": True,
     }
     if (
@@ -2084,6 +2102,7 @@ def _arm_urans_impulse_recovery(
             trigger_reason=result.reason,
             trigger_time=_latest_time(tcase),
             startup_max_delta_t=startup_max_delta_t,
+            configured_max_courant=configured_max_courant,
             period_s=result.period_s,
             window_start=result.window_start,
             window_end=result.window_end,
@@ -2095,6 +2114,7 @@ def _restore_urans_impulse_recovery(
     tcase: Path,
     *,
     fallback_max_delta_t: float | None,
+    configured_max_courant: float | None = None,
 ) -> None:
     """Reapply a persisted impulse rung before a continuation starts.
 
@@ -2107,6 +2127,8 @@ def _restore_urans_impulse_recovery(
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         marker = {}
+    if not isinstance(marker, dict):
+        marker = {}
     stored_max_delta_t = marker.get("max_delta_t")
     max_delta_t = (
         float(stored_max_delta_t)
@@ -2116,7 +2138,9 @@ def _restore_urans_impulse_recovery(
         else fallback_max_delta_t
     )
     control_entries: dict[str, object] = {
-        "maxCo": URANS_STARTUP_MAX_COURANT,
+        "maxCo": _urans_quality_recovery_max_courant(
+            configured_max_courant, marker.get("max_courant")
+        ),
         "runTimeModifiable": True,
     }
     if (
@@ -3509,6 +3533,11 @@ def _make_urans_monitor(
     settled_max_courant: Optional[float] = None,
     startup_max_delta_t: Optional[float] = None,
 ) -> Callable[[], None]:
+    configured_max_courant = (
+        solver_params.transient_max_courant
+        if solver_params is not None
+        else settled_max_courant
+    )
     impulse_recovery_armed = (
         tcase / URANS_IMPULSE_RECOVERY_MARKER
     ).is_file()
@@ -3516,6 +3545,7 @@ def _make_urans_monitor(
         _restore_urans_impulse_recovery(
             tcase,
             fallback_max_delta_t=startup_max_delta_t,
+            configured_max_courant=configured_max_courant,
         )
     state: dict[str, object] = {
         "cadence_period": None,
@@ -3571,6 +3601,7 @@ def _make_urans_monitor(
                 tcase,
                 result,
                 startup_max_delta_t=startup_max_delta_t,
+                configured_max_courant=configured_max_courant,
             )
             # Changing live dictionaries can itself contaminate a few boundary
             # samples.  Forget all earlier certification and require a fresh,
@@ -5244,6 +5275,7 @@ def _run_transient_attempt(
         _arm_controller_urans_quality_recovery(
             tcase,
             startup_max_delta_t=max_delta_t,
+            configured_max_courant=solver_params.transient_max_courant,
         )
     start_t = _latest_time(tcase)
     end_t = start_t + run_time
@@ -5306,6 +5338,7 @@ def _run_transient_attempt(
             _restore_urans_impulse_recovery(
                 tcase,
                 fallback_max_delta_t=pass_max_delta_t,
+                configured_max_courant=pass_params.transient_max_courant,
             )
         # Arm the heartbeat march-rate watchdog for this chunk: it projects
         # trailing simulated-time progress against the bounded tier budget.
@@ -5326,7 +5359,7 @@ def _run_transient_attempt(
                 tcase,
                 spec,
                 coeff_start_time,
-                solver_params=solver_params,
+                solver_params=pass_params,
                 settled_max_courant=settled_max_courant,
                 startup_max_delta_t=pass_max_delta_t,
             ),

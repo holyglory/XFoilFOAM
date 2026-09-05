@@ -126,6 +126,12 @@ export async function createPointCorrection(
         WHERE source_attempt_classification.result_attempt_id = ${resultAttempts.id}
           AND source_attempt_classification.state = 'rejected'
       )`,
+      sourceResultExcluded: sql<boolean>`EXISTS (
+        SELECT 1 FROM result_review_verdicts exclusion
+        WHERE exclusion.result_id = ${results.id}
+          AND exclusion.verdict = 'exclude'
+          AND exclusion."revokedAt" IS NULL
+      )`,
       airfoilId: results.airfoilId,
       bcId: results.bcId,
       airfoilName: airfoils.name,
@@ -192,11 +198,13 @@ export async function createPointCorrection(
     source.sourceAttemptStatus === "failed" || source.sourceAttemptRejected;
   const selectedResultIsRepairable =
     selectedGeneration &&
-    (source.status === "failed" || source.classificationState === "rejected");
+    (source.status === "failed" ||
+      source.classificationState === "rejected" ||
+      source.sourceResultExcluded);
   if (!exactAttemptIsRepairable && !selectedResultIsRepairable) {
     throw new CampaignError(
       "validation",
-      "a fresh recalculation can be created only for an unpublished failed or rejected point",
+      "a fresh recalculation can be created only for an unpublished failed, rejected, or explicitly excluded point",
     );
   }
 

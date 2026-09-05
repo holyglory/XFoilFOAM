@@ -33,6 +33,8 @@ import {
   solverEvidenceArtifacts,
   resultAttempts,
   resultClassifications,
+  recordReviewVerdict,
+  revokeActiveReviewVerdict,
   results,
   simJobs,
   simPrecalcObligations,
@@ -100,6 +102,109 @@ const cleanupAirfoilIds: string[] = [];
 
 /** results row ids by α for the seeded story points. */
 const resultIdByAoa = new Map<number, string>();
+
+describe("excluded numerical corrections", () => {
+  it("replaces only an actively excluded selected generation without rewriting its evidence", async () => {
+    const resultId = resultIdByAoa.get(2)!;
+    const [original] = await db
+      .select({ currentResultAttemptId: results.currentResultAttemptId })
+      .from(results)
+      .where(eq(results.id, resultId));
+    const attemptId = await createExactResultAttemptFixture(db, resultId, {
+      publication: "selected-eligible",
+    });
+    try {
+      const story = await app.inject({
+        method: "GET",
+        url: `/api/admin/point-history/${resultId}/story`,
+      });
+      expect(story.statusCode).toBe(200);
+      const payload = {
+        ...story.json().point.correctionSetup,
+        resultAttemptId: attemptId,
+        fidelity: "precalc",
+        freshBudgetOverrideS: 28_800,
+      };
+      const submit = () =>
+        app.inject({
+          method: "POST",
+          url: `/api/admin/point-history/${resultId}/corrected-run`,
+          payload,
+        });
+      expect((await submit()).statusCode).toBe(422);
+      await recordReviewVerdict(db, {
+        resultId,
+        verdict: "defer",
+        reviewer: PREFIX,
+      });
+      expect((await submit()).statusCode).toBe(422);
+      await recordReviewVerdict(db, {
+        resultId,
+        verdict: "exclude",
+        reviewer: PREFIX,
+        note: "The executed timestep differs from the immutable request.",
+      });
+      await revokeActiveReviewVerdict(db, resultId, PREFIX);
+      expect((await submit()).statusCode).toBe(422);
+      await recordReviewVerdict(db, {
+        resultId,
+        verdict: "exclude",
+        reviewer: PREFIX,
+      });
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: null })
+        .where(eq(results.id, resultId));
+      expect((await submit()).statusCode).toBe(422);
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: attemptId })
+        .where(eq(results.id, resultId));
+      const created = await submit();
+      expect(created.statusCode, JSON.stringify(created.json())).toBe(201);
+      const body = created.json();
+      const [preset] = await db
+        .select()
+        .from(simulationPresets)
+        .where(eq(simulationPresets.id, body.presetId));
+      correctionCleanups.push({
+        presetId: preset.id,
+        requestId: body.request.id,
+        meshProfileId: preset.meshProfileId,
+        solverProfileId: preset.solverProfileId,
+        sweepDefinitionId: preset.sweepDefinitionId,
+        boundaryConditionId: preset.legacyBoundaryConditionId,
+      });
+      expect(body.revisionId).not.toBe(revisionId);
+      expect(body.request).toMatchObject({
+        state: "pending",
+        aoaDeg: 2,
+        fidelity: "precalc",
+      });
+      const replay = await submit();
+      expect(replay.statusCode).toBe(200);
+      expect(replay.json().request.id).toBe(body.request.id);
+      const [retained] = await db
+        .select({ status: resultAttempts.status })
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, attemptId));
+      expect(retained.status).toBe("done");
+      const classifications = await db
+        .select({ state: resultClassifications.state })
+        .from(resultClassifications)
+        .where(eq(resultClassifications.resultId, resultId));
+      expect(classifications.every((row) => row.state === "accepted")).toBe(
+        true,
+      );
+    } finally {
+      await revokeActiveReviewVerdict(db, resultId, PREFIX);
+      await db
+        .update(results)
+        .set({ currentResultAttemptId: original.currentResultAttemptId })
+        .where(eq(results.id, resultId));
+    }
+  }, 30_000);
+});
 
 beforeAll(async () => {
   app = await buildServer();

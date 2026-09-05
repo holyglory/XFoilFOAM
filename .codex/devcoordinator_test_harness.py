@@ -218,6 +218,15 @@ def _urans_recovery_regression() -> int:
         return seeded
     commands = [
         (
+            "python-urans-courant",
+            "tighter requested Courant limits survive live recovery and restored chunks",
+            [
+                str(ROOT / ".venv/bin/python"), "-m", "pytest", "-q",
+                "tests/test_divergence_watchdog.py", "tests/test_frame_track.py",
+                "-k", "courant or tight_numerics or controller_retry",
+            ],
+        ),
+        (
             "python-urans-initialization",
             "point-scoped initializer and legacy scientific gates",
             [
