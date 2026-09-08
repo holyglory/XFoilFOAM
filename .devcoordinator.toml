@@ -95,6 +95,36 @@ image = "postgres:16-alpine"
 database = "aerodb"
 user = "aerodb"
 
+[test.progressive-reset-preparation]
+timeout_seconds = 900
+
+[test.progressive-reset-preparation.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-reset-preparation.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.progressive-reset-preparation.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive-reset-preparation.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-reset-preparation.check]]
+name = "rehearsal"
+tier = "development"
+requires = ["types", "seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/prepare-progressive-reset.test.ts"]
+
 [[test.progressive.check]]
 name = "python-syntax"
 tier = "development"

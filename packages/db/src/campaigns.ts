@@ -1456,7 +1456,7 @@ const POINT_CELL_JOIN = sql`r.airfoil_id = p.airfoil_id AND r.simulation_preset_
 
 /** Insert requested points for a set of conditions × the campaign airfoil set
  *  from TS-generated canonical angle arrays (spec §5.3e / §9.2). */
-async function insertCampaignPoints(
+export async function insertCampaignPoints(
   tx: CampaignTx,
   campaignId: string,
   planRevisionNumber: number,

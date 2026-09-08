@@ -19,9 +19,10 @@ Read the allocated web port with `devcoordinator2 deployment status --name progr
 and open `/airfoils/ag24` or `/compare?airfoil=ag24&airfoil=ag25` on that local
 origin. AG25 is added after campaign creation and enrolled through the same
 automatic profile-enrollment path used for later catalog additions. The isolated API cannot connect to
-the production solver or object bucket. No CFD runner is started by this preview.
-The page is preliminary; composite CFD correction, final layout/performance
-verification and production readiness remain separate outstanding outcomes.
+the production solver or object bucket. Its separate AG24 CFD campaign now uses
+the persistent private preview engine for real fast and precise refinement.
+The page is preliminary; final layout/performance verification, scientific
+validation and production readiness remain separate outstanding outcomes.
 
 Comparison preserves selected profiles in the URL, including an explicitly
 cleared selection. Matching uses the exact physical-condition key, not rounded
@@ -632,6 +633,16 @@ objects in the dedicated GCS bucket without changing bucket/IAM/soft-delete poli
 Soft-deleted generations expire according to that retained policy. Generation
 fences reject delayed old results. Append reset/replan history and reset execution
 counters without pretending the historical campaign request never existed.
+
+For a cleared solver domain, `packages/db/src/prepare-progressive-reset-cli.ts`
+reads an exact campaign id, expected plan revision, material id, sourced gas model
+and source reference from standard input. Run `--rehearse` to execute the entire
+transaction and roll it back, then `--apply` against the same unchanged target.
+It requires disabled admission and no existing solver data or campaign requests.
+It appends an unchanged campaign plan with reset provenance, resolves new material
+snapshots without altering historical revisions, and restores requested angles
+using the existing symmetry rules. Changed operating or numerical setup values
+require an explicit replan rather than being silently adopted.
 
 Deploy the same tested pushed-master revision to the VPS and hz-solver2 using the
 canonical deployment wrappers. Restore their deployment roles and verified capacity,
