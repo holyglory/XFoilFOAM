@@ -109,7 +109,13 @@ beforeAll(async () => {
       eq(simulationPresetRevisions.id, condition.simulationPresetRevisionId),
     );
   originalPlan = plan.plan;
-  previousSnapshot = revision.snapshot;
+  previousSnapshot = structuredClone(revision.snapshot);
+  delete (previousSnapshot.solver as Record<string, unknown>)
+    .uransPrecalcBudgetS;
+  await db
+    .update(simulationPresetRevisions)
+    .set({ snapshot: previousSnapshot })
+    .where(eq(simulationPresetRevisions.id, revision.id));
   previousRevisionId = revision.id;
   input = {
     campaignId: campaign.id,
@@ -169,6 +175,17 @@ it("refuses changed plans, active admission and cancelled campaigns without muta
 });
 
 it("rehearses with complete rollback then restores requested points without changing campaign intent or old evidence", async () => {
+  await expect(
+    db.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        UPDATE solver_profiles SET urans_precalc_budget_s = 14400
+        WHERE id IN (SELECT preset.solver_profile_id FROM simulation_presets preset
+          JOIN sim_campaign_conditions condition ON condition.preset_id = preset.id
+          WHERE condition.campaign_id = ${input.campaignId})
+      `);
+      await prepareProgressiveReset(transaction as unknown as DB, input);
+    }),
+  ).rejects.toThrow("preserved solver values have changed");
   await expect(
     db.transaction(async (transaction) => {
       await transaction.execute(sql`

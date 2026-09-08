@@ -188,8 +188,20 @@ export async function prepareProgressiveReset(
         "output",
       ] as const)
         assert.deepEqual(
-          resolved.snapshot[key],
-          snapshot[key],
+          key === "solver"
+            ? {
+                ...resolved.snapshot.solver,
+                uransPrecalcBudgetS:
+                  resolved.snapshot.solver.uransPrecalcBudgetS ?? null,
+              }
+            : resolved.snapshot[key],
+          key === "solver"
+            ? {
+                ...snapshot.solver,
+                uransPrecalcBudgetS:
+                  snapshot.solver.uransPrecalcBudgetS ?? null,
+              }
+            : snapshot[key],
           `The preserved ${key} values have changed; an explicit setup replan is required`,
         );
       for (const key of ["temperatureK", "pressurePa", "speedMps"] as const)
