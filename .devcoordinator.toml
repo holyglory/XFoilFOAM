@@ -1,22 +1,33 @@
-schema = 1
+schema = 2
 
 [test]
 default = "python"
 
 [test.python]
-command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "python-suite"]
 timeout_seconds = 7200
+
+[[test.python.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "python-suite"]
 
 [test.node]
-command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "node-suite"]
 timeout_seconds = 7200
 
+[[test.node.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "node-suite"]
+
 [test.types]
-command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
 timeout_seconds = 1800
 
+[[test.types.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
 [test.urans]
-command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "urans-recovery-regression"]
 timeout_seconds = 7200
 
 [test.urans.postgres]
@@ -24,8 +35,12 @@ image = "postgres:16-alpine"
 database = "aerodb"
 user = "aerodb"
 
+[[test.urans.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "urans-recovery-regression"]
+
 [test.sync]
-command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "sync-remote-validation-regression"]
 timeout_seconds = 7200
 
 [test.sync.postgres]
@@ -33,8 +48,12 @@ image = "postgres:16-alpine"
 database = "aerodb"
 user = "aerodb"
 
+[[test.sync.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "sync-remote-validation-regression"]
+
 [test.storage]
-command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "storage-retention-regression"]
 timeout_seconds = 7200
 
 [test.storage.postgres]
@@ -42,11 +61,767 @@ image = "postgres:16-alpine"
 database = "aerodb"
 user = "aerodb"
 
+[[test.storage.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "storage-retention-regression"]
+
 [test.campaign]
-command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "campaign-performance-regression"]
 timeout_seconds = 7200
 
 [test.campaign.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
 user = "aerodb"
+
+[[test.campaign.check]]
+name = "main"
+tier = "development"
+command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "campaign-performance-regression"]
+
+[test.reset]
+timeout_seconds = 600
+
+[[test.reset.check]]
+name = "boundaries"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_domain_reset.py", "-q"]
+
+[test.progressive]
+timeout_seconds = 7200
+
+[test.progressive.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive.check]]
+name = "python-syntax"
+tier = "development"
+command = ["/usr/bin/python3", "-c", "import ast; from pathlib import Path; paths = sorted([*Path('src/airfoilfoam').rglob('*.py'), *Path('tests').rglob('*.py')]); [ast.parse(path.read_text(encoding='utf-8'), filename=str(path)) for path in paths]; print(f'Parsed {len(paths)} Python source/test files')"]
+
+[[test.progressive.check]]
+name = "dependencies"
+tier = "development"
+requires = ["python-syntax"]
+command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
+
+[[test.progressive.check]]
+name = "inference"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "-q"]
+
+[[test.progressive.check]]
+name = "enrollment"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "test/polar-compatibility-cache.test.ts"]
+
+[[test.progressive.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.progressive.check]]
+name = "remote-campaign-ownership"
+tier = "development"
+requires = ["dependencies", "types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/campaigns.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-standalone-claims"
+tier = "development"
+requires = ["dependencies", "types", "remote-campaign-ownership"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/catalog.test.ts", "-t", "gates sync API status and claims"]
+
+[[test.progressive.check]]
+name = "services"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts"]
+
+[[test.progressive.check]]
+name = "execution-contract"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/progressive-execution.test.ts", "test/solver-budget.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-execution-contract"
+tier = "development"
+requires = ["types", "execution-contract"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-execution.test.ts", "test/progressive-remote-report.test.ts"]
+
+[[test.progressive.check]]
+name = "point-evidence-contract"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/fidelity-contract-pin.test.ts", "test/frame-track-contract-pin.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-point-projection"
+tier = "development"
+requires = ["types", "point-evidence-contract"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/progressive-remote-points.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-dispatch"
+tier = "development"
+requires = ["dependencies", "types", "remote-execution-contract"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch"]
+
+[[test.progressive.check]]
+name = "remote-capabilities"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-archive-broker"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/brokered-evidence-canary-fence.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-transfer-integration"
+tier = "development"
+requires = ["dependencies", "types", "remote-standalone-claims"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "ready evidence delivery cannot suppress independent CPU admission|keeps transfer-heartbeat failures retryable"]
+
+[[test.progressive.check]]
+name = "fixture-scope-cleanup"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "cleans only the owned retained-condition scopes"]
+
+[[test.progressive.check]]
+name = "execution"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive execution stop and settlement"]
+
+[[test.progressive.check]]
+name = "execution-budget-stop"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reconciles budget stops without releasing work"]
+
+[[test.progressive.check]]
+name = "runtime-budget"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive live solver accounting"]
+
+[[test.progressive.check]]
+name = "numerical-recovery"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "bounded progressive numerical recovery"]
+
+[[test.progressive.check]]
+name = "recovery-mesh"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_shared_mesh_recovery.py", "tests/test_targeted_urans_warmstart.py", "tests/test_jobs_mesh_resolution.py", "-q"]
+
+[[test.progressive.check]]
+name = "submission"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive submission recovery"]
+
+[[test.progressive.check]]
+name = "admission"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive CPU admission|progressive submission recovery|pins a shared execution revision|separates retry budgets"]
+
+[[test.progressive.check]]
+name = "stages"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive durable stage transitions"]
+
+[[test.progressive.check]]
+name = "reset"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_domain_reset.py", "-q"]
+
+[[test.progressive.check]]
+name = "scheduling"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "exec", "vitest", "run", "test/progressive-scheduling.test.ts", "test/gas-thermodynamics.test.ts", "test/progressive-curve-metrics.test.ts", "test/polar-publication.test.ts"]
+
+[[test.progressive.check]]
+name = "public-curve"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "publishes a real fitted curve|matches comparison conditions"]
+
+[[test.progressive.check]]
+name = "history-eligibility"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reduces actual unconverged histories"]
+
+[[test.progressive.check]]
+name = "comparison-model"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/compare-selection.test.ts", "test/progressive-comparison.test.ts"]
+
+[[test.progressive.check]]
+name = "air-material-audit"
+tier = "development"
+requires = ["compressible"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--no-sync", "--with", "CoolProp==8.0.0", "python", "scripts/materials/evaluate-air-fit.py", "--minimum-temperature", "100", "--output-directory", ".codex-artifacts/material-fit"]
+retained_artifacts = [{ name = "source-fit", path = ".codex-artifacts/material-fit", max_bytes = 10485760 }]
+
+[[test.progressive.check]]
+name = "air-pressure-contract"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_air_pressure_audit.py", "-q"]
+
+[[test.progressive.check]]
+name = "air-pressure-audit"
+tier = "development"
+requires = ["air-pressure-contract"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--no-sync", "--with", "CoolProp==8.0.0", "python", "scripts/materials/evaluate-air-pressure.py", "--output-directory", ".codex-artifacts/material-pressure"]
+retained_artifacts = [{ name = "source-pressure", path = ".codex-artifacts/material-pressure", max_bytes = 10485760 }]
+
+[[test.progressive.check]]
+name = "compressible"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_calorics.py", "tests/test_material_fitting.py", "tests/test_transport.py", "tests/test_material_domain.py", "tests/test_native_thermophysics_verifier.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "tests/test_images_extra.py", "tests/test_media_grind_guardrails.py", "tests/test_cache.py", "tests/test_warm_boundary_velocity.py", "-q"]
+
+[[test.progressive.check]]
+name = "warm-boundaries"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_warm_boundary_velocity.py", "tests/test_cache.py", "-q"]
+
+[[test.progressive.check]]
+name = "material-domain"
+tier = "development"
+requires = ["compressible", "types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "exec", "vitest", "run", "test/core.test.ts", "test/precalc-recovery-policy.test.ts"]
+
+[[test.progressive.check]]
+name = "material-domain-campaigns"
+tier = "development"
+requires = ["material-domain"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "does not convert|unconverged"]
+
+[[test.progressive.check]]
+name = "material-state"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "exec", "vitest", "run", "test/gas-state.test.ts", "test/gas-model-validation.test.ts", "test/gas-thermodynamics.test.ts", "test/material-physics.test.ts", "test/core.test.ts"]
+
+[[test.progressive.check]]
+name = "material-state-campaigns"
+tier = "development"
+requires = ["material-state", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "freezes explicit gas material"]
+
+[[test.progressive.check]]
+name = "material-state-sync"
+tier = "development"
+requires = ["material-state-campaigns"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/sync-remote-validation.test.ts", "-t", "explicit gas material"]
+
+[[test.progressive.check]]
+name = "material-lifecycle"
+tier = "development"
+requires = ["material-state", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/medium-gas-model.test.ts"]
+
+[test.progressive-live]
+timeout_seconds = 7200
+
+[test.progressive-density-live]
+timeout_seconds = 2900
+
+[test.progressive-density-live.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-density-live.check]]
+name = "dependencies"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
+
+[[test.progressive-density-live.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.progressive-density-live.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive-density-live.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-density-live.check]]
+name = "high-mach"
+tier = "development"
+requires = ["dependencies", "types", "seed"]
+timeout_seconds = 2700
+env = { PROGRESSIVE_LIVE_SPEED_MPS = "1020", PROGRESSIVE_LIVE_ENGINE_DEPLOYMENT = "progressive-test-engine" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+retained_artifacts = [{ name = "real-high-mach-journey", path = ".codex-artifacts/progressive-live-1020", max_bytes = 10485760 }]
+
+[test.progressive-live.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[test.progressive-pressure-candidate]
+timeout_seconds = 2200
+
+[test.progressive-pressure-candidate.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-pressure-candidate.check]]
+name = "dependencies"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
+
+[[test.progressive-pressure-candidate.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.progressive-pressure-candidate.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive-pressure-candidate.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-pressure-candidate.check]]
+name = "first-order-pressure"
+tier = "development"
+requires = ["dependencies", "types", "seed"]
+timeout_seconds = 2100
+env = { PROGRESSIVE_LIVE_SPEED_MPS = "166", PROGRESSIVE_LIVE_MOMENTUM_SCHEME = "upwind" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+retained_artifacts = [{ name = "first-order-pressure-journey", path = ".codex-artifacts/progressive-live-166-upwind", max_bytes = 10485760 }]
+
+[[test.progressive-live.check]]
+name = "dependencies"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
+
+[[test.progressive-live.check]]
+name = "ingest-schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive-live.check]]
+name = "ingest-seed"
+tier = "development"
+requires = ["ingest-schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-live.check]]
+name = "live-journey-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.progressive-live.check]]
+name = "live-fast-journey"
+tier = "development"
+requires = ["dependencies", "live-journey-types", "ingest-seed"]
+timeout_seconds = 2100
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+retained_artifacts = [{ name = "real-progressive-journey", path = ".codex-artifacts/progressive-live-30", max_bytes = 10485760 }]
+
+[[test.progressive-live.check]]
+name = "live-compressible-journey"
+tier = "development"
+requires = ["live-fast-journey"]
+timeout_seconds = 2100
+env = { PROGRESSIVE_LIVE_SPEED_MPS = "166" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+retained_artifacts = [{ name = "real-compressible-journey", path = ".codex-artifacts/progressive-live-166", max_bytes = 10485760 }]
+
+[[test.progressive-live.check]]
+name = "live-high-mach-journey"
+tier = "release"
+requires = ["live-compressible-journey"]
+timeout_seconds = 2700
+env = { PROGRESSIVE_LIVE_SPEED_MPS = "1020" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+retained_artifacts = [{ name = "real-high-mach-journey", path = ".codex-artifacts/progressive-live-1020", max_bytes = 10485760 }]
+
+[[test.progressive.check]]
+name = "budget"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_budget.py", "tests/test_runner.py", "tests/test_jobs_mesh_resolution.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "-q"]
+
+[[test.progressive.check]]
+name = "case-allocations"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_budget.py", "tests/test_api.py", "-k", "budget or health_and_capabilities", "-q"]
+
+[[test.progressive.check]]
+name = "allocation-contract"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/solver-budget.test.ts"]
+
+[[test.progressive.check]]
+name = "gateway"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_api.py", "tests/test_execution_stop.py", "tests/test_submission.py", "-q"]
+
+[[test.progressive.check]]
+name = "ingest-schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive.check]]
+name = "ingest-seed"
+tier = "development"
+requires = ["ingest-schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive.check]]
+name = "independent-manual"
+tier = "development"
+requires = ["ingest-seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/campaign-submit-lifecycle.test.ts", "-t", "promotes manual reuse of an automatic request"]
+
+[[test.progressive.check]]
+name = "current-submission"
+tier = "development"
+requires = ["ingest-seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/campaign-submit-lifecycle.test.ts", "-t", "progressive RANS compensation|does not release claims when another submitter|claims the pending job before|retries persisted compensating|promotes manual reuse|stationary budget-stopped|accepted wave-2 task"]
+
+[[test.progressive.check]]
+name = "refinement-proof"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-refinement-proof.test.ts"]
+
+[[test.progressive.check]]
+name = "acoustic-startup"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_acoustic_startup.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "-q"]
+
+[[test.progressive.check]]
+name = "pressure-initialization"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initialization.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_cache.py", "-q"]
+
+[[test.progressive.check]]
+name = "local-steady"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "-q"]
+
+[[test.progressive.check]]
+name = "local-steady-binding"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "composes high-Mach fast local-time"]
+
+[[test.progressive.check]]
+name = "local-steady-request"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/build-request-transient-pin.test.ts"]
+
+[[test.progressive.check]]
+name = "image-locks"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_frozen_python_images.py", "-q"]
+
+[[test.progressive.check]]
+name = "shock-reference"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_oblique_shock.py", "-q"]
+
+[[test.progressive.check]]
+name = "material-abort"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_material_abort.py", "tests/test_runner.py", "tests/test_acoustic_startup.py", "tests/test_numerical_canary.py", "-q"]
+
+[[test.progressive.check]]
+name = "worker-control"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "tests/test_api.py", "-q"]
+
+[[test.progressive.check]]
+name = "submission-legacy"
+tier = "development"
+requires = ["ingest-seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/campaign-submit-lifecycle.test.ts", "-t", "submission|submit|orphan"]
+
+[[test.progressive.check]]
+name = "ingest"
+tier = "development"
+requires = ["ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/replace-guard.test.ts", "test/ingest-lease.test.ts"]
+
+[test.enrollment]
+timeout_seconds = 1200
+
+[test.progressive-cfd-canary]
+timeout_seconds = 900
+
+[[test.progressive-cfd-canary.check]]
+name = "runtime"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_cfd_canary.py", "-q", "-k", "pinned_runtime"]
+
+[[test.progressive-cfd-canary.check]]
+name = "subsonic"
+tier = "development"
+requires = ["runtime"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_cfd_canary.py", "-q", "-s", "-k", "rhoSimple-subsonic"]
+
+[[test.progressive-cfd-canary.check]]
+name = "transonic"
+tier = "development"
+requires = ["runtime"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_cfd_canary.py", "-q", "-s", "-k", "rhoPimple-transonic"]
+
+[[test.progressive-cfd-canary.check]]
+name = "mach2"
+tier = "development"
+requires = ["runtime"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_cfd_canary.py", "-q", "-s", "-k", "rhoCentral-mach2"]
+
+[[test.progressive-cfd-canary.check]]
+name = "mach3"
+tier = "development"
+requires = ["runtime"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_cfd_canary.py", "-q", "-s", "-k", "rhoCentral-mach3"]
+
+[test.enrollment.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.enrollment.check]]
+name = "lifecycle"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts"]
+
+[deployment.progressive-preview]
+source = ["worktree"]
+domain = "airfoils-progressive-preview"
+components = ["db", "api", "web", "solver"]
+public = false
+
+[deployment.progressive-engine]
+source = ["worktree"]
+components = ["engine"]
+public = false
+ttl_seconds = 86400
+
+[deployment.progressive-test-engine]
+source = ["worktree"]
+components = ["engine"]
+public = false
+ttl_seconds = 86400
+
+[deployment.progressive-test-engine.component.engine]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain", PROGRESSIVE_ENGINE_SUBNET = "172.16.85.0/24" }
+env_file = ".codex-artifacts/progressive-engine.env"
+files = ["compose.progressive-engine.yml"]
+services = ["redis", "gateway", "worker", "subsonic", "transonic", "mach2", "mach3", "boundary-carry", "control-check"]
+finite_services = ["subsonic", "transonic", "mach2", "mach3", "boundary-carry", "control-check"]
+independent_services = ["worker"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.local-steady-check]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.shock-verification]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.shock-verification.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.shock-verification.yml"]
+services = ["artifacts", "coarse", "fine", "mach2-coarse", "mach2-fine", "mach3-coarse", "mach3-fine", "physical-mach2", "physical-mach2p5", "physical-mach3"]
+finite_services = ["coarse", "fine", "mach2-coarse", "mach2-fine", "mach3-coarse", "mach3-fine", "physical-mach2", "physical-mach2p5", "physical-mach3"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.local-steady-check.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }
+files = ["compose.local-steady-check.yml"]
+services = ["artifacts", "detector", "steady"]
+finite_services = ["detector", "steady"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.progressive-engine.component.engine]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }
+env_file = ".codex-artifacts/progressive-engine.env"
+files = ["compose.progressive-engine.yml"]
+services = ["redis", "gateway", "worker", "subsonic", "transonic", "mach2", "mach3", "boundary-carry", "control-check"]
+finite_services = ["subsonic", "transonic", "mach2", "mach3", "boundary-carry", "control-check"]
+independent_services = ["worker"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.progressive-numerics]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.thermophysics-check]
+source = ["worktree"]
+components = ["inspection"]
+public = false
+ttl_seconds = 86400
+
+[deployment.thermophysics-check.component.inspection]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }
+files = ["compose.thermophysics-check.yml"]
+services = ["artifacts", "inspection", "subsonic", "transonic", "mach2", "mach3"]
+finite_services = ["inspection", "subsonic", "transonic", "mach2", "mach3"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.progressive-numerics.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "quiet" }
+files = ["compose.progressive-numerics.yml"]
+services = ["artifacts", "subsonic", "transonic", "mach2", "mach3"]
+finite_services = ["subsonic", "transonic", "mach2", "mach3"]
+build = false
+port = true
+route = true
+timeout_seconds = 600
+
+[deployment.progressive-preview.component.db]
+type = "postgres"
+image = "postgres:16-alpine"
+database = "aerodb_preview"
+user = "aerodb"
+
+[deployment.progressive-preview.component.api]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "api"]
+port = true
+depends_on = ["db"]
+health = { path = "/health", timeout_seconds = 120 }
+
+[deployment.progressive-preview.component.web]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
+port = true
+route = true
+depends_on = ["api"]
+health = { path = "/airfoils/ag24", timeout_seconds = 600 }
+
+[deployment.progressive-preview.component.solver]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "solver"]
+port = true
+depends_on = ["api"]
+health = { path = "/health", timeout_seconds = 120 }
+
+[test.progressive-ui]
+timeout_seconds = 900
+
+[[test.progressive-ui.check]]
+name = "real-cfd-evidence"
+tier = "development"
+command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs"]
+
+[[test.progressive-ui.check]]
+name = "api-origin"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/api-origin.test.ts"]
+
+[[test.progressive-ui.check]]
+name = "material-editor"
+tier = "development"
+requires = ["preview-origin", "api-origin"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "exec", "tsx", "scripts/dev/verify-material-editor.mts"]
+
+[[test.progressive-ui.check]]
+name = "preview-origin"
+tier = "development"
+command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs"]
+
+[[test.progressive-ui.check]]
+name = "interactions"
+tier = "development"
+requires = ["preview-origin"]
+command = ["node", "scripts/dev/verify-progressive-preview.mjs"]
+
+[[test.progressive-ui.check]]
+name = "comparison-interactions"
+tier = "development"
+requires = ["preview-origin"]
+command = ["node", "scripts/dev/verify-progressive-comparison.mjs"]
+
+[[test.progressive-ui.check]]
+name = "scroll-diagnostic"
+tier = "development"
+requires = ["preview-origin"]
+command = ["node", "scripts/dev/diagnose-progressive-scroll.mjs"]
+
+[[test.progressive-ui.check]]
+name = "verifier-self-test"
+tier = "development"
+command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
+
+[[test.progressive-ui.check]]
+name = "layout"
+tier = "development"
+requires = ["verifier-self-test", "preview-origin"]
+command = ["node", "scripts/dev/verify-progressive-layout.mjs"]

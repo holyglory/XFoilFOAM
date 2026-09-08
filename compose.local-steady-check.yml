@@ -1,0 +1,56 @@
+services:
+  detector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: thermophysics-check
+    network_mode: none
+    volumes:
+      - ./scripts/materials/steady-probe/case:/fixture/case:ro
+      - ./scripts/materials/verify-native-steady.py:/fixture/verify.py:ro
+      - steady-evidence:/evidence
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >-
+        source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1 || exit 1;
+        export LD_LIBRARY_PATH="/opt/xfoilfoam-thermophysics/lib:$$LD_LIBRARY_PATH";
+        python3 /fixture/verify.py
+  steady:
+    image: xfoilfoam-local-steady:verification
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    network_mode: none
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    volumes:
+      - ./packages/db/seed/selig-database/ag24.dat:/candidate/ag24.dat:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/candidate/air.json:ro
+      - steady-evidence:/evidence
+    command: ["python", "-m", "airfoilfoam.local_steady_canary", "--coordinates", "/candidate/ag24.dat", "--material", "/candidate/air.json", "--destination", "/evidence/local-steady-wall40-upwind", "--iterations", "5000", "--budget-seconds", "600", "--target-y-plus", "40", "--momentum-scheme", "upwind"]
+    depends_on:
+      detector:
+        condition: service_completed_successfully
+  artifacts:
+    image: xfoilfoam-local-steady:verification
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - steady-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  steady-evidence:

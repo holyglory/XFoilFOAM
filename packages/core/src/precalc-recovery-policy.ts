@@ -143,6 +143,18 @@ export function planPrecalcRecovery(
     inferredNumericalNoise(text),
   );
 
+  if (input.failureDisposition === "material_domain") {
+    return {
+      failureType: "deterministic_setup_failure",
+      action: "recover_deterministic_setup",
+      consumesSolverAttempt: false,
+      evidenceCompleteness,
+      statisticalMeanScore,
+      numericalNoiseScore,
+      reason: "material coverage or numerical behavior must be corrected before another solve",
+    };
+  }
+
   if (
     input.failureDisposition === "infrastructure" ||
     input.status === "cancelled" ||

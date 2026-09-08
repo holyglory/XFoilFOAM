@@ -13,7 +13,7 @@ import {
   type ResultReviewVerdict,
 } from "./result-review";
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
 /** Thrown by aj() on non-2xx: message = server {error}; status + body kept so
  *  callers (e.g. campaign 409 stale-diff dialogs) can read refreshed payloads. */
@@ -1088,6 +1088,7 @@ export interface MediumInput {
   sutherlandS?: number | null;
   viscosityTable?: ViscosityTablePointDTO[];
   speedOfSound?: number | null;
+  gasThermodynamics?: MediumDTO["gasThermodynamics"];
   notes?: string | null;
 }
 
@@ -1143,6 +1144,8 @@ export const updateAdminMedium = (id: string, body: Partial<MediumInput>) =>
     method: "PATCH",
     body: JSON.stringify(body),
   });
+export const deleteAdminMedium = (id: string) =>
+  aj<void>(`/api/mediums/${encodeURIComponent(id)}`, { method: "DELETE" });
 export const getAdminBoundaryConditions = () =>
   aj<{ items: AdminBoundaryCondition[] }>("/api/admin/boundary-conditions");
 export const createAdminBoundaryCondition = (body: BoundaryConditionInput) =>

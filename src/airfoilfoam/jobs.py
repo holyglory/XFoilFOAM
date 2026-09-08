@@ -12,7 +12,7 @@ from . import physics
 from .airfoil import load_airfoil
 from .cache import EngineCache
 from .cancellation import JobCancelled
-from .capabilities import MESH_RECOVERY_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
+from .capabilities import MESH_RECOVERY_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from .config import Settings, get_settings
 from .meshing.base import Mesher, get_mesher
 from .models import (
@@ -99,6 +99,8 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
     )
     return PolarPoint(
         case_slug=slug,
+        solver_active_seconds=outcome.solver_active_seconds,
+        solver_budget=outcome.solver_budget,
         continuation_transient_subdir=outcome.continuation_transient_subdir,
         aoa_deg=outcome.spec.aoa_deg,
         cl=outcome.cl, cd=outcome.cd, cm=outcome.cm, cl_cd=outcome.cl_cd,
@@ -140,6 +142,7 @@ def execute_job(
     store: Optional[JobStore] = None,
     settings: Optional[Settings] = None,
     progress: ProgressCb = None,
+    budget_started: Optional[Callable] = None,
 ) -> JobResult:
     settings = settings or get_settings()
     store = store or JobStore(settings)
@@ -200,12 +203,28 @@ def execute_job(
         and request.expected_urans_initialization_version != URANS_INITIALIZATION_VERSION
     ):
         raise RuntimeError("worker URANS-initialization capability mismatch before staging or CFD")
+    if (
+        request.resources.case_solver_allocations is not None
+        and request.expected_solver_budget_version != SOLVER_BUDGET_VERSION
+    ) or (
+        request.expected_solver_budget_version is not None
+        and request.expected_solver_budget_version != SOLVER_BUDGET_VERSION
+    ):
+        raise RuntimeError("worker solver-budget capability mismatch before staging or CFD")
     airfoil = load_airfoil(
         request.airfoil.name, request.airfoil.coordinates, request.airfoil.points,
         request.airfoil.format,
     )
     mesher = get_mesher(request.mesh.mesher)
     runner = get_runner(settings)
+    from .openfoam.execution import configure_flow_execution
+    configure_flow_execution(runner, request)
+    if request.resources.case_solver_budget_seconds is not None or request.resources.case_solver_allocations is not None:
+        from .openfoam.budget import BudgetedRunner
+        runner = BudgetedRunner(runner, request.resources.case_solver_budget_seconds,
+                                case_allocations=request.resources.case_solver_allocations)
+        if budget_started is not None:
+            budget_started(runner)
     aoas = request.aoa.expand()
     chords, speeds = request.chord_lengths, request.speeds
     total = len(chords) * len(speeds) * len(aoas)

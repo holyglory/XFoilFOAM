@@ -743,6 +743,223 @@
       "when": 1792281600000,
       "tag": "0105_point_urans_initialization",
       "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1792368000000,
+      "tag": "0106_campaign_catalog_enrollment",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1792368000001,
+      "tag": "0107_progressive_generations",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1792368000002,
+      "tag": "0108_progressive_scope_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "7",
+      "when": 1792368000003,
+      "tag": "0109_progressive_cfd_units",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1792368000004,
+      "tag": "0110_progressive_cfd_execution",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "7",
+      "when": 1792368000005,
+      "tag": "0111_progressive_cfd_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1792368000006,
+      "tag": "0112_progressive_polar_models",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1792368000007,
+      "tag": "0113_progressive_fit_quality",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "7",
+      "when": 1792368000008,
+      "tag": "0114_progressive_execution_stops",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "7",
+      "when": 1792368000009,
+      "tag": "0115_progressive_stage_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1792368000010,
+      "tag": "0116_progressive_case_budget_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1792368000011,
+      "tag": "0117_progressive_runtime_progress",
+      "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1792368000012,
+      "tag": "0118_progressive_cfd_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1792368000013,
+      "tag": "0119_progressive_remote_dispatches",
+      "breakpoints": true
+    },
+    {
+      "idx": 120,
+      "version": "7",
+      "when": 1792368000014,
+      "tag": "0120_progressive_remote_reports",
+      "breakpoints": true
+    },
+    {
+      "idx": 121,
+      "version": "7",
+      "when": 1792368000015,
+      "tag": "0121_progressive_worker_reports",
+      "breakpoints": true
+    },
+    {
+      "idx": 122,
+      "version": "7",
+      "when": 1792368000016,
+      "tag": "0122_progressive_worker_submission_intents",
+      "breakpoints": true
+    },
+    {
+      "idx": 123,
+      "version": "7",
+      "when": 1792368000017,
+      "tag": "0123_progressive_worker_assignment_cursors",
+      "breakpoints": true
+    },
+    {
+      "idx": 124,
+      "version": "7",
+      "when": 1792368000018,
+      "tag": "0124_progressive_remote_progress_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1792368000019,
+      "tag": "0125_progressive_worker_evidence_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 126,
+      "version": "7",
+      "when": 1792368000020,
+      "tag": "0126_progressive_remote_evidence_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 127,
+      "version": "7",
+      "when": 1792368000021,
+      "tag": "0127_progressive_report_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 128,
+      "version": "7",
+      "when": 1792368000022,
+      "tag": "0128_progressive_worker_hub_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 129,
+      "version": "7",
+      "when": 1792368000023,
+      "tag": "0129_progressive_worker_delivery_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 130,
+      "version": "7",
+      "when": 1792368000024,
+      "tag": "0130_progressive_worker_archive_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 131,
+      "version": "7",
+      "when": 1792368000025,
+      "tag": "0131_progressive_late_archive_custody",
+      "breakpoints": true
+    },
+    {
+      "idx": 132,
+      "version": "7",
+      "when": 1792368000026,
+      "tag": "0132_progressive_worker_evidence_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 133,
+      "version": "7",
+      "when": 1792368000027,
+      "tag": "0133_progressive_worker_staging_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 134,
+      "version": "7",
+      "when": 1792368000028,
+      "tag": "0134_progressive_worker_archive_deliveries",
+      "breakpoints": true
+    },
+    {
+      "idx": 135,
+      "version": "7",
+      "when": 1792368000029,
+      "tag": "0135_progressive_remote_report_inventories",
+      "breakpoints": true
+    },
+    {
+      "idx": 136,
+      "version": "7",
+      "when": 1792368000030,
+      "tag": "0136_medium_gas_thermodynamics",
+      "breakpoints": true
     }
   ]
 }

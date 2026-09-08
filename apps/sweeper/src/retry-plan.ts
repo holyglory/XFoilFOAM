@@ -23,6 +23,7 @@ export type RansFailureDisposition =
   | "none"
   | "hard_solver"
   | "deterministic_mesh"
+  | "material_domain"
   | "infrastructure";
 
 export interface RansRetryScope {
@@ -236,7 +237,7 @@ export async function ransRetryPlanForJobScoped(
       failureDisposition: sql<RansFailureDisposition | null>`
         CASE
           WHEN ${resultAttempts.evidencePayload} ->> 'failure_disposition'
-            IN ('none', 'hard_solver', 'deterministic_mesh', 'infrastructure')
+            IN ('none', 'hard_solver', 'deterministic_mesh', 'material_domain', 'infrastructure')
           THEN ${resultAttempts.evidencePayload} ->> 'failure_disposition'
           ELSE NULL
         END

@@ -1,4 +1,9 @@
-import { type DB, simJobs, sweeperState } from "@aerodb/db";
+import {
+  type DB,
+  simJobs,
+  sweeperState,
+  solverDirectLifecycleSql,
+} from "@aerodb/db";
 import {
   EngineError,
   type EngineClient,
@@ -292,11 +297,14 @@ export async function cancelDisposableJobsForDiskPressure(
     .select()
     .from(simJobs)
     .where(
-      or(
-        inArray(simJobs.status, ["submitted", "running"]),
-        and(
-          eq(simJobs.status, "pending"),
-          eq(simJobs.engineState, "submitting"),
+      and(
+        solverDirectLifecycleSql(),
+        or(
+          inArray(simJobs.status, ["submitted", "running"]),
+          and(
+            eq(simJobs.status, "pending"),
+            eq(simJobs.engineState, "submitting"),
+          ),
         ),
       ),
     )

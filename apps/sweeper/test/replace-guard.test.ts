@@ -66,7 +66,7 @@ import type {
   PolarPoint,
 } from "@aerodb/engine-client";
 import { and, eq, inArray } from "drizzle-orm";
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -630,11 +630,44 @@ function acceptingPrecalcPoint(): PolarPoint {
   };
 }
 
+const initializedMediaJobs = new Set<string>();
+
 function jobResult(jobId: string, point: PolarPoint): JobResult {
+  const scoped = structuredClone(point);
+  const prefix = "/jobs/guard-job/";
+  const namespace = (path: string) => path.replace(prefix, `/jobs/${jobId}/`);
+  for (const key of ["images", "mean_images", "video"] as const) {
+    const media = scoped[key];
+    if (media) {
+      scoped[key] = Object.fromEntries(
+        Object.entries(media).map(([field, path]) => [field, namespace(path)]),
+      );
+    }
+  }
+  if (scoped.evidence_artifacts) {
+    scoped.evidence_artifacts = scoped.evidence_artifacts.map((artifact) => ({
+      ...artifact,
+      path: artifact.path ? namespace(artifact.path) : artifact.path,
+      url: artifact.url ? namespace(artifact.url) : artifact.url,
+    }));
+  }
+  if (!initializedMediaJobs.has(jobId)) {
+    const source = join(mediaRoot, "jobs/guard-job/cases/a0/images");
+    const destination = join(mediaRoot, `jobs/${jobId}/cases/a0/images`);
+    mkdirSync(destination, { recursive: true });
+    for (const name of [
+      "velocity_magnitude.png",
+      "velocity_magnitude_mean.png",
+      "velocity_magnitude.mp4",
+    ]) {
+      copyFileSync(join(source, name), join(destination, name));
+    }
+    initializedMediaJobs.add(jobId);
+  }
   return {
     job_id: jobId,
     state: "completed",
-    polars: [{ speed: SPEED, chord: CHORD, reynolds, mach, points: [point] }],
+    polars: [{ speed: SPEED, chord: CHORD, reynolds, mach, points: [scoped] }],
   };
 }
 
@@ -1968,7 +2001,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     ).toBe(true);
   }, 120000);
 
-  it("keeps a final URANS trajectory on exact-state continuation while every segment advances physical time", async () => {
+  it("keeps a final URANS trajectory while segments advance time and post-horizon quality improves", async () => {
     await cleanCell();
     const seeded = await seedAcceptedPrecalcCell("productive-final-trajectory");
     const [item] = await db
@@ -2041,6 +2074,9 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       (initialRejected.frame_track as { window: { t_end: number } }).window
         .t_end,
     );
+    const initialDrift = Number(
+      (initialRejected.frame_track as { drift_frac: number }).drift_frac,
+    );
     for (let segment = 1; segment <= 3; segment += 1) {
       const sourceAttemptId = settled.latestResultAttemptId!;
       const sourceResultId = await attachExactRestartArchive(sourceAttemptId);
@@ -2085,6 +2121,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             unknown
           >),
           periods_retained: 1.4 + segment,
+          drift_frac: initialDrift * 0.8 ** segment,
           stationary: false,
           window: {
             t_start: 10.2154,
@@ -2157,6 +2194,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
             unknown
           >),
           periods_retained: 4.4,
+          drift_frac: initialDrift * 0.8 ** 3,
           stationary: false,
           window: {
             t_start: 10.2154,
@@ -3238,7 +3276,7 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
       );
     const videoPath = join(
       mediaRoot,
-      "jobs/guard-job/cases/a0/images/velocity_magnitude.mp4",
+      `jobs/${engineJobId}/cases/a0/images/velocity_magnitude.mp4`,
     );
     await rm(videoPath, { force: true });
     try {

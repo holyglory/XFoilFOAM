@@ -1,0 +1,109 @@
+x-worker: &worker
+  image: xfoilfoam-progressive-worker:local
+  pull_policy: build
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.worker
+    args:
+      AIRFOILFOAM_BUILD_ID: progressive-local-validation
+  ulimits: &worker-limits
+    nofile:
+      soft: 65536
+      hard: 524288
+  environment: &worker-environment
+    AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+    AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+    AIRFOILFOAM_CACHE_DIR: /data/cache
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: "${AIRFOILFOAM_CONTROL_PLANE_TOKEN:?Private engine credentials are required}"
+    AIRFOILFOAM_CELERY_CONCURRENCY: "1"
+    AIRFOILFOAM_WORKER_CPU_BUDGET: "1"
+    AIRFOILFOAM_CASE_CONCURRENCY: "1"
+
+x-canary: &canary
+  image: xfoilfoam-progressive-worker:local
+  pull_policy: never
+  network_mode: none
+  environment:
+    <<: *worker-environment
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+  ulimits: *worker-limits
+  volumes:
+    - ./packages/db/seed/selig-database/ag24.dat:/canary/ag24.dat:ro
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      args:
+        AIRFOILFOAM_BUILD_ID: progressive-local-validation
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://redis:6379/0
+      AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+      AIRFOILFOAM_CACHE_DIR: /data/cache
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: "${AIRFOILFOAM_CONTROL_PLANE_TOKEN:?Private engine credentials are required}"
+    ports:
+      - "127.0.0.1:${PORT}:8000"
+    volumes:
+      - results:/data/airfoilfoam
+      - cache:/data/cache:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+  worker:
+    <<: *worker
+    volumes:
+      - results:/data/airfoilfoam
+      - cache:/data/cache
+    depends_on:
+      redis:
+        condition: service_healthy
+  subsonic:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoSimpleFoam", "--mach", "0.72", "--coordinates", "/canary/ag24.dat", "--case-dir", "/tmp/subsonic"]
+  transonic:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoPimpleFoam", "--mach", "0.9", "--coordinates", "/canary/ag24.dat", "--case-dir", "/tmp/transonic"]
+  mach2:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "2", "--coordinates", "/canary/ag24.dat", "--case-dir", "/tmp/mach2"]
+  mach3:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/tmp/mach3"]
+  boundary-carry:
+    <<: *canary
+    command: ["python", "/canary/verify-native-boundary-carry.py"]
+    volumes:
+      - ./scripts/materials/verify-native-boundary-carry.py:/canary/verify-native-boundary-carry.py:ro
+  control-check:
+    image: xfoilfoam-progressive-worker:local
+    pull_policy: never
+    environment:
+      <<: *worker-environment
+    command: ["python", "-m", "airfoilfoam.control_canary", "--api", "http://gateway:8000", "--coordinates", "/canary/ag24.dat"]
+    volumes:
+      - ./packages/db/seed/selig-database/ag24.dat:/canary/ag24.dat:ro
+    depends_on:
+      gateway:
+        condition: service_started
+      worker:
+        condition: service_started
+
+volumes:
+  results:
+  cache:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${PROGRESSIVE_ENGINE_SUBNET:-172.16.84.0/24}

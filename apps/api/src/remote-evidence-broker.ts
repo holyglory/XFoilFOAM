@@ -1,4 +1,8 @@
 import {
+  resolveProgressiveRemoteEvidence,
+  readProgressiveRemoteEvidenceReceipt,
+  assertProgressiveReportedManifest,
+  type ProgressiveRemoteEvidenceReference,
   registeredRemoteSolvers,
   resultAttempts,
   results,
@@ -39,6 +43,7 @@ const MAX_ACTIVE_BYTES_PER_SOLVER = Number(
 );
 
 export interface BrokeredEvidenceRequest {
+  progressiveEvidence?: ProgressiveRemoteEvidenceReference;
   idempotencyKey: string;
   promiseId: string;
   remoteResultId: string;
@@ -495,6 +500,7 @@ export async function expireBrokeredEvidenceUploads(
         OR (
           (promise.status IN ('cancelled', 'expired') OR promise."expiresAt" <= now())
           AND NOT is_exact_settled_legacy_evidence_upgrade(upload)
+          AND NOT is_exact_retained_progressive_archive(upload)
         )
       )
   `);
@@ -527,6 +533,12 @@ export async function requestBrokeredEvidenceUpload(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`remote-evidence-broker:${solver.id}`}, 0))`,
     );
+    const progressiveSource = await resolveProgressiveRemoteEvidence(tx, {
+      ...input,
+      solverId: solver.id,
+    });
+    if (progressiveSource)
+      assertProgressiveReportedManifest(progressiveSource, input);
     const objectKey = contentKey(input.storedSha256);
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`remote-evidence-object:${bucket}:${objectKey}`}, 0))`,
@@ -678,9 +690,16 @@ export async function requestBrokeredEvidenceUpload(
         point,
         input,
       ));
-    if (!activeLease && !settledLegacyUpgrade)
+    const retainedProgressive = progressiveSource
+      ? await readProgressiveRemoteEvidenceReceipt(tx, {
+          ...input,
+          solverId: solver.id,
+          progressiveEvidence: input.progressiveEvidence!,
+        })
+      : null;
+    if (!activeLease && !settledLegacyUpgrade && !retainedProgressive)
       throw new Error(
-        "exact promise point is neither active work nor an eligible settled legacy evidence upgrade",
+        "exact promise point is neither active work nor an eligible settled legacy evidence upgrade or retained progressive source",
       );
 
     const [quota] = await tx

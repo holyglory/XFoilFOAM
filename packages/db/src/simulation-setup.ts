@@ -1,10 +1,17 @@
 import { createHash } from "node:crypto";
 
-import { canonicalSiString } from "@aerodb/core";
+import {
+  canonicalSiString,
+  deriveFlowConditionState,
+  materialPhysicsValues,
+  type MediumStateInput,
+  type ProgressiveSolverFamily,
+} from "@aerodb/core";
 import { desc, eq, type InferSelectModel } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
 import type { DB } from "./client";
+import { resolveMaterialSnapshot } from "./material-snapshot";
 import {
   boundaryProfiles,
   flowConditions,
@@ -37,6 +44,7 @@ const uransPrecalcMeshProfiles = alias(
 );
 
 export interface SimulationSetupSnapshot {
+  material?: MediumStateInput;
   preset: {
     id: string;
     slug: string;
@@ -96,7 +104,12 @@ export interface SimulationSetupSnapshot {
     | "isSeeded"
     | "solverImplementationId"
     | "uransInitializationIterations"
-  > & { uransInitializationIterations?: number | null };
+  > & {
+    uransInitializationIterations?: number | null;
+    flowSolverFamily?: ProgressiveSolverFamily;
+    timeCoordinate?: import("@aerodb/core").ProgressiveTimeCoordinate;
+    turbulentPrandtl?: number;
+  };
   scheduling: Omit<
     InferSelectModel<typeof schedulingProfiles>,
     "createdAt" | "updatedAt" | "isSeeded"
@@ -190,9 +203,16 @@ export function physicsHashForSnapshot(
       : {}),
   };
   const subset = {
+    ...(snapshot.material
+      ? { material: materialPhysicsValues(snapshot.material) }
+      : {}),
     flowState: {
-      mediumId: flowState.mediumId,
-      mediumSlug: flowState.mediumSlug,
+      ...(snapshot.material?.gasThermodynamics
+        ? {}
+        : {
+            mediumId: flowState.mediumId,
+            mediumSlug: flowState.mediumSlug,
+          }),
       temperatureK: flowState.temperatureK,
       pressurePa: flowState.pressurePa,
       speedMps: flowState.speedMps,
@@ -475,7 +495,10 @@ export async function resolveSimulationPresetSnapshot(
     isSeeded: _swSeeded,
     ...sweepPayload
   } = sweep;
+  const material = await resolveMaterialSnapshot(db, medium);
+  const resolvedFlow = deriveFlowConditionState(material, flowState);
   return {
+    material,
     preset: {
       id: preset.id,
       slug: preset.slug,
@@ -503,10 +526,7 @@ export async function resolveSimulationPresetSnapshot(
       temperatureK: flowState.temperatureK,
       pressurePa: flowState.pressurePa,
       speedMps: flowState.speedMps,
-      density: flowState.density,
-      dynamicViscosity: flowState.dynamicViscosity,
-      kinematicViscosity: flowState.kinematicViscosity,
-      mach: flowState.mach,
+      ...resolvedFlow,
     },
     referenceGeometry: {
       id: referenceGeometry.id,
@@ -521,9 +541,9 @@ export async function resolveSimulationPresetSnapshot(
     derived: {
       reynolds: Math.round(
         (flowState.speedMps * referenceGeometry.referenceLengthM) /
-          flowState.kinematicViscosity,
+          resolvedFlow.kinematicViscosity,
       ),
-      mach: flowState.mach,
+      mach: resolvedFlow.mach,
     },
     boundary: {
       id: boundary.id,

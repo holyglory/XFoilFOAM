@@ -2,11 +2,31 @@
 // src/airfoilfoam/models.py. JSON uses snake_case — keep these field names exact.
 
 import type { PointFidelity, SteadyHistory, UransFidelity } from "./fidelity";
+import type {
+  GasThermodynamicModel,
+  ProgressiveSolverFamily,
+} from "@aerodb/core";
 import type { FrameTrack } from "./frame-track";
 import type { AperiodicMeanCertificate } from "./aperiodic-mean-certificate";
 import type { NoSheddingCertificate } from "./no-shedding-certificate";
 import type { RansHoldCertificate } from "./rans-hold-certificate";
 import type { UransCycleCertificate } from "./urans-cycle-certificate";
+
+export interface EngineExecutionStopProof {
+  ownership_basis?:
+    | "recorded_execution_namespace"
+    | "never_started_cancellation_fence"
+    | null;
+  version: 1;
+  job_id: string;
+  execution_stopped: boolean;
+  producer_stopped: boolean;
+  namespace_verified: boolean;
+  remaining: number[] | null;
+  observed_at: string;
+  error: string | null;
+  fence: "cancel_marker" | "terminal_result" | null;
+}
 
 /** Logical numerical implementation identity. Runtime/build provenance is
  * deliberately separate: rebuilding an image without changing numerics must
@@ -64,6 +84,7 @@ export interface EngineCapabilityDescriptor {
  * result payloads only after a worker has accepted/executed the request.
  * Legacy single-adapter fields remain optional during the rolling cutover. */
 export interface EngineCapabilities {
+  solver_budget_version?: number;
   engine?: EngineRuntimeIdentity | null;
   /** Queue/routing key accepted by this adapter API. */
   routing_key?: string;
@@ -96,6 +117,7 @@ export interface AirfoilInput {
 }
 
 export interface FluidProperties {
+  gas?: GasThermodynamicModel;
   density?: number;
   dynamic_viscosity?: number;
   kinematic_viscosity?: number;
@@ -153,6 +175,8 @@ export const ALL_IMAGE_FIELDS: ImageFieldName[] = [
 ];
 
 export interface SolverParams {
+  flow_solver_family?: ProgressiveSolverFamily;
+  turbulent_prandtl?: number;
   turbulence?: TurbulenceParams;
   n_iterations?: number;
   urans_initialization_iterations?: number;
@@ -195,7 +219,16 @@ export type ResourcePolicy =
   | "case_parallel"
   | "exclusive";
 
+export interface SolverCaseAllocation {
+  chord: number;
+  speed: number;
+  aoa_deg: number;
+  limit_seconds: number;
+}
+
 export interface ResourceParams {
+  case_solver_budget_seconds?: number;
+  case_solver_allocations?: SolverCaseAllocation[];
   cpu_budget?: number | null;
   case_concurrency?: number | null;
   solver_processes?: number | null;
@@ -214,7 +247,9 @@ export interface ContinueFrom {
 }
 
 export interface PolarRequest {
+  execution_id?: string;
   expected_urans_initialization_version?: number;
+  expected_solver_budget_version?: number;
   /** Exact logical implementation requested by the control plane. New clients
    * always send this field; omission remains accepted only for legacy callers. */
   expected_engine?: EngineIdentity;
@@ -226,6 +261,7 @@ export interface PolarRequest {
   speeds?: number[];
   aoa: AoASpec;
   fluid?: FluidProperties;
+  flow_state?: { temperature_k: number; pressure_pa: number };
   roughness?: RoughnessParams;
   mesh?: MeshParams;
   urans_mesh?: MeshParams;
@@ -300,6 +336,20 @@ export interface JobStatus {
   phase?: JobPhase;
   total_cases: number;
   completed_cases: number;
+  solver_budget_progress?: {
+    version: 1;
+    job_id: string;
+    observed_at: string;
+    cases: Array<{
+      chord: number;
+      speed: number;
+      aoa_deg: number;
+      solver_active_seconds: number;
+      limit_seconds: number;
+      solver_running: boolean;
+    }>;
+  } | null;
+  solver_budget_error?: string | null;
   message?: string | null;
   task_id?: string | null;
   queued_at?: string | null;
@@ -349,6 +399,7 @@ export interface EngineHealth {
    * zero and must not authorize continuation or corrective final recovery. */
   urans_recovery_version?: number;
   urans_initialization_version?: number;
+  solver_budget_version?: number;
   /** Structured engine/runtime identity. Top-level version/build_id remain for
    * legacy control-plane and operator compatibility during rollout. */
   engine?: EngineRuntimeIdentity | null;
@@ -807,6 +858,13 @@ export interface JobRuntimeResponse {
 }
 
 export interface PolarPoint {
+  solver_active_seconds?: number | null;
+  solver_budget?: {
+    version: 1;
+    scope: "physical_case_v1";
+    limit_seconds: number;
+    exhausted: boolean;
+  } | null;
   case_slug?: string | null;
   /** Exact child transient that produced this attempt. Required for new
    * restartable URANS evidence; absent on legacy engine results. */
@@ -879,6 +937,7 @@ export type FailureDisposition =
   | "none"
   | "hard_solver"
   | "deterministic_mesh"
+  | "material_domain"
   | "infrastructure";
 
 export type ContinuationFailureKind = "transient" | "permanent";

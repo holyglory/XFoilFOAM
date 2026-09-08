@@ -11,6 +11,7 @@ import {
   simJobs,
   syncBlobLockStripe,
   solverEvidenceArtifacts,
+  solverDirectLifecycleSql,
 } from "@aerodb/db";
 import { EngineError, type EngineClient } from "@aerodb/engine-client";
 import { eq, inArray, sql } from "drizzle-orm";
@@ -341,6 +342,7 @@ export async function stripTerminalJobs(
         ) AS delete_job_dir
       FROM sim_jobs j
       WHERE j.status IN ('done', 'failed', 'cancelled')
+        AND ${solverDirectLifecycleSql("j")}
         AND j.engine_job_id IS NOT NULL
         -- A remote-solver job owns upload source bytes until the hub has
         -- acknowledged every exact generation and the delivery loop has

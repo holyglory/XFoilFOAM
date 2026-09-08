@@ -20,6 +20,7 @@ import {
   polarCompatibilityFitPoints,
   polarCompatibilityFitSets,
   pointCorrectionProjectionSql,
+  publicProgressivePolars,
   type PointCorrectionProjection,
   type Result,
   resultClassifications,
@@ -1051,8 +1052,14 @@ export async function assembleDetail(
     (x, y) => x - y,
   );
   const simulationWorks = await loadSimulationWorks(a.id);
+  const progressivePolars = await publicProgressivePolars(
+    db,
+    a.id,
+    opts.revisionId,
+  );
   const displayedMach =
     polars.find((polar) => polar.points.length > 0)?.mach ??
+    progressivePolars[0]?.mach ??
     simulationWorks.find((work) => work.mach !== null)?.mach ??
     0;
 
@@ -1075,6 +1082,7 @@ export async function assembleDetail(
     mach: displayedMach,
     reList,
     polars,
+    progressivePolars,
     simulationWorks,
     downloads: {
       selig: `/api/airfoils/${a.slug}/coords.dat?format=selig`,

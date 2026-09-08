@@ -19,6 +19,10 @@ import { alias } from "drizzle-orm/pg-core";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
+import {
+  progressiveParentRevisionIds,
+  supersedeProgressivePriorEvidence,
+} from "./progressive-cfd-numerical-recovery";
 import { activeReviewVerdicts } from "./review-verdicts";
 import {
   airfoils,
@@ -187,6 +191,7 @@ function toEvidence(row: {
       row.failureDisposition === "none" ||
       row.failureDisposition === "hard_solver" ||
       row.failureDisposition === "deterministic_mesh" ||
+      row.failureDisposition === "material_domain" ||
       row.failureDisposition === "infrastructure"
         ? row.failureDisposition
         : null,
@@ -1152,7 +1157,13 @@ export async function refreshPolarCacheForRevision(
   airfoilId: string,
   simulationPresetRevisionId: string,
   hooks?: PolarCacheRefreshHooks,
+  visited: ReadonlySet<string> = new Set(),
 ): Promise<PolarCacheRefreshResult> {
+  if (visited.has(simulationPresetRevisionId))
+    throw new Error(
+      "Progressive polar cache recovery ancestry contains a cycle",
+    );
+  const ancestry = new Set(visited).add(simulationPresetRevisionId);
   const refreshed = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const compatibilityHash = await resolveRevisionMethodCompatibilityHash(
@@ -1275,6 +1286,11 @@ export async function refreshPolarCacheForRevision(
       simulationPresetRevisionId,
     );
     await supersedePrecalcWithVerifiedUrans(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+    );
+    await supersedeProgressivePriorEvidence(
       tx,
       airfoilId,
       simulationPresetRevisionId,
@@ -1446,6 +1462,18 @@ export async function refreshPolarCacheForRevision(
       refreshed.compatibilityHash,
     );
   }
+  for (const parent of await progressiveParentRevisionIds(
+    db,
+    airfoilId,
+    simulationPresetRevisionId,
+  ))
+    await refreshPolarCacheForRevision(
+      db,
+      airfoilId,
+      parent,
+      undefined,
+      ancestry,
+    );
   return refreshed.result;
 }
 

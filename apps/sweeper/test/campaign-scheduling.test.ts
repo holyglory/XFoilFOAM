@@ -263,7 +263,7 @@ describe("RANS→URANS retry scoping: conditional whole-polar preliminary URANS"
     expect(decision!.queueCanonicalAoas).toEqual([]);
   });
 
-  it.each(["infrastructure", "deterministic_mesh"] as const)(
+  it.each(["infrastructure", "deterministic_mesh", "material_domain"] as const)(
     "FALSE-POSITIVE GUARD: %s rejection neither promotes nor routes to URANS",
     (failureDisposition) => {
       const decision = decideRansRetry({

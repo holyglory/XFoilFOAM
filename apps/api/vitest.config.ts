@@ -9,5 +9,10 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     fileParallelism: false,
+    setupFiles: [
+      "../../packages/db/test-support/global-admission-test-lease.ts",
+    ],
+    sequence: { hooks: "stack" },
+    hookTimeout: 300_000,
   },
 });

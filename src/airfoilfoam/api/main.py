@@ -29,7 +29,7 @@ from ..archive_reduction import (
     reduce_remote_archive_clean_cycles,
 )
 from ..cache import EngineCache
-from ..capabilities import MESH_RECOVERY_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
+from ..capabilities import MESH_RECOVERY_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from ..config import Settings, get_settings
 from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
@@ -67,6 +67,7 @@ from ..evidence_upload_broker import (
 from ..meshing.base import list_meshers
 from ..models import (
     AirfoilInput,
+    EngineIdentity,
     ImageField,
     JobPhase,
     JobResult,
@@ -84,6 +85,12 @@ from ..openfoam.dialects import (
 from ..postprocess.images import compute_field_extents, render_animations, render_contours, render_custom_field, render_mean_contours
 from ..retention import JobRetentionRefused, delete_job_dir, strip_job_dir
 from ..storage import JobStore
+from ..submission import SubmissionError, fence_stable_submission, register_stable_submission
+
+
+class StableCancellationRequest(BaseModel):
+    expected_engine: EngineIdentity | None = None
+    expected_execution_pool: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class RuntimeRequest(BaseModel):
@@ -833,6 +840,8 @@ def _evidence_hydration_cache_maintenance_loop(
 
 
 def create_app() -> FastAPI:
+    from .predictions import prediction_router
+
     settings = get_settings()
 
     @asynccontextmanager
@@ -858,6 +867,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     store = JobStore(settings)
+    app.include_router(prediction_router(settings.control_plane_token, _require_control_plane_bearer))
     # Worker runtime identity is immutable for the lifetime of one exact
     # worker/queue binding. Celery's `inspect.conf()` handler creates a Kombu
     # transport on the worker; polling it on every /queue request leaked
@@ -907,6 +917,7 @@ def create_app() -> FastAPI:
             "mesh_recovery_version": MESH_RECOVERY_VERSION,
             "urans_recovery_version": URANS_RECOVERY_VERSION,
             "urans_initialization_version": URANS_INITIALIZATION_VERSION,
+            "solver_budget_version": SOLVER_BUDGET_VERSION,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
             # provenance appears solely on worker-acknowledged status/results.
@@ -947,6 +958,7 @@ def create_app() -> FastAPI:
         ]
         return {
             "meshers": list_meshers(),
+            "solver_budget_version": SOLVER_BUDGET_VERSION,
             "turbulence_models": [m.value for m in TurbulenceModel],
             "openfoam_image": settings.openfoam_image,
             "runner": settings.openfoam_runner,
@@ -1040,6 +1052,12 @@ def create_app() -> FastAPI:
                     ),
                 },
             )
+        if request.expected_solver_budget_version is not None and request.expected_solver_budget_version != SOLVER_BUDGET_VERSION:
+            raise HTTPException(status_code=409, detail={
+                "code": "solver_budget_version_mismatch",
+                "requested_version": request.expected_solver_budget_version,
+                "actual_version": SOLVER_BUDGET_VERSION,
+            })
         if (
             request.expected_urans_initialization_version is not None
             and request.expected_urans_initialization_version != URANS_INITIALIZATION_VERSION
@@ -1077,6 +1095,26 @@ def create_app() -> FastAPI:
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=422, detail=f"Invalid airfoil: {exc}")
+
+        if request.execution_id is not None:
+            from ..celery_app import task_hard_time_limit_s
+            from ..tasks import run_polar
+
+            def enqueue_registered(job_id: str, registered: PolarRequest) -> str:
+                task = run_polar.apply_async(
+                    args=[job_id, registered.model_dump_json()], task_id=job_id, queue=dialect.queue_name,
+                    time_limit=task_hard_time_limit_s(
+                        get_settings(), max(1, len(registered.cases())), budget_override_s=registered.budget_override_s,
+                    ),
+                )
+                return task.id
+
+            try:
+                return register_stable_submission(store, request, enqueue_registered)
+            except SubmissionError as error:
+                raise HTTPException(status_code=error.status_code, detail={
+                    "code": error.code, "job_id": str(request.execution_id), "message": str(error),
+                }) from error
 
         job_id = uuid.uuid4().hex
         store.create(job_id, request)
@@ -1403,17 +1441,74 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail=f"Job status unreadable: {error}")
         if status is None:
             raise HTTPException(status_code=404, detail="Job not found")
+        status.solver_budget_progress, status.solver_budget_error = store.read_solver_budget_progress(job_id)
         return status
 
+    @app.post("/jobs/{job_id}/execution-stop-proof")
+    def job_execution_stop_proof(job_id: str) -> dict:
+        if not store.exists(job_id):
+            raise HTTPException(status_code=404, detail="Job not found")
+        from ..worker_control import request_worker_control
+
+        status = store.read_status(job_id)
+        request = store.read_request(job_id)
+        requested_engine = (
+            status.requested_engine if status is not None and status.requested_engine is not None
+            else request.expected_engine if request is not None and request.expected_engine is not None
+            else OPENCFD_2606_IDENTITY
+        )
+        try:
+            queue_name = get_openfoam_dialect(requested_engine).queue_name
+        except UnsupportedEngineIdentity as error:
+            raise HTTPException(status_code=409, detail="Execution-stop inspection engine route is unknown") from error
+        try:
+            proof = request_worker_control("inspect", job_id, queue_name, requested_engine)
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="Worker execution-stop inspection is unavailable") from error
+        if not isinstance(proof, dict) or proof.get("job_id") != job_id or proof.get("version") != 1:
+            raise HTTPException(status_code=503, detail="Worker execution-stop inspection returned no exact proof")
+        if proof.get("execution_stopped") is True and not (
+            proof.get("producer_stopped") is True and proof.get("namespace_verified") is True
+            and proof.get("remaining") == [] and proof.get("error") is None
+            and proof.get("fence") in {"cancel_marker", "terminal_result"}
+            and isinstance(proof.get("observed_at"), str) and proof["observed_at"]
+        ):
+            raise HTTPException(status_code=503, detail="Worker execution-stop inspection is incomplete")
+        return proof
+
     @app.post("/jobs/{job_id}/cancel")
-    def cancel_job(job_id: str) -> dict:
+    def cancel_job(job_id: str, cancellation: StableCancellationRequest | None = None) -> dict:
+        fenced = False
+        if cancellation is not None and cancellation.expected_execution_pool is not None and cancellation.expected_engine is None:
+            raise HTTPException(status_code=422, detail="Stable cancellation requires its exact engine identity")
+        if cancellation is not None and cancellation.expected_engine is not None:
+            try:
+                route = get_openfoam_dialect(cancellation.expected_engine)
+                if route.identity.handshake_key not in settings.enabled_engine_key_set():
+                    raise SubmissionError("engine_not_enabled", "The cancellation engine route is not enabled")
+                if cancellation.expected_execution_pool is not None and cancellation.expected_execution_pool != route.queue_name:
+                    raise SubmissionError("execution_pool_mismatch", "Cancellation execution pool does not match its exact engine route")
+                fence_stable_submission(store, job_id, cancellation.expected_engine)
+                fenced = True
+            except (SubmissionError, ValueError, UnsupportedEngineIdentity) as error:
+                raise HTTPException(status_code=error.status_code if isinstance(error, SubmissionError) else 422,
+                                    detail={"code": error.code if isinstance(error, SubmissionError) else "invalid_execution_identity",
+                                            "job_id": job_id, "message": str(error)}) from error
         if not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         from ..celery_app import celery_app
-        from ..tasks import kill_job_processes
+        from ..worker_control import request_worker_control
 
         status_before_cancel = store.read_status(job_id)
         request_before_cancel = store.read_request(job_id)
+        if not fenced and ((request_before_cancel is not None and request_before_cancel.execution_id is not None)
+                or store.has_stable_submission(job_id)):
+            try:
+                fence_stable_submission(store, job_id)
+            except (SubmissionError, ValueError) as error:
+                raise HTTPException(status_code=error.status_code if isinstance(error, SubmissionError) else 422,
+                                    detail={"code": error.code if isinstance(error, SubmissionError) else "invalid_execution_identity",
+                                            "job_id": job_id, "message": str(error)}) from error
         requested_engine = (
             status_before_cancel.requested_engine
             if status_before_cancel is not None and status_before_cancel.requested_engine is not None
@@ -1436,8 +1531,8 @@ def create_app() -> FastAPI:
         reaper_results: list[dict] = []
         for _ in range(2):
             try:
-                reaper = kill_job_processes.apply_async(args=[job_id], queue=reaper_queue)
-                reaper_results.append(reaper.get(timeout=5, propagate=False))
+                receipt = request_worker_control("reap", job_id, reaper_queue, requested_engine)
+                reaper_results.append(receipt if isinstance(receipt, dict) else {"error": str(receipt)})
             except Exception as exc:  # noqa: BLE001 - cancellation should still revoke
                 reaper_results.append({"error": f"reaper failed: {exc}"})
         try:
@@ -1445,8 +1540,8 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"Could not cancel task: {exc}")
         try:
-            reaper = kill_job_processes.apply_async(args=[job_id], queue=reaper_queue)
-            reaper_results.append(reaper.get(timeout=5, propagate=False))
+            receipt = request_worker_control("reap", job_id, reaper_queue, requested_engine)
+            reaper_results.append(receipt if isinstance(receipt, dict) else {"error": str(receipt)})
         except Exception as exc:  # noqa: BLE001
             reaper_results.append({"error": f"post-revoke reaper failed: {exc}"})
         status = store.read_status(job_id) or JobStatus(job_id=job_id, state=JobState.cancelled)
@@ -1455,7 +1550,16 @@ def create_app() -> FastAPI:
         status.message = "cancelled"
         store.write_status(status)
         store.terminalize_cancelled_result(job_id)
-        return {"job_id": job_id, "cancelled": True, "reaper": reaper_results}
+        final_reaper = reaper_results[-1] if reaper_results else None
+        stop_proof = final_reaper.get("stop_proof") if isinstance(final_reaper, dict) else None
+        execution_stopped = (
+            isinstance(stop_proof, dict) and stop_proof.get("version") == 1
+            and stop_proof.get("job_id") == job_id and stop_proof.get("execution_stopped") is True
+            and stop_proof.get("producer_stopped") is True and stop_proof.get("namespace_verified") is True
+            and stop_proof.get("remaining") == [] and stop_proof.get("error") is None
+        )
+        return {"job_id": job_id, "cancelled": True, "execution_stopped": execution_stopped,
+                "stop_proof": stop_proof, "reaper": reaper_results}
 
     @app.post("/jobs/{job_id}/strip")
     def strip_job(job_id: str, request: StripJobRequest) -> dict:

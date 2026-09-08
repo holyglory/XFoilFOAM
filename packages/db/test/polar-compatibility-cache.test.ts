@@ -16,6 +16,7 @@ import {
   physicsHashForSnapshot,
   type SimulationSetupSnapshot,
 } from "../src/simulation-setup";
+import { progressiveRecipes } from "../src/progressive-materialization";
 
 function candidate(
   id: string,
@@ -285,6 +286,24 @@ describe("physics compatibility hash contract", () => {
     expect(physicsHashForSnapshot(withLimit(600))).not.toBe(
       physicsHashForSnapshot(withLimit(1200)),
     );
+  });
+  it("keeps local pseudo-time numerics distinct without altering the precise recipe", () => {
+    const density = structuredClone(snapshot);
+    density.derived.mach = 3;
+    density.solver.flowSolverFamily = "rhoCentralFoam";
+    const original = structuredClone(density);
+    const recipes = progressiveRecipes(density);
+    expect(recipes.fast).toMatchObject({
+      recipe_id: "openfoam-fast-density-local-v1",
+      timeCoordinate: "local_pseudo_time_iterations",
+      mesh: { targetYPlus: 40 },
+      solver: { nIterations: 5000, momentumScheme: "upwind" },
+    });
+    expect(recipes.precise).not.toHaveProperty("timeCoordinate");
+    expect(density).toEqual(original);
+    const physicalTimeHash = physicsHashForSnapshot(density);
+    density.solver.timeCoordinate = "local_pseudo_time_iterations";
+    expect(physicsHashForSnapshot(density)).not.toBe(physicalTimeHash);
   });
   it("ignores batch/preset metadata, sweep, scheduling, and output policy", () => {
     const changed: SimulationSetupSnapshot = {

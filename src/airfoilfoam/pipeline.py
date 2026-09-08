@@ -49,11 +49,13 @@ from .evidence_store import (
     EvidenceUnavailableError,
 )
 from .meshing.base import Mesher, MeshResult, get_mesher
+from .material_domain import check_material_domain, material_domain_failure
 from .models import (
     AperiodicMeanCertificate,
     FRAME_IMAGE_ARTIFACT_KIND,
     PRECALC_WALLFN_MAX_CONCAVE_CURVATURE,
     CaseSpec,
+    CaseSolverBudget,
     EvidenceArtifact,
     EngineIdentity,
     EngineRuntimeIdentity,
@@ -85,11 +87,16 @@ from .models import (
     urans_budget_seconds,
     urans_point_fidelity,
 )
+from .openfoam.budget import begin_case_budget, case_solver_seconds, case_solver_budget
+from .openfoam.execution import is_compressible, is_density_based
+from .openfoam.acoustic_startup import acoustic_startup_step
+from .openfoam.potential_initialization import PRESSURE_INITIALIZATION_DIR, initialize_compressible_velocity
 from .openfoam.runner import (
     CommandTimeoutError,
     DeterministicMeshError,
     HardSolverError,
     InfrastructureError,
+    MaterialDomainError,
     OpenFOAMError,
     RunResult,
     Runner,
@@ -123,7 +130,7 @@ from .postprocess.images import (
     select_vtus,
 )
 from .postprocess.aperiodic import reduce_aperiodic_mean
-from .postprocess.residuals import parse_convergence
+from .postprocess.residuals import parse_convergence, parse_local_steady_convergence
 from .postprocess.unsteady import (
     CLEAN_CYCLE_CERTIFICATION_VERSION,
     DRIFT_ABS_FLOOR,
@@ -176,10 +183,42 @@ def _check_cancel(cancel_check: CancelCheck) -> None:
         cancel_check()
 
 
+def _case_builder(runner, airfoil, patches, resolved, spec, fluid, roughness, solver, **kwargs):
+    if not is_compressible(runner):
+        return CaseBuilder(airfoil, patches, resolved, spec, fluid, roughness, solver, **kwargs)
+    from .case.compressible import CompressibleCaseBuilder
+    from .thermodynamics import CompressibleTimeWindow
+
+    context = runner.flow_execution
+    family = "rhoCentralFoam" if is_density_based(runner) else "rhoSimpleFoam"
+    window = None
+    if family == "rhoCentralFoam":
+        duration = spec.chord / spec.speed
+        acoustic_step = 0.001 * spec.chord / (spec.speed + context.gas.speed_of_sound(context.state))
+        window = CompressibleTimeWindow(
+            start_time=0, end_time=duration, delta_t=acoustic_step,
+            maximum_delta_t=acoustic_step, write_interval=duration / 100,
+            maximum_courant=min(0.5, solver.transient_max_courant),
+        )
+    return CompressibleCaseBuilder(
+        airfoil, patches, resolved, spec, fluid, roughness, solver,
+        gas=context.gas, state=context.state, solver_family=family,
+        turbulent_prandtl=context.turbulent_prandtl, time_window=window, **kwargs,
+    )
+
+
+def _potential_initialization(case_dir, runner, patches, dialect):
+    if is_compressible(runner):
+        return initialize_compressible_velocity(case_dir, runner, patches, dialect.potential_foam_command)
+    return runner.application(case_dir, dialect.potential_foam_command, timeout=600)
+
+
 @dataclass
 class CaseOutcome:
     spec: CaseSpec
     reynolds: float
+    solver_active_seconds: Optional[float] = None
+    solver_budget: Optional[CaseSolverBudget] = None
     engine: Optional[EngineRuntimeIdentity] = None
     method_key: str = "openfoam.rans"
     cl: Optional[float] = None
@@ -453,6 +492,7 @@ def _checked_solver_result(case_dir: Path, result: RunResult) -> RunResult:
     exits remain fail-closed infrastructure errors. No display-string parsing
     participates in this classification.
     """
+    check_material_domain(case_dir, result)
     if getattr(result, "timed_out", False):
         # RunResult.check raises CommandTimeoutError from the typed flag.
         result.check()
@@ -526,6 +566,9 @@ def _transient_process_failure(
     numerical recovery pass.
     """
 
+    domain_failure = material_domain_failure(case_dir, result)
+    if domain_failure is not None:
+        return domain_failure
     timed_out = (
         bool(getattr(result, "timed_out", False))
         or (
@@ -723,7 +766,9 @@ def _preserve_transient_failure_evidence(
 
 def _record_outcome_failure(outcome: CaseOutcome, exc: BaseException) -> None:
     """Persist error text and structured provenance on a case outcome."""
-    if isinstance(exc, DeterministicMeshError):
+    if isinstance(exc, MaterialDomainError):
+        disposition = FailureDisposition.material_domain
+    elif isinstance(exc, DeterministicMeshError):
         disposition = FailureDisposition.deterministic_mesh
     elif isinstance(exc, InfrastructureError) or isinstance(exc, (TimeoutError, OSError)):
         disposition = FailureDisposition.infrastructure
@@ -5148,7 +5193,8 @@ def _prepare_transient_case(
             )
         }
     )
-    CaseBuilder(
+    _case_builder(
+        runner,
         airfoil,
         patches,
         tmesh,
@@ -5168,6 +5214,8 @@ def _prepare_transient_case(
     if shared_mesh_dir is None or not shared_mesh_qa_verified(shared_mesh_dir):
         _run_transient_mesh_qa_gate(tcase, runner, quality_warnings)
     _check_cancel(cancel_check)
+    if is_density_based(runner):
+        return tmesh, patches
     # Preferred warm start: continue from an ACCEPTED in-job steady RANS field
     # solved on the SAME shared mesh (URANS-only jobs run that stage first).
     # Non-converged/non-accepted full steady fields are filtered by
@@ -5182,6 +5230,8 @@ def _prepare_transient_case(
         logger.info("transient %s warm-started from steady field %s", tcase, steady_field_dir)
         return tmesh, patches
     if freestream_fallback:
+        if is_compressible(runner):
+            return tmesh, patches
         # A rejected full-steady field means this condition is hostile to
         # SIMPLE initialisation — skip the in-case short simpleFoam init (its
         # own field is garbage at exactly these cells). But PURE uniform
@@ -5203,7 +5253,7 @@ def _prepare_transient_case(
         )
         _check_cancel(cancel_check)
         return tmesh, patches
-    potential = runner.application(tcase, dialect.potential_foam_command, timeout=600)
+    potential = _potential_initialization(tcase, runner, patches, dialect)
     _checked_initialization_result(tcase, potential, stage="potentialFoam")
     _check_cancel(cancel_check)
     # Unconditional steady (RANS) initialisation stage, for the URANS-only path
@@ -5213,6 +5263,7 @@ def _prepare_transient_case(
     _check_cancel(cancel_check)
     (tcase / "log.simpleFoam.init").write_text(init.stdout)
     _isolate_steady_initialization_postprocessing(tcase)
+    check_material_domain(tcase, init)
     # The steady initialisation is only a convenience seed for pimpleFoam. When
     # the whole polar has already been promoted because RANS is fragile, failing
     # here with the same SIMPLE problem should not prevent the transient attempt.
@@ -5312,7 +5363,8 @@ def _run_transient_attempt(
                 "URANS integration stopped by the wall-clock budget guard before "
                 "the numerical recovery pass could start"
             )
-        CaseBuilder(
+        _case_builder(
+            runner,
             airfoil,
             patches,
             tmesh,
@@ -5340,6 +5392,9 @@ def _run_transient_attempt(
                 fallback_max_delta_t=pass_max_delta_t,
                 configured_max_courant=pass_params.transient_max_courant,
             )
+        if is_density_based(runner):
+            startup_delta_t = acoustic_startup_step(tcase, runner, pass_params.transient_max_courant)
+            _set_control_dict_entries(tcase / "system" / "controlDict", {"deltaT": startup_delta_t})
         # Arm the heartbeat march-rate watchdog for this chunk: it projects
         # trailing simulated-time progress against the bounded tier budget.
         write_march_budget_marker(
@@ -5411,7 +5466,8 @@ def _run_transient_attempt(
     if failure is not None:
         event_dir = _next_transient_recovery_event(tcase)
         classification = (
-            "numerical" if isinstance(failure, HardSolverError) else "infrastructure"
+            "material_domain" if isinstance(failure, MaterialDomainError)
+            else "numerical" if isinstance(failure, HardSolverError) else "infrastructure"
         )
         _preserve_transient_failure_evidence(
             tcase,
@@ -6351,7 +6407,7 @@ def _extend_transient_until_periods(
                 ),
             )
             break
-        except InfrastructureError:
+        except (InfrastructureError, MaterialDomainError):
             # Runtime/launcher/storage failures do not become aerodynamic
             # evidence merely because they happened during an extension chunk.
             raise
@@ -6734,7 +6790,7 @@ def _run_transient(
         # A refined pass that timed out without gradable data must not discard
         # the completed base pass — fall back to the base result below.
         refined = None
-    except InfrastructureError:
+    except (InfrastructureError, MaterialDomainError):
         raise
     except HardSolverError:
         # Both failed numerical passes are a critical exhausted-recovery
@@ -7103,6 +7159,21 @@ def _archive_case_evidence(
         if log.is_file():
             _copy_file_preserving_rel(log.parent, log, raw_dir / "logs" / log.parent.name, entries, "log", manifest_base=evidence_dir)
 
+    for diagnostic in {
+        directory / filename
+        for directory in (case_dir, post_dir)
+        for filename in ("material-domain-diagnostic.json", "acoustic-startup.json", "pressure-initialization.json")
+    }:
+        if diagnostic.is_file():
+            _copy_file_preserving_rel(diagnostic.parent, diagnostic, raw_dir / "logs" / diagnostic.parent.name, entries, "quality_evidence", manifest_base=evidence_dir)
+
+    for directory in {case_dir, post_dir}:
+        _copy_tree_files(
+            directory / PRESSURE_INITIALIZATION_DIR,
+            raw_dir / PRESSURE_INITIALIZATION_DIR / directory.name,
+            entries, "dictionary", manifest_base=evidence_dir,
+        )
+
     _copy_tree_files_classified(
         post_dir / "postProcessing",
         raw_dir / "postProcessing",
@@ -7381,7 +7452,8 @@ def _finalize_outcome(
             ) from exc
         outcome.cl, outcome.cd, outcome.cm = coeffs.cl, coeffs.cd, coeffs.cm
         outcome.cl_cd = coeffs.cl_cd
-        if not outcome.converged and force_is_steady(steady_coeff):
+        local_steady = is_density_based(runner) and not solver_params.force_transient
+        if not outcome.converged and not local_steady and force_is_steady(steady_coeff):
             outcome.converged = True
         steady_field_accepted = bool(steady_field_dir is not None and outcome.converged)
         # Oscillating-steady averaging (R1): a steady solve that failed both
@@ -7413,7 +7485,7 @@ def _finalize_outcome(
                     mean_stable=osc.mean_stable,
                     note=osc.note,
                 )
-                if osc.mean_stable:
+                if osc.mean_stable and not local_steady:
                     outcome.cl, outcome.cd, outcome.cm = osc.cl_mean, osc.cd_mean, osc.cm_mean
                     outcome.cl_cd = osc.cl_mean / osc.cd_mean if osc.cd_mean else None
                     outcome.converged = True
@@ -8151,6 +8223,7 @@ def run_case(
     skipped entirely and the URANS transient restarts from latestTime with
     ``urans_budget_s`` (when given) replacing the tier wall budget."""
     spec = _spec_with_airfoil_geometry(spec, airfoil)
+    begin_case_budget(runner, spec)
     case_dir.mkdir(parents=True, exist_ok=True)
     re = physics.reynolds(spec.speed, spec.chord, fluid.nu)
     runtime = (
@@ -8202,6 +8275,8 @@ def run_case(
             raise
         except (OpenFOAMError, Exception) as exc:  # noqa: BLE001 - report, don't crash the batch
             _record_outcome_failure(outcome, exc)
+        outcome.solver_active_seconds = case_solver_seconds(runner, spec)
+        outcome.solver_budget = case_solver_budget(runner, spec)
         return outcome
 
     try:
@@ -8225,7 +8300,8 @@ def run_case(
             mesher.write_inputs(case_dir, airfoil, resolved, spec.chord)
 
         def write_case(sp):
-            CaseBuilder(
+            _case_builder(
+                runner,
                 airfoil,
                 patches,
                 resolved,
@@ -8257,11 +8333,9 @@ def run_case(
                 case_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
                 runner, cache, cancel_check=cancel_check,
             )
-            if not seeded:
+            if not seeded and not is_density_based(runner):
                 # Potential-flow initialisation greatly stabilises the cold RANS start.
-                potential = runner.application(
-                    case_dir, dialect.potential_foam_command, timeout=600
-                )
+                potential = _potential_initialization(case_dir, runner, patches, dialect)
                 _checked_initialization_result(
                     case_dir, potential, stage="potentialFoam"
                 )
@@ -8270,6 +8344,7 @@ def run_case(
                 case_dir, dialect.steady_solver_command, n_proc, timeout=steady_timeout
             )
             _check_cancel(cancel_check)
+            check_material_domain(case_dir, res)
             return res
 
         # 4/5. solve, with an automatic first-order fallback for fragile cases
@@ -8284,26 +8359,27 @@ def run_case(
         # A steady failure must not abort the URANS attempt, and the steady
         # coefficients are never accepted as the reported result.
         steady_field_dir: Optional[Path] = None
-        res = solve_once(steady_solver_params)
-        if not res.ok and steady_solver_params.momentum_scheme != "upwind":
-            outcome.first_order_fallback = True
-            res = solve_once(steady_solver_params.model_copy(update={"momentum_scheme": "upwind"}))
-        if solver_params.force_transient and not res.ok:
-            (case_dir / "log.simpleFoam").write_text(res.stdout)
-            outcome.quality_warnings.append(
-                "steady RANS initialisation stage failed; URANS falls back to a short steady init"
-            )
-        else:
-            log = _checked_solver_result(case_dir, res).stdout
-            (case_dir / "log.simpleFoam").write_text(log)
-            conv = parse_convergence(log)
-            outcome.converged = conv.converged
-            outcome.iterations = conv.iterations
-            outcome.final_residual = conv.final_residual
-            if solver_params.force_transient:
-                lt_dir = _latest_time_dir(case_dir)
-                if lt_dir is not None and float(lt_dir.name) > 0:
-                    steady_field_dir = lt_dir
+        if not is_density_based(runner) or not solver_params.force_transient:
+            res = solve_once(steady_solver_params)
+            if not res.ok and steady_solver_params.momentum_scheme != "upwind":
+                outcome.first_order_fallback = True
+                res = solve_once(steady_solver_params.model_copy(update={"momentum_scheme": "upwind"}))
+            if solver_params.force_transient and not res.ok:
+                (case_dir / "log.simpleFoam").write_text(res.stdout)
+                outcome.quality_warnings.append(
+                    "steady RANS initialisation stage failed; URANS falls back to a short steady init"
+                )
+            else:
+                log = _checked_solver_result(case_dir, res).stdout
+                (case_dir / "log.simpleFoam").write_text(log)
+                conv = parse_local_steady_convergence(log, solver_params.convergence_tolerance) if is_density_based(runner) else parse_convergence(log)
+                outcome.converged = conv.converged
+                outcome.iterations = conv.iterations
+                outcome.final_residual = conv.final_residual
+                if solver_params.force_transient:
+                    lt_dir = _latest_time_dir(case_dir)
+                    if lt_dir is not None and float(lt_dir.name) > 0:
+                        steady_field_dir = lt_dir
 
         _finalize_outcome(
             case_dir, outcome, airfoil, resolved, spec, fluid, roughness, solver_params,
@@ -8325,6 +8401,7 @@ def run_case(
             _publish_steady_seed(
                 cache, case_dir, airfoil, spec.chord, resolved, spec, fluid,
                 roughness, steady_solver_params,
+                runner=runner,
             )
 
     except JobCancelled:
@@ -8335,6 +8412,8 @@ def run_case(
     if not solver_params.force_transient:
         _record_unexceptional_rans_rejection(outcome)
 
+    outcome.solver_active_seconds = case_solver_seconds(runner, spec)
+    outcome.solver_budget = case_solver_budget(runner, spec)
     return outcome
 
 
@@ -8779,7 +8858,8 @@ def validate_shared_mesh(
     qa_dir.mkdir(parents=True, exist_ok=True)
     qa: Optional[MeshQaResult] = None
     try:
-        CaseBuilder(
+        _case_builder(
+            runner,
             airfoil,
             get_mesher(resolved.mesher).patches(resolved),
             resolved,
@@ -9150,12 +9230,22 @@ def _rewrite_carried_inlet_velocity(
     CaseBuilder stay authoritative for everything else."""
     fv = physics.freestream_vector(spec.speed, spec.aoa_deg)
     uval = f'"uniform ({fv.ux:.10g} {fv.uy:.10g} 0)"'
-    for cmd in (
-        f"foamDictionary -entry boundaryField.inlet.value -set {uval} {field_dir}/U",
-        f"foamDictionary -entry boundaryField.outlet.value -set {uval} {field_dir}/U",
-    ):
+    entries = []
+    for patch in ("inlet", "outlet"):
         _check_cancel(cancel_check)
-        runner.application(case_dir, cmd).check()
+        inspected = runner.application(
+            case_dir, f"foamDictionary -entry boundaryField.{patch}.type -value {field_dir}/U"
+        )
+        inspected.check()
+        boundary_type = inspected.stdout.strip().rstrip(";").strip()
+        if boundary_type not in {"fixedValue", "zeroGradient", "inletOutlet", "freestream", "freestreamVelocity"}:
+            raise InfrastructureError(f"Unsupported carried velocity boundary type on {patch}: {boundary_type!r}")
+        entries.append(f"boundaryField.{patch}.value")
+        if boundary_type in {"freestream", "freestreamVelocity"}:
+            entries.append(f"boundaryField.{patch}.freestreamValue")
+    for entry in entries:
+        _check_cancel(cancel_check)
+        runner.application(case_dir, f"foamDictionary -entry {entry} -set {uval} {field_dir}/U").check()
 
 
 def _try_seed_initial_field(
@@ -9173,7 +9263,8 @@ def _try_seed_initial_field(
     stage = case_dir / "_seed_stage"
     try:
         mesh_key = cache.mesh_key(airfoil, chord, resolved)
-        seed_key = cache.seed_key(mesh_key, fluid, spec.speed)
+        context = getattr(runner, "flow_execution", None)
+        seed_key = cache.seed_key(mesh_key, fluid, spec.speed, flow_state=context.state if is_compressible(runner) else None)
         signature = cache.solver_signature(solver_params, roughness)
         hit: Optional[SeedHit] = cache.find_seed(
             seed_key, spec.aoa_deg, signature, max_delta_deg=SEED_MAX_ANGLE_DELTA_DEG
@@ -9219,7 +9310,7 @@ def _try_seed_initial_field(
 
 def _publish_steady_seed(
     cache: Optional[EngineCache], case_dir: Path, airfoil, chord, resolved, spec, fluid,
-    roughness, solver_params, solver: Optional[str] = None,
+    roughness, solver_params, solver: Optional[str] = None, runner=None,
 ) -> None:
     """Publish the latest-time fields of an ACCEPTED steady solve so later jobs
     at the same (mesh, fluid, speed) can seed nearby angles from them."""
@@ -9228,7 +9319,7 @@ def _publish_steady_seed(
     if solver is None:
         from .openfoam.dialects import get_openfoam_dialect
 
-        solver = get_openfoam_dialect(cache.engine_identity).steady_solver_command
+        solver = (dialect_for_runner(runner) if runner is not None else get_openfoam_dialect(cache.engine_identity)).steady_solver_command
     if spec.aoa_deg < 0:
         # Never make an unverified negative branch a cross-job initial state.
         # The primary polar marcher has its own retained 0-degree anchor for
@@ -9240,7 +9331,8 @@ def _publish_steady_seed(
         if lt_dir is None or float(lt_dir.name) <= 0:
             return
         mesh_key = cache.mesh_key(airfoil, chord, resolved)
-        seed_key = cache.seed_key(mesh_key, fluid, spec.speed)
+        context = getattr(runner, "flow_execution", None)
+        seed_key = cache.seed_key(mesh_key, fluid, spec.speed, flow_state=context.state if is_compressible(runner) else None)
         signature = cache.solver_signature(solver_params, roughness)
         cache.publish_seed(
             seed_key, spec.aoa_deg, signature, lt_dir,
@@ -9261,7 +9353,8 @@ def _solve_cold_marched(
 
     def write_case(sp):
         _check_cancel(cancel_check)
-        CaseBuilder(
+        _case_builder(
+            runner,
             airfoil,
             patches,
             resolved,
@@ -9284,10 +9377,8 @@ def _solve_cold_marched(
             polar_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
             runner, cache, cancel_check=cancel_check,
         )
-        if not seeded:
-            potential = runner.application(
-                polar_dir, dialect.potential_foam_command, timeout=600
-            )
+        if not seeded and not is_density_based(runner):
+            potential = _potential_initialization(polar_dir, runner, patches, dialect)
             _checked_initialization_result(
                 polar_dir, potential, stage="potentialFoam"
             )
@@ -9296,6 +9387,7 @@ def _solve_cold_marched(
             polar_dir, dialect.steady_solver_command, n_proc, timeout=solver_timeout
         )
         _check_cancel(cancel_check)
+        check_material_domain(polar_dir, res)
         return res
 
     res = solve_once(solver_params)
@@ -9648,6 +9740,7 @@ def solve_polar_marched(
                 CaseSpec(chord=chord, speed=speed, aoa_deg=aoa),
                 airfoil,
             )
+            begin_case_budget(runner, spec)
             if phase_progress:
                 phase_progress(
                     JobPhase.solving_urans if solver_params.force_transient else JobPhase.solving_rans,
@@ -9709,26 +9802,31 @@ def solve_polar_marched(
                 use_cold_start = not live_steady_state_accepted
 
             try:
-                if use_cold_start:
-                    res = _solve_cold_marched(
-                        polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
-                        rans_solver, runner, steady_timeout, outcome, n_proc=n_proc,
-                        cancel_check=cancel_check, cache=cache,
-                    )
+                if is_density_based(runner) and solver_params.force_transient:
+                    _case_builder(
+                        runner, airfoil, patches, resolved, spec, fluid, roughness, rans_solver,
+                        n_proc=n_proc, dialect=dialect_for_runner(runner),
+                    ).write(polar_dir)
+                    _link_mesh(polar_dir, mesh_dir, runner)
                 else:
-                    res = _solve_warm(
-                        polar_dir, spec, rans_solver, runner, steady_timeout, n_proc=n_proc,
-                        cancel_check=cancel_check,
-                    )
+                    if use_cold_start or is_density_based(runner):
+                        res = _solve_cold_marched(
+                            polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
+                            rans_solver, runner, steady_timeout, outcome, n_proc=n_proc,
+                            cancel_check=cancel_check, cache=cache,
+                        )
+                    else:
+                        res = _solve_warm(
+                            polar_dir, spec, rans_solver, runner, steady_timeout, n_proc=n_proc,
+                            cancel_check=cancel_check,
+                        )
+                    log = _checked_solver_result(polar_dir, res).stdout
+                    (polar_dir / f"log.a{case_index}").write_text(log)
+                    conv = parse_local_steady_convergence(log, rans_solver.convergence_tolerance) if is_density_based(runner) else parse_convergence(log)
+                    outcome.converged = conv.converged
+                    outcome.iterations = log.count("\nTime = ") or conv.iterations
+                    outcome.final_residual = conv.final_residual
                 _check_cancel(cancel_check)
-                log = _checked_solver_result(polar_dir, res).stdout
-                (polar_dir / f"log.a{case_index}").write_text(log)
-                conv = parse_convergence(log)
-                outcome.converged = conv.converged
-                # iterations relative to this segment (a warm continuation reports the
-                # absolute time, so count the timesteps actually taken instead)
-                outcome.iterations = log.count("\nTime = ") or conv.iterations
-                outcome.final_residual = conv.final_residual
                 _finalize_outcome(
                     polar_dir, outcome, airfoil, resolved, spec, fluid, roughness, rans_solver,
                     runner, n_proc, render_images, solver_timeout,
@@ -9743,6 +9841,8 @@ def solve_polar_marched(
             except (OpenFOAMError, Exception) as exc:  # noqa: BLE001
                 _record_outcome_failure(outcome, exc)
             _record_unexceptional_rans_rejection(outcome)
+            outcome.solver_active_seconds = case_solver_seconds(runner, spec)
+            outcome.solver_budget = case_solver_budget(runner, spec)
             stored = StoredCaseOutcome(slug=polar_dir.name, outcome=outcome)
             attempts.append(stored)
             # The policy separates the numerical decision from execution ownership:
@@ -9872,6 +9972,7 @@ def solve_polar_marched(
                     # validated by the normal evidence classifier.
                     _publish_steady_seed(
                         cache, polar_dir, airfoil, chord, resolved, spec, fluid, roughness, rans_solver,
+                        runner=runner,
                     )
             final_points.append(stored)
             if outcome_progress:

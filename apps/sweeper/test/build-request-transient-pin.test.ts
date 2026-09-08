@@ -14,6 +14,8 @@
 
 import type { Airfoil } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
+import { evaluateGasState } from "@aerodb/core";
+import { sourceAirModel } from "../../../packages/core/test/fixtures/source-air-model";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -92,6 +94,58 @@ const setup = {
 } as unknown as SimulationSetupSnapshot;
 
 describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)", () => {
+  it("pins local density RANS separately from physical-time URANS", () => {
+    const gas = sourceAirModel();
+    const state = evaluateGasState(gas, 288.15, 101325);
+    const snapshot: SimulationSetupSnapshot = {
+      ...setup,
+      material: {
+        phase: "gas",
+        density: state.density,
+        refTemperatureK: 288.15,
+        refPressurePa: 101325,
+        speedOfSound: state.speedOfSound,
+        viscosity: { model: "constant", mu: state.dynamicViscosity },
+        gasThermodynamics: gas,
+      },
+      flowState: {
+        ...setup.flowState,
+        speedMps: 1020,
+        density: state.density,
+        dynamicViscosity: state.dynamicViscosity,
+        kinematicViscosity: state.kinematicViscosity,
+        mach: 1020 / state.speedOfSound,
+      },
+      solver: {
+        ...setup.solver,
+        flowSolverFamily: "rhoCentralFoam",
+        turbulentPrandtl: 0.85,
+        timeCoordinate: "local_pseudo_time_iterations",
+      },
+    };
+    const { request } = buildPolarRequest({
+      airfoil,
+      setup: snapshot,
+      aoaList: [-2, 4],
+      wave: 1,
+    });
+    expect(request.solver).toMatchObject({
+      flow_solver_family: "rhoCentralFoam",
+      force_transient: false,
+      transient_fallback: false,
+    });
+    expect(() =>
+      buildPolarRequest({ airfoil, setup: snapshot, aoaList: [-2], wave: 2 }),
+    ).toThrow("time coordinate");
+    snapshot.solver.timeCoordinate = "physical_time_seconds";
+    expect(
+      buildPolarRequest({ airfoil, setup: snapshot, aoaList: [-2], wave: 2 })
+        .request.solver?.force_transient,
+    ).toBe(true);
+    expect(() =>
+      buildPolarRequest({ airfoil, setup: snapshot, aoaList: [-2], wave: 1 }),
+    ).toThrow("time coordinate");
+  });
   it.each([null, undefined, 1200])(
     "pins only explicit wave-2 initialization %s",
     (iterations) => {

@@ -2,6 +2,7 @@ import {
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   RANS_RECOVERY_REMEDIATION_VERSION,
   type DB,
+  canonicalAnalysisJson,
   enforceSweeperAdmissionFence,
   onResultIngested,
   probeCampaignCompletion,
@@ -20,6 +21,8 @@ import {
   simUransVerifyQueue,
   syncApiSettings,
   settlePrecalcObligationsForJobInTransaction,
+  solverCpuReservationSql,
+  solverLocalExecutionSql,
 } from "@aerodb/db";
 import { releasedResultStatusSql } from "@aerodb/db/result-claim-lifecycle";
 import {
@@ -37,6 +40,7 @@ import { configuredAdmissionFencePolicy } from "./config";
 
 import { isEngineConnectionFailure } from "./engine-backoff";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
+import { effectiveMaxConcurrentJobs } from "./solver-capacity";
 
 export type GuardedSubmitOutcome =
   | { kind: "submitted"; status: JobStatus }
@@ -130,16 +134,7 @@ export async function solverQueuePressure(
   db: DB,
   opts: { jobIds?: string[] } = {},
 ): Promise<number> {
-  const filters = [
-    sql`(
-      ${simJobs.status} IN ('submitted', 'running', 'ingesting')
-      OR (${simJobs.status} = 'pending' AND ${simJobs.engineState} = 'submitting')
-      OR (
-        ${simJobs.status} = 'cancelled'
-        AND ${simJobs.engineState} IN ('cancelling', 'cancel_pending')
-      )
-    )`,
-  ];
+  const filters = [solverCpuReservationSql(), solverLocalExecutionSql()];
   if (opts.jobIds?.length) filters.push(inArray(simJobs.id, opts.jobIds));
   const [row] = await db
     .select({
@@ -156,8 +151,39 @@ function errorMessage(error: unknown): string {
 
 function pendingSubmitWhere(jobId: string, campaignId: string | null) {
   return and(
+    solverLocalExecutionSql(),
     eq(simJobs.id, jobId),
     eq(simJobs.status, "pending"),
+    sql`(${simJobs.campaignId} IS NULL OR coalesce(${simJobs.requestPayload} ? 'progressive', false))`,
+    sql`((NOT coalesce(${simJobs.requestPayload} ? 'progressive', false)
+      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts existing_binding WHERE existing_binding.sim_job_id = ${simJobs.id})) OR (
+      ${simJobs.requestPayload} -> 'progressive' ->> 'executionContract' = 'progressive-cfd-v1'
+      AND ${simJobs.requestPayload} -> 'progressive' ->> 'executionId' = ${simJobs.id}::text
+      AND ${simJobs.requestPayload} -> 'engineRequest' ->> 'execution_id' = ${simJobs.id}::text
+      AND ${simJobs.totalCases} > 0
+      AND (SELECT count(*) FROM progressive_cfd_attempts binding WHERE binding.sim_job_id = ${simJobs.id}) = ${simJobs.totalCases}
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_cfd_attempts binding
+        JOIN progressive_cfd_units unit ON unit.id = binding.unit_id
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN progressive_generations generation ON generation.id = work.generation_id
+        JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id
+        JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+        WHERE binding.sim_job_id = ${simJobs.id} AND (
+          binding.outcome <> 'running' OR unit.state <> 'leased'
+          OR unit.lease_token IS DISTINCT FROM binding.token OR unit.lease_until <= clock_timestamp()
+          OR generation.status <> 'active' OR generation.stage <> work.stage OR work.state <> 'pending'
+          OR NOT epoch.current OR generation.plan_revision_id IS DISTINCT FROM campaign.current_plan_revision_id
+          OR campaign.status NOT IN ('active', 'attention')
+          OR epoch.id::text IS DISTINCT FROM (${simJobs.requestPayload} -> 'progressive' ->> 'epochId')
+          OR generation.id::text IS DISTINCT FROM (${simJobs.requestPayload} -> 'progressive' ->> 'generationId')
+          OR work.target_id IS DISTINCT FROM (${simJobs.requestPayload} -> 'progressive' ->> 'targetId')
+          OR generation.campaign_id IS DISTINCT FROM ${simJobs.campaignId}
+          OR binding.owner IS DISTINCT FROM unit.lease_owner
+          OR binding.execution_recipe_id IS DISTINCT FROM (${simJobs.requestPayload} -> 'progressive' ->> 'recipeId')
+        )
+      )
+    ))`,
     ...(campaignId
       ? [
           eq(simJobs.campaignId, campaignId),
@@ -578,6 +604,9 @@ async function withSubmitLifecycleLocks<T>(
 ): Promise<T> {
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+    await tx.execute(
+      sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+    );
     if (campaignId) {
       await tx.execute(sql`
         SELECT campaign.id
@@ -706,6 +735,13 @@ type GlobalAdmissionSubmitResult =
       error: string;
     };
 
+export type GlobalAdmissionResult<Value> =
+  | { kind: "accepted"; value: Value }
+  | { kind: "denied"; error: string }
+  | { kind: "check_failed"; error: string }
+  | { kind: "operation_error"; error: unknown }
+  | { kind: "accepted_gate_commit_failed"; value: Value; error: string };
+
 /** Last-moment global admission boundary shared by every local, ladder and
  * remote submit path. The singleton row lock is held until the bounded engine
  * acceptance call answers. Hazard-transition triggers take that same lock, so
@@ -715,14 +751,15 @@ type GlobalAdmissionSubmitResult =
  * Engine exceptions are returned untouched for the existing submit-failure
  * policy. If the engine accepted but the permit transaction itself could not
  * commit, retain the exact engine id for compensating cancellation. */
-async function submitWithGlobalAdmissionPermit(
+export async function withGlobalAdmissionPermit<Value>(
   db: DB,
   jobId: string,
   admissionLane: SubmissionAdmissionLane | undefined,
   request: PolarRequest,
-  submit: () => Promise<JobStatus>,
-): Promise<GlobalAdmissionSubmitResult> {
-  let acceptedStatus: JobStatus | null = null;
+  operation: (connection: DB) => Promise<Value>,
+): Promise<GlobalAdmissionResult<Value>> {
+  let acceptedValue: Value | undefined;
+  let operationCompleted = false;
   try {
     return await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
@@ -790,6 +827,7 @@ async function submitWithGlobalAdmissionPermit(
         availableSlots: number,
       ): Promise<boolean> => {
         if (requestedSlots <= availableSlots) return true;
+        if (request.execution_id) return false;
         const fitted = fitAdmissionResourcesToAvailableSlots(
           request.resources,
           requestedSlots,
@@ -822,17 +860,7 @@ async function submitWithGlobalAdmissionPermit(
         requestedSlots = fitted.slots;
         return true;
       };
-      const activeReservationPredicate = sql`(
-        job.status IN ('submitted', 'running', 'ingesting')
-        OR (
-          job.status = 'pending'
-          AND job.engine_state = ${SUBMITTING_ENGINE_STATE}
-        )
-        OR (
-          job.status = 'cancelled'
-          AND job.engine_state IN ('cancelling', 'cancel_pending')
-        )
-      )`;
+      const activeReservationPredicate = sql`(${solverCpuReservationSql("job")} AND ${solverLocalExecutionSql("job")})`;
       if (effectiveAdmissionLane === "remote") {
         const [remotePolicy] = (await tx.execute(sql`
           SELECT remote_solver_cpu_budget::integer AS cap,
@@ -908,14 +936,11 @@ async function submitWithGlobalAdmissionPermit(
         const workerBudget = Number(
           process.env.AIRFOILFOAM_WORKER_CPU_BUDGET ?? 2,
         );
-        const sharedCapacity =
-          Number.isInteger(cpuSlots) && cpuSlots > 0
-            ? cpuSlots
-            : Number.isInteger(configuredMax) && configuredMax > 0
-              ? configuredMax
-              : Number.isInteger(workerBudget) && workerBudget > 0
-                ? workerBudget
-                : 2;
+        const sharedCapacity = effectiveMaxConcurrentJobs(
+          configuredMax,
+          cpuSlots,
+          workerBudget,
+        );
         const [pressure] = (await tx.execute(sql`
           SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
           FROM sim_jobs job
@@ -946,19 +971,20 @@ async function submitWithGlobalAdmissionPermit(
         };
       }
       try {
-        acceptedStatus = await submit();
-        return { kind: "submitted" as const, status: acceptedStatus };
+        acceptedValue = await operation(tx);
+        operationCompleted = true;
+        return { kind: "accepted" as const, value: acceptedValue };
       } catch (error) {
-        return { kind: "engine_error" as const, error };
+        return { kind: "operation_error" as const, error };
       }
     });
   } catch (error) {
     const message = errorMessage(error);
-    if (acceptedStatus) {
+    if (operationCompleted) {
       return {
         kind: "accepted_gate_commit_failed",
-        status: acceptedStatus,
-        error: `global admission transaction failed after engine acceptance: ${message}`,
+        value: acceptedValue as Value,
+        error: `global admission transaction failed after the admitted operation: ${message}`,
       };
     }
     console.error(
@@ -970,6 +996,29 @@ async function submitWithGlobalAdmissionPermit(
       error: `global admission safety check unavailable: ${message}`,
     };
   }
+}
+
+async function submitWithGlobalAdmissionPermit(
+  db: DB,
+  jobId: string,
+  admissionLane: SubmissionAdmissionLane | undefined,
+  request: PolarRequest,
+  submit: () => Promise<JobStatus>,
+): Promise<GlobalAdmissionSubmitResult> {
+  const result = await withGlobalAdmissionPermit(
+    db,
+    jobId,
+    admissionLane,
+    request,
+    submit,
+  );
+  if (result.kind === "accepted")
+    return { kind: "submitted", status: result.value };
+  if (result.kind === "operation_error")
+    return { kind: "engine_error", error: result.error };
+  if (result.kind === "accepted_gate_commit_failed")
+    return { kind: result.kind, status: result.value, error: result.error };
+  return result;
 }
 
 async function stopBeforeEngineSubmit(
@@ -997,8 +1046,10 @@ async function stopBeforeEngineSubmit(
             : isNull(simJobs.engineState),
         ),
       )
-      .returning({ id: simJobs.id });
+      .returning({ id: simJobs.id, payload: simJobs.requestPayload });
     if (!stopped) return;
+    if ((stopped.payload as { progressive?: unknown } | null)?.progressive)
+      return;
     await tx
       .update(results)
       .set({
@@ -1781,6 +1832,30 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   ladderSubmitOwner?: LadderSubmitOwner;
 }): Promise<GuardedSubmitOutcome> {
   const campaignId = opts.campaignId ?? null;
+  const [submissionJob] = await opts.db
+    .select({ payload: simJobs.requestPayload })
+    .from(simJobs)
+    .where(eq(simJobs.id, opts.jobId));
+  const submissionPayload = submissionJob?.payload as {
+    progressive?: { executionId?: string };
+    remoteProgressiveExecution?: unknown;
+    engineRequest?: PolarRequest;
+  } | null;
+  if (submissionPayload?.remoteProgressiveExecution !== undefined)
+    throw new Error(
+      "Assigned remote executions require their dedicated submission lifecycle",
+    );
+  const progressive = Boolean(submissionPayload?.progressive);
+  if (
+    progressive &&
+    (submissionPayload?.progressive?.executionId !== opts.jobId ||
+      opts.request.execution_id !== opts.jobId ||
+      canonicalAnalysisJson(submissionPayload?.engineRequest) !==
+        canonicalAnalysisJson(JSON.parse(JSON.stringify(opts.request))))
+  )
+    throw new Error(
+      "Progressive submission differs from its immutable registered request",
+    );
   if (opts.precalcObligationIds?.length && opts.ladderSubmitOwner) {
     throw new Error(
       "a submit cannot use both precalc-obligation and full-ladder retry ledgers",
@@ -1890,6 +1965,18 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   }
   if (admission.kind === "accepted_gate_commit_failed") {
     const reason = `${admission.error}; accepted engine task ${admission.status.job_id} did not cross the durable admission boundary`;
+    if (progressive) {
+      await opts.db
+        .update(simJobs)
+        .set({
+          engineJobId: admission.status.job_id,
+          engineState: "submission_cancel_pending",
+          error: reason,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(simJobs.id, opts.jobId), isNull(simJobs.engineJobId)));
+      return { kind: "submission_in_progress" };
+    }
     return compensateAcceptedEngineTask(
       opts.db,
       opts.engine,
@@ -1903,9 +1990,34 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   try {
     if (admission.kind === "engine_error") throw admission.error;
     status = admission.status;
+    if (progressive && status.job_id !== opts.request.execution_id) {
+      await opts.db
+        .update(simJobs)
+        .set({
+          engineJobId: status.job_id,
+          engineState: "submission_identity_conflict",
+          error: "Engine acknowledged a different execution identity",
+        })
+        .where(and(eq(simJobs.id, opts.jobId), isNull(simJobs.engineJobId)));
+      throw new Error(
+        "Engine acknowledged a different execution identity; both identities require explicit reconciliation",
+      );
+    }
     await persistEngineRuntimeForJob(opts.db, opts.jobId, status.engine);
   } catch (error) {
     const message = errorMessage(error);
+    if (progressive) {
+      await opts.db
+        .update(simJobs)
+        .set({ error: `Progressive submission ownership retained: ${message}` })
+        .where(
+          and(
+            eq(simJobs.id, opts.jobId),
+            inArray(simJobs.status, ["pending", "cancelled", "failed"]),
+          ),
+        );
+      return { kind: "submission_in_progress" };
+    }
     if (isEngineConnectionFailure(error)) {
       await recordUnexecutedTransientSubmitFailure(
         opts.db,
@@ -2045,6 +2157,18 @@ export async function submitPendingJobWithLifecycleGuard(opts: {
   const reason = campaignId
     ? `campaign paused or cancelled before accepted engine task ${status.job_id} crossed the DB submission boundary`
     : `job stopped before accepted engine task ${status.job_id} crossed the DB submission boundary`;
+  if (progressive) {
+    await opts.db
+      .update(simJobs)
+      .set({
+        engineJobId: status.job_id,
+        engineState: "submission_cancel_pending",
+        error: reason,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(simJobs.id, opts.jobId), isNull(simJobs.engineJobId)));
+    return { kind: "submission_in_progress" };
+  }
   return compensateAcceptedEngineTask(
     opts.db,
     opts.engine,

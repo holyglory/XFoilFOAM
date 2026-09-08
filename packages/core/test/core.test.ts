@@ -1,4 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { baseRejectionReasons } from "../src/polar-fit";
+
+it("rejects clamped material evidence even with nominally converged finite coefficients", () => {
+  expect(baseRejectionReasons({
+    a: 2, cl: 0.4, cd: 0.02, cm: -0.01,
+    status: "done", source: "solved", regime: "rans",
+    converged: true, stalled: false, error: null,
+    failureDisposition: "material_domain",
+  })).toContain("material-domain");
+});
 
 import {
   buildNaca4,
@@ -507,7 +517,7 @@ describe("RANS stall classification and fitted polar", () => {
     ).toEqual(["needs_urans", "needs_urans"]);
   });
 
-  it.each(["infrastructure", "deterministic_mesh"] as const)(
+  it.each(["infrastructure", "deterministic_mesh", "material_domain"] as const)(
     "does not turn a low-AoA %s rejection into a polar-wide physics verdict",
     (failureDisposition) => {
       const classified = classifyPolarEvidence([
@@ -605,7 +615,7 @@ describe("automatic RANS -> fast URANS handoff evidence", () => {
     ).toBe(true);
   });
 
-  it.each(["deterministic_mesh", "infrastructure"])(
+  it.each(["deterministic_mesh", "infrastructure", "material_domain"])(
     "FALSE-POSITIVE GUARD: typed %s stays on its repair path",
     (failureDisposition) => {
       expect(

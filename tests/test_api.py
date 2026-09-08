@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from airfoilfoam import jobs
-from airfoilfoam.capabilities import URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
+from airfoilfoam.capabilities import SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
@@ -76,9 +76,11 @@ def test_health_and_capabilities(client):
     assert health["status"] == "ok"
     assert health["mesh_recovery_version"] == 2
     assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION
+    assert health["solver_budget_version"] == SOLVER_BUDGET_VERSION == 2
     assert health["evidence_storage"]["backend"] == "volume"
     assert health["evidence_storage"]["bucket"] is None
     caps = client.get("/capabilities").json()
+    assert caps["solver_budget_version"] == SOLVER_BUDGET_VERSION
     assert "blockmesh-cgrid" in caps["meshers"]
     assert "kOmegaSST" in caps["turbulence_models"]
     assert "kOmegaSSTLM" in caps["turbulence_models"]  # transition model exposed
@@ -284,6 +286,31 @@ def test_worker_rejects_urans_initialization_mismatch_before_geometry(version):
     }).model_copy(update={"expected_urans_initialization_version": version})
     with pytest.raises(RuntimeError, match="URANS-initialization capability mismatch"):
         jobs.execute_job("initialization-mismatch", request, store=JobStore())
+
+
+@pytest.mark.parametrize("version", [0, 1, 3])
+def test_polar_submit_rejects_solver_budget_mismatch_before_queueing(client, version):
+    response = client.post("/polars", json={
+        "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
+        "chord_lengths": [1], "speeds": [30], "aoa": {"angles": [0]},
+        "resources": {"case_solver_allocations": [{"chord": 1, "speed": 30, "aoa_deg": 0, "limit_seconds": 6}]},
+        "expected_solver_budget_version": version,
+    })
+    assert response.status_code == 409
+    assert response.json()["detail"] == {"code": "solver_budget_version_mismatch",
+                                          "requested_version": version, "actual_version": 2}
+
+
+@pytest.mark.parametrize("version", [None, 0, 1, 3])
+def test_worker_rejects_solver_budget_mismatch_before_geometry(version):
+    request = PolarRequest.model_validate({
+        "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
+        "chord_lengths": [1], "speeds": [30], "aoa": {"angles": [0]},
+        "resources": {"case_solver_allocations": [{"chord": 1, "speed": 30, "aoa_deg": 0, "limit_seconds": 6}]},
+        "expected_solver_budget_version": 2,
+    }).model_copy(update={"expected_solver_budget_version": version})
+    with pytest.raises(RuntimeError, match="solver-budget capability mismatch"):
+        jobs.execute_job("allocation-mismatch", request, store=JobStore())
 
 
 def test_polar_submit_rejects_urans_recovery_cutover_before_queueing(
@@ -656,6 +683,153 @@ def test_job_not_found(client):
     assert client.get("/jobs/doesnotexist").status_code == 404
 
 
+def test_job_status_preserves_actual_budget_observation_time(client, naca0012_selig_text):
+    from datetime import datetime, timezone
+    from airfoilfoam.models import SolverBudgetProgress
+
+    store = JobStore()
+    job_id = "budget-observation"
+    store.create(job_id, PolarRequest(airfoil=AirfoilInput(name="budget", coordinates=naca0012_selig_text), aoa={"angles": [-2, 0]}))
+    progress = SolverBudgetProgress(version=1, job_id=job_id, observed_at=datetime(2026, 9, 6, tzinfo=timezone.utc), cases=[{
+        "chord": 1, "speed": 30, "aoa_deg": -2, "solver_active_seconds": 8.25,
+        "limit_seconds": 900, "solver_running": True,
+    }])
+    store.write_runtime_heartbeat(job_id, 1234, 1, solver_budget_progress=progress)
+    before = store.read_status(job_id).updated_at
+    response = client.get(f"/jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["solver_budget_progress"] == progress.model_dump(mode="json")
+    assert response.json()["solver_budget_error"] is None
+    assert store.read_status(job_id).updated_at == before
+    assert store.read_status(job_id).solver_budget_progress is None
+    assert store.read_result(job_id) is None
+    with pytest.raises(ValueError, match="another job"):
+        store.write_runtime_heartbeat("another-job", 1234, 1, solver_budget_progress=progress)
+
+
+@pytest.mark.parametrize("corruption", ["identity", "version", "missing_version", "nonfinite", "duplicate", "timezone"])
+def test_invalid_budget_progress_is_unavailable_not_zero(client, naca0012_selig_text, corruption):
+    import json
+
+    store = JobStore()
+    job_id = f"bad-budget-{corruption}"
+    store.create(job_id, PolarRequest(airfoil=AirfoilInput(name="budget", coordinates=naca0012_selig_text), aoa={"angles": [-2, 0]}))
+    progress = {"version": 1, "job_id": job_id, "observed_at": "2026-09-06T00:00:00Z", "cases": [{
+        "chord": 1, "speed": 30, "aoa_deg": 0, "solver_active_seconds": 8.25,
+        "limit_seconds": 900, "solver_running": True,
+    }]}
+    if corruption == "identity":
+        progress["job_id"] = "another-job"
+    elif corruption == "version":
+        progress["version"] = 2
+    elif corruption == "missing_version":
+        del progress["version"]
+    elif corruption == "nonfinite":
+        progress["cases"][0]["solver_active_seconds"] = float("inf")
+    elif corruption == "duplicate":
+        progress["cases"].append(dict(progress["cases"][0]))
+    else:
+        progress["observed_at"] = "2026-09-06T00:00:00"
+    store._write_json_atomic(store.job_dir(job_id) / "runtime.json", json.dumps({
+        "job_id": job_id, "solver_budget_progress": progress,
+    }))
+    response = client.get(f"/jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["solver_budget_progress"] is None
+    assert response.json()["solver_budget_error"]
+
+
+def test_completed_worker_keeps_budget_observation_without_inventing_unexecuted_case_time(client, fake_run_case, naca0012_selig_text):
+    response = client.post("/polars", json={
+        "airfoil": {"name": "budget-worker", "coordinates": naca0012_selig_text},
+        "chord_lengths": [1], "speeds": [30], "aoa": {"angles": [0]},
+        "resources": {"case_solver_budget_seconds": 900},
+        "solver": {"n_iterations": 100, "write_images": []},
+    })
+    assert response.status_code == 202
+    status = client.get(f"/jobs/{response.json()['job_id']}").json()
+    assert status["state"] == "completed"
+    assert status["solver_budget_progress"]["job_id"] == response.json()["job_id"]
+    assert status["solver_budget_progress"]["cases"] == []
+    assert status["solver_budget_progress"]["observed_at"]
+    assert status["solver_budget_error"] is None
+
+
+def test_stable_execution_submission_is_idempotent_and_conflicts_on_changed_scope(client, fake_run_case, naca0012_selig_text, monkeypatch):
+    from uuid import uuid4
+    from airfoilfoam import tasks
+
+    calls = []
+    original = tasks.run_polar.apply_async
+
+    def enqueue(*args, **kwargs):
+        calls.append(kwargs["task_id"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tasks.run_polar, "apply_async", enqueue)
+    identity = str(uuid4())
+    request = {"execution_id": identity, "airfoil": {"name": "stable-n12", "coordinates": naca0012_selig_text},
+               "aoa": {"angles": [0]}, "solver": {"n_iterations": 100, "write_images": []}}
+    first = client.post("/polars", json=request)
+    assert first.status_code == 202 and first.json()["job_id"] == identity
+    assert first.json()["state"] == "completed"
+    replay = client.post("/polars", json=request)
+    assert replay.status_code == 202 and replay.json() == first.json()
+    assert calls == [identity]
+    conflict = client.post("/polars", json={**request, "aoa": {"angles": [1]}})
+    assert conflict.status_code == 409 and conflict.json()["detail"]["code"] == "execution_identity_conflict"
+    assert calls == [identity]
+
+
+@pytest.mark.parametrize("inventory_readable", [True, False])
+@pytest.mark.parametrize("registered", [True, False])
+def test_stable_queued_cancellation_fences_replay_without_solver_evidence(client, naca0012_selig_text, monkeypatch, inventory_readable, registered):
+    from types import SimpleNamespace
+    from uuid import uuid4
+    from airfoilfoam import tasks
+    from airfoilfoam.execution_stop import execution_stop_proof
+    from airfoilfoam.models import EngineIdentity
+
+    identity = str(uuid4())
+    calls = []
+
+    def enqueue(*_args, **kwargs):
+        calls.append(kwargs["task_id"])
+        return SimpleNamespace(id=kwargs["task_id"])
+
+    monkeypatch.setattr(tasks.run_polar, "apply_async", enqueue)
+    monkeypatch.setattr(celery_app.control, "revoke", lambda *_args, **_kwargs: None)
+    store = JobStore()
+    def inventory(job_id, *, strict):
+        assert job_id == identity and strict is True
+        if not inventory_readable:
+            raise PermissionError("isolated unreadable worker inventory")
+        return []
+
+    monkeypatch.setattr(store, "job_processes", inventory)
+    from airfoilfoam import worker_control
+    monkeypatch.setattr(worker_control, "request_worker_control", lambda action, job_id, pool, engine: {
+        "stop_proof": execution_stop_proof(store, job_id),
+    })
+    request = {"execution_id": identity, "airfoil": {"name": "queued-n12", "coordinates": naca0012_selig_text}, "aoa": {"angles": [0]}}
+    if registered:
+        submitted = client.post("/polars", json=request)
+        assert submitted.status_code == 202 and submitted.json()["state"] == "pending"
+        cancelled = client.post(f"/jobs/{identity}/cancel")
+    else:
+        assert client.post(f"/jobs/{identity}/cancel").status_code == 404
+        cancelled = client.post(f"/jobs/{identity}/cancel", json={"expected_engine": EngineIdentity().model_dump(mode="json")})
+    assert cancelled.status_code == 200
+    assert cancelled.json()["execution_stopped"] is inventory_readable
+    if not inventory_readable:
+        assert cancelled.json()["stop_proof"]["error"] == "isolated unreadable worker inventory"
+    replay = client.post("/polars", json=request)
+    assert replay.status_code == 409 and replay.json()["detail"]["code"] == "execution_cancelled"
+    assert calls == ([identity] if registered else [])
+    assert store.read_result(identity) is None
+    assert not (store.job_dir(identity) / ".execution-owner.json").exists()
+
+
 def test_cancel_terminalizes_partial_result_without_discarding_polars():
     store = JobStore()
     job_id = "cancel-partial-result"
@@ -669,6 +843,22 @@ def test_cancel_terminalizes_partial_result_without_discarding_polars():
     assert result is not None
     assert result.state is JobState.cancelled
     assert result.message == "worker lost"
+
+
+@pytest.mark.parametrize("invalid", ["identity", "pool", "missing_engine"])
+def test_unregistered_cancellation_validates_scope_before_creating_a_tombstone(client, invalid):
+    from uuid import uuid4
+    from airfoilfoam.models import EngineIdentity
+
+    identity = "not-a-uuid" if invalid == "identity" else str(uuid4())
+    payload = {"expected_engine": EngineIdentity().model_dump(mode="json")}
+    if invalid in {"pool", "missing_engine"}:
+        payload["expected_execution_pool"] = "unrelated-execution-pool"
+    if invalid == "missing_engine":
+        del payload["expected_engine"]
+    response = client.post(f"/jobs/{identity}/cancel", json=payload)
+    assert response.status_code == (409 if invalid == "pool" else 422)
+    assert not JobStore().exists(identity)
 
 
 def test_cancel_does_not_overwrite_terminal_result():

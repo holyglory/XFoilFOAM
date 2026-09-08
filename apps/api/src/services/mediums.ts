@@ -59,6 +59,7 @@ export function toMediumDTO(
     dynamicViscosity: m.dynamicViscosity,
     kinematicViscosity: m.kinematicViscosity,
     speedOfSound: m.speedOfSound,
+    gasThermodynamics: m.gasThermodynamics ?? null,
     notes: m.notes,
     isSeeded: m.isSeeded,
   };
@@ -157,6 +158,7 @@ export function deriveBcState(
       refPressurePa: medium.refPressurePa,
       viscosity: specFromMedium(medium, points),
       speedOfSound: medium.speedOfSound,
+      gasThermodynamics: medium.gasThermodynamics,
     },
     {
       temperatureK: input.temperatureK,
@@ -180,6 +182,7 @@ export function deriveFlowState(
       refPressurePa: medium.refPressurePa,
       viscosity: specFromMedium(medium, points),
       speedOfSound: medium.speedOfSound,
+      gasThermodynamics: medium.gasThermodynamics,
     },
     {
       temperatureK: input.temperatureK,

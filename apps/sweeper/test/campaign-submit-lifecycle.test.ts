@@ -20,6 +20,12 @@ import {
   claimNextPendingUransRequest,
   claimNextPendingVerifyItem,
   createClient,
+  claimProgressiveWork,
+  claimProgressiveCfdBatch,
+  initializeProgressiveCfdWork,
+  materializeProgressiveCampaignScope,
+  storeNeuralFoilPrediction,
+  enforceSweeperAdmissionFence,
   createUransRequest,
   discoverMissingResultMediaRepairs,
   enqueuePrecalcVerifications,
@@ -66,6 +72,7 @@ import {
   simUransVerifyQueueCampaigns,
   simUransVerifyQueueRequests,
   simulationPresets,
+  simulationPresetRevisions,
   settlePrecalcObligationsForJob,
   solverProfiles,
   solverEvidenceArtifacts,
@@ -78,6 +85,11 @@ import {
   URANS_BUDGET_STOP_MARKER,
 } from "@aerodb/core";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
+import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "../src/build-request";
+import { composeProgressiveCfdJob } from "../src/progressive-cfd-jobs";
+import { recoverProgressiveSubmissions } from "../src/progressive-submission";
+import { progressivePredictionFixture } from "../../../packages/db/test-support/progressive-prediction";
 import {
   createAcceptedPrecalcAttemptFixture,
   createVerifiedRestartArchiveFixture,
@@ -91,14 +103,14 @@ import {
   URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
 import { and, asc, eq, inArray, sql as sqlFragment } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   clearEngineUnreachable,
   currentBackoffMs,
   resetEngineBackoffForTests,
 } from "../src/engine-backoff";
-import { submitCampaignBatch } from "../src/loop";
+import { submitCampaignBatch, submitContinuousBatch } from "../src/loop";
 import { reconcileLegacyPrecalcFinalOwners } from "../src/precalc-final-owner-backfill";
 import {
   enqueueVerificationsForJob,
@@ -107,7 +119,10 @@ import {
   settleCampaignAfterRefresh,
   submitUransRetryForJob,
 } from "../src/reconcile";
-import { submitPendingJobWithLifecycleGuard } from "../src/submit-lifecycle";
+import {
+  solverQueuePressure,
+  submitPendingJobWithLifecycleGuard,
+} from "../src/submit-lifecycle";
 import { resetUransLadderMemory, uransLadderTick } from "../src/urans-ladder";
 
 const { db, sql } = createClient({ max: 2 });
@@ -193,9 +208,36 @@ async function setupFor(campaignId: string) {
     throw new Error("campaign preset has no legacy boundary condition");
   return {
     conditionId: condition.id,
+    presetId: condition.presetId,
     revisionId: condition.revisionId,
     bcId: preset.bcId,
   };
+}
+
+async function submitIndependentObservedBatch(
+  engine: EngineClient,
+  batch: NonNullable<Awaited<ReturnType<typeof findCampaignGapBatch>>>,
+  meshRecoveryVersion = 0,
+) {
+  expect(batch.entries).toHaveLength(1);
+  const setup = await setupFor(batch.campaignId);
+  return submitContinuousBatch(
+    db,
+    engine,
+    {
+      airfoilId: batch.airfoilId,
+      bcId: setup.bcId,
+      presetId: setup.presetId,
+      presetRevisionId: setup.revisionId,
+      aoas: batch.angles,
+      effectivePriority: batch.effectivePriority,
+      reynolds: batch.reynolds,
+      slug: batch.slug,
+      headAoa: batch.headAoa,
+    },
+    1,
+    meshRecoveryVersion,
+  );
 }
 
 async function createAcceptedPrecalcAttemptWithRestartArchive(
@@ -237,6 +279,39 @@ async function requestedFailedOrphans(campaignId: string) {
     );
 }
 
+async function progressiveSubmissionFixture(campaignId: string) {
+  await materializeProgressiveCampaignScope(db, campaignId);
+  for (;;) {
+    const lease = await claimProgressiveWork(db, {
+      owner: PREFIX,
+      stages: [1],
+      leaseSeconds: 120,
+    });
+    if (!lease) break;
+    expect(lease.campaignId).toBe(campaignId);
+    await storeNeuralFoilPrediction(
+      db,
+      lease,
+      progressivePredictionFixture(lease),
+    );
+  }
+  await initializeProgressiveCfdWork(db);
+  const leases = await claimProgressiveCfdBatch(db, {
+    owner: PREFIX,
+    leaseSeconds: 120,
+    solverBudgetVersion: 2,
+  });
+  expect(leases.length).toBeGreaterThan(0);
+  expect(leases.every((lease) => lease.campaignId === campaignId)).toBe(true);
+  return composeProgressiveCfdJob(db, leases, {
+    cpuSlots: 1,
+    meshRecoveryVersion: 2,
+    solverBudgetVersion: 2,
+  });
+}
+
+let readySweeperState: typeof sweeperState.$inferSelect | null = null;
+
 beforeAll(async () => {
   const [state] = await db
     .select({ enabled: sweeperState.enabled })
@@ -247,6 +322,10 @@ beforeAll(async () => {
     .insert(sweeperState)
     .values({ id: 1, enabled: true })
     .onConflictDoUpdate({ target: sweeperState.id, set: { enabled: true } });
+  [readySweeperState] = await db
+    .select()
+    .from(sweeperState)
+    .where(eq(sweeperState.id, 1));
 
   const [category] = await db
     .insert(categories)
@@ -313,6 +392,24 @@ beforeAll(async () => {
   profileIds.solver = solver.id;
   profileIds.scheduling = scheduling.id;
   profileIds.output = output.id;
+});
+
+afterEach(async () => {
+  await cleanupCampaignFixtures(db, {
+    campaignIds: campaignIds.splice(0),
+    presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
+  });
+  const fence = await enforceSweeperAdmissionFence(db);
+  expect(
+    fence.hazardPresent,
+    "The current scenario must remove its admission hazards",
+  ).toBe(false);
+  if (readySweeperState)
+    await db
+      .update(sweeperState)
+      .set(readySweeperState)
+      .where(eq(sweeperState.id, 1));
+  resetEngineBackoffForTests();
 });
 
 afterAll(async () => {
@@ -469,6 +566,89 @@ describe("campaign compose→submit lifecycle boundary", () => {
     expect(stillOwned).toEqual({ state: "running", simJobId: ownerJob.id });
   }, 15_000);
 
+  it("submits the selected immutable revision after preset edits and refuses missing or mismatched revisions", async () => {
+    const campaignId = await launch("independent-revision-pin", 17.237);
+    const setup = await setupFor(campaignId);
+    const selected = await findCampaignGapBatch(db, {
+      campaignIds: [campaignId],
+    });
+    expect(selected).toBeTruthy();
+    const [original] = await db
+      .select()
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, setup.revisionId));
+    await db
+      .update(simulationPresets)
+      .set({ name: `${PREFIX}-changed-after-selection` })
+      .where(eq(simulationPresets.id, setup.presetId));
+    const latest = await ensureSimulationPresetRevision(db, setup.presetId);
+    expect(latest?.revision.id).not.toBe(setup.revisionId);
+    let submitCalls = 0;
+    const engineJobId = `${PREFIX}-immutable-independent`;
+    const engine = {
+      submitPolar: async (): Promise<JobStatus> => {
+        submitCalls += 1;
+        return {
+          job_id: engineJobId,
+          state: "pending",
+          total_cases: ANGLES.length,
+          completed_cases: 0,
+        };
+      },
+    } as unknown as EngineClient;
+    const batch = {
+      airfoilId,
+      bcId: setup.bcId,
+      presetId: setup.presetId,
+      presetRevisionId: setup.revisionId,
+      aoas: ANGLES,
+      effectivePriority: selected!.effectivePriority,
+      reynolds: selected!.reynolds,
+      slug: selected!.slug,
+      headAoa: ANGLES[0],
+    };
+    expect(
+      await submitContinuousBatch(
+        db,
+        engine,
+        { ...batch, presetRevisionId: "00000000-0000-0000-0000-000000000000" },
+        1,
+        2,
+      ),
+    ).toBe(false);
+    expect(
+      await submitContinuousBatch(
+        db,
+        engine,
+        { ...batch, presetId: "00000000-0000-0000-0000-000000000000" },
+        1,
+        2,
+      ),
+    ).toBe(false);
+    expect(submitCalls).toBe(0);
+    expect(await submitContinuousBatch(db, engine, batch, 1, 2)).toBe(true);
+    expect(submitCalls).toBe(1);
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.engineJobId, engineJobId));
+    expect(job.campaignId).toBeNull();
+    expect(job.simulationPresetRevisionId).toBe(setup.revisionId);
+    expect(job.requestPayload).toEqual(
+      expect.objectContaining({ setupSnapshot: original.snapshot }),
+    );
+    const claimed = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    expect(claimed).toHaveLength(ANGLES.length);
+    expect(
+      claimed.every(
+        (row) => row.simulationPresetRevisionId === setup.revisionId,
+      ),
+    ).toBe(true);
+  }, 120000);
+
   it("does not submit a stale RANS batch selected before terminal cancellation", async () => {
     const campaignId = await launch("stale-cancel", 17.137);
     const batch = await findCampaignGapBatch(db, {
@@ -512,15 +692,11 @@ describe("campaign compose→submit lifecycle boundary", () => {
     ).toBe(true);
   }, 120000);
 
-  it("compensates an accepted RANS task when pause commits during submit", async () => {
+  it("persists progressive RANS compensation and holds execution ownership when pause commits during submit", async () => {
     const campaignId = await launch("pause-rans", 18.137);
-    const batch = await findCampaignGapBatch(db, {
-      limit: 500,
-      campaignIds: [campaignId],
-    });
-    expect(batch).not.toBeNull();
+    const prepared = await progressiveSubmissionFixture(campaignId);
     const cancelledEngineIds: string[] = [];
-    const engineJobId = `${PREFIX}-pause-rans-engine`;
+    const engineJobId = prepared.jobId;
     const engine = {
       submitPolar: async (): Promise<JobStatus> => {
         await pauseCampaign(db, campaignId);
@@ -537,8 +713,17 @@ describe("campaign compose→submit lifecycle boundary", () => {
       },
     } as unknown as EngineClient;
 
-    expect(await submitCampaignBatch(db, engine, batch!, 0, 0)).toBe(false);
-    expect(cancelledEngineIds).toEqual([engineJobId]);
+    const outcome = await submitPendingJobWithLifecycleGuard({
+      db,
+      engine,
+      jobId: prepared.jobId,
+      campaignId,
+      request: prepared.request,
+      connectionErrorPrefix: "connection",
+      submitErrorPrefix: "submit",
+    });
+    expect(outcome.kind).toBe("submission_in_progress");
+    expect(cancelledEngineIds).toEqual([]);
     const [job] = await db
       .select()
       .from(simJobs)
@@ -546,7 +731,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
     expect(job).toMatchObject({
       status: "cancelled",
       engineJobId,
-      engineState: "cancelled",
+      engineState: "submission_cancel_pending",
     });
     const claims = await db
       .select({ status: results.status, simJobId: results.simJobId })
@@ -554,9 +739,12 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(
         eq(results.simulationPresetRevisionId, job.simulationPresetRevisionId!),
       );
-    expect(
-      claims.every((row) => row.status === "pending" && row.simJobId === null),
-    ).toBe(true);
+    expect(claims).toHaveLength(prepared.request.aoa!.angles!.length);
+    expect(await solverQueuePressure(db, { jobIds: [prepared.jobId] })).toBe(1);
+    const [bound] =
+      await db.execute(sqlFragment`SELECT count(*)::int AS attempts FROM progressive_cfd_attempts
+      WHERE sim_job_id = ${prepared.jobId} AND outcome = 'running'`);
+    expect(bound.attempts).toBe(prepared.request.aoa!.angles!.length);
   }, 120000);
 
   it("compensates an accepted wave-2 task when pause commits during submit", async () => {
@@ -723,6 +911,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       await uransLadderTick(db, resumedEngine, 0, {
         campaignIds: [campaignId],
         requestIds: [],
+        uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
       }),
     ).toBe(true);
     expect(resumedRequests).toHaveLength(1);
@@ -1832,9 +2021,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         };
       },
     } as unknown as EngineClient;
-    expect(await submitCampaignBatch(db, engine, batch!, 0, undefined, 2)).toBe(
-      true,
-    );
+    expect(await submitIndependentObservedBatch(engine, batch!, 2)).toBe(true);
     expect(submittedRequests).toHaveLength(1);
     expect(submittedRequests[0].expected_mesh_recovery_version).toBe(2);
     const [replacementJob] = await db
@@ -2453,8 +2640,9 @@ describe("campaign compose→submit lifecycle boundary", () => {
   }, 120000);
 
   it("does not release claims when another submitter already won pending→submitted", async () => {
-    const campaignId = await launch("submit-winner", 20.137);
-    const setup = await setupFor(campaignId);
+    const fixtureCampaignId = await launch("submit-winner", 20.137);
+    const setup = await setupFor(fixtureCampaignId);
+    const campaignId = null;
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2541,8 +2729,9 @@ describe("campaign compose→submit lifecycle boundary", () => {
   }, 120000);
 
   it("claims the pending job before the external call so a second submitter never reaches the engine", async () => {
-    const campaignId = await launch("single-submit-owner", 21.137);
-    const setup = await setupFor(campaignId);
+    const fixtureCampaignId = await launch("single-submit-owner", 21.137);
+    const setup = await setupFor(fixtureCampaignId);
+    const campaignId = null;
     const [job] = await db
       .insert(simJobs)
       .values({
@@ -2617,21 +2806,12 @@ describe("campaign compose→submit lifecycle boundary", () => {
   it("retries persisted compensating cancellation even when the engine queue omits the task", async () => {
     const campaignId = await launch("durable-compensation", 22.137);
     const setup = await setupFor(campaignId);
+    const prepared = await progressiveSubmissionFixture(campaignId);
     const [job] = await db
-      .insert(simJobs)
-      .values({
-        airfoilId,
-        bcIds: [setup.bcId],
-        simulationPresetRevisionId: setup.revisionId,
-        campaignId,
-        jobKind: "targeted",
-        referenceChordM: CHORD,
-        wave: 2,
-        status: "pending",
-        totalCases: 1,
-      })
-      .returning();
-    const engineJobId = `${PREFIX}-cancel-retry-engine`;
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, prepared.jobId));
+    const engineJobId = job.id;
     const foreignEngineJobId = `${PREFIX}-foreign-cancel-retry-engine`;
     const foreignError = "foreign cancellation belongs to another reconciler";
     const [foreignCancellation] = await db
@@ -2659,7 +2839,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
         return {
           job_id: engineJobId,
           state: "pending",
-          total_cases: 1,
+          total_cases: prepared.request.aoa!.angles!.length,
           completed_cases: 0,
         };
       },
@@ -2670,6 +2850,18 @@ describe("campaign compose→submit lifecycle boundary", () => {
           throw new Error("temporary cancel transport failure");
         return { job_id: id, cancelled: true };
       },
+      getExecutionStopProof: async (id: string) => ({
+        version: 1,
+        job_id: id,
+        execution_stopped: true,
+        producer_stopped: true,
+        namespace_verified: true,
+        remaining: [],
+        observed_at: new Date().toISOString(),
+        error: null,
+        fence: "cancel_marker",
+        ownership_basis: "never_started_cancellation_fence",
+      }),
       // The persisted obligation, not queue visibility, must drive retry.
       getQueue: async () => ({
         active: [],
@@ -2689,11 +2881,11 @@ describe("campaign compose→submit lifecycle boundary", () => {
       jobId: job.id,
       admissionLane: "local",
       campaignId,
-      request: {} as PolarRequest,
+      request: prepared.request,
       connectionErrorPrefix: "unreachable: ",
       submitErrorPrefix: "failed: ",
     });
-    expect(outcome.kind).toBe("lifecycle_stopped");
+    expect(outcome.kind).toBe("submission_in_progress");
     const [pendingCancel] = await db
       .select({
         status: simJobs.status,
@@ -2704,14 +2896,18 @@ describe("campaign compose→submit lifecycle boundary", () => {
       .where(eq(simJobs.id, job.id));
     expect(pendingCancel).toEqual({
       status: "cancelled",
-      engineState: "cancel_pending",
+      engineState: "submission_cancel_pending",
       engineJobId,
     });
 
-    await reconcile(db, engine, {
+    const firstRecovery = await recoverProgressiveSubmissions(db, engine, {
       jobIds: [job.id],
-      skipFailedRecovery: true,
     });
+    expect(firstRecovery.errors).toHaveLength(1);
+    const recovered = await recoverProgressiveSubmissions(db, engine, {
+      jobIds: [job.id],
+    });
+    expect(recovered.neverStarted).toBe(1);
     expect(cancelAttempts).toBe(2);
     const [settled] = await db
       .select({ status: simJobs.status, engineState: simJobs.engineState })
@@ -5391,8 +5587,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
 
     const engineJobId = `${PREFIX}-failed-ingest-atomic-engine`;
     expect(
-      await submitCampaignBatch(
-        db,
+      await submitIndependentObservedBatch(
         {
           submitPolar: async (): Promise<JobStatus> => ({
             job_id: engineJobId,
@@ -5402,19 +5597,12 @@ describe("campaign compose→submit lifecycle boundary", () => {
           }),
         } as unknown as EngineClient,
         batch!,
-        0,
-        0,
       ),
     ).toBe(true);
     const [job] = await db
       .select()
       .from(simJobs)
-      .where(
-        and(
-          eq(simJobs.campaignId, campaignId),
-          eq(simJobs.engineJobId, engineJobId),
-        ),
-      );
+      .where(and(eq(simJobs.engineJobId, engineJobId)));
     expect(job).toBeTruthy();
     // This regression is about atomic replay, not the independent one-shot
     // crash retry. Mark it already consumed so the recovered failure remains
@@ -5600,7 +5788,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       },
     } as unknown as EngineClient;
 
-    expect(await submitCampaignBatch(db, engine, batch!, 0, 0)).toBe(false);
+    expect(await submitIndependentObservedBatch(engine, batch!)).toBe(false);
     expect(submitCalls).toBe(1);
     const blocked = await db
       .select({
@@ -6266,7 +6454,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
     expect(afterObligation).toMatchObject({
       state: "pending",
       attemptCount: 1,
-      lastOutcome: "rejected",
+      lastOutcome: "observation_continuation_pending",
     });
     expect(afterLedger).toMatchObject({
       state: "rejected",
@@ -6296,7 +6484,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       campaignIds: [campaignId],
     });
     expect(firstBatch).toBeTruthy();
-    expect(await submitCampaignBatch(db, engine, firstBatch!, 0, 0)).toBe(
+    expect(await submitIndependentObservedBatch(engine, firstBatch!)).toBe(
       false,
     );
     expect(submitCalls).toBe(1);
@@ -6345,7 +6533,7 @@ describe("campaign compose→submit lifecycle boundary", () => {
       campaignIds: [campaignId],
     });
     expect(retryBatch).toBeTruthy();
-    expect(await submitCampaignBatch(db, engine, retryBatch!, 0, 0)).toBe(
+    expect(await submitIndependentObservedBatch(engine, retryBatch!)).toBe(
       false,
     );
     expect(submitCalls).toBe(2);
@@ -6414,7 +6602,9 @@ describe("campaign compose→submit lifecycle boundary", () => {
           campaignIds: [campaignId],
         });
         expect(batch).toBeTruthy();
-        expect(await submitCampaignBatch(db, engine, batch!, 0, 0)).toBe(false);
+        expect(await submitIndependentObservedBatch(engine, batch!)).toBe(
+          false,
+        );
         expect(submitCalls).toBe(attempt);
         expect(currentBackoffMs()).toBeGreaterThan(0);
 

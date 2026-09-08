@@ -1,0 +1,12 @@
+{
+  "kind": "application-generated-numerical-recipe",
+  "sourceDeployment": "d2603b4bd169fbf04",
+  "sourceCase": "1380d6fa-9ad5-4956-b9ad-f8e1af5a8e61",
+  "solver": "rhoCentralFoam",
+  "timeCoordinate": "local_pseudo_time_iterations",
+  "reconstruction": "upwind",
+  "files": {
+    "fvSchemes": "dafd68f828f2b11790674ab3151582322abee13aaa51f61dfb00db0f5598bc54",
+    "fvSolution": "9c3f1124e93e61c928f086ff72722bb119a06b679378c1a82e41e0f5631d249f"
+  }
+}

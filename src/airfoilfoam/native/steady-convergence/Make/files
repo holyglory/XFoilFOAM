@@ -1,0 +1,3 @@
+steadyConvergence.C
+
+LIB = $(FOAM_USER_LIBBIN)/libxfoilfoamSteadyConvergence

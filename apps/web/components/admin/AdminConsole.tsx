@@ -65,6 +65,7 @@ import {
   archiveSyncConflict,
   cancelJob,
   createAdminMedium,
+  deleteAdminMedium,
   createBoundaryProfile,
   createFlowCondition,
   createMeshProfile,
@@ -1424,6 +1425,7 @@ function issueFor(issues: ValidationIssue[], field: string) {
 }
 
 function MediumsPanel() {
+  const mediumDialog = useRef<HTMLDialogElement>(null);
   const [items, setItems] = useState<MediumDTO[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [form, setForm] = useState<MediumInput>(defaultMediumForm);
@@ -1439,7 +1441,14 @@ function MediumsPanel() {
     refresh().catch((e) => setErr((e as Error).message));
   }, []);
 
-  const select = (m: MediumDTO) => {
+  const openMediumEditor = () => {
+    requestAnimationFrame(() => {
+      if (!mediumDialog.current?.open) mediumDialog.current?.showModal();
+      mediumDialog.current?.querySelector<HTMLInputElement>('[data-admin-field="Name"] input')?.focus();
+    });
+  };
+
+  const select = (m: MediumDTO, open = true) => {
     setValidationIssues([]);
     setSelectedId(m.id);
     const next: MediumInput = {
@@ -1455,9 +1464,12 @@ function MediumsPanel() {
       sutherlandS: m.sutherlandS,
       viscosityTable: m.viscosityTable,
       speedOfSound: m.speedOfSound,
+      gasThermodynamics: m.gasThermodynamics ? structuredClone(m.gasThermodynamics) : null,
       notes: m.notes,
     };
     setForm(next);
+    setErr(null);
+    if (open) openMediumEditor();
   };
 
   const validateMedium = () =>
@@ -1496,7 +1508,7 @@ function MediumsPanel() {
     if (validationIssues.length) setValidationIssues(validateMedium());
   }, [form, validationIssues.length]);
 
-  const save = async () => {
+  const save = async (mode: "create" | "update") => {
     const issues = validateMedium();
     if (issues.length) {
       setValidationIssues(issues);
@@ -1515,9 +1527,12 @@ function MediumsPanel() {
         })),
         speedOfSound: form.speedOfSound || null,
       };
-      if (selected) await updateAdminMedium(selected.id, body);
-      else await createAdminMedium(body);
+      const saved = mode === "update" && selected
+        ? await updateAdminMedium(selected.id, body)
+        : await createAdminMedium(body);
       await refresh();
+      select(saved, false);
+      mediumDialog.current?.close();
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -1525,13 +1540,30 @@ function MediumsPanel() {
     }
   };
 
-  const reset = () => {
+  const reset = (open = true) => {
     setSelectedId("");
     setValidationIssues([]);
     setForm({
       ...defaultMediumForm,
       viscosityTable: [...(defaultMediumForm.viscosityTable ?? [])],
     });
+    setErr(null);
+    if (open) openMediumEditor();
+  };
+
+  const removeMedium = async (medium: MediumDTO) => {
+    if (!window.confirm(`Remove medium “${medium.name}”? Referenced media cannot be removed.`)) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await deleteAdminMedium(medium.id);
+      if (selectedId === medium.id) reset(false);
+      await refresh();
+    } catch (error) {
+      setErr((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const setTableRow = (
@@ -1548,58 +1580,25 @@ function MediumsPanel() {
   return (
     <div>
       {err && <ErrorLine text={err} />}
-      <div className="admin-editor-grid">
-        <div style={card}>
-          <div style={label}>MATERIALS</div>
-          <div className="admin-table-scroll">
-            <TableHead
-              columns="minmax(160px, 1.25fr) 62px 84px 84px 88px 88px"
-              labels={["Name", "Phase", "ρ", "T ref", "μ", "ν"]}
-            />
-            {items.map((m) => (
-              <button
-                key={m.id}
-                type="button"
-                onClick={() => select(m)}
-                style={{
-                  minWidth: 610,
-                  width: "100%",
-                  display: "grid",
-                  gridTemplateColumns:
-                    "minmax(160px, 1.25fr) 62px 84px 84px 88px 88px",
-                  gap: 10,
-                  alignItems: "center",
-                  textAlign: "left",
-                  fontFamily: MONO,
-                  fontSize: 11,
-                  color: selectedId === m.id ? C.teal : C.muted,
-                  background: selectedId === m.id ? C.rowActive : "transparent",
-                  border: "none",
-                  borderBottom: `1px solid ${C.borderRow}`,
-                  padding: "9px 0",
-                  cursor: "pointer",
-                }}
-              >
-                <span
-                  style={{
-                    color: C.text,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {m.name}
-                </span>
-                <span>{m.phase}</span>
-                <span>{f(m.density, 3)}</span>
-                <span>{f(m.refTemperatureK, 1)}</span>
-                <span>{fSci(m.dynamicViscosity, 2)}</span>
-                <span>{fSci(m.kinematicViscosity, 2)}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div style={card}>
+      <div data-testid="medium-materials">
+        <SetupRecordListPanel
+          title="MATERIALS"
+          items={items}
+          selectedId={selectedId}
+          onSelect={select}
+          onNew={() => reset()}
+          onRemove={removeMedium}
+          describe={(medium) => `${medium.gasThermodynamics ? "Gas model" : medium.phase} · ${f(medium.refTemperatureK, 1)} K`}
+          emptyText="No materials yet"
+          busy={busy}
+        />
+        <dialog
+          ref={mediumDialog}
+          aria-label="Medium editor"
+          data-testid="medium-editor"
+          style={{ ...card, margin: "auto", width: "min(560px, calc(100vw - 32px))", maxHeight: "calc(100dvh - 48px)", overflowY: "auto", boxSizing: "border-box", color: C.text }}
+        >
+          {err && <ErrorLine text={err} />}
           <div
             style={{
               display: "flex",
@@ -1608,13 +1607,14 @@ function MediumsPanel() {
               gap: 10,
             }}
           >
-            <div style={label}>{selected ? "EDIT MEDIUM" : "ADD MEDIUM"}</div>
+            <div style={label}>{selected ? "MEDIUM DETAILS" : "ADD MEDIUM"}</div>
             <button
               type="button"
-              onClick={reset}
+              onClick={() => mediumDialog.current?.close()}
+              disabled={busy}
               style={{ ...ghostBtn, padding: "5px 8px", fontSize: 10 }}
             >
-              new
+              Cancel
             </button>
           </div>
           <TextField
@@ -1629,6 +1629,34 @@ function MediumsPanel() {
               value={form.slug ?? ""}
               onChange={(slug) => setForm((f) => ({ ...f, slug }))}
             />
+          )}
+          {selected?.gasThermodynamics && (
+            <section aria-label="Gas material model" style={{ marginBlock: 12, fontSize: 13, color: C.text }}>
+              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={!!form.gasThermodynamics}
+                  disabled={busy}
+                  onChange={(event) => setForm((current) => ({
+                    ...current,
+                    gasThermodynamics: event.target.checked ? structuredClone(selected.gasThermodynamics) : null,
+                  }))}
+                />
+                Use selected gas model
+              </label>
+              <p style={{ color: C.muted, lineHeight: 1.5 }}>
+                {form.gasThermodynamics
+                  ? "This model determines operating density, viscosity, heat capacity and sound speed. The fields below retain reference measurements; changing them does not refit the model."
+                  : "Saving will use the reference properties below instead of this gas model. Existing calculation snapshots stay unchanged."}
+              </p>
+              <details>
+                <summary style={{ cursor: "pointer" }}>Model source and temperature range</summary>
+                <p style={{ overflowWrap: "anywhere", lineHeight: 1.5 }}>{selected.gasThermodynamics.provenance}</p>
+                {selected.gasThermodynamics.nasa7 && (
+                  <p>{selected.gasThermodynamics.nasa7.minimum_temperature_k}–{selected.gasThermodynamics.nasa7.maximum_temperature_k} K · Temperature-dependent heat capacity</p>
+                )}
+              </details>
+            </section>
           )}
           <div className="admin-form-grid">
             <SelectField
@@ -1808,16 +1836,15 @@ function MediumsPanel() {
             value={form.notes ?? ""}
             onChange={(notes) => setForm((f) => ({ ...f, notes }))}
           />
-          <ValidationSummary issues={validationIssues} />
-          <button
-            type="button"
-            disabled={busy}
-            onClick={save}
-            style={{ ...primaryBtn(busy), width: "100%", marginTop: 12 }}
-          >
-            {busy ? "saving…" : selected ? "save medium" : "add medium"}
-          </button>
-        </div>
+          <ProfileSaveActions
+            busy={busy}
+            selected={!!selected}
+            noun="medium"
+            issues={validationIssues}
+            onCreate={() => save("create")}
+            onUpdateSelected={() => save("update")}
+          />
+        </dialog>
       </div>
     </div>
   );

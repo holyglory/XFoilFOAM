@@ -17,6 +17,20 @@ const base = {
 };
 
 describe("preliminary URANS recovery policy", () => {
+  it("blocks material-domain failures instead of retrying or continuing invalid histories", () => {
+    expect(planPrecalcRecovery({
+      ...base,
+      status: "failed",
+      failureDisposition: "material_domain",
+      error: "infrastructure watchdog also stopped this run",
+      observationProgress: 1,
+    })).toMatchObject({
+      failureType: "deterministic_setup_failure",
+      action: "recover_deterministic_setup",
+      consumesSolverAttempt: false,
+    });
+  });
+
   it("pins one quality-gated exact continuation to eight hours", () => {
     expect(AUTO_PRECALC_CONTINUATION_BUDGET_S).toBe(8 * 60 * 60);
   });

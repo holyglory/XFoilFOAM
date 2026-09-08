@@ -9,12 +9,17 @@ examples/*.dat
 .code-review-graph/
 tests/
 *.log
+.env
+.env.*
+.codex-artifacts/
+.devcoordinator/
 
 # --- Node / JS monorepo (kept out of the Python build context) ---
 node_modules/
 **/node_modules/
 .next/
 **/.next/
+**/.next-progressive-preview*/
 dist/
 **/dist/
 .turbo/

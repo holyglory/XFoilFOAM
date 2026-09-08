@@ -1,4 +1,8 @@
-import { type Point } from "@aerodb/core";
+import {
+  gasThermodynamicsForMaterial,
+  progressiveSolverIsTransient,
+  type Point,
+} from "@aerodb/core";
 import {
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   type Airfoil,
@@ -105,6 +109,22 @@ export function buildPolarRequest(opts: {
         : undefined;
   const nu = setup.flowState.kinematicViscosity;
   const speed = setup.flowState.speedMps;
+  const compressible =
+    setup.solver.flowSolverFamily?.startsWith("rho") ?? false;
+  if (
+    setup.solver.timeCoordinate !== undefined &&
+    (!setup.solver.flowSolverFamily ||
+      progressiveSolverIsTransient(
+        setup.solver.flowSolverFamily,
+        setup.solver.timeCoordinate,
+      ) !==
+        (wave === 2))
+  )
+    throw new Error(
+      "Requested wave differs from the immutable numerical time coordinate",
+    );
+  if (compressible && !setup.material)
+    throw new Error("Compressible setup has no immutable material model");
   const points = (airfoil.points as Point[]).map(
     (p) => [p.x, p.y] as [number, number],
   );
@@ -142,7 +162,21 @@ export function buildPolarRequest(opts: {
     chord_lengths: [setup.referenceGeometry.referenceLengthM],
     speeds: speeds && speeds.length ? speeds : [speed],
     aoa: { angles: aoaList },
-    fluid: { density: setup.flowState.density, kinematic_viscosity: nu },
+    fluid: {
+      density: setup.flowState.density,
+      kinematic_viscosity: nu,
+      ...(compressible
+        ? { gas: gasThermodynamicsForMaterial(setup.material!) }
+        : {}),
+    },
+    ...(compressible
+      ? {
+          flow_state: {
+            temperature_k: setup.flowState.temperatureK,
+            pressure_pa: setup.flowState.pressurePa,
+          },
+        }
+      : {}),
     roughness: {
       sand_grain_height: setup.boundary.sandGrainHeight,
       roughness_constant: setup.boundary.roughnessConstant,
@@ -153,6 +187,12 @@ export function buildPolarRequest(opts: {
       ? { urans_precalc_mesh: meshBlock(setup.uransPrecalcMesh) }
       : {}),
     solver: {
+      ...(setup.solver.flowSolverFamily
+        ? { flow_solver_family: setup.solver.flowSolverFamily }
+        : {}),
+      ...(compressible
+        ? { turbulent_prandtl: setup.solver.turbulentPrandtl }
+        : {}),
       turbulence: {
         model: setup.solver.turbulenceModel as TurbulenceModelName,
         intensity: setup.boundary.turbulenceIntensity,

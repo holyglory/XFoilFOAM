@@ -52,3 +52,5 @@ product-design-audits/
 # --- local SSH credentials ---
 .ssh/
 apps/web/.next-e2e/
+apps/web/.next-progressive-preview/
+apps/web/.next-progressive-preview-*/

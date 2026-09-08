@@ -32,9 +32,11 @@ import {
 import type { SimModalReviewContext } from "@/lib/result-review";
 import { C, MONO } from "@/lib/tokens";
 import { PolarViewer } from "./PolarViewer";
+import { ProgressivePolarViewer } from "./ProgressivePolarViewer";
 import { SolverWorkPanel } from "./SolverWorkPanel";
 import { SimModal } from "./SimModal";
 import { SpecSheet } from "./SpecSheet";
+import styles from "./DetailIsland.module.css";
 
 export interface HoverState {
   key: string;
@@ -51,10 +53,16 @@ export interface HoverState {
  *  page was opened from an admin evidence link with ?revision=<uuid>, so the
  *  payload is scoped to that one setup revision (enabled or not). A compact
  *  context chip above the charts says so and links back to the public view. */
-export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: AirfoilDetailPayload; pinnedRevisionId?: string | null }) {
+export function DetailIsland({
+  detail,
+  pinnedRevisionId = null,
+}: {
+  detail: AirfoilDetailPayload;
+  pinnedRevisionId?: string | null;
+}) {
   const [chartType, setChartType] = useState<ChartType>("cla");
-  const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>(() =>
-    initialSeriesVisibility(detail.polars),
+  const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>(
+    () => initialSeriesVisibility(detail.polars),
   );
   const [hover, setHover] = useState<HoverState | null>(null);
   // zoom/pan window; null = zoom-to-fit. Axes change meaning per chart type,
@@ -66,12 +74,20 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
   }, []);
 
   const [simOpen, setSimOpen] = useState(false);
-  const [simCtx, setSimCtx] = useState<{ re: number; aoa: number; resultId?: string | null; mirrored?: boolean; mirroredFromAoaDeg?: number | null } | null>(null);
+  const [simCtx, setSimCtx] = useState<{
+    re: number;
+    aoa: number;
+    resultId?: string | null;
+    mirrored?: boolean;
+    mirroredFromAoaDeg?: number | null;
+  } | null>(null);
   const [simDetail, setSimDetail] = useState<SimulationDetail | null>(null);
   const [simMessage, setSimMessage] = useState<string | null>(null);
   const [simField, setSimField] = useState<FieldId>("vorticity");
   const [simTrack, setSimTrack] = useState<FieldTrackPoint[]>([]);
-  const [simReview, setSimReview] = useState<SimModalReviewContext | null>(null);
+  const [simReview, setSimReview] = useState<SimModalReviewContext | null>(
+    null,
+  );
   const [playing, setPlaying] = useState(true);
 
   useEffect(() => {
@@ -96,7 +112,9 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     () =>
       detail.polars.find((p) => visibleSeries[p.seriesId] && p.fit?.metrics) ??
       detail.polars.find((p) => p.fit?.metrics) ??
-      detail.polars.find((p) => visibleSeries[p.seriesId] && p.points.length >= 3) ??
+      detail.polars.find(
+        (p) => visibleSeries[p.seriesId] && p.points.length >= 3,
+      ) ??
       detail.polars.find((p) => p.points.length >= 3) ??
       null,
     [detail.polars, visibleSeries],
@@ -150,7 +168,9 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     setSimCtx({
       re: vm.re,
       aoa: vm.point.a,
-      resultId: derived.derived ? derived.derivedFromResultId ?? vm.point.resultId : vm.point.resultId,
+      resultId: derived.derived
+        ? (derived.derivedFromResultId ?? vm.point.resultId)
+        : vm.point.resultId,
       mirrored: derived.derived,
       mirroredFromAoaDeg: derived.derivedFromAoaDeg,
     });
@@ -161,21 +181,29 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     setSimOpen(true);
   }, []);
 
-  const openSolverWorkResult = useCallback((ctx: { re: number; aoa: number; resultId: string }, review?: SimModalReviewContext | null) => {
-    setSimCtx({ re: ctx.re, aoa: ctx.aoa, resultId: ctx.resultId });
-    setSimDetail(null);
-    setSimMessage(null);
-    setSimReview(review ?? null);
-    setPlaying(true);
-    setSimOpen(true);
-  }, []);
+  const openSolverWorkResult = useCallback(
+    (
+      ctx: { re: number; aoa: number; resultId: string },
+      review?: SimModalReviewContext | null,
+    ) => {
+      setSimCtx({ re: ctx.re, aoa: ctx.aoa, resultId: ctx.resultId });
+      setSimDetail(null);
+      setSimMessage(null);
+      setSimReview(review ?? null);
+      setPlaying(true);
+      setSimOpen(true);
+    },
+    [],
+  );
 
   // fetch the simulation detail whenever the modal opens for a new point
   useEffect(() => {
     if (!simOpen || !simCtx) return;
     if (!simCtx.resultId) {
       setSimDetail(null);
-      setSimMessage("No solved OpenFOAM result is stored for this point yet. Queue or rerun the sweep to inspect real CFD media here.");
+      setSimMessage(
+        "No solved OpenFOAM result is stored for this point yet. Queue or rerun the sweep to inspect real CFD media here.",
+      );
       setPlaying(false);
       return;
     }
@@ -187,14 +215,21 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
           setSimDetail(d);
           setSimMessage(null);
           setSimField((current) => {
-            if (d.status !== "solved" || d.availableFields.length === 0 || d.availableFields.includes(current)) return current;
+            if (
+              d.status !== "solved" ||
+              d.availableFields.length === 0 ||
+              d.availableFields.includes(current)
+            )
+              return current;
             return d.availableFields[0];
           });
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setSimMessage("No solved OpenFOAM result is stored for this point yet. Queue or rerun the sweep to inspect real CFD media here.");
+          setSimMessage(
+            "No solved OpenFOAM result is stored for this point yet. Queue or rerun the sweep to inspect real CFD media here.",
+          );
         }
       });
     return () => {
@@ -225,38 +260,26 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
     );
   }, [simOpen, simTrack, detail.slug, simField]);
 
-  const selectTrackPoint = useCallback((point: FieldTrackPoint) => {
-    setSimCtx({ re: point.re, aoa: point.aoa, resultId: point.resultId });
-    const cached = getCachedSim(
-      detail.slug,
-      point.re,
-      point.aoa,
-      point.resultId,
-    );
-    if (cached) setSimDetail(cached);
-    setSimMessage(null);
-    setSimReview(null);
-    setPlaying(true);
-  }, [detail.slug]);
+  const selectTrackPoint = useCallback(
+    (point: FieldTrackPoint) => {
+      setSimCtx({ re: point.re, aoa: point.aoa, resultId: point.resultId });
+      const cached = getCachedSim(
+        detail.slug,
+        point.re,
+        point.aoa,
+        point.resultId,
+      );
+      if (cached) setSimDetail(cached);
+      setSimMessage(null);
+      setSimReview(null);
+      setPlaying(true);
+    },
+    [detail.slug],
+  );
 
   return (
     <>
-      {/* Stack the spec sheet above the charts on narrow viewports — the fixed
-          344px column otherwise pushes the whole chart column off-canvas. */}
-      <style jsx>{`
-        .detail-two-col {
-          display: grid;
-          grid-template-columns: 344px minmax(0, 1fr);
-          gap: 20px;
-          align-items: start;
-        }
-        @media (max-width: 760px) {
-          .detail-two-col {
-            grid-template-columns: minmax(0, 1fr);
-          }
-        }
-      `}</style>
-      <div className="detail-two-col">
+      <div className={styles.columns}>
         <SpecSheet
           detail={detail}
           polarRows={polarRows}
@@ -266,7 +289,10 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
           fitStatus={metricPolar?.fit?.status ?? null}
         />
         {/* minWidth 0 so the pinned chip's text cannot widen the 1fr track past the viewport */}
-        <div style={{ display: "grid", gap: 14, minWidth: 0 }}>
+        <div
+          className={styles.chartColumn}
+          style={{ display: "grid", gap: 14, minWidth: 0 }}
+        >
           {pinnedRevisionId && (
             <span
               data-testid="pinned-revision-chip"
@@ -296,30 +322,58 @@ export function DetailIsland({ detail, pinnedRevisionId = null }: { detail: Airf
                 href={`/airfoils/${encodeURIComponent(detail.slug)}`}
                 title="View public data (enabled setups only)"
                 aria-label="Unpin — view public data"
-                style={{ color: C.teal, textDecoration: "none", fontWeight: 700, padding: "0 4px", lineHeight: 1 }}
+                style={{
+                  color: C.teal,
+                  textDecoration: "none",
+                  fontWeight: 700,
+                  padding: "0 4px",
+                  lineHeight: 1,
+                }}
               >
                 ×
               </Link>
             </span>
           )}
-          <PolarViewer
-            chartType={chartType}
-            onChartType={changeChartType}
-            projection={projection}
-            polars={chartPolars}
-            domain={chartDomain}
-            onDomainChange={setChartDomain}
-            visibleSeries={visibleSeries}
-            onToggleSeries={(seriesId) =>
-              setVisibleSeries((visibility) => toggleSeriesVisibility(visibility, seriesId))
-            }
-            solvedPointCount={solvedPointCount}
-            machStr={chartMachStr}
-            hover={hover}
-            onHover={setHover}
-            onPointClick={onPointClick}
+          {!!detail.progressivePolars?.length && (
+            <ProgressivePolarViewer
+              series={detail.progressivePolars}
+              onOpenResult={openSolverWorkResult}
+            />
+          )}
+          {(!detail.progressivePolars?.length || solvedPointCount > 0) && (
+            <details open={!detail.progressivePolars?.length}>
+              <summary
+                style={{ cursor: "pointer", padding: "10px 0", color: C.text }}
+              >
+                CFD points
+              </summary>
+              <PolarViewer
+                chartType={chartType}
+                onChartType={changeChartType}
+                projection={projection}
+                polars={chartPolars}
+                domain={chartDomain}
+                onDomainChange={setChartDomain}
+                visibleSeries={visibleSeries}
+                onToggleSeries={(seriesId) =>
+                  setVisibleSeries((visibility) =>
+                    toggleSeriesVisibility(visibility, seriesId),
+                  )
+                }
+                solvedPointCount={solvedPointCount}
+                machStr={chartMachStr}
+                hover={hover}
+                onHover={setHover}
+                onPointClick={onPointClick}
+              />
+            </details>
+          )}
+          <SolverWorkPanel
+            slug={detail.slug}
+            airfoilId={detail.id}
+            revisionId={pinnedRevisionId}
+            onOpenResult={openSolverWorkResult}
           />
-          <SolverWorkPanel slug={detail.slug} airfoilId={detail.id} revisionId={pinnedRevisionId} onOpenResult={openSolverWorkResult} />
         </div>
       </div>
 

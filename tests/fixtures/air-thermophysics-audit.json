@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "kind": "source-derived-native-material-regression",
+  "installed": false,
+  "source_audit_sha256": "92e5e59716e71c02dfe1788f85d7774f87cc6cb01788e4e841fad39ab947a4f5",
+  "source": {
+    "caloric_density_basis": "pressure/(gas_constant*temperature): exact ideal-gas reference density",
+    "caloric_properties": [
+      "CP0MASS",
+      "HMASS_IDEALGAS",
+      "SMASS_IDEALGAS"
+    ],
+    "cas": "AIR.PPF",
+    "documentation": "https://coolprop.org/coolprop/HighLevelAPI.html",
+    "fluid": "HEOS::Air",
+    "fluid_json_sha256": "905789eaae428ef2bcea594e572509be33107a27a9c0ea53b7602268a0cae5f3",
+    "fluid_source": "https://github.com/CoolProp/CoolProp/blob/v8.0.0/dev/fluids/Air.json",
+    "git_revision": "ae81610e7d23efc57f9d051c8e70a4d66e87537f",
+    "name": "CoolProp",
+    "transport_pressure_pa": 101325,
+    "transport_properties": [
+      "VISCOSITY",
+      "CONDUCTIVITY"
+    ],
+    "version": "8.0.0"
+  },
+  "gas_constant": 287.0491267875601,
+  "calorics": {
+    "common_temperature_k": 1000,
+    "entropy_reference_pressure_pa": 101325,
+    "high_coefficients": [
+      2.184636548247734,
+      0.0034929485757043423,
+      -0.0000024525070690057077,
+      8.680841745765986e-10,
+      -1.2191725489431656e-13,
+      778.6577149964178,
+      0.3372425297885826
+    ],
+    "low_coefficients": [
+      3.5277047741397856,
+      -0.000374916446146311,
+      7.431184739424791e-7,
+      9.111020954814551e-10,
+      -8.35763922788758e-13,
+      436.32833906630515,
+      -6.506169487268522
+    ],
+    "maximum_join_relative_error": 0.0001,
+    "maximum_temperature_k": 2000,
+    "minimum_temperature_k": 100,
+    "provenance": "Relative least-squares fit to CoolProp 8.0.0 HEOS::Air ideal-gas calorics; source JSON SHA256 905789eaae428ef2bcea594e572509be33107a27a9c0ea53b7602268a0cae5f3; continuous Cp/H/S join; candidate, not validated CFD"
+  },
+  "transport": {
+    "dynamic_viscosity_coefficients": [
+      -5.810077775470323e-7,
+      8.631585516281238e-8,
+      -1.0579411304021043e-10,
+      1.2974581639508772e-13,
+      -1.0856642998762702e-16,
+      5.642804454279919e-20,
+      -1.6224078638128142e-23,
+      1.9606160092189868e-27
+    ],
+    "maximum_temperature_k": 2000,
+    "minimum_temperature_k": 100,
+    "provenance": "Independent viscosity and conductivity fits to CoolProp 8.0.0 HEOS::Air at 101325.0 Pa; source JSON SHA256 905789eaae428ef2bcea594e572509be33107a27a9c0ea53b7602268a0cae5f3; candidate, not installed",
+    "thermal_conductivity_coefficients": [
+      -0.0011932679460919249,
+      0.00011674907644117693,
+      -1.1334292138285875e-7,
+      1.2755217272442072e-10,
+      -9.830175023151184e-14,
+      4.767045061064358e-17,
+      -1.2946598459387396e-20,
+      1.4930026503457874e-24
+    ]
+  },
+  "source_samples": [
+    {
+      "cp0_j_per_kg_k": 1002.2098718110801,
+      "dynamic_viscosity_pa_s": 0.000007106945419151486,
+      "enthalpy0_j_per_kg": 225977.82976079485,
+      "entropy0_j_per_kg_k": 2785.93439198755,
+      "temperature_k": 100,
+      "thermal_conductivity_w_per_m_k": 0.00947074759039186
+    },
+    {
+      "cp0_j_per_kg_k": 1002.2099444202114,
+      "dynamic_viscosity_pa_s": 0.000007142349246912418,
+      "enthalpy0_j_per_kg": 226492.3390351112,
+      "entropy0_j_per_kg_k": 2791.0663229536444,
+      "temperature_k": 100.51337476357742,
+      "thermal_conductivity_w_per_m_k": 0.009520451112514662
+    },
+    {
+      "cp0_j_per_kg_k": 1002.2116904298075,
+      "dynamic_viscosity_pa_s": 0.000007633750633264264,
+      "enthalpy0_j_per_kg": 233695.4746286768,
+      "entropy0_j_per_kg_k": 2860.2835573231496,
+      "temperature_k": 107.70062145366117,
+      "thermal_conductivity_w_per_m_k": 0.010213080286790507
+    },
+    {
+      "cp0_j_per_kg_k": 1002.2467105196364,
+      "dynamic_viscosity_pa_s": 0.000010459471778319247,
+      "enthalpy0_j_per_kg": 277429.4481980077,
+      "entropy0_j_per_kg_k": 3201.197217686915,
+      "temperature_k": 151.33747635774114,
+      "thermal_conductivity_w_per_m_k": 0.014272290617531056
+    },
+    {
+      "cp0_j_per_kg_k": 1004.2294244542402,
+      "dynamic_viscosity_pa_s": 0.00001794904737137246,
+      "enthalpy0_j_per_kg": 414368.29199657263,
+      "entropy0_j_per_kg_k": 3846.0188044524357,
+      "temperature_k": 287.8951634693326,
+      "thermal_conductivity_w_per_m_k": 0.025479492618219798
+    },
+    {
+      "cp0_j_per_kg_k": 1004.2399978492774,
+      "dynamic_viscosity_pa_s": 0.000017961537371721847,
+      "enthalpy0_j_per_kg": 414624.2076855054,
+      "entropy0_j_per_kg_k": 3846.907330983542,
+      "temperature_k": 288.15,
+      "thermal_conductivity_w_per_m_k": 0.025498669217482565
+    },
+    {
+      "cp0_j_per_kg_k": 1004.2507649434057,
+      "dynamic_viscosity_pa_s": 0.000017974204117607546,
+      "enthalpy0_j_per_kg": 414883.8435109487,
+      "entropy0_j_per_kg_k": 3847.807970989441,
+      "temperature_k": 288.40853823291,
+      "thermal_conductivity_w_per_m_k": 0.025518118814525495
+    },
+    {
+      "cp0_j_per_kg_k": 1008.6398823312966,
+      "dynamic_viscosity_pa_s": 0.000021144525155331384,
+      "enthalpy0_j_per_kg": 483067.6023987912,
+      "entropy0_j_per_kg_k": 4060.135889489228,
+      "temperature_k": 356.17400702512833,
+      "thermal_conductivity_w_per_m_k": 0.03043783744105389
+    },
+    {
+      "cp0_j_per_kg_k": 1053.882780927679,
+      "dynamic_viscosity_pa_s": 0.00003122067086246969,
+      "enthalpy0_j_per_kg": 746963.7441864597,
+      "entropy0_j_per_kg_k": 4616.990402543957,
+      "temperature_k": 612.8613888138341,
+      "thermal_conductivity_w_per_m_k": 0.046766351942049894
+    },
+    {
+      "cp0_j_per_kg_k": 1114.219987198847,
+      "dynamic_viscosity_pa_s": 0.00003948914128219391,
+      "enthalpy0_j_per_kg": 1025326.5234053832,
+      "entropy0_j_per_kg_k": 4995.748103041267,
+      "temperature_k": 869.5487706025399,
+      "thermal_conductivity_w_per_m_k": 0.0609495200402574
+    },
+    {
+      "cp0_j_per_kg_k": 1140.894587959659,
+      "dynamic_viscosity_pa_s": 0.000043278315287075806,
+      "enthalpy0_j_per_kg": 1172398.3746994569,
+      "entropy0_j_per_kg_k": 5153.299190718966,
+      "temperature_k": 999.9459605512023,
+      "thermal_conductivity_w_per_m_k": 0.06767438206327767
+    },
+    {
+      "cp0_j_per_kg_k": 1140.9048406464692,
+      "dynamic_viscosity_pa_s": 0.00004327984201577027,
+      "enthalpy0_j_per_kg": 1172460.0282911544,
+      "entropy0_j_per_kg_k": 5153.360845976584,
+      "temperature_k": 1000,
+      "thermal_conductivity_w_per_m_k": 0.0676771187675638
+    },
+    {
+      "cp0_j_per_kg_k": 1140.9919613809643,
+      "dynamic_viscosity_pa_s": 0.00004329281787034364,
+      "enthalpy0_j_per_kg": 1172984.1061859382,
+      "entropy0_j_per_kg_k": 5153.88480354294,
+      "temperature_k": 1000.4593353147798,
+      "thermal_conductivity_w_per_m_k": 0.06770037921814961
+    },
+    {
+      "cp0_j_per_kg_k": 1162.9746539044197,
+      "dynamic_viscosity_pa_s": 0.00004674847333238932,
+      "enthalpy0_j_per_kg": 1317321.9633707574,
+      "entropy0_j_per_kg_k": 5289.788587102287,
+      "temperature_k": 1125.7227776276682,
+      "thermal_conductivity_w_per_m_k": 0.07394897079962115
+    },
+    {
+      "cp0_j_per_kg_k": 1223.9454438600546,
+      "dynamic_viscosity_pa_s": 0.00005968277789678893,
+      "enthalpy0_j_per_kg": 1931663.2655519363,
+      "entropy0_j_per_kg_k": 5738.687998656454,
+      "temperature_k": 1639.0975412050798,
+      "thermal_conductivity_w_per_m_k": 0.09819010031811268
+    },
+    {
+      "cp0_j_per_kg_k": 1250.1354410443648,
+      "dynamic_viscosity_pa_s": 0.00006806829017419041,
+      "enthalpy0_j_per_kg": 2378381.186448376,
+      "entropy0_j_per_kg_k": 5984.9216832176035,
+      "temperature_k": 2000,
+      "thermal_conductivity_w_per_m_k": 0.11448629921265828
+    }
+  ]
+}

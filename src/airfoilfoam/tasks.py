@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from celery.signals import worker_ready
 
@@ -21,6 +21,7 @@ from .capabilities import MESH_RECOVERY_VERSION
 from .celery_app import celery_app
 from .config import Settings, get_settings
 from .jobs import execute_job
+from .execution_stop import execution_stop_proof, record_execution_owner
 from .models import (
     FailureDisposition,
     JobPhase,
@@ -28,8 +29,11 @@ from .models import (
     JobState,
     JobStatus,
     PolarRequest,
+    SolverBudgetProgress,
 )
+from .openfoam.budget import BudgetedRunner
 from .openfoam.runner import (
+    MaterialDomainError,
     DeterministicMeshError,
     InfrastructureError,
     install_subprocess_signal_handlers,
@@ -779,14 +783,35 @@ def kill_job_processes(job_id: str) -> dict:
     store = JobStore(settings)
     pids = store.job_processes(job_id)
     _kill_pids(pids, signal.SIGTERM)
-    time.sleep(1)
     remaining = store.job_processes(job_id)
+    soft_deadline = time.monotonic() + 1.0
+    while remaining and time.monotonic() < soft_deadline:
+        time.sleep(0.1)
+        remaining = store.job_processes(job_id)
+    killed = list(remaining)
     _kill_pids(remaining, signal.SIGKILL)
-    return {"job_id": job_id, "terminated": pids, "killed": remaining}
+    deadline = time.monotonic() + 2.0
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.1)
+        remaining = store.job_processes(job_id)
+    return {"job_id": job_id, "terminated": pids, "killed": killed, "remaining": remaining,
+            "stop_proof": execution_stop_proof(store, job_id)}
+
+
+@celery_app.task(name="airfoilfoam.inspect_job_execution_stop")
+def inspect_job_execution_stop(job_id: str) -> dict:
+    store = JobStore(get_settings())
+    return execution_stop_proof(store, job_id)
+
+
+from .worker_control import register_worker_controls
+
+register_worker_controls()
 
 
 def _start_runtime_heartbeat(
-    store: JobStore, job_id: str, settings: Optional[Settings] = None
+    store: JobStore, job_id: str, settings: Optional[Settings] = None,
+    solver_budget_progress: Optional[Callable[[], Optional[SolverBudgetProgress]]] = None,
 ) -> tuple[threading.Event, threading.Thread]:
     stop = threading.Event()
     settings = settings or get_settings()
@@ -833,6 +858,7 @@ def _start_runtime_heartbeat(
                     last_progress_at=(
                         last_progress.isoformat() if last_progress is not None else None
                     ),
+                    solver_budget_progress=solver_budget_progress() if solver_budget_progress is not None else None,
                 )
             except Exception:
                 pass
@@ -1009,6 +1035,8 @@ def _runtime_last_progress_at(
 def _terminal_failure_disposition(
     exc: Exception,
 ) -> Optional[FailureDisposition]:
+    if isinstance(exc, MaterialDomainError):
+        return FailureDisposition.material_domain
     if isinstance(exc, DeterministicMeshError):
         return FailureDisposition.deterministic_mesh
     if isinstance(exc, InfrastructureError):
@@ -1023,6 +1051,16 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
     runtime_engine = settings.engine_runtime_identity()
     store = JobStore(settings)
     request = PolarRequest.model_validate_json(request_json)
+    if request.execution_id is not None:
+        if str(request.execution_id) != job_id:
+            raise ValueError("Stable execution message has the wrong job identity")
+        registered = store.read_request(job_id)
+        if registered is None:
+            if store.is_cancelled(job_id):
+                return {"job_id": job_id, "state": "cancelled"}
+            raise RuntimeError("Stable execution registration is unavailable; refusing to recreate retired work")
+        if registered.model_dump(mode="json") != request.model_dump(mode="json"):
+            raise ValueError("Stable execution message differs from its immutable registration")
     lock_path = store.job_dir(job_id) / ".execute.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock_file:
@@ -1040,6 +1078,15 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
         existing = store.read_result(job_id)
         if existing and existing.state in {JobState.completed, JobState.failed, JobState.cancelled}:
             return {"job_id": job_id, "state": existing.state.value}
+        if store.is_cancelled(job_id):
+            store.terminalize_cancelled_result(job_id)
+            cancelled_status = store.read_status(job_id) or JobStatus(job_id=job_id, state=JobState.cancelled)
+            cancelled_status.state = JobState.cancelled
+            cancelled_status.phase = JobPhase.cancelled
+            cancelled_status.message = "cancelled before execution"
+            store.write_status(cancelled_status)
+            return {"job_id": job_id, "state": "cancelled"}
+        record_execution_owner(store, job_id)
         status = store.read_status(job_id)
         if status:
             status.task_id = getattr(self.request, "id", None) or status.task_id
@@ -1051,9 +1098,14 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
             status.engine = runtime_engine
             status.execution_pool = settings.celery_queue
             store.write_status(status)
-        stop_heartbeat, heartbeat_thread = _start_runtime_heartbeat(store, job_id, settings)
+        budget_runners: list[BudgetedRunner] = []
+
+        def budget_progress() -> Optional[SolverBudgetProgress]:
+            return budget_runners[0].progress(job_id) if budget_runners else None
+
+        stop_heartbeat, heartbeat_thread = _start_runtime_heartbeat(store, job_id, settings, budget_progress)
         try:
-            result = execute_job(job_id, request, store=store, settings=settings)
+            result = execute_job(job_id, request, store=store, settings=settings, budget_started=budget_runners.append)
         except JobCancelled:
             terminalized_partial = store.terminalize_cancelled_result(job_id)
             result = store.read_result(job_id)
@@ -1120,6 +1172,7 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
                     phase=status.phase.value if status else None,
                     cpu_tokens_waiting=status.cpu_tokens_waiting if status else 0,
                     cpu_tokens_held=status.cpu_tokens_held if status else 0,
+                    solver_budget_progress=budget_progress(),
                 )
             except Exception:
                 pass

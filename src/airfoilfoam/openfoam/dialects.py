@@ -235,7 +235,13 @@ def get_openfoam_dialect(identity: EngineIdentity | None = None) -> OpenFoamDial
 def dialect_for_runner(runner) -> OpenFoamDialect:
     settings = getattr(runner, "settings", None)
     identity = settings.engine_identity() if settings is not None else OPENCFD_2606_IDENTITY
-    return get_openfoam_dialect(identity)
+    base = get_openfoam_dialect(identity)
+    scoped = getattr(runner, "flow_dialect", None)
+    if scoped is not None:
+        if not isinstance(scoped, OpenFoamDialect) or scoped.identity != base.identity:
+            raise UnsupportedEngineIdentity("Request-scoped flow dialect differs from the worker engine")
+        return scoped
+    return base
 
 
 FORCE_COEFFICIENT_FILENAMES: tuple[str, ...] = tuple(

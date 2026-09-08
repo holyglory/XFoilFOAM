@@ -1,0 +1,59 @@
+x-verification: &verification
+  image: xfoilfoam-local-steady:verification
+  pull_policy: never
+  network_mode: none
+  environment:
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ./scripts/materials/oblique_shock.py:/verification/oblique_shock.py:ro
+    - ./scripts/materials/verify_oblique_shock.py:/verification/verify_oblique_shock.py:ro
+    - ./tests/fixtures/oblique-shock:/verification/recipe:ro
+    - shock-evidence:/evidence
+
+services:
+  coarse:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/coarse", "--recipe", "/verification/recipe", "--cells", "64"]
+  fine:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/fine", "--recipe", "/verification/recipe", "--cells", "128"]
+  mach2-coarse:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/mach2-coarse", "--recipe", "/verification/recipe", "--cells", "64", "--mach", "2"]
+  mach2-fine:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/mach2-fine", "--recipe", "/verification/recipe", "--cells", "128", "--mach", "2"]
+  mach3-coarse:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/mach3-coarse", "--recipe", "/verification/recipe", "--cells", "64", "--mach", "3"]
+  mach3-fine:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/mach3-fine", "--recipe", "/verification/recipe", "--cells", "128", "--mach", "3"]
+  physical-mach2:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/physical-mach2", "--recipe", "/verification/recipe", "--cells", "128", "--mach", "2", "--physical-time"]
+  physical-mach2p5:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/physical-mach2p5", "--recipe", "/verification/recipe", "--cells", "128", "--physical-time"]
+  physical-mach3:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/physical-mach3", "--recipe", "/verification/recipe", "--cells", "128", "--mach", "3", "--physical-time"]
+  artifacts:
+    image: xfoilfoam-local-steady:verification
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - shock-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  shock-evidence:

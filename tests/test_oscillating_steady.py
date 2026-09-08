@@ -330,6 +330,20 @@ def test_force_plateau_convergence_ships_null_history(tmp_path, monkeypatch):
     assert outcome.quality_warnings == []
 
 
+@pytest.mark.parametrize("oscillating", [False, True])
+def test_local_pseudo_time_cannot_be_certified_by_flat_or_bounded_forces(tmp_path, monkeypatch, oscillating):
+    case_dir = tmp_path / "case"
+    if oscillating:
+        _bounded_oscillation(_case_coeff_path(case_dir))
+    else:
+        _write_steady_coeffs(_case_coeff_path(case_dir), cl_fn=lambda iteration: 0.9, cd_fn=lambda iteration: 0.02)
+    monkeypatch.setattr(pipeline, "is_density_based", lambda runner: True)
+    outcome, calls = _finalize_steady(case_dir, monkeypatch,
+        solver_params=SolverParams(transient_fallback=False, force_transient=False, write_images=[]))
+    assert not outcome.converged and calls["transient"] == 0
+    assert outcome.steady_history is not None
+
+
 # --------------------------------------------------------------------------- #
 # Detector unit behaviour: downsampling + direct analysis edge cases
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,164 @@
+{
+  "repoRoot": "/home/holyglory/XFoilFOAM",
+  "targets": [
+    {
+      "name": "progressive-polar",
+      "url": "/airfoils/ag24",
+      "waitFor": {
+        "selector": "[data-testid='progressive-polar-viewer'][aria-busy='false']"
+      },
+      "journeys": [
+        {
+          "id": "inspect-polar",
+          "name": "Inspect the available polar",
+          "frequencyPercent": 100,
+          "risk": "normal",
+          "rationale": "Curve-first aerodynamic inspection"
+        }
+      ],
+      "primaryJourney": "inspect-polar",
+      "regions": [
+        {
+          "name": "Polar",
+          "selector": "[data-testid='progressive-polar-viewer']",
+          "role": "primary-content",
+          "journey": "inspect-polar"
+        }
+      ],
+      "theme": "dark",
+      "reviewInputs": [
+        {
+          "path": "apps/web/components/detail/ProgressivePolarViewer.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/detail/DetailIsland.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/detail/DetailIsland.module.css",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/detail/SpecSheet.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/detail/SolverWorkPanel.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/app/globals.css",
+          "kind": "tokens"
+        },
+        {
+          "path": "apps/web/lib/tokens.ts",
+          "kind": "tokens"
+        }
+      ],
+      "states": [
+        {
+          "name": "prediction-samples",
+          "actions": [
+            {
+              "action": "check",
+              "selector": "[data-testid='progressive-polar-viewer'] input[type='checkbox']"
+            }
+          ],
+          "continuation": {
+            "kind": "in-page",
+            "anchor": "[data-testid='progressive-polar-viewer'] svg",
+            "focusWithin": "[data-testid='progressive-polar-viewer']",
+            "maxScrollDelta": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "progressive-comparison",
+      "url": "/compare?airfoil=ag24&airfoil=ag25",
+      "waitFor": {
+        "selector": "[data-testid='progressive-comparison'][aria-busy='false']"
+      },
+      "journeys": [
+        {
+          "id": "compare-polars",
+          "name": "Compare profiles at the same condition",
+          "frequencyPercent": 100,
+          "risk": "normal",
+          "rationale": "Actual cached curves appear before numerical summaries"
+        }
+      ],
+      "primaryJourney": "compare-polars",
+      "regions": [
+        {
+          "name": "Polars",
+          "selector": "[data-testid='progressive-comparison']",
+          "role": "primary-content",
+          "journey": "compare-polars"
+        }
+      ],
+      "theme": "dark",
+      "reviewInputs": [
+        {
+          "path": "apps/web/components/compare/ProgressiveCompareView.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/compare/CompareView.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/app/compare/page.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/AirfoilSelector.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/app/globals.css",
+          "kind": "tokens"
+        },
+        {
+          "path": "apps/web/lib/tokens.ts",
+          "kind": "tokens"
+        }
+      ],
+      "states": [
+        {
+          "name": "curve-samples",
+          "actions": [
+            {
+              "action": "check",
+              "selector": "[data-testid='progressive-comparison'] input[type='checkbox']"
+            }
+          ],
+          "continuation": {
+            "kind": "in-page",
+            "anchor": "[data-testid='progressive-comparison'] svg",
+            "focusWithin": "[data-testid='progressive-comparison']",
+            "maxScrollDelta": 8
+          }
+        }
+      ]
+    }
+  ],
+  "viewports": [
+    {
+      "name": "mobile",
+      "width": 390,
+      "height": 844
+    },
+    {
+      "name": "desktop",
+      "width": 1440,
+      "height": 1000
+    }
+  ],
+  "performance": {
+    "ttfbMs": 10,
+    "lcpMs": 800,
+    "ttfbLocalOnly": true
+  }
+}

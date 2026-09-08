@@ -22,7 +22,17 @@
 // referenced by a live foreign graph are left for that suite's own cleanup
 // (or the admin purge) instead of exploding this one.
 
-import { and, eq, inArray, like, notExists, or, sql } from "drizzle-orm";
+import {
+  and,
+  eq,
+  inArray,
+  isNull,
+  like,
+  notExists,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
 
 import type { DB } from "./client";
 import {
@@ -134,12 +144,27 @@ export async function cleanupCampaignFixtures(
       })
       .from(simulationPresets)
       .where(
-        conditionPresetIds.length
-          ? or(
-              like(simulationPresets.slug, slugPattern),
-              inArray(simulationPresets.id, conditionPresetIds),
-            )
-          : like(simulationPresets.slug, slugPattern),
+        and(
+          conditionPresetIds.length
+            ? or(
+                like(simulationPresets.slug, slugPattern),
+                inArray(simulationPresets.id, conditionPresetIds),
+              )
+            : like(simulationPresets.slug, slugPattern),
+          notExists(
+            db
+              .select({ one: sql`1` })
+              .from(simCampaignConditions)
+              .where(
+                and(
+                  eq(simCampaignConditions.presetId, simulationPresets.id),
+                  campaignIds.length
+                    ? notInArray(simCampaignConditions.campaignId, campaignIds)
+                    : sql`true`,
+                ),
+              ),
+          ),
+        ),
       );
     const presetIds = campaignPresets.map((p) => p.id);
 
@@ -278,11 +303,37 @@ export async function cleanupCampaignFixtures(
           await db
             .select({ id: simJobs.id })
             .from(simJobs)
-            .where(inArray(simJobs.campaignId, campaignIds))
+            .where(
+              and(
+                inArray(simJobs.campaignId, campaignIds),
+                revisionIds.length
+                  ? or(
+                      isNull(simJobs.simulationPresetRevisionId),
+                      inArray(simJobs.simulationPresetRevisionId, revisionIds),
+                    )
+                  : isNull(simJobs.simulationPresetRevisionId),
+              ),
+            )
         ).map((row) => row.id)
       : [];
 
     if (campaignIds.length) {
+      await db.execute(sql`
+        DELETE FROM campaign_condition_scopes scope
+        USING sim_campaign_conditions condition
+        WHERE scope.condition_id = condition.id
+          AND condition.campaign_id IN (${sql.join(
+            campaignIds.map((id) => sql`${id}::uuid`),
+            sql`, `,
+          )})
+      `);
+      await db.execute(sql`
+        DELETE FROM progressive_generations generation
+        WHERE generation.campaign_id IN (${sql.join(
+          campaignIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )})
+      `);
       await db
         .delete(simCampaigns)
         .where(inArray(simCampaigns.id, campaignIds));

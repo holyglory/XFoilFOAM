@@ -21,7 +21,7 @@ const cardLabel: CSSProperties = {
   fontFamily: MONO,
   fontSize: 10,
   letterSpacing: "0.12em",
-  color: C.dim,
+  color: C.muted,
 };
 
 export interface PolarMetricRow {
@@ -47,8 +47,14 @@ export function SpecSheet({
   const g = detail.geometry;
   const { profilePath, camberPath } = profilePaths(g);
   const geomRows = [
-    { k: "max thickness", v: `${g.thicknessPct.toFixed(1)}% @ ${g.thicknessXPct.toFixed(0)}%c` },
-    { k: "max camber", v: `${g.camberPct.toFixed(1)}% @ ${g.camberXPct.toFixed(0)}%c` },
+    {
+      k: "max thickness",
+      v: `${g.thicknessPct.toFixed(1)}% @ ${g.thicknessXPct.toFixed(0)}%c`,
+    },
+    {
+      k: "max camber",
+      v: `${g.camberPct.toFixed(1)}% @ ${g.camberXPct.toFixed(0)}%c`,
+    },
     { k: "LE radius", v: `${g.leRadiusPct.toFixed(2)}%c` },
     { k: "area upper / chord", v: g.areaUpper.toFixed(4) },
     { k: "area lower / chord", v: g.areaLower.toFixed(4) },
@@ -69,77 +75,152 @@ export function SpecSheet({
       <div style={card}>
         <div style={cardHead}>
           <span style={cardLabel}>PROFILE</span>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>{detail.name}</span>
+          <span style={{ fontFamily: MONO, fontSize: 10, color: C.muted }}>
+            {detail.name}
+          </span>
         </div>
         <div style={{ padding: "8px 12px 4px" }}>
           <svg width="100%" viewBox="0 0 340 150" style={{ display: "block" }}>
-            <line x1="14" y1="80" x2="326" y2="80" style={{ stroke: C.borderRule }} strokeWidth="1" strokeDasharray="3 4" />
-            <path d={profilePath} fill="rgba(45,212,191,0.10)" style={{ stroke: C.teal }} strokeWidth="1.6" strokeLinejoin="round" />
-            <path d={camberPath} fill="none" style={{ stroke: C.amber }} strokeWidth="1" strokeDasharray="4 3" opacity="0.8" />
+            <line
+              x1="14"
+              y1="80"
+              x2="326"
+              y2="80"
+              style={{ stroke: C.borderRule }}
+              strokeWidth="1"
+              strokeDasharray="3 4"
+            />
+            <path
+              d={profilePath}
+              fill="rgba(45,212,191,0.10)"
+              style={{ stroke: C.teal }}
+              strokeWidth="1.6"
+              strokeLinejoin="round"
+            />
+            <path
+              d={camberPath}
+              fill="none"
+              style={{ stroke: C.amber }}
+              strokeWidth="1"
+              strokeDasharray="4 3"
+              opacity="0.8"
+            />
           </svg>
         </div>
         <div
-          style={{ display: "flex", gap: 18, padding: "4px 14px 12px", fontFamily: MONO, fontSize: 10, color: C.muted }}
+          style={{
+            display: "flex",
+            gap: 18,
+            padding: "4px 14px 12px",
+            fontFamily: MONO,
+            fontSize: 10,
+            color: C.muted,
+          }}
         >
           <span>
-            <span style={{ display: "inline-block", width: 10, borderTop: `2px solid ${C.teal}`, verticalAlign: "middle", marginRight: 5 }} />
+            <span
+              style={{
+                display: "inline-block",
+                width: 10,
+                borderTop: `2px solid ${C.teal}`,
+                verticalAlign: "middle",
+                marginRight: 5,
+              }}
+            />
             surface
           </span>
           <span>
-            <span style={{ display: "inline-block", width: 10, borderTop: `2px dashed ${C.amber}`, verticalAlign: "middle", marginRight: 5 }} />
+            <span
+              style={{
+                display: "inline-block",
+                width: 10,
+                borderTop: `2px dashed ${C.amber}`,
+                verticalAlign: "middle",
+                marginRight: 5,
+              }}
+            />
             camber line
           </span>
         </div>
       </div>
 
       {/* fitted polar */}
-      <div style={card}>
-        <div style={cardHead}>
-          <span style={cardLabel}>BEST-FIT POLAR</span>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: solvedSeriesLabel ? C.teal : C.dim }}>
-            {solvedSeriesLabel ? `${solvedSeriesLabel}${fitStatus ? ` · ${fitStatus}` : ""}` : "queued"}
-          </span>
-        </div>
-        <div style={{ padding: "6px 14px 12px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", fontFamily: MONO, fontSize: 9.5, padding: "7px 0 6px", borderBottom: `1px solid ${C.borderRule}` }}>
-            <span style={{ color: C.dim }}>{solvedPointCount} solved point{solvedPointCount === 1 ? "" : "s"}</span>
-            <span style={{ color: C.dim }}>M {machStr}</span>
+      {(!detail.progressivePolars?.length || polarRows.length > 0) && (
+        <div style={card}>
+          <div style={cardHead}>
+            <span style={cardLabel}>BEST-FIT POLAR</span>
+            <span
+              style={{
+                fontFamily: MONO,
+                fontSize: 10,
+                color: solvedSeriesLabel ? C.teal : C.muted,
+              }}
+            >
+              {solvedSeriesLabel
+                ? `${solvedSeriesLabel}${fitStatus ? ` · ${fitStatus}` : ""}`
+                : "queued"}
+            </span>
           </div>
-          {polarRows.length > 0 ? (
-            polarRows.map((r) => (
+          <div style={{ padding: "6px 14px 12px" }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontFamily: MONO,
+                fontSize: 9.5,
+                padding: "7px 0 6px",
+                borderBottom: `1px solid ${C.borderRule}`,
+              }}
+            >
+              <span style={{ color: C.muted }}>
+                {solvedPointCount} solved point
+                {solvedPointCount === 1 ? "" : "s"}
+              </span>
+              <span style={{ color: C.muted }}>M {machStr}</span>
+            </div>
+            {polarRows.length > 0 ? (
+              polarRows.map((r) => (
+                <div
+                  key={r.k}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr auto",
+                    fontFamily: MONO,
+                    fontSize: 11,
+                    padding: "6px 0",
+                    borderBottom: `1px solid ${C.borderRow}`,
+                    alignItems: "baseline",
+                    gap: 12,
+                  }}
+                >
+                  <span style={{ color: C.muted }}>{r.k}</span>
+                  <span style={{ textAlign: "right", color: C.text }}>
+                    {r.v}
+                  </span>
+                </div>
+              ))
+            ) : (
               <div
-                key={r.k}
                 style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr auto",
                   fontFamily: MONO,
-                  fontSize: 11,
-                  padding: "6px 0",
-                  borderBottom: `1px solid ${C.borderRow}`,
-                  alignItems: "baseline",
-                  gap: 12,
+                  fontSize: 10,
+                  color: C.muted,
+                  lineHeight: 1.55,
+                  padding: "12px 0 4px",
                 }}
               >
-                <span style={{ color: C.muted }}>{r.k}</span>
-                <span style={{ textAlign: "right", color: C.tealText }}>{r.v}</span>
+                Best-fit metrics appear after at least three solved AoA points
+                are stored for one operating condition.
               </div>
-            ))
-          ) : (
-            <div style={{ fontFamily: MONO, fontSize: 10, color: C.muted, lineHeight: 1.55, padding: "12px 0 4px" }}>
-              Best-fit metrics appear after at least three solved AoA points are stored for one operating condition.
-            </div>
-          )}
-          <div style={{ fontFamily: MONO, fontSize: 9, color: C.dimmest, marginTop: 8, lineHeight: 1.5 }}>
-            fit is derived from stored OpenFOAM evidence only
+            )}
           </div>
         </div>
-      </div>
+      )}
 
       {/* geometry / area */}
       <div style={card}>
         <div style={cardHead}>
           <span style={cardLabel}>GEOMETRY · AREA METRICS</span>
-          <span style={{ color: C.dim, fontSize: 11 }}>▾</span>
         </div>
         <div style={{ padding: "4px 14px 12px" }}>
           {geomRows.map((row) => (
@@ -166,7 +247,14 @@ export function SpecSheet({
         <div style={{ ...cardHead, borderBottom: `1px solid ${C.borderSoft}` }}>
           <span style={cardLabel}>DOWNLOAD COORDINATES</span>
         </div>
-        <div style={{ padding: "12px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div
+          style={{
+            padding: "12px 14px",
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 8,
+          }}
+        >
           {formats.map((f) => {
             const style: CSSProperties = {
               fontFamily: MONO,

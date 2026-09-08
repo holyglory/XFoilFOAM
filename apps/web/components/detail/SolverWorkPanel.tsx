@@ -467,7 +467,7 @@ export function SolverWorkPanel({
             style={{
               fontFamily: MONO,
               fontSize: 11,
-              color: C.dim,
+              color: C.muted,
               letterSpacing: "0.12em",
             }}
           >
@@ -712,7 +712,7 @@ function ConditionGroup({
               whiteSpace: "nowrap",
             }}
           >
-            <span aria-hidden style={{ color: C.dim, marginRight: 6 }}>
+            <span aria-hidden style={{ color: C.muted, marginRight: 6 }}>
               {expanded ? "▾" : "▸"}
             </span>
             <strong style={{ color: C.violet, fontWeight: 800 }}>

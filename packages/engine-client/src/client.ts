@@ -1,10 +1,15 @@
 import { Agent } from "undici";
+import type {
+  ProgressivePolarFitRequest,
+  ProgressivePolarFitResponse,
+} from "./progressive-polar";
 
 import type {
   ArchiveCleanCycleReductionRequest,
   ArchiveCleanCycleReductionResponse,
   ArchiveCleanCycleReductionState,
   EngineCapabilities,
+  EngineExecutionStopProof,
   EngineCacheStats,
   EngineHealth,
   EngineIdentity,
@@ -443,6 +448,52 @@ export class EngineClient {
   }
 
   /** Submit a polar job → 202 with a job_id. */
+  predictNeuralFoil(
+    request: {
+      epoch_id: string;
+      lease_token: string;
+      coordinates: number[][];
+      geometry_provenance: Record<string, unknown>;
+      conditions: Array<{
+        target_signature: string;
+        reynolds: number;
+        mach: number;
+        alpha: number[];
+        n_crit: number;
+        transition_upper: number;
+        transition_lower: number;
+        roughness_height: number;
+      }>;
+      recipe: Record<string, unknown>;
+    },
+    opts?: EngineCallOptions,
+  ): Promise<{
+    epoch_id: string;
+    lease_token: string;
+    predictions: Record<string, unknown>[];
+  }> {
+    return this.json("/predictions/neuralfoil", opts?.timeoutMs ?? 120_000, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.controlPlaneToken ?? ""}` },
+      body: JSON.stringify(request),
+    });
+  }
+
+  fitProgressivePolar(
+    request: ProgressivePolarFitRequest,
+    opts?: EngineCallOptions,
+  ): Promise<ProgressivePolarFitResponse> {
+    return this.json(
+      "/predictions/progressive-polar",
+      opts?.timeoutMs ?? 120_000,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.controlPlaneToken ?? ""}` },
+        body: JSON.stringify(request),
+      },
+    );
+  }
+
   submitPolar(
     request: PolarRequest,
     opts?: EngineCallOptions,
@@ -490,14 +541,41 @@ export class EngineClient {
     });
   }
 
-  cancelJob(
+  getExecutionStopProof(
     jobId: string,
     opts?: EngineCallOptions,
-  ): Promise<{ job_id: string; cancelled: boolean }> {
-    return this.json<{ job_id: string; cancelled: boolean }>(
+  ): Promise<EngineExecutionStopProof> {
+    return this.json<EngineExecutionStopProof>(
+      `/jobs/${encodeURIComponent(jobId)}/execution-stop-proof`,
+      opts?.timeoutMs ?? ENGINE_POLL_TIMEOUT_MS,
+      { method: "POST", body: "{}" },
+    );
+  }
+
+  cancelJob(
+    jobId: string,
+    opts?: EngineCallOptions & {
+      unregisteredExecution?: {
+        expected_engine: EngineIdentity;
+        expected_execution_pool?: string;
+      };
+    },
+  ): Promise<{
+    job_id: string;
+    cancelled: boolean;
+    execution_stopped?: boolean;
+  }> {
+    return this.json<{
+      job_id: string;
+      cancelled: boolean;
+      execution_stopped?: boolean;
+    }>(
       `/jobs/${encodeURIComponent(jobId)}/cancel`,
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,
-      { method: "POST", body: "{}" },
+      {
+        method: "POST",
+        body: JSON.stringify(opts?.unregisteredExecution ?? {}),
+      },
     );
   }
 

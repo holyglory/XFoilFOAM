@@ -13,6 +13,20 @@ type SweeperStateSnapshot = typeof sweeperState.$inferSelect;
 
 const LEASE_KEY = "aerodb:sweeper-tests:global-admission";
 
+const API_EXCLUSIVE_FILES = new Set([
+  "admin-queue.test.ts",
+  "campaign-lifecycle-guard.test.ts",
+  "campaigns.test.ts",
+  "catalog.test.ts",
+  "exact-generation-public.test.ts",
+  "point-history.test.ts",
+  "review-buckets.test.ts",
+  "solver-execution-pool-admission.test.ts",
+  "solver-work.test.ts",
+  "sweeper-admission-fence.test.ts",
+  "sync-remote-validation.test.ts",
+]);
+
 /**
  * These files intentionally mutate the sweeper singleton or create one of the
  * production-global hazards read by enforceSweeperAdmissionFence. They must be
@@ -25,6 +39,7 @@ const LEASE_KEY = "aerodb:sweeper-tests:global-admission";
  * belongs here; never weaken the runtime detector to make a fixture pass.
  */
 const EXCLUSIVE_FILES = new Set([
+  ...API_EXCLUSIVE_FILES,
   "admission-circuit-breaker.test.ts",
   "admission-predicate-transitions.test.ts",
   "auto-retry-mesh-qa.test.ts",
@@ -59,7 +74,7 @@ interface VitestWorkerState {
   filepath?: string;
 }
 
-function currentTestFile(): string {
+function currentTestPath(): string {
   const filepath = (
     globalThis as typeof globalThis & {
       __vitest_worker__?: VitestWorkerState;
@@ -70,7 +85,7 @@ function currentTestFile(): string {
       "global admission test lease could not identify the current Vitest file",
     );
   }
-  return basename(filepath);
+  return filepath;
 }
 
 let client: ReturnType<typeof createClient> | null = null;
@@ -136,7 +151,13 @@ async function restoreSweeperState(
 }
 
 beforeAll(async () => {
-  const testFile = currentTestFile();
+  const filepath = currentTestPath();
+  const testFile = basename(filepath);
+  if (
+    filepath.replace(/\\/g, "/").includes("/apps/api/") &&
+    !API_EXCLUSIVE_FILES.has(testFile)
+  )
+    return;
   if (DATABASE_FREE_FILES.has(testFile)) return;
   exclusive = EXCLUSIVE_FILES.has(testFile);
   client = createClient({ max: 2 });

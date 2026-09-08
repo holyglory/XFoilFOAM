@@ -36,7 +36,11 @@ function isConnError(err: unknown): boolean {
  * render. Retrying briefly lets the page wait it out instead. HTTP error statuses
  * are NOT retried — only refused/dropped connections.
  */
-async function apiFetch(path: string, init?: RequestInit, retries = 4): Promise<Response> {
+async function apiFetch(
+  path: string,
+  init?: RequestInit,
+  retries = 4,
+): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -44,59 +48,70 @@ async function apiFetch(path: string, init?: RequestInit, retries = 4): Promise<
     } catch (err) {
       lastErr = err;
       if (!isConnError(err) || attempt === retries) break;
-      await new Promise((r) => setTimeout(r, Math.min(250 * 2 ** attempt, 2000)));
+      await new Promise((r) =>
+        setTimeout(r, Math.min(250 * 2 ** attempt, 2000)),
+      );
     }
   }
   throw lastErr;
 }
 
-export async function getAirfoilDetail(slug: string, revisionId?: string | null): Promise<AirfoilDetailPayload | null> {
+export async function getAirfoilDetail(
+  slug: string,
+  revisionId?: string | null,
+  signal?: AbortSignal,
+): Promise<AirfoilDetailPayload | null> {
   const qs = revisionId ? `?revisionId=${encodeURIComponent(revisionId)}` : "";
   const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}${qs}`, {
     cache: "no-store",
+    signal,
   });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GET /api/airfoils/${slug} → ${res.status}`);
   return res.json();
 }
 
-export async function listAirfoils(params: {
-  q?: string;
-  category?: string;
-  includeSubcategories?: boolean;
-  sort?: string;
-  dir?: "asc" | "desc";
-  includePoints?: boolean;
-  hashtags?: string[];
-  thicknessMin?: number;
-  thicknessMax?: number;
-  areaMin?: number;
-  areaMax?: number;
-  upperAreaMin?: number;
-  upperAreaMax?: number;
-  upperPositiveMin?: number;
-  upperPositiveMax?: number;
-  upperNegativeMin?: number;
-  upperNegativeMax?: number;
-  lowerAreaMin?: number;
-  lowerAreaMax?: number;
-  lowerPositiveMin?: number;
-  lowerPositiveMax?: number;
-  lowerNegativeMin?: number;
-  lowerNegativeMax?: number;
-  camberAreaMin?: number;
-  camberAreaMax?: number;
-  camberPositiveMin?: number;
-  camberPositiveMax?: number;
-  camberNegativeMin?: number;
-  camberNegativeMax?: number;
-} = {}): Promise<AirfoilSummary[]> {
+export async function listAirfoils(
+  params: {
+    q?: string;
+    category?: string;
+    includeSubcategories?: boolean;
+    sort?: string;
+    dir?: "asc" | "desc";
+    includePoints?: boolean;
+    hashtags?: string[];
+    thicknessMin?: number;
+    thicknessMax?: number;
+    areaMin?: number;
+    areaMax?: number;
+    upperAreaMin?: number;
+    upperAreaMax?: number;
+    upperPositiveMin?: number;
+    upperPositiveMax?: number;
+    upperNegativeMin?: number;
+    upperNegativeMax?: number;
+    lowerAreaMin?: number;
+    lowerAreaMax?: number;
+    lowerPositiveMin?: number;
+    lowerPositiveMax?: number;
+    lowerNegativeMin?: number;
+    lowerNegativeMax?: number;
+    camberAreaMin?: number;
+    camberAreaMax?: number;
+    camberPositiveMin?: number;
+    camberPositiveMax?: number;
+    camberNegativeMin?: number;
+    camberNegativeMax?: number;
+  } = {},
+): Promise<AirfoilSummary[]> {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (Array.isArray(v) && v.length) qs.set(k, v.join(","));
     else if (v !== undefined && v !== "" && v !== null) qs.set(k, String(v));
   }
-  const res = await apiFetch(`/api/airfoils?${qs.toString()}`, { cache: "no-store" });
+  const res = await apiFetch(`/api/airfoils?${qs.toString()}`, {
+    cache: "no-store",
+  });
   if (!res.ok) throw new Error(`GET /api/airfoils → ${res.status}`);
   return (await res.json()).items as AirfoilSummary[];
 }
@@ -154,7 +169,12 @@ export function getCachedSim(
   return entry.value;
 }
 
-export async function getSim(slug: string, re: number, aoa: number, resultId?: string | null): Promise<SimulationDetail> {
+export async function getSim(
+  slug: string,
+  re: number,
+  aoa: number,
+  resultId?: string | null,
+): Promise<SimulationDetail> {
   const key = simDetailKey(slug, re, aoa, resultId);
   const cached = getCachedSim(slug, re, aoa, resultId);
   if (cached) return cached;
@@ -164,7 +184,10 @@ export async function getSim(slug: string, re: number, aoa: number, resultId?: s
   const qs = new URLSearchParams({ re: String(re), aoa: String(aoa) });
   if (resultId) qs.set("resultId", resultId);
   const promise = (async () => {
-    const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/sim?${qs.toString()}`, { cache: "no-store" });
+    const res = await apiFetch(
+      `/api/airfoils/${encodeURIComponent(slug)}/sim?${qs.toString()}`,
+      { cache: "no-store" },
+    );
     if (!res.ok) throw new Error(`GET sim → ${res.status}`);
     const value = (await res.json()) as SimulationDetail;
     // Bridge mixed-version deploys: older API instances did not echo this id.
@@ -185,7 +208,8 @@ export async function getSim(slug: string, re: number, aoa: number, resultId?: s
   try {
     return await promise;
   } catch (error) {
-    if (simDetailCache.get(key)?.promise === promise) simDetailCache.delete(key);
+    if (simDetailCache.get(key)?.promise === promise)
+      simDetailCache.delete(key);
     throw error;
   }
 }
@@ -197,7 +221,10 @@ export interface SimDetailPrefetchTarget {
   resultId?: string | null;
 }
 
-function preloadSimField(detail: SimulationDetail, preferredField?: FieldId): void {
+function preloadSimField(
+  detail: SimulationDetail,
+  preferredField?: FieldId,
+): void {
   if (typeof window === "undefined" || typeof Image === "undefined") return;
   const field =
     preferredField && detail.availableFields.includes(preferredField)
@@ -257,25 +284,42 @@ export function prefetchSimDetails(
   );
 }
 
-export async function getFieldTrack(slug: string, revisionId?: string | null): Promise<FieldTrackPoint[]> {
+export async function getFieldTrack(
+  slug: string,
+  revisionId?: string | null,
+): Promise<FieldTrackPoint[]> {
   const qs = new URLSearchParams();
   if (revisionId) qs.set("revisionId", revisionId);
-  const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/field-track?${qs.toString()}`, { cache: "no-store" });
+  const res = await apiFetch(
+    `/api/airfoils/${encodeURIComponent(slug)}/field-track?${qs.toString()}`,
+    { cache: "no-store" },
+  );
   if (!res.ok) throw new Error(`GET field-track → ${res.status}`);
   return (await res.json()).items as FieldTrackPoint[];
 }
 
-export async function getSolverWork(slug: string, revisionId?: string | null): Promise<SolverWorkPayload> {
+export async function getSolverWork(
+  slug: string,
+  revisionId?: string | null,
+): Promise<SolverWorkPayload> {
   const qs = new URLSearchParams();
   if (revisionId) qs.set("revision", revisionId);
   const suffix = qs.toString();
-  const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}/solver-work${suffix ? `?${suffix}` : ""}`, { cache: "no-store" });
+  const res = await apiFetch(
+    `/api/airfoils/${encodeURIComponent(slug)}/solver-work${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
   if (!res.ok) throw new Error(`GET solver-work → ${res.status}`);
   return res.json();
 }
 
-export async function getResultEvidence(resultId: string): Promise<{ artifacts: EvidenceArtifactDTO[] }> {
-  const res = await apiFetch(`/api/results/${encodeURIComponent(resultId)}/evidence`, { cache: "no-store" });
+export async function getResultEvidence(
+  resultId: string,
+): Promise<{ artifacts: EvidenceArtifactDTO[] }> {
+  const res = await apiFetch(
+    `/api/results/${encodeURIComponent(resultId)}/evidence`,
+    { cache: "no-store" },
+  );
   if (!res.ok) throw new Error(`GET evidence → ${res.status}`);
   return res.json();
 }
@@ -295,12 +339,25 @@ export async function renderResultField(
     widthPx?: number;
     heightPx?: number;
   },
-): Promise<{ id: string; cached: boolean; field: FieldId; role: string; url: string; mimeType: string; sha256: string; byteSize: number; paramsHash: string }> {
-  const res = await apiFetch(`/api/results/${encodeURIComponent(resultId)}/render`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+): Promise<{
+  id: string;
+  cached: boolean;
+  field: FieldId;
+  role: string;
+  url: string;
+  mimeType: string;
+  sha256: string;
+  byteSize: number;
+  paramsHash: string;
+}> {
+  const res = await apiFetch(
+    `/api/results/${encodeURIComponent(resultId)}/render`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
   if (!res.ok) {
     const err = (await res.json().catch(() => ({}))) as { error?: string };
     throw new Error(err.error || `POST render → ${res.status}`);
@@ -329,7 +386,9 @@ export interface CreateAirfoilBody {
   coordinates?: string;
 }
 
-export async function createAirfoil(body: CreateAirfoilBody): Promise<AirfoilSummary> {
+export async function createAirfoil(
+  body: CreateAirfoilBody,
+): Promise<AirfoilSummary> {
   const res = await fetch(`${apiBase()}/api/airfoils`, {
     method: "POST",
     headers: { "content-type": "application/json" },

@@ -1,5 +1,7 @@
 import {
   acquireResultEvidenceLock,
+  assertProgressiveCfdEvidenceJob,
+  recordProgressiveCfdEvidence,
   airfoils,
   type CampaignLaneKey,
   fieldColorScales,
@@ -25,6 +27,7 @@ import {
   solverEvidenceBlobs,
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
+import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import {
   baseRejectionReasons,
   canonicalSi,
@@ -38,9 +41,17 @@ import {
   type FinalizeRemoteEvidenceRequest,
   type ImageFieldName,
   type JobResult,
-  parseFrameTrack,
-  parsePointFidelity,
-  parseSteadyHistory,
+  stalledForPoint,
+  validForPolarPoint,
+  failedForPoint,
+  frameTrackForPoint,
+  fidelityForPoint,
+  solverRegimeForPoint,
+  solverPointEvidencePayload,
+  steadyHistoryForPoint,
+  STEADY_OSCILLATING_MARKER,
+  hasStableSteadyMean,
+  qualityWarningsForPoint,
   type PointFidelity,
   type PolarPoint,
   type RansPrecalcPromotion,
@@ -1040,158 +1051,18 @@ async function registerEvidenceFieldInventory(
   return inventory.size;
 }
 
-function stalledForPoint(p: PolarPoint): boolean {
-  return p.unsteady || p.converged === false;
-}
-
-function validForPolarPoint(p: PolarPoint): boolean {
-  const hasCoefficients = finiteNumber(p.cl) && finiteNumber(p.cd) && p.cd > 0;
-  if (p.unsteady) return !p.error && hasCoefficients;
-  return (
-    p.converged === true && !stalledForPoint(p) && !p.error && hasCoefficients
-  );
-}
-
-/** A point with an error or without finite coefficients is failure/absence —
- *  exported so reconcile's worker-restart orphan path can keep ONLY solved
- *  points as evidence and release everything else for a re-solve. */
-export function failedForPoint(p: PolarPoint): boolean {
-  return Boolean(p.error) || !finiteNumber(p.cl) || !finiteNumber(p.cd);
-}
-
-/** frame_track value to persist on the results row: the engine payload
- *  VERBATIM (null-safe). Contract drift is validated loudly here but the raw
- *  value is still persisted — it is solver evidence, and the classifier's
- *  stationarity gate fails closed on drifted shapes (a malformed frame_track
- *  can only ever REJECT a point, never sneak one through). Exported for the
- *  contract pin test. */
-export function frameTrackForPoint(p: PolarPoint, context: string): unknown {
-  const raw = p.frame_track ?? null;
-  if (raw === null) {
-    if (p.unsteady) {
-      // Post-contract engines ship frame_track on EVERY shedding URANS point.
-      // A shedding point arriving WITHOUT it (period unmeasurable / stats
-      // computation failed engine-side) has zero stationarity evidence, so it
-      // must NOT persist as null — null means legacy pre-contract evidence
-      // and skips the classifier's stationarity gate entirely. Persist a
-      // fail-closed sentinel: the gate reads stationary / periods_retained
-      // and rejects honestly (non-stationary + insufficient-periods).
-      console.error(
-        `[sweeper] frame_track MISSING on shedding URANS point (${context}); persisting fail-closed sentinel`,
-      );
-      return {
-        missing: true,
-        stationary: false,
-        periods_retained: null,
-        reason: "engine shipped no frame_track for a shedding URANS point",
-      };
-    }
-    return null;
-  }
-  const parsed = parseFrameTrack(raw);
-  if (!parsed.ok) {
-    // Loud, never silent: a drifted engine payload means the pinned
-    // frame-track contract broke on one side. Tests pin both sides; this log
-    // is the production tripwire.
-    console.error(
-      `[sweeper] frame_track CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`,
-    );
-  }
-  return raw;
-}
-
-/** Fidelity tier to persist on the results row (ladder contract 1/3).
- *  Precedence: the engine's strict-parsed echo; else the tier the JOB
- *  requested (including physically no-shedding URANS points — with a loud
- *  drift log, because a post-ladder engine must echo); else the honest
- *  regime-derived tier matching the 0034 backfill semantics (pre-ladder
- *  engines: urans = full behavior, steady = rans). Exported for the pin test. */
-export function fidelityForPoint(
-  p: PolarPoint,
-  requestedUransFidelity: UransFidelity | undefined,
-  context: string,
-): PointFidelity {
-  const echoed = parsePointFidelity(p.fidelity);
-  if (echoed) return echoed;
-  if (requestedUransFidelity) {
-    console.error(
-      `[sweeper] fidelity echo MISSING on a '${requestedUransFidelity}'-fidelity job (${context}); persisting the requested tier — engine contract drift`,
-    );
-    return requestedUransFidelity === "precalc"
-      ? "urans_precalc"
-      : "urans_full";
-  }
-  return p.unsteady ? "urans_full" : "rans";
-}
-
-/**
- * Solver regime describes the numerical method that produced an attempt; it
- * is not synonymous with whether the final physical wake sheds. A successful
- * URANS no-shedding observation is deliberately `unsteady=false`, but it must
- * remain attributable to URANS for provenance, comparison and the immutable
- * attempt identity. Conversely an unsteady payload claiming RANS fidelity is
- * a producer-contract contradiction and must never be silently reclassified.
- */
-export function solverRegimeForPoint(
-  p: PolarPoint,
-  fidelity: PointFidelity,
-  context: string,
-): "rans" | "urans" {
-  const urans = fidelity === "urans_precalc" || fidelity === "urans_full";
-  if (p.unsteady && !urans) {
-    throw new Error(
-      `solver regime contract drift (${context}): shedding point carries non-URANS fidelity '${fidelity}'`,
-    );
-  }
-  return urans ? "urans" : "rans";
-}
-
-/** steady_history value to persist verbatim (ladder contract 2). Like
- *  frame_track: drift is validated loudly but the raw payload is still
- *  persisted (solver evidence) — the classifier reads mean_stable fail-closed,
- *  so a malformed payload can never WAIVE a convergence gate. Exported for the
- *  pin test. */
-export function steadyHistoryForPoint(p: PolarPoint, context: string): unknown {
-  const raw = p.steady_history ?? null;
-  if (raw === null) return null;
-  const parsed = parseSteadyHistory(raw);
-  if (!parsed.ok) {
-    console.error(
-      `[sweeper] steady_history CONTRACT DRIFT (${context}): ${parsed.errors.join("; ")}`,
-    );
-  }
-  return raw;
-}
-
-/** Oscillating-steady quality marker (ladder contract 2): a steady point
- *  accepted through mean-stable oscillating averaging carries the honest
- *  note in quality_warnings — the marker every point-story surface already
- *  reads. Never duplicates an engine-shipped warning. Exported for tests. */
-export const STEADY_OSCILLATING_MARKER = "steady-oscillating-mean";
-
-function hasStableSteadyMean(p: PolarPoint): boolean {
-  return Boolean(
-    !p.unsteady &&
-    p.steady_history &&
-    typeof p.steady_history === "object" &&
-    (p.steady_history as { mean_stable?: unknown }).mean_stable === true,
-  );
-}
-
-export function qualityWarningsForPoint(p: PolarPoint): string[] | null {
-  const warnings = [...(p.quality_warnings ?? [])];
-  const history = p.steady_history;
-  if (hasStableSteadyMean(p) && history && typeof history === "object") {
-    const note =
-      typeof (history as { note?: unknown }).note === "string" &&
-      (history as { note: string }).note.trim()
-        ? (history as { note: string }).note
-        : "steady solve settled into a bounded oscillation; coefficients are stable window means";
-    const marker = `${STEADY_OSCILLATING_MARKER}: ${note}`;
-    if (!warnings.includes(marker)) warnings.push(marker);
-  }
-  return warnings.length ? warnings : null;
-}
+export {
+  stalledForPoint,
+  validForPolarPoint,
+  failedForPoint,
+  frameTrackForPoint,
+  fidelityForPoint,
+  solverRegimeForPoint,
+  steadyHistoryForPoint,
+  STEADY_OSCILLATING_MARKER,
+  hasStableSteadyMean,
+  qualityWarningsForPoint,
+} from "@aerodb/engine-client";
 
 /** Quality-warning marker prefix stamped on the ATTEMPT row when the replace
  *  guard keeps the canonical row (gate incident 2026-07-07: a rejected precalc
@@ -1436,24 +1307,12 @@ async function insertResultAttempt(opts: {
   for (const extra of opts.extraQualityWarnings ?? []) {
     if (!warnings.includes(extra)) warnings.push(extra);
   }
-  const evidencePayload = {
-    ...p,
-    // Keep the immutable payload engine-owned. Job-level failure fallback and
-    // local quarantine/replace annotations are scheduler context; a running
-    // partial and terminal replay of the same engine case must compare equal.
-    error: p.error ?? null,
+  const evidencePayload = solverPointEvidencePayload(p, {
     fidelity,
-    frame_track: derived?.frameTrack ?? p.frame_track ?? null,
-    steady_history: derived?.steadyHistory ?? p.steady_history ?? null,
-    quality_warnings: qualityWarningsForPoint(p) ?? [],
-    // This job-level acknowledgement was added after immutable attempt
-    // payloads were already live. Keep absence as absence when the engine did
-    // not acknowledge a version, so an ordinary deploy cannot rewrite the
-    // identity of legacy evidence merely by adding a new optional null key.
-    ...(opts.meshRecoveryVersion == null
-      ? {}
-      : { mesh_recovery_version: opts.meshRecoveryVersion }),
-  };
+    frameTrack: derived?.frameTrack,
+    steadyHistory: derived?.steadyHistory,
+    meshRecoveryVersion: opts.meshRecoveryVersion,
+  });
   const [inserted] = await db
     .insert(resultAttempts)
     .values({
@@ -5869,6 +5728,7 @@ export async function ingestResult(opts: {
    *  missing (with a loud drift log). Absent on wave-1/legacy jobs. */
   uransFidelity?: UransFidelity;
   result: JobResult;
+  remoteProgressiveReportSequence?: number;
   /** Job-level failure message stamped onto failed points whose own `error`
    *  is empty (incident 2026-07-04: failed rows landed with NULL error →
    *  failures endpoint errorClass 'unknown'). Only the failed-job ingest path
@@ -5894,6 +5754,7 @@ export async function ingestResult(opts: {
   media: number;
   attempts: number;
   evidenceCleanups: number;
+  resultAttemptIds: string[];
   dirtyLanes: CampaignLaneKey[];
   ransPrecalcPromotions: IngestedRansPrecalcPromotion[];
 }> {
@@ -5907,6 +5768,26 @@ export async function ingestResult(opts: {
     conditionMap,
     result,
   } = opts;
+  const progressive =
+    (await assertProgressiveCfdEvidenceJob(
+      db,
+      simJobId,
+      engineJobId,
+      result.polars.flatMap((polar) =>
+        [...polar.points, ...(polar.attempts ?? [])].map((point) => ({
+          alpha: point.aoa_deg,
+          speed: polar.speed,
+          chord: polar.chord,
+          solverActiveSeconds: point.solver_active_seconds,
+        })),
+      ),
+    )) ||
+    (await assertProgressiveWorkerEvidenceJob(db, {
+      simJobId,
+      engineJobId,
+      result,
+      reportSequence: opts.remoteProgressiveReportSequence,
+    }));
   const jobRuntime = await persistEngineRuntimeForJob(
     db,
     simJobId,
@@ -5923,6 +5804,7 @@ export async function ingestResult(opts: {
   let attempts = 0;
   const dirtyLanes = new Map<string, CampaignLaneKey>();
   const candidatesByRevision = new Map<string, StagedPoint[]>();
+  const stagedAttemptIds = new Set<string>();
   const legacyCandidates: StagedPoint[] = [];
   const ransPrecalcPromotions: IngestedRansPrecalcPromotion[] = [];
   const remoteEvidenceCleanups = new Map<
@@ -6003,6 +5885,7 @@ export async function ingestResult(opts: {
     if (!resultAttemptId) {
       throw new Error(`failed to stage exact attempt (${pointContext})`);
     }
+    stagedAttemptIds.add(resultAttemptId);
 
     // Exact immutable evidence is complete before any canonical projection or
     // current pointer can change. Every row carries both owner ids, enforced
@@ -6197,12 +6080,17 @@ export async function ingestResult(opts: {
 
   const finalizedByResult = new Map<string, FinalizedPoint>();
   for (const [revisionId, candidates] of candidatesByRevision) {
-    const finalized = await publishStagedPoints(
-      db,
-      airfoilId,
-      revisionId,
-      candidates,
-    );
+    const finalized = await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await assertProgressiveCfdEvidenceJob(connection, simJobId, engineJobId);
+      await assertProgressiveWorkerEvidenceJob(connection, {
+        simJobId,
+        engineJobId,
+        result,
+        reportSequence: opts.remoteProgressiveReportSequence,
+      });
+      return publishStagedPoints(connection, airfoilId, revisionId, candidates);
+    });
     for (const row of finalized) finalizedByResult.set(row.resultId, row);
   }
   // Revision-less legacy evidence cannot participate in the compatibility
@@ -6248,7 +6136,7 @@ export async function ingestResult(opts: {
   // Campaign and obligation state observe only committed selected evidence (or
   // a pointer-null machine failure). A rejected child of an existing public
   // generation settles against the kept current row returned above.
-  for (const finalized of finalizedByResult.values()) {
+  for (const finalized of progressive ? [] : finalizedByResult.values()) {
     const candidate = [...candidatesByRevision.values(), legacyCandidates]
       .flat()
       .find((item) => item.resultId === finalized.resultId);
@@ -6264,11 +6152,17 @@ export async function ingestResult(opts: {
     });
     for (const key of laneKeys) dirtyLanes.set(laneKeyId(key), key);
   }
+  await recordProgressiveCfdEvidence(db, {
+    simJobId,
+    engineJobId,
+    resultAttemptIds: [...stagedAttemptIds],
+  });
   return {
     points,
     media,
     attempts,
     evidenceCleanups,
+    resultAttemptIds: [...stagedAttemptIds],
     dirtyLanes: [...dirtyLanes.values()],
     ransPrecalcPromotions,
   };

@@ -19,6 +19,8 @@ dependencies = [
     "celery>=5.3",
     "redis>=5.0",
     "numpy>=1.24",
+    "neuralfoil==0.3.3",
+    "aerosandbox==4.2.10",
     "matplotlib>=3.7",
     "meshio>=5.3",
     "google-cloud-storage>=2.18",

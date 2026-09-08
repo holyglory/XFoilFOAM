@@ -4,6 +4,7 @@ import {
   boundaryProfiles,
   categories,
   type DB,
+  canonicalAnalysisJson,
   flowConditions,
   hasPrecalcContinuationWarning,
   isExactRestartablePrecalcAttempt,
@@ -32,6 +33,7 @@ import {
   solverImplementations,
   solverProfiles,
   solverRuntimeBuilds,
+  solverCpuReservationSql,
   sweeperState,
   syncApiSettings,
   syncRemoteHubBindingReceipts,
@@ -54,6 +56,22 @@ import {
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
+import { reconcileProgressiveRemoteWorker } from "./progressive-remote-reconciliation";
+import { observeProgressiveRemoteJob } from "./progressive-remote-observation";
+import { receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
+import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
+import {
+  claimProgressiveWorkerArchive,
+  renewProgressiveWorkerArchiveClaim,
+  settleProgressiveWorkerArchiveClaim,
+} from "./progressive-worker-archive-delivery";
+import { progressiveWorkerEvidenceReference } from "./progressive-worker-evidence-delivery";
+import { mirrorProgressiveRemoteJob } from "./progressive-remote-jobs";
+import { submitProgressiveRemoteJob } from "./progressive-remote-submission";
+import {
+  progressiveWorkerCapabilityMetadata,
+  refreshProgressiveWorkerCapabilities,
+} from "./progressive-worker-capabilities";
 import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
 import {
   createHash,
@@ -942,7 +960,10 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
       cpuCapacity: remoteWorkerCpuCapacity(settings),
       cpuBudget: settings.remoteSolverCpuBudget,
       buildVersion: configuredBuildVersion(),
-      metadata: { engine: configuredEngineIdentity() },
+      metadata: {
+        engine: configuredEngineIdentity(),
+        ...progressiveWorkerCapabilityMetadata(db),
+      },
     }),
   });
   const payload = (await res.json().catch(() => null)) as {
@@ -1004,6 +1025,7 @@ async function heartbeat(
   },
   solvedCount?: number,
   pushedCount?: number,
+  progressiveMetadata?: ReturnType<typeof progressiveWorkerCapabilityMetadata>,
 ): Promise<boolean> {
   if (!settings.remoteSolverRegisteredId) return false;
   const response = await fetch(
@@ -1022,6 +1044,7 @@ async function heartbeat(
         ...(solvedCount == null ? {} : { solvedCount }),
         ...(pushedCount == null ? {} : { pushedCount }),
         health: telemetry,
+        ...(progressiveMetadata ? { metadata: progressiveMetadata } : {}),
       }),
     },
   ).catch(() => null);
@@ -1127,6 +1150,7 @@ async function reportRemoteSolverFleetHeartbeat(
     telemetry,
     counters?.solvedCount,
     counters?.pushedCount,
+    progressiveWorkerCapabilityMetadata(db),
   );
   return { remoteCap, reservedCpuSlots };
 }
@@ -1220,6 +1244,7 @@ async function activeRemoteJobs(db: DB, settings: Settings) {
       and(
         remoteJobOwnerSql(settings, "sim_jobs"),
         or(
+          solverCpuReservationSql(),
           inArray(simJobs.status, [
             "pending",
             "submitted",
@@ -1244,17 +1269,7 @@ async function remoteReservedCpuSlots(
     SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
     FROM sim_jobs job
     WHERE ${remoteJobOwnerSql(settings, "job")}
-      AND (
-        job.status IN ('submitted', 'running', 'ingesting')
-        OR (
-          job.status = 'pending'
-          AND job.engine_state = 'submitting'
-        )
-        OR (
-          job.status = 'cancelled'
-          AND job.engine_state IN ('cancelling', 'cancel_pending')
-        )
-      )
+      AND ${solverCpuReservationSql("job")}
   `)) as unknown as Array<{ slots: number }>;
   return Number(row?.slots ?? 0);
 }
@@ -1463,6 +1478,10 @@ async function mirroredRemotePromiseIds(
         eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
         sql`${syncSweepPromises.expiresAt} > now()`,
         sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
+        sql`${syncSweepPromises.requestPayload}->>'executionContract' IS DISTINCT FROM 'progressive-cfd-v1'`,
+        sql`NOT EXISTS (SELECT 1 FROM sim_jobs assigned_job
+          WHERE assigned_job.request_payload->>'syncPromiseId' = ${syncSweepPromises.id}::text
+            AND assigned_job.request_payload ? 'remoteProgressiveExecution')`,
         remotePromiseOwnerSql(settings),
       ),
     )
@@ -1493,6 +1512,26 @@ async function cancelAuthoritativelyExpiredPromise(
   for (const job of jobs) {
     let engineState: "cancelled" | "cancel_pending" = "cancelled";
     let error = reason;
+    if (Object.hasOwn(job.requestPayload ?? {}, "remoteProgressiveExecution")) {
+      engineState = "cancel_pending";
+      await db
+        .update(simJobs)
+        .set({ status: "cancelled", engineState, error })
+        .where(eq(simJobs.id, job.id));
+      try {
+        const observed = await observeProgressiveRemoteJob(db, engine, job.id, {
+          stop: true,
+        });
+        if (observed.stopped) engineState = "cancelled";
+      } catch (cancelError) {
+        error = `${reason}; exact execution stop remains unproved: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`;
+      }
+      await db
+        .update(simJobs)
+        .set({ engineState, error })
+        .where(eq(simJobs.id, job.id));
+      continue;
+    }
     if (job.engineJobId && job.status !== "pending") {
       try {
         await engine.cancelJob(job.engineJobId);
@@ -2201,6 +2240,7 @@ async function composeRemotePromiseJob(
     .limit(1);
   if (
     !promise ||
+    promise.requestPayload?.executionContract === "progressive-cfd-v1" ||
     promise.status !== "active" ||
     promise.expiresAt.getTime() <= Date.now() ||
     promise.sourceBaseUrl !== syncBase(settings) ||
@@ -2249,6 +2289,8 @@ async function composeRemotePromiseJob(
       FROM sim_jobs job
       WHERE job.request_payload ->> 'syncPromiseId' = ${promiseId}
         AND (
+          ${solverCpuReservationSql("job")}
+          OR
           job.status IN ('pending', 'submitted', 'running', 'ingesting')
           OR (
             job.status = 'cancelled'
@@ -2475,6 +2517,108 @@ async function submitMirroredRemotePromise(
   return { kind: "terminal", error };
 }
 
+export async function receiveProgressiveCampaignAssignments(
+  db: DB,
+  engine: EngineClient,
+  fetcher: typeof fetch = fetch,
+) {
+  return receiveProgressiveAssignmentPage(
+    db,
+    async (document, owner) => {
+      const [settings] = await db
+        .select()
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1));
+      if (
+        !settings?.remoteSolverEnabled ||
+        settings.remoteSolverRegisteredId !== owner.solverId ||
+        syncBase(settings) !== owner.baseUrl
+      )
+        throw new Error(
+          "The worker configuration changed before assignment receipt",
+        );
+      const raw = document.promise;
+      const airfoil = raw.airfoil as RemoteClaim["airfoil"] | undefined;
+      const revision = raw.setupRevision as
+        | RemoteClaim["setupRevision"]
+        | undefined;
+      if (
+        typeof raw.id !== "string" ||
+        raw.id !== document.envelope.promiseId ||
+        typeof raw.expiresAt !== "string" ||
+        !Number.isFinite(Date.parse(raw.expiresAt)) ||
+        !["active", "fulfilled", "expired", "cancelled"].includes(
+          String(raw.status),
+        ) ||
+        typeof raw.expired !== "boolean" ||
+        !airfoil ||
+        typeof airfoil.slug !== "string" ||
+        !airfoil.slug ||
+        typeof airfoil.name !== "string" ||
+        typeof airfoil.pointFormat !== "string" ||
+        !Array.isArray(airfoil.points) ||
+        !revision ||
+        typeof revision.signatureHash !== "string" ||
+        !revision.snapshot ||
+        simulationSetupSignature(revision.snapshot) !==
+          revision.signatureHash ||
+        !Array.isArray(raw.aoas) ||
+        canonicalAnalysisJson(raw.aoas) !==
+          canonicalAnalysisJson(
+            document.envelope.scope.units.map((unit) => unit.alpha),
+          )
+      )
+        throw new Error(
+          "The assignment catalog/setup document is malformed or changed its physical scope",
+        );
+      const claim: RemoteClaim = {
+        id: raw.id,
+        expiresAt: raw.expiresAt,
+        airfoil,
+        setupRevision: revision,
+        aoas: raw.aoas as number[],
+      };
+      const localAirfoil = await ensureRemoteAirfoil(db, claim);
+      const localSetup = await ensureRemoteRevision(db, claim, settings);
+      await persistClaimedRemotePromise(db, {
+        claim,
+        solverId: owner.solverId,
+        sourceBaseUrl: owner.baseUrl,
+        airfoilId: localAirfoil.id,
+        simulationPresetRevisionId: localSetup.revision.id,
+        progressive: {
+          executionId: document.envelope.scope.executionId,
+          status:
+            raw.expired && raw.status === "active"
+              ? "expired"
+              : (raw.status as
+                  | "active"
+                  | "fulfilled"
+                  | "expired"
+                  | "cancelled"),
+        },
+      });
+      await mirrorProgressiveRemoteJob(db, {
+        envelope: document.envelope,
+        assignment: {
+          solverId: owner.solverId,
+          promiseId: document.envelope.promiseId,
+          executionId: document.envelope.scope.executionId,
+          contentSignature: document.envelope.contentSignature,
+        },
+      });
+      if (raw.status !== "active" || raw.expired)
+        await observeProgressiveRemoteJob(
+          db,
+          engine,
+          document.envelope.scope.executionId,
+          { stop: true },
+        );
+    },
+    fetcher,
+  );
+}
+
 async function claimRemoteWork(
   db: DB,
   engine: EngineClient,
@@ -2538,6 +2682,10 @@ export async function persistClaimedRemotePromise(
     sourceBaseUrl: string;
     airfoilId: string;
     simulationPresetRevisionId: string;
+    progressive?: {
+      executionId: string;
+      status: "active" | "fulfilled" | "expired" | "cancelled";
+    };
   },
 ): Promise<void> {
   const { claim, solverId } = input;
@@ -2545,6 +2693,12 @@ export async function persistClaimedRemotePromise(
     remoteSolver: true,
     solverId,
     upstreamBaseUrl: input.sourceBaseUrl,
+    ...(input.progressive
+      ? {
+          executionContract: "progressive-cfd-v1",
+          progressiveExecutionId: input.progressive.executionId,
+        }
+      : {}),
   };
   await db.transaction(async (tx) => {
     const [settings] = await tx
@@ -2557,6 +2711,30 @@ export async function persistClaimedRemotePromise(
         "claimed remote promise owner does not match the registered local solver identity",
       );
     }
+    if (syncBase(settings) !== input.sourceBaseUrl)
+      throw new Error(
+        "Claimed remote promise belongs to a different configured upstream",
+      );
+    const [existingPromise] = await tx
+      .select()
+      .from(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, claim.id))
+      .for("update");
+    if (
+      existingPromise &&
+      (existingPromise.registeredSolverId !== solverId ||
+        existingPromise.sourceBaseUrl !== input.sourceBaseUrl ||
+        existingPromise.airfoilId !== input.airfoilId ||
+        existingPromise.simulationPresetRevisionId !==
+          input.simulationPresetRevisionId ||
+        (existingPromise.requestPayload?.executionContract ===
+          "progressive-cfd-v1" &&
+          existingPromise.requestPayload?.progressiveExecutionId !==
+            input.progressive?.executionId))
+    )
+      throw new Error(
+        "Claimed remote promise conflicts with its existing immutable owner or setup",
+      );
 
     // The hub owns the credential-bearing registry row. The remote node keeps
     // only a non-secret mirror of its own identity so its local promise FK and
@@ -2664,6 +2842,7 @@ export async function persistClaimedRemotePromise(
         lastHeartbeatAt: new Date(),
         registeredSolverId: solverId,
         requestPayload: ownershipPayload,
+        status: input.progressive?.status ?? "active",
       })
       .onConflictDoUpdate({
         target: syncSweepPromises.id,
@@ -2672,7 +2851,12 @@ export async function persistClaimedRemotePromise(
           aoaCount: claim.aoas.length,
           lastHeartbeatAt: new Date(),
           registeredSolverId: solverId,
-          requestPayload: ownershipPayload,
+          requestPayload: sql`coalesce(${syncSweepPromises.requestPayload}, '{}'::jsonb) || ${JSON.stringify(ownershipPayload)}::jsonb`,
+          ...(input.progressive
+            ? {
+                status: sql`CASE WHEN ${syncSweepPromises.status} = 'active' THEN ${input.progressive.status}::sync_promise_status ELSE ${syncSweepPromises.status} END`,
+              }
+            : {}),
           updatedAt: new Date(),
         },
       });
@@ -2684,6 +2868,7 @@ export async function persistClaimedRemotePromise(
           airfoilId: input.airfoilId,
           simulationPresetRevisionId: input.simulationPresetRevisionId,
           aoaDeg,
+          status: input.progressive?.status ?? "active",
         })),
       )
       .onConflictDoNothing();
@@ -4388,6 +4573,311 @@ export async function processRestartableRemotePrecalcCheckpoint(
   return false;
 }
 
+export async function deliverNextProgressiveWorkerArchive(
+  db: DB,
+  engine: EngineClient,
+): Promise<boolean> {
+  const claim = await claimProgressiveWorkerArchive(db);
+  if (!claim) return false;
+  let transferLease: RemotePromiseTransferLease | null = null;
+  try {
+    const [settings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.id, claim.resultAttemptId));
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, claim.executionId));
+    const promiseId = (job?.requestPayload as Record<string, unknown> | null)
+      ?.syncPromiseId;
+    if (
+      !settings?.upstreamBaseUrl ||
+      !settings.remoteSolverAuthToken ||
+      !settings.remoteSolverRegisteredId ||
+      !attempt?.resultId ||
+      attempt.simJobId !== claim.executionId ||
+      attempt.engineJobId !== claim.executionId ||
+      typeof promiseId !== "string"
+    )
+      throw new Error("Progressive archive source ownership is unavailable");
+    const progressiveEvidence = await progressiveWorkerEvidenceReference(
+      db,
+      claim.executionId,
+      attempt.id,
+    );
+    if (
+      progressiveEvidence.pointContentSignature !== claim.pointContentSignature
+    )
+      throw new Error(
+        "Progressive archive claim differs from its retained source",
+      );
+    const artifacts = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(solverEvidenceArtifacts.resultId, attempt.resultId),
+          eq(solverEvidenceArtifacts.resultAttemptId, attempt.id),
+          eq(solverEvidenceArtifacts.engineJobId, claim.executionId),
+          sql`${solverEvidenceArtifacts.engineCaseSlug} IS NOT DISTINCT FROM ${attempt.engineCaseSlug}`,
+        ),
+      );
+    const manifests = artifacts.filter(
+      (artifact) => artifact.kind === "manifest",
+    );
+    const bundles = artifacts.filter(
+      (artifact) => artifact.kind === "engine_bundle",
+    );
+    if (manifests.length !== 1 || bundles.length !== 1)
+      throw new Error(
+        "Progressive archive requires one exact manifest and one engine bundle",
+      );
+    const manifest = manifests[0]!;
+    const bundle = bundles[0]!;
+    const metadata = (bundle.metadata ?? {}) as Record<string, unknown>;
+    const source = {
+      solverId: settings.remoteSolverRegisteredId,
+      promiseId,
+      engineJobId: claim.executionId,
+      aoaDeg: attempt.aoaDeg,
+      engineCaseSlug: attempt.engineCaseSlug,
+      remoteResultId: attempt.resultId,
+      remoteResultAttemptId: attempt.id,
+      progressiveEvidence,
+    };
+    const brokerRequest = {
+      ...source,
+      idempotencyKey: brokeredEvidenceIdempotencyKey(promiseId, attempt.id),
+      storedSha256: bundle.sha256.toLowerCase(),
+      storedByteSize: bundle.byteSize,
+      tarSha256: String(metadata.uncompressedTarSha256 ?? "").toLowerCase(),
+      tarByteSize: Number(metadata.uncompressedTarByteSize ?? 0),
+      manifestSha256: manifest.sha256.toLowerCase(),
+      manifestByteSize: manifest.byteSize,
+      zstdLevel: Number(metadata.zstdLevel ?? 0),
+      bundledFileCount: Number(metadata.bundledFileCount ?? 0),
+    };
+    if (
+      ![
+        brokerRequest.storedSha256,
+        brokerRequest.tarSha256,
+        brokerRequest.manifestSha256,
+      ].every((hash) => /^[a-f0-9]{64}$/.test(hash)) ||
+      ![
+        brokerRequest.storedByteSize,
+        brokerRequest.tarByteSize,
+        brokerRequest.manifestByteSize,
+        brokerRequest.bundledFileCount,
+      ].every((size) => Number.isSafeInteger(size) && size > 0) ||
+      !Number.isInteger(brokerRequest.zstdLevel) ||
+      brokerRequest.zstdLevel < 1 ||
+      brokerRequest.zstdLevel > 22
+    )
+      throw new Error(
+        "Progressive archive lacks its exact stored and uncompressed identities",
+      );
+    const uploads: StreamUpload[] = [
+      {
+        fieldName: "evidence_manifest",
+        storageKey: manifest.storageKey,
+        mimeType: manifest.mimeType,
+        sha256: manifest.sha256,
+        byteSize: manifest.byteSize,
+      },
+    ];
+    await preflightMultipartUploads(uploads);
+    transferLease = await startRemotePromiseTransferLease(
+      db,
+      engine,
+      settings,
+      promiseId,
+      () => renewProgressiveWorkerArchiveClaim(db, claim),
+      { renewUpstreamPromise: false },
+    );
+    const request = async (path: string, payload: unknown, timeout: number) => {
+      const response = await fetch(`${syncBase(settings)}${path}`, {
+        method: "POST",
+        headers: headers(settings),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.any([
+          transferLease!.signal,
+          AbortSignal.timeout(timeout),
+        ]),
+      });
+      const body = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null;
+      if (!response.ok || !body)
+        throw new Error(
+          `Progressive archive broker ${path} failed (${response.status})`,
+        );
+      return body;
+    };
+    let broker = await request(
+      "/evidence-uploads",
+      brokerRequest,
+      REMOTE_POLL_TIMEOUT_MS,
+    );
+    if (broker.state === "issued") {
+      if (
+        typeof broker.id !== "string" ||
+        typeof broker.uploadUrl !== "string" ||
+        typeof broker.bucket !== "string" ||
+        broker.objectKey !==
+          `solver-evidence/v1/sha256/${brokerRequest.storedSha256.slice(0, 2)}/${brokerRequest.storedSha256}.tar.zst`
+      )
+        throw new Error(
+          "Progressive archive broker omitted its exact upload capability",
+        );
+      await preflightRequiredEvidenceSource(bundle);
+      const generation = await uploadBrokeredEvidenceFile(
+        broker.uploadUrl,
+        { bucket: broker.bucket, objectKey: String(broker.objectKey) },
+        bundle.storageKey,
+        bundle.byteSize,
+        async () => {
+          transferLease!.throwIfFailed();
+        },
+        transferLease.signal,
+      );
+      broker = await request(
+        `/evidence-uploads/${broker.id}/verify`,
+        { generation },
+        REMOTE_PUSH_ABSOLUTE_TIMEOUT_MS,
+      );
+    }
+    const pointer = broker.remote as Record<string, unknown> | undefined;
+    if (
+      typeof broker.id !== "string" ||
+      !["verified", "bound"].includes(String(broker.state)) ||
+      !pointer ||
+      typeof pointer.bucket !== "string" ||
+      typeof pointer.objectKey !== "string" ||
+      pointer.objectKey !==
+        `solver-evidence/v1/sha256/${brokerRequest.storedSha256.slice(0, 2)}/${brokerRequest.storedSha256}.tar.zst` ||
+      typeof pointer.generation !== "string" ||
+      !pointer.generation ||
+      typeof pointer.crc32c !== "string" ||
+      !pointer.crc32c
+    )
+      throw new Error(
+        "Progressive archive broker omitted its verified generation",
+      );
+    const remote = {
+      bucket: pointer.bucket,
+      objectKey: pointer.objectKey,
+      generation: pointer.generation,
+      crc32c: pointer.crc32c,
+      storedSha256: brokerRequest.storedSha256,
+      storedByteSize: brokerRequest.storedByteSize,
+      tarSha256: brokerRequest.tarSha256,
+      tarByteSize: brokerRequest.tarByteSize,
+      manifestSha256: brokerRequest.manifestSha256,
+      manifestByteSize: brokerRequest.manifestByteSize,
+      zstdLevel: brokerRequest.zstdLevel,
+      bundledFileCount: brokerRequest.bundledFileCount,
+    };
+    const payload = {
+      promiseId,
+      sourceInstanceId: settings.instanceId,
+      sourceInstanceName: settings.instanceName,
+      results: [
+        {
+          ...source,
+          progressiveArchiveOnly: true,
+          evidenceArtifacts: [
+            {
+              kind: "manifest",
+              mimeType: manifest.mimeType,
+              sha256: manifest.sha256,
+              byteSize: manifest.byteSize,
+              uploadField: "evidence_manifest",
+            },
+            {
+              kind: "engine_bundle",
+              mimeType: bundle.mimeType,
+              sha256: bundle.sha256,
+              byteSize: bundle.byteSize,
+              remoteEvidenceUploadId: broker.id,
+              metadata: {
+                ...metadata,
+                ...remote,
+                storageBackend: "gcs",
+                tarByteSize: String(remote.tarByteSize),
+                manifestByteSize: String(remote.manifestByteSize),
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const boundary = `progressive-archive-${randomUUID()}`;
+    const manifestJson = JSON.stringify(payload);
+    const uploadAbort = createProgressAwareAbort();
+    let body: {
+      conflictIds?: unknown[];
+      progressiveArchiveReceipts?: unknown[];
+    } | null;
+    try {
+      const response = await fetch(`${syncBase(settings)}/polars`, {
+        method: "POST",
+        duplex: "half",
+        signal: AbortSignal.any([transferLease.signal, uploadAbort.signal]),
+        headers: {
+          ...headers(settings),
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+          "content-length": String(
+            multipartPolarContentLength(boundary, manifestJson, uploads),
+          ),
+        },
+        body: Readable.from(
+          multipartPolarBody(boundary, manifestJson, uploads, async () => {
+            uploadAbort.progress();
+            transferLease!.throwIfFailed();
+          }),
+        ) as unknown as RequestInit["body"],
+      } as RequestInit & { duplex: "half" });
+      body = (await response.json().catch(() => null)) as typeof body;
+      if (!response.ok)
+        throw new Error(
+          `Progressive archive import failed (${response.status})`,
+        );
+    } finally {
+      uploadAbort.dispose();
+    }
+    if (
+      body?.conflictIds?.length ||
+      body?.progressiveArchiveReceipts?.length !== 1
+    )
+      throw new Error(
+        "Progressive archive import did not return exact custody",
+      );
+    transferLease.throwIfFailed();
+    await recordProgressiveWorkerArchiveCustody(
+      db,
+      body.progressiveArchiveReceipts[0],
+      {
+        source,
+        brokeredUploadId: broker.id,
+        remote,
+      },
+    );
+    await settleProgressiveWorkerArchiveClaim(db, claim);
+    return true;
+  } catch (error) {
+    await settleProgressiveWorkerArchiveClaim(db, claim, error);
+    return false;
+  } finally {
+    await transferLease?.stop();
+  }
+}
+
 async function pushOneRemoteResult(
   db: DB,
   engine: EngineClient,
@@ -4397,6 +4887,11 @@ async function pushOneRemoteResult(
   result: typeof results.$inferSelect,
 ): Promise<boolean> {
   const attempt = await currentAttemptForResult(db, job, result);
+  const progressiveEvidence = (
+    job.requestPayload as Record<string, unknown> | null
+  )?.remoteProgressiveExecution
+    ? await progressiveWorkerEvidenceReference(db, job.id, attempt.id)
+    : undefined;
   const [runtime] = attempt.solverRuntimeBuildId
     ? await db
         .select({
@@ -4598,6 +5093,7 @@ async function pushOneRemoteResult(
       // broker request. The deterministic UUID preserves both properties.
       idempotencyKey: brokeredEvidenceIdempotencyKey(promiseId, attempt.id),
       promiseId,
+      progressiveEvidence,
       remoteResultId: result.id,
       remoteResultAttemptId: attempt.id,
       aoaDeg: attempt.aoaDeg,
@@ -4860,6 +5356,7 @@ async function pushOneRemoteResult(
       remoteResultId: result.id,
       remoteResultAttemptId: attempt.id,
       evidencePayload: attempt.evidencePayload,
+      progressiveEvidence,
       forceHistory: attemptForceHistory(attempt),
       // A fulfilled replay is a storage-container upgrade, not a second
       // publication pass. Keep the accepted media/extents immutable on the
@@ -4923,6 +5420,7 @@ async function pushOneRemoteResult(
       fulfilledAoas?: unknown[];
       unfulfilledAoas?: unknown[];
       bindingReceipts?: unknown[];
+      progressiveArchiveReceipts?: unknown[];
       error?: unknown;
     } | null;
     try {
@@ -4989,6 +5487,43 @@ async function pushOneRemoteResult(
         conflictIds,
       });
       throw new Error(error);
+    }
+    if (progressiveEvidence) {
+      if (responsePayload?.progressiveArchiveReceipts?.length !== 1)
+        throw new Error(
+          "Progressive archive delivery omitted its exact custody receipt",
+        );
+      await recordProgressiveWorkerArchiveCustody(
+        db,
+        responsePayload.progressiveArchiveReceipts[0],
+        {
+          source: {
+            solverId: settings.remoteSolverRegisteredId!,
+            promiseId,
+            engineJobId: job.id,
+            aoaDeg: attempt.aoaDeg,
+            engineCaseSlug: attempt.engineCaseSlug,
+            remoteResultId: result.id,
+            remoteResultAttemptId: attempt.id,
+            progressiveEvidence,
+          },
+          brokeredUploadId: remoteEvidenceUploadId,
+          remote: {
+            bucket: String(remotePointer.bucket),
+            objectKey: String(remotePointer.objectKey),
+            generation: String(remotePointer.generation),
+            crc32c: String(remotePointer.crc32c),
+            storedSha256: brokerRequest.storedSha256,
+            storedByteSize: brokerRequest.storedByteSize,
+            tarSha256: brokerRequest.tarSha256,
+            tarByteSize: brokerRequest.tarByteSize,
+            manifestSha256: brokerRequest.manifestSha256,
+            manifestByteSize: brokerRequest.manifestByteSize,
+            zstdLevel: brokerRequest.zstdLevel,
+            bundledFileCount: brokerRequest.bundledFileCount,
+          },
+        },
+      );
     }
     const exactFulfilled = responsePayload?.fulfilledAoas?.some(
       (aoa) => typeof aoa === "number" && aoa === result.aoaDeg,
@@ -6380,11 +6915,20 @@ export async function reconcileRemoteSolverTick(
     assertRemoteSolverNodeEvidenceContract(
       settings?.remoteSolverEnabled ?? false,
     );
+    const progressive = await reconcileProgressiveRemoteWorker(db, engine);
+    if (progressive.inspected)
+      console.log(
+        JSON.stringify({
+          component: "progressive-remote-observation",
+          ...progressive,
+        }),
+      );
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.remoteSolverLastStatus !== "disabled")
         await setStatus(db, "disabled", null);
       return false;
     }
+    await refreshProgressiveWorkerCapabilities(db, engine);
     if (!settings.remoteSolverRegisteredId || !settings.remoteSolverAuthToken) {
       if (!settings.upstreamSecret)
         throw new Error(
@@ -6392,6 +6936,11 @@ export async function reconcileRemoteSolverTick(
         );
       await registerSolver(db, settings);
     }
+    const intake = await receiveProgressiveCampaignAssignments(db, engine);
+    if (intake.seen || intake.errors.length)
+      console.log(
+        JSON.stringify({ component: "progressive-remote-intake", ...intake }),
+      );
     await renewMirroredPromiseLeases(db, engine, settings);
     await expireMirroredRemotePromises(db, settings);
     await releaseUnacceptedPromiseResults(db, settings);
@@ -6450,6 +6999,7 @@ export async function transferRemoteSolverTick(
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
         await cancelMirroredPromisesForDisabledSolver(db, engine, settings);
+        return deliverNextProgressiveWorkerArchive(db, engine);
       }
       return false;
     }
@@ -6463,6 +7013,7 @@ export async function transferRemoteSolverTick(
       // unrelated valid result behind it.
       (await processRemoteResultDeliveries(db, engine, settings)) ||
       (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
+      (await deliverNextProgressiveWorkerArchive(db, engine)) ||
       (await processRestartableRemotePrecalcCheckpoint(db, engine, settings));
     const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
     if (readyPromiseId) {
@@ -6619,6 +7170,7 @@ export async function admitRemoteSolverTick(
     // promise), while independent promises fill every available token.
     const MAX_ADMISSIONS_PER_TICK = 16;
     let admitted = false;
+    const attemptedAssignments = new Set<string>();
     for (let attempt = 0; attempt < MAX_ADMISSIONS_PER_TICK; attempt++) {
       if ((await remoteReservedCpuSlots(db, settings)) >= remoteCap) break;
       if (engineBackoffActive()) {
@@ -6628,6 +7180,65 @@ export async function admitRemoteSolverTick(
           "remote solver is waiting for the shared engine connection backoff",
         );
         break;
+      }
+      const [assigned] = await db.execute(sql`
+        SELECT job.id FROM sim_jobs job JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
+        WHERE job.status = 'pending' AND job.engine_state IS NULL AND job.engine_job_id IS NULL
+          AND job.request_payload->>'remoteSolver' = 'true' AND job.request_payload ? 'remoteProgressiveExecution'
+          AND promise.registered_solver_id = ${settings.remoteSolverRegisteredId}::uuid
+          AND promise.source_base_url = ${syncBase(settings)} AND job.request_payload->>'upstreamBaseUrl' = ${syncBase(settings)}
+          AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+          AND NOT EXISTS (SELECT 1 FROM progressive_worker_submission_intents intent WHERE intent.sim_job_id = job.id)
+          ${
+            attemptedAssignments.size
+              ? sql`AND job.id NOT IN (${sql.join(
+                  [...attemptedAssignments].map((id) => sql`${id}::uuid`),
+                  sql`, `,
+                )})`
+              : sql``
+          }
+        ORDER BY job."updatedAt", job.id LIMIT 1
+      `);
+      if (assigned) {
+        const jobId = String(assigned.id);
+        attemptedAssignments.add(jobId);
+        try {
+          const submitted = await submitProgressiveRemoteJob(db, engine, jobId);
+          if (submitted.kind === "submitted") admitted = true;
+          if (submitted.kind === "stop_required") {
+            await db
+              .update(simJobs)
+              .set({
+                status: "cancelled",
+                engineState: "cancel_pending",
+                error: submitted.reason,
+              })
+              .where(eq(simJobs.id, jobId));
+            const observed = await observeProgressiveRemoteJob(
+              db,
+              engine,
+              jobId,
+              { stop: true },
+            );
+            if (observed.stopped)
+              await db
+                .update(simJobs)
+                .set({ engineState: "cancelled" })
+                .where(eq(simJobs.id, jobId));
+          }
+        } catch (error) {
+          await db
+            .update(simJobs)
+            .set({
+              error: error instanceof Error ? error.message : String(error),
+            })
+            .where(eq(simJobs.id, jobId));
+        }
+        await db
+          .update(simJobs)
+          .set({ updatedAt: new Date() })
+          .where(eq(simJobs.id, jobId));
+        continue;
       }
       const mirrored = await mirroredRemotePromiseIds(db, settings);
       let outcome: RemotePromiseSubmitResult | null = null;

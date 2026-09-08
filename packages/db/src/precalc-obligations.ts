@@ -2293,6 +2293,7 @@ export interface PrecalcTerminalSettlementOptions {
     | "none"
     | "hard_solver"
     | "deterministic_mesh"
+    | "material_domain"
     | "infrastructure"
     | null;
   /** Typed continuation-stage failure emitted by the engine before CFD starts.
@@ -2613,6 +2614,7 @@ export async function settlePrecalcObligationsForJobInTransaction(
     const deterministic = Boolean(
       continuationFailureKind == null &&
       (failureDisposition === "deterministic_mesh" ||
+        failureDisposition === "material_domain" ||
         (failureDisposition == null && isDeterministicMeshBlockerError(error))),
     );
     const restartable = Boolean(

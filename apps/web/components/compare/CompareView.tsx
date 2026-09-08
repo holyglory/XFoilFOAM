@@ -15,7 +15,7 @@ import {
   type PolarPointData,
   xyOf,
 } from "@aerodb/core";
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { AirfoilSelector } from "@/components/AirfoilSelector";
 import { getAirfoilDetail } from "@/lib/api";
@@ -26,6 +26,8 @@ import {
   primaryPolarEvidencePoints,
 } from "@/lib/polar-series";
 import { C, MONO, VIZ } from "@/lib/tokens";
+import { comparisonHref, parseCompareSelection } from "@/lib/compare-selection";
+import { ProgressiveCompareView } from "./ProgressiveCompareView";
 
 const COLORS = ["#2dd4bf", "#a78bfa", "#f56565", "#38bdf8"];
 const CHART_TABS: ["clcd" | "cla" | "lda", string][] = [
@@ -34,7 +36,7 @@ const CHART_TABS: ["clcd" | "cla" | "lda", string][] = [
   ["lda", "L/D–α"],
 ];
 interface Sel {
-  a: AirfoilSummary;
+  a: Pick<AirfoilSummary, "slug" | "name" | "thicknessPct" | "camberPct">;
   color: string;
   points: PolarPointData[];
   m: PolarFitMetrics | null;
@@ -43,29 +45,102 @@ interface Sel {
 
 export function CompareView({
   items: initialItems,
+  initialSelection = null,
+  initialDetails = {},
+  initialUnavailable = [],
 }: {
   items: AirfoilSummary[];
+  initialSelection?: string[] | null;
+  initialDetails?: Record<string, AirfoilDetailPayload>;
+  initialUnavailable?: string[];
 }) {
   const items = initialItems;
+  const [interactive, setInteractive] = useState(false);
   const [slugs, setSlugs] = useState<string[]>(
-    initialItems.slice(0, 2).map((a) => a.slug),
+    initialSelection ?? initialItems.slice(0, 2).map((a) => a.slug),
   );
   const [chartType, setChartType] = useState<"clcd" | "cla" | "lda">("clcd");
   const [requestedSeriesId, setRequestedSeriesId] = useState<string | null>(
     null,
   );
-  const [details, setDetails] = useState<Record<string, AirfoilDetailPayload>>(
-    {},
+  const [details, setDetails] =
+    useState<Record<string, AirfoilDetailPayload>>(initialDetails);
+  const [errors, setErrors] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      initialUnavailable.map((slug) => [slug, "Profile unavailable."]),
+    ),
+  );
+  const controllers = useRef(new Map<string, AbortController>());
+
+  useEffect(() => setInteractive(true), []);
+
+  useEffect(
+    () => () => {
+      for (const controller of controllers.current.values()) controller.abort();
+      controllers.current.clear();
+    },
+    [],
   );
 
   useEffect(() => {
-    slugs.forEach((s) => {
-      if (!details[s])
-        getAirfoilDetail(s).then(
-          (d) => d && setDetails((prev) => ({ ...prev, [s]: d })),
-        );
-    });
-  }, [slugs, details]);
+    for (const slug of slugs) {
+      if (details[slug] || errors[slug] || controllers.current.has(slug))
+        continue;
+      const controller = new AbortController();
+      controllers.current.set(slug, controller);
+      getAirfoilDetail(slug, null, controller.signal)
+        .then((detail) => {
+          if (controllers.current.get(slug) !== controller) return;
+          if (detail)
+            setDetails((previous) => ({ ...previous, [slug]: detail }));
+          else
+            setErrors((previous) => ({
+              ...previous,
+              [slug]: "Profile unavailable.",
+            }));
+        })
+        .catch(() => {
+          if (
+            controllers.current.get(slug) === controller &&
+            !controller.signal.aborted
+          )
+            setErrors((previous) => ({
+              ...previous,
+              [slug]: "Could not load this profile.",
+            }));
+        })
+        .finally(() => {
+          if (controllers.current.get(slug) === controller)
+            controllers.current.delete(slug);
+        });
+    }
+  }, [slugs, details, errors]);
+
+  const changeSelection = (next: string[]) => {
+    const selection = parseCompareSelection(next)!;
+    for (const [slug, controller] of controllers.current) {
+      if (!selection.includes(slug)) {
+        controller.abort();
+        controllers.current.delete(slug);
+      }
+    }
+    setSlugs(selection);
+    setDetails((previous) =>
+      Object.fromEntries(
+        Object.entries(previous).filter(([slug]) => selection.includes(slug)),
+      ),
+    );
+    setErrors((previous) =>
+      Object.fromEntries(
+        Object.entries(previous).filter(([slug]) => selection.includes(slug)),
+      ),
+    );
+    window.history.replaceState(
+      null,
+      "",
+      comparisonHref(selection, window.location.search),
+    );
+  };
 
   const seriesOptions = useMemo(
     () => polarSeriesOptions(slugs.map((slug) => details[slug])),
@@ -79,9 +154,13 @@ export function CompareView({
   const selected: Sel[] = useMemo(() => {
     const out: Sel[] = [];
     slugs.forEach((s, i) => {
-      const a = items.find((x) => x.slug === s);
-      if (!a) return;
       const detail = details[s];
+      const a = items.find((item) => item.slug === s) ?? {
+        slug: s,
+        name: detail?.name ?? s,
+        thicknessPct: detail?.geometry.thicknessPct ?? null,
+        camberPct: detail?.geometry.camberPct ?? null,
+      };
       const polar = selectedSeriesId
         ? detail?.polars.find(
             (candidate) => candidate.seriesId === selectedSeriesId,
@@ -99,6 +178,19 @@ export function CompareView({
     });
     return out;
   }, [slugs, items, selectedSeriesId, details]);
+  const hasProgressive = selected.some(
+    (profile) => profile.detail?.progressivePolars?.length,
+  );
+  const progressiveProfiles = useMemo(
+    () =>
+      selected.map((profile) => ({
+        slug: profile.a.slug,
+        name: profile.a.name,
+        color: profile.color,
+        series: profile.detail?.progressivePolars ?? [],
+      })),
+    [selected],
+  );
 
   return (
     <div>
@@ -138,11 +230,15 @@ export function CompareView({
             {s.a.name}
             <button
               type="button"
-              onClick={() => setSlugs((v) => v.filter((x) => x !== s.a.slug))}
+              aria-label={`Remove ${s.a.name} from comparison`}
+              disabled={!interactive}
+              onClick={() =>
+                changeSelection(slugs.filter((slug) => slug !== s.a.slug))
+              }
               style={{
                 background: "none",
                 border: "none",
-                color: C.dim,
+                color: C.muted,
                 cursor: "pointer",
                 fontSize: 13,
                 padding: 0,
@@ -154,118 +250,165 @@ export function CompareView({
         ))}
         {slugs.length < 4 && (
           <AirfoilSelector
+            disabled={!interactive}
             items={items}
             exclude={slugs}
-            onSelect={(a) =>
-              setSlugs((v) =>
-                v.includes(a.slug) || v.length >= 4 ? v : [...v, a.slug],
-              )
-            }
+            onSelect={(airfoil) => changeSelection([...slugs, airfoil.slug])}
           />
         )}
+        {slugs.length > 0 && (
+          <button
+            type="button"
+            onClick={() => changeSelection([])}
+            disabled={!interactive}
+            style={{
+              color: C.muted,
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+            }}
+          >
+            Clear comparison
+          </button>
+        )}
+        {!hasProgressive && (
+          <div
+            style={{
+              marginLeft: "auto",
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                background: C.panel2,
+                border: `1px solid ${C.stroke2}`,
+                borderRadius: 9,
+                padding: 3,
+                gap: 2,
+              }}
+            >
+              {CHART_TABS.map(([id, label]) => {
+                const on = chartType === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setChartType(id)}
+                    style={{
+                      fontFamily: MONO,
+                      fontSize: 11,
+                      border: "none",
+                      borderRadius: 6,
+                      padding: "6px 11px",
+                      cursor: "pointer",
+                      background: on ? C.tabActive : "transparent",
+                      color: on ? C.teal : C.muted,
+                      fontWeight: on ? 600 : 400,
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+            <select
+              aria-label="Polar operating condition"
+              value={selectedSeriesId ?? ""}
+              disabled={seriesOptions.length === 0}
+              onChange={(e) => setRequestedSeriesId(e.target.value || null)}
+              style={{
+                fontFamily: MONO,
+                fontSize: 12,
+                color: C.muted,
+                background: C.panel3,
+                border: `1px solid ${C.stroke}`,
+                borderRadius: 8,
+                padding: "7px 11px",
+                cursor: seriesOptions.length ? "pointer" : "default",
+              }}
+            >
+              {seriesOptions.length === 0 && (
+                <option value="">No polar data</option>
+              )}
+              {seriesOptions.map((option) => (
+                <option
+                  key={option.seriesId}
+                  value={option.seriesId}
+                  style={{ background: C.panel }}
+                >
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {slugs.length === 0 && (
+        <p role="status">Choose profiles to compare their polars.</p>
+      )}
+      {slugs.some((slug) => !details[slug] && !errors[slug]) && (
+        <p role="status">Loading selected profiles…</p>
+      )}
+      {slugs
+        .filter((slug) => errors[slug])
+        .map((slug) => (
+          <p key={slug} role="alert" style={{ color: C.text2 }}>
+            {details[slug]?.name ??
+              items.find((item) => item.slug === slug)?.name ??
+              slug}
+            : {errors[slug]}{" "}
+            <button
+              type="button"
+              disabled={!interactive}
+              onClick={() =>
+                setErrors((previous) => {
+                  const next = { ...previous };
+                  delete next[slug];
+                  return next;
+                })
+              }
+            >
+              Retry
+            </button>
+          </p>
+        ))}
+      {hasProgressive ? (
+        <ProgressiveCompareView profiles={progressiveProfiles} />
+      ) : (
         <div
           style={{
-            marginLeft: "auto",
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
+            display: "grid",
+            gridTemplateColumns: "1.4fr 1fr",
+            gap: 20,
+            alignItems: "start",
           }}
         >
           <div
             style={{
-              display: "flex",
-              background: C.panel2,
-              border: `1px solid ${C.stroke2}`,
-              borderRadius: 9,
-              padding: 3,
-              gap: 2,
+              background: VIZ.bg,
+              border: `1px solid ${C.border}`,
+              borderRadius: 12,
+              padding: "16px 16px 8px",
             }}
           >
-            {CHART_TABS.map(([id, label]) => {
-              const on = chartType === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => setChartType(id)}
-                  style={{
-                    fontFamily: MONO,
-                    fontSize: 11,
-                    border: "none",
-                    borderRadius: 6,
-                    padding: "6px 11px",
-                    cursor: "pointer",
-                    background: on ? C.tabActive : "transparent",
-                    color: on ? C.teal : C.muted,
-                    fontWeight: on ? 600 : 400,
-                  }}
-                >
-                  {label}
-                </button>
-              );
-            })}
+            <CompareChart selected={selected} chartType={chartType} />
           </div>
-          <select
-            aria-label="Polar operating condition"
-            value={selectedSeriesId ?? ""}
-            disabled={seriesOptions.length === 0}
-            onChange={(e) => setRequestedSeriesId(e.target.value || null)}
+          <div
             style={{
-              fontFamily: MONO,
-              fontSize: 12,
-              color: C.muted,
-              background: C.panel3,
-              border: `1px solid ${C.stroke}`,
-              borderRadius: 8,
-              padding: "7px 11px",
-              cursor: seriesOptions.length ? "pointer" : "default",
+              background: C.panel,
+              border: `1px solid ${C.border}`,
+              borderRadius: 12,
+              overflow: "hidden",
             }}
           >
-            {seriesOptions.length === 0 && (
-              <option value="">No polar data</option>
-            )}
-            {seriesOptions.map((option) => (
-              <option
-                key={option.seriesId}
-                value={option.seriesId}
-                style={{ background: C.panel }}
-              >
-                {option.label}
-              </option>
-            ))}
-          </select>
+            <DiffTable selected={selected} />
+          </div>
         </div>
-      </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "1.4fr 1fr",
-          gap: 20,
-          alignItems: "start",
-        }}
-      >
-        <div
-          style={{
-            background: VIZ.bg,
-            border: `1px solid ${C.border}`,
-            borderRadius: 12,
-            padding: "16px 16px 8px",
-          }}
-        >
-          <CompareChart selected={selected} chartType={chartType} />
-        </div>
-        <div
-          style={{
-            background: C.panel,
-            border: `1px solid ${C.border}`,
-            borderRadius: 12,
-            overflow: "hidden",
-          }}
-        >
-          <DiffTable selected={selected} />
-        </div>
-      </div>
+      )}
     </div>
   );
 }

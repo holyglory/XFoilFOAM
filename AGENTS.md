@@ -198,20 +198,22 @@
 
 ## Solver Evidence Versus Valid Polars
 
-- Treat stored solver evidence and valid polar points as separate concepts.
-- Apply the global no-fake rule strictly: no generated placeholder, invented,
-  synthesized, reference, sample, or estimated geometry, aerodynamic
-  coefficients, polars, rankings, media, status, or action controls may appear
-  anywhere in runtime product/API behavior. If OpenFOAM or source geometry
-  evidence is missing, show a missing or queued state and keep the relevant
-  values null.
+- Treat immutable solver evidence, accepted CFD points, actual NeuralFoil
+  predictions, and composite polar estimates as distinct concepts. The approved
+  progressive-polar contract in `docs/progressive-polars.md` explicitly permits
+  evidence-derived estimates; it does not permit fabricated solver results.
+- Never insert placeholder coefficients, demo geometry, simulated execution
+  status, invented media, or estimated values into solver-evidence tables. Real
+  NeuralFoil predictions and composite estimates have their own identities,
+  provenance, uncertainty and caches. Missing predictions and missing source
+  geometry remain unavailable, never replaced by a stock airfoil or sample polar.
 - Airfoil geometry must come from imported coordinates, trusted seed coordinate
   files, or an explicit deterministic airfoil definition requested by the user
   and stored with provenance. Never seed or retain random/demo `pw-%` profiles
   or invented shapes as catalog data.
 - A completed solver row proves a calculation happened; it does not prove the
   result is physically acceptable for a published polar.
-- Final polar curves must include only accepted points: URANS results with
+- Accepted CFD-only polar curves must include only accepted points: URANS results with
   stored unsteady evidence, or RANS results that converged and were not marked
   stalled. Detail views may also show `needs_urans` RANS evidence as
   provisional points with a distinct visual style and explanation.
@@ -219,16 +221,20 @@
   evidence for the same AoA arrives. Once accepted URANS exists, the matching
   RANS evidence becomes `superseded_by_urans` and must be excluded from final
   metrics and final curves.
-- Failed, non-converged, stalled, noisy, or otherwise rejected RANS attempts must
-  remain stored as evidence/attempt history so they are not silently repeated,
-  but they must not be drawn as valid polar curves or used for Browse ranking.
+- Failed, non-converged, stalled, noisy, or otherwise rejected RANS attempts stay
+  in attempt history and are never relabeled accepted CFD. Informative finite
+  histories may contribute to a separately classified composite estimate with
+  appropriate uncertainty; divergent, corrupt, incompatible and startup-only
+  evidence may not. Explicitly requested solver-domain resets may discard the
+  old history under the reset rules above.
 - Tests that touch solver display must assert both sides of the contract:
   rejected evidence is retained, and rejected evidence is excluded from valid
   polar metrics/charts.
-- Chart legends, polar tabs, ranking rows, and comparison chips must be created
-  only from accepted stored solver points. Do not render configured Reynolds,
-  queued sweeps, defaults, or zero-count placeholders as if they were polars;
-  scheduled/running work belongs in a separate queue/work panel.
+- Public charts display cached curves first, with CFD points opt-in. Create polar
+  entries only from real cached predictions, composite estimates or accepted CFD
+  curves, never configured Reynolds, queued sweeps or zero-count placeholders.
+  Method comparisons name only methods which actually contributed evidence or a
+  real prediction. Queue state remains separate from aerodynamic results.
 - When a chart/list/table item represents a stored solver evidence row,
   follow-up actions must use the stable evidence id (`resultId`, attempt id, or
   preset revision id) instead of rediscovering the row from rounded display
@@ -239,6 +245,9 @@
   that differ only in sweep, scheduling, output, or provenance may contribute
   to one public polar; same-Re evidence with different flow, geometry,
   boundary, mesh, or solver values must remain separate series.
+- Multi-fidelity fusion uses a separate exact physical-target identity and an
+  explicit relationship between fast and precise numerical recipes. Do not
+  weaken the existing CFD compatibility key to combine meshes or solver settings.
 - Public-detail tests must conserve eligible stored evidence across the
   Solver Work and polar-chart read models: every verified/provisional result
   exposed for a public-compatible setup must remain reachable by its stable
@@ -259,10 +268,10 @@
 - Do not show persistent legend semantics such as "post-stall -> URANS" unless
   the displayed data actually contains such points or state. Generic pipeline
   legends create false expectations about unscheduled or unavailable evidence.
-- Browse/Search/Compare metrics must be derived from the cached fitted polar for
-  the actual solved setup revision, not from ad hoc raw result aggregation. If
-  no fit cache exists, aerodynamic metric cells stay empty until the cache is
-  rebuilt from stored evidence.
+- Browse/Search/Compare metrics come from the same cached composite curve shown
+  on Detail, with its physical-target identity and provenance. CFD-only metrics
+  use their exact accepted setup revision. Neither path uses ad hoc raw-result
+  aggregation; if its applicable cache is missing, metric cells remain empty.
 - Fitted polar caches are evidence-derived artifacts. They must include an
   evidence signature/version, mark final versus provisional status, and be
   refreshed after solver ingestion, URANS supersession, imports, migrations, or
@@ -369,6 +378,10 @@
   fixed.
 
 ## RANS Sweep Abort And URANS Promotion
+
+These are the legacy evidence-preserving promotion rules. Progressive campaigns
+instead follow `docs/progressive-polars.md`: a failed fast anchor never promotes
+the whole campaign polar to URANS or bypasses the strict campaign-stage barrier.
 
 - Batch polars should be submitted as continuous marched sweeps whenever the
   goal is to build a production polar, so the engine can observe whether the

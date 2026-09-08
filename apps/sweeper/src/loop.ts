@@ -5,6 +5,7 @@ import {
   type DB,
   enforceSweeperAdmissionFence,
   findCampaignGapBatch,
+  reconcileCampaignProfileEnrollment,
   results,
   simJobs,
   simulationPresetRevisions,
@@ -13,12 +14,11 @@ import {
 } from "@aerodb/db";
 import {
   ensureEnabledSimulationPresetRevisions,
-  ensureSimulationPresetRevision,
   snapshotAoas,
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 
 import {
   admissionCpuSlotsForRequest,
@@ -32,23 +32,16 @@ import {
   refreshDiskAdmission,
 } from "./disk-admission";
 import { configuredAdmissionFencePolicy } from "./config";
-import {
-  submitCampaignPrecalcRecoveries,
-  submitInterleavedVerifyIfDue,
-  submitPendingPointCorrectionFastRequest,
-  submitRemotePromisePrecalcRecoveries,
-  submitRecordedPromotionRecovery,
-  uransLadderTick,
-} from "./urans-ladder";
+import { admitProgressiveCfdBatch } from "./progressive-admission";
+import { submitPendingPointCorrectionFastRequest } from "./urans-ladder";
+import { engineProgressiveCapabilities } from "./engine-capabilities";
+import { prepareProgressiveRemoteFleet } from "./progressive-remote-admission";
+import { reconcileProgressiveRemoteProgress } from "./progressive-remote-progress";
 import {
   clearEngineUnreachable,
   engineBackoffActive,
   recordEngineUnreachable,
 } from "./engine-backoff";
-import {
-  engineMeshRecoveryVersion,
-  engineUransRecoveryVersion,
-} from "./engine-capabilities";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { type ContinuousBatch, findGaps, firstBatch } from "./gaps";
 import {
@@ -68,6 +61,8 @@ import {
 } from "./remote-solver";
 import { retentionTick } from "./retention";
 import { retryScopeForRequestedPolar } from "./retry-plan";
+import { effectiveMaxConcurrentJobs } from "./solver-capacity";
+export { effectiveMaxConcurrentJobs } from "./solver-capacity";
 import {
   solverQueuePressure,
   submitPendingJobWithLifecycleGuard,
@@ -92,18 +87,6 @@ interface SweeperConfig {
  * the engine through compose; retain a conservative fallback for unusual
  * local/development deployments that do not set it.
  */
-export function effectiveMaxConcurrentJobs(
-  configuredMax: number | null | undefined,
-  cpuSlots: number | null | undefined,
-  workerBudget = Number(process.env.AIRFOILFOAM_WORKER_CPU_BUDGET ?? 2),
-): number {
-  if (Number.isInteger(cpuSlots) && (cpuSlots ?? 0) > 0)
-    return cpuSlots as number;
-  if (Number.isInteger(configuredMax) && (configuredMax ?? 0) > 0)
-    return configuredMax as number;
-  return Number.isInteger(workerBudget) && workerBudget > 0 ? workerBudget : 2;
-}
-
 export async function getState(db: DB): Promise<SweeperConfig> {
   // Projected select (not select()) so the sweeper keeps working while the
   // 0026 engineUnreachableSince column has not been applied yet.
@@ -294,7 +277,7 @@ async function submitComposedJob(
   return false;
 }
 
-async function submitContinuousBatch(
+export async function submitContinuousBatch(
   db: DB,
   engine: EngineClient,
   batch: ContinuousBatch,
@@ -306,8 +289,20 @@ async function submitContinuousBatch(
     .from(airfoils)
     .where(eq(airfoils.id, batch.airfoilId))
     .limit(1);
-  const setup = await ensureSimulationPresetRevision(db, batch.presetId);
-  if (!a || !setup) return false;
+  const [revision] = await db
+    .select()
+    .from(simulationPresetRevisions)
+    .where(
+      and(
+        eq(simulationPresetRevisions.id, batch.presetRevisionId),
+        eq(simulationPresetRevisions.presetId, batch.presetId),
+      ),
+    );
+  if (!a || !revision) return false;
+  const setup = {
+    revision,
+    snapshot: revision.snapshot as unknown as SimulationSetupSnapshot,
+  };
   const executionPool = await requireExecutionPoolForSetup(db, setup.snapshot);
   const bcId = setup.snapshot.preset.legacyBoundaryConditionId ?? batch.bcId;
   const retryScope = retryScopeForRequestedPolar(
@@ -751,6 +746,20 @@ export async function tick(
   // (heartbeat fresh, tick >5 min without completing) from this pair —
   // liveness itself is the independent index.ts timer.
   await markTickStarted(db);
+  await reconcileCampaignProfileEnrollment(db);
+  const remoteProgress = await reconcileProgressiveRemoteProgress(db);
+  if (
+    remoteProgress.applied ||
+    remoteProgress.indexed ||
+    remoteProgress.settled ||
+    remoteProgress.errors.length
+  )
+    console.log(
+      JSON.stringify({
+        component: "progressive-remote-progress",
+        ...remoteProgress,
+      }),
+    );
   const preReconcileFence = await checkAdmissionFence(db, "before_reconcile");
   await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
   // Reconciliation can be the operation which records a blocked obligation or
@@ -775,7 +784,7 @@ export async function tick(
   let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;
   const admissionFenceGuardFailed =
     preReconcileFence.guardFailed || postReconcileFence.guardFailed;
-  let inFlightJobs = await inFlight(db);
+  const inFlightJobs = await inFlight(db);
   // Disk pressure blocks admission only. Reconciliation, partial ingestion,
   // retention and heartbeat progress above remain live so the system can
   // recover automatically instead of turning storage pressure into fake job
@@ -791,252 +800,96 @@ export async function tick(
       diskAdmission = await refreshDiskAdmission(db, engine);
     }
   }
-  // Its NEW RANS lane is considered only after durable FAST URANS below.
-  // Dedicated remote-solver instances intentionally leave the local scheduler
-  // disabled and use their independent remote CPU budget. In mixed mode,
-  // mirrored RANS shares the visible local capacity and must wait rather than
-  // queueing ahead of FAST URANS while every slot is occupied.
-  const sharedRemoteCapacityAvailable =
-    !state.enabled || inFlightJobs < state.maxConcurrentJobs;
-  let localCapacityOpen =
+  if (
+    state.enabled &&
+    !admissionFenced &&
+    !admissionFenceGuardFailed &&
+    diskAdmission.allowed
+  ) {
+    const remote = await prepareProgressiveRemoteFleet(db);
+    if (remote.prepared || remote.errors.length)
+      console.log(
+        JSON.stringify({ component: "progressive-remote-dispatch", ...remote }),
+      );
+  }
+  const remediationDue =
+    !admissionFenceGuardFailed &&
+    (preReconcileFence.hazardPresent || postReconcileFence.hazardPresent);
+  const admissionEligible =
     state.enabled &&
     !admissionFenced &&
     diskAdmission.allowed &&
     inFlightJobs < state.maxConcurrentJobs;
-  const remoteFastCapacityOpen =
-    remoteAdmissionReady &&
-    sharedRemoteCapacityAvailable &&
-    !admissionFenced &&
-    diskAdmission.allowed;
-  const anyNewAdmissionEligible =
-    !admissionFenced &&
-    diskAdmission.allowed &&
-    (localCapacityOpen || remoteAdmissionReady);
-
-  let engineHealthy = false;
-  let meshRecoveryVersion: number | null = null;
-  let uransRecoveryVersion: number | null = null;
-  let fastUransSubmitted = false;
-  let fastUransExhausted = false;
-
-  // One capability/health decision owns every local-engine NEW lane, including
-  // work mirrored from an upstream hub. Unknown capability is never v0.
-  // A latched safety stop closes only NEW work. Reconciliation above may have
-  // just persisted a deterministic mesh blocker from an older engine
-  // strategy, so capability discovery and the bounded versioned ledger
-  // transition must remain live behind the fence. That transition is not an
-  // admission: this tick remains fenced even when it successfully reopens the
-  // exact blocker, and only a later explicit Resume may submit it.
-  const fencedMeshRemediationDue =
-    !admissionFenceGuardFailed &&
-    (preReconcileFence.hazardPresent || postReconcileFence.hazardPresent);
-  if (
-    (anyNewAdmissionEligible || fencedMeshRemediationDue) &&
-    !engineBackoffActive()
-  ) {
-    try {
-      engineHealthy = await engine.health();
-    } catch {
-      engineHealthy = false;
-    }
-    if (!engineHealthy) {
-      await recordEngineUnreachable(db);
-    } else {
-      await clearEngineUnreachable(db);
-      meshRecoveryVersion =
-        localCapacityOpen || fencedMeshRemediationDue
-          ? await prepareAutomaticMeshRecovery(db, engine)
-          : await engineMeshRecoveryVersion(engine);
-      if (fencedMeshRemediationDue) {
-        // The latch is deliberately not cleared by remediation. Re-read the
-        // guard after the durable transition so a concurrent or unrelated
-        // critical outcome is retained as current provenance; either way the
-        // pre/post gates above make this entire tick admission-free.
-        const postRemediationFence = await checkAdmissionFence(
-          db,
-          "after_mesh_remediation",
-        );
-        admissionFenced =
-          admissionFenced ||
-          postRemediationFence.blocked ||
-          postRemediationFence.guardFailed;
-      }
-      if (meshRecoveryVersion == null) {
-        console.error(
-          "[sweeper] NEW admission deferred: engine mesh-recovery capability is unavailable or malformed; FAST URANS, remote RANS, and ordinary RANS remain queued",
-        );
-      } else if (localCapacityOpen || remoteFastCapacityOpen) {
-        uransRecoveryVersion = await engineUransRecoveryVersion(engine);
-        // A recorded whole-polar promotion and an exact targeted RANS
-        // rejection are normal automatic escalation work. They own every
-        // available slot before mirrored remote RANS or any other new RANS
-        // lane. One-at-a-time submission left a 64-slot remote node half empty
-        // while a long batch tail released many one-angle obligations at once,
-        // so refill the independently fenced lane in this tick. Every composer
-        // still crosses the serialized submit lifecycle, and disk/capacity are
-        // re-measured after each accepted job.
-        const MAX_FAST_URANS_ADMISSIONS_PER_TICK = 16;
-        let pointCorrectionConsideredThisTick = false;
-        for (let i = 0; i < MAX_FAST_URANS_ADMISSIONS_PER_TICK; i++) {
-          if (engineBackoffActive()) break;
-          diskAdmission = await refreshDiskAdmission(db, engine);
-          if (!diskAdmission.allowed) break;
-          if (
-            localCapacityOpen &&
-            (await inFlight(db)) >= state.maxConcurrentJobs
-          ) {
-            localCapacityOpen = false;
-          }
-          const promotedSubmitted = await submitRecordedPromotionRecovery(
-            db,
-            engine,
-            state.cpuSlots,
-            {
-              meshRecoveryVersion,
-              uransRecoveryVersion,
-              ...(!localCapacityOpen ? { syncPromiseOnly: true } : {}),
-            },
-          );
-          const pointCorrectionAdmission: {
-            attempted: boolean;
-            submitted: boolean;
-          } = shouldAttemptPointCorrectionFast({
-            promotionSubmitted: promotedSubmitted,
-            localCapacityOpen,
-            consideredThisTick: pointCorrectionConsideredThisTick,
-          })
-            ? await submitPendingPointCorrectionFastRequest(
-                db,
-                engine,
-                state.cpuSlots,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              )
-            : { attempted: false, submitted: false };
-          pointCorrectionConsideredThisTick =
-            pointCorrectionConsideredThisTick ||
-            pointCorrectionAdmission.attempted;
-          const pointCorrectionSubmitted = pointCorrectionAdmission.submitted;
-          const campaignTargetedSubmitted = campaignFastMayUseThisIteration({
-            promotionSubmitted: promotedSubmitted,
-            pointCorrectionSubmitted,
-            localCapacityOpen,
-          })
-            ? await submitCampaignPrecalcRecoveries(
-                db,
-                engine,
-                undefined,
-                undefined,
-                meshRecoveryVersion,
-                uransRecoveryVersion,
-              )
-            : false;
-          const remoteTargetedSubmitted =
-            promotedSubmitted ||
-            pointCorrectionSubmitted ||
-            campaignTargetedSubmitted ||
-            !remoteFastCapacityOpen
-              ? false
-              : await submitRemotePromisePrecalcRecoveries(
-                  db,
-                  engine,
-                  meshRecoveryVersion,
-                  uransRecoveryVersion,
-                );
-          const submitted =
-            promotedSubmitted ||
-            pointCorrectionSubmitted ||
-            campaignTargetedSubmitted ||
-            remoteTargetedSubmitted;
-          if (!submitted) {
-            fastUransExhausted = true;
-            break;
-          }
-          fastUransSubmitted = true;
-        }
-      }
-    }
+  if ((!admissionEligible && !remediationDue) || engineBackoffActive()) {
+    await markTickCompleted(db);
+    return;
   }
-
-  let remoteAdmissionConsumed = false;
+  let healthy = false;
+  try {
+    healthy = await engine.health();
+  } catch {
+    healthy = false;
+  }
+  if (!healthy) {
+    await recordEngineUnreachable(db);
+    await markTickCompleted(db);
+    return;
+  }
+  await clearEngineUnreachable(db);
+  const meshRecoveryVersion = await prepareAutomaticMeshRecovery(db, engine);
+  if (remediationDue) {
+    const remediatedFence = await checkAdmissionFence(
+      db,
+      "after_mesh_remediation",
+    );
+    admissionFenced =
+      admissionFenced || remediatedFence.blocked || remediatedFence.guardFailed;
+  }
+  if (!admissionEligible || admissionFenced || meshRecoveryVersion == null) {
+    await markTickCompleted(db);
+    return;
+  }
+  const { uransRecoveryVersion, solverBudgetVersion } =
+    await engineProgressiveCapabilities(engine);
   if (remoteAdmissionReady) {
-    const decision = remoteAdmissionDecisionForTick({
-      admissionFenced,
-      diskAllowed: diskAdmission.allowed,
-      fastUransSubmitted: fastUransOwnsRemainingAdmission({
-        submitted: fastUransSubmitted,
-        exhausted: fastUransExhausted,
-      }),
-      sharedCapacityAvailable: sharedRemoteCapacityAvailable,
-      engineHealthy,
+    await admitRemoteSolverTick(db, engine, {
+      kind: "allow",
       meshRecoveryVersion,
     });
-    remoteAdmissionConsumed = await admitRemoteSolverTick(db, engine, decision);
-    if (remoteAdmissionConsumed) {
-      inFlightJobs = await inFlight(db);
-      diskAdmission = await refreshDiskAdmission(db, engine);
-      localCapacityOpen =
-        state.enabled &&
-        !admissionFenced &&
-        diskAdmission.allowed &&
-        inFlightJobs < state.maxConcurrentJobs;
-    }
+    await markTickCompleted(db);
+    return;
   }
-
-  // Local work can use any capacity left after the remote refill. Recheck the
-  // shared backoff because a remote submit attempt may have discovered a
-  // connection failure after the successful health probe.
-  if (
-    localCapacityOpen &&
-    engineHealthy &&
-    meshRecoveryVersion != null &&
-    !fastUransOwnsRemainingAdmission({
-      submitted: fastUransSubmitted,
-      exhausted: fastUransExhausted,
-    }) &&
-    !engineBackoffActive()
-  ) {
-    // Fill every remaining weighted slot in this tick. Each composer still
-    // claims one independent polar and the submit lifecycle fence serializes
-    // the final admission, so concurrent ticks cannot over-admit. Persistent
-    // priority logic decides what each successive slot receives.
-    const MAX_LOCAL_ADMISSIONS_PER_TICK = 16;
-    for (let i = 0; i < MAX_LOCAL_ADMISSIONS_PER_TICK; i++) {
-      if ((await inFlight(db)) >= state.maxConcurrentJobs) break;
-      if (engineBackoffActive()) break;
-      // A clean start may have several empty slots. Re-measure after every
-      // successful submission so its exact DB job shape joins the active
-      // future-growth forecast before another slot is filled. One permissive
-      // pre-loop decision must never authorize a multi-job storage burst.
-      diskAdmission = await refreshDiskAdmission(db, engine);
-      if (!diskAdmission.allowed) break;
-      const interleavedVerifySubmitted = await submitInterleavedVerifyIfDue(
-        db,
-        engine,
-        state.cpuSlots,
-        {
-          uransRecoveryVersion,
-        },
+  if (uransRecoveryVersion != null)
+    await submitPendingPointCorrectionFastRequest(
+      db,
+      engine,
+      state.cpuSlots,
+      meshRecoveryVersion,
+      uransRecoveryVersion,
+    );
+  for (let admission = 0; admission < state.maxConcurrentJobs; admission += 1) {
+    if (
+      engineBackoffActive() ||
+      (await inFlight(db)) >= state.maxConcurrentJobs
+    )
+      break;
+    await touchHeartbeat(db);
+    diskAdmission = await refreshDiskAdmission(db, engine);
+    if (!diskAdmission.allowed) break;
+    const receipt = await admitProgressiveCfdBatch(db, engine, {
+      meshRecoveryVersion,
+      uransRecoveryVersion,
+      solverBudgetVersion,
+    });
+    if (receipt.kind === "capability_wait")
+      console.warn(
+        JSON.stringify({ component: "progressive-cfd-admission", ...receipt }),
       );
-      if (interleavedVerifySubmitted) continue;
-      const ransSubmitted = await submitOneBatch(
-        db,
-        engine,
-        state.cpuSlots,
-        meshRecoveryVersion,
-      );
-      if (ransSubmitted) continue;
-      const ladderSubmitted = await uransLadderTick(
-        db,
-        engine,
-        state.cpuSlots,
-        {
-          meshRecoveryVersion,
-          uransRecoveryVersion,
-        },
-      );
-      if (!ladderSubmitted) break;
-    }
+    if (receipt.kind !== "attempted") break;
+    console.log(
+      JSON.stringify({ component: "progressive-cfd-admission", ...receipt }),
+    );
+    if (receipt.outcome.kind !== "submitted") break;
   }
   await markTickCompleted(db);
 }

@@ -1076,6 +1076,8 @@ function stubFetch(
           headers: { "content-type": "application/json" },
         },
       );
+    if (url.includes("/progressive-executions?"))
+      return Response.json({ items: [], nextCursor: null });
     if (url.endsWith("/sweeps/claim"))
       return new Response(
         JSON.stringify({

@@ -27,6 +27,7 @@ from matplotlib.path import Path as MplPath  # noqa: E402
 import meshio  # noqa: E402
 
 from ..models import FRAME_TRACK_MAX_FRAMES, ImageField  # noqa: E402
+from .pressure_reference import read_pressure_reference
 
 # field -> (label, matplotlib colormap)
 _FIELD_STYLE = {
@@ -360,17 +361,29 @@ def _extract_value(mesh: "meshio.Mesh", mask: np.ndarray, field: ImageField) -> 
 
 
 def _field_values(
-    mesh: "meshio.Mesh", mask: np.ndarray, f2d: _Field2D, field: ImageField, freestream_speed: float
+    mesh: "meshio.Mesh", mask: np.ndarray, f2d: _Field2D, field: ImageField, freestream_speed: float,
+    *, case_dir: Path | None = None,
 ) -> np.ndarray:
     """Per-node field values, including the derived vorticity / Cp fields."""
     if field == ImageField.vorticity:
         U = np.asarray(mesh.point_data["U"])[mask]
         return compute_vorticity(f2d.triang, U[:, 0], U[:, 1])
+    reference = read_pressure_reference(case_dir) if case_dir is not None and field in {ImageField.pressure, ImageField.pressure_coefficient} else None
     if field == ImageField.pressure_coefficient:
         p = np.asarray(mesh.point_data["p"])[mask]
+        if reference is not None:
+            if freestream_speed > 0 and not np.isclose(freestream_speed, reference.speed, rtol=1e-6, atol=0):
+                raise ValueError("Render speed differs from stored compressible reference evidence")
+            return (p - reference.pressure_pa) / (0.5 * reference.density * reference.speed ** 2)
         q = 0.5 * max(freestream_speed, 1e-9) ** 2
         return p / q
     return _extract_value(mesh, mask, field)
+
+
+def _field_style(field: ImageField, case_dir: Path):
+    if field == ImageField.pressure and read_pressure_reference(case_dir) is not None:
+        return "Static pressure p [Pa]", "coolwarm"
+    return _FIELD_STYLE[field]
 
 
 def _build_triangulation(mesh: "meshio.Mesh", airfoil_xy: np.ndarray) -> tuple[np.ndarray, _Field2D]:
@@ -452,7 +465,7 @@ def compute_field_extents(
             if field in failed:
                 continue
             try:
-                values = _field_values(mesh, mask, f2d, field, freestream_speed)
+                values = _field_values(mesh, mask, f2d, field, freestream_speed, case_dir=case_dir)
             except (KeyError, ValueError):
                 failed.add(field)
                 continue
@@ -543,9 +556,9 @@ def render_contours(
 
     results: dict[str, str] = {}
     for field in fields:
-        label, cmap = _FIELD_STYLE[field]
         try:
-            values = _field_values(mesh, mask, f2d, field, freestream_speed)
+            values = _field_values(mesh, mask, f2d, field, freestream_speed, case_dir=case_dir)
+            label, cmap = _field_style(field, case_dir)
         except (KeyError, ValueError):
             continue
         vmin, vmax = _scale_for(field_scales, field)
@@ -611,7 +624,7 @@ def render_mean_contours(
                     u_sum = uv if u_sum is None else u_sum + uv
                     frame_supported.add(field)
                     continue
-                vals = _field_values(mesh, mask, f2d, field, freestream_speed)
+                vals = _field_values(mesh, mask, f2d, field, freestream_speed, case_dir=case_dir)
             except (KeyError, ValueError):
                 continue
             frame_supported.add(field)
@@ -626,7 +639,7 @@ def render_mean_contours(
     for field in fields:
         if field not in (supported or set()) or field not in acc:
             continue
-        label, cmap = _FIELD_STYLE[field]
+        label, cmap = _field_style(field, case_dir)
         vmin, vmax = _scale_for(field_scales, field)
         fig, ax = plt.subplots(figsize=(9, 6))
         _draw_field(
@@ -742,7 +755,7 @@ def render_animations(
             if field in failed:
                 continue
             try:
-                per_field[field].append(_field_values(mesh, mask, f2d, field, freestream_speed))
+                per_field[field].append(_field_values(mesh, mask, f2d, field, freestream_speed, case_dir=case_dir))
             except (KeyError, ValueError):
                 failed.add(field)
 
@@ -761,7 +774,7 @@ def render_animations(
         if vmin is None or vmax is None:
             allv = np.concatenate(frames)
             vmin, vmax = (float(np.percentile(allv, 2)), float(np.percentile(allv, 98)))
-        label, cmap = _FIELD_STYLE[field]
+        label, cmap = _field_style(field, case_dir)
         title = f"{label}{(' — ' + title_suffix) if title_suffix else ''}"
 
         def draw(ax, i: int, frames=frames, label=label, cmap=cmap, title=title, vmin=vmin, vmax=vmax) -> None:
@@ -847,7 +860,7 @@ def render_frame_track_images(
             if field in failed:
                 continue
             try:
-                per_field[field].append(_field_values(mesh, mask, f2d, field, freestream_speed))
+                per_field[field].append(_field_values(mesh, mask, f2d, field, freestream_speed, case_dir=case_dir))
             except (KeyError, ValueError):
                 failed.add(field)
 
@@ -866,7 +879,7 @@ def render_frame_track_images(
             break
         frames_vals = per_field[field]
         vmin, vmax = _robust_frame_track_scale(field, frames_vals)
-        _label, cmap = _FIELD_STYLE[field]
+        _label, cmap = _field_style(field, case_dir)
         field_dir = out_root / field.value
         field_dir.mkdir(parents=True, exist_ok=True)
         complete = True
@@ -957,14 +970,14 @@ def render_custom_field(
         else:
             acc = None
             for vtu in selected:
-                vals = _field_values(meshio.read(vtu), mask, f2d, field, freestream_speed)
+                vals = _field_values(meshio.read(vtu), mask, f2d, field, freestream_speed, case_dir=case_dir)
                 acc = vals if acc is None else acc + vals
             assert acc is not None
             values = acc / len(selected)
     else:
-        values = _field_values(meshio.read(selected[0]), mask, f2d, field, freestream_speed)
+        values = _field_values(meshio.read(selected[0]), mask, f2d, field, freestream_speed, case_dir=case_dir)
 
-    label, default_cmap = _FIELD_STYLE[field]
+    label, default_cmap = _field_style(field, case_dir)
     cmap = colormap or default_cmap
     xlim = (-zoom_chords * chord, (1.0 + zoom_chords) * chord)
     ylim = (-zoom_chords * chord, zoom_chords * chord)

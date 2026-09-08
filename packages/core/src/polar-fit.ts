@@ -239,6 +239,7 @@ export interface PolarEvidencePoint {
     | "none"
     | "hard_solver"
     | "deterministic_mesh"
+    | "material_domain"
     | "infrastructure"
     | null;
   finalResidual?: number | null;
@@ -429,6 +430,7 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     reasons.push("non-physical-coefficients");
   }
   if (p.error) reasons.push("solver-error");
+  if (p.failureDisposition === "material_domain") reasons.push("material-domain");
   // Oscillating-steady acceptance (v4, ladder contract 2): a steady solve that
   // settled into a bounded oscillation and was mean-averaged over a stable
   // window (steady_history.mean_stable === true) IS valid RANS evidence — the
@@ -886,6 +888,7 @@ export function isAutomaticRansPrecalcHandoffEvidence(
 ): boolean {
   if (
     evidence.failureDisposition === "deterministic_mesh" ||
+    evidence.failureDisposition === "material_domain" ||
     evidence.failureDisposition === "infrastructure"
   ) {
     return false;

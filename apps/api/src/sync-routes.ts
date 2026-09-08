@@ -21,6 +21,21 @@ import {
   referenceGeometryProfiles,
   registerVerifiedBrokeredEvidenceArchive,
   registeredRemoteSolvers,
+  progressiveRemoteDispatches,
+  ProgressiveRemoteEvidenceConflict,
+  ProgressiveCfdEvidenceScopeClosed,
+  assertProgressiveReportedManifest,
+  recordProgressiveRemoteEvidenceReceipt,
+  readProgressiveRemoteEvidenceReceipt,
+  readProgressiveEvidenceCustodyReceipt,
+  signProgressiveEvidenceCustodyReceipt,
+  type ProgressiveEvidenceCustodyReceipt,
+  ProgressiveRemoteReportConflict,
+  storeProgressiveRemoteReport,
+  listProgressiveRemoteAssignments,
+  readProgressiveRemoteAssignment,
+  readProgressiveRemoteContinuation,
+  authorizeProgressiveRemoteStart,
   remoteAssetReferences,
   resultAttempts,
   resultClassifications,
@@ -37,6 +52,7 @@ import {
   solverEvidenceArtifacts,
   simCampaignPoints,
   simCampaigns,
+  simJobs,
   simUransVerifyQueue,
   simUransVerifyQueueCampaigns,
   SYNC_BLOB_LOCK_NAMESPACE,
@@ -58,7 +74,17 @@ import {
   enqueuePrecalcVerifications,
   hasExactVerifiedRestartableEvidenceArchive,
 } from "@aerodb/db";
-import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
+import {
+  canonicalRemoteHubBaseUrl,
+  parseGasThermodynamicModel,
+  evaluateGasState,
+  polarEvidencePublicationRank,
+} from "@aerodb/core";
+import type { EngineRuntimeIdentity } from "@aerodb/engine-client";
+import {
+  assertProgressivePolarImportScope,
+  prepareProgressivePolarImport,
+} from "./progressive-polar-import";
 import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import {
   ensureEnabledSimulationPresetRevisions,
@@ -258,6 +284,13 @@ const solverHeartbeatSchema = solverRegisterSchema.partial().extend({
 });
 
 const brokeredEvidenceRequestSchema = z.object({
+  progressiveEvidence: z
+    .object({
+      sequence: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+      reportContentSignature: z.string().regex(/^[a-f0-9]{64}$/),
+      pointContentSignature: z.string().regex(/^[a-f0-9]{64}$/),
+    })
+    .optional(),
   idempotencyKey: z.string().uuid(),
   promiseId: z.string().uuid(),
   remoteResultId: z.string().uuid(),
@@ -389,20 +422,22 @@ const syncEngineRuntimeSchema = z
       .optional(),
     architecture: z.string().trim().nullable().optional(),
   })
-  .transform((engine) => ({
-    family: engine.family,
-    distribution: engine.distribution,
-    version: engine.version,
-    numerics_revision: engine.numericsRevision,
-    adapter_contract_version: engine.adapterContractVersion,
-    build_id: engine.buildId,
-    source_revision: engine.sourceRevision ?? null,
-    image_digest: engine.imageDigest ?? null,
-    application_source_sha256: engine.applicationSourceSha256 ?? null,
-    package_sha256: engine.packageSha256 ?? null,
-    binary_sha256: engine.binarySha256 ?? null,
-    architecture: engine.architecture ?? null,
-  }));
+  .transform(
+    (engine): EngineRuntimeIdentity => ({
+      family: engine.family,
+      distribution: engine.distribution,
+      version: engine.version,
+      numerics_revision: engine.numericsRevision,
+      adapter_contract_version: engine.adapterContractVersion,
+      build_id: engine.buildId,
+      source_revision: engine.sourceRevision ?? null,
+      image_digest: engine.imageDigest ?? null,
+      application_source_sha256: engine.applicationSourceSha256 ?? null,
+      package_sha256: engine.packageSha256 ?? null,
+      binary_sha256: engine.binarySha256 ?? null,
+      architecture: engine.architecture ?? null,
+    }),
+  );
 
 const polarPointSchema = z.object({
   aoaDeg: z.coerce.number(),
@@ -446,6 +481,14 @@ const polarPointSchema = z.object({
   engineCaseSlug: z.string().nullable().optional(),
   remoteResultId: z.string().uuid().optional(),
   remoteResultAttemptId: z.string().uuid().optional(),
+  progressiveArchiveOnly: z.boolean().optional(),
+  progressiveEvidence: z
+    .object({
+      sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      reportContentSignature: z.string().regex(/^[a-f0-9]{64}$/),
+      pointContentSignature: z.string().regex(/^[a-f0-9]{64}$/),
+    })
+    .optional(),
   evidencePayload: z.record(z.unknown()).optional(),
   forceHistory: forceHistorySchema.optional(),
   fieldExtents: z.array(z.record(z.unknown())).default([]),
@@ -971,6 +1014,17 @@ function mediumValuesFromPayload(data: Record<string, unknown>) {
   );
   const density = numberWithFallback(data.density, 1);
   const phase: "gas" | "liquid" = data.phase === "liquid" ? "liquid" : "gas";
+  const rawGasModel = data.gasThermodynamics ?? data.gas_thermodynamics;
+  const gasThermodynamics = rawGasModel == null ? null : parseGasThermodynamicModel(rawGasModel);
+  if (gasThermodynamics != null) {
+    const referenceTemperature = data.refTemperatureK ?? data.ref_temperature_k;
+    const referencePressure = data.refPressurePa ?? data.ref_pressure_pa;
+    const referenceViscosity = data.dynamicViscosity ?? data.dynamic_viscosity;
+    if (data.phase !== "gas" || typeof referenceTemperature !== "number" || typeof referencePressure !== "number" ||
+        ![data.density, referenceViscosity].every((value) => typeof value === "number" && Number.isFinite(value) && value > 0))
+      throw new Error("Explicit gas material sync requires its declared gas phase and reference state");
+    evaluateGasState(gasThermodynamics, referenceTemperature, referencePressure);
+  }
   return {
     slug,
     name: nullableText(data.name) ?? slug,
@@ -1002,6 +1056,7 @@ function mediumValuesFromPayload(data: Record<string, unknown>) {
       dynamicViscosity / density,
     ),
     speedOfSound: nullableNumber(data.speedOfSound ?? data.speed_of_sound),
+    gasThermodynamics,
     notes: nullableText(data.notes),
     isSeeded: false,
   };
@@ -4173,7 +4228,7 @@ async function isCancelledPromiseSettledEvidenceUpgrade(
   return true;
 }
 
-async function importPolarPush(
+export async function importPolarPush(
   payload: PolarPushPayload,
   files: Map<string, UploadedFileRef>,
   capacityReservation?: SyncUploadCapacityReservation | null,
@@ -4189,6 +4244,10 @@ async function importPolarPush(
   fulfilledAoas: number[];
   unfulfilledAoas: number[];
   bindingReceipts: HubBindingReceipt[];
+  progressiveArchiveReceipts: ProgressiveEvidenceCustodyReceipt[];
+  progressiveEvidenceReceipts: Array<
+    Awaited<ReturnType<typeof recordProgressiveRemoteEvidenceReceipt>>
+  >;
 }> {
   await expirePromises();
   const conflictIds: string[] = [];
@@ -4201,10 +4260,18 @@ async function importPolarPush(
   const fulfilledAoas: number[] = [];
   const unfulfilledAoas: number[] = [];
   const bindingReceipts: HubBindingReceipt[] = [];
+  const progressiveArchiveReceipts: ProgressiveEvidenceCustodyReceipt[] = [];
+  const retentionOnlyProgressive = new Set<number>();
+  const progressiveEvidenceReceipts: Array<
+    Awaited<ReturnType<typeof recordProgressiveRemoteEvidenceReceipt>>
+  > = [];
   let airfoilId: string | null = null;
   let revisionId: string | null = null;
   let bcId: string | null = payload.bcId ?? null;
   let promise: typeof syncSweepPromises.$inferSelect | null = null;
+  let progressive = new Map() as Awaited<
+    ReturnType<typeof prepareProgressivePolarImport>
+  >;
 
   if (payload.promiseId) {
     [promise] = await db
@@ -4212,6 +4279,14 @@ async function importPolarPush(
       .from(syncSweepPromises)
       .where(eq(syncSweepPromises.id, payload.promiseId))
       .limit(1);
+    progressive = await prepareProgressivePolarImport(
+      db,
+      payload,
+      promise?.registeredSolverId ?? null,
+    );
+    const progressiveReplay =
+      progressive.size === payload.results.length &&
+      [...progressive.values()].every((entry) => entry.receipt !== null);
     // Fulfilled/expired promises still identify their scope and the ingest is
     // idempotent — LATE chunks must land (validation incident 2026-07-11: a
     // ladder child's /complete fulfilled the promise after shipping 1 of 3
@@ -4225,7 +4300,9 @@ async function importPolarPush(
       (await isCancelledPromiseSettledEvidenceUpgrade(promise, payload));
     if (
       !promise ||
-      (promise.status === "cancelled" && !cancelledEvidenceUpgrade)
+      (promise.status === "cancelled" &&
+        !cancelledEvidenceUpgrade &&
+        !progressiveReplay)
     ) {
       throw new PolarPromiseScopeError("promise is not active");
     }
@@ -4240,6 +4317,10 @@ async function importPolarPush(
     }
     airfoilId = promise.airfoilId;
     revisionId = promise.simulationPresetRevisionId;
+  } else if (payload.results.some((point) => point.progressiveEvidence)) {
+    throw new ProgressiveRemoteEvidenceConflict(
+      "Progressive evidence requires its exact promise",
+    );
   } else if (payload.airfoilSlug) {
     const [airfoil] = await db
       .select({ id: airfoils.id })
@@ -4287,6 +4368,8 @@ async function importPolarPush(
       fulfilledAoas,
       unfulfilledAoas,
       bindingReceipts,
+      progressiveArchiveReceipts,
+      progressiveEvidenceReceipts,
     };
   }
 
@@ -4307,6 +4390,26 @@ async function importPolarPush(
     : [];
   const snapshot = jsonObject(revision?.snapshot);
   const snapshotPreset = jsonObject(snapshot.preset);
+  if (progressive.size) {
+    const executionId = progressive.values().next().value!.source.report
+      .executionId;
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, executionId))
+      .limit(1);
+    if (
+      !job ||
+      job.airfoilId !== airfoilId ||
+      job.simulationPresetRevisionId !== revisionId ||
+      job.bcIds.length !== 1
+    )
+      throw new ProgressiveRemoteEvidenceConflict(
+        "Progressive evidence changed its immutable setup ownership",
+      );
+    bcId = job.bcIds[0];
+    await assertProgressivePolarImportScope(db, progressive);
+  }
   // Never trust a pushing instance's bc id blindly: remote solvers send THEIR
   // database's uuid (validation incident 2026-07-11 — the Mac's local bc id
   // hit results_bc_id fk on the hub with a 500 on every chunk). Accept the
@@ -4347,6 +4450,8 @@ async function importPolarPush(
       fulfilledAoas,
       unfulfilledAoas,
       bindingReceipts,
+      progressiveArchiveReceipts,
+      progressiveEvidenceReceipts,
     };
   }
   const rawSourceInstanceId =
@@ -4380,11 +4485,14 @@ async function importPolarPush(
           eq(syncSweepPromisePoints.airfoilId, airfoilId),
           eq(syncSweepPromisePoints.simulationPresetRevisionId, revisionId),
           inArray(syncSweepPromisePoints.aoaDeg, pushedAoas),
-          inArray(syncSweepPromisePoints.status, [
-            "active",
-            "expired",
-            "fulfilled",
-          ]),
+          progressive.size &&
+            [...progressive.values()].every((entry) => entry.receipt !== null)
+            ? sql`true`
+            : inArray(syncSweepPromisePoints.status, [
+                "active",
+                "expired",
+                "fulfilled",
+              ]),
         ),
       );
     const ownedAoas = new Set(ownedPoints.map((point) => point.aoaDeg));
@@ -4419,14 +4527,46 @@ async function importPolarPush(
     brokeredUploadId: string | null;
     storageOnlyReplay: boolean;
   }> = [];
-  for (const point of payload.results) {
+  for (const transportedPoint of payload.results) {
+    const progressivePoint = progressive.get(transportedPoint.aoaDeg);
+    if (transportedPoint.progressiveArchiveOnly) {
+      if (
+        !progressivePoint ||
+        !(await readProgressiveRemoteEvidenceReceipt(
+          db,
+          progressivePoint.delivery,
+        ))
+      )
+        throw new ProgressiveRemoteEvidenceConflict(
+          "Archive-only delivery requires a previously retained progressive source",
+        );
+      if (
+        !transportedPoint.evidenceArtifacts.some(
+          (artifact) => artifact.kind === "manifest",
+        ) ||
+        !transportedPoint.evidenceArtifacts.some(
+          (artifact) =>
+            artifact.kind === "engine_bundle" &&
+            typeof artifact.remoteEvidenceUploadId === "string",
+        )
+      )
+        throw new ProgressiveRemoteEvidenceConflict(
+          "Archive-only delivery requires its manifest and brokered archive",
+        );
+      retentionOnlyProgressive.add(transportedPoint.aoaDeg);
+    }
+    const point = progressivePoint
+      ? { ...transportedPoint, ...progressivePoint.projection }
+      : transportedPoint;
     const runtime = await resolveEngineRuntimeBuild(db, point.engine);
     const rawEngineJobId =
       point.engineJobId ?? payload.promiseId ?? "direct-push";
-    const importedEngineJobId = `sync:${sourceInstanceId}:${syncIdentityToken(
-      rawEngineJobId,
-      "engineJobId",
-    )}`;
+    const importedEngineJobId = progressivePoint
+      ? rawEngineJobId
+      : `sync:${sourceInstanceId}:${syncIdentityToken(
+          rawEngineJobId,
+          "engineJobId",
+        )}`;
     const incomingResult: Partial<typeof results.$inferInsert> =
       remoteResultValues(point, bcId, importedEngineJobId, runtime);
     const { regime: attemptRegime, values: attemptValues } =
@@ -4438,6 +4578,14 @@ async function importPolarPush(
         engineJobId: importedEngineJobId,
         runtime,
       });
+    const ownedAttemptValues = progressivePoint
+      ? {
+          ...attemptValues,
+          simJobId: importedEngineJobId,
+          evidencePayload: progressivePoint.projection.evidencePayload,
+        }
+      : attemptValues;
+    if (progressivePoint) incomingResult.simJobId = importedEngineJobId;
     const insertAttemptForResult = async (tx: DB, resultId: string) => {
       const [existingAttempt] = await tx
         .select()
@@ -4448,7 +4596,9 @@ async function importPolarPush(
             eq(resultAttempts.aoaDeg, point.aoaDeg),
             eq(resultAttempts.regime, attemptRegime),
             sql`${resultAttempts.engineCaseSlug} IS NOT DISTINCT FROM ${point.engineCaseSlug ?? null}`,
-            isNull(resultAttempts.simJobId),
+            progressivePoint
+              ? eq(resultAttempts.simJobId, importedEngineJobId)
+              : isNull(resultAttempts.simJobId),
           ),
         )
         .limit(1);
@@ -4463,7 +4613,9 @@ async function importPolarPush(
             ),
           ) !==
           stableHash(
-            comparableRemoteAttempt(attemptValues as Record<string, unknown>),
+            comparableRemoteAttempt(
+              ownedAttemptValues as Record<string, unknown>,
+            ),
           )
         ) {
           return { kind: "conflict" as const, attempt: existingAttempt };
@@ -4477,7 +4629,7 @@ async function importPolarPush(
         .insert(resultAttempts)
         .values({
           resultId,
-          ...attemptValues,
+          ...ownedAttemptValues,
           solvedAt: point.status === "done" ? new Date() : null,
         })
         .returning({ id: resultAttempts.id });
@@ -4518,6 +4670,12 @@ async function importPolarPush(
       );
     }
     const manifestSha256 = manifests[0]?.stored.sha256 ?? null;
+    if (progressivePoint && manifests[0]) {
+      assertProgressiveReportedManifest(progressivePoint.source, {
+        manifestSha256: manifests[0].stored.sha256,
+        manifestByteSize: manifests[0].stored.byteSize,
+      });
+    }
     if (manifests[0] && manifests[0].stored.byteSize <= 0) {
       throw new PolarEvidenceBindingError(
         `point ${point.aoaDeg} exact-attempt manifest is empty`,
@@ -4555,6 +4713,11 @@ async function importPolarPush(
       await prepareBrokeredArchiveRegistration(preparedArtifacts);
     const resolution = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
+      if (progressivePoint)
+        await assertProgressivePolarImportScope(
+          tx,
+          new Map([[point.aoaDeg, progressivePoint]]),
+        );
       const orderedArtifactKeys = [...preparedArtifacts].sort((a, b) =>
         `${a.stored.storageKey}:${a.stored.sha256}`.localeCompare(
           `${b.stored.storageKey}:${b.stored.sha256}`,
@@ -4684,7 +4847,9 @@ async function importPolarPush(
             .where(
               and(
                 eq(resultAttempts.resultId, existing.id),
-                isNull(resultAttempts.simJobId),
+                progressivePoint
+                  ? eq(resultAttempts.simJobId, importedEngineJobId)
+                  : isNull(resultAttempts.simJobId),
                 eq(resultAttempts.engineJobId, importedEngineJobId),
                 sql`${resultAttempts.engineCaseSlug} IS NOT DISTINCT FROM ${point.engineCaseSlug ?? null}`,
                 eq(resultAttempts.aoaDeg, point.aoaDeg),
@@ -4737,6 +4902,8 @@ async function importPolarPush(
           .returning();
         createdResult = true;
         await acquireResultEvidenceLocks(tx, [existing.id]);
+      } else if (progressivePoint) {
+        kind = "equivalent";
       } else if (exactStorageOnlyReplay || equivalentResult(existing, point)) {
         if (!ownedContinuation && !exactReplayAttempt) {
           return { kind: "conflict" as const, existing };
@@ -4805,7 +4972,7 @@ async function importPolarPush(
         resultId: existing.id,
         resultAttemptId: attempt.id,
         airfoilId,
-        simJobId: null,
+        simJobId: progressivePoint ? importedEngineJobId : null,
         engineJobId: importedEngineJobId,
         engineCaseSlug: point.engineCaseSlug ?? null,
         methodKey: point.methodKey ?? null,
@@ -5290,7 +5457,9 @@ async function importPolarPush(
       brokeredUploadId:
         preparedArtifacts.find(({ stored }) => stored.brokeredUploadId)?.stored
           .brokeredUploadId ?? null,
-      storageOnlyReplay: resolution.storageOnlyReplay,
+      storageOnlyReplay:
+        transportedPoint.progressiveArchiveOnly === true ||
+        (resolution.storageOnlyReplay && !progressivePoint),
     });
   }
 
@@ -5300,20 +5469,44 @@ async function importPolarPush(
   // the old complete generation or the new complete generation.
   await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
     afterAttemptClassifications: async (tx) => {
+      const publishableProgressive = await assertProgressivePolarImportScope(
+        tx,
+        progressive,
+      );
+      for (const committed of committedPoints) {
+        const entry = progressive.get(committed.aoaDeg);
+        if (entry) {
+          if (!publishableProgressive.has(committed.aoaDeg))
+            retentionOnlyProgressive.add(committed.aoaDeg);
+          progressiveEvidenceReceipts.push(
+            await recordProgressiveRemoteEvidenceReceipt(tx, {
+              ...entry.delivery,
+              resultAttemptId: committed.attemptId,
+            }),
+          );
+          if (committed.brokeredUploadId)
+            progressiveArchiveReceipts.push(
+              await readProgressiveEvidenceCustodyReceipt(
+                tx,
+                entry.delivery,
+                committed.brokeredUploadId,
+              ),
+            );
+        }
+      }
       let promotedAny = false;
-      const fidelityRank = (
-        state: "accepted" | "needs_urans",
-        fidelity: string | null,
-        regime: "rans" | "urans" | null,
-      ) =>
-        (state === "accepted" ? 200 : 100) +
-        (fidelity === "urans_full"
-          ? 30
-          : fidelity === "urans_precalc" || regime === "urans"
-            ? 20
-            : 10);
       for (const committed of committedPoints) {
         if (committed.storageOnlyReplay) continue;
+        if (
+          progressive.has(committed.aoaDeg) &&
+          committed.observedCurrentAttemptId === committed.attemptId
+        )
+          continue;
+        if (
+          progressive.has(committed.aoaDeg) &&
+          !publishableProgressive.has(committed.aoaDeg)
+        )
+          continue;
         const [incomingClass] = await tx
           .select({ state: resultClassifications.state })
           .from(resultClassifications)
@@ -5378,14 +5571,14 @@ async function importPolarPush(
             const currentFidelity = nullableText(
               jsonObject(current.evidencePayload).fidelity,
             );
-            currentRank = fidelityRank(
+            currentRank = polarEvidencePublicationRank(
               current.state as "accepted" | "needs_urans",
               currentFidelity,
               current.regime,
             );
           }
         }
-        const incomingRank = fidelityRank(
+        const incomingRank = polarEvidencePublicationRank(
           incomingClass.state as "accepted" | "needs_urans",
           committed.fidelity,
           committed.regime,
@@ -5431,6 +5624,7 @@ async function importPolarPush(
   // generation is acknowledged only after its exact GCS archive is
   // restartable and one durable FINAL owner exists.
   for (const committed of committedPoints) {
+    if (progressive.has(committed.aoaDeg)) continue;
     const [selected] = await db
       .select({
         status: results.status,
@@ -5542,6 +5736,10 @@ async function importPolarPush(
 
   if (payload.promiseId) {
     for (const committed of committedPoints) {
+      if (retentionOnlyProgressive.has(committed.aoaDeg)) {
+        unfulfilledAoas.push(committed.aoaDeg);
+        continue;
+      }
       const pointSettlement = await db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as DB;
         const [classified] = (await tx.execute(sql`
@@ -5765,6 +5963,8 @@ async function importPolarPush(
     fulfilledAoas: [...new Set(fulfilledAoas)].sort((a, b) => a - b),
     unfulfilledAoas: [...new Set(unfulfilledAoas)].sort((a, b) => a - b),
     bindingReceipts,
+    progressiveArchiveReceipts,
+    progressiveEvidenceReceipts,
   };
 }
 
@@ -6671,6 +6871,220 @@ async function runUpstreamSync(
 }
 
 export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/api/sync/v1/progressive-executions", async (req, reply) => {
+    const solver = await requireRegisteredRemoteSolver(req, reply);
+    if (!solver) return;
+    const context = await getSettings();
+    if (
+      !context.settings.enabled ||
+      !context.permissions.find(
+        (permission) => permission.dataType === "sweeps",
+      )?.canFetch
+    )
+      return reply.code(403).send({ error: "fetch disabled for sweeps" });
+    const query = z
+      .object({
+        after: z.string().uuid().optional(),
+        limit: z.coerce.number().int().min(1).max(50).optional(),
+      })
+      .strict()
+      .safeParse(req.query);
+    if (!query.success)
+      return reply
+        .code(400)
+        .send({ error: "invalid progressive assignment query" });
+    return listProgressiveRemoteAssignments(db, {
+      solverId: solver.id,
+      ...query.data,
+    });
+  });
+
+  app.get(
+    "/api/sync/v1/progressive-executions/:executionId/control",
+    async (req, reply) => {
+      const solver = await requireRegisteredRemoteSolver(req, reply);
+      if (!solver) return;
+      const context = await getSettings();
+      if (
+        !context.settings.enabled ||
+        !context.permissions.find(
+          (permission) => permission.dataType === "sweeps",
+        )?.canFetch
+      )
+        return reply.code(403).send({ error: "fetch disabled for sweeps" });
+      const params = z
+        .object({ executionId: z.string().uuid() })
+        .safeParse(req.params);
+      if (!params.success)
+        return reply
+          .code(400)
+          .send({ error: "invalid progressive assignment identity" });
+      const [dispatch] =
+        await db.execute(sql`SELECT content_signature FROM progressive_remote_dispatches
+        WHERE sim_job_id = ${params.data.executionId}::uuid AND solver_id = ${solver.id}::uuid`);
+      if (!dispatch)
+        return reply
+          .code(404)
+          .send({ error: "progressive assignment not found" });
+      const identity = {
+        solverId: solver.id,
+        executionId: params.data.executionId,
+        contentSignature: String(dispatch.content_signature),
+      };
+      const continuation = await readProgressiveRemoteContinuation(
+        db,
+        identity,
+      );
+      return {
+        executionId: identity.executionId,
+        contentSignature: identity.contentSignature,
+        continuation,
+      };
+    },
+  );
+
+  app.get(
+    "/api/sync/v1/progressive-executions/:executionId",
+    async (req, reply) => {
+      const solver = await requireRegisteredRemoteSolver(req, reply);
+      if (!solver) return;
+      const context = await getSettings();
+      if (
+        !context.settings.enabled ||
+        !context.permissions.find(
+          (permission) => permission.dataType === "sweeps",
+        )?.canFetch
+      )
+        return reply.code(403).send({ error: "fetch disabled for sweeps" });
+      const params = z
+        .object({ executionId: z.string().uuid() })
+        .safeParse(req.params);
+      if (!params.success)
+        return reply
+          .code(400)
+          .send({ error: "invalid progressive assignment identity" });
+      const assignment = await readProgressiveRemoteAssignment(db, {
+        solverId: solver.id,
+        executionId: params.data.executionId,
+      });
+      if (!assignment)
+        return reply
+          .code(404)
+          .send({ error: "progressive assignment not found" });
+      const continuation = await readProgressiveRemoteContinuation(db, {
+        solverId: solver.id,
+        executionId: params.data.executionId,
+        contentSignature: assignment.envelope.contentSignature,
+      });
+      return { assignment, continuation };
+    },
+  );
+
+  app.post(
+    "/api/sync/v1/progressive-executions/:executionId/start",
+    async (req, reply) => {
+      const solver = await requireRegisteredRemoteSolver(req, reply);
+      if (!solver) return;
+      const params = z
+        .object({ executionId: z.string().uuid() })
+        .safeParse(req.params);
+      const body = z
+        .object({ contentSignature: z.string().regex(/^[a-f0-9]{64}$/) })
+        .strict()
+        .safeParse(req.body);
+      if (!params.success || !body.success)
+        return reply
+          .code(400)
+          .send({ error: "invalid progressive start request" });
+      const [dispatch] = await db
+        .select({
+          contentSignature: progressiveRemoteDispatches.contentSignature,
+        })
+        .from(progressiveRemoteDispatches)
+        .where(
+          and(
+            eq(progressiveRemoteDispatches.simJobId, params.data.executionId),
+            eq(progressiveRemoteDispatches.solverId, solver.id),
+          ),
+        )
+        .limit(1);
+      if (!dispatch)
+        return reply
+          .code(403)
+          .send({ error: "remote solver does not own this execution" });
+      if (dispatch.contentSignature !== body.data.contentSignature)
+        return reply
+          .code(409)
+          .send({ error: "start request changed the immutable assignment" });
+      const decision = await authorizeProgressiveRemoteStart(db, {
+        solverId: solver.id,
+        executionId: params.data.executionId,
+        contentSignature: body.data.contentSignature,
+      });
+      const [clock] = await db.execute(sql`SELECT clock_timestamp() AS at`);
+      return reply.code(decision.kind === "stop" ? 409 : 200).send({
+        decision,
+        checkedAt: new Date(clock.at as string | Date).toISOString(),
+      });
+    },
+  );
+
+  app.post(
+    "/api/sync/v1/progressive-executions/:executionId/reports",
+    { bodyLimit: SYNC_POLAR_PUSH_BODY_LIMIT_BYTES },
+    async (req, reply) => {
+      const solver = await requireRegisteredRemoteSolver(req, reply);
+      if (!solver) return;
+      const context = await getSettings();
+      if (
+        !context.settings.enabled ||
+        !context.permissions.find(
+          (permission) => permission.dataType === "polars",
+        )?.canPush
+      )
+        return reply.code(403).send({ error: "push disabled for polars" });
+      const params = z
+        .object({ executionId: z.string().uuid() })
+        .safeParse(req.params);
+      const body = z
+        .object({ promiseId: z.string().uuid(), report: z.record(z.unknown()) })
+        .strict()
+        .safeParse(req.body);
+      if (!params.success || !body.success)
+        return reply
+          .code(400)
+          .send({ error: "invalid progressive report request" });
+      const [dispatch] = await db
+        .select({ id: progressiveRemoteDispatches.simJobId })
+        .from(progressiveRemoteDispatches)
+        .where(
+          and(
+            eq(progressiveRemoteDispatches.simJobId, params.data.executionId),
+            eq(progressiveRemoteDispatches.promiseId, body.data.promiseId),
+            eq(progressiveRemoteDispatches.solverId, solver.id),
+          ),
+        )
+        .limit(1);
+      if (!dispatch)
+        return reply
+          .code(403)
+          .send({ error: "remote solver does not own this execution" });
+      try {
+        const receipt = await storeProgressiveRemoteReport(db, {
+          solverId: solver.id,
+          promiseId: body.data.promiseId,
+          executionId: params.data.executionId,
+          report: body.data.report,
+        });
+        return { received: true, receipt };
+      } catch (error) {
+        if (error instanceof ProgressiveRemoteReportConflict)
+          return reply.code(409).send({ error: error.message });
+        throw error;
+      }
+    },
+  );
+
   app.get("/api/sync/v1/status", async (req, reply) => {
     const ctx = await requireSync(req, reply);
     if (!ctx) return;
@@ -7068,167 +7482,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       aoa_deg: number;
     };
     const claimRowLimit = Math.max(body.limit * 3, body.limit);
-    const campaignRows = (await db.execute(sql`
-      SELECT
-        a.id AS airfoil_id,
-        a.slug AS airfoil_slug,
-        a.name AS airfoil_name,
-        a.source AS airfoil_source,
-        a.point_format AS point_format,
-        a.points AS points,
-        p.id AS preset_id,
-        p.legacy_boundary_condition_id AS bc_id,
-        rev.id AS revision_id,
-        rev.signature_hash,
-        rev.reynolds,
-        rev.mach,
-        rev.reference_length_m,
-        rev.snapshot,
-        campaign_point.aoa_deg::float8 AS aoa_deg,
-        campaign.priority::int AS priority
-      FROM sim_campaigns campaign
-      JOIN LATERAL (
-        SELECT
-          condition.id AS condition_id,
-          condition.preset_id,
-          condition.simulation_preset_revision_id AS revision_id,
-          condition.reynolds,
-          chosen_airfoil.airfoil_id
-        FROM sim_campaign_conditions condition
-        JOIN simulation_presets eligible_preset
-          ON eligible_preset.id = condition.preset_id
-         AND eligible_preset.legacy_boundary_condition_id IS NOT NULL
-        JOIN LATERAL (
-          SELECT candidate_airfoil.id AS airfoil_id
-          FROM airfoils candidate_airfoil
-          WHERE candidate_airfoil."archivedAt" IS NULL
-            AND candidate_airfoil."deletedAt" IS NULL
-            AND EXISTS (
-              SELECT 1
-              FROM sim_campaign_points candidate_point
-              LEFT JOIN results candidate_result
-                ON candidate_result.airfoil_id = candidate_point.airfoil_id
-               AND candidate_result.simulation_preset_revision_id =
-                   candidate_point.revision_id
-               AND candidate_result.aoa_deg = candidate_point.aoa_deg
-              WHERE candidate_point.campaign_id = campaign.id
-                AND candidate_point.condition_id = condition.id
-                AND candidate_point.airfoil_id = candidate_airfoil.id
-                AND candidate_point.revision_id =
-                    condition.simulation_preset_revision_id
-                AND candidate_point.state = 'requested'
-                AND NOT candidate_point.derived_by_symmetry
-                AND (
-                  candidate_result.id IS NULL
-                  OR candidate_result.status IN ('pending', 'stale')
-                )
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM sync_sweep_promise_points promised_point
-                  JOIN sync_sweep_promises active_promise
-                    ON active_promise.id = promised_point.promise_id
-                  WHERE promised_point.airfoil_id = candidate_point.airfoil_id
-                    AND promised_point.simulation_preset_revision_id =
-                        candidate_point.revision_id
-                    AND promised_point.aoa_deg = candidate_point.aoa_deg
-                    AND promised_point.status = 'active'
-                    AND active_promise.status = 'active'
-                    AND active_promise."expiresAt" > now()
-                )
-                AND (
-                  ${terminalExclusionSolverId}::uuid IS NULL
-                  OR NOT EXISTS (
-                    SELECT 1
-                    FROM sync_sweep_promise_points terminal_point
-                    JOIN sync_sweep_promises terminal_promise
-                      ON terminal_promise.id = terminal_point.promise_id
-                    WHERE terminal_point.airfoil_id =
-                          candidate_point.airfoil_id
-                      AND terminal_point.simulation_preset_revision_id =
-                          candidate_point.revision_id
-                      AND terminal_point.aoa_deg = candidate_point.aoa_deg
-                      AND terminal_promise.registered_solver_id =
-                          ${terminalExclusionSolverId}::uuid
-                      AND terminal_promise.status = 'cancelled'
-                      AND terminal_promise.response_payload
-                        #>> '{remoteCancellation,disposition}' =
-                          'terminal_local_state'
-                      AND terminal_promise.response_payload
-                        #>> '{remoteCancellation,buildVersion}'
-                          IS NOT DISTINCT FROM
-                            ${terminalExclusionBuildVersion}::text
-                  )
-                )
-              LIMIT 1
-            )
-          ORDER BY candidate_airfoil.slug, candidate_airfoil.id
-          LIMIT 1
-        ) chosen_airfoil ON true
-        WHERE condition.campaign_id = campaign.id
-          AND condition.generation = campaign.current_condition_generation
-          AND condition.status IN ('active', 'kept')
-        ORDER BY condition.reynolds, condition.ord, condition.id
-        LIMIT 1
-      ) selected ON true
-      JOIN airfoils a ON a.id = selected.airfoil_id
-      JOIN simulation_preset_revisions rev ON rev.id = selected.revision_id
-      JOIN simulation_presets p ON p.id = selected.preset_id
-      JOIN sim_campaign_points campaign_point
-        ON campaign_point.campaign_id = campaign.id
-       AND campaign_point.condition_id = selected.condition_id
-       AND campaign_point.airfoil_id = selected.airfoil_id
-       AND campaign_point.revision_id = selected.revision_id
-      LEFT JOIN results r
-        ON r.airfoil_id = campaign_point.airfoil_id
-       AND r.simulation_preset_revision_id = campaign_point.revision_id
-       AND r.aoa_deg = campaign_point.aoa_deg
-      WHERE campaign.status = 'active'
-        AND campaign_point.state = 'requested'
-        AND NOT campaign_point.derived_by_symmetry
-        AND (r.id IS NULL OR r.status IN ('pending', 'stale'))
-        AND NOT EXISTS (
-          SELECT 1
-          FROM sync_sweep_promise_points promised_point
-          JOIN sync_sweep_promises active_promise
-            ON active_promise.id = promised_point.promise_id
-          WHERE promised_point.airfoil_id = campaign_point.airfoil_id
-            AND promised_point.simulation_preset_revision_id =
-                campaign_point.revision_id
-            AND promised_point.aoa_deg = campaign_point.aoa_deg
-            AND promised_point.status = 'active'
-            AND active_promise.status = 'active'
-            AND active_promise."expiresAt" > now()
-        )
-        AND (
-          ${terminalExclusionSolverId}::uuid IS NULL
-          OR NOT EXISTS (
-            SELECT 1
-            FROM sync_sweep_promise_points terminal_point
-            JOIN sync_sweep_promises terminal_promise
-              ON terminal_promise.id = terminal_point.promise_id
-            WHERE terminal_point.airfoil_id = campaign_point.airfoil_id
-              AND terminal_point.simulation_preset_revision_id =
-                  campaign_point.revision_id
-              AND terminal_point.aoa_deg = campaign_point.aoa_deg
-              AND terminal_promise.registered_solver_id =
-                  ${terminalExclusionSolverId}::uuid
-              AND terminal_promise.status = 'cancelled'
-              AND terminal_promise.response_payload
-                #>> '{remoteCancellation,disposition}' =
-                  'terminal_local_state'
-              AND terminal_promise.response_payload
-                #>> '{remoteCancellation,buildVersion}'
-                  IS NOT DISTINCT FROM
-                    ${terminalExclusionBuildVersion}::text
-          )
-        )
-      ORDER BY campaign.priority DESC, selected.reynolds,
-               a.slug, campaign_point.aoa_deg
-      LIMIT ${claimRowLimit}
-    `)) as unknown as ClaimGapRow[];
-    const rows = campaignRows.length
-      ? campaignRows
-      : ((await db.execute(sql`
+    const rows = (await db.execute(sql`
           WITH latest_revision AS (
             SELECT DISTINCT ON (preset_id) preset_id, id, signature_hash, reynolds, mach, reference_length_m, snapshot
             FROM simulation_preset_revisions
@@ -7263,6 +7517,17 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             ) AS g
             LEFT JOIN results r ON r.airfoil_id = a.id AND r.simulation_preset_revision_id = rev.id AND r.aoa_deg = g.aoa
             WHERE p.enabled = true
+              AND p.origin <> 'campaign'
+              AND NOT EXISTS (
+                SELECT 1 FROM sim_campaign_conditions campaign_condition
+                WHERE campaign_condition.preset_id = p.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM progressive_cfd_execution_recipes execution_recipe
+                JOIN simulation_preset_revisions execution_revision
+                  ON execution_revision.id = execution_recipe.execution_revision_id
+                WHERE execution_revision.preset_id = p.id
+              )
               AND (
                 p.target_scope = 'all'
                 OR EXISTS (
@@ -7313,12 +7578,12 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           FROM gap_rows
           ORDER BY priority DESC, reynolds ASC, airfoil_slug ASC, aoa_deg ASC
           LIMIT ${claimRowLimit}
-        `)) as unknown as ClaimGapRow[]);
+        `)) as unknown as ClaimGapRow[];
     const first = rows[0];
-    if (!first) return { promise: null };
     const candidateAoas = rows
       .filter(
         (row) =>
+          first &&
           row.airfoil_id === first.airfoil_id &&
           row.revision_id === first.revision_id,
       )
@@ -7387,6 +7652,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
+      if (!first) return { promise: null };
       const aoas = await lockAndFilterRemoteClaimAoas(
         tx,
         first.airfoil_id,
@@ -7926,6 +8192,13 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       const ctx = await requireSync(req, reply, item.type, "push");
       if (!ctx) return;
     }
+    try {
+      for (const item of body.items)
+        if (item.type === "mediums" && (item.data.gasThermodynamics != null || item.data.gas_thermodynamics != null))
+          mediumValuesFromPayload(item.data);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid gas material model" });
+    }
     let imported = 0;
     const conflictIds: string[] = [];
     for (const item of body.items) {
@@ -8081,7 +8354,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       } catch (error) {
         if (
           error instanceof PolarPromiseScopeError ||
-          error instanceof PolarEvidenceBindingError
+          error instanceof PolarEvidenceBindingError ||
+          error instanceof ProgressiveRemoteEvidenceConflict ||
+          error instanceof ProgressiveCfdEvidenceScopeClosed
         ) {
           conflictError = error.message;
         } else {
@@ -8107,7 +8382,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         // queue never waits for someone to open the page to become truthful.
         await reconcileObsoleteExactPolarConflicts();
         if (!authenticatedSolver) {
-          return { ...response, bindingReceipts: [] };
+          return {
+            ...response,
+            bindingReceipts: [],
+            progressiveArchiveReceipts: [],
+          };
         }
         const token = remoteSolverToken(req);
         if (!token) {
@@ -8119,6 +8398,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           ...response,
           bindingReceipts: response.bindingReceipts.map((receipt) =>
             signHubBindingReceipt(receipt, token),
+          ),
+          progressiveArchiveReceipts: response.progressiveArchiveReceipts.map(
+            (receipt) => signProgressiveEvidenceCustodyReceipt(receipt, token),
           ),
         };
       }

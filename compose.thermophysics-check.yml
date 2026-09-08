@@ -1,0 +1,79 @@
+x-material-canary: &material-canary
+  image: xfoilfoam-material-worker:local
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.worker
+  network_mode: none
+  depends_on:
+    inspection:
+      condition: service_completed_successfully
+  environment:
+    AIRFOILFOAM_OPENFOAM_RUNNER: local
+    AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+    AIRFOILFOAM_DATA_DIR: /reports/cfd/data
+    AIRFOILFOAM_CACHE_DIR: /reports/cfd/cache
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 524288
+  volumes:
+    - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
+    - ./packages/db/seed/selig-database/ag24.dat:/fixture/ag24.dat:ro
+    - thermo-reports:/reports
+
+services:
+  artifacts:
+    image: xfoilfoam-progressive-worker:local
+    pull_policy: never
+    network_mode: bridge
+    read_only: true
+    command: ["python", "-m", "http.server", "8080", "--directory", "/reports"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - thermo-reports:/reports:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  inspection:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: thermophysics-check
+    network_mode: none
+    read_only: true
+    environment:
+      PYTHONPATH: /candidate/src
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - thermo-reports:/reports
+      - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
+      - ./scripts/materials/verify-native-thermophysics.py:/verify.py:ro
+      - ./src:/candidate/src:ro
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >-
+        source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1 || exit 1;
+        set -e;
+        export LD_LIBRARY_PATH="/opt/xfoilfoam-thermophysics/lib:$$LD_LIBRARY_PATH";
+        python3 /verify.py --fixture /fixture/air.json --reports /reports
+
+  subsonic:
+    <<: *material-canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoSimpleFoam", "--mach", "0.72", "--coordinates", "/fixture/ag24.dat", "--case-dir", "/reports/cfd/subsonic", "--material-fixture", "/fixture/air.json"]
+  transonic:
+    <<: *material-canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoPimpleFoam", "--mach", "0.9", "--coordinates", "/fixture/ag24.dat", "--case-dir", "/reports/cfd/transonic", "--material-fixture", "/fixture/air.json"]
+  mach2:
+    <<: *material-canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "2", "--coordinates", "/fixture/ag24.dat", "--case-dir", "/reports/cfd/mach2", "--material-fixture", "/fixture/air.json"]
+  mach3:
+    <<: *material-canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/fixture/ag24.dat", "--case-dir", "/reports/cfd/mach3", "--material-fixture", "/fixture/air.json"]
+
+volumes:
+  thermo-reports:

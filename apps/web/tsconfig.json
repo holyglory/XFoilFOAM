@@ -28,9 +28,14 @@
     "**/*.tsx",
     ".next-build/types/**/*.ts",
     ".next-e2e/types/**/*.ts",
+    ".next-instrument-qa/types/**/*.ts",
+    ".next-progressive-preview-7/types/**/*.ts",
+    ".next-progressive-preview-8/types/**/*.ts",
+    ".next-progressive-preview-9/types/**/*.ts",
+    ".next-progressive-preview/types/**/*.ts",
     ".next/types/**/*.ts",
     "next-env.d.ts",
-    ".next-instrument-qa/types/**/*.ts"
+    ".next-progressive-preview-10/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

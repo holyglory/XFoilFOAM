@@ -1,4 +1,4 @@
-import { DEFAULT_TRANSIENT_MAX_COURANT, type Point } from "@aerodb/core";
+import { DEFAULT_TRANSIENT_MAX_COURANT, type GasThermodynamicModel, type Point } from "@aerodb/core";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -13,6 +13,7 @@ import {
   pgEnum,
   primaryKey,
   pgTable,
+  smallint,
   text,
   timestamp,
   unique,
@@ -355,6 +356,7 @@ export const mediums = pgTable("mediums", {
   dynamicViscosity: doublePrecision("dynamic_viscosity").notNull(),
   kinematicViscosity: doublePrecision("kinematic_viscosity").notNull(),
   speedOfSound: doublePrecision("speed_of_sound"),
+  gasThermodynamics: jsonb("gas_thermodynamics").$type<GasThermodynamicModel>(),
   notes: text("notes"),
   isSeeded: boolean("is_seeded").notNull().default(false),
   createdAt: ts().notNull().defaultNow(),
@@ -362,7 +364,12 @@ export const mediums = pgTable("mediums", {
     .notNull()
     .defaultNow()
     .$onUpdate(() => new Date()),
-});
+}, (table) => ({
+  gasThermodynamicsPhase: check(
+    "mediums_gas_thermodynamics_phase_check",
+    sql`${table.gasThermodynamics} IS NULL OR (${table.phase} = 'gas' AND jsonb_typeof(${table.gasThermodynamics}) = 'object')`,
+  ),
+}));
 
 export const mediumViscosityTablePoints = pgTable(
   "medium_viscosity_table_points",
@@ -4050,6 +4057,7 @@ export const simJobs = pgTable(
     // one sweeper process; expiry makes a crashed owner's job recoverable
     // without holding a transaction across engine/media work.
     ingestLeaseToken: text("ingest_lease_token"),
+    ingestLeasePreviousStatus: simJobStatusEnum("ingest_lease_previous_status"),
     ingestLeaseClaimedAt: timestamp("ingest_lease_claimed_at", {
       withTimezone: true,
     }),
@@ -4111,6 +4119,10 @@ export const simJobs = pgTable(
       )`,
     ),
     statusIdx: index("sim_jobs_status_idx").on(t.status),
+    ingestLeasePreviousStatusCheck: check(
+      "sim_jobs_ingest_lease_previous_status_check",
+      sql`${t.ingestLeasePreviousStatus} IS NULL OR ${t.ingestLeasePreviousStatus} <> 'ingesting'`,
+    ),
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
     solverImplementationIdx: index("sim_jobs_solver_implementation_idx").on(
       t.solverImplementationId,
@@ -4351,8 +4363,7 @@ export const simCampaignLifecycleEvents = pgTable(
   }),
 );
 
-// Campaign scope resolved to an explicit airfoil list at launch; growth is via
-// the Add airfoils action only.
+// Campaign membership includes explicit selection and durable catalog expansion.
 export const simCampaignAirfoils = pgTable(
   "sim_campaign_airfoils",
   {
@@ -4367,6 +4378,94 @@ export const simCampaignAirfoils = pgTable(
   (t) => ({
     pk: primaryKey({ columns: [t.campaignId, t.airfoilId] }),
     airfoilIdx: index("sim_campaign_airfoils_airfoil_idx").on(t.airfoilId),
+  }),
+);
+
+export const catalogProfileEvents = pgTable(
+  "catalog_profile_events",
+  {
+    airfoilId: uuid("airfoil_id")
+      .primaryKey()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    registeredAt: timestamp("registered_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    registeredIdx: index("catalog_profile_events_registered_idx").on(
+      table.registeredAt,
+      table.airfoilId,
+    ),
+  }),
+);
+
+export const campaignCatalogBoundaries = pgTable(
+  "campaign_catalog_boundaries",
+  {
+    campaignId: uuid("campaign_id")
+      .primaryKey()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    openedAt: timestamp("opened_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+);
+
+export const campaignCatalogSnapshot = pgTable(
+  "campaign_catalog_snapshot",
+  {
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.campaignId, table.airfoilId] }),
+  }),
+);
+
+export const campaignProfileExpansions = pgTable(
+  "campaign_profile_expansions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    airfoilIds: uuid("airfoil_ids").array().notNull(),
+    createdAt: ts().notNull().defaultNow(),
+  },
+  (table) => ({
+    campaignIdx: index("campaign_profile_expansions_campaign_idx").on(
+      table.campaignId,
+      table.createdAt,
+    ),
+    nonempty: check(
+      "campaign_profile_expansions_nonempty",
+      sql`cardinality(${table.airfoilIds}) > 0`,
+    ),
+  }),
+);
+
+export const campaignConditionScopes = pgTable(
+  "campaign_condition_scopes",
+  {
+    conditionId: uuid("condition_id")
+      .primaryKey()
+      .references((): AnyPgColumn => simCampaignConditions.id, {
+        onDelete: "cascade",
+      }),
+    angles: doublePrecision("angles").array().notNull(),
+    sourcePlanRevisionId: uuid("source_plan_revision_id")
+      .notNull()
+      .references((): AnyPgColumn => simCampaignPlanRevisions.id),
+  },
+  (table) => ({
+    finite: check(
+      "campaign_condition_scopes_finite",
+      sql`NOT ${table.angles} && ARRAY['NaN'::float8, 'Infinity'::float8, '-Infinity'::float8]`,
+    ),
   }),
 );
 
@@ -6781,3 +6880,1227 @@ export type SimSolverIncidentCampaign =
 export type SimRansPolarPromotion = typeof simRansPolarPromotions.$inferSelect;
 export type SimRansPolarPromotionPoint =
   typeof simRansPolarPromotionPoints.$inferSelect;
+
+export const calculationEpochs = pgTable(
+  "calculation_epochs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    current: boolean("current").notNull().default(true),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    currentUq: uniqueIndex("calculation_epochs_current_uq")
+      .on(table.current)
+      .where(sql`${table.current}`),
+  }),
+);
+
+export const polarAnalysisTargets = pgTable(
+  "polar_analysis_targets",
+  {
+    id: text("id").primaryKey(),
+    airfoilId: uuid("airfoil_id")
+      .notNull()
+      .references(() => airfoils.id, { onDelete: "cascade" }),
+    physical: jsonb("physical").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    airfoilIdx: index("polar_analysis_targets_airfoil_idx").on(table.airfoilId),
+    identityCheck: check(
+      "polar_analysis_targets_id_check",
+      sql`${table.id} ~ '^[a-f0-9]{64}$'`,
+    ),
+    physicalCheck: check(
+      "polar_analysis_targets_physical_check",
+      sql`jsonb_typeof(${table.physical}) = 'object'`,
+    ),
+  }),
+);
+
+export const progressiveGenerations = pgTable(
+  "progressive_generations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    epochId: uuid("epoch_id")
+      .notNull()
+      .references(() => calculationEpochs.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    planRevisionId: uuid("plan_revision_id")
+      .notNull()
+      .references(() => simCampaignPlanRevisions.id),
+    scopeKey: text("scope_key").notNull(),
+    scopeSignature: text("scope_signature").notNull(),
+    stage: smallint("stage").notNull().default(1),
+    status: text("status").notNull().default("active"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => ({
+    scopeUq: unique(
+      "progressive_generations_epoch_id_campaign_id_scope_key_key",
+    ).on(table.epochId, table.campaignId, table.scopeKey),
+    stageCheck: check(
+      "progressive_generations_stage_check",
+      sql`${table.stage} IN (1, 2, 3)`,
+    ),
+    statusCheck: check(
+      "progressive_generations_status_check",
+      sql`${table.status} IN ('active', 'complete', 'attention', 'cancelled')`,
+    ),
+  }),
+);
+
+export const progressiveGenerationTargets = pgTable(
+  "progressive_generation_targets",
+  {
+    generationId: uuid("generation_id")
+      .notNull()
+      .references(() => progressiveGenerations.id, { onDelete: "cascade" }),
+    targetId: text("target_id")
+      .notNull()
+      .references(() => polarAnalysisTargets.id, { onDelete: "cascade" }),
+    revisionId: uuid("revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id),
+    angles: doublePrecision("angles").array().notNull(),
+    recipes: jsonb("recipes").$type<Record<string, unknown>>().notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.generationId, table.targetId] }),
+    anglesCheck: check(
+      "progressive_generation_targets_angles_check",
+      sql`cardinality(${table.angles}) > 0`,
+    ),
+    recipesCheck: check(
+      "progressive_generation_targets_recipes_check",
+      sql`jsonb_typeof(${table.recipes}) = 'object'`,
+    ),
+  }),
+);
+
+export const progressiveWork = pgTable(
+  "progressive_work",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    generationId: uuid("generation_id").notNull(),
+    targetId: text("target_id").notNull(),
+    stage: smallint("stage").notNull(),
+    state: text("state").notNull().default("pending"),
+    leaseToken: uuid("lease_token"),
+    leaseOwner: text("lease_owner"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    attempts: integer("attempts").notNull().default(0),
+    error: text("error"),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => ({
+    scopeFk: foreignKey({
+      columns: [table.generationId, table.targetId],
+      foreignColumns: [
+        progressiveGenerationTargets.generationId,
+        progressiveGenerationTargets.targetId,
+      ],
+    }).onDelete("cascade"),
+    scopeUq: unique("progressive_work_generation_id_target_id_stage_key").on(
+      table.generationId,
+      table.targetId,
+      table.stage,
+    ),
+    pendingIdx: index("progressive_work_pending_idx").on(
+      table.generationId,
+      table.stage,
+      table.state,
+    ),
+    stageCheck: check(
+      "progressive_work_stage_check",
+      sql`${table.stage} IN (1, 2, 3)`,
+    ),
+    stateCheck: check(
+      "progressive_work_state_check",
+      sql`${table.state} IN ('pending', 'leased', 'complete', 'gap')`,
+    ),
+    attemptsCheck: check(
+      "progressive_work_attempts_check",
+      sql`${table.attempts} >= 0`,
+    ),
+    leaseCheck: check(
+      "progressive_work_check",
+      sql`(${table.state} = 'leased') = (${table.leaseToken} IS NOT NULL AND ${table.leaseOwner} IS NOT NULL AND ${table.leaseUntil} IS NOT NULL)`,
+    ),
+  }),
+);
+
+export const progressiveWorkAttempts = pgTable(
+  "progressive_work_attempts",
+  {
+    token: uuid("token").primaryKey(),
+    workId: uuid("work_id")
+      .notNull()
+      .references(() => progressiveWork.id, { onDelete: "cascade" }),
+    owner: text("owner").notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }).notNull(),
+    outcome: text("outcome").notNull().default("running"),
+    error: text("error"),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (table) => ({
+    runningUq: uniqueIndex("progressive_work_attempts_running_uq")
+      .on(table.workId)
+      .where(sql`${table.outcome} = 'running'`),
+    outcomeCheck: check(
+      "progressive_work_attempts_outcome_check",
+      sql`${table.outcome} IN ('running', 'complete', 'failed', 'expired', 'cancelled')`,
+    ),
+  }),
+);
+
+export const neuralfoilPredictions = pgTable(
+  "neuralfoil_predictions",
+  {
+    id: text("id").primaryKey(),
+    epochId: uuid("epoch_id")
+      .notNull()
+      .references(() => calculationEpochs.id, { onDelete: "cascade" }),
+    targetId: text("target_id")
+      .notNull()
+      .references(() => polarAnalysisTargets.id, { onDelete: "cascade" }),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    targetIdx: index("neuralfoil_predictions_target_idx").on(
+      table.targetId,
+      table.createdAt.desc(),
+    ),
+    identityCheck: check(
+      "neuralfoil_predictions_id_check",
+      sql`${table.id} ~ '^[a-f0-9]{64}$'`,
+    ),
+    payloadCheck: check(
+      "neuralfoil_predictions_payload_check",
+      sql`${table.payload}->>'kind' = 'prediction' AND ${table.payload}->>'method' = 'neuralfoil' AND ${table.payload}->>'cfd_evidence' = 'false'`,
+    ),
+  }),
+);
+
+export const progressivePredictionLinks = pgTable(
+  "progressive_prediction_links",
+  {
+    workId: uuid("work_id")
+      .primaryKey()
+      .references(() => progressiveWork.id, { onDelete: "cascade" }),
+    predictionId: text("prediction_id")
+      .notNull()
+      .references(() => neuralfoilPredictions.id, { onDelete: "cascade" }),
+  },
+);
+
+export const progressiveScopeRequests = pgTable(
+  "progressive_scope_requests",
+  {
+    campaignId: uuid("campaign_id")
+      .primaryKey()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    requestedVersion: bigint("requested_version", { mode: "number" })
+      .notNull()
+      .default(1),
+    processedVersion: bigint("processed_version", { mode: "number" })
+      .notNull()
+      .default(0),
+    requestedAt: timestamp("requested_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
+    error: text("error"),
+    generationId: uuid("generation_id").references(
+      () => progressiveGenerations.id,
+      { onDelete: "set null" },
+    ),
+  },
+  (table) => ({
+    pendingIdx: index("progressive_scope_requests_pending_idx")
+      .on(table.requestedAt)
+      .where(sql`${table.requestedVersion} > ${table.processedVersion}`),
+    versionCheck: check(
+      "progressive_scope_requests_check",
+      sql`${table.requestedVersion} > 0 AND ${table.processedVersion} >= 0 AND ${table.processedVersion} <= ${table.requestedVersion}`,
+    ),
+  }),
+);
+
+export const progressiveCfdUnits = pgTable(
+  "progressive_cfd_units",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    workId: uuid("work_id")
+      .notNull()
+      .references(() => progressiveWork.id, { onDelete: "cascade" }),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    ordinal: integer("ordinal").notNull(),
+    purpose: text("purpose").notNull(),
+    recipe: jsonb("recipe").$type<Record<string, unknown>>().notNull(),
+    reason: text("reason").notNull(),
+    policyVersion: text("policy_version").notNull(),
+    activeBudgetSeconds: doublePrecision("active_budget_seconds").notNull(),
+    activeSeconds: doublePrecision("active_seconds").notNull().default(0),
+    state: text("state").notNull().default("pending"),
+    leaseToken: uuid("lease_token"),
+    leaseOwner: text("lease_owner"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    attempts: integer("attempts").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    error: text("error"),
+  },
+  (table) => ({
+    angleUq: uniqueIndex("progressive_cfd_units_work_id_aoa_deg_key").on(
+      table.workId,
+      table.aoaDeg,
+    ),
+    ordinalUq: uniqueIndex("progressive_cfd_units_work_id_ordinal_key").on(
+      table.workId,
+      table.ordinal,
+    ),
+    pendingIdx: index("progressive_cfd_units_pending_idx")
+      .on(table.workId, table.ordinal)
+      .where(sql`${table.state} = 'pending'`),
+    alphaCheck: check(
+      "progressive_cfd_units_aoa_deg_check",
+      sql`${table.aoaDeg} BETWEEN -180 AND 180`,
+    ),
+    ordinalCheck: check(
+      "progressive_cfd_units_ordinal_check",
+      sql`${table.ordinal} >= 0`,
+    ),
+    purposeCheck: check(
+      "progressive_cfd_units_purpose_check",
+      sql`${table.purpose} IN ('initial', 'adaptive', 'precise')`,
+    ),
+    recipeCheck: check(
+      "progressive_cfd_units_recipe_check",
+      sql`jsonb_typeof(${table.recipe}) = 'object'`,
+    ),
+    budgetCheck: check(
+      "progressive_cfd_units_active_budget_seconds_check",
+      sql`${table.activeBudgetSeconds} > 0 AND ${table.activeBudgetSeconds} <= 43200`,
+    ),
+    activeCheck: check(
+      "progressive_cfd_units_active_seconds_check",
+      sql`${table.activeSeconds} >= 0 AND ${table.activeSeconds} < 'Infinity'::double precision`,
+    ),
+    stateCheck: check(
+      "progressive_cfd_units_state_check",
+      sql`${table.state} IN ('pending', 'leased', 'blocked', 'complete', 'gap', 'cancelled')`,
+    ),
+    attemptsCheck: check(
+      "progressive_cfd_units_attempts_check",
+      sql`${table.attempts} BETWEEN 0 AND 3`,
+    ),
+    leaseCheck: check(
+      "progressive_cfd_units_check",
+      sql`(${table.state} = 'leased') = (${table.leaseToken} IS NOT NULL AND ${table.leaseOwner} IS NOT NULL AND ${table.leaseUntil} IS NOT NULL)`,
+    ),
+  }),
+);
+
+export const progressiveCfdAttempts = pgTable(
+  "progressive_cfd_attempts",
+  {
+    token: uuid("token").primaryKey(),
+    unitId: uuid("unit_id")
+      .notNull()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    owner: text("owner").notNull(),
+    executionRecipeId: text("execution_recipe_id").references(
+      () => progressiveCfdExecutionRecipes.id,
+    ),
+    simJobId: uuid("sim_job_id").references(() => simJobs.id, {
+      onDelete: "set null",
+    }),
+    startedAt: timestamp("started_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }).notNull(),
+    outcome: text("outcome").notNull().default("running"),
+    activeSeconds: doublePrecision("active_seconds").notNull().default(0),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    error: text("error"),
+  },
+  (table) => ({
+    runningUq: uniqueIndex("progressive_cfd_attempts_running_uq")
+      .on(table.unitId)
+      .where(sql`${table.outcome} = 'running'`),
+    jobUnitUq: uniqueIndex("progressive_cfd_attempts_job_unit_uq")
+      .on(table.simJobId, table.unitId)
+      .where(sql`${table.simJobId} IS NOT NULL`),
+    outcomeCheck: check(
+      "progressive_cfd_attempts_outcome_check",
+      sql`${table.outcome} IN ('running', 'complete', 'failed', 'expired', 'cancelled')`,
+    ),
+    activeCheck: check(
+      "progressive_cfd_attempts_active_seconds_check",
+      sql`${table.activeSeconds} >= 0 AND ${table.activeSeconds} < 'Infinity'::double precision`,
+    ),
+  }),
+);
+
+export const progressiveCfdRecoveryPlans = pgTable(
+  "progressive_cfd_recovery_plans",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    unitId: uuid("unit_id")
+      .notNull()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    ordinal: integer("ordinal").notNull(),
+    parentAttemptToken: uuid("parent_attempt_token")
+      .notNull()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    parentJobId: uuid("parent_job_id")
+      .notNull()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    diagnosticAttemptId: uuid("diagnostic_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    diagnosticSignature: text("diagnostic_signature").notNull(),
+    scope: text("scope").notNull(),
+    reason: text("reason").notNull(),
+    recipe: jsonb("recipe").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    signatureCheck: check(
+      "progressive_cfd_recovery_plans_diagnostic_signature_check",
+      sql`${table.diagnosticSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    scopeCheck: check(
+      "progressive_cfd_recovery_plans_scope_check",
+      sql`${table.scope} IN ('targeted', 'original_sweep')`,
+    ),
+    reasonCheck: check(
+      "progressive_cfd_recovery_plans_reason_check",
+      sql`${table.reason} IN ('hard_solver', 'needs_urans', 'accepted_precalc')`,
+    ),
+    unitOrdinalUq: unique(
+      "progressive_cfd_recovery_plans_unit_id_ordinal_key",
+    ).on(table.unitId, table.ordinal),
+    ordinalCheck: check(
+      "progressive_cfd_recovery_plans_ordinal_check",
+      sql`${table.ordinal} IN (1, 2)`,
+    ),
+    verificationCheck: check(
+      "progressive_cfd_recovery_plans_check",
+      sql`(${table.ordinal} = 2) = (${table.reason} = 'accepted_precalc')`,
+    ),
+    recipeCheck: check(
+      "progressive_cfd_recovery_plans_recipe_check",
+      sql`jsonb_typeof(${table.recipe}) = 'object'`,
+    ),
+  }),
+);
+
+export const progressiveCfdRecoveryClaims = pgTable(
+  "progressive_cfd_recovery_claims",
+  {
+    attemptToken: uuid("attempt_token")
+      .primaryKey()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    recoveryPlanId: uuid("recovery_plan_id")
+      .notNull()
+      .unique()
+      .references(() => progressiveCfdRecoveryPlans.id, {
+        onDelete: "cascade",
+      }),
+  },
+);
+
+export const progressiveCfdExecutionRecipes = pgTable(
+  "progressive_cfd_execution_recipes",
+  {
+    id: text("id").primaryKey(),
+    sourceRevisionId: uuid("source_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    recipe: jsonb("recipe").$type<Record<string, unknown>>().notNull(),
+    executionRevisionId: uuid("execution_revision_id")
+      .notNull()
+      .references(() => simulationPresetRevisions.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    idCheck: check(
+      "progressive_cfd_execution_recipes_id_check",
+      sql`${table.id} ~ '^[a-f0-9]{64}$'`,
+    ),
+    recipeCheck: check(
+      "progressive_cfd_execution_recipes_recipe_check",
+      sql`jsonb_typeof(${table.recipe}) = 'object'`,
+    ),
+  }),
+);
+
+export const progressiveCfdRuntimeProgress = pgTable(
+  "progressive_cfd_runtime_progress",
+  {
+    attemptToken: uuid("attempt_token")
+      .primaryKey()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    engineJobId: text("engine_job_id").notNull(),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+    activeSeconds: doublePrecision("active_seconds").notNull(),
+    limitSeconds: doublePrecision("limit_seconds").notNull(),
+    solverRunning: boolean("solver_running").notNull(),
+    observation: jsonb("observation")
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    observationSignature: text("observation_signature").notNull(),
+  },
+  (table) => ({
+    durationCheck: check(
+      "progressive_cfd_runtime_progress_active_seconds_check",
+      sql`${table.activeSeconds} >= 0 AND ${table.activeSeconds} < 'Infinity'::double precision`,
+    ),
+    limitCheck: check(
+      "progressive_cfd_runtime_progress_limit_seconds_check",
+      sql`${table.limitSeconds} > 0 AND ${table.limitSeconds} <= 43200`,
+    ),
+    observationCheck: check(
+      "progressive_cfd_runtime_progress_observation_check",
+      sql`jsonb_typeof(${table.observation}) = 'object'`,
+    ),
+    signatureCheck: check(
+      "progressive_cfd_runtime_progress_observation_signature_check",
+      sql`${table.observationSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
+export const progressiveCfdEvidence = pgTable(
+  "progressive_cfd_evidence",
+  {
+    attemptToken: uuid("attempt_token")
+      .notNull()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    evidenceSignature: text("evidence_signature").notNull(),
+    solverActiveSeconds: doublePrecision("solver_active_seconds").notNull(),
+    budgetGuardExhausted: boolean("budget_guard_exhausted")
+      .notNull()
+      .default(false),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.attemptToken, table.resultAttemptId] }),
+    evidenceUq: uniqueIndex(
+      "progressive_cfd_evidence_result_attempt_id_key",
+    ).on(table.resultAttemptId),
+    signatureCheck: check(
+      "progressive_cfd_evidence_evidence_signature_check",
+      sql`${table.evidenceSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    durationCheck: check(
+      "progressive_cfd_evidence_solver_active_seconds_check",
+      sql`${table.solverActiveSeconds} >= 0 AND ${table.solverActiveSeconds} < 'Infinity'::double precision`,
+    ),
+  }),
+);
+
+export const progressiveCfdStageDecisions = pgTable(
+  "progressive_cfd_stage_decisions",
+  {
+    workId: uuid("work_id")
+      .notNull()
+      .references(() => progressiveWork.id, { onDelete: "cascade" }),
+    ordinal: integer("ordinal").notNull(),
+    kind: text("kind").notNull(),
+    reason: text("reason").notNull(),
+    modelId: text("model_id").references(() => progressivePolarModels.id, {
+      onDelete: "cascade",
+    }),
+    costEvidenceId: uuid("cost_evidence_id").references(
+      () => resultAttempts.id,
+      { onDelete: "cascade" },
+    ),
+    candidateAlpha: doublePrecision("candidate_alpha"),
+    summary: jsonb("summary").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.workId, table.ordinal] }),
+    ordinalCheck: check(
+      "progressive_cfd_stage_decisions_ordinal_check",
+      sql`${table.ordinal} >= 0`,
+    ),
+    kindCheck: check(
+      "progressive_cfd_stage_decisions_kind_check",
+      sql`${table.kind} IN ('adaptive', 'close_fast', 'close_precise')`,
+    ),
+    reasonCheck: check(
+      "progressive_cfd_stage_decisions_reason_check",
+      sql`length(${table.reason}) > 0`,
+    ),
+    summaryCheck: check(
+      "progressive_cfd_stage_decisions_summary_check",
+      sql`jsonb_typeof(${table.summary}) = 'object'`,
+    ),
+    shapeCheck: check(
+      "progressive_cfd_stage_decisions_check",
+      sql`(${table.kind} = 'adaptive' AND ${table.candidateAlpha} IS NOT NULL
+      AND ${table.candidateAlpha} > '-Infinity'::double precision AND ${table.candidateAlpha} < 'Infinity'::double precision
+      AND ${table.modelId} IS NOT NULL AND ${table.costEvidenceId} IS NOT NULL)
+      OR (${table.kind} <> 'adaptive' AND ${table.candidateAlpha} IS NULL)`,
+    ),
+  }),
+);
+
+export const progressiveCfdExecutionStops = pgTable(
+  "progressive_cfd_execution_stops",
+  {
+    simJobId: uuid("sim_job_id")
+      .primaryKey()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    engineJobId: text("engine_job_id").notNull(),
+    epochId: uuid("epoch_id")
+      .notNull()
+      .references(() => calculationEpochs.id, { onDelete: "cascade" }),
+    proof: jsonb("proof").$type<Record<string, unknown>>().notNull(),
+    proofSignature: text("proof_signature").notNull(),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    epochIdx: index("progressive_cfd_execution_stops_epoch_idx").on(
+      table.epochId,
+    ),
+    proofCheck: check(
+      "progressive_cfd_execution_stops_proof_check",
+      sql`jsonb_typeof(${table.proof}) = 'object' AND ${table.proof}->>'execution_stopped' = 'true'`,
+    ),
+    signatureCheck: check(
+      "progressive_cfd_execution_stops_proof_signature_check",
+      sql`${table.proofSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
+export const progressiveRemoteDispatches = pgTable(
+  "progressive_remote_dispatches",
+  {
+    simJobId: uuid("sim_job_id")
+      .primaryKey()
+      .references(() => simJobs.id, { onDelete: "restrict" }),
+    promiseId: uuid("promise_id")
+      .notNull()
+      .unique()
+      .references(() => syncSweepPromises.id, { onDelete: "restrict" }),
+    solverId: uuid("solver_id")
+      .notNull()
+      .references(() => registeredRemoteSolvers.id, { onDelete: "restrict" }),
+    cpuSlots: integer("cpu_slots").notNull(),
+    contentSignature: text("content_signature").notNull(),
+    envelope: jsonb("envelope").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    solverIdx: index("progressive_remote_dispatches_solver_idx").on(
+      table.solverId,
+    ),
+    slotsCheck: check(
+      "progressive_remote_dispatches_cpu_slots_check",
+      sql`${table.cpuSlots} > 0`,
+    ),
+    signatureCheck: check(
+      "progressive_remote_dispatches_content_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    envelopeCheck: check(
+      "progressive_remote_dispatches_check",
+      sql`
+      coalesce(jsonb_typeof(${table.envelope}) = 'object'
+      AND ${table.envelope}->>'version' = '1'
+      AND ${table.envelope}->>'solverId' = ${table.solverId}::text
+      AND ${table.envelope}->>'promiseId' = ${table.promiseId}::text
+      AND ${table.envelope}->>'contentSignature' = ${table.contentSignature}
+      AND ${table.envelope}#>>'{scope,executionId}' = ${table.simJobId}::text
+      AND ${table.envelope}#>>'{request,execution_id}' = ${table.simJobId}::text, false)
+    `,
+    ),
+  }),
+);
+
+export const progressiveRemoteReports = pgTable(
+  "progressive_remote_reports",
+  {
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references(() => progressiveRemoteDispatches.simJobId, {
+        onDelete: "cascade",
+      }),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    contentSignature: text("content_signature").notNull(),
+    report: jsonb("report").$type<Record<string, unknown>>().notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    sequenceCheck: check(
+      "progressive_remote_reports_sequence_check",
+      sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
+    ),
+    signatureCheck: check(
+      "progressive_remote_reports_content_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    reportCheck: check(
+      "progressive_remote_reports_check",
+      sql`coalesce(jsonb_typeof(${table.report}) = 'object'
+      AND ${table.report}->>'version' = '1'
+      AND ${table.report}->>'executionId' = ${table.simJobId}::text
+      AND ${table.report}->>'sequence' = ${table.sequence}::text, false)`,
+    ),
+  }),
+);
+
+export const progressiveRemoteReportInventories = pgTable(
+  "progressive_remote_report_inventories",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    reportContentSignature: text("report_content_signature").notNull(),
+    inventorySignature: text("inventory_signature").notNull(),
+    sourceCount: integer("source_count").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    report: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveRemoteReports.simJobId,
+        progressiveRemoteReports.sequence,
+      ],
+    }).onDelete("cascade"),
+    reportSignature: check(
+      "progressive_remote_report_inventories_report_content_signature_check",
+      sql`${table.reportContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    signature: check(
+      "progressive_remote_report_inventories_inventory_signature_check",
+      sql`${table.inventorySignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    count: check(
+      "progressive_remote_report_inventories_source_count_check",
+      sql`${table.sourceCount} >= 0`,
+    ),
+  }),
+);
+
+export const progressiveRemoteReportSources = pgTable(
+  "progressive_remote_report_sources",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    aoaDeg: doublePrecision("aoa_deg").notNull(),
+    caseSlug: text("case_slug"),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.sequence, table.pointContentSignature],
+    }),
+    inventory: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveRemoteReportInventories.simJobId,
+        progressiveRemoteReportInventories.sequence,
+      ],
+    }).onDelete("cascade"),
+    point: index("progressive_remote_report_sources_point_idx").on(
+      table.simJobId,
+      table.pointContentSignature,
+    ),
+    signature: check(
+      "progressive_remote_report_sources_point_content_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    alpha: check(
+      "progressive_remote_report_sources_aoa_deg_check",
+      sql`${table.aoaDeg} > '-Infinity'::double precision AND ${table.aoaDeg} < 'Infinity'::double precision`,
+    ),
+  }),
+);
+
+export const progressiveWorkerSubmissionIntents = pgTable(
+  "progressive_worker_submission_intents",
+  {
+    simJobId: uuid("sim_job_id")
+      .primaryKey()
+      .references(() => simJobs.id, { onDelete: "restrict" }),
+    token: uuid("token").notNull().unique(),
+    assignmentSignature: text("assignment_signature").notNull(),
+    authorization: jsonb("authorization")
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    signatureCheck: check(
+      "progressive_worker_submission_intents_assignment_signature_check",
+      sql`${table.assignmentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    authorizationCheck: check(
+      "progressive_worker_submission_intents_check",
+      sql`coalesce(jsonb_typeof(${table.authorization}) = 'object'
+      AND ${table.authorization}->>'kind' = 'authorized'
+      AND ${table.authorization}->>'executionId' = ${table.simJobId}::text
+      AND ${table.authorization}->>'contentSignature' = ${table.assignmentSignature}, false)`,
+    ),
+  }),
+);
+
+export const progressiveWorkerReports = pgTable(
+  "progressive_worker_reports",
+  {
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    contentSignature: text("content_signature").notNull(),
+    report: jsonb("report").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true }),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    pendingIdx: index("progressive_worker_reports_pending_idx")
+      .on(table.simJobId, table.sequence)
+      .where(sql`${table.acknowledgedAt} IS NULL`),
+    sequenceCheck: check(
+      "progressive_worker_reports_sequence_check",
+      sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
+    ),
+    signatureCheck: check(
+      "progressive_worker_reports_content_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    reportCheck: check(
+      "progressive_worker_reports_check",
+      sql`coalesce(jsonb_typeof(${table.report}) = 'object'
+      AND ${table.report}->>'version' = '1'
+      AND ${table.report}->>'executionId' = ${table.simJobId}::text
+      AND ${table.report}->>'sequence' = ${table.sequence}::text, false)`,
+    ),
+  }),
+);
+
+export const progressiveRemoteProgressReceipts = pgTable(
+  "progressive_remote_progress_receipts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    contentSignature: text("content_signature").notNull(),
+    appliedAt: timestamp("applied_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    report: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveRemoteReports.simJobId,
+        progressiveRemoteReports.sequence,
+      ],
+    }).onDelete("cascade"),
+    signatureCheck: check(
+      "progressive_remote_progress_receipts_content_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
+export const progressiveRemoteEvidenceReceipts = pgTable(
+  "progressive_remote_evidence_receipts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .unique()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    remoteResultId: uuid("remote_result_id").notNull(),
+    remoteResultAttemptId: uuid("remote_result_attempt_id").notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    report: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveRemoteReports.simJobId,
+        progressiveRemoteReports.sequence,
+      ],
+    }).onDelete("cascade"),
+    pointSignatureCheck: check(
+      "progressive_remote_evidence_receipts_point_content_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
+export const progressiveWorkerEvidenceReceipts = pgTable(
+  "progressive_worker_evidence_receipts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    contentSignature: text("content_signature").notNull(),
+    stagedAt: timestamp("staged_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    report: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveWorkerReports.simJobId,
+        progressiveWorkerReports.sequence,
+      ],
+    }).onDelete("cascade"),
+    signatureCheck: check(
+      "progressive_worker_evidence_receipts_content_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
+export const progressiveWorkerEvidenceAttempts = pgTable(
+  "progressive_worker_evidence_attempts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    pointContentSignature: text("point_content_signature").notNull(),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.sequence, table.resultAttemptId],
+    }),
+    receipt: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveWorkerEvidenceReceipts.simJobId,
+        progressiveWorkerEvidenceReceipts.sequence,
+      ],
+    }).onDelete("cascade"),
+    attemptIdx: index("progressive_worker_evidence_attempts_attempt_idx").on(
+      table.resultAttemptId,
+    ),
+    pointSignatureCheck: check(
+      "progressive_worker_evidence_attempts_point_content_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
+export const progressiveWorkerHubReceipts = pgTable(
+  "progressive_worker_hub_receipts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    source: foreignKey({
+      columns: [table.simJobId, table.sequence, table.resultAttemptId],
+      foreignColumns: [
+        progressiveWorkerEvidenceAttempts.simJobId,
+        progressiveWorkerEvidenceAttempts.sequence,
+        progressiveWorkerEvidenceAttempts.resultAttemptId,
+      ],
+    }).onDelete("cascade"),
+    signatureCheck: check(
+      "progressive_worker_hub_receipts_point_content_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    receiptCheck: check(
+      "progressive_worker_hub_receipts_receipt_check",
+      sql`jsonb_typeof(${table.receipt}) = 'object'`,
+    ),
+  }),
+);
+
+export const progressiveWorkerStagingFailures = pgTable(
+  "progressive_worker_staging_failures",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    attemptCount: integer("attempt_count").notNull(),
+    retryAfter: timestamp("retry_after", { withTimezone: true }).notNull(),
+    lastError: text("last_error").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    source: foreignKey({
+      columns: [table.simJobId, table.sequence],
+      foreignColumns: [
+        progressiveWorkerReports.simJobId,
+        progressiveWorkerReports.sequence,
+      ],
+    }).onDelete("cascade"),
+    attemptsCheck: check(
+      "progressive_worker_staging_failures_attempt_count_check",
+      sql`${table.attemptCount} > 0`,
+    ),
+  }),
+);
+
+export const progressiveWorkerArchiveReceipts = pgTable(
+  "progressive_worker_archive_receipts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    brokeredUploadId: uuid("brokered_upload_id").notNull(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    source: foreignKey({
+      columns: [table.simJobId, table.pointContentSignature],
+      foreignColumns: [
+        progressiveWorkerHubReceipts.simJobId,
+        progressiveWorkerHubReceipts.pointContentSignature,
+      ],
+    }).onDelete("cascade"),
+    receiptCheck: check(
+      "progressive_worker_archive_receipts_receipt_check",
+      sql`jsonb_typeof(${table.receipt}) = 'object'`,
+    ),
+  }),
+);
+
+export const progressiveWorkerArchiveDeliveries = pgTable(
+  "progressive_worker_archive_deliveries",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    retryAfter: timestamp("retry_after", { withTimezone: true }),
+    lastError: text("last_error"),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    source: foreignKey({
+      columns: [table.simJobId, table.pointContentSignature],
+      foreignColumns: [
+        progressiveWorkerHubReceipts.simJobId,
+        progressiveWorkerHubReceipts.pointContentSignature,
+      ],
+    }).onDelete("cascade"),
+    attempts: check(
+      "progressive_worker_archive_deliveries_attempt_count_check",
+      sql`${table.attemptCount} >= 0`,
+    ),
+    claim: check(
+      "progressive_worker_archive_deliveries_claim_check",
+      sql`(${table.claimToken} IS NULL) = (${table.claimExpiresAt} IS NULL)`,
+    ),
+  }),
+);
+
+export const progressiveWorkerDeliveryFailures = pgTable(
+  "progressive_worker_delivery_failures",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    state: text("state").notNull(),
+    attemptCount: integer("attempt_count").notNull(),
+    retryAfter: timestamp("retry_after", { withTimezone: true }),
+    lastHttpStatus: integer("last_http_status"),
+    lastError: text("last_error").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    source: foreignKey({
+      columns: [table.simJobId, table.sequence, table.resultAttemptId],
+      foreignColumns: [
+        progressiveWorkerEvidenceAttempts.simJobId,
+        progressiveWorkerEvidenceAttempts.sequence,
+        progressiveWorkerEvidenceAttempts.resultAttemptId,
+      ],
+    }).onDelete("cascade"),
+    signatureCheck: check(
+      "progressive_worker_delivery_failures_point_content_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    stateCheck: check(
+      "progressive_worker_delivery_failures_state_check",
+      sql`${table.state} IN ('retry', 'conflict')`,
+    ),
+    countCheck: check(
+      "progressive_worker_delivery_failures_attempt_count_check",
+      sql`${table.attemptCount} > 0`,
+    ),
+    httpCheck: check(
+      "progressive_worker_delivery_failures_last_http_status_check",
+      sql`${table.lastHttpStatus} BETWEEN 100 AND 599`,
+    ),
+    retryCheck: check(
+      "progressive_worker_delivery_failures_check",
+      sql`(${table.state} = 'retry' AND ${table.retryAfter} IS NOT NULL) OR (${table.state} = 'conflict' AND ${table.retryAfter} IS NULL)`,
+    ),
+  }),
+);
+
+export const progressiveWorkerAssignmentCursors = pgTable(
+  "progressive_worker_assignment_cursors",
+  {
+    settingsId: integer("settings_id")
+      .primaryKey()
+      .references(() => syncApiSettings.id, { onDelete: "cascade" }),
+    solverId: uuid("solver_id").notNull(),
+    upstreamBaseUrl: text("upstream_base_url").notNull(),
+    afterExecutionId: uuid("after_execution_id"),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+);
+
+export const progressivePolarModels = pgTable("progressive_polar_models", {
+  id: text("id").primaryKey(),
+  predictionId: text("prediction_id")
+    .notNull()
+    .references(() => neuralfoilPredictions.id, { onDelete: "cascade" }),
+  sourceSignature: text("source_signature").notNull(),
+  request: jsonb("request").$type<Record<string, unknown>>().notNull(),
+  response: jsonb("response").$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .default(sql`clock_timestamp()`),
+});
+
+export const progressivePolarFitWork = pgTable(
+  "progressive_polar_fit_work",
+  {
+    predictionId: text("prediction_id")
+      .primaryKey()
+      .references(() => neuralfoilPredictions.id, { onDelete: "cascade" }),
+    sourceVersion: integer("source_version").notNull().default(1),
+    state: text("state").notNull().default("pending"),
+    leaseToken: uuid("lease_token"),
+    leaseOwner: text("lease_owner"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    attempts: integer("attempts").notNull().default(0),
+    modelId: text("model_id").references(() => progressivePolarModels.id, {
+      onDelete: "set null",
+    }),
+    error: text("error"),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    pendingIdx: index("progressive_polar_fit_work_pending_idx").on(
+      table.state,
+      table.updatedAt,
+    ),
+  }),
+);
+
+export const progressivePolarModelEvidence = pgTable(
+  "progressive_polar_model_evidence",
+  {
+    modelId: text("model_id")
+      .notNull()
+      .references(() => progressivePolarModels.id, { onDelete: "cascade" }),
+    attemptToken: uuid("attempt_token").notNull(),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.modelId, table.resultAttemptId] }),
+    receiptFk: foreignKey({
+      columns: [table.attemptToken, table.resultAttemptId],
+      foreignColumns: [
+        progressiveCfdEvidence.attemptToken,
+        progressiveCfdEvidence.resultAttemptId,
+      ],
+    }).onDelete("cascade"),
+  }),
+);

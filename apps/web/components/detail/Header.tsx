@@ -1,14 +1,23 @@
 import type { AirfoilDetailPayload } from "@aerodb/core";
+import Link from "next/link";
 
 import { browserUrl } from "@/lib/api";
 import { C, MONO } from "@/lib/tokens";
+import { comparisonHref } from "@/lib/compare-selection";
 
 export function DetailHeader({ detail }: { detail: AirfoilDetailPayload }) {
   const { breadcrumb, name, subtitle, tags } = detail;
   return (
     <>
       {/* breadcrumb */}
-      <div style={{ fontFamily: MONO, fontSize: 11, color: C.dim, marginBottom: 14 }}>
+      <div
+        style={{
+          fontFamily: MONO,
+          fontSize: 11,
+          color: C.dim,
+          marginBottom: 14,
+        }}
+      >
         <span style={{ color: C.muted }}>{breadcrumb.db}</span>{" "}
         <span style={{ color: C.dimmer }}>/</span>{" "}
         <span style={{ color: C.muted }}>{breadcrumb.family}</span>{" "}
@@ -47,12 +56,23 @@ export function DetailHeader({ detail }: { detail: AirfoilDetailPayload }) {
               </span>
             ))}
           </div>
-          <h1 style={{ margin: 0, fontSize: 34, fontWeight: 700, letterSpacing: "-0.01em" }}>{name}</h1>
-          <div style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>{subtitle}</div>
+          <h1
+            style={{
+              margin: 0,
+              fontSize: 34,
+              fontWeight: 700,
+              letterSpacing: "-0.01em",
+            }}
+          >
+            {name}
+          </h1>
+          <div style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>
+            {subtitle}
+          </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-          <button
-            type="button"
+          <Link
+            href={comparisonHref([detail.slug])}
             style={{
               display: "flex",
               alignItems: "center",
@@ -66,8 +86,8 @@ export function DetailHeader({ detail }: { detail: AirfoilDetailPayload }) {
               cursor: "pointer",
             }}
           >
-            ＋ Add to compare
-          </button>
+            Compare
+          </Link>
           <a
             href={browserUrl(detail.downloads.selig ?? "#")}
             style={{

@@ -1,5 +1,5 @@
 import { simJobs, type DB } from "@aerodb/db";
-import { and, eq, gt, inArray, isNull, lte, or } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 
 /** Longer than any one bounded engine HTTP call. Long multi-point/media
@@ -42,6 +42,7 @@ export async function claimJobForIngest(
     token?: string;
     now?: Date;
     leaseMs?: number;
+    progressiveStopped?: boolean;
   } = {},
 ): Promise<IngestLease | null> {
   const now = opts.now ?? new Date();
@@ -63,6 +64,15 @@ export async function claimJobForIngest(
         eq(simJobs.id, jobId),
         or(
           inArray(simJobs.status, ["submitted", "running", "failed"]),
+          opts.progressiveStopped
+            ? and(
+                eq(simJobs.status, "cancelled"),
+                isNull(simJobs.ingestedAt),
+                sql`${simJobs.requestPayload}->'progressive' IS NOT NULL`,
+                sql`EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+                  WHERE stopped.sim_job_id = ${simJobs.id} AND stopped.engine_job_id = ${simJobs.engineJobId})`,
+              )
+            : undefined,
           and(
             eq(simJobs.status, "ingesting"),
             or(

@@ -105,6 +105,22 @@ export function supportsDurableUransRecovery(
   return version != null && version >= MIN_DURABLE_URANS_RECOVERY_VERSION;
 }
 
+export async function engineProgressiveCapabilities(engine: EngineClient) {
+  const health = await engineHealthDetails(engine);
+  return {
+    uransRecoveryVersion: health
+      ? "urans_recovery_version" in health
+        ? parsedUransRecoveryVersion(health.urans_recovery_version)
+        : 0
+      : null,
+    solverBudgetVersion: health
+      ? "solver_budget_version" in health
+        ? parsedUransRecoveryVersion(health.solver_budget_version)
+        : 0
+      : null,
+  };
+}
+
 export async function engineUransInitializationVersion(
   engine: EngineClient,
 ): Promise<number | null> {

@@ -2,6 +2,9 @@
 // Sutherland's law etc. — the Python solver stays a dumb scalar consumer (it is
 // handed a resolved density + dynamic/kinematic viscosity per boundary condition).
 
+import type { GasThermodynamicModel } from "./gas-thermodynamics";
+import { evaluateGasState } from "./gas-state";
+
 export type ViscosityModelName = "constant" | "sutherland" | "table";
 
 export type ViscositySpec =
@@ -14,7 +17,10 @@ export type ViscositySpec =
  *
  * Sutherland's law: μ(T) = μ_ref · (T/T_ref)^1.5 · (T_ref + S) / (T + S)
  */
-export function evalDynamicViscosity(spec: ViscositySpec, tempK: number): number {
+export function evalDynamicViscosity(
+  spec: ViscositySpec,
+  tempK: number,
+): number {
   switch (spec.model) {
     case "constant":
       return spec.mu;
@@ -55,6 +61,7 @@ export interface MediumStateInput {
   refPressurePa: number;
   viscosity: ViscositySpec;
   speedOfSound?: number | null;
+  gasThermodynamics?: GasThermodynamicModel | null;
 }
 
 export interface FlowConditionInput {
@@ -78,23 +85,91 @@ export interface OperatingConditionState extends FlowConditionState {
   reynolds: number;
 }
 
-export function densityAtState(medium: MediumStateInput, state: Pick<FlowConditionInput, "temperatureK" | "pressurePa">): number {
+export function densityAtState(
+  medium: MediumStateInput,
+  state: Pick<FlowConditionInput, "temperatureK" | "pressurePa">,
+): number {
+  if (medium.gasThermodynamics != null) {
+    if (medium.phase !== "gas")
+      throw new Error("Only gas materials may supply a gas model");
+    return evaluateGasState(
+      medium.gasThermodynamics,
+      state.temperatureK,
+      state.pressurePa,
+    ).density;
+  }
   if (medium.phase !== "gas") return medium.density;
-  return medium.density * (state.pressurePa / medium.refPressurePa) * (medium.refTemperatureK / state.temperatureK);
+  return (
+    medium.density *
+    (state.pressurePa / medium.refPressurePa) *
+    (medium.refTemperatureK / state.temperatureK)
+  );
 }
 
 export function deriveFlowConditionState(
   medium: MediumStateInput,
   state: FlowConditionInput,
 ): FlowConditionState {
-  const dynamicViscosity = evalDynamicViscosity(medium.viscosity, state.temperatureK);
+  if (medium.gasThermodynamics != null) {
+    if (medium.phase !== "gas")
+      throw new Error("Only gas materials may supply a gas model");
+    if (!Number.isFinite(state.speedMps) || state.speedMps < 0)
+      throw new Error("Flow speed must be finite and nonnegative");
+    const gas = evaluateGasState(
+      medium.gasThermodynamics,
+      state.temperatureK,
+      state.pressurePa,
+    );
+    return {
+      density: gas.density,
+      dynamicViscosity: gas.dynamicViscosity,
+      kinematicViscosity: gas.kinematicViscosity,
+      mach: state.speedMps / gas.speedOfSound,
+    };
+  }
+  const dynamicViscosity = evalDynamicViscosity(
+    medium.viscosity,
+    state.temperatureK,
+  );
   const density = densityAtState(medium, state);
   const kinematicViscosity = dynamicViscosity / density;
-  const mach = medium.speedOfSound && medium.speedOfSound > 0 ? state.speedMps / medium.speedOfSound : null;
+  const soundSpeed = speedOfSoundAtState(medium, state.temperatureK);
+  const mach = soundSpeed === null ? null : state.speedMps / soundSpeed;
   return { dynamicViscosity, density, kinematicViscosity, mach };
 }
 
-export function reynoldsFromFlowReference(flow: Pick<FlowConditionInput, "speedMps"> & Pick<FlowConditionState, "kinematicViscosity">, referenceLengthM: number): number {
+export function speedOfSoundAtState(
+  medium: MediumStateInput,
+  temperatureK: number,
+): number | null {
+  if (medium.gasThermodynamics != null) {
+    if (medium.phase !== "gas")
+      throw new Error("Only gas materials may supply a gas model");
+    return evaluateGasState(
+      medium.gasThermodynamics,
+      temperatureK,
+      medium.refPressurePa,
+    ).speedOfSound;
+  }
+  if (!(medium.speedOfSound && medium.speedOfSound > 0)) return null;
+  if (medium.phase !== "gas") return medium.speedOfSound;
+  if (
+    !Number.isFinite(temperatureK) ||
+    temperatureK <= 0 ||
+    !Number.isFinite(medium.refTemperatureK) ||
+    medium.refTemperatureK <= 0
+  )
+    throw new Error(
+      "Gas speed of sound requires positive absolute temperature",
+    );
+  return medium.speedOfSound * Math.sqrt(temperatureK / medium.refTemperatureK);
+}
+
+export function reynoldsFromFlowReference(
+  flow: Pick<FlowConditionInput, "speedMps"> &
+    Pick<FlowConditionState, "kinematicViscosity">,
+  referenceLengthM: number,
+): number {
   return (flow.speedMps * referenceLengthM) / flow.kinematicViscosity;
 }
 
@@ -103,5 +178,11 @@ export function deriveOperatingConditionState(
   state: OperatingConditionInput,
 ): OperatingConditionState {
   const flow = deriveFlowConditionState(medium, state);
-  return { ...flow, reynolds: reynoldsFromFlowReference({ speedMps: state.speedMps, kinematicViscosity: flow.kinematicViscosity }, state.referenceChordM) };
+  return {
+    ...flow,
+    reynolds: reynoldsFromFlowReference(
+      { speedMps: state.speedMps, kinematicViscosity: flow.kinematicViscosity },
+      state.referenceChordM,
+    ),
+  };
 }

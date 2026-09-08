@@ -22,6 +22,7 @@ from airfoilfoam.models import (
     EngineIdentity,
     FluidProperties,
     JobState,
+    JobResult,
     JobStatus,
     MeshParams,
     PolarRequest,
@@ -730,6 +731,46 @@ def test_queue_reports_unknown_worker_consumers_when_inspector_unavailable(
     }
 
 
+@pytest.mark.parametrize("mode", ["completed", "running", "wrong_job", "unavailable", "incomplete"])
+def test_execution_stop_inspection_preserves_result_and_routes_to_its_worker_pool(tmp_path, monkeypatch, mode):
+    settings = Settings(data_dir=tmp_path / "data")
+    store = JobStore(settings)
+    job_id = "inspect-foundation-job"
+    store.write_status(JobStatus(job_id=job_id, state=JobState.completed, requested_engine=FOUNDATION_14_IDENTITY))
+    store.write_result(JobResult(job_id=job_id, state=JobState.completed))
+    original = (store.job_dir(job_id) / "result.json").read_bytes()
+    calls = []
+
+    class Inspection:
+        def get(self, **_kwargs):
+            if mode == "unavailable":
+                raise RuntimeError("isolated unavailable worker")
+            proof = {"version": 1, "job_id": job_id, "execution_stopped": mode != "running",
+                     "producer_stopped": mode != "running", "namespace_verified": True,
+                     "remaining": [], "error": None, "fence": "terminal_result", "observed_at": "2026-09-06T00:00:00Z"}
+            if mode == "wrong_job":
+                proof["job_id"] = "other-job"
+            if mode == "incomplete":
+                proof.pop("fence")
+            return proof
+
+    def inspect_control(action, identity, pool, engine):
+        assert action == "inspect" and engine == FOUNDATION_14_IDENTITY
+        calls.append({"args": [identity], "queue": pool})
+        return Inspection().get()
+
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
+    from airfoilfoam import worker_control
+    monkeypatch.setattr(worker_control, "request_worker_control", inspect_control)
+    response = TestClient(api_main.create_app()).post(f"/jobs/{job_id}/execution-stop-proof")
+    assert calls == [{"args": [job_id], "queue": FOUNDATION_14.queue_name}]
+    assert response.status_code == (200 if mode in {"completed", "running"} else 503)
+    if response.status_code == 200:
+        assert response.json()["execution_stopped"] is (mode == "completed")
+    assert (store.job_dir(job_id) / "result.json").read_bytes() == original
+    assert store.is_cancelled(job_id) is False
+
+
 def test_worker_rejects_wrong_configured_pool_as_infrastructure_before_geometry(tmp_path):
     request = PolarRequest.model_validate(
         {
@@ -750,7 +791,8 @@ def test_worker_rejects_wrong_configured_pool_as_infrastructure_before_geometry(
         execute_job("wrong-pool", request, store=JobStore(settings), settings=settings)
 
 
-def test_cancel_routes_every_reaper_to_the_job_engine_pool(tmp_path, monkeypatch):
+@pytest.mark.parametrize("proof_state", ["confirmed", "held", "unknown", "wrong_job", "earlier_only", "unavailable"])
+def test_cancel_routes_every_reaper_to_the_job_engine_pool(tmp_path, monkeypatch, proof_state):
     settings = Settings(data_dir=tmp_path / "data")
     store = JobStore(settings)
     store.write_status(
@@ -765,16 +807,27 @@ def test_cancel_routes_every_reaper_to_the_job_engine_pool(tmp_path, monkeypatch
 
     class ReaperResult:
         def get(self, **_kwargs):
-            return {"terminated": []}
+            if proof_state == "unavailable":
+                raise RuntimeError("isolated unavailable reaper")
+            proof = {"version": 1, "job_id": "foundation-running", "execution_stopped": True,
+                     "producer_stopped": True, "namespace_verified": True, "remaining": [], "error": None}
+            if proof_state == "held":
+                proof["producer_stopped"] = False
+            if proof_state == "wrong_job":
+                proof["job_id"] = "another-job"
+            if proof_state == "unknown" or (proof_state == "earlier_only" and len(calls) == 3):
+                proof = None
+            return {"terminated": [], "stop_proof": proof}
 
-    class FakeReaper:
-        def apply_async(self, **kwargs):
-            calls.append(kwargs)
-            return ReaperResult()
+    def reap_control(action, identity, pool, engine):
+        assert action == "reap" and engine == FOUNDATION_14_IDENTITY
+        calls.append({"args": [identity], "queue": pool})
+        return ReaperResult().get()
 
     revoked: list[tuple] = []
     monkeypatch.setattr(api_main, "get_settings", lambda: settings)
-    monkeypatch.setattr(tasks, "kill_job_processes", FakeReaper())
+    from airfoilfoam import worker_control
+    monkeypatch.setattr(worker_control, "request_worker_control", reap_control)
     monkeypatch.setattr(
         celery_app.control,
         "revoke",
@@ -785,6 +838,8 @@ def test_cancel_routes_every_reaper_to_the_job_engine_pool(tmp_path, monkeypatch
     response = client.post("/jobs/foundation-running/cancel")
 
     assert response.status_code == 200
+    assert response.json()["cancelled"] is True
+    assert response.json()["execution_stopped"] is (proof_state == "confirmed")
     assert len(calls) == 3
     assert {call["queue"] for call in calls} == {FOUNDATION_14.queue_name}
     assert revoked and revoked[0][0] == ("foundation-running",)

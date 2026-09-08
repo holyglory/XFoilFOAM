@@ -1,5 +1,5 @@
 import { type Point } from "@aerodb/core";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   airfoils,
   boundaryConditions,
@@ -13,6 +13,7 @@ import {
   polarFitSets,
   referenceGeometryProfiles,
   registeredRemoteSolvers,
+  progressiveRemoteReports,
   refreshPolarCacheForRevision,
   resultClassifications,
   resultMedia,
@@ -37,6 +38,7 @@ import { assembleDetail } from "../src/services/detail";
 import { listAirfoils } from "../src/services/catalog";
 import { assembleSim } from "../src/services/sim";
 import { createExactResultAttemptFixture } from "./exact-result-fixture";
+import { createProgressiveReportFixture } from "./progressive-report-fixture";
 
 const cleanupResultIds = new Set<string>();
 const cleanupClassificationIds = new Set<string>();
@@ -336,6 +338,11 @@ describe("catalog solved-metric evidence", () => {
   it("gates sync API status and claims by enablement, secret, and permissions", async () => {
     const secret = `sync-api-test-${Date.now()}`;
     const sourceInstanceId = `sync-api-test-${process.pid}-${Date.now()}`;
+    const standalone = await createTestBoundaryCondition(
+      sourceInstanceId,
+      true,
+      537219,
+    );
     await db.insert(syncApiSettings).values({ id: 1 }).onConflictDoNothing();
     const [savedSettings] = await db
       .select()
@@ -583,6 +590,8 @@ describe("catalog solved-metric evidence", () => {
           setupRevision: { id: string };
         };
       };
+      expect(body.promise).not.toBeNull();
+      expect(body.promise?.setupRevision.id).toBe(standalone.presetRevisionId);
       if (body.promise) {
         expect(body.promise.aoas.length).toBe(1);
         cleanupSyncPromiseIds.add(body.promise.id);
@@ -608,6 +617,340 @@ describe("catalog solved-metric evidence", () => {
       });
 
       if (body.promise) {
+        const fixture = await createProgressiveReportFixture({
+          solverId: registered.solver.id,
+          promiseId: body.promise.id,
+          airfoilId: body.promise.airfoil.id,
+          revisionId: body.promise.setupRevision.id,
+          bcId: standalone.id,
+          alpha: body.promise.aoas[0],
+        });
+        const reportUrl = `/api/sync/v1/progressive-executions/${fixture.executionId}/reports`;
+        const reportPayload = {
+          promiseId: body.promise.id,
+          report: fixture.report,
+        };
+        const reportHeaders = {
+          "x-xfoilfoam-solver-token": registered.authToken,
+        };
+        try {
+          const assignmentsUrl = "/api/sync/v1/progressive-executions";
+          const assignmentUrl = `${assignmentsUrl}/${fixture.executionId}`;
+          const startPayload = {
+            contentSignature: fixture.envelope.contentSignature,
+          };
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: `${assignmentUrl}/start`,
+                payload: startPayload,
+              })
+            ).statusCode,
+          ).toBe(401);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: `${assignmentUrl}/start`,
+                headers: { "x-xfoilfoam-sync-secret": secret },
+                payload: startPayload,
+              })
+            ).statusCode,
+          ).toBe(401);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: `${assignmentUrl}/start`,
+                headers: reportHeaders,
+                payload: { ...startPayload, unknown: true },
+              })
+            ).statusCode,
+          ).toBe(400);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: `${assignmentUrl}/start`,
+                headers: reportHeaders,
+                payload: { contentSignature: "0".repeat(64) },
+              })
+            ).statusCode,
+          ).toBe(409);
+          const obsoleteStart = await app.inject({
+            method: "POST",
+            url: `${assignmentUrl}/start`,
+            headers: reportHeaders,
+            payload: startPayload,
+          });
+          expect(obsoleteStart.statusCode).toBe(409);
+          expect(obsoleteStart.json().decision.kind).toBe("stop");
+          for (const url of [
+            assignmentsUrl,
+            assignmentUrl,
+            `${assignmentUrl}/control`,
+          ]) {
+            expect((await app.inject({ method: "GET", url })).statusCode).toBe(
+              401,
+            );
+            expect(
+              (
+                await app.inject({
+                  method: "GET",
+                  url,
+                  headers: { "x-xfoilfoam-sync-secret": secret },
+                })
+              ).statusCode,
+            ).toBe(401);
+          }
+          const control = await app.inject({
+            method: "GET",
+            url: `${assignmentUrl}/control`,
+            headers: reportHeaders,
+          });
+          expect(control.statusCode).toBe(200);
+          expect(control.json()).toEqual({
+            executionId: fixture.executionId,
+            contentSignature: fixture.envelope.contentSignature,
+            continuation: { kind: "stop", reason: expect.any(String) },
+          });
+          const assignments = await app.inject({
+            method: "GET",
+            url: assignmentsUrl,
+            headers: reportHeaders,
+          });
+          expect(assignments.statusCode).toBe(200);
+          expect(assignments.json()).toEqual({
+            items: [
+              {
+                executionId: fixture.executionId,
+                promiseId: body.promise.id,
+                contentSignature: fixture.envelope.contentSignature,
+                cpuSlots: 1,
+              },
+            ],
+            nextCursor: null,
+          });
+          expect(
+            (
+              await app.inject({
+                method: "GET",
+                url: `${assignmentsUrl}?limit=51`,
+                headers: reportHeaders,
+              })
+            ).statusCode,
+          ).toBe(400);
+          expect(
+            (
+              await app.inject({
+                method: "GET",
+                url: `${assignmentsUrl}?solverId=${randomUUID()}`,
+                headers: reportHeaders,
+              })
+            ).statusCode,
+          ).toBe(400);
+          expect(
+            (
+              await app.inject({
+                method: "GET",
+                url: `${assignmentsUrl}/${randomUUID()}`,
+                headers: reportHeaders,
+              })
+            ).statusCode,
+          ).toBe(404);
+          expect(
+            (
+              await app.inject({
+                method: "GET",
+                url: `${assignmentsUrl}?after=${fixture.executionId}`,
+                headers: reportHeaders,
+              })
+            ).json(),
+          ).toEqual({ items: [], nextCursor: null });
+          const assignment = await app.inject({
+            method: "GET",
+            url: assignmentUrl,
+            headers: reportHeaders,
+          });
+          expect(assignment.statusCode).toBe(200);
+          expect(assignment.json().assignment).toMatchObject({
+            envelope: fixture.envelope,
+            executionStopped: false,
+            receivedSequence: 0,
+            job: { status: "pending", engineState: null },
+            promise: {
+              id: body.promise.id,
+              status: "active",
+              expired: false,
+              setupRevision: { id: body.promise.setupRevision.id },
+              aoas: [body.promise.aoas[0]],
+            },
+          });
+          await db
+            .update(syncApiPermissions)
+            .set({ canFetch: false })
+            .where(eq(syncApiPermissions.dataType, "sweeps"));
+          for (const url of [assignmentsUrl, assignmentUrl])
+            expect(
+              (await app.inject({ method: "GET", url, headers: reportHeaders }))
+                .statusCode,
+            ).toBe(403);
+          await db
+            .update(syncApiPermissions)
+            .set({ canFetch: true })
+            .where(eq(syncApiPermissions.dataType, "sweeps"));
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: reportUrl,
+                payload: reportPayload,
+              })
+            ).statusCode,
+          ).toBe(401);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: reportUrl,
+                headers: { "x-xfoilfoam-sync-secret": secret },
+                payload: reportPayload,
+              })
+            ).statusCode,
+          ).toBe(401);
+          await db
+            .insert(syncApiPermissions)
+            .values({ dataType: "polars", canPush: false })
+            .onConflictDoUpdate({
+              target: syncApiPermissions.dataType,
+              set: { canPush: false },
+            });
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: reportUrl,
+                headers: reportHeaders,
+                payload: reportPayload,
+              })
+            ).statusCode,
+          ).toBe(403);
+          await db
+            .update(syncApiPermissions)
+            .set({ canPush: true })
+            .where(eq(syncApiPermissions.dataType, "polars"));
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: reportUrl,
+                headers: reportHeaders,
+                payload: { ...reportPayload, promiseId: randomUUID() },
+              })
+            ).statusCode,
+          ).toBe(403);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: reportUrl,
+                headers: reportHeaders,
+                payload: { ...reportPayload, unknown: true },
+              })
+            ).statusCode,
+          ).toBe(400);
+          const received = await app.inject({
+            method: "POST",
+            url: reportUrl,
+            headers: reportHeaders,
+            payload: reportPayload,
+          });
+          expect(received.statusCode).toBe(200);
+          expect(received.json()).toMatchObject({
+            received: true,
+            receipt: {
+              executionId: fixture.executionId,
+              sequence: 1,
+              replayed: false,
+            },
+          });
+          const replay = await app.inject({
+            method: "POST",
+            url: reportUrl,
+            headers: reportHeaders,
+            payload: reportPayload,
+          });
+          expect(replay.statusCode).toBe(200);
+          expect(replay.json().receipt).toMatchObject({
+            ...received.json().receipt,
+            replayed: true,
+          });
+          const changed = await app.inject({
+            method: "POST",
+            url: reportUrl,
+            headers: reportHeaders,
+            payload: {
+              ...reportPayload,
+              report: {
+                ...fixture.report,
+                status: {
+                  ...fixture.report.status,
+                  message: "changed immutable report",
+                },
+              },
+            },
+          });
+          expect(changed.statusCode).toBe(409);
+          const persisted = await db
+            .select()
+            .from(progressiveRemoteReports)
+            .where(eq(progressiveRemoteReports.simJobId, fixture.executionId));
+          expect(persisted).toHaveLength(1);
+          expect(persisted[0].report).toEqual(fixture.report);
+          const afterReport = await app.inject({
+            method: "GET",
+            url: assignmentUrl,
+            headers: reportHeaders,
+          });
+          expect(afterReport.json().assignment.receivedSequence).toBe(1);
+          await db
+            .update(syncSweepPromises)
+            .set({ expiresAt: new Date(Date.now() - 1000) })
+            .where(eq(syncSweepPromises.id, body.promise.id));
+          const expired = await app.inject({
+            method: "GET",
+            url: assignmentUrl,
+            headers: reportHeaders,
+          });
+          expect(expired.json().assignment).toMatchObject({
+            envelope: fixture.envelope,
+            executionStopped: false,
+            promise: { expired: true },
+          });
+          expect(
+            (
+              await app.inject({
+                method: "GET",
+                url: assignmentsUrl,
+                headers: reportHeaders,
+              })
+            ).json().items,
+          ).toHaveLength(1);
+          await db
+            .update(syncSweepPromises)
+            .set({ expiresAt: new Date(Date.now() + 3600000) })
+            .where(eq(syncSweepPromises.id, body.promise.id));
+          const [unchanged] = await db
+            .select()
+            .from(simJobs)
+            .where(eq(simJobs.id, fixture.executionId));
+          expect(unchanged.status).toBe("pending");
+          expect(unchanged.engineJobId).toBeNull();
+          expect(unchanged.completedCases).toBe(0);
+        } finally {
+          await fixture.cleanup();
+        }
         const terminalCancel = await app.inject({
           method: "POST",
           url: `/api/sync/v1/sweeps/${body.promise.id}/cancel`,

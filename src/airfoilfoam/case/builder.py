@@ -146,8 +146,12 @@ class CaseBuilder:
                 "timeFormat": "general",
                 "runTimeModifiable": "true",
                 "functions": {"forceCoeffs1": force_coeffs},
+                **self._control_library_entries(),
             },
         )
+
+    def _control_library_entries(self) -> dict:
+        return {}
 
     def _write_fv_schemes(self, turb) -> None:
         u_scheme = (

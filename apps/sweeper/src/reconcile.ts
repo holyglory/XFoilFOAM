@@ -1,4 +1,6 @@
 import {
+  assertProgressiveExecutionIdentity,
+  acknowledgeProgressiveCfdExecutionStop,
   airfoils,
   autoRetryCrashedResultsForJob,
   type CampaignLaneKey,
@@ -39,6 +41,7 @@ import {
   simCampaignLanes,
   simCampaigns,
   simJobs,
+  solverDirectLifecycleSql,
   simulationPresetRevisions,
   syncSweepPromises,
   simUransRequests,
@@ -112,6 +115,12 @@ import {
   expectedExecutionPoolForJob,
 } from "./engine-routing";
 import { touchHeartbeat } from "./heartbeat";
+import { reconcileProgressiveExecutions } from "./progressive-execution";
+import { recoverProgressiveSubmissions } from "./progressive-submission";
+import {
+  recordProgressiveCfdRuntimeProgress,
+  recordProgressiveCfdRecoveryPlans,
+} from "@aerodb/db";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
 import {
   type ConditionMapEntry,
@@ -1655,10 +1664,7 @@ export function remainingAdmissionCpuSlotsForStatus(
     return Math.max(1, currentSlots);
   }
   const unfinishedCases = totalCases - completedCases;
-  const remainingConcurrentCases = Math.min(
-    caseConcurrency,
-    unfinishedCases,
-  );
+  const remainingConcurrentCases = Math.min(caseConcurrency, unfinishedCases);
   const remainingSlots = Math.max(
     1,
     remainingConcurrentCases * solverProcesses,
@@ -1671,13 +1677,14 @@ async function markIngestRetry(
   jobId: string,
   e: unknown,
   lease?: Pick<IngestLease, "jobId" | "token">,
+  engineState: string | null = "completed",
 ): Promise<void> {
   const now = new Date();
   await db
     .update(simJobs)
     .set({
       status: "ingesting",
-      engineState: "completed",
+      engineState,
       error: "ingest retry pending: " + errorMessage(e),
       polledAt: now,
       finishedAt: null,
@@ -1997,6 +2004,7 @@ async function cancelTerminalEngineTasks(
     .where(
       and(
         inArray(simJobs.engineJobId, candidateIds),
+        solverDirectLifecycleSql(),
         inArray(simJobs.status, ["done", "failed", "cancelled"]),
       ),
     );
@@ -2038,6 +2046,8 @@ async function retryPersistedCancellationObligations(
   jobIds: string[] = [],
 ): Promise<Set<string>> {
   const filters = [
+    sql`${simJobs.requestPayload}->'progressive' IS NULL`,
+    solverDirectLifecycleSql(),
     eq(simJobs.status, "cancelled"),
     inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
     isNotNull(simJobs.engineJobId),
@@ -3807,6 +3817,8 @@ async function recoverFailedEngineJobs(
   ids?: string[],
 ): Promise<void> {
   const filters = [
+    sql`${simJobs.requestPayload}->'progressive' IS NULL`,
+    solverDirectLifecycleSql(),
     eq(simJobs.status, "failed"),
     isNotNull(simJobs.engineJobId),
     or(
@@ -4113,17 +4125,216 @@ async function handlePollMiss(
 }
 
 /** Poll in-flight engine jobs; completed jobs ingest, transient engine misses recover or requeue. */
+export async function reconcileProgressiveCfdJob(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+): Promise<void> {
+  if (!job.engineJobId || !requestPayload(job).progressive) return;
+  const [local] = await db
+    .select({ id: simJobs.id })
+    .from(simJobs)
+    .where(and(eq(simJobs.id, job.id), solverDirectLifecycleSql()))
+    .limit(1);
+  if (!local) return;
+  assertProgressiveExecutionIdentity(
+    job.id,
+    job.engineJobId,
+    job.requestPayload,
+  );
+  const route = {
+    expectedEngine: expectedEngineForJob(job),
+    expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
+  };
+  const status = await engine.getJob(job.engineJobId, route);
+  if (status.job_id !== job.engineJobId)
+    throw new Error("Progressive status belongs to another engine execution");
+  if (status.solver_budget_progress)
+    await recordProgressiveCfdRuntimeProgress(db, {
+      simJobId: job.id,
+      engineJobId: job.engineJobId,
+      progress: status.solver_budget_progress,
+    });
+  const terminal = ["completed", "failed", "cancelled"].includes(status.state);
+  if (!terminal) {
+    if (job.status === "cancelled") return;
+    await updateJobFromEngineStatus(db, job, {
+      ...status,
+      completed_cases: job.completedCases,
+    });
+    if (
+      status.state !== "running" ||
+      status.completed_cases <= job.completedCases
+    )
+      return;
+  } else {
+    const proof = await engine.getExecutionStopProof(job.engineJobId, route);
+    if (!proof.execution_stopped) return;
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: job.id,
+      proof,
+    });
+  }
+  const lease = await claimJobForIngest(db, job.id, {
+    progressiveStopped: terminal,
+  });
+  if (!lease) return;
+  try {
+    let result: JobResult | null;
+    try {
+      result = await engine.getResult(job.engineJobId, route);
+    } catch (error) {
+      if (!terminal || status.state === "completed" || !isNotFound(error))
+        throw error;
+      result = null;
+    }
+    if (result && result.job_id !== job.engineJobId)
+      throw new Error("Progressive result belongs to another engine execution");
+    if (
+      result &&
+      terminal &&
+      !["completed", "failed", "cancelled"].includes(result.state)
+    )
+      throw new Error(
+        "Stopped progressive execution has not sealed its final result snapshot",
+      );
+    if (result) {
+      job = await jobWithPersistedMeshRecoveryAcknowledgement(
+        db,
+        job,
+        result.mesh_recovery_version,
+        result.engine,
+        lease,
+      );
+      const ingested = await ingestResult({
+        db,
+        engine,
+        engineJobId: job.engineJobId!,
+        simJobId: job.id,
+        airfoilId: job.airfoilId,
+        speedMap: speedMapForJob(job),
+        conditionMap: conditionMapForJob(job) ?? undefined,
+        jobAoas: anglesForJob(job),
+        uransFidelity: uransFidelityForJob(job),
+        result,
+        ingestLeaseToken: lease.token,
+        heartbeat: () => renewIngestAndHeartbeat(db, lease),
+      });
+      if (terminal)
+        await recordProgressiveCfdRecoveryPlans(
+          db,
+          job.id,
+          ingested.ransPrecalcPromotions,
+        );
+      await refreshPolarCachesForJob(db, job, () =>
+        renewIngestAndHeartbeat(db, lease),
+      );
+    }
+    if (!terminal) {
+      const [updated] = await db
+        .update(simJobs)
+        .set({ completedCases: status.completed_cases })
+        .where(ingestLeaseOwnedWhere(job.id, lease.token))
+        .returning({ id: simJobs.id });
+      if (!updated) throw new IngestLeaseLostError(job.id);
+      if (!(await releaseIngestLeaseToRunning(db, lease)))
+        throw new IngestLeaseLostError(job.id);
+      return;
+    }
+    await db.transaction(async (raw) => {
+      const transaction = raw as unknown as DB;
+      const [finished] = await transaction
+        .update(simJobs)
+        .set({
+          status:
+            status.state === "completed"
+              ? "done"
+              : status.state === "cancelled"
+                ? "cancelled"
+                : "failed",
+          engineState: status.state,
+          completedCases: status.completed_cases,
+          totalCases: status.total_cases,
+          polledAt: new Date(),
+          ingestedAt: new Date(),
+          finishedAt: new Date(),
+          error:
+            status.state === "completed"
+              ? null
+              : (status.message ?? "progressive execution stopped"),
+          ingestLeaseToken: null,
+          ingestLeaseClaimedAt: null,
+          ingestLeaseExpiresAt: null,
+        })
+        .where(ingestLeaseOwnedWhere(job.id, lease.token))
+        .returning({ id: simJobs.id });
+      if (!finished) throw new IngestLeaseLostError(job.id);
+      await releaseResultClaimsForJob(transaction, job.id, [
+        "queued",
+        "running",
+      ]);
+    });
+  } catch (error) {
+    await markIngestRetry(db, job.id, error, lease, status.state);
+    throw error;
+  }
+}
+
+async function pollProgressiveCfdJob(
+  db: DB,
+  engine: EngineClient,
+  job: SimJobRow,
+): Promise<void> {
+  await touchHeartbeat(db);
+  try {
+    await reconcileProgressiveCfdJob(db, engine, job);
+  } catch (error) {
+    await db
+      .update(simJobs)
+      .set({
+        error: "ingest retry pending: " + errorMessage(error),
+        polledAt: new Date(),
+      })
+      .where(
+        and(
+          eq(simJobs.id, job.id),
+          outsideLiveIngestLeaseWhere(),
+          or(
+            inArray(simJobs.status, [...activeJobStatuses, "failed"]),
+            and(eq(simJobs.status, "cancelled"), isNull(simJobs.ingestedAt)),
+          ),
+        ),
+      );
+  }
+}
+
 export async function reconcile(
   db: DB,
   engine: EngineClient,
   options: ReconcileOptions = {},
 ): Promise<void> {
+  const submissions = await recoverProgressiveSubmissions(db, engine, {
+    jobIds: options.jobIds,
+  });
+  if (submissions.inspected)
+    console.log(
+      JSON.stringify({ component: "progressive-submission", ...submissions }),
+    );
   if (!options.skipFailedRecovery) {
     await recoverFailedEngineJobs(db, engine, options.recoverFailedJobIds);
   }
 
   const activeFilters = [
-    inArray(simJobs.status, activeJobStatuses),
+    solverDirectLifecycleSql(),
+    or(
+      inArray(simJobs.status, activeJobStatuses),
+      and(
+        inArray(simJobs.status, ["failed", "cancelled"]),
+        isNull(simJobs.ingestedAt),
+        isNotNull(simJobs.engineJobId),
+        sql`${simJobs.requestPayload}->'progressive' IS NOT NULL`,
+      ),
+    ),
     outsideLiveIngestLeaseWhere(),
   ];
   if (options.jobIds?.length)
@@ -4177,6 +4388,10 @@ export async function reconcile(
   }
 
   await runWithConcurrency(jobs, activeReconcileConcurrency(), async (job) => {
+    if (requestPayload(job).progressive) {
+      await pollProgressiveCfdJob(db, engine, job);
+      return;
+    }
     await reconcileRunningPrecalcHandoff(db, job);
     if (!job.engineJobId) return;
     // Engine API calls take seconds when the worker saturates every core; a
@@ -4294,6 +4509,13 @@ export async function reconcile(
     }
   });
 
+  const progressive = await reconcileProgressiveExecutions(db, engine, {
+    jobIds: options.jobIds,
+  });
+  if (progressive.inspected)
+    console.log(
+      JSON.stringify({ component: "progressive-execution", ...progressive }),
+    );
   await drainCampaignMaintenance(db);
 }
 
@@ -4410,7 +4632,11 @@ export async function resetOrphans(
   db: DB,
   opts: { jobIds?: string[]; resultIds?: string[] } = {},
 ): Promise<void> {
-  const pendingFilters = [eq(simJobs.status, "pending")];
+  const pendingFilters = [
+    solverDirectLifecycleSql(),
+    eq(simJobs.status, "pending"),
+    sql`NOT coalesce(${simJobs.requestPayload} ? 'progressive', false)`,
+  ];
   if (opts.jobIds?.length)
     pendingFilters.push(inArray(simJobs.id, opts.jobIds));
   const cancelledPending = await db.transaction(async (tx) => {
@@ -4544,6 +4770,10 @@ export async function resetOrphans(
           AND ${results.simJobId} IS NULL
           AND ${EVIDENCE_BACKED_WAVE2_RESULT_SQL}
         )`,
+        sql`NOT EXISTS (SELECT 1 FROM sim_jobs progressive_job
+          WHERE progressive_job.id = ${results.simJobId}
+            AND (progressive_job.request_payload->'progressive' IS NOT NULL
+              OR progressive_job.request_payload ? 'remoteProgressiveExecution'))`,
       ),
     );
 }

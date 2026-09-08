@@ -132,6 +132,8 @@ import {
   startSystemHealthSampler,
   systemHealthSnapshot,
 } from "./services/system-health";
+import { mediumGasModelForWrite } from "./services/medium-gas-model";
+import { refreshFlowConditionsForMedium, refreshPresetRevisionsForRows } from "./services/medium-flow-refresh";
 import { solverFleetHealth } from "./services/solver-fleet-health";
 import {
   readSweeperState,
@@ -985,6 +987,7 @@ const mediumBodyBase = z
     sutherlandS: z.coerce.number().positive().nullable().optional(),
     viscosityTable: z.array(viscosityTablePointBody).optional(),
     speedOfSound: z.coerce.number().positive().nullable().optional(),
+    gasThermodynamics: z.unknown().optional(),
     notes: z.string().nullable().optional(),
   })
   .strict();
@@ -1636,42 +1639,6 @@ async function rowsForSimulationSetup() {
   };
 }
 
-async function refreshFlowConditionDerived(id: string) {
-  const [row] = await db
-    .select({ flowState: flowConditions, medium: mediums })
-    .from(flowConditions)
-    .innerJoin(mediums, eq(mediums.id, flowConditions.mediumId))
-    .where(eq(flowConditions.id, id))
-    .limit(1);
-  if (!row) return null;
-  const points = await tablePointsForMediums([row.medium.id]);
-  const derived = deriveFlowState(
-    row.medium,
-    row.flowState,
-    points.get(row.medium.id) ?? [],
-  );
-  const [updated] = await db
-    .update(flowConditions)
-    .set({
-      density: derived.density,
-      dynamicViscosity: derived.dynamicViscosity,
-      kinematicViscosity: derived.kinematicViscosity,
-      mach: derived.mach,
-    })
-    .where(eq(flowConditions.id, id))
-    .returning();
-  await refreshPresetsByFlowConditionId(id);
-  return updated;
-}
-
-async function refreshFlowConditionsForMedium(mediumId: string) {
-  const rows = await db
-    .select({ id: flowConditions.id })
-    .from(flowConditions)
-    .where(eq(flowConditions.mediumId, mediumId));
-  for (const row of rows) await refreshFlowConditionDerived(row.id);
-}
-
 async function refreshBoundaryConditionDerived(id: string) {
   const [row] = await db
     .select({ bc: boundaryConditions, medium: mediums })
@@ -1714,13 +1681,6 @@ async function syncLegacyBoundaryConditionForPreset(
   presetId: string,
 ): Promise<string | null> {
   return syncLegacyBoundaryConditionForPresetDb(db, presetId);
-}
-
-async function refreshPresetRevisionsForRows(rows: { id: string }[]) {
-  for (const row of rows) {
-    await syncLegacyBoundaryConditionForPreset(row.id);
-    await ensureSimulationPresetRevision(db, row.id);
-  }
 }
 
 async function refreshPresetsByFlowConditionId(id: string) {
@@ -2336,6 +2296,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         .limit(1);
       if (exists)
         return reply.code(409).send({ error: "medium slug already exists" });
+      const gasThermodynamics = await mediumGasModelForWrite(b);
       const { dynamicViscosity, kinematicViscosity } = resolveViscosity(
         b,
         b.density,
@@ -2351,6 +2312,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           refTemperatureK: b.refTemperatureK,
           refPressurePa: b.refPressurePa,
           ...mediumViscosityColumns(b),
+          gasThermodynamics,
           dynamicViscosity,
           kinematicViscosity,
           speedOfSound: b.speedOfSound ?? null,
@@ -2377,6 +2339,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(mediums.id, id))
         .limit(1);
       if (!existing) return reply.code(404).send({ error: "medium not found" });
+      const gasThermodynamics = await mediumGasModelForWrite(b, existing);
       const existingPoints = await tablePointsForMediums([id]);
       const existingInput = mediumViscosityInputFromMedium(
         existing,
@@ -2404,6 +2367,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
           refTemperatureK: b.refTemperatureK,
           refPressurePa: b.refPressurePa,
           ...mediumViscosityColumns(viscosityInput),
+          gasThermodynamics,
           dynamicViscosity,
           kinematicViscosity,
           speedOfSound: Object.prototype.hasOwnProperty.call(b, "speedOfSound")

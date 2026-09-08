@@ -8,9 +8,10 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, TypeVar
+from uuid import UUID
 
 from .config import Settings, get_settings
-from .models import EngineIdentity, JobPhase, JobResult, JobState, JobStatus, PolarRequest
+from .models import EngineIdentity, JobPhase, JobResult, JobState, JobStatus, PolarRequest, SolverBudgetProgress
 
 T = TypeVar("T", JobResult, JobStatus, PolarRequest)
 
@@ -39,6 +40,18 @@ class JobStore:
     def cases_dir(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "cases"
 
+    def submission_dir(self, job_id: str) -> Path:
+        identity = UUID(job_id)
+        if identity.version != 4 or str(identity) != job_id:
+            raise ValueError("Stable execution identity must be a canonical UUID4")
+        return self.settings.data_dir / "submissions" / job_id
+
+    def has_stable_submission(self, job_id: str) -> bool:
+        try:
+            return self.submission_dir(job_id).is_dir()
+        except ValueError:
+            return False
+
     def case_dir(self, job_id: str, slug: str) -> Path:
         return self.cases_dir(job_id) / slug
 
@@ -59,6 +72,10 @@ class JobStore:
         if cancel_path.exists():
             cancel_path.unlink()
         self._write_json_atomic(self.job_dir(job_id) / "request.json", request.model_dump_json(indent=2))
+        self._write_json_atomic(
+            self.job_dir(job_id) / ".execution-not-started.json",
+            json.dumps({"version": 1, "job_id": job_id}),
+        )
         total = len(request.cases())
         requested_engine = request.expected_engine or EngineIdentity()
         requested_pool = (
@@ -82,7 +99,12 @@ class JobStore:
         path.write_text(reason)
 
     def is_cancelled(self, job_id: str) -> bool:
-        return (self.job_dir(job_id) / "cancelled").exists()
+        if (self.job_dir(job_id) / "cancelled").exists():
+            return True
+        try:
+            return (self.submission_dir(job_id) / ".submission-cancelled.json").exists()
+        except ValueError:
+            return False
 
     def terminalize_cancelled_result(self, job_id: str, reason: str = "cancelled") -> bool:
         """Make a partial running result terminal after cancellation.
@@ -281,6 +303,7 @@ class JobStore:
         cpu_tokens_held: Optional[int] = None,
         current_case: Optional[str] = None,
         last_progress_at: Optional[str] = None,
+        solver_budget_progress: Optional[SolverBudgetProgress] = None,
     ) -> None:
         payload = {
             "job_id": job_id,
@@ -305,7 +328,25 @@ class JobStore:
             payload["current_case"] = current_case
         if last_progress_at is not None:
             payload["last_progress_at"] = last_progress_at
+        if solver_budget_progress is not None:
+            if solver_budget_progress.job_id != job_id:
+                raise ValueError("Solver budget progress belongs to another job")
+            payload["solver_budget_progress"] = solver_budget_progress.model_dump(mode="json")
         self._write_json_atomic(self.job_dir(job_id) / "runtime.json", json.dumps(payload, indent=2))
+
+    def read_solver_budget_progress(self, job_id: str) -> tuple[Optional[SolverBudgetProgress], Optional[str]]:
+        runtime, error = self.read_runtime_info(job_id)
+        if error:
+            return None, "Solver budget runtime file is unreadable"
+        if runtime is None or runtime.get("solver_budget_progress") is None:
+            return None, None
+        try:
+            progress = SolverBudgetProgress.model_validate(runtime["solver_budget_progress"])
+            if runtime.get("job_id") != job_id or progress.job_id != job_id:
+                return None, "Solver budget progress belongs to another job"
+            return progress, None
+        except (ValueError, TypeError):
+            return None, "Solver budget progress is invalid"
 
     def read_runtime_info(self, job_id: str) -> tuple[Optional[dict], Optional[str]]:
         path = self.job_dir(job_id) / "runtime.json"
@@ -412,12 +453,14 @@ class JobStore:
             reconciled.append(job_id)
         return reconciled
 
-    def job_processes(self, job_id: str) -> list[int]:
-        return [proc["pid"] for proc in self.job_process_details(job_id)]
+    def job_processes(self, job_id: str, *, strict: bool = False) -> list[int]:
+        return [proc["pid"] for proc in self.job_process_details(job_id, strict=strict)]
 
-    def job_process_details(self, job_id: str) -> list[dict]:
+    def job_process_details(self, job_id: str, *, strict: bool = False) -> list[dict]:
         proc_root = Path("/proc")
         if not proc_root.exists():
+            if strict:
+                raise RuntimeError("Worker process inventory is unavailable")
             return []
         root = self.job_dir(job_id).resolve()
         processes: list[dict] = []
@@ -428,8 +471,12 @@ class JobStore:
             if pid == os.getpid():
                 continue
             try:
-                cwd = (proc / "cwd").resolve()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                cwd = (proc / "cwd").resolve(strict=strict)
+            except PermissionError:
+                if strict:
+                    raise
+                continue
+            except (FileNotFoundError, ProcessLookupError):
                 continue
             try:
                 cwd.relative_to(root)

@@ -6,6 +6,11 @@ claude.ai artifact "Simulations UX — Airfoils.Pro admin mockups". Decisions re
 `DecisionHistory.md` (2026-07-04 entries). Design was adversarially reviewed in three
 critique passes; the rules below are binding, including every "honesty" rule.
 
+The approved September 6, 2026 progressive campaign contract in
+`progressive-polars.md` supersedes the original solver ordering, manual-only
+catalog growth, and CFD-only public-curve rules. Implementation readiness is
+tracked in the software-owned completion ledger, not inferred from this spec.
+
 ## 1. Purpose
 
 Give the admin one guided flow to compose and launch batch CFD work ("campaigns"),
@@ -53,8 +58,11 @@ All new tables use uuid PKs + createdAt/updatedAt like existing tables unless no
 - completedAt timestamptz NULL
 
 **sim_campaign_airfoils** — PK (campaignId, airfoilId); FK airfoils ON DELETE CASCADE.
-Campaign scope is resolved to this explicit list at launch ("snapshot at launch" is
-stated in the UI; growth is via Add airfoils).
+Campaign scope is initially resolved to an explicit list. Eligible profiles added
+after launch also join automatically through durable enrollment, including after
+completion. Paused campaigns remain paused; cancelled/archived campaigns stay
+inactive and catch up only after explicit reactivation. Manual Add airfoils
+remains available for previously excluded profiles.
 
 **sim_campaign_plan_revisions** (append-only audit; optimistic-concurrency anchor)
 

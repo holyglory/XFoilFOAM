@@ -56,13 +56,19 @@ def test_active_images_install_only_from_hash_pinned_locks():
             contents.index(copy_command),
             contents.index(build_install),
             contents.index(runtime_install),
-            contents.index(project_install),
-            contents.index("python3 -m pip check"),
-            contents.index("from importlib.metadata import version"),
-            contents.index(
-                "rm -f /tmp/build-requirements.lock /tmp/requirements.lock"
-            ),
         ]
+        checked_dependencies = [contents.index("from importlib.metadata import version"),
+            contents.index("rm -f /tmp/build-requirements.lock /tmp/requirements.lock")]
+        installed_project = [contents.index(project_install), contents.index("python3 -m pip check")]
+        if dockerfile.name in {"Dockerfile.api", "Dockerfile.worker"}:
+            ordered.extend(checked_dependencies)
+            ordered.append(contents.index("COPY src ./src"))
+            ordered.extend(installed_project)
+            if dockerfile.name == "Dockerfile.worker":
+                assert contents.index(runtime_install) < contents.index("COPY --from=thermophysics-build")
+        else:
+            ordered.extend(installed_project)
+            ordered.extend(checked_dependencies)
 
         assert ordered == sorted(ordered), dockerfile
         for name, expected in EXPECTED_STORAGE_VERSIONS.items():

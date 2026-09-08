@@ -6,7 +6,9 @@ from enum import Enum
 import math
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, UUID4, model_validator
+
+from .thermodynamics import GasThermodynamics, ThermodynamicState
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +137,7 @@ class FailureDisposition(str, Enum):
     none = "none"
     hard_solver = "hard_solver"
     deterministic_mesh = "deterministic_mesh"
+    material_domain = "material_domain"
     infrastructure = "infrastructure"
 
 
@@ -177,6 +180,7 @@ class AirfoilInput(BaseModel):
 class FluidProperties(BaseModel):
     """Fluid material properties. Supply kinematic viscosity, or density + dynamic viscosity."""
 
+    gas: Optional[GasThermodynamics] = None
     density: float = Field(default=1.225, gt=0, description="Density rho [kg/m^3].")
     dynamic_viscosity: Optional[float] = Field(
         default=None, gt=0, description="Dynamic viscosity mu [Pa.s]."
@@ -403,6 +407,8 @@ ALL_IMAGE_FIELDS: tuple[ImageField, ...] = tuple(ImageField)
 
 
 class SolverParams(BaseModel):
+    flow_solver_family: Optional[Literal["simpleFoam", "pimpleFoam", "rhoSimpleFoam", "rhoPimpleFoam", "rhoCentralFoam"]] = None
+    turbulent_prandtl: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     turbulence: TurbulenceParams = Field(default_factory=TurbulenceParams)
     n_iterations: int = Field(default=3000, ge=50, le=20000, description="Max SIMPLE iterations.")
     urans_initialization_iterations: Optional[int] = Field(
@@ -628,8 +634,19 @@ class ResourcePolicy(str, Enum):
     exclusive = "exclusive"
 
 
+class SolverCaseAllocation(BaseModel):
+    chord: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    speed: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    aoa_deg: float = Field(allow_inf_nan=False, strict=True)
+    limit_seconds: float = Field(gt=0, le=43200, allow_inf_nan=False, strict=True)
+
+
 class ResourceParams(BaseModel):
     """Requested CPU scheduling policy for one airfoil job."""
+
+    case_solver_budget_seconds: Optional[float] = Field(default=None, gt=0, le=43200, allow_inf_nan=False,
+        description="Cumulative active solver-command wall time per physical case, shared by initialization and recovery; excludes meshing, rendering and MPI preparation.")
+    case_solver_allocations: Optional[list[SolverCaseAllocation]] = Field(default=None, min_length=1, max_length=512)
 
     cpu_budget: Optional[int] = Field(
         default=None,
@@ -655,6 +672,17 @@ class ResourceParams(BaseModel):
         default=ResourcePolicy.auto,
         description="Scheduling policy: auto, airfoil_parallel, case_parallel, or exclusive.",
     )
+
+
+    @model_validator(mode="after")
+    def _validate_solver_allocations(self) -> "ResourceParams":
+        if self.case_solver_allocations is not None:
+            if self.case_solver_budget_seconds is not None:
+                raise ValueError("Specify either one shared case budget or exact case allocations, not both")
+            keys = [(entry.chord, entry.speed, entry.aoa_deg) for entry in self.case_solver_allocations]
+            if len(keys) != len(set(keys)):
+                raise ValueError("Solver case allocations must have unique physical identities")
+        return self
 
 
 class AoASpec(BaseModel):
@@ -694,6 +722,7 @@ class AoASpec(BaseModel):
 class PolarRequest(BaseModel):
     """Compute one or more polars. A polar is produced for every (speed, chord) combination."""
 
+    execution_id: Optional[UUID4] = None
     airfoil: AirfoilInput
     chord_lengths: list[float] = Field(
         default=[1.0], min_length=1, description="Chord length(s) [m]. One polar per chord."
@@ -703,6 +732,7 @@ class PolarRequest(BaseModel):
     )
     aoa: AoASpec
     fluid: FluidProperties = Field(default_factory=FluidProperties)
+    flow_state: Optional[ThermodynamicState] = None
     roughness: RoughnessParams = Field(default_factory=RoughnessParams)
     mesh: MeshParams = Field(default_factory=MeshParams)
     urans_mesh: Optional[MeshParams] = Field(
@@ -755,6 +785,7 @@ class PolarRequest(BaseModel):
         "reopened recovery work during a rolling deployment.",
     )
     expected_urans_initialization_version: Optional[int] = Field(default=None, strict=True, ge=0)
+    expected_solver_budget_version: Optional[int] = Field(default=None, strict=True, ge=0)
     expected_engine: Optional[EngineIdentity] = Field(
         default=None,
         description="Exact logical solver implementation required by the controller. "
@@ -771,6 +802,40 @@ class PolarRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "PolarRequest":
+        if self.resources.case_solver_allocations is not None:
+            if self.expected_solver_budget_version is None:
+                raise ValueError("Exact case allocations require expected_solver_budget_version")
+            requested = [(spec.chord, spec.speed, spec.aoa_deg) for spec in self.cases()]
+            allocated = [(entry.chord, entry.speed, entry.aoa_deg) for entry in self.resources.case_solver_allocations]
+            if len(requested) != len(set(requested)) or set(requested) != set(allocated):
+                raise ValueError("Solver case allocations must cover exactly the requested physical cases")
+        family = self.solver.flow_solver_family
+        compressible = family is not None and family.startswith("rho")
+        if compressible:
+            gas, state = self.fluid.gas, self.flow_state
+            if gas is None or state is None or self.solver.turbulent_prandtl is None:
+                raise ValueError("Compressible requests require explicit gas, thermodynamic state and turbulent Prandtl")
+            if self.solver.turbulence.model != TurbulenceModel.k_omega_sst:
+                raise ValueError("Compressible execution currently requires fully turbulent SST")
+            if not math.isclose(self.fluid.density, gas.density(state), rel_tol=1e-6):
+                raise ValueError("Request density differs from the gas operating state")
+            if not math.isclose(self.fluid.nu * self.fluid.density, gas.dynamic_viscosity(state.temperature_k), rel_tol=1e-6):
+                raise ValueError("Request viscosity differs from the gas transport law")
+            for speed in self.speeds:
+                gas.validate_adiabatic_temperature_range(state.temperature_k, speed)
+                mach = speed / gas.speed_of_sound(state)
+                if not math.isfinite(mach) or mach <= 0 or mach > 3 + 1e-12:
+                    raise ValueError("Compressible execution requires Mach greater than zero and at most three")
+                if family == "rhoCentralFoam" and mach < 1.2 - 1e-12:
+                    raise ValueError("Density-based execution requires Mach at least 1.2")
+        elif self.fluid.gas is not None or self.flow_state is not None or self.solver.turbulent_prandtl is not None:
+            raise ValueError("Gas state and thermal transport require an explicit compressible solver family")
+        if family is not None:
+            transient = family in {"pimpleFoam", "rhoPimpleFoam"}
+            if family != "rhoCentralFoam" and transient != self.solver.force_transient:
+                raise ValueError("Selected flow solver and transient execution mode disagree")
+            if family == "rhoCentralFoam" and not self.solver.force_transient and self.solver.transient_fallback:
+                raise ValueError("Local pseudo-time RANS requires explicit controller-owned transient fallback")
         if (
             self.solver.urans_initialization_iterations is not None
             and self.expected_urans_initialization_version is None
@@ -1392,7 +1457,42 @@ class EvidenceArtifact(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
+class CaseSolverBudget(BaseModel):
+    version: Literal[1]
+    scope: Literal["physical_case_v1"]
+    limit_seconds: float = Field(gt=0, le=43200, allow_inf_nan=False)
+    exhausted: bool = Field(strict=True)
+
+
+class CaseSolverProgress(BaseModel):
+    chord: float = Field(gt=0, allow_inf_nan=False)
+    speed: float = Field(ge=0, allow_inf_nan=False)
+    aoa_deg: float = Field(allow_inf_nan=False)
+    solver_active_seconds: float = Field(ge=0, allow_inf_nan=False)
+    limit_seconds: float = Field(gt=0, le=43200, allow_inf_nan=False)
+    solver_running: bool = Field(strict=True)
+
+
+class SolverBudgetProgress(BaseModel):
+    version: Literal[1]
+    job_id: str = Field(min_length=1)
+    observed_at: datetime
+    cases: list[CaseSolverProgress] = Field(max_length=512)
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        if self.observed_at.tzinfo is None:
+            raise ValueError("Solver budget observations require an explicit timezone")
+        identities = [(case.chord, case.speed, case.aoa_deg) for case in self.cases]
+        if len(identities) != len(set(identities)):
+            raise ValueError("Solver budget observations require unique physical cases")
+        return self
+
+
 class PolarPoint(BaseModel):
+    solver_budget: Optional[CaseSolverBudget] = None
+    solver_active_seconds: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False,
+        description="Measured cumulative active solver-command seconds for this chord/speed/AoA in this engine job. Repeated attempts report the cumulative maximum, not additive durations.")
     case_slug: Optional[str] = Field(default=None, description="Engine case directory slug for this AoA evidence.")
     continuation_transient_subdir: Optional[str] = Field(
         default=None,
@@ -1570,6 +1670,8 @@ class JobStatus(BaseModel):
     phase: JobPhase = JobPhase.pending
     total_cases: int = 0
     completed_cases: int = 0
+    solver_budget_progress: Optional[SolverBudgetProgress] = None
+    solver_budget_error: Optional[str] = None
     message: Optional[str] = None
     task_id: Optional[str] = None
     queued_at: Optional[datetime] = None

@@ -1,0 +1,51 @@
+x-canary: &canary
+  image: xfoilfoam-progressive-worker:local
+  pull_policy: never
+  network_mode: none
+  environment:
+    PYTHONPATH: /candidate/src
+    AIRFOILFOAM_OPENFOAM_RUNNER: local
+    AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+    AIRFOILFOAM_DATA_DIR: /canary-output/data
+    AIRFOILFOAM_CACHE_DIR: /canary-output/cache
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 524288
+  volumes:
+    - ./src:/candidate/src:ro
+    - ./packages/db/seed/selig-database/ag24.dat:/canary/ag24.dat:ro
+    - numerical-results:/canary-output
+
+services:
+  artifacts:
+    image: xfoilfoam-progressive-worker:local
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/canary-output"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - numerical-results:/canary-output:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  subsonic:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoSimpleFoam", "--mach", "0.72", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/subsonic"]
+  transonic:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoPimpleFoam", "--mach", "0.9", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/transonic"]
+  mach2:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "2", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach2"]
+  mach3:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3"]
+
+volumes:
+  numerical-results:

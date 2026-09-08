@@ -1,5 +1,38 @@
 # Worker image: OpenFOAM + Python. The container *is* the OpenFOAM environment,
 # so the solver runs locally inside it (AIRFOILFOAM_OPENFOAM_RUNNER=local).
+FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb AS thermophysics-build
+
+ARG TARGETARCH
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl g++ make python3 \
+    && case "${TARGETARCH}" in \
+         amd64) tools_sha="159d102ba465301e3f8562fe3e9dd917414b77a5491bdec206ee25d5ee89e2da" ;; \
+         arm64) tools_sha="5b0c88c2fbd85fd17e9d6559d0cc716815fccb8fb6158b53973cfdc7b416c5fd" ;; \
+         *) exit 1 ;; \
+       esac \
+    && curl -fL "https://dl.openfoam.com/repos/deb/dists/resolute/main/pool/2606_0/binary-${TARGETARCH}/openfoam2606-tools_2606.0~rc2-1_${TARGETARCH}.deb" -o /tmp/tools.deb \
+    && echo "${tools_sha}  /tmp/tools.deb" | sha256sum -c - \
+    && curl -fL https://dl.openfoam.com/repos/deb/dists/resolute/main/pool/2606_0/binary-all/openfoam2606-source_2606.0~rc2-1_all.deb -o /tmp/source.deb \
+    && echo "d2f4b4a056e38a8d96a268c00492eaa599d34c136965d3eba097560d5816c6d2  /tmp/source.deb" | sha256sum -c - \
+    && test "$(dpkg-query -W -f='${Version}' openfoam2606)" = "2606.0~rc2-1" \
+    && dpkg -i /tmp/tools.deb /tmp/source.deb \
+    && rm /tmp/tools.deb /tmp/source.deb \
+    && rm -rf /var/lib/apt/lists/*
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; test "$WM_PROJECT_VERSION" = v2606; wmakeLnIncludeAll -update "$FOAM_SRC"'
+COPY src/airfoilfoam/native/thermophysics /build/thermophysics
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib; wmake libso /build/thermophysics; sha256sum "$FOAM_USER_LIBBIN/libxfoilfoamThermophysics.so" > /opt/xfoilfoam-thermophysics/library.sha256'
+COPY src/airfoilfoam/native/acoustic-startup /build/acoustic-startup
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib FOAM_USER_APPBIN=/opt/xfoilfoam-thermophysics/bin; wmake /build/acoustic-startup'
+COPY src/airfoilfoam/native/steady-convergence /build/steady-convergence
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib; wmake libso /build/steady-convergence'
+
+FROM thermophysics-build AS thermophysics-check
+COPY scripts/materials/native-probe /build/native-probe
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib FOAM_USER_APPBIN=/opt/xfoilfoam-thermophysics/bin; wmake /build/native-probe'
+COPY scripts/materials/steady-probe /build/steady-probe
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib FOAM_USER_APPBIN=/opt/xfoilfoam-thermophysics/bin; wmake /build/steady-probe'
+
 FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb
 
 ARG TARGETARCH
@@ -66,15 +99,18 @@ ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
 RUN python3 -m venv "${VIRTUAL_ENV}"
 WORKDIR /app
 COPY docker/build-requirements.lock docker/requirements.lock /tmp/
+RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/build-requirements.lock \
+    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && python3 -c "from importlib.metadata import version; expected = {'google-cloud-storage': '3.13.0', 'google-crc32c': '1.8.0', 'zstandard': '0.25.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, f'dependency version mismatch: {actual!r}'" \
+    && rm -f /tmp/build-requirements.lock /tmp/requirements.lock
+COPY --from=thermophysics-build /opt/xfoilfoam-thermophysics/lib /opt/xfoilfoam-thermophysics/lib
+COPY --from=thermophysics-build /opt/xfoilfoam-thermophysics/bin /opt/xfoilfoam-thermophysics/bin
+COPY --from=thermophysics-build /opt/xfoilfoam-thermophysics/library.sha256 /opt/xfoilfoam-thermophysics/library.sha256
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN PYTHONPATH=src python3 -c "from pathlib import Path; from airfoilfoam.provenance import write_application_source_sha256; write_application_source_sha256(Path('/app'))" \
-    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/build-requirements.lock \
-    && python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
     && python3 -m pip install --no-cache-dir --no-deps --no-build-isolation . \
-    && python3 -m pip check \
-    && python3 -c "from importlib.metadata import version; expected = {'google-cloud-storage': '3.13.0', 'google-crc32c': '1.8.0', 'zstandard': '0.25.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, f'dependency version mismatch: {actual!r}'" \
-    && rm -f /tmp/build-requirements.lock /tmp/requirements.lock
+    && python3 -m pip check
 
 RUN mkdir -p /data/airfoilfoam
 

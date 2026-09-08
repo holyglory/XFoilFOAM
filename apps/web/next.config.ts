@@ -8,8 +8,8 @@ const config: NextConfig = {
   eslint: { ignoreDuringBuilds: true },
   typescript: { ignoreBuildErrors: false },
   async rewrites() {
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? process.env.API_URL ?? "http://localhost:4000";
-    return [{ source: "/api/sync/:path*", destination: `${apiUrl.replace(/\/$/, "")}/api/sync/:path*` }];
+    const apiUrl = process.env.API_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
+    return [{ source: "/api/:path*", destination: `${apiUrl.replace(/\/$/, "")}/api/:path*` }];
   },
 };
 

@@ -11,11 +11,13 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from ..config import Settings, get_settings
+from ..material_warning import MATERIAL_DOMAIN_WARNING
 
 
 class OpenFOAMError(RuntimeError):
@@ -28,6 +30,10 @@ class HardSolverError(OpenFOAMError):
 
 class DeterministicMeshError(OpenFOAMError):
     """A repeatable mesh construction or mesh-quality failure."""
+
+
+class MaterialDomainError(OpenFOAMError):
+    """The numerical trajectory evaluated outside its declared material model."""
 
 
 class InfrastructureError(OpenFOAMError):
@@ -147,6 +153,7 @@ def _run_subprocess(
     command: str,
     monitor: RunMonitor | None = None,
     monitor_interval: float = 10.0,
+    abort_on_material_domain: bool = False,
 ) -> RunResult:
     proc = subprocess.Popen(
         args,
@@ -160,7 +167,7 @@ def _run_subprocess(
     with _ACTIVE_PROCESS_GROUPS_LOCK:
         _ACTIVE_PROCESS_GROUPS.add(pgid)
     try:
-        if monitor is None:
+        if monitor is None and not abort_on_material_domain:
             try:
                 stdout, _ = proc.communicate(timeout=timeout)
                 return RunResult(command=command, returncode=proc.returncode, stdout=stdout or "")
@@ -175,12 +182,18 @@ def _run_subprocess(
                 return RunResult(command=command, returncode=124, stdout=(stdout or "") + msg, timed_out=True)
 
         chunks: list[str] = []
+        material_failure = threading.Event()
 
         def read_stdout() -> None:
+            recent_output = ""
             if proc.stdout is None:
                 return
             for line in proc.stdout:
                 chunks.append(line)
+                if abort_on_material_domain and not material_failure.is_set():
+                    recent_output = (recent_output + line)[-2048:]
+                    if MATERIAL_DOMAIN_WARNING.search(recent_output):
+                        material_failure.set()
 
         reader = threading.Thread(target=read_stdout, name="openfoam-stdout-reader", daemon=True)
         reader.start()
@@ -189,16 +202,25 @@ def _run_subprocess(
         timed_out = False
         while proc.poll() is None:
             now = time.monotonic()
+            if material_failure.is_set():
+                _terminate_process_group(pgid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _terminate_process_group(pgid, signal.SIGKILL)
+                    proc.wait()
+                reader.join(timeout=2)
+                return RunResult(command=command, returncode=proc.returncode or 1, stdout="".join(chunks))
             if now - started >= timeout:
                 timed_out = True
                 break
-            if now >= next_monitor:
+            if monitor is not None and now >= next_monitor:
                 try:
                     monitor()
                 except Exception as exc:  # noqa: BLE001 - monitoring must not crash solver process
                     chunks.append(f"\n[monitor error] {type(exc).__name__}: {exc}\n")
                 next_monitor = now + max(0.5, monitor_interval)
-            time.sleep(0.2)
+            material_failure.wait(0.1)
         if timed_out:
             _terminate_process_group(pgid, signal.SIGTERM)
             try:
@@ -212,8 +234,17 @@ def _run_subprocess(
         reader.join(timeout=2)
         return RunResult(command=command, returncode=proc.returncode or 0, stdout="".join(chunks))
     finally:
-        with _ACTIVE_PROCESS_GROUPS_LOCK:
-            _ACTIVE_PROCESS_GROUPS.discard(pgid)
+        try:
+            if proc.poll() is None:
+                _terminate_process_group(pgid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _terminate_process_group(pgid, signal.SIGKILL)
+                    proc.wait()
+        finally:
+            with _ACTIVE_PROCESS_GROUPS_LOCK:
+                _ACTIVE_PROCESS_GROUPS.discard(pgid)
 
 
 class Runner:
@@ -300,6 +331,7 @@ class LocalRunner(Runner):
             timeout=timeout,
             command=command,
             monitor=monitor,
+            abort_on_material_domain=getattr(self, "flow_execution", None) is not None,
         )
 
 
@@ -318,10 +350,14 @@ class DockerRunner(Runner):
         bashrc = self.settings.openfoam_bashrc
         inner = f"source {shlex.quote(bashrc)} >/dev/null 2>&1; cd /case && {command}"
         uid, gid = os.getuid(), os.getgid()
+        container_name = f"airfoilfoam-command-{uuid.uuid4().hex}"
         docker_cmd = [
             self.settings.docker_binary,
-            "run",
-            "--rm",
+            "create",
+            "--name",
+            container_name,
+            "--label",
+            f"org.airfoilfoam.command-owner={container_name}",
             "--user",
             f"{uid}:{gid}",
             "-e",
@@ -335,13 +371,35 @@ class DockerRunner(Runner):
             "-lc",
             inner,
         ]
-        return _run_subprocess(
-            docker_cmd,
-            cwd=case_dir,
-            timeout=timeout,
-            command=command,
-            monitor=monitor,
-        )
+        try:
+            _run_subprocess(
+                docker_cmd, cwd=case_dir, timeout=min(60, timeout), command="allocate OpenFOAM command container",
+            ).check()
+            return _run_subprocess(
+                [self.settings.docker_binary, "start", "--attach", container_name],
+                cwd=case_dir, timeout=timeout, command=command, monitor=monitor,
+                abort_on_material_domain=getattr(self, "flow_execution", None) is not None,
+            )
+        finally:
+            self._remove_command_container(container_name)
+
+    def _remove_command_container(self, container_name: str) -> None:
+        try:
+            removed = subprocess.run(
+                [self.settings.docker_binary, "rm", "--force", container_name],
+                capture_output=True, text=True, timeout=30,
+            )
+            if removed.returncode == 0:
+                return
+            remaining = subprocess.run(
+                [self.settings.docker_binary, "container", "ls", "--all", "--quiet",
+                 "--filter", f"name=^/{container_name}$"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                raise InfrastructureError(f"Cannot confirm removal of owned OpenFOAM container {container_name}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise InfrastructureError(f"Cannot confirm removal of owned OpenFOAM container {container_name}: {type(exc).__name__}") from exc
 
 
 def get_runner(settings: Settings | None = None) -> Runner:

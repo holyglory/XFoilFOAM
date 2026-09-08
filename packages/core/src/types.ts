@@ -1,4 +1,5 @@
 import type { ViscosityModelName } from "./viscosity";
+import type { GasThermodynamicModel } from "./gas-thermodynamics";
 
 // ============================ geometry ============================
 export interface Point {
@@ -256,8 +257,53 @@ export interface AirfoilDetailPayload {
    *  display metadata and is not unique across series. */
   reList: number[];
   polars: Polar[]; // one per public series; Detail carries solved CFD points only
+  progressivePolars?: ProgressivePolarSeries[];
   simulationWorks: SimulationWorkItem[];
   downloads: Record<string, string | null>;
+}
+
+export interface ProgressivePolarSeries {
+  targetId: string;
+  conditionKey: string;
+  modelId: string;
+  kind: "prediction" | "estimate";
+  re: number;
+  mach: number;
+  branch: string;
+  updatedAt: string;
+  curves: Array<{
+    method: "neuralfoil" | "openfoam_fast" | "openfoam_precise" | "composite";
+    metrics:
+      | import("./progressive-curve-metrics").ProgressiveCurveMetrics
+      | null;
+    samples: Array<{
+      alpha: number;
+      cl: number;
+      cd: number;
+      cm: number;
+      lower?: { cl: number; cd: number; cm: number };
+      upper?: { cl: number; cd: number; cm: number };
+    }>;
+  }>;
+  explanation: {
+    calibration: "unvalidated" | "validated";
+    modelVersions: Record<string, string>;
+    geometryRms: number;
+    geometryMaximumError: number;
+    sourceSignature?: string;
+    modelSignature?: string;
+    contributors?: Array<{
+      observationId: string;
+      resultId: string;
+      attemptId: string;
+      alpha?: number | null;
+      method: "openfoam_fast" | "openfoam_precise";
+      window: [number, number] | null;
+      numericalConvergence: string;
+      statisticalCertification: string;
+    }>;
+    exclusions?: Array<{ observationId: string; reason: string }>;
+  };
 }
 
 export interface CategoryNode {
@@ -300,6 +346,7 @@ export interface MediumDTO {
   dynamicViscosity: number;
   kinematicViscosity: number;
   speedOfSound: number | null;
+  gasThermodynamics?: GasThermodynamicModel | null;
   notes: string | null;
   isSeeded: boolean;
 }

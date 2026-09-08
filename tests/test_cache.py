@@ -108,6 +108,10 @@ class FakeRunner(Runner):
 
     def run(self, case_dir: Path, command: str, timeout: int = 7200, monitor=None) -> RunResult:
         self.commands.append(command)
+        if "boundaryField.inlet.type -value" in command:
+            return RunResult(command=command, returncode=0, stdout="fixedValue\n")
+        if "boundaryField.outlet.type -value" in command:
+            return RunResult(command=command, returncode=0, stdout="inletOutlet\n")
         return RunResult(command=command, returncode=0, stdout="")
 
     def count(self, prefix: str) -> int:

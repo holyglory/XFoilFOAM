@@ -13,7 +13,7 @@ export default defineConfig({
     setupFiles:
       process.env.VITEST_PURE_REDUCER_TEST === "1"
         ? []
-        : ["./test/global-admission-test-lease.ts"],
+        : ["../../packages/db/test-support/global-admission-test-lease.ts"],
     sequence: { hooks: "stack" },
     hookTimeout: 300_000,
   },

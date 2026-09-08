@@ -51,7 +51,7 @@ _LEGACY_ENGINE_NAMESPACE = "openfoam:opencfd:2406:numerics-1"
 # this independently from mesh topology: an older seed may be byte-perfect yet
 # encode the alternate low-negative-angle branch that the zero-anchored
 # marcher deliberately avoids.
-STEADY_RANS_MARCHER_SEED_VERSION = "zero-anchored-v1"
+STEADY_RANS_MARCHER_SEED_VERSION = "zero-anchored-freestream-v2"
 
 
 def _canon(value: float) -> str:
@@ -163,9 +163,14 @@ class EngineCache:
         }
 
     @classmethod
-    def seed_key(cls, mesh_key: str, fluid: FluidProperties, speed: float) -> str:
+    def seed_key(cls, mesh_key: str, fluid: FluidProperties, speed: float, flow_state=None) -> str:
+        thermodynamics = {}
+        if fluid.gas is not None:
+            if flow_state is None:
+                raise ValueError("Compressible seed identity requires its exact thermodynamic state")
+            thermodynamics = {"gas": fluid.gas.model_dump(), "state": flow_state.model_dump()}
         payload = json.dumps(
-            {"mesh": mesh_key, "fluid": cls.fluid_signature(fluid), "speed": _canon(speed)},
+            {"mesh": mesh_key, "fluid": cls.fluid_signature(fluid), "speed": _canon(speed), **thermodynamics},
             sort_keys=True,
         )
         return _sha256_text(payload)
@@ -176,6 +181,8 @@ class EngineCache:
         payload = json.dumps(
             {
                 "steadyRansMarcher": STEADY_RANS_MARCHER_SEED_VERSION,
+                "flowSolverFamily": solver_params.flow_solver_family,
+                "turbulentPrandtl": solver_params.turbulent_prandtl,
                 "turbulence": {
                     "model": solver_params.turbulence.model.value,
                     "intensity": _canon(solver_params.turbulence.intensity),

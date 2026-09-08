@@ -21,7 +21,6 @@ import {
   deriveFlowConditionState,
   expandAngleGrid,
   type MediumStateInput,
-  type ViscositySpec,
 } from "@aerodb/core";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 
@@ -31,6 +30,7 @@ import {
 } from "./campaign-execution";
 import { readCampaignDerivedSummaryMetrics } from "./campaign-summary-metrics";
 import type { DB } from "./client";
+import { resolveMaterialSnapshot } from "./material-snapshot";
 import {
   exactValidSolverManifestSql,
   exactVerifiedRestartableEvidenceArchiveSql,
@@ -60,7 +60,6 @@ import {
   flowConditions,
   type Medium,
   mediums,
-  mediumViscosityTablePoints,
   meshProfiles,
   outputProfiles,
   referenceGeometryProfiles,
@@ -700,7 +699,9 @@ function slugifyCampaign(name: string): string {
 // NOT NULL, so campaign launch runs this for every found-or-created preset
 // BEFORE any points/results rows are created.
 // ---------------------------------------------------------------------------
-function legacyBoundaryValuesFromSnapshot(snapshot: SimulationSetupSnapshot) {
+export function legacyBoundaryValuesFromSnapshot(
+  snapshot: SimulationSetupSnapshot,
+) {
   return {
     name: snapshot.preset.name,
     mediumId: snapshot.flowState.mediumId,
@@ -816,63 +817,17 @@ async function loadMediumState(
     .where(eq(mediums.id, mediumId))
     .limit(1);
   if (!medium) throw new CampaignError("not_found", "medium not found");
-  let viscosity: ViscositySpec;
-  if (medium.viscosityModel === "sutherland") {
-    if (
-      !(medium.sutherlandMuRef && medium.sutherlandTRef && medium.sutherlandS)
-    ) {
-      throw new CampaignError(
-        "validation",
-        `medium ${medium.slug} is missing Sutherland coefficients`,
-      );
-    }
-    viscosity = {
-      model: "sutherland",
-      muRef: medium.sutherlandMuRef,
-      tRef: medium.sutherlandTRef,
-      s: medium.sutherlandS,
+  try {
+    return {
+      medium,
+      stateInput: await resolveMaterialSnapshot(asDb(db), medium),
     };
-  } else if (medium.viscosityModel === "table") {
-    const rows = await asDb(db)
-      .select()
-      .from(mediumViscosityTablePoints)
-      .where(eq(mediumViscosityTablePoints.mediumId, medium.id))
-      .orderBy(
-        asc(mediumViscosityTablePoints.sortOrder),
-        asc(mediumViscosityTablePoints.temperatureK),
-      );
-    if (rows.length === 0)
-      throw new CampaignError(
-        "validation",
-        `medium ${medium.slug} has an empty viscosity table`,
-      );
-    viscosity = {
-      model: "table",
-      tempsK: rows.map((r) => r.temperatureK),
-      mu: rows.map((r) => r.dynamicViscosity),
-    };
-  } else {
-    if (
-      !(medium.constantDynamicViscosity && medium.constantDynamicViscosity > 0)
-    ) {
-      throw new CampaignError(
-        "validation",
-        `medium ${medium.slug} is missing a constant dynamic viscosity`,
-      );
-    }
-    viscosity = { model: "constant", mu: medium.constantDynamicViscosity };
+  } catch (error) {
+    throw new CampaignError(
+      "validation",
+      error instanceof Error ? error.message : String(error),
+    );
   }
-  return {
-    medium,
-    stateInput: {
-      phase: medium.phase,
-      density: medium.density,
-      refTemperatureK: medium.refTemperatureK,
-      refPressurePa: medium.refPressurePa,
-      viscosity,
-      speedOfSound: medium.speedOfSound,
-    },
-  };
 }
 
 async function uniqueSlug(
@@ -1142,6 +1097,7 @@ function stripSolverRowMeta(row: typeof solverProfiles.$inferSelect) {
 function buildPhysicsHashSnapshot(args: {
   flow: typeof flowConditions.$inferSelect;
   medium: Medium;
+  material: MediumStateInput;
   geo: typeof referenceGeometryProfiles.$inferSelect;
   numerics: NumericsRows;
 }): {
@@ -1150,10 +1106,12 @@ function buildPhysicsHashSnapshot(args: {
   mach: number | null;
 } {
   const { flow, medium, geo, numerics } = args;
+  const resolvedFlow = deriveFlowConditionState(args.material, flow);
   const reynolds = Math.round(
-    (flow.speedMps * geo.referenceLengthM) / flow.kinematicViscosity,
+    (flow.speedMps * geo.referenceLengthM) / resolvedFlow.kinematicViscosity,
   );
   const snapshot = {
+    material: args.material,
     preset: {
       id: "",
       slug: "",
@@ -1182,10 +1140,7 @@ function buildPhysicsHashSnapshot(args: {
       temperatureK: flow.temperatureK,
       pressurePa: flow.pressurePa,
       speedMps: flow.speedMps,
-      density: flow.density,
-      dynamicViscosity: flow.dynamicViscosity,
-      kinematicViscosity: flow.kinematicViscosity,
-      mach: flow.mach,
+      ...resolvedFlow,
     },
     referenceGeometry: {
       id: geo.id,
@@ -1197,7 +1152,7 @@ function buildPhysicsHashSnapshot(args: {
       spanM: geo.spanM,
       referenceAreaM2: geo.referenceAreaM2,
     },
-    derived: { reynolds, mach: flow.mach },
+    derived: { reynolds, mach: resolvedFlow.mach },
     boundary: {
       id: numerics.boundary.id,
       slug: numerics.boundary.slug,
@@ -1217,7 +1172,7 @@ function buildPhysicsHashSnapshot(args: {
     output: null,
     sweep: null,
   } as unknown as SimulationSetupSnapshot;
-  return { snapshot, reynolds, mach: flow.mach };
+  return { snapshot, reynolds, mach: resolvedFlow.mach };
 }
 
 interface ResolvedCampaignRevision {
@@ -1363,6 +1318,7 @@ async function resolveCampaignConditionRevision(
     combo: CampaignConditionCombo;
     flow: typeof flowConditions.$inferSelect;
     medium: Medium;
+    material: MediumStateInput;
     geo: typeof referenceGeometryProfiles.$inferSelect;
     numerics: NumericsRows;
     support: () => Promise<CampaignPresetSupport>;
@@ -1372,6 +1328,7 @@ async function resolveCampaignConditionRevision(
   const { snapshot, reynolds, mach } = buildPhysicsHashSnapshot({
     flow: args.flow,
     medium: args.medium,
+    material: args.material,
     geo: args.geo,
     numerics: args.numerics,
   });
@@ -2522,6 +2479,7 @@ async function resolveConditionSetups(
       combo,
       flow: flow.row,
       medium: mediumState.medium,
+      material: mediumState.stateInput,
       geo: geo.row,
       numerics,
       support: supportLoader,
@@ -2872,6 +2830,7 @@ export async function previewCampaignReuse(
         const { snapshot, reynolds } = buildPhysicsHashSnapshot({
           flow,
           medium: mediumState.medium,
+          material: mediumState.stateInput,
           geo,
           numerics,
         });
@@ -3704,6 +3663,22 @@ async function applyPlanEditCore(
   await linkPresolvedEvidence(tx, campaign.id);
   await reconcileLinkedCampaignLadderWork(tx, campaign.id);
 
+  if (cls.internal.keptConditionIds.length > 0) {
+    await asDb(tx).execute(sql`
+      INSERT INTO campaign_condition_scopes (condition_id, angles, source_plan_revision_id)
+      SELECT condition.id,
+        coalesce(array_agg(DISTINCT point.aoa_deg ORDER BY point.aoa_deg)
+          FILTER (WHERE point.aoa_deg IS NOT NULL AND point.state <> 'released'), '{}'::float8[]),
+        ${planRevision.id}::uuid
+      FROM sim_campaign_conditions condition
+      LEFT JOIN sim_campaign_points point ON point.condition_id = condition.id
+      WHERE condition.id = ANY(${pgUuidArray(cls.internal.keptConditionIds)}::uuid[])
+      GROUP BY condition.id
+      ON CONFLICT (condition_id) DO UPDATE
+      SET angles = EXCLUDED.angles, source_plan_revision_id = EXCLUDED.source_plan_revision_id
+    `);
+  }
+
   // Lane updates for objective toggles / tolerance edits (spec §6.1/§8.7).
   await ensureCampaignLanes(tx, campaign.id, cls.newPlan);
   for (const delta of cls.objectiveDeltas) {
@@ -3818,6 +3793,45 @@ export type AddAirfoilsResult =
     }
   | { status: "stale_diff"; preview: AddAirfoilsPreview };
 
+export async function campaignEnrollmentScope(db: DbTx, campaignId: string) {
+  const { campaign, revision, plan } = await loadCampaignWithCurrentPlan(
+    db,
+    campaignId,
+  );
+  const rows = (await asDb(db).execute(sql`
+    SELECT condition.id, condition.status, scope.angles
+    FROM sim_campaign_conditions condition
+    LEFT JOIN campaign_condition_scopes scope ON scope.condition_id = condition.id
+    WHERE condition.campaign_id = ${campaignId}
+      AND condition.generation = ${campaign.currentConditionGeneration}
+      AND condition.status IN ('active', 'kept')
+    ORDER BY condition.id
+  `)) as unknown as Array<{
+    id: string;
+    status: string;
+    angles: number[] | null;
+  }>;
+  const activeAngles = campaignAngleSets(plan).angles;
+  const cellsByCondition = new Map<
+    string,
+    { status: string; angles: number[] }
+  >();
+  for (const row of rows) {
+    if (row.status === "kept" && row.angles === null) {
+      throw new CampaignError(
+        "invalid_state",
+        "retained campaign angle intent is missing",
+      );
+    }
+    cellsByCondition.set(row.id, {
+      status: row.status,
+      angles:
+        row.status === "active" ? activeAngles : (row.angles ?? []).map(Number),
+    });
+  }
+  return { cellsByCondition, revisionId: revision.id };
+}
+
 async function buildAddAirfoilsPreview(
   db: DbTx,
   campaignId: string,
@@ -3835,31 +3849,10 @@ async function buildAddAirfoilsPreview(
     .filter((a) => existingSet.has(a.id))
     .map((a) => a.id);
 
-  // Inherited work = the campaign's obligated cell set: active conditions'
-  // full requested cells AND kept conditions' remaining (solved-angle) cells.
-  const cellRows = (await asDb(db).execute(sql`
-    SELECT p.condition_id, cc.status, p.aoa_deg::float8 AS aoa
-    FROM sim_campaign_points p
-    JOIN sim_campaign_conditions cc ON cc.id = p.condition_id
-    WHERE p.campaign_id = ${campaignId} AND p.state <> 'released' AND cc.status IN ('active', 'kept')
-    GROUP BY p.condition_id, cc.status, p.aoa_deg
-  `)) as unknown as Array<{
-    condition_id: string;
-    status: string;
-    aoa: number;
-  }>;
-  const cellsByCondition = new Map<
-    string,
-    { status: string; angles: number[] }
-  >();
-  for (const row of cellRows) {
-    const bucket = cellsByCondition.get(row.condition_id) ?? {
-      status: row.status,
-      angles: [],
-    };
-    bucket.angles.push(canonicalAoa(Number(row.aoa)));
-    cellsByCondition.set(row.condition_id, bucket);
-  }
+  const { cellsByCondition, revisionId } = await campaignEnrollmentScope(
+    db,
+    campaignId,
+  );
 
   const nSym = newAirfoils.filter((a) => a.isSymmetric).length;
   const nAsym = newAirfoils.length - nSym;
@@ -3882,6 +3875,8 @@ async function buildAddAirfoilsPreview(
   const diffHash = campaignDiffHash({
     campaignId,
     airfoilIds: newAirfoils.map((a) => a.id).sort(),
+    revisionId,
+    scope: [...cellsByCondition],
     perCondition,
     addedPoints,
   });
@@ -3945,32 +3940,37 @@ export async function addCampaignAirfoils(
       )
       .onConflictDoNothing();
 
-    // Inherit the campaign's obligated cells; symmetric airfoils get solver
-    // cells at |α| plus derived rows for the negative side (spec §9.2).
     const newIds = preview.newAirfoilIds;
+    const { cellsByCondition } = await campaignEnrollmentScope(tx, campaignId);
+    const conditionIds: string[] = [];
+    const targetAngles: number[] = [];
+    for (const [conditionId, scope] of cellsByCondition) {
+      for (const angle of scope.angles) {
+        conditionIds.push(conditionId);
+        targetAngles.push(canonicalAoa(angle));
+      }
+    }
     await asDb(tx).execute(sql`
       INSERT INTO sim_campaign_points
         (campaign_id, condition_id, airfoil_id, aoa_deg, revision_id, plan_revision_number, state, derived_by_symmetry)
-      SELECT DISTINCT p.campaign_id, p.condition_id, af.id, p.aoa_deg, p.revision_id, ${revision.revisionNumber}::int,
-        'requested', (af.is_symmetric AND p.aoa_deg < 0)
-      FROM sim_campaign_points p
-      JOIN sim_campaign_conditions cc ON cc.id = p.condition_id AND cc.status IN ('active', 'kept')
+      SELECT cc.campaign_id, cc.id, af.id, target.aoa, cc.simulation_preset_revision_id, ${revision.revisionNumber}::int,
+        'requested', (af.is_symmetric AND target.aoa < 0)
+      FROM unnest(${pgUuidArray(conditionIds)}::uuid[], ${pgFloatArray(targetAngles)}::float8[]) AS target(condition_id, aoa)
+      JOIN sim_campaign_conditions cc ON cc.id = target.condition_id AND cc.status IN ('active', 'kept')
       CROSS JOIN airfoils af
-      WHERE p.campaign_id = ${campaignId}
-        AND p.state <> 'released'
+      WHERE cc.campaign_id = ${campaignId}
         AND af.id = ANY(${pgUuidArray(newIds)}::uuid[])
       ON CONFLICT (campaign_id, condition_id, airfoil_id, aoa_deg) DO NOTHING
     `);
     await asDb(tx).execute(sql`
       INSERT INTO sim_campaign_points
         (campaign_id, condition_id, airfoil_id, aoa_deg, revision_id, plan_revision_number, state, derived_by_symmetry)
-      SELECT DISTINCT p.campaign_id, p.condition_id, af.id, abs(p.aoa_deg), p.revision_id, ${revision.revisionNumber}::int, 'requested', false
-      FROM sim_campaign_points p
-      JOIN sim_campaign_conditions cc ON cc.id = p.condition_id AND cc.status IN ('active', 'kept')
+      SELECT cc.campaign_id, cc.id, af.id, abs(target.aoa), cc.simulation_preset_revision_id, ${revision.revisionNumber}::int, 'requested', false
+      FROM unnest(${pgUuidArray(conditionIds)}::uuid[], ${pgFloatArray(targetAngles)}::float8[]) AS target(condition_id, aoa)
+      JOIN sim_campaign_conditions cc ON cc.id = target.condition_id AND cc.status IN ('active', 'kept')
       CROSS JOIN airfoils af
-      WHERE p.campaign_id = ${campaignId}
-        AND p.state <> 'released'
-        AND p.aoa_deg < 0
+      WHERE cc.campaign_id = ${campaignId}
+        AND target.aoa < 0
         AND af.id = ANY(${pgUuidArray(newIds)}::uuid[])
         AND af.is_symmetric
       ON CONFLICT (campaign_id, condition_id, airfoil_id, aoa_deg) DO NOTHING
@@ -3987,6 +3987,91 @@ export async function addCampaignAirfoils(
       addedAirfoils: newIds.length,
       addedPoints: preview.addedPoints,
       totals,
+    };
+  });
+}
+
+export async function reconcileCampaignProfileEnrollment(
+  db: DB,
+  batchSize = 16,
+): Promise<{
+  campaignId: string;
+  addedAirfoils: number;
+  addedPoints: number;
+} | null> {
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100) {
+    throw new CampaignError(
+      "validation",
+      "enrollment batch size must be between 1 and 100",
+    );
+  }
+  return db.transaction(async (tx) => {
+    const eligibility = sql`
+      profile."deletedAt" IS NULL AND profile."archivedAt" IS NULL
+      AND jsonb_typeof(profile.points) = 'array'
+      AND CASE WHEN jsonb_typeof(profile.points) = 'array' THEN jsonb_array_length(profile.points) >= 3 ELSE false END
+      AND NOT EXISTS (
+        SELECT 1 FROM campaign_catalog_snapshot original
+        WHERE original.campaign_id = campaign.id AND original.airfoil_id = profile.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_campaign_airfoils member
+        WHERE member.campaign_id = campaign.id AND member.airfoil_id = profile.id
+      )
+    `;
+    const candidates = (await asDb(tx).execute(sql`
+      SELECT campaign.id
+      FROM sim_campaigns campaign
+      JOIN campaign_catalog_boundaries boundary ON boundary.campaign_id = campaign.id
+      WHERE campaign.status IN ('active', 'paused', 'attention', 'completed')
+        AND campaign.current_plan_revision_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM catalog_profile_events event
+          JOIN airfoils profile ON profile.id = event.airfoil_id
+          WHERE ${eligibility}
+        )
+      ORDER BY campaign.priority DESC,
+        coalesce((SELECT max(expansion."createdAt") FROM campaign_profile_expansions expansion
+                  WHERE expansion.campaign_id = campaign.id), campaign."createdAt"), campaign.id
+      LIMIT 1 FOR UPDATE OF campaign SKIP LOCKED
+    `)) as unknown as Array<{ id: string }>;
+    const campaignId = candidates[0]?.id;
+    if (!campaignId) return null;
+    const profiles = (await asDb(tx).execute(sql`
+      SELECT profile.id
+      FROM sim_campaigns campaign
+      JOIN campaign_catalog_boundaries boundary ON boundary.campaign_id = campaign.id
+      CROSS JOIN catalog_profile_events event
+      JOIN airfoils profile ON profile.id = event.airfoil_id
+      WHERE campaign.id = ${campaignId} AND ${eligibility}
+      ORDER BY event.registered_at, profile.id
+      LIMIT ${batchSize} FOR KEY SHARE OF profile
+    `)) as unknown as Array<{ id: string }>;
+    if (!profiles.length) return null;
+    const airfoilIds = profiles.map((profile) => profile.id);
+    const preview = await buildAddAirfoilsPreview(tx, campaignId, airfoilIds);
+    const result = await addCampaignAirfoils(
+      asDb(tx),
+      campaignId,
+      airfoilIds,
+      preview.diffHash,
+    );
+    if (result.status !== "applied") {
+      throw new CampaignError(
+        "invalid_state",
+        "campaign scope changed during locked enrollment",
+      );
+    }
+    if (result.addedAirfoils > 0) {
+      await asDb(tx).execute(sql`
+        INSERT INTO campaign_profile_expansions (campaign_id, airfoil_ids)
+        VALUES (${campaignId}, ${pgUuidArray(preview.newAirfoilIds)}::uuid[])
+      `);
+    }
+    return {
+      campaignId,
+      addedAirfoils: result.addedAirfoils,
+      addedPoints: result.addedPoints,
     };
   });
 }
@@ -6850,6 +6935,7 @@ export async function campaignPreliminaryOutcomes(
         fidelity === "rans" &&
         ((row.classification_state === "needs_urans" &&
           failureDisposition !== "deterministic_mesh" &&
+          failureDisposition !== "material_domain" &&
           failureDisposition !== "infrastructure") ||
           (row.classification_state === "rejected" &&
             (failureDisposition === "hard_solver" ||

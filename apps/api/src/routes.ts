@@ -6,6 +6,7 @@ import {
 } from "@aerodb/core";
 import {
   airfoils,
+  boundaryConditions,
   boundaryProfiles,
   categories,
   fieldColorScales,
@@ -83,6 +84,8 @@ import {
   toMediumDTO,
 } from "./services/mediums";
 import { assembleSim } from "./services/sim";
+import { mediumGasModelForWrite } from "./services/medium-gas-model";
+import { refreshFlowConditionsForMedium } from "./services/medium-flow-refresh";
 import { assembleSolverWork } from "./services/solver-work";
 import { readSweeperState, writeSweeperState } from "./services/sweeper-state";
 
@@ -750,6 +753,7 @@ const mediumBodyBase = z
     sutherlandS: z.coerce.number().positive().nullable().optional(),
     viscosityTable: z.array(viscosityTablePointBody).optional(),
     speedOfSound: z.coerce.number().positive().nullable().optional(),
+    gasThermodynamics: z.unknown().optional(),
     notes: z.string().nullable().optional(),
   })
   .strict();
@@ -1859,6 +1863,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   app.post("/api/mediums", { preHandler: requireAdmin }, async (req, reply) => {
     const b = mediumBody.parse(req.body);
+    const gasThermodynamics = await mediumGasModelForWrite(b);
     const { dynamicViscosity, kinematicViscosity } = resolveViscosity(
       b,
       b.density,
@@ -1874,6 +1879,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         refTemperatureK: b.refTemperatureK,
         refPressurePa: b.refPressurePa,
         ...mediumViscosityColumns(b),
+        gasThermodynamics,
         dynamicViscosity,
         kinematicViscosity,
         speedOfSound: b.speedOfSound ?? null,
@@ -1899,6 +1905,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(mediums.id, id))
         .limit(1);
       if (!existing) return reply.code(404).send({ error: "medium not found" });
+      const gasThermodynamics = await mediumGasModelForWrite(b, existing);
       const existingPoints = await tablePointsForMediums([id]);
       const existingInput = mediumViscosityInputFromMedium(
         existing,
@@ -1927,6 +1934,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
           refTemperatureK: b.refTemperatureK,
           refPressurePa: b.refPressurePa,
           ...mediumViscosityColumns(viscosityInput),
+          gasThermodynamics,
           dynamicViscosity,
           kinematicViscosity,
           speedOfSound: Object.prototype.hasOwnProperty.call(b, "speedOfSound")
@@ -1944,6 +1952,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
           ? (viscosityInput.viscosityTable ?? [])
           : [],
       );
+      await refreshFlowConditionsForMedium(id);
       return toMediumDTO(row, viscosityInput.viscosityTable ?? []);
     },
   );
@@ -1953,15 +1962,25 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     { preHandler: requireAdmin },
     async (req, reply) => {
       const { id } = req.params as { id: string };
-      const [refs] = await db
-        .select({ n: count() })
-        .from(flowConditions)
-        .where(eq(flowConditions.mediumId, id));
-      if ((refs?.n ?? 0) > 0)
+      const references = await Promise.all([
+        db.select({ id: flowConditions.id }).from(flowConditions).where(eq(flowConditions.mediumId, id)).limit(1),
+        db.select({ id: operatingConditions.id }).from(operatingConditions).where(eq(operatingConditions.mediumId, id)).limit(1),
+        db.select({ id: boundaryConditions.id }).from(boundaryConditions).where(eq(boundaryConditions.mediumId, id)).limit(1),
+      ]);
+      if (references.some((rows) => rows.length > 0))
         return reply
           .code(409)
           .send({ error: "medium is referenced by flow states" });
-      await db.delete(mediums).where(eq(mediums.id, id));
+      try {
+        const removed = await db.delete(mediums).where(eq(mediums.id, id)).returning({ id: mediums.id });
+        if (!removed.length) return reply.code(404).send({ error: "medium not found" });
+      } catch (error) {
+        const failure = error as { code?: string; cause?: { code?: string } };
+        if (failure.code === "23503" || failure.cause?.code === "23503") {
+          return reply.code(409).send({ error: "medium is referenced by flow states" });
+        }
+        throw error;
+      }
       return reply.code(204).send();
     },
   );

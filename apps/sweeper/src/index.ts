@@ -7,6 +7,10 @@ import {
 } from "./config";
 import { startHeartbeatTimer } from "./heartbeat";
 import { runLoop } from "./loop";
+import { runProgressiveBaselineService } from "./progressive-service";
+import { runProgressiveReportService } from "./progressive-report-service";
+import { runProgressiveEvidenceService } from "./progressive-evidence-service";
+import { runSweeperServices } from "./service-lifecycle";
 import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 
 const { db, sql, engine } = makeContext();
@@ -40,10 +44,24 @@ console.log(
 const stopHeartbeat = startHeartbeatTimer(db);
 const stopRemoteFleetHeartbeat = startRemoteSolverFleetHeartbeatTimer(db);
 try {
-  await runLoop(db, engine, ac.signal);
+  await runSweeperServices(ac.signal, [
+    { name: "controller", run: (signal) => runLoop(db, engine, signal) },
+    {
+      name: "progressive-polars",
+      run: (signal) => runProgressiveBaselineService(db, sql, engine, signal),
+    },
+    {
+      name: "progressive-report-delivery",
+      run: (signal) => runProgressiveReportService(db, sql, signal),
+    },
+    {
+      name: "progressive-compact-evidence",
+      run: (signal) => runProgressiveEvidenceService(db, sql, engine, signal),
+    },
+  ]);
 } finally {
   stopRemoteFleetHeartbeat();
   stopHeartbeat();
+  await sql.end();
 }
-await sql.end();
 console.log("[sweeper] stopped");

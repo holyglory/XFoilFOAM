@@ -740,7 +740,7 @@ describe("campaign launch (§5)", () => {
     }
   });
 
-  it("leases active campaign gaps before a newer globally enabled revision", async () => {
+  it("never leases campaign work through legacy remote claims, including newer enabled revisions", async () => {
     const [condition] = (await db.execute(sql`
       SELECT cc.preset_id, cc.simulation_preset_revision_id AS revision_id
       FROM sim_campaign_conditions cc
@@ -760,6 +760,17 @@ describe("campaign launch (§5)", () => {
       .limit(1);
     const sourceInstanceId = `${PREFIX}-campaign-first-remote`;
     const secret = `${PREFIX}-campaign-first-secret`;
+    const [savedCampaign] = await db
+      .select({ status: simCampaigns.status })
+      .from(simCampaigns)
+      .where(eq(simCampaigns.id, campaignId));
+    const [savedPreset] = await db
+      .select({
+        enabled: simulationPresets.enabled,
+        origin: simulationPresets.origin,
+      })
+      .from(simulationPresets)
+      .where(eq(simulationPresets.id, condition.preset_id));
     try {
       await db
         .update(simulationPresets)
@@ -786,24 +797,45 @@ describe("campaign launch (§5)", () => {
           set: { canFetch: true, canPush: false, updatedAt: new Date() },
         });
 
-      const claim = await app.inject({
-        method: "POST",
-        url: "/api/sync/v1/sweeps/claim",
-        headers: { "x-xfoilfoam-sync-secret": secret },
-        payload: { limit: 1, sourceInstanceId },
-      });
-      expect(claim.statusCode).toBe(200);
-      expect(claim.json().promise).toMatchObject({
-        setupRevision: { id: condition.revision_id },
-      });
+      for (const origin of ["campaign", "library"] as const) {
+        await db
+          .update(simulationPresets)
+          .set({ origin })
+          .where(eq(simulationPresets.id, condition.preset_id));
+        for (const status of [
+          "active",
+          "paused",
+          "completed",
+          "cancelled",
+        ] as const) {
+          await db
+            .update(simCampaigns)
+            .set({ status })
+            .where(eq(simCampaigns.id, campaignId));
+          const claim = await app.inject({
+            method: "POST",
+            url: "/api/sync/v1/sweeps/claim",
+            headers: { "x-xfoilfoam-sync-secret": secret },
+            payload: { limit: 1, sourceInstanceId },
+          });
+          expect(claim.statusCode).toBe(200);
+          const promisedRevision = claim.json().promise?.setupRevision.id;
+          expect(promisedRevision).not.toBe(condition.revision_id);
+          expect(promisedRevision).not.toBe(newer!.revision.id);
+        }
+      }
     } finally {
       await db
         .delete(syncSweepPromises)
         .where(eq(syncSweepPromises.sourceInstanceId, sourceInstanceId));
       await db
         .update(simulationPresets)
-        .set({ enabled: false })
+        .set(savedPreset)
         .where(eq(simulationPresets.id, condition.preset_id));
+      await db
+        .update(simCampaigns)
+        .set(savedCampaign)
+        .where(eq(simCampaigns.id, campaignId));
       if (savedSettings) {
         await db
           .update(syncApiSettings)
@@ -826,7 +858,7 @@ describe("campaign launch (§5)", () => {
           .where(eq(syncApiPermissions.dataType, "sweeps"));
       }
     }
-  });
+  }, 60_000);
 
   describe("plan editing + closure (§6)", () => {
     let baseRevision = 1;
@@ -1007,6 +1039,7 @@ describe("campaign launch (§5)", () => {
   it("carries only sanitized safety-stop stage/fidelity on the bounded campaign summary", async () => {
     const [previous] = await db
       .select({
+        enabled: sweeperState.enabled,
         admissionFenceActive: sweeperState.admissionFenceActive,
         lastAdmissionFenceAt: sweeperState.lastAdmissionFenceAt,
         lastAdmissionFenceReason: sweeperState.lastAdmissionFenceReason,
@@ -1020,6 +1053,7 @@ describe("campaign launch (§5)", () => {
     await db
       .update(sweeperState)
       .set({
+        enabled: false,
         admissionFenceActive: true,
         lastAdmissionFenceAt: new Date(),
         lastAdmissionFenceReason: "critical_solver_incident",
