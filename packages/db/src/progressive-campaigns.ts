@@ -335,7 +335,7 @@ export async function claimProgressiveWork(
       AND work.target_id IN (
         SELECT grouped.target_id FROM progressive_generation_targets grouped
         JOIN polar_analysis_targets physical_target ON physical_target.id = grouped.target_id
-        WHERE grouped.generation_id = generation.id
+        WHERE grouped.generation_id = ${input.baselineGroup.generationId}
           AND physical_target.airfoil_id = ${input.baselineGroup.airfoilId}
           AND physical_target.physical->'geometry' = ${canonicalAnalysisJson(input.baselineGroup.geometry)}::jsonb
           AND grouped.recipes->'neuralfoil' = ${canonicalAnalysisJson(input.baselineGroup.recipe)}::jsonb
