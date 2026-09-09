@@ -249,17 +249,29 @@ export async function claimProgressiveCfdUnit(
         ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
     `);
     if (!campaign) return null;
+    const initializedGenerations = (await connection.execute(sql`
+      SELECT generation.id FROM progressive_generations generation
+      WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+        AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
+        AND generation.status = 'active' AND generation.stage IN (2, 3)
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_work sibling
+          WHERE sibling.generation_id = generation.id AND sibling.stage = generation.stage
+            AND sibling.state = 'pending'
+            AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units initialized WHERE initialized.work_id = sibling.id)
+        )
+    `)) as unknown as Array<{ id: string }>;
+    if (!initializedGenerations.length) return null;
     const [unit] = (await connection.execute(sql`
-      SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
-        work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
-        (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
-        ${recoveryParent} AS recovery_parent_job_id,
-        unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
+      WITH selected AS MATERIALIZED (
+      SELECT unit.id
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
-      JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
-      JOIN polar_analysis_targets target ON target.id = work.target_id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+        AND generation.id IN (${sql.join(
+          initializedGenerations.map((generation) => sql`${generation.id}`),
+          sql`, `,
+        )})
         AND ${targetFilter}
         AND ${familyFilter}
         AND ${recoveryOwner}
@@ -267,10 +279,6 @@ export async function claimProgressiveCfdUnit(
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage = generation.stage AND work.stage IN (2, 3) AND work.state = 'pending'
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_work sibling WHERE sibling.generation_id = generation.id AND sibling.stage = work.stage
-            AND sibling.state = 'pending' AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units initialized WHERE initialized.work_id = sibling.id)
-        )
         AND (unit.purpose <> 'adaptive' OR NOT EXISTS (
           SELECT 1 FROM progressive_cfd_units initial JOIN progressive_work sibling ON sibling.id = initial.work_id
           WHERE sibling.generation_id = generation.id AND sibling.stage = work.stage
@@ -278,6 +286,17 @@ export async function claimProgressiveCfdUnit(
         ))
       ORDER BY generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
+      )
+      SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
+        work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
+        (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
+        ${recoveryParent} AS recovery_parent_job_id,
+        unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
+      FROM selected JOIN progressive_cfd_units unit ON unit.id = selected.id
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
+      JOIN polar_analysis_targets target ON target.id = work.target_id
     `)) as unknown as Array<{
       id: string;
       work_id: string;

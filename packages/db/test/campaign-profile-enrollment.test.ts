@@ -5925,6 +5925,43 @@ describe("durable progressive CFD units", () => {
     });
   });
 
+  it("waits for complete cohort initialization before selecting a CFD candidate", async () => {
+    const { generationId } = await fastCfdGeneration(true);
+    expect(await initializeProgressiveCfdWork(db)).toBe(4);
+    const [missing] = await db.execute(sql`
+      SELECT id FROM progressive_work WHERE generation_id = ${generationId} AND stage = 2
+      ORDER BY target_id DESC LIMIT 1
+    `);
+    await db.execute(
+      sql`DELETE FROM progressive_cfd_units WHERE work_id = ${missing.id}`,
+    );
+    expect(await claimCfd()).toBeNull();
+    expect(await initializeProgressiveCfdWork(db)).toBe(2);
+    const first = (await claimCfd())!;
+    const second = (await claimCfd())!;
+    expect(first.generationId).toBe(generationId);
+    expect(second.generationId).toBe(generationId);
+    expect(first.targetId).not.toBe(second.targetId);
+  });
+
+  it("does not let a terminal gap without units block initialized CFD targets", async () => {
+    const { generationId } = await fastCfdGeneration(true);
+    expect(await initializeProgressiveCfdWork(db)).toBe(4);
+    const [missing] = await db.execute(sql`
+      SELECT id FROM progressive_work WHERE generation_id = ${generationId} AND stage = 2
+      ORDER BY target_id DESC LIMIT 1
+    `);
+    await db.execute(
+      sql`DELETE FROM progressive_cfd_units WHERE work_id = ${missing.id}`,
+    );
+    await db.execute(
+      sql`UPDATE progressive_work SET state = 'gap' WHERE id = ${missing.id}`,
+    );
+    const candidate = (await claimCfd())!;
+    expect(candidate.generationId).toBe(generationId);
+    expect(candidate.workId).not.toBe(missing.id);
+  });
+
   it("charges measured active time idempotently and requires a stop when the shared angle budget is exhausted", async () => {
     await fastCfdGeneration();
     await initializeProgressiveCfdWork(db);

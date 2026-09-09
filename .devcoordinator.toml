@@ -267,6 +267,12 @@ requires = ["dependencies"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive CPU admission|progressive submission recovery|pins a shared execution revision|separates retry budgets"]
 
 [[test.progressive.check]]
+name = "cfd-cohort"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "durable progressive CFD units"]
+
+[[test.progressive.check]]
 name = "stages"
 tier = "development"
 requires = ["dependencies"]
@@ -804,6 +810,14 @@ health = { path = "/health", timeout_seconds = 120 }
 
 [test.progressive-ui]
 timeout_seconds = 900
+
+[test.progressive-production-ui]
+timeout_seconds = 180
+
+[[test.progressive-production-ui.check]]
+name = "curves"
+tier = "development"
+command = ["node", "scripts/dev/verify-production-progressive.mjs"]
 
 [[test.progressive-ui.check]]
 name = "real-cfd-evidence"
