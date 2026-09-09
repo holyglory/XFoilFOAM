@@ -5506,6 +5506,83 @@ describe("progressive CFD evidence accounting", () => {
 });
 
 describe("durable progressive CFD units", () => {
+  it("keeps prior-generation stop safety scoped to the exact target and execution", async () => {
+    const fixture = await cfdEvidenceFixture();
+    const originalLease = fixture.leases[0];
+    const [stored] = await db.execute(sql`
+      SELECT target.airfoil_id, scope.revision_id, scope.angles, scope.recipes, target.physical,
+        generation.plan_revision_id
+      FROM progressive_generation_targets scope
+      JOIN progressive_generations generation ON generation.id = scope.generation_id
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      WHERE scope.generation_id = ${originalLease.generationId} AND scope.target_id = ${originalLease.targetId}
+    `);
+    const added = await newProfile();
+    await reconcileCampaignProfileEnrollment(db);
+    const original: SealedPolarTarget = {
+      airfoilId: String(stored.airfoil_id),
+      targetId: originalLease.targetId,
+      revisionId: String(stored.revision_id),
+      physical: stored.physical as SealedPolarTarget["physical"],
+      angles: stored.angles as number[],
+      recipes: stored.recipes as SealedPolarTarget["recipes"],
+    };
+    const otherPhysical = { ...original.physical, airfoilId: added };
+    const otherTarget = analysisContentHash(otherPhysical);
+    const generation = await sealProgressiveGeneration(db, {
+      campaignId: fixture.campaignId,
+      planRevisionId: String(stored.plan_revision_id),
+      scopeKey: "prior-execution-safety",
+      targets: [
+        original,
+        {
+          ...original,
+          airfoilId: added,
+          physical: otherPhysical,
+          targetId: otherTarget,
+        },
+      ],
+    });
+    for (let index = 0; index < 2; index += 1) {
+      const baseline = (await claim([1]))!;
+      expect(baseline.generationId).toBe(generation.id);
+      await storeNeuralFoilPrediction(
+        db,
+        baseline,
+        predictionFixture(baseline),
+      );
+    }
+    await initializeProgressiveCfdWork(db);
+    const unrelated = await claimProgressiveCfdBatch(db, {
+      owner: "unrelated-target",
+      leaseSeconds: 120,
+    });
+    expect(unrelated.length).toBeGreaterThan(0);
+    expect(unrelated.every((lease) => lease.targetId === otherTarget)).toBe(
+      true,
+    );
+    expect(await claimCfd()).toBeNull();
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    await db
+      .update(simJobs)
+      .set({ engineJobId: randomUUID() })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    expect(await claimCfd()).toBeNull();
+    await db
+      .update(simJobs)
+      .set({ engineJobId: fixture.engineJobId })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    const released = await claimCfd();
+    expect(released).toMatchObject({
+      generationId: generation.id,
+      targetId: originalLease.targetId,
+    });
+    expect((await claimCfd())?.generationId).toBe(generation.id);
+  });
+
   it.each(["rans", "urans"] as const)(
     "reclaims only its stopped failed %s cell for an authorized retry",
     async (regime) => {

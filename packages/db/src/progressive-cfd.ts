@@ -216,16 +216,21 @@ export async function claimProgressiveCfdUnit(
       OR (${effectiveRecipe})->'selection'->>'solver' IN ('simpleFoam', 'rhoSimpleFoam')
       OR ((${effectiveRecipe})->'selection'->>'solver' = 'rhoCentralFoam'
         AND (${effectiveRecipe})->>'timeCoordinate' = 'local_pseudo_time_iterations'))`;
-    const previousExecutionStopped = sql`NOT EXISTS (
-      SELECT 1 FROM progressive_cfd_attempts previous_attempt
+    const previousExecutions = sql`prior_executions AS MATERIALIZED (
+      SELECT DISTINCT current_generation.id AS generation_id, previous_work.target_id
+      FROM progressive_cfd_attempts previous_attempt
       JOIN progressive_cfd_units previous_unit ON previous_unit.id = previous_attempt.unit_id
       JOIN progressive_work previous_work ON previous_work.id = previous_unit.work_id
       JOIN progressive_generations previous_generation ON previous_generation.id = previous_work.generation_id
       JOIN sim_jobs previous_job ON previous_job.id = previous_attempt.sim_job_id
-      WHERE previous_generation.campaign_id = generation.campaign_id AND previous_work.target_id = work.target_id
-        AND previous_generation.id <> generation.id
+      JOIN progressive_generations current_generation ON current_generation.campaign_id = previous_generation.campaign_id
+        AND current_generation.id <> previous_generation.id
+      WHERE current_generation.epoch_id = ${epoch.id} AND current_generation.status = 'active'
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
           WHERE stopped.sim_job_id = previous_job.id AND stopped.engine_job_id = previous_job.engine_job_id)
+    )`;
+    const previousExecutionStopped = sql`(generation.id, work.target_id) NOT IN (
+      SELECT generation_id, target_id FROM prior_executions
     )`;
     if (input.requireSweeperEnabled) {
       const [state] = await connection.execute(
@@ -234,6 +239,7 @@ export async function claimProgressiveCfdUnit(
       if (!state?.enabled) return null;
     }
     const [campaign] = await connection.execute(sql`
+      WITH ${previousExecutions}
       SELECT campaign.id FROM sim_campaigns campaign WHERE campaign.status IN ('active', 'attention')
         AND EXISTS (
           SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
@@ -263,7 +269,7 @@ export async function claimProgressiveCfdUnit(
     `)) as unknown as Array<{ id: string }>;
     if (!initializedGenerations.length) return null;
     const [unit] = (await connection.execute(sql`
-      WITH selected AS MATERIALIZED (
+      WITH ${previousExecutions}, selected AS MATERIALIZED (
       SELECT unit.id
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
