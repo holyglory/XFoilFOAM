@@ -364,6 +364,16 @@ in scope; adding support does not silently add new conditions to existing campai
   900-second per-anchor allocation. Precise work retains physical-time integration
   and its requested mesh. The requested y+ is not a measured wall-resolution result.
 
+Primary pressure-based RANS does not become accepted merely because SIMPLE stops
+at its first residual convergence. Within the original iteration cap and shared
+active-time allocation, the producer can continue in 200-iteration segments until
+the existing raw Cl/Cd/Cm hold test certifies stability. It changes complete
+dictionaries atomically between stopped solver processes, retains each segment's
+settings and native log, and restores the original setup afterward. Forced-URANS
+initialization and density-based calculations do not use this continuation.
+Missing hold proof leaves the attempt provisional; it also excludes those fields
+from accepted warm-start donors. Mesh reuse is unchanged.
+
 Local pseudo-time advances individual cells with numerical steps to seek a steady
 solution; its iteration coordinate is never a physical URANS history. The sealed
 recipe and derived solver snapshot identify the time coordinate, and local/remote

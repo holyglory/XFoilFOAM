@@ -51,7 +51,7 @@ _LEGACY_ENGINE_NAMESPACE = "openfoam:opencfd:2406:numerics-1"
 # this independently from mesh topology: an older seed may be byte-perfect yet
 # encode the alternate low-negative-angle branch that the zero-anchored
 # marcher deliberately avoids.
-STEADY_RANS_MARCHER_SEED_VERSION = "zero-anchored-freestream-v2"
+STEADY_RANS_MARCHER_SEED_VERSION = "zero-anchored-held-rans-v3"
 
 
 def _canon(value: float) -> str:

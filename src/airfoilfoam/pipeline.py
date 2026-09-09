@@ -131,6 +131,7 @@ from .postprocess.images import (
 )
 from .postprocess.aperiodic import reduce_aperiodic_mean
 from .postprocess.residuals import parse_convergence, parse_local_steady_convergence
+from .openfoam.rans_hold import HOLD_MARKER, complete_rans_hold
 from .postprocess.unsteady import (
     CLEAN_CYCLE_CERTIFICATION_VERSION,
     DRIFT_ABS_FLOOR,
@@ -8370,11 +8371,14 @@ def run_case(
                     "steady RANS initialisation stage failed; URANS falls back to a short steady init"
                 )
             else:
+                if not solver_params.force_transient and not is_density_based(runner):
+                    res = complete_rans_hold(case_dir, res, runner, steady_solver_params, spec, n_proc,
+                                             steady_timeout, lambda: _check_cancel(cancel_check))
                 log = _checked_solver_result(case_dir, res).stdout
                 (case_dir / "log.simpleFoam").write_text(log)
                 conv = parse_local_steady_convergence(log, solver_params.convergence_tolerance) if is_density_based(runner) else parse_convergence(log)
                 outcome.converged = conv.converged
-                outcome.iterations = conv.iterations
+                outcome.iterations = (log.count("\nTime = ") or conv.iterations) if HOLD_MARKER in log else conv.iterations
                 outcome.final_residual = conv.final_residual
                 if solver_params.force_transient:
                     lt_dir = _latest_time_dir(case_dir)
@@ -8396,7 +8400,7 @@ def run_case(
         if (
             cache is not None
             and not solver_params.force_transient
-            and not rans_outcome_rejected_for_polar(outcome)
+            and _steady_seed_accepted(outcome)
         ):
             _publish_steady_seed(
                 cache, case_dir, airfoil, spec.chord, resolved, spec, fluid,
@@ -9578,6 +9582,16 @@ def rans_outcome_rejected_for_polar(outcome: CaseOutcome) -> bool:
     return outcome.cd <= 0
 
 
+def _steady_seed_accepted(outcome: CaseOutcome) -> bool:
+    return (
+        not rans_outcome_rejected_for_polar(outcome)
+        and outcome.method_key == "openfoam.rans"
+        and outcome.fidelity == "rans"
+        and outcome.rans_hold_certificate is not None
+        and outcome.rans_hold_certificate.certified
+    )
+
+
 def steady_outcome_shippable(outcome: CaseOutcome) -> bool:
     """True when a REJECTED steady RANS outcome still carries real force data
     and therefore ships as an honest point (converged=false, final-window
@@ -9820,6 +9834,9 @@ def solve_polar_marched(
                             polar_dir, spec, rans_solver, runner, steady_timeout, n_proc=n_proc,
                             cancel_check=cancel_check,
                         )
+                    if not solver_params.force_transient and not is_density_based(runner):
+                        res = complete_rans_hold(polar_dir, res, runner, rans_solver, spec, n_proc,
+                                                 steady_timeout, lambda: _check_cancel(cancel_check))
                     log = _checked_solver_result(polar_dir, res).stdout
                     (polar_dir / f"log.a{case_index}").write_text(log)
                     conv = parse_local_steady_convergence(log, rans_solver.convergence_tolerance) if is_density_based(runner) else parse_convergence(log)
@@ -9959,7 +9976,9 @@ def solve_polar_marched(
                 if outcome_progress:
                     outcome_progress(stored, True)
                 continue
-            if primary_steady_rans:
+            if primary_steady_rans and not _steady_seed_accepted(outcome):
+                live_steady_state_accepted = False
+            elif primary_steady_rans:
                 live_steady_state_accepted = True
                 if zero_anchored and aoa == 0.0:
                     zero_checkpoint = _snapshot_steady_march_state(polar_dir, "zero")

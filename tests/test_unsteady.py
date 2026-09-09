@@ -50,6 +50,20 @@ from airfoilfoam.pipeline import (
 )
 
 
+def _held_rans_fixture(directory, outcome):
+    if not outcome.converged:
+        return
+    path = Path(directory) / f"fixture-held-{outcome.spec.aoa_deg}.dat"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Time Cd Cl CmPitch\n" + "".join(
+        f"{iteration} {outcome.cd} {outcome.cl} {outcome.cm}\n" for iteration in range(1, 201)
+    ))
+    outcome.method_key = "openfoam.rans"
+    outcome.fidelity = "rans"
+    outcome.rans_hold_certificate = pipeline._rans_hold_certificate_from_raw(path)
+    assert outcome.rans_hold_certificate is not None
+
+
 def test_dominant_frequency_recovers_known_tone():
     f = 2.0  # Hz
     n = 600
@@ -1860,6 +1874,7 @@ def test_marched_core_rans_failure_stops_rans_and_promotes_full_urans(tmp_path, 
         outcome.cd = 0.02
         outcome.cm = 0.0
         outcome.cl_cd = outcome.cl / outcome.cd
+        _held_rans_fixture(_case_dir, outcome)
 
     def fake_full_urans(
         polar_dir,
@@ -1924,7 +1939,8 @@ def test_marched_core_rans_failure_stops_rans_and_promotes_full_urans(tmp_path, 
     assert all(p.outcome.unsteady for p in result.points)
 
 
-def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkeypatch):
+@pytest.mark.parametrize("missing_hold", [False, True])
+def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkeypatch, missing_hold):
     """MUST-CATCH A18: branch order and rejected-state recovery are explicit.
 
     The first negative point starts from the saved 0-degree fields.  When -2
@@ -1959,7 +1975,7 @@ def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkey
     def fake_warm(_polar_dir, spec, *_args, **_kwargs):
         calls.append(("warm", spec.aoa_deg))
         stdout = "Time = 2\n"
-        if spec.aoa_deg != -2.0:
+        if spec.aoa_deg != -2.0 or missing_hold:
             stdout += "SIMPLE solution converged in 1 iterations\n"
         return FakeRunResult(stdout)
 
@@ -1968,6 +1984,9 @@ def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkey
         outcome.cd = 0.02
         outcome.cm = 0.0
         outcome.cl_cd = outcome.cl / outcome.cd
+        _held_rans_fixture(_case_dir, outcome)
+        if missing_hold and outcome.spec.aoa_deg == -2.0:
+            outcome.rans_hold_certificate = None
 
     monkeypatch.setattr(pipeline, "_solve_cold_marched", fake_cold)
     monkeypatch.setattr(pipeline, "_solve_warm", fake_warm)
@@ -1985,7 +2004,7 @@ def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkey
     monkeypatch.setattr(
         pipeline,
         "_publish_steady_seed",
-        lambda *_args: published.append(_args[5].aoa_deg),
+        lambda *_args, **_kwargs: published.append(_args[5].aoa_deg),
     )
 
     result = solve_polar_marched(
@@ -2026,7 +2045,9 @@ def test_primary_rans_zero_anchor_restores_only_accepted_fields(tmp_path, monkey
     ]
     assert [item.outcome.spec.aoa_deg for item in result.attempts] == [0.0, 1.0, 2.0, -1.0, -2.0, -3.0]
     assert [item.outcome.spec.aoa_deg for item in result.points] == [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0]
-    assert not next(item.outcome for item in result.points if item.outcome.spec.aoa_deg == -2.0).converged
+    unsettled = next(item.outcome for item in result.points if item.outcome.spec.aoa_deg == -2.0)
+    assert unsettled.converged is missing_hold
+    assert unsettled.rans_hold_certificate is None
 
 
 def test_steady_march_checkpoint_restores_accepted_case_without_touching_evidence(tmp_path):
@@ -2101,6 +2122,7 @@ def test_marched_primary_rans_honors_profile_iterations_and_short_timeout(tmp_pa
         outcome.cd = 0.02
         outcome.cm = 0.0
         outcome.cl_cd = 5.0
+        _held_rans_fixture(_case_dir, outcome)
 
     def fake_full_urans(*_args, **kwargs):
         nonlocal urans_timeout

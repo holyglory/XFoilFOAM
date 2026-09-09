@@ -377,7 +377,11 @@ export async function cleanupCampaignFixtures(
       // all result-owned media/evidence children in dependency order.
       await db
         .update(results)
-        .set({ currentResultAttemptId: null })
+        .set({
+          currentResultAttemptId: null,
+          currentResultInterpretationId: null,
+          currentCanonicalSelectionId: null,
+        })
         .where(inArray(results.simulationPresetRevisionId, revisionIds));
       await db
         .delete(resultAttempts)

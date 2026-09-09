@@ -53,6 +53,7 @@ const requestedSpeedMps = Number(
 );
 const requestedMomentumScheme =
   process.env.PROGRESSIVE_LIVE_MOMENTUM_SCHEME ?? "linearUpwind";
+const requireRansHold = process.env.PROGRESSIVE_REQUIRE_RANS_HOLD === "1";
 assert(
   ["linearUpwind", "upwind"].includes(requestedMomentumScheme),
   "Unsupported numerical comparison recipe",
@@ -183,7 +184,7 @@ const { db, sql: connection } = createClient({ max: 4 });
 const prefix = `pw-progressive-live-${randomUUID()}`;
 const directory = resolve(
   root,
-  `.codex-artifacts/progressive-live-${requestedSpeedMps}${requestedMomentumScheme === "upwind" ? "-upwind" : ""}`,
+  `.codex-artifacts/progressive-live-${requestedSpeedMps}${requestedMomentumScheme === "upwind" ? "-upwind" : ""}${requireRansHold ? "-hold" : ""}`,
 );
 mkdirSync(directory, { recursive: true });
 const abort = new AbortController();
@@ -482,6 +483,37 @@ try {
             report.firstRefinement ??= curves;
           }
           if (proof.refined) {
+            if (requireRansHold) {
+              const attemptIds = [
+                ...new Set(
+                  (curves[0].explanation.contributors ?? []).map(
+                    (entry) => entry.attemptId,
+                  ),
+                ),
+              ];
+              const held = await db.execute(sql`
+                SELECT attempt.id, attempt.aoa_deg, attempt.regime, attempt.converged,
+                  classification.state, attempt.evidence_payload->'rans_hold_certificate' AS certificate
+                FROM result_attempts attempt JOIN result_classifications classification ON classification.result_attempt_id = attempt.id
+                WHERE attempt.id IN (${sql.join(
+                  attemptIds.map((id) => sql`${id}::uuid`),
+                  sql`, `,
+                )})
+              `);
+              report.ransHoldProof = held;
+              const accepted = held.filter(
+                (row) =>
+                  row.regime === "rans" &&
+                  row.converged === true &&
+                  row.state === "accepted" &&
+                  (row.certificate as { certified?: boolean } | null)
+                    ?.certified === true,
+              );
+              assert(
+                new Set(accepted.map((row) => Number(row.aoa_deg))).size >= 2,
+                "Two actual accepted RANS angles with exact hold certificates are required",
+              );
+            }
             report.distinctCfdAngles = proof.distinctCfdAngles;
             refined = true;
             report.refinedObservedAt = new Date().toISOString();
