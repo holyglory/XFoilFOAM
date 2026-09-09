@@ -1,11 +1,202 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OPENCFD_2606_ENGINE, type EngineClient } from "@aerodb/engine-client";
 import type { DB } from "@aerodb/db";
 import { parseProgressiveRemoteCapabilities } from "../src/progressive-remote-admission";
 import {
   progressiveWorkerCapabilityMetadata,
   refreshProgressiveWorkerCapabilities,
+  runProgressiveWorkerCapabilityService,
 } from "../src/progressive-worker-capabilities";
+
+vi.mock("node:timers/promises", () => ({
+  setTimeout: (
+    milliseconds: number,
+    value: unknown,
+    options: { signal: AbortSignal },
+  ) =>
+    new Promise((resolve, reject) => {
+      const finish = () => {
+        clearTimeout(timer);
+        options.signal.removeEventListener("abort", finish);
+        if (options.signal.aborted) reject(new Error("aborted"));
+        else resolve(value);
+      };
+      const timer = setTimeout(finish, milliseconds);
+      options.signal.addEventListener("abort", finish, { once: true });
+      if (options.signal.aborted) finish();
+    }),
+}));
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+function serviceFixture() {
+  const execute = vi.fn().mockResolvedValue([{ remote_solver_enabled: true }]);
+  const db = { execute } as unknown as DB;
+  const healthDetails = vi.fn().mockResolvedValue({
+    status: "ok",
+    solver_budget_version: 2,
+    mesh_recovery_version: 1,
+    urans_recovery_version: 14,
+    supported_engines: [OPENCFD_2606_ENGINE],
+  });
+  const inventory = vi.fn().mockResolvedValue({
+    solver_budget_version: 2,
+    default_engine: OPENCFD_2606_ENGINE,
+    engines: [
+      {
+        engine: OPENCFD_2606_ENGINE,
+        routing_key: "isolated-pool",
+        analysis_methods: ["rans"],
+        steady: true,
+        transient: true,
+        mesh_evidence: true,
+        volume_fields: true,
+        stored_media: true,
+        custom_field_rendering: true,
+        multi_element_geometry: false,
+        supported_turbulence_models: ["kOmegaSST"],
+        supported_image_fields: ["pressure"],
+      },
+    ],
+  });
+  return {
+    db,
+    execute,
+    healthDetails,
+    inventory,
+    engine: {
+      healthDetails,
+      capabilities: inventory,
+    } as unknown as EngineClient,
+  };
+}
+
+it("refreshes remote eligibility beyond sixty seconds without a controller tick and stops cleanly", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const fixture = serviceFixture();
+  const owner = new AbortController();
+  const running = runProgressiveWorkerCapabilityService(
+    fixture.db,
+    fixture.engine,
+    owner.signal,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).toEqual(capabilities());
+  const first = progressiveWorkerCapabilityMetadata(
+    fixture.db,
+  ).progressiveExecutionObservedAt;
+  await vi.advanceTimersByTimeAsync(70000);
+  expect(fixture.healthDetails).toHaveBeenCalledTimes(3);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).toEqual(capabilities());
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db)
+      .progressiveExecutionObservedAt,
+  ).not.toBe(first);
+  owner.abort();
+  await running;
+  await vi.advanceTimersByTimeAsync(60000);
+  expect(fixture.healthDetails).toHaveBeenCalledTimes(3);
+});
+
+it("clears eligibility when the role is disabled without probing the engine", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const fixture = serviceFixture();
+  await refreshProgressiveWorkerCapabilities(fixture.db, fixture.engine);
+  fixture.execute.mockResolvedValue([{ remote_solver_enabled: false }]);
+  const owner = new AbortController();
+  const running = runProgressiveWorkerCapabilityService(
+    fixture.db,
+    fixture.engine,
+    owner.signal,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).toBeNull();
+  expect(fixture.healthDetails).toHaveBeenCalledOnce();
+  owner.abort();
+  await running;
+});
+
+it("bounds a slow observation, shares concurrent refreshes and ignores a late response", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const fixture = serviceFixture();
+  await refreshProgressiveWorkerCapabilities(fixture.db, fixture.engine);
+  await vi.advanceTimersByTimeAsync(30001);
+  let release: (value: unknown) => void = () => {};
+  fixture.healthDetails.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  const first = refreshProgressiveWorkerCapabilities(
+    fixture.db,
+    fixture.engine,
+  );
+  const second = refreshProgressiveWorkerCapabilities(
+    fixture.db,
+    fixture.engine,
+  );
+  await vi.advanceTimersByTimeAsync(4999);
+  expect(fixture.healthDetails).toHaveBeenCalledTimes(2);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).not.toBeNull();
+  await vi.advanceTimersByTimeAsync(1);
+  await Promise.all([first, second]);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).toBeNull();
+  release({
+    status: "ok",
+    solver_budget_version: 2,
+    mesh_recovery_version: 1,
+    urans_recovery_version: 14,
+    supported_engines: [OPENCFD_2606_ENGINE],
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).toBeNull();
+});
+it("drains a bounded in-flight observation during shutdown without scheduling another probe", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const fixture = serviceFixture();
+  fixture.healthDetails.mockImplementation(() => new Promise(() => {}));
+  const owner = new AbortController();
+  let finished = false;
+  const running = runProgressiveWorkerCapabilityService(
+    fixture.db,
+    fixture.engine,
+    owner.signal,
+  ).then(() => {
+    finished = true;
+  });
+  await vi.advanceTimersByTimeAsync(1000);
+  owner.abort();
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(finished).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  await running;
+  expect(finished).toBe(true);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).toBeNull();
+  await vi.advanceTimersByTimeAsync(60000);
+  expect(fixture.healthDetails).toHaveBeenCalledOnce();
+});
 
 function capabilities() {
   return {

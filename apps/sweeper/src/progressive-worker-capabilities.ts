@@ -1,4 +1,6 @@
 import type { DB } from "@aerodb/db";
+import { setTimeout as delay } from "node:timers/promises";
+import { sql } from "drizzle-orm";
 import { canonicalAnalysisJson } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import {
@@ -46,10 +48,19 @@ export async function refreshProgressiveWorkerCapabilities(
     const checkedAt = performance.now();
     const sampledAt = new Date().toISOString();
     let capabilities: ProgressiveRemoteCapabilities | null = null;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      const [health, inventory] = await Promise.all([
-        engine.healthDetails({ timeoutMs: 5000 }),
-        engine.capabilities({ timeoutMs: 5000 }),
+      const [health, inventory] = await Promise.race([
+        Promise.all([
+          engine.healthDetails({ timeoutMs: 5000 }),
+          engine.capabilities({ timeoutMs: 5000 }),
+        ]),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("Engine capability observation timed out")),
+            5000,
+          );
+        }),
       ]);
       const identity = inventory.default_engine;
       if (
@@ -85,6 +96,8 @@ export async function refreshProgressiveWorkerCapabilities(
       }
     } catch {
       capabilities = null;
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
     observations.set(db, { checkedAt, sampledAt, capabilities });
   };
@@ -94,5 +107,35 @@ export async function refreshProgressiveWorkerCapabilities(
     await operation;
   } finally {
     if (pending.get(db) === operation) pending.delete(db);
+  }
+}
+
+export async function runProgressiveWorkerCapabilityService(
+  db: DB,
+  engine: EngineClient,
+  signal: AbortSignal,
+): Promise<void> {
+  while (!signal.aborted) {
+    try {
+      const [settings] = await db.execute(
+        sql`SELECT remote_solver_enabled FROM sync_api_settings WHERE id = 1`,
+      );
+      if (signal.aborted) break;
+      if (settings?.remote_solver_enabled)
+        await refreshProgressiveWorkerCapabilities(db, engine);
+      else observations.delete(db);
+    } catch (error) {
+      observations.delete(db);
+      console.error(
+        "[sweeper] progressive capability refresh failed:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    if (signal.aborted) break;
+    try {
+      await delay(30000, undefined, { signal });
+    } catch (error) {
+      if (!signal.aborted) throw error;
+    }
   }
 }

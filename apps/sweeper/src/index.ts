@@ -11,6 +11,7 @@ import { runProgressiveBaselineService } from "./progressive-service";
 import { runProgressiveReportService } from "./progressive-report-service";
 import { runProgressiveEvidenceService } from "./progressive-evidence-service";
 import { runProgressiveArchiveService } from "./progressive-archive-service";
+import { runProgressiveWorkerCapabilityService } from "./progressive-worker-capabilities";
 import { runSweeperServices } from "./service-lifecycle";
 import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 
@@ -47,6 +48,11 @@ const stopRemoteFleetHeartbeat = startRemoteSolverFleetHeartbeatTimer(db);
 try {
   await runSweeperServices(ac.signal, [
     { name: "controller", run: (signal) => runLoop(db, engine, signal) },
+    {
+      name: "progressive-capabilities",
+      run: (signal) =>
+        runProgressiveWorkerCapabilityService(db, engine, signal),
+    },
     {
       name: "progressive-polars",
       run: (signal) => runProgressiveBaselineService(db, sql, engine, signal),
