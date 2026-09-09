@@ -93,6 +93,27 @@ timeout_seconds = 7200
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.neuralfoil-geometry-research]
+timeout_seconds = 120
+
+[test.campaign-catalog-deletion]
+timeout_seconds = 120
+
+[test.campaign-catalog-deletion.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.campaign-catalog-deletion.check]]
+name = "concurrent-deletion"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "opens a campaign while an unrelated profile deletion commits"]
+
+[[test.neuralfoil-geometry-research.check]]
+name = "polyline-fit"
+tier = "development"
+command = [".venv/bin/python", "scripts/materials/inspect_neuralfoil_geometry.py"]
+
 [[test.rae-reference.check]]
 name = "source-contract"
 tier = "development"

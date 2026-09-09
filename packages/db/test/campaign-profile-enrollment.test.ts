@@ -6730,6 +6730,56 @@ afterAll(async () => {
 });
 
 describe("durable profile enrollment", () => {
+  it("opens a campaign while an unrelated profile deletion commits", async () => {
+    const removed = await newProfile();
+    let release!: () => void;
+    let notify!: (pid: number) => void;
+    const ready = new Promise<number>((resolve) => {
+      notify = resolve;
+    });
+    const proceed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const deletion = db.transaction(async (transaction) => {
+      const [backend] = await transaction.execute(
+        sql`SELECT pg_backend_pid() AS pid`,
+      );
+      await transaction.delete(airfoils).where(eq(airfoils.id, removed));
+      notify(Number(backend.pid));
+      await proceed;
+    });
+    const blocker = await ready;
+    const launch = campaign().then(
+      (id) => ({ id, error: null }),
+      (error: unknown) => ({ id: null, error }),
+    );
+    try {
+      await expect
+        .poll(
+          async () => {
+            const [waiting] = await db.execute(sql`
+          SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+            WHERE ${blocker}::integer = ANY(pg_blocking_pids(pid))) AS blocked
+        `);
+            return waiting.blocked;
+          },
+          { timeout: 10000, interval: 10 },
+        )
+        .toBe(true);
+    } finally {
+      release();
+      await deletion;
+    }
+    const result = await launch;
+    expect(result.error).toBeNull();
+    expect(result.id).not.toBeNull();
+    const rows = await db.execute(sql`
+      SELECT airfoil_id FROM campaign_catalog_snapshot
+      WHERE campaign_id = ${result.id}::uuid AND airfoil_id = ${removed}::uuid
+    `);
+    expect(rows).toHaveLength(0);
+  });
+
   it("cleans only the owned retained-condition scopes and progressive generations", async () => {
     const removedId = await campaign("active", [73.9181]);
     const survivorId = await campaign("active", [73.9182]);
