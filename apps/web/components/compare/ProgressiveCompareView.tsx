@@ -8,6 +8,7 @@ import {
   type ProgressiveComparisonProfile,
 } from "@/lib/progressive-comparison";
 import { C, MONO, VIZ } from "@/lib/tokens";
+import { polarAxisLayout } from "@/lib/polar-axis";
 import {
   POLAR_QUANTITY_LABELS as QUANTITIES,
   PolarQuantitySelector,
@@ -113,15 +114,12 @@ export function ProgressiveCompareView({
   );
   const yMinimum = minimum - padding;
   const yMaximum = maximum + padding;
+  const axis = polarAxisLayout(yMinimum, yMaximum, width);
   const projectX = (value: number) =>
-    58 +
-    ((value - xMinimum) / Math.max(xMaximum - xMinimum, 1e-9)) * (width - 82);
+    axis.left +
+    ((value - xMinimum) / Math.max(xMaximum - xMinimum, 1e-9)) * axis.plotWidth;
   const projectY = (value: number) =>
     height - 42 - ((value - yMinimum) / (yMaximum - yMinimum)) * (height - 66);
-  const ticks = Array.from(
-    { length: width < 440 ? 4 : 6 },
-    (_, index) => index / (width < 440 ? 3 : 5),
-  );
   return (
     <section
       data-testid="progressive-comparison"
@@ -227,20 +225,20 @@ export function ProgressiveCompareView({
               <defs>
                 <clipPath id={clipId}>
                   <rect
-                    x={58}
+                    x={axis.left}
                     y={24}
-                    width={Math.max(1, width - 82)}
+                    width={axis.plotWidth}
                     height={height - 66}
                   />
                 </clipPath>
               </defs>
-              {ticks.map((fraction) => {
+              {axis.ticks.map(({ fraction, label }) => {
                 const horizontal = xMinimum + (xMaximum - xMinimum) * fraction;
                 const vertical = yMinimum + (yMaximum - yMinimum) * fraction;
                 return (
                   <g key={fraction}>
                     <line
-                      x1={58}
+                      x1={axis.left}
                       x2={width - 24}
                       y1={projectY(vertical)}
                       y2={projectY(vertical)}
@@ -254,14 +252,16 @@ export function ProgressiveCompareView({
                       stroke={VIZ.grid}
                     />
                     <text
-                      x={50}
+                      data-polar-axis-tick="y"
+                      x={axis.left - 8}
                       y={projectY(vertical) + 4}
                       textAnchor="end"
                       fill={VIZ.text}
                     >
-                      {display(vertical)}
+                      {label}
                     </text>
                     <text
+                      data-polar-axis-tick="x"
                       x={projectX(horizontal)}
                       y={height - 23}
                       textAnchor={

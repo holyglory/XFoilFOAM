@@ -1124,7 +1124,7 @@ command = ["node", "scripts/dev/verify-modal-stack.mjs"]
 [[test.progressive-ui.check]]
 name = "api-origin"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/api-origin.test.ts", "test/theme-contrast.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/api-origin.test.ts", "test/theme-contrast.test.ts", "test/polar-axis.test.ts"]
 
 [[test.progressive-ui.check]]
 name = "material-editor"

@@ -3,6 +3,7 @@
 import { fRe, type ProgressivePolarSeries } from "@aerodb/core";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { C, MONO, VIZ } from "@/lib/tokens";
+import { polarAxisLayout } from "@/lib/polar-axis";
 import {
   POLAR_QUANTITY_LABELS as CHARTS,
   PolarQuantitySelector,
@@ -97,14 +98,17 @@ export function ProgressivePolarViewer({
     );
     const yMin = lower - padding;
     const yMax = upper + padding;
+    const axis = polarAxisLayout(yMin, yMax, width);
     return {
+      axis,
       curves,
       xMin,
       xMax,
       yMin,
       yMax,
       x: (value: number) =>
-        58 + ((value - xMin) / Math.max(xMax - xMin, 1e-9)) * (width - 82),
+        axis.left +
+        ((value - xMin) / Math.max(xMax - xMin, 1e-9)) * axis.plotWidth,
       y: (value: number) =>
         height - 42 - ((value - yMin) / (yMax - yMin)) * (height - 66),
     };
@@ -125,11 +129,6 @@ export function ProgressivePolarViewer({
         ["Cm at zero angle", metrics.momentAtZeroAlpha],
       ] as const)
     : [];
-  const tickCount = width < 440 ? 4 : 6;
-  const ticks = Array.from(
-    { length: tickCount },
-    (_, index) => index / (tickCount - 1),
-  );
   const yTitle =
     chart === "ld"
       ? "Cl / Cd"
@@ -230,7 +229,34 @@ export function ProgressivePolarViewer({
           </label>
         )}
         {projected.curves.map((curve) => (
-          <span key={curve.method}>{METHODS[curve.method]}</span>
+          <span
+            key={curve.method}
+            data-polar-method={curve.method}
+            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 22,
+                height: 12,
+                flexShrink: 0,
+                background: VIZ.bg,
+                borderRadius: 2,
+              }}
+            >
+              <span
+                data-polar-line-key
+                style={{
+                  width: 16,
+                  borderTop: `2px solid ${COLORS[curve.method]}`,
+                }}
+              />
+            </span>
+            {METHODS[curve.method]}
+          </span>
         ))}
       </div>
       <div
@@ -257,14 +283,14 @@ export function ProgressivePolarViewer({
           <defs>
             <clipPath id={clipId}>
               <rect
-                x={58}
+                x={projected.axis.left}
                 y={24}
-                width={Math.max(1, width - 82)}
+                width={projected.axis.plotWidth}
                 height={height - 66}
               />
             </clipPath>
           </defs>
-          {ticks.map((fraction) => {
+          {projected.axis.ticks.map(({ fraction, label }) => {
             const xValue =
               projected.xMin + (projected.xMax - projected.xMin) * fraction;
             const yValue =
@@ -272,7 +298,7 @@ export function ProgressivePolarViewer({
             return (
               <g key={fraction}>
                 <line
-                  x1={58}
+                  x1={projected.axis.left}
                   x2={width - 24}
                   y1={projected.y(yValue)}
                   y2={projected.y(yValue)}
@@ -286,14 +312,16 @@ export function ProgressivePolarViewer({
                   stroke={VIZ.grid}
                 />
                 <text
-                  x={50}
+                  data-polar-axis-tick="y"
+                  x={projected.axis.left - 8}
                   y={projected.y(yValue) + 4}
                   textAnchor="end"
                   fill={VIZ.text}
                 >
-                  {number(yValue)}
+                  {label}
                 </text>
                 <text
+                  data-polar-axis-tick="x"
                   x={projected.x(xValue)}
                   y={height - 23}
                   textAnchor={

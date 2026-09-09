@@ -49,6 +49,35 @@ try {
     await expect(viewer.getByTestId("progressive-polar-curve")).toHaveCount(
       series.curves.length,
     );
+    const lineKeys = await viewer
+      .locator("[data-polar-line-key]")
+      .evaluateAll((keys) =>
+        keys.map((key) => getComputedStyle(key).borderTopColor),
+      );
+    const lineColors = await viewer
+      .getByTestId("progressive-polar-curve")
+      .evaluateAll((curves) =>
+        curves.map((curve) => getComputedStyle(curve).stroke),
+      );
+    assert.deepEqual(lineKeys, lineColors);
+    const tickBounds = await viewer
+      .locator("[data-polar-axis-tick]")
+      .evaluateAll((ticks) =>
+        ticks.map((tick) => {
+          const bounds = tick.getBBox();
+          const viewport = tick.ownerSVGElement.viewBox.baseVal;
+          return {
+            x: bounds.x,
+            right: bounds.x + bounds.width,
+            width: viewport.width,
+          };
+        }),
+      );
+    assert(tickBounds.length > 0);
+    assert(
+      tickBounds.every((tick) => tick.x >= 4 && tick.right <= tick.width - 4),
+      JSON.stringify(tickBounds),
+    );
     await viewer.getByLabel("Compare methods").uncheck();
     await viewer.getByLabel("Show curve samples").check();
     assert((await viewer.getByTestId("prediction-sample").count()) > 0);
