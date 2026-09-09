@@ -4082,6 +4082,9 @@ export const simJobs = pgTable(
       .$onUpdate(() => new Date()),
   },
   (t) => ({
+    syncPromiseIdentityIdx: index("sim_jobs_sync_promise_identity_idx").on(
+      sql`(${t.requestPayload}->>'syncPromiseId')`,
+    ),
     runtimeBuildOwnerFk: foreignKey({
       columns: [t.solverRuntimeBuildId, t.solverImplementationId],
       foreignColumns: [

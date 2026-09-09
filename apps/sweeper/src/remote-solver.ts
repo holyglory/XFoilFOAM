@@ -1,4 +1,5 @@
 import { runRemoteTransferSteps } from "./remote-transfer-steps";
+import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 import {
   airfoils,
   boundaryConditions,
@@ -7209,7 +7210,11 @@ export async function admitRemoteSolverTick(
         );
         break;
       }
-      const [assigned] = await db.execute(sql`
+      const concurrency = Math.min(
+        activeReconcileConcurrency(),
+        MAX_ADMISSIONS_PER_TICK - attempt,
+      );
+      const assigned = await db.execute(sql`
         SELECT job.id FROM sim_jobs job JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
         WHERE job.status = 'pending' AND job.engine_state IS NULL AND job.engine_job_id IS NULL
           AND job.request_payload->>'remoteSolver' = 'true' AND job.request_payload ? 'remoteProgressiveExecution'
@@ -7225,47 +7230,54 @@ export async function admitRemoteSolverTick(
                 )})`
               : sql``
           }
-        ORDER BY job."updatedAt", job.id LIMIT 1
+        ORDER BY job."updatedAt", job.id LIMIT ${concurrency}
       `);
-      if (assigned) {
-        const jobId = String(assigned.id);
-        attemptedAssignments.add(jobId);
-        try {
-          const submitted = await submitProgressiveRemoteJob(db, engine, jobId);
-          if (submitted.kind === "submitted") admitted = true;
-          if (submitted.kind === "stop_required") {
-            await db
-              .update(simJobs)
-              .set({
-                status: "cancelled",
-                engineState: "cancel_pending",
-                error: submitted.reason,
-              })
-              .where(eq(simJobs.id, jobId));
-            const observed = await observeProgressiveRemoteJob(
+      if (assigned.length) {
+        for (const job of assigned) attemptedAssignments.add(String(job.id));
+        await runWithConcurrency(assigned, concurrency, async (job) => {
+          const jobId = String(job.id);
+          try {
+            const submitted = await submitProgressiveRemoteJob(
               db,
               engine,
               jobId,
-              { stop: true },
             );
-            if (observed.stopped)
+            if (submitted.kind === "submitted") admitted = true;
+            if (submitted.kind === "stop_required") {
               await db
                 .update(simJobs)
-                .set({ engineState: "cancelled" })
+                .set({
+                  status: "cancelled",
+                  engineState: "cancel_pending",
+                  error: submitted.reason,
+                })
                 .where(eq(simJobs.id, jobId));
+              const observed = await observeProgressiveRemoteJob(
+                db,
+                engine,
+                jobId,
+                { stop: true },
+              );
+              if (observed.stopped)
+                await db
+                  .update(simJobs)
+                  .set({ engineState: "cancelled" })
+                  .where(eq(simJobs.id, jobId));
+            }
+          } catch (error) {
+            await db
+              .update(simJobs)
+              .set({
+                error: error instanceof Error ? error.message : String(error),
+              })
+              .where(eq(simJobs.id, jobId));
           }
-        } catch (error) {
           await db
             .update(simJobs)
-            .set({
-              error: error instanceof Error ? error.message : String(error),
-            })
+            .set({ updatedAt: new Date() })
             .where(eq(simJobs.id, jobId));
-        }
-        await db
-          .update(simJobs)
-          .set({ updatedAt: new Date() })
-          .where(eq(simJobs.id, jobId));
+        });
+        attempt += assigned.length - 1;
         continue;
       }
       const mirrored = await mirroredRemotePromiseIds(db, settings);

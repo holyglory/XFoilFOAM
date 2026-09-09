@@ -22,6 +22,10 @@ export async function verifyProgressiveWorkerReportDelivery(
   reports: ProgressiveRemoteReport[],
 ) {
   const executionId = envelope.scope.executionId;
+  const [lookupIndex] =
+    await db.execute(sql`SELECT indexdef FROM pg_indexes WHERE schemaname = 'public'
+    AND tablename = 'sim_jobs' AND indexname = 'sim_jobs_sync_promise_identity_idx'`);
+  expect(String(lookupIndex?.indexdef)).toContain("syncPromiseId");
   const [settings] = await db.execute(sql`
     SELECT remote_solver_enabled, remote_solver_registered_id, remote_solver_auth_token, upstream_base_url,
       remote_solver_transfer_paused FROM sync_api_settings WHERE id = 1
