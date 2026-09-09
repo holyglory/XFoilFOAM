@@ -74,6 +74,20 @@ export async function verifyProgressiveWorkerArchiveDelivery(
       await connection.execute(
         sql`UPDATE sync_api_settings SET remote_solver_auth_token = ${source.remote_solver_auth_token} WHERE id = 1`,
       );
+      const [originalAttempt] = await connection.execute(sql`
+        SELECT evidence_payload FROM result_attempts WHERE id = ${source.result_attempt_id}::uuid
+      `);
+      for (const artifacts of [null, [], [{ kind: "log" }]]) {
+        await connection.execute(sql`
+          UPDATE result_attempts SET evidence_payload = jsonb_set(evidence_payload, '{evidence_artifacts}', ${JSON.stringify(artifacts)}::jsonb)
+          WHERE id = ${source.result_attempt_id}::uuid
+        `);
+        expect(await claimProgressiveWorkerArchive(connection)).toBeNull();
+      }
+      await connection.execute(sql`
+        UPDATE result_attempts SET evidence_payload = ${JSON.stringify(originalAttempt.evidence_payload)}::jsonb
+        WHERE id = ${source.result_attempt_id}::uuid
+      `);
       const claim = await claimProgressiveWorkerArchive(connection);
       expect(claim).toMatchObject({
         executionId,

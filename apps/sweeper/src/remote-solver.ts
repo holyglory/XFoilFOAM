@@ -1,3 +1,4 @@
+import { runRemoteTransferSteps } from "./remote-transfer-steps";
 import {
   airfoils,
   boundaryConditions,
@@ -7004,17 +7005,34 @@ export async function transferRemoteSolverTick(
       return false;
     }
     if (!settings.remoteSolverAuthToken) return false;
+    const transfer = await runRemoteTransferSteps([
+      {
+        name: "promoted-parents",
+        run: async () =>
+          Boolean(await settlePromotedRemoteParentDeliveries(db, settings)),
+      },
+      {
+        name: "accepted-results",
+        run: () => processRemoteResultDeliveries(db, engine, settings),
+      },
+      {
+        name: "fulfilled-upgrades",
+        run: () => processFulfilledEvidenceUpgrades(db, engine, settings),
+      },
+      {
+        name: "reported-archives",
+        run: () => deliverNextProgressiveWorkerArchive(db, engine),
+      },
+      {
+        name: "restart-checkpoints",
+        run: () =>
+          processRestartableRemotePrecalcCheckpoint(db, engine, settings),
+      },
+    ]);
     const processedDurableDelivery =
       Boolean(releasedUnavailablePromises) ||
       Boolean(repairedCancelledJobs) ||
-      Boolean(await settlePromotedRemoteParentDeliveries(db, settings)) ||
-      // Accepted current generations release authoritative promise points and
-      // local storage. A missing rejected checkpoint must not starve every
-      // unrelated valid result behind it.
-      (await processRemoteResultDeliveries(db, engine, settings)) ||
-      (await processFulfilledEvidenceUpgrades(db, engine, settings)) ||
-      (await deliverNextProgressiveWorkerArchive(db, engine)) ||
-      (await processRestartableRemotePrecalcCheckpoint(db, engine, settings));
+      transfer.processed;
     const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
     if (readyPromiseId) {
       await setStatus(db, "pushing", null);
@@ -7028,6 +7046,16 @@ export async function transferRemoteSolverTick(
       engine,
       settings,
     );
+    if (transfer.errors.length) {
+      await setStatus(
+        db,
+        "error",
+        transfer.errors
+          .map((failure) => `${failure.step}: ${failure.message}`)
+          .join("; ")
+          .slice(0, 2000),
+      );
+    }
     return (
       processedDurableDelivery || Boolean(readyPromiseId) || reusedEvidence
     );

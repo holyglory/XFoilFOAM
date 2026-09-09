@@ -285,6 +285,12 @@ requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/sim-evidence-presentation.test.ts"]
 
 [[test.progressive.check]]
+name = "archive-transfer-fairness"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-transfer-steps.test.ts"]
+
+[[test.progressive.check]]
 name = "stages"
 tier = "development"
 requires = ["dependencies"]

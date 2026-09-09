@@ -26,6 +26,12 @@ export async function claimProgressiveWorkerArchive(
       LEFT JOIN progressive_worker_archive_deliveries delivery ON delivery.sim_job_id = retained.sim_job_id
         AND delivery.point_content_signature = retained.point_content_signature
       WHERE custody.sim_job_id IS NULL AND attempt.result_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM jsonb_array_elements(CASE
+            WHEN jsonb_typeof(attempt.evidence_payload->'evidence_artifacts') = 'array'
+              THEN attempt.evidence_payload->'evidence_artifacts' ELSE '[]'::jsonb END) artifact
+          WHERE artifact->>'kind' = 'manifest'
+        )
         AND (delivery.claim_expires_at IS NULL OR delivery.claim_expires_at <= clock_timestamp())
         AND (delivery.retry_after IS NULL OR delivery.retry_after <= clock_timestamp())
         AND NOT settings.remote_solver_transfer_paused
