@@ -59,7 +59,6 @@ import {
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
-import { reconcileProgressiveRemoteWorker } from "./progressive-remote-reconciliation";
 import { observeProgressiveRemoteJob } from "./progressive-remote-observation";
 import { receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
@@ -6922,14 +6921,6 @@ export async function reconcileRemoteSolverTick(
     assertRemoteSolverNodeEvidenceContract(
       settings?.remoteSolverEnabled ?? false,
     );
-    const progressive = await reconcileProgressiveRemoteWorker(db, engine);
-    if (progressive.inspected)
-      console.log(
-        JSON.stringify({
-          component: "progressive-remote-observation",
-          ...progressive,
-        }),
-      );
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.remoteSolverLastStatus !== "disabled")
         await setStatus(db, "disabled", null);
@@ -7252,17 +7243,6 @@ export async function admitRemoteSolverTick(
                   error: submitted.reason,
                 })
                 .where(eq(simJobs.id, jobId));
-              const observed = await observeProgressiveRemoteJob(
-                db,
-                engine,
-                jobId,
-                { stop: true },
-              );
-              if (observed.stopped)
-                await db
-                  .update(simJobs)
-                  .set({ engineState: "cancelled" })
-                  .where(eq(simJobs.id, jobId));
             }
           } catch (error) {
             await db

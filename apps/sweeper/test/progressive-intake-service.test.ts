@@ -4,6 +4,12 @@ import type { EngineClient } from "@aerodb/engine-client";
 import { receiveProgressiveAssignmentPage } from "../src/progressive-remote-intake";
 import { receiveProgressiveCampaignAssignments } from "../src/remote-solver";
 import { runProgressiveAssignmentIntakeService } from "../src/progressive-intake-service";
+import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
+import { runProgressiveRemoteObservationService } from "../src/progressive-observation-service";
+
+vi.mock("../src/progressive-remote-reconciliation", () => ({
+  reconcileProgressiveRemoteWorker: vi.fn(),
+}));
 
 vi.mock("../src/remote-solver", () => ({
   receiveProgressiveCampaignAssignments: vi.fn(),
@@ -31,6 +37,37 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.resetAllMocks();
   vi.useRealTimers();
+});
+
+it("observes obsolete execution independently and drains its active proof before shutdown", async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const observe = vi.mocked(reconcileProgressiveRemoteWorker);
+  observe.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        release = () =>
+          resolve({ inspected: 0, reported: 0, stopped: 0, errors: [] });
+      }),
+  );
+  const owner = new AbortController();
+  let finished = false;
+  const running = runProgressiveRemoteObservationService(
+    {} as DB,
+    {} as EngineClient,
+    owner.signal,
+  ).then(() => {
+    finished = true;
+  });
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(observe).toHaveBeenCalledOnce();
+  owner.abort();
+  expect(finished).toBe(false);
+  release();
+  await running;
+  expect(finished).toBe(true);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(observe).toHaveBeenCalledOnce();
 });
 
 it("shares a slow intake between the independent service and controller", async () => {

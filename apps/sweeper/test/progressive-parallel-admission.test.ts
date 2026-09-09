@@ -140,20 +140,20 @@ it("retains full-capacity and safety holds before issuing any request", async ()
   expect(hooks.submit).not.toHaveBeenCalled();
 });
 
-it("keeps rejected starts cancellation-pending until their exact stop is proved", async () => {
+it("queues rejected starts without waiting for a blocked stop endpoint or claiming stop proof", async () => {
   const scope = fixture();
   hooks.submit.mockResolvedValue({
     kind: "stop_required",
     reason: "expired exact authorization",
   });
-  hooks.observe.mockResolvedValue({ stopped: false });
+  hooks.observe.mockImplementation(() => new Promise(() => {}));
   expect(
     await admitRemoteSolverTick(scope.db, scope.engine, {
       kind: "allow",
       meshRecoveryVersion: 1,
     }),
   ).toBe(false);
-  expect(hooks.observe).toHaveBeenCalledTimes(4);
+  expect(hooks.observe).not.toHaveBeenCalled();
   expect(
     scope.updates.filter((update) => update.engineState === "cancel_pending"),
   ).toHaveLength(4);
