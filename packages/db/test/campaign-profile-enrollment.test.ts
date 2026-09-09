@@ -117,6 +117,7 @@ import {
   reconcileCampaignProfileEnrollment,
 } from "../src/campaigns";
 import { cleanupCampaignFixtures } from "../src/test-cleanup";
+import { simCampaignConditions } from "../src/schema";
 import {
   bindProgressiveRemoteDispatch,
   progressiveRemoteReservedSlots,
@@ -1710,6 +1711,55 @@ describe("progressive live solver accounting", () => {
 });
 
 describe("progressive CPU admission", () => {
+  it("indexes exact text promise identity without broadening legacy ownership", async () => {
+    const campaignId = await campaign();
+    const [condition] = await db
+      .select()
+      .from(simCampaignConditions)
+      .where(eq(simCampaignConditions.campaignId, campaignId))
+      .limit(1);
+    const promiseIds: string[] = [];
+    try {
+      const inserted = await db.execute(sql`
+        INSERT INTO sync_sweep_promises (airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        SELECT ${originalId}::uuid, ${condition.simulationPresetRevisionId}::uuid, 1, clock_timestamp() + interval '1 hour'
+        FROM generate_series(1, 800) RETURNING id
+      `);
+      promiseIds.push(...inserted.map((row) => String(row.id)));
+      await db.execute(sql`ANALYZE sync_sweep_promises`);
+      const exact = promiseIds.find((id) => /[a-f]/.test(id))!;
+      const [planned] = await db.execute(sql`EXPLAIN (ANALYZE, FORMAT JSON)
+        SELECT id FROM sync_sweep_promises WHERE id::text = ${exact}`);
+      const plan = (
+        planned["QUERY PLAN"] as Array<{ Plan: Record<string, unknown> }>
+      )[0].Plan;
+      expect(JSON.stringify(plan)).toContain(
+        "sync_sweep_promises_text_identity_idx",
+      );
+      expect(plan["Actual Rows"]).toBe(1);
+      for (const incorrect of [
+        exact.toUpperCase(),
+        `${exact} `,
+        "not-a-uuid",
+        null,
+      ]) {
+        expect(
+          await db.execute(
+            sql`SELECT id FROM sync_sweep_promises WHERE id::text = ${incorrect}`,
+          ),
+        ).toHaveLength(0);
+      }
+    } finally {
+      if (promiseIds.length)
+        await db.execute(sql`
+        DELETE FROM sync_sweep_promises WHERE id IN (${sql.join(
+          promiseIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )})
+      `);
+    }
+  });
+
   async function ready(
     run: (scope: {
       campaignId: string;

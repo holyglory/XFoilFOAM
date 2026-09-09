@@ -6103,6 +6103,7 @@ export const syncSweepPromises = pgTable(
   },
   (t) => ({
     statusIdx: index("sync_sweep_promises_status_idx").on(t.status),
+    textIdentityIdx: index("sync_sweep_promises_text_identity_idx").on(sql`(${t.id}::text)`),
     expiresIdx: index("sync_sweep_promises_expires_idx").on(t.expiresAt),
     scopeIdx: index("sync_sweep_promises_scope_idx").on(
       t.airfoilId,
