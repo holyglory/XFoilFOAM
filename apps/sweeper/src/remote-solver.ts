@@ -35,6 +35,7 @@ import {
   solverProfiles,
   solverRuntimeBuilds,
   solverCpuReservationSql,
+  settleProgressiveWorkerFinalReport,
   sweeperState,
   syncApiSettings,
   syncRemoteHubBindingReceipts,
@@ -1514,6 +1515,7 @@ async function cancelAuthoritativelyExpiredPromise(
     let engineState: "cancelled" | "cancel_pending" = "cancelled";
     let error = reason;
     if (Object.hasOwn(job.requestPayload ?? {}, "remoteProgressiveExecution")) {
+      if (await settleProgressiveWorkerFinalReport(db, job.id)) continue;
       engineState = "cancel_pending";
       await db
         .update(simJobs)

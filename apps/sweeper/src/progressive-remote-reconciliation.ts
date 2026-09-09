@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
-import type { DB } from "@aerodb/db";
+import { settleProgressiveWorkerFinalReport, type DB } from "@aerodb/db";
 import {
   ENGINE_SUBMIT_TIMEOUT_MS,
   type EngineClient,
@@ -37,6 +37,45 @@ export async function reconcileProgressiveRemoteWorker(
     errors: [] as Array<{ executionId: string; error: string }>,
   };
   if (options.jobIds?.length === 0) return receipt;
+  const finalMirrors = await db.execute(sql`
+    SELECT job.id FROM sim_jobs job
+    JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
+    JOIN sync_api_settings settings ON settings.id = 1
+    WHERE job.request_payload->>'remoteSolver' = 'true' AND job.request_payload ? 'remoteProgressiveExecution'
+      AND promise.registered_solver_id = settings.remote_solver_registered_id
+      AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
+      AND (job.status IN ('pending', 'submitted', 'running', 'ingesting') OR job.engine_state IN ('cancelling', 'cancel_pending'))
+      AND EXISTS (SELECT 1 FROM progressive_worker_reports report WHERE report.sim_job_id = job.id
+        AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+        AND report.report#>>'{stopProof,job_id}' = job.id::text)
+      ${
+        options.jobIds
+          ? sql`AND job.id IN (${sql.join(
+              options.jobIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )})`
+          : sql``
+      }
+    ORDER BY job."updatedAt", job.id LIMIT ${limit}
+  `);
+  await runWithConcurrency(
+    finalMirrors,
+    activeReconcileConcurrency(),
+    async (job) => {
+      const executionId = String(job.id);
+      try {
+        if (await settleProgressiveWorkerFinalReport(db, executionId)) {
+          receipt.inspected += 1;
+          receipt.stopped += 1;
+        }
+      } catch (error) {
+        receipt.errors.push({
+          executionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+  );
   const candidates = await db.execute(sql`
     SELECT job.id, job.engine_job_id, job.request_payload,
       coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}') AS assignment_signature,

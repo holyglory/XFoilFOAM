@@ -9,6 +9,7 @@ import {
   acknowledgeProgressiveWorkerReport,
   enqueueProgressiveWorkerReport,
   readPendingProgressiveWorkerReport,
+  settleProgressiveWorkerFinalReport,
 } from "../src/progressive-worker-reports";
 import {
   publishProgressiveWorkerReport,
@@ -26,7 +27,7 @@ export async function verifyProgressiveWorkerReportDelivery(
       remote_solver_transfer_paused FROM sync_api_settings WHERE id = 1
   `);
   const [job] = await db.execute(
-    sql`SELECT request_payload FROM sim_jobs WHERE id = ${executionId}::uuid`,
+    sql`SELECT request_payload, to_jsonb(sim_jobs) AS original_state FROM sim_jobs WHERE id = ${executionId}::uuid`,
   );
   const [promise] = await db.execute(
     sql`SELECT source_base_url FROM sync_sweep_promises WHERE id = ${envelope.promiseId}::uuid`,
@@ -68,11 +69,84 @@ export async function verifyProgressiveWorkerReportDelivery(
       true,
     ]);
     expect(initial[0].contentSignature).toBe(initial[1].contentSignature);
+    expect(await settleProgressiveWorkerFinalReport(db, executionId)).toBe(
+      false,
+    );
     const second = await capture(reports[1]);
     await db.execute(
       sql`UPDATE sync_api_settings SET remote_solver_enabled = false WHERE id = 1`,
     );
     const third = await capture(reports[2]);
+    const expectedState =
+      reports[2].status.state === "completed"
+        ? "done"
+        : reports[2].status.state;
+    const checkProjection = async () => {
+      const [projected] = await db.execute(
+        sql`SELECT status, engine_state, total_cases, completed_cases, "ingestedAt" FROM sim_jobs WHERE id = ${executionId}::uuid`,
+      );
+      expect(projected).toMatchObject({
+        status: expectedState,
+        engine_state: reports[2].status.state,
+        total_cases: reports[2].status.total_cases,
+        completed_cases: reports[2].status.completed_cases,
+      });
+      expect(projected.ingestedAt).toBeNull();
+    };
+    await checkProjection();
+    await db.execute(
+      sql`UPDATE sim_jobs SET status = 'submitted', engine_state = 'pending' WHERE id = ${executionId}::uuid`,
+    );
+    expect(await settleProgressiveWorkerFinalReport(db, executionId)).toBe(
+      true,
+    );
+    await checkProjection();
+    await db.execute(
+      sql`UPDATE sim_jobs SET engine_job_id = ${randomUUID()} WHERE id = ${executionId}::uuid`,
+    );
+    await expect(
+      settleProgressiveWorkerFinalReport(db, executionId),
+    ).rejects.toThrow("foreign engine identity");
+    await db.execute(
+      sql`UPDATE sim_jobs SET engine_job_id = ${(job.original_state as Record<string, unknown>).engine_job_id ?? null} WHERE id = ${executionId}::uuid`,
+    );
+    const corruptRead = {
+      transaction: (callback: (connection: DB) => Promise<unknown>) =>
+        db.transaction(async (transaction) =>
+          callback({
+            execute: async (statement: Parameters<DB["execute"]>[0]) => {
+              const rows = await transaction.execute(statement);
+              return rows.map((row) =>
+                row.content_signature
+                  ? { ...row, content_signature: "0".repeat(64) }
+                  : row,
+              );
+            },
+          } as unknown as DB),
+        ),
+    } as unknown as DB;
+    await expect(
+      settleProgressiveWorkerFinalReport(corruptRead, executionId),
+    ).rejects.toThrow("content signature changed");
+    await db.execute(
+      sql`UPDATE sync_api_settings SET remote_solver_registered_id = ${randomUUID()}::uuid WHERE id = 1`,
+    );
+    expect(await settleProgressiveWorkerFinalReport(db, executionId)).toBe(
+      false,
+    );
+    await db.execute(
+      sql`UPDATE sync_api_settings SET remote_solver_registered_id = ${envelope.solverId}::uuid WHERE id = 1`,
+    );
+    await db.execute(
+      sql`UPDATE sync_api_settings SET upstream_base_url = 'https://other-worker-authority.invalid/api/sync/v1' WHERE id = 1`,
+    );
+    expect(await settleProgressiveWorkerFinalReport(db, executionId)).toBe(
+      false,
+    );
+    await db.execute(
+      sql`UPDATE sync_api_settings SET upstream_base_url = ${baseUrl} WHERE id = 1`,
+    );
+    await checkProjection();
     expect([initial[0].sequence, second.sequence, third.sequence]).toEqual([
       1, 2, 3,
     ]);
@@ -200,7 +274,12 @@ export async function verifyProgressiveWorkerReportDelivery(
       sql`DELETE FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid`,
     );
     await db.execute(
-      sql`UPDATE sim_jobs SET request_payload = ${JSON.stringify(job.request_payload)}::jsonb WHERE id = ${executionId}::uuid`,
+      sql`UPDATE sim_jobs SET request_payload = ${JSON.stringify(job.request_payload)}::jsonb,
+        status = (saved->>'status')::sim_job_status, engine_state = saved->>'engine_state',
+        engine_job_id = saved->>'engine_job_id', error = saved->>'error',
+        total_cases = (saved->>'total_cases')::integer, completed_cases = (saved->>'completed_cases')::integer,
+        "finishedAt" = (saved->>'finishedAt')::timestamptz, "updatedAt" = (saved->>'updatedAt')::timestamptz
+      FROM (SELECT ${JSON.stringify(job.original_state)}::jsonb AS saved) original WHERE id = ${executionId}::uuid`,
     );
     await db.execute(
       sql`UPDATE sync_sweep_promises SET source_base_url = ${promise.source_base_url} WHERE id = ${envelope.promiseId}::uuid`,

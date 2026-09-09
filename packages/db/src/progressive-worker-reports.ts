@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import type { DB } from "./client";
 import { canonicalAnalysisJson } from "./analysis-target";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
@@ -8,6 +9,77 @@ import {
   validateProgressiveRemoteReportOrder,
   type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
+
+async function projectFinalWorkerReport(
+  db: DB,
+  report: ProgressiveRemoteReport,
+): Promise<boolean> {
+  if (!isFinalProgressiveRemoteReport(report)) return false;
+  const state = report.status.state;
+  const finished =
+    typeof report.status.updated_at === "string" &&
+    Number.isFinite(Date.parse(report.status.updated_at))
+      ? report.status.updated_at
+      : null;
+  const rows = await db.execute(sql`
+    UPDATE sim_jobs SET status = ${state === "completed" ? "done" : state}::sim_job_status,
+      engine_state = ${state}, total_cases = ${report.status.total_cases}, completed_cases = ${report.status.completed_cases},
+      "finishedAt" = coalesce("finishedAt", ${finished}::timestamptz), "updatedAt" = clock_timestamp(),
+      error = CASE WHEN ${state} = 'completed' THEN NULL ELSE coalesce(${report.status.message ?? null}, error) END
+    WHERE id = ${report.executionId}::uuid AND (engine_job_id IS NULL OR engine_job_id = ${report.executionId}) RETURNING id
+  `);
+  if (rows.length !== 1)
+    throw new Error("Final worker report has a foreign engine identity");
+  return true;
+}
+
+export async function settleProgressiveWorkerFinalReport(
+  db: DB,
+  executionId: string,
+): Promise<boolean> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [owned] = await connection.execute(sql`
+      SELECT job.request_payload, promise.id AS promise_id, promise.registered_solver_id AS solver_id,
+        latest.report, latest.content_signature, settings.upstream_base_url
+      FROM sim_jobs job
+      JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
+      JOIN sync_api_settings settings ON settings.id = 1
+      JOIN LATERAL (SELECT report, content_signature FROM progressive_worker_reports
+        WHERE sim_job_id = job.id ORDER BY sequence DESC LIMIT 1) latest ON true
+      WHERE job.id = ${executionId}::uuid AND job.request_payload->>'remoteSolver' = 'true'
+        AND promise.registered_solver_id = settings.remote_solver_registered_id
+        AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
+      FOR UPDATE OF job
+    `);
+    if (!owned) return false;
+    const payload = owned.request_payload as Record<string, unknown>;
+    if (
+      canonicalRemoteHubBaseUrl(String(owned.upstream_base_url)) !==
+      payload.upstreamBaseUrl
+    )
+      return false;
+    const report = owned.report as unknown as ProgressiveRemoteReport;
+    const envelope = verifyProgressiveRemoteExecution(
+      payload.remoteProgressiveExecution,
+      {
+        executionId,
+        solverId: String(owned.solver_id),
+        promiseId: String(owned.promise_id),
+        contentSignature: report.assignmentSignature,
+      },
+    );
+    if (
+      canonicalAnalysisJson(payload.engineRequest) !==
+      canonicalAnalysisJson(envelope.request)
+    )
+      throw new Error("Final worker report differs from its immutable request");
+    const validated = validateProgressiveRemoteReport(report, envelope);
+    if (validated.contentSignature !== owned.content_signature)
+      throw new Error("Final worker report content signature changed");
+    return projectFinalWorkerReport(connection, validated.report);
+  });
+}
 
 export async function enqueueProgressiveWorkerReport(
   db: DB,
@@ -62,13 +134,18 @@ export async function enqueueProgressiveWorkerReport(
         { ...content, sequence: Number(latest.sequence) },
         envelope,
       );
-      if (replay.contentSignature === latest.content_signature)
+      if (replay.contentSignature === latest.content_signature) {
+        await projectFinalWorkerReport(
+          connection,
+          latest.report as unknown as ProgressiveRemoteReport,
+        );
         return {
           executionId: input.executionId,
           sequence: Number(latest.sequence),
           contentSignature: replay.contentSignature,
           replayed: true,
         };
+      }
     }
     const next = validateProgressiveRemoteReport(
       { ...content, sequence: Number(latest?.sequence ?? 0) + 1 },
@@ -83,17 +160,23 @@ export async function enqueueProgressiveWorkerReport(
       isFinalProgressiveRemoteReport(
         latest.report as unknown as ProgressiveRemoteReport,
       )
-    )
+    ) {
+      await projectFinalWorkerReport(
+        connection,
+        latest.report as unknown as ProgressiveRemoteReport,
+      );
       return {
         executionId: input.executionId,
         sequence: Number(latest.sequence),
         contentSignature: String(latest.content_signature),
         replayed: true,
       };
+    }
     await connection.execute(sql`
       INSERT INTO progressive_worker_reports (sim_job_id, sequence, content_signature, report)
       VALUES (${input.executionId}::uuid, ${next.report.sequence}, ${next.contentSignature}, ${JSON.stringify(next.report)}::jsonb)
     `);
+    await projectFinalWorkerReport(connection, next.report);
     await connection.execute(
       sql`SELECT pg_notify('progressive_worker_report_changed', ${input.executionId})`,
     );
