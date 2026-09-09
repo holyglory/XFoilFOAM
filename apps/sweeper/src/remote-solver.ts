@@ -7003,7 +7003,6 @@ export async function transferRemoteSolverTick(
     if (!settings?.remoteSolverEnabled || !settings.upstreamBaseUrl) {
       if (settings?.upstreamBaseUrl && settings.remoteSolverAuthToken) {
         await cancelMirroredPromisesForDisabledSolver(db, engine, settings);
-        return deliverNextProgressiveWorkerArchive(db, engine);
       }
       return false;
     }
@@ -7021,10 +7020,6 @@ export async function transferRemoteSolverTick(
       {
         name: "fulfilled-upgrades",
         run: () => processFulfilledEvidenceUpgrades(db, engine, settings),
-      },
-      {
-        name: "reported-archives",
-        run: () => deliverNextProgressiveWorkerArchive(db, engine),
       },
       {
         name: "restart-checkpoints",

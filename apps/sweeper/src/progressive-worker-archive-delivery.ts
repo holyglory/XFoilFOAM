@@ -2,19 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 
-export type ProgressiveArchiveClaim = {
-  executionId: string;
-  pointContentSignature: string;
-  resultAttemptId: string;
-  token: string;
-};
-
-export async function claimProgressiveWorkerArchive(
-  db: DB,
-): Promise<ProgressiveArchiveClaim | null> {
-  return db.transaction(async (transaction) => {
-    const [source] = await transaction.execute(sql`
-      SELECT retained.sim_job_id, retained.point_content_signature, retained.result_attempt_id
+const archiveCandidateScope = sql`
       FROM progressive_worker_hub_receipts retained
       JOIN result_attempts attempt ON attempt.id = retained.result_attempt_id AND attempt.sim_job_id = retained.sim_job_id
         AND attempt.engine_job_id = retained.sim_job_id::text
@@ -32,8 +20,6 @@ export async function claimProgressiveWorkerArchive(
               THEN attempt.evidence_payload->'evidence_artifacts' ELSE '[]'::jsonb END) artifact
           WHERE artifact->>'kind' = 'manifest'
         )
-        AND (delivery.claim_expires_at IS NULL OR delivery.claim_expires_at <= clock_timestamp())
-        AND (delivery.retry_after IS NULL OR delivery.retry_after <= clock_timestamp())
         AND NOT settings.remote_solver_transfer_paused
         AND settings.remote_solver_auth_token <> '' AND settings.upstream_base_url IS NOT NULL
         AND job.request_payload->>'remoteSolver' = 'true'
@@ -44,6 +30,39 @@ export async function claimProgressiveWorkerArchive(
         AND NOT EXISTS (SELECT 1 FROM result_classifications classification
           JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
           WHERE classification.result_attempt_id = attempt.id AND classification.state = 'accepted')
+`;
+
+export async function nextProgressiveArchiveWakeAt(
+  db: DB,
+): Promise<Date | null> {
+  const [pending] = await db.execute(sql`
+    SELECT min(greatest(delivery.claim_expires_at, delivery.retry_after)) AS wake_at
+    ${archiveCandidateScope}
+      AND (delivery.claim_expires_at > clock_timestamp() OR delivery.retry_after > clock_timestamp())
+  `);
+  return pending?.wake_at == null
+    ? null
+    : pending.wake_at instanceof Date
+      ? pending.wake_at
+      : new Date(String(pending.wake_at));
+}
+
+export type ProgressiveArchiveClaim = {
+  executionId: string;
+  pointContentSignature: string;
+  resultAttemptId: string;
+  token: string;
+};
+
+export async function claimProgressiveWorkerArchive(
+  db: DB,
+): Promise<ProgressiveArchiveClaim | null> {
+  return db.transaction(async (transaction) => {
+    const [source] = await transaction.execute(sql`
+      SELECT retained.sim_job_id, retained.point_content_signature, retained.result_attempt_id
+      ${archiveCandidateScope}
+        AND (delivery.claim_expires_at IS NULL OR delivery.claim_expires_at <= clock_timestamp())
+        AND (delivery.retry_after IS NULL OR delivery.retry_after <= clock_timestamp())
       ORDER BY coalesce(delivery.retry_after, retained.delivered_at), retained.delivered_at, retained.sim_job_id, retained.point_content_signature
       LIMIT 1 FOR UPDATE OF retained SKIP LOCKED
     `);

@@ -14,6 +14,7 @@ import { progressiveArchiveManifestBytes } from "./progressive-archive-data";
 import { deliverNextProgressiveWorkerArchive } from "../../../apps/sweeper/src/remote-solver";
 import {
   claimProgressiveWorkerArchive,
+  nextProgressiveArchiveWakeAt,
   renewProgressiveWorkerArchiveClaim,
   settleProgressiveWorkerArchiveClaim,
 } from "../../../apps/sweeper/src/progressive-worker-archive-delivery";
@@ -67,6 +68,7 @@ export async function verifyProgressiveWorkerArchiveDelivery(
         sql`UPDATE sync_api_settings SET remote_solver_transfer_paused = true WHERE id = 1`,
       );
       expect(await claimProgressiveWorkerArchive(connection)).toBeNull();
+      expect(await nextProgressiveArchiveWakeAt(connection)).toBeNull();
       await connection.execute(
         sql`UPDATE sync_api_settings SET remote_solver_transfer_paused = false, remote_solver_auth_token = '' WHERE id = 1`,
       );
@@ -130,6 +132,18 @@ export async function verifyProgressiveWorkerArchiveDelivery(
         executionId,
         resultAttemptId: source.result_attempt_id,
       });
+      const nextWake = await nextProgressiveArchiveWakeAt(connection);
+      expect(nextWake?.getTime()).toBeGreaterThan(Date.now() + 29 * 60 * 1000);
+      const [deadline] = await connection.execute(sql`
+        SELECT claim_expires_at FROM progressive_worker_archive_deliveries
+        WHERE sim_job_id = ${executionId}::uuid AND point_content_signature = ${source.point_content_signature}
+      `);
+      expect(nextWake?.getTime()).toBe(
+        (deadline.claim_expires_at instanceof Date
+          ? deadline.claim_expires_at
+          : new Date(String(deadline.claim_expires_at))
+        ).getTime(),
+      );
       expect(await claimProgressiveWorkerArchive(connection)).toBeNull();
       await expect(
         settleProgressiveWorkerArchiveClaim(connection, claim!),

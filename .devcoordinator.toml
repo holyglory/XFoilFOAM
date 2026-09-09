@@ -90,6 +90,14 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_domain_reset.p
 [test.progressive]
 timeout_seconds = 7200
 
+[test.rae-reference]
+timeout_seconds = 120
+
+[[test.rae-reference.check]]
+name = "source-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_reference.py", "tests/test_rae2822_pressure.py", "-q"]
+
 [test.progressive.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
@@ -288,13 +296,19 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vite
 name = "archive-transfer-fairness"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-transfer-steps.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-transfer-steps.test.ts", "test/progressive-archive-service.test.ts"]
 
 [[test.progressive.check]]
 name = "remote-cancellation-transfer"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "repairs a terminal job whose settled result delivery predates|a closed promise without the exact result-attempt owner|terminal wave-2 children unblock"]
+
+[[test.progressive.check]]
+name = "remote-fleet-payload"
+tier = "development"
+requires = ["dependencies", "types", "remote-standalone-claims"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "reports fleet liveness while a promise renewal holds|a running serial polar does not block"]
 
 [[test.progressive.check]]
 name = "stages"
@@ -734,6 +748,86 @@ source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
+
+[deployment.rae-verification]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-verification.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.rae-verification.yml"]
+services = ["artifacts"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-fast]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-fast.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "fast"]
+finite_services = ["fast"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-precise]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-precise.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "precise"]
+finite_services = ["precise"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-refined]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-refined.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "refined"]
+finite_services = ["refined"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-transonic]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-transonic.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "transonic"]
+finite_services = ["transonic"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.shock-verification.component.numerics]
 type = "compose"

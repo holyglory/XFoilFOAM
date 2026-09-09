@@ -658,3 +658,26 @@ Validate uncertainty with held-out whole profiles and conditions. Keep numerical
 verification separate from physical-model validation. Exercise real public
 wide/narrow UI journeys, method/evidence controls, lifecycle expansion, stale
 delivery rejection, saturated queue responsiveness and recovery after restart.
+
+The RAE 2822 reference in `tests/fixtures/rae2822` preserves the original NASA
+Study 1 geometry and measured pressure bytes. Its loader checks hashes and the
+documented lower-surface and negative-Cp plotting signs. The condition is Mach
+0.729 at 2.31 degrees, not the similarly named nominal Mach-0.725 case. The source
+Reynolds number and the value resolved from the selected material are reported
+separately; no measurement uncertainty is invented.
+
+Run `rae-reference` through the coordinator before the isolated `rae-fast`,
+`rae-precise`, `rae-refined` or experimental `rae-transonic` deployments. These
+use separate native jobs so a failed case cannot terminate another deployment.
+The original `rae-verification` deployment serves retained first-pass artifacts
+only. Reports distinguish convergence, time-budget exhaustion, material-domain
+failure and pressure-comparison error. A completed measurement command is not
+an aerodynamic accuracy certificate. Experimental transonic pressure correction
+changes only a newly generated benchmark dictionary before any solver starts;
+it does not change the production recipe.
+
+Progressive archive delivery uses its own notification-driven service. It drains
+exact retained sources independently of legacy transfer housekeeping, reusing
+the existing claims, oldest-due ordering, custody verification, transfer pause
+and persisted retry deadlines. It does not create additional CFD jobs or relax
+the remote promise cap.

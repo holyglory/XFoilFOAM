@@ -10,6 +10,7 @@ import { runLoop } from "./loop";
 import { runProgressiveBaselineService } from "./progressive-service";
 import { runProgressiveReportService } from "./progressive-report-service";
 import { runProgressiveEvidenceService } from "./progressive-evidence-service";
+import { runProgressiveArchiveService } from "./progressive-archive-service";
 import { runSweeperServices } from "./service-lifecycle";
 import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 
@@ -57,6 +58,10 @@ try {
     {
       name: "progressive-compact-evidence",
       run: (signal) => runProgressiveEvidenceService(db, sql, engine, signal),
+    },
+    {
+      name: "progressive-archive-delivery",
+      run: (signal) => runProgressiveArchiveService(db, sql, engine, signal),
     },
   ]);
 } finally {

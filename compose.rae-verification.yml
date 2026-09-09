@@ -1,0 +1,40 @@
+x-verification: &verification
+  image: xfoilfoam-local-steady:verification
+  pull_policy: never
+  network_mode: none
+  environment:
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ./scripts/materials/rae2822_reference.py:/verification/rae2822_reference.py:ro
+    - ./scripts/materials/verify_rae2822.py:/verification/verify_rae2822.py:ro
+    - ./tests/fixtures/rae2822:/verification/reference:ro
+    - ./tests/fixtures/air-thermophysics-audit.json:/verification/material.json:ro
+    - rae-evidence:/evidence
+
+services:
+  fast:
+    <<: *verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/fast", "--tier", "fast"]
+  precise:
+    <<: *verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/precise", "--tier", "precise"]
+  refined:
+    <<: *verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/refined", "--tier", "refined"]
+  transonic:
+    <<: *verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/transonic", "--tier", "precise", "--transonic"]
+  artifacts:
+    image: xfoilfoam-local-steady:verification
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - rae-evidence:/evidence:ro
+
+volumes:
+  rae-evidence:

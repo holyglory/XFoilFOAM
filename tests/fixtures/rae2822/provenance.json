@@ -1,0 +1,29 @@
+{
+  "study": "NASA NPARC RAE 2822 Study 1",
+  "url": "https://www.grc.nasa.gov/www/wind/valid/raetaf/raetaf01/raetaf01.html",
+  "mach": 0.729,
+  "alpha_deg": 2.31,
+  "reynolds": 6500000,
+  "chord_ft": 1,
+  "temperature_rankine": 460,
+  "pressure_psia": 15.80734,
+  "reference_computation_turbulence_model": "Spalart-Allmaras",
+  "pressure_data_kind": "experimental",
+  "measurement_uncertainty": null,
+  "geometry": {
+    "file": "geometry.txt",
+    "url": "https://www.grc.nasa.gov/www/wind/valid/raetaf/geom.txt",
+    "sha256": "0bef162c8778247a4746f02a1b487f33083a1ae80fdc82ea58afc259c87da736",
+    "processing_url": "https://www.grc.nasa.gov/www/wind/valid/raetaf/geom.f90",
+    "columns": ["x_over_c", "negative_lower_z_over_c", "upper_z_over_c"]
+  },
+  "pressure": {
+    "file": "pressure.gen",
+    "url": "https://www.grc.nasa.gov/www/wind/valid/raetaf/raetaf01/cp.exp.gen",
+    "sha256": "498b8ccc63348bc5b1007f5c5d61cdd24283159a728f1f56c17b8ba73ed3658b",
+    "processing_url": "https://www.grc.nasa.gov/www/wind/valid/raetaf/raetaf01/cfpost.cp.com",
+    "ordinate": "negative_cp",
+    "traversal": "upper_trailing_edge_to_leading_edge_then_lower_trailing_edge"
+  },
+  "solver_validation_performed": false
+}
