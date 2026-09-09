@@ -173,12 +173,30 @@ export function validateProgressiveRemoteReport(
     );
   const states = ["pending", "running", "completed", "failed", "cancelled"];
   const status = value.status;
+  const failedBeforeCases =
+    record(status) &&
+    status.state === "failed" &&
+    status.total_cases === 0 &&
+    status.completed_cases === 0 &&
+    ["deterministic_mesh", "infrastructure"].includes(
+      String(status.failure_disposition),
+    ) &&
+    record(value.stopProof) &&
+    (value.result === null ||
+      (record(value.result) &&
+        Array.isArray(value.result.polars) &&
+        value.result.polars.length === 0)) &&
+    (status.solver_budget_progress == null ||
+      (record(status.solver_budget_progress) &&
+        Array.isArray(status.solver_budget_progress.cases) &&
+        status.solver_budget_progress.cases.length === 0));
   if (
     !record(status) ||
     status.job_id !== envelope.scope.executionId ||
     typeof status.state !== "string" ||
     !states.includes(status.state) ||
     (status.total_cases !== envelope.scope.units.length &&
+      !failedBeforeCases &&
       !(
         status.total_cases === 0 &&
         record(value.stopProof) &&

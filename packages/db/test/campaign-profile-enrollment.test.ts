@@ -5445,6 +5445,113 @@ describe("progressive CFD evidence accounting", () => {
 });
 
 describe("durable progressive CFD units", () => {
+  it.each(["rans", "urans"] as const)(
+    "reclaims only its stopped failed %s cell for an authorized retry",
+    async (regime) => {
+      const fixture = await cfdEvidenceFixture(32.173, 3);
+      const originalLease = fixture.leases[0];
+      const evidenceId = await fixture.save(25, regime, originalLease.alpha, {
+        failure_disposition: "infrastructure",
+      });
+      await fixture.record([evidenceId]);
+      const [evidence] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, evidenceId));
+      await db
+        .update(results)
+        .set({ status: "failed", regime })
+        .where(eq(results.id, evidence.resultId!));
+      await db
+        .update(simJobs)
+        .set({ status: "done", ingestedAt: new Date() })
+        .where(eq(simJobs.id, fixture.composed.jobId));
+      await acknowledgeProgressiveCfdExecutionStop(db, {
+        simJobId: fixture.composed.jobId,
+        proof: executionStopProof(fixture.engineJobId),
+      });
+      expect(
+        (await settleProgressiveCfdExecution(db, fixture.composed.jobId)).retry,
+      ).toBe(1);
+      const retry = await claimProgressiveCfdBatch(db, {
+        owner: "owned-retry-fixture",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+      });
+      expect(retry).toHaveLength(1);
+      expect(retry[0].id).toBe(originalLease.id);
+      const [pool] = await db
+        .select()
+        .from(solverExecutionPools)
+        .where(
+          eq(
+            solverExecutionPools.solverImplementationId,
+            fixture.execution.revision.solverImplementationId,
+          ),
+        )
+        .limit(1);
+      await db
+        .update(sweeperState)
+        .set({ enabled: true })
+        .where(eq(sweeperState.id, 1));
+      await db
+        .update(solverExecutionPools)
+        .set({ enabled: true })
+        .where(eq(solverExecutionPools.id, pool.id));
+      const options = {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      };
+      try {
+        for (const guard of ["no-stop", "completed-cell"] as const) {
+          await expect(
+            db.transaction(async (transaction) => {
+              if (guard === "no-stop")
+                await transaction.execute(sql`
+            DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id = ${fixture.composed.jobId}
+          `);
+              else
+                await transaction
+                  .update(results)
+                  .set({ status: "done" })
+                  .where(eq(results.id, evidence.resultId!));
+              await composeProgressiveCfdJob(
+                transaction as unknown as DB,
+                retry,
+                options,
+              );
+            }),
+          ).rejects.toThrow("another execution owner");
+        }
+        const retried = await composeProgressiveCfdJob(db, retry, options);
+        expect(retried.jobId).not.toBe(fixture.composed.jobId);
+        const [cell] = await db
+          .select()
+          .from(results)
+          .where(eq(results.id, evidence.resultId!));
+        expect(cell).toMatchObject({
+          simJobId: retried.jobId,
+          status: "queued",
+        });
+        const [preserved] = await db
+          .select()
+          .from(resultAttempts)
+          .where(eq(resultAttempts.id, evidenceId));
+        expect(preserved).toEqual(evidence);
+      } finally {
+        await db
+          .update(sweeperState)
+          .set({ enabled: false })
+          .where(eq(sweeperState.id, 1));
+        await db
+          .update(solverExecutionPools)
+          .set({ enabled: pool.enabled })
+          .where(eq(solverExecutionPools.id, pool.id));
+      }
+    },
+  );
+
   it("matches comparison conditions across geometries without merging different physical inputs", async () => {
     const campaignId = await campaign();
     const scope = await progressiveScope(campaignId);

@@ -241,6 +241,7 @@ export async function composeProgressiveCfdJob(
       execution.revision.id,
       angles,
       jobId,
+      leases,
     );
     if (
       canonicalAnalysisJson(

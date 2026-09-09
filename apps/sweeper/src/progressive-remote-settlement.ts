@@ -14,6 +14,7 @@ import {
 } from "@aerodb/db";
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
+import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 import { validateRansPrecalcPromotionSignal } from "./ingest";
 
 type RetainedExecution = Extract<
@@ -130,11 +131,13 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       sql`SELECT sim_job_id FROM progressive_cfd_execution_stops WHERE sim_job_id = ${executionId}::uuid`,
     );
     if (!stop) return { kind: "waiting" as const, reason: "physical_stop" };
-    if (job.ingestedAt)
+    if (job.ingestedAt) {
+      await retireSettledProgressivePromise(connection, executionId);
       return {
         kind: "settled" as const,
         counts: await settleProgressiveCfdExecution(connection, executionId),
       };
+    }
     const [scope] = await connection.execute(sql`SELECT EXISTS (
       SELECT 1 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
       JOIN progressive_work work ON work.id = unit.work_id JOIN progressive_generations generation ON generation.id = work.generation_id
@@ -149,6 +152,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         "queued",
         "running",
       ]);
+      await retireSettledProgressivePromise(connection, executionId);
       return {
         kind: "settled" as const,
         counts: await settleProgressiveCfdExecution(connection, executionId),
@@ -235,6 +239,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       "queued",
       "running",
     ]);
+    await retireSettledProgressivePromise(connection, executionId);
     return {
       kind: "settled" as const,
       counts: await settleProgressiveCfdExecution(connection, executionId),

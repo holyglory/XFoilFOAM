@@ -153,6 +153,10 @@ export async function reconcileProgressiveRemoteProgress(db: DB) {
       OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
       OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
         AND EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt WHERE attempt.sim_job_id = job.id AND attempt.outcome = 'running'))
+      OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
+        SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+        WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'
+      ))
     GROUP BY report.sim_job_id, job."polledAt", job."updatedAt" ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
   for (const job of jobs) {
     const executionId = String(job.sim_job_id);

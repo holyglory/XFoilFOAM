@@ -1,5 +1,9 @@
 import { type DB, lockPrecalcCells } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import {
+  progressiveRetryClaimSql,
+  type ProgressiveResultClaimUnit,
+} from "./progressive-result-claim";
 
 /** Drizzle transaction clients expose the same insert builder but deliberately
  * omit `transaction` itself. Claiming needs execute; the top-level client is
@@ -15,6 +19,7 @@ async function claimAoasInTransaction(
   presetRevisionId: string,
   aoas: number[],
   simJobId: string,
+  progressiveUnits?: ProgressiveResultClaimUnit[],
 ): Promise<number[]> {
   await lockPrecalcCells(
     tx,
@@ -26,6 +31,10 @@ async function claimAoasInTransaction(
   );
   const claimed: number[] = [];
   for (const aoa of aoas) {
+    const progressiveRetry = progressiveRetryClaimSql(
+      progressiveUnits?.find((unit) => unit.alpha === aoa),
+      simJobId,
+    );
     const rows = (await tx.execute(sql`
       INSERT INTO results (
         airfoil_id, bc_id, simulation_preset_revision_id, aoa_deg,
@@ -61,9 +70,9 @@ async function claimAoasInTransaction(
       DO UPDATE SET
         status = 'queued', source = 'queued', sim_job_id = ${simJobId}::uuid,
         error = NULL, "updatedAt" = now()
-      WHERE results.status IN ('pending', 'stale')
+      WHERE ((results.status IN ('pending', 'stale')
         AND results.regime IS DISTINCT FROM 'urans'
-        AND COALESCE(results.fidelity::text, '') NOT LIKE 'urans%'
+        AND COALESCE(results.fidelity::text, '') NOT LIKE 'urans%') OR ${progressiveRetry})
         AND NOT EXISTS (
           SELECT 1 FROM sim_precalc_obligations obligation
           WHERE obligation.airfoil_id = results.airfoil_id
@@ -115,6 +124,7 @@ export async function claimAoas(
   presetRevisionId: string,
   aoas: number[],
   simJobId: string,
+  progressiveUnits?: ProgressiveResultClaimUnit[],
 ): Promise<number[]> {
   if (typeof db.transaction === "function") {
     return db.transaction((tx) =>
@@ -125,6 +135,7 @@ export async function claimAoas(
         presetRevisionId,
         aoas,
         simJobId,
+        progressiveUnits,
       ),
     );
   }
@@ -135,5 +146,6 @@ export async function claimAoas(
     presetRevisionId,
     aoas,
     simJobId,
+    progressiveUnits,
   );
 }

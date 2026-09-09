@@ -466,6 +466,22 @@ async function exerciseProgressiveArchiveCustody(
     );
     expect(finished.status).toBe("failed");
     expect(finished.ingestedAt).not.toBeNull();
+    const [retiredPromise] = await db.execute(sql`
+      SELECT status FROM sync_sweep_promises WHERE id = ${source.promiseId}::uuid
+    `);
+    expect(retiredPromise.status).toBe(
+      status === "active" ? "cancelled" : status,
+    );
+    const [retiredPoint] = await db.execute(sql`
+      SELECT status, result_id, result_attempt_id FROM sync_sweep_promise_points WHERE id = ${point.id}::uuid
+    `);
+    expect(retiredPoint.result_id).toBe(point.result_id);
+    expect(retiredPoint.result_attempt_id).toBe(point.result_attempt_id);
+    expect(retiredPoint.status).toBe(
+      point.status === "active" && status === "active"
+        ? "cancelled"
+        : point.status,
+    );
     expect(
       await settleProgressiveRemoteJob(db, source.engineJobId),
     ).toMatchObject({

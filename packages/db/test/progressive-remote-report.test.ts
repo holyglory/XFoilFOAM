@@ -231,6 +231,66 @@ describe("remote progressive incremental report validation", () => {
     );
   });
 
+  it.each(["deterministic_mesh", "infrastructure"] as const)(
+    "retains a stopped %s failure before any cases exist",
+    (failureDisposition) => {
+      const { assignment, report } = fixture();
+      report.status = {
+        ...report.status,
+        state: "failed",
+        total_cases: 0,
+        completed_cases: 0,
+        failure_disposition: failureDisposition,
+        solver_budget_progress: null,
+      };
+      report.result = null;
+      report.stopProof = {
+        version: 1,
+        job_id: report.executionId,
+        execution_stopped: true,
+        producer_stopped: true,
+        namespace_verified: true,
+        remaining: [],
+        observed_at: "2026-09-09T00:00:00Z",
+        error: null,
+        fence: "terminal_result",
+        ownership_basis: "recorded_execution_namespace",
+      };
+      expect(
+        validateProgressiveRemoteReport(report, assignment).report.status
+          .total_cases,
+      ).toBe(0);
+      report.status.completed_cases = 1;
+      expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+        "execution progress",
+      );
+      report.status.completed_cases = 0;
+      report.status.state = "running";
+      expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+        "execution progress",
+      );
+      report.status.state = "failed";
+      report.status.failure_disposition = "hard_solver";
+      expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+        "execution progress",
+      );
+      report.status.failure_disposition = failureDisposition;
+      report.result = fixture().report.result;
+      expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+        "execution progress",
+      );
+      report.result = null;
+      report.stopProof.namespace_verified = false;
+      expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+        "verified execution-stop proof",
+      );
+      report.stopProof = null;
+      expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+        "execution progress",
+      );
+    },
+  );
+
   it("retains unpublished attempts and measured progress without making a valid polar claim", () => {
     const { assignment, report } = fixture();
     const validated = validateProgressiveRemoteReport(report, assignment);
