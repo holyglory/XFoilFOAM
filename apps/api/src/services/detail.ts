@@ -780,12 +780,18 @@ export async function assembleDetail(
     )
     .limit(1);
   if (!a) return null;
-  const [cat] = await db
-    .select()
-    .from(categories)
-    .where(eq(categories.id, a.categoryId))
-    .limit(1);
-  const normalizedTags = (await hashtagsByAirfoilIds([a.id])).get(a.id) ?? [];
+  const [[cat], tagsByAirfoil, simulationWorks, progressivePolars] =
+    await Promise.all([
+      db
+        .select()
+        .from(categories)
+        .where(eq(categories.id, a.categoryId))
+        .limit(1),
+      hashtagsByAirfoilIds([a.id]),
+      loadSimulationWorks(a.id),
+      publicProgressivePolars(db, a.id, opts.revisionId),
+    ]);
+  const normalizedTags = tagsByAirfoil.get(a.id) ?? [];
 
   const geo = geometryFor(a);
 
@@ -1050,12 +1056,6 @@ export async function assembleDetail(
   }
   const reList = [...new Set(polars.map((polar) => polar.re))].sort(
     (x, y) => x - y,
-  );
-  const simulationWorks = await loadSimulationWorks(a.id);
-  const progressivePolars = await publicProgressivePolars(
-    db,
-    a.id,
-    opts.revisionId,
   );
   const displayedMach =
     polars.find((polar) => polar.points.length > 0)?.mach ??

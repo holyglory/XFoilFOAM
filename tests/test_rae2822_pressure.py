@@ -1,7 +1,17 @@
 import numpy as np
 import pytest
 
-from scripts.materials.verify_rae2822 import compare_pressure, configure_transonic_pressure, pressure_iteration, wall_pressure
+from scripts.materials.verify_rae2822 import benchmark_mesh, compare_pressure, configure_transonic_pressure, pressure_iteration, wall_pressure
+
+
+@pytest.mark.parametrize("tier", ["fast", "precise", "refined"])
+def test_wall_function_experiment_changes_only_requested_wall_resolution(tier):
+    resolved = benchmark_mesh(tier)
+    wall_function = benchmark_mesh(tier, True)
+    assert resolved["target_y_plus"] == 1
+    assert wall_function == {**resolved, "target_y_plus": 40}
+    with pytest.raises(ValueError, match="explicit"):
+        benchmark_mesh(tier, "true")
 
 
 def surface_xml(pressure="100 120 110 130"):

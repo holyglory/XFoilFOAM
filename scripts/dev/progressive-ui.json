@@ -28,6 +28,14 @@
       "theme": "dark",
       "reviewInputs": [
         {
+          "path": "apps/web/components/PolarQuantitySelector.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/PolarControls.module.css",
+          "kind": "ui-code"
+        },
+        {
           "path": "apps/web/components/detail/ProgressivePolarViewer.tsx",
           "kind": "ui-code"
         },
@@ -100,6 +108,14 @@
       ],
       "theme": "dark",
       "reviewInputs": [
+        {
+          "path": "apps/web/components/PolarQuantitySelector.tsx",
+          "kind": "ui-code"
+        },
+        {
+          "path": "apps/web/components/PolarControls.module.css",
+          "kind": "ui-code"
+        },
         {
           "path": "apps/web/components/compare/ProgressiveCompareView.tsx",
           "kind": "ui-code"

@@ -1,17 +1,15 @@
 "use client";
 
-import type { ProgressivePolarSeries } from "@aerodb/core";
+import { fRe, type ProgressivePolarSeries } from "@aerodb/core";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { C, MONO, VIZ } from "@/lib/tokens";
+import {
+  POLAR_QUANTITY_LABELS as CHARTS,
+  PolarQuantitySelector,
+  type PolarQuantity as Chart,
+} from "@/components/PolarQuantitySelector";
+import controls from "@/components/PolarControls.module.css";
 
-const CHARTS = {
-  cl: "Lift",
-  cd: "Drag",
-  cm: "Pitching moment",
-  ld: "Lift / drag",
-  polar: "Drag polar",
-} as const;
-type Chart = keyof typeof CHARTS;
 const METHODS = {
   neuralfoil: "NeuralFoil",
   openfoam_fast: "OpenFOAM fast",
@@ -147,6 +145,7 @@ export function ProgressivePolarViewer({
       aria-label="Progressive polars"
       aria-busy={!interactive}
       data-testid="progressive-polar-viewer"
+      className={controls.card}
       style={{
         minWidth: 0,
         border: `1px solid ${C.border}`,
@@ -155,29 +154,20 @@ export function ProgressivePolarViewer({
         padding: 16,
       }}
     >
-      <header
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          alignItems: "center",
-          gap: 10,
-          marginBottom: 12,
-        }}
-      >
+      <header className={controls.header}>
         <h2 style={{ fontSize: 18, margin: 0 }}>Polars</h2>
         <span style={{ color: C.text2, fontSize: 12 }}>Preliminary</span>
         <label
+          className={controls.condition}
           style={{
             marginLeft: "auto",
             display: "flex",
-            flexWrap: "wrap",
             gap: 6,
             alignItems: "center",
-            maxWidth: "100%",
             fontSize: 13,
           }}
         >
-          Condition
+          <span className={controls.conditionText}>Condition</span>
           <select
             aria-label="Polar condition"
             disabled={!interactive}
@@ -186,6 +176,7 @@ export function ProgressivePolarViewer({
             style={{
               maxWidth: "100%",
               minWidth: 0,
+              width: "100%",
               padding: "6px 8px",
               color: C.text,
               background: C.panel2,
@@ -195,35 +186,18 @@ export function ProgressivePolarViewer({
           >
             {series.map((item, index) => (
               <option key={item.targetId} value={item.targetId}>
-                Re {number(item.re)} · Mach {number(item.mach)} · {index + 1}
+                Re {fRe(item.re)} · M{number(item.mach)} · {index + 1}
               </option>
             ))}
           </select>
         </label>
       </header>
-      <div
-        aria-label="Polar quantities"
-        style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}
-      >
-        {Object.entries(CHARTS).map(([key, label]) => (
-          <button
-            key={key}
-            type="button"
-            disabled={!interactive}
-            aria-pressed={chart === key}
-            onClick={() => setChart(key as Chart)}
-            style={{
-              border: `1px solid ${chart === key ? C.tealBorder : C.border}`,
-              borderRadius: 6,
-              padding: "6px 10px",
-              color: chart === key ? C.text : C.text2,
-              background: chart === key ? C.tealFill : C.panel2,
-            }}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <PolarQuantitySelector
+        label="Polar quantities"
+        value={chart}
+        onChange={setChart}
+        disabled={!interactive}
+      />
       <div
         style={{
           display: "flex",

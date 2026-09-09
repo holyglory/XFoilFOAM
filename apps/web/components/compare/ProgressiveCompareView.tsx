@@ -1,27 +1,26 @@
 "use client";
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { fRe } from "@aerodb/core";
 import {
   progressiveComparisonConditions,
   progressiveComparisonCurve,
   type ProgressiveComparisonProfile,
 } from "@/lib/progressive-comparison";
 import { C, MONO, VIZ } from "@/lib/tokens";
+import {
+  POLAR_QUANTITY_LABELS as QUANTITIES,
+  PolarQuantitySelector,
+  type PolarQuantity as Quantity,
+} from "@/components/PolarQuantitySelector";
+import controls from "@/components/PolarControls.module.css";
 
-const QUANTITIES = {
-  cl: "Lift",
-  cd: "Drag",
-  cm: "Pitching moment",
-  ld: "Lift / drag",
-  polar: "Drag polar",
-} as const;
 const METHODS = {
   neuralfoil: "NeuralFoil",
   openfoam_fast: "OpenFOAM fast estimate",
   openfoam_precise: "OpenFOAM precise estimate",
   composite: "Combined estimate",
 } as const;
-type Quantity = keyof typeof QUANTITIES;
 const display = (value: number | null) =>
   value === null ? "—" : Number(value.toPrecision(4)).toString();
 
@@ -131,6 +130,7 @@ export function ProgressiveCompareView({
       style={{ minWidth: 0 }}
     >
       <div
+        className={controls.card}
         style={{
           padding: 16,
           background: C.panel,
@@ -139,29 +139,20 @@ export function ProgressiveCompareView({
           minWidth: 0,
         }}
       >
-        <header
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: 10,
-            alignItems: "center",
-            marginBottom: 12,
-          }}
-        >
+        <header className={controls.header}>
           <h2 style={{ margin: 0, fontSize: 18 }}>Polars</h2>
           <span style={{ color: C.muted, fontSize: 12 }}>Preliminary</span>
           <label
+            className={controls.condition}
             style={{
               marginLeft: "auto",
               display: "flex",
-              flexWrap: "wrap",
               gap: 8,
               alignItems: "center",
-              maxWidth: "100%",
               fontSize: 13,
             }}
           >
-            Condition
+            <span className={controls.conditionText}>Condition</span>
             <select
               aria-label="Comparison condition"
               disabled={!interactive || !conditions.length}
@@ -171,6 +162,8 @@ export function ProgressiveCompareView({
                 color: C.text,
                 background: C.panel2,
                 maxWidth: "100%",
+                minWidth: 0,
+                width: "100%",
                 padding: 6,
                 border: `1px solid ${C.border}`,
                 borderRadius: 6,
@@ -181,41 +174,19 @@ export function ProgressiveCompareView({
               )}
               {conditions.map((option, index) => (
                 <option key={option.key} value={option.key}>
-                  Re {display(option.re)} · Mach {display(option.mach)} ·{" "}
+                  Re {fRe(option.re)} · M{display(option.mach)} ·{" "}
                   {option.branch} · {index + 1}
                 </option>
               ))}
             </select>
           </label>
         </header>
-        <div
-          aria-label="Comparison quantities"
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: 6,
-            marginBottom: 12,
-          }}
-        >
-          {Object.entries(QUANTITIES).map(([key, label]) => (
-            <button
-              key={key}
-              type="button"
-              disabled={!interactive}
-              aria-pressed={quantity === key}
-              onClick={() => setQuantity(key as Quantity)}
-              style={{
-                padding: "6px 10px",
-                background: quantity === key ? C.tealFill : C.panel2,
-                border: `1px solid ${quantity === key ? C.tealBorder : C.border}`,
-                borderRadius: 6,
-                color: C.text,
-              }}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        <PolarQuantitySelector
+          label="Comparison quantities"
+          value={quantity}
+          onChange={setQuantity}
+          disabled={!interactive}
+        />
         <label
           style={{
             display: "block",

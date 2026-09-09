@@ -14,6 +14,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 from rae2822_reference import load_reference, selig_coordinates
 
 
+RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
+
+
+def benchmark_mesh(tier, wall_functions=False):
+    if not isinstance(wall_functions, bool):
+        raise ValueError("Wall treatment must be an explicit benchmark choice")
+    dimensions = RAE_TIERS[tier]
+    return {"n_surface": dimensions[0], "n_radial": dimensions[1], "n_wake": dimensions[2],
+            "target_y_plus": 40 if wall_functions else 1, "farfield_radius_chords": 15, "wake_length_chords": 12}
+
+
 def wall_pressure(path, chord, pressure, density, speed, coordinates):
     piece = xml.parse(path).getroot().find("./PolyData/Piece")
     if piece is None:
@@ -104,7 +115,7 @@ def configure_transonic_pressure(path):
     Path(path).write_text(changed)
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False):
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
     from airfoilfoam.material_domain import check_material_domain
@@ -117,7 +128,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False):
     from airfoilfoam.openfoam.potential_initialization import initialize_compressible_velocity
     from airfoilfoam.openfoam.runner import get_runner
     from airfoilfoam.pipeline import _case_builder, _run_transient_mesh_qa_gate, _set_control_dict_entries, resolve_mesh_params
-    from airfoilfoam.postprocess.forces import parse_force_coefficients
+    from airfoilfoam.postprocess.forces import parse_force_coefficients, parse_y_plus
     from airfoilfoam.postprocess.residuals import parse_convergence
     from airfoilfoam.thermodynamics import ThermodynamicState
 
@@ -130,13 +141,12 @@ def run(reference_directory, material_path, destination, tier, transonic=False):
     speed = conditions["mach"] * gas.speed_of_sound(state)
     density = gas.density(state)
     viscosity = gas.dynamic_viscosity(state.temperature_k)
-    dimensions = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}[tier]
+    dimensions = RAE_TIERS[tier]
     request = PolarRequest.model_validate({
         "airfoil": {"name": "RAE 2822 NASA Study 1 isolated validation", "coordinates": selig_coordinates(reference)},
         "chord_lengths": [conditions["chord_m"]], "speeds": [speed], "aoa": {"angles": [conditions["alpha_deg"]]},
         "fluid": {"density": density, "dynamic_viscosity": viscosity, "gas": gas.model_dump()}, "flow_state": state.model_dump(),
-        "mesh": {"n_surface": dimensions[0], "n_radial": dimensions[1], "n_wake": dimensions[2], "target_y_plus": 1,
-                 "farfield_radius_chords": 15, "wake_length_chords": 12},
+        "mesh": benchmark_mesh(tier, wall_functions),
         "solver": {"flow_solver_family": "rhoSimpleFoam", "force_transient": False, "transient_fallback": False,
                    "momentum_scheme": "linearUpwind", "turbulent_prandtl": 0.85, "n_iterations": dimensions[3],
                    "convergence_tolerance": dimensions[4], "write_images": []},
@@ -149,6 +159,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False):
     report = {"kind": "rae2822-transonic-pressure-validation", "tier": tier, "production_evidence": False,
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
+              "experimental_wall_functions": wall_functions,
+              "velocity_initialization": "uniform-freestream" if uniform_start else "velocity-only-potential",
               "resolved_reynolds": density * speed * spec.chord / viscosity,
               "request": request.model_dump(mode="json")}
     try:
@@ -172,9 +184,10 @@ def run(reference_directory, material_path, destination, tier, transonic=False):
             raise ValueError("Mesh quality is unavailable")
         report["mesh_quality"] = asdict(verdict)
         report["mesh_warnings"] = warnings
-        initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
-        (destination / "log.potentialFoam").write_text(initialized.stdout)
-        initialized.check()
+        if not uniform_start:
+            initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
+            (destination / "log.potentialFoam").write_text(initialized.stdout)
+            initialized.check()
         solved = budgeted.solver(destination, "rhoSimpleFoam", 1, timeout=600)
         (destination / "log.rhoSimpleFoam").write_text(solved.stdout)
         check_material_domain(destination, solved)
@@ -197,6 +210,17 @@ def run(reference_directory, material_path, destination, tier, transonic=False):
         report["pressure_comparison"] = compare_pressure(computed, reference["pressure"])
         report["pressure_surface"] = {"path": str(surfaces[0].relative_to(destination)),
             "sha256": hashlib.sha256(surfaces[0].read_bytes()).hexdigest(), "samples": computed}
+        wall_result = runner.application(destination, dialect_for_runner(runner).y_plus_command, timeout=120)
+        (destination / "log.yPlus").write_text(wall_result.stdout)
+        wall_result.check()
+        wall_files = sorted(destination.glob("postProcessing/yPlus/*/yPlus.dat"))
+        if not wall_files:
+            raise ValueError("Wall resolution has no measured yPlus artifact")
+        average, maximum = parse_y_plus(wall_files[-1])
+        if any(value is None or not np.isfinite(value) or value <= 0 for value in (average, maximum)):
+            raise ValueError("Wall resolution has invalid measured yPlus")
+        report["wall_resolution"] = {"target_y_plus": request.mesh.target_y_plus, "average": average, "maximum": maximum,
+            "path": str(wall_files[-1].relative_to(destination)), "sha256": hashlib.sha256(wall_files[-1].read_bytes()).hexdigest()}
         report["outcome"] = "measured_converged" if report["convergence"]["converged"] else "measured_unconverged"
     except Exception as error:
         report["error"] = str(error)
@@ -216,5 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--destination", required=True)
     parser.add_argument("--tier", choices=["fast", "precise", "refined"], required=True)
     parser.add_argument("--transonic", action="store_true")
+    parser.add_argument("--wall-functions", action="store_true")
+    parser.add_argument("--uniform-start", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start)

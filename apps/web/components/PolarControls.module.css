@@ -1,0 +1,118 @@
+.card {
+  container-type: inline-size;
+}
+
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.header > h2,
+.header > span {
+  flex-shrink: 0;
+}
+
+.condition {
+  flex: 1 1 260px;
+  min-width: 0;
+  max-width: 360px;
+}
+
+.conditionText {
+  white-space: nowrap;
+}
+
+.quantities {
+  --quantity-label-gap: 6px;
+  --quantity-label-padding: 8px;
+  display: flex;
+  position: relative;
+  font-size: 13px;
+  gap: var(--quantity-label-gap);
+  min-width: 0;
+  margin-bottom: 12px;
+}
+
+.quantity {
+  position: relative;
+  flex-shrink: 0;
+  min-width: 44px;
+  min-height: 32px;
+  padding: 6px var(--quantity-label-padding);
+  border: 1px solid var(--aero-border);
+  border-radius: 6px;
+  color: var(--aero-text2);
+  background: var(--aero-panel2);
+  font: inherit;
+}
+
+.quantity[aria-pressed="true"] {
+  border-color: var(--aero-teal-border);
+  color: var(--aero-text);
+  background: var(--aero-teal-fill);
+}
+
+.fullLabel,
+.measuredLabel {
+  display: inline-block;
+  width: max-content;
+  white-space: nowrap;
+}
+
+.shortLabel {
+  display: none;
+}
+
+.quantities[data-compact="true"] .fullLabel {
+  display: none;
+}
+
+.measurements {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.quantities[data-compact="true"] .shortLabel {
+  display: inline;
+}
+
+.quantities[data-compact="true"] .quantity {
+  min-height: 44px;
+  padding-inline: 6px;
+}
+
+.quantities[data-compact="true"] {
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+@media (pointer: coarse) {
+  .quantity {
+    min-height: 44px;
+  }
+}
+
+@container (max-width: 500px) {
+  .conditionText {
+    display: none;
+  }
+}
+
+@container (max-width: 240px) {
+  .header {
+    flex-wrap: wrap;
+  }
+
+  .condition {
+    flex-basis: 100%;
+  }
+}

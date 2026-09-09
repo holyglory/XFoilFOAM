@@ -12,6 +12,8 @@ case "${1:?Expected api or web}" in
   web)
     export API_URL="http://127.0.0.1:${DC2_PORT_API:?}"
     export NEXT_PUBLIC_API_URL="" NEXT_DIST_DIR=".next-progressive-preview-${DC2_GENERATION:?}"
+    export NEXT_TSCONFIG_PATH
+    NEXT_TSCONFIG_PATH="$(node scripts/dev/prepare-progressive-tsconfig.mjs apps/web "$DC2_GENERATION")"
     corepack pnpm --filter @aerodb/web exec next build
     exec corepack pnpm --filter @aerodb/web exec next start --hostname 127.0.0.1 --port "${PORT:?}"
     ;;

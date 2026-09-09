@@ -199,6 +199,18 @@ requires = ["dependencies"]
 command = [".venv/bin/python", "-m", "pytest", "tests/test_rans_hold_continuation.py", "tests/test_rans_hold_certificate.py", "tests/test_targeted_urans_warmstart.py", "tests/test_warm_boundary_velocity.py", "tests/test_unsteady.py", "tests/test_cache.py", "-q"]
 
 [[test.progressive.check]]
+name = "detail-reads"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/pinned-detail.test.ts", "test/detail-polar-compatibility.test.ts", "test/symmetry-detail.test.ts"]
+
+[[test.progressive.check]]
+name = "remote-maintenance"
+tier = "development"
+requires = ["dependencies"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_remote_solver_2606_deploy.py", "-q"]
+
+[[test.progressive.check]]
 name = "enrollment"
 tier = "development"
 requires = ["dependencies"]
@@ -861,6 +873,22 @@ port = true
 route = true
 timeout_seconds = 900
 
+[deployment.rae-wall-function]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-wall-function.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts"]
+finite_services = []
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.rae-transonic]
 source = ["worktree"]
 components = ["numerics"]
@@ -877,12 +905,44 @@ port = true
 route = true
 timeout_seconds = 900
 
+[deployment.rae-uniform-start]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-uniform-start.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "uniform-start"]
+finite_services = ["uniform-start"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.shock-verification.component.numerics]
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain" }
 files = ["compose.shock-verification.yml"]
 services = ["artifacts", "coarse", "fine", "mach2-coarse", "mach2-fine", "mach3-coarse", "mach3-fine", "physical-mach2", "physical-mach2p5", "physical-mach3"]
 finite_services = ["coarse", "fine", "mach2-coarse", "mach2-fine", "mach3-coarse", "mach3-fine", "physical-mach2", "physical-mach2p5", "physical-mach3"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-guarded-start]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-guarded-start.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "guarded-start"]
+finite_services = ["guarded-start"]
 build = false
 port = true
 route = true
@@ -996,6 +1056,12 @@ tier = "development"
 command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs"]
 
 [[test.progressive-ui.check]]
+name = "control-sizing"
+tier = "development"
+requires = ["preview-origin"]
+command = ["node", "scripts/dev/verify-polar-control-sizing.mjs"]
+
+[[test.progressive-ui.check]]
 name = "api-origin"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/api-origin.test.ts"]
@@ -1010,7 +1076,7 @@ command = ["/usr/bin/corepack", "pnpm", "exec", "tsx", "scripts/dev/verify-mater
 [[test.progressive-ui.check]]
 name = "preview-origin"
 tier = "development"
-command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs"]
+command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs", "scripts/dev/prepare-progressive-tsconfig.test.mjs"]
 
 [[test.progressive-ui.check]]
 name = "interactions"

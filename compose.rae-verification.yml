@@ -26,6 +26,16 @@ services:
   transonic:
     <<: *verification
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/transonic", "--tier", "precise", "--transonic"]
+  wall-function:
+    <<: *verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/wall-function", "--tier", "fast", "--wall-functions"]
+  uniform-start:
+    <<: *verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/uniform-start", "--tier", "fast", "--wall-functions", "--uniform-start"]
+  guarded-start:
+    <<: *verification
+    image: xfoilfoam-progressive-worker:local
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/guarded-start", "--tier", "fast", "--wall-functions"]
   artifacts:
     image: xfoilfoam-local-steady:verification
     pull_policy: never
