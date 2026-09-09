@@ -1239,28 +1239,17 @@ function remoteJobOwnerSql(settings: Settings, tableAlias = "job") {
 }
 
 async function activeRemoteJobs(db: DB, settings: Settings) {
-  const jobs = await db
-    .select({ totalCases: simJobs.totalCases })
-    .from(simJobs)
-    .where(
-      and(
-        remoteJobOwnerSql(settings, "sim_jobs"),
-        or(
-          solverCpuReservationSql(),
-          inArray(simJobs.status, [
-            "pending",
-            "submitted",
-            "running",
-            "ingesting",
-          ]),
-          and(
-            eq(simJobs.status, "cancelled"),
-            inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
-          ),
-        ),
-      ),
-    );
-  return jobs;
+  const jobs = await db.execute(sql`
+    WITH active_jobs AS MATERIALIZED (
+      SELECT job.request_payload, job.total_cases FROM sim_jobs job
+      WHERE ${solverCpuReservationSql("job")}
+        OR job.status IN ('pending', 'submitted', 'running', 'ingesting')
+        OR (job.status = 'cancelled' AND job.engine_state IN ('cancelling', 'cancel_pending'))
+    )
+    SELECT job.total_cases AS "totalCases" FROM active_jobs job
+    WHERE ${remoteJobOwnerSql(settings, "job")}
+  `);
+  return jobs.map((job) => ({ totalCases: Number(job.totalCases) }));
 }
 
 async function remoteReservedCpuSlots(
@@ -1268,10 +1257,13 @@ async function remoteReservedCpuSlots(
   settings: Settings,
 ): Promise<number> {
   const [row] = (await db.execute(sql`
+    WITH reserved_jobs AS MATERIALIZED (
+      SELECT job.request_payload, job.admission_cpu_slots FROM sim_jobs job
+      WHERE ${solverCpuReservationSql("job")}
+    )
     SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
-    FROM sim_jobs job
+    FROM reserved_jobs job
     WHERE ${remoteJobOwnerSql(settings, "job")}
-      AND ${solverCpuReservationSql("job")}
   `)) as unknown as Array<{ slots: number }>;
   return Number(row?.slots ?? 0);
 }

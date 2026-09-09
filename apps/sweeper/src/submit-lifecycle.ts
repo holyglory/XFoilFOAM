@@ -907,12 +907,14 @@ export async function withGlobalAdmissionPermit<Value>(
             )`
           : sql`job.request_payload ->> 'upstreamBaseUrl' = ${remotePolicy?.upstream_base_url ?? ""}`;
         const [remotePressure] = (await tx.execute(sql`
+          WITH reserved_jobs AS MATERIALIZED (
+            SELECT job.id, job.request_payload, job.admission_cpu_slots FROM sim_jobs job
+            WHERE job.id <> ${jobId} AND ${activeReservationPredicate}
+          )
           SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
-          FROM sim_jobs job
-          WHERE job.id <> ${jobId}
-            AND job.request_payload ->> 'remoteSolver' = 'true'
+          FROM reserved_jobs job
+          WHERE job.request_payload ->> 'remoteSolver' = 'true'
             AND ${remoteOwnerPredicate}
-            AND ${activeReservationPredicate}
         `)) as unknown as Array<{ slots: number }>;
         const remoteReservedSlots = Number(remotePressure?.slots ?? 0);
         const attemptedSlots = requestedSlots;
