@@ -23,7 +23,27 @@ function uuid(value: unknown): value is string {
   );
 }
 
+const pendingPages = new WeakMap<
+  DB,
+  ReturnType<typeof receiveAssignmentPage>
+>();
+
 export async function receiveProgressiveAssignmentPage(
+  ...args: Parameters<typeof receiveAssignmentPage>
+) {
+  const [db] = args;
+  const existing = pendingPages.get(db);
+  if (existing) return existing;
+  const operation = receiveAssignmentPage(...args);
+  pendingPages.set(db, operation);
+  try {
+    return await operation;
+  } finally {
+    if (pendingPages.get(db) === operation) pendingPages.delete(db);
+  }
+}
+
+async function receiveAssignmentPage(
   db: DB,
   receive: (
     document: ProgressiveAssignmentDocument,
