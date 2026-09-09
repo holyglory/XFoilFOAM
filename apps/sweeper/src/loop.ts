@@ -775,12 +775,6 @@ export async function tick(
   scheduleRemoteSolverReclaims(db, engine);
   scheduleRemoteSolverTransfer(db, engine);
   scheduleResultMediaStorageMaintenance(db);
-  await retentionTick(db, engine, {
-    // A forecast-only pause is an abnormal capacity state. Optional saved
-    // restart caches yield on the next tick; exact active continuation owners
-    // remain protected by retention's live-owner predicates.
-    reclaimOptionalCaseState: state.diskAdmissionBlocked,
-  });
   let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;
   const admissionFenceGuardFailed =
     preReconcileFence.guardFailed || postReconcileFence.guardFailed;

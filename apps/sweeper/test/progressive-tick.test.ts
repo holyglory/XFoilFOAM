@@ -230,11 +230,38 @@ describe("progressive controller tick", () => {
     expect(hooks.enrollment).toHaveBeenCalledTimes(1);
     expect(hooks.remoteReconcile).toHaveBeenCalledTimes(1);
     expect(hooks.transfer).toHaveBeenCalledTimes(1);
-    expect(hooks.retention).toHaveBeenCalledTimes(1);
+    expect(hooks.retention).not.toHaveBeenCalled();
     expect(hooks.remoteProgress).toHaveBeenCalledTimes(1);
     expect(hooks.remotePrepare).not.toHaveBeenCalled();
     expect(hooks.admission).not.toHaveBeenCalled();
     expect(scope.health).not.toHaveBeenCalled();
+  });
+
+  it("does not put routine cleanup ahead of free CPU admission", async () => {
+    hooks.retention.mockImplementation(() => new Promise(() => {}));
+    const scope = fixture();
+    await tick(scope.db, scope.engine);
+    expect(hooks.admission).toHaveBeenCalledTimes(3);
+    expect(hooks.retention).not.toHaveBeenCalled();
+  });
+
+  it("still awaits emergency cleanup before considering new work", async () => {
+    hooks.emergency.mockReturnValue(true);
+    hooks.cancelDisk.mockResolvedValue(1);
+    let release: () => void = () => {};
+    hooks.retention.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const scope = fixture();
+    const running = tick(scope.db, scope.engine);
+    await vi.waitFor(() => expect(hooks.retention).toHaveBeenCalledOnce());
+    expect(hooks.admission).not.toHaveBeenCalled();
+    release();
+    await running;
+    expect(hooks.admission).toHaveBeenCalledTimes(3);
   });
 
   it("does not admit past a hazard discovered by reconciliation", async () => {

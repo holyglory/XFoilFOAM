@@ -750,7 +750,7 @@ export async function sweepSyncImportOrphans(
   return removed;
 }
 
-export async function retentionTick(
+async function runRetentionPass(
   db: DB,
   engine: EngineClient,
   options: RetentionTickOptions = {},
@@ -795,5 +795,24 @@ export async function retentionTick(
         `[sweeper] RETENTION: sync import GC failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+}
+
+const pendingRetention = new WeakMap<DB, Promise<void>>();
+
+export async function retentionTick(
+  db: DB,
+  engine: EngineClient,
+  options: RetentionTickOptions = {},
+): Promise<void> {
+  const previous = pendingRetention.get(db);
+  const operation = (previous ?? Promise.resolve())
+    .catch(() => {})
+    .then(() => runRetentionPass(db, engine, options));
+  pendingRetention.set(db, operation);
+  try {
+    await operation;
+  } finally {
+    if (pendingRetention.get(db) === operation) pendingRetention.delete(db);
   }
 }
