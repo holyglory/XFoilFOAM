@@ -8,8 +8,12 @@ assert(response.ok, `Public polar request returned ${response.status}`);
 const detail = await response.json();
 assert.equal(detail.slug, slug);
 assert.equal(detail.progressivePolars.length, 15);
+const prediction = detail.progressivePolars.find(
+  (series) => series.kind === "prediction",
+);
 assert(
-  detail.progressivePolars.every((series) => series.kind === "prediction"),
+  prediction,
+  "The prediction-only condition fixture is no longer available",
 );
 const browser = await chromium.launch({ headless: true });
 const receipts = [];
@@ -43,7 +47,7 @@ try {
       );
       const conditions = viewer.getByLabel("Polar condition");
       assert.equal(await conditions.locator("option").count(), 15);
-      await conditions.selectOption({ index: 14 });
+      await conditions.selectOption(prediction.targetId);
       for (const quantity of [
         "Drag",
         "Pitching moment",

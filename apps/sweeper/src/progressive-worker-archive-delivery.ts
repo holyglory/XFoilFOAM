@@ -44,7 +44,7 @@ export async function claimProgressiveWorkerArchive(
         AND NOT EXISTS (SELECT 1 FROM result_classifications classification
           JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
           WHERE classification.result_attempt_id = attempt.id AND classification.state = 'accepted')
-      ORDER BY delivery.updated_at NULLS FIRST, retained.delivered_at, retained.sim_job_id, retained.point_content_signature
+      ORDER BY coalesce(delivery.retry_after, retained.delivered_at), retained.delivered_at, retained.sim_job_id, retained.point_content_signature
       LIMIT 1 FOR UPDATE OF retained SKIP LOCKED
     `);
     if (!source) return null;

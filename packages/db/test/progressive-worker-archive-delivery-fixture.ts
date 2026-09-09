@@ -74,6 +74,43 @@ export async function verifyProgressiveWorkerArchiveDelivery(
       await connection.execute(
         sql`UPDATE sync_api_settings SET remote_solver_auth_token = ${source.remote_solver_auth_token} WHERE id = 1`,
       );
+      const schedulingRollback = new Error(
+        "Rollback archive queue ordering fixture",
+      );
+      await expect(
+        connection.transaction(async (ordering) => {
+          const freshSignature = createHash("sha256")
+            .update(`archive-queue-${executionId}`)
+            .digest("hex");
+          await ordering.execute(sql`
+          INSERT INTO progressive_worker_hub_receipts(sim_job_id, sequence, result_attempt_id, point_content_signature, receipt, delivered_at)
+          SELECT sim_job_id, sequence, result_attempt_id, ${freshSignature},
+            jsonb_set(receipt, '{pointContentSignature}', to_jsonb(${freshSignature}::text)), clock_timestamp()
+          FROM progressive_worker_hub_receipts WHERE sim_job_id = ${executionId}::uuid
+            AND point_content_signature = ${source.point_content_signature}
+        `);
+          await ordering.execute(sql`
+          INSERT INTO progressive_worker_archive_deliveries(sim_job_id, point_content_signature, attempt_count, retry_after)
+          VALUES (${executionId}::uuid, ${source.point_content_signature}, 1, clock_timestamp() - interval '1 minute')
+        `);
+          const oldest = await claimProgressiveWorkerArchive(
+            ordering as unknown as DB,
+          );
+          expect(oldest?.pointContentSignature).toBe(
+            source.point_content_signature,
+          );
+          await ordering.execute(sql`
+          UPDATE progressive_worker_archive_deliveries SET claim_token = NULL, claim_expires_at = NULL,
+            retry_after = clock_timestamp() + interval '1 minute'
+          WHERE sim_job_id = ${executionId}::uuid AND point_content_signature = ${source.point_content_signature}
+        `);
+          const fresh = await claimProgressiveWorkerArchive(
+            ordering as unknown as DB,
+          );
+          expect(fresh?.pointContentSignature).toBe(freshSignature);
+          throw schedulingRollback;
+        }),
+      ).rejects.toBe(schedulingRollback);
       const [originalAttempt] = await connection.execute(sql`
         SELECT evidence_payload FROM result_attempts WHERE id = ${source.result_attempt_id}::uuid
       `);

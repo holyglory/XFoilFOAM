@@ -3575,6 +3575,12 @@ async function settleCancelledRemoteJobDeliveries(
   settings: Settings,
 ): Promise<number> {
   const candidates = (await db.execute(sql`
+    WITH candidate_jobs AS MATERIALIZED (
+      SELECT id, "createdAt", request_payload->>'syncPromiseId' AS promise_id
+      FROM sim_jobs
+      WHERE status IN ('done', 'failed', 'cancelled')
+        AND request_payload->>'remoteSolver' = 'true'
+    )
     SELECT
       job.id AS job_id,
       promise.id::text AS promise_id,
@@ -3582,17 +3588,14 @@ async function settleCancelledRemoteJobDeliveries(
         promise.response_payload ->> 'error',
         'remote promise cancelled; terminal solver work released for restart'
       ) AS reason
-    FROM sim_jobs job
+    FROM candidate_jobs job
     JOIN sync_sweep_promises promise
-      ON promise.id::text =
-          COALESCE(job.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
+      ON promise.id::text = job.promise_id
      AND promise.status = 'cancelled'
      AND promise.source_base_url = ${syncBase(settings)}
      AND promise.request_payload ->> 'remoteSolver' = 'true'
      AND ${remotePromiseOwnerSql(settings, "promise")}
-    WHERE job.status IN ('done', 'failed', 'cancelled')
-      AND COALESCE(job.request_payload, '{}'::jsonb) ->> 'remoteSolver' = 'true'
-      AND NOT EXISTS (
+    WHERE NOT EXISTS (
         SELECT 1
         FROM sync_remote_result_deliveries terminal_delivery
         WHERE terminal_delivery.promise_id = promise.id

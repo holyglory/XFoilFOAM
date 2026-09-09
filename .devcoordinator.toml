@@ -291,6 +291,12 @@ requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-transfer-steps.test.ts"]
 
 [[test.progressive.check]]
+name = "remote-cancellation-transfer"
+tier = "development"
+requires = ["dependencies", "types", "remote-standalone-claims"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "repairs a terminal job whose settled result delivery predates|a closed promise without the exact result-attempt owner|terminal wave-2 children unblock"]
+
+[[test.progressive.check]]
 name = "stages"
 tier = "development"
 requires = ["dependencies"]
