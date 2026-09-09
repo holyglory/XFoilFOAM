@@ -5,6 +5,7 @@ import {
   canonicalAnalysisJson,
   claimProgressiveCfdBatch,
   progressiveRemoteReservedSlots,
+  progressiveRemoteActivePromiseCount,
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
@@ -134,11 +135,11 @@ export async function prepareProgressiveRemoteDispatch(
         throw new RemoteProgressiveAdmissionWait(
           "The worker has not advertised the exact progressive execution contract",
         );
-      const [active] = await connection.execute(sql`
-        SELECT count(*)::integer AS count FROM sync_sweep_promises
-        WHERE registered_solver_id = ${solverId}::uuid AND status = 'active' AND "expiresAt" > clock_timestamp()
-      `);
-      if (Number(active.count) >= Number(solver.max_active_polar_promises))
+      const active = await progressiveRemoteActivePromiseCount(
+        connection,
+        solverId,
+      );
+      if (active >= Number(solver.max_active_polar_promises))
         throw new RemoteProgressiveAdmissionWait(
           "The worker has reached its assigned polar limit",
         );

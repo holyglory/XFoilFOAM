@@ -22,6 +22,24 @@ export async function progressiveRemoteReservedSlots(
   return Number(row.reserved);
 }
 
+export async function progressiveRemoteActivePromiseCount(
+  db: DB,
+  solverId: string,
+): Promise<number> {
+  const [row] = await db.execute(sql`
+    SELECT count(*)::integer AS count FROM sync_sweep_promises promise
+    WHERE promise.registered_solver_id = ${solverId}::uuid
+      AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_remote_dispatches dispatch
+        JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = dispatch.sim_job_id
+          AND stopped.engine_job_id = dispatch.sim_job_id::text
+        WHERE dispatch.promise_id = promise.id AND dispatch.solver_id = promise.registered_solver_id
+      )
+  `);
+  return Number(row.count);
+}
+
 export async function bindProgressiveRemoteDispatch(
   db: DB,
   input: { simJobId: string; promiseId: string; solverId: string },
@@ -176,11 +194,11 @@ export async function bindProgressiveRemoteDispatch(
       throw new Error(
         "Remote execution exceeds the exact available CPU reservation",
       );
-    const [active] = await connection.execute(sql`
-      SELECT count(*)::integer AS count FROM sync_sweep_promises
-      WHERE registered_solver_id = ${input.solverId}::uuid AND status = 'active' AND "expiresAt" > clock_timestamp()
-    `);
-    if (Number(active.count) > Number(solver.max_active_polar_promises))
+    const active = await progressiveRemoteActivePromiseCount(
+      connection,
+      input.solverId,
+    );
+    if (active > Number(solver.max_active_polar_promises))
       throw new Error("Remote execution exceeds the registered promise policy");
     await connection.execute(sql`
       INSERT INTO progressive_remote_dispatches (sim_job_id, promise_id, solver_id, cpu_slots, content_signature, envelope)

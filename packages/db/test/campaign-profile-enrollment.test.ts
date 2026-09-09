@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import {
@@ -2293,6 +2294,9 @@ describe("progressive CPU admission", () => {
           progressiveExecutionId: prepared.envelope.scope.executionId,
           executionContract: "progressive-cfd-v1",
         });
+        expect(await progressiveRemoteActivePromiseCount(db, solverId)).toBe(
+          Number(targets.count),
+        );
         await verifyProgressiveRemoteStart(db, prepared.envelope);
         await db.execute(
           sql`UPDATE registered_remote_solvers SET last_heartbeat_at = clock_timestamp() - interval '3 minutes' WHERE id = ${solverId}::uuid`,
@@ -2329,6 +2333,47 @@ describe("progressive CPU admission", () => {
           executionId: job.id,
           report: neverStarted,
         });
+        const [expiredPromise] = await db.execute(sql`
+          SELECT "expiresAt" FROM sync_sweep_promises WHERE id = ${prepared.envelope.promiseId}::uuid
+        `);
+        await db.execute(sql`
+          UPDATE sync_sweep_promises SET "expiresAt" = ${promise.expiresAt.toISOString()}
+          WHERE id = ${prepared.envelope.promiseId}::uuid
+        `);
+        expect(await progressiveRemoteActivePromiseCount(db, solverId)).toBe(
+          Number(targets.count),
+        );
+        await db.execute(
+          sql`UPDATE sim_jobs SET engine_job_id = id::text WHERE id = ${job.id}::uuid`,
+        );
+        await acknowledgeProgressiveCfdExecutionStop(db, {
+          simJobId: job.id,
+          proof: neverStarted.stopProof!,
+        });
+        expect(await progressiveRemoteActivePromiseCount(db, solverId)).toBe(
+          Number(targets.count) - 1,
+        );
+        const [unsettled] = await db.execute(sql`
+          SELECT promise.status, job."ingestedAt" AS ingested FROM sync_sweep_promises promise
+          JOIN sim_jobs job ON job.id = ${job.id}::uuid WHERE promise.id = ${prepared.envelope.promiseId}::uuid
+        `);
+        expect(unsettled).toEqual({ status: "active", ingested: null });
+        const legacyPromise = randomUUID();
+        await db.execute(sql`
+          INSERT INTO sync_sweep_promises (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+          SELECT ${legacyPromise}::uuid, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt"
+          FROM sync_sweep_promises WHERE id = ${prepared.envelope.promiseId}::uuid
+        `);
+        expect(await progressiveRemoteActivePromiseCount(db, solverId)).toBe(
+          Number(targets.count),
+        );
+        await db.execute(
+          sql`DELETE FROM sync_sweep_promises WHERE id = ${legacyPromise}::uuid`,
+        );
+        await db.execute(sql`
+          UPDATE sync_sweep_promises SET "expiresAt" = ${new Date(expiredPromise.expiresAt as string | Date).toISOString()}
+          WHERE id = ${prepared.envelope.promiseId}::uuid
+        `);
         expect(await applyProgressiveRemoteProgress(db, job.id)).toMatchObject({
           kind: "applied",
           stopped: true,
