@@ -1239,7 +1239,7 @@ function remoteJobOwnerSql(settings: Settings, tableAlias = "job") {
 
 async function activeRemoteJobs(db: DB, settings: Settings) {
   const jobs = await db
-    .select()
+    .select({ totalCases: simJobs.totalCases })
     .from(simJobs)
     .where(
       and(
