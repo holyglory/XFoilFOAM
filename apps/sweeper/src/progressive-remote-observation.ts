@@ -130,7 +130,8 @@ export async function observeProgressiveRemoteJob(
       if (
         !(
           error instanceof EngineError &&
-          error.status === 404 &&
+          (error.status === 404 ||
+            (error.status === 409 && status.state === "running")) &&
           status.completed_cases === 0
         )
       )

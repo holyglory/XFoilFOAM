@@ -98,12 +98,54 @@ export async function verifyProgressiveWorkerObservation(
   ).rejects.toThrow("engine job is missing");
   expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
   if (mode === "success") {
+    const rollback = new Error("isolated status-only observation rollback");
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        engine.getJob.mockResolvedValueOnce({ ...status, completed_cases: 0 });
+        engine.getResult.mockRejectedValueOnce(
+          new EngineError("first result not ready", 409),
+        );
+        expect(
+          await observeProgressiveRemoteJob(connection, engine, executionId),
+        ).toMatchObject({
+          sequence: 1,
+          stopped: false,
+          completedCases: 0,
+        });
+        const [pending] = await connection.execute(sql`
+        SELECT report FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid
+      `);
+        expect(pending.report).toMatchObject({
+          status: { state: "running", completed_cases: 0 },
+          result: null,
+          stopProof: null,
+        });
+        expect(
+          await solverQueuePressure(connection, { jobIds: [executionId] }),
+        ).toBe(1);
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+    for (const statusCode of [404, 409]) {
+      engine.getResult.mockRejectedValueOnce(
+        new EngineError("isolated incomplete result publication", statusCode),
+      );
+      await expect(
+        observeProgressiveRemoteJob(db, engine, executionId),
+      ).rejects.toThrow("incomplete result publication");
+    }
+    engine.getJob.mockResolvedValueOnce({
+      ...status,
+      state: "completed",
+      completed_cases: 0,
+    });
     engine.getResult.mockRejectedValueOnce(
-      new EngineError("isolated incomplete result publication", 404),
+      new EngineError("terminal result not ready", 409),
     );
     await expect(
       observeProgressiveRemoteJob(db, engine, executionId),
-    ).rejects.toThrow("incomplete result publication");
+    ).rejects.toThrow("terminal result not ready");
     const receipt = await observeProgressiveRemoteJob(db, engine, executionId);
     expect(receipt).toMatchObject({
       sequence: 1,
