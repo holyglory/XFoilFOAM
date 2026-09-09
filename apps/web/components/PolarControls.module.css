@@ -1,5 +1,6 @@
 .card {
   container-type: inline-size;
+  padding: 16px;
 }
 
 .header {
@@ -98,6 +99,12 @@
 @media (pointer: coarse) {
   .quantity {
     min-height: 44px;
+  }
+}
+
+@media (max-width: 360px) {
+  .card {
+    padding-inline: 8px;
   }
 }
 

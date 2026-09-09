@@ -162,6 +162,11 @@
   ],
   "viewports": [
     {
+      "name": "narrow",
+      "width": 320,
+      "height": 844
+    },
+    {
       "name": "mobile",
       "width": 390,
       "height": 844

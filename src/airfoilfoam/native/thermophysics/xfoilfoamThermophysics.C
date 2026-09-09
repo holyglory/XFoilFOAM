@@ -4,6 +4,7 @@
 #include "perfectGas.H"
 #include "janafThermo.H"
 #include "sensibleInternalEnergy.H"
+#include "sensibleEnthalpy.H"
 #include "thermo.H"
 #include "polynomialTransport.H"
 #include "hePsiThermo.H"
@@ -18,6 +19,18 @@ namespace Foam
         pureMixture,
         polynomialTransport,
         sensibleInternalEnergy,
+        janafThermo,
+        perfectGas,
+        specie
+    );
+
+    makeThermos
+    (
+        psiThermo,
+        hePsiThermo,
+        pureMixture,
+        polynomialTransport,
+        sensibleEnthalpy,
         janafThermo,
         perfectGas,
         specie

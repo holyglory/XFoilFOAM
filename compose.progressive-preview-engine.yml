@@ -1,0 +1,6 @@
+services:
+  worker:
+    image: sha256:6e39ed099259d1e29220523d4c26ad2bee5a9b3b248533a0133296c3d3d7acff
+    pull_policy: never
+  gateway:
+    pull_policy: never

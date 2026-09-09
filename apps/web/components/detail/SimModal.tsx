@@ -176,9 +176,9 @@ export function SimModal(props: {
     review,
   } = props;
 
-  useModalLayer(open);
+  useModalLayer(open, { fixedBody: false });
 
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const clMonRef = useRef<HTMLCanvasElement>(null);
@@ -239,11 +239,14 @@ export function SimModal(props: {
       : document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
     const frame = requestAnimationFrame(() => {
       closeButtonRef.current?.focus({ preventScroll: true });
     });
     return () => {
       cancelAnimationFrame(frame);
+      if (dialog?.open) dialog.close();
       const trigger = restoreFocusRef.current;
       if (trigger?.isConnected) trigger.focus({ preventScroll: true });
     };
@@ -267,7 +270,7 @@ export function SimModal(props: {
     return () => document.removeEventListener("keydown", onKey, true);
   }, [open, onClose]);
 
-  const trapDialogFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+  const trapDialogFocus = (event: ReactKeyboardEvent<HTMLDialogElement>) => {
     if (event.key !== "Tab") return;
     const dialog = dialogRef.current;
     if (!dialog) return;
@@ -1724,7 +1727,7 @@ export function SimModal(props: {
             gap: 10,
             fontFamily: MONO,
             fontSize: 10,
-            color: C.dim,
+            color: C.muted,
           }}
         >
           <span>AoA evidence</span>
@@ -1771,7 +1774,13 @@ export function SimModal(props: {
     if (!sim) return null;
     if (sim.observation)
       return (
-        <div data-testid="sim-attempt-evidence" style={{ marginBottom: 12 }}>
+        <div
+          data-testid="sim-attempt-evidence"
+          data-ui-continuation-anchor="Recorded coefficients"
+          role="region"
+          aria-label="Recorded coefficients"
+          style={{ marginBottom: 12 }}
+        >
           <div
             style={{
               display: "grid",
@@ -2342,6 +2351,9 @@ export function SimModal(props: {
       onClick={onClose}
     >
       <style jsx>{`
+        dialog::backdrop {
+          background: transparent;
+        }
         .sim-hero-grid {
           display: grid;
           grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr);
@@ -2365,7 +2377,7 @@ export function SimModal(props: {
           }
         }
       `}</style>
-      <div
+      <dialog
         ref={dialogRef}
         data-testid="sim-modal-dialog"
         role="dialog"
@@ -2374,6 +2386,11 @@ export function SimModal(props: {
         tabIndex={-1}
         style={{
           width: reviewLayerVisible ? "min(1160px,94vw)" : "min(900px,94vw)",
+          maxWidth: "calc(100vw - 32px)",
+          position: "fixed",
+          margin: "auto",
+          padding: 0,
+          color: C.text,
           maxHeight: "92vh",
           overflow: "auto",
           overscrollBehavior: "contain",
@@ -2384,8 +2401,23 @@ export function SimModal(props: {
           borderRadius: 14,
           boxShadow: `0 30px 80px ${C.shadow}`,
         }}
+        onCancel={(event) => {
+          event.preventDefault();
+          onClose();
+        }}
         onKeyDown={trapDialogFocus}
-        onClick={(e) => e.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation();
+          const rect = event.currentTarget.getBoundingClientRect();
+          if (
+            event.target === event.currentTarget &&
+            (event.clientX < rect.left ||
+              event.clientX > rect.right ||
+              event.clientY < rect.top ||
+              event.clientY > rect.bottom)
+          )
+            onClose();
+        }}
       >
         {/* header */}
         <div
@@ -2522,7 +2554,7 @@ export function SimModal(props: {
             resultContent()
           )}
         </div>
-      </div>
+      </dialog>
     </div>
   );
 }
@@ -2600,7 +2632,7 @@ function AccentStat({
       >
         {value}
       </div>
-      <div style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>{sub}</div>
+      <div style={{ fontFamily: MONO, fontSize: 9, color: C.muted }}>{sub}</div>
     </div>
   );
 }

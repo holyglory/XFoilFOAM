@@ -151,7 +151,6 @@ export function ProgressivePolarViewer({
         border: `1px solid ${C.border}`,
         borderRadius: 12,
         background: C.panel,
-        padding: 16,
       }}
     >
       <header className={controls.header}>

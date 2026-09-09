@@ -115,7 +115,25 @@ def configure_transonic_pressure(path):
     Path(path).write_text(changed)
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False):
+def configure_enthalpy_energy(directory):
+    directory = Path(directory)
+    updates = []
+    for relative, pattern, replacement, expected in [
+        ("constant/thermophysicalProperties", r"\benergy\s+sensibleInternalEnergy\s*;", "energy sensibleEnthalpy;", 1),
+        ("system/fvSchemes", r"div\(phi,e\)", "div(phi,h)", 1),
+        ("system/fvSolution", r"(?m)^(\s*)e(\s+[-+\d.eE]+\s*;)", r"\1h\2", 2),
+    ]:
+        path = directory / relative
+        original = path.read_text()
+        updated, count = re.subn(pattern, replacement, original)
+        if count != expected:
+            raise ValueError(f"Enthalpy experiment requires exact generated energy settings: {relative}")
+        updates.append((path, updated))
+    for path, updated in updates:
+        path.write_text(updated)
+
+
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False):
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
     from airfoilfoam.material_domain import check_material_domain
@@ -161,6 +179,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_transonic_pressure": transonic,
               "experimental_wall_functions": wall_functions,
               "velocity_initialization": "uniform-freestream" if uniform_start else "velocity-only-potential",
+              "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
               "resolved_reynolds": density * speed * spec.chord / viscosity,
               "request": request.model_dump(mode="json")}
     try:
@@ -170,6 +189,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         patches = mesher.patches(mesh)
         builder = _case_builder(budgeted, airfoil, patches, mesh, spec, request.fluid, request.roughness, request.solver)
         builder.write(destination)
+        if enthalpy:
+            configure_enthalpy_energy(destination)
         if transonic:
             configure_transonic_pressure(destination / "system/fvSolution")
         _set_control_dict_entries(destination / "system/controlDict", {"writeInterval": 100, "purgeWrite": 2})
@@ -242,5 +263,6 @@ if __name__ == "__main__":
     parser.add_argument("--transonic", action="store_true")
     parser.add_argument("--wall-functions", action="store_true")
     parser.add_argument("--uniform-start", action="store_true")
+    parser.add_argument("--enthalpy", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy)

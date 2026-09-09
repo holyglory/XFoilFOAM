@@ -21,7 +21,7 @@ let snapshot: ScrollSnapshot | null = null;
 const useClientLayoutEffect =
   typeof window === "undefined" ? useEffect : useLayoutEffect;
 
-function acquireDocumentScrollLock() {
+function acquireDocumentScrollLock(fixedBody: boolean) {
   modalLayerCount += 1;
   if (modalLayerCount > 1) return;
 
@@ -49,11 +49,13 @@ function acquireDocumentScrollLock() {
 
   html.style.overflow = "hidden";
   html.style.overscrollBehavior = "none";
-  body.style.position = "fixed";
-  body.style.top = `${-scrollY}px`;
-  body.style.left = `${-scrollX}px`;
-  body.style.right = "0";
-  body.style.width = "100%";
+  if (fixedBody) {
+    body.style.position = "fixed";
+    body.style.top = `${-scrollY}px`;
+    body.style.left = `${-scrollX}px`;
+    body.style.right = "0";
+    body.style.width = "100%";
+  }
   body.style.overflow = "hidden";
   if (scrollbarWidth > 0) {
     body.style.paddingRight = `${bodyPaddingRight + scrollbarWidth}px`;
@@ -82,10 +84,14 @@ function releaseDocumentScrollLock() {
 }
 
 /** Locks the document behind one or more stacked modal layers. */
-export function useModalLayer(active = true) {
+export function useModalLayer(
+  active = true,
+  options: { fixedBody?: boolean } = {},
+) {
+  const fixedBody = options.fixedBody !== false;
   useClientLayoutEffect(() => {
     if (!active) return;
-    acquireDocumentScrollLock();
+    acquireDocumentScrollLock(fixedBody);
     return releaseDocumentScrollLock;
-  }, [active]);
+  }, [active, fixedBody]);
 }

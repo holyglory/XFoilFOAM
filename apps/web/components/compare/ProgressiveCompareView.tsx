@@ -132,7 +132,6 @@ export function ProgressiveCompareView({
       <div
         className={controls.card}
         style={{
-          padding: 16,
           background: C.panel,
           border: `1px solid ${C.border}`,
           borderRadius: 12,

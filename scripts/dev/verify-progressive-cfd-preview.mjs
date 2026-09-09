@@ -61,7 +61,9 @@ try {
       Number.isFinite(entry.alpha),
     );
     const control = viewer
-      .locator(`button[data-result-id="${contributor.resultId}"][data-result-attempt-id="${contributor.attemptId}"]`)
+      .locator(
+        `button[data-result-id="${contributor.resultId}"][data-result-attempt-id="${contributor.attemptId}"]`,
+      )
       .first();
     await expect(control).toBeVisible();
     const evidenceResponse = page.waitForResponse((response) => {
@@ -73,6 +75,8 @@ try {
         url.searchParams.get("resultAttemptId") === contributor.attemptId
       );
     });
+    await control.focus();
+    const scrollBeforeDialog = await page.evaluate(() => window.scrollY);
     await control.click();
     const stored = await evidenceResponse;
     assert(stored.ok(), `Stored result request failed: ${stored.status()}`);
@@ -82,8 +86,26 @@ try {
     assert.equal(payload.status, "evidence");
     const dialog = page.getByTestId("sim-modal-dialog");
     await expect(dialog).toBeVisible();
+    assert.equal(
+      await dialog.evaluate((element) => element.matches("dialog:modal")),
+      true,
+    );
+    assert.equal(await page.evaluate(() => window.scrollY), scrollBeforeDialog);
     await expect(dialog.getByTestId("sim-attempt-evidence")).toBeVisible();
+    await page.locator(".topbar-brand").evaluate((element) => element.focus());
+    assert.equal(
+      await dialog.evaluate((element) =>
+        element.contains(document.activeElement),
+      ),
+      true,
+    );
     await page.keyboard.press("Escape");
+    await expect(dialog).not.toBeVisible();
+    await expect(control).toBeFocused();
+    assert.equal(await page.evaluate(() => window.scrollY), scrollBeforeDialog);
+    await control.click();
+    await expect(dialog).toBeVisible();
+    await page.mouse.click(2, 2);
     await expect(dialog).not.toBeVisible();
     const disclosure = page
       .locator("details")

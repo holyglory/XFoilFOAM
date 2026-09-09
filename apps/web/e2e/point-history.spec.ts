@@ -29,8 +29,29 @@ test.describe("Point History Explorer (read-only)", () => {
       /all [\d,]+/,
     );
 
-    // Row click opens the story side panel in place — URL keeps the tab.
-    const trigger = rows.first();
+    const acceptedResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname === "/api/admin/point-history" &&
+        url.searchParams.get("status") === "accepted"
+      );
+    });
+    await page.getByTestId("points-chip-accepted").click();
+    const accepted = await acceptedResponse;
+    expect(accepted.ok()).toBe(true);
+    const available = (await accepted.json()).items.find(
+      (item: { kind: string; attemptCount: number }) =>
+        item.kind === "result" && item.attemptCount > 0,
+    );
+    expect(
+      available,
+      "The nested evidence journey needs an actual accepted stored attempt",
+    ).toBeTruthy();
+    const trigger = page
+      .locator(
+        `[data-testid="point-history-row"][data-result-id="${available.resultId}"]`,
+      )
+      .first();
     await trigger.focus();
     await expect(trigger).toBeFocused();
     const scrollBeforeOpen = await page.evaluate(() => window.scrollY);

@@ -211,6 +211,12 @@ requires = ["dependencies"]
 command = [".venv/bin/python", "-m", "pytest", "tests/test_remote_solver_2606_deploy.py", "-q"]
 
 [[test.progressive.check]]
+name = "retention-policy"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/retention.test.ts", "test/sync-import-retention.test.ts"]
+
+[[test.progressive.check]]
 name = "enrollment"
 tier = "development"
 requires = ["dependencies"]
@@ -236,7 +242,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vite
 [[test.progressive.check]]
 name = "services"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts", "test/retention-service.test.ts"]
 
 [[test.progressive.check]]
 name = "execution-contract"
@@ -272,7 +278,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "remote-capabilities"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts", "test/progressive-parallel-admission.test.ts"]
 
 [[test.progressive.check]]
 name = "remote-archive-broker"
@@ -776,7 +782,6 @@ public = false
 source = ["worktree"]
 components = ["engine"]
 public = false
-ttl_seconds = 86400
 
 [deployment.progressive-test-engine]
 source = ["worktree"]
@@ -959,15 +964,47 @@ port = true
 route = true
 timeout_seconds = 900
 
+[deployment.rae-enthalpy]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-enthalpy.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy"]
+finite_services = ["enthalpy"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.progressive-engine.component.engine]
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }
 env_file = ".codex-artifacts/progressive-engine.env"
-files = ["compose.progressive-engine.yml"]
-services = ["redis", "gateway", "worker", "subsonic", "transonic", "mach2", "mach3", "boundary-carry", "control-check"]
-finite_services = ["subsonic", "transonic", "mach2", "mach3", "boundary-carry", "control-check"]
+files = ["compose.progressive-engine.yml", "compose.progressive-preview-engine.yml"]
+services = ["redis", "gateway", "worker"]
+finite_services = []
 independent_services = ["worker"]
-build = true
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-enthalpy-precise]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-enthalpy-precise.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts"]
+finite_services = []
+build = false
 port = true
 route = true
 timeout_seconds = 900
@@ -977,6 +1014,22 @@ source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
+
+[deployment.rae-enthalpy-transonic]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-enthalpy-transonic.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts"]
+finite_services = []
+build = false
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.thermophysics-check]
 source = ["worktree"]
@@ -1053,23 +1106,30 @@ command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs", "--producti
 [[test.progressive-ui.check]]
 name = "real-cfd-evidence"
 tier = "development"
+requires = ["preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs"]
 
 [[test.progressive-ui.check]]
 name = "control-sizing"
 tier = "development"
-requires = ["preview-origin"]
+requires = ["preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/verify-polar-control-sizing.mjs"]
+
+[[test.progressive-ui.check]]
+name = "nested-evidence"
+tier = "development"
+requires = ["preview-ready"]
+command = ["node", "scripts/dev/verify-modal-stack.mjs"]
 
 [[test.progressive-ui.check]]
 name = "api-origin"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/api-origin.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/api-origin.test.ts", "test/theme-contrast.test.ts"]
 
 [[test.progressive-ui.check]]
 name = "material-editor"
 tier = "development"
-requires = ["preview-origin", "api-origin"]
+requires = ["preview-origin", "api-origin", "preview-ready"]
 timeout_seconds = 180
 command = ["/usr/bin/corepack", "pnpm", "exec", "tsx", "scripts/dev/verify-material-editor.mts"]
 
@@ -1079,21 +1139,27 @@ tier = "development"
 command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs", "scripts/dev/prepare-progressive-tsconfig.test.mjs"]
 
 [[test.progressive-ui.check]]
-name = "interactions"
+name = "preview-ready"
 tier = "development"
 requires = ["preview-origin"]
+command = ["node", "scripts/dev/verify-progressive-preview-ready.mjs"]
+
+[[test.progressive-ui.check]]
+name = "interactions"
+tier = "development"
+requires = ["preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-preview.mjs"]
 
 [[test.progressive-ui.check]]
 name = "comparison-interactions"
 tier = "development"
-requires = ["preview-origin"]
+requires = ["preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-comparison.mjs"]
 
 [[test.progressive-ui.check]]
 name = "scroll-diagnostic"
 tier = "development"
-requires = ["preview-origin"]
+requires = ["preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/diagnose-progressive-scroll.mjs"]
 
 [[test.progressive-ui.check]]
@@ -1104,5 +1170,5 @@ command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
 [[test.progressive-ui.check]]
 name = "layout"
 tier = "development"
-requires = ["verifier-self-test", "preview-origin"]
+requires = ["verifier-self-test", "preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-layout.mjs"]

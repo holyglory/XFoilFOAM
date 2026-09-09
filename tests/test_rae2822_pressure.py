@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from scripts.materials.verify_rae2822 import benchmark_mesh, compare_pressure, configure_transonic_pressure, pressure_iteration, wall_pressure
+from scripts.materials.verify_rae2822 import benchmark_mesh, compare_pressure, configure_enthalpy_energy, configure_transonic_pressure, pressure_iteration, wall_pressure
 
 
 @pytest.mark.parametrize("tier", ["fast", "precise", "refined"])
@@ -79,3 +79,25 @@ def test_transonic_experiment_requires_one_exact_generated_option(tmp_path):
         path.write_text(text)
         with pytest.raises(ValueError, match="one generated"):
             configure_transonic_pressure(path)
+
+
+def test_enthalpy_experiment_preflights_all_dictionaries_before_any_write(tmp_path):
+    (tmp_path / "constant").mkdir()
+    (tmp_path / "system").mkdir()
+    originals = {"constant/thermophysicalProperties": "thermoType { energy sensibleInternalEnergy; }",
+        "system/fvSchemes": "divSchemes { div(phi,e) bounded Gauss upwind; }",
+        "system/fvSolution": "SIMPLE { residualControl {\n e 1e-4;\n} }\nrelaxationFactors { equations {\n e 0.7;\n} }\n"}
+    for relative, content in originals.items():
+        (tmp_path / relative).write_text(content)
+    (tmp_path / "system/fvSolution").write_text("SIMPLE {}")
+    with pytest.raises(ValueError, match="exact generated"):
+        configure_enthalpy_energy(tmp_path)
+    assert (tmp_path / "constant/thermophysicalProperties").read_text() == originals["constant/thermophysicalProperties"]
+    assert (tmp_path / "system/fvSchemes").read_text() == originals["system/fvSchemes"]
+    (tmp_path / "system/fvSolution").write_text(originals["system/fvSolution"])
+    configure_enthalpy_energy(tmp_path)
+    assert "sensibleEnthalpy" in (tmp_path / "constant/thermophysicalProperties").read_text()
+    assert "div(phi,h)" in (tmp_path / "system/fvSchemes").read_text()
+    assert (tmp_path / "system/fvSolution").read_text().count("\n h ") == 2
+    with pytest.raises(ValueError, match="exact generated"):
+        configure_enthalpy_energy(tmp_path)

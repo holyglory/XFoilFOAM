@@ -4,6 +4,11 @@ import { fileURLToPath } from "node:url";
 export function originFromDeployment(response) {
   if (!response?.ok || response.data?.state !== "running")
     throw new Error("The progressive preview deployment is not running");
+  if (
+    response.data.readiness?.ready !== true ||
+    response.data.readiness.pending_apply !== false
+  )
+    throw new Error("The progressive preview source has not finished applying");
   const web =
     response.data.components?.filter((component) => component.name === "web") ??
     [];

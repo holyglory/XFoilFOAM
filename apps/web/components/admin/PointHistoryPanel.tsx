@@ -1084,6 +1084,7 @@ export function PointHistoryPanel() {
                   role="button"
                   tabIndex={0}
                   data-testid="point-history-row"
+                  data-result-id={item.resultId}
                   onClick={() => openStory(item)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {

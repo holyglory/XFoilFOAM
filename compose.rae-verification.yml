@@ -36,6 +36,21 @@ services:
     <<: *verification
     image: xfoilfoam-progressive-worker:local
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/guarded-start", "--tier", "fast", "--wall-functions"]
+  enthalpy:
+    <<: *verification
+    image: xfoilfoam-enthalpy:verification
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy", "--tier", "fast", "--wall-functions", "--uniform-start", "--enthalpy"]
+  enthalpy-precise:
+    <<: *verification
+    image: xfoilfoam-enthalpy:verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-precise", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy"]
+  enthalpy-transonic:
+    <<: *verification
+    image: xfoilfoam-enthalpy:verification
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-transonic", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--transonic"]
   artifacts:
     image: xfoilfoam-local-steady:verification
     pull_policy: never
