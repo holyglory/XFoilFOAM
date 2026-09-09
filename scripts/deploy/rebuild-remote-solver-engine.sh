@@ -248,6 +248,7 @@ WITH activity AS (
     (SELECT count(*) FROM sim_jobs WHERE status IN ('pending','submitted','running','ingesting'))::int AS live_jobs,
     (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations WHERE state <> 'delivered')::int AS unsettled_cancellations,
+    (SELECT count(*) FROM progressive_worker_archive_deliveries WHERE claim_expires_at > clock_timestamp())::int AS progressive_archive_claims,
     (SELECT count(*) FROM result_media_repairs WHERE state = 'running')::int AS running_media_repairs
 )
 SELECT row_to_json(activity)::text FROM activity;" | python3 -c '
@@ -298,7 +299,9 @@ WITH activity AS (
     (SELECT count(*) FROM sync_remote_result_deliveries
       WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations
-      WHERE state <> 'delivered')::int AS unsettled_cancellations
+      WHERE state <> 'delivered')::int AS unsettled_cancellations,
+    (SELECT count(*) FROM progressive_worker_archive_deliveries
+      WHERE claim_expires_at > clock_timestamp())::int AS progressive_archive_claims
 )
 SELECT row_to_json(activity)::text FROM activity;" | python3 -c '
 import json, sys

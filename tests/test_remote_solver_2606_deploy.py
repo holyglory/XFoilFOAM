@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+from uuid import uuid4
 
 import pytest
 
@@ -612,6 +614,47 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     assert "unsettled_cancellations" in maintenance_db
     assert "running_media_repairs" in maintenance_db
     assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
+
+
+@pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="Requires governed PostgreSQL")
+@pytest.mark.parametrize("function_name,next_name", [
+    ("remote_transfer_activity", "wait_remote_transfer_quiescence"),
+    ("maintenance_database_activity", "remote_transfer_paused"),
+])
+def test_maintenance_waits_only_for_live_progressive_archive_claims(function_name, next_name):
+    schema = "archive_maintenance_" + uuid4().hex
+    environment = {**os.environ, "PGOPTIONS": f"-c search_path={schema}"}
+
+    def query(statement):
+        return subprocess.run(
+            ["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c", statement],
+            env=environment, check=True, text=True, capture_output=True,
+        ).stdout.strip()
+
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text()
+    start = source.index(f"{function_name}() {{")
+    stop = source.index(f"\n{next_name}()", start)
+    probe = 'compose() { psql -X -qAt -v ON_ERROR_STOP=1 -c "${@: -1}"; }\n' + source[start:stop] + f"\n{function_name}\n"
+    try:
+        query(f"""
+            CREATE SCHEMA {schema};
+            CREATE TABLE sim_jobs (status text);
+            CREATE TABLE result_media_repairs (state text);
+            CREATE TABLE sync_remote_result_deliveries (state text);
+            CREATE TABLE sync_remote_promise_cancellations (state text);
+            CREATE TABLE progressive_worker_archive_deliveries (claim_expires_at timestamptz);
+            INSERT INTO progressive_worker_archive_deliveries VALUES (NULL), (now() - interval '1 second');
+        """)
+        idle = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
+        assert idle.stdout.strip() == ""
+        query("INSERT INTO progressive_worker_archive_deliveries VALUES (now() + interval '1 hour')")
+        busy = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
+        assert json.loads(busy.stdout)["progressive_archive_claims"] == 1
+        query("DELETE FROM progressive_worker_archive_deliveries WHERE claim_expires_at > now()")
+        resumed = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
+        assert resumed.stdout.strip() == ""
+    finally:
+        query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
 def test_remote_maintenance_pause_is_a_real_transfer_admission_gate() -> None:
