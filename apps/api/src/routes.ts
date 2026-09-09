@@ -992,11 +992,12 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/airfoils/:slug/sim", async (req, reply) => {
     const { slug } = req.params as { slug: string };
-    const { re, aoa, resultId } = z
+    const { re, aoa, resultId, resultAttemptId } = z
       .object({
         re: z.coerce.number().optional(),
         aoa: z.coerce.number().optional(),
         resultId: z.string().uuid().optional(),
+        resultAttemptId: z.string().uuid().optional(),
       })
       .refine(
         (query) =>
@@ -1006,7 +1007,11 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         },
       )
       .parse(req.query);
-    const sim = await assembleSim(slug, re, aoa, resultId);
+    if (resultAttemptId && !resultId)
+      return reply
+        .code(400)
+        .send({ error: "An attempt requires its owning result" });
+    const sim = await assembleSim(slug, re, aoa, resultId, resultAttemptId);
     if (!sim)
       return reply
         .code(404)
@@ -1963,21 +1968,39 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const { id } = req.params as { id: string };
       const references = await Promise.all([
-        db.select({ id: flowConditions.id }).from(flowConditions).where(eq(flowConditions.mediumId, id)).limit(1),
-        db.select({ id: operatingConditions.id }).from(operatingConditions).where(eq(operatingConditions.mediumId, id)).limit(1),
-        db.select({ id: boundaryConditions.id }).from(boundaryConditions).where(eq(boundaryConditions.mediumId, id)).limit(1),
+        db
+          .select({ id: flowConditions.id })
+          .from(flowConditions)
+          .where(eq(flowConditions.mediumId, id))
+          .limit(1),
+        db
+          .select({ id: operatingConditions.id })
+          .from(operatingConditions)
+          .where(eq(operatingConditions.mediumId, id))
+          .limit(1),
+        db
+          .select({ id: boundaryConditions.id })
+          .from(boundaryConditions)
+          .where(eq(boundaryConditions.mediumId, id))
+          .limit(1),
       ]);
       if (references.some((rows) => rows.length > 0))
         return reply
           .code(409)
           .send({ error: "medium is referenced by flow states" });
       try {
-        const removed = await db.delete(mediums).where(eq(mediums.id, id)).returning({ id: mediums.id });
-        if (!removed.length) return reply.code(404).send({ error: "medium not found" });
+        const removed = await db
+          .delete(mediums)
+          .where(eq(mediums.id, id))
+          .returning({ id: mediums.id });
+        if (!removed.length)
+          return reply.code(404).send({ error: "medium not found" });
       } catch (error) {
         const failure = error as { code?: string; cause?: { code?: string } };
         if (failure.code === "23503" || failure.cause?.code === "23503") {
-          return reply.code(409).send({ error: "medium is referenced by flow states" });
+          return reply
+            .code(409)
+            .send({ error: "medium is referenced by flow states" });
         }
         throw error;
       }

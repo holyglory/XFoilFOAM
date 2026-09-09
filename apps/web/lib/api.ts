@@ -143,8 +143,11 @@ function simDetailKey(
   re: number,
   aoa: number,
   resultId?: string | null,
+  resultAttemptId?: string | null,
 ): string {
-  return resultId ? `result:${resultId}` : `point:${slug}:${re}:${aoa}`;
+  return resultId
+    ? `result:${resultId}${resultAttemptId ? `:attempt:${resultAttemptId}` : ""}`
+    : `point:${slug}:${re}:${aoa}`;
 }
 
 function trimSimDetailCache(): void {
@@ -160,8 +163,9 @@ export function getCachedSim(
   re: number,
   aoa: number,
   resultId?: string | null,
+  resultAttemptId?: string | null,
 ): SimulationDetail | null {
-  const key = simDetailKey(slug, re, aoa, resultId);
+  const key = simDetailKey(slug, re, aoa, resultId, resultAttemptId);
   const entry = simDetailCache.get(key);
   if (!entry?.value || entry.expiresAt <= Date.now()) return null;
   simDetailCache.delete(key);
@@ -174,15 +178,17 @@ export async function getSim(
   re: number,
   aoa: number,
   resultId?: string | null,
+  resultAttemptId?: string | null,
 ): Promise<SimulationDetail> {
-  const key = simDetailKey(slug, re, aoa, resultId);
-  const cached = getCachedSim(slug, re, aoa, resultId);
+  const key = simDetailKey(slug, re, aoa, resultId, resultAttemptId);
+  const cached = getCachedSim(slug, re, aoa, resultId, resultAttemptId);
   if (cached) return cached;
   const inFlight = simDetailCache.get(key)?.promise;
   if (inFlight) return inFlight;
 
   const qs = new URLSearchParams({ re: String(re), aoa: String(aoa) });
   if (resultId) qs.set("resultId", resultId);
+  if (resultAttemptId) qs.set("resultAttemptId", resultAttemptId);
   const promise = (async () => {
     const res = await apiFetch(
       `/api/airfoils/${encodeURIComponent(slug)}/sim?${qs.toString()}`,

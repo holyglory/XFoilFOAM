@@ -273,6 +273,18 @@ requires = ["dependencies", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "durable progressive CFD units"]
 
 [[test.progressive.check]]
+name = "history-startup"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "persistent progressive polar cache"]
+
+[[test.progressive.check]]
+name = "observation-presentation"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/sim-evidence-presentation.test.ts"]
+
+[[test.progressive.check]]
 name = "stages"
 tier = "development"
 requires = ["dependencies"]
@@ -818,6 +830,11 @@ timeout_seconds = 180
 name = "curves"
 tier = "development"
 command = ["node", "scripts/dev/verify-production-progressive.mjs"]
+
+[[test.progressive-production-ui.check]]
+name = "cfd-evidence"
+tier = "development"
+command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs", "--production"]
 
 [[test.progressive-ui.check]]
 name = "real-cfd-evidence"

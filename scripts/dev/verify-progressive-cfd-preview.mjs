@@ -2,7 +2,16 @@ import assert from "node:assert/strict";
 import { chromium, expect } from "@playwright/test";
 import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
 
-const origin = progressivePreviewOrigin();
+if (
+  process.argv.length > 3 ||
+  (process.argv[2] && process.argv[2] !== "--production")
+)
+  throw new Error(
+    "Only the declared preview or --production read-only journey is supported",
+  );
+const production = process.argv[2] === "--production";
+const origin = production ? "https://airfoils.pro" : progressivePreviewOrigin();
+const slug = production ? "naca-652415" : "ag24";
 const browser = await chromium.launch({ headless: true });
 const outcomes = [];
 try {
@@ -13,12 +22,12 @@ try {
     const page = await browser.newPage({ viewport });
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
-    await page.goto(`${origin}/airfoils/ag24`, {
+    await page.goto(`${origin}/airfoils/${slug}`, {
       waitUntil: "domcontentloaded",
     });
     const viewer = page.getByTestId("progressive-polar-viewer");
     await expect(viewer).toHaveAttribute("aria-busy", "false");
-    const response = await page.request.get(`${origin}/api/airfoils/ag24`);
+    const response = await page.request.get(`${origin}/api/airfoils/${slug}`);
     assert(response.ok());
     const detail = await response.json();
     const series = detail.progressivePolars.find(
@@ -52,15 +61,16 @@ try {
       Number.isFinite(entry.alpha),
     );
     const control = viewer
-      .locator(`button[data-result-id="${contributor.resultId}"]`)
+      .locator(`button[data-result-id="${contributor.resultId}"][data-result-attempt-id="${contributor.attemptId}"]`)
       .first();
     await expect(control).toBeVisible();
     const evidenceResponse = page.waitForResponse((response) => {
       const url = new URL(response.url());
       return (
         url.origin === origin &&
-        url.pathname === "/api/airfoils/ag24/sim" &&
-        url.searchParams.get("resultId") === contributor.resultId
+        url.pathname === `/api/airfoils/${slug}/sim` &&
+        url.searchParams.get("resultId") === contributor.resultId &&
+        url.searchParams.get("resultAttemptId") === contributor.attemptId
       );
     });
     await control.click();
@@ -68,8 +78,11 @@ try {
     assert(stored.ok(), `Stored result request failed: ${stored.status()}`);
     const payload = await stored.json();
     assert.equal(payload.resultId, contributor.resultId);
+    assert.equal(payload.resultAttemptId, contributor.attemptId);
+    assert.equal(payload.status, "evidence");
     const dialog = page.getByTestId("sim-modal-dialog");
     await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId("sim-attempt-evidence")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(dialog).not.toBeVisible();
     const disclosure = page
@@ -109,4 +122,12 @@ try {
 } finally {
   await browser.close();
 }
-console.log(JSON.stringify({ kind: "real-cfd-preview-journey", outcomes }));
+console.log(
+  JSON.stringify({
+    kind: "real-cfd-journey",
+    origin,
+    slug,
+    observeOnly: true,
+    outcomes,
+  }),
+);

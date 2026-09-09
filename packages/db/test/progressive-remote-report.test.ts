@@ -260,7 +260,17 @@ describe("remote progressive incremental report validation", () => {
         validateProgressiveRemoteReport(report, assignment).report.status
           .total_cases,
       ).toBe(0);
+      expect(isFinalProgressiveRemoteReport(report)).toBe(true);
+      const previous = structuredClone(report);
+      report.sequence = previous.sequence + 1;
+      previous.status.state = "running";
+      previous.status.total_cases = assignment.scope.units.length;
+      previous.stopProof = null;
+      expect(() =>
+        validateProgressiveRemoteReportOrder(report, previous),
+      ).not.toThrow();
       report.status.completed_cases = 1;
+      expect(isFinalProgressiveRemoteReport(report)).toBe(false);
       expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
         "execution progress",
       );

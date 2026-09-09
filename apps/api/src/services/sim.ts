@@ -35,7 +35,7 @@ import {
   activeReviewVerdict,
 } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
 import { mediaStore, resultMediaUrl } from "../media-store";
@@ -269,12 +269,12 @@ async function solvedDetail(
   name: string,
   re: number,
   r: Result,
+  observation?: SimulationDetail["observation"],
 ): Promise<SimulationDetailWithReview | null> {
   if (!r.currentResultAttemptId) return null;
   if (
-    !finiteStored(r.cl) ||
-    !finiteStored(r.cd) ||
-    r.cd <= 0 ||
+    (!observation &&
+      (!finiteStored(r.cl) || !finiteStored(r.cd) || r.cd <= 0)) ||
     !finiteStored(re) ||
     re <= 0
   ) {
@@ -496,7 +496,10 @@ async function solvedDetail(
       : null;
   return {
     resultId: r.id,
-    status: "solved",
+    status: observation ? "evidence" : "solved",
+    ...(observation
+      ? { observation, resultAttemptId: r.currentResultAttemptId }
+      : {}),
     regime: r.unsteady ? "stalled" : "attached",
     airfoilName: name,
     alpha: r.aoaDeg,
@@ -505,7 +508,7 @@ async function solvedDetail(
     cl,
     cd,
     cm: r.cm,
-    ld: r.clCd ?? cl / cd,
+    ld: r.clCd ?? (cl !== null && cd !== null && cd > 0 ? cl / cd : null),
     clStd: r.clStd,
     cdStd: r.cdStd,
     strouhal: r.strouhal,
@@ -577,6 +580,7 @@ export async function assembleSim(
   re?: number,
   aoa?: number,
   resultId?: string,
+  resultAttemptId?: string,
 ): Promise<SimulationDetail | null> {
   const [a] = await db
     .select()
@@ -590,6 +594,72 @@ export async function assembleSim(
     )
     .limit(1);
   if (!a) return null;
+
+  if (resultId && resultAttemptId) {
+    const [selected] = await db
+      .select({
+        result: results,
+        attempt: resultAttempts,
+        classification: resultClassifications.state,
+        reynolds: simulationPresetRevisions.reynolds,
+      })
+      .from(results)
+      .innerJoin(
+        resultAttempts,
+        and(
+          eq(resultAttempts.resultId, results.id),
+          eq(resultAttempts.id, resultAttemptId),
+          eq(resultAttempts.airfoilId, a.id),
+          eq(
+            resultAttempts.simulationPresetRevisionId,
+            results.simulationPresetRevisionId,
+          ),
+        ),
+      )
+      .innerJoin(
+        simulationPresetRevisions,
+        eq(
+          simulationPresetRevisions.id,
+          resultAttempts.simulationPresetRevisionId,
+        ),
+      )
+      .leftJoin(
+        resultClassifications,
+        eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .where(
+        and(
+          eq(results.id, resultId),
+          eq(results.airfoilId, a.id),
+          sql`EXISTS (
+        SELECT 1 FROM progressive_cfd_evidence evidence
+        JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
+        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN progressive_generations generation ON generation.id = work.generation_id
+        JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+        JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+        WHERE evidence.result_attempt_id = ${resultAttemptId}::uuid
+          AND attempt.sim_job_id = ${resultAttempts.simJobId}
+          AND generation.status <> 'cancelled' AND generation.plan_revision_id = campaign.current_plan_revision_id
+          AND campaign.status IN ('active', 'attention', 'paused', 'completed')
+      )`,
+        ),
+      )
+      .limit(1);
+    if (!selected) return null;
+    return solvedDetail(
+      a.name,
+      selected.reynolds,
+      selectedResultProjection(selected.result, selected.attempt),
+      {
+        method: selected.attempt.regime === "urans" ? "URANS" : "RANS",
+        classification: selected.classification,
+        converged: selected.attempt.converged === true,
+        error: selected.attempt.error?.slice(0, 600) ?? null,
+      },
+    );
+  }
 
   if (resultId) {
     const [selected] = await db

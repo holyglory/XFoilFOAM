@@ -93,6 +93,13 @@ export function isFinalProgressiveRemoteReport(
     report.stopProof !== null &&
     ["completed", "failed", "cancelled"].includes(report.status.state) &&
     (report.stopProof.ownership_basis === "never_started_cancellation_fence" ||
+      (report.result === null &&
+        report.status.state === "failed" &&
+        report.status.total_cases === 0 &&
+        report.status.completed_cases === 0 &&
+        ["deterministic_mesh", "infrastructure"].includes(
+          String(report.status.failure_disposition),
+        )) ||
       (report.result !== null &&
         ["completed", "failed", "cancelled"].includes(report.result.state)))
   );

@@ -18,7 +18,7 @@ import type {
 } from "@aerodb/engine-client";
 
 const ASSUMPTIONS = {
-  version: "progressive-fit-assumptions-v3",
+  version: "progressive-fit-assumptions-v4",
   minimumUncertifiedConvectiveTransits: 1,
   acquisition: "fixed-posterior-coverage-v1",
   priorLiftStd: 0.3,
@@ -168,7 +168,7 @@ function candidateFor(
       if (!finite(length) || length <= 0 || !finite(speed) || speed <= 0)
         return excluded(candidate, "missing_physical_history_scale");
       if (
-        start <
+        start - coordinate[0] <
         (ASSUMPTIONS.minimumUncertifiedConvectiveTransits * length) / speed
       )
         return excluded(candidate, "startup_only_history");

@@ -78,6 +78,7 @@ export function DetailIsland({
     re: number;
     aoa: number;
     resultId?: string | null;
+    resultAttemptId?: string | null;
     mirrored?: boolean;
     mirroredFromAoaDeg?: number | null;
   } | null>(null);
@@ -183,10 +184,20 @@ export function DetailIsland({
 
   const openSolverWorkResult = useCallback(
     (
-      ctx: { re: number; aoa: number; resultId: string },
+      ctx: {
+        re: number;
+        aoa: number;
+        resultId: string;
+        resultAttemptId?: string;
+      },
       review?: SimModalReviewContext | null,
     ) => {
-      setSimCtx({ re: ctx.re, aoa: ctx.aoa, resultId: ctx.resultId });
+      setSimCtx({
+        re: ctx.re,
+        aoa: ctx.aoa,
+        resultId: ctx.resultId,
+        resultAttemptId: ctx.resultAttemptId,
+      });
       setSimDetail(null);
       setSimMessage(null);
       setSimReview(review ?? null);
@@ -209,14 +220,20 @@ export function DetailIsland({
     }
     let cancelled = false;
     setSimMessage(null);
-    getSim(detail.slug, simCtx.re, simCtx.aoa, simCtx.resultId)
+    getSim(
+      detail.slug,
+      simCtx.re,
+      simCtx.aoa,
+      simCtx.resultId,
+      simCtx.resultAttemptId,
+    )
       .then((d) => {
         if (!cancelled) {
           setSimDetail(d);
           setSimMessage(null);
           setSimField((current) => {
             if (
-              d.status !== "solved" ||
+              (d.status !== "solved" && d.status !== "evidence") ||
               d.availableFields.length === 0 ||
               d.availableFields.includes(current)
             )

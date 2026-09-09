@@ -35,6 +35,7 @@ export function ProgressivePolarViewer({
     re: number;
     aoa: number;
     resultId: string;
+    resultAttemptId?: string;
   }) => void;
 }) {
   const [selectedId, setSelectedId] = useState(series[0]?.targetId ?? "");
@@ -434,9 +435,11 @@ export function ProgressivePolarViewer({
                         re: selected.re,
                         aoa: entry.alpha!,
                         resultId: entry.resultId,
+                        resultAttemptId: entry.attemptId,
                       })
                     }
                     data-result-id={entry.resultId}
+                    data-result-attempt-id={entry.attemptId}
                     style={{
                       color: C.teal,
                       background: "none",

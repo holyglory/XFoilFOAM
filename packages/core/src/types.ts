@@ -388,7 +388,7 @@ export interface BoundaryConditionDTO {
 }
 
 // ============================ simulation modal ============================
-export type SimStatus = "solved" | "queued" | "running";
+export type SimStatus = "solved" | "queued" | "running" | "evidence";
 export type SimRegime = "attached" | "stalled";
 export type FieldId =
   | "velocity_magnitude"
@@ -532,16 +532,23 @@ export interface SimulationDetail {
   /** Stable stored-result identity. Used by the evidence viewer to keep the
    *  previous frame visible until a newly selected AoA has actually loaded. */
   resultId?: string;
+  resultAttemptId?: string;
+  observation?: {
+    method: "RANS" | "URANS";
+    classification: string | null;
+    converged: boolean;
+    error: string | null;
+  };
   status: SimStatus;
   regime: SimRegime;
   airfoilName: string;
   alpha: number;
   re: number;
   mach: number;
-  cl: number;
-  cd: number;
+  cl: number | null;
+  cd: number | null;
   cm: number | null;
-  ld: number;
+  ld: number | null;
   clStd?: number | null;
   cdStd?: number | null;
   strouhal?: number | null;

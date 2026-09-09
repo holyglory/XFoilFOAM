@@ -320,7 +320,9 @@ export function SimModal(props: {
   const activeFieldId = asFieldId(activeField);
   const fieldLabel = labelForField(activeField);
   const realField = (f: FieldId | null) =>
-    f && sim?.status === "solved" ? sim.media?.[f] : undefined;
+    f && (sim?.status === "solved" || sim?.status === "evidence")
+      ? sim.media?.[f]
+      : undefined;
   const activeStoredMedia = realField(activeFieldId);
   const fieldChoices = useMemo(() => {
     const out: string[] = [];
@@ -343,6 +345,7 @@ export function SimModal(props: {
   );
   const evidencePresentation = sim
     ? simEvidencePresentation({
+        observation: sim.observation,
         fidelity: sim.fidelity,
         regime: sim.regime,
         turbulenceModel: sim.condition?.turbulenceModel,
@@ -633,7 +636,11 @@ export function SimModal(props: {
   );
 
   useEffect(() => {
-    if (!open || sim?.status !== "solved" || !sim.availableFields.length)
+    if (
+      !open ||
+      (sim?.status !== "solved" && sim?.status !== "evidence") ||
+      !sim.availableFields.length
+    )
       return;
     if (!sim.availableFields.includes(field)) onField(sim.availableFields[0]);
   }, [open, sim?.status, sim?.availableFields, field, onField]);
@@ -1630,6 +1637,18 @@ export function SimModal(props: {
 
   const qualityChips = () => {
     if (!sim) return null;
+    if (sim.observation)
+      return (
+        <HeaderChip
+          color={C.amber}
+          border={C.stroke}
+          text={
+            sim.observation.converged
+              ? "numerically converged"
+              : "not numerically converged"
+          }
+        />
+      );
     if (stalled) {
       const frequency = playerModel?.periodS ? 1 / playerModel.periodS : null;
       return (
@@ -1750,6 +1769,46 @@ export function SimModal(props: {
 
   const meansRow = () => {
     if (!sim) return null;
+    if (sim.observation)
+      return (
+        <div data-testid="sim-attempt-evidence" style={{ marginBottom: 12 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
+              gap: 10,
+            }}
+          >
+            <AccentStat
+              label="Cl"
+              color={C.teal}
+              value={fmt(sim.cl, 4)}
+              sub="recorded coefficient"
+            />
+            <AccentStat
+              label="Cd"
+              color={C.amber}
+              value={fmt(sim.cd, 5)}
+              sub="recorded coefficient"
+            />
+            <AccentStat
+              label="Cm"
+              color={C.text}
+              value={fmtOptional(sim.cm, 4)}
+              sub="recorded coefficient"
+            />
+          </div>
+          <p>{evidencePresentation?.historyText}</p>
+          {sim.observation.error && (
+            <details>
+              <summary>Calculation issue</summary>
+              <p style={{ overflowWrap: "anywhere" }}>
+                {sim.observation.error}
+              </p>
+            </details>
+          )}
+        </div>
+      );
     if (stalled && playerModel) {
       return (
         <div
@@ -1911,7 +1970,7 @@ export function SimModal(props: {
           style={mediaStyle}
         />
       );
-    if (sim?.status === "solved") {
+    if (sim?.status === "solved" || sim?.status === "evidence") {
       return (
         <MediaEmpty
           text={
@@ -2805,8 +2864,8 @@ function MediaEmpty({ text, testId }: { text: string; testId?: string }) {
   );
 }
 
-function fmt(n: number, digits: number) {
-  return Number.isFinite(n) ? n.toFixed(digits) : "—";
+function fmt(n: number | null, digits: number) {
+  return n !== null && Number.isFinite(n) ? n.toFixed(digits) : "—";
 }
 
 function fmtSci(n: number) {

@@ -4754,6 +4754,17 @@ describe("persistent progressive polar cache", () => {
         }),
       ]),
     );
+    history.t = history.t.map((time) => time + 203);
+    history.window_start += 203;
+    expect(buildProgressiveFitRequest(startup).observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          attempt_id: unsteadySource.resultAttemptId,
+          eligible: false,
+          exclusion_reason: "startup_only_history",
+        }),
+      ]),
+    );
     expect(
       excludedStartup.histories.every(
         (item) => item.coordinate_kind === "iteration",

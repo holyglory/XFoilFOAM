@@ -6,6 +6,27 @@ const allVisibleLabels = (view: ReturnType<typeof simEvidencePresentation>) =>
   `${view.methodChip} ${view.mediaTag} ${view.provenance} ${view.historyTitle} ${view.historyText}`;
 
 describe("simEvidencePresentation", () => {
+  it.each(["RANS", "URANS"] as const)(
+    "does not label an unconverged %s observation as a certified result",
+    (method) => {
+      const view = simEvidencePresentation({
+        fidelity: null,
+        regime: "attached",
+        observation: {
+          method,
+          converged: false,
+          classification: "rejected",
+          error: null,
+        },
+      });
+      expect(view.method).toBe(method);
+      expect(view.methodChip).toBe(`${method} · provisional`);
+      expect(view.historyText).toContain("not accepted CFD");
+      expect(allVisibleLabels(view)).not.toMatch(
+        /certified|pointwise-converged|vortex shedding|no.shedding/,
+      );
+    },
+  );
   it("labels an explicit RANS result as steady RANS evidence", () => {
     const view = simEvidencePresentation({
       fidelity: "rans",

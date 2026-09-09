@@ -1,4 +1,8 @@
-import type { PointFidelityTier, SimRegime } from "@aerodb/core";
+import type {
+  PointFidelityTier,
+  SimRegime,
+  SimulationDetail,
+} from "@aerodb/core";
 
 export interface SimEvidencePresentationInput {
   fidelity: PointFidelityTier | null | undefined;
@@ -6,6 +10,7 @@ export interface SimEvidencePresentationInput {
   turbulenceModel?: string | null;
   transportActive?: boolean;
   hasRecordedFrames?: boolean;
+  observation?: SimulationDetail["observation"];
 }
 
 export interface SimEvidencePresentation {
@@ -24,7 +29,20 @@ export function simEvidencePresentation({
   turbulenceModel,
   transportActive = false,
   hasRecordedFrames = false,
+  observation,
 }: SimEvidencePresentationInput): SimEvidencePresentation {
+  if (observation)
+    return {
+      method: observation.method,
+      methodChip: `${observation.method} · ${observation.classification === "accepted" ? "accepted" : "provisional"}`,
+      mediaTag: `${observation.method} · recorded evidence`,
+      provenance: `${observation.method} · ${observation.converged ? "numerically converged" : "not numerically converged"}`,
+      historyTitle: "Stored calculation",
+      historyText:
+        observation.classification === "accepted"
+          ? "This attempt is accepted CFD evidence."
+          : "This attempt is not accepted CFD. Its retained history can inform an estimated curve without becoming a converged point.",
+    };
   const method: "RANS" | "URANS" =
     fidelity === "urans_precalc" ||
     fidelity === "urans_full" ||

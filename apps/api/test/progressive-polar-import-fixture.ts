@@ -15,6 +15,7 @@ import {
 } from "@aerodb/db";
 import { registerSyncRoutes, type importPolarPush } from "../src/sync-routes";
 import { verifyProgressivePolarArchiveImport } from "./progressive-polar-archive-fixture";
+import { assembleSim } from "../src/services/sim";
 
 const isolated = vi.hoisted(() => ({
   connection: null as DB | null,
@@ -218,6 +219,49 @@ export async function verifyProgressivePolarImport(
       .where(eq(results.id, receipt.resultId));
     expect(canonical.currentResultAttemptId).not.toBe(attempt.id);
     expect(canonical.cl).toBeNull();
+    const [profile] = await db.execute(
+      sql`SELECT slug FROM airfoils WHERE id = ${job.airfoil_id}::uuid`,
+    );
+    const observed = await assembleSim(
+      String(profile.slug),
+      undefined,
+      undefined,
+      receipt.resultId,
+      receipt.resultAttemptId,
+    );
+    expect(observed).toMatchObject({
+      resultId: receipt.resultId,
+      resultAttemptId: receipt.resultAttemptId,
+      status: "evidence",
+      observation: { converged: projection.converged === true },
+    });
+    expect(
+      await assembleSim(
+        String(profile.slug),
+        undefined,
+        undefined,
+        randomUUID(),
+        receipt.resultAttemptId,
+      ),
+    ).toBeNull();
+    expect(
+      await assembleSim(
+        "unrelated-profile",
+        undefined,
+        undefined,
+        receipt.resultId,
+        receipt.resultAttemptId,
+      ),
+    ).toBeNull();
+    expect(
+      await assembleSim(
+        String(profile.slug),
+        undefined,
+        undefined,
+        receipt.resultId,
+        randomUUID(),
+      ),
+    ).toBeNull();
     const replay = await push(payload, new Map());
     expect(replay.attempts).toBe(0);
     expect(replay.progressiveEvidenceReceipts).toEqual(
@@ -227,6 +271,15 @@ export async function verifyProgressivePolarImport(
       sql`UPDATE sim_campaigns SET status = 'cancelled' WHERE id = ${job.campaign_id}::uuid`,
     );
     const cancelledReplay = await push(payload, new Map());
+    expect(
+      await assembleSim(
+        String(profile.slug),
+        undefined,
+        undefined,
+        receipt.resultId,
+        receipt.resultAttemptId,
+      ),
+    ).toBeNull();
     expect(cancelledReplay.progressiveEvidenceReceipts).toEqual(
       imported.progressiveEvidenceReceipts,
     );
