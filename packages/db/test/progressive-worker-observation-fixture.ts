@@ -315,6 +315,25 @@ export async function verifyProgressiveWorkerObservation(
     ),
   ).toMatchObject({ inspected: 0, reported: 0, stopped: 0, errors: [] });
   expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(0);
+  const projections = await db.execute(sql`
+    SELECT assignment_signature = report->>'assignmentSignature' AS assignment_matches,
+      stopped_engine_job_id IS NOT DISTINCT FROM
+        CASE WHEN report#>>'{stopProof,execution_stopped}' = 'true'
+          THEN report#>>'{stopProof,job_id}' END AS stop_matches
+    FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid
+  `);
+  expect(projections.length).toBeGreaterThan(0);
+  expect(
+    projections.every((row) => row.assignment_matches && row.stop_matches),
+  ).toBe(true);
+  await expect(
+    db.execute(sql`
+    UPDATE progressive_worker_reports SET stopped_engine_job_id = ${randomUUID()}
+    WHERE sim_job_id = ${executionId}::uuid
+  `),
+  ).rejects.toThrow(
+    'column "stopped_engine_job_id" can only be updated to DEFAULT',
+  );
   if (mode === "timeout") expect(engine.getResult).not.toHaveBeenCalled();
   expect(engine.cancelJob).toHaveBeenCalledWith(
     executionId,

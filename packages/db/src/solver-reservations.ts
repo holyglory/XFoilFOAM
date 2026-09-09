@@ -28,9 +28,8 @@ export function solverCpuReservationSql(alias = "sim_jobs"): SQL {
       SELECT 1 FROM progressive_worker_reports report
       JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = report.sim_job_id
       WHERE report.sim_job_id = ${job}.id
-        AND report.report->>'assignmentSignature' = intent.assignment_signature
-        AND report.report#>>'{stopProof,job_id}' = ${job}.id::text
-        AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+        AND report.assignment_signature = intent.assignment_signature
+        AND report.stopped_engine_job_id = ${job}.id::text
     )
   ) ELSE (
     ${job}.status IN ('submitted', 'running', 'ingesting')

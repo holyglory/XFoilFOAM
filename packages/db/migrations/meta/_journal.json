@@ -988,6 +988,13 @@
       "when": 1792368000034,
       "tag": "0140_campaign_catalog_snapshot_lock",
       "breakpoints": true
+    },
+    {
+      "idx": 141,
+      "version": "7",
+      "when": 1792368000035,
+      "tag": "0141_progressive_worker_stop_projection",
+      "breakpoints": true
     }
   ]
 }

@@ -7706,6 +7706,13 @@ export const progressiveWorkerReports = pgTable(
     sequence: bigint("sequence", { mode: "number" }).notNull(),
     contentSignature: text("content_signature").notNull(),
     report: jsonb("report").$type<Record<string, unknown>>().notNull(),
+    assignmentSignature: text("assignment_signature").generatedAlwaysAs(
+      sql`report->>'assignmentSignature'`,
+    ),
+    stoppedEngineJobId: text("stopped_engine_job_id").generatedAlwaysAs(
+      sql`CASE WHEN report#>>'{stopProof,execution_stopped}' = 'true'
+        THEN report#>>'{stopProof,job_id}' END`,
+    ),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
@@ -7716,6 +7723,9 @@ export const progressiveWorkerReports = pgTable(
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NULL`),
+    stopIdentityIdx: index("progressive_worker_reports_stop_identity_idx")
+      .on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
+      .where(sql`${table.stoppedEngineJobId} IS NOT NULL`),
     sequenceCheck: check(
       "progressive_worker_reports_sequence_check",
       sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
