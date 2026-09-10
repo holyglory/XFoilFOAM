@@ -706,6 +706,18 @@ recipes and the density-based fast recipe are unchanged. This preliminary
 throughput policy remains unvalidated for aerodynamic accuracy. Existing sealed
 generations are not rewritten by this change and require explicit adoption.
 
+For an active campaign still in stage 1 or 2, pause new admissions and let its
+bound jobs stop and settle through the normal controller. Run
+`pnpm --filter @aerodb/db exec tsx src/adopt-progressive-wall-policy.ts CAMPAIGN_UUID --dry-run`
+to rehearse the transactional upgrade, then use `--apply` for the same campaign.
+The default is a rollback-only dry run. Restore the previous admission state
+afterward. The operation retains the campaign plan, predictions, results and
+old sealed recipes, appends a stage-1 successor, and records an idempotent
+adoption receipt. It refuses paused, cancelled or archived campaigns and any
+generation that has already reached the precise stage. Completed campaigns
+adopt new defaults when new profiles are enrolled; this command does not restart
+their finished work.
+
 Windowed URANS histories carry `source_start_time`, the first recorded source
 coefficient time before startup discard or period selection. The retained `t`
 array still describes only its original selected window. Uncertified-history

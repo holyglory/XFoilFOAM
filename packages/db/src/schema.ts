@@ -6964,6 +6964,43 @@ export const progressiveGenerations = pgTable(
   }),
 );
 
+export const progressiveRecipeAdoptions = pgTable(
+  "progressive_recipe_adoptions",
+  {
+    epochId: uuid("epoch_id")
+      .notNull()
+      .references(() => calculationEpochs.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    planRevisionId: uuid("plan_revision_id")
+      .notNull()
+      .references(() => simCampaignPlanRevisions.id),
+    policy: text("policy").notNull(),
+    previousGenerationIds: uuid("previous_generation_ids").array().notNull(),
+    generationId: uuid("generation_id")
+      .notNull()
+      .references(() => progressiveGenerations.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    identity: primaryKey({
+      columns: [
+        table.epochId,
+        table.campaignId,
+        table.planRevisionId,
+        table.policy,
+      ],
+    }),
+    previousRequired: check(
+      "progressive_recipe_adoptions_previous_generation_ids_check",
+      sql`cardinality(${table.previousGenerationIds}) > 0`,
+    ),
+  }),
+);
+
 export const progressiveGenerationTargets = pgTable(
   "progressive_generation_targets",
   {

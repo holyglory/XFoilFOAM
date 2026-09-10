@@ -160,7 +160,7 @@ command = ["node", "--import", "tsx", "scripts/dev/verify-wall-spacing-contract.
 name = "campaign-expansion"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "seals guarded fast recipes"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "seals guarded fast recipes|adopts an old preliminary recipe"]
 
 [test.history-transport]
 timeout_seconds = 300

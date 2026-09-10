@@ -7,6 +7,7 @@ export * from "./campaigns";
 export * from "./analysis-target";
 export * from "./progressive-campaigns";
 export * from "./progressive-materialization";
+export * from "./progressive-recipe-adoption";
 export * from "./progressive-public";
 export * from "./progressive-polar-cache";
 export * from "./progressive-cfd-settlement";

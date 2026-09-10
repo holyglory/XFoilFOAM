@@ -1002,6 +1002,13 @@
       "when": 1792368000036,
       "tag": "0142_progressive_prediction_repairs",
       "breakpoints": true
+    },
+    {
+      "idx": 143,
+      "version": "7",
+      "when": 1792368000037,
+      "tag": "0143_progressive_recipe_adoptions",
+      "breakpoints": true
     }
   ]
 }

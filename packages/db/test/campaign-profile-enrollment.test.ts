@@ -11,6 +11,7 @@ import {
   storeRepairedPrediction,
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
+import { adoptProgressiveWallPolicy } from "../src/progressive-recipe-adoption";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -525,6 +526,167 @@ describe("durable progressive scope requests", () => {
     );
     expect(after).toMatchObject({ ...plan, status: "active" });
     expect(await reconcileProgressiveGenerationRequest(db)).toBeNull();
+  }, 30_000);
+
+  it("adopts an old preliminary recipe transactionally without changing sealed truth", async () => {
+    const id = await campaign();
+    const original = (await reconcileProgressiveGenerationRequest(db))!;
+    const [scope] = await db.execute(sql`
+      SELECT scope.*,target.physical,target.airfoil_id FROM progressive_generation_targets scope
+      JOIN polar_analysis_targets target ON target.id=scope.target_id WHERE generation_id=${original.generationId}
+    `);
+    const [plan] = await db.execute(
+      sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+    );
+    await db.execute(
+      sql`UPDATE progressive_generations SET status='cancelled' WHERE id=${original.generationId}`,
+    );
+    const recipes = structuredClone(
+      scope.recipes,
+    ) as SealedPolarTarget["recipes"];
+    delete recipes.fast.wallSpacing;
+    recipes.fast.recipe_id = "openfoam-fast-v1";
+    const legacy = await sealProgressiveGeneration(db, {
+      campaignId: id,
+      planRevisionId: String(plan.current_plan_revision_id),
+      scopeKey: "isolated-old-wall-policy",
+      targets: [
+        {
+          airfoilId: String(scope.airfoil_id),
+          targetId: String(scope.target_id),
+          physical: scope.physical as SealedPolarTarget["physical"],
+          revisionId: String(scope.revision_id),
+          angles: scope.angles as number[],
+          recipes,
+        },
+      ],
+    });
+    await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+    await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
+      "Pause new solver admissions",
+    );
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    for (const status of ["paused", "completed", "cancelled", "archived"]) {
+      await db
+        .update(simCampaigns)
+        .set({ status })
+        .where(eq(simCampaigns.id, id));
+      await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
+        "active preliminary",
+      );
+    }
+    await db
+      .update(simCampaigns)
+      .set({ status: "active" })
+      .where(eq(simCampaigns.id, id));
+    await db.execute(
+      sql`UPDATE progressive_generations SET stage=3 WHERE id=${legacy.id}`,
+    );
+    await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
+      "precise generation",
+    );
+    await db.execute(
+      sql`UPDATE progressive_generations SET stage=1 WHERE id=${legacy.id}`,
+    );
+    const [work] = await db.execute(
+      sql`SELECT id FROM progressive_work WHERE generation_id=${legacy.id} AND stage=1`,
+    );
+    await db.execute(
+      sql`UPDATE progressive_work SET state='leased',lease_token=${randomUUID()}::uuid,lease_owner='isolated-live-prediction',lease_until=clock_timestamp()+interval '1 minute' WHERE id=${work.id}`,
+    );
+    await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
+      "physically stopped and settled",
+    );
+    await db.execute(
+      sql`UPDATE progressive_work SET state='pending',lease_token=NULL,lease_owner=NULL,lease_until=NULL WHERE id=${work.id}`,
+    );
+    const baseline = (await claim([1]))!;
+    expect(baseline.generationId).toBe(legacy.id);
+    const predictionId = await storeNeuralFoilPrediction(
+      db,
+      baseline,
+      predictionFixture(baseline),
+    );
+    await initializeProgressiveCfdWork(db);
+    const cfd = (await claimCfd())!;
+    const jobId = randomUUID();
+    await db
+      .insert(simJobs)
+      .values({
+        id: jobId,
+        engineJobId: jobId,
+        airfoilId: originalId,
+        bcIds: [],
+        referenceChordM: 0.76319,
+        campaignId: id,
+        status: "done",
+      });
+    await db.execute(
+      sql`UPDATE progressive_cfd_attempts SET sim_job_id=${jobId},outcome='failed',finished_at=clock_timestamp() WHERE token=${cfd.token}`,
+    );
+    await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
+      "physically stopped and settled",
+    );
+    const foreign = randomUUID();
+    const proof = executionStopProof(jobId);
+    await db.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+      VALUES(${jobId},${foreign},${legacy.epochId},${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())`);
+    await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
+      "physically stopped and settled",
+    );
+    await db.execute(
+      sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${jobId}`,
+    );
+    await db.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+      VALUES(${jobId},${jobId},${legacy.epochId},${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())`);
+    const retainedPrediction = await db.execute(
+      sql`SELECT id,payload FROM neuralfoil_predictions WHERE id=${predictionId}`,
+    );
+    const rollback = new Error("isolated-adoption-dry-run");
+    await expect(
+      db.transaction(async (transaction) => {
+        expect(
+          (await adoptProgressiveWallPolicy(transaction as unknown as DB, id))
+            .kind,
+        ).toBe("adopted");
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+    const [stillActive] = await db.execute(
+      sql`SELECT status FROM progressive_generations WHERE id=${legacy.id}`,
+    );
+    expect(stillActive.status).toBe("active");
+    const adopted = await adoptProgressiveWallPolicy(db, id);
+    expect(adopted.kind).toBe("adopted");
+    expect(await adoptProgressiveWallPolicy(db, id)).toMatchObject({
+      ...adopted,
+      kind: "replayed",
+    });
+    expect(
+      await db.execute(
+        sql`SELECT recipes FROM progressive_generation_targets WHERE generation_id=${legacy.id}`,
+      ),
+    ).toEqual([{ recipes }]);
+    const [unchangedPlan] = await db.execute(
+      sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+    );
+    expect(unchangedPlan).toEqual(plan);
+    const [receipt] = await db.execute(
+      sql`SELECT generation_id FROM progressive_recipe_adoptions WHERE campaign_id=${id}`,
+    );
+    const [successor] = await db.execute(
+      sql`SELECT stage,status FROM progressive_generations WHERE id=${receipt.generation_id}`,
+    );
+    expect(successor).toMatchObject({ stage: 1, status: "active" });
+    expect(
+      await db.execute(
+        sql`SELECT id,payload FROM neuralfoil_predictions WHERE id=${predictionId}`,
+      ),
+    ).toEqual(retainedPrediction);
+    const [cancelled] = await db.execute(
+      sql`SELECT state FROM progressive_cfd_units WHERE id=${cfd.id}`,
+    );
+    expect(cancelled.state).toBe("cancelled");
   }, 30_000);
 
   it("coalesces concurrent requests without duplicate generations", async () => {
