@@ -125,6 +125,43 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.fast-wall-spacing]
+timeout_seconds = 300
+
+[test.fast-wall-spacing.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.fast-wall-spacing.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.fast-wall-spacing.check]]
+name = "geometry-and-recipes"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "exec", "vitest", "run", "test/wall-spacing.test.ts"]
+
+[[test.fast-wall-spacing.check]]
+name = "recipes"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/polar-compatibility-cache.test.ts"]
+
+[[test.fast-wall-spacing.check]]
+name = "native-geometry"
+tier = "development"
+requires = ["types"]
+command = ["node", "--import", "tsx", "scripts/dev/verify-wall-spacing-contract.mjs"]
+
+[[test.fast-wall-spacing.check]]
+name = "campaign-expansion"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "seals guarded fast recipes"]
+
 [test.history-transport]
 timeout_seconds = 300
 

@@ -18,6 +18,7 @@ import {
   deriveFlowConditionState,
   evaluateGasState,
   materialPhysicsValues,
+  parseCoordinates,
 } from "@aerodb/core";
 import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
 import { progressivePredictionFixture as predictionFixture } from "../test-support/progressive-prediction";
@@ -455,6 +456,76 @@ describe("durable progressive scope requests", () => {
     expect(targets.map((target) => target.airfoil_id)).toEqual([added]);
     expect(await reconcileProgressiveGenerationRequest(db)).toBeNull();
   });
+
+  it("seals guarded fast recipes for new profiles without rewriting a completed cohort", async () => {
+    const id = await campaign();
+    const initial = (await reconcileProgressiveGenerationRequest(db))!;
+    const before = await db.execute(
+      sql`SELECT target_id, recipes FROM progressive_generation_targets WHERE generation_id = ${initial.generationId} ORDER BY target_id`,
+    );
+    const [plan] = await db.execute(
+      sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${id}`,
+    );
+    await db.execute(
+      sql`UPDATE progressive_generations SET status='complete' WHERE id=${initial.generationId}`,
+    );
+    await db
+      .update(simCampaigns)
+      .set({ status: "completed" })
+      .where(eq(simCampaigns.id, id));
+    const normal = await newProfile({
+      points: parseCoordinates(
+        readFileSync(
+          resolve(ROOT, "packages/db/seed/selig-database/ag24.dat"),
+          "utf8",
+        ),
+      ).points,
+    });
+    const concave = await newProfile({
+      points: parseCoordinates(
+        readFileSync(
+          resolve(ROOT, "packages/db/seed/selig-database/s1223.dat"),
+          "utf8",
+        ),
+      ).points,
+    });
+    await reconcileCampaignProfileEnrollment(db);
+    const expanded = (await reconcileProgressiveGenerationRequest(db))!;
+    expect(expanded).toMatchObject({ profiles: 2, error: null });
+    const targets = await db.execute(sql`
+      SELECT target.airfoil_id, scope.recipes FROM progressive_generation_targets scope
+      JOIN polar_analysis_targets target ON target.id=scope.target_id
+      WHERE scope.generation_id=${expanded.generationId}
+    `);
+    expect(
+      targets.find((row) => row.airfoil_id === normal)?.recipes,
+    ).toMatchObject({
+      fast: {
+        mesh: { targetYPlus: 40 },
+        wallSpacing: { selection: "wall_function" },
+      },
+      precise: { mesh: { targetYPlus: 1 } },
+    });
+    expect(
+      targets.find((row) => row.airfoil_id === concave)?.recipes,
+    ).toMatchObject({
+      fast: {
+        mesh: { targetYPlus: 1 },
+        wallSpacing: { selection: "requested" },
+      },
+      precise: { mesh: { targetYPlus: 1 } },
+    });
+    expect(
+      await db.execute(
+        sql`SELECT target_id, recipes FROM progressive_generation_targets WHERE generation_id = ${initial.generationId} ORDER BY target_id`,
+      ),
+    ).toEqual(before);
+    const [after] = await db.execute(
+      sql`SELECT current_plan_revision_id,status FROM sim_campaigns WHERE id=${id}`,
+    );
+    expect(after).toMatchObject({ ...plan, status: "active" });
+    expect(await reconcileProgressiveGenerationRequest(db)).toBeNull();
+  }, 30_000);
 
   it("coalesces concurrent requests without duplicate generations", async () => {
     const id = await campaign();

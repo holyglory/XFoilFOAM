@@ -696,6 +696,16 @@ and do not call the implementation complete based on unit tests alone.
 
 ## Verification
 
+New pressure-based fast recipes use curvature-guarded wall-function spacing.
+The original profile coordinates are aligned and normalized using the same
+geometry convention as the native solver. A maximum concave curvature no greater
+than 2.5 per chord, measured over a 0.025-chord arc window, permits a wall target
+of yPlus 40. Strongly concave or unmeasurable profiles retain the requested
+spacing. The measured selection is stored in the immutable fast recipe; precise
+recipes and the density-based fast recipe are unchanged. This preliminary
+throughput policy remains unvalidated for aerodynamic accuracy. Existing sealed
+generations are not rewritten by this change and require explicit adoption.
+
 Windowed URANS histories carry `source_start_time`, the first recorded source
 coefficient time before startup discard or period selection. The retained `t`
 array still describes only its original selected window. Uncertified-history

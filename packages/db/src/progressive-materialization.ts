@@ -1,5 +1,10 @@
 import { sql } from "drizzle-orm";
-import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
+import {
+  airfoilConcaveCurvature,
+  fastWallSpacing,
+  FAST_WALL_SPACING_POLICY,
+  PROGRESSIVE_COMPUTE_POLICY,
+} from "@aerodb/core";
 import type { DB } from "./client";
 import { cancelObsoleteProgressiveCfdUnits } from "./progressive-cfd";
 import { campaignEnrollmentScope } from "./campaigns";
@@ -12,6 +17,7 @@ import type { SimulationSetupSnapshot } from "./simulation-setup";
 
 export function progressiveRecipes(
   snapshot: SimulationSetupSnapshot,
+  maximumConcaveCurvature: number | null = null,
 ): SealedPolarTarget["recipes"] {
   if (snapshot.solver.turbulenceModel !== "kOmegaSST")
     throw new Error(
@@ -38,6 +44,10 @@ export function progressiveRecipes(
     snapshot.derived.mach !== null &&
     snapshot.derived.mach >=
       PROGRESSIVE_COMPUTE_POLICY.densityBasedMachThreshold;
+  const wallSpacing = fastWallSpacing(
+    mesh.targetYPlus,
+    maximumConcaveCurvature,
+  );
   return {
     neuralfoil: {
       recipe_id: "neuralfoil-prior-v1",
@@ -49,13 +59,14 @@ export function progressiveRecipes(
       ...common,
       recipe_id: localDensity
         ? "openfoam-fast-density-local-v1"
-        : "openfoam-fast-v1",
+        : "openfoam-fast-wall-v2",
+      ...(!localDensity ? { wallSpacing } : {}),
       ...(localDensity
         ? { timeCoordinate: "local_pseudo_time_iterations" }
         : {}),
       mesh: {
         ...mesh,
-        ...(localDensity ? { targetYPlus: 40 } : {}),
+        targetYPlus: localDensity ? 40 : wallSpacing.targetYPlus,
         nSurface: Math.min(
           mesh.nSurface,
           Math.max(80, Math.floor(mesh.nSurface * 0.65)),
@@ -132,6 +143,12 @@ export async function materializeProgressiveCampaignScope(
       snapshot: SimulationSetupSnapshot;
     }>;
     const targets: SealedPolarTarget[] = [];
+    const profileCurvature = new Map(
+      profiles.map((profile) => [
+        profile.id,
+        airfoilConcaveCurvature(profile.points),
+      ]),
+    );
     for (const condition of conditions) {
       const { snapshot } = condition;
       if (!snapshot.material)
@@ -141,8 +158,11 @@ export async function materializeProgressiveCampaignScope(
       const angles = intent.cellsByCondition.get(condition.id)?.angles;
       if (!angles)
         throw new Error("Campaign condition has no preserved angle intent");
-      const recipes = progressiveRecipes(snapshot);
       for (const profile of profiles) {
+        const recipes = progressiveRecipes(
+          snapshot,
+          profileCurvature.get(profile.id) ?? null,
+        );
         const target = createAnalysisTarget({
           airfoilId: profile.id,
           points: profile.points,
@@ -174,6 +194,7 @@ export async function materializeProgressiveCampaignScope(
       campaignId,
       planRevisionId: intent.revisionId,
       scopeKey: analysisContentHash({
+        fastWallSpacingPolicy: FAST_WALL_SPACING_POLICY,
         plan: intent.revisionId,
         profiles: profiles.map((profile) => profile.id),
         ...(requestVersion ? { requestVersion } : {}),

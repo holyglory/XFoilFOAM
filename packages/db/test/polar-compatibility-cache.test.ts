@@ -274,6 +274,33 @@ const snapshot: SimulationSetupSnapshot = {
 };
 
 describe("physics compatibility hash contract", () => {
+  it("selects a guarded fast wall mesh while preserving precise and physical setup", () => {
+    const original = structuredClone(snapshot);
+    const normal = progressiveRecipes(snapshot, 0.2);
+    const concave = progressiveRecipes(snapshot, 4.9);
+    const unknown = progressiveRecipes(snapshot);
+    expect(normal.fast).toMatchObject({
+      recipe_id: "openfoam-fast-wall-v2",
+      mesh: { targetYPlus: 40 },
+      wallSpacing: { selection: "wall_function", maximumConcaveCurvature: 0.2 },
+    });
+    for (const recipes of [concave, unknown])
+      expect(recipes.fast).toMatchObject({
+        mesh: { targetYPlus: 1 },
+        wallSpacing: { selection: "requested" },
+      });
+    expect(normal.precise).toEqual(concave.precise);
+    expect(normal.precise).toMatchObject({
+      mesh: { targetYPlus: 1 },
+      recipe_id: "openfoam-precise-v1",
+    });
+    expect(normal.neuralfoil).toEqual(unknown.neuralfoil);
+    expect(snapshot).toEqual(original);
+    const density = { ...snapshot, derived: { ...snapshot.derived, mach: 2 } };
+    expect(progressiveRecipes(density, 0.2)).toEqual(
+      progressiveRecipes(density, 4.9),
+    );
+  });
   it("preserves legacy hashes for absent initialization and separates explicit limits", () => {
     const withLimit = (iterations: number | null | undefined) => ({
       ...snapshot,

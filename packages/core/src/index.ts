@@ -8,6 +8,7 @@ export * from "./viscosity";
 export * from "./reynolds";
 export * from "./solver-presets";
 export * from "./geometry";
+export * from "./wall-spacing";
 export * from "./metrics";
 export * from "./polar-fit";
 export * from "./polar-publication";
