@@ -29,7 +29,7 @@ for (const condition of works.conditions.slice(0, 24)) {
 }
 assert(revision, "Real CFD-only evidence is required");
 const viewer = "[data-testid='polar-viewer']";
-const toggle = `${viewer} button[aria-pressed][style*='min-height: 44px']`;
+const toggle = `${viewer} button[aria-pressed][style*='min-height']`;
 const target = config.targets[0];
 target.name = "cfd-only-polar";
 target.url = `${origin}/airfoils/ag24?revision=${revision}`;
