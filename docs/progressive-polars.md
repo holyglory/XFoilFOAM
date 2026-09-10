@@ -708,7 +708,7 @@ generations are not rewritten by this change and require explicit adoption.
 
 For an active campaign still in stage 1 or 2, pause new admissions and let its
 bound jobs stop and settle through the normal controller. Run
-`pnpm --filter @aerodb/db exec tsx src/adopt-progressive-wall-policy.ts CAMPAIGN_UUID --dry-run`
+`pnpm --filter @aerodb/db exec node --import tsx src/adopt-progressive-wall-policy.ts CAMPAIGN_UUID --dry-run`
 to rehearse the transactional upgrade, then use `--apply` for the same campaign.
 The default is a rollback-only dry run. Restore the previous admission state
 afterward. The operation retains the campaign plan, predictions, results and

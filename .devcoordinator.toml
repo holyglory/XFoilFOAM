@@ -128,6 +128,11 @@ timeout_seconds = 120
 [test.fast-wall-spacing]
 timeout_seconds = 300
 
+[[test.fast-wall-spacing.check]]
+name = "finite-loader"
+tier = "development"
+command = ["node", "scripts/dev/verify-finite-typescript-loader.mjs"]
+
 [test.fast-wall-spacing.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
@@ -218,7 +223,7 @@ user = "aerodb"
 [[test.progressive-urans-live.check]]
 name = "schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-urans-live.check]]
 name = "seed"
@@ -236,7 +241,7 @@ name = "joint-physical-histories"
 tier = "development"
 requires = ["seed", "types"]
 env = { PROGRESSIVE_REQUIRE_URANS_HISTORIES = "1" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 timeout_seconds = 3900
 retained_artifacts = [{ name = "joint-urans-journey", path = ".codex-artifacts/progressive-live-30-urans", max_bytes = 10485760 }]
 
@@ -251,7 +256,7 @@ user = "aerodb"
 [[test.progressive-urans-wall-live.check]]
 name = "schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-urans-wall-live.check]]
 name = "seed"
@@ -269,7 +274,7 @@ name = "joint-wall-histories"
 tier = "development"
 requires = ["seed", "types"]
 env = { PROGRESSIVE_REQUIRE_URANS_HISTORIES = "1", PROGRESSIVE_LIVE_TARGET_Y_PLUS = "40" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 timeout_seconds = 3900
 retained_artifacts = [{ name = "joint-wall-urans", path = ".codex-artifacts/progressive-live-30-urans-yplus40", max_bytes = 10485760 }]
 
@@ -281,7 +286,7 @@ user = "aerodb"
 [[test.progressive-hold-live.check]]
 name = "schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-hold-live.check]]
 name = "seed"
@@ -299,7 +304,7 @@ name = "two-held-rans-angles"
 tier = "development"
 requires = ["seed", "types"]
 env = { PROGRESSIVE_REQUIRE_RANS_HOLD = "1" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 timeout_seconds = 2100
 retained_artifacts = [{ name = "held-rans-journey", path = ".codex-artifacts/progressive-live-30-hold", max_bytes = 10485760 }]
 
@@ -308,7 +313,7 @@ name = "two-held-compressible-angles"
 tier = "release"
 requires = ["two-held-rans-angles"]
 env = { PROGRESSIVE_REQUIRE_RANS_HOLD = "1", PROGRESSIVE_LIVE_SPEED_MPS = "166" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 timeout_seconds = 2100
 retained_artifacts = [{ name = "held-compressible-journey", path = ".codex-artifacts/progressive-live-166-hold", max_bytes = 10485760 }]
 
@@ -333,7 +338,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 [[test.progressive-reset-preparation.check]]
 name = "schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-reset-preparation.check]]
 name = "seed"
@@ -674,7 +679,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typechec
 [[test.progressive-density-live.check]]
 name = "schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-density-live.check]]
 name = "seed"
@@ -688,7 +693,7 @@ tier = "development"
 requires = ["dependencies", "types", "seed"]
 timeout_seconds = 2700
 env = { PROGRESSIVE_LIVE_SPEED_MPS = "1020", PROGRESSIVE_LIVE_ENGINE_DEPLOYMENT = "progressive-test-engine" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 retained_artifacts = [{ name = "real-high-mach-journey", path = ".codex-artifacts/progressive-live-1020", max_bytes = 10485760 }]
 
 [test.progressive-live.postgres]
@@ -717,7 +722,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typechec
 [[test.progressive-pressure-candidate.check]]
 name = "schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-pressure-candidate.check]]
 name = "seed"
@@ -731,7 +736,7 @@ tier = "development"
 requires = ["dependencies", "types", "seed"]
 timeout_seconds = 2100
 env = { PROGRESSIVE_LIVE_SPEED_MPS = "166", PROGRESSIVE_LIVE_MOMENTUM_SCHEME = "upwind" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 retained_artifacts = [{ name = "first-order-pressure-journey", path = ".codex-artifacts/progressive-live-166-upwind", max_bytes = 10485760 }]
 
 [[test.progressive-live.check]]
@@ -742,7 +747,7 @@ command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev"
 [[test.progressive-live.check]]
 name = "ingest-schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive-live.check]]
 name = "ingest-seed"
@@ -760,7 +765,7 @@ name = "live-fast-journey"
 tier = "development"
 requires = ["dependencies", "live-journey-types", "ingest-seed"]
 timeout_seconds = 2100
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 retained_artifacts = [{ name = "real-progressive-journey", path = ".codex-artifacts/progressive-live-30", max_bytes = 10485760 }]
 
 [[test.progressive-live.check]]
@@ -769,7 +774,7 @@ tier = "development"
 requires = ["live-fast-journey"]
 timeout_seconds = 2100
 env = { PROGRESSIVE_LIVE_SPEED_MPS = "166" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 retained_artifacts = [{ name = "real-compressible-journey", path = ".codex-artifacts/progressive-live-166", max_bytes = 10485760 }]
 
 [[test.progressive-live.check]]
@@ -778,7 +783,7 @@ tier = "release"
 requires = ["live-compressible-journey"]
 timeout_seconds = 2700
 env = { PROGRESSIVE_LIVE_SPEED_MPS = "1020" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
 retained_artifacts = [{ name = "real-high-mach-journey", path = ".codex-artifacts/progressive-live-1020", max_bytes = 10485760 }]
 
 [[test.progressive.check]]
@@ -807,7 +812,7 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_api.py", "tests/test_
 [[test.progressive.check]]
 name = "ingest-schema"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
 [[test.progressive.check]]
 name = "ingest-seed"
@@ -1407,7 +1412,7 @@ name = "material-editor"
 tier = "development"
 requires = ["preview-origin", "api-origin", "preview-ready"]
 timeout_seconds = 180
-command = ["/usr/bin/corepack", "pnpm", "exec", "tsx", "scripts/dev/verify-material-editor.mts"]
+command = ["/usr/bin/corepack", "pnpm", "exec", "node", "--import", "tsx", "scripts/dev/verify-material-editor.mts"]
 
 [[test.progressive-ui.check]]
 name = "preview-origin"

@@ -12,9 +12,9 @@
   },
   "scripts": {
     "generate": "drizzle-kit generate",
-    "migrate": "tsx src/migrate.ts",
+    "migrate": "node --import tsx src/migrate.ts",
     "push": "drizzle-kit push",
-    "seed": "tsx seed/index.ts",
+    "seed": "node --import tsx seed/index.ts",
     "backfill:polar-cache": "tsx src/backfill-polar-cache.ts",
     "backfill:physics-hash": "tsx src/backfill-physics-hash.ts",
     "backfill:canonical-keys": "tsx src/backfill-canonical-keys.ts",

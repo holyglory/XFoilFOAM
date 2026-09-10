@@ -6,7 +6,7 @@ case "${1:?Expected api or web}" in
     export API_PORT="${PORT:?}" API_HOST=127.0.0.1
     export ENGINE_URL=http://127.0.0.1:1 AIRFOILFOAM_EVIDENCE_BUCKET= ENGINE_CONTROL_PLANE_TOKEN=
     corepack pnpm --filter @aerodb/db migrate
-    corepack pnpm --filter @aerodb/db exec tsx src/seed-progressive-preview.ts
+    corepack pnpm --filter @aerodb/db exec node --import tsx src/seed-progressive-preview.ts
     exec node scripts/dev/progressive-preview-engine.mjs api
     ;;
   web)
