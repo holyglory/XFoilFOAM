@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from airfoilfoam.neuralfoil_solver import BaselineCondition, BaselineRecipe, solve_baseline
+from airfoilfoam.neuralfoil_solver import _distances_to_segments, _geometry_fit_errors, _neuralfoil_geometry
 
 
 def geometry():
@@ -59,6 +60,64 @@ def test_inaccurate_geometry_fit_is_reported_as_unavailable():
     points, provenance = geometry()
     with pytest.raises(ValueError, match="not represented accurately"):
         solve_baseline(points, provenance, [condition()], replace(recipe(), maximum_geometry_rms=1e-12))
+
+
+@pytest.mark.parametrize("profile", ["b707b", "b707c", "cap21c", "e49"])
+def test_sparse_geometry_fallback_evaluates_the_same_retained_polyline(profile):
+    import aerosandbox as asb
+
+    source = Path(__file__).resolve().parents[1] / f"packages/db/seed/selig-database/{profile}.dat"
+    original = asb.Airfoil(name=profile, coordinates=str(source))
+    coordinates = original.coordinates.tolist()
+    preserved = json.dumps(coordinates)
+    fitted, fit = _neuralfoil_geometry(original, recipe())
+    assert fit["method"] == "retained-polyline-segment-sampling-v1"
+    assert fit["fit_point_count"] > len(coordinates)
+    assert np.max(_distances_to_segments(fitted.coordinates, original.coordinates)) < 1e-12
+    assert all(np.any(np.all(fitted.coordinates == vertex, axis=1)) for vertex in original.coordinates)
+    predictions = solve_baseline(coordinates, {"source": "trusted-seed", "profile": profile}, [condition(), condition(0.729)], recipe())
+    expected = fitted.get_aero_from_neuralfoil(alpha=np.asarray(condition().alpha), Re=500000.0, mach=0.1,
+                                              n_crit=9, xtr_upper=0, xtr_lower=0, model_size="large")
+    np.testing.assert_allclose(predictions[0]["coefficients"], np.column_stack([expected[name] for name in ["CL", "CD", "CM"]]))
+    assert predictions[0]["geometry_fit"] == fit
+    assert json.dumps(coordinates) == preserved
+    assert all(prediction["uncertainty_calibration"] == "unvalidated" for prediction in predictions)
+
+
+@pytest.mark.parametrize("profile", ["fx79w470a", "hs1430", "r1145msm"])
+def test_fallback_does_not_relax_geometry_limits(profile):
+    import aerosandbox as asb
+
+    source = Path(__file__).resolve().parents[1] / f"packages/db/seed/selig-database/{profile}.dat"
+    original = asb.Airfoil(name=profile, coordinates=str(source))
+    with pytest.raises(ValueError, match="not represented accurately"):
+        solve_baseline(original.coordinates.tolist(), {"source": "trusted-seed", "profile": profile}, [condition()], recipe())
+
+
+def test_native_fit_is_retained_without_new_prediction_provenance():
+    import aerosandbox as asb
+
+    coordinates, _ = geometry()
+    original = asb.Airfoil(name="ag24", coordinates=np.asarray(coordinates))
+    fitted, fit = _neuralfoil_geometry(original, recipe())
+    assert fitted is original
+    assert set(fit) == {"rms_chord", "maximum_chord"}
+
+
+def test_fit_sampling_budget_prevents_unbounded_expansion(monkeypatch):
+    from types import SimpleNamespace
+
+    coordinates = np.tile([[0.0, 0.0], [1.0, 0.0]], (100, 1))
+    normalized = SimpleNamespace(coordinates=coordinates, to_kulfan_airfoil=lambda **kwargs: SimpleNamespace(coordinates=coordinates))
+    original = SimpleNamespace(coordinates=coordinates, normalize=lambda: normalized)
+    monkeypatch.setattr("airfoilfoam.neuralfoil_solver._geometry_fit_errors", lambda *args: (1.0, 1.0))
+    with pytest.raises(ValueError, match="bounded NeuralFoil fit sampling budget"):
+        _neuralfoil_geometry(original, recipe())
+
+
+def test_nonfinite_fit_geometry_is_unavailable():
+    with pytest.raises(ValueError, match="geometry fit is not finite"):
+        _geometry_fit_errors(np.asarray([[0.0, 0.0], [1.0, 0.0]]), np.asarray([[0.0, np.nan], [1.0, 0.0]]))
 
 
 def test_missing_geometry_never_falls_back_to_name_based_airfoil_generation():

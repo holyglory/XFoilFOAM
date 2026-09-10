@@ -94,6 +94,50 @@ def _validate_condition(condition: BaselineCondition) -> None:
         raise ValueError("A baseline needs a finite increasing polar angle grid")
 
 
+def _geometry_fit_errors(reference: np.ndarray, approximation: np.ndarray) -> tuple[float, float]:
+    if not np.all(np.isfinite(reference)) or not np.all(np.isfinite(approximation)):
+        raise ValueError("NeuralFoil geometry fit is not finite")
+    distances = np.concatenate((
+        _distances_to_segments(reference, approximation),
+        _distances_to_segments(approximation, reference),
+    ))
+    rms, maximum = float(np.sqrt(np.mean(distances ** 2))), float(np.max(distances))
+    if not np.isfinite(rms) or not np.isfinite(maximum):
+        raise ValueError("NeuralFoil geometry fit is not finite")
+    return rms, maximum
+
+
+def _neuralfoil_geometry(original, recipe: BaselineRecipe):
+    import aerosandbox as asb
+
+    normalized = original.normalize()
+    approximation = normalized.to_kulfan_airfoil(n_weights_per_side=8, normalize_coordinates=False)
+    native_rms, native_maximum = _geometry_fit_errors(normalized.coordinates, approximation.coordinates)
+    if native_rms <= recipe.maximum_geometry_rms and native_maximum <= recipe.maximum_geometry_error:
+        return original, {"rms_chord": native_rms, "maximum_chord": native_maximum}
+    spacing = 0.01
+    counts = np.maximum(1, np.ceil(np.linalg.norm(np.diff(normalized.coordinates, axis=0), axis=1) / spacing).astype(int))
+    if int(np.sum(counts)) + 1 > 8192:
+        raise ValueError("Stored geometry exceeds the bounded NeuralFoil fit sampling budget")
+    segments = []
+    for index, count in enumerate(counts):
+        start, end = original.coordinates[index:index + 2]
+        segments.extend(start + (end - start) * step / count for step in range(count))
+    coordinates = np.asarray([*segments, original.coordinates[-1]])
+    candidate = asb.Airfoil(name="stored-polyline-fit", coordinates=coordinates)
+    candidate_normalized = candidate.normalize()
+    approximation = candidate_normalized.to_kulfan_airfoil(n_weights_per_side=8, normalize_coordinates=False)
+    rms, maximum = _geometry_fit_errors(normalized.coordinates, approximation.coordinates)
+    if rms > recipe.maximum_geometry_rms or maximum > recipe.maximum_geometry_error:
+        raise ValueError(f"Stored geometry is not represented accurately enough by NeuralFoil: rms={rms:g}, max={maximum:g}")
+    return candidate, {
+        "rms_chord": rms, "maximum_chord": maximum,
+        "method": "retained-polyline-segment-sampling-v1",
+        "maximum_segment_chord": spacing, "fit_point_count": len(coordinates),
+        "native_rms_chord": native_rms, "native_maximum_chord": native_maximum,
+    }
+
+
 def solve_baseline(coordinates: list[list[float]], geometry_provenance: dict,
                    conditions: list[BaselineCondition], recipe: BaselineRecipe) -> list[dict]:
     import aerosandbox as asb
@@ -116,21 +160,11 @@ def solve_baseline(coordinates: list[list[float]], geometry_provenance: dict,
         raise ValueError("Duplicate baseline target")
     provenance = model_provenance(recipe.model_size)
     original = asb.Airfoil(name="stored-coordinate-profile", coordinates=points)
-    normalized = original.normalize()
-    kulfan = normalized.to_kulfan_airfoil(n_weights_per_side=8, normalize_coordinates=False)
-    approximation = np.asarray(kulfan.coordinates, dtype=float)
-    distances = np.concatenate((
-        _distances_to_segments(normalized.coordinates, approximation),
-        _distances_to_segments(approximation, normalized.coordinates),
-    ))
-    rms = float(np.sqrt(np.mean(distances ** 2)))
-    maximum = float(np.max(distances))
-    if rms > recipe.maximum_geometry_rms or maximum > recipe.maximum_geometry_error:
-        raise ValueError(f"Stored geometry is not represented accurately enough by NeuralFoil: rms={rms:g}, max={maximum:g}")
+    fitted, geometry_fit = _neuralfoil_geometry(original, recipe)
     lengths = [len(condition.alpha) for condition in conditions]
     angles = np.concatenate([condition.alpha for condition in conditions])
     expanded = lambda name: np.repeat([getattr(condition, name) for condition in conditions], lengths)
-    aerodynamic = original.get_aero_from_neuralfoil(
+    aerodynamic = fitted.get_aero_from_neuralfoil(
         alpha=angles, Re=expanded("reynolds"), mach=expanded("mach"), n_crit=expanded("n_crit"),
         xtr_upper=expanded("transition_upper"), xtr_lower=expanded("transition_lower"), model_size=recipe.model_size,
     )
@@ -150,7 +184,7 @@ def solve_baseline(coordinates: list[list[float]], geometry_provenance: dict,
             "version": BASELINE_VERSION, "kind": "prediction", "method": "neuralfoil",
             "target_signature": condition.target_signature, "condition": asdict(condition),
             "recipe": asdict(recipe), "model": provenance, "geometry_signature": geometry_signature,
-            "geometry_provenance": geometry_provenance, "geometry_fit": {"rms_chord": rms, "maximum_chord": maximum},
+            "geometry_provenance": geometry_provenance, "geometry_fit": geometry_fit,
             "alpha": condition.alpha, "coefficients": coefficients[offset:offset + length].tolist(),
             "analysis_confidence": confidence[offset:offset + length].tolist(),
             "compressibility_diagnostics": {
