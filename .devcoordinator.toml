@@ -93,6 +93,14 @@ timeout_seconds = 7200
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.rae-field-diagnostics]
+timeout_seconds = 120
+
+[[test.rae-field-diagnostics.check]]
+name = "retained-field-extrema"
+tier = "development"
+command = [".venv/bin/python", "scripts/materials/inspect_rae_extrema.py", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-enthalpy-upwind-20260909", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-donor-refinement-20260909", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-mixed-energy-20260909"]
+
 [test.neuralfoil-geometry-research]
 timeout_seconds = 120
 
@@ -121,6 +129,39 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_reference.py"
 
 [test.progressive-hold-live]
 timeout_seconds = 4500
+
+[test.progressive-urans-live]
+timeout_seconds = 4500
+
+[test.progressive-urans-live.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-urans-live.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive-urans-live.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-urans-live.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.progressive-urans-live.check]]
+name = "joint-physical-histories"
+tier = "development"
+requires = ["seed", "types"]
+env = { PROGRESSIVE_REQUIRE_URANS_HISTORIES = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+timeout_seconds = 2100
+retained_artifacts = [{ name = "joint-urans-journey", path = ".codex-artifacts/progressive-live-30-urans", max_bytes = 10485760 }]
 
 [test.progressive-hold-live.postgres]
 image = "postgres:16-alpine"
@@ -1058,6 +1099,39 @@ components = ["inspection"]
 public = false
 ttl_seconds = 86400
 
+[deployment.rae-enthalpy-upwind]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-pressure-damped]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-pressure-damped.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-transonic-damped"]
+finite_services = ["enthalpy-transonic-damped"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-enthalpy-upwind.component.numerics]
+type = "compose"
+env = { RAE_DONOR_CASE = "/evidence/enthalpy-upwind/ececb357-7185-46ff-b4e9-6032268384a6" }
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-transonic-relaxed"]
+finite_services = ["enthalpy-transonic-relaxed"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.thermophysics-check.component.inspection]
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }
@@ -1129,6 +1203,12 @@ name = "real-cfd-evidence"
 tier = "development"
 requires = ["preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs"]
+
+[[test.progressive-ui.check]]
+name = "deferred-cfd-points"
+tier = "development"
+requires = ["preview-ready"]
+command = ["node", "scripts/dev/verify-deferred-cfd-points.mjs"]
 
 [[test.progressive-ui.check]]
 name = "control-sizing"

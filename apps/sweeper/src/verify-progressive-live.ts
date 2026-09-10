@@ -39,7 +39,10 @@ import {
 } from "../../../packages/db/seed/runtime-profiles";
 import { assertSeedCoordinateIntegrity } from "../../../packages/db/seed/coordinate-integrity";
 import { sourceAirModel } from "../../../packages/core/test/fixtures/source-air-model";
-import { progressiveRefinementProof } from "./progressive-refinement-proof";
+import {
+  progressiveRefinementProof,
+  progressiveUransHistoryProof,
+} from "./progressive-refinement-proof";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const engineDeployment =
@@ -54,6 +57,12 @@ const requestedSpeedMps = Number(
 const requestedMomentumScheme =
   process.env.PROGRESSIVE_LIVE_MOMENTUM_SCHEME ?? "linearUpwind";
 const requireRansHold = process.env.PROGRESSIVE_REQUIRE_RANS_HOLD === "1";
+const requireUransHistories =
+  process.env.PROGRESSIVE_REQUIRE_URANS_HISTORIES === "1";
+assert(
+  !(requireRansHold && requireUransHistories),
+  "Choose one explicit native evidence proof",
+);
 assert(
   ["linearUpwind", "upwind"].includes(requestedMomentumScheme),
   "Unsupported numerical comparison recipe",
@@ -184,7 +193,7 @@ const { db, sql: connection } = createClient({ max: 4 });
 const prefix = `pw-progressive-live-${randomUUID()}`;
 const directory = resolve(
   root,
-  `.codex-artifacts/progressive-live-${requestedSpeedMps}${requestedMomentumScheme === "upwind" ? "-upwind" : ""}${requireRansHold ? "-hold" : ""}`,
+  `.codex-artifacts/progressive-live-${requestedSpeedMps}${requestedMomentumScheme === "upwind" ? "-upwind" : ""}${requireRansHold ? "-hold" : ""}${requireUransHistories ? "-urans" : ""}`,
 );
 mkdirSync(directory, { recursive: true });
 const abort = new AbortController();
@@ -212,6 +221,7 @@ const report: Record<string, unknown> = {
   buildId: health.build_id,
   requestedSpeedMps,
   requestedMomentumScheme,
+  requireUransHistories,
   experimentalNumericalRecipe: requestedMomentumScheme === "upwind",
   workerRuntime: worker,
   expectedSolverSource,
@@ -344,7 +354,7 @@ try {
         fromDeg: null,
         toDeg: null,
         stepDeg: null,
-        listDeg: [-2, 0, 2, 4],
+        listDeg: requireUransHistories ? [18, 20, 22, 24] : [-2, 0, 2, 4],
       },
       objectives: {
         ldMax: { enabled: false, toleranceDeg: 0.1, maxRounds: 4 },
@@ -483,6 +493,48 @@ try {
             report.firstRefinement ??= curves;
           }
           if (proof.refined) {
+            let historiesReady = true;
+            if (requireUransHistories) {
+              const stored = await db.execute(sql`
+                SELECT id, aoa_deg, regime, converged FROM result_attempts WHERE id IN (
+                  ${sql.join(
+                    proof.contributorAttemptIds.map((id) => sql`${id}::uuid`),
+                    sql`, `,
+                  )}
+                )
+              `);
+              const [model] = await db.execute(
+                sql`SELECT request FROM progressive_polar_models WHERE id = ${modelId}`,
+              );
+              const manifest = model?.request as
+                | {
+                    histories?: unknown;
+                    history_policy?: { minimum_samples?: number };
+                  }
+                | undefined;
+              const historyProof = progressiveUransHistoryProof(
+                proof.contributorAttemptIds,
+                manifest?.histories,
+                new Map(
+                  stored.map((row) => [
+                    String(row.id),
+                    {
+                      alpha: Number(row.aoa_deg),
+                      regime: String(row.regime),
+                      converged:
+                        row.converged === true
+                          ? true
+                          : row.converged === false
+                            ? false
+                            : null,
+                    },
+                  ]),
+                ),
+                Number(manifest?.history_policy?.minimum_samples),
+              );
+              report.uransHistoryProof = historyProof;
+              historiesReady = historyProof.joint;
+            }
             if (requireRansHold) {
               const attemptIds = [
                 ...new Set(
@@ -514,18 +566,22 @@ try {
                 "Two actual accepted RANS angles with exact hold certificates are required",
               );
             }
-            report.distinctCfdAngles = proof.distinctCfdAngles;
-            refined = true;
-            report.refinedObservedAt = new Date().toISOString();
-            report.refined = curves;
-            break;
+            if (historiesReady) {
+              report.distinctCfdAngles = proof.distinctCfdAngles;
+              refined = true;
+              report.refinedObservedAt = new Date().toISOString();
+              report.refined = curves;
+              break;
+            }
           }
         }
       }
     }
     assert(
       Number(snapshot.observed_stages) < 3 || Number(snapshot.open_work) > 0,
-      "All campaign stages closed without two usable CFD angles; inspect retained work and evidence",
+      requireUransHistories
+        ? "All campaign stages closed without joint multi-angle URANS histories; inspect retained evidence"
+        : "All campaign stages closed without two usable CFD angles; inspect retained work and evidence",
     );
     await delay(100, undefined, { signal: abort.signal });
   }

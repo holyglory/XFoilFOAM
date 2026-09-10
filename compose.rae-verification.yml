@@ -51,6 +51,30 @@ services:
     <<: *verification
     image: xfoilfoam-enthalpy:verification
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-transonic", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--transonic"]
+  enthalpy-upwind:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order"]
+  enthalpy-refine:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-refine", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--donor", "${RAE_DONOR_CASE:-/evidence/unavailable-donor}"]
+  enthalpy-mixed-energy:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-mixed-energy", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--donor", "${RAE_DONOR_CASE:-/evidence/unavailable-donor}", "--upwind-energy"]
+  enthalpy-transonic-krylov:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-transonic-krylov", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--transonic", "--pressure-krylov"]
+  enthalpy-transonic-relaxed:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-transonic-relaxed", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--transonic", "--pressure-equation-relaxation"]
+  enthalpy-transonic-damped:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-transonic-damped", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--transonic", "--pressure-equation-relaxation", "0.3"]
   artifacts:
     image: xfoilfoam-local-steady:verification
     pull_policy: never

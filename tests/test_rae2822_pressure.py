@@ -1,7 +1,129 @@
 import numpy as np
 import pytest
+import json
+import hashlib
 
-from scripts.materials.verify_rae2822 import benchmark_mesh, compare_pressure, configure_enthalpy_energy, configure_transonic_pressure, pressure_iteration, wall_pressure
+from scripts.materials.verify_rae2822 import benchmark_mesh, benchmark_momentum_scheme, compare_pressure, configure_enthalpy_energy, configure_pressure_equation_relaxation, configure_pressure_krylov, configure_transonic_pressure, configure_upwind_energy, pressure_iteration, restore_verified_donor, wall_pressure
+
+
+def test_pressure_equation_relaxation_does_not_replace_field_relaxation(tmp_path):
+    path = tmp_path / "fvSolution"
+    fields = "fields { p 0.3; rho 0.01; }"
+    path.write_text(f"relaxationFactors {{ {fields} equations {{ U 0.3; h 0.7; }} }}")
+    configure_pressure_equation_relaxation(path)
+    assert fields in path.read_text()
+    assert "p 1;" in path.read_text()
+    assert "pFinal 1;" in path.read_text()
+    assert "U 0.3; h 0.7;" in path.read_text()
+    before = path.read_text()
+    with pytest.raises(ValueError, match="without pressure"):
+        configure_pressure_equation_relaxation(path)
+    assert path.read_text() == before
+
+
+def test_pressure_equation_damping_is_explicit_and_bounded(tmp_path):
+    path = tmp_path / "fvSolution"
+    original = "relaxationFactors { fields {p 0.3;} equations {U 0.3; h 0.7;} }"
+    path.write_text(original)
+    for value in [0, -1, 1.1, float("nan")]:
+        with pytest.raises(ValueError, match="relaxation must"):
+            configure_pressure_equation_relaxation(path, value)
+        assert path.read_text() == original
+    configure_pressure_equation_relaxation(path, 0.3)
+    assert "pFinal 0.3;" in path.read_text()
+    assert "fields {p 0.3;}" in path.read_text()
+
+
+def test_pressure_krylov_changes_only_two_generated_pressure_blocks(tmp_path):
+    path = tmp_path / "fvSolution"
+    pressure = "solver GAMG; smoother GaussSeidel; tolerance 1e-7; relTol 0.01;"
+    other = "Phi {solver GAMG; smoother DIC; tolerance 1e-6;}"
+    original = f"solvers {{p {{{pressure}}} pFinal {{{pressure}}} {other}}}"
+    path.write_text(original)
+    configure_pressure_krylov(path)
+    assert path.read_text().count("solver PBiCGStab;") == 2
+    assert path.read_text().count("preconditioner DILU;") == 2
+    assert other in path.read_text()
+    malformed = original.replace("pFinal", "otherPressure")
+    path.write_text(malformed)
+    with pytest.raises(ValueError, match="exactly p and pFinal"):
+        configure_pressure_krylov(path)
+    assert path.read_text() == malformed
+
+
+def test_energy_transport_experiment_preserves_momentum_and_preflights_before_write(tmp_path):
+    path = tmp_path / "fvSchemes"
+    original = "divSchemes {\n" + "\n".join(f"div(phi,{field}) bounded Gauss linearUpwind limited;" for field in ["U", "h", "K", "Ekp"]) + "\n}"
+    path.write_text(original)
+    configure_upwind_energy(path)
+    assert "div(phi,U) bounded Gauss linearUpwind limited;" in path.read_text()
+    for field in ["h", "K", "Ekp"]:
+        assert f"div(phi,{field}) bounded Gauss upwind;" in path.read_text()
+    malformed = original.replace("div(phi,h)", "div(phi,T)")
+    path.write_text(malformed)
+    with pytest.raises(ValueError, match="three energy"):
+        configure_upwind_energy(path)
+    assert path.read_text() == malformed
+
+
+def donor_fixture(directory):
+    source, destination = directory / "donor", directory / "fresh"
+    (source / "2147").mkdir(parents=True)
+    (source / "constant/polyMesh").mkdir(parents=True)
+    destination.mkdir()
+    request = {"solver": {"momentum_scheme": "linearUpwind"}, "mesh": {"n_surface": 128}}
+    report = {"outcome": "measured_converged", "convergence": {"converged": True}, "pressure_iteration": 2147,
+              "request": {**request, "solver": {"momentum_scheme": "upwind"}},
+              "experimental_transonic_pressure": False, "experimental_energy_form": "sensibleEnthalpy"}
+    (source / "report.json").write_text(json.dumps(report))
+    for field in ["U", "p", "T", "k", "omega", "rho", "phi"]:
+        (source / "2147" / field).write_text(f"isolated field fixture {field}")
+    for member in ["points", "faces", "owner", "neighbour", "boundary"]:
+        (source / "constant/polyMesh" / member).write_text(f"isolated mesh fixture {member}")
+    return source, destination, request
+
+
+def test_verified_donor_preserves_source_and_copies_only_exact_mesh_and_field_bytes(tmp_path):
+    source, destination, request = donor_fixture(tmp_path)
+    before = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+    receipt = restore_verified_donor(source, destination, request, True, False)
+    assert receipt["coordinate"] == 2147
+    assert receipt["report_sha256"] == hashlib.sha256(before["report.json"]).hexdigest()
+    assert len(receipt["members"]) == 12
+    for member in receipt["members"]:
+        assert (destination / member["path"]).read_bytes() == before[member["path"]]
+    assert before == {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+    assert not (destination / "report.json").exists()
+    assert not (destination / "postProcessing").exists()
+
+
+@pytest.mark.parametrize("defect", ["field", "mesh", "physical", "convergence", "symlink"])
+def test_donor_preflight_rejects_incomplete_or_incompatible_input_before_copy(tmp_path, defect):
+    source, destination, request = donor_fixture(tmp_path)
+    if defect == "field":
+        (source / "2147/T").unlink()
+    elif defect == "mesh":
+        (source / "constant/polyMesh/points").unlink()
+    elif defect == "physical":
+        request["mesh"]["n_surface"] = 256
+    elif defect == "convergence":
+        report = json.loads((source / "report.json").read_text())
+        report["convergence"]["converged"] = False
+        (source / "report.json").write_text(json.dumps(report))
+    else:
+        (source / "2147/linked").symlink_to(source / "2147/U")
+    with pytest.raises(ValueError):
+        restore_verified_donor(source, destination, request, True, False)
+    assert list(destination.iterdir()) == []
+    with pytest.raises(ValueError, match="separate sibling"):
+        restore_verified_donor(source, source / "nested", request, True, False)
+
+
+def test_first_order_experiment_is_explicit_and_preserves_the_default():
+    assert benchmark_momentum_scheme() == "linearUpwind"
+    assert benchmark_momentum_scheme(True) == "upwind"
+    with pytest.raises(ValueError, match="explicit"):
+        benchmark_momentum_scheme("true")
 
 
 @pytest.mark.parametrize("tier", ["fast", "precise", "refined"])

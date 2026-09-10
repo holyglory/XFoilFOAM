@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import sys
 import xml.etree.ElementTree as xml
 from dataclasses import asdict
@@ -15,6 +16,12 @@ from rae2822_reference import load_reference, selig_coordinates
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
+
+
+def benchmark_momentum_scheme(first_order=False):
+    if not isinstance(first_order, bool):
+        raise ValueError("Transport order must be an explicit benchmark choice")
+    return "upwind" if first_order else "linearUpwind"
 
 
 def benchmark_mesh(tier, wall_functions=False):
@@ -133,7 +140,87 @@ def configure_enthalpy_energy(directory):
         path.write_text(updated)
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False):
+def configure_pressure_equation_relaxation(path, factor=1):
+    if not isinstance(factor, (int, float)) or not np.isfinite(factor) or not 0 < factor <= 1:
+        raise ValueError("Pressure equation relaxation must be in (0, 1]")
+    path = Path(path)
+    original = path.read_text()
+    matches = list(re.finditer(r"\bequations\s*\{([^{}]*)\}", original))
+    if len(matches) != 1 or re.search(r"\bp(?:Final)?\s+", matches[0][1]):
+        raise ValueError("Expected one generated equation block without pressure relaxation")
+    match = matches[0]
+    replacement = f"equations {{{match[1]}\n        p {factor:g};\n        pFinal {factor:g};\n    }}"
+    path.write_text(original[:match.start()] + replacement + original[match.end():])
+
+
+def configure_pressure_krylov(path):
+    path = Path(path)
+    original = path.read_text()
+    names = []
+
+    def replace(match):
+        names.append(match[1])
+        body, solvers = re.subn(r"\bsolver\s+GAMG\s*;", "solver PBiCGStab;", match[2])
+        body, preconditioners = re.subn(r"\bsmoother\s+GaussSeidel\s*;", "preconditioner DILU;", body)
+        if solvers != 1 or preconditioners != 1:
+            raise ValueError("Expected generated pressure GAMG settings")
+        return f"{match[1]} {{{body}}}"
+
+    updated = re.sub(r"\b(p|pFinal)\s*\{([^{}]*)\}", replace, original)
+    if sorted(names) != ["p", "pFinal"]:
+        raise ValueError("Expected exactly p and pFinal pressure solvers")
+    path.write_text(updated)
+
+
+def configure_upwind_energy(path):
+    path = Path(path)
+    original = path.read_text()
+    updated, count = re.subn(r"(div\(phi,(?:e|h|K|Ekp)\)\s+)bounded Gauss linearUpwind limited;", r"\1bounded Gauss upwind;", original)
+    if count != 3 or len(re.findall(r"div\(phi,U\)\s+bounded Gauss linearUpwind limited;", original)) != 1:
+        raise ValueError("Expected exact higher-order momentum and three energy transport entries")
+    path.write_text(updated)
+
+
+def restore_verified_donor(source, destination, request, enthalpy, transonic):
+    source, destination = Path(source).resolve(), Path(destination).resolve()
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError("Donor and fresh result must be separate sibling scopes")
+    report_bytes = (source / "report.json").read_bytes()
+    report = json.loads(report_bytes)
+    expected = json.loads(json.dumps(request))
+    expected["solver"]["momentum_scheme"] = "upwind"
+    coordinate = report.get("pressure_iteration")
+    if (report.get("outcome") != "measured_converged" or report.get("convergence", {}).get("converged") is not True
+            or report.get("request") != expected or report.get("experimental_transonic_pressure") != transonic
+            or report.get("experimental_energy_form") != ("sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy")
+            or not isinstance(coordinate, (int, float)) or not np.isfinite(coordinate) or coordinate <= 0 or not float(coordinate).is_integer()):
+        raise ValueError("Donor does not match the converged physical and numerical setup")
+    time_name = str(int(coordinate))
+    for field in ["U", "p", "T", "k", "omega", "rho", "phi"]:
+        if not (source / time_name / field).is_file():
+            raise ValueError(f"Donor lacks the stored {field} field")
+    for member in ["points", "faces", "owner", "neighbour", "boundary"]:
+        if not (source / "constant/polyMesh" / member).is_file():
+            raise ValueError(f"Donor lacks the stored mesh {member}")
+    trees = [Path("constant/polyMesh"), Path(time_name)]
+    members = []
+    for tree in trees:
+        if not (source / tree).is_dir() or (destination / tree).exists():
+            raise ValueError("Donor mesh/fields are missing or the fresh destination is occupied")
+        for path in sorted((source / tree).rglob("*")):
+            if path.is_symlink():
+                raise ValueError("Donor members must be retained regular files")
+            if path.is_file():
+                members.append({"path": str(path.relative_to(source)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    for tree in trees:
+        shutil.copytree(source / tree, destination / tree)
+    for member in members:
+        if hashlib.sha256((destination / member["path"]).read_bytes()).hexdigest() != member["sha256"]:
+            raise ValueError("Copied donor field checksum mismatch")
+    return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
+
+
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None):
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
     from airfoilfoam.material_domain import check_material_domain
@@ -151,6 +238,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     from airfoilfoam.thermodynamics import ThermodynamicState
 
     reference = load_reference(reference_directory)
+    momentum_scheme = benchmark_momentum_scheme(first_order)
     conditions = reference["conditions"]
     destination = Path(destination) / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
@@ -166,7 +254,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         "fluid": {"density": density, "dynamic_viscosity": viscosity, "gas": gas.model_dump()}, "flow_state": state.model_dump(),
         "mesh": benchmark_mesh(tier, wall_functions),
         "solver": {"flow_solver_family": "rhoSimpleFoam", "force_transient": False, "transient_fallback": False,
-                   "momentum_scheme": "linearUpwind", "turbulent_prandtl": 0.85, "n_iterations": dimensions[3],
+                   "momentum_scheme": momentum_scheme, "turbulent_prandtl": 0.85, "n_iterations": dimensions[3],
                    "convergence_tolerance": dimensions[4], "write_images": []},
     })
     runner = get_runner(Settings())
@@ -178,8 +266,12 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
               "experimental_wall_functions": wall_functions,
-              "velocity_initialization": "uniform-freestream" if uniform_start else "velocity-only-potential",
+              "velocity_initialization": "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
+              "experimental_momentum_scheme": momentum_scheme,
+              "experimental_energy_transport": "upwind" if upwind_energy else momentum_scheme,
+              "experimental_pressure_solver": "PBiCGStab" if pressure_krylov else "GAMG",
+              "experimental_pressure_equation_relaxation": pressure_equation_relaxation,
               "resolved_reynolds": density * speed * spec.chord / viscosity,
               "request": request.model_dump(mode="json")}
     try:
@@ -191,21 +283,33 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         builder.write(destination)
         if enthalpy:
             configure_enthalpy_energy(destination)
+        if upwind_energy:
+            configure_upwind_energy(destination / "system/fvSchemes")
         if transonic:
             configure_transonic_pressure(destination / "system/fvSolution")
+        if pressure_krylov:
+            configure_pressure_krylov(destination / "system/fvSolution")
+        if pressure_equation_relaxation is not None:
+            configure_pressure_equation_relaxation(destination / "system/fvSolution", pressure_equation_relaxation)
         _set_control_dict_entries(destination / "system/controlDict", {"writeInterval": 100, "purgeWrite": 2})
         report["benchmark_output_policy"] = {"write_interval_iterations": 100, "retained_field_times": 2}
-        mesher.write_inputs(destination, airfoil, mesh, spec.chord)
-        meshed = budgeted.application(destination, "blockMesh", timeout=120)
-        (destination / "log.blockMesh").write_text(meshed.stdout)
-        meshed.check()
+        if donor:
+            report["donor"] = restore_verified_donor(donor, destination, request.model_dump(mode="json"), enthalpy, transonic)
+            _set_control_dict_entries(destination / "system/controlDict", {
+                "startFrom": "latestTime", "endTime": int(report["donor"]["coordinate"]) + dimensions[3],
+            })
+        else:
+            mesher.write_inputs(destination, airfoil, mesh, spec.chord)
+            meshed = budgeted.application(destination, "blockMesh", timeout=120)
+            (destination / "log.blockMesh").write_text(meshed.stdout)
+            meshed.check()
         warnings = []
         verdict = _run_transient_mesh_qa_gate(destination, budgeted, warnings)
         if verdict is None:
             raise ValueError("Mesh quality is unavailable")
         report["mesh_quality"] = asdict(verdict)
         report["mesh_warnings"] = warnings
-        if not uniform_start:
+        if not uniform_start and not donor:
             initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
             (destination / "log.potentialFoam").write_text(initialized.stdout)
             initialized.check()
@@ -227,6 +331,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         if len(surfaces) != 1:
             raise ValueError(f"Expected one latest airfoil pressure surface, found {len(surfaces)}")
         report["pressure_iteration"] = pressure_iteration(surfaces[0])
+        if donor and report["pressure_iteration"] <= report["donor"]["coordinate"]:
+            raise ValueError("Refinement did not publish a newly calculated pressure field")
         computed = wall_pressure(surfaces[0], spec.chord, state.pressure_pa, density, speed, reference["coordinates"])
         report["pressure_comparison"] = compare_pressure(computed, reference["pressure"])
         report["pressure_surface"] = {"path": str(surfaces[0].relative_to(destination)),
@@ -264,5 +370,10 @@ if __name__ == "__main__":
     parser.add_argument("--wall-functions", action="store_true")
     parser.add_argument("--uniform-start", action="store_true")
     parser.add_argument("--enthalpy", action="store_true")
+    parser.add_argument("--first-order", action="store_true")
+    parser.add_argument("--donor")
+    parser.add_argument("--upwind-energy", action="store_true")
+    parser.add_argument("--pressure-krylov", action="store_true")
+    parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation)
