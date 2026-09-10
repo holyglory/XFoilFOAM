@@ -199,6 +199,42 @@ export async function verifyProgressiveRemoteReportInventory(
                   await settleProgressiveRemoteJob(unowned, executionId);
                 }),
               ).rejects.toThrow("no longer owns");
+              for (const delta of [-1, 0, 0.125]) {
+                const restoreBudget = new Error(
+                  "Restore isolated exhausted budget",
+                );
+                try {
+                  await scoped.transaction(async (isolated) => {
+                    const exhausted = isolated as unknown as DB;
+                    await exhausted.execute(sql`UPDATE progressive_cfd_units SET state='blocked',lease_token=NULL,lease_owner=NULL,lease_until=NULL,
+                      active_seconds=active_budget_seconds+${delta}
+                      WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)`);
+                    if (delta < 0)
+                      await expect(
+                        settleProgressiveRemoteJob(exhausted, executionId),
+                      ).rejects.toThrow("no longer owns");
+                    else {
+                      expect(
+                        await settleProgressiveRemoteJob(
+                          exhausted,
+                          executionId,
+                        ),
+                      ).toMatchObject({
+                        kind: "settled",
+                        evidencePending: true,
+                        counts: { complete: 0, retry: 0 },
+                      });
+                      const [retained] = await exhausted.execute(
+                        sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`,
+                      );
+                      expect(retained.ingestedAt).toBeNull();
+                    }
+                    throw restoreBudget;
+                  });
+                } catch (error) {
+                  if (error !== restoreBudget) throw error;
+                }
+              }
               await scoped.execute(sql`UPDATE sim_jobs SET ingest_lease_expires_at=clock_timestamp()+interval '1 minute'
                 WHERE id=${executionId}::uuid`);
               expect(

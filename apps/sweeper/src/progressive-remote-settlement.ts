@@ -35,15 +35,19 @@ async function settleCancelledUndeliveredExecution(
     >[1]["proof"],
   });
   const units =
-    await db.execute(sql`SELECT attempt.token,unit.id,unit.state,unit.lease_token
+    await db.execute(sql`SELECT attempt.token,unit.id,unit.state,unit.lease_token,unit.active_seconds,unit.active_budget_seconds
     FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
     WHERE attempt.sim_job_id=${executionId}::uuid AND attempt.outcome='running'
     ORDER BY unit.id FOR UPDATE OF unit,attempt`);
   if (
     units.some(
       (unit) =>
-        !["leased", "blocked"].includes(String(unit.state)) ||
-        unit.lease_token !== unit.token,
+        !(
+          (unit.state === "leased" && unit.lease_token === unit.token) ||
+          (unit.state === "blocked" &&
+            unit.lease_token === null &&
+            Number(unit.active_seconds) >= Number(unit.active_budget_seconds))
+        ),
     )
   )
     throw new Error(
