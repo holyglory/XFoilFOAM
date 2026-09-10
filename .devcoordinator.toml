@@ -1404,6 +1404,22 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.rae-density-lag-study]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-density-lag-study.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-density-refined"]
+finite_services = ["enthalpy-density-refined"]
+build = false
+port = true
+route = true
+timeout_seconds = 3300
+
 [deployment.rae-mpi-comparison]
 source = ["worktree"]
 components = ["numerics"]

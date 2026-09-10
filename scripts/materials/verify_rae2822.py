@@ -158,6 +158,17 @@ def configure_transonic_pressure(path):
     Path(path).write_text(changed)
 
 
+def configure_density_relaxation(path, factor):
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not np.isfinite(factor) or not 0 < factor <= 1:
+        raise ValueError("Density relaxation must be finite and in (0, 1]")
+    original = Path(path).read_text()
+    changed, count = re.subn(r"(\bfields\s*\{[^{}]*\brho\s+)0\.01(\s*;)",
+                             lambda match: f"{match[1]}{factor:g}{match[2]}", original)
+    if count != 1:
+        raise ValueError("Expected one generated density field relaxation")
+    Path(path).write_text(changed)
+
+
 def configure_consistent_pressure(path):
     original = Path(path).read_text()
     changed, count = re.subn(r"\bconsistent\s+no\s*;", "consistent yes;", original)
@@ -225,7 +236,7 @@ def configure_upwind_energy(path):
     path.write_text(updated)
 
 
-def restore_verified_donor(source, destination, request, enthalpy, transonic, consistent_pressure=False):
+def restore_verified_donor(source, destination, request, enthalpy, transonic, consistent_pressure=False, density_relaxation=None):
     source, destination = Path(source).resolve(), Path(destination).resolve()
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError("Donor and fresh result must be separate sibling scopes")
@@ -237,6 +248,7 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     if (report.get("outcome") != "measured_converged" or report.get("convergence", {}).get("converged") is not True
             or report.get("request") != expected or report.get("experimental_transonic_pressure") != transonic
             or report.get("experimental_consistent_pressure", False) != consistent_pressure
+            or report.get("experimental_density_relaxation") != density_relaxation
             or report.get("experimental_energy_form") != ("sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy")
             or not isinstance(coordinate, (int, float)) or not np.isfinite(coordinate) or coordinate <= 0 or not float(coordinate).is_integer()):
         raise ValueError("Donor does not match the converged physical and numerical setup")
@@ -265,8 +277,10 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None):
     started_at = time.monotonic()
+    if transonic and density_relaxation is not None:
+        raise ValueError("Transonic native pressure correction bypasses density relaxation")
     time_budget_seconds = benchmark_time_budget(time_budget_seconds)
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
@@ -320,6 +334,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
               "experimental_consistent_pressure": consistent_pressure,
+              "experimental_density_relaxation": density_relaxation,
               "experimental_wall_functions": wall_functions,
               "velocity_initialization": "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
@@ -346,6 +361,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             configure_transonic_pressure(destination / "system/fvSolution")
         if consistent_pressure:
             configure_consistent_pressure(destination / "system/fvSolution")
+        if density_relaxation is not None:
+            configure_density_relaxation(destination / "system/fvSolution", density_relaxation)
         if pressure_krylov:
             configure_pressure_krylov(destination / "system/fvSolution")
         if pressure_equation_relaxation is not None:
@@ -353,7 +370,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         _set_control_dict_entries(destination / "system/controlDict", {"writeInterval": 100, "purgeWrite": 2})
         report["benchmark_output_policy"] = {"write_interval_iterations": 100, "retained_field_times": 2}
         if donor:
-            report["donor"] = restore_verified_donor(donor, destination, request.model_dump(mode="json"), enthalpy, transonic, consistent_pressure)
+            report["donor"] = restore_verified_donor(donor, destination, request.model_dump(mode="json"), enthalpy, transonic, consistent_pressure, density_relaxation)
             _set_control_dict_entries(destination / "system/controlDict", {
                 "startFrom": "latestTime", "endTime": int(report["donor"]["coordinate"]) + dimensions[3],
             })
@@ -436,6 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--transonic", action="store_true")
     parser.add_argument("--consistent-pressure", action="store_true")
     parser.add_argument("--processes", type=int, default=1)
+    parser.add_argument("--density-relaxation", type=float)
     parser.add_argument("--wall-functions", action="store_true")
     parser.add_argument("--uniform-start", action="store_true")
     parser.add_argument("--enthalpy", action="store_true")
@@ -449,4 +467,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation)

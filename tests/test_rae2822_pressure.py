@@ -116,6 +116,27 @@ def test_donor_rejects_changed_consistent_pressure_algorithm(tmp_path):
         restore_verified_donor(source, destination, request, True, False, True)
 
 
+def test_density_relaxation_is_explicit_and_changes_only_its_field(tmp_path):
+    from scripts.materials.verify_rae2822 import configure_density_relaxation, run
+
+    path = tmp_path / "fvSolution"
+    original = "relaxationFactors { fields { p 0.3; rho 0.01; } equations { U 0.3; h 0.7; } }"
+    path.write_text(original)
+    for factor in [True, 0, -1, 1.1, float('nan'), float('inf')]:
+        with pytest.raises(ValueError, match="Density relaxation"):
+            configure_density_relaxation(path, factor)
+        assert path.read_text() == original
+    configure_density_relaxation(path, 1)
+    assert path.read_text() == original.replace("rho 0.01", "rho 1")
+    with pytest.raises(ValueError, match="one generated"):
+        configure_density_relaxation(path, 1)
+    with pytest.raises(ValueError, match="bypasses"):
+        run(None, None, None, "precise", transonic=True, density_relaxation=1)
+    source, destination, request = donor_fixture(tmp_path)
+    with pytest.raises(ValueError, match="does not match"):
+        restore_verified_donor(source, destination, request, True, False, density_relaxation=1)
+
+
 def test_benchmark_process_count_preserves_actual_worker_budget():
     from scripts.materials.verify_rae2822 import benchmark_processes
 
