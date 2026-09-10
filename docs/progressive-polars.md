@@ -614,6 +614,10 @@ paused. Progressive jobs use a separate ingestion path: cancelled final historie
 are retained after a physical-stop proof, omitted angles stay absent, and the legacy
 RANS-to-URANS handoff cannot launch replacement work from that ingestion. A terminal
 job status without a completed ingestion stamp cannot complete current-scope units.
+Progressive workers publish through their dedicated compact-evidence and archive
+services, never the legacy accepted-result publisher. A terminal worker report
+may precede local point staging; that temporary absence is not an empty solve and
+must not cancel the promise or create a legacy blocked-delivery receipt.
 If an exact remote promise was cancelled before all reported evidence arrived,
 verified physical stop and drained final reports may close its scheduling attempt
 as cancelled and its unfinished anchors as explicit gaps. This does not mark the

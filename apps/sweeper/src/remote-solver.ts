@@ -6385,16 +6385,13 @@ async function processFulfilledEvidenceUpgrades(
   return false;
 }
 
-async function processRemoteResultDeliveries(
-  db: DB,
-  engine: EngineClient,
-  settings: Settings,
-): Promise<boolean> {
-  const jobs = await db
+export async function readyLegacyRemoteResultJobs(db: DB, settings: Settings) {
+  return db
     .select()
     .from(simJobs)
     .where(
       and(
+        sql`NOT (${simJobs.requestPayload} ? 'remoteProgressiveExecution')`,
         // Multi-case jobs can become terminal after earlier cases have
         // already produced accepted immutable evidence. Job cancellation or
         // failure stops execution; it does not revoke those completed cases.
@@ -6549,6 +6546,14 @@ async function processRemoteResultDeliveries(
       simJobs.id,
     )
     .limit(250);
+}
+
+async function processRemoteResultDeliveries(
+  db: DB,
+  engine: EngineClient,
+  settings: Settings,
+): Promise<boolean> {
+  const jobs = await readyLegacyRemoteResultJobs(db, settings);
   for (const job of jobs) {
     const promiseId = (job.requestPayload as { syncPromiseId?: string } | null)
       ?.syncPromiseId;

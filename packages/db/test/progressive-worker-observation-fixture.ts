@@ -17,6 +17,7 @@ import type { EngineClient } from "../../engine-client/src";
 import { assertProgressiveWorkerEvidenceJob } from "../../../apps/sweeper/src/progressive-remote-jobs";
 import { verifyProgressiveWorkerEvidence } from "./progressive-worker-evidence-fixture";
 import { verifyProgressiveRestartRetention } from "./progressive-restart-retention-fixture";
+import { verifyProgressivePublicationOwner } from "./progressive-publication-owner-fixture";
 import {
   progressiveArchiveManifestBytes,
   progressiveArchiveManifestSha256,
@@ -410,6 +411,8 @@ export async function verifyProgressiveWorkerObservation(
     sql`SELECT count(*)::integer AS count FROM results WHERE sim_job_id = ${executionId}::uuid`,
   );
   expect(evidence.count).toBe(0);
+  if (mode === "success")
+    await verifyProgressivePublicationOwner(db, executionId);
   if (mode === "success")
     await verifyProgressiveWorkerEvidence(
       db,
