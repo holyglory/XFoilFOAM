@@ -18,7 +18,8 @@ import type {
 } from "@aerodb/engine-client";
 
 const ASSUMPTIONS = {
-  version: "progressive-fit-assumptions-v4",
+  version: "progressive-fit-assumptions-v5",
+  historyOrigin: "recorded-source-before-windowing-v1",
   minimumUncertifiedConvectiveTransits: 1,
   acquisition: "fixed-posterior-coverage-v1",
   priorLiftStd: 0.3,
@@ -162,13 +163,18 @@ function candidateFor(
       : steadyWindow?.start_iter;
     if (!finite(start) || start < coordinate[0] || start > coordinate.at(-1)!)
       return excluded(candidate, "missing_informative_window");
+    const origin = transient
+      ? (raw.source_start_time ?? coordinate[0])
+      : coordinate[0];
+    if (!finite(origin) || origin > coordinate[0])
+      return excluded(candidate, "invalid_history_origin");
     if (transient && evidence.classification?.state !== "accepted") {
       const length = lease.source.physical.reference.referenceLengthM;
       const speed = lease.source.physical.flow.speedMps;
       if (!finite(length) || length <= 0 || !finite(speed) || speed <= 0)
         return excluded(candidate, "missing_physical_history_scale");
       if (
-        start - coordinate[0] <
+        start - origin <
         (ASSUMPTIONS.minimumUncertifiedConvectiveTransits * length) / speed
       )
         return excluded(candidate, "startup_only_history");

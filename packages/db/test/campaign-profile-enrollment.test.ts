@@ -12,7 +12,7 @@ import {
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import {
   deriveFlowConditionState,
@@ -5195,6 +5195,86 @@ describe("persistent progressive polar cache", () => {
         .where(eq(sweeperState.id, 1));
     }
   }, 120_000);
+
+  it("reduces actual unconverged histories after producer windowing without losing the source origin", async () => {
+    const fixture = await fitFixture();
+    const evidenceIds: string[] = [];
+    for (const unit of fixture.leases.slice(0, 2)) {
+      const evidenceId = await fixture.save(70, "urans", unit.alpha);
+      evidenceIds.push(evidenceId);
+      const history = JSON.parse(
+        execFileSync(
+          resolve(ROOT, ".venv/bin/python"),
+          [resolve(ROOT, "tests/windowed_force_history_fixture.py")],
+          {
+            cwd: ROOT,
+            encoding: "utf8",
+            timeout: 20_000,
+            input: JSON.stringify({ offset: 203, alpha: unit.alpha }),
+          },
+        ),
+      );
+      expect(history.t[0]).toBeCloseTo(history.window_start, 10);
+      expect(history.source_start_time).toBe(203);
+      await db
+        .update(resultAttempts)
+        .set({
+          evidencePayload: {
+            fixture_kind: "synthetic-producer-window-contract",
+            solver_active_seconds: 70,
+            unsteady: true,
+            converged: false,
+            force_history: history,
+          },
+        })
+        .where(eq(resultAttempts.id, evidenceId));
+    }
+    await fixture.record(evidenceIds);
+    const lease = (await fixture.acquire())!;
+    const request = buildProgressiveFitRequest(lease);
+    expect(request.histories).toHaveLength(2);
+    const response = await fitUsingPython(request);
+    expect(
+      new Set(response.estimate.contributors.map((row) => row.attempt_id)),
+    ).toEqual(new Set(evidenceIds));
+    for (const origin of [null, 1e9, "203"]) {
+      const invalid = structuredClone(lease);
+      for (const evidence of invalid.source.evidence)
+        (
+          evidence.payload.force_history as Record<string, unknown>
+        ).source_start_time = origin;
+      expect(buildProgressiveFitRequest(invalid).histories).toHaveLength(0);
+    }
+    for (const offset of [-500, 500]) {
+      const shifted = structuredClone(lease);
+      for (const evidence of shifted.source.evidence) {
+        const history = evidence.payload.force_history as {
+          t: number[];
+          source_start_time: number;
+          window_start: number;
+          window_end: number;
+        };
+        history.t = history.t.map((value) => value + offset);
+        history.source_start_time += offset;
+        history.window_start += offset;
+        history.window_end += offset;
+      }
+      expect(buildProgressiveFitRequest(shifted).histories).toHaveLength(2);
+    }
+    const negative = structuredClone(lease);
+    for (const evidence of negative.source.evidence)
+      (evidence.payload.force_history as { cd: number[] }).cd[0] = -0.01;
+    expect(buildProgressiveFitRequest(negative).histories).toHaveLength(0);
+    const startup = structuredClone(lease);
+    for (const evidence of startup.source.evidence) {
+      const history = evidence.payload.force_history as {
+        source_start_time: number;
+        window_start: number;
+      };
+      history.source_start_time = history.window_start;
+    }
+    expect(buildProgressiveFitRequest(startup).histories).toHaveLength(0);
+  });
 
   it("reduces actual unconverged histories and excludes earlier lineage evidence without inventing points", async () => {
     const fixture = await fitFixture();

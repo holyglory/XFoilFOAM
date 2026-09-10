@@ -36,6 +36,7 @@ class ForceHistory:
     retained_cycles: int | None = None
     window_start: float | None = None
     window_end: float | None = None
+    source_start_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3217,6 +3218,7 @@ def force_history(
             cm_mean, cm_rms = _time_weighted_mean_std(wt, wcm)
     return ForceHistory(
         t=_downsample(wt.tolist(), max_points),
+        source_start_time=float(t_all[0]),
         cl=_downsample(wcl.tolist(), max_points),
         cd=_downsample(wcd.tolist(), max_points),
         cm=_downsample(wcm.tolist(), max_points),

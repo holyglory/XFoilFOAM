@@ -353,7 +353,7 @@ def _force_history_transport(history: Any) -> dict[str, Any]:
     certificate's sample count, endpoints, and published means before an
     archive interpretation becomes canonical.
     """
-    return {
+    payload = {
         "t": [float(value) for value in history.t],
         "cl": [float(value) for value in history.cl],
         "cd": [float(value) for value in history.cd],
@@ -365,6 +365,12 @@ def _force_history_transport(history: Any) -> dict[str, Any]:
         "window_start": float(history.window_start),
         "window_end": float(history.window_end),
     }
+    origin = getattr(history, "source_start_time", None)
+    if origin is not None:
+        if not math.isfinite(origin) or not history.t or origin > history.t[0]:
+            raise ValueError("Invalid source history start")
+        payload["source_start_time"] = float(origin)
+    return payload
 
 
 def _no_shedding_certificate(

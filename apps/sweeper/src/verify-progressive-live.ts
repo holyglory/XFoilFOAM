@@ -420,7 +420,12 @@ try {
       process.stdout.write(chunk);
     });
   const deadline =
-    Date.now() + (requestedSpeedMps === 1020 ? 2_400_000 : 1_800_000);
+    Date.now() +
+    (requireUransHistories
+      ? 3_600_000
+      : requestedSpeedMps === 1020
+        ? 2_400_000
+        : 1_800_000);
   let lastSignature = "";
   let baselineObserved = false;
   let refined = false;
@@ -496,7 +501,7 @@ try {
             let historiesReady = true;
             if (requireUransHistories) {
               const stored = await db.execute(sql`
-                SELECT id, aoa_deg, regime, converged FROM result_attempts WHERE id IN (
+                SELECT id, aoa_deg, regime, converged, evidence_payload FROM result_attempts WHERE id IN (
                   ${sql.join(
                     proof.contributorAttemptIds.map((id) => sql`${id}::uuid`),
                     sql`, `,
@@ -532,8 +537,37 @@ try {
                 ),
                 Number(manifest?.history_policy?.minimum_samples),
               );
-              report.uransHistoryProof = historyProof;
-              historiesReady = historyProof.joint;
+              const origins = historyProof.sources.map((source) => {
+                const payload = stored.find(
+                  (row) => row.id === source.attemptId,
+                )?.evidence_payload as
+                  | {
+                      force_history?: {
+                        source_start_time?: unknown;
+                        t?: unknown;
+                      };
+                    }
+                  | undefined;
+                const history = payload?.force_history;
+                const origin = history?.source_start_time;
+                const first = Array.isArray(history?.t) ? history.t[0] : null;
+                return {
+                  attemptId: source.attemptId,
+                  sourceStartTime: origin,
+                  firstRetainedTime: first,
+                  recorded:
+                    typeof origin === "number" &&
+                    Number.isFinite(origin) &&
+                    typeof first === "number" &&
+                    Number.isFinite(first) &&
+                    origin <= first,
+                };
+              });
+              report.uransHistoryProof = { ...historyProof, origins };
+              historiesReady =
+                historyProof.joint &&
+                historyProof.unconvergedHistories > 0 &&
+                origins.every((origin) => origin.recorded);
             }
             if (requireRansHold) {
               const attemptIds = [

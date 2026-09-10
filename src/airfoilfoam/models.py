@@ -6,7 +6,7 @@ from enum import Enum
 import math
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, UUID4, model_validator
+from pydantic import BaseModel, Field, UUID4, model_serializer, model_validator
 
 from .thermodynamics import GasThermodynamics, ThermodynamicState
 
@@ -928,6 +928,20 @@ class ForceHistory(BaseModel):
     retained_cycles: Optional[int] = Field(default=None, description="Integer number of shedding periods retained.")
     window_start: Optional[float] = Field(default=None, description="Start time of the retained integer-period window.")
     window_end: Optional[float] = Field(default=None, description="End time of the retained integer-period window.")
+    source_start_time: Optional[float] = Field(default=None, strict=True, allow_inf_nan=False, description="First recorded source coefficient time before startup discard and window selection.")
+
+    @model_validator(mode="after")
+    def validate_source_start_time(self) -> "ForceHistory":
+        if self.source_start_time is not None and (not self.t or self.source_start_time > self.t[0]):
+            raise ValueError("Source history start must not follow the first retained coefficient")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_known_origin(self, handler):
+        payload = handler(self)
+        if self.source_start_time is None:
+            payload.pop("source_start_time", None)
+        return payload
 
 
 # --------------------------------------------------------------------------- #

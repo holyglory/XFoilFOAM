@@ -696,6 +696,15 @@ and do not call the implementation complete based on unit tests alone.
 
 ## Verification
 
+Windowed URANS histories carry `source_start_time`, the first recorded source
+coefficient time before startup discard or period selection. The retained `t`
+array still describes only its original selected window. Uncertified-history
+startup age is measured from that recorded origin, never from an assumed zero
+or the first already-trimmed sample. An unknown legacy origin is omitted from
+serialization and retains the conservative existing fallback. An invalid origin
+cannot contribute evidence. This metadata does not certify convergence or relax
+the retained-coefficient and physical-window checks.
+
 Validate numerical recipes on representative low-Mach airfoils, RAE 2822 transonic
 cases, a Mach-2 wedge, a viscous supersonic airfoil and Mach-3 cases. Perform mesh and
 time-step studies on these representative recipes, not on every production cell.

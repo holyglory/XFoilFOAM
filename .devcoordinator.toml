@@ -192,7 +192,7 @@ tier = "development"
 requires = ["seed", "types"]
 env = { PROGRESSIVE_REQUIRE_URANS_HISTORIES = "1" }
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
-timeout_seconds = 2100
+timeout_seconds = 3900
 retained_artifacts = [{ name = "joint-urans-journey", path = ".codex-artifacts/progressive-live-30-urans", max_bytes = 10485760 }]
 
 [test.progressive-hold-live.postgres]
@@ -284,7 +284,7 @@ command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev"
 name = "inference"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_force_history_origin.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "-q"]
 
 [[test.progressive.check]]
 name = "rans-hold-continuation"

@@ -93,6 +93,7 @@ def _outcome_to_point(job_id: str, slug: str, outcome: CaseOutcome) -> PolarPoin
             shedding_freq_hz=fh.shedding_freq_hz, samples=fh.samples,
             period_s=fh.period_s, retained_cycles=fh.retained_cycles,
             window_start=fh.window_start, window_end=fh.window_end,
+            **({"source_start_time": fh.source_start_time} if fh.source_start_time is not None else {}),
         )
         if fh is not None
         else None

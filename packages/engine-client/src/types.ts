@@ -1066,6 +1066,7 @@ export interface EngineForceHistory {
   retained_cycles?: number | null;
   window_start?: number | null;
   window_end?: number | null;
+  source_start_time?: number | null;
 }
 
 export interface Polar {
