@@ -87,12 +87,24 @@ target.states = [
 config.targets = [target];
 config.maxPageCount = config.viewports.length * (target.states.length + 1);
 const directory = mkdtempSync(join(tmpdir(), "cfd-only-layout-"));
+const reports = mkdtempSync(join(tmpdir(), "cfd-only-layout-reports-"));
 try {
   const path = join(directory, "config.json");
   writeFileSync(path, JSON.stringify(config));
   const result = spawnSync(
     "/usr/local/bin/devcoordinator2-tooling",
-    ["formal-ui", "verify", "--config", path, "--fail-on", "critical"],
+    [
+      "formal-ui",
+      "verify",
+      "--config",
+      path,
+      "--json-out",
+      join(reports, "report.json"),
+      "--markdown-out",
+      join(reports, "report.md"),
+      "--fail-on",
+      "critical",
+    ],
     { stdio: "inherit" },
   );
   if (result.error) throw result.error;

@@ -365,10 +365,11 @@ export function DetailIsland({
           {pinnedRevisionId && (
             <span
               data-testid="pinned-revision-chip"
+              title={`Setup revision ${pinnedRevisionId}`}
               style={{
                 display: "inline-flex",
                 alignItems: "center",
-                flexWrap: "wrap",
+                flexWrap: "nowrap",
                 gap: 8,
                 width: "fit-content",
                 maxWidth: "100%",
@@ -378,24 +379,24 @@ export function DetailIsland({
                 overflow: "hidden",
                 fontFamily: MONO,
                 fontSize: 10,
-                color: C.teal,
+                color: C.text2,
                 background: C.tealFill,
                 border: `1px solid ${C.tealBorder}`,
                 borderRadius: 999,
                 padding: "3px 6px 3px 10px",
               }}
             >
-              Pinned to setup revision {pinnedRevisionId.slice(0, 8)}
-              {detail.polars.length === 1 ? ` · ${detail.polars[0].label}` : ""}
+              Pinned setup
               <Link
                 href={`/airfoils/${encodeURIComponent(detail.slug)}`}
                 title="View public data (enabled setups only)"
                 aria-label="Unpin — view public data"
+                className={styles.pinnedClear}
                 style={{
-                  color: C.teal,
+                  color: C.text2,
                   textDecoration: "none",
                   fontWeight: 700,
-                  padding: "0 4px",
+                  padding: 0,
                   lineHeight: 1,
                 }}
               >

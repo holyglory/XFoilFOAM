@@ -97,6 +97,15 @@ try {
       };
       await verifyGeometry();
       await expect(toggle).toHaveAttribute("aria-pressed", "false");
+      const unpin = page.getByRole("link", {
+        name: "Unpin — view public data",
+      });
+      const unpinBounds = await unpin.boundingBox();
+      assert(
+        unpinBounds &&
+          unpinBounds.width >= (width < 500 ? 44 : 32) &&
+          unpinBounds.height >= (width < 500 ? 44 : 32),
+      );
       await expect(chart.locator('circle[role="button"]')).toHaveCount(0);
       if (
         !scope.evidence.length ||
@@ -192,6 +201,9 @@ try {
       await expect(chart.locator('circle[role="button"]')).toHaveCount(0);
       await page.reload({ waitUntil: "networkidle" });
       await expect(toggle).toHaveAttribute("aria-pressed", "false");
+      await unpin.click();
+      await expect(page.getByTestId("progressive-polar-viewer")).toBeVisible();
+      assert.equal(new URL(page.url()).search, "");
       outcomes.push({
         width,
         revision: scope.revision,
