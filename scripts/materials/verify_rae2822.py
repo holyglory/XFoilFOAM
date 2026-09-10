@@ -18,6 +18,12 @@ from rae2822_reference import load_reference, selig_coordinates
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
 
 
+def benchmark_time_budget(value=600):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not 0 < value <= 3600:
+        raise ValueError("Benchmark time budget must be finite, positive and at most 3600 seconds")
+    return float(value)
+
+
 def benchmark_momentum_scheme(first_order=False):
     if not isinstance(first_order, bool):
         raise ValueError("Transport order must be an explicit benchmark choice")
@@ -220,7 +226,8 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic):
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600):
+    time_budget_seconds = benchmark_time_budget(time_budget_seconds)
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
     from airfoilfoam.material_domain import check_material_domain
@@ -259,10 +266,11 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     })
     runner = get_runner(Settings())
     configure_flow_execution(runner, request)
-    budgeted = BudgetedRunner(runner, 600)
+    budgeted = BudgetedRunner(runner, time_budget_seconds)
     spec = request.cases()[0]
     budgeted.begin_case(spec)
     report = {"kind": "rae2822-transonic-pressure-validation", "tier": tier, "production_evidence": False,
+              "time_budget_seconds": time_budget_seconds,
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
               "experimental_wall_functions": wall_functions,
@@ -313,7 +321,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
             (destination / "log.potentialFoam").write_text(initialized.stdout)
             initialized.check()
-        solved = budgeted.solver(destination, "rhoSimpleFoam", 1, timeout=600)
+        solved = budgeted.solver(destination, "rhoSimpleFoam", 1, timeout=time_budget_seconds)
         (destination / "log.rhoSimpleFoam").write_text(solved.stdout)
         check_material_domain(destination, solved)
         if not solved.timed_out:
@@ -375,5 +383,6 @@ if __name__ == "__main__":
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
+    parser.add_argument("--time-budget-seconds", type=float, default=600)
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds)

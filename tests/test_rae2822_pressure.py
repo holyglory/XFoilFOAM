@@ -1,9 +1,22 @@
 import numpy as np
 import pytest
+
 import json
 import hashlib
 
-from scripts.materials.verify_rae2822 import benchmark_mesh, benchmark_momentum_scheme, compare_pressure, configure_enthalpy_energy, configure_pressure_equation_relaxation, configure_pressure_krylov, configure_transonic_pressure, configure_upwind_energy, pressure_iteration, restore_verified_donor, wall_pressure
+from scripts.materials.verify_rae2822 import benchmark_mesh, benchmark_momentum_scheme, benchmark_time_budget, compare_pressure, configure_enthalpy_energy, configure_pressure_equation_relaxation, configure_pressure_krylov, configure_transonic_pressure, configure_upwind_energy, pressure_iteration, restore_verified_donor, wall_pressure
+
+
+def test_benchmark_time_budget_preserves_default_and_allows_bounded_mesh_study():
+    assert benchmark_time_budget() == 600
+    assert benchmark_time_budget(3000) == 3000
+    assert benchmark_time_budget(3600) == 3600
+
+
+@pytest.mark.parametrize("value", [0, -1, 3601, float("nan"), float("inf"), True, "3000", None])
+def test_benchmark_time_budget_rejects_unbounded_or_ambiguous_values(value):
+    with pytest.raises(ValueError, match="Benchmark time budget"):
+        benchmark_time_budget(value)
 
 
 def test_pressure_equation_relaxation_does_not_replace_field_relaxation(tmp_path):

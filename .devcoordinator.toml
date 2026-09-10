@@ -1164,6 +1164,22 @@ port = true
 route = true
 timeout_seconds = 900
 
+[deployment.rae-upwind-mesh-study]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-upwind-mesh-study.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-upwind-refined"]
+finite_services = ["enthalpy-upwind-refined"]
+build = false
+port = true
+route = true
+timeout_seconds = 3300
+
 [deployment.thermophysics-check.component.inspection]
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }

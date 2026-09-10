@@ -55,6 +55,10 @@ services:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order"]
+  enthalpy-upwind-refined:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind-refined", "--tier", "refined", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--time-budget-seconds", "3000"]
   enthalpy-refine:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
