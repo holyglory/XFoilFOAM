@@ -9,6 +9,7 @@ x-verification: &verification
   volumes:
     - ./scripts/materials/rae2822_reference.py:/verification/rae2822_reference.py:ro
     - ./scripts/materials/verify_rae2822.py:/verification/verify_rae2822.py:ro
+    - ./scripts/materials/solver_stability.py:/verification/solver_stability.py:ro
     - ./tests/fixtures/rae2822:/verification/reference:ro
     - ./tests/fixtures/air-thermophysics-audit.json:/verification/material.json:ro
     - rae-evidence:/evidence

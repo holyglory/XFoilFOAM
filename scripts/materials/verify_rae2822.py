@@ -13,6 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from rae2822_reference import load_reference, selig_coordinates
+from solver_stability import solver_stability
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
@@ -340,6 +341,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             initialized.check()
         solved = budgeted.solver(destination, "rhoSimpleFoam", 1, timeout=time_budget_seconds)
         (destination / "log.rhoSimpleFoam").write_text(solved.stdout)
+        report["numerical_stability"] = solver_stability(solved.stdout.splitlines())
         check_material_domain(destination, solved)
         if not solved.timed_out:
             solved.check()

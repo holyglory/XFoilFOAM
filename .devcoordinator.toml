@@ -178,6 +178,25 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_force_history_origin.
 [test.rae-field-diagnostics]
 timeout_seconds = 120
 
+[test.rae-transonic-field-diagnostics]
+timeout_seconds = 120
+
+[[test.rae-transonic-field-diagnostics.check]]
+name = "stability-parser"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_stability.py", "-q"]
+
+[[test.rae-transonic-field-diagnostics.check]]
+name = "retained-conservation"
+tier = "development"
+requires = ["stability-parser"]
+command = [".venv/bin/python", "scripts/materials/solver_stability.py", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-enthalpy-upwind-20260909", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-upwind-refined-20260910", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-upwind-transonic-refined-20260910"]
+
+[[test.rae-transonic-field-diagnostics.check]]
+name = "retained-extrema"
+tier = "development"
+command = [".venv/bin/python", "scripts/materials/inspect_rae_extrema.py", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-upwind-refined-20260910", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-upwind-transonic-refined-20260910"]
+
 [[test.rae-field-diagnostics.check]]
 name = "retained-field-extrema"
 tier = "development"
