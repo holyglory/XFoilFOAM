@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { DB } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import { reconcileProgressiveRemoteWorker } from "./progressive-remote-reconciliation";
+import { MAX_ACTIVE_RECONCILE_JOB_LIMIT } from "./reconcile";
 
 export async function runProgressiveRemoteObservationService(
   db: DB,
@@ -10,7 +11,9 @@ export async function runProgressiveRemoteObservationService(
 ): Promise<void> {
   while (!signal.aborted) {
     try {
-      const receipt = await reconcileProgressiveRemoteWorker(db, engine);
+      const receipt = await reconcileProgressiveRemoteWorker(db, engine, {
+        limit: MAX_ACTIVE_RECONCILE_JOB_LIMIT,
+      });
       if (receipt.inspected || receipt.errors.length)
         console.log(
           JSON.stringify({

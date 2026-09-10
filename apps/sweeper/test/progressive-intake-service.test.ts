@@ -6,6 +6,11 @@ import { receiveProgressiveCampaignAssignments } from "../src/remote-solver";
 import { runProgressiveAssignmentIntakeService } from "../src/progressive-intake-service";
 import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
 import { runProgressiveRemoteObservationService } from "../src/progressive-observation-service";
+import {
+  activeReconcileConcurrency,
+  activeReconcileJobLimit,
+  MAX_ACTIVE_RECONCILE_JOB_LIMIT,
+} from "../src/reconcile";
 
 vi.mock("../src/progressive-remote-reconciliation", () => ({
   reconcileProgressiveRemoteWorker: vi.fn(),
@@ -61,6 +66,12 @@ it("observes obsolete execution independently and drains its active proof before
   });
   await vi.advanceTimersByTimeAsync(15000);
   expect(observe).toHaveBeenCalledOnce();
+  expect(observe.mock.calls[0][2]).toEqual({
+    limit: MAX_ACTIVE_RECONCILE_JOB_LIMIT,
+  });
+  expect(MAX_ACTIVE_RECONCILE_JOB_LIMIT).toBe(64);
+  expect(activeReconcileJobLimit("")).toBe(8);
+  expect(activeReconcileConcurrency("")).toBe(4);
   owner.abort();
   expect(finished).toBe(false);
   release();

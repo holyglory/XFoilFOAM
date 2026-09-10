@@ -177,7 +177,7 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
 ];
 
 export const DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT = 8;
-const MAX_ACTIVE_RECONCILE_JOB_LIMIT = 64;
+export const MAX_ACTIVE_RECONCILE_JOB_LIMIT = 64;
 export const DEFAULT_ACTIVE_RECONCILE_CONCURRENCY = 4;
 const MAX_ACTIVE_RECONCILE_CONCURRENCY = 8;
 
