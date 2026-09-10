@@ -1398,6 +1398,22 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.rae-consistent-pressure-study]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-consistent-pressure-study.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-consistent-refined"]
+finite_services = ["enthalpy-consistent-refined"]
+build = false
+port = true
+route = true
+timeout_seconds = 3300
+
 [deployment.rae-nasa-grid-check]
 source = ["worktree"]
 components = ["numerics"]

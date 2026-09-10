@@ -110,6 +110,30 @@ def donor_fixture(directory):
     return source, destination, request
 
 
+def test_donor_rejects_changed_consistent_pressure_algorithm(tmp_path):
+    source, destination, request = donor_fixture(tmp_path)
+    with pytest.raises(ValueError, match="does not match"):
+        restore_verified_donor(source, destination, request, True, False, True)
+
+
+def test_consistent_pressure_changes_only_the_declared_algorithm(tmp_path):
+    from scripts.materials.verify_rae2822 import configure_consistent_pressure
+
+    path = tmp_path / "fvSolution"
+    original = "SIMPLE { consistent no; transonic yes; } relaxationFactors { fields { p 0.3; } equations { p 1; U 0.3; } }"
+    path.write_text(original)
+    configure_consistent_pressure(path)
+    assert path.read_text() == original.replace("consistent no;", "consistent yes;")
+    with pytest.raises(ValueError, match="one generated"):
+        configure_consistent_pressure(path)
+    assert path.read_text() == original.replace("consistent no;", "consistent yes;")
+    duplicated = original + "\nSIMPLE { consistent no; }"
+    path.write_text(duplicated)
+    with pytest.raises(ValueError, match="one generated"):
+        configure_consistent_pressure(path)
+    assert path.read_text() == duplicated
+
+
 def test_verified_donor_preserves_source_and_copies_only_exact_mesh_and_field_bytes(tmp_path):
     source, destination, request = donor_fixture(tmp_path)
     before = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
