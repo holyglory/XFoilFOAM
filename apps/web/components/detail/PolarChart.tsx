@@ -15,6 +15,11 @@ import type {
 } from "react";
 
 import { VIZ } from "@/lib/tokens";
+import {
+  nearestProjectedPoint,
+  POLAR_POINT_TARGET_RADIUS,
+  type PolarChartView,
+} from "@/lib/polar-chart-layout";
 
 /** Data-space cursor sample raised on every pointer move inside the axes. */
 export interface ChartCursor {
@@ -33,18 +38,20 @@ const DRAG_THRESHOLD = 3;
 
 export function PolarChart({
   projection,
+  view = CHART_VIEW,
   onPointClick,
   onDomainChange,
   onCursor,
 }: {
   projection: ChartProjection;
+  view?: PolarChartView;
   onPointClick: (vm: ChartPointVM) => void;
   /** zoom/pan window updates; null = back to zoom-to-fit */
   onDomainChange?: (d: ChartDomain | null) => void;
   /** cursor tracking for the mouse-following value badge; null when leaving the axes */
   onCursor?: (c: ChartCursor | null) => void;
 }) {
-  const { PX0, PX1, PY0, PY1, w, h } = CHART_VIEW;
+  const { PX0, PX1, PY0, PY1, w, h } = view;
   const clipId = "polar-clip-" + useId().replace(/:/g, "");
   const svgRef = useRef<SVGSVGElement | null>(null);
   // The native wheel listener registers once; refs keep it on fresh state.
@@ -166,7 +173,7 @@ export function PolarChart({
       viewBox={`0 0 ${w} ${h}`}
       data-testid="polar-chart-svg"
       data-ui-continuation-anchor
-      role="img"
+      role={projection.points.length ? "group" : "img"}
       aria-label={`${projection.yTitle} versus ${projection.xTitle}`}
       style={{
         display: "block",
@@ -202,11 +209,12 @@ export function PolarChart({
           />
           <text
             x={PX0 - 8}
+            data-ui-verify-svg-overlap="CFD axis labels must remain separated"
             y={t.labelPos}
             textAnchor="end"
             fontFamily="IBM Plex Mono"
             fontSize="10"
-            fill={VIZ.dim}
+            fill={VIZ.text}
           >
             {t.label}
           </text>
@@ -225,11 +233,12 @@ export function PolarChart({
           />
           <text
             x={t.pos}
-            y={354}
+            data-ui-verify-svg-overlap="CFD axis labels must remain separated"
+            y={PY1 + 18}
             textAnchor="middle"
             fontFamily="IBM Plex Mono"
             fontSize="10"
-            fill={VIZ.dim}
+            fill={VIZ.text}
           >
             {t.label}
           </text>
@@ -269,7 +278,6 @@ export function PolarChart({
         ))}
         {projection.points.map((p) => {
           const choiceCount = p.resultChoices?.length ?? 1;
-          const activate = () => onPointClick(p);
           return (
             <g key={p.key}>
               <circle
@@ -279,17 +287,8 @@ export function PolarChart({
                 fill={p.fill}
                 stroke={p.stroke}
                 strokeWidth={p.sw}
-                style={{ cursor: "pointer" }}
-                tabIndex={0}
-                role="button"
-                aria-label={`${p.label}; ${choiceCount} stored result${choiceCount === 1 ? "" : "s"}`}
-                onClick={activate}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    activate();
-                  }
-                }}
+                pointerEvents="none"
+                aria-hidden="true"
               />
               {choiceCount > 1 && (
                 <text
@@ -308,10 +307,42 @@ export function PolarChart({
           );
         })}
       </g>
+      <g>
+        {projection.points.map((point) => (
+          <circle
+            key={point.key}
+            cx={point.cx}
+            cy={point.cy}
+            r={Math.max(POLAR_POINT_TARGET_RADIUS, point.r)}
+            fill="transparent"
+            style={{ cursor: "pointer" }}
+            tabIndex={0}
+            role="button"
+            data-result-id={point.point.resultId}
+            aria-label={`${point.label}; ${point.resultChoices?.length ?? 1} stored result${(point.resultChoices?.length ?? 1) === 1 ? "" : "s"}`}
+            onClick={(event) => {
+              const location = toViewBox(event);
+              onPointClick(
+                nearestProjectedPoint(
+                  projection.points,
+                  location.vx,
+                  location.vy,
+                ) ?? point,
+              );
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onPointClick(point);
+              }
+            }}
+          />
+        ))}
+      </g>
       {/* x axis title */}
       <text
-        x={361}
-        y={366}
+        x={(PX0 + PX1) / 2}
+        y={h - 8}
         textAnchor="middle"
         fontFamily="IBM Plex Mono"
         fontSize="11"

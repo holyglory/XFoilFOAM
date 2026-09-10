@@ -45,8 +45,11 @@ try {
   const fitted = scopes.find((scope) => scope.evidence.length);
   const missing = scopes.find((scope) => !scope.evidence.length);
   assert(fitted && missing, "Both real evidence and empty scopes are required");
-  for (const width of [390, 1440]) {
-    const page = await browser.newPage({ viewport: { width, height: 1000 } });
+  for (const width of [320, 390, 1440]) {
+    const page = await browser.newPage({
+      viewport: { width, height: 1000 },
+      hasTouch: width < 500,
+    });
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     for (const scope of [fitted, missing]) {
@@ -56,6 +59,43 @@ try {
       const chart = viewer.getByTestId("polar-chart-svg");
       const toggle = viewer.getByRole("button", { name: /^CFD points/ });
       await expect(viewer).toBeVisible();
+      const verifyGeometry = async () => {
+        const geometry = await chart.evaluate((element) => {
+          const bounds = element.getBoundingClientRect();
+          const view = element.viewBox.baseVal;
+          const axes = [
+            ...element.querySelectorAll("text[data-ui-verify-svg-overlap]"),
+          ];
+          return {
+            width: bounds.width,
+            viewWidth: view.width,
+            height: bounds.height,
+            minimumAxisFont: Math.min(
+              ...axes.map(
+                (axis) =>
+                  (parseFloat(getComputedStyle(axis).fontSize) * bounds.width) /
+                  view.width,
+              ),
+            ),
+            labelsInside: [...element.querySelectorAll("text")].every(
+              (text) => {
+                const label = text.getBoundingClientRect();
+                return (
+                  label.left >= bounds.left - 1 &&
+                  label.right <= bounds.right + 1 &&
+                  label.top >= bounds.top - 1 &&
+                  label.bottom <= bounds.bottom + 1
+                );
+              },
+            ),
+          };
+        });
+        assert(Math.abs(geometry.width - geometry.viewWidth) < 1);
+        assert(geometry.height >= 239);
+        assert(geometry.minimumAxisFont >= 9.5);
+        assert(geometry.labelsInside);
+      };
+      await verifyGeometry();
       await expect(toggle).toHaveAttribute("aria-pressed", "false");
       await expect(chart.locator('circle[role="button"]')).toHaveCount(0);
       if (
@@ -94,16 +134,27 @@ try {
       if (scope.evidence.length) {
         const point = chart.locator('circle[role="button"]').first();
         await expect(point).toBeVisible();
+        await expect(chart).toHaveAttribute("role", "group");
+        const expectedResultId = await point.getAttribute("data-result-id");
+        assert(
+          scope.evidence.some((entry) => entry.resultId === expectedResultId),
+        );
+        const target = await point.boundingBox();
+        assert(target && target.width >= 43 && target.height >= 43);
         const storedResponse = page.waitForResponse(
           (response) =>
             new URL(response.url()).pathname === "/api/airfoils/ag24/sim" &&
             new URL(response.url()).searchParams.has("resultId"),
         );
-        await point.focus();
-        await point.press("Enter");
+        if (width < 500) await point.tap();
+        else {
+          await point.focus();
+          await point.press("Enter");
+        }
         const stored = await storedResponse;
         assert(stored.ok());
         const result = await stored.json();
+        assert.equal(result.resultId, expectedResultId);
         assert(
           scope.evidence.some(
             (evidence) => evidence.resultId === result.resultId,
@@ -111,6 +162,28 @@ try {
         );
         await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
         await page.keyboard.press("Escape");
+        await point.focus();
+        await page.setViewportSize({
+          width: width < 500 ? 1440 : 390,
+          height: 1000,
+        });
+        await expect(point).toBeFocused();
+        await expect
+          .poll(() =>
+            chart.evaluate((element) =>
+              Math.abs(
+                element.getBoundingClientRect().width -
+                  element.viewBox.baseVal.width,
+              ),
+            ),
+          )
+          .toBeLessThan(1);
+        await verifyGeometry();
+        await point.press("Enter");
+        await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+        await page.keyboard.press("Escape");
+        await page.setViewportSize({ width, height: 1000 });
+        await expect(point).toBeFocused();
       }
       await toggle.click();
       await expect(chart.locator('circle[role="button"]')).toHaveCount(0);

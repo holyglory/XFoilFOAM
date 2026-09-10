@@ -31,6 +31,7 @@ import {
 } from "react";
 
 import { C, MONO, VIZ } from "@/lib/tokens";
+import { responsivePolarProjection } from "@/lib/polar-chart-layout";
 import { containedBadgePosition, POLAR_BADGE_EDGE } from "@/lib/polar-badge";
 import {
   formatPolarAoa,
@@ -95,9 +96,14 @@ export function PolarViewer(props: {
     pointsControl,
   } = props;
   const showPoints = pointsControl?.visible ?? true;
+  const [chartWidth, setChartWidth] = useState<number>(CHART_VIEW.w);
+  const chartLayout = useMemo(
+    () => responsivePolarProjection(evidenceProjection, chartWidth),
+    [evidenceProjection, chartWidth],
+  );
   const projection = useMemo(
-    () => polarDisplayProjection(evidenceProjection, showPoints),
-    [evidenceProjection, showPoints],
+    () => polarDisplayProjection(chartLayout.projection, showPoints),
+    [chartLayout.projection, showPoints],
   );
   const [cursor, setCursor] = useState<ChartCursor | null>(null);
   const [resultChoice, setResultChoice] = useState<ChartPointVM | null>(null);
@@ -112,6 +118,23 @@ export function PolarViewer(props: {
   const maximizeButtonRef = useRef<HTMLButtonElement | null>(null);
   const viewerId = useId();
   const panelId = `${viewerId}-panel`;
+
+  useLayoutEffect(() => {
+    const surface = chartSurfaceRef.current;
+    if (!surface) return;
+    const measure = () => {
+      const style = getComputedStyle(surface);
+      const width =
+        surface.clientWidth -
+        parseFloat(style.paddingLeft) -
+        parseFloat(style.paddingRight);
+      if (width > 0) setChartWidth(width);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(surface);
+    return () => observer.disconnect();
+  }, [profileView?.active, maximized]);
 
   useEffect(
     () => setResultChoice(null),
@@ -263,8 +286,11 @@ export function PolarViewer(props: {
     const place = () => {
       const containerWidth = surface.clientWidth;
       const containerHeight = surface.clientHeight;
-      const anchorX = (badgeAnchor.px / CHART_VIEW.w) * containerWidth;
-      const anchorY = (badgeAnchor.py / CHART_VIEW.h) * containerHeight;
+      const style = getComputedStyle(surface);
+      const horizontalInset = parseFloat(style.paddingLeft);
+      const verticalInset = parseFloat(style.paddingTop);
+      const anchorX = horizontalInset + badgeAnchor.px;
+      const anchorY = verticalInset + badgeAnchor.py;
       setBadgePosition(
         containedBadgePosition({
           anchorX,
@@ -287,6 +313,7 @@ export function PolarViewer(props: {
     hover?.head,
     readoutRows.length,
     maximized,
+    chartWidth,
   ]);
 
   const zoomBy = (factor: number) => {
@@ -679,6 +706,7 @@ export function PolarViewer(props: {
             >
               <PolarChart
                 projection={projection}
+                view={chartLayout.view}
                 onPointClick={activatePoint}
                 onDomainChange={onDomainChange}
                 onCursor={handleCursor}
