@@ -1270,6 +1270,12 @@ requires = ["preview-ready"]
 command = ["node", "--import", "tsx", "scripts/dev/verify-cfd-only-curves.mjs"]
 
 [[test.progressive-ui.check]]
+name = "cfd-only-layout"
+tier = "development"
+requires = ["preview-ready"]
+command = ["node", "scripts/dev/verify-cfd-only-layout.mjs"]
+
+[[test.progressive-ui.check]]
 name = "control-sizing"
 tier = "development"
 requires = ["preview-origin", "preview-ready"]
