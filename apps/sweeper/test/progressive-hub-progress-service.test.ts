@@ -3,6 +3,10 @@ import type { DB, Sql } from "@aerodb/db";
 import { acknowledgeProgressiveRemoteStops } from "../src/progressive-remote-stop-receipt";
 import { reconcileProgressiveRemoteProgress } from "../src/progressive-remote-progress";
 import { runProgressiveHubProgressService } from "../src/progressive-hub-progress-service";
+import { prepareProgressiveRemoteFleet } from "../src/progressive-remote-admission";
+vi.mock("../src/progressive-remote-admission", () => ({
+  prepareProgressiveRemoteFleet: vi.fn(),
+}));
 
 vi.mock("../src/progressive-remote-stop-receipt", () => ({
   acknowledgeProgressiveRemoteStops: vi.fn(),
@@ -19,6 +23,11 @@ afterEach(() => {
 function fixture() {
   vi.useFakeTimers();
   vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.mocked(prepareProgressiveRemoteFleet).mockResolvedValue({
+    prepared: 0,
+    waiting: 1,
+    errors: [],
+  });
   let notify = () => {};
   const unlisten = vi.fn(async () => {});
   const notifications = {
@@ -45,6 +54,10 @@ function fixture() {
 it("releases exact stop receipts before replay and drains available ordered reports without controller ticks", async () => {
   const scope = fixture();
   const order: string[] = [];
+  vi.mocked(prepareProgressiveRemoteFleet).mockImplementation(async () => {
+    order.push("admission");
+    return { prepared: 0, waiting: 1, errors: [] };
+  });
   vi.mocked(acknowledgeProgressiveRemoteStops).mockImplementation(async () => {
     order.push("stop");
     return { acknowledged: 0, errors: [] };
@@ -79,12 +92,19 @@ it("releases exact stop receipts before replay and drains available ordered repo
     owner.signal,
   );
   await vi.advanceTimersByTimeAsync(0);
-  expect(order).toEqual(["stop", "progress", "stop", "progress"]);
+  expect(order).toEqual([
+    "stop",
+    "progress",
+    "admission",
+    "stop",
+    "progress",
+    "admission",
+  ]);
   await vi.advanceTimersByTimeAsync(4999);
-  expect(order).toHaveLength(4);
+  expect(order).toHaveLength(6);
   scope.notify();
   await vi.advanceTimersByTimeAsync(0);
-  expect(order).toHaveLength(6);
+  expect(order).toHaveLength(9);
   owner.abort();
   await running;
   expect(scope.unlisten).toHaveBeenCalledOnce();
@@ -118,4 +138,26 @@ it("retains notifications and drains an in-flight acknowledgement on shutdown", 
   await running;
   expect(scope.unlisten).toHaveBeenCalledOnce();
   expect(finished).toBe(true);
+  expect(prepareProgressiveRemoteFleet).not.toHaveBeenCalled();
+});
+
+it("keeps filling available assignments without waiting for another controller tick", async () => {
+  const scope = fixture();
+  vi.mocked(prepareProgressiveRemoteFleet).mockResolvedValueOnce({
+    prepared: 2,
+    waiting: 1,
+    errors: [],
+  });
+  const owner = new AbortController();
+  const running = runProgressiveHubProgressService(
+    {} as DB,
+    scope.notifications,
+    owner.signal,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  expect(prepareProgressiveRemoteFleet).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(prepareProgressiveRemoteFleet).toHaveBeenCalledTimes(3);
+  owner.abort();
+  await running;
 });
