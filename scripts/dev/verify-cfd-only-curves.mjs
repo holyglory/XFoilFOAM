@@ -78,7 +78,7 @@ try {
         await expect(point).toBeVisible();
         const storedResponse = page.waitForResponse(
           (response) =>
-            response.url().includes("/api/simulations/") &&
+            new URL(response.url()).pathname === "/api/airfoils/ag24/sim" &&
             new URL(response.url()).searchParams.has("resultId"),
         );
         await point.focus();
