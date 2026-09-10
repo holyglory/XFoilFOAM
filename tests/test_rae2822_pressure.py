@@ -116,6 +116,37 @@ def test_donor_rejects_changed_consistent_pressure_algorithm(tmp_path):
         restore_verified_donor(source, destination, request, True, False, True)
 
 
+def test_benchmark_process_count_preserves_actual_worker_budget():
+    from scripts.materials.verify_rae2822 import benchmark_processes
+
+    assert benchmark_processes(4, 8) == 4
+    assert benchmark_processes(1, 1) == 1
+    for requested, available in [(True, 8), (1.0, 8), (0, 8), (-1, 8), (9, 8), (1, 0), (1, True)]:
+        with pytest.raises(ValueError, match="worker CPU budget"):
+            benchmark_processes(requested, available)
+
+
+def test_parallel_timeout_reconstructs_real_latest_fields_before_inspection(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from scripts.materials.verify_rae2822 import reconstruct_timed_out_parallel_case
+
+    runner = Mock()
+    result = runner.application.return_value
+    result.stdout = "retained reconstruction fixture"
+    reconstruct_timed_out_parallel_case(runner, tmp_path, SimpleNamespace(timed_out=True), 4)
+    runner.application.assert_called_once_with(tmp_path, "reconstructPar -latestTime", timeout=120)
+    result.check.assert_called_once_with()
+    assert (tmp_path / "log.reconstructPar").read_text() == result.stdout
+    runner.reset_mock()
+    reconstruct_timed_out_parallel_case(runner, tmp_path, SimpleNamespace(timed_out=False), 4)
+    reconstruct_timed_out_parallel_case(runner, tmp_path, SimpleNamespace(timed_out=True), 1)
+    runner.application.assert_not_called()
+    result.check.side_effect = RuntimeError("missing processor fields")
+    with pytest.raises(RuntimeError, match="missing processor fields"):
+        reconstruct_timed_out_parallel_case(runner, tmp_path, SimpleNamespace(timed_out=True), 4)
+
+
 def test_consistent_pressure_changes_only_the_declared_algorithm(tmp_path):
     from scripts.materials.verify_rae2822 import configure_consistent_pressure
 

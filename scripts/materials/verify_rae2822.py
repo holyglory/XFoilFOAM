@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import sys
+import time
 import xml.etree.ElementTree as xml
 from dataclasses import asdict
 from pathlib import Path
@@ -18,6 +19,19 @@ from rae2822_grid import write_nasa_grid
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
+
+
+def benchmark_processes(requested, available):
+    if type(requested) is not int or type(available) is not int or not 1 <= requested <= available:
+        raise ValueError("Benchmark processes must be positive integers within the worker CPU budget")
+    return requested
+
+
+def reconstruct_timed_out_parallel_case(runner, destination, solved, processes):
+    if processes > 1 and solved.timed_out:
+        reconstructed = runner.application(destination, "reconstructPar -latestTime", timeout=120)
+        (destination / "log.reconstructPar").write_text(reconstructed.stdout)
+        reconstructed.check()
 
 
 def benchmark_time_budget(value=600):
@@ -251,7 +265,8 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1):
+    started_at = time.monotonic()
     time_budget_seconds = benchmark_time_budget(time_budget_seconds)
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
@@ -292,12 +307,15 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
                    "convergence_tolerance": dimensions[4], "write_images": []},
     })
     runner = get_runner(Settings())
+    available_processes = int(runner.settings.resolved_worker_cpu_budget())
+    processes = benchmark_processes(processes, available_processes)
     configure_flow_execution(runner, request)
     budgeted = BudgetedRunner(runner, time_budget_seconds)
     spec = request.cases()[0]
     budgeted.begin_case(spec)
     report = {"kind": "rae2822-transonic-pressure-validation", "tier": tier, "production_evidence": False,
               "time_budget_seconds": time_budget_seconds,
+              "execution_resources": {"mpi_processes": processes, "worker_cpu_budget": available_processes},
               "experimental_nonorthogonal_correction": "limited 0.5" if limited_nonorthogonal else "corrected",
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
@@ -316,7 +334,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         mesh = resolve_mesh_params(request.mesh, spec, request.fluid)
         mesher = BlockMeshCGrid()
         patches = mesher.patches(mesh)
-        builder = _case_builder(budgeted, airfoil, patches, mesh, spec, request.fluid, request.roughness, request.solver)
+        builder = _case_builder(budgeted, airfoil, patches, mesh, spec, request.fluid, request.roughness, request.solver, n_proc=processes)
         builder.write(destination)
         if limited_nonorthogonal:
             configure_limited_nonorthogonal(destination / "system/fvSchemes")
@@ -359,8 +377,9 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
             (destination / "log.potentialFoam").write_text(initialized.stdout)
             initialized.check()
-        solved = budgeted.solver(destination, "rhoSimpleFoam", 1, timeout=time_budget_seconds)
+        solved = budgeted.solver(destination, "rhoSimpleFoam", processes, timeout=time_budget_seconds)
         (destination / "log.rhoSimpleFoam").write_text(solved.stdout)
+        reconstruct_timed_out_parallel_case(runner, destination, solved, processes)
         report["numerical_stability"] = solver_stability(solved.stdout.splitlines())
         check_material_domain(destination, solved)
         if not solved.timed_out:
@@ -401,6 +420,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         raise
     finally:
         report["active_seconds"] = budgeted.consumed(spec)
+        report["elapsed_seconds"] = time.monotonic() - started_at
         (destination / "report.json").write_text(json.dumps(report, allow_nan=False) + "\n")
         print(json.dumps({"kind": report["kind"], "tier": tier, "outcome": report["outcome"],
             "convergence": report.get("convergence"), "active_seconds": report["active_seconds"],
@@ -415,6 +435,7 @@ if __name__ == "__main__":
     parser.add_argument("--tier", choices=["fast", "precise", "refined"], required=True)
     parser.add_argument("--transonic", action="store_true")
     parser.add_argument("--consistent-pressure", action="store_true")
+    parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--wall-functions", action="store_true")
     parser.add_argument("--uniform-start", action="store_true")
     parser.add_argument("--enthalpy", action="store_true")
@@ -428,4 +449,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes)

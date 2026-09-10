@@ -79,6 +79,10 @@ services:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind-transonic-refined", "--tier", "refined", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--transonic", "--pressure-equation-relaxation", "1", "--time-budget-seconds", "3000"]
+  enthalpy-upwind-mpi:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind-mpi", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--processes", "4"]
   enthalpy-consistent-refined:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
