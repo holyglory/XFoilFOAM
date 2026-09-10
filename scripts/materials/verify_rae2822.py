@@ -24,6 +24,20 @@ def benchmark_time_budget(value=600):
     return float(value)
 
 
+def configure_limited_nonorthogonal(path):
+    original = Path(path).read_text()
+    patterns = [
+        (r"(\blaplacianSchemes\s*\{\s*default\s+)Gauss linear corrected(\s*;\s*\})", r"\g<1>Gauss linear limited 0.5\2"),
+        (r"(\bsnGradSchemes\s*\{\s*default\s+)corrected(\s*;\s*\})", r"\g<1>limited 0.5\2"),
+    ]
+    changed = original
+    for pattern, replacement in patterns:
+        changed, count = re.subn(pattern, replacement, changed)
+        if count != 1:
+            raise ValueError("Expected exact generated Laplacian and surface-normal correction blocks")
+    Path(path).write_text(changed)
+
+
 def benchmark_momentum_scheme(first_order=False):
     if not isinstance(first_order, bool):
         raise ValueError("Transport order must be an explicit benchmark choice")
@@ -226,7 +240,7 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic):
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False):
     time_budget_seconds = benchmark_time_budget(time_budget_seconds)
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
@@ -271,6 +285,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     budgeted.begin_case(spec)
     report = {"kind": "rae2822-transonic-pressure-validation", "tier": tier, "production_evidence": False,
               "time_budget_seconds": time_budget_seconds,
+              "experimental_nonorthogonal_correction": "limited 0.5" if limited_nonorthogonal else "corrected",
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
               "experimental_wall_functions": wall_functions,
@@ -289,6 +304,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         patches = mesher.patches(mesh)
         builder = _case_builder(budgeted, airfoil, patches, mesh, spec, request.fluid, request.roughness, request.solver)
         builder.write(destination)
+        if limited_nonorthogonal:
+            configure_limited_nonorthogonal(destination / "system/fvSchemes")
         if enthalpy:
             configure_enthalpy_energy(destination)
         if upwind_energy:
@@ -384,5 +401,6 @@ if __name__ == "__main__":
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
     parser.add_argument("--time-budget-seconds", type=float, default=600)
+    parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal)

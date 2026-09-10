@@ -3,6 +3,7 @@ import pytest
 
 import json
 import hashlib
+from scripts.materials.verify_rae2822 import configure_limited_nonorthogonal
 
 from scripts.materials.verify_rae2822 import benchmark_mesh, benchmark_momentum_scheme, benchmark_time_budget, compare_pressure, configure_enthalpy_energy, configure_pressure_equation_relaxation, configure_pressure_krylov, configure_transonic_pressure, configure_upwind_energy, pressure_iteration, restore_verified_donor, wall_pressure
 
@@ -11,6 +12,19 @@ def test_benchmark_time_budget_preserves_default_and_allows_bounded_mesh_study()
     assert benchmark_time_budget() == 600
     assert benchmark_time_budget(3000) == 3000
     assert benchmark_time_budget(3600) == 3600
+
+
+def test_nonorthogonal_comparison_changes_only_both_preflighted_corrections(tmp_path):
+    path = tmp_path / "fvSchemes"
+    original = "laplacianSchemes { default Gauss linear corrected; }\nsnGradSchemes { default corrected; }\ndivSchemes { default none; div(phi,h) bounded Gauss upwind; }"
+    path.write_text(original)
+    configure_limited_nonorthogonal(path)
+    assert path.read_text() == original.replace("Gauss linear corrected", "Gauss linear limited 0.5").replace("default corrected", "default limited 0.5")
+    for malformed in [original.replace("snGradSchemes", "other"), original.replace("laplacianSchemes", "other"), original + "\nsnGradSchemes { default corrected; }"]:
+        path.write_text(malformed)
+        with pytest.raises(ValueError, match="exact generated"):
+            configure_limited_nonorthogonal(path)
+        assert path.read_text() == malformed
 
 
 @pytest.mark.parametrize("value", [0, -1, 3601, float("nan"), float("inf"), True, "3000", None])
