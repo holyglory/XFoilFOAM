@@ -1,10 +1,12 @@
 import type { AirfoilDetailPayload, Polar, PolarPointData } from "@aerodb/core";
+import { projectChart } from "@aerodb/core";
 import { describe, expect, it } from "vitest";
 
 import {
   activePolarSeriesId,
   initialSeriesVisibility,
   polarLegendItems,
+  polarDisplayProjection,
   polarSeriesOptions,
   formatPolarAoa,
   primaryPolarEvidencePoints,
@@ -50,6 +52,71 @@ const sameRePolars: Polar[] = [
 ];
 
 const detail = (polars: Polar[]) => ({ polars }) as AirfoilDetailPayload;
+
+describe("CFD-only curve-first display", () => {
+  const accepted = [point("accepted-0", 0), point("accepted-2", 2)];
+  const provisional = {
+    ...point("provisional-4", 4),
+    classificationState: "needs_urans" as const,
+  };
+  const fitted: Polar = {
+    ...sameRePolars[0],
+    points: [...accepted, provisional],
+    fit: {
+      status: "provisional",
+      confidence: 0.5,
+      metrics: null,
+      points: [0, 1, 2].map((alpha) => ({
+        ...point("fit-only-test", alpha),
+        cm: -0.02,
+      })),
+      acceptedPointCount: 2,
+      provisionalPointCount: 1,
+      rejectedPointCount: 0,
+      evidenceSignature: "isolated-fixture",
+    },
+  };
+  const project = (polar: Polar) =>
+    projectChart({
+      chartType: "cla",
+      polars: [polar],
+      visibleSeries: { [polar.seriesId]: true },
+      hoverKey: null,
+    });
+
+  it("shows only supported cached curves and conserves exact evidence on opt-in", () => {
+    const evidence = project(fitted);
+    const first = polarDisplayProjection(evidence, false);
+    expect(first.points).toEqual([]);
+    expect(first.curves.length).toBeGreaterThan(0);
+    expect(first.curves.every((curve) => curve.kind === "fit")).toBe(true);
+    expect(first.curves).toEqual(
+      evidence.curves.filter((curve) => curve.kind === "fit"),
+    );
+    const inspected = polarDisplayProjection(evidence, true);
+    expect(inspected).toBe(evidence);
+    expect(inspected.points.map((marker) => marker.point.resultId)).toEqual([
+      "accepted-0",
+      "accepted-2",
+      "provisional-4",
+    ]);
+    expect(polarDisplayProjection(evidence, false)).toEqual(first);
+  });
+
+  it("does not substitute point-connecting lines for a missing cache", () => {
+    const evidence = project({ ...fitted, fit: null });
+    expect(evidence.curves.length).toBeGreaterThan(0);
+    expect(polarDisplayProjection(evidence, false).curves).toEqual([]);
+    expect(polarDisplayProjection(evidence, false).points).toEqual([]);
+    expect(polarDisplayProjection(evidence, true)).toBe(evidence);
+  });
+
+  it("does not turn unsupported cached samples into a published curve", () => {
+    const evidence = project({ ...fitted, points: [provisional] });
+    expect(polarDisplayProjection(evidence, false).curves).toEqual([]);
+    expect(polarDisplayProjection(evidence, true).points).toHaveLength(1);
+  });
+});
 
 describe("public polar-series UI model", () => {
   it("starts every emitted public series visible and toggles same-Re series independently", () => {

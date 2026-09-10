@@ -67,9 +67,7 @@ export function DetailIsland({
     null,
   );
   const detail = loadedDetail ?? initialDetail;
-  const [pointsOpen, setPointsOpen] = useState(
-    openCfdInitially || !initialDetail.progressivePolars?.length,
-  );
+  const [pointsOpen, setPointsOpen] = useState(openCfdInitially);
   const [pointsLoading, setPointsLoading] = useState(false);
   const [pointsError, setPointsError] = useState<string | null>(null);
   const [pointsInteractive, setPointsInteractive] = useState(false);
@@ -107,7 +105,7 @@ export function DetailIsland({
     setLoadedDetail(null);
     setPointsLoading(false);
     setPointsError(null);
-    setPointsOpen(openCfdInitially || !initialDetail.progressivePolars?.length);
+    setPointsOpen(openCfdInitially);
     setPointsInteractive(true);
     return () => {
       pointsRequest.current?.abort();
@@ -411,78 +409,118 @@ export function DetailIsland({
               onOpenResult={openSolverWorkResult}
             />
           )}
-          {(!detail.progressivePolars?.length ||
-            solvedPointCount > 0 ||
-            initialDetail.cfdPointsDeferred ||
-            openCfdInitially) && (
-            <details
-              id="cfd-points"
-              open={pointsOpen}
-              inert={initialDetail.cfdPointsDeferred && !pointsInteractive}
-              onToggle={(event) => {
-                const opened = event.currentTarget.open;
-                setPointsOpen(opened);
-                if (opened) void loadCfdPoints();
-                else {
-                  pointsRequest.current?.abort();
-                  pointsRequest.current = null;
-                  setPointsLoading(false);
-                }
+          {!detail.progressivePolars?.length && (
+            <PolarViewer
+              chartType={chartType}
+              onChartType={changeChartType}
+              projection={projection}
+              polars={chartPolars}
+              domain={chartDomain}
+              onDomainChange={setChartDomain}
+              visibleSeries={visibleSeries}
+              onToggleSeries={(seriesId) =>
+                setVisibleSeries((visibility) =>
+                  toggleSeriesVisibility(visibility, seriesId),
+                )
+              }
+              solvedPointCount={solvedPointCount}
+              machStr={chartMachStr}
+              hover={hover}
+              onHover={setHover}
+              onPointClick={onPointClick}
+              pointsControl={{
+                visible: pointsOpen,
+                onToggle: () => setPointsOpen((visible) => !visible),
               }}
-            >
-              <summary
-                style={{ cursor: "pointer", padding: "10px 0", color: C.text }}
-              >
-                CFD points
-              </summary>
-              {initialDetail.cfdPointsDeferred && !loadedDetail ? (
-                <div aria-live="polite" style={{ color: C.text2 }}>
-                  {pointsLoading && <p role="status">Loading CFD points…</p>}
-                  {pointsError && (
-                    <p role="alert">
-                      {pointsError}{" "}
-                      <button
-                        type="button"
-                        onClick={() => void loadCfdPoints()}
-                        style={{
-                          color: C.text,
-                          background: C.panel2,
-                          border: `1px solid ${C.border}`,
-                          borderRadius: 6,
-                          padding: "8px 12px",
-                          minHeight: 44,
-                          cursor: "pointer",
-                        }}
-                      >
-                        Retry
-                      </button>
-                    </p>
-                  )}
-                </div>
-              ) : detail.progressivePolars?.length && solvedPointCount === 0 ? (
-                <p style={{ color: C.text2 }}>No CFD points yet.</p>
-              ) : (
-                <PolarViewer
-                  chartType={chartType}
-                  onChartType={changeChartType}
-                  projection={projection}
-                  polars={chartPolars}
-                  domain={chartDomain}
-                  onDomainChange={setChartDomain}
-                  visibleSeries={visibleSeries}
-                  onToggleSeries={(seriesId) =>
-                    setVisibleSeries((visibility) =>
-                      toggleSeriesVisibility(visibility, seriesId),
-                    )
+            />
+          )}
+          {!!detail.progressivePolars?.length &&
+            (solvedPointCount > 0 ||
+              initialDetail.cfdPointsDeferred ||
+              openCfdInitially) && (
+              <details
+                id="cfd-points"
+                open={pointsOpen}
+                inert={initialDetail.cfdPointsDeferred && !pointsInteractive}
+                onToggle={(event) => {
+                  const opened = event.currentTarget.open;
+                  setPointsOpen(opened);
+                  if (opened) void loadCfdPoints();
+                  else {
+                    pointsRequest.current?.abort();
+                    pointsRequest.current = null;
+                    setPointsLoading(false);
                   }
-                  solvedPointCount={solvedPointCount}
-                  machStr={chartMachStr}
-                  hover={hover}
-                  onHover={setHover}
-                  onPointClick={onPointClick}
-                />
-              )}
-            </details>
+                }}
+              >
+                <summary
+                  style={{
+                    cursor: "pointer",
+                    padding: "10px 0",
+                    color: C.text,
+                  }}
+                >
+                  CFD points
+                </summary>
+                {initialDetail.cfdPointsDeferred && !loadedDetail ? (
+                  <div aria-live="polite" style={{ color: C.text2 }}>
+                    {pointsLoading && <p role="status">Loading CFD points…</p>}
+                    {pointsError && (
+                      <p role="alert">
+                        {pointsError}{" "}
+                        <button
+                          type="button"
+                          onClick={() => void loadCfdPoints()}
+                          style={{
+                            color: C.text,
+                            background: C.panel2,
+                            border: `1px solid ${C.border}`,
+                            borderRadius: 6,
+                            padding: "8px 12px",
+                            minHeight: 44,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Retry
+                        </button>
+                      </p>
+                    )}
+                  </div>
+                ) : detail.progressivePolars?.length &&
+                  solvedPointCount === 0 ? (
+                  <p style={{ color: C.text2 }}>No CFD points yet.</p>
+                ) : (
+                  <PolarViewer
+                    chartType={chartType}
+                    onChartType={changeChartType}
+                    projection={projection}
+                    polars={chartPolars}
+                    domain={chartDomain}
+                    onDomainChange={setChartDomain}
+                    visibleSeries={visibleSeries}
+                    onToggleSeries={(seriesId) =>
+                      setVisibleSeries((visibility) =>
+                        toggleSeriesVisibility(visibility, seriesId),
+                      )
+                    }
+                    solvedPointCount={solvedPointCount}
+                    machStr={chartMachStr}
+                    hover={hover}
+                    onHover={setHover}
+                    onPointClick={onPointClick}
+                  />
+                )}
+              </details>
+            )}
+          {!detail.progressivePolars?.length && !pointsOpen && (
+            <noscript>
+              <a
+                href={`/airfoils/${encodeURIComponent(detail.slug)}?${pinnedRevisionId ? `revision=${encodeURIComponent(pinnedRevisionId)}&` : ""}points=1`}
+                style={{ color: C.teal }}
+              >
+                Show CFD points
+              </a>
+            </noscript>
           )}
           {initialDetail.cfdPointsDeferred && (
             <noscript>

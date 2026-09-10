@@ -35,6 +35,7 @@ import { containedBadgePosition, POLAR_BADGE_EDGE } from "@/lib/polar-badge";
 import {
   formatPolarAoa,
   polarLegendItems,
+  polarDisplayProjection,
   storedResultsHeading,
 } from "@/lib/polar-series";
 import type { HoverState } from "./DetailIsland";
@@ -65,6 +66,7 @@ export function PolarViewer(props: {
   hover: HoverState | null;
   onHover: (h: HoverState | null) => void;
   onPointClick: (vm: ChartPointVM) => void;
+  pointsControl?: { visible: boolean; onToggle: () => void };
   /** zoom/pan window (null = zoom-to-fit) */
   domain: ChartDomain | null;
   onDomainChange: (d: ChartDomain | null) => void;
@@ -78,7 +80,7 @@ export function PolarViewer(props: {
   const {
     chartType,
     onChartType,
-    projection,
+    projection: evidenceProjection,
     polars,
     visibleSeries,
     onToggleSeries,
@@ -90,7 +92,13 @@ export function PolarViewer(props: {
     domain,
     onDomainChange,
     profileView,
+    pointsControl,
   } = props;
+  const showPoints = pointsControl?.visible ?? true;
+  const projection = useMemo(
+    () => polarDisplayProjection(evidenceProjection, showPoints),
+    [evidenceProjection, showPoints],
+  );
   const [cursor, setCursor] = useState<ChartCursor | null>(null);
   const [resultChoice, setResultChoice] = useState<ChartPointVM | null>(null);
   const [maximized, setMaximized] = useState(false);
@@ -227,9 +235,11 @@ export function PolarViewer(props: {
   const readoutRows = useMemo(
     () =>
       cursor && !hover
-        ? readoutAtX({ chartType, polars, visibleSeries, x: cursor.x })
+        ? readoutAtX({ chartType, polars, visibleSeries, x: cursor.x }).filter(
+            (row) => showPoints || row.kind === "fit",
+          )
         : [],
-    [cursor, hover, chartType, polars, visibleSeries],
+    [cursor, hover, chartType, polars, visibleSeries, showPoints],
   );
   const legendItems = useMemo(
     () => polarLegendItems(polars, visibleSeries),
@@ -471,22 +481,48 @@ export function PolarViewer(props: {
               flexWrap: "wrap",
             }}
           >
-            <span
-              style={{
-                fontFamily: MONO,
-                fontSize: 11,
-                color: solvedPointCount ? C.teal : C.dim,
-                border: `1px solid ${solvedPointCount ? C.tealBorder : C.stroke}`,
-                background: solvedPointCount ? C.tealFill : C.panel3,
-                borderRadius: 8,
-                padding: "7px 12px",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {solvedPointCount
-                ? solvedPointLabel
-                : "waiting for solved points"}
-            </span>
+            {pointsControl ? (
+              <button
+                type="button"
+                aria-pressed={showPoints}
+                onClick={() => {
+                  onHover(null);
+                  setResultChoice(null);
+                  setCursor(null);
+                  pointsControl.onToggle();
+                }}
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: showPoints ? C.teal : C.text,
+                  background: showPoints ? C.tealFill : C.panel3,
+                  border: `1px solid ${C.stroke}`,
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  minHeight: 44,
+                  cursor: "pointer",
+                }}
+              >
+                CFD points{solvedPointCount ? ` · ${solvedPointCount}` : ""}
+              </button>
+            ) : (
+              <span
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  color: solvedPointCount ? C.teal : C.dim,
+                  border: `1px solid ${solvedPointCount ? C.tealBorder : C.stroke}`,
+                  background: solvedPointCount ? C.tealFill : C.panel3,
+                  borderRadius: 8,
+                  padding: "7px 12px",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {solvedPointCount
+                  ? solvedPointLabel
+                  : "waiting for solved points"}
+              </span>
+            )}
             <span
               style={{
                 fontFamily: MONO,
@@ -659,39 +695,46 @@ export function PolarViewer(props: {
               >
                 {projection.yTitle}
               </div>
-              {projection.points.length === 0 && (
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: "22% 10%",
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    textAlign: "center",
-                    pointerEvents: "none",
-                    fontFamily: MONO,
-                    color: C.muted,
-                    background: "rgba(7, 12, 18, 0.52)",
-                    border: `1px dashed ${C.stroke2}`,
-                    borderRadius: 10,
-                    padding: 16,
-                  }}
-                >
-                  <span
-                    style={{ color: C.text, fontSize: 12, fontWeight: 700 }}
+              {projection.points.length === 0 &&
+                projection.curves.length === 0 && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      inset: "22% 10%",
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      textAlign: "center",
+                      pointerEvents: "none",
+                      fontFamily: MONO,
+                      color: C.muted,
+                      background: "rgba(7, 12, 18, 0.52)",
+                      border: `1px dashed ${C.stroke2}`,
+                      borderRadius: 10,
+                      padding: 16,
+                    }}
                   >
-                    {chartType === "cma" && solvedPointCount > 0
-                      ? "Cm is unavailable for these solved points"
-                      : "No solved OpenFOAM polar points yet"}
-                  </span>
-                  <span style={{ marginTop: 7, fontSize: 10, lineHeight: 1.5 }}>
-                    {chartType === "cma" && solvedPointCount > 0
-                      ? "No moment-coefficient evidence was stored. The other coefficient charts remain available."
-                      : "Queued/running points will appear here only after a completed result row is stored."}
-                  </span>
-                </div>
-              )}
+                    <span
+                      style={{ color: C.text, fontSize: 12, fontWeight: 700 }}
+                    >
+                      {!showPoints
+                        ? "No polar curve available yet."
+                        : chartType === "cma" && solvedPointCount > 0
+                          ? "Cm is unavailable for these solved points"
+                          : "No solved OpenFOAM polar points yet"}
+                    </span>
+                    {showPoints && (
+                      <span
+                        style={{ marginTop: 7, fontSize: 10, lineHeight: 1.5 }}
+                      >
+                        {chartType === "cma" && solvedPointCount > 0
+                          ? "No moment-coefficient evidence was stored. The other coefficient charts remain available."
+                          : "Queued/running points will appear here only after a completed result row is stored."}
+                      </span>
+                    )}
+                  </div>
+                )}
               {hover && (
                 <div
                   ref={badgeRef}

@@ -1217,8 +1217,29 @@ health = { path = "/health", timeout_seconds = 120 }
 [test.progressive-ui]
 timeout_seconds = 900
 
+[test.cfd-curve-display]
+timeout_seconds = 300
+
+[[test.cfd-curve-display.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "typecheck"]
+
+[[test.cfd-curve-display.check]]
+name = "projection"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/polar-series.test.ts", "test/polar-viewer.test.ts"]
+
 [test.progressive-production-ui]
 timeout_seconds = 180
+
+[test.prediction-repair-production]
+timeout_seconds = 180
+
+[[test.prediction-repair-production.check]]
+name = "repaired-curves"
+tier = "development"
+command = ["node", "scripts/dev/verify-repaired-predictions-production.mjs"]
 
 [[test.progressive-production-ui.check]]
 name = "curves"
@@ -1241,6 +1262,12 @@ name = "deferred-cfd-points"
 tier = "development"
 requires = ["preview-ready"]
 command = ["node", "scripts/dev/verify-deferred-cfd-points.mjs"]
+
+[[test.progressive-ui.check]]
+name = "cfd-only-curves"
+tier = "development"
+requires = ["preview-ready"]
+command = ["node", "scripts/dev/verify-cfd-only-curves.mjs"]
 
 [[test.progressive-ui.check]]
 name = "control-sizing"

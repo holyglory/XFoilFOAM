@@ -1,5 +1,6 @@
 import {
   derivedBySymmetryInfo,
+  type ChartProjection,
   type AirfoilDetailPayload,
   type Polar,
   type PolarPointData,
@@ -7,6 +8,18 @@ import {
 } from "@aerodb/core";
 
 export type SeriesVisibility = Record<string, boolean>;
+
+export function polarDisplayProjection(
+  projection: ChartProjection,
+  showPoints: boolean,
+): ChartProjection {
+  if (showPoints) return projection;
+  return {
+    ...projection,
+    curves: projection.curves.filter((curve) => curve.kind === "fit"),
+    points: [],
+  };
+}
 
 export function initialSeriesVisibility(
   polars: Pick<Polar, "seriesId">[],
