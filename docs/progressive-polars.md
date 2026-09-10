@@ -618,6 +618,12 @@ Progressive workers publish through their dedicated compact-evidence and archive
 services, never the legacy accepted-result publisher. A terminal worker report
 may precede local point staging; that temporary absence is not an empty solve and
 must not cancel the promise or create a legacy blocked-delivery receipt.
+Compact evidence publication alternates a current, unexpired-promise priority
+pass with an oldest-first pass, so current curves do not wait behind retained
+cancelled work and historical evidence still advances. Each pass attempts both
+staging and delivery even if one fails; existing retry deadlines, exact-report
+ownership and conflict checks remain unchanged. This is publication order, not
+permission to accept a cancelled promise or change campaign-stage priorities.
 The hub can recover an angle lost to that legacy publication race once, using
 the authenticated cancellation reason and immutable final report it already
 holds. `node --import tsx packages/db/src/recover-progressive-publication.ts

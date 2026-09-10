@@ -11,6 +11,7 @@ import {
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import type { EngineClient, JobResult } from "@aerodb/engine-client";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
+import { progressiveEvidencePriority } from "./progressive-evidence-priority";
 import { ingestResult } from "./ingest";
 import {
   DEFAULT_INGEST_LEASE_MS,
@@ -213,7 +214,10 @@ export async function stageProgressiveWorkerEvidence(
 export async function stageNextProgressiveWorkerEvidence(
   db: DB,
   engine: EngineClient,
-  hooks: { afterEvidenceStaged?: () => Promise<void> } = {},
+  hooks: {
+    afterEvidenceStaged?: () => Promise<void>;
+    preferActive?: boolean;
+  } = {},
 ): Promise<boolean> {
   const [pending] = await db.execute(sql`
     SELECT report.sim_job_id, report.sequence FROM progressive_worker_reports report
@@ -231,7 +235,8 @@ export async function stageNextProgressiveWorkerEvidence(
       AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-    ORDER BY report.created_at, report.sim_job_id, report.sequence LIMIT 1
+    ORDER BY ${progressiveEvidencePriority(hooks.preferActive === true)},
+      report.created_at, report.sim_job_id, report.sequence LIMIT 1
   `);
   if (!pending) return false;
   try {

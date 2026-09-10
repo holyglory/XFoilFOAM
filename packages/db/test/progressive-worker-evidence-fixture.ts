@@ -11,6 +11,7 @@ import {
 } from "../../../apps/sweeper/src/progressive-worker-evidence";
 import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progressive-evidence-service";
 import { verifyProgressiveWorkerEvidenceDelivery } from "./progressive-worker-evidence-delivery-fixture";
+import { progressiveEvidencePriority } from "../../../apps/sweeper/src/progressive-evidence-priority";
 
 export async function verifyProgressiveWorkerEvidence(
   db: DB,
@@ -25,6 +26,20 @@ export async function verifyProgressiveWorkerEvidence(
     sql`SELECT status FROM sim_jobs WHERE id = ${executionId}::uuid`,
   );
   try {
+    for (const preferActive of [true, false]) {
+      const rows =
+        await db.execute(sql`WITH promise(status,"expiresAt",created_at,label) AS (VALUES
+        ('cancelled',clock_timestamp()+interval '1 hour',1,'retained'),
+        ('active',clock_timestamp()-interval '1 second',2,'expired-active'),
+        ('expired',clock_timestamp()+interval '1 hour',3,'expired'),
+        ('active',clock_timestamp()+interval '1 hour',4,'current'))
+        SELECT label FROM promise ORDER BY ${progressiveEvidencePriority(preferActive)},created_at`);
+      expect(rows.map((row) => row.label)).toEqual(
+        preferActive
+          ? ["current", "retained", "expired-active", "expired"]
+          : ["retained", "expired-active", "expired", "current"],
+      );
+    }
     expect(
       await stageProgressiveWorkerEvidence(db, engine, executionId),
     ).toEqual({ kind: "idle" });

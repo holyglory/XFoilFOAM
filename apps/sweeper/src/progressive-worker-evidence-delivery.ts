@@ -10,10 +10,12 @@ import {
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
+import { progressiveEvidencePriority } from "./progressive-evidence-priority";
 
 export async function deliverNextProgressiveWorkerEvidence(
   db: DB,
   fetcher: typeof fetch = fetch,
+  selection: { preferActive?: boolean } = {},
 ): Promise<boolean> {
   const [pending] = await db.execute(sql`
     SELECT source.sim_job_id, source.sequence, source.result_attempt_id, source.point_content_signature,
@@ -40,7 +42,8 @@ export async function deliverNextProgressiveWorkerEvidence(
       AND promise.registered_solver_id = settings.remote_solver_registered_id
       AND promise.source_base_url = settings.upstream_base_url
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
-    ORDER BY report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id LIMIT 1
+    ORDER BY ${progressiveEvidencePriority(selection.preferActive === true)},
+      report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id LIMIT 1
   `);
   if (!pending) return false;
   const executionId = String(pending.sim_job_id);

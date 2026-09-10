@@ -5,6 +5,32 @@ import { runNotificationDrain } from "./notification-drain";
 import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evidence-delivery";
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
 
+export function progressiveEvidenceDrain(
+  stage: (preferActive: boolean) => Promise<boolean>,
+  deliver: (preferActive: boolean) => Promise<boolean>,
+) {
+  let preferActive = true;
+  return async () => {
+    const preference = preferActive;
+    preferActive = !preferActive;
+    let progress = false;
+    const errors: unknown[] = [];
+    for (const operation of [stage, deliver]) {
+      try {
+        progress = (await operation(preference)) || progress;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(
+        errors,
+        "Progressive evidence pass has retryable or conflicting work",
+      );
+    return progress;
+  };
+}
+
 export async function nextProgressiveEvidenceWakeAt(
   db: DB,
 ): Promise<Date | null> {
@@ -65,9 +91,12 @@ export async function runProgressiveEvidenceService(
     {
       drain:
         options.drain ??
-        (async () =>
-          (await deliverNextProgressiveWorkerEvidence(db)) ||
-          (await stageNextProgressiveWorkerEvidence(db, engine))),
+        progressiveEvidenceDrain(
+          (preferActive) =>
+            stageNextProgressiveWorkerEvidence(db, engine, { preferActive }),
+          (preferActive) =>
+            deliverNextProgressiveWorkerEvidence(db, fetch, { preferActive }),
+        ),
       nextWakeAt:
         options.nextWakeAt ?? (() => nextProgressiveEvidenceWakeAt(db)),
       reportError:

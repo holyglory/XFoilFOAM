@@ -1,7 +1,10 @@
 import type { DB, Sql } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runProgressiveEvidenceService } from "../src/progressive-evidence-service";
+import {
+  progressiveEvidenceDrain,
+  runProgressiveEvidenceService,
+} from "../src/progressive-evidence-service";
 import { runSweeperServices } from "../src/service-lifecycle";
 
 function notifications() {
@@ -20,6 +23,37 @@ function notifications() {
 }
 
 afterEach(() => vi.useRealTimers());
+
+it("alternates current-work priority with oldest-first while both stages progress", async () => {
+  const stage = vi.fn().mockResolvedValue(true);
+  const deliver = vi.fn().mockResolvedValue(true);
+  const drain = progressiveEvidenceDrain(stage, deliver);
+  for (let pass = 0; pass < 4; pass += 1) expect(await drain()).toBe(true);
+  expect(stage.mock.calls).toEqual([[true], [false], [true], [false]]);
+  expect(deliver.mock.calls).toEqual(stage.mock.calls);
+});
+
+it("does not let permanent delivery errors prevent staging or vice versa", async () => {
+  const stage = vi.fn().mockResolvedValue(true);
+  const deliver = vi.fn().mockRejectedValue(new Error("old receipt conflict"));
+  const drain = progressiveEvidenceDrain(stage, deliver);
+  for (let pass = 0; pass < 3; pass += 1)
+    await expect(drain()).rejects.toThrow(AggregateError);
+  expect(stage).toHaveBeenCalledTimes(3);
+  expect(stage.mock.calls).toEqual([[true], [false], [true]]);
+  stage.mockRejectedValue(new Error("retained source staging error"));
+  deliver.mockResolvedValue(true);
+  await expect(drain()).rejects.toThrow(AggregateError);
+  expect(deliver).toHaveBeenCalledTimes(4);
+});
+
+it("sleeps only when neither staging nor delivery made progress", async () => {
+  const stage = vi.fn().mockResolvedValue(false);
+  const deliver = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
+  const drain = progressiveEvidenceDrain(stage, deliver);
+  expect(await drain()).toBe(true);
+  expect(await drain()).toBe(false);
+});
 
 describe("independent compact evidence delivery", () => {
   it("stages and delivers new evidence while the bulk transfer is blocked", async () => {
