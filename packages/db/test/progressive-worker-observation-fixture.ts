@@ -16,6 +16,7 @@ import { reconcileProgressiveRemoteWorker } from "../../../apps/sweeper/src/prog
 import type { EngineClient } from "../../engine-client/src";
 import { assertProgressiveWorkerEvidenceJob } from "../../../apps/sweeper/src/progressive-remote-jobs";
 import { verifyProgressiveWorkerEvidence } from "./progressive-worker-evidence-fixture";
+import { verifyProgressiveRestartRetention } from "./progressive-restart-retention-fixture";
 import {
   progressiveArchiveManifestBytes,
   progressiveArchiveManifestSha256,
@@ -415,6 +416,8 @@ export async function verifyProgressiveWorkerObservation(
       engine as unknown as EngineClient,
       envelope,
     );
+  if (mode === "success")
+    await verifyProgressiveRestartRetention(db, executionId);
   await db.execute(
     sql`UPDATE sim_jobs SET engine_job_id = ${randomUUID()} WHERE id = ${executionId}::uuid`,
   );

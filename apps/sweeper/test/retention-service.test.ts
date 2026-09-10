@@ -4,6 +4,7 @@ import type { EngineClient } from "@aerodb/engine-client";
 import { PgDialect } from "drizzle-orm/pg-core";
 import * as retention from "../src/retention";
 import { runRetentionService } from "../src/retention-service";
+import * as progressiveRetention from "../src/progressive-restart-retention";
 
 vi.mock("node:timers/promises", () => ({
   setTimeout: (
@@ -62,6 +63,9 @@ it("serializes an emergency pass behind existing cleanup without dropping its op
 
 it("keeps cleanup active while scheduling is paused and preserves forecast reclamation", async () => {
   vi.useFakeTimers();
+  const progressive = vi
+    .spyOn(progressiveRetention, "reclaimProgressiveRestartState")
+    .mockResolvedValue({ stripped: 1, bytesFreed: 0 });
   const cleanup = vi.spyOn(retention, "retentionTick").mockResolvedValue();
   const db = {
     execute: vi
@@ -76,6 +80,7 @@ it("keeps cleanup active while scheduling is paused and preserves forecast recla
     expect(cleanup).toHaveBeenCalledWith(db, engine, {
       reclaimOptionalCaseState: true,
     });
+    expect(progressive).toHaveBeenCalledWith(db, engine);
     await vi.advanceTimersByTimeAsync(5000);
     expect(cleanup).toHaveBeenCalledTimes(2);
   } finally {
@@ -117,4 +122,31 @@ it("does not overlap slow cleanup and drains it when the service stops", async (
   expect(finished).toBe(true);
   await vi.advanceTimersByTimeAsync(20000);
   expect(cleanup).toHaveBeenCalledOnce();
+});
+
+it("uses the existing cleanup batch and stops when pressure reclamation is exhausted", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(retention, "retentionTick").mockResolvedValue();
+  vi.spyOn(retention, "retentionConfigFromEnv").mockReturnValue({
+    ...retention.retentionConfigFromEnv(),
+    stripMaxPerTick: 2,
+  });
+  const reclaim = vi
+    .spyOn(progressiveRetention, "reclaimProgressiveRestartState")
+    .mockResolvedValueOnce({ stripped: 1, bytesFreed: 8192 })
+    .mockResolvedValue({ stripped: 0, bytesFreed: 0 });
+  const db = {
+    execute: vi.fn().mockResolvedValue([{ disk_admission_blocked: true }]),
+  } as unknown as DB;
+  const owner = new AbortController();
+  const running = runRetentionService(db, {} as EngineClient, owner.signal);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reclaim).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reclaim).toHaveBeenCalledTimes(3);
+  } finally {
+    owner.abort();
+    await running;
+  }
 });

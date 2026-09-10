@@ -2,7 +2,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { DB } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
-import { retentionTick } from "./retention";
+import { retentionConfigFromEnv, retentionTick } from "./retention";
+import { reclaimProgressiveRestartState } from "./progressive-restart-retention";
 
 export async function runRetentionService(
   db: DB,
@@ -15,6 +16,24 @@ export async function runRetentionService(
         sql`SELECT disk_admission_blocked FROM sweeper_state WHERE id = 1`,
       );
       if (signal.aborted) break;
+      if (state?.disk_admission_blocked === true) {
+        const { stripMaxPerTick } = retentionConfigFromEnv();
+        for (
+          let index = 0;
+          index < stripMaxPerTick && !signal.aborted;
+          index += 1
+        ) {
+          const reclaimed = await reclaimProgressiveRestartState(db, engine);
+          if (reclaimed.bytesFreed || reclaimed.error)
+            console.log(
+              JSON.stringify({
+                component: "progressive-restart-retention",
+                ...reclaimed,
+              }),
+            );
+          if (!reclaimed.bytesFreed) break;
+        }
+      }
       await retentionTick(db, engine, {
         reclaimOptionalCaseState: state?.disk_admission_blocked === true,
       });

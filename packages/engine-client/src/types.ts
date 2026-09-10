@@ -437,6 +437,8 @@ export interface EngineStripJobRequest {
 }
 
 export interface EngineStripJobResponse {
+  job_id?: string;
+  unknown_entries?: string[];
   bytes_freed: number;
   files_removed: number;
   kept_case_state: boolean;

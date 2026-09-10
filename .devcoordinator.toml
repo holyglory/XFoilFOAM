@@ -422,6 +422,17 @@ tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts", "test/retention-service.test.ts", "test/progressive-intake-service.test.ts", "test/progressive-hub-progress-service.test.ts"]
 
 [[test.progressive.check]]
+name = "restart-retention"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-restart-retention.test.ts", "test/retention-service.test.ts"]
+
+[[test.progressive.check]]
+name = "restart-retention-native"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_retention.py", "-q"]
+
+[[test.progressive.check]]
 name = "execution-contract"
 tier = "development"
 requires = ["types"]
