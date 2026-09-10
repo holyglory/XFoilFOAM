@@ -1404,13 +1404,13 @@ port = true
 route = true
 timeout_seconds = 3300
 
-[deployment.rae-local-time-continuation]
+[deployment.rae-local-time-continuation-v2]
 source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
 
-[deployment.rae-local-time-continuation.component.numerics]
+[deployment.rae-local-time-continuation-v2.component.numerics]
 type = "compose"
 files = ["compose.rae-verification.yml"]
 services = ["artifacts", "enthalpy-local-continuation"]
