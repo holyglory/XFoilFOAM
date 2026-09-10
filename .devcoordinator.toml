@@ -304,7 +304,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vite
 [[test.progressive.check]]
 name = "services"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts", "test/retention-service.test.ts", "test/progressive-intake-service.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts", "test/retention-service.test.ts", "test/progressive-intake-service.test.ts", "test/progressive-hub-progress-service.test.ts"]
 
 [[test.progressive.check]]
 name = "execution-contract"

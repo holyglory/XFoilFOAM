@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -2014,6 +2015,48 @@ describe("progressive CPU admission", () => {
         };
         await storeProgressiveRemoteReport(db, { ...sender, report: terminal });
         expect(await progressiveRemoteReservedSlots(db, solverId)).toBe(1);
+        const stopRollback = new Error(
+          "isolated early-stop acknowledgement rollback",
+        );
+        await expect(
+          db.transaction(async (transaction) => {
+            const connection = transaction as unknown as DB;
+            expect(
+              await acknowledgeLatestProgressiveRemoteStop(connection, job.id),
+            ).toBe(true);
+            expect(
+              await progressiveRemoteReservedSlots(connection, solverId),
+            ).toBe(0);
+            expect(
+              await acknowledgeLatestProgressiveRemoteStop(connection, job.id),
+            ).toBe(false);
+            const [unchanged] = await connection.execute(sql`
+            SELECT job.status, job."ingestedAt" AS ingested,
+              (SELECT count(*)::integer FROM progressive_remote_progress_receipts receipt WHERE receipt.sim_job_id = job.id) AS progress
+            FROM sim_jobs job WHERE id = ${job.id}::uuid
+          `);
+            expect(unchanged).toEqual({
+              status: "pending",
+              ingested: null,
+              progress: 0,
+            });
+            for (const sequence of [1, 2]) {
+              expect(
+                await applyProgressiveRemoteProgress(connection, job.id),
+              ).toMatchObject({ kind: "applied", sequence });
+            }
+            expect(
+              await progressiveRemoteReservedSlots(connection, solverId),
+            ).toBe(0);
+            await connection.execute(
+              sql`UPDATE sim_jobs SET engine_job_id = ${randomUUID()} WHERE id = ${job.id}::uuid`,
+            );
+            await expect(
+              acknowledgeLatestProgressiveRemoteStop(connection, job.id),
+            ).rejects.toThrow("immutable hub execution ownership");
+            throw stopRollback;
+          }),
+        ).rejects.toBe(stopRollback);
         await expect(
           storeProgressiveRemoteReport(db, {
             ...sender,

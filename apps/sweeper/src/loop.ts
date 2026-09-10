@@ -36,7 +36,6 @@ import { admitProgressiveCfdBatch } from "./progressive-admission";
 import { submitPendingPointCorrectionFastRequest } from "./urans-ladder";
 import { engineProgressiveCapabilities } from "./engine-capabilities";
 import { prepareProgressiveRemoteFleet } from "./progressive-remote-admission";
-import { reconcileProgressiveRemoteProgress } from "./progressive-remote-progress";
 import {
   clearEngineUnreachable,
   engineBackoffActive,
@@ -747,19 +746,6 @@ export async function tick(
   // liveness itself is the independent index.ts timer.
   await markTickStarted(db);
   await reconcileCampaignProfileEnrollment(db);
-  const remoteProgress = await reconcileProgressiveRemoteProgress(db);
-  if (
-    remoteProgress.applied ||
-    remoteProgress.indexed ||
-    remoteProgress.settled ||
-    remoteProgress.errors.length
-  )
-    console.log(
-      JSON.stringify({
-        component: "progressive-remote-progress",
-        ...remoteProgress,
-      }),
-    );
   const preReconcileFence = await checkAdmissionFence(db, "before_reconcile");
   await reconcile(db, engine, reconcileOptions); // always reconcile, even when paused
   // Reconciliation can be the operation which records a blocked obligation or

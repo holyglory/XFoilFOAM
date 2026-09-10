@@ -231,7 +231,7 @@ describe("progressive controller tick", () => {
     expect(hooks.remoteReconcile).toHaveBeenCalledTimes(1);
     expect(hooks.transfer).toHaveBeenCalledTimes(1);
     expect(hooks.retention).not.toHaveBeenCalled();
-    expect(hooks.remoteProgress).toHaveBeenCalledTimes(1);
+    expect(hooks.remoteProgress).not.toHaveBeenCalled();
     expect(hooks.remotePrepare).not.toHaveBeenCalled();
     expect(hooks.admission).not.toHaveBeenCalled();
     expect(scope.health).not.toHaveBeenCalled();
