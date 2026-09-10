@@ -60,6 +60,7 @@ def authenticated_mapping_source(source, request, settings):
     if expected != source_request:
         raise ValueError("Mapping source physical or numerical setup differs")
     defaults = {"experimental_consistent_pressure": False, "experimental_local_time_pressure": False, "experimental_density_relaxation": None,
+                "experimental_pressure_advection": "upwind",
                 "experimental_nonorthogonal_correction": "corrected", "experimental_pressure_equation_relaxation": None,
                 "experimental_pressure_solver": "GAMG", "experimental_energy_transport": report.get("experimental_momentum_scheme")}
     if any(report.get(key, defaults.get(key)) != value for key, value in settings.items()):

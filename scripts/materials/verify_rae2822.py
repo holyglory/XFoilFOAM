@@ -279,8 +279,10 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind"):
     started_at = time.monotonic()
+    if pressure_advection != "upwind" and not local_time_pressure:
+        raise ValueError("Pressure-advection experiment requires local-time pressure coupling")
     if resume_local_pressure and (not local_time_pressure or donor or mapped_donor or reference_grid or mesh_only):
         raise ValueError("Experimental continuation requires only the local pressure recipe")
     if local_time_pressure and (not enthalpy or not uniform_start or donor or mapped_donor or transonic or consistent_pressure or density_relaxation is not None or pressure_equation_relaxation is not None or pressure_krylov or upwind_energy):
@@ -344,6 +346,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_consistent_pressure": consistent_pressure,
               "experimental_density_relaxation": density_relaxation,
               "experimental_local_time_pressure": local_time_pressure,
+              "experimental_pressure_advection": pressure_advection,
               "experimental_wall_functions": wall_functions,
               "velocity_initialization": "resumed-local-pressure-state" if resume_local_pressure else "mapped-converged-donor" if mapped_donor else "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
@@ -379,7 +382,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         _set_control_dict_entries(destination / "system/controlDict", {"writeInterval": 100, "purgeWrite": 2})
         application = "rhoPimpleFoam" if local_time_pressure else "rhoSimpleFoam"
         if local_time_pressure:
-            report["actual_execution"] = configure_local_time_pressure(destination, spec.chord, spec.speed)
+            report["actual_execution"] = configure_local_time_pressure(destination, spec.chord, spec.speed, pressure_advection)
             _set_control_dict_entries(destination / "system/controlDict", {"application": application, "deltaT": 1, "adjustTimeStep": "no"})
         report["benchmark_output_policy"] = {"write_interval_iterations": 100, "retained_field_times": 2}
         if resume_local_pressure:
@@ -492,6 +495,7 @@ if __name__ == "__main__":
     parser.add_argument("--mapped-donor")
     parser.add_argument("--local-time-pressure", action="store_true")
     parser.add_argument("--resume-local-pressure")
+    parser.add_argument("--pressure-advection", choices=["upwind", "vanLeer"], default="upwind")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -500,4 +504,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection)

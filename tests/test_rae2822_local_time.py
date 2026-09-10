@@ -7,14 +7,15 @@ from scripts.materials.rae2822_local_time import configure_local_time_pressure, 
 
 
 @pytest.mark.parametrize("transport", ["upwind", "linearUpwind limited"])
-def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport):
+@pytest.mark.parametrize("pressure_advection", ["upwind", "vanLeer"])
+def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pressure_advection):
     (tmp_path / "system").mkdir()
     (tmp_path / "constant").mkdir()
     schemes = tmp_path / "system/fvSchemes"
-    schemes.write_text(f"ddtSchemes {{ default steadyState; }} divSchemes {{ div(phi,h) bounded Gauss {transport}; }}")
+    schemes.write_text(f"ddtSchemes {{ default steadyState; }} divSchemes {{ div(phi,h) bounded Gauss {transport}; div(phid,p) Gauss upwind; div(phiv,p) Gauss upwind; }}")
     thermo = tmp_path / "constant/thermophysicalProperties"
     thermo.write_text("source material fixture unchanged")
-    receipt = configure_local_time_pressure(tmp_path, 0.3048, 233)
+    receipt = configure_local_time_pressure(tmp_path, 0.3048, 233, pressure_advection)
     assert receipt["physical_time_history"] is False
     assert receipt["solver_family"] == "rhoPimpleFoam"
     assert receipt["steady_acceptance_certificate"] == "unavailable_experimental"
@@ -22,6 +23,8 @@ def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport):
     assert "localEuler" in schemes.read_text()
     assert "bounded" not in schemes.read_text()
     assert f"Gauss {transport};" in schemes.read_text()
+    assert f"div(phid,p) Gauss {pressure_advection};" in schemes.read_text()
+    assert "div(phiv,p) Gauss upwind;" in schemes.read_text()
     assert json.loads((tmp_path / "constant/numericalExecution.json").read_text()) == receipt
     assert thermo.read_text() == "source material fixture unchanged"
     solution = (tmp_path / "system/fvSolution").read_text()
@@ -36,6 +39,19 @@ def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport):
 def test_local_pressure_rejects_invented_or_nonfinite_time_scales(tmp_path, chord, speed):
     with pytest.raises(ValueError, match="finite physical"):
         configure_local_time_pressure(tmp_path, chord, speed)
+
+
+def test_pressure_advection_rejects_unknown_scheme_and_missing_entry_before_writing(tmp_path):
+    with pytest.raises(ValueError, match="Unsupported"):
+        configure_local_time_pressure(tmp_path, 0.3, 200, "invented")
+    (tmp_path / "system").mkdir()
+    path = tmp_path / "system/fvSchemes"
+    original = "ddtSchemes { default steadyState; } divSchemes { div(phi,h) bounded Gauss upwind; }"
+    path.write_text(original)
+    with pytest.raises(ValueError, match="pressure-advection entry"):
+        configure_local_time_pressure(tmp_path, 0.3, 200, "vanLeer")
+    assert path.read_text() == original
+    assert not (tmp_path / "system/fvSolution").exists()
 
 
 def continuation_fixture(tmp_path, change=None):

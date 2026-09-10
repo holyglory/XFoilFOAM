@@ -64,7 +64,9 @@ def restore_local_pressure_state(source, destination, request, execution):
             "report_sha256": verified["report.json"], "prior_active_seconds": previous_cost, "members": copied}
 
 
-def configure_local_time_pressure(directory, chord, speed):
+def configure_local_time_pressure(directory, chord, speed, pressure_advection="upwind"):
+    if pressure_advection not in ("upwind", "vanLeer"):
+        raise ValueError("Unsupported experimental pressure-advection scheme")
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 for value in (chord, speed)):
         raise ValueError("Local pressure time scale requires finite physical chord and speed")
     directory = Path(directory)
@@ -73,6 +75,10 @@ def configure_local_time_pressure(directory, chord, speed):
     schemes, count = re.subn(r"(\bddtSchemes\s*\{\s*default\s+)steadyState(\s*;\s*\})", r"\g<1>localEuler\2", original)
     if count != 1 or "div(phi,h)" not in schemes:
         raise ValueError("Local pressure study requires the generated enthalpy steady schemes")
+    schemes, count = re.subn(r"(div\(phid,p\)\s+)Gauss upwind(\s*;)",
+                             lambda match: f"{match[1]}Gauss {pressure_advection}{match[2]}", schemes)
+    if count != 1:
+        raise ValueError("Expected one generated pressure-advection entry")
     schemes = schemes.replace("bounded Gauss upwind", "Gauss upwind")
     schemes = schemes.replace("bounded Gauss linearUpwind limited", "Gauss linearUpwind limited")
     pressure = {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.01}
