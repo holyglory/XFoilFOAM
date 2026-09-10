@@ -125,6 +125,14 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.history-transport]
+timeout_seconds = 300
+
+[[test.history-transport.check]]
+name = "api-archive-origin"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_force_history_origin.py", "tests/test_api.py", "tests/test_archive_reduction.py", "-q"]
+
 [test.rae-field-diagnostics]
 timeout_seconds = 120
 

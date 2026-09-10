@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -150,6 +151,35 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert csv.status_code == 200
     assert "aoa_deg,cl,cd" in csv.text
     assert csv.text.count("\n") >= 4  # header + 3 rows
+
+
+@pytest.mark.parametrize("known_origin", [False, True])
+def test_result_http_preserves_windowed_history_origin_without_mutating_legacy_bytes(client, known_origin):
+    from windowed_force_history_fixture import windowed_history_fixture
+
+    _, history = windowed_history_fixture(offset=203)
+    payload = history.model_dump(mode="json", exclude_unset=True)
+    if not known_origin:
+        payload.pop("source_start_time")
+    job_id = f"isolated-history-origin-{known_origin}"
+    store = JobStore()
+    directory = store.job_dir(job_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    result = {
+        "job_id": job_id, "state": "completed",
+        "polars": [{"speed": 20, "chord": 1, "reynolds": 1_000_000, "points": [{
+            "aoa_deg": 0, "cl": 0.5, "cd": 0.025, "cm": -0.03,
+            "unsteady": True, "converged": False, "first_order_fallback": False,
+            "images": {}, "force_history": payload,
+        }]}],
+    }
+    path = directory / "result.json"
+    original = json.dumps(result).encode()
+    path.write_bytes(original)
+    response = client.get(f"/jobs/{job_id}/result")
+    assert response.status_code == 200
+    assert response.json()["polars"][0]["points"][0]["force_history"] == payload
+    assert path.read_bytes() == original
 
 
 def test_result_transport_preserves_absent_legacy_certificate():
