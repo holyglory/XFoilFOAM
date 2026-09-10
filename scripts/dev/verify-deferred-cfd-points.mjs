@@ -13,6 +13,9 @@ try {
   );
   assert(fullResponse.ok() && curvesResponse.ok());
   const full = await fullResponse.json();
+  const hasCfdPoints = full.polars.some((polar) =>
+    polar.points.some((point) => point.source === "solved"),
+  );
   const curves = await curvesResponse.json();
   assert.equal(curves.cfdPointsDeferred, true);
   assert.deepEqual(curves.polars, []);
@@ -88,9 +91,32 @@ try {
     assert.equal(requests, 1);
     behavior = "success";
     await disclosure.getByRole("button", { name: "Retry" }).click();
-    await expect(disclosure.getByTestId("polar-viewer")).toBeVisible();
+    const loadedPoints = hasCfdPoints
+      ? disclosure.getByTestId("polar-viewer")
+      : disclosure.getByText("No CFD points yet.", { exact: true });
+    await expect(loadedPoints).toBeVisible();
     await expect(disclosure.getByRole("alert")).toHaveCount(0);
-    const storedPoint = disclosure.locator('circle[role="button"]').first();
+    let storedPoint = disclosure.locator('circle[role="button"]').first();
+    if (!hasCfdPoints) {
+      const series = full.progressivePolars.find(
+        (series) => series.explanation.contributors?.length,
+      );
+      assert(
+        series,
+        "Real included CFD evidence must be available for the evidence journey",
+      );
+      await viewer.getByLabel("Polar condition").selectOption(series.targetId);
+      await viewer
+        .locator("summary")
+        .filter({ hasText: "Why this curve" })
+        .click();
+      const contributor = series.explanation.contributors[0];
+      storedPoint = viewer
+        .locator(
+          `button[data-result-id="${contributor.resultId}"][data-result-attempt-id="${contributor.attemptId}"]`,
+        )
+        .first();
+    }
     await expect(storedPoint).toBeVisible();
     const storedResponse = page.waitForResponse((response) => {
       const url = new URL(response.url());
@@ -128,7 +154,7 @@ try {
     await settled;
     behavior = "success";
     await summary.click();
-    await expect(disclosure.getByTestId("polar-viewer")).toBeVisible();
+    await expect(loadedPoints).toBeVisible();
     assert.equal(requests, 4);
     assert.deepEqual(errors, []);
     results.push({
@@ -150,7 +176,11 @@ try {
     .getByRole("link", { name: "Load CFD points", exact: true })
     .click();
   await expect(page.locator("#cfd-points")).toHaveAttribute("open", "");
-  await expect(page.getByTestId("polar-viewer")).toBeVisible();
+  await expect(
+    hasCfdPoints
+      ? page.getByTestId("polar-viewer")
+      : page.getByText("No CFD points yet.", { exact: true }),
+  ).toBeVisible();
   await noScript.close();
 } finally {
   await browser.close();

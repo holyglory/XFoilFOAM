@@ -148,7 +148,12 @@ try {
       await disclosure.locator("summary").click();
       await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
     } else {
-      await expect(disclosure).toHaveCount(0);
+      await disclosure.locator("summary").click();
+      await expect(
+        disclosure.getByText("No CFD points yet.", { exact: true }),
+      ).toBeVisible();
+      await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
+      await disclosure.locator("summary").click();
     }
     await page.reload({ waitUntil: "domcontentloaded" });
     await expect(viewer).toHaveAttribute("aria-busy", "false");
