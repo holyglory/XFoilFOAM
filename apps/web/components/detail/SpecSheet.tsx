@@ -145,7 +145,7 @@ export function SpecSheet({
       </div>
 
       {/* fitted polar */}
-      {(!detail.progressivePolars?.length || polarRows.length > 0) && (
+      {polarRows.length > 0 && (
         <div style={card}>
           <div style={cardHead}>
             <span style={cardLabel}>BEST-FIT POLAR</span>

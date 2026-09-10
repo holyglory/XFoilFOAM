@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   activePolarSeriesId,
+  hasAcceptedCfdFit,
   initialSeriesVisibility,
   polarLegendItems,
   polarDisplayProjection,
@@ -115,6 +116,24 @@ describe("CFD-only curve-first display", () => {
     const evidence = project({ ...fitted, points: [provisional] });
     expect(polarDisplayProjection(evidence, false).curves).toEqual([]);
     expect(polarDisplayProjection(evidence, true).points).toHaveLength(1);
+  });
+
+  it("never publishes provisional or unsupported CFD-fit metrics", () => {
+    expect(hasAcceptedCfdFit(fitted)).toBe(false);
+    expect(hasAcceptedCfdFit({ fit: null })).toBe(false);
+    const finalFit = {
+      ...fitted.fit!,
+      status: "final" as const,
+      acceptedPointCount: 3,
+      provisionalPointCount: 0,
+    };
+    expect(hasAcceptedCfdFit({ fit: finalFit })).toBe(true);
+    expect(
+      hasAcceptedCfdFit({ fit: { ...finalFit, acceptedPointCount: 1 } }),
+    ).toBe(false);
+    expect(
+      hasAcceptedCfdFit({ fit: { ...finalFit, provisionalPointCount: 1 } }),
+    ).toBe(false);
   });
 });
 

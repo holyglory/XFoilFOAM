@@ -9,6 +9,14 @@ import {
 
 export type SeriesVisibility = Record<string, boolean>;
 
+export function hasAcceptedCfdFit(polar: Pick<Polar, "fit">): boolean {
+  return Boolean(
+    polar.fit?.status === "final" &&
+    polar.fit.acceptedPointCount >= 3 &&
+    polar.fit.provisionalPointCount === 0,
+  );
+}
+
 export function polarDisplayProjection(
   projection: ChartProjection,
   showPoints: boolean,

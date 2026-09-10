@@ -25,6 +25,7 @@ import {
   prefetchSimDetails,
 } from "@/lib/api";
 import {
+  hasAcceptedCfdFit,
   initialSeriesVisibility,
   publicSolvedPointCount,
   toggleSeriesVisibility,
@@ -161,17 +162,16 @@ export function DetailIsland({
       ),
     [detail.polars],
   );
-  const metricPolar = useMemo(
-    () =>
-      detail.polars.find((p) => visibleSeries[p.seriesId] && p.fit?.metrics) ??
-      detail.polars.find((p) => p.fit?.metrics) ??
-      detail.polars.find(
-        (p) => visibleSeries[p.seriesId] && p.points.length >= 3,
-      ) ??
-      detail.polars.find((p) => p.points.length >= 3) ??
-      null,
-    [detail.polars, visibleSeries],
-  );
+  const metricPolar = useMemo(() => {
+    const candidates = detail.polars.filter(
+      (polar) => hasAcceptedCfdFit(polar) && polar.fit?.metrics,
+    );
+    return (
+      candidates.find((polar) => visibleSeries[polar.seriesId]) ??
+      candidates[0] ??
+      null
+    );
+  }, [detail.polars, visibleSeries]);
   const solvedM = metricPolar?.fit?.metrics ?? null;
   const chartMachStr = visibleMachDisplay(detail.polars, visibleSeries);
 

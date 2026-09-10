@@ -58,6 +58,15 @@ try {
       await expect(viewer).toBeVisible();
       await expect(toggle).toHaveAttribute("aria-pressed", "false");
       await expect(chart.locator('circle[role="button"]')).toHaveCount(0);
+      if (
+        !scope.evidence.length ||
+        scope.evidence.some(
+          (point) => point.classificationState === "needs_urans",
+        )
+      )
+        await expect(
+          page.getByText("BEST-FIT POLAR", { exact: true }),
+        ).toHaveCount(0);
       if (scope.fit) {
         await expect(chart.locator("polyline").first()).toBeVisible();
         assert(
