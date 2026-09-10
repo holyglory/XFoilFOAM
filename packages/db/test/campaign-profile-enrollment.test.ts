@@ -610,17 +610,15 @@ describe("durable progressive scope requests", () => {
     await initializeProgressiveCfdWork(db);
     const cfd = (await claimCfd())!;
     const jobId = randomUUID();
-    await db
-      .insert(simJobs)
-      .values({
-        id: jobId,
-        engineJobId: jobId,
-        airfoilId: originalId,
-        bcIds: [],
-        referenceChordM: 0.76319,
-        campaignId: id,
-        status: "done",
-      });
+    await db.insert(simJobs).values({
+      id: jobId,
+      engineJobId: jobId,
+      airfoilId: originalId,
+      bcIds: [],
+      referenceChordM: 0.76319,
+      campaignId: id,
+      status: "done",
+    });
     await db.execute(
       sql`UPDATE progressive_cfd_attempts SET sim_job_id=${jobId},outcome='failed',finished_at=clock_timestamp() WHERE token=${cfd.token}`,
     );
@@ -656,6 +654,42 @@ describe("durable progressive scope requests", () => {
       sql`SELECT status FROM progressive_generations WHERE id=${legacy.id}`,
     );
     expect(stillActive.status).toBe("active");
+    for (const cacheCase of ["missing", "wrong-angles", "wrong-content-hash"]) {
+      await expect(
+        db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(
+            sql`DELETE FROM progressive_prediction_links WHERE work_id=${baseline.id}`,
+          );
+          if (cacheCase !== "missing") {
+            const payload = predictionFixture(baseline);
+            if (cacheCase === "wrong-angles") payload.alpha = [99];
+            const identity =
+              cacheCase === "wrong-content-hash"
+                ? "c".repeat(64)
+                : analysisContentHash({ epochId: legacy.epochId, payload });
+            await connection.execute(
+              sql`INSERT INTO neuralfoil_predictions(id,epoch_id,target_id,payload) VALUES(${identity},${legacy.epochId},${baseline.targetId},${JSON.stringify(payload)}::jsonb)`,
+            );
+            await connection.execute(
+              sql`INSERT INTO progressive_prediction_links(work_id,prediction_id) VALUES(${baseline.id},${identity})`,
+            );
+          }
+          const result = await adoptProgressiveWallPolicy(connection, id);
+          if (result.kind !== "adopted")
+            throw new Error("Expected isolated adoption");
+          const [generation] = await connection.execute(
+            sql`SELECT stage FROM progressive_generations WHERE id=${result.generation_id}`,
+          );
+          expect(generation.stage).toBe(1);
+          const [count] = await connection.execute(
+            sql`SELECT count(*)::int AS count FROM progressive_work work JOIN progressive_prediction_links link ON link.work_id=work.id WHERE work.generation_id=${result.generation_id}`,
+          );
+          expect(count.count).toBe(0);
+          throw rollback;
+        }),
+      ).rejects.toBe(rollback);
+    }
     const adopted = await adoptProgressiveWallPolicy(db, id);
     expect(adopted.kind).toBe("adopted");
     expect(await adoptProgressiveWallPolicy(db, id)).toMatchObject({
@@ -677,7 +711,15 @@ describe("durable progressive scope requests", () => {
     const [successor] = await db.execute(
       sql`SELECT stage,status FROM progressive_generations WHERE id=${receipt.generation_id}`,
     );
-    expect(successor).toMatchObject({ stage: 1, status: "active" });
+    expect(successor).toMatchObject({ stage: 2, status: "active" });
+    const links = await db.execute(
+      sql`SELECT link.prediction_id FROM progressive_work work JOIN progressive_prediction_links link ON link.work_id=work.id WHERE generation_id=${receipt.generation_id}`,
+    );
+    expect(links).toEqual([{ prediction_id: predictionId }]);
+    const [newAttempts] = await db.execute(
+      sql`SELECT count(*)::int AS count FROM progressive_work_attempts attempt JOIN progressive_work work ON work.id=attempt.work_id WHERE work.generation_id=${receipt.generation_id}`,
+    );
+    expect(newAttempts.count).toBe(0);
     expect(
       await db.execute(
         sql`SELECT id,payload FROM neuralfoil_predictions WHERE id=${predictionId}`,

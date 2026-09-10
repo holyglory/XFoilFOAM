@@ -713,7 +713,10 @@ to rehearse the transactional upgrade, then use `--apply` for the same campaign.
 The default is a rollback-only dry run. Restore the previous admission state
 afterward. The operation retains the campaign plan, predictions, results and
 old sealed recipes, appends a stage-1 successor, and records an idempotent
-adoption receipt. It refuses paused, cancelled or archived campaigns and any
+adoption receipt. Compatible existing NeuralFoil predictions are linked after
+exact content and setup validation, without inventing a new solver attempt;
+only missing baselines require calculation before the fast stage can begin.
+It refuses paused, cancelled or archived campaigns and any
 generation that has already reached the precise stage. Completed campaigns
 adopt new defaults when new profiles are enrolled; this command does not restart
 their finished work.

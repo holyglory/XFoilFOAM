@@ -3,6 +3,88 @@ import { FAST_WALL_SPACING_POLICY } from "@aerodb/core";
 import type { DB } from "./client";
 import { cancelObsoleteProgressiveCfdUnits } from "./progressive-cfd";
 import { materializeProgressiveCampaignScope } from "./progressive-materialization";
+import { analysisContentHash } from "./analysis-target";
+import {
+  advanceGeneration,
+  type SealedPolarTarget,
+  validateNeuralFoilPredictionPayload,
+} from "./progressive-campaigns";
+
+async function reusePreviousBaselines(
+  db: DB,
+  generationId: string,
+  previousIds: string[],
+  epochId: string,
+) {
+  const previous = sql.join(
+    previousIds.map((id) => sql`${id}::uuid`),
+    sql`, `,
+  );
+  let cursor: string | null = null;
+  let reused = 0;
+  for (;;) {
+    const batch: Record<string, unknown>[] = await db.execute(sql`
+      SELECT work.id,work.target_id,scope.angles,scope.recipes,target.physical,cached.prediction_id,cached.payload
+      FROM progressive_work work JOIN progressive_generation_targets scope
+        ON scope.generation_id=work.generation_id AND scope.target_id=work.target_id
+      JOIN polar_analysis_targets target ON target.id=scope.target_id
+      LEFT JOIN LATERAL (
+        SELECT prediction.id AS prediction_id,prediction.payload FROM progressive_work prior
+        JOIN progressive_prediction_links link ON link.work_id=prior.id
+        JOIN neuralfoil_predictions prediction ON prediction.id=link.prediction_id
+        WHERE prior.generation_id IN (${previous}) AND prior.stage=1 AND prior.target_id=work.target_id
+          AND prior.state='complete' AND prediction.target_id=work.target_id AND prediction.epoch_id=${epochId}::uuid
+        ORDER BY prediction.created_at DESC,prediction.id LIMIT 1
+      ) cached ON true
+      WHERE work.generation_id=${generationId}::uuid AND work.stage=1 AND work.state='pending'
+        ${cursor ? sql`AND work.id>${cursor}::uuid` : sql``}
+      ORDER BY work.id LIMIT 256
+    `);
+    if (!batch.length) break;
+    const links: Array<{ workId: string; predictionId: string }> = [];
+    for (const row of batch) {
+      cursor = String(row.id);
+      if (
+        !row.payload ||
+        analysisContentHash({ epochId, payload: row.payload }) !==
+          row.prediction_id
+      )
+        continue;
+      try {
+        validateNeuralFoilPredictionPayload(
+          String(row.target_id),
+          {
+            angles: row.angles as number[],
+            recipes: row.recipes as SealedPolarTarget["recipes"],
+            physical: row.physical as SealedPolarTarget["physical"],
+          },
+          row.payload as Record<string, unknown>,
+        );
+      } catch {
+        continue;
+      }
+      links.push({
+        workId: String(row.id),
+        predictionId: String(row.prediction_id),
+      });
+    }
+    if (links.length) {
+      await db.execute(sql`INSERT INTO progressive_prediction_links(work_id,prediction_id)
+        VALUES ${sql.join(
+          links.map((link) => sql`(${link.workId}::uuid,${link.predictionId})`),
+          sql`, `,
+        )}`);
+      await db.execute(sql`UPDATE progressive_work SET state='complete',completed_at=clock_timestamp(),error=NULL
+        WHERE id IN (${sql.join(
+          links.map((link) => sql`${link.workId}::uuid`),
+          sql`, `,
+        )})`);
+      reused += links.length;
+    }
+  }
+  await advanceGeneration(db, generationId);
+  return reused;
+}
 
 export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(campaignId))
@@ -93,6 +175,12 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
     );
     if (!successor)
       throw new Error("Recipe adoption has no current eligible profile scope");
+    await reusePreviousBaselines(
+      connection,
+      successor.id,
+      generationIds,
+      String(epoch.id),
+    );
     await connection.execute(sql`
       INSERT INTO progressive_recipe_adoptions(epoch_id,campaign_id,plan_revision_id,policy,previous_generation_ids,generation_id)
       VALUES(${epoch.id},${campaignId}::uuid,${campaign.current_plan_revision_id},${FAST_WALL_SPACING_POLICY},ARRAY[${ids}],${successor.id})
