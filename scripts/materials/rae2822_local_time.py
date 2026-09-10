@@ -1,9 +1,65 @@
 import json
+import hashlib
 import math
 from pathlib import Path
 import re
+import shutil
 
 from airfoilfoam.openfoam.foam_dict import write_foam_dict
+
+try:
+    from .rae2822_mapping import authenticated_retained_source
+except ImportError:
+    from rae2822_mapping import authenticated_retained_source
+
+
+def restore_local_pressure_state(source, destination, request, execution):
+    destination = Path(destination).resolve()
+    source = Path(source).resolve()
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError("Experimental continuation needs separate source and target")
+    source, manifest_bytes, manifest, verified, report = authenticated_retained_source(source)
+    coordinate = report.get("pressure_iteration")
+    active = report.get("active_seconds")
+    if (report.get("outcome") != "measured_uncertified" or report.get("error") is not None
+            or report.get("actual_execution") != execution or report.get("request") != request
+            or report.get("experimental_local_time_pressure") is not True
+            or report.get("numerical_stability", {}).get("pressure_limited_iterations") != 0):
+        raise ValueError("Experimental continuation source is failed or incompatible")
+    if (type(coordinate) is not int or coordinate <= 0 or isinstance(active, bool)
+            or not isinstance(active, (int, float)) or not math.isfinite(active) or active <= 0):
+        raise ValueError("Experimental continuation has no exact coordinate or measured cost")
+    previous_cost = report.get("accumulated_active_seconds", active)
+    if isinstance(previous_cost, bool) or not isinstance(previous_cost, (int, float)) or not math.isfinite(previous_cost) or previous_cost < active:
+        raise ValueError("Experimental continuation accumulated cost is invalid")
+    for name in ("system/fvSchemes", "system/fvSolution", "system/controlDict", "constant/thermophysicalProperties", "constant/turbulenceProperties", "constant/numericalExecution.json"):
+        if name not in verified or hashlib.sha256((destination / name).read_bytes()).hexdigest() != verified[name]:
+            raise ValueError("Experimental continuation dictionaries differ")
+    time_name = str(coordinate)
+    required = [f"{time_name}/{name}" for name in ("U", "p", "T", "k", "omega", "rho", "phi", "rDeltaT")]
+    required += [f"constant/polyMesh/{name}" for name in ("points", "faces", "owner", "neighbour", "boundary")]
+    if any(name not in verified for name in required):
+        raise ValueError("Experimental continuation is missing authenticated state")
+    trees = ("constant/polyMesh", time_name)
+    if any((destination / name).exists() for name in trees):
+        raise ValueError("Experimental continuation target is occupied")
+    copied = {name: signature for name, signature in verified.items() if any(name.startswith(tree + "/") for tree in trees)}
+    for tree in trees:
+        paths = list((source / tree).rglob("*"))
+        if any(path.is_symlink() for path in paths):
+            raise ValueError("Experimental continuation tree contains a symbolic link")
+        actual = {str(path.relative_to(source)) for path in paths if path.is_file()}
+        if actual != {name for name in copied if name.startswith(tree + "/")}:
+            raise ValueError("Experimental continuation tree has unauthenticated members")
+    for tree in trees:
+        shutil.copytree(source / tree, destination / tree)
+    if any(hashlib.sha256((destination / name).read_bytes()).hexdigest() != signature for name, signature in copied.items()):
+        raise ValueError("Experimental continuation copied state differs")
+    if authenticated_retained_source(source)[1] != manifest_bytes:
+        raise ValueError("Experimental continuation source manifest changed")
+    return {"kind": "uncertified_local_iteration_continuation", "source": str(source), "coordinate": coordinate,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(), "source_revision": manifest.get("sourceRevision"),
+            "report_sha256": verified["report.json"], "prior_active_seconds": previous_cost, "members": copied}
 
 
 def configure_local_time_pressure(directory, chord, speed):

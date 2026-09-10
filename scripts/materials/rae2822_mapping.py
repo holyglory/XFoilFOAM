@@ -12,7 +12,7 @@ except ImportError:
     from inspect_rae_extrema import field, mesh_list
 
 
-def authenticated_mapping_source(source, request, settings):
+def authenticated_retained_source(source):
     source = Path(source).resolve()
     manifest_bytes = (source / "retained-source-manifest.json").read_bytes()
     manifest = json.loads(manifest_bytes)
@@ -35,6 +35,11 @@ def authenticated_mapping_source(source, request, settings):
     if "report.json" not in verified:
         raise ValueError("Mapping source report is not authenticated")
     report = json.loads((source / "report.json").read_bytes())
+    return source, manifest_bytes, manifest, verified, report
+
+
+def authenticated_mapping_source(source, request, settings):
+    source, manifest_bytes, manifest, verified, report = authenticated_retained_source(source)
     coordinate = report.get("pressure_iteration")
     if report.get("outcome") != "measured_converged" or report.get("convergence", {}).get("converged") is not True:
         raise ValueError("Mapping requires a genuinely converged donor")

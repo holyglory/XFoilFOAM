@@ -17,7 +17,7 @@ from rae2822_reference import load_reference, selig_coordinates
 from solver_stability import solver_stability
 from rae2822_grid import write_nasa_grid
 from rae2822_mapping import map_verified_initial_fields
-from rae2822_local_time import configure_local_time_pressure
+from rae2822_local_time import configure_local_time_pressure, restore_local_pressure_state
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
@@ -279,8 +279,10 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None):
     started_at = time.monotonic()
+    if resume_local_pressure and (not local_time_pressure or donor or mapped_donor or reference_grid or mesh_only):
+        raise ValueError("Experimental continuation requires only the local pressure recipe")
     if local_time_pressure and (not enthalpy or not first_order or not uniform_start or donor or mapped_donor or transonic or consistent_pressure or density_relaxation is not None or pressure_equation_relaxation is not None or pressure_krylov or upwind_energy):
         raise ValueError("Local pressure study requires its explicit uniform first-order enthalpy recipe without other solver overrides")
     if mapped_donor and (donor or reference_grid or not uniform_start):
@@ -343,7 +345,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_density_relaxation": density_relaxation,
               "experimental_local_time_pressure": local_time_pressure,
               "experimental_wall_functions": wall_functions,
-              "velocity_initialization": "mapped-converged-donor" if mapped_donor else "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
+              "velocity_initialization": "resumed-local-pressure-state" if resume_local_pressure else "mapped-converged-donor" if mapped_donor else "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
               "experimental_momentum_scheme": momentum_scheme,
               "experimental_energy_transport": "upwind" if upwind_energy else momentum_scheme,
@@ -380,7 +382,12 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             report["actual_execution"] = configure_local_time_pressure(destination, spec.chord, spec.speed)
             _set_control_dict_entries(destination / "system/controlDict", {"application": application, "deltaT": 1, "adjustTimeStep": "no"})
         report["benchmark_output_policy"] = {"write_interval_iterations": 100, "retained_field_times": 2}
-        if donor:
+        if resume_local_pressure:
+            report["experimental_continuation"] = restore_local_pressure_state(resume_local_pressure, destination, report["request"], report["actual_execution"])
+            _set_control_dict_entries(destination / "system/controlDict", {
+                "startFrom": "latestTime", "endTime": report["experimental_continuation"]["coordinate"] + dimensions[3],
+            })
+        elif donor:
             report["donor"] = restore_verified_donor(donor, destination, request.model_dump(mode="json"), enthalpy, transonic, consistent_pressure, density_relaxation)
             _set_control_dict_entries(destination / "system/controlDict", {
                 "startFrom": "latestTime", "endTime": int(report["donor"]["coordinate"]) + dimensions[3],
@@ -409,7 +416,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
             (destination / "log.potentialFoam").write_text(initialized.stdout)
             initialized.check()
-        solved = budgeted.solver(destination, application, processes, timeout=time_budget_seconds)
+        solved = budgeted.solver(destination, application, processes, timeout=time_budget_seconds, restart=bool(donor or resume_local_pressure))
         (destination / f"log.{application}").write_text(solved.stdout)
         reconstruct_timed_out_parallel_case(runner, destination, solved, processes)
         report["numerical_stability"] = solver_stability(solved.stdout.splitlines())
@@ -434,6 +441,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         report["pressure_iteration"] = pressure_iteration(surfaces[0])
         if donor and report["pressure_iteration"] <= report["donor"]["coordinate"]:
             raise ValueError("Refinement did not publish a newly calculated pressure field")
+        if resume_local_pressure and report["pressure_iteration"] <= report["experimental_continuation"]["coordinate"]:
+            raise ValueError("Experimental continuation did not publish newly calculated fields")
         computed = wall_pressure(surfaces[0], spec.chord, state.pressure_pa, density, speed, reference["coordinates"])
         report["pressure_comparison"] = compare_pressure(computed, reference["pressure"])
         report["pressure_surface"] = {"path": str(surfaces[0].relative_to(destination)),
@@ -456,6 +465,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         raise
     finally:
         report["active_seconds"] = budgeted.consumed(spec)
+        if "experimental_continuation" in report:
+            report["accumulated_active_seconds"] = report["experimental_continuation"]["prior_active_seconds"] + report["active_seconds"]
         report["elapsed_seconds"] = time.monotonic() - started_at
         (destination / "report.json").write_text(json.dumps(report, allow_nan=False) + "\n")
         print(json.dumps({"kind": report["kind"], "tier": tier, "outcome": report["outcome"],
@@ -480,6 +491,7 @@ if __name__ == "__main__":
     parser.add_argument("--donor")
     parser.add_argument("--mapped-donor")
     parser.add_argument("--local-time-pressure", action="store_true")
+    parser.add_argument("--resume-local-pressure")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -488,4 +500,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure)
