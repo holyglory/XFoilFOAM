@@ -36,7 +36,7 @@ def mapping_fixture(tmp_path):
 def test_mapping_source_authenticates_real_bytes_and_only_permits_resolution_change(tmp_path):
     source, target = mapping_fixture(tmp_path)
     before = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}
-    receipt = authenticated_mapping_source(source, target, {"experimental_energy_form": "sensibleEnthalpy"})
+    receipt = authenticated_mapping_source(source, target, {"experimental_energy_form": "sensibleEnthalpy", "experimental_local_time_pressure": False})
     assert receipt["coordinate"] == 2000
     assert receipt["report_sha256"] == hashlib.sha256(before["report.json"]).hexdigest()
     assert before == {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*") if path.is_file()}

@@ -12,6 +12,7 @@ x-verification: &verification
     - ./scripts/materials/solver_stability.py:/verification/solver_stability.py:ro
     - ./scripts/materials/rae2822_grid.py:/verification/rae2822_grid.py:ro
     - ./scripts/materials/rae2822_mapping.py:/verification/rae2822_mapping.py:ro
+    - ./scripts/materials/rae2822_local_time.py:/verification/rae2822_local_time.py:ro
     - ./scripts/materials/inspect_rae_extrema.py:/verification/inspect_rae_extrema.py:ro
     - ./tests/fixtures/rae2822:/verification/reference:ro
     - ./tests/fixtures/air-thermophysics-audit.json:/verification/material.json:ro
@@ -81,6 +82,10 @@ services:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind-transonic-refined", "--tier", "refined", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--transonic", "--pressure-equation-relaxation", "1", "--time-budget-seconds", "3000"]
+  enthalpy-local-pressure:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-local-pressure", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--processes", "4", "--local-time-pressure"]
   enthalpy-mapped-refined:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
