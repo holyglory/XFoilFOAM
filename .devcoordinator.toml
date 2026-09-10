@@ -1114,8 +1114,8 @@ ttl_seconds = 86400
 [deployment.rae-pressure-damped.component.numerics]
 type = "compose"
 files = ["compose.rae-verification.yml"]
-services = ["artifacts", "enthalpy-transonic-damped"]
-finite_services = ["enthalpy-transonic-damped"]
+services = ["artifacts"]
+finite_services = []
 build = false
 port = true
 route = true
