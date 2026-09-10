@@ -26,9 +26,11 @@ def restore_local_pressure_state(source, destination, request, execution):
             or report.get("experimental_local_time_pressure") is not True
             or report.get("numerical_stability", {}).get("pressure_limited_iterations") != 0):
         raise ValueError("Experimental continuation source is failed or incompatible")
-    if (type(coordinate) is not int or coordinate <= 0 or isinstance(active, bool)
+    if (isinstance(coordinate, bool) or not isinstance(coordinate, (int, float)) or not math.isfinite(coordinate)
+            or coordinate <= 0 or not float(coordinate).is_integer() or isinstance(active, bool)
             or not isinstance(active, (int, float)) or not math.isfinite(active) or active <= 0):
         raise ValueError("Experimental continuation has no exact coordinate or measured cost")
+    coordinate = int(coordinate)
     previous_cost = report.get("accumulated_active_seconds", active)
     if isinstance(previous_cost, bool) or not isinstance(previous_cost, (int, float)) or not math.isfinite(previous_cost) or previous_cost < active:
         raise ValueError("Experimental continuation accumulated cost is invalid")

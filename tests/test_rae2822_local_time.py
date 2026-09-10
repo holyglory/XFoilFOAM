@@ -66,8 +66,9 @@ def continuation_fixture(tmp_path, change=None):
     return source, target, request, execution
 
 
-def test_uncertified_continuation_keeps_exact_state_and_cost_without_acceptance(tmp_path):
-    source, target, request, execution = continuation_fixture(tmp_path)
+@pytest.mark.parametrize("coordinate", [3000, 3000.0])
+def test_uncertified_continuation_keeps_exact_state_and_cost_without_acceptance(tmp_path, coordinate):
+    source, target, request, execution = continuation_fixture(tmp_path, {"pressure_iteration": coordinate})
     receipt = restore_local_pressure_state(source, target, request, execution)
     assert receipt["coordinate"] == 3000
     assert receipt["prior_active_seconds"] == 100
@@ -83,6 +84,7 @@ def test_uncertified_continuation_keeps_exact_state_and_cost_without_acceptance(
 @pytest.mark.parametrize("change", [
     {"outcome": "failed"}, {"error": "thermal clamp"}, {"actual_execution": {"physical_time_history": True}},
     {"request": {"fixture": "different"}}, {"active_seconds": -1}, {"pressure_iteration": True},
+    {"pressure_iteration": 3000.5}, {"pressure_iteration": float('inf')},
     {"accumulated_active_seconds": 99}, {"numerical_stability": {"pressure_limited_iterations": 1}},
 ])
 def test_continuation_refuses_failed_incompatible_or_unaccounted_source(tmp_path, change):
