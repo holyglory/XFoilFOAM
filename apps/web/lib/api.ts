@@ -60,8 +60,12 @@ export async function getAirfoilDetail(
   slug: string,
   revisionId?: string | null,
   signal?: AbortSignal,
+  view: "curves" | "full" = "full",
 ): Promise<AirfoilDetailPayload | null> {
-  const qs = revisionId ? `?revisionId=${encodeURIComponent(revisionId)}` : "";
+  const query = new URLSearchParams();
+  if (revisionId) query.set("revisionId", revisionId);
+  if (view === "curves") query.set("view", view);
+  const qs = query.size ? `?${query}` : "";
   const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}${qs}`, {
     cache: "no-store",
     signal,
@@ -69,6 +73,10 @@ export async function getAirfoilDetail(
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GET /api/airfoils/${slug} → ${res.status}`);
   return res.json();
+}
+
+export function getAirfoilCurveDetail(slug: string) {
+  return getAirfoilDetail(slug, null, undefined, "curves");
 }
 
 export async function listAirfoils(

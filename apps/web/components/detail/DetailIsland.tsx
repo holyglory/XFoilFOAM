@@ -15,10 +15,11 @@ import {
   type SimulationDetail,
 } from "@aerodb/core";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   getCachedSim,
+  getAirfoilDetail,
   getFieldTrack,
   getSim,
   prefetchSimDetails,
@@ -54,12 +55,65 @@ export interface HoverState {
  *  payload is scoped to that one setup revision (enabled or not). A compact
  *  context chip above the charts says so and links back to the public view. */
 export function DetailIsland({
-  detail,
+  detail: initialDetail,
   pinnedRevisionId = null,
+  openCfdInitially = false,
 }: {
   detail: AirfoilDetailPayload;
   pinnedRevisionId?: string | null;
+  openCfdInitially?: boolean;
 }) {
+  const [loadedDetail, setLoadedDetail] = useState<AirfoilDetailPayload | null>(
+    null,
+  );
+  const detail = loadedDetail ?? initialDetail;
+  const [pointsOpen, setPointsOpen] = useState(
+    openCfdInitially || !initialDetail.progressivePolars?.length,
+  );
+  const [pointsLoading, setPointsLoading] = useState(false);
+  const [pointsError, setPointsError] = useState<string | null>(null);
+  const [pointsInteractive, setPointsInteractive] = useState(false);
+  const pointsRequest = useRef<AbortController | null>(null);
+  const loadCfdPoints = useCallback(async () => {
+    if (
+      !initialDetail.cfdPointsDeferred ||
+      loadedDetail ||
+      pointsRequest.current
+    )
+      return;
+    const request = new AbortController();
+    pointsRequest.current = request;
+    setPointsLoading(true);
+    setPointsError(null);
+    try {
+      const full = await getAirfoilDetail(
+        initialDetail.slug,
+        pinnedRevisionId,
+        request.signal,
+      );
+      if (!full || full.id !== initialDetail.id || full.cfdPointsDeferred)
+        throw new Error("Full point data is unavailable");
+      if (!request.signal.aborted) setLoadedDetail(full);
+    } catch {
+      if (!request.signal.aborted) setPointsError("Unable to load CFD points.");
+    } finally {
+      if (pointsRequest.current === request) {
+        pointsRequest.current = null;
+        setPointsLoading(false);
+      }
+    }
+  }, [initialDetail, loadedDetail, pinnedRevisionId]);
+  useEffect(() => {
+    setLoadedDetail(null);
+    setPointsLoading(false);
+    setPointsError(null);
+    setPointsOpen(openCfdInitially || !initialDetail.progressivePolars?.length);
+    setPointsInteractive(true);
+    return () => {
+      pointsRequest.current?.abort();
+      pointsRequest.current = null;
+    };
+  }, [initialDetail, pinnedRevisionId, openCfdInitially]);
   const [chartType, setChartType] = useState<ChartType>("cla");
   const [visibleSeries, setVisibleSeries] = useState<Record<string, boolean>>(
     () => initialSeriesVisibility(detail.polars),
@@ -357,33 +411,88 @@ export function DetailIsland({
               onOpenResult={openSolverWorkResult}
             />
           )}
-          {(!detail.progressivePolars?.length || solvedPointCount > 0) && (
-            <details open={!detail.progressivePolars?.length}>
+          {(!detail.progressivePolars?.length ||
+            solvedPointCount > 0 ||
+            initialDetail.cfdPointsDeferred ||
+            openCfdInitially) && (
+            <details
+              id="cfd-points"
+              open={pointsOpen}
+              inert={initialDetail.cfdPointsDeferred && !pointsInteractive}
+              onToggle={(event) => {
+                const opened = event.currentTarget.open;
+                setPointsOpen(opened);
+                if (opened) void loadCfdPoints();
+                else {
+                  pointsRequest.current?.abort();
+                  pointsRequest.current = null;
+                  setPointsLoading(false);
+                }
+              }}
+            >
               <summary
                 style={{ cursor: "pointer", padding: "10px 0", color: C.text }}
               >
                 CFD points
               </summary>
-              <PolarViewer
-                chartType={chartType}
-                onChartType={changeChartType}
-                projection={projection}
-                polars={chartPolars}
-                domain={chartDomain}
-                onDomainChange={setChartDomain}
-                visibleSeries={visibleSeries}
-                onToggleSeries={(seriesId) =>
-                  setVisibleSeries((visibility) =>
-                    toggleSeriesVisibility(visibility, seriesId),
-                  )
-                }
-                solvedPointCount={solvedPointCount}
-                machStr={chartMachStr}
-                hover={hover}
-                onHover={setHover}
-                onPointClick={onPointClick}
-              />
+              {initialDetail.cfdPointsDeferred && !loadedDetail ? (
+                <div aria-live="polite" style={{ color: C.text2 }}>
+                  {pointsLoading && <p role="status">Loading CFD points…</p>}
+                  {pointsError && (
+                    <p role="alert">
+                      {pointsError}{" "}
+                      <button
+                        type="button"
+                        onClick={() => void loadCfdPoints()}
+                        style={{
+                          color: C.text,
+                          background: C.panel2,
+                          border: `1px solid ${C.border}`,
+                          borderRadius: 6,
+                          padding: "8px 12px",
+                          minHeight: 44,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Retry
+                      </button>
+                    </p>
+                  )}
+                </div>
+              ) : detail.progressivePolars?.length && solvedPointCount === 0 ? (
+                <p style={{ color: C.text2 }}>No CFD points yet.</p>
+              ) : (
+                <PolarViewer
+                  chartType={chartType}
+                  onChartType={changeChartType}
+                  projection={projection}
+                  polars={chartPolars}
+                  domain={chartDomain}
+                  onDomainChange={setChartDomain}
+                  visibleSeries={visibleSeries}
+                  onToggleSeries={(seriesId) =>
+                    setVisibleSeries((visibility) =>
+                      toggleSeriesVisibility(visibility, seriesId),
+                    )
+                  }
+                  solvedPointCount={solvedPointCount}
+                  machStr={chartMachStr}
+                  hover={hover}
+                  onHover={setHover}
+                  onPointClick={onPointClick}
+                />
+              )}
             </details>
+          )}
+          {initialDetail.cfdPointsDeferred && (
+            <noscript>
+              <a
+                href={`/airfoils/${encodeURIComponent(detail.slug)}?points=1#cfd-points`}
+                style={{ color: C.teal }}
+              >
+                Load CFD points
+              </a>
+            </noscript>
           )}
           <SolverWorkPanel
             slug={detail.slug}

@@ -766,7 +766,7 @@ async function loadCompatibilityCache(
  *  setup anchors; internal batch/revision names never define a curve. */
 export async function assembleDetail(
   slug: string,
-  opts: { revisionId?: string | null } = {},
+  opts: { revisionId?: string | null; view?: "curves" | "full" } = {},
 ): Promise<AirfoilDetailPayload | null> {
   const [a] = await db
     .select()
@@ -794,6 +794,44 @@ export async function assembleDetail(
   const normalizedTags = tagsByAirfoil.get(a.id) ?? [];
 
   const geo = geometryFor(a);
+  const family = cat?.name ?? "—";
+  const subtitle = `${geo.camberPct > 0.5 ? "Cambered" : "Symmetric"} · ${geo.thicknessPct.toFixed(0)}% thick · low-to-mid Re`;
+  const metadata = {
+    id: a.id,
+    slug: a.slug,
+    name: a.name,
+    categoryId: cat?.id ?? a.categoryId,
+    categorySlug: cat?.slug ?? "",
+    categoryPath: cat?.path ?? "",
+    family,
+    subtitle,
+    tags: normalizedTags.length
+      ? normalizedTags.map((tag) => tag.name)
+      : a.tags,
+    hashtags: normalizedTags,
+    breadcrumb: { db: "database", family, name: a.name },
+    geometry: geo,
+    simulationWorks,
+    downloads: {
+      selig: `/api/airfoils/${a.slug}/coords.dat?format=selig`,
+      lednicer: `/api/airfoils/${a.slug}/coords.dat?format=lednicer`,
+      xfoil: `/api/airfoils/${a.slug}/coords.dat?format=xfoil`,
+      csv: `/api/airfoils/${a.slug}/coords.dat?format=csv`,
+      dxf: null,
+    },
+  };
+  if (opts.view === "curves" && !opts.revisionId && progressivePolars.length) {
+    return {
+      ...metadata,
+      mach: progressivePolars[0].mach,
+      reList: [...new Set(progressivePolars.map((polar) => polar.re))].sort(
+        (left, right) => left - right,
+      ),
+      polars: [],
+      progressivePolars,
+      cfdPointsDeferred: true,
+    };
+  }
 
   // Public curves are grouped by physics/numerics compatibility, never by a
   // batch/revision name and never by rounded Reynolds alone. Enabled library
@@ -1063,33 +1101,11 @@ export async function assembleDetail(
     simulationWorks.find((work) => work.mach !== null)?.mach ??
     0;
 
-  const family = cat?.name ?? "—";
-  const subtitle = `${geo.camberPct > 0.5 ? "Cambered" : "Symmetric"} · ${geo.thicknessPct.toFixed(0)}% thick · low-to-mid Re`;
-
   return {
-    id: a.id,
-    slug: a.slug,
-    name: a.name,
-    categoryId: cat?.id ?? a.categoryId,
-    categorySlug: cat?.slug ?? "",
-    categoryPath: cat?.path ?? "",
-    family,
-    subtitle,
-    tags: normalizedTags.length ? normalizedTags.map((h) => h.name) : a.tags,
-    hashtags: normalizedTags,
-    breadcrumb: { db: "database", family, name: a.name },
-    geometry: geo,
+    ...metadata,
     mach: displayedMach,
     reList,
     polars,
     progressivePolars,
-    simulationWorks,
-    downloads: {
-      selig: `/api/airfoils/${a.slug}/coords.dat?format=selig`,
-      lednicer: `/api/airfoils/${a.slug}/coords.dat?format=lednicer`,
-      xfoil: `/api/airfoils/${a.slug}/coords.dat?format=xfoil`,
-      csv: `/api/airfoils/${a.slug}/coords.dat?format=csv`,
-      dxf: null,
-    },
   };
 }

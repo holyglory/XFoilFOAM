@@ -258,6 +258,7 @@ export interface AirfoilDetailPayload {
   reList: number[];
   polars: Polar[]; // one per public series; Detail carries solved CFD points only
   progressivePolars?: ProgressivePolarSeries[];
+  cfdPointsDeferred?: boolean;
   simulationWorks: SimulationWorkItem[];
   downloads: Record<string, string | null>;
 }

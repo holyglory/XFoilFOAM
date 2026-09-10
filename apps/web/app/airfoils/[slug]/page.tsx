@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { DetailHeader } from "@/components/detail/Header";
 import { DetailIsland } from "@/components/detail/DetailIsland";
 import { AppShell } from "@/components/shell/AppShell";
-import { getAirfoilDetail } from "@/lib/api";
+import { getAirfoilCurveDetail, getAirfoilDetail } from "@/lib/api";
 import { parsePinnedRevisionParam } from "@/lib/detail-links";
 
 export default async function AirfoilDetailPage({
@@ -18,14 +18,25 @@ export default async function AirfoilDetailPage({
   // evidence links pin the job's setup revision so campaign evidence — whose
   // presets are disabled by design — is visible here. Invalid shapes are
   // ignored and the page falls back to the public enabled-presets view.
-  const pinnedRevisionId = parsePinnedRevisionParam((await searchParams).revision);
-  const detail = await getAirfoilDetail(slug, pinnedRevisionId);
+  const query = await searchParams;
+  const pinnedRevisionId = parsePinnedRevisionParam(query.revision);
+  const openCfdInitially = query.points === "1";
+  const detail =
+    pinnedRevisionId || openCfdInitially
+      ? await getAirfoilDetail(slug, pinnedRevisionId)
+      : await getAirfoilCurveDetail(slug);
   if (!detail) notFound();
   return (
     <AppShell active="detail">
-      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "20px 22px 56px" }}>
+      <div
+        style={{ maxWidth: 1280, margin: "0 auto", padding: "20px 22px 56px" }}
+      >
         <DetailHeader detail={detail} />
-        <DetailIsland detail={detail} pinnedRevisionId={pinnedRevisionId} />
+        <DetailIsland
+          detail={detail}
+          pinnedRevisionId={pinnedRevisionId}
+          openCfdInitially={openCfdInitially}
+        />
       </div>
     </AppShell>
   );

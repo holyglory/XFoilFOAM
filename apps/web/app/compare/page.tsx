@@ -1,6 +1,6 @@
 import { CompareView } from "@/components/compare/CompareView";
 import { AppShell } from "@/components/shell/AppShell";
-import { getAirfoilDetail, listAirfoils } from "@/lib/api";
+import { getAirfoilCurveDetail, listAirfoils } from "@/lib/api";
 import { parseCompareSelection } from "@/lib/compare-selection";
 import { C, MONO } from "@/lib/tokens";
 
@@ -17,7 +17,7 @@ export default async function ComparePage({
     Promise.all(
       (selection ?? []).map(async (slug) => ({
         slug,
-        detail: await getAirfoilDetail(slug),
+        detail: await getAirfoilCurveDetail(slug),
       })),
     ),
   ]);

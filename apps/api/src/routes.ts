@@ -953,10 +953,13 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const { slug } = req.params as { slug: string };
     // revisionId: minimal pinned-revision scope for the campaign cell side
     // panel (spec §11 surgical exception) — omits nothing, invents nothing.
-    const { revisionId } = z
-      .object({ revisionId: z.string().uuid().optional() })
+    const { revisionId, view } = z
+      .object({
+        revisionId: z.string().uuid().optional(),
+        view: z.enum(["curves", "full"]).optional(),
+      })
       .parse(req.query);
-    const detail = await assembleDetail(slug, { revisionId });
+    const detail = await assembleDetail(slug, { revisionId, view });
     if (!detail) return reply.code(404).send({ error: "airfoil not found" });
     return detail;
   });
