@@ -700,7 +700,10 @@ Windowed URANS histories carry `source_start_time`, the first recorded source
 coefficient time before startup discard or period selection. The retained `t`
 array still describes only its original selected window. Uncertified-history
 startup age is measured from that recorded origin, never from an assumed zero
-or the first already-trimmed sample. An unknown legacy origin is omitted from
+or the first already-trimmed sample. The reduction starts at the later of the
+producer's window start and the required post-startup elapsed time; an earlier
+window prefix does not discard an otherwise informative suffix. The suffix must
+still contain enough real samples. An unknown legacy origin is omitted from
 serialization and retains the conservative existing fallback. An invalid origin
 cannot contribute evidence. This metadata does not certify convergence or relax
 the retained-coefficient and physical-window checks.

@@ -18,8 +18,9 @@ import type {
 } from "@aerodb/engine-client";
 
 const ASSUMPTIONS = {
-  version: "progressive-fit-assumptions-v5",
+  version: "progressive-fit-assumptions-v6",
   historyOrigin: "recorded-source-before-windowing-v1",
+  informativeWindow: "post-startup-suffix-v1",
   minimumUncertifiedConvectiveTransits: 1,
   acquisition: "fixed-posterior-coverage-v1",
   priorLiftStd: 0.3,
@@ -163,6 +164,7 @@ function candidateFor(
       : steadyWindow?.start_iter;
     if (!finite(start) || start < coordinate[0] || start > coordinate.at(-1)!)
       return excluded(candidate, "missing_informative_window");
+    let informativeStart = start;
     const origin = transient
       ? (raw.source_start_time ?? coordinate[0])
       : coordinate[0];
@@ -173,10 +175,12 @@ function candidateFor(
       const speed = lease.source.physical.flow.speedMps;
       if (!finite(length) || length <= 0 || !finite(speed) || speed <= 0)
         return excluded(candidate, "missing_physical_history_scale");
-      if (
-        start - origin <
-        (ASSUMPTIONS.minimumUncertifiedConvectiveTransits * length) / speed
-      )
+      informativeStart = Math.max(
+        start,
+        origin +
+          (ASSUMPTIONS.minimumUncertifiedConvectiveTransits * length) / speed,
+      );
+      if (informativeStart >= coordinate.at(-1)!)
         return excluded(candidate, "startup_only_history");
     }
     const iat = evidence.interpretation?.maxIatSeconds;
@@ -187,7 +191,7 @@ function candidateFor(
       coordinate_kind: coordinateKind,
       coordinate,
       coefficients: coefficients as ProgressiveCoefficientVector[],
-      informative_start: start,
+      informative_start: informativeStart,
       correlation_time: correlation,
       correlation_evidence_id:
         correlation === null ? null : evidence.interpretation!.id,

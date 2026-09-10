@@ -5237,7 +5237,7 @@ describe("persistent progressive polar cache", () => {
     expect(
       new Set(response.estimate.contributors.map((row) => row.attempt_id)),
     ).toEqual(new Set(evidenceIds));
-    for (const origin of [null, 1e9, "203"]) {
+    for (const origin of [1e9, "203"]) {
       const invalid = structuredClone(lease);
       for (const evidence of invalid.source.evidence)
         (
@@ -5265,16 +5265,59 @@ describe("persistent progressive polar cache", () => {
     for (const evidence of negative.source.evidence)
       (evidence.payload.force_history as { cd: number[] }).cd[0] = -0.01;
     expect(buildProgressiveFitRequest(negative).histories).toHaveLength(0);
-    const startup = structuredClone(lease);
+    const transit =
+      lease.source.physical.reference.referenceLengthM /
+      lease.source.physical.flow.speedMps;
+    const partialStartup = structuredClone(lease);
+    for (const evidence of partialStartup.source.evidence) {
+      const history = evidence.payload.force_history as {
+        t: number[];
+        source_start_time: number;
+        window_start: number;
+        window_end: number;
+      };
+      history.source_start_time = 203;
+      history.t = history.t.map(
+        (_, index) =>
+          203 + (0.6 + (0.9 * index) / (history.t.length - 1)) * transit,
+      );
+      history.window_start = history.t[0];
+      history.window_end = history.t.at(-1)!;
+    }
+    const suffixRequest = buildProgressiveFitRequest(partialStartup);
+    expect(suffixRequest.histories).toHaveLength(2);
+    for (const history of suffixRequest.histories)
+      expect(history.informative_start).toBeCloseTo(203 + transit, 10);
+    const suffixResponse = await fitUsingPython(suffixRequest);
+    expect(
+      new Set(
+        suffixResponse.estimate.contributors.map((row) => row.attempt_id),
+      ),
+    ).toEqual(new Set(evidenceIds));
+    for (const origin of [undefined, null]) {
+      const unknown = structuredClone(partialStartup);
+      for (const evidence of unknown.source.evidence)
+        (
+          evidence.payload.force_history as Record<string, unknown>
+        ).source_start_time = origin;
+      expect(buildProgressiveFitRequest(unknown).histories).toHaveLength(0);
+    }
+    const startup = structuredClone(partialStartup);
     for (const evidence of startup.source.evidence) {
       const history = evidence.payload.force_history as {
         source_start_time: number;
         window_start: number;
+        t: number[];
+        window_end: number;
       };
-      history.source_start_time = history.window_start;
+      history.t = history.t.map(
+        (_, index) => 203 + (0.5 * transit * index) / (history.t.length - 1),
+      );
+      history.window_start = history.t[0];
+      history.window_end = history.t.at(-1)!;
     }
     expect(buildProgressiveFitRequest(startup).histories).toHaveLength(0);
-  });
+  }, 30_000);
 
   it("reduces actual unconverged histories and excludes earlier lineage evidence without inventing points", async () => {
     const fixture = await fitFixture();
