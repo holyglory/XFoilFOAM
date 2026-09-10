@@ -792,6 +792,23 @@ verification separate from physical-model validation. Exercise real public
 wide/narrow UI journeys, method/evidence controls, lifecycle expansion, stale
 delivery rejection, saturated queue responsiveness and recovery after restart.
 
+`scripts/materials/validate_polar_uncertainty.py` evaluates a fixed model policy
+against supplied held-out references. Its version-1 input records the policy-fit
+profile and condition identities, the holdout axis, and cases containing the
+actual prior, sparse observations, reference coefficients and source-artifact
+path/checksum. The source loader must establish that numeric rows represent that
+artifact; a matching file hash alone does not establish scientific validity.
+The evaluator verifies bytes, rejects policy-fitting group overlap and reference
+reuse in anchors, and compares only exact computed angles. Missing coefficients
+stay unavailable. Reports include per-case point and angle-weighted coverage,
+errors, widths, equal-case aggregates and reproducible input/model signatures.
+Run it with `python -m scripts.materials.validate_polar_uncertainty --input
+evaluation.json --output measurement.json`. Existing reports are never overwritten.
+This holdout concerns discrepancy-policy fitting, not unknown surrogate-training
+membership. The output remains an unvalidated measurement with no acceptance
+verdict; neither successful execution nor good synthetic-fixture coverage changes
+public uncertainty labels or stopping thresholds.
+
 The RAE 2822 reference in `tests/fixtures/rae2822` preserves the original NASA
 Study 1 geometry and measured pressure bytes. Its loader checks hashes and the
 documented lower-surface and negative-Cp plotting signs. The condition is Mach

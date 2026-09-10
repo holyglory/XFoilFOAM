@@ -128,6 +128,14 @@ timeout_seconds = 120
 [test.rae-grid-reference]
 timeout_seconds = 120
 
+[test.polar-uncertainty-validation]
+timeout_seconds = 120
+
+[[test.polar-uncertainty-validation.check]]
+name = "held-out-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_progressive_polar.py", "-q"]
+
 [[test.rae-grid-reference.check]]
 name = "grid-contract"
 tier = "development"
