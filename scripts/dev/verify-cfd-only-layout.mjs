@@ -75,7 +75,7 @@ target.states = [
   },
 ];
 config.targets = [target];
-config.maxPageCount = 8;
+config.maxPageCount = config.viewports.length * (target.states.length + 1);
 const directory = mkdtempSync(join(tmpdir(), "cfd-only-layout-"));
 try {
   const path = join(directory, "config.json");
