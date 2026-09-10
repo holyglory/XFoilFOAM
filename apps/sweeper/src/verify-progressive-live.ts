@@ -56,6 +56,14 @@ const requestedSpeedMps = Number(
 );
 const requestedMomentumScheme =
   process.env.PROGRESSIVE_LIVE_MOMENTUM_SCHEME ?? "linearUpwind";
+const requestedTargetYPlus =
+  process.env.PROGRESSIVE_LIVE_TARGET_Y_PLUS === undefined
+    ? null
+    : Number(process.env.PROGRESSIVE_LIVE_TARGET_Y_PLUS);
+assert(
+  requestedTargetYPlus === null || requestedTargetYPlus === 40,
+  "Only the explicit yPlus40 mesh comparison is supported",
+);
 const requireRansHold = process.env.PROGRESSIVE_REQUIRE_RANS_HOLD === "1";
 const requireUransHistories =
   process.env.PROGRESSIVE_REQUIRE_URANS_HISTORIES === "1";
@@ -193,7 +201,7 @@ const { db, sql: connection } = createClient({ max: 4 });
 const prefix = `pw-progressive-live-${randomUUID()}`;
 const directory = resolve(
   root,
-  `.codex-artifacts/progressive-live-${requestedSpeedMps}${requestedMomentumScheme === "upwind" ? "-upwind" : ""}${requireRansHold ? "-hold" : ""}${requireUransHistories ? "-urans" : ""}`,
+  `.codex-artifacts/progressive-live-${requestedSpeedMps}${requestedMomentumScheme === "upwind" ? "-upwind" : ""}${requireRansHold ? "-hold" : ""}${requireUransHistories ? "-urans" : ""}${requestedTargetYPlus === null ? "" : `-yplus${requestedTargetYPlus}`}`,
 );
 mkdirSync(directory, { recursive: true });
 const abort = new AbortController();
@@ -204,6 +212,7 @@ let airfoilId: string | undefined;
 let categoryId: string | undefined;
 let originalMedium: typeof mediums.$inferSelect | undefined;
 let originalSolver: typeof solverProfiles.$inferSelect | undefined;
+let originalMesh: typeof meshProfiles.$inferSelect | undefined;
 let controller: ReturnType<typeof spawn> | undefined;
 let controllerStopped: Promise<void> | undefined;
 let controllerExit:
@@ -221,8 +230,10 @@ const report: Record<string, unknown> = {
   buildId: health.build_id,
   requestedSpeedMps,
   requestedMomentumScheme,
+  requestedTargetYPlus,
   requireUransHistories,
-  experimentalNumericalRecipe: requestedMomentumScheme === "upwind",
+  experimentalNumericalRecipe:
+    requestedMomentumScheme === "upwind" || requestedTargetYPlus !== null,
   workerRuntime: worker,
   expectedSolverSource,
   deploymentPendingApply: deployment.data.readiness.pending_apply,
@@ -324,6 +335,13 @@ try {
     .from(outputProfiles)
     .where(eq(outputProfiles.slug, SEEDED_RUNTIME_PROFILE_SLUGS.output));
   assert(medium && boundary && mesh && solver && output);
+  originalMesh = mesh;
+  if (requestedTargetYPlus !== null)
+    await db
+      .update(meshProfiles)
+      .set({ targetYPlus: requestedTargetYPlus })
+      .where(eq(meshProfiles.id, mesh.id));
+  report.meshTargetYPlus = requestedTargetYPlus ?? mesh.targetYPlus;
   originalSolver = solver;
   if (solver.momentumScheme !== requestedMomentumScheme)
     await db
@@ -669,6 +687,10 @@ try {
         .from(simJobs)
         .where(eq(simJobs.airfoilId, airfoilId));
       report.jobs = jobs;
+      report.submittedMeshTargets = await db.execute(sql`
+        SELECT id, request_payload#>'{engineRequest,mesh}' AS mesh
+        FROM sim_jobs WHERE airfoil_id = ${airfoilId}::uuid ORDER BY id
+      `);
       report.sourceReceipts =
         await db.execute(sql`SELECT receipt.*, attempt.sim_job_id
         FROM progressive_cfd_evidence receipt
@@ -722,6 +744,11 @@ try {
         .update(solverProfiles)
         .set({ momentumScheme: originalSolver.momentumScheme })
         .where(eq(solverProfiles.id, originalSolver.id));
+    if (originalMesh)
+      await db
+        .update(meshProfiles)
+        .set({ targetYPlus: originalMesh.targetYPlus })
+        .where(eq(meshProfiles.id, originalMesh.id));
     report.databaseFixturesRemoved = true;
   } catch (error) {
     report.outcome = "failed";

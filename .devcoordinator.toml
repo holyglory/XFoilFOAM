@@ -203,6 +203,39 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 timeout_seconds = 3900
 retained_artifacts = [{ name = "joint-urans-journey", path = ".codex-artifacts/progressive-live-30-urans", max_bytes = 10485760 }]
 
+[test.progressive-urans-wall-live]
+timeout_seconds = 4500
+
+[test.progressive-urans-wall-live.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-urans-wall-live.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "tsx", "src/migrate.ts"]
+
+[[test.progressive-urans-wall-live.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-urans-wall-live.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.progressive-urans-wall-live.check]]
+name = "joint-wall-histories"
+tier = "development"
+requires = ["seed", "types"]
+env = { PROGRESSIVE_REQUIRE_URANS_HISTORIES = "1", PROGRESSIVE_LIVE_TARGET_Y_PLUS = "40" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "tsx", "src/verify-progressive-live.ts"]
+timeout_seconds = 3900
+retained_artifacts = [{ name = "joint-wall-urans", path = ".codex-artifacts/progressive-live-30-urans-yplus40", max_bytes = 10485760 }]
+
 [test.progressive-hold-live.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
