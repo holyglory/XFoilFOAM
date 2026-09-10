@@ -283,8 +283,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     started_at = time.monotonic()
     if resume_local_pressure and (not local_time_pressure or donor or mapped_donor or reference_grid or mesh_only):
         raise ValueError("Experimental continuation requires only the local pressure recipe")
-    if local_time_pressure and (not enthalpy or not first_order or not uniform_start or donor or mapped_donor or transonic or consistent_pressure or density_relaxation is not None or pressure_equation_relaxation is not None or pressure_krylov or upwind_energy):
-        raise ValueError("Local pressure study requires its explicit uniform first-order enthalpy recipe without other solver overrides")
+    if local_time_pressure and (not enthalpy or not uniform_start or donor or mapped_donor or transonic or consistent_pressure or density_relaxation is not None or pressure_equation_relaxation is not None or pressure_krylov or upwind_energy):
+        raise ValueError("Local pressure study requires its explicit uniform enthalpy recipe without other solver overrides")
     if mapped_donor and (donor or reference_grid or not uniform_start):
         raise ValueError("Mapped donor requires a new generated mesh and no other initializer")
     if transonic and density_relaxation is not None:

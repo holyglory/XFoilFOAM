@@ -6,11 +6,12 @@ import pytest
 from scripts.materials.rae2822_local_time import configure_local_time_pressure, restore_local_pressure_state
 
 
-def test_local_pressure_is_not_a_physical_time_history(tmp_path):
+@pytest.mark.parametrize("transport", ["upwind", "linearUpwind limited"])
+def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport):
     (tmp_path / "system").mkdir()
     (tmp_path / "constant").mkdir()
     schemes = tmp_path / "system/fvSchemes"
-    schemes.write_text("ddtSchemes { default steadyState; } divSchemes { div(phi,h) bounded Gauss upwind; }")
+    schemes.write_text(f"ddtSchemes {{ default steadyState; }} divSchemes {{ div(phi,h) bounded Gauss {transport}; }}")
     thermo = tmp_path / "constant/thermophysicalProperties"
     thermo.write_text("source material fixture unchanged")
     receipt = configure_local_time_pressure(tmp_path, 0.3048, 233)
@@ -20,6 +21,7 @@ def test_local_pressure_is_not_a_physical_time_history(tmp_path):
     assert receipt["maximum_local_step_seconds"] == pytest.approx(0.3048 / 233)
     assert "localEuler" in schemes.read_text()
     assert "bounded" not in schemes.read_text()
+    assert f"Gauss {transport};" in schemes.read_text()
     assert json.loads((tmp_path / "constant/numericalExecution.json").read_text()) == receipt
     assert thermo.read_text() == "source material fixture unchanged"
     solution = (tmp_path / "system/fvSolution").read_text()

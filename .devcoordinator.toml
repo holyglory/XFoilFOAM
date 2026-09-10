@@ -1404,6 +1404,22 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.rae-local-higher-order]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-local-higher-order.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-local-higher-order"]
+finite_services = ["enthalpy-local-higher-order"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.rae-local-time-continuation-v2]
 source = ["worktree"]
 components = ["numerics"]

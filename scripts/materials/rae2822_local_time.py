@@ -74,6 +74,7 @@ def configure_local_time_pressure(directory, chord, speed):
     if count != 1 or "div(phi,h)" not in schemes:
         raise ValueError("Local pressure study requires the generated enthalpy steady schemes")
     schemes = schemes.replace("bounded Gauss upwind", "Gauss upwind")
+    schemes = schemes.replace("bounded Gauss linearUpwind limited", "Gauss linearUpwind limited")
     pressure = {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.01}
     transport = {"solver": "PBiCGStab", "preconditioner": "DILU", "tolerance": 1e-8, "relTol": 0.01}
     solution = {
