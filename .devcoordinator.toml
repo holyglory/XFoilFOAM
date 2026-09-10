@@ -131,10 +131,25 @@ timeout_seconds = 120
 [test.polar-uncertainty-validation]
 timeout_seconds = 120
 
+[test.uiuc-prior-evaluation]
+timeout_seconds = 300
+
+[[test.uiuc-prior-evaluation.check]]
+name = "reference-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_uiuc_volume1_reference.py", "tests/test_polar_validation.py", "-q"]
+
+[[test.uiuc-prior-evaluation.check]]
+name = "real-prior-measurement"
+tier = "development"
+requires = ["reference-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.evaluate_uiuc_prior", "--archive", "/mnt/build-storage/codex/xfoilfoam-verification/uiuc-volume1-source-20260910/volume01.zip", "--output", ".codex-artifacts/uiuc-prior-baseline/report.json"]
+retained_artifacts = [{ name = "uiuc-prior-evaluation", path = ".codex-artifacts/uiuc-prior-baseline", max_bytes = 16777216 }]
+
 [[test.polar-uncertainty-validation.check]]
 name = "held-out-contract"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_progressive_polar.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_progressive_polar.py", "tests/test_uiuc_volume1_reference.py", "-q"]
 
 [[test.rae-grid-reference.check]]
 name = "grid-contract"

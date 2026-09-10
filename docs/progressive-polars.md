@@ -809,6 +809,25 @@ membership. The output remains an unvalidated measurement with no acceptance
 verdict; neither successful execution nor good synthetic-fixture coverage changes
 public uncertainty labels or stopping thresholds.
 
+The exploratory UIUC prior evaluation uses the checksum-pinned original Volume 1
+archive, including its as-tested `.dap` coordinates for E387(A), S1223 and SD8020.
+`python -m scripts.materials.evaluate_uiuc_prior --archive volume01.zip --output
+new-report.json` runs real NeuralFoil predictions at each drag run's exact
+Reynolds number and angles. It explicitly assumes Mach 0, `n_crit=9`, free
+transition and nominally smooth clean surfaces; these are not claimed measured
+tunnel inputs. The discrepancy policy is not tuned on those profiles and no
+experimental point is used as an anchor, so this measures only the initial prior,
+not multi-fidelity or compressible calibration.
+
+Data attribution is **UIUC Low-Speed Airfoil Test program, Summary of Low-Speed
+Airfoil Data, Volume 1**. Preserve the original archive and its GPL data license,
+manifesto, copyright notice and source-use terms with any data distribution.
+The source-format loader keeps each recorded run and sweep direction distinct.
+Volume 1's moment column is computational correction input, not experimental
+moment data, and remains excluded; spanwise drag samples are not automatically
+treated as measurement standard errors. Source documentation and distribution
+terms are available at https://m-selig.ae.illinois.edu/pd.html.
+
 The RAE 2822 reference in `tests/fixtures/rae2822` preserves the original NASA
 Study 1 geometry and measured pressure bytes. Its loader checks hashes and the
 documented lower-surface and negative-Cp plotting signs. The condition is Mach
