@@ -7,9 +7,9 @@ import shlex
 import numpy as np
 
 try:
-    from .inspect_rae_extrema import field
+    from .inspect_rae_extrema import field, mesh_list
 except ImportError:
-    from inspect_rae_extrema import field
+    from inspect_rae_extrema import field, mesh_list
 
 
 def authenticated_mapping_source(source, request, settings):
@@ -81,13 +81,15 @@ def map_verified_initial_fields(runner, source, destination, request, settings):
     (destination / "log.mapFields").write_text(result.stdout)
     result.check()
     mapped = {}
-    count = None
+    owner = mesh_list(destination / "constant/polyMesh/owner")
+    if not len(owner):
+        raise ValueError("Mapped target mesh has no cells")
+    count = int(owner.max()) + 1
     for name, width in [("U", 3), ("p", 1), ("T", 1), ("k", 1), ("omega", 1)]:
         path = destination / "0" / name
         values = field(path, width)
-        if count is not None and len(values) != count:
-            raise ValueError("Mapped field cell counts differ")
-        count = len(values)
+        if len(values) != count:
+            raise ValueError("Mapped field cell counts differ from the target mesh")
         if not count or not np.isfinite(values).all() or (name != "U" and np.any(values <= 0)):
             raise ValueError("Mapped initial field is not physically finite")
         if name == "T":

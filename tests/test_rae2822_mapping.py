@@ -60,6 +60,40 @@ def test_mapping_refuses_same_scope_before_any_command(tmp_path):
         map_verified_initial_fields(None, source, source / "nested", target, {})
 
 
+def test_mapping_checks_the_target_mesh_and_preserves_initialization_identity(tmp_path):
+    from unittest.mock import Mock
+
+    source, request = mapping_fixture(tmp_path)
+    request["fluid"] = {"gas": {"nasa7": {"minimum_temperature_k": 150, "maximum_temperature_k": 1500}}}
+    manifest_path = source / "retained-source-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    report_path = source / "report.json"
+    report = json.loads(report_path.read_text())
+    report["request"]["fluid"] = request["fluid"]
+    raw = json.dumps(report).encode()
+    report_path.write_bytes(raw)
+    manifest["files"][-1].update(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+    manifest_path.write_text(json.dumps(manifest))
+    destination = tmp_path / "target"
+    (destination / "0").mkdir(parents=True)
+    (destination / "constant/polyMesh").mkdir(parents=True)
+    (destination / "constant/polyMesh/owner").write_text("FoamFile { format ascii; }\n2(0 1)")
+    for name, values in {"U": "(200 1 0) (200 2 0)", "p": "100000 100001", "T": "250 251", "k": "1 1", "omega": "2 2"}.items():
+        kind = "vector" if name == "U" else "scalar"
+        (destination / "0" / name).write_text(f"FoamFile {{ format ascii; }}\ninternalField nonuniform List<{kind}> 2({values});")
+    runner = Mock()
+    runner.application.return_value.stdout = "isolated native mapping fixture"
+    receipt = map_verified_initial_fields(runner, source, destination, request, {})
+    assert receipt["kind"] == "mapped_initial_conditions_not_solver_evidence"
+    assert receipt["target_coordinate"] == 0
+    assert receipt["mapped_fields"]["U"]["cells"] == 2
+    assert "-sourceTime 2000 -consistent -mapMethod interpolate" in receipt["command"]
+    runner.application.return_value.check.assert_called_once_with()
+    (destination / "constant/polyMesh/owner").write_text("FoamFile { format ascii; }\n3(0 1 2)")
+    with pytest.raises(ValueError, match="target mesh"):
+        map_verified_initial_fields(runner, source, destination, request, {})
+
+
 @pytest.mark.parametrize("mutation", ["unconverged", "missing", "duplicate", "traversal", "symlink"])
 def test_mapping_rejects_unsafe_or_incomplete_donor(tmp_path, mutation):
     source, target = mapping_fixture(tmp_path)
