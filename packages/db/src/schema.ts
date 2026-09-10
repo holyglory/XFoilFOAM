@@ -7363,6 +7363,72 @@ export const progressiveCfdAttempts = pgTable(
   }),
 );
 
+export const progressivePublicationRecoveries = pgTable(
+  "progressive_publication_recoveries",
+  {
+    unitId: uuid("unit_id")
+      .primaryKey()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    predecessorAttemptToken: uuid("predecessor_attempt_token")
+      .notNull()
+      .unique()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    reportSequence: bigint("report_sequence", { mode: "number" }).notNull(),
+    reportSignature: text("report_signature").notNull(),
+    cancellation: jsonb("cancellation")
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    activeSeconds: doublePrecision("active_seconds").notNull(),
+    attemptsBefore: integer("attempts_before").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    sequenceCheck: check(
+      "progressive_publication_recoveries_report_sequence_check",
+      sql`${table.reportSequence} > 0`,
+    ),
+    signatureCheck: check(
+      "progressive_publication_recoveries_report_signature_check",
+      sql`${table.reportSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    cancellationCheck: check(
+      "progressive_publication_recoveries_cancellation_check",
+      sql`jsonb_typeof(${table.cancellation})='object'`,
+    ),
+    activeCheck: check(
+      "progressive_publication_recoveries_active_seconds_check",
+      sql`${table.activeSeconds} >= 0 AND ${table.activeSeconds} < 'Infinity'::double precision`,
+    ),
+    attemptsCheck: check(
+      "progressive_publication_recoveries_attempts_before_check",
+      sql`${table.attemptsBefore} BETWEEN 1 AND 2`,
+    ),
+  }),
+);
+
+export const progressivePublicationRecoveryClaims = pgTable(
+  "progressive_publication_recovery_claims",
+  {
+    unitId: uuid("unit_id")
+      .primaryKey()
+      .references(() => progressivePublicationRecoveries.unitId, {
+        onDelete: "cascade",
+      }),
+    attemptToken: uuid("attempt_token")
+      .notNull()
+      .unique()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+);
+
 export const progressiveCfdRecoveryPlans = pgTable(
   "progressive_cfd_recovery_plans",
   {

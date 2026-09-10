@@ -10,6 +10,7 @@ import {
 } from "../src/progressive-remote-inventory";
 import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
+import { verifyPublicationRecovery } from "./progressive-publication-recovery-fixture";
 
 export async function verifyProgressiveRemoteReportInventory(
   db: DB,
@@ -291,6 +292,7 @@ export async function verifyProgressiveRemoteReportInventory(
                 sql`SELECT count(*)::integer AS count FROM result_attempts WHERE sim_job_id=${executionId}::uuid`,
               );
               expect(rows.count).toBe(0);
+              await verifyPublicationRecovery(scoped, executionId);
             }
             expect(
               await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports

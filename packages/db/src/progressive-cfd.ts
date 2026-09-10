@@ -11,6 +11,7 @@ import {
   type AnalysisPhysical,
 } from "./analysis-target";
 import type { DB } from "./client";
+import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
 import type { SealedPolarTarget } from "./progressive-campaigns";
 
 interface WorkScope {
@@ -196,7 +197,11 @@ export async function claimProgressiveCfdUnit(
     const recoveryOwner = input.remoteSolverId
       ? sql`(${recoveryParent} IS NULL OR EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = ${recoveryParent} AND dispatch.solver_id = ${input.remoteSolverId}::uuid))`
       : sql`(${recoveryParent} IS NULL OR NOT EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = ${recoveryParent}))`;
-    const attemptAvailable = sql`(unit.attempts < 2 OR (unit.attempts = 2 AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version} AND EXISTS (
+    const publicationRecovery = sql`EXISTS(SELECT 1 FROM progressive_publication_recoveries recovery
+      WHERE recovery.unit_id=unit.id AND recovery.attempts_before=unit.attempts AND unit.active_seconds>=recovery.active_seconds
+        AND NOT EXISTS(SELECT 1 FROM progressive_publication_recovery_claims claimed WHERE claimed.unit_id=recovery.unit_id))`;
+    const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
+    const attemptAvailable = sql`(${ordinaryAttempts} < 2 OR ${publicationRecovery} OR (${ordinaryAttempts} = 2 AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version} AND EXISTS (
       SELECT 1 FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id AND recovery.ordinal = 2
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_recovery_claims claimed WHERE claimed.recovery_plan_id = recovery.id)
     )))`;
@@ -296,7 +301,7 @@ export async function claimProgressiveCfdUnit(
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
         work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
-        ${recoveryParent} AS recovery_parent_job_id,
+        ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
         unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
       FROM selected JOIN progressive_cfd_units unit ON unit.id = selected.id
       JOIN progressive_work work ON work.id = unit.work_id
@@ -316,6 +321,7 @@ export async function claimProgressiveCfdUnit(
       remaining_active_seconds: number;
       recovery_plan_id: string | null;
       recovery_parent_job_id: string | null;
+      publication_recovery: boolean;
     }>;
     if (!unit) return null;
     const token = randomUUID();
@@ -333,6 +339,9 @@ export async function claimProgressiveCfdUnit(
         INSERT INTO progressive_cfd_recovery_claims (attempt_token, recovery_plan_id)
         VALUES (${token}, ${unit.recovery_plan_id})
       `);
+    if (unit.publication_recovery)
+      await connection.execute(sql`INSERT INTO progressive_publication_recovery_claims(unit_id,attempt_token)
+        VALUES(${unit.id}::uuid,${token}::uuid)`);
     return {
       id: unit.id,
       workId: unit.work_id,

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
 
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
@@ -25,7 +26,8 @@ export async function recoverUnboundProgressiveCfdLeases(
     `);
     if (!campaign) return receipt;
     const units = await connection.execute(sql`
-      SELECT unit.id, unit.lease_token, unit.attempts, unit.active_seconds, unit.active_budget_seconds
+      SELECT unit.id, unit.lease_token, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
@@ -38,7 +40,7 @@ export async function recoverUnboundProgressiveCfdLeases(
     `);
     for (const unit of units) {
       const retry =
-        Number(unit.attempts) < 2 &&
+        Number(unit.ordinary_attempts) < 2 &&
         Number(unit.active_seconds) < Number(unit.active_budget_seconds);
       const reason = retry
         ? "unbound claim expired before engine submission"

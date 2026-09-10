@@ -3,6 +3,7 @@ import { assertProgressiveExecutionIdentity } from "./progressive-execution-iden
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
+import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
 
 export function validateProgressiveExecutionStopProof(
   proof: EngineExecutionStopProof,
@@ -201,6 +202,7 @@ export async function settleProgressiveCfdExecution(
       );
     const units = await connection.execute(sql`
       SELECT attempt.token, attempt.outcome, unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts,
         work.stage, epoch.current AND generation.status = 'active' AND generation.plan_revision_id = campaign.current_plan_revision_id
           AND campaign.status IN ('active', 'attention', 'paused') AS current_scope,
         evidence.count, evidence.accepted, evidence.infrastructure_only, fitted.state AS fit_state,
@@ -274,8 +276,8 @@ export async function settleProgressiveCfdExecution(
       const retry =
         !complete &&
         !exhausted &&
-        (Number(unit.attempts) < 2 ||
-          (Number(unit.attempts) === 2 &&
+        (Number(unit.ordinary_attempts) < 2 ||
+          (Number(unit.ordinary_attempts) === 2 &&
             unit.stage === 3 &&
             unit.precise_verification === true)) &&
         (unit.numerical_recovery === true ||

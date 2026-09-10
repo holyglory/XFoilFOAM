@@ -618,6 +618,19 @@ Progressive workers publish through their dedicated compact-evidence and archive
 services, never the legacy accepted-result publisher. A terminal worker report
 may precede local point staging; that temporary absence is not an empty solve and
 must not cancel the promise or create a legacy blocked-delivery receipt.
+The hub can recover an angle lost to that legacy publication race once, using
+the authenticated cancellation reason and immutable final report it already
+holds. `node --import tsx packages/db/src/recover-progressive-publication.ts
+CAMPAIGN_UUID --dry-run` reports aggregate eligibility without exporting private
+execution inventories; `--apply` records the correction and requeues eligible
+fast-stage gaps. The normal controller creates a new execution and consumes an
+immutable recovery claim. Original promises, attempts, recipes, measured time
+and remaining budgets are unchanged. The one corrective attempt may exceed the
+ordinary attempt-count limit, never the remaining-time budget; numerical recovery
+plans and obsolete, finished, paused or cancelled campaign work are not reopened.
+Total attempt counters retain the correction. The ordinary retry allowance
+subtracts the one consumed corrective claim, so a publication repair does not
+silently remove an otherwise available numerical or infrastructure retry.
 If an exact remote promise was cancelled before all reported evidence arrived,
 verified physical stop and drained final reports may close its scheduling attempt
 as cancelled and its unfinished anchors as explicit gaps. This does not mark the
