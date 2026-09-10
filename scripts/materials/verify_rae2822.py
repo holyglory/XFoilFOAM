@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from rae2822_reference import load_reference, selig_coordinates
 from solver_stability import solver_stability
 from rae2822_grid import write_nasa_grid
+from rae2822_mapping import map_verified_initial_fields
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
@@ -277,8 +278,10 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None):
     started_at = time.monotonic()
+    if mapped_donor and (donor or reference_grid or not uniform_start):
+        raise ValueError("Mapped donor requires a new generated mesh and no other initializer")
     if transonic and density_relaxation is not None:
         raise ValueError("Transonic native pressure correction bypasses density relaxation")
     time_budget_seconds = benchmark_time_budget(time_budget_seconds)
@@ -336,7 +339,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_consistent_pressure": consistent_pressure,
               "experimental_density_relaxation": density_relaxation,
               "experimental_wall_functions": wall_functions,
-              "velocity_initialization": "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
+              "velocity_initialization": "mapped-converged-donor" if mapped_donor else "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
               "experimental_momentum_scheme": momentum_scheme,
               "experimental_energy_transport": "upwind" if upwind_energy else momentum_scheme,
@@ -390,6 +393,10 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         if mesh_only:
             report["outcome"] = "mesh_verified_only"
             return
+        if mapped_donor:
+            settings = {key: value for key, value in report.items() if key.startswith("experimental_")}
+            report["mapped_initialization"] = map_verified_initial_fields(runner, mapped_donor, destination,
+                                                                          report["request"], settings)
         if not uniform_start and not donor:
             initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
             (destination / "log.potentialFoam").write_text(initialized.stdout)
@@ -459,6 +466,7 @@ if __name__ == "__main__":
     parser.add_argument("--enthalpy", action="store_true")
     parser.add_argument("--first-order", action="store_true")
     parser.add_argument("--donor")
+    parser.add_argument("--mapped-donor")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -467,4 +475,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor)
