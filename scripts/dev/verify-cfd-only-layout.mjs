@@ -56,19 +56,29 @@ target.states = [
     actions: [points],
     continuation: {
       kind: "in-page",
-      anchor: `${viewer} svg`,
+      anchor: "[data-testid='polar-chart-svg']",
       focusWithin: toggle,
       maxScrollDelta: 8,
     },
   },
-  { name: "light", theme: "light", actions: [light] },
+  {
+    name: "light",
+    theme: "light",
+    actions: [light],
+    continuation: {
+      kind: "in-page",
+      anchor: "[data-testid='polar-chart-svg']",
+      focusWithin: "button[aria-label='Switch to dark theme']",
+      maxScrollDelta: 8,
+    },
+  },
   {
     name: "light-points",
     theme: "light",
     actions: [light, points],
     continuation: {
       kind: "in-page",
-      anchor: `${viewer} svg`,
+      anchor: "[data-testid='polar-chart-svg']",
       focusWithin: toggle,
       maxScrollDelta: 8,
     },

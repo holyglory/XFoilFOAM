@@ -165,6 +165,9 @@ export function PolarChart({
       width="100%"
       viewBox={`0 0 ${w} ${h}`}
       data-testid="polar-chart-svg"
+      data-ui-continuation-anchor
+      role="img"
+      aria-label={`${projection.yTitle} versus ${projection.xTitle}`}
       style={{
         display: "block",
         overflow: "hidden",

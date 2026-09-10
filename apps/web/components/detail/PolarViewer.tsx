@@ -427,7 +427,7 @@ export function PolarViewer(props: {
                 padding: "6px 11px",
                 cursor: "pointer",
                 background: profileView.active ? C.tabActive : "transparent",
-                color: profileView.active ? C.teal : C.muted,
+                color: profileView.active ? C.text : C.muted,
                 fontWeight: profileView.active ? 600 : 400,
                 whiteSpace: "nowrap",
               }}
@@ -456,7 +456,7 @@ export function PolarViewer(props: {
                   padding: "6px 11px",
                   cursor: "pointer",
                   background: on ? C.tabActive : "transparent",
-                  color: on ? C.teal : C.muted,
+                  color: on ? C.text : C.muted,
                   fontWeight: on ? 600 : 400,
                   whiteSpace: "nowrap",
                 }}
@@ -510,7 +510,7 @@ export function PolarViewer(props: {
                 style={{
                   fontFamily: MONO,
                   fontSize: 11,
-                  color: solvedPointCount ? C.teal : C.dim,
+                  color: solvedPointCount ? C.teal : C.text2,
                   border: `1px solid ${solvedPointCount ? C.tealBorder : C.stroke}`,
                   background: solvedPointCount ? C.tealFill : C.panel3,
                   borderRadius: 8,
@@ -527,7 +527,7 @@ export function PolarViewer(props: {
               style={{
                 fontFamily: MONO,
                 fontSize: 11,
-                color: C.dim,
+                color: C.text2,
                 border: `1px solid ${C.stroke}`,
                 borderRadius: 8,
                 padding: "7px 11px",
@@ -708,7 +708,7 @@ export function PolarViewer(props: {
                       textAlign: "center",
                       pointerEvents: "none",
                       fontFamily: MONO,
-                      color: C.muted,
+                      color: VIZ.text,
                       background: "rgba(7, 12, 18, 0.52)",
                       border: `1px dashed ${C.stroke2}`,
                       borderRadius: 10,
@@ -716,7 +716,7 @@ export function PolarViewer(props: {
                     }}
                   >
                     <span
-                      style={{ color: C.text, fontSize: 12, fontWeight: 700 }}
+                      style={{ color: VIZ.text, fontSize: 12, fontWeight: 700 }}
                     >
                       {!showPoints
                         ? "No polar curve available yet."
@@ -955,7 +955,7 @@ export function PolarViewer(props: {
                 fontFamily: MONO,
                 fontSize: 10,
                 letterSpacing: "0.1em",
-                color: C.dim,
+                color: C.text2,
                 marginRight: 2,
               }}
             >
@@ -982,8 +982,8 @@ export function PolarViewer(props: {
                     color: item.pointCount
                       ? item.visible
                         ? C.text
-                        : C.dim
-                      : C.dimmest,
+                        : C.text2
+                      : C.text2,
                   }}
                 >
                   <span
