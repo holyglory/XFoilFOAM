@@ -38,16 +38,19 @@ export async function reconcileProgressiveRemoteWorker(
   };
   if (options.jobIds?.length === 0) return receipt;
   const finalMirrors = await db.execute(sql`
-    SELECT job.id FROM sim_jobs job
+    WITH active_jobs AS MATERIALIZED (
+      SELECT id, request_payload, "updatedAt" FROM sim_jobs
+      WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
+        OR engine_state IN ('cancelling', 'cancel_pending')
+    )
+    SELECT job.id FROM active_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
     WHERE job.request_payload->>'remoteSolver' = 'true' AND job.request_payload ? 'remoteProgressiveExecution'
       AND promise.registered_solver_id = settings.remote_solver_registered_id
       AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
-      AND (job.status IN ('pending', 'submitted', 'running', 'ingesting') OR job.engine_state IN ('cancelling', 'cancel_pending'))
       AND EXISTS (SELECT 1 FROM progressive_worker_reports report WHERE report.sim_job_id = job.id
-        AND report.report#>>'{stopProof,execution_stopped}' = 'true'
-        AND report.report#>>'{stopProof,job_id}' = job.id::text)
+        AND report.stopped_engine_job_id = job.id::text)
       ${
         options.jobIds
           ? sql`AND job.id IN (${sql.join(
@@ -94,14 +97,13 @@ export async function reconcileProgressiveRemoteWorker(
         OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp())
       AND ((job.engine_job_id IS NOT NULL AND job.engine_job_id <> job.id::text) OR NOT EXISTS (
         SELECT 1 FROM progressive_worker_reports report WHERE report.sim_job_id = job.id
-          AND report.report#>>'{stopProof,job_id}' = job.id::text
-          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+          AND report.stopped_engine_job_id = job.id::text
           AND (report.report#>>'{stopProof,ownership_basis}' = 'never_started_cancellation_fence'
             OR report.report#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
             OR (report.report->'result' = 'null'::jsonb AND report.report#>>'{status,state}' = 'failed'
               AND report.report#>>'{status,total_cases}' = '0' AND report.report#>>'{status,completed_cases}' = '0'
               AND report.report#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure')))
-          AND report.report->>'assignmentSignature' = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')))
+          AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')))
       ${
         options.jobIds
           ? sql`AND job.id IN (${sql.join(

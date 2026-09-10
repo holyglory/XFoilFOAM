@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
+import type { EngineClient } from "../../engine-client/src";
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
@@ -15,6 +16,7 @@ import {
   publishProgressiveWorkerReport,
   publishNextProgressiveWorkerReport,
 } from "../../../apps/sweeper/src/progressive-remote-publication";
+import { reconcileProgressiveRemoteWorker } from "../../../apps/sweeper/src/progressive-remote-reconciliation";
 
 export async function verifyProgressiveWorkerReportDelivery(
   db: DB,
@@ -105,6 +107,52 @@ export async function verifyProgressiveWorkerReportDelivery(
       true,
     );
     await checkProjection();
+    const observedEngine = {
+      getJob: vi.fn(),
+      getResult: vi.fn(),
+      cancelJob: vi.fn(),
+      getExecutionStopProof: vi.fn(),
+    };
+    const reconcile = (jobIds = [executionId]) =>
+      reconcileProgressiveRemoteWorker(
+        db,
+        observedEngine as unknown as EngineClient,
+        { jobIds },
+      );
+    for (const [status, engineState] of [
+      ["pending", "pending"],
+      ["submitted", "pending"],
+      ["running", "running"],
+      ["ingesting", "completed"],
+      ["done", "cancelling"],
+      ["failed", "cancel_pending"],
+    ]) {
+      await db.execute(sql`
+        UPDATE sim_jobs SET status = ${status}, engine_state = ${engineState}
+        WHERE id = ${executionId}::uuid
+      `);
+      expect(await reconcile([randomUUID()])).toMatchObject({
+        inspected: 0,
+        reported: 0,
+        stopped: 0,
+        errors: [],
+      });
+      expect(await reconcile()).toMatchObject({
+        inspected: 1,
+        reported: 0,
+        stopped: 1,
+        errors: [],
+      });
+      await checkProjection();
+      expect(await reconcile()).toMatchObject({
+        inspected: 0,
+        reported: 0,
+        stopped: 0,
+        errors: [],
+      });
+    }
+    for (const operation of Object.values(observedEngine))
+      expect(operation).not.toHaveBeenCalled();
     await db.execute(
       sql`UPDATE sim_jobs SET engine_job_id = ${randomUUID()} WHERE id = ${executionId}::uuid`,
     );
