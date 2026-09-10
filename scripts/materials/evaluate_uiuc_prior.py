@@ -16,13 +16,14 @@ def identity(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def evaluate_archive(path):
+def evaluate_archive(path, profiles=None, include_cases=False):
     source = load_uiuc_volume1_archive(path)
     cases, predictions, limitations = [], [], []
     policy = PolarModelPolicy("fixed-production-prior-assumptions-evaluation-v1", [0.4, 0.4, 0.1], [0.15, 0.15, 0.03],
                               [0.5, 0.3, 0.1], [0.15, 0.2, 0.03], [0.03, 0.03, 0.005], [0.01, 0.01, 0.001], 2, 0.8, "unvalidated")
     recipe = BaselineRecipe("uiuc-as-tested-prior-evaluation-v1", "large", 0.003, 0.012)
-    for profile, coordinate_name in (("E387A", "e387a.dap"), ("S1223", "s1223.dap"), ("SD8020", "sd8020.dap")):
+    profiles = profiles if profiles is not None else (("E387A", "e387a.dap"), ("S1223", "s1223.dap"), ("SD8020", "sd8020.dap"))
+    for profile, coordinate_name in profiles:
         coordinates = parse_airfoil(source["coordinates"][coordinate_name].decode("ascii"))
         geometry = [[float(point[0]), float(point[1])] for point in coordinates]
         geometry_hash = identity(geometry)
@@ -31,7 +32,8 @@ def evaluate_archive(path):
         for run in polar["runs"]:
             for branch_index, branch in enumerate(run["branches"]):
                 if len(branch["rows"]) < 2:
-                    limitations.append({"profile": profile, "run": run["source_run"], "reason": "fewer_than_two_reference_angles"})
+                    limitations.append({"profile": profile, "run": run["source_run"], "branch": branch_index,
+                                        "samples": len(branch["rows"]), "reason": "fewer_than_two_reference_angles"})
                     continue
                 rows = sorted(branch["rows"], key=lambda row: row["alpha"])
                 angles = [row["alpha"] for row in rows]
@@ -53,12 +55,14 @@ def evaluate_archive(path):
             predictions.append(prediction)
     result = evaluate_held_out_polars(cases, policy, fit_profiles=[], fit_conditions=[], split_axis="profile_and_condition")
     result.update({"attribution": ATTRIBUTION, "source_archive_sha256": source["archive_sha256"], "evaluation_kind": "untuned_neuralfoil_prior_baseline",
-                   "reference_integrity": "pinned_archive_and_source_specific_parser", "profiles": 3,
+                   "reference_integrity": "pinned_archive_and_source_specific_parser", "profiles": len(profiles),
                    "comparison_assumptions": {"mach": 0, "n_crit": 9, "transition": "free", "roughness": "clean_as_nominally_smooth",
                                               "as_tested_geometry": True, "measured_mach": None, "measured_n_crit": None},
                    "limitations": limitations + [{"reason": "not_multifidelity_or_compressible_calibration"}, {"reason": "surrogate_training_membership_unknown"},
                                                    {"reason": "measurement_uncertainty_unavailable"}, {"reason": "experimental_moment_unavailable"}],
                    "predictions": predictions, "policy": asdict(policy)})
+    if include_cases:
+        result["case_inputs"] = [asdict(case) for case in cases]
     return result
 
 

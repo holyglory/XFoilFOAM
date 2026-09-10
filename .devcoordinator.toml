@@ -134,6 +134,36 @@ timeout_seconds = 120
 [test.uiuc-prior-evaluation]
 timeout_seconds = 300
 
+[test.uiuc-reference-inventory]
+timeout_seconds = 120
+
+[test.uiuc-family-calibration]
+timeout_seconds = 600
+
+[[test.uiuc-family-calibration.check]]
+name = "protocol-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_uiuc_family_calibration.py", "tests/test_uiuc_inventory.py", "tests/test_uiuc_volume1_reference.py", "tests/test_polar_validation.py", "-q"]
+
+[[test.uiuc-family-calibration.check]]
+name = "real-family-study"
+tier = "development"
+requires = ["protocol-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.uiuc_family_calibration", "--archive", "/mnt/build-storage/codex/xfoilfoam-verification/uiuc-volume1-source-20260910/volume01.zip", "--output", ".codex-artifacts/uiuc-family-calibration-v2"]
+retained_artifacts = [{ name = "uiuc-family-calibration", path = ".codex-artifacts/uiuc-family-calibration-v2", max_bytes = 16777216 }]
+
+[[test.uiuc-reference-inventory.check]]
+name = "source-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_uiuc_volume1_reference.py", "tests/test_uiuc_inventory.py", "-q"]
+
+[[test.uiuc-reference-inventory.check]]
+name = "available-reference-groups"
+tier = "development"
+requires = ["source-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.inventory_uiuc_references", "--archive", "/mnt/build-storage/codex/xfoilfoam-verification/uiuc-volume1-source-20260910/volume01.zip", "--output", ".codex-artifacts/uiuc-reference-inventory/report.json"]
+retained_artifacts = [{ name = "uiuc-reference-inventory", path = ".codex-artifacts/uiuc-reference-inventory", max_bytes = 1048576 }]
+
 [[test.uiuc-prior-evaluation.check]]
 name = "reference-contract"
 tier = "development"

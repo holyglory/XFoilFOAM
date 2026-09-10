@@ -819,6 +819,26 @@ tunnel inputs. The discrepancy policy is not tuned on those profiles and no
 experimental point is used as an anchor, so this measures only the initial prior,
 not multi-fidelity or compressible calibration.
 
+`scripts.materials.inventory_uiuc_references` inventories exact as-tested geometry
+matches before inspecting prediction errors. The family study in
+`scripts.materials.uiuc_family_calibration` writes its fixed protocol before
+running predictions: 19 calibration families and seven held-out families, with
+the three previously inspected pilot families excluded from validation. The
+candidate uses each family's maximum standardized lift/log-drag error and the
+finite-sample 95% rank, not an interpolated percentile. Fewer than 19 valid
+calibration families cannot produce a finite 95% scale. Single-angle branches
+are explicitly excluded from curve evaluation; source exclusions are retained.
+Run with `--archive volume01.zip --output new-study-directory`.
+
+The initial study covered 122 runs and 1,304 measured rows; 15 single-angle
+branches were excluded. Its scale of 1.2743 widened the existing intervals.
+Both the original and widened intervals covered all 339 held-out rows in 36
+runs across seven families. Thus this candidate did not improve observed
+held-out coverage or prediction errors, and is not adopted into production.
+Family exchangeability is unestablished and seven evaluation families are not
+a calibration certificate. Sparse-CFD refinement, condition holdout and
+compressible accuracy remain separate validation requirements.
+
 Data attribution is **UIUC Low-Speed Airfoil Test program, Summary of Low-Speed
 Airfoil Data, Volume 1**. Preserve the original archive and its GPL data license,
 manifesto, copyright notice and source-use terms with any data distribution.
