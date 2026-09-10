@@ -14,6 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from rae2822_reference import load_reference, selig_coordinates
 from solver_stability import solver_stability
+from rae2822_grid import write_nasa_grid
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
@@ -241,7 +242,7 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic):
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False):
     time_budget_seconds = benchmark_time_budget(time_budget_seconds)
     from airfoilfoam.airfoil import Airfoil, parse_airfoil
     from airfoilfoam.config import Settings
@@ -260,6 +261,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     from airfoilfoam.thermodynamics import ThermodynamicState
 
     reference = load_reference(reference_directory)
+    if reference_grid and (donor or wall_functions):
+        raise ValueError("Published wall-resolved reference grid cannot be combined with donor or wall-function spacing")
     momentum_scheme = benchmark_momentum_scheme(first_order)
     conditions = reference["conditions"]
     destination = Path(destination) / str(uuid4())
@@ -324,6 +327,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             _set_control_dict_entries(destination / "system/controlDict", {
                 "startFrom": "latestTime", "endTime": int(report["donor"]["coordinate"]) + dimensions[3],
             })
+        elif reference_grid:
+            report["reference_grid"] = write_nasa_grid(reference_grid, destination, spec.chord, mesh.span_chords)
         else:
             mesher.write_inputs(destination, airfoil, mesh, spec.chord)
             meshed = budgeted.application(destination, "blockMesh", timeout=120)
@@ -335,6 +340,9 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             raise ValueError("Mesh quality is unavailable")
         report["mesh_quality"] = asdict(verdict)
         report["mesh_warnings"] = warnings
+        if mesh_only:
+            report["outcome"] = "mesh_verified_only"
+            return
         if not uniform_start and not donor:
             initialized = initialize_compressible_velocity(destination, budgeted, patches, dialect_for_runner(runner).potential_foam_command)
             (destination / "log.potentialFoam").write_text(initialized.stdout)
@@ -403,6 +411,8 @@ if __name__ == "__main__":
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
     parser.add_argument("--time-budget-seconds", type=float, default=600)
+    parser.add_argument("--reference-grid", type=Path)
+    parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only)

@@ -125,6 +125,14 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.rae-grid-reference]
+timeout_seconds = 120
+
+[[test.rae-grid-reference.check]]
+name = "grid-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_grid.py", "-q"]
+
 [test.fast-wall-spacing]
 timeout_seconds = 300
 
@@ -1330,6 +1338,22 @@ build = false
 port = true
 route = true
 timeout_seconds = 3300
+
+[deployment.rae-nasa-grid-check]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-nasa-grid-check.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "nasa-grid-check"]
+finite_services = ["nasa-grid-check"]
+build = false
+port = true
+route = true
+timeout_seconds = 300
 
 [deployment.thermophysics-check.component.inspection]
 type = "compose"

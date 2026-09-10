@@ -10,11 +10,22 @@ x-verification: &verification
     - ./scripts/materials/rae2822_reference.py:/verification/rae2822_reference.py:ro
     - ./scripts/materials/verify_rae2822.py:/verification/verify_rae2822.py:ro
     - ./scripts/materials/solver_stability.py:/verification/solver_stability.py:ro
+    - ./scripts/materials/rae2822_grid.py:/verification/rae2822_grid.py:ro
     - ./tests/fixtures/rae2822:/verification/reference:ro
     - ./tests/fixtures/air-thermophysics-audit.json:/verification/material.json:ro
     - rae-evidence:/evidence
 
 services:
+  nasa-grid-check:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    volumes:
+      - ./scripts/materials:/verification:ro
+      - ./tests/fixtures/rae2822:/reference:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
+      - /mnt/build-storage/codex/xfoilfoam-verification/rae2822-nasa-grid-source-20260910/raetaf.x.fmt:/source/raetaf.x.fmt:ro
+      - rae-evidence:/evidence
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/nasa-grid-check", "--tier", "precise", "--uniform-start", "--enthalpy", "--first-order", "--reference-grid", "/source/raetaf.x.fmt", "--mesh-only"]
   fast:
     <<: *verification
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/fast", "--tier", "fast"]
