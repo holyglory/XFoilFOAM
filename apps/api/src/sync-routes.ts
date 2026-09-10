@@ -1238,6 +1238,13 @@ export async function lockAndFilterRemoteClaimAoas(
       aoaDeg,
     })),
   );
+  const [parents] = await tx.execute(sql`
+    SELECT revision.id FROM simulation_preset_revisions revision
+    JOIN airfoils airfoil ON airfoil.id = ${airfoilId}::uuid
+    WHERE revision.id = ${revisionId}::uuid AND airfoil."deletedAt" IS NULL AND airfoil."archivedAt" IS NULL
+    FOR KEY SHARE OF revision, airfoil
+  `);
+  if (!parents) return [];
   const values = sql.join(
     candidates.map((aoaDeg) => sql`(${aoaDeg}::float8)`),
     sql`, `,

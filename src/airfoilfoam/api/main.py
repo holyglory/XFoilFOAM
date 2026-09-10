@@ -918,6 +918,7 @@ def create_app() -> FastAPI:
             "urans_recovery_version": URANS_RECOVERY_VERSION,
             "urans_initialization_version": URANS_INITIALIZATION_VERSION,
             "solver_budget_version": SOLVER_BUDGET_VERSION,
+            "neuralfoil_geometry_fit_version": 2,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
             # provenance appears solely on worker-acknowledged status/results.

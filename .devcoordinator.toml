@@ -90,6 +90,38 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_domain_reset.p
 [test.progressive]
 timeout_seconds = 7200
 
+[test.prediction-repair-live]
+timeout_seconds = 300
+
+[test.prediction-repair-live.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.prediction-repair-live.check]]
+name = "real-geometry-repair"
+tier = "development"
+env = { PROGRESSIVE_PREDICTION_REPAIR_LIVE = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "repairs real old-engine geometry gaps"]
+
+[[test.progressive.check]]
+name = "remote-claim-parent-race"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/sync-remote-validation.test.ts", "-t", "rechecks remote claim"]
+
+[[test.progressive.check]]
+name = "prediction-repair"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "supplemental prediction repair"]
+
+[[test.progressive.check]]
+name = "prediction-repair-worker"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/prediction-repair.test.ts"]
+
 [test.rae-reference]
 timeout_seconds = 120
 

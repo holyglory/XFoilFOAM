@@ -495,6 +495,87 @@ export async function failProgressiveWork(
   });
 }
 
+export function validateNeuralFoilPredictionPayload(
+  targetId: string,
+  scope: Pick<SealedPolarTarget, "angles" | "recipes" | "physical">,
+  payload: Record<string, unknown>,
+) {
+  if (
+    payload.kind !== "prediction" ||
+    payload.method !== "neuralfoil" ||
+    payload.cfd_evidence !== false ||
+    payload.target_signature !== targetId ||
+    !/^[a-f0-9]{64}$/.test(String(payload.prediction_id)) ||
+    canonicalAnalysisJson(payload.alpha) !==
+      canonicalAnalysisJson(scope.angles) ||
+    canonicalAnalysisJson(payload.recipe) !==
+      canonicalAnalysisJson(scope.recipes.neuralfoil)
+  )
+    throw new Error("Prediction does not match its sealed target and recipe");
+  const expectedCondition = {
+    target_signature: targetId,
+    reynolds: scope.physical.derived.reynolds,
+    mach: scope.physical.derived.mach,
+    alpha: scope.angles,
+    n_crit: scope.physical.transition.nCrit,
+    transition_upper: scope.physical.transition.upper,
+    transition_lower: scope.physical.transition.lower,
+    roughness_height: scope.physical.boundary.sandGrainHeight,
+  };
+  if (
+    canonicalAnalysisJson(payload.condition) !==
+    canonicalAnalysisJson(expectedCondition)
+  )
+    throw new Error(
+      "Prediction physical inputs differ from the analysis target",
+    );
+  const coefficients = payload.coefficients;
+  const confidence = payload.analysis_confidence;
+  if (
+    !Array.isArray(coefficients) ||
+    coefficients.length !== scope.angles.length ||
+    !coefficients.every(
+      (row) =>
+        Array.isArray(row) &&
+        row.length === 3 &&
+        row.every(Number.isFinite) &&
+        row[1] > 0,
+    ) ||
+    !Array.isArray(confidence) ||
+    confidence.length !== scope.angles.length ||
+    !confidence.every(
+      (value) => Number.isFinite(value) && value >= 0 && value <= 1,
+    )
+  )
+    throw new Error("Prediction contains invalid aerodynamic output");
+  const model = payload.model as Record<string, unknown> | undefined;
+  const geometryFit = payload.geometry_fit as
+    | Record<string, unknown>
+    | undefined;
+  if (
+    !model ||
+    model.neuralfoil !== "0.3.3" ||
+    model.aerosandbox !== "4.2.10" ||
+    model.model_size !== scope.recipes.neuralfoil.model_size ||
+    !/^[a-f0-9]{64}$/.test(String(model.weights_sha256)) ||
+    !/^[a-f0-9]{64}$/.test(String(model.training_distribution_sha256)) ||
+    payload.uncertainty_calibration !== "unvalidated" ||
+    !payload.geometry_provenance ||
+    !geometryFit ||
+    typeof geometryFit.rms_chord !== "number" ||
+    !Number.isFinite(geometryFit.rms_chord) ||
+    geometryFit.rms_chord < 0 ||
+    typeof geometryFit.maximum_chord !== "number" ||
+    !Number.isFinite(geometryFit.maximum_chord) ||
+    geometryFit.maximum_chord < geometryFit.rms_chord ||
+    geometryFit.rms_chord >
+      Number(scope.recipes.neuralfoil.maximum_geometry_rms) ||
+    geometryFit.maximum_chord >
+      Number(scope.recipes.neuralfoil.maximum_geometry_error)
+  )
+    throw new Error("Prediction is missing model and geometry provenance");
+}
+
 export async function storeNeuralFoilPrediction(
   db: DB,
   lease: ProgressiveLease,
@@ -536,80 +617,7 @@ export async function storeNeuralFoilPrediction(
       WHERE scope.generation_id = ${lease.generationId} AND scope.target_id = ${lease.targetId}
     `,
     );
-    if (
-      payload.kind !== "prediction" ||
-      payload.method !== "neuralfoil" ||
-      payload.cfd_evidence !== false ||
-      payload.target_signature !== lease.targetId ||
-      !/^[a-f0-9]{64}$/.test(String(payload.prediction_id)) ||
-      canonicalAnalysisJson(payload.alpha) !==
-        canonicalAnalysisJson(scope.angles) ||
-      canonicalAnalysisJson(payload.recipe) !==
-        canonicalAnalysisJson(scope.recipes.neuralfoil)
-    )
-      throw new Error("Prediction does not match its sealed target and recipe");
-    const expectedCondition = {
-      target_signature: lease.targetId,
-      reynolds: scope.physical.derived.reynolds,
-      mach: scope.physical.derived.mach,
-      alpha: scope.angles,
-      n_crit: scope.physical.transition.nCrit,
-      transition_upper: scope.physical.transition.upper,
-      transition_lower: scope.physical.transition.lower,
-      roughness_height: scope.physical.boundary.sandGrainHeight,
-    };
-    if (
-      canonicalAnalysisJson(payload.condition) !==
-      canonicalAnalysisJson(expectedCondition)
-    )
-      throw new Error(
-        "Prediction physical inputs differ from the analysis target",
-      );
-    const coefficients = payload.coefficients;
-    const confidence = payload.analysis_confidence;
-    if (
-      !Array.isArray(coefficients) ||
-      coefficients.length !== scope.angles.length ||
-      !coefficients.every(
-        (row) =>
-          Array.isArray(row) &&
-          row.length === 3 &&
-          row.every(Number.isFinite) &&
-          row[1] > 0,
-      ) ||
-      !Array.isArray(confidence) ||
-      confidence.length !== scope.angles.length ||
-      !confidence.every(
-        (value) => Number.isFinite(value) && value >= 0 && value <= 1,
-      )
-    )
-      throw new Error("Prediction contains invalid aerodynamic output");
-    const model = payload.model as Record<string, unknown> | undefined;
-    const geometryFit = payload.geometry_fit as
-      | Record<string, unknown>
-      | undefined;
-    if (
-      !model ||
-      model.neuralfoil !== "0.3.3" ||
-      model.aerosandbox !== "4.2.10" ||
-      model.model_size !== scope.recipes.neuralfoil.model_size ||
-      !/^[a-f0-9]{64}$/.test(String(model.weights_sha256)) ||
-      !/^[a-f0-9]{64}$/.test(String(model.training_distribution_sha256)) ||
-      payload.uncertainty_calibration !== "unvalidated" ||
-      !payload.geometry_provenance ||
-      !geometryFit ||
-      typeof geometryFit.rms_chord !== "number" ||
-      !Number.isFinite(geometryFit.rms_chord) ||
-      geometryFit.rms_chord < 0 ||
-      typeof geometryFit.maximum_chord !== "number" ||
-      !Number.isFinite(geometryFit.maximum_chord) ||
-      geometryFit.maximum_chord < geometryFit.rms_chord ||
-      geometryFit.rms_chord >
-        Number(scope.recipes.neuralfoil.maximum_geometry_rms) ||
-      geometryFit.maximum_chord >
-        Number(scope.recipes.neuralfoil.maximum_geometry_error)
-    )
-      throw new Error("Prediction is missing model and geometry provenance");
+    validateNeuralFoilPredictionPayload(lease.targetId, scope, payload);
     await connection.execute(sql`
       INSERT INTO neuralfoil_predictions (id, epoch_id, target_id, payload)
       VALUES (${id}, ${lease.epochId}, ${lease.targetId}, ${canonicalAnalysisJson(payload)}::jsonb)

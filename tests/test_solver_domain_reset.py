@@ -34,7 +34,8 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
     assert {"results", "result_attempts", "force_history", "sim_jobs",
             "sync_sweep_promises", "polar_fit_sets", "solver_evidence_incomplete_quarantines",
             "solver_evidence_orphan_quarantines", "progressive_cfd_units", "progressive_cfd_attempts",
-            "progressive_cfd_execution_stops", "progressive_cfd_stage_decisions", "progressive_cfd_runtime_progress"} <= RESET["SOLVER_TABLES"]
+            "progressive_cfd_execution_stops", "progressive_cfd_stage_decisions", "progressive_cfd_runtime_progress",
+            "progressive_prediction_repairs", "progressive_prediction_repair_attempts"} <= RESET["SOLVER_TABLES"]
 
 
 def test_preserved_foreign_keys_cannot_retain_solver_dependencies():

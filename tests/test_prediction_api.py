@@ -5,7 +5,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from airfoilfoam.api.main import _require_control_plane_bearer
+from airfoilfoam.api.main import _require_control_plane_bearer, create_app
 from airfoilfoam.api.predictions import prediction_router
 from test_neuralfoil_solver import condition, geometry, recipe
 from test_polar_history import history, reduction
@@ -19,6 +19,10 @@ def client_and_request():
     request = {"epoch_id": str(uuid4()), "lease_token": str(uuid4()), "coordinates": coordinates,
                "geometry_provenance": provenance, "conditions": [asdict(condition())], "recipe": asdict(recipe())}
     return TestClient(app), request
+
+
+def test_health_advertises_the_actual_geometry_fit_implementation():
+    assert TestClient(create_app()).get("/health").json()["neuralfoil_geometry_fit_version"] == 2
 
 
 def test_engine_api_returns_real_fenced_prediction_not_a_cfd_job():

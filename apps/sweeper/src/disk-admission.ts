@@ -3,6 +3,7 @@ import {
   simJobs,
   sweeperState,
   solverDirectLifecycleSql,
+  solverLocalExecutionSql,
 } from "@aerodb/db";
 import {
   EngineError,
@@ -253,15 +254,18 @@ export async function loadDiskAdmissionExposure(
       })
       .from(simJobs)
       .where(
-        or(
-          inArray(simJobs.status, ["submitted", "running", "ingesting"]),
-          and(
-            eq(simJobs.status, "pending"),
-            eq(simJobs.engineState, "submitting"),
-          ),
-          and(
-            eq(simJobs.status, "cancelled"),
-            inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+        and(
+          solverLocalExecutionSql(),
+          or(
+            inArray(simJobs.status, ["submitted", "running", "ingesting"]),
+            and(
+              eq(simJobs.status, "pending"),
+              eq(simJobs.engineState, "submitting"),
+            ),
+            and(
+              eq(simJobs.status, "cancelled"),
+              inArray(simJobs.engineState, ["cancelling", "cancel_pending"]),
+            ),
           ),
         ),
       ),

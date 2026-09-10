@@ -15,6 +15,7 @@ export * from "./progressive-cfd-stages";
 export * from "./progressive-cfd-recovery";
 export * from "./progressive-remote-execution";
 export * from "./progressive-remote-dispatch";
+export * from "./progressive-prediction-repair";
 export * from "./progressive-remote-report";
 export * from "./progressive-remote-reports";
 export * from "./progressive-remote-evidence";

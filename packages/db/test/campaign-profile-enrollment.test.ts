@@ -1,4 +1,15 @@
 import { randomUUID } from "node:crypto";
+import { loadDiskAdmissionExposure } from "../../../apps/sweeper/src/disk-admission";
+import {
+  localPredictionRepairEngines,
+  trustedRepairGeometry,
+} from "./prediction-repair-live-fixture";
+import { repairMissingPredictions } from "../../../apps/sweeper/src/repair-missing-predictions";
+import {
+  claimMissingPredictionRepair,
+  failPredictionRepair,
+  storeRepairedPrediction,
+} from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { spawn } from "node:child_process";
@@ -1023,6 +1034,353 @@ function executionStopProof(engineJobId: string): EngineExecutionStopProof {
 }
 
 describe("progressive durable stage transitions", () => {
+  it.skipIf(process.env.PROGRESSIVE_PREDICTION_REPAIR_LIVE !== "1")(
+    "repairs real old-engine geometry gaps through the new prediction engine without CFD replay",
+    async () => {
+      const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+      const engines = localPredictionRepairEngines(root);
+      expect(
+        (await engines.original.healthDetails())
+          .neuralfoil_geometry_fit_version,
+      ).not.toBe(2);
+      expect(
+        (await engines.repaired.healthDetails())
+          .neuralfoil_geometry_fit_version,
+      ).toBe(2);
+      const [state] = await db.execute(
+        sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
+      );
+      await db.execute(
+        sql`UPDATE sweeper_state SET enabled = true WHERE id = 1`,
+      );
+      try {
+        for (const profile of ["b707b", "b707c", "cap21c", "e49"]) {
+          const geometry = trustedRepairGeometry(root, profile);
+          await db
+            .update(airfoils)
+            .set({ points: geometry.points })
+            .where(eq(airfoils.id, originalId));
+          const campaignId = await campaign();
+          const generation = await materializeProgressiveCampaignScope(
+            db,
+            campaignId,
+          );
+          const original = await runProgressiveBaselineBatch(
+            db,
+            engines.original,
+            `real-old-fit-${profile}`,
+            { requireSweeperEnabled: true },
+          );
+          expect(original).toMatchObject({ claimed: 1, stored: 0 });
+          expect(original.errors.join(" ")).toContain(
+            "not represented accurately enough",
+          );
+          const before =
+            await db.execute(sql`SELECT work.id, work.state, work.error, work.stage, generation.stage AS campaign_stage
+          FROM progressive_work work JOIN progressive_generations generation ON generation.id = work.generation_id
+          WHERE generation.id = ${generation!.id}::uuid ORDER BY work.stage`);
+          expect(before[0]).toMatchObject({ state: "gap", campaign_stage: 2 });
+          const receipt = await repairMissingPredictions(
+            db,
+            engines.repaired,
+            campaignId,
+            1,
+          );
+          expect(receipt).toEqual({
+            claimed: 1,
+            stored: 1,
+            gaps: 0,
+            errors: [],
+          });
+          expect(
+            await db.execute(sql`SELECT work.id, work.state, work.error, work.stage, generation.stage AS campaign_stage
+          FROM progressive_work work JOIN progressive_generations generation ON generation.id = work.generation_id
+          WHERE generation.id = ${generation!.id}::uuid ORDER BY work.stage`),
+          ).toEqual(before);
+          const [stored] =
+            await db.execute(sql`SELECT prediction.id, prediction.payload, scope.revision_id
+          FROM progressive_prediction_repairs repair JOIN neuralfoil_predictions prediction ON prediction.id = repair.prediction_id
+          JOIN progressive_work work ON work.id = repair.work_id
+          JOIN progressive_generation_targets scope ON scope.generation_id = work.generation_id AND scope.target_id = work.target_id
+          WHERE work.generation_id = ${generation!.id}::uuid`);
+          const payload = stored.payload as {
+            coefficients: number[][];
+            geometry_fit: { method: string };
+            cfd_evidence: boolean;
+          };
+          expect(payload.geometry_fit.method).toBe(
+            "retained-polyline-segment-sampling-v1",
+          );
+          expect(payload.cfd_evidence).toBe(false);
+          expect(
+            payload.coefficients.every(
+              (row) => row.every(Number.isFinite) && row[1] > 0,
+            ),
+          ).toBe(true);
+          expect(
+            (
+              await publicProgressivePolars(
+                db,
+                originalId,
+                String(stored.revision_id),
+              )
+            ).some((series) => series.modelId === stored.id),
+          ).toBe(true);
+          expect(
+            (
+              await db.execute(
+                sql`SELECT count(*)::integer AS jobs FROM sim_jobs WHERE campaign_id = ${campaignId}::uuid`,
+              )
+            )[0].jobs,
+          ).toBe(0);
+          console.log(
+            JSON.stringify({
+              operation: "real-missing-prediction-repair",
+              profile,
+              geometrySha256: geometry.sha256,
+              predictionId: stored.id,
+              rows: payload.coefficients.length,
+              originalGapPreserved: true,
+              campaignStage: 2,
+              cfdJobs: 0,
+            }),
+          );
+        }
+      } finally {
+        await db
+          .update(airfoils)
+          .set({ points })
+          .where(eq(airfoils.id, originalId));
+        await db.execute(
+          sql`UPDATE sweeper_state SET enabled = ${state.enabled} WHERE id = 1`,
+        );
+      }
+    },
+    120000,
+  );
+
+  it("supplemental prediction repair preserves advanced stages, gap history and existing CFD ownership", async () => {
+    const campaignId = await campaign("active", [32.1741]);
+    await materializeProgressiveCampaignScope(db, campaignId);
+    const baseline = (await claim([1]))!;
+    await failProgressiveWork(
+      db,
+      baseline,
+      "original geometry fit unavailable",
+      false,
+    );
+    await initializeProgressiveCfdWork(db);
+    const [state] = await db.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
+    );
+    await db.execute(sql`UPDATE sweeper_state SET enabled = true WHERE id = 1`);
+    try {
+      const before =
+        await db.execute(sql`SELECT generation.stage, work.id, work.state, work.attempts
+        FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
+        WHERE generation.id = ${baseline.generationId}::uuid ORDER BY work.stage`);
+      const unitsBefore =
+        await db.execute(sql`SELECT unit.* FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
+        WHERE work.generation_id = ${baseline.generationId}::uuid ORDER BY unit.id`);
+      expect(before[0].stage).toBe(2);
+      const leases = await Promise.all([
+        claimMissingPredictionRepair(db, campaignId, "repair-first"),
+        claimMissingPredictionRepair(db, campaignId, "repair-second"),
+      ]);
+      expect(leases.filter(Boolean)).toHaveLength(1);
+      const lease = leases.find(Boolean)!;
+      const payload = predictionFixture(lease);
+      const rollback = new Error("isolated repair lifecycle rollback");
+      await expect(
+        db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(
+            sql`UPDATE sim_campaigns SET status = 'cancelled' WHERE id = ${campaignId}::uuid`,
+          );
+          await expect(
+            storeRepairedPrediction(connection, lease, payload),
+          ).rejects.toThrow("obsolete or expired");
+          throw rollback;
+        }),
+      ).rejects.toBe(rollback);
+      await expect(
+        storeRepairedPrediction(db, { ...lease, token: randomUUID() }, payload),
+      ).rejects.toThrow("obsolete or expired");
+      await expect(
+        storeRepairedPrediction(db, lease, {
+          ...payload,
+          target_signature: "other",
+        }),
+      ).rejects.toThrow("sealed target");
+      await expect(
+        storeRepairedPrediction(db, lease, {
+          ...payload,
+          geometry_fit: { rms_chord: 1, maximum_chord: 2 },
+        }),
+      ).rejects.toThrow("provenance");
+      const predictionId = await storeRepairedPrediction(db, lease, payload);
+      expect(await storeRepairedPrediction(db, lease, payload)).toBe(
+        predictionId,
+      );
+      await expect(
+        storeRepairedPrediction(db, lease, {
+          ...payload,
+          prediction_id: "b".repeat(64),
+        }),
+      ).rejects.toThrow("changed content");
+      expect(
+        await claimMissingPredictionRepair(db, campaignId, "after-success"),
+      ).toBeNull();
+      expect(
+        await db.execute(sql`SELECT generation.stage, work.id, work.state, work.attempts
+        FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
+        WHERE generation.id = ${baseline.generationId}::uuid ORDER BY work.stage`),
+      ).toEqual(before);
+      expect(
+        await db.execute(sql`SELECT unit.* FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
+        WHERE work.generation_id = ${baseline.generationId}::uuid ORDER BY unit.id`),
+      ).toEqual(unitsBefore);
+      const [history] = await db.execute(
+        sql`SELECT outcome, error FROM progressive_work_attempts WHERE token = ${baseline.token}::uuid`,
+      );
+      expect(history).toEqual({
+        outcome: "failed",
+        error: "original geometry fit unavailable",
+      });
+      const [fit] = await db.execute(
+        sql`SELECT state FROM progressive_polar_fit_work WHERE prediction_id = ${predictionId}`,
+      );
+      expect(fit.state).toBe("pending");
+      expect(
+        (
+          await publicProgressivePolars(
+            db,
+            baseline.physical.airfoilId,
+            baseline.revisionId,
+          )
+        ).some((series) => series.targetId === baseline.targetId),
+      ).toBe(true);
+    } finally {
+      await db.execute(
+        sql`UPDATE sweeper_state SET enabled = ${state.enabled} WHERE id = 1`,
+      );
+    }
+  });
+
+  it("supplemental prediction repair respects pause, obsolete ownership and bounded retry history", async () => {
+    const campaignId = await campaign("active", [36.174]);
+    await materializeProgressiveCampaignScope(db, campaignId);
+    const baseline = (await claim([1]))!;
+    const [state] = await db.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
+    );
+    await db.execute(sql`UPDATE sweeper_state SET enabled = true WHERE id = 1`);
+    try {
+      expect(
+        await claimMissingPredictionRepair(db, campaignId, "not-a-gap"),
+      ).toBeNull();
+      await failProgressiveWork(db, baseline, "geometry unavailable", false);
+      await db.execute(
+        sql`UPDATE sim_campaigns SET status = 'paused' WHERE id = ${campaignId}::uuid`,
+      );
+      expect(
+        await claimMissingPredictionRepair(db, campaignId, "paused"),
+      ).toBeNull();
+      await db.execute(
+        sql`UPDATE sim_campaigns SET status = 'active' WHERE id = ${campaignId}::uuid`,
+      );
+      const first = (await claimMissingPredictionRepair(
+        db,
+        campaignId,
+        "first",
+      ))!;
+      await db.execute(
+        sql`UPDATE progressive_prediction_repairs SET lease_until = clock_timestamp() - interval '1 second' WHERE work_id = ${first.workId}::uuid`,
+      );
+      const second = (await claimMissingPredictionRepair(
+        db,
+        campaignId,
+        "second",
+      ))!;
+      expect(second.token).not.toBe(first.token);
+      await expect(
+        storeRepairedPrediction(db, first, predictionFixture(first)),
+      ).rejects.toThrow("obsolete or expired");
+      await failPredictionRepair(db, second, "second transport failure", true);
+      expect(
+        await claimMissingPredictionRepair(db, campaignId, "third"),
+      ).toBeNull();
+      const attempts = await db.execute(
+        sql`SELECT outcome FROM progressive_prediction_repair_attempts WHERE work_id = ${first.workId}::uuid ORDER BY created_at`,
+      );
+      expect(attempts.map((attempt) => attempt.outcome)).toEqual([
+        "expired",
+        "failed",
+      ]);
+      expect(
+        (
+          await db.execute(
+            sql`SELECT stage FROM progressive_generations WHERE id = ${baseline.generationId}::uuid`,
+          )
+        )[0].stage,
+      ).toBe(2);
+    } finally {
+      await db.execute(
+        sql`UPDATE sweeper_state SET enabled = ${state.enabled} WHERE id = 1`,
+      );
+    }
+  });
+
+  it("supplemental prediction repair exhausts an expired final retry without leaving a live lease", async () => {
+    const campaignId = await campaign("active", [38.174]);
+    await materializeProgressiveCampaignScope(db, campaignId);
+    const baseline = (await claim([1]))!;
+    await failProgressiveWork(db, baseline, "geometry unavailable", false);
+    const [state] = await db.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
+    );
+    await db.execute(sql`UPDATE sweeper_state SET enabled = true WHERE id = 1`);
+    try {
+      const first = (await claimMissingPredictionRepair(
+        db,
+        campaignId,
+        "first",
+      ))!;
+      await failPredictionRepair(
+        db,
+        first,
+        "temporary transport failure",
+        true,
+      );
+      const second = (await claimMissingPredictionRepair(
+        db,
+        campaignId,
+        "second",
+      ))!;
+      await db.execute(
+        sql`UPDATE progressive_prediction_repairs SET lease_until = clock_timestamp() - interval '1 second' WHERE work_id = ${second.workId}::uuid`,
+      );
+      expect(
+        await claimMissingPredictionRepair(db, campaignId, "third"),
+      ).toBeNull();
+      const [repair] = await db.execute(
+        sql`SELECT state, lease_token, attempts FROM progressive_prediction_repairs WHERE work_id = ${second.workId}::uuid`,
+      );
+      expect(repair).toEqual({ state: "gap", lease_token: null, attempts: 2 });
+      expect(
+        (
+          await db.execute(
+            sql`SELECT outcome FROM progressive_prediction_repair_attempts WHERE work_id = ${second.workId}::uuid ORDER BY created_at`,
+          )
+        ).map((attempt) => attempt.outcome),
+      ).toEqual(["failed", "expired"]);
+    } finally {
+      await db.execute(
+        sql`UPDATE sweeper_state SET enabled = ${state.enabled} WHERE id = 1`,
+      );
+    }
+  });
+
   it("recovers only expired unbound claims, bounds retries, and advances an evidence-free fast gap", async () => {
     const campaignId = await campaign();
     await materializeProgressiveCampaignScope(db, campaignId);
@@ -1918,6 +2276,29 @@ describe("progressive CPU admission", () => {
         expect(bound.envelope.request).toEqual(
           JSON.parse(JSON.stringify(composed.request)),
         );
+        const forecastRollback = new Error(
+          "isolated disk attribution rollback",
+        );
+        await expect(
+          db.transaction(async (transaction) => {
+            const connection = transaction as unknown as DB;
+            await connection.execute(
+              sql`UPDATE sim_jobs SET status = 'running', engine_state = 'running' WHERE id = ${job.id}::uuid`,
+            );
+            const remote = await loadDiskAdmissionExposure(connection);
+            await connection.execute(
+              sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id = ${job.id}::uuid`,
+            );
+            const local = await loadDiskAdmissionExposure(connection);
+            expect(local.activeLocalJobCount).toBe(
+              remote.activeLocalJobCount + 1,
+            );
+            expect(local.activeLocalReservedBytes).toBeGreaterThan(
+              remote.activeLocalReservedBytes,
+            );
+            throw forecastRollback;
+          }),
+        ).rejects.toBe(forecastRollback);
         const report: ProgressiveRemoteReport = {
           version: 1,
           solverId,

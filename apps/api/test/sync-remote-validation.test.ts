@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql as query } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sourceAirModel } from "../../../packages/core/test/fixtures/source-air-model";
 
@@ -1198,6 +1198,86 @@ describe("remote solver sync validation regressions", () => {
       ),
     );
     expect(blockedByLocalClaim).toEqual([]);
+  });
+
+  it("rechecks remote claim parents after a concurrent setup deletion", async () => {
+    const [original] = await db
+      .select()
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId));
+    const copyId = randomUUID();
+    await db
+      .insert(simulationPresetRevisions)
+      .values({
+        ...original,
+        id: copyId,
+        revisionNumber: original.revisionNumber + 1000,
+        signatureHash: createHash("sha256").update(copyId).digest("hex"),
+      });
+    let release!: () => void;
+    let notify!: (pid: number) => void;
+    const ready = new Promise<number>((resolve) => {
+      notify = resolve;
+    });
+    const proceed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const deleting = db.transaction(async (transaction) => {
+      const [backend] = await transaction.execute(
+        query`SELECT pg_backend_pid() AS pid`,
+      );
+      await transaction
+        .delete(simulationPresetRevisions)
+        .where(eq(simulationPresetRevisions.id, copyId));
+      notify(Number(backend.pid));
+      await proceed;
+    });
+    const blocker = await ready;
+    const claiming = db.transaction((transaction) =>
+      lockAndFilterRemoteClaimAoas(
+        transaction as unknown as typeof db,
+        airfoilId,
+        copyId,
+        [699.953],
+      ),
+    );
+    try {
+      await expect
+        .poll(
+          async () => {
+            const [waiting] = await db.execute(
+              query`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ${blocker}::integer = ANY(pg_blocking_pids(pid))) AS blocked`,
+            );
+            return waiting.blocked;
+          },
+          { timeout: 10000, interval: 10 },
+        )
+        .toBe(true);
+    } finally {
+      release();
+      await deleting;
+    }
+    expect(await claiming).toEqual([]);
+    expect(
+      await db.transaction((transaction) =>
+        lockAndFilterRemoteClaimAoas(
+          transaction as unknown as typeof db,
+          randomUUID(),
+          revisionId,
+          [699.954],
+        ),
+      ),
+    ).toEqual([]);
+    expect(
+      await db.transaction((transaction) =>
+        lockAndFilterRemoteClaimAoas(
+          transaction as unknown as typeof db,
+          airfoilId,
+          randomUUID(),
+          [699.955],
+        ),
+      ),
+    ).toEqual([]);
   });
 
   it("exchanges the bootstrap secret exactly once for a legacy solver credential", async () => {

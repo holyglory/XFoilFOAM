@@ -49,6 +49,31 @@ were still disposable verification state.
 
 ## User-visible outcome
 
+### Supplemental prediction repair
+
+Missing NeuralFoil predictions may be retried after their original campaign stage
+has advanced. The explicit operator command is
+`pnpm --filter @aerodb/sweeper predictions:repair <campaign-uuid> <maximum-count>`
+(1–256 repairs). It refuses an engine without `neuralfoil_geometry_fit_version=2`.
+Deploy the verified prediction implementation before running it; this command does
+not rebuild an engine or relax its maintenance prerequisites.
+
+Repair receipts and their attempts are separate from original campaign work.
+The original gap, attempts, generation stage, CFD units, and CFD ownership remain
+unchanged. A successful repair validates the same sealed physical target, angle
+grid, numerical recipe, model provenance, and geometry limits as initial baseline
+ingestion. It inserts a real prediction and queues a fitted-curve refresh, allowing
+compatible existing CFD evidence to refine it without rerunning the campaign.
+Existing predictions are not replaced. Paused/cancelled or obsolete scopes cannot
+start repairs; failures and expired leases remain recorded with bounded retries.
+
+The geometry fallback retains every original contour vertex and adds only points
+on existing straight segments, at most 0.01 chord apart and 8192 fit points. It is
+used only after the native eight-weight fit fails the unchanged geometry limits.
+The same validated representation is used for inference and its method is stored
+in prediction provenance. This is not a geometry correction or an aerodynamic
+accuracy certificate; unsuitable profiles remain unavailable.
+
 Every existing and new campaign first produces complete NeuralFoil prediction
 curves, then improves coverage with bounded fast OpenFOAM calculations, and finally
 resolves the original angle targets with precise OpenFOAM. These are strict stages
@@ -373,6 +398,16 @@ settings and native log, and restores the original setup afterward. Forced-URANS
 initialization and density-based calculations do not use this continuation.
 Missing hold proof leaves the attempt provisional; it also excludes those fields
 from accepted warm-start donors. Mesh reuse is unchanged.
+
+An experimental, not-yet-deployed guard treats potential-flow initialization as
+only a proposal for the initial velocity, not
+compressible CFD evidence. Its complete finite vector field must fit the selected
+gas's available stagnation enthalpy above the material's minimum temperature.
+An inadmissible proposal is retained with its checksum and measured peak, while
+the exact original freestream velocity is restored. Pressure, temperature and
+material properties remain unchanged. The producer does not clip velocities or
+extend the gas model's temperature range. This necessary energy check does not
+certify convergence or aerodynamic accuracy.
 
 Local pseudo-time advances individual cells with numerical steps to seek a steady
 solution; its iteration coordinate is never a physical URANS history. The sealed

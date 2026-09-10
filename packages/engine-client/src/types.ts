@@ -386,6 +386,7 @@ export interface JobStatus {
 }
 
 export interface EngineHealth {
+  neuralfoil_geometry_fit_version?: number;
   status: string;
   role?: string | null;
   version: string;

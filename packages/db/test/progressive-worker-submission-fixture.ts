@@ -11,6 +11,7 @@ import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { verifyProgressiveWorkerObservation } from "./progressive-worker-observation-fixture";
 import { solverQueuePressure } from "../../../apps/sweeper/src/submit-lifecycle";
+import { loadDiskAdmissionExposure } from "../../../apps/sweeper/src/disk-admission";
 import { submitProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-submission";
 import { admitRemoteSolverTick } from "../../../apps/sweeper/src/remote-solver";
 
@@ -166,6 +167,9 @@ export async function verifyProgressiveWorkerSubmission(
     expect(engineSubmit).toHaveBeenCalledTimes(1);
     expect(engineSubmit.mock.calls[0]?.[0]).toEqual(envelope.request);
     expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+    expect(
+      (await loadDiskAdmissionExposure(db)).activeLocalJobCount,
+    ).toBeGreaterThanOrEqual(1);
     await db.execute(
       sql`UPDATE sim_jobs SET status = 'cancelled', engine_state = 'cancelled' WHERE id = ${executionId}::uuid`,
     );

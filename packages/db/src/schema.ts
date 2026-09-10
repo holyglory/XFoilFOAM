@@ -7102,6 +7102,68 @@ export const neuralfoilPredictions = pgTable(
   }),
 );
 
+export const progressivePredictionRepairs = pgTable(
+  "progressive_prediction_repairs",
+  {
+    workId: uuid("work_id")
+      .notNull()
+      .references(() => progressiveWork.id, { onDelete: "cascade" }),
+    policyVersion: text("policy_version").notNull(),
+    state: text("state").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    leaseToken: uuid("lease_token"),
+    leaseOwner: text("lease_owner"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    predictionId: text("prediction_id").references(
+      () => neuralfoilPredictions.id,
+      { onDelete: "cascade" },
+    ),
+    error: text("error"),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.workId, table.policyVersion] }),
+    stateCheck: check(
+      "progressive_prediction_repairs_state_check",
+      sql`${table.state} IN ('pending', 'leased', 'complete', 'gap')`,
+    ),
+    attemptCheck: check(
+      "progressive_prediction_repairs_attempts_check",
+      sql`${table.attempts} BETWEEN 0 AND 2`,
+    ),
+  }),
+);
+
+export const progressivePredictionRepairAttempts = pgTable(
+  "progressive_prediction_repair_attempts",
+  {
+    token: uuid("token").primaryKey(),
+    workId: uuid("work_id").notNull(),
+    policyVersion: text("policy_version").notNull(),
+    outcome: text("outcome").notNull().default("running"),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (table) => ({
+    owner: foreignKey({
+      columns: [table.workId, table.policyVersion],
+      foreignColumns: [
+        progressivePredictionRepairs.workId,
+        progressivePredictionRepairs.policyVersion,
+      ],
+    }).onDelete("cascade"),
+    outcomeCheck: check(
+      "progressive_prediction_repair_attempts_outcome_check",
+      sql`${table.outcome} IN ('running', 'complete', 'failed', 'expired')`,
+    ),
+  }),
+);
+
 export const progressivePredictionLinks = pgTable(
   "progressive_prediction_links",
   {
