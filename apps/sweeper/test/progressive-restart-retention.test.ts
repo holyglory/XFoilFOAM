@@ -26,7 +26,11 @@ function fixture(blocked = true, candidates = true) {
             {
               id: executionId,
               sequence: 3,
-              report: { result: { state: "completed" } },
+              report: {
+                result: { state: "completed" },
+                status: { state: "completed" },
+                stopProof: { execution_stopped: true },
+              },
             },
           ]
         : [],
@@ -81,7 +85,9 @@ it("authenticates exact worker ownership and requests only checkpoint stripping"
   for (const guard of [
     "FOR UPDATE",
     "SKIP LOCKED",
-    "stopProof,job_id",
+    "stopped_engine_job_id",
+    "live_jobs AS MATERIALIZED",
+    "selected AS MATERIALIZED",
     "continue_from,engine_job_id",
     "ingest_lease_expires_at",
     "sim_urans_requests",
