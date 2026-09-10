@@ -865,6 +865,27 @@ an aerodynamic accuracy certificate. Experimental transonic pressure correction
 changes only a newly generated benchmark dictionary before any solver starts;
 it does not change the production recipe.
 
+The reference driver accepts an explicit `--processes` count within the worker
+CPU budget; serial remains the default. Parallel runs retain reconstructed fields
+even after a bounded timeout and report solver and overall elapsed time separately.
+Four ranks improved elapsed time for the measured coarse case, not necessarily
+CPU efficiency or fine-grid throughput.
+
+`--mapped-donor` authenticates a retained converged source before interpolating
+its volume fields into a new finer mesh. Physical setup and numerical settings
+must match except for the declared resolution and iteration/tolerance changes.
+Mapped fields are initial conditions at coordinate zero, never completed CFD.
+
+The isolated `--local-time-pressure` experiment uses `rhoPimpleFoam` with
+`localEuler`; its clock is numerical iteration, not physical URANS time.
+`--resume-local-pressure` resumes only compatible, authenticated experimental
+state in a separate case, preserving the source, exact mesh and latest fields,
+and accumulated solver cost. It does not weaken the converged-donor gate.
+Native linear residuals and a passing force-stability check are insufficient
+for this experimental method's steady acceptance: reports remain uncertified.
+The measured coarse continuation reduced force drift but retained substantial
+pressure error, so these options are not production recipe defaults.
+
 Progressive archive delivery uses its own notification-driven service. It drains
 exact retained sources independently of legacy transfer housekeeping, reusing
 the existing claims, oldest-due ordering, custody verification, transfer pause
