@@ -133,6 +133,12 @@ name = "grid-contract"
 tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_grid.py", "-q"]
 
+[[test.rae-grid-reference.check]]
+name = "reference-face-angles"
+tier = "development"
+requires = ["grid-contract"]
+command = [".venv/bin/python", "scripts/materials/rae2822_grid.py", "/mnt/build-storage/codex/xfoilfoam-verification/rae2822-nasa-grid-source-20260910/raetaf.x.fmt", "--inspect"]
+
 [test.fast-wall-spacing]
 timeout_seconds = 300
 
@@ -1364,8 +1370,8 @@ ttl_seconds = 86400
 [deployment.rae-nasa-ordered-grid-check.component.numerics]
 type = "compose"
 files = ["compose.rae-verification.yml"]
-services = ["artifacts", "nasa-grid-check"]
-finite_services = ["nasa-grid-check"]
+services = ["artifacts"]
+finite_services = []
 build = false
 port = true
 route = true

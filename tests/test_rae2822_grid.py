@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from scripts.materials.rae2822_grid import extruded_c_grid, parse_plot3d_grid, write_nasa_grid
+from scripts.materials.rae2822_grid import extruded_c_grid, grid_nonorthogonality, parse_plot3d_grid, write_nasa_grid
 
 
 def small_grid():
@@ -31,6 +31,9 @@ def test_c_grid_welds_only_wake_and_owns_all_faces():
     order = [(face["owner"], face["neighbour"]) for face in mesh["internal"]]
     assert order == sorted(order)
     assert mesh["minimum_volume"] > 0
+    diagnostic = grid_nonorthogonality(mesh, 6)
+    assert len(diagnostic["largest"]) == 5
+    assert all(0 <= face["angle_degrees"] < 90 for face in diagnostic["largest"])
 
 
 def test_rejects_changed_seams_degenerate_cells_and_dimensions(tmp_path):

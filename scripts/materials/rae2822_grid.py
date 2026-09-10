@@ -48,6 +48,7 @@ def extruded_c_grid(grid, wall_start, wall_end, chord, span_chords):
     plane_count = len(planar)
     points = planar + [(horizontal, vertical, chord * span_chords) for horizontal, vertical, _ in planar]
     faces = {}
+    cell_centres = []
     minimum_volume = math.inf
     for row in range(radial - 1):
         for column in range(horizontal - 1):
@@ -57,6 +58,10 @@ def extruded_c_grid(grid, wall_start, wall_end, chord, span_chords):
             area = 0.5 * float(np.sum(coordinates[:, 0] * np.roll(coordinates[:, 1], -1) - coordinates[:, 1] * np.roll(coordinates[:, 0], -1)))
             if area == 0 or len(set(quad)) != 4:
                 raise ValueError("Degenerate reference grid cell")
+            following = np.roll(coordinates, -1, axis=0)
+            cross = coordinates[:, 0] * following[:, 1] - following[:, 0] * coordinates[:, 1]
+            centre = np.sum((coordinates + following) * cross[:, None], axis=0) / (6 * area)
+            cell_centres.append((float(centre[0]), float(centre[1]), chord * span_chords / 2))
             if area < 0:
                 quad.reverse()
             minimum_volume = min(minimum_volume, abs(area) * chord * span_chords)
@@ -89,7 +94,30 @@ def extruded_c_grid(grid, wall_start, wall_end, chord, span_chords):
             if face["patch"] not in boundary:
                 raise ValueError("Unpaired wake or unknown exterior reference face")
             boundary[face["patch"]].append(face)
-    return {"points": points, "internal": internal, "boundary": boundary, "cells": (horizontal - 1) * (radial - 1), "minimum_volume": minimum_volume}
+    return {"points": points, "internal": internal, "boundary": boundary, "cell_centres": cell_centres,
+            "cells": (horizontal - 1) * (radial - 1), "minimum_volume": minimum_volume}
+
+
+def grid_nonorthogonality(mesh, horizontal_cells):
+    points = np.asarray(mesh["points"])
+    centres = np.asarray(mesh["cell_centres"])
+    largest = []
+    for face in mesh["internal"]:
+        vertices = points[list(face["vertices"])]
+        normal = np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])
+        delta = centres[face["neighbour"]] - centres[face["owner"]]
+        magnitude = np.linalg.norm(normal) * np.linalg.norm(delta)
+        if magnitude <= 0:
+            raise ValueError("Degenerate face or adjacent cell centres")
+        cosine = float(np.dot(normal, delta) / magnitude)
+        angle = math.degrees(math.acos(np.clip(cosine, -1, 1)))
+        largest.append({"angle_degrees": angle, "owner_cell": face["owner"], "neighbour_cell": face["neighbour"],
+                        "owner_ij": [face["owner"] % horizontal_cells, face["owner"] // horizontal_cells],
+                        "neighbour_ij": [face["neighbour"] % horizontal_cells, face["neighbour"] // horizontal_cells],
+                        "face_centre": vertices.mean(axis=0).tolist()})
+    largest.sort(key=lambda entry: entry["angle_degrees"], reverse=True)
+    return {"centre_method": "exact_planar_polygon_centroid_extruded_prism", "severe_over_70": sum(entry["angle_degrees"] > 70 for entry in largest),
+            "largest": largest[:5]}
 
 
 def write_nasa_grid(source, destination, chord, span_chords):
@@ -130,6 +158,16 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("source")
-    parser.add_argument("destination")
+    parser.add_argument("destination", nargs="?")
+    parser.add_argument("--inspect", action="store_true")
     arguments = parser.parse_args()
-    print(json.dumps(write_nasa_grid(arguments.source, arguments.destination, 0.3048, 0.1), allow_nan=False))
+    if arguments.inspect:
+        raw = Path(arguments.source).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != GRID_SHA256:
+            raise ValueError("Published NASA grid checksum differs")
+        mesh = extruded_c_grid(parse_plot3d_grid(raw), 32, 336, 0.3048, 0.1)
+        print(json.dumps(grid_nonorthogonality(mesh, 368), allow_nan=False))
+    elif arguments.destination:
+        print(json.dumps(write_nasa_grid(arguments.source, arguments.destination, 0.3048, 0.1), allow_nan=False))
+    else:
+        parser.error("A destination or --inspect is required")
