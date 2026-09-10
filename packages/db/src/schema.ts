@@ -7887,6 +7887,9 @@ export const progressiveWorkerReports = pgTable(
     acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true }),
   },
   (table) => ({
+    stagingCandidateIdx: index("progressive_worker_reports_staging_candidate_idx")
+      .on(table.simJobId, table.sequence, table.createdAt)
+      .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)

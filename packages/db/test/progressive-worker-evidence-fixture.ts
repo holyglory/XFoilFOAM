@@ -26,6 +26,15 @@ export async function verifyProgressiveWorkerEvidence(
     sql`SELECT status FROM sim_jobs WHERE id = ${executionId}::uuid`,
   );
   try {
+    const [index] =
+      await db.execute(sql`SELECT indisvalid,pg_get_expr(indpred,indrelid) AS predicate FROM pg_index
+      WHERE indexrelid='progressive_worker_reports_staging_candidate_idx'::regclass`);
+    expect(index.indisvalid).toBe(true);
+    expect(index.predicate).toContain("acknowledged_at IS NOT NULL");
+    const candidates = () =>
+      db.execute(sql`SELECT sequence FROM progressive_worker_reports
+      WHERE sim_job_id=${executionId}::uuid AND acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object' ORDER BY sequence`);
+    expect(await candidates()).toHaveLength(0);
     for (const preferActive of [true, false]) {
       const rows =
         await db.execute(sql`WITH promise(status,"expiresAt",created_at,label) AS (VALUES
@@ -52,6 +61,28 @@ export async function verifyProgressiveWorkerEvidence(
       sequence: Number(report.sequence),
       contentSignature: String(report.content_signature),
     });
+    expect((await candidates()).map((row) => Number(row.sequence))).toContain(
+      Number(report.sequence),
+    );
+    const plannerRollback = new Error(
+      "Restore staging planner diagnostic flags",
+    );
+    try {
+      await db.transaction(async (transaction) => {
+        await transaction.execute(sql`SET LOCAL enable_seqscan=off`);
+        await transaction.execute(sql`SET LOCAL enable_bitmapscan=off`);
+        const [plan] =
+          await transaction.execute(sql`EXPLAIN(FORMAT JSON) SELECT sim_job_id,sequence,created_at
+          FROM progressive_worker_reports WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'
+          ORDER BY sim_job_id,sequence,created_at LIMIT 1`);
+        expect(JSON.stringify(plan)).toContain(
+          "progressive_worker_reports_staging_candidate_idx",
+        );
+        throw plannerRollback;
+      });
+    } catch (error) {
+      if (error !== plannerRollback) throw error;
+    }
     await db.execute(
       sql`UPDATE sync_api_settings SET remote_solver_transfer_paused = true WHERE id = 1`,
     );
