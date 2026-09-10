@@ -24,6 +24,33 @@ export async function verifyProgressiveRemoteReportInventory(
     await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
       const executionId = terminal.executionId;
+      const [index] =
+        await connection.execute(sql`SELECT indisvalid,pg_get_expr(indpred,indrelid) AS predicate
+        FROM pg_index WHERE indexrelid='progressive_remote_reports_stop_candidate_idx'::regclass`);
+      expect(index.indisvalid).toBe(true);
+      expect(index.predicate).toContain("stopProof,execution_stopped");
+      const candidateIds =
+        await connection.execute(sql`SELECT sim_job_id,sequence FROM progressive_remote_reports
+        WHERE sim_job_id=${executionId}::uuid AND report#>>'{stopProof,execution_stopped}'='true' ORDER BY sequence`);
+      expect(
+        candidateIds.map((row) => ({ ...row, sequence: Number(row.sequence) })),
+      ).toEqual([{ sim_job_id: executionId, sequence: terminal.sequence }]);
+      const explainRollback = new Error("Restore planner diagnostic flags");
+      try {
+        await connection.transaction(async (nested) => {
+          await nested.execute(sql`SET LOCAL enable_seqscan=off`);
+          await nested.execute(sql`SET LOCAL enable_bitmapscan=off`);
+          const [plan] =
+            await nested.execute(sql`EXPLAIN(FORMAT JSON) SELECT sim_job_id FROM progressive_remote_reports
+            WHERE report#>>'{stopProof,execution_stopped}'='true' ORDER BY sim_job_id LIMIT 96`);
+          expect(JSON.stringify(plan)).toContain(
+            "progressive_remote_reports_stop_candidate_idx",
+          );
+          throw explainRollback;
+        });
+      } catch (error) {
+        if (error !== explainRollback) throw error;
+      }
       const sender = {
         executionId,
         solverId: terminal.solverId,

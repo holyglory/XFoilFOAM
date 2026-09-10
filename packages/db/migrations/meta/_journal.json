@@ -1016,6 +1016,13 @@
       "when": 1792368000038,
       "tag": "0144_progressive_publication_recovery",
       "breakpoints": true
+    },
+    {
+      "idx": 145,
+      "version": "7",
+      "when": 1792368000039,
+      "tag": "0145_progressive_stop_candidate_index",
+      "breakpoints": true
     }
   ]
 }

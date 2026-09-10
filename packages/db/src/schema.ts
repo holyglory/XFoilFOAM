@@ -7743,6 +7743,9 @@ export const progressiveRemoteReports = pgTable(
   },
   (table) => ({
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    stopCandidateIdx: index("progressive_remote_reports_stop_candidate_idx")
+      .on(table.simJobId)
+      .where(sql`${table.report}#>>'{stopProof,execution_stopped}'='true'`),
     sequenceCheck: check(
       "progressive_remote_reports_sequence_check",
       sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
