@@ -74,7 +74,7 @@ import {
   progressiveWorkerCapabilityMetadata,
   refreshProgressiveWorkerCapabilities,
 } from "./progressive-worker-capabilities";
-import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, gt, inArray, or, sql } from "drizzle-orm";
 import {
   createHash,
   createHmac,
@@ -6387,8 +6387,15 @@ async function processFulfilledEvidenceUpgrades(
 
 export async function readyLegacyRemoteResultJobs(db: DB, settings: Settings) {
   return db
-    .select()
+    .select(getTableColumns(simJobs))
     .from(simJobs)
+    .innerJoin(
+      sql`(WITH legacy_publication_jobs AS MATERIALIZED (
+        SELECT id FROM sim_jobs WHERE NOT (request_payload ? 'remoteProgressiveExecution')
+          AND request_payload ? 'syncPromiseId' AND request_payload->>'remoteSolver'='true'
+      ) SELECT id FROM legacy_publication_jobs) legacy_publication`,
+      sql`legacy_publication.id=${simJobs.id}`,
+    )
     .where(
       and(
         sql`NOT (${simJobs.requestPayload} ? 'remoteProgressiveExecution')`,
