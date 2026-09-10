@@ -9,6 +9,7 @@ import {
   progressiveRemoteReportInventory,
 } from "../src/progressive-remote-inventory";
 import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
+import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
 
 export async function verifyProgressiveRemoteReportInventory(
   db: DB,
@@ -150,6 +151,121 @@ export async function verifyProgressiveRemoteReportInventory(
         (SELECT count(*)::integer FROM progressive_remote_evidence_receipts WHERE sim_job_id = ${executionId}::uuid) AS received,
         (SELECT count(*)::integer FROM result_attempts WHERE sim_job_id = ${executionId}::uuid) AS attempts`);
       expect(counts).toEqual({ received: 0, attempts: 0 });
+      for (let sequence = 3; sequence <= final.sequence; sequence += 1)
+        expect(
+          await applyProgressiveRemoteProgress(connection, executionId),
+        ).toMatchObject({ kind: "applied", sequence });
+      await connection.execute(sql`UPDATE sim_campaigns SET status='active'
+        WHERE id=(SELECT campaign_id FROM sim_jobs WHERE id=${executionId}::uuid)`);
+      for (const status of [
+        "active",
+        "expired",
+        "fulfilled",
+        "cancelled",
+      ] as const) {
+        const restore = new Error("Restore isolated promise settlement state");
+        try {
+          await connection.transaction(async (nested) => {
+            const scoped = nested as unknown as DB;
+            await scoped.execute(sql`UPDATE sync_sweep_promises SET status=${status}::sync_promise_status
+              WHERE id=${terminal.promiseId}::uuid`);
+            const evidenceBefore =
+              await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports
+              WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+            if (status !== "cancelled") {
+              expect(
+                await settleProgressiveRemoteJob(scoped, executionId),
+              ).toMatchObject({ kind: "waiting", reason: "raw_evidence" });
+            } else {
+              const missingStop = new Error("Restore exact physical stop");
+              try {
+                await scoped.transaction(async (isolated) => {
+                  const unstopped = isolated as unknown as DB;
+                  await unstopped.execute(sql`DELETE FROM progressive_cfd_execution_stops
+                    WHERE sim_job_id=${executionId}::uuid`);
+                  expect(
+                    await settleProgressiveRemoteJob(unstopped, executionId),
+                  ).toMatchObject({ kind: "waiting", reason: "physical_stop" });
+                  throw missingStop;
+                });
+              } catch (error) {
+                if (error !== missingStop) throw error;
+              }
+              await expect(
+                scoped.transaction(async (isolated) => {
+                  const unowned = isolated as unknown as DB;
+                  await unowned.execute(sql`UPDATE progressive_cfd_units SET state='pending',lease_token=NULL,lease_owner=NULL,lease_until=NULL
+                  WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)`);
+                  await settleProgressiveRemoteJob(unowned, executionId);
+                }),
+              ).rejects.toThrow("no longer owns");
+              await scoped.execute(sql`UPDATE sim_jobs SET ingest_lease_expires_at=clock_timestamp()+interval '1 minute'
+                WHERE id=${executionId}::uuid`);
+              expect(
+                await settleProgressiveRemoteJob(scoped, executionId),
+              ).toMatchObject({ kind: "waiting", reason: "ingestion_owner" });
+              await scoped.execute(
+                sql`UPDATE sim_jobs SET ingest_lease_expires_at=NULL WHERE id=${executionId}::uuid`,
+              );
+              expect(
+                await settleProgressiveRemoteJob(scoped, executionId),
+              ).toMatchObject({
+                kind: "settled",
+                evidencePending: true,
+                counts: { complete: 0, retry: 0, waiting: 0 },
+              });
+              const [job] = await scoped.execute(
+                sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`,
+              );
+              expect(job).toEqual({ status: "cancelled", ingestedAt: null });
+              const attempts =
+                await scoped.execute(sql`SELECT attempt.outcome,unit.state,unit.lease_token
+                FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+                WHERE attempt.sim_job_id=${executionId}::uuid`);
+              expect(attempts.length).toBeGreaterThan(0);
+              expect(
+                attempts.every(
+                  (attempt) =>
+                    attempt.outcome === "cancelled" &&
+                    attempt.state === "gap" &&
+                    attempt.lease_token === null,
+                ),
+              ).toBe(true);
+              expect(
+                await settleProgressiveRemoteJob(scoped, executionId),
+              ).toMatchObject({
+                kind: "settled",
+                evidencePending: true,
+                counts: {
+                  complete: 0,
+                  retry: 0,
+                  gaps: 0,
+                  cancelled: 0,
+                  waiting: 0,
+                },
+              });
+              expect(
+                await readProgressiveRemoteRetention(scoped, executionId),
+              ).toMatchObject({
+                kind: "waiting",
+                reason: "raw_evidence",
+                pendingCount: 2,
+              });
+              const [rows] = await scoped.execute(
+                sql`SELECT count(*)::integer AS count FROM result_attempts WHERE sim_job_id=${executionId}::uuid`,
+              );
+              expect(rows.count).toBe(0);
+            }
+            expect(
+              await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports
+              WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`),
+            ).toEqual(evidenceBefore);
+            throw restore;
+          });
+        } catch (error) {
+          if (error !== restore) throw error;
+        }
+      }
       throw rollback;
     });
   } catch (error) {

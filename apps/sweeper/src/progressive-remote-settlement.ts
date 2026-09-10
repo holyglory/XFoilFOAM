@@ -15,6 +15,63 @@ import {
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
+
+async function settleCancelledUndeliveredExecution(
+  db: DB,
+  executionId: string,
+  promiseId: string,
+) {
+  const [promise] = await db.execute(sql`SELECT status FROM sync_sweep_promises
+    WHERE id = ${promiseId}::uuid FOR UPDATE`);
+  if (promise?.status !== "cancelled") return null;
+  const [stopped] =
+    await db.execute(sql`SELECT proof FROM progressive_cfd_execution_stops
+    WHERE sim_job_id = ${executionId}::uuid`);
+  if (!stopped) return null;
+  await acknowledgeProgressiveCfdExecutionStop(db, {
+    simJobId: executionId,
+    proof: stopped.proof as Parameters<
+      typeof acknowledgeProgressiveCfdExecutionStop
+    >[1]["proof"],
+  });
+  const units =
+    await db.execute(sql`SELECT attempt.token,unit.id,unit.state,unit.lease_token
+    FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+    WHERE attempt.sim_job_id=${executionId}::uuid AND attempt.outcome='running'
+    ORDER BY unit.id FOR UPDATE OF unit,attempt`);
+  if (
+    units.some(
+      (unit) =>
+        !["leased", "blocked"].includes(String(unit.state)) ||
+        unit.lease_token !== unit.token,
+    )
+  )
+    throw new Error(
+      "Cancelled remote execution no longer owns its pending units",
+    );
+  for (const unit of units) {
+    await db.execute(sql`UPDATE progressive_cfd_attempts SET outcome='cancelled',finished_at=clock_timestamp(),
+      error='Scheduling promise cancelled before evidence delivery; retained reports remain unresolved'
+      WHERE token=${unit.token}::uuid`);
+    await db.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL,
+      error='Cancelled remote delivery has unresolved evidence' WHERE id=${unit.id}::uuid`);
+  }
+  await db.execute(sql`UPDATE sim_jobs SET status='cancelled',"finishedAt"=coalesce("finishedAt",clock_timestamp()),
+    error='Scheduling promise cancelled; evidence delivery remains unresolved'
+    WHERE id=${executionId}::uuid`);
+  await releaseResultClaimsForJob(db, executionId, ["queued", "running"]);
+  return {
+    kind: "settled" as const,
+    counts: {
+      complete: 0,
+      retry: 0,
+      gaps: units.length,
+      cancelled: 0,
+      waiting: 0,
+    },
+    evidencePending: true,
+  };
+}
 import { validateRansPrecalcPromotionSignal } from "./ingest";
 
 type RetainedExecution = Extract<
@@ -162,7 +219,17 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       connection,
       executionId,
     );
-    if (retained.kind === "waiting") return retained;
+    if (retained.kind === "waiting") {
+      if (retained.reason === "raw_evidence") {
+        const cancelled = await settleCancelledUndeliveredExecution(
+          connection,
+          executionId,
+          String(dispatch.promise_id),
+        );
+        if (cancelled) return cancelled;
+      }
+      return retained;
+    }
     const result = retained.report.result;
     const finalPoints = new Set(
       result

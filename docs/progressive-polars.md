@@ -613,7 +613,14 @@ The normal reconciliation pass performs these stop checks even while scheduling 
 paused. Progressive jobs use a separate ingestion path: cancelled final histories
 are retained after a physical-stop proof, omitted angles stay absent, and the legacy
 RANS-to-URANS handoff cannot launch replacement work from that ingestion. A terminal
-job status without a completed ingestion stamp cannot settle current-scope units.
+job status without a completed ingestion stamp cannot complete current-scope units.
+If an exact remote promise was cancelled before all reported evidence arrived,
+verified physical stop and drained final reports may close its scheduling attempt
+as cancelled and its unfinished anchors as explicit gaps. This does not mark the
+job ingested or accept its missing values: reports, existing evidence, delivery
+conflicts and remote archives remain retained. Active, expired and fulfilled
+promises still wait for normal evidence ingestion; missing archives alone do not
+qualify for this cancellation path.
 Transient retrieval failures remain retryable and do not consume a running job's
 completed-case publication counter.
 Informative fitted evidence may complete a fast anchor, but precise work requires
