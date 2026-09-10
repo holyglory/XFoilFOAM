@@ -8,6 +8,7 @@ import { registerAdminRoutes } from "./admin-routes";
 import { registerCampaignRoutes } from "./campaign-routes";
 import { registerEngineCutoverRoutes } from "./engine-cutover-routes";
 import { registerPointHistoryRoutes } from "./point-history-routes";
+import { registerRetainedReportRoutes } from "./retained-report-routes";
 import { db } from "./db";
 import { createBrokeredEvidenceUploadReconciler } from "./remote-evidence-broker";
 import { registerRoutes } from "./routes";
@@ -62,6 +63,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerAdminRoutes(app);
   await registerSolvedPointsRoutes(app);
   await registerPointHistoryRoutes(app);
+  await registerRetainedReportRoutes(app);
   await registerCampaignRoutes(app);
   await registerEngineCutoverRoutes(app);
   app.setErrorHandler(

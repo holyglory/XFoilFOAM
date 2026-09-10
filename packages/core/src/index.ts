@@ -2,6 +2,7 @@
 // and the web app. Ported from the design's airfoil-db.js + Airfoil Detail.dc.html.
 //
 export * from "./types";
+export * from "./retained-reports";
 export * from "./format";
 export * from "./colormaps";
 export * from "./viscosity";

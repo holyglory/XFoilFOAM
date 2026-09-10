@@ -631,6 +631,16 @@ plans and obsolete, finished, paused or cancelled campaign work are not reopened
 Total attempt counters retain the correction. The ordinary retry allowance
 subtracts the one consumed corrective claim, so a publication repair does not
 silently remove an otherwise available numerical or infrastructure retry.
+
+Authenticated admins can inspect retained report metadata through
+`GET /api/admin/retained-reports`. It searches profile names/slugs and campaigns,
+uses lossless microsecond keyset pagination, and defaults to reports with source
+records not yet received as point evidence. `includeDelivered=true` includes the
+other retained reports. This is a read model over immutable reports, not a source
+of accepted polar points. An exact execution, sequence and signature identify
+the download; it revalidates the dispatch, report and inventory and returns the
+stored canonical JSON with its content hash. Neither list nor download contacts
+an engine, generates media, reactivates a promise or changes solver evidence.
 If an exact remote promise was cancelled before all reported evidence arrived,
 verified physical stop and drained final reports may close its scheduling attempt
 as cancelled and its unfinished anchors as explicit gaps. This does not mark the

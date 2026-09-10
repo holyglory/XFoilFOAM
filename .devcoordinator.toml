@@ -433,6 +433,12 @@ tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_retention.py", "-q"]
 
 [[test.progressive.check]]
+name = "retained-report-api"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/retained-report-routes.test.ts"]
+
+[[test.progressive.check]]
 name = "execution-contract"
 tier = "development"
 requires = ["types"]

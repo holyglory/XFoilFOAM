@@ -9,6 +9,7 @@ export * from "./progressive-campaigns";
 export * from "./progressive-materialization";
 export * from "./progressive-recipe-adoption";
 export * from "./progressive-publication-recovery";
+export * from "./retained-solver-reports";
 export * from "./progressive-public";
 export * from "./progressive-polar-cache";
 export * from "./progressive-cfd-settlement";

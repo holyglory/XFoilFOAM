@@ -11,6 +11,7 @@ import {
 import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
 import { verifyPublicationRecovery } from "./progressive-publication-recovery-fixture";
+import { verifyRetainedReports } from "./retained-report-fixture";
 
 export async function verifyProgressiveRemoteReportInventory(
   db: DB,
@@ -152,6 +153,7 @@ export async function verifyProgressiveRemoteReportInventory(
         (SELECT count(*)::integer FROM progressive_remote_evidence_receipts WHERE sim_job_id = ${executionId}::uuid) AS received,
         (SELECT count(*)::integer FROM result_attempts WHERE sim_job_id = ${executionId}::uuid) AS attempts`);
       expect(counts).toEqual({ received: 0, attempts: 0 });
+      await verifyRetainedReports(connection, executionId);
       for (let sequence = 3; sequence <= final.sequence; sequence += 1)
         expect(
           await applyProgressiveRemoteProgress(connection, executionId),
