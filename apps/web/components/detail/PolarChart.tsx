@@ -319,16 +319,24 @@ export function PolarChart({
             tabIndex={0}
             role="button"
             data-result-id={point.point.resultId}
+            data-point-key={point.key}
             aria-label={`${point.label}; ${point.resultChoices?.length ?? 1} stored result${(point.resultChoices?.length ?? 1) === 1 ? "" : "s"}`}
             onClick={(event) => {
               const location = toViewBox(event);
-              onPointClick(
+              const selected =
                 nearestProjectedPoint(
                   projection.points,
                   location.vx,
                   location.vy,
-                ) ?? point,
-              );
+                ) ?? point;
+              Array.from(
+                svgRef.current?.querySelectorAll<SVGCircleElement>(
+                  "circle[data-point-key]",
+                ) ?? [],
+              )
+                .find((target) => target.dataset.pointKey === selected.key)
+                ?.focus({ preventScroll: true });
+              onPointClick(selected);
             }}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") {

@@ -162,7 +162,8 @@ try {
         );
         await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
         await page.keyboard.press("Escape");
-        await point.focus();
+        await expect(page.getByTestId("sim-modal-dialog")).not.toBeVisible();
+        await expect(point).toBeFocused();
         await page.setViewportSize({
           width: width < 500 ? 1440 : 390,
           height: 1000,
@@ -182,6 +183,8 @@ try {
         await point.press("Enter");
         await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
         await page.keyboard.press("Escape");
+        await expect(page.getByTestId("sim-modal-dialog")).not.toBeVisible();
+        await expect(point).toBeFocused();
         await page.setViewportSize({ width, height: 1000 });
         await expect(point).toBeFocused();
       }

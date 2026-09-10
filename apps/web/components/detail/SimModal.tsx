@@ -154,7 +154,7 @@ export function SimModal(props: {
   onClose: () => void;
   /** Explicit opener for nested modal stacks whose lower layer becomes inert
    * before this dialog's focus effect runs. */
-  restoreFocusTo?: HTMLElement | null;
+  restoreFocusTo?: HTMLElement | SVGElement | null;
   unavailableMessage?: string | null;
   review?: SimModalReviewContext | null;
 }) {
@@ -180,7 +180,7 @@ export function SimModal(props: {
 
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
-  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const restoreFocusRef = useRef<HTMLElement | SVGElement | null>(null);
   const clMonRef = useRef<HTMLCanvasElement>(null);
   const cdMonRef = useRef<HTMLCanvasElement>(null);
   const ldMonRef = useRef<HTMLCanvasElement>(null);
@@ -236,7 +236,8 @@ export function SimModal(props: {
     if (!open) return;
     restoreFocusRef.current = restoreFocusTo?.isConnected
       ? restoreFocusTo
-      : document.activeElement instanceof HTMLElement
+      : document.activeElement instanceof HTMLElement ||
+          document.activeElement instanceof SVGElement
         ? document.activeElement
         : null;
     const dialog = dialogRef.current;
