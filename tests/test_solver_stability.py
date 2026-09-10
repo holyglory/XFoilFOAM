@@ -36,6 +36,23 @@ time step continuity errors : sum local = 2.9, global = -0.4, cumulative = -1087
     assert measured["maximum_sum_local"] == 3.1
 
 
+def test_reconstruction_time_does_not_displace_a_real_iteration():
+    lines = ["Time = 1", "pressureControl: p max 230000", "Time = 2",
+             "time step continuity errors : sum local = 1e-7, global = 0, cumulative = 0"]
+    measured = solver_stability(lines + ["Time = 2", "Reconstructing fields"], 2)
+    assert measured == solver_stability(lines, 2)
+    assert measured["pressure_limited_iterations"] == 1
+    assert measured["first_coordinate"] == 1
+
+
+def test_restarted_coordinates_do_not_mix_with_a_prior_run():
+    measured = solver_stability(["Time = 100", "pressureControl: p max 230000", "Time = 1",
+                                 "time step continuity errors : sum local = 1e-7, global = 0, cumulative = 0"])
+    assert measured["window_iterations"] == 1
+    assert measured["first_coordinate"] == 1
+    assert measured["pressure_limited_iterations"] == 0
+
+
 def test_does_not_invent_continuity_or_match_configuration_text():
     assert solver_stability(["pressureControl: p max 2"]) == {"available": False, "reason": "no_solver_iterations"}
     measured = solver_stability(["Time = 1", "    pMaxFactor 2;", "pressureControl limits disabled"])

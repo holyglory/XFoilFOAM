@@ -24,6 +24,12 @@ def solver_stability(lines, tail_iterations=200):
             if not math.isfinite(value) or value < 0:
                 raise ValueError("Invalid solver coordinate")
             if current is not None:
+                if value == current["coordinate"]:
+                    continue
+                if value < current["coordinate"]:
+                    history.clear()
+                    current = None
+            if current is not None:
                 history.append(current)
                 history = history[-tail_iterations:]
             current = {"coordinate": value, "continuity": [], "limits": set()}
