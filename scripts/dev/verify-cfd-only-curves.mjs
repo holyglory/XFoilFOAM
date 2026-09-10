@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chromium, expect } from "@playwright/test";
+import { projectChart } from "../../packages/core/src/index.ts";
 import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
 
 const origin = progressivePreviewOrigin();
@@ -21,21 +22,29 @@ try {
     assert(response.ok());
     const detail = await response.json();
     if (detail.progressivePolars?.length) continue;
+    const projection = projectChart({
+      chartType: "cla",
+      polars: detail.polars,
+      visibleSeries: Object.fromEntries(
+        detail.polars.map((polar) => [polar.seriesId, true]),
+      ),
+      hoverKey: null,
+    });
     scopes.push({
       revision,
-      fit: detail.polars.some((polar) => polar.fit?.points.length > 1),
+      fit: projection.curves.some((curve) => curve.kind === "fit"),
       evidence: detail.polars.flatMap((polar) => polar.points),
     });
-    if (scopes.some((scope) => scope.fit) && scopes.some((scope) => !scope.fit))
+    if (
+      scopes.some((scope) => scope.evidence.length) &&
+      scopes.some((scope) => !scope.evidence.length)
+    )
       break;
   }
   await discovery.close();
-  const fitted = scopes.find((scope) => scope.fit);
-  const missing = scopes.find((scope) => !scope.fit);
-  assert(
-    fitted && missing,
-    "Both real cached and missing-curve scopes are required",
-  );
+  const fitted = scopes.find((scope) => scope.evidence.length);
+  const missing = scopes.find((scope) => !scope.evidence.length);
+  assert(fitted && missing, "Both real evidence and empty scopes are required");
   for (const width of [390, 1440]) {
     const page = await browser.newPage({ viewport: { width, height: 1000 } });
     const errors = [];
@@ -73,7 +82,7 @@ try {
       assert(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 1);
       await toggle.click();
       await expect(toggle).toHaveAttribute("aria-pressed", "true");
-      if (scope.fit) {
+      if (scope.evidence.length) {
         const point = chart.locator('circle[role="button"]').first();
         await expect(point).toBeVisible();
         const storedResponse = page.waitForResponse(
@@ -110,9 +119,12 @@ try {
   const noScript = await browser.newContext({ javaScriptEnabled: false });
   const page = await noScript.newPage();
   await page.goto(`${origin}/airfoils/ag24?revision=${fitted.revision}`);
-  await expect(
-    page.getByTestId("polar-chart-svg").locator("polyline").first(),
-  ).toBeVisible();
+  if (fitted.fit)
+    await expect(
+      page.getByTestId("polar-chart-svg").locator("polyline").first(),
+    ).toBeVisible();
+  else
+    await expect(page.getByText("No polar curve available yet.")).toBeVisible();
   await page
     .getByRole("link", { name: "Show CFD points", exact: true })
     .click();

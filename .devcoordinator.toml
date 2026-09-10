@@ -1267,7 +1267,7 @@ command = ["node", "scripts/dev/verify-deferred-cfd-points.mjs"]
 name = "cfd-only-curves"
 tier = "development"
 requires = ["preview-ready"]
-command = ["node", "scripts/dev/verify-cfd-only-curves.mjs"]
+command = ["node", "--import", "tsx", "scripts/dev/verify-cfd-only-curves.mjs"]
 
 [[test.progressive-ui.check]]
 name = "control-sizing"
