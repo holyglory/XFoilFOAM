@@ -641,7 +641,16 @@ export async function assembleSim(
         JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
         WHERE evidence.result_attempt_id = ${resultAttemptId}::uuid
           AND attempt.sim_job_id = ${resultAttempts.simJobId}
-          AND generation.status <> 'cancelled' AND generation.plan_revision_id = campaign.current_plan_revision_id
+          AND (generation.status <> 'cancelled' OR EXISTS (
+            SELECT 1 FROM progressive_recipe_adoptions adoption
+            JOIN progressive_generations successor ON successor.id=adoption.generation_id
+            JOIN progressive_generation_targets inherited ON inherited.generation_id=successor.id AND inherited.target_id=work.target_id
+            WHERE generation.id=ANY(adoption.previous_generation_ids)
+              AND adoption.epoch_id=epoch.id AND successor.epoch_id=epoch.id
+              AND adoption.campaign_id=campaign.id AND successor.campaign_id=campaign.id
+              AND adoption.plan_revision_id=campaign.current_plan_revision_id
+              AND successor.plan_revision_id=campaign.current_plan_revision_id AND successor.status<>'cancelled'
+          )) AND generation.plan_revision_id = campaign.current_plan_revision_id
           AND campaign.status IN ('active', 'attention', 'paused', 'completed')
       )`,
         ),

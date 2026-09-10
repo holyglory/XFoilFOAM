@@ -16,6 +16,7 @@ import {
 import { registerSyncRoutes, type importPolarPush } from "../src/sync-routes";
 import { verifyProgressivePolarArchiveImport } from "./progressive-polar-archive-fixture";
 import { assembleSim } from "../src/services/sim";
+import { verifyAdoptedEvidenceAccess } from "./progressive-adopted-evidence-fixture";
 
 const isolated = vi.hoisted(() => ({
   connection: null as DB | null,
@@ -235,6 +236,18 @@ export async function verifyProgressivePolarImport(
       status: "evidence",
       observation: { converged: projection.converged === true },
     });
+    await verifyAdoptedEvidenceAccess(
+      db,
+      {
+        executionId: delivery.engineJobId,
+        slug: String(profile.slug),
+        resultId: receipt.resultId,
+        attemptId: receipt.resultAttemptId,
+      },
+      (connection) => {
+        isolated.connection = connection;
+      },
+    );
     expect(
       await assembleSim(
         String(profile.slug),

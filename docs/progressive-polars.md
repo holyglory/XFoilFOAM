@@ -621,6 +621,11 @@ job ingested or accept its missing values: reports, existing evidence, delivery
 conflicts and remote archives remain retained. Active, expired and fulfilled
 promises still wait for normal evidence ingestion; missing archives alone do not
 qualify for this cancellation path.
+An explicit numerical-policy adoption does not hide the old curve's contributors.
+Their exact stored evidence remains publicly reachable only through the immutable
+adoption receipt to a current-epoch, current-plan, non-cancelled successor with
+the same physical target. Ordinary cancelled generations and cancelled campaigns
+do not acquire this exception; scientific acceptance is unchanged.
 Under measured storage pressure, the worker's existing retention service can
 strip optional restart copies from an exact stopped execution. It authenticates
 the immutable worker report and refuses live continuations and ingestion owners.
