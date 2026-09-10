@@ -1348,6 +1348,22 @@ ttl_seconds = 86400
 [deployment.rae-nasa-grid-check.component.numerics]
 type = "compose"
 files = ["compose.rae-verification.yml"]
+services = ["artifacts"]
+finite_services = []
+build = false
+port = true
+route = true
+timeout_seconds = 300
+
+[deployment.rae-nasa-ordered-grid-check]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-nasa-ordered-grid-check.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
 services = ["artifacts", "nasa-grid-check"]
 finite_services = ["nasa-grid-check"]
 build = false

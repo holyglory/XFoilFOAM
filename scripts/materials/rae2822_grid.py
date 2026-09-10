@@ -82,7 +82,7 @@ def extruded_c_grid(grid, wall_start, wall_end, chord, span_chords):
                     if not any(vertices == reversed_vertices[offset:] + reversed_vertices[:offset] for offset in range(4)):
                         raise ValueError("Adjacent reference cells have inconsistent face orientation")
                     existing["neighbour"] = cell
-    internal = [face for face in faces.values() if face["neighbour"] is not None]
+    internal = sorted((face for face in faces.values() if face["neighbour"] is not None), key=lambda face: (face["owner"], face["neighbour"]))
     boundary = {patch: [] for patch in ("inlet", "outlet", "airfoil", "frontAndBack")}
     for face in faces.values():
         if face["neighbour"] is None:

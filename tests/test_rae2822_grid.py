@@ -28,6 +28,8 @@ def test_c_grid_welds_only_wake_and_owns_all_faces():
     assert len(mesh["internal"]) == 6
     assert 2 * len(mesh["internal"]) + sum(len(rows) for rows in mesh["boundary"].values()) == 6 * mesh["cells"]
     assert all(face["owner"] < face["neighbour"] for face in mesh["internal"])
+    order = [(face["owner"], face["neighbour"]) for face in mesh["internal"]]
+    assert order == sorted(order)
     assert mesh["minimum_volume"] > 0
 
 
