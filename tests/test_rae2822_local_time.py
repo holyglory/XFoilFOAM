@@ -16,6 +16,19 @@ def test_continuation_target_can_finish_original_scope_without_extra_iterations(
         continuation_end_iteration(0, 6000)
 
 
+def test_extended_research_allocation_is_explicit_bounded_and_cannot_affect_ordinary_work():
+    from scripts.materials.verify_rae2822 import run
+
+    assert continuation_end_iteration(3000, 3000, 30000, research_allowance=27000) == 30000
+    with pytest.raises(ValueError, match="iteration allowance"):
+        continuation_end_iteration(3000, 3000, 30000)
+    for allowance in (0, -1, True, 30001, 27000.0):
+        with pytest.raises(ValueError, match="research allowance"):
+            continuation_end_iteration(3000, 3000, 30000, research_allowance=allowance)
+    with pytest.raises(ValueError, match="native-checked continuation"):
+        run(None, None, None, "precise", research_iteration_allowance=27000)
+
+
 @pytest.mark.parametrize("transport", ["upwind", "linearUpwind limited"])
 @pytest.mark.parametrize("pressure_advection", ["upwind", "vanLeer"])
 @pytest.mark.parametrize("maximum_courant", [0.5, 0.8])

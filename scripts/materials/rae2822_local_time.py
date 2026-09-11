@@ -15,9 +15,13 @@ except ImportError:
     from rae2822_mapping import authenticated_retained_source
 
 
-def continuation_end_iteration(start, allowance, requested=None):
+def continuation_end_iteration(start, allowance, requested=None, research_allowance=None):
     if type(start) is not int or type(allowance) is not int or start <= 0 or allowance <= 0:
         raise ValueError("Continuation needs a positive exact start and iteration allowance")
+    if research_allowance is not None:
+        if type(research_allowance) is not int or not 1 <= research_allowance <= 30000:
+            raise ValueError("Explicit research allowance must be an integer from1through30000")
+        allowance = research_allowance
     target = start + allowance if requested is None else requested
     if type(target) is not int or not start < target <= start + allowance:
         raise ValueError("Continuation target must advance within its iteration allowance")

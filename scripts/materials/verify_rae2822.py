@@ -281,8 +281,12 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False, research_iteration_allowance=None):
     started_at = time.monotonic()
+    if research_iteration_allowance is not None:
+        if not resume_local_pressure or not native_steady_check or resume_to_iteration is None:
+            raise ValueError("Extended research allowance requires a native-checked continuation and exact target")
+        continuation_end_iteration(1, 1, research_allowance=research_iteration_allowance)
     if low_re_k_wall and (not local_time_pressure or wall_functions or donor or mapped_donor or resume_local_pressure):
         raise ValueError("Low-Re k wall study requires a fresh wall-resolved local-pressure case")
     if local_step_smoothing != 0.02 and not local_time_pressure:
@@ -419,7 +423,10 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         report["benchmark_output_policy"] = {"write_interval_iterations": 100, "retained_field_times": 2}
         if resume_local_pressure:
             report["experimental_continuation"] = restore_local_pressure_state(resume_local_pressure, destination, report["request"], report["actual_execution"])
-            report["continuation_target_iteration"] = continuation_end_iteration(report["experimental_continuation"]["coordinate"], dimensions[3], resume_to_iteration)
+            report["continuation_target_iteration"] = continuation_end_iteration(report["experimental_continuation"]["coordinate"], dimensions[3], resume_to_iteration, research_iteration_allowance)
+            if research_iteration_allowance is not None:
+                report["research_execution_allocation"] = {"additional_iterations": research_iteration_allowance,
+                                                           "solver_seconds_ceiling": time_budget_seconds, "campaign_budget_changed": False}
             _set_control_dict_entries(destination / "system/controlDict", {
                 "startFrom": "latestTime", "endTime": report["continuation_target_iteration"],
             })
@@ -546,6 +553,7 @@ if __name__ == "__main__":
     parser.add_argument("--local-max-courant", type=float, choices=[0.5, 0.8], default=0.5)
     parser.add_argument("--local-step-smoothing", type=float, choices=[0.02, 0.2], default=0.02)
     parser.add_argument("--low-re-k-wall", action="store_true")
+    parser.add_argument("--research-iteration-allowance", type=int)
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -554,4 +562,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall, arguments.research_iteration_allowance)
