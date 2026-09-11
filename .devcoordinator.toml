@@ -22,6 +22,41 @@ command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "node-su
 [test.types]
 timeout_seconds = 1800
 
+[test.reservation-accounting]
+timeout_seconds = 900
+
+[test.reservation-accounting.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.reservation-accounting.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.reservation-accounting.check]]
+name = "equivalence"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-reservation-query.test.ts"]
+
+[[test.reservation-accounting.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.reservation-accounting.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.reservation-accounting.check]]
+name = "admission-races"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/admission-predicate-transitions.test.ts", "test/admission-circuit-breaker.test.ts"]
+
 [test.progressive-archive-reclaim]
 timeout_seconds = 900
 
@@ -617,6 +652,18 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "restart-retention-native"
 tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_retention.py", "-q"]
+
+[[test.progressive.check]]
+name = "reservation-equivalence"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-reservation-query.test.ts"]
+
+[[test.progressive.check]]
+name = "reservation-transitions"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/admission-predicate-transitions.test.ts"]
 
 [[test.progressive.check]]
 name = "progressive-archive-reclaim"

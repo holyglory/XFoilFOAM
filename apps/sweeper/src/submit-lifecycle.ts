@@ -22,6 +22,7 @@ import {
   syncApiSettings,
   settlePrecalcObligationsForJobInTransaction,
   solverCpuReservationSql,
+  solverCpuReservedJobIdsSql,
   solverLocalExecutionSql,
 } from "@aerodb/db";
 import { releasedResultStatusSql } from "@aerodb/db/result-claim-lifecycle";
@@ -860,7 +861,7 @@ export async function withGlobalAdmissionPermit<Value>(
         requestedSlots = fitted.slots;
         return true;
       };
-      const activeReservationPredicate = sql`(${solverCpuReservationSql("job")} AND ${solverLocalExecutionSql("job")})`;
+      const activeReservationPredicate = sql`(job.id IN (${solverCpuReservedJobIdsSql()}) AND ${solverLocalExecutionSql("job")})`;
       if (effectiveAdmissionLane === "remote") {
         const [remotePolicy] = (await tx.execute(sql`
           SELECT remote_solver_cpu_budget::integer AS cap,

@@ -36,6 +36,7 @@ import {
   solverProfiles,
   solverRuntimeBuilds,
   solverCpuReservationSql,
+  solverCpuReservedJobIdsSql,
   settleProgressiveWorkerFinalReport,
   sweeperState,
   syncApiSettings,
@@ -1263,7 +1264,7 @@ async function remoteReservedCpuSlots(
   const [row] = (await db.execute(sql`
     WITH reserved_jobs AS MATERIALIZED (
       SELECT job.request_payload, job.admission_cpu_slots FROM sim_jobs job
-      WHERE ${solverCpuReservationSql("job")}
+      WHERE job.id IN (${solverCpuReservedJobIdsSql()})
     )
     SELECT COALESCE(SUM(GREATEST(job.admission_cpu_slots, 1)), 0)::integer AS slots
     FROM reserved_jobs job

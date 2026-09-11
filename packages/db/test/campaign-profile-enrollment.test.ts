@@ -105,7 +105,10 @@ import {
   submitPendingJobWithLifecycleGuard,
   solverQueuePressure,
 } from "../../../apps/sweeper/src/submit-lifecycle";
-import { solverCpuReservationSql } from "../src/solver-reservations";
+import {
+  solverCpuReservationSql,
+  solverCpuReservedJobIdsSql,
+} from "../src/solver-reservations";
 import { claimJobForIngest } from "../../../apps/sweeper/src/ingest-lease";
 import { materializeProgressiveCfdExecution } from "../src/progressive-cfd-execution";
 import {
@@ -3860,9 +3863,11 @@ describe("progressive execution stop and settlement", () => {
         .where(eq(simJobs.id, jobId));
       expect(await solverQueuePressure(db, { jobIds: [jobId] })).toBe(3);
       const [aliased] = await db.execute(
-        sql`SELECT ${solverCpuReservationSql("job")} AS reserved FROM sim_jobs job WHERE job.id = ${jobId}`,
+        sql`SELECT ${solverCpuReservationSql("job")} AS reserved,
+          job.id IN (${solverCpuReservedJobIdsSql()}) AS set_reserved FROM sim_jobs job WHERE job.id = ${jobId}`,
       );
       expect(aliased.reserved).toBe(true);
+      expect(aliased.set_reserved).toBe(true);
     }
     await db.execute(
       sql`UPDATE progressive_cfd_attempts SET outcome = 'cancelled', finished_at = clock_timestamp() WHERE sim_job_id = ${jobId}`,
@@ -3877,11 +3882,19 @@ describe("progressive execution stop and settlement", () => {
       .set({ status: "ingesting", ingestedAt: null })
       .where(eq(simJobs.id, jobId));
     expect(await solverQueuePressure(db, { jobIds: [jobId] })).toBe(0);
+    const [releasedSet] = await db.execute(
+      sql`SELECT ${jobId}::uuid IN (${solverCpuReservedJobIdsSql()}) AS reserved`,
+    );
+    expect(releasedSet.reserved).toBe(false);
     await db
       .update(simJobs)
       .set({ engineJobId: randomUUID() })
       .where(eq(simJobs.id, jobId));
     expect(await solverQueuePressure(db, { jobIds: [jobId] })).toBe(3);
+    const [foreignSet] = await db.execute(
+      sql`SELECT ${jobId}::uuid IN (${solverCpuReservedJobIdsSql()}) AS reserved`,
+    );
+    expect(foreignSet.reserved).toBe(true);
   });
 
   it("preserves legacy reservation semantics for jobs without progressive bindings", async () => {
