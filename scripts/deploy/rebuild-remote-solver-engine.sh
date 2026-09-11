@@ -183,11 +183,12 @@ restore_writers() {
 }
 
 openfoam_processes() {
-  local running
+  local running probe
+  probe="$(cat "$DEPLOY_SCRIPT_DIR/openfoam_process_guard.py")" || return 12
+  [[ -n "$probe" ]] || return 12
   running="$(compose ps --status running -q worker)" || return 12
   [[ -n "$running" ]] || return 0
-  compose exec -T worker sh -lc \
-    'pgrep -af "[s]impleFoam|[p]impleFoam|[p]otentialFoam|[s]nappyHexMesh|[s]urfaceFeatureExtract|[b]lockMesh|[c]heckMesh|[d]ecomposePar|[r]econstructPar|[r]enumberMesh|[m]apFields|[p]ostProcess|[f]oamToVTK|[f]oamRun|[f]oamJob" || true'
+  compose exec -T worker python3 -c "$probe"
 }
 
 queue_activity() {

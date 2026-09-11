@@ -877,14 +877,15 @@ unconfigured_running_engine_workers() {
 }
 
 openfoam_processes() {
-  local services service running output
+  local services service running output probe
+  probe="$(cat "$DEPLOY_SCRIPT_DIR/openfoam_process_guard.py")" || return 12
+  [[ -n "$probe" ]] || return 12
   services="$(known_engine_worker_services)" || return 12
   while IFS= read -r service; do
     [[ -n "$service" ]] || continue
     running="$(compose --profile '*' ps --status running -q "$service")" || return 12
     [[ -n "$running" ]] || continue
-    output="$(compose --profile '*' exec -T "$service" sh -lc \
-      'pgrep -af "[s]impleFoam|[p]impleFoam|[p]otentialFoam|[s]nappyHexMesh|[s]urfaceFeatureExtract|[b]lockMesh|[c]heckMesh|[d]ecomposePar|[r]econstructPar|[r]enumberMesh|[m]apFields|[p]ostProcess|[f]oamToVTK|[f]oamRun|[f]oamJob" || true')" || return 12
+    output="$(compose --profile '*' exec -T "$service" python3 -c "$probe")" || return 12
     if [[ -n "$output" ]]; then
       while IFS= read -r line; do
         printf '%s: %s\n' "$service" "$line"

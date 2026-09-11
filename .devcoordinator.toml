@@ -131,6 +131,14 @@ timeout_seconds = 120
 [test.mpi-placement]
 timeout_seconds = 120
 
+[test.engine-maintenance-process-guard]
+timeout_seconds = 600
+
+[[test.engine-maintenance-process-guard.check]]
+name = "exact-process-and-maintenance-contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_openfoam_process_guard.py", "tests/test_deploy_sweeper_state.py", "tests/test_remote_solver_2606_deploy.py", "-q"]
+
 [[test.mpi-placement.check]]
 name = "launcher-and-budget-contract"
 tier = "development"
