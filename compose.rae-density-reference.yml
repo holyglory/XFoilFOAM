@@ -1,5 +1,5 @@
 services:
-  density:
+  density: &density-reference
     image: sha256:1ebe170cd8cae2b2a13cfa2bf4cb1f5b3d00a65dd5e62467c1cff1c2480b7132
     pull_policy: never
     network_mode: none
@@ -18,6 +18,9 @@ services:
       - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
       - density-evidence:/evidence
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/density-reference", "--tier", "precise", "--wall-functions", "--uniform-start", "--first-order", "--density-local-time", "--processes", "4"]
+  density-higher-order:
+    <<: *density-reference
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/density-higher-order", "--tier", "precise", "--wall-functions", "--uniform-start", "--density-local-time", "--processes", "4"]
   artifacts:
     image: sha256:1ebe170cd8cae2b2a13cfa2bf4cb1f5b3d00a65dd5e62467c1cff1c2480b7132
     pull_policy: never

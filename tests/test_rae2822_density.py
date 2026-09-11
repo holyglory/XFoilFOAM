@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from scripts.materials.rae2822_density import configure_density_reference, densi
 from scripts.materials.rae2822_reference import load_reference, selig_coordinates
 
 
-def case_builder(directory, family="rhoSimpleFoam", mach=0.729):
+def case_builder(directory, family="rhoSimpleFoam", mach=0.729, scheme="upwind"):
     reference = load_reference(Path(__file__).parent / "fixtures/rae2822")
     gas = GasThermodynamics(gas_constant=287.05, heat_capacity_cp=1005, transport_model="constant",
         reference_dynamic_viscosity=1.82e-5, reference_temperature_k=298, prandtl=0.71,
@@ -24,7 +25,7 @@ def case_builder(directory, family="rhoSimpleFoam", mach=0.729):
         patches=[BoundaryPatch("airfoil", "wall"), BoundaryPatch("inlet", "inlet"), BoundaryPatch("outlet", "outlet"), BoundaryPatch("frontAndBack", "empty")],
         mesh_params=MeshParams(), spec=CaseSpec(chord=1, speed=mach * gas.speed_of_sound(state), aoa_deg=2.31),
         fluid=FluidProperties(density=gas.density(state), dynamic_viscosity=gas.dynamic_viscosity(state.temperature_k)),
-        roughness=RoughnessParams(), solver=SolverParams(momentum_scheme="upwind", force_transient=False, transient_fallback=False,
+        roughness=RoughnessParams(), solver=SolverParams(momentum_scheme=scheme, force_transient=False, transient_fallback=False,
             n_iterations=3000, convergence_tolerance=1e-5), gas=gas, state=state, solver_family=family, turbulent_prandtl=0.85,
     )
     builder.write(directory)
@@ -80,10 +81,30 @@ def test_density_reference_requires_native_certificate_and_force_hold():
         density_reference_convergence("XFOILFOAM_LOCAL_STEADY_CONVERGED " + json.dumps(certificate), 1e-5, True)
 
 
-@pytest.mark.parametrize("option", [{"uniform_start": False}, {"first_order": False}, {"enthalpy": True},
+@pytest.mark.parametrize("option", [{"uniform_start": False}, {"enthalpy": True},
     {"donor": "retained"}, {"local_time_pressure": True}, {"native_steady_check": True}, {"transonic": True}])
 def test_density_reference_does_not_silently_combine_experiments(option):
     from scripts.materials.verify_rae2822 import run
     options = {"density_local_time": True, "uniform_start": True, "first_order": True, **option}
     with pytest.raises(ValueError, match="without other experiments"):
         run(None, None, None, "precise", **options)
+
+
+def test_density_order_comparison_changes_only_three_reconstruction_entries(tmp_path):
+    first = tmp_path / "first"
+    higher = tmp_path / "higher"
+    first_builder = case_builder(first)
+    higher_builder = case_builder(higher, scheme="linearUpwind")
+    first_execution = configure_density_reference(first, first_builder)
+    higher_execution = configure_density_reference(higher, higher_builder)
+    assert first_execution["reconstruction_schemes"] == {"rho": "upwind", "U": "upwind", "T": "upwind"}
+    assert higher_execution["reconstruction_schemes"] == {"rho": "vanLeer", "U": "vanLeerV", "T": "vanLeer"}
+    assert first_execution["flux_scheme"] == higher_execution["flux_scheme"] == "Kurganov"
+    assert first_execution["preserved_physical_files"] == higher_execution["preserved_physical_files"]
+    for relative in ("system/controlDict", "system/fvSolution"):
+        assert (first / relative).read_bytes() == (higher / relative).read_bytes()
+    expected = (first / "system/fvSchemes").read_text()
+    for field, scheme in (("rho", "vanLeer"), ("U", "vanLeerV"), ("T", "vanLeer")):
+        expected, count = re.subn(rf"(reconstruct\({field}\)\s+)upwind;", rf"\g<1>{scheme};", expected)
+        assert count == 1
+    assert (higher / "system/fvSchemes").read_text() == expected

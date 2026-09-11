@@ -284,13 +284,13 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
 
 def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False, research_iteration_allowance=None, tight_inner_solves=False, sst_gradient_limiter=False, density_local_time=False):
     started_at = time.monotonic()
-    if density_local_time and (not uniform_start or not first_order or any([
+    if density_local_time and (not uniform_start or any([
         enthalpy, donor, mapped_donor, resume_local_pressure, local_time_pressure, transonic,
         consistent_pressure, upwind_energy, pressure_krylov, pressure_equation_relaxation is not None,
         density_relaxation is not None, native_steady_check, snapshot_audit, reference_grid, mesh_only,
         limited_nonorthogonal, low_re_k_wall, tight_inner_solves, sst_gradient_limiter,
     ])):
-        raise ValueError("Density reference requires a fresh uniform first-order internal-energy case without other experiments")
+        raise ValueError("Density reference requires a fresh uniform internal-energy case without other experiments")
     if sst_gradient_limiter and not local_time_pressure:
         raise ValueError("SST gradient experiment requires local-time pressure solving")
     if tight_inner_solves and (not local_time_pressure or not native_steady_check):

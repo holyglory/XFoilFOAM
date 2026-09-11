@@ -43,6 +43,9 @@ def configure_density_reference(directory, builder):
         raise ValueError("Density comparison changed the protected physical reference")
     execution = json.loads(identity_path.read_text())
     execution.update({"experiment": "rae2822-transonic-density-v1", "production_admission": False,
+                      "flux_scheme": "Kurganov",
+                      "reconstruction_schemes": {field: "upwind" if builder.solver.momentum_scheme == "upwind" else scheme
+                                                 for field, scheme in (("rho", "vanLeer"), ("U", "vanLeerV"), ("T", "vanLeer"))},
                       "preserved_physical_files": before, "mach": mach,
                       "boundary_recipe": "unchanged-transonic-freestream",
                       "steady_acceptance_certificate": "native_v2_stored_rates_with_force_window"})

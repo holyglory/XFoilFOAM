@@ -1586,6 +1586,22 @@ port = true
 route = true
 timeout_seconds = 900
 
+[deployment.rae-density-higher-order]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-density-higher-order.component.numerics]
+type = "compose"
+files = ["compose.rae-density-reference.yml"]
+services = ["artifacts", "density-higher-order"]
+finite_services = ["density-higher-order"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.initialization-guard-check.component.numerics]
 type = "compose"
 files = ["compose.initialization-guard-check.yml"]
