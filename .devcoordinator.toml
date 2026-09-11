@@ -201,6 +201,14 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.rae-unsteady-reference]
+timeout_seconds = 180
+
+[[test.rae-unsteady-reference.check]]
+name = "unsteady-source-and-time-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_unsteady.py", "tests/test_rae2822_hold.py", "tests/test_rae2822_pressure.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_rans_hold_certificate.py", "-q"]
+
 [test.rae-hold-reference]
 timeout_seconds = 180
 
@@ -1589,6 +1597,22 @@ source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
+
+[deployment.rae-unsteady-reference]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-unsteady-reference.component.numerics]
+type = "compose"
+files = ["compose.rae-unsteady-reference.yml"]
+services = ["artifacts", "unsteady"]
+finite_services = ["unsteady"]
+build = false
+port = true
+route = true
+timeout_seconds = 1200
 
 [deployment.rae-hold-reference.component.numerics]
 type = "compose"
