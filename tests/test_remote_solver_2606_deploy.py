@@ -643,7 +643,9 @@ def test_maintenance_waits_only_for_live_progressive_archive_claims(function_nam
             CREATE TABLE sync_remote_result_deliveries (state text);
             CREATE TABLE sync_remote_promise_cancellations (state text);
             CREATE TABLE progressive_worker_archive_deliveries (claim_expires_at timestamptz);
+            CREATE TABLE progressive_worker_archive_reclaims (claim_expires_at timestamptz, completed_at timestamptz);
             INSERT INTO progressive_worker_archive_deliveries VALUES (NULL), (now() - interval '1 second');
+            INSERT INTO progressive_worker_archive_reclaims VALUES (NULL, NULL), (now() - interval '1 second', NULL), (now() + interval '1 hour', now());
         """)
         idle = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
         assert idle.stdout.strip() == ""
@@ -653,6 +655,12 @@ def test_maintenance_waits_only_for_live_progressive_archive_claims(function_nam
         query("DELETE FROM progressive_worker_archive_deliveries WHERE claim_expires_at > now()")
         resumed = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
         assert resumed.stdout.strip() == ""
+        query("INSERT INTO progressive_worker_archive_reclaims VALUES (now() + interval '1 hour', NULL)")
+        reclaiming = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
+        assert json.loads(reclaiming.stdout)["progressive_reclaim_claims"] == 1
+        query("UPDATE progressive_worker_archive_reclaims SET completed_at=now() WHERE completed_at IS NULL")
+        reclaimed = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
+        assert reclaimed.stdout.strip() == ""
     finally:
         query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
