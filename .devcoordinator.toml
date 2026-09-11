@@ -49,7 +49,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [[test.progressive-archive-reclaim.check]]
 name = "native-reclaim"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "tests/test_remote_solver_2606_deploy.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "tests/test_remote_solver_2606_deploy.py", "tests/test_ubuntu_apt_https.py", "-q"]
 
 [[test.progressive-archive-reclaim.check]]
 name = "seed"
@@ -627,7 +627,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [[test.progressive.check]]
 name = "progressive-archive-reclaim-native"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "tests/test_ubuntu_apt_https.py", "-q"]
 
 [[test.progressive.check]]
 name = "retained-report-api"

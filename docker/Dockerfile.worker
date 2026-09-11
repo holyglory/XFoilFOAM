@@ -4,7 +4,8 @@ FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5d
 
 ARG TARGETARCH
 USER root
-RUN apt-get update \
+COPY docker/ubuntu-apt-https.sh /tmp/ubuntu-apt-https.sh
+RUN sh /tmp/ubuntu-apt-https.sh && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl g++ make python3 \
     && case "${TARGETARCH}" in \
          amd64) tools_sha="159d102ba465301e3f8562fe3e9dd917414b77a5491bdec206ee25d5ee89e2da" ;; \
@@ -54,7 +55,8 @@ LABEL org.opencontainers.image.source="https://github.com/holyglory/XFoilFOAM" \
 
 USER root
 
-RUN apt-get update \
+COPY docker/ubuntu-apt-https.sh /tmp/ubuntu-apt-https.sh
+RUN sh /tmp/ubuntu-apt-https.sh && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-pip python3-venv ffmpeg \
     && case "${TARGETARCH}" in \
          amd64) package_arch=amd64; package_sha="aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d" ;; \
