@@ -1,5 +1,6 @@
 from copy import deepcopy
 from dataclasses import asdict
+import re
 
 import numpy as np
 import pytest
@@ -76,3 +77,25 @@ def test_unsteady_dictionary_uses_real_time_native_courant_control_and_enthalpy(
     assert "localEuler" not in schemes and "div(phi,h)" in schemes
     assert "nOuterCorrectors 3;" in solution and "nCorrectors 2;" in solution
     assert "energy sensibleEnthalpy;" in (tmp_path / "constant/thermophysicalProperties").read_text()
+
+
+def test_pressure_advection_comparison_changes_only_the_selected_entry(tmp_path):
+    first = tmp_path / "upwind"
+    second = tmp_path / "vanleer"
+    builders = [case_builder(directory, scheme="linearUpwind") for directory in (first, second)]
+    window = physical_window(builders[0].spec.chord, builders[0].spec.speed)
+    configure_unsteady_case(builders[0], first, window)
+    configure_unsteady_case(builders[1], second, window, "vanLeer")
+    for path in first.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(first)
+        if str(relative) == "system/fvSchemes":
+            expected, count = re.subn(r"(div\(phid,p\)\s+)Gauss upwind;", r"\g<1>Gauss vanLeer;", path.read_text())
+            assert count == 1 and (second / relative).read_text() == expected
+        else:
+            assert (second / relative).read_bytes() == path.read_bytes()
+    before = (first / "system/controlDict").read_bytes()
+    with pytest.raises(ValueError, match="Unsupported"):
+        configure_unsteady_case(builders[0], first, window, "invented")
+    assert (first / "system/controlDict").read_bytes() == before

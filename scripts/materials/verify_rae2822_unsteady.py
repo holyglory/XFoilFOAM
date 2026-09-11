@@ -33,7 +33,9 @@ except ImportError:
     from verify_rae2822 import benchmark_time_budget, compare_pressure, pressure_iteration, reconstruct_timed_out_parallel_case, wall_pressure
 
 
-def configure_unsteady_case(builder, directory, window):
+def configure_unsteady_case(builder, directory, window, pressure_advection="upwind"):
+    if pressure_advection not in {"upwind", "vanLeer"}:
+        raise ValueError("Unsupported reference pressure-advection scheme")
     builder.write_transient(directory, 0, window["end_time"], window["initial_delta_t"],
                             window["write_interval"], window["maximum_delta_t"])
     for relative, pattern, replacement in [
@@ -46,9 +48,17 @@ def configure_unsteady_case(builder, directory, window):
         if count != 1:
             raise ValueError("Unsteady enthalpy conversion differs from the exact generated dictionary")
         path.write_text(content)
+    if pressure_advection == "vanLeer":
+        path = Path(directory) / "system/fvSchemes"
+        content, count = re.subn(r"(div\(phid,p\)\s+)Gauss upwind;", r"\g<1>Gauss vanLeer;", path.read_text())
+        if count != 1:
+            raise ValueError("Pressure comparison requires one exact implicit pressure-advection entry")
+        path.write_text(content)
 
 
-def run(source, destination, reference_directory, time_budget_seconds=600):
+def run(source, destination, reference_directory, time_budget_seconds=600, pressure_advection="upwind"):
+    if pressure_advection not in {"upwind", "vanLeer"}:
+        raise ValueError("Unsupported reference pressure-advection scheme")
     source, manifest_bytes, manifest, verified, held = authenticated_retained_source(source)
     histories = find_force_coefficient_files(source)
     if not histories:
@@ -86,6 +96,7 @@ def run(source, destination, reference_directory, time_budget_seconds=600):
               "source_fields_iteration": coordinate, "seed_active_seconds": held["accumulated_active_seconds"],
               "reference": reference["provenance"], "physical_window": window, "time_budget_seconds": budget,
               "time_discretization": "Euler", "spatial_transport": "linearUpwind limited", "energy_form": "sensibleEnthalpy",
+              "pressure_advection": pressure_advection,
               "initial_step_policy": "native_compressibleCourantNo_and_setInitialDeltaT_before_time_loop"}
     started = time.monotonic()
     try:
@@ -94,7 +105,7 @@ def run(source, destination, reference_directory, time_budget_seconds=600):
         patches = BlockMeshCGrid().patches(mesh)
         builder = _case_builder(budgeted, airfoil, patches, mesh, spec, request.fluid, request.roughness, request.solver, n_proc=processes)
         builder.write(destination)
-        configure_unsteady_case(builder, destination, window)
+        configure_unsteady_case(builder, destination, window, pressure_advection)
         if hashlib.sha256((destination / "constant/thermophysicalProperties").read_bytes()).hexdigest() != verified.get("constant/thermophysicalProperties"):
             raise ValueError("Unsteady material dictionary differs from the held source")
         copied = {}
@@ -167,5 +178,6 @@ if __name__ == "__main__":
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--time-budget-seconds", type=float, default=600)
+    parser.add_argument("--pressure-advection", choices=["upwind", "vanLeer"], default="upwind")
     arguments = parser.parse_args()
-    run(arguments.source, arguments.destination, arguments.reference, arguments.time_budget_seconds)
+    run(arguments.source, arguments.destination, arguments.reference, arguments.time_budget_seconds, arguments.pressure_advection)
