@@ -127,7 +127,9 @@ def restore_local_pressure_state(source, destination, request, execution):
             "report_sha256": verified["report.json"], "prior_active_seconds": previous_cost, "members": copied}
 
 
-def configure_local_time_pressure(directory, chord, speed, pressure_advection="upwind"):
+def configure_local_time_pressure(directory, chord, speed, pressure_advection="upwind", maximum_courant=0.5):
+    if maximum_courant not in (0.5, 0.8):
+        raise ValueError("Local pressure Courant study supports only0.5and0.8")
     if pressure_advection not in ("upwind", "vanLeer"):
         raise ValueError("Unsupported experimental pressure-advection scheme")
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 for value in (chord, speed)):
@@ -152,7 +154,7 @@ def configure_local_time_pressure(directory, chord, speed, pressure_advection="u
                     '"(U|h|k|omega)"': transport, '"(U|h|k|omega)Final"': {**transport, "relTol": 0}},
         "PIMPLE": {"momentumPredictor": "yes", "nOuterCorrectors": 3, "nCorrectors": 2,
                    "nNonOrthogonalCorrectors": 1, "transonic": "yes", "consistent": "no",
-                   "pMinFactor": 0.1, "pMaxFactor": 2, "maxCo": 0.5, "maxDeltaT": chord / speed,
+                   "pMinFactor": 0.1, "pMaxFactor": 2, "maxCo": maximum_courant, "maxDeltaT": chord / speed,
                    "rDeltaTSmoothingCoeff": 0.02, "rDeltaTDampingCoeff": 0.2},
         "relaxationFactors": {"fields": {"p": 0.3}, "equations": {"p": 1, "pFinal": 1, "U": 0.7, "h": 0.7, "k": 0.5, "omega": 0.5}},
     }
@@ -160,6 +162,6 @@ def configure_local_time_pressure(directory, chord, speed, pressure_advection="u
     schemes_path.write_text(schemes)
     execution = {"version": 1, "solver_family": "rhoPimpleFoam", "time_coordinate": "local_pseudo_time_iterations",
                  "physical_time_history": False, "steady_acceptance_certificate": "unavailable_experimental",
-                 "local_max_courant": 0.5, "maximum_local_step_seconds": chord / speed}
+                 "local_max_courant": maximum_courant, "maximum_local_step_seconds": chord / speed}
     (directory / "constant/numericalExecution.json").write_text(json.dumps(execution, allow_nan=False) + "\n")
     return execution

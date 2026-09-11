@@ -18,14 +18,15 @@ def test_continuation_target_can_finish_original_scope_without_extra_iterations(
 
 @pytest.mark.parametrize("transport", ["upwind", "linearUpwind limited"])
 @pytest.mark.parametrize("pressure_advection", ["upwind", "vanLeer"])
-def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pressure_advection):
+@pytest.mark.parametrize("maximum_courant", [0.5, 0.8])
+def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pressure_advection, maximum_courant):
     (tmp_path / "system").mkdir()
     (tmp_path / "constant").mkdir()
     schemes = tmp_path / "system/fvSchemes"
     schemes.write_text(f"ddtSchemes {{ default steadyState; }} divSchemes {{ div(phi,h) bounded Gauss {transport}; div(phid,p) Gauss upwind; div(phiv,p) Gauss upwind; }}")
     thermo = tmp_path / "constant/thermophysicalProperties"
     thermo.write_text("source material fixture unchanged")
-    receipt = configure_local_time_pressure(tmp_path, 0.3048, 233, pressure_advection)
+    receipt = configure_local_time_pressure(tmp_path, 0.3048, 233, pressure_advection, maximum_courant)
     assert receipt["physical_time_history"] is False
     assert receipt["solver_family"] == "rhoPimpleFoam"
     assert receipt["steady_acceptance_certificate"] == "unavailable_experimental"
@@ -40,7 +41,8 @@ def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pres
     solution = (tmp_path / "system/fvSolution").read_text()
     assert "PIMPLE" in solution and "SIMPLE\n" not in solution
     assert "pMaxFactor      2;" in solution
-    assert "maxCo           0.5;" in solution
+    assert f"maxCo           {maximum_courant};" in solution
+    assert receipt["local_max_courant"] == maximum_courant
     with pytest.raises(ValueError, match="generated enthalpy"):
         configure_local_time_pressure(tmp_path, 0.3048, 233)
 
@@ -62,6 +64,16 @@ def test_pressure_advection_rejects_unknown_scheme_and_missing_entry_before_writ
         configure_local_time_pressure(tmp_path, 0.3, 200, "vanLeer")
     assert path.read_text() == original
     assert not (tmp_path / "system/fvSolution").exists()
+
+
+def test_local_courant_experiment_does_not_change_physical_mode_or_accept_arbitrary_values(tmp_path):
+    from scripts.materials.verify_rae2822 import run
+
+    with pytest.raises(ValueError, match="physical-time"):
+        run(None, None, None, "precise", local_max_courant=0.8)
+    for value in (0, -1, True, 1, float('nan')):
+        with pytest.raises(ValueError, match="Courant study"):
+            configure_local_time_pressure(tmp_path, 0.3, 200, maximum_courant=value)
 
 
 def continuation_fixture(tmp_path, change=None):
