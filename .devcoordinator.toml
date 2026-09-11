@@ -125,6 +125,14 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.initialization-energy-guard]
+timeout_seconds = 180
+
+[[test.initialization-energy-guard.check]]
+name = "physical-startup-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initialization.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_cache.py", "-q"]
+
 [test.pressure-rate-audit]
 timeout_seconds = 120
 
@@ -1448,6 +1456,22 @@ build = false
 port = true
 route = true
 timeout_seconds = 3300
+
+[deployment.initialization-guard-check]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.initialization-guard-check.component.numerics]
+type = "compose"
+files = ["compose.initialization-guard-check.yml"]
+services = ["artifacts", "guarded"]
+finite_services = ["guarded"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.pressure-sst-gradients]
 source = ["worktree"]

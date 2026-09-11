@@ -1,0 +1,40 @@
+services:
+  guarded:
+    image: xfoilfoam-startup-guard:verification
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      args:
+        AIRFOILFOAM_BUILD_ID: verification-startup-guard-v1
+    network_mode: none
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    volumes:
+      - ./scripts/materials:/verification:ro
+      - ./tests/fixtures/rae2822:/reference:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
+      - initialization-evidence:/evidence
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/guarded-potential-start", "--tier", "fast", "--wall-functions"]
+  artifacts:
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - initialization-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  initialization-evidence:
