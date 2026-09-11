@@ -386,6 +386,7 @@ export async function verifyProgressiveWorkerArchiveDelivery(
       };
       let corruptReadback = true;
       let stealClaim = false;
+      let pauseOwnedClaim = false;
       let engineReclaims = 0;
       const previousControlToken = process.env.ENGINE_CONTROL_PLANE_TOKEN;
       process.env.ENGINE_CONTROL_PLANE_TOKEN =
@@ -394,6 +395,11 @@ export async function verifyProgressiveWorkerArchiveDelivery(
         const url = String(input);
         expect(init?.redirect).toBe("error");
         if (url.endsWith(`/evidence-uploads/${uploadId}/download`)) {
+          if (pauseOwnedClaim) {
+            await connection.execute(
+              sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true WHERE id=1`,
+            );
+          }
           if (stealClaim) {
             await connection.execute(sql`UPDATE progressive_worker_archive_reclaims SET claim_token=${randomUUID()}::uuid,
               claim_expires_at=clock_timestamp()+interval '30 minutes' WHERE sim_job_id=${executionId}::uuid`);
@@ -482,6 +488,7 @@ export async function verifyProgressiveWorkerArchiveDelivery(
         expect(stolen.claim_token).not.toBeNull();
         expect(stolen.completed_at).toBeNull();
         stealClaim = false;
+        pauseOwnedClaim = true;
         await connection.execute(
           sql`UPDATE progressive_worker_archive_reclaims SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE sim_job_id=${executionId}::uuid`,
         );

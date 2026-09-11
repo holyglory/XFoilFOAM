@@ -151,7 +151,7 @@ async function reclaimClaim(
       WHERE sim_job_id=${claim.executionId}::uuid AND point_content_signature=${claim.signature}
         AND claim_token=${claim.token}::uuid AND claim_expires_at>clock_timestamp() AND completed_at IS NULL
         AND EXISTS (SELECT 1 FROM sync_api_settings settings WHERE settings.id=1
-          AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token=${settings.remoteSolverAuthToken}
+          AND settings.remote_solver_auth_token=${settings.remoteSolverAuthToken}
           AND settings.remote_solver_registered_id=${settings.remoteSolverRegisteredId}::uuid
           AND settings.upstream_base_url=${settings.upstreamBaseUrl}) RETURNING sim_job_id`);
     if (rows.length !== 1)
