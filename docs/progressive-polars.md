@@ -870,6 +870,10 @@ CPU budget; serial remains the default. Parallel runs retain reconstructed field
 even after a bounded timeout and report solver and overall elapsed time separately.
 Four ranks improved elapsed time for the measured coarse case, not necessarily
 CPU efficiency or fine-grid throughput.
+The legacy `--wall-functions` benchmark option selects target yPlus40 spacing
+instead of yPlus1; both use the same blended wall boundary types. Reports retain
+the requested mesh settings and measured yPlus rather than claiming that the
+option switches wall functions on or off.
 
 `--mapped-donor` authenticates a retained converged source before interpolating
 its volume fields into a new finer mesh. Physical setup and numerical settings

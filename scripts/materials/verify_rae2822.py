@@ -361,7 +361,6 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_density_relaxation": density_relaxation,
               "experimental_local_time_pressure": local_time_pressure,
               "experimental_pressure_advection": pressure_advection,
-              "experimental_wall_functions": wall_functions,
               "velocity_initialization": "resumed-local-pressure-state" if resume_local_pressure else "mapped-converged-donor" if mapped_donor else "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
               "experimental_momentum_scheme": momentum_scheme,
@@ -523,7 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--consistent-pressure", action="store_true")
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--density-relaxation", type=float)
-    parser.add_argument("--wall-functions", action="store_true")
+    parser.add_argument("--wall-functions", action="store_true", help="Use target yPlus40 spacing instead of yPlus1; the blended wall boundary types are unchanged")
     parser.add_argument("--uniform-start", action="store_true")
     parser.add_argument("--enthalpy", action="store_true")
     parser.add_argument("--first-order", action="store_true")
