@@ -15,6 +15,9 @@ services:
   pressure-wall-resolved:
     <<: *pressure_case
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/pressure-wall-resolved", "--tier", "precise", "--uniform-start", "--enthalpy", "--processes", "4", "--local-time-pressure", "--pressure-advection", "vanLeer", "--native-steady-check", "--local-max-courant", "0.8"]
+  pressure-step-smoothing:
+    <<: *pressure_case
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/pressure-step-smoothing", "--tier", "precise", "--uniform-start", "--enthalpy", "--processes", "4", "--local-time-pressure", "--pressure-advection", "vanLeer", "--native-steady-check", "--local-max-courant", "0.8", "--local-step-smoothing", "0.2"]
   artifacts:
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
     network_mode: bridge

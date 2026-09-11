@@ -1449,6 +1449,22 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.pressure-step-smoothing]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.pressure-step-smoothing.component.numerics]
+type = "compose"
+files = ["compose.pressure-courant-check.yml"]
+services = ["artifacts", "pressure-step-smoothing"]
+finite_services = ["pressure-step-smoothing"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
 [deployment.pressure-wall-resolved]
 source = ["worktree"]
 components = ["numerics"]

@@ -127,7 +127,9 @@ def restore_local_pressure_state(source, destination, request, execution):
             "report_sha256": verified["report.json"], "prior_active_seconds": previous_cost, "members": copied}
 
 
-def configure_local_time_pressure(directory, chord, speed, pressure_advection="upwind", maximum_courant=0.5):
+def configure_local_time_pressure(directory, chord, speed, pressure_advection="upwind", maximum_courant=0.5, step_smoothing=0.02):
+    if step_smoothing not in (0.02, 0.2):
+        raise ValueError("Local pressure smoothing study supports only0.02and0.2")
     if maximum_courant not in (0.5, 0.8):
         raise ValueError("Local pressure Courant study supports only0.5and0.8")
     if pressure_advection not in ("upwind", "vanLeer"):
@@ -155,7 +157,7 @@ def configure_local_time_pressure(directory, chord, speed, pressure_advection="u
         "PIMPLE": {"momentumPredictor": "yes", "nOuterCorrectors": 3, "nCorrectors": 2,
                    "nNonOrthogonalCorrectors": 1, "transonic": "yes", "consistent": "no",
                    "pMinFactor": 0.1, "pMaxFactor": 2, "maxCo": maximum_courant, "maxDeltaT": chord / speed,
-                   "rDeltaTSmoothingCoeff": 0.02, "rDeltaTDampingCoeff": 0.2},
+                   "rDeltaTSmoothingCoeff": step_smoothing, "rDeltaTDampingCoeff": 0.2},
         "relaxationFactors": {"fields": {"p": 0.3}, "equations": {"p": 1, "pFinal": 1, "U": 0.7, "h": 0.7, "k": 0.5, "omega": 0.5}},
     }
     write_foam_dict(directory / "system/fvSolution", "dictionary", "fvSolution", solution)

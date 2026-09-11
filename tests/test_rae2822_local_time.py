@@ -19,14 +19,15 @@ def test_continuation_target_can_finish_original_scope_without_extra_iterations(
 @pytest.mark.parametrize("transport", ["upwind", "linearUpwind limited"])
 @pytest.mark.parametrize("pressure_advection", ["upwind", "vanLeer"])
 @pytest.mark.parametrize("maximum_courant", [0.5, 0.8])
-def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pressure_advection, maximum_courant):
+@pytest.mark.parametrize("step_smoothing", [0.02, 0.2])
+def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pressure_advection, maximum_courant, step_smoothing):
     (tmp_path / "system").mkdir()
     (tmp_path / "constant").mkdir()
     schemes = tmp_path / "system/fvSchemes"
     schemes.write_text(f"ddtSchemes {{ default steadyState; }} divSchemes {{ div(phi,h) bounded Gauss {transport}; div(phid,p) Gauss upwind; div(phiv,p) Gauss upwind; }}")
     thermo = tmp_path / "constant/thermophysicalProperties"
     thermo.write_text("source material fixture unchanged")
-    receipt = configure_local_time_pressure(tmp_path, 0.3048, 233, pressure_advection, maximum_courant)
+    receipt = configure_local_time_pressure(tmp_path, 0.3048, 233, pressure_advection, maximum_courant, step_smoothing)
     assert receipt["physical_time_history"] is False
     assert receipt["solver_family"] == "rhoPimpleFoam"
     assert receipt["steady_acceptance_certificate"] == "unavailable_experimental"
@@ -43,6 +44,7 @@ def test_local_pressure_is_not_a_physical_time_history(tmp_path, transport, pres
     assert "pMaxFactor      2;" in solution
     assert f"maxCo           {maximum_courant};" in solution
     assert receipt["local_max_courant"] == maximum_courant
+    assert f"rDeltaTSmoothingCoeff {step_smoothing};" in solution
     with pytest.raises(ValueError, match="generated enthalpy"):
         configure_local_time_pressure(tmp_path, 0.3048, 233)
 
@@ -74,6 +76,16 @@ def test_local_courant_experiment_does_not_change_physical_mode_or_accept_arbitr
     for value in (0, -1, True, 1, float('nan')):
         with pytest.raises(ValueError, match="Courant study"):
             configure_local_time_pressure(tmp_path, 0.3, 200, maximum_courant=value)
+
+
+def test_step_smoothing_is_scoped_to_the_declared_local_pressure_study(tmp_path):
+    from scripts.materials.verify_rae2822 import run
+
+    with pytest.raises(ValueError, match="physical-time"):
+        run(None, None, None, "precise", local_step_smoothing=0.2)
+    for value in (0, -1, True, 1, float('nan')):
+        with pytest.raises(ValueError, match="smoothing study"):
+            configure_local_time_pressure(tmp_path, 0.3, 200, step_smoothing=value)
 
 
 def continuation_fixture(tmp_path, change=None):
