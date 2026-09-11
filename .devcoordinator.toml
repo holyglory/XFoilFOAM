@@ -125,6 +125,20 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.mpi-affinity-observation]
+timeout_seconds = 120
+
+[[test.mpi-affinity-observation.check]]
+name = "probe-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_mpi_affinity_observation.py", "-q"]
+
+[[test.mpi-affinity-observation.check]]
+name = "live-placement"
+tier = "development"
+requires = ["probe-contract"]
+command = [".venv/bin/python", "scripts/materials/inspect_mpi_affinity.py"]
+
 [test.rae-grid-reference]
 timeout_seconds = 120
 
@@ -1403,6 +1417,22 @@ build = false
 port = true
 route = true
 timeout_seconds = 3300
+
+[deployment.rae-mpi-unbound]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-mpi-unbound.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-pressure-unbound"]
+finite_services = ["enthalpy-pressure-unbound"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.rae-pressure-limiter-resume]
 source = ["worktree"]

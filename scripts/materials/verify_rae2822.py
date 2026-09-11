@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -339,7 +340,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     budgeted.begin_case(spec)
     report = {"kind": "rae2822-transonic-pressure-validation", "tier": tier, "production_evidence": False,
               "time_budget_seconds": time_budget_seconds,
-              "execution_resources": {"mpi_processes": processes, "worker_cpu_budget": available_processes},
+              "execution_resources": {"mpi_processes": processes, "worker_cpu_budget": available_processes,
+                                      "mpi_binding_policy": os.environ.get("OMPI_MCA_hwloc_base_binding_policy", "runtime_default")},
               "experimental_nonorthogonal_correction": "limited 0.5" if limited_nonorthogonal else "corrected",
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
