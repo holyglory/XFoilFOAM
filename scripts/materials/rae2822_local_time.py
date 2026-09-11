@@ -13,6 +13,15 @@ except ImportError:
     from rae2822_mapping import authenticated_retained_source
 
 
+def continuation_end_iteration(start, allowance, requested=None):
+    if type(start) is not int or type(allowance) is not int or start <= 0 or allowance <= 0:
+        raise ValueError("Continuation needs a positive exact start and iteration allowance")
+    target = start + allowance if requested is None else requested
+    if type(target) is not int or not start < target <= start + allowance:
+        raise ValueError("Continuation target must advance within its iteration allowance")
+    return target
+
+
 def restore_local_pressure_state(source, destination, request, execution):
     destination = Path(destination).resolve()
     source = Path(source).resolve()

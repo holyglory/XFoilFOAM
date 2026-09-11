@@ -1434,6 +1434,22 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.rae-fine-unbound-resume]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-fine-unbound-resume.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-fine-unbound-resume"]
+finite_services = ["enthalpy-fine-unbound-resume"]
+build = false
+port = true
+route = true
+timeout_seconds = 3300
+
 [deployment.rae-mpi-unbound-cli]
 source = ["worktree"]
 components = ["numerics"]

@@ -3,7 +3,17 @@ import hashlib
 
 import pytest
 
-from scripts.materials.rae2822_local_time import configure_local_time_pressure, restore_local_pressure_state
+from scripts.materials.rae2822_local_time import configure_local_time_pressure, continuation_end_iteration, restore_local_pressure_state
+
+
+def test_continuation_target_can_finish_original_scope_without_extra_iterations():
+    assert continuation_end_iteration(3300, 6000, 6000) == 6000
+    assert continuation_end_iteration(3000, 3000) == 6000
+    for target in (3300, 3299, 9301, 6000.5, True):
+        with pytest.raises(ValueError, match="within its iteration allowance"):
+            continuation_end_iteration(3300, 6000, target)
+    with pytest.raises(ValueError, match="positive exact"):
+        continuation_end_iteration(0, 6000)
 
 
 @pytest.mark.parametrize("transport", ["upwind", "linearUpwind limited"])
