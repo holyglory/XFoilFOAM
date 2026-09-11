@@ -19,6 +19,7 @@ from solver_stability import solver_stability
 from rae2822_grid import write_nasa_grid
 from rae2822_mapping import map_verified_initial_fields
 from rae2822_local_time import configure_local_time_pressure, restore_local_pressure_state
+from mpi_binding_experiment import configure_unbound_mpi
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
@@ -280,7 +281,7 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind"):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False):
     started_at = time.monotonic()
     if pressure_advection != "upwind" and not local_time_pressure:
         raise ValueError("Pressure-advection experiment requires local-time pressure coupling")
@@ -332,6 +333,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
                    "convergence_tolerance": dimensions[4], "write_images": []},
     })
     runner = get_runner(Settings())
+    if unbound_mpi:
+        configure_unbound_mpi(runner)
     available_processes = int(runner.settings.resolved_worker_cpu_budget())
     processes = benchmark_processes(processes, available_processes)
     configure_flow_execution(runner, request)
@@ -341,7 +344,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     report = {"kind": "rae2822-transonic-pressure-validation", "tier": tier, "production_evidence": False,
               "time_budget_seconds": time_budget_seconds,
               "execution_resources": {"mpi_processes": processes, "worker_cpu_budget": available_processes,
-                                      "mpi_binding_policy": os.environ.get("OMPI_MCA_hwloc_base_binding_policy", "runtime_default")},
+                                      "mpi_binding_environment_request": os.environ.get("OMPI_MCA_hwloc_base_binding_policy"),
+                                      "mpi_binding_command_line": "none" if unbound_mpi else None},
               "experimental_nonorthogonal_correction": "limited 0.5" if limited_nonorthogonal else "corrected",
               "accuracy_certified": False, "outcome": "failed", "reference": reference["provenance"],
               "experimental_transonic_pressure": transonic,
@@ -498,6 +502,7 @@ if __name__ == "__main__":
     parser.add_argument("--local-time-pressure", action="store_true")
     parser.add_argument("--resume-local-pressure")
     parser.add_argument("--pressure-advection", choices=["upwind", "vanLeer"], default="upwind")
+    parser.add_argument("--unbound-mpi", action="store_true")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -506,4 +511,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi)

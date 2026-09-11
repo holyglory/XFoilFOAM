@@ -131,7 +131,7 @@ timeout_seconds = 120
 [[test.mpi-affinity-observation.check]]
 name = "probe-contract"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_mpi_affinity_observation.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_mpi_affinity_observation.py", "tests/test_mpi_binding_experiment.py", "-q"]
 
 [[test.mpi-affinity-observation.check]]
 name = "live-placement"
@@ -1417,6 +1417,22 @@ build = false
 port = true
 route = true
 timeout_seconds = 3300
+
+[deployment.rae-mpi-unbound-cli]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-mpi-unbound-cli.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-pressure-unbound-cli"]
+finite_services = ["enthalpy-pressure-unbound-cli"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.rae-mpi-unbound]
 source = ["worktree"]

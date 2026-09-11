@@ -13,6 +13,7 @@ x-verification: &verification
     - ./scripts/materials/rae2822_grid.py:/verification/rae2822_grid.py:ro
     - ./scripts/materials/rae2822_mapping.py:/verification/rae2822_mapping.py:ro
     - ./scripts/materials/rae2822_local_time.py:/verification/rae2822_local_time.py:ro
+    - ./scripts/materials/mpi_binding_experiment.py:/verification/mpi_binding_experiment.py:ro
     - ./scripts/materials/inspect_rae_extrema.py:/verification/inspect_rae_extrema.py:ro
     - ./tests/fixtures/rae2822:/verification/reference:ro
     - ./tests/fixtures/air-thermophysics-audit.json:/verification/material.json:ro
@@ -109,6 +110,9 @@ services:
       AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
       PYTHONDONTWRITEBYTECODE: "1"
       OMPI_MCA_hwloc_base_binding_policy: "none"
+  enthalpy-pressure-unbound-cli:
+    <<: *pressure_limiter_continuation
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/enthalpy-pressure-unbound-cli", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--processes", "4", "--local-time-pressure", "--pressure-advection", "vanLeer", "--resume-local-pressure", "/continuation", "--unbound-mpi"]
   enthalpy-pressure-limiter-refined:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 
-SOLVERS = {"rhoPimpleFoam", "rhoSimpleFoam", "rhoCentralFoam", "simpleFoam", "pimpleFoam"}
+SOLVERS = {"rhoPimpleFoam", "rhoSimpleFoam", "rhoCentralFoam", "simpleFoam", "pimpleFoam", "mpirun", "prterun", "prted", "orted", "orterun"}
 
 
 def parse_cpu_list(value):
