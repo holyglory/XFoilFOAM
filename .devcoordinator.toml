@@ -125,6 +125,21 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.pressure-rate-audit]
+timeout_seconds = 120
+
+[[test.pressure-rate-audit.check]]
+name = "arithmetic-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_pressure_rate_audit.py", "-q"]
+
+[[test.pressure-rate-audit.check]]
+name = "native-saved-state-rates"
+tier = "development"
+requires = ["arithmetic-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.audit_pressure_rates", "--case", "/mnt/build-storage/codex/xfoilfoam-verification/pressure-rate-audit-20260911-result", "--output", ".codex-artifacts/pressure-rate-audit/measurement.json"]
+retained_artifacts = [{ name = "pressure-rate-arithmetic", path = ".codex-artifacts/pressure-rate-audit", max_bytes = 1048576 }]
+
 [test.mpi-affinity-observation]
 timeout_seconds = 120
 
