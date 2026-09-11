@@ -76,6 +76,19 @@ def attach_pressure_energy_output(directory):
     path.write_text(original[:position] + body + original[position:])
 
 
+def configure_low_re_k_wall(directory):
+    path = Path(directory) / "0/k"
+    original = path.read_text()
+    patches = list(re.finditer(r"\bairfoil\s*\{([^{}]*)\}", original))
+    if len(patches) != 1:
+        raise ValueError("Low-Re k study requires one exact airfoil boundary")
+    patch = patches[0]
+    changed, count = re.subn(r"\btype\s+kqRWallFunction\s*;", "type kLowReWallFunction;", patch[1])
+    if count != 1:
+        raise ValueError("Low-Re k study requires the original zero-gradient wrapper")
+    path.write_text(original[:patch.start(1)] + changed + original[patch.end(1):])
+
+
 def restore_local_pressure_state(source, destination, request, execution):
     destination = Path(destination).resolve()
     source = Path(source).resolve()
@@ -85,6 +98,7 @@ def restore_local_pressure_state(source, destination, request, execution):
     coordinate = report.get("pressure_iteration")
     active = report.get("active_seconds")
     if (report.get("outcome") != "measured_uncertified" or report.get("error") is not None
+            or report.get("experimental_low_re_k_wall", False) is not False
             or report.get("actual_execution") != execution or report.get("request") != request
             or report.get("experimental_local_time_pressure") is not True
             or report.get("numerical_stability", {}).get("pressure_limited_iterations") != 0):

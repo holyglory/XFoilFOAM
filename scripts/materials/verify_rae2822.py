@@ -18,7 +18,7 @@ from rae2822_reference import load_reference, selig_coordinates
 from solver_stability import solver_stability
 from rae2822_grid import write_nasa_grid
 from rae2822_mapping import map_verified_initial_fields
-from rae2822_local_time import attach_pressure_energy_output, attach_pressure_steady_detector, configure_local_time_pressure, continuation_end_iteration, pressure_steady_convergence, restore_local_pressure_state
+from rae2822_local_time import attach_pressure_energy_output, attach_pressure_steady_detector, configure_local_time_pressure, configure_low_re_k_wall, continuation_end_iteration, pressure_steady_convergence, restore_local_pressure_state
 from mpi_binding_experiment import configure_unbound_mpi
 
 
@@ -281,8 +281,10 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False):
     started_at = time.monotonic()
+    if low_re_k_wall and (not local_time_pressure or wall_functions or donor or mapped_donor or resume_local_pressure):
+        raise ValueError("Low-Re k wall study requires a fresh wall-resolved local-pressure case")
     if local_step_smoothing != 0.02 and not local_time_pressure:
         raise ValueError("Local smoothing experiment cannot change physical-time settings")
     if local_max_courant != 0.5 and not local_time_pressure:
@@ -364,6 +366,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_local_time_pressure": local_time_pressure,
               "experimental_pressure_advection": pressure_advection,
               "experimental_time_step_smoothing": local_step_smoothing,
+              "experimental_low_re_k_wall": low_re_k_wall,
               "velocity_initialization": "resumed-local-pressure-state" if resume_local_pressure else "mapped-converged-donor" if mapped_donor else "verified-donor" if donor else "uniform-freestream" if uniform_start else "velocity-only-potential",
               "experimental_energy_form": "sensibleEnthalpy" if enthalpy else "sensibleInternalEnergy",
               "experimental_momentum_scheme": momentum_scheme,
@@ -379,6 +382,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         patches = mesher.patches(mesh)
         builder = _case_builder(budgeted, airfoil, patches, mesh, spec, request.fluid, request.roughness, request.solver, n_proc=processes)
         builder.write(destination)
+        if low_re_k_wall:
+            configure_low_re_k_wall(destination)
         if limited_nonorthogonal:
             configure_limited_nonorthogonal(destination / "system/fvSchemes")
         if enthalpy:
@@ -540,6 +545,7 @@ if __name__ == "__main__":
     parser.add_argument("--snapshot-audit", action="store_true")
     parser.add_argument("--local-max-courant", type=float, choices=[0.5, 0.8], default=0.5)
     parser.add_argument("--local-step-smoothing", type=float, choices=[0.02, 0.2], default=0.02)
+    parser.add_argument("--low-re-k-wall", action="store_true")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -548,4 +554,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall)

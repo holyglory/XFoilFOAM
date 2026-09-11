@@ -88,6 +88,31 @@ def test_step_smoothing_is_scoped_to_the_declared_local_pressure_study(tmp_path)
             configure_local_time_pressure(tmp_path, 0.3, 200, step_smoothing=value)
 
 
+def test_low_re_k_wall_changes_only_the_exact_airfoil_patch(tmp_path):
+    from scripts.materials.rae2822_local_time import configure_low_re_k_wall
+
+    path = tmp_path / "0/k"
+    path.parent.mkdir()
+    original = "internalField uniform 0.08; boundaryField { inlet { type fixedValue; value uniform 0.08; } airfoil { type kqRWallFunction; value uniform 0.08; } }"
+    path.write_text(original)
+    configure_low_re_k_wall(tmp_path)
+    assert path.read_text() == original.replace("type kqRWallFunction;", "type kLowReWallFunction;")
+    with pytest.raises(ValueError, match="original"):
+        configure_low_re_k_wall(tmp_path)
+    path.write_text(original + " airfoil { type kqRWallFunction; }")
+    with pytest.raises(ValueError, match="one exact"):
+        configure_low_re_k_wall(tmp_path)
+
+
+def test_low_re_wall_trial_cannot_silently_change_a_donor_or_high_yplus_recipe():
+    from scripts.materials.verify_rae2822 import run
+
+    for overrides in ({}, {"local_time_pressure": True, "wall_functions": True},
+                      {"local_time_pressure": True, "resume_local_pressure": "source"}):
+        with pytest.raises(ValueError, match="fresh wall-resolved"):
+            run(None, None, None, "precise", low_re_k_wall=True, **overrides)
+
+
 def continuation_fixture(tmp_path, change=None):
     source, target = tmp_path / "source", tmp_path / "target"
     source.mkdir()
@@ -135,6 +160,7 @@ def test_uncertified_continuation_keeps_exact_state_and_cost_without_acceptance(
 
 @pytest.mark.parametrize("change", [
     {"outcome": "failed"}, {"error": "thermal clamp"}, {"actual_execution": {"physical_time_history": True}},
+    {"experimental_low_re_k_wall": True},
     {"request": {"fixture": "different"}}, {"active_seconds": -1}, {"pressure_iteration": True},
     {"pressure_iteration": 3000.5}, {"pressure_iteration": float('inf')},
     {"accumulated_active_seconds": 99}, {"numerical_stability": {"pressure_limited_iterations": 1}},
