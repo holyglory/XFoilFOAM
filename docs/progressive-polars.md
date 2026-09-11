@@ -193,6 +193,12 @@ Unconverged evidence remains distinct from accepted points. The full archive pat
 carries the same source proof; a prior compact receipt must not suppress later
 publication when the complete evidence passes the still-current execution gates.
 Existing receipts may replay after cancellation without reopening that execution.
+Both compact and full-result imports persist the hub's retained-attempt receipt
+before recording archive custody. A replay keeps the original receipt's report
+sequence, which must resolve to an acknowledged local association for the exact
+same attempt and point content. Archive custody verifies its own signed source
+sequence independently; another report containing the same point does not rewrite
+that immutable source or substitute a different attempt.
 Interrupted worker staging retains its actual attempt evidence and prior job state,
 defers that exact report with a durable retry deadline, and permits other eligible
 reports to be staged. The selected sequence is passed through the claim boundary;

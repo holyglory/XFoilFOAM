@@ -12,7 +12,10 @@ import {
   type ProgressiveEvidenceCustodyReceipt,
 } from "../src/progressive-evidence-custody";
 import { recordProgressiveWorkerArchiveCustody } from "../../../apps/sweeper/src/progressive-worker-archive-custody";
-import { progressiveWorkerEvidenceReference } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
+import {
+  progressiveWorkerEvidenceReference,
+  recordProgressiveWorkerEvidenceReceipt,
+} from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
 
 export async function verifyProgressiveWorkerArchiveCustody(
   db: DB,
@@ -56,7 +59,7 @@ export async function verifyProgressiveWorkerArchiveCustody(
       ).remoteProgressiveExecution;
       const validated = validateProgressiveRemoteReport(later, envelope);
       await connection.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id, sequence, content_signature, report, acknowledged_at)
-        VALUES (${executionId}::uuid, ${later.sequence}, ${validated.contentSignature}, ${JSON.stringify(later)}::jsonb, clock_timestamp())`);
+        VALUES (${executionId}::uuid, ${later.sequence}, ${validated.contentSignature}, ${JSON.stringify(later)}::jsonb, NULL)`);
       await connection.execute(sql`INSERT INTO progressive_worker_evidence_receipts(sim_job_id, sequence, content_signature)
         VALUES (${executionId}::uuid, ${later.sequence}, ${validated.contentSignature})`);
       await connection.execute(sql`INSERT INTO progressive_worker_evidence_attempts(sim_job_id, sequence, result_attempt_id, point_content_signature)
@@ -64,9 +67,49 @@ export async function verifyProgressiveWorkerArchiveCustody(
       await connection.execute(
         sql`DELETE FROM progressive_worker_hub_receipts WHERE sim_job_id = ${executionId}::uuid AND point_content_signature = ${reference.pointContentSignature}`,
       );
-      await connection.execute(sql`INSERT INTO progressive_worker_hub_receipts(sim_job_id, sequence, result_attempt_id, point_content_signature, receipt)
-        VALUES (${executionId}::uuid, ${later.sequence}, ${owned.result_attempt_id}::uuid, ${reference.pointContentSignature},
-          ${JSON.stringify({ ...(owned.receipt as object), sequence: later.sequence })}::jsonb)`);
+      const expected = {
+        executionId,
+        pointContentSignature: reference.pointContentSignature,
+        resultId: String(owned.result_id),
+        resultAttemptId: String(owned.result_attempt_id),
+      };
+      const originalReceipt = {
+        ...(owned.receipt as object),
+        sequence: later.sequence,
+      };
+      await expect(
+        recordProgressiveWorkerEvidenceReceipt(
+          connection,
+          originalReceipt,
+          expected,
+        ),
+      ).rejects.toThrow("acknowledged exact source association");
+      await connection.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
+        WHERE sim_job_id=${executionId}::uuid AND sequence=${later.sequence}`);
+      await expect(
+        recordProgressiveWorkerEvidenceReceipt(
+          connection,
+          { ...originalReceipt, sequence: later.sequence + 1000 },
+          expected,
+        ),
+      ).rejects.toThrow("acknowledged exact source association");
+      await recordProgressiveWorkerEvidenceReceipt(
+        connection,
+        originalReceipt,
+        expected,
+      );
+      await recordProgressiveWorkerEvidenceReceipt(
+        connection,
+        originalReceipt,
+        expected,
+      );
+      await expect(
+        recordProgressiveWorkerEvidenceReceipt(
+          connection,
+          { ...originalReceipt, resultId: randomUUID() },
+          expected,
+        ),
+      ).rejects.toThrow("immutable progressive attempt receipt");
       expect(
         await progressiveWorkerEvidenceReference(
           connection,
@@ -78,6 +121,14 @@ export async function verifyProgressiveWorkerArchiveCustody(
         reportContentSignature: validated.contentSignature,
         pointContentSignature: reference.pointContentSignature,
       });
+      expect(
+        await progressiveWorkerEvidenceReference(
+          connection,
+          executionId,
+          String(owned.result_attempt_id),
+          reference.sequence,
+        ),
+      ).toEqual(reference);
       throw rollbackReference;
     });
   } catch (error) {
@@ -149,6 +200,35 @@ export async function verifyProgressiveWorkerArchiveCustody(
   );
   expect(empty.count).toBe(0);
   const signed = sign(receipt);
+  const rollbackFullImport = new Error(
+    "Rollback isolated full import receipt handoff",
+  );
+  try {
+    await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.execute(sql`DELETE FROM progressive_worker_hub_receipts
+        WHERE sim_job_id=${executionId}::uuid AND point_content_signature=${reference.pointContentSignature}`);
+      await expect(
+        recordProgressiveWorkerArchiveCustody(connection, signed, receipt),
+      ).rejects.toThrow("owned retained-attempt");
+      await recordProgressiveWorkerEvidenceReceipt(connection, owned.receipt, {
+        executionId,
+        pointContentSignature: reference.pointContentSignature,
+        resultId: String(owned.result_id),
+        resultAttemptId: String(owned.result_attempt_id),
+      });
+      expect(
+        await recordProgressiveWorkerArchiveCustody(
+          connection,
+          signed,
+          receipt,
+        ),
+      ).toEqual(receipt);
+      throw rollbackFullImport;
+    });
+  } catch (error) {
+    if (error !== rollbackFullImport) throw error;
+  }
   expect(
     await Promise.all([
       recordProgressiveWorkerArchiveCustody(db, signed, receipt),

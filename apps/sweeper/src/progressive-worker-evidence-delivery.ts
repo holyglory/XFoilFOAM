@@ -12,6 +12,80 @@ import { sql } from "drizzle-orm";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import { progressiveEvidencePriority } from "./progressive-evidence-priority";
 
+export async function recordProgressiveWorkerEvidenceReceipt(
+  db: DB,
+  supplied: unknown,
+  expected: {
+    executionId: string;
+    pointContentSignature: string;
+    resultId: string;
+    resultAttemptId: string;
+  },
+) {
+  const receipt = supplied as Record<string, unknown> | null;
+  const uuid =
+    /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+  if (
+    !receipt ||
+    receipt.version !== 1 ||
+    receipt.kind !== "retained-progressive-attempt" ||
+    receipt.executionId !== expected.executionId ||
+    !Number.isSafeInteger(receipt.sequence) ||
+    Number(receipt.sequence) < 1 ||
+    receipt.pointContentSignature !== expected.pointContentSignature ||
+    receipt.remoteResultId !== expected.resultId ||
+    receipt.remoteResultAttemptId !== expected.resultAttemptId ||
+    typeof receipt.resultId !== "string" ||
+    !uuid.test(receipt.resultId) ||
+    typeof receipt.resultAttemptId !== "string" ||
+    !uuid.test(receipt.resultAttemptId) ||
+    typeof receipt.receivedAt !== "string" ||
+    !Number.isFinite(Date.parse(receipt.receivedAt))
+  )
+    throw new Error("Hub did not retain the exact progressive source attempt");
+  const sequence = Number(receipt.sequence);
+  await db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [source] = await connection.execute(sql`
+      SELECT report.report FROM progressive_worker_evidence_attempts association
+      JOIN progressive_worker_reports report ON report.sim_job_id=association.sim_job_id AND report.sequence=association.sequence
+      JOIN result_attempts attempt ON attempt.id=association.result_attempt_id
+        AND attempt.sim_job_id=association.sim_job_id AND attempt.engine_job_id=association.sim_job_id::text
+      WHERE association.sim_job_id=${expected.executionId}::uuid AND association.sequence=${sequence}
+        AND association.result_attempt_id=${expected.resultAttemptId}::uuid
+        AND association.point_content_signature=${expected.pointContentSignature}
+        AND attempt.result_id=${expected.resultId}::uuid AND report.acknowledged_at IS NOT NULL
+    `);
+    if (!source)
+      throw new Error(
+        "Hub receipt has no acknowledged exact source association",
+      );
+    await assertProgressiveWorkerEvidenceJob(connection, {
+      simJobId: expected.executionId,
+      engineJobId: expected.executionId,
+      reportSequence: sequence,
+      result: (source.report as unknown as ProgressiveRemoteReport).result!,
+    });
+    await connection.execute(sql`
+      INSERT INTO progressive_worker_hub_receipts (sim_job_id, sequence, result_attempt_id, point_content_signature, receipt)
+      VALUES (${expected.executionId}::uuid, ${sequence}, ${expected.resultAttemptId}::uuid,
+        ${expected.pointContentSignature}, ${JSON.stringify(receipt)}::jsonb)
+      ON CONFLICT (sim_job_id, point_content_signature) DO NOTHING
+    `);
+    const [stored] =
+      await connection.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts
+      WHERE sim_job_id=${expected.executionId}::uuid AND point_content_signature=${expected.pointContentSignature}`);
+    if (
+      !stored ||
+      analysisContentHash(stored.receipt) !== analysisContentHash(receipt)
+    )
+      throw new Error("Hub changed its immutable progressive attempt receipt");
+    await connection.execute(sql`DELETE FROM progressive_worker_delivery_failures
+      WHERE sim_job_id=${expected.executionId}::uuid AND point_content_signature=${expected.pointContentSignature}`);
+  });
+  return receipt;
+}
+
 export async function deliverNextProgressiveWorkerEvidence(
   db: DB,
   fetcher: typeof fetch = fetch,
@@ -133,52 +207,11 @@ export async function deliverNextProgressiveWorkerEvidence(
       Array.isArray(receipts) && receipts.length === 1
         ? (receipts[0] as Record<string, unknown> | null)
         : null;
-    const uuid =
-      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-    if (
-      !receipt ||
-      receipt.version !== 1 ||
-      receipt.kind !== "retained-progressive-attempt" ||
-      receipt.executionId !== executionId ||
-      receipt.sequence !== sequence ||
-      receipt.pointContentSignature !== source.contentSignature ||
-      receipt.remoteResultId !== pending.result_id ||
-      receipt.remoteResultAttemptId !== pending.result_attempt_id ||
-      typeof receipt.resultId !== "string" ||
-      !uuid.test(receipt.resultId) ||
-      typeof receipt.resultAttemptId !== "string" ||
-      !uuid.test(receipt.resultAttemptId) ||
-      typeof receipt.receivedAt !== "string" ||
-      !Number.isFinite(Date.parse(receipt.receivedAt))
-    )
-      throw new Error(
-        "Hub did not retain the exact progressive source attempt",
-      );
-    await db.transaction(async (transaction) => {
-      const connection = transaction as unknown as DB;
-      await assertProgressiveWorkerEvidenceJob(connection, {
-        simJobId: executionId,
-        engineJobId: executionId,
-        reportSequence: sequence,
-        result: report.result!,
-      });
-      await connection.execute(sql`
-      INSERT INTO progressive_worker_hub_receipts (sim_job_id, sequence, result_attempt_id, point_content_signature, receipt)
-      VALUES (${executionId}::uuid, ${sequence}, ${pending.result_attempt_id}::uuid, ${source.contentSignature}, ${JSON.stringify(receipt)}::jsonb)
-      ON CONFLICT (sim_job_id, point_content_signature) DO NOTHING
-    `);
-      const [stored] =
-        await connection.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts
-      WHERE sim_job_id = ${executionId}::uuid AND point_content_signature = ${source.contentSignature}`);
-      if (
-        !stored ||
-        analysisContentHash(stored.receipt) !== analysisContentHash(receipt)
-      )
-        throw new Error(
-          "Hub changed its immutable progressive attempt receipt",
-        );
-      await connection.execute(sql`DELETE FROM progressive_worker_delivery_failures
-      WHERE sim_job_id = ${executionId}::uuid AND point_content_signature = ${source.contentSignature}`);
+    await recordProgressiveWorkerEvidenceReceipt(db, receipt, {
+      executionId,
+      pointContentSignature: source.contentSignature,
+      resultId: String(pending.result_id),
+      resultAttemptId: String(pending.result_attempt_id),
     });
     return true;
   } catch (error) {
@@ -203,7 +236,15 @@ export async function progressiveWorkerEvidenceReference(
   db: DB,
   executionId: string,
   resultAttemptId: string,
+  sequence?: number,
 ): Promise<ProgressiveRemoteEvidenceReference> {
+  if (
+    sequence !== undefined &&
+    (!Number.isSafeInteger(sequence) || sequence < 1)
+  )
+    throw new Error(
+      "Progressive source requires a positive exact report sequence",
+    );
   const [source] = await db.execute(sql`
     SELECT association.sequence, association.point_content_signature, report.content_signature, report.report
     FROM progressive_worker_evidence_attempts association
@@ -214,6 +255,7 @@ export async function progressiveWorkerEvidenceReference(
       AND retained.point_content_signature = association.point_content_signature
     WHERE association.sim_job_id = ${executionId}::uuid AND association.result_attempt_id = ${resultAttemptId}::uuid
       AND report.acknowledged_at IS NOT NULL
+      AND (${sequence === undefined} OR association.sequence = ${sequence ?? 0})
     ORDER BY CASE WHEN retained.sequence = association.sequence THEN 0 ELSE 1 END, association.sequence LIMIT 1
   `);
   if (!source)

@@ -63,6 +63,7 @@ import type { EngineClient } from "@aerodb/engine-client";
 import { observeProgressiveRemoteJob } from "./progressive-remote-observation";
 import { receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
+import { recordProgressiveWorkerEvidenceReceipt } from "./progressive-worker-evidence-delivery";
 import {
   reclaimProgressiveArchives,
   runArchiveReclaimPass,
@@ -5424,6 +5425,7 @@ async function pushOneRemoteResult(
       unfulfilledAoas?: unknown[];
       bindingReceipts?: unknown[];
       progressiveArchiveReceipts?: unknown[];
+      progressiveEvidenceReceipts?: unknown[];
       error?: unknown;
     } | null;
     try {
@@ -5492,6 +5494,20 @@ async function pushOneRemoteResult(
       throw new Error(error);
     }
     if (progressiveEvidence) {
+      if (responsePayload?.progressiveEvidenceReceipts?.length !== 1)
+        throw new Error(
+          "Progressive result delivery omitted its retained source receipt",
+        );
+      await recordProgressiveWorkerEvidenceReceipt(
+        db,
+        responsePayload.progressiveEvidenceReceipts[0],
+        {
+          executionId: job.id,
+          pointContentSignature: progressiveEvidence.pointContentSignature,
+          resultId: result.id,
+          resultAttemptId: attempt.id,
+        },
+      );
       if (responsePayload?.progressiveArchiveReceipts?.length !== 1)
         throw new Error(
           "Progressive archive delivery omitted its exact custody receipt",

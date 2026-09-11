@@ -19,6 +19,7 @@ export async function recordProgressiveWorkerArchiveCustody(
     db,
     expected.source.engineJobId,
     expected.source.remoteResultAttemptId,
+    expected.source.progressiveEvidence.sequence,
   );
   if (
     analysisContentHash(reference) !==

@@ -8,6 +8,7 @@ import type { DB } from "../src/client";
 import {
   deliverNextProgressiveWorkerEvidence,
   progressiveWorkerEvidenceReference,
+  recordProgressiveWorkerEvidenceReceipt,
 } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
 
 export async function verifyProgressiveWorkerEvidenceDelivery(
@@ -124,6 +125,21 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
       sql`SELECT * FROM progressive_worker_hub_receipts WHERE sim_job_id = ${executionId}::uuid`,
     );
     expect(noReceipt).toHaveLength(0);
+    const expected = {
+      executionId,
+      pointContentSignature: String(source.point_content_signature),
+      resultId: String(source.result_id),
+      resultAttemptId: String(source.result_attempt_id),
+    };
+    for (const sequence of [0, -1, 1.5, "1", null]) {
+      await expect(
+        recordProgressiveWorkerEvidenceReceipt(
+          db,
+          { ...receipt, sequence },
+          expected,
+        ),
+      ).rejects.toThrow("exact progressive source attempt");
+    }
     const delivered = vi.fn(
       async (_url: string | URL | Request, init?: RequestInit) => {
         expect(String(_url)).toMatch(/\/polars$/);
