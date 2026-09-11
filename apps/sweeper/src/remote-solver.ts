@@ -7115,23 +7115,6 @@ export async function reclaimRemoteSolverEvidenceTick(
   );
 }
 
-const scheduleRemoteReclaimOnce = createSingleFlightBackgroundRunner(
-  (error) => {
-    console.error(
-      "[sweeper] remote evidence reclaim pass failed:",
-      error instanceof Error ? error.message : String(error),
-    );
-  },
-);
-
-/** Keep storage release independent from result publication and scheduling. */
-export function scheduleRemoteSolverReclaims(
-  db: DB,
-  engine: EngineClient,
-): void {
-  scheduleRemoteReclaimOnce(() => reclaimRemoteSolverEvidenceTick(db, engine));
-}
-
 function remoteAdmissionHoldMessage(
   reason: RemoteEngineAdmissionHoldReason,
 ): string {

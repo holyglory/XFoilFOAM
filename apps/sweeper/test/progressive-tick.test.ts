@@ -230,6 +230,7 @@ describe("progressive controller tick", () => {
     expect(hooks.enrollment).toHaveBeenCalledTimes(1);
     expect(hooks.remoteReconcile).toHaveBeenCalledTimes(1);
     expect(hooks.transfer).toHaveBeenCalledTimes(1);
+    expect(hooks.reclaim).not.toHaveBeenCalled();
     expect(hooks.retention).not.toHaveBeenCalled();
     expect(hooks.remoteProgress).not.toHaveBeenCalled();
     expect(hooks.remotePrepare).not.toHaveBeenCalled();

@@ -11,6 +11,7 @@ import { runProgressiveBaselineService } from "./progressive-service";
 import { runProgressiveReportService } from "./progressive-report-service";
 import { runProgressiveEvidenceService } from "./progressive-evidence-service";
 import { runProgressiveArchiveService } from "./progressive-archive-service";
+import { runArchiveReclaimService } from "./archive-reclaim-service";
 import { runProgressiveWorkerCapabilityService } from "./progressive-worker-capabilities";
 import { runRetentionService } from "./retention-service";
 import { runProgressiveAssignmentIntakeService } from "./progressive-intake-service";
@@ -90,6 +91,10 @@ try {
     {
       name: "progressive-archive-delivery",
       run: (signal) => runProgressiveArchiveService(db, sql, engine, signal),
+    },
+    {
+      name: "archive-reclamation",
+      run: (signal) => runArchiveReclaimService(db, sql, engine, signal),
     },
   ]);
 } finally {

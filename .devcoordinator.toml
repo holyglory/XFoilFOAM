@@ -44,7 +44,7 @@ command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
 name = "readback"
 tier = "development"
 requires = ["schema"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-archive-reclaim.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-archive-reclaim.test.ts", "test/archive-reclaim-service.test.ts", "test/progressive-tick.test.ts"]
 
 [[test.progressive-archive-reclaim.check]]
 name = "native-reclaim"
@@ -622,7 +622,7 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_retention.py", "-q"]
 name = "progressive-archive-reclaim"
 tier = "development"
 requires = ["types", "dependencies"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-archive-reclaim.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-archive-reclaim.test.ts", "test/archive-reclaim-service.test.ts", "test/progressive-tick.test.ts"]
 
 [[test.progressive.check]]
 name = "progressive-archive-reclaim-native"

@@ -54,7 +54,6 @@ import { reconcile, resetOrphans } from "./reconcile";
 import {
   admitRemoteSolverTick,
   reconcileRemoteSolverTick,
-  scheduleRemoteSolverReclaims,
   scheduleRemoteSolverTransfer,
   type RemoteEngineAdmissionDecision,
 } from "./remote-solver";
@@ -758,7 +757,6 @@ export async function tick(
   // and must not starve the independent per-case reclaim outbox during that
   // entire interval.
   const remoteAdmissionReady = await reconcileRemoteSolverTick(db, engine);
-  scheduleRemoteSolverReclaims(db, engine);
   scheduleRemoteSolverTransfer(db, engine);
   scheduleResultMediaStorageMaintenance(db);
   let admissionFenced = preReconcileFence.blocked || postReconcileFence.blocked;

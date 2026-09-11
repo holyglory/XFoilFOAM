@@ -224,6 +224,11 @@ with matching size and SHA-256 permits the native job-locked, manifest-checked
 cleanup. Native acknowledgement and deletion intent make interrupted cleanup
 restart-safe. Failed verification keeps local bytes and a bounded retry deadline;
 successful reclamation never changes coefficients, classifications or promises.
+Reclamation has one lifecycle-managed service, not a controller-tick trigger.
+It continues immediately after a useful bounded batch, listens for archive changes,
+and uses durable retry deadlines with bounded idle backoff for legacy work.
+The eight-claim limit and fair legacy/progressive allocation remain unchanged;
+shutdown waits for owned cleanup rather than abandoning it.
 The worker verifies custody against its acknowledged source and prior compact hub
 receipt, then stores it immutably and idempotently. Accepted-archive delivery uses
 this record as a separate step before its existing fulfillment checks; cancelled
