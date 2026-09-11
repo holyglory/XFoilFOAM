@@ -115,6 +115,12 @@ revisions of those presets or progressive execution variants around the ordered
 controller; ordinary standalone preset claims retain their existing access and
 capacity policy.
 
+The active-promise count excludes a physically stopped dispatch only when both its
+solver ownership and exact engine execution identity match. Missing dispatches,
+foreign dispatch ownership and a stop for another execution cannot release that
+promise's place. The count uses direct joins rather than a nested historical scan;
+its original lease-expiry, ownership and capacity-lock rules remain unchanged.
+
 Assignment discovery is paged and authenticated with the registered worker's
 existing credential. Fetching an assignment returns the exact sealed request and
 the actual promise/receipt state; it is not permission to restart expired work.

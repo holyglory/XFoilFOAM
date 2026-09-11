@@ -22,21 +22,25 @@ export async function progressiveRemoteReservedSlots(
   return Number(row.reserved);
 }
 
+export function progressiveRemoteActivePromiseIdsSql(solverId: string) {
+  return sql`
+    SELECT promise.id FROM sync_sweep_promises promise
+    LEFT JOIN progressive_remote_dispatches dispatch ON dispatch.promise_id = promise.id
+      AND dispatch.solver_id = promise.registered_solver_id
+    LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = dispatch.sim_job_id
+      AND stopped.engine_job_id = dispatch.sim_job_id::text
+    WHERE promise.registered_solver_id = ${solverId}::uuid
+      AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+      AND stopped.sim_job_id IS NULL
+  `;
+}
+
 export async function progressiveRemoteActivePromiseCount(
   db: DB,
   solverId: string,
 ): Promise<number> {
-  const [row] = await db.execute(sql`
-    SELECT count(*)::integer AS count FROM sync_sweep_promises promise
-    WHERE promise.registered_solver_id = ${solverId}::uuid
-      AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
-      AND NOT EXISTS (
-        SELECT 1 FROM progressive_remote_dispatches dispatch
-        JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = dispatch.sim_job_id
-          AND stopped.engine_job_id = dispatch.sim_job_id::text
-        WHERE dispatch.promise_id = promise.id AND dispatch.solver_id = promise.registered_solver_id
-      )
-  `);
+  const [row] = await db.execute(sql`SELECT count(*)::integer AS count
+    FROM (${progressiveRemoteActivePromiseIdsSql(solverId)}) active_promises`);
   return Number(row.count);
 }
 

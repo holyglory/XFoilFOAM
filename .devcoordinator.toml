@@ -25,6 +25,41 @@ timeout_seconds = 1800
 [test.reservation-accounting]
 timeout_seconds = 900
 
+[test.promise-count-query]
+timeout_seconds = 900
+
+[test.promise-count-query.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.promise-count-query.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.promise-count-query.check]]
+name = "query-equivalence"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-promise-count-query.test.ts", "test/solver-reservation-query.test.ts"]
+
+[[test.promise-count-query.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.promise-count-query.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.promise-count-query.check]]
+name = "capacity-races"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+
 [test.parallel-lease-renewal]
 timeout_seconds = 600
 
@@ -747,6 +782,12 @@ name = "reservation-equivalence"
 tier = "development"
 requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-reservation-query.test.ts"]
+
+[[test.progressive.check]]
+name = "promise-count-equivalence"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-promise-count-query.test.ts"]
 
 [[test.progressive.check]]
 name = "reservation-transitions"
