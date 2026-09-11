@@ -46,6 +46,10 @@ for name, arguments, changing_channels, invalid in scenarios:
         else:
             if result.returncode != 0:
                 raise RuntimeError(f"Native probe exited {result.returncode}; see log.probe")
+            mode = "primitive" if "-primitiveFields" in arguments else "stored"
+            energy_field = ("e" if "-internalEnergy" in arguments else "h") if mode == "primitive" else "rhoE"
+            sources = {tuple(line.split()[1:]) for line in raw.splitlines() if line.startswith("XFOILFOAM_LOCAL_STEADY_FIELD_SOURCE ")}
+            assert sources == {(mode, energy_field)}
             rows = [line.split()[1:] for line in raw.splitlines() if line.startswith("XFOILFOAM_LOCAL_STEADY_RESIDUAL ")]
             assert len(rows) == 100 and all(len(row) == 6 for row in rows)
             if changing_channels:

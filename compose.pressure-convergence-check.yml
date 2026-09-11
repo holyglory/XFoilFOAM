@@ -1,0 +1,60 @@
+services:
+  detector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: thermophysics-check
+    network_mode: none
+    volumes:
+      - ./scripts/materials/steady-probe/case:/fixture/case:ro
+      - ./scripts/materials/verify-native-steady.py:/fixture/verify.py:ro
+      - pressure-evidence:/evidence
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >-
+        source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1 || exit 1;
+        export LD_LIBRARY_PATH="/opt/xfoilfoam-thermophysics/lib:$$LD_LIBRARY_PATH";
+        python3 /fixture/verify.py
+  pressure:
+    image: xfoilfoam-pressure-convergence:verification
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      args:
+        AIRFOILFOAM_BUILD_ID: verification-pressure-native-v1
+    network_mode: none
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    volumes:
+      - ./scripts/materials:/verification:ro
+      - ./tests/fixtures/rae2822:/reference:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
+      - pressure-evidence:/evidence
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/pressure-native-check", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--processes", "4", "--local-time-pressure", "--pressure-advection", "vanLeer", "--native-steady-check"]
+    depends_on:
+      detector:
+        condition: service_completed_successfully
+  artifacts:
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - pressure-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pressure-evidence:

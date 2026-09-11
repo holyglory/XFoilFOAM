@@ -64,6 +64,9 @@ public:
         energyScale_ = densityScale_*specificEnergy;
         turbulenceEnergyScale_ = turbulenceEnergy*speed/length;
         turbulenceFrequencyScale_ = turbulenceFrequency*speed/length;
+        if (Pstream::master())
+            Info << "XFOILFOAM_LOCAL_STEADY_FIELD_SOURCE " << fieldMode << " "
+                << (primitiveFields_ ? energyField_ : word("rhoE")) << endl;
         stableSteps_ = 0;
         maximumWindowResidual_ = 0;
         return true;

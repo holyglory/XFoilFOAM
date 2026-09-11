@@ -4,8 +4,10 @@ import math
 from pathlib import Path
 import re
 import shutil
+from dataclasses import asdict
 
-from airfoilfoam.openfoam.foam_dict import write_foam_dict
+from airfoilfoam.openfoam.foam_dict import Raw, _render_entries, write_foam_dict
+from airfoilfoam.postprocess.residuals import parse_local_steady_convergence
 
 try:
     from .rae2822_mapping import authenticated_retained_source
@@ -20,6 +22,45 @@ def continuation_end_iteration(start, allowance, requested=None):
     if type(target) is not int or not start < target <= start + allowance:
         raise ValueError("Continuation target must advance within its iteration allowance")
     return target
+
+
+def attach_pressure_steady_detector(directory, references, tolerance, energy_field="h"):
+    required = {"referenceDensity", "referenceSpeed", "referenceLength", "referenceSpecificEnergy",
+                "referenceTurbulenceEnergy", "referenceTurbulenceFrequency"}
+    if set(references) != required or energy_field not in {"h", "e"}:
+        raise ValueError("Pressure detector requires exact physical references and energy field")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+           for value in [*references.values(), tolerance]):
+        raise ValueError("Pressure detector references and tolerance must be finite and positive")
+    path = Path(directory) / "system/controlDict"
+    original = path.read_text()
+    matches = list(re.finditer(r"\bfunctions\s*\{", original))
+    if len(matches) != 1 or re.search(r"\bpressureSteadyConvergence\b", original):
+        raise ValueError("Pressure detector requires one fresh function-object dictionary")
+    config = {"type": "xfoilfoamSteadyConvergence",
+              "libs": [Raw('"/opt/xfoilfoam-thermophysics/lib/libxfoilfoamSteadyConvergence.so"')],
+              "executeControl": "timeStep", "executeInterval": 1, "conservedFields": "primitive", "energyField": energy_field,
+              **references, "tolerance": tolerance, "consecutiveSteps": 100}
+    body = "\n" + "\n".join(_render_entries({"pressureSteadyConvergence": config}, 4)) + "\n"
+    position = matches[0].end()
+    path.write_text(original[:position] + body + original[position:])
+    return {"conserved_fields": "primitive", "energy_field": energy_field, "references": references,
+            "tolerance": tolerance, "consecutive_steps": 100, "force_window_samples": 200}
+
+
+def pressure_steady_convergence(log, tolerance, force_stable, stability, energy_field="h"):
+    if type(force_stable) is not bool or energy_field not in {"h", "e"}:
+        raise ValueError("Pressure convergence requires an observed force-window verdict")
+    sources = {tuple(line.split()[1:]) for line in log.splitlines() if line.startswith("XFOILFOAM_LOCAL_STEADY_FIELD_SOURCE ")}
+    if sources != {("primitive", energy_field)}:
+        raise ValueError("Native primitive-field capability is not proven")
+    rates = parse_local_steady_convergence(log, tolerance)
+    clear = (stability.get("available") is True and type(stability.get("window_iterations")) is int
+             and stability["window_iterations"] >= 200 and type(stability.get("pressure_limited_iterations")) is int
+             and stability["pressure_limited_iterations"] == 0)
+    return {**asdict(rates), "converged": rates.converged and force_stable and clear,
+            "native_rate_certificate": rates.converged, "force_window_stable": force_stable, "pressure_window_clear": clear,
+            "interpretation": "native_local_iteration_rates_and_force_window"}
 
 
 def restore_local_pressure_state(source, destination, request, execution):

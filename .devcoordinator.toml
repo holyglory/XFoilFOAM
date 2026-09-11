@@ -329,7 +329,7 @@ command = [".venv/bin/python", "scripts/materials/inspect_neuralfoil_geometry.py
 [[test.rae-reference.check]]
 name = "source-contract"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_reference.py", "tests/test_rae2822_pressure.py", "tests/test_rae2822_mapping.py", "tests/test_rae2822_local_time.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_reference.py", "tests/test_rae2822_pressure.py", "tests/test_rae2822_mapping.py", "tests/test_rae2822_local_time.py", "tests/test_pressure_steady_check.py", "tests/test_local_steady_convergence.py", "-q"]
 
 [test.progressive-hold-live]
 timeout_seconds = 4500
@@ -1433,6 +1433,22 @@ build = false
 port = true
 route = true
 timeout_seconds = 3300
+
+[deployment.pressure-native-reference]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.pressure-native-reference.component.numerics]
+type = "compose"
+files = ["compose.pressure-convergence-check.yml"]
+services = ["artifacts", "detector", "pressure"]
+finite_services = ["detector", "pressure"]
+build = true
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.pressure-steady-detector]
 source = ["worktree"]
