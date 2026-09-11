@@ -1434,6 +1434,22 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.pressure-steady-detector]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.pressure-steady-detector.component.numerics]
+type = "compose"
+files = ["compose.local-steady-check.yml"]
+services = ["artifacts", "detector"]
+finite_services = ["detector"]
+build = true
+port = true
+route = true
+timeout_seconds = 600
+
 [deployment.rae-fine-unbound-resume]
 source = ["worktree"]
 components = ["numerics"]

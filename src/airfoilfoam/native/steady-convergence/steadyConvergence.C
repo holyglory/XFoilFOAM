@@ -20,6 +20,8 @@ class xfoilfoamSteadyConvergence : public fvMeshFunctionObject
     label observedSteps_ = 0;
     scalar maximumWindowResidual_ = 0;
     label lastTimeIndex_ = -1;
+    bool primitiveFields_ = false;
+    word energyField_ = "e";
 
 public:
     TypeName("xfoilfoamSteadyConvergence");
@@ -41,6 +43,14 @@ public:
         const scalar turbulenceFrequency = config.get<scalar>("referenceTurbulenceFrequency");
         tolerance_ = config.get<scalar>("tolerance");
         requiredSteps_ = config.get<label>("consecutiveSteps");
+        const word fieldMode = config.getOrDefault<word>("conservedFields", "stored");
+        energyField_ = config.getOrDefault<word>("energyField", "e");
+        if ((fieldMode != "stored" && fieldMode != "primitive")
+            || (fieldMode == "primitive" && energyField_ != "e" && energyField_ != "h"))
+        {
+            FatalIOErrorInFunction(config) << "Invalid conserved-field source" << exit(FatalIOError);
+        }
+        primitiveFields_ = fieldMode == "primitive";
         if (!std::isfinite(density) || density <= 0 || !std::isfinite(speed) || speed <= 0
             || !std::isfinite(length) || length <= 0 || !std::isfinite(specificEnergy) || specificEnergy <= 0
             || !std::isfinite(turbulenceEnergy) || turbulenceEnergy <= 0
@@ -65,8 +75,6 @@ public:
         if (current <= 0 || current == lastTimeIndex_) return true;
         lastTimeIndex_ = current;
         const auto& density = mesh_.lookupObject<volScalarField>("rho");
-        const auto& momentum = mesh_.lookupObject<volVectorField>("rhoU");
-        const auto& energy = mesh_.lookupObject<volScalarField>("rhoE");
         const auto& turbulenceEnergy = mesh_.lookupObject<volScalarField>("k");
         const auto& turbulenceFrequency = mesh_.lookupObject<volScalarField>("omega");
         const auto& reciprocalStep = mesh_.lookupObject<volScalarField>("rDeltaT");
@@ -75,8 +83,32 @@ public:
         if (!std::isfinite(minimumStep) || minimumStep <= 0 || !std::isfinite(maximumStep))
             FatalErrorInFunction << "Invalid local pseudo-time field" << exit(FatalError);
         const scalar densityResidual = gMax(mag(density.primitiveField() - density.oldTime().primitiveField())*reciprocalStep.primitiveField())/densityScale_;
-        const scalar momentumResidual = gMax(mag(momentum.primitiveField() - momentum.oldTime().primitiveField())*reciprocalStep.primitiveField())/momentumScale_;
-        const scalar energyResidual = gMax(mag(energy.primitiveField() - energy.oldTime().primitiveField())*reciprocalStep.primitiveField())/energyScale_;
+        scalar momentumResidual;
+        scalar energyResidual;
+        if (primitiveFields_)
+        {
+            const auto& velocity = mesh_.lookupObject<volVectorField>("U");
+            const auto& specificEnergy = mesh_.lookupObject<volScalarField>(energyField_);
+            const vectorField momentum(density.primitiveField()*velocity.primitiveField());
+            const vectorField previousMomentum(density.oldTime().primitiveField()*velocity.oldTime().primitiveField());
+            scalarField energy(density.primitiveField()*(specificEnergy.primitiveField() + 0.5*magSqr(velocity.primitiveField())));
+            scalarField previousEnergy(density.oldTime().primitiveField()*(specificEnergy.oldTime().primitiveField() + 0.5*magSqr(velocity.oldTime().primitiveField())));
+            if (energyField_ == "h")
+            {
+                const auto& pressure = mesh_.lookupObject<volScalarField>("p");
+                energy -= pressure.primitiveField();
+                previousEnergy -= pressure.oldTime().primitiveField();
+            }
+            momentumResidual = gMax(mag(momentum - previousMomentum)*reciprocalStep.primitiveField())/momentumScale_;
+            energyResidual = gMax(mag(energy - previousEnergy)*reciprocalStep.primitiveField())/energyScale_;
+        }
+        else
+        {
+            const auto& momentum = mesh_.lookupObject<volVectorField>("rhoU");
+            const auto& energy = mesh_.lookupObject<volScalarField>("rhoE");
+            momentumResidual = gMax(mag(momentum.primitiveField() - momentum.oldTime().primitiveField())*reciprocalStep.primitiveField())/momentumScale_;
+            energyResidual = gMax(mag(energy.primitiveField() - energy.oldTime().primitiveField())*reciprocalStep.primitiveField())/energyScale_;
+        }
         const scalar turbulenceEnergyResidual = gMax(mag(turbulenceEnergy.primitiveField() - turbulenceEnergy.oldTime().primitiveField())*reciprocalStep.primitiveField())/turbulenceEnergyScale_;
         const scalar turbulenceFrequencyResidual = gMax(mag(turbulenceFrequency.primitiveField() - turbulenceFrequency.oldTime().primitiveField())*reciprocalStep.primitiveField())/turbulenceFrequencyScale_;
         if (!std::isfinite(densityResidual) || !std::isfinite(momentumResidual) || !std::isfinite(energyResidual)
