@@ -20,6 +20,7 @@ from rae2822_grid import write_nasa_grid
 from rae2822_mapping import map_verified_initial_fields
 from rae2822_local_time import attach_pressure_energy_output, attach_pressure_steady_detector, configure_local_time_pressure, configure_low_re_k_wall, continuation_end_iteration, limit_sst_gradients, pressure_steady_convergence, restore_local_pressure_state, tighten_pressure_inner_solves
 from mpi_binding_experiment import configure_unbound_mpi
+from rae2822_density import configure_density_reference, density_reference_convergence
 
 
 RAE_TIERS = {"fast": (84, 52, 40, 1500, 1e-4), "precise": (128, 80, 64, 3000, 1e-5), "refined": (256, 160, 128, 6000, 1e-5)}
@@ -281,8 +282,15 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False, research_iteration_allowance=None, tight_inner_solves=False, sst_gradient_limiter=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False, research_iteration_allowance=None, tight_inner_solves=False, sst_gradient_limiter=False, density_local_time=False):
     started_at = time.monotonic()
+    if density_local_time and (not uniform_start or not first_order or any([
+        enthalpy, donor, mapped_donor, resume_local_pressure, local_time_pressure, transonic,
+        consistent_pressure, upwind_energy, pressure_krylov, pressure_equation_relaxation is not None,
+        density_relaxation is not None, native_steady_check, snapshot_audit, reference_grid, mesh_only,
+        limited_nonorthogonal, low_re_k_wall, tight_inner_solves, sst_gradient_limiter,
+    ])):
+        raise ValueError("Density reference requires a fresh uniform first-order internal-energy case without other experiments")
     if sst_gradient_limiter and not local_time_pressure:
         raise ValueError("SST gradient experiment requires local-time pressure solving")
     if tight_inner_solves and (not local_time_pressure or not native_steady_check):
@@ -372,6 +380,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_consistent_pressure": consistent_pressure,
               "experimental_density_relaxation": density_relaxation,
               "experimental_local_time_pressure": local_time_pressure,
+              "experimental_density_local_time": density_local_time,
               "experimental_pressure_advection": pressure_advection,
               "experimental_time_step_smoothing": local_step_smoothing,
               "experimental_low_re_k_wall": low_re_k_wall,
@@ -424,6 +433,9 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             report["native_steady_detector"] = attach_pressure_steady_detector(destination, references, request.solver.convergence_tolerance)
             report["actual_execution"]["steady_acceptance_certificate"] = "native_v2_primitive_rates_with_force_window"
             (destination / "constant/numericalExecution.json").write_text(json.dumps(report["actual_execution"]) + "\n")
+        if density_local_time:
+            report["actual_execution"] = configure_density_reference(destination, builder)
+            application = "rhoCentralFoam"
         report["benchmark_output_policy"] = {"write_interval_iterations": 100, "retained_field_times": 2}
         if resume_local_pressure:
             report["experimental_continuation"] = restore_local_pressure_state(resume_local_pressure, destination, report["request"], report["actual_execution"])
@@ -492,6 +504,9 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         if native_steady_check:
             report["convergence"] = pressure_steady_convergence(solved.stdout, request.solver.convergence_tolerance,
                                                                  force_is_steady(histories[-1]), report["numerical_stability"])
+        if density_local_time:
+            report["convergence"] = density_reference_convergence(solved.stdout, request.solver.convergence_tolerance,
+                                                                   force_is_steady(histories[-1]))
         report["force_coefficients"] = asdict(parse_force_coefficients(histories[-1]))
         converted = runner.application(destination, "foamToVTK -latestTime -ascii -no-internal -patches '(airfoil)' -fields '(p)'", timeout=120)
         (destination / "log.foamToVTK").write_text(converted.stdout)
@@ -508,7 +523,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
         report["pressure_comparison"] = compare_pressure(computed, reference["pressure"])
         report["pressure_surface"] = {"path": str(surfaces[0].relative_to(destination)),
             "sha256": hashlib.sha256(surfaces[0].read_bytes()).hexdigest(), "samples": computed}
-        wall_command = f"{application} -postProcess -func yPlus -latestTime" if local_time_pressure else dialect_for_runner(runner).y_plus_command
+        wall_command = f"{application} -postProcess -func yPlus -latestTime" if local_time_pressure or density_local_time else dialect_for_runner(runner).y_plus_command
         wall_result = runner.application(destination, wall_command, timeout=120)
         (destination / "log.yPlus").write_text(wall_result.stdout)
         wall_result.check()
@@ -520,7 +535,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             raise ValueError("Wall resolution has invalid measured yPlus")
         report["wall_resolution"] = {"target_y_plus": request.mesh.target_y_plus, "average": average, "maximum": maximum,
             "path": str(wall_files[-1].relative_to(destination)), "sha256": hashlib.sha256(wall_files[-1].read_bytes()).hexdigest()}
-        report["outcome"] = "measured_uncertified" if local_time_pressure else "measured_converged" if report["convergence"]["converged"] else "measured_unconverged"
+        report["outcome"] = "measured_uncertified" if local_time_pressure or density_local_time else "measured_converged" if report["convergence"]["converged"] else "measured_unconverged"
     except Exception as error:
         report["error"] = str(error)
         raise
@@ -564,6 +579,7 @@ if __name__ == "__main__":
     parser.add_argument("--research-iteration-allowance", type=int)
     parser.add_argument("--tight-inner-solves", action="store_true")
     parser.add_argument("--sst-gradient-limiter", action="store_true")
+    parser.add_argument("--density-local-time", action="store_true")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -572,4 +588,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall, arguments.research_iteration_allowance, arguments.tight_inner_solves, arguments.sst_gradient_limiter)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall, arguments.research_iteration_allowance, arguments.tight_inner_solves, arguments.sst_gradient_limiter, arguments.density_local_time)

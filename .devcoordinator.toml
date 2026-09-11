@@ -201,6 +201,14 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.rae-density-reference]
+timeout_seconds = 180
+
+[[test.rae-density-reference.check]]
+name = "density-reference-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_density.py", "tests/test_rae2822_pressure.py", "tests/test_rae2822_local_time.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_local_steady_convergence.py", "-q"]
+
 [test.initialization-energy-guard]
 timeout_seconds = 180
 
@@ -1561,6 +1569,22 @@ source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
+
+[deployment.rae-density-reference]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-density-reference.component.numerics]
+type = "compose"
+files = ["compose.rae-density-reference.yml"]
+services = ["artifacts", "density"]
+finite_services = ["density"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.initialization-guard-check.component.numerics]
 type = "compose"

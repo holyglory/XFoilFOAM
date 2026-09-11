@@ -1,0 +1,36 @@
+services:
+  density:
+    image: sha256:1ebe170cd8cae2b2a13cfa2bf4cb1f5b3d00a65dd5e62467c1cff1c2480b7132
+    pull_policy: never
+    network_mode: none
+    environment:
+      AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    volumes:
+      - ./scripts/materials:/verification:ro
+      - ./tests/fixtures/rae2822:/reference:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
+      - density-evidence:/evidence
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/density-reference", "--tier", "precise", "--wall-functions", "--uniform-start", "--first-order", "--density-local-time", "--processes", "4"]
+  artifacts:
+    image: sha256:1ebe170cd8cae2b2a13cfa2bf4cb1f5b3d00a65dd5e62467c1cff1c2480b7132
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - density-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+volumes:
+  density-evidence:

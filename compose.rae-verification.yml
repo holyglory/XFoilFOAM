@@ -13,6 +13,7 @@ x-verification: &verification
     - ./scripts/materials/rae2822_grid.py:/verification/rae2822_grid.py:ro
     - ./scripts/materials/rae2822_mapping.py:/verification/rae2822_mapping.py:ro
     - ./scripts/materials/rae2822_local_time.py:/verification/rae2822_local_time.py:ro
+    - ./scripts/materials/rae2822_density.py:/verification/rae2822_density.py:ro
     - ./scripts/materials/mpi_binding_experiment.py:/verification/mpi_binding_experiment.py:ro
     - ./scripts/materials/inspect_rae_extrema.py:/verification/inspect_rae_extrema.py:ro
     - ./tests/fixtures/rae2822:/verification/reference:ro
