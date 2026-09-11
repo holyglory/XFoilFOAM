@@ -46,6 +46,19 @@ def remaining_allocation(report, log, coordinate, maximum):
             "remaining_seconds": total - used, "start_iteration": coordinate, "maximum_iteration": maximum}
 
 
+def checkpoint_signatures(directory, coordinate):
+    if type(coordinate) is not int or coordinate <= 0:
+        raise ValueError("Held checkpoint requires an exact positive iteration")
+    signatures = {}
+    for name in ("U", "p", "T", "k", "omega", "rho", "phi"):
+        relative = f"{coordinate}/{name}"
+        path = Path(directory) / relative
+        if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+            raise ValueError("Held reference lacks a complete checkpoint")
+        signatures[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return signatures
+
+
 def run(source, destination):
     source, manifest_bytes, manifest, verified, original = authenticated_retained_source(source)
     coordinate = latest_iteration(source)
@@ -105,6 +118,8 @@ def run(source, destination):
         report["native_returncode"] = result.returncode
         report["timed_out"] = result.timed_out
         report["eligible_urans_seed"] = bool(result.ok and hold and hold.certified and end == hold.end_iteration)
+        if report["eligible_urans_seed"]:
+            report["checkpoint_sha256"] = checkpoint_signatures(destination, end)
         report["outcome"] = "held_reference" if report["eligible_urans_seed"] else "hold_unavailable"
         for name in ("system/controlDict", "system/fvSolution"):
             if hashlib.sha256((destination / name).read_bytes()).hexdigest() != verified[name]:

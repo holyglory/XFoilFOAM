@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from scripts.materials.verify_rae2822_hold import remaining_allocation
+from scripts.materials.verify_rae2822_hold import checkpoint_signatures, remaining_allocation
 
 
 REPORT = {"kind": "rae2822-transonic-pressure-validation", "production_evidence": False,
@@ -37,3 +37,18 @@ def test_report_claim_cannot_replace_native_convergence_or_extend_allocation():
         remaining_allocation(REPORT, LOG, 2150, 3200)
     with pytest.raises(ValueError, match="ceiling"):
         remaining_allocation(REPORT, LOG, True, 3000)
+
+
+def test_held_checkpoint_requires_every_nonempty_field(tmp_path):
+    directory = tmp_path / "2350"
+    directory.mkdir()
+    for name in ("U", "p", "T", "k", "omega", "rho", "phi"):
+        (directory / name).write_text(f"isolated checkpoint fixture {name}")
+    assert len(checkpoint_signatures(tmp_path, 2350)) == 7
+    for name in ("U", "p", "T", "k", "omega", "rho", "phi"):
+        path = directory / name
+        content = path.read_bytes()
+        path.write_bytes(b"")
+        with pytest.raises(ValueError, match="complete checkpoint"):
+            checkpoint_signatures(tmp_path, 2350)
+        path.write_bytes(content)
