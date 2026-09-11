@@ -143,6 +143,20 @@ engine responses retain CPU ownership and reconcile only the original execution
 UUID; they do not allocate another attempt. A missing result file is not the same
 as a missing engine job and must not trigger cancellation of a healthy run.
 
+Storage forecasting keeps existing local work separate from queued requests and
+unassigned capacity. Known, unsubmitted, unreserved local requests use the same
+per-case growth estimates as active work, including the full transient allowance
+when fallback is enabled. A highest-cost-per-slot fractional bound covers any
+whole-job selection within the available capacity; it is a forecast, not a CPU
+reservation or permission to start. Original physical conditions are unchanged.
+Unknown queued shapes keep the job/slot fallback, unassigned slots retain 30 GiB
+each, and the 20 GiB system floor and emergency limits remain independent.
+Missing slot identity fails closed. An incomplete queue read (over 4,096 eligible
+rows) retains the previous standby forecast rather than using a cheap partial
+subset. The query excludes geometry, dispatched remote work, uncertain engine
+ownership and durable CPU reservations. Actual admission still rechecks its normal
+ownership, priority, capacity, campaign and storage gates.
+
 Assigned worker jobs have their own observation and cancellation path. Ordinary
 orphan recovery and retention cannot clear their ownership. A worker releases its
 local reservation only after recording a verified stop proof; the hub independently

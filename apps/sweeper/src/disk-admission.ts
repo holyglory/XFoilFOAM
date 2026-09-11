@@ -4,6 +4,7 @@ import {
   sweeperState,
   solverDirectLifecycleSql,
   solverLocalExecutionSql,
+  solverCpuReservationSql,
 } from "@aerodb/db";
 import {
   EngineError,
@@ -11,9 +12,13 @@ import {
   type EngineMaintenanceDiskResponse,
 } from "@aerodb/engine-client";
 import { statfs } from "node:fs/promises";
-import { and, desc, eq, inArray, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import { cancelJobAndReleaseClaims, type SimJobRow } from "./reconcile";
+import {
+  MAX_FORECAST_QUEUE_JOBS,
+  queuedDiskExposure,
+} from "./queued-disk-exposure";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -163,6 +168,7 @@ export function diskAdmissionExposureForJobs(
   jobs: readonly LocalDiskJob[],
   config: DiskAdmissionConfig = diskAdmissionConfigFromEnv(),
   configuredCpuSlots?: number,
+  queuedJobs: readonly LocalDiskJob[] = [],
 ): DiskAdmissionExposure {
   let activeLocalReservedBytes = 0;
   let activeLocalCpuSlots = 0;
@@ -219,7 +225,20 @@ export function diskAdmissionExposureForJobs(
       // Reserve measured per-slot working growth, not a maximum-shaped job
       // for every CPU slot. The separate job reserve remains the fail-closed
       // fallback for one unresolved/malformed active job.
-      idleLocalReservedBytes: idleLocalCpuSlots * config.idleSlotReserveBytes,
+      idleLocalReservedBytes: queuedDiskExposure(
+        queuedJobs,
+        idleLocalCpuSlots,
+        {
+          ...config,
+          ransCaseReserveBytes:
+            config.ransCaseReserveBytes ?? DEFAULT_DISK_RANS_CASE_RESERVE_BYTES,
+          precalcCaseReserveBytes:
+            config.precalcCaseReserveBytes ??
+            DEFAULT_DISK_PRECALC_CASE_RESERVE_BYTES,
+          fullCaseReserveBytes:
+            config.fullCaseReserveBytes ?? DEFAULT_DISK_FULL_CASE_RESERVE_BYTES,
+        },
+      ).reservedBytes,
     };
   }
   return exposure;
@@ -240,11 +259,21 @@ export function configuredDiskCapacitySlots(
   return Number.isInteger(workerBudget) && workerBudget > 0 ? workerBudget : 2;
 }
 
+export function queuedDiskJobScope() {
+  return and(
+    solverLocalExecutionSql(),
+    eq(simJobs.status, "pending"),
+    isNull(simJobs.engineState),
+    isNull(simJobs.engineJobId),
+    sql`NOT coalesce(${solverCpuReservationSql()}, false)`,
+  );
+}
+
 export async function loadDiskAdmissionExposure(
   db: DB,
   config: DiskAdmissionConfig = diskAdmissionConfigFromEnv(),
 ): Promise<DiskAdmissionExposure> {
-  const [jobs, [capacityState]] = await Promise.all([
+  const [jobs, [capacityState], queuedJobs] = await Promise.all([
     db
       .select({
         totalCases: simJobs.totalCases,
@@ -277,11 +306,29 @@ export async function loadDiskAdmissionExposure(
       .from(sweeperState)
       .where(eq(sweeperState.id, 1))
       .limit(1),
+    db
+      .select({
+        totalCases: simJobs.totalCases,
+        completedCases: simJobs.completedCases,
+        admissionCpuSlots: simJobs.admissionCpuSlots,
+        requestPayload: sql<
+          Record<string, unknown>
+        >`jsonb_build_object('engineRequest',
+        jsonb_build_object('solver',${simJobs.requestPayload}#>'{engineRequest,solver}',
+          'aoa',${simJobs.requestPayload}#>'{engineRequest,aoa}',
+          'chord_lengths',${simJobs.requestPayload}#>'{engineRequest,chord_lengths}',
+          'speeds',${simJobs.requestPayload}#>'{engineRequest,speeds}',
+          'continue_from',${simJobs.requestPayload}#>'{engineRequest,continue_from}'))`,
+      })
+      .from(simJobs)
+      .where(queuedDiskJobScope())
+      .limit(MAX_FORECAST_QUEUE_JOBS + 1),
   ]);
   return diskAdmissionExposureForJobs(
     jobs,
     config,
     configuredDiskCapacitySlots(capacityState ?? null),
+    queuedJobs,
   );
 }
 

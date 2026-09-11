@@ -11,7 +11,10 @@ import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { verifyProgressiveWorkerObservation } from "./progressive-worker-observation-fixture";
 import { solverQueuePressure } from "../../../apps/sweeper/src/submit-lifecycle";
-import { loadDiskAdmissionExposure } from "../../../apps/sweeper/src/disk-admission";
+import {
+  loadDiskAdmissionExposure,
+  queuedDiskJobScope,
+} from "../../../apps/sweeper/src/disk-admission";
 import { submitProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-submission";
 import { admitRemoteSolverTick } from "../../../apps/sweeper/src/remote-solver";
 
@@ -67,6 +70,10 @@ export async function verifyProgressiveWorkerSubmission(
     });
   };
   try {
+    const queued = await db.execute(
+      sql`SELECT id FROM sim_jobs WHERE id=${executionId}::uuid AND ${queuedDiskJobScope()}`,
+    );
+    expect(queued.map((row) => row.id)).toEqual([executionId]);
     await db.execute(
       sql`UPDATE sync_sweep_promise_points SET status = 'expired' WHERE promise_id = ${sourcePromiseId}::uuid AND status = 'active'`,
     );
@@ -170,6 +177,11 @@ export async function verifyProgressiveWorkerSubmission(
     expect(
       (await loadDiskAdmissionExposure(db)).activeLocalJobCount,
     ).toBeGreaterThanOrEqual(1);
+    const reservedPending = await db.execute(sql`WITH sim_jobs AS (
+      SELECT id,request_payload,'pending'::text AS status,NULL::text AS engine_state,NULL::text AS engine_job_id
+      FROM public.sim_jobs WHERE id=${executionId}::uuid
+    ) SELECT id FROM sim_jobs WHERE ${queuedDiskJobScope()}`);
+    expect(reservedPending).toEqual([]);
     await db.execute(
       sql`UPDATE sim_jobs SET status = 'cancelled', engine_state = 'cancelled' WHERE id = ${executionId}::uuid`,
     );

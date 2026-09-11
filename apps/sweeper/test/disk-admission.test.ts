@@ -345,7 +345,7 @@ describe("disk admission", () => {
       "utf8",
     );
     const refillStart = loopSource.indexOf(
-      "for (let i = 0; i < MAX_LOCAL_ADMISSIONS_PER_TICK; i++)",
+      "for (let admission = 0; admission < state.maxConcurrentJobs; admission += 1)",
     );
     const refillEnd = loopSource.indexOf(
       "  await markTickCompleted(db);",
@@ -359,7 +359,7 @@ describe("disk admission", () => {
       "diskAdmission = await refreshDiskAdmission(db, engine)",
     );
     expect(refillLoop.indexOf("refreshDiskAdmission")).toBeLessThan(
-      refillLoop.indexOf("submitInterleavedVerifyIfDue"),
+      refillLoop.indexOf("admitProgressiveCfdBatch"),
     );
     expect(refillLoop).toContain("if (!diskAdmission.allowed) break");
   });

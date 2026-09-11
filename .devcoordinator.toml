@@ -25,6 +25,42 @@ timeout_seconds = 1800
 [test.reservation-accounting]
 timeout_seconds = 900
 
+[test.queued-disk-exposure]
+timeout_seconds = 900
+
+[test.queued-disk-exposure.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.queued-disk-exposure.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.queued-disk-exposure.check]]
+name = "forecast-bounds"
+tier = "development"
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/queued-disk-exposure.test.ts", "test/disk-admission.test.ts"]
+
+[[test.queued-disk-exposure.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.queued-disk-exposure.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.queued-disk-exposure.check]]
+name = "worker-ownership"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+
 [test.reservation-accounting.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
@@ -703,6 +739,12 @@ name = "reservation-transitions"
 tier = "development"
 requires = ["types", "ingest-seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/admission-predicate-transitions.test.ts"]
+
+[[test.progressive.check]]
+name = "queued-disk-forecast"
+tier = "development"
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/queued-disk-exposure.test.ts", "test/disk-admission.test.ts"]
 
 [[test.progressive.check]]
 name = "progressive-archive-reclaim"
