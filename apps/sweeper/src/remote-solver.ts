@@ -1,5 +1,6 @@
 import { runRemoteTransferSteps } from "./remote-transfer-steps";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
+import { renewIndependentPromises } from "./remote-promise-renewal";
 import {
   airfoils,
   boundaryConditions,
@@ -1838,61 +1839,79 @@ async function renewMirroredPromiseLeases(
     )
     .orderBy(syncSweepPromises.expiresAt, syncSweepPromises.id)
     .limit(100);
-  for (const promise of rows) {
-    let response: Response;
-    try {
-      response = await fetch(
-        `${syncBase(settings)}/sweeps/${promise.id}/heartbeat`,
-        {
-          method: "POST",
-          signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
-          headers: headers(settings),
-          body: JSON.stringify({ ttlHours: REMOTE_PROMISE_TTL_HOURS }),
-        },
-      );
-    } catch (error) {
-      throw new Error(
-        `remote promise ${promise.id} heartbeat failed transiently: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-    if (response.status === 404 || response.status === 409) {
-      await cancelAuthoritativelyExpiredPromise(
-        db,
-        engine,
-        promise.id,
-        `up-tier rejected promise lease renewal (${response.status})`,
-      );
-      continue;
-    }
-    if (!response.ok) {
-      throw new Error(
-        `remote promise ${promise.id} heartbeat failed (${response.status})`,
-      );
-    }
-    const payload = (await response.json().catch(() => null)) as {
-      expiresAt?: unknown;
-    } | null;
-    const expiresAt =
-      typeof payload?.expiresAt === "string"
-        ? new Date(payload.expiresAt)
-        : null;
-    if (!expiresAt || !Number.isFinite(expiresAt.getTime())) {
-      throw new Error(
-        `remote promise ${promise.id} heartbeat omitted a valid expiry`,
-      );
-    }
-    await db
-      .update(syncSweepPromises)
-      .set({ expiresAt, lastHeartbeatAt: new Date(), updatedAt: new Date() })
-      .where(
-        and(
-          eq(syncSweepPromises.id, promise.id),
-          eq(syncSweepPromises.status, "active"),
-        ),
-      );
-  }
+  const started = performance.now();
+  const concurrency = activeReconcileConcurrency();
+  const renewal = await renewIndependentPromises(
+    rows,
+    concurrency,
+    AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+    async (promise) => {
+      let response: Response;
+      try {
+        response = await fetch(
+          `${syncBase(settings)}/sweeps/${promise.id}/heartbeat`,
+          {
+            method: "POST",
+            signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+            headers: headers(settings),
+            body: JSON.stringify({ ttlHours: REMOTE_PROMISE_TTL_HOURS }),
+          },
+        );
+      } catch (error) {
+        throw new Error(
+          `remote promise ${promise.id} heartbeat failed transiently: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      if (response.status === 404 || response.status === 409) {
+        await cancelAuthoritativelyExpiredPromise(
+          db,
+          engine,
+          promise.id,
+          `up-tier rejected promise lease renewal (${response.status})`,
+        );
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(
+          `remote promise ${promise.id} heartbeat failed (${response.status})`,
+        );
+      }
+      const payload = (await response.json().catch(() => null)) as {
+        expiresAt?: unknown;
+      } | null;
+      const expiresAt =
+        typeof payload?.expiresAt === "string"
+          ? new Date(payload.expiresAt)
+          : null;
+      if (!expiresAt || !Number.isFinite(expiresAt.getTime())) {
+        throw new Error(
+          `remote promise ${promise.id} heartbeat omitted a valid expiry`,
+        );
+      }
+      await db
+        .update(syncSweepPromises)
+        .set({ expiresAt, lastHeartbeatAt: new Date(), updatedAt: new Date() })
+        .where(
+          and(
+            eq(syncSweepPromises.id, promise.id),
+            eq(syncSweepPromises.status, "active"),
+          ),
+        );
+    },
+  );
+  if (rows.length)
+    console.log(
+      JSON.stringify({
+        component: "remote-promise-renewal",
+        selected: rows.length,
+        ...renewal,
+        concurrency,
+        durationMs: performance.now() - started,
+        checkedAt: new Date().toISOString(),
+      }),
+    );
 }
 
 async function cancelMirroredRemotePromise(

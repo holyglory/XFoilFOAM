@@ -25,6 +25,20 @@ timeout_seconds = 1800
 [test.reservation-accounting]
 timeout_seconds = 900
 
+[test.parallel-lease-renewal]
+timeout_seconds = 600
+
+[[test.parallel-lease-renewal.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.parallel-lease-renewal.check]]
+name = "renewal-contract"
+tier = "development"
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-transfer-steps.test.ts"]
+
 [test.queued-disk-exposure]
 timeout_seconds = 900
 
@@ -745,6 +759,12 @@ name = "queued-disk-forecast"
 tier = "development"
 env = { VITEST_PURE_REDUCER_TEST = "1" }
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/queued-disk-exposure.test.ts", "test/disk-admission.test.ts"]
+
+[[test.progressive.check]]
+name = "parallel-lease-renewal"
+tier = "development"
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-transfer-steps.test.ts"]
 
 [[test.progressive.check]]
 name = "progressive-archive-reclaim"

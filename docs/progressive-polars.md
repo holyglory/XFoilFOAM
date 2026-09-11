@@ -184,6 +184,15 @@ than replanning its angles. Hub preparation uses fresh observed gateway capabili
 and remains independent of local CPU saturation. Recovery selection stays with the
 worker that owned its parent execution; local recovery cannot claim remote parents.
 
+Independent mirrored-lease heartbeats use the existing reconciliation concurrency
+and a 15-second budget for launching each selected batch. Started requests keep
+their own existing 15-second HTTP timeout; deferred renewals remain unchanged.
+A stalled endpoint cannot turn 100 requests into 100 sequential timeouts, and a
+healthy backlog is not labeled an outage merely because the launch budget expires.
+All started work is observed, including bounded authoritative cancellation, before
+the first input-order failure is reported. Candidate selection, lease ownership,
+expiry validation and cancellation rules are unchanged.
+
 The separate report projector records measured active time and exact physical stops
 without turning raw report coefficients into accepted evidence. Terminal jobs await
 artifact ingestion, and cancellation cannot be undone by an older running report.
