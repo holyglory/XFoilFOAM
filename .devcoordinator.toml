@@ -37,7 +37,7 @@ command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
 name = "renewal-contract"
 tier = "development"
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-transfer-steps.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-reconciliation-timing.test.ts", "test/remote-transfer-steps.test.ts"]
 
 [test.queued-disk-exposure]
 timeout_seconds = 900
@@ -764,7 +764,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "parallel-lease-renewal"
 tier = "development"
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-transfer-steps.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-reconciliation-timing.test.ts", "test/remote-transfer-steps.test.ts"]
 
 [[test.progressive.check]]
 name = "progressive-archive-reclaim"

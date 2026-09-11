@@ -8220,6 +8220,10 @@ export const progressiveWorkerDeliveryFailures = pgTable(
     retryAfter: timestamp("retry_after", { withTimezone: true }),
     lastHttpStatus: integer("last_http_status"),
     lastError: text("last_error").notNull(),
+    remoteConflictIds: jsonb("remote_conflict_ids")
+      .$type<string[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
@@ -8251,6 +8255,11 @@ export const progressiveWorkerDeliveryFailures = pgTable(
     httpCheck: check(
       "progressive_worker_delivery_failures_last_http_status_check",
       sql`${table.lastHttpStatus} BETWEEN 100 AND 599`,
+    ),
+    conflictIdsCheck: check(
+      "progressive_worker_delivery_failures_conflict_ids_check",
+      sql`jsonb_typeof(${table.remoteConflictIds}) = 'array' AND jsonb_array_length(${table.remoteConflictIds}) <= 128
+        AND (${table.state} = 'conflict' OR ${table.remoteConflictIds} = '[]'::jsonb)`,
     ),
     retryCheck: check(
       "progressive_worker_delivery_failures_check",

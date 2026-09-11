@@ -1,6 +1,7 @@
 import { runRemoteTransferSteps } from "./remote-transfer-steps";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 import { renewIndependentPromises } from "./remote-promise-renewal";
+import { measureRemoteReconciliationStep } from "./remote-reconciliation-timing";
 import {
   airfoils,
   boundaryConditions,
@@ -6970,7 +6971,9 @@ export async function reconcileRemoteSolverTick(
         await setStatus(db, "disabled", null);
       return false;
     }
-    await refreshProgressiveWorkerCapabilities(db, engine);
+    await measureRemoteReconciliationStep("capabilities", () =>
+      refreshProgressiveWorkerCapabilities(db, engine),
+    );
     if (!settings.remoteSolverRegisteredId || !settings.remoteSolverAuthToken) {
       if (!settings.upstreamSecret)
         throw new Error(
@@ -6978,18 +6981,29 @@ export async function reconcileRemoteSolverTick(
         );
       await registerSolver(db, settings);
     }
-    const intake = await receiveProgressiveCampaignAssignments(db, engine);
+    const intake = await measureRemoteReconciliationStep(
+      "assignment_intake",
+      () => receiveProgressiveCampaignAssignments(db, engine),
+    );
     if (intake.seen || intake.errors.length)
       console.log(
         JSON.stringify({ component: "progressive-remote-intake", ...intake }),
       );
-    await renewMirroredPromiseLeases(db, engine, settings);
-    await expireMirroredRemotePromises(db, settings);
-    await releaseUnacceptedPromiseResults(db, settings);
+    await measureRemoteReconciliationStep("lease_renewal", () =>
+      renewMirroredPromiseLeases(db, engine, settings),
+    );
+    await measureRemoteReconciliationStep("promise_expiry", () =>
+      expireMirroredRemotePromises(db, settings),
+    );
+    await measureRemoteReconciliationStep("rejected_results", () =>
+      releaseUnacceptedPromiseResults(db, settings),
+    );
     const { remoteCap, reservedCpuSlots } =
-      await reportRemoteSolverFleetHeartbeat(db, settings, {
-        includeOutcomeCounters: true,
-      });
+      await measureRemoteReconciliationStep("fleet_heartbeat", () =>
+        reportRemoteSolverFleetHeartbeat(db, settings, {
+          includeOutcomeCounters: true,
+        }),
+      );
     return remoteCap > 0 && reservedCpuSlots < remoteCap;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));

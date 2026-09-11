@@ -124,6 +124,7 @@ export async function deliverNextProgressiveWorkerEvidence(
   const sequence = Number(pending.sequence);
   const report = pending.report as unknown as ProgressiveRemoteReport;
   let responseStatus: number | null = null;
+  let importConflictIds: string[] = [];
   try {
     await assertProgressiveWorkerEvidenceJob(db, {
       simJobId: executionId,
@@ -201,7 +202,27 @@ export async function deliverNextProgressiveWorkerEvidence(
       );
     const body = (await response.json()) as {
       progressiveEvidenceReceipts?: unknown;
+      conflictIds?: unknown;
     } | null;
+    if (body?.conflictIds !== undefined) {
+      const uuid =
+        /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+      if (
+        !Array.isArray(body.conflictIds) ||
+        body.conflictIds.length > 128 ||
+        body.conflictIds.some(
+          (value) => typeof value !== "string" || !uuid.test(value),
+        )
+      )
+        throw new Error(
+          "Hub returned malformed progressive import conflict references",
+        );
+      importConflictIds = [...new Set(body.conflictIds as string[])];
+      if (importConflictIds.length)
+        throw new Error(
+          "Progressive evidence delivery requires import conflict review",
+        );
+    }
     const receipts = body?.progressiveEvidenceReceipts;
     const receipt =
       Array.isArray(receipts) && receipts.length === 1
@@ -215,18 +236,19 @@ export async function deliverNextProgressiveWorkerEvidence(
     });
     return true;
   } catch (error) {
-    const conflict = responseStatus === 409;
+    const conflict = responseStatus === 409 || importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures
-        (sim_job_id, sequence, result_attempt_id, point_content_signature, state, attempt_count, retry_after, last_http_status, last_error)
+        (sim_job_id, sequence, result_attempt_id, point_content_signature, state, attempt_count, retry_after, last_http_status, last_error, remote_conflict_ids)
       VALUES (${executionId}::uuid, ${sequence}, ${pending.result_attempt_id}::uuid, ${pending.point_content_signature},
         ${conflict ? "conflict" : "retry"}, 1, ${conflict ? sql`NULL` : sql`clock_timestamp() + interval '2 seconds'`},
-        ${responseStatus}, ${error instanceof Error ? error.message : String(error)})
+        ${responseStatus}, ${error instanceof Error ? error.message : String(error)}, ${JSON.stringify(importConflictIds)}::jsonb)
       ON CONFLICT (sim_job_id, point_content_signature) DO UPDATE SET
         state = excluded.state, attempt_count = progressive_worker_delivery_failures.attempt_count + 1,
         retry_after = CASE WHEN excluded.state = 'conflict' THEN NULL
           ELSE clock_timestamp() + make_interval(secs => LEAST(60, power(2, LEAST(5, progressive_worker_delivery_failures.attempt_count + 1)))::double precision) END,
-        last_http_status = excluded.last_http_status, last_error = excluded.last_error, updated_at = clock_timestamp()
+        last_http_status = excluded.last_http_status, last_error = excluded.last_error,
+        remote_conflict_ids = excluded.remote_conflict_ids, updated_at = clock_timestamp()
     `);
     throw error;
   }

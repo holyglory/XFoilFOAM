@@ -216,6 +216,12 @@ Unconverged evidence remains distinct from accepted points. The full archive pat
 carries the same source proof; a prior compact receipt must not suppress later
 publication when the complete evidence passes the still-current execution gates.
 Existing receipts may replay after cancellation without reopening that execution.
+An explicit import-conflict response is not a successful retained-attempt receipt
+or a transient transport failure. The compact worker records valid remote conflict
+IDs and the original HTTP status, including HTTP 200 conflict responses, then stops
+automatic retries for that exact point. Malformed references and missing receipts
+remain retryable. The hub's preserved conflict and immutable reports remain the
+review sources; recording a conflict never accepts or replaces solver evidence.
 Both compact and full-result imports persist the hub's retained-attempt receipt
 before recording archive custody. A replay keeps the original receipt's report
 sequence, which must resolve to an acknowledged local association for the exact

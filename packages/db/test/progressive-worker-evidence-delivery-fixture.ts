@@ -106,6 +106,54 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     await db.execute(
       sql`DELETE FROM progressive_worker_delivery_failures WHERE sim_job_id = ${executionId}::uuid`,
     );
+    const remoteConflictId = randomUUID();
+    const importConflict = vi.fn(async () =>
+      Response.json({
+        conflictIds: [remoteConflictId, remoteConflictId],
+        progressiveEvidenceReceipts: [],
+      }),
+    );
+    await expect(
+      deliverNextProgressiveWorkerEvidence(db, importConflict),
+    ).rejects.toThrow("import conflict review");
+    const [retainedConflict] =
+      await db.execute(sql`SELECT state,last_http_status,retry_after,remote_conflict_ids
+      FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`);
+    expect(retainedConflict).toMatchObject({
+      state: "conflict",
+      last_http_status: 200,
+      retry_after: null,
+      remote_conflict_ids: [remoteConflictId],
+    });
+    expect(await deliverNextProgressiveWorkerEvidence(db, unused)).toBe(false);
+    expect(importConflict).toHaveBeenCalledTimes(1);
+    expect(unused).not.toHaveBeenCalled();
+    await db.execute(
+      sql`DELETE FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`,
+    );
+    for (const conflictIds of [
+      null,
+      "invalid",
+      ["invalid"],
+      Array.from({ length: 129 }, () => remoteConflictId),
+    ]) {
+      await expect(
+        deliverNextProgressiveWorkerEvidence(db, async () =>
+          Response.json({ conflictIds, progressiveEvidenceReceipts: [] }),
+        ),
+      ).rejects.toThrow("malformed progressive import conflict");
+      const [malformed] =
+        await db.execute(sql`SELECT state,last_http_status,remote_conflict_ids FROM progressive_worker_delivery_failures
+        WHERE sim_job_id=${executionId}::uuid`);
+      expect(malformed).toMatchObject({
+        state: "retry",
+        last_http_status: 200,
+        remote_conflict_ids: [],
+      });
+      await db.execute(
+        sql`DELETE FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`,
+      );
+    }
     const foreign = vi.fn(
       async () =>
         new Response(
