@@ -18,7 +18,7 @@ from rae2822_reference import load_reference, selig_coordinates
 from solver_stability import solver_stability
 from rae2822_grid import write_nasa_grid
 from rae2822_mapping import map_verified_initial_fields
-from rae2822_local_time import attach_pressure_steady_detector, configure_local_time_pressure, continuation_end_iteration, pressure_steady_convergence, restore_local_pressure_state
+from rae2822_local_time import attach_pressure_energy_output, attach_pressure_steady_detector, configure_local_time_pressure, continuation_end_iteration, pressure_steady_convergence, restore_local_pressure_state
 from mpi_binding_experiment import configure_unbound_mpi
 
 
@@ -281,8 +281,10 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False):
     started_at = time.monotonic()
+    if snapshot_audit and (not native_steady_check or not resume_local_pressure or resume_to_iteration is None):
+        raise ValueError("Snapshot audit requires an explicit native-check continuation target")
     if native_steady_check and not local_time_pressure:
         raise ValueError("Native pressure-rate checking requires local-time pressure solving")
     if resume_to_iteration is not None and not resume_local_pressure:
@@ -412,6 +414,13 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
             _set_control_dict_entries(destination / "system/controlDict", {
                 "startFrom": "latestTime", "endTime": report["continuation_target_iteration"],
             })
+            if snapshot_audit:
+                if report["continuation_target_iteration"] - report["experimental_continuation"]["coordinate"] > 250:
+                    raise ValueError("Snapshot audit is limited to250new iterations")
+                attach_pressure_energy_output(destination)
+                _set_control_dict_entries(destination / "system/controlDict", {"writeInterval": 1, "writePrecision": 17})
+                report["benchmark_output_policy"] = {"write_interval_iterations": 1, "retained_field_times": 2,
+                                                       "write_precision": 17, "explicit_energy_field": "h", "purpose": "conserved_rate_audit"}
         elif donor:
             report["donor"] = restore_verified_donor(donor, destination, request.model_dump(mode="json"), enthalpy, transonic, consistent_pressure, density_relaxation)
             _set_control_dict_entries(destination / "system/controlDict", {
@@ -524,6 +533,7 @@ if __name__ == "__main__":
     parser.add_argument("--unbound-mpi", action="store_true")
     parser.add_argument("--resume-to-iteration", type=int)
     parser.add_argument("--native-steady-check", action="store_true")
+    parser.add_argument("--snapshot-audit", action="store_true")
     parser.add_argument("--upwind-energy", action="store_true")
     parser.add_argument("--pressure-krylov", action="store_true")
     parser.add_argument("--pressure-equation-relaxation", nargs="?", const=1, type=float)
@@ -532,4 +542,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit)

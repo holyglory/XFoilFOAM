@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from scripts.materials.rae2822_local_time import attach_pressure_steady_detector, pressure_steady_convergence
+from scripts.materials.rae2822_local_time import attach_pressure_energy_output, attach_pressure_steady_detector, pressure_steady_convergence
 
 
 def references():
@@ -25,6 +25,20 @@ def test_detector_preserves_force_function_and_uses_derived_references(tmp_path)
     assert receipt["force_window_samples"] == 200
     with pytest.raises(ValueError, match="fresh"):
         attach_pressure_steady_detector(tmp_path, references(), 1e-5)
+
+
+def test_energy_output_is_an_explicit_addition_and_preserves_the_detector(tmp_path):
+    path = tmp_path / "system/controlDict"
+    path.parent.mkdir()
+    path.write_text("functions { forceCoeffs1 { type forceCoeffs; } }")
+    attach_pressure_steady_detector(tmp_path, references(), 1e-5)
+    attach_pressure_energy_output(tmp_path)
+    assert "pressureSteadyConvergence" in path.read_text()
+    assert "pressureEnergySnapshots" in path.read_text()
+    assert "writeOption     anyWrite;" in path.read_text()
+    assert "objects         (h);" in path.read_text()
+    with pytest.raises(ValueError, match="fresh"):
+        attach_pressure_energy_output(tmp_path)
 
 
 @pytest.mark.parametrize("tolerance", [0, -1, True, float('nan'), float('inf')])

@@ -63,6 +63,19 @@ def pressure_steady_convergence(log, tolerance, force_stable, stability, energy_
             "interpretation": "native_local_iteration_rates_and_force_window"}
 
 
+def attach_pressure_energy_output(directory):
+    path = Path(directory) / "system/controlDict"
+    original = path.read_text()
+    matches = list(re.finditer(r"\bfunctions\s*\{", original))
+    if len(matches) != 1 or re.search(r"\bpressureEnergySnapshots\b", original):
+        raise ValueError("Energy snapshots require one fresh function-object dictionary")
+    config = {"type": "writeObjects", "libs": [Raw('"libutilityFunctionObjects.so"')],
+              "objects": ["h"], "writeOption": "anyWrite", "writeControl": "timeStep", "writeInterval": 1}
+    body = "\n" + "\n".join(_render_entries({"pressureEnergySnapshots": config}, 4)) + "\n"
+    position = matches[0].end()
+    path.write_text(original[:position] + body + original[position:])
+
+
 def restore_local_pressure_state(source, destination, request, execution):
     destination = Path(destination).resolve()
     source = Path(source).resolve()
