@@ -1404,6 +1404,38 @@ port = true
 route = true
 timeout_seconds = 3300
 
+[deployment.rae-pressure-limiter-continuation]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-pressure-limiter-continuation.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-pressure-limiter-continuation"]
+finite_services = ["enthalpy-pressure-limiter-continuation"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.rae-pressure-limiter-refined]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-pressure-limiter-refined.component.numerics]
+type = "compose"
+files = ["compose.rae-verification.yml"]
+services = ["artifacts", "enthalpy-pressure-limiter-refined"]
+finite_services = ["enthalpy-pressure-limiter-refined"]
+build = false
+port = true
+route = true
+timeout_seconds = 3300
+
 [deployment.rae-pressure-advection-study]
 source = ["worktree"]
 components = ["numerics"]

@@ -92,6 +92,20 @@ services:
       - /mnt/build-storage/codex/xfoilfoam-verification/rae2822-local-pressure-20260910:/continuation:ro
       - rae-evidence:/evidence
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/enthalpy-local-continuation", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--processes", "4", "--local-time-pressure", "--resume-local-pressure", "/continuation"]
+  enthalpy-pressure-limiter-continuation:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    volumes:
+      - ./scripts/materials:/verification:ro
+      - ./tests/fixtures/rae2822:/reference:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
+      - /mnt/build-storage/codex/xfoilfoam-verification/rae2822-pressure-advection-20260910:/continuation:ro
+      - rae-evidence:/evidence
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/enthalpy-pressure-limiter-continuation", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--processes", "4", "--local-time-pressure", "--pressure-advection", "vanLeer", "--resume-local-pressure", "/continuation"]
+  enthalpy-pressure-limiter-refined:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-pressure-limiter-refined", "--tier", "refined", "--wall-functions", "--uniform-start", "--enthalpy", "--processes", "4", "--local-time-pressure", "--pressure-advection", "vanLeer", "--time-budget-seconds", "3000"]
   enthalpy-local-pressure-limiter:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
