@@ -8124,6 +8124,54 @@ export const progressiveWorkerArchiveReceipts = pgTable(
   }),
 );
 
+export const progressiveWorkerArchiveReclaims = pgTable(
+  "progressive_worker_archive_reclaims",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    claimToken: uuid("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    retryAfter: timestamp("retry_after", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    reclaimedBytes: bigint("reclaimed_bytes", { mode: "number" }),
+    lastError: text("last_error"),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    source: foreignKey({
+      columns: [table.simJobId, table.pointContentSignature],
+      foreignColumns: [
+        progressiveWorkerArchiveReceipts.simJobId,
+        progressiveWorkerArchiveReceipts.pointContentSignature,
+      ],
+    }).onDelete("cascade"),
+    attempts: check(
+      "progressive_worker_archive_reclaims_attempt_count_check",
+      sql`${table.attemptCount} >= 0`,
+    ),
+    bytes: check(
+      "progressive_worker_archive_reclaims_reclaimed_bytes_check",
+      sql`${table.reclaimedBytes} >= 0`,
+    ),
+    claim: check(
+      "progressive_worker_archive_reclaims_check",
+      sql`(${table.claimToken} IS NULL) = (${table.claimExpiresAt} IS NULL)`,
+    ),
+    complete: check(
+      "progressive_worker_archive_reclaims_check1",
+      sql`(${table.completedAt} IS NULL) = (${table.reclaimedBytes} IS NULL)`,
+    ),
+    due: index("progressive_worker_archive_reclaims_due_idx")
+      .on(table.retryAfter)
+      .where(sql`${table.completedAt} IS NULL`),
+  }),
+);
+
 export const progressiveWorkerArchiveDeliveries = pgTable(
   "progressive_worker_archive_deliveries",
   {

@@ -215,6 +215,15 @@ deliveries without an archive return no custody receipt. Receipt verification us
 the existing registered-solver credential with a distinct receipt kind and signing
 domain. Local deletion still requires the separate fresh generation-pinned restore
 proof; receiving custody alone does not invoke cleanup.
+The existing remote reclamation service discovers previously stored progressive
+custody in a separate durable outbox. It excludes legacy accepted-point bindings,
+requires a physically stopped terminal job without live continuation ownership,
+authenticates the original source and custody, and registers the exact proxyable
+remote archive reference. Only a fresh generation-pinned download read to EOF
+with matching size and SHA-256 permits the native job-locked, manifest-checked
+cleanup. Native acknowledgement and deletion intent make interrupted cleanup
+restart-safe. Failed verification keeps local bytes and a bounded retry deadline;
+successful reclamation never changes coefficients, classifications or promises.
 The worker verifies custody against its acknowledged source and prior compact hub
 receipt, then stores it immutably and idempotently. Accepted-archive delivery uses
 this record as a separate step before its existing fulfillment checks; cancelled

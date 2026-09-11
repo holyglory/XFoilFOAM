@@ -480,8 +480,37 @@ def _brokered_reclaim_authorization(
     )
 
 
+def _progressive_reclaim_authorization(authorization):
+    receipt = authorization.receipt
+    return BrokeredRemoteEvidenceReclaim(
+        job_id=authorization.job_id,
+        case_slug=authorization.case_slug,
+        evidence_base=authorization.evidence_base,
+        receipt={
+            "schemaVersion": 1,
+            "kind": "hub-progressive-evidence-custody",
+            "source": {
+                "engineJobId": authorization.job_id,
+                "engineCaseSlug": authorization.case_slug,
+                "progressiveEvidence": {
+                    "sequence": 2,
+                    "reportContentSignature": "b" * 64,
+                    "pointContentSignature": "c" * 64,
+                },
+            },
+            "brokeredUploadId": receipt["brokeredUploadId"],
+            "canonical": {**receipt["canonical"], "archiveId": "d" * 36},
+            "remote": receipt["remote"],
+            "boundAt": receipt["boundAt"],
+        },
+        receipt_hmac=authorization.receipt_hmac,
+    )
+
+
+@pytest.mark.parametrize("progressive", [False, True])
 def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
     tmp_path: Path,
+    progressive: bool,
 ) -> None:
     job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
     legacy_archive = evidence / "openfoam_evidence.tar.gz"
@@ -489,6 +518,8 @@ def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
     authorization = _brokered_reclaim_authorization(
         job_root, evidence, publication
     )
+    if progressive:
+        authorization = _progressive_reclaim_authorization(authorization)
     with pytest.raises(RuntimeError, match="injected"):
         reclaim_brokered_remote_evidence(
             job_root,
@@ -548,13 +579,17 @@ def test_brokered_reclaim_can_skip_job_lock_after_api_proves_case_inactive(
     assert completed.bytes_freed > 0
 
 
+@pytest.mark.parametrize("progressive", [False, True])
 def test_brokered_reclaim_refuses_repopulated_or_changed_intended_paths(
     tmp_path: Path,
+    progressive: bool,
 ) -> None:
     job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
     authorization = _brokered_reclaim_authorization(
         job_root, evidence, publication
     )
+    if progressive:
+        authorization = _progressive_reclaim_authorization(authorization)
     with pytest.raises(RuntimeError, match="injected"):
         reclaim_brokered_remote_evidence(
             job_root,
@@ -567,6 +602,26 @@ def test_brokered_reclaim_refuses_repopulated_or_changed_intended_paths(
         reclaim_brokered_remote_evidence(job_root, evidence, authorization)
     assert (evidence / "engine_evidence.tar.zst").is_file()
     assert not (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).exists()
+
+
+@pytest.mark.parametrize("failure", ["unlocked", "foreign_source", "missing_archive", "bad_manifest"])
+def test_progressive_reclaim_preserves_bytes_without_exact_stopped_custody(tmp_path, failure):
+    job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    authorization = _progressive_reclaim_authorization(
+        _brokered_reclaim_authorization(job_root, evidence, publication)
+    )
+    if failure == "foreign_source":
+        authorization.receipt["source"]["engineJobId"] = "foreign"
+    elif failure == "missing_archive":
+        authorization.receipt["canonical"].pop("archiveId")
+    elif failure == "bad_manifest":
+        authorization.receipt["remote"]["manifestSha256"] = "f" * 64
+    with pytest.raises(EvidenceCleanupError):
+        reclaim_brokered_remote_evidence(
+            job_root, evidence, authorization, acquire_job_lock=failure != "unlocked"
+        )
+    assert (evidence / "engine_evidence.tar.zst").is_file()
+    assert (evidence / "openfoam").is_dir()
 
 
 def test_tar_zst_upload_materialize_and_selective_hydration_round_trip(tmp_path: Path) -> None:

@@ -996,13 +996,26 @@ def reclaim_brokered_remote_evidence(
     receipt = authorization.receipt
     remote = receipt.get("remote")
     canonical = receipt.get("canonical")
+    progressive = receipt.get("kind") == "hub-progressive-evidence-custody"
+    source = receipt.get("source") if progressive else receipt
+    binding_valid = (
+        acquire_job_lock
+        and isinstance(source, dict)
+        and isinstance(source.get("progressiveEvidence"), dict)
+        and isinstance(canonical, dict)
+        and isinstance(canonical.get("archiveId"), str)
+        and bool(canonical.get("archiveId"))
+    ) if progressive else (
+        receipt.get("kind") == "hub-canonical-evidence-binding"
+        and receipt.get("bindingState") == "bound"
+        and receipt.get("promisePointState") == "fulfilled"
+    )
     if (
         receipt.get("schemaVersion") != 1
-        or receipt.get("kind") != "hub-canonical-evidence-binding"
-        or receipt.get("bindingState") != "bound"
-        or receipt.get("promisePointState") != "fulfilled"
-        or receipt.get("engineJobId") != authorization.job_id
-        or receipt.get("engineCaseSlug") != authorization.case_slug
+        or not binding_valid
+        or not isinstance(source, dict)
+        or source.get("engineJobId") != authorization.job_id
+        or source.get("engineCaseSlug") != authorization.case_slug
         or not isinstance(remote, dict)
         or not isinstance(canonical, dict)
         or not all(
@@ -1014,8 +1027,13 @@ def reclaim_brokered_remote_evidence(
         or any(c not in "0123456789abcdef" for c in authorization.receipt_hmac)
     ):
         raise EvidenceCleanupError(
-            "exact bound and fulfilled hub receipt is required for brokered reclaim"
+            "exact hub binding or stopped progressive custody is required for brokered reclaim"
         )
+
+    verification = (
+        "hub-signed-progressive-custody+local-archive+intent"
+        if progressive else "hub-signed-bind+fulfillment+local-archive+intent"
+    )
 
     required_hashes = ("storedSha256", "tarSha256", "manifestSha256")
     if any(
@@ -1105,7 +1123,7 @@ def reclaim_brokered_remote_evidence(
                 ack_path,
                 {
                     "schemaVersion": 1,
-                    "state": "hub_bound_and_fulfilled",
+                    "state": "hub_progressive_custody" if progressive else "hub_bound_and_fulfilled",
                     "authorization": canonical_authorization,
                     "registeredAt": datetime.now(timezone.utc).isoformat(),
                 },
@@ -1202,7 +1220,7 @@ def reclaim_brokered_remote_evidence(
                 state="no_local_bytes",
                 evidence_base=authorization.evidence_base,
                 bytes_freed=int(existing_intent["plannedBytes"]),
-                verification="hub-signed-bind+fulfillment+local-archive+intent",
+                verification=verification,
                 association_count=1,
             )
 
@@ -1224,7 +1242,7 @@ def reclaim_brokered_remote_evidence(
             state="complete",
             evidence_base=authorization.evidence_base,
             bytes_freed=int(existing_intent["plannedBytes"]),
-            verification="hub-signed-bind+fulfillment+local-archive+intent",
+            verification=verification,
             association_count=1,
         )
 

@@ -22,6 +22,47 @@ command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "node-su
 [test.types]
 timeout_seconds = 1800
 
+[test.progressive-archive-reclaim]
+timeout_seconds = 900
+
+[test.progressive-archive-reclaim.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-archive-reclaim.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.progressive-archive-reclaim.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.progressive-archive-reclaim.check]]
+name = "readback"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-archive-reclaim.test.ts"]
+
+[[test.progressive-archive-reclaim.check]]
+name = "native-reclaim"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "-q"]
+
+[[test.progressive-archive-reclaim.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-archive-reclaim.check]]
+name = "custody-reclaim"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+
 [[test.types.check]]
 name = "main"
 tier = "development"
@@ -576,6 +617,17 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "restart-retention-native"
 tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_retention.py", "-q"]
+
+[[test.progressive.check]]
+name = "progressive-archive-reclaim"
+tier = "development"
+requires = ["types", "dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-archive-reclaim.test.ts"]
+
+[[test.progressive.check]]
+name = "progressive-archive-reclaim-native"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "-q"]
 
 [[test.progressive.check]]
 name = "retained-report-api"

@@ -63,6 +63,10 @@ import { observeProgressiveRemoteJob } from "./progressive-remote-observation";
 import { receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
 import {
+  reclaimProgressiveArchives,
+  runArchiveReclaimPass,
+} from "./progressive-archive-reclaim";
+import {
   claimProgressiveWorkerArchive,
   renewProgressiveWorkerArchiveClaim,
   settleProgressiveWorkerArchiveClaim,
@@ -7104,7 +7108,11 @@ export async function reclaimRemoteSolverEvidenceTick(
   // Deletion still requires the current owning solver token to read back and
   // authenticate each exact bound hub archive. Missing/rotated credentials
   // leave the durable outbox and all local bytes intact.
-  return processBrokeredRemoteEvidenceReclaims(db, settings, 8, engine);
+  return runArchiveReclaimPass(
+    (limit) =>
+      processBrokeredRemoteEvidenceReclaims(db, settings, limit, engine),
+    (limit) => reclaimProgressiveArchives(db, settings, limit),
+  );
 }
 
 const scheduleRemoteReclaimOnce = createSingleFlightBackgroundRunner(

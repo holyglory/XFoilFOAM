@@ -12,6 +12,7 @@ import {
 } from "../src/progressive-evidence-custody";
 import { progressiveArchiveManifestBytes } from "./progressive-archive-data";
 import { deliverNextProgressiveWorkerArchive } from "../../../apps/sweeper/src/remote-solver";
+import { reclaimProgressiveArchives } from "../../../apps/sweeper/src/progressive-archive-reclaim";
 import {
   claimProgressiveWorkerArchive,
   nextProgressiveArchiveWakeAt,
@@ -375,6 +376,149 @@ export async function verifyProgressiveWorkerArchiveDelivery(
         fulfilled: 0,
         valid: false,
       });
+      const [settings] = await connection.execute(
+        sql`SELECT upstream_base_url FROM sync_api_settings WHERE id=1`,
+      );
+      const reclaimSettings = {
+        upstreamBaseUrl: String(settings.upstream_base_url),
+        remoteSolverAuthToken: String(source.remote_solver_auth_token),
+        remoteSolverRegisteredId: String(source.remote_solver_registered_id),
+      };
+      let corruptReadback = true;
+      let stealClaim = false;
+      let engineReclaims = 0;
+      const previousControlToken = process.env.ENGINE_CONTROL_PLANE_TOKEN;
+      process.env.ENGINE_CONTROL_PLANE_TOKEN =
+        "isolated-progressive-reclaim-control";
+      fetcher.mockImplementation(async (input, init) => {
+        const url = String(input);
+        expect(init?.redirect).toBe("error");
+        if (url.endsWith(`/evidence-uploads/${uploadId}/download`)) {
+          if (stealClaim) {
+            await connection.execute(sql`UPDATE progressive_worker_archive_reclaims SET claim_token=${randomUUID()}::uuid,
+              claim_expires_at=clock_timestamp()+interval '30 minutes' WHERE sim_job_id=${executionId}::uuid`);
+          }
+          expect(
+            new Headers(init?.headers).get("x-xfoilfoam-solver-token"),
+          ).toBe(reclaimSettings.remoteSolverAuthToken);
+          return new Response(bundleBytes, {
+            headers: {
+              "content-type": "application/zstd",
+              "content-length": String(bundleBytes.length),
+              "x-content-sha256": bundleHash,
+              "x-gcs-generation": corruptReadback ? "wrong" : remote.generation,
+            },
+          });
+        }
+        expect(url.endsWith("/internal/evidence-uploads/reclaim")).toBe(true);
+        const payload = JSON.parse(String(init?.body));
+        expect(payload).toMatchObject({
+          jobId: executionId,
+          evidenceBase: "isolated-case",
+          receipt: {
+            kind: "hub-progressive-evidence-custody",
+            source: { engineJobId: executionId },
+          },
+        });
+        expect(payload.receipt).not.toHaveProperty("promisePointState");
+        engineReclaims += 1;
+        return Response.json({
+          state: "complete",
+          bytes_freed: 1234,
+          evidence_base: "isolated-case",
+          verification: "hub-signed-progressive-custody+local-archive+intent",
+        });
+      });
+      try {
+        await connection.execute(
+          sql`UPDATE sim_jobs SET status='running' WHERE id=${executionId}::uuid`,
+        );
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(0);
+        expect(engineReclaims).toBe(0);
+        await connection.execute(
+          sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${executionId}::uuid`,
+        );
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(0);
+        const [refused] = await connection.execute(
+          sql`SELECT attempt_count,last_error,completed_at FROM progressive_worker_archive_reclaims WHERE sim_job_id=${executionId}::uuid`,
+        );
+        expect(refused).toMatchObject({
+          attempt_count: 1,
+          completed_at: null,
+          last_error: expect.stringContaining("readback"),
+        });
+        expect(engineReclaims).toBe(0);
+        const priorReads = fetcher.mock.calls.length;
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(0);
+        expect(fetcher.mock.calls.length).toBe(priorReads);
+        corruptReadback = false;
+        await connection.execute(
+          sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true WHERE id=1`,
+        );
+        await connection.execute(
+          sql`UPDATE progressive_worker_archive_reclaims SET retry_after=clock_timestamp()-interval '1 second' WHERE sim_job_id=${executionId}::uuid`,
+        );
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(0);
+        expect(fetcher.mock.calls.length).toBe(priorReads);
+        await connection.execute(
+          sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=false WHERE id=1`,
+        );
+        stealClaim = true;
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(0);
+        expect(engineReclaims).toBe(0);
+        const [stolen] = await connection.execute(
+          sql`SELECT claim_token,completed_at FROM progressive_worker_archive_reclaims WHERE sim_job_id=${executionId}::uuid`,
+        );
+        expect(stolen.claim_token).not.toBeNull();
+        expect(stolen.completed_at).toBeNull();
+        stealClaim = false;
+        await connection.execute(
+          sql`UPDATE progressive_worker_archive_reclaims SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE sim_job_id=${executionId}::uuid`,
+        );
+        await connection.execute(
+          sql`UPDATE progressive_worker_archive_reclaims SET retry_after=clock_timestamp()-interval '1 second' WHERE sim_job_id=${executionId}::uuid`,
+        );
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(1);
+        const [reclaimed] = await connection.execute(
+          sql`SELECT completed_at IS NOT NULL AS complete,reclaimed_bytes,claim_token FROM progressive_worker_archive_reclaims WHERE sim_job_id=${executionId}::uuid`,
+        );
+        expect(reclaimed).toMatchObject({
+          complete: true,
+          reclaimed_bytes: "1234",
+          claim_token: null,
+        });
+        expect(
+          await reclaimProgressiveArchives(connection, reclaimSettings, 1),
+        ).toBe(0);
+        expect(engineReclaims).toBe(1);
+        const [reference] = await connection.execute(
+          sql`SELECT remote_download_url,availability,metadata FROM remote_asset_references WHERE local_storage_key=${bundleKey}`,
+        );
+        expect(reference).toMatchObject({
+          remote_download_url: expect.stringContaining(
+            `/evidence-uploads/${uploadId}/download`,
+          ),
+          availability: "remote_only",
+          metadata: { generation: remote.generation },
+        });
+        expect(await readFile(join(root, bundleKey))).toEqual(bundleBytes);
+      } finally {
+        if (previousControlToken === undefined)
+          delete process.env.ENGINE_CONTROL_PLANE_TOKEN;
+        else process.env.ENGINE_CONTROL_PLANE_TOKEN = previousControlToken;
+      }
       throw rollback;
     });
   } catch (error) {

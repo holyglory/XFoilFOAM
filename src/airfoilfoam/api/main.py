@@ -1902,6 +1902,13 @@ def create_app() -> FastAPI:
         terminal = {JobState.completed, JobState.failed, JobState.cancelled}
         terminal_job = status is not None and status.state in terminal
         terminal_result = result is not None and result.state in terminal
+        if request.receipt.get("kind") == "hub-progressive-evidence-custody" and not (
+            terminal_job and terminal_result
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Progressive evidence reclaim requires a stopped terminal job",
+            )
         if not (terminal_job and terminal_result):
             # Partial running results are published after each completed case.
             # Once the hub has returned an exact signed binding receipt, that

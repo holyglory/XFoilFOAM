@@ -115,7 +115,38 @@ def test_brokered_reclaim_accepts_only_completed_inactive_case_from_running_job(
         assert accepted.json()["bytes_freed"] == 4096
         assert active.status_code == 409
         assert missing.status_code == 409
+        progressive = client.post(
+            "/internal/evidence-uploads/reclaim",
+            headers=headers,
+            json={
+                "jobId": job_id,
+                "caseSlug": completed_slug,
+                "evidenceBase": "evidence",
+                "receipt": {"kind": "hub-progressive-evidence-custody", "aoaDeg": 0.0},
+                "receiptHmac": "a" * 64,
+            },
+        )
+        assert progressive.status_code == 409
         assert calls == [completed_slug]
         assert lock_modes == [False]
+        for name in ("status.json", "result.json"):
+            path = job_root / name
+            payload = json.loads(path.read_text())
+            payload["state"] = "completed"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        terminal_custody = client.post(
+            "/internal/evidence-uploads/reclaim",
+            headers=headers,
+            json={
+                "jobId": job_id,
+                "caseSlug": completed_slug,
+                "evidenceBase": "evidence",
+                "receipt": {"kind": "hub-progressive-evidence-custody"},
+                "receiptHmac": "a" * 64,
+            },
+        )
+        assert terminal_custody.status_code == 200
+        assert calls == [completed_slug, completed_slug]
+        assert lock_modes == [False, True]
     finally:
         get_settings.cache_clear()
