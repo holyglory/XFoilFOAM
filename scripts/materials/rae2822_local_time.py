@@ -93,6 +93,41 @@ def configure_low_re_k_wall(directory):
     path.write_text(original[:patch.start(1)] + changed + original[patch.end(1):])
 
 
+def normalized_continuation_control(text, start_from, end_iteration):
+    if start_from not in {"startTime", "latestTime"} or type(end_iteration) is not int or end_iteration <= 0:
+        raise ValueError("Invalid recorded continuation control window")
+    for key, expected in (("startFrom", start_from), ("endTime", str(end_iteration))):
+        matches = list(re.finditer(rf"(?m)^({key}[ \t]+)([^;\n]+)(;[ \t]*)$", text))
+        if len(matches) != 1 or matches[0][2].strip() != expected:
+            raise ValueError("Continuation control window differs from its recorded allocation")
+        match = matches[0]
+        text = text[:match.start(2)] + f"<{key}>" + text[match.end(2):]
+    return text
+
+
+def continuation_controls_match(source_text, target_text, report, request):
+    if source_text == target_text:
+        return True
+    previous = report.get("experimental_continuation")
+    if not isinstance(previous, dict) or previous.get("kind") != "uncertified_local_iteration_continuation":
+        return False
+    original_limit = request["solver"]["n_iterations"]
+    source_limit = report.get("continuation_target_iteration")
+    return normalized_continuation_control(source_text, "latestTime", source_limit) == normalized_continuation_control(target_text, "startTime", original_limit)
+
+
+def tighten_pressure_inner_solves(directory):
+    path = Path(directory) / "system/fvSolution"
+    original = path.read_text()
+    changed, absolute = re.subn(r"\btolerance\s+(?:1e-07|1e-08)\s*;", "tolerance 1e-12;", original)
+    changed, relative = re.subn(r"\brelTol\s+(?:0\.01|0)\s*;", "relTol 0;", changed)
+    if absolute != 4 or relative != 4:
+        raise ValueError("Tighter inner solves require four original pressure/transport solver entries")
+    path.write_text(changed)
+    return {"before_sha256": hashlib.sha256(original.encode()).hexdigest(), "after_sha256": hashlib.sha256(changed.encode()).hexdigest(),
+            "absolute_tolerance": 1e-12, "relative_tolerance": 0, "acceptance_threshold_changed": False}
+
+
 def restore_local_pressure_state(source, destination, request, execution):
     destination = Path(destination).resolve()
     source = Path(source).resolve()
@@ -116,7 +151,13 @@ def restore_local_pressure_state(source, destination, request, execution):
     if isinstance(previous_cost, bool) or not isinstance(previous_cost, (int, float)) or not math.isfinite(previous_cost) or previous_cost < active:
         raise ValueError("Experimental continuation accumulated cost is invalid")
     for name in ("system/fvSchemes", "system/fvSolution", "system/controlDict", "constant/thermophysicalProperties", "constant/turbulenceProperties", "constant/numericalExecution.json"):
-        if name not in verified or hashlib.sha256((destination / name).read_bytes()).hexdigest() != verified[name]:
+        if name not in verified:
+            raise ValueError("Experimental continuation dictionaries differ")
+        if name == "system/controlDict":
+            matches = continuation_controls_match((source / name).read_text(), (destination / name).read_text(), report, request)
+        else:
+            matches = hashlib.sha256((destination / name).read_bytes()).hexdigest() == verified[name]
+        if not matches:
             raise ValueError("Experimental continuation dictionaries differ")
     time_name = str(coordinate)
     required = [f"{time_name}/{name}" for name in ("U", "p", "T", "k", "omega", "rho", "phi", "rDeltaT")]

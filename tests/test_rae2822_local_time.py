@@ -196,3 +196,35 @@ def test_continuation_rejects_changed_target_dictionary_and_unmanifested_source(
     (source / "3000/unmanifested").write_text("unverified bytes")
     with pytest.raises(ValueError, match="unauthenticated"):
         restore_local_pressure_state(source, target, request, execution)
+
+
+def test_continuation_chain_normalizes_only_the_authenticated_execution_window():
+    from scripts.materials.rae2822_local_time import continuation_controls_match
+
+    target = "startFrom       startTime;\nendTime         3000;\ndeltaT          1;\n"
+    source = target.replace("startTime", "latestTime").replace("3000", "30000")
+    report = {"experimental_continuation": {"kind": "uncertified_local_iteration_continuation"}, "continuation_target_iteration": 30000}
+    request = {"solver": {"n_iterations": 3000}}
+    assert continuation_controls_match(source, target, report, request)
+    assert not continuation_controls_match(source.replace("deltaT          1", "deltaT          2"), target, report, request)
+    assert not continuation_controls_match(source, target, {}, request)
+    with pytest.raises(ValueError, match="recorded allocation"):
+        continuation_controls_match(source.replace("30000", "30001"), target, report, request)
+    with pytest.raises(ValueError):
+        continuation_controls_match(source + "endTime 30000;\n", target, report, request)
+
+
+def test_tighter_inner_solves_preserve_outer_acceptance_and_every_other_setting(tmp_path):
+    from scripts.materials.rae2822_local_time import tighten_pressure_inner_solves
+
+    path = tmp_path / "system/fvSolution"
+    path.parent.mkdir()
+    original = 'solvers { p { tolerance 1e-07; relTol 0.01; } pFinal { tolerance 1e-07; relTol 0; } "(U|h|k|omega)" { tolerance 1e-08; relTol 0.01; } "(U|h|k|omega)Final" { tolerance 1e-08; relTol 0; } }\nPIMPLE { maxCo 0.8; nOuterCorrectors 3; }\n'
+    path.write_text(original)
+    receipt = tighten_pressure_inner_solves(tmp_path)
+    expected = original.replace("tolerance 1e-07;", "tolerance 1e-12;").replace("tolerance 1e-08;", "tolerance 1e-12;").replace("relTol 0.01;", "relTol 0;")
+    assert path.read_text() == expected
+    assert receipt["acceptance_threshold_changed"] is False
+    assert receipt["before_sha256"] != receipt["after_sha256"]
+    with pytest.raises(ValueError, match="four original"):
+        tighten_pressure_inner_solves(tmp_path)
