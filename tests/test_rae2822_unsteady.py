@@ -40,6 +40,19 @@ def test_nonuniform_frames_are_time_weighted_and_missing_intervals_are_not_bridg
     assert incomplete["available"] is False and incomplete["reason"] == "pressure_frame_gap"
 
 
+def test_common_window_interpolates_boundaries_without_inventing_saved_frames():
+    frames = [(float(timestamp), {side: [[0.1, float(timestamp)], [0.9, float(timestamp)]] for side in ("upper", "lower")})
+              for timestamp in np.linspace(2, 5, 61)]
+    window = physical_window(1, 1)
+    result = weighted_pressure_mean(frames, window, (2.12, 4.34))
+    assert result["available"] and result["field_frames"] == 44
+    assert result["interpolated_boundaries"] == [2.12, 4.34]
+    assert result["mean"]["upper"][0][1] == pytest.approx(3.23, abs=1e-12)
+    for interval in ((1.9, 4.5), (2.1, 5.1), (4, 3), (True, 4), (2, float("nan"))):
+        with pytest.raises(ValueError):
+            weighted_pressure_mean(frames, window, interval)
+
+
 def test_pressure_mean_refuses_duplicate_times_changed_mesh_and_nonfinite_values():
     window = physical_window(1, 1)
     with pytest.raises(ValueError, match="unique"):

@@ -31,7 +31,7 @@ def validate_held_report(report, coefficients):
     return report["fields_iteration"]
 
 
-def weighted_pressure_mean(samples, window):
+def weighted_pressure_mean(samples, window, interval=None):
     if not samples:
         return {"available": False, "reason": "no_saved_pressure_frames", "field_frames": 0}
     samples = sorted(samples, key=lambda sample: sample[0])
@@ -39,11 +39,30 @@ def weighted_pressure_mean(samples, window):
     if not np.isfinite(times).all() or np.any(times <= 0) or np.any(np.diff(times) <= 0):
         raise ValueError("Pressure frames require unique increasing physical times")
     selected = [sample for sample in samples if sample[0] >= window["startup_until"]]
-    if len(selected) < window["minimum_field_frames"] or selected[-1][0] - selected[0][0] < window["minimum_comparison_duration"]:
-        return {"available": False, "reason": "insufficient_developed_history", "field_frames": len(selected)}
+    if not selected:
+        return {"available": False, "reason": "insufficient_developed_history", "field_frames": 0}
+    if interval is None:
+        start, end = selected[0][0], selected[-1][0]
+    else:
+        if not isinstance(interval, (tuple, list)) or len(interval) != 2 or any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in interval
+        ):
+            raise ValueError("Pressure comparison interval must be finite physical times")
+        start, end = interval
+        if start >= end or start < selected[0][0] or end > selected[-1][0]:
+            raise ValueError("Pressure comparison interval is outside developed saved evidence")
     times = np.asarray([sample[0] for sample in selected])
-    if np.max(np.diff(times)) > window["write_interval"] * 1.5:
-        return {"available": False, "reason": "pressure_frame_gap", "field_frames": len(selected)}
+    actual_count = int(np.count_nonzero((times >= start) & (times <= end)))
+    if actual_count < window["minimum_field_frames"] or end - start < window["minimum_comparison_duration"]:
+        return {"available": False, "reason": "insufficient_developed_history", "field_frames": actual_count}
+    first = max(0, int(np.searchsorted(times, start, side="right")) - 1)
+    last = min(len(selected) - 1, int(np.searchsorted(times, end, side="left")))
+    selected = selected[first:last + 1]
+    source_times = times[first:last + 1]
+    if np.max(np.diff(source_times)) > window["write_interval"] * 1.5:
+        return {"available": False, "reason": "pressure_frame_gap", "field_frames": actual_count}
+    boundaries = [value for value in (start, end) if value not in source_times]
+    times = np.r_[start, source_times[(source_times > start) & (source_times < end)], end]
     mean = {}
     for side in ("upper", "lower"):
         arrays = [np.asarray(sample[1][side], dtype=float) for sample in selected]
@@ -55,8 +74,10 @@ def weighted_pressure_mean(samples, window):
             raise ValueError("Pressure history changed its spatial sampling")
         if len(coordinates) < 2 or np.any(np.diff(coordinates) <= 0):
             raise ValueError("Pressure history has invalid surface coordinates")
-        values = np.asarray([array[:, 1] for array in arrays])
+        stored = np.asarray([array[:, 1] for array in arrays])
+        values = np.column_stack([np.interp(times, source_times, stored[:, index]) for index in range(stored.shape[1])])
         averaged = np.sum((values[:-1] + values[1:]) * 0.5 * np.diff(times)[:, None], axis=0) / (times[-1] - times[0])
         mean[side] = np.column_stack((coordinates, averaged)).tolist()
-    return {"available": True, "field_frames": len(selected), "start_time": float(times[0]), "end_time": float(times[-1]),
+    return {"available": True, "field_frames": actual_count, "start_time": float(times[0]), "end_time": float(times[-1]),
+            "interpolated_boundaries": boundaries,
             "mean": mean, "statistical_certification": False, "interpretation": "time_weighted_pressure_not_a_period_certificate"}
