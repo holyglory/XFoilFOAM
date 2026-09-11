@@ -1640,6 +1640,22 @@ port = true
 route = true
 timeout_seconds = 900
 
+[deployment.rae-unsteady-horizon]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-unsteady-horizon.component.numerics]
+type = "compose"
+files = ["compose.rae-unsteady-reference.yml"]
+services = ["artifacts", "unsteady-vanleer-horizon"]
+finite_services = ["unsteady-vanleer-horizon"]
+build = false
+port = true
+route = true
+timeout_seconds = 2400
+
 [deployment.rae-density-reference.component.numerics]
 type = "compose"
 files = ["compose.rae-density-reference.yml"]
