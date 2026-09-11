@@ -305,6 +305,21 @@ requires = ["protocol-contract"]
 command = [".venv/bin/python", "-m", "scripts.materials.uiuc_family_calibration", "--archive", "/mnt/build-storage/codex/xfoilfoam-verification/uiuc-volume1-source-20260910/volume01.zip", "--output", ".codex-artifacts/uiuc-family-calibration-v2"]
 retained_artifacts = [{ name = "uiuc-family-calibration", path = ".codex-artifacts/uiuc-family-calibration-v2", max_bytes = 16777216 }]
 
+[test.uiuc-condition-validation]
+timeout_seconds = 600
+
+[[test.uiuc-condition-validation.check]]
+name = "condition-protocol-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_uiuc_condition_validation.py", "tests/test_uiuc_family_calibration.py", "tests/test_uiuc_inventory.py", "tests/test_uiuc_volume1_reference.py", "tests/test_polar_validation.py", "-q"]
+
+[[test.uiuc-condition-validation.check]]
+name = "real-condition-study"
+tier = "development"
+requires = ["condition-protocol-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.uiuc_condition_validation", "--archive", "/mnt/build-storage/codex/xfoilfoam-verification/uiuc-volume1-source-20260910/volume01.zip", "--output", ".codex-artifacts/uiuc-condition-validation-v1"]
+retained_artifacts = [{ name = "uiuc-condition-validation", path = ".codex-artifacts/uiuc-condition-validation-v1", max_bytes = 16777216 }]
+
 [[test.uiuc-reference-inventory.check]]
 name = "source-contract"
 tier = "development"

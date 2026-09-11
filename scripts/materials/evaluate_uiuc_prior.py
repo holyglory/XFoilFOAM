@@ -19,6 +19,7 @@ def identity(value):
 def evaluate_archive(path, profiles=None, include_cases=False):
     source = load_uiuc_volume1_archive(path)
     cases, predictions, limitations = [], [], []
+    condition_values = {}
     policy = PolarModelPolicy("fixed-production-prior-assumptions-evaluation-v1", [0.4, 0.4, 0.1], [0.15, 0.15, 0.03],
                               [0.5, 0.3, 0.1], [0.15, 0.2, 0.03], [0.03, 0.03, 0.005], [0.01, 0.01, 0.001], 2, 0.8, "unvalidated")
     recipe = BaselineRecipe("uiuc-as-tested-prior-evaluation-v1", "large", 0.003, 0.012)
@@ -37,8 +38,10 @@ def evaluate_archive(path, profiles=None, include_cases=False):
                     continue
                 rows = sorted(branch["rows"], key=lambda row: row["alpha"])
                 angles = [row["alpha"] for row in rows]
-                condition_id = identity({"reynolds": run["reynolds"], "mach_assumption": 0, "n_crit_assumption": 9,
-                                         "transition_assumption": "free", "surface": polar["condition"]})
+                physical_condition = {"reynolds": run["reynolds"], "mach_assumption": 0, "n_crit_assumption": 9,
+                                      "transition_assumption": "free", "surface": polar["condition"]}
+                condition_id = identity(physical_condition)
+                condition_values[condition_id] = physical_condition
                 branch_name = f'{branch["direction"]}-{branch_index}'
                 target_id = identity({"geometry": geometry_hash, "condition": condition_id, "source_run": run["source_run"], "branch": branch_name})
                 conditions.append(BaselineCondition(target_id, run["reynolds"], 0, angles, 9, 1, 1, 0))
@@ -63,6 +66,7 @@ def evaluate_archive(path, profiles=None, include_cases=False):
                    "predictions": predictions, "policy": asdict(policy)})
     if include_cases:
         result["case_inputs"] = [asdict(case) for case in cases]
+        result["condition_values"] = condition_values
     return result
 
 

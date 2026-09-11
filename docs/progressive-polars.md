@@ -850,8 +850,24 @@ Both the original and widened intervals covered all 339 held-out rows in 36
 runs across seven families. Thus this candidate did not improve observed
 held-out coverage or prediction errors, and is not adopted into production.
 Family exchangeability is unestablished and seven evaluation families are not
-a calibration certificate. Sparse-CFD refinement, condition holdout and
+a calibration certificate. Sparse-CFD refinement, prospective condition holdout and
 compressible accuracy remain separate validation requirements.
+
+`scripts.materials.uiuc_condition_validation` evaluates the same archive with
+retrospective leave-one-Reynolds-group-out folds. Analyst-defined centers of
+40k, 60k, 100k, 150k, 200k, 250k and 300k, each within 5%, keep nearby measured
+conditions together across profiles and sweep branches. Grouping never changes
+the actual Reynolds used for prediction or its exact physical identity. Values
+outside these declared groups are refused. Each fold retains its exact fitting
+and evaluation condition identities, source hashes, errors and interval coverage.
+Run with `--archive volume01.zip --output new-study-directory`.
+
+The first condition study evaluates all 122 eligible runs and 1,304 rows once
+across seven folds, with the same 15 explicit single-angle exclusions. Each fold
+has only six calibration groups, so no finite 95% conformal scale is available.
+The archive was already used in previous studies: these diagnostics are not an
+untouched prospective holdout, do not validate sparse CFD corrections, and do
+not change the public model or its unvalidated calibration status.
 
 Data attribution is **UIUC Low-Speed Airfoil Test program, Summary of Low-Speed
 Airfoil Data, Volume 1**. Preserve the original archive and its GPL data license,
