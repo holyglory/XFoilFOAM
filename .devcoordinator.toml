@@ -344,7 +344,7 @@ command = [".venv/bin/python", "scripts/materials/inspect_neuralfoil_geometry.py
 [[test.rae-reference.check]]
 name = "source-contract"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_reference.py", "tests/test_rae2822_pressure.py", "tests/test_rae2822_mapping.py", "tests/test_rae2822_local_time.py", "tests/test_pressure_steady_check.py", "tests/test_local_steady_convergence.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_reference.py", "tests/test_rae2822_pressure.py", "tests/test_rae2822_mapping.py", "tests/test_rae2822_local_time.py", "tests/test_pressure_steady_check.py", "tests/test_local_steady_convergence.py", "tests/test_sst_gradient_experiment.py", "-q"]
 
 [test.progressive-hold-live]
 timeout_seconds = 4500
@@ -1448,6 +1448,22 @@ build = false
 port = true
 route = true
 timeout_seconds = 3300
+
+[deployment.pressure-sst-gradients]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.pressure-sst-gradients.component.numerics]
+type = "compose"
+files = ["compose.pressure-courant-check.yml"]
+services = ["artifacts", "pressure-sst-gradients"]
+finite_services = ["pressure-sst-gradients"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
 
 [deployment.pressure-inner-control]
 source = ["worktree"]

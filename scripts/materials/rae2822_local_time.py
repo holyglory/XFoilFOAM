@@ -116,6 +116,24 @@ def continuation_controls_match(source_text, target_text, report, request):
     return normalized_continuation_control(source_text, "latestTime", source_limit) == normalized_continuation_control(target_text, "startTime", original_limit)
 
 
+def limit_sst_gradients(directory):
+    path = Path(directory) / "system/fvSchemes"
+    original = path.read_text()
+    blocks = list(re.finditer(r"\bgradSchemes\s*\{([^{}]*)\}", original))
+    if len(blocks) != 1:
+        raise ValueError("SST gradient study requires one gradient dictionary")
+    block = blocks[0]
+    if (not re.search(r"\blimited\s+cellLimited Gauss linear 1\s*;", block[1])
+            or not re.search(r"\bgrad\(U\)\s+\$limited\s*;", block[1])
+            or re.search(r"\bgrad\((?:k|omega)\)", block[1])):
+        raise ValueError("SST gradient study requires the original velocity-only limiter")
+    additions = "\n    grad(k)         $limited;\n    grad(omega)     $limited;\n"
+    updated = original[:block.end(1)] + additions + original[block.end(1):]
+    path.write_text(updated)
+    return {"before_sha256": hashlib.sha256(original.encode()).hexdigest(), "after_sha256": hashlib.sha256(updated.encode()).hexdigest(),
+            "fields": ["k", "omega"], "scheme": "cellLimited Gauss linear 1", "acceptance_threshold_changed": False}
+
+
 def tighten_pressure_inner_solves(directory):
     path = Path(directory) / "system/fvSolution"
     original = path.read_text()
