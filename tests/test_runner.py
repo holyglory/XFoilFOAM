@@ -93,7 +93,7 @@ def test_parallel_solver_uses_bounded_logical_cpu_slots(tmp_path):
         (
             tmp_path,
             "decomposePar -force && "
-            "mpirun --allow-run-as-root --use-hwthread-cpus -np 8 "
+            "mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np 8 "
             "pimpleFoam -parallel && reconstructPar -latestTime",
             321,
             None,

@@ -125,7 +125,7 @@ class BudgetedRunner(Runner):
                 if n_proc <= 1:
                     result = self.inner.solver(case_dir, app, n_proc, timeout=min(timeout, remaining), restart=restart, monitor=monitor)
                 else:
-                    result = self.inner.run(case_dir, f"mpirun --allow-run-as-root --use-hwthread-cpus -np {n_proc} {app} -parallel",
+                    result = self.inner.run(case_dir, f"mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np {n_proc} {app} -parallel",
                                             timeout=min(timeout, remaining), monitor=monitor)
             finally:
                 with budget.lock:

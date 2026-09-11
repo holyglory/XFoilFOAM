@@ -153,7 +153,7 @@ def test_mpi_only_charges_solver_not_mesh_decomposition_or_reconstruction(budget
     assert runner.consumed(case()) == 4
     assert inner.commands == [
         ("decomposePar -latestTime -force", 7200, None),
-        ("mpirun --allow-run-as-root --use-hwthread-cpus -np 4 rhoPimpleFoam -parallel", 10, monitor),
+        ("mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np 4 rhoPimpleFoam -parallel", 10, monitor),
         ("reconstructPar -latestTime", 7200, None),
     ]
     assert "reconstructPar" in result.stdout

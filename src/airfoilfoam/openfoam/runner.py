@@ -309,7 +309,7 @@ class Runner:
             # eight schedulable hardware threads. Use those real threads as
             # slots; do not use --oversubscribe, which could launch more solver
             # ranks than the worker's bounded CPU budget.
-            f"mpirun --allow-run-as-root --use-hwthread-cpus -np {n_proc} {app} -parallel && "
+            f"mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np {n_proc} {app} -parallel && "
             f"reconstructPar -latestTime"
         )
         return self.run(case_dir, steps, timeout=timeout, monitor=monitor)
