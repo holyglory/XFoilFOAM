@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { expect, it } from "vitest";
+import { VIZ } from "../lib/tokens";
 
 const css = readFileSync(
   new URL("../app/globals.css", import.meta.url),
@@ -49,4 +50,33 @@ it("detects the original low-contrast pairs without rejecting black on white", (
   expect(contrast(channels("#0d9488"), channels("#ffffff"))).toBeLessThan(4.5);
   expect(contrast(channels("#bb7a0c"), channels("#ffffff"))).toBeLessThan(4.5);
   expect(contrast(channels("#000000"), channels("#ffffff"))).toBe(21);
+});
+
+it("keeps evidence captions and stored track scales readable in both themes", () => {
+  const dark = css.match(/\[data-theme="dark"\]\s*\{([^}]+)\}/)![1];
+  for (const theme of [dark, light]) {
+    const color = (name: string) =>
+      channels(
+        theme.match(new RegExp(`--aero-${name}:\\s*(#[a-f0-9]{6});`))![1],
+      );
+    expect(contrast(color("muted"), color("panel2"))).toBeGreaterThanOrEqual(
+      4.5,
+    );
+    expect(contrast(color("dim"), color("panel2"))).toBeLessThan(4.5);
+  }
+  expect(contrast(channels(VIZ.text), channels(VIZ.bg))).toBeGreaterThanOrEqual(
+    4.5,
+  );
+  expect(contrast(channels(token("muted")), channels(VIZ.bg))).toBeLessThan(
+    4.5,
+  );
+  const modal = readFileSync(
+    new URL("../components/detail/SimModal.tsx", import.meta.url),
+    "utf8",
+  );
+  for (const id of ["sim-active-scale", "sim-coefficient-caption"]) {
+    expect(
+      modal.slice(modal.indexOf(`data-testid="${id}"`)).split("</")[0],
+    ).toContain("color: C.muted");
+  }
 });

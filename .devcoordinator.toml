@@ -2398,6 +2398,31 @@ timeout_seconds = 900
 [test.cfd-curve-display]
 timeout_seconds = 300
 
+[test.evidence-metadata-contrast]
+timeout_seconds = 300
+
+[[test.evidence-metadata-contrast.check]]
+name = "tokens"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/theme-contrast.test.ts"]
+
+[[test.evidence-metadata-contrast.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "typecheck"]
+
+[[test.evidence-metadata-contrast.check]]
+name = "verifier-self-test"
+tier = "development"
+command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
+
+[[test.evidence-metadata-contrast.check]]
+name = "rendered-metadata"
+tier = "development"
+requires = ["tokens", "types", "verifier-self-test"]
+command = ["node", "scripts/dev/verify-evidence-metadata-contrast.mjs"]
+retained_artifacts = [{ name = "metadata-contrast", path = ".codex-artifacts/evidence-metadata-contrast", max_bytes = 16777216 }]
+
 [[test.cfd-curve-display.check]]
 name = "types"
 tier = "development"

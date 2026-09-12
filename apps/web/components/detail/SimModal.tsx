@@ -975,7 +975,7 @@ export function SimModal(props: {
           style={{
             fontFamily: MONO,
             fontSize: 10,
-            color: C.dim,
+            color: C.muted,
             border: `1px solid ${C.stroke}`,
             borderRadius: 999,
             padding: "4px 8px",
@@ -2244,8 +2244,8 @@ export function SimModal(props: {
               fontFamily: MONO,
               fontSize: 9,
               fontWeight: 600,
-              color: transportActive ? C.teal : C.muted,
-              background: "rgba(7,11,16,0.62)",
+              color: transportActive ? C.teal : VIZ.text,
+              background: VIZ.bg,
               borderRadius: 5,
               padding: "2px 6px",
             }}
@@ -2633,7 +2633,12 @@ function AccentStat({
       >
         {value}
       </div>
-      <div style={{ fontFamily: MONO, fontSize: 9, color: C.muted }}>{sub}</div>
+      <div
+        data-testid="sim-coefficient-caption"
+        style={{ fontFamily: MONO, fontSize: 9, color: C.muted }}
+      >
+        {sub}
+      </div>
     </div>
   );
 }
