@@ -265,6 +265,13 @@ and the selected report still passes full immutable-source verification. The
 ordering index avoids sorting the entire backlog; it does not discard history or
 sample a truncated candidate list.
 
+The single evidence drain overlaps one staging operation with one independently
+ready delivery. It waits for both before another pass and preserves alternating
+current-work/FIFO priority and existing database capacity. Delivery can see only
+committed staging receipts; newly staged evidence can be picked up on the next
+immediate pass. Failure in one operation does not cancel its safe sibling, and
+shutdown waits for both started operations.
+
 A cumulative report can reuse already staged point attempts only when every source
 matches an earlier acknowledged report, its immutable association, complete point
 signature, projected engine/setup context, coefficients and stored evidence payload.

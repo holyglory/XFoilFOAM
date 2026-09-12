@@ -13,21 +13,22 @@ export function progressiveEvidenceDrain(
   return async () => {
     const preference = preferActive;
     preferActive = !preferActive;
-    let progress = false;
-    const errors: unknown[] = [];
-    for (const operation of [stage, deliver]) {
-      try {
-        progress = (await operation(preference)) || progress;
-      } catch (error) {
-        errors.push(error);
-      }
-    }
+    const results = await Promise.allSettled(
+      [stage, deliver].map((operation) =>
+        Promise.resolve().then(() => operation(preference)),
+      ),
+    );
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
     if (errors.length)
       throw new AggregateError(
         errors,
         "Progressive evidence pass has retryable or conflicting work",
       );
-    return progress;
+    return results.some(
+      (result) => result.status === "fulfilled" && result.value,
+    );
   };
 }
 

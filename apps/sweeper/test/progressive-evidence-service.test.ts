@@ -55,6 +55,85 @@ it("sleeps only when neither staging nor delivery made progress", async () => {
   expect(await drain()).toBe(false);
 });
 
+it("starts delivery while staging is pending and waits for both before another pass", async () => {
+  let finishStage: (progress: boolean) => void = () => {};
+  let finishDelivery: (progress: boolean) => void = () => {};
+  const stage = vi.fn(
+    () =>
+      new Promise<boolean>((resolve) => {
+        finishStage = resolve;
+      }),
+  );
+  const deliver = vi.fn(
+    () =>
+      new Promise<boolean>((resolve) => {
+        finishDelivery = resolve;
+      }),
+  );
+  const drain = progressiveEvidenceDrain(stage, deliver);
+  let settled = false;
+  const result = drain().then((value) => {
+    settled = true;
+    return value;
+  });
+  await Promise.resolve();
+  expect(stage).toHaveBeenCalledWith(true);
+  expect(deliver).toHaveBeenCalledWith(true);
+  finishDelivery(true);
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  finishStage(false);
+  expect(await result).toBe(true);
+  expect(stage).toHaveBeenCalledTimes(1);
+  expect(deliver).toHaveBeenCalledTimes(1);
+});
+
+it("retains input-order errors and observes a pending sibling after an early failure", async () => {
+  const first = new Error("stage failed");
+  const second = new Error("delivery failed");
+  let rejectStage: (error: Error) => void = () => {};
+  let settled = false;
+  const drain = progressiveEvidenceDrain(
+    () =>
+      new Promise<boolean>((_, reject) => {
+        rejectStage = reject;
+      }),
+    () => {
+      throw second;
+    },
+  );
+  const result = drain().catch((error) => {
+    settled = true;
+    return error;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  rejectStage(first);
+  const error = await result;
+  expect(error).toBeInstanceOf(AggregateError);
+  expect(error.errors).toEqual([first, second]);
+});
+
+it("picks up newly staged evidence on the next pass without inventing a receipt", async () => {
+  let staged = false;
+  const stage = async () => {
+    await Promise.resolve();
+    const changed = !staged;
+    staged = true;
+    return changed;
+  };
+  const delivered: boolean[] = [];
+  const drain = progressiveEvidenceDrain(stage, async () => {
+    delivered.push(staged);
+    return staged;
+  });
+  expect(await drain()).toBe(true);
+  expect(delivered).toEqual([false]);
+  expect(await drain()).toBe(true);
+  expect(delivered).toEqual([false, true]);
+});
+
 describe("independent compact evidence delivery", () => {
   it("stages and delivers new evidence while the bulk transfer is blocked", async () => {
     vi.useFakeTimers();
