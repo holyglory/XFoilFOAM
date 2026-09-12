@@ -37,6 +37,8 @@ except ImportError:
 def configure_unsteady_case(builder, directory, window, pressure_advection="upwind"):
     if pressure_advection not in {"upwind", "vanLeer"}:
         raise ValueError("Unsupported reference pressure-advection scheme")
+    if window["maximum_courant"] != min(0.5, builder.solver.transient_max_courant):
+        raise ValueError("Physical window Courant ceiling differs from the generated solver recipe")
     builder.write_transient(directory, 0, window["end_time"], window["initial_delta_t"],
                             window["write_interval"], window["maximum_delta_t"])
     for relative, pattern, replacement in [
@@ -57,7 +59,7 @@ def configure_unsteady_case(builder, directory, window, pressure_advection="upwi
         path.write_text(content)
 
 
-def run(source, destination, reference_directory, time_budget_seconds=600, pressure_advection="upwind", refined=False):
+def run(source, destination, reference_directory, time_budget_seconds=600, pressure_advection="upwind", refined=False, maximum_courant=None):
     if pressure_advection not in {"upwind", "vanLeer"}:
         raise ValueError("Unsupported reference pressure-advection scheme")
     source, manifest_bytes, manifest, verified, held = authenticated_retained_source(source)
@@ -71,12 +73,12 @@ def run(source, destination, reference_directory, time_budget_seconds=600, press
     reference = load_reference(reference_directory)
     if reference["provenance"] != held["reference"] or held["energy_form"] != "sensibleEnthalpy":
         raise ValueError("Unsteady reference must preserve the exact source and enthalpy recipe")
-    raw_request = unsteady_request(held["request"], refined)
+    raw_request = unsteady_request(held["request"], refined, maximum_courant)
     request = PolarRequest.model_validate(raw_request)
     if len(request.cases()) != 1:
         raise ValueError("Unsteady reference requires one exact physical case")
     spec = request.cases()[0]
-    window = physical_window(spec.chord, spec.speed)
+    window = physical_window(spec.chord, spec.speed, min(0.5, request.solver.transient_max_courant))
     budget = benchmark_time_budget(time_budget_seconds)
     runner = get_runner(Settings())
     configure_flow_execution(runner, request)
@@ -200,5 +202,7 @@ if __name__ == "__main__":
     parser.add_argument("--time-budget-seconds", type=float, default=600)
     parser.add_argument("--pressure-advection", choices=["upwind", "vanLeer"], default="upwind")
     parser.add_argument("--refined", action="store_true")
+    parser.add_argument("--maximum-courant", type=float, choices=[0.25, 0.5])
     arguments = parser.parse_args()
-    run(arguments.source, arguments.destination, arguments.reference, arguments.time_budget_seconds, arguments.pressure_advection, arguments.refined)
+    run(arguments.source, arguments.destination, arguments.reference, arguments.time_budget_seconds, arguments.pressure_advection,
+        arguments.refined, arguments.maximum_courant)

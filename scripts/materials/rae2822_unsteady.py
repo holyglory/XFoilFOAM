@@ -7,10 +7,13 @@ import numpy as np
 from airfoilfoam.postprocess.forces import analyze_rans_hold
 
 
-def unsteady_request(held_request, refined=False):
+def unsteady_request(held_request, refined=False, maximum_courant=None):
     if type(refined) is not bool:
         raise ValueError("Refinement must be explicitly enabled or disabled")
     request = deepcopy(held_request)
+    if maximum_courant is not None:
+        validate_reference_courant(maximum_courant)
+        request["solver"]["transient_max_courant"] = maximum_courant
     if refined:
         for key in ("n_surface", "n_radial", "n_wake"):
             value = request.get("mesh", {}).get(key)
@@ -22,13 +25,19 @@ def unsteady_request(held_request, refined=False):
     return request
 
 
-def physical_window(chord, speed):
+def validate_reference_courant(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value not in (0.25, 0.5):
+        raise ValueError("Reference Courant comparison requires 0.25 or 0.5")
+
+
+def physical_window(chord, speed, maximum_courant=0.5):
+    validate_reference_courant(maximum_courant)
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 for value in (chord, speed)):
         raise ValueError("Physical reference requires finite positive chord and speed")
     transit = chord / speed
     return {"convective_time": transit, "start_time": 0.0, "end_time": 10 * transit,
             "initial_delta_t": transit / 100, "maximum_delta_t": transit / 100,
-            "write_interval": transit / 20, "maximum_courant": 0.5,
+            "write_interval": transit / 20, "maximum_courant": maximum_courant,
             "startup_until": 2 * transit, "minimum_comparison_duration": 2 * transit,
             "minimum_field_frames": 40}
 

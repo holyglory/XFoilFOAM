@@ -1874,6 +1874,22 @@ port = true
 route = true
 timeout_seconds = 4200
 
+[deployment.rae-unsteady-half-courant]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.rae-unsteady-half-courant.component.numerics]
+type = "compose"
+files = ["compose.rae-unsteady-reference.yml"]
+services = ["artifacts", "unsteady-half-courant"]
+finite_services = ["unsteady-half-courant"]
+build = false
+port = true
+route = true
+timeout_seconds = 2400
+
 [deployment.rae-density-reference.component.numerics]
 type = "compose"
 files = ["compose.rae-density-reference.yml"]

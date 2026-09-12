@@ -135,3 +135,40 @@ def test_refined_physical_request_changes_only_resolution_and_explicit_unsteady_
             unsteady_request(changed, True)
     with pytest.raises(ValueError, match="explicitly"):
         unsteady_request(original, 1)
+
+
+def test_courant_study_preserves_physics_cadence_and_other_numerics(tmp_path):
+    from scripts.materials.rae2822_unsteady import unsteady_request
+
+    original = {"solver": {"transient_max_courant": 4}, "mesh": {"n_surface": 128}, "flow_state": {"temperature_k": 255.5}}
+    baseline = unsteady_request(original)
+    candidate = unsteady_request(original, maximum_courant=0.25)
+    assert original["solver"]["transient_max_courant"] == 4
+    assert candidate == {**baseline, "solver": {**baseline["solver"], "transient_max_courant": 0.25}}
+    first, second = tmp_path / "baseline", tmp_path / "candidate"
+    builders = [case_builder(directory, scheme="linearUpwind") for directory in (first, second)]
+    builders[1].solver.transient_max_courant = 0.25
+    windows = [physical_window(1, 1), physical_window(1, 1, 0.25)]
+    assert windows[1] == {**windows[0], "maximum_courant": 0.25}
+    for builder, directory, window in zip(builders, (first, second), windows):
+        configure_unsteady_case(builder, directory, window, "vanLeer")
+    for relative in ("system/controlDict", "system/fvSchemes", "system/fvSolution", "constant/thermophysicalProperties", "constant/turbulenceProperties"):
+        expected = (first / relative).read_text()
+        if relative == "system/controlDict":
+            expected, count = re.subn(r"(\bmaxCo\s+)0\.5;", r"\g<1>0.25;", expected)
+            assert count == 1
+        assert (second / relative).read_text() == expected
+    before = (first / "system/controlDict").read_bytes()
+    with pytest.raises(ValueError, match="differs"):
+        configure_unsteady_case(builders[0], first, windows[1])
+    assert (first / "system/controlDict").read_bytes() == before
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -0.25, 0.8, float("nan"), float("inf"), "0.25"])
+def test_courant_study_rejects_unsupported_or_nonfinite_ceilings(value):
+    from scripts.materials.rae2822_unsteady import unsteady_request
+
+    with pytest.raises(ValueError, match="Courant"):
+        unsteady_request({"solver": {}}, maximum_courant=value)
+    with pytest.raises(ValueError, match="Courant"):
+        physical_window(1, 1, value)
