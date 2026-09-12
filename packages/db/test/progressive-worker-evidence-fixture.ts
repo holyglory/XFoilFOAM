@@ -12,6 +12,7 @@ import {
 import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progressive-evidence-service";
 import { verifyProgressiveWorkerEvidenceDelivery } from "./progressive-worker-evidence-delivery-fixture";
 import { progressiveEvidencePriority } from "../../../apps/sweeper/src/progressive-evidence-priority";
+import { verifyProgressiveEvidenceReuse } from "./progressive-evidence-reuse-fixture";
 
 export async function verifyProgressiveWorkerEvidence(
   db: DB,
@@ -214,6 +215,7 @@ export async function verifyProgressiveWorkerEvidence(
       db.execute(sql`UPDATE progressive_worker_evidence_attempts SET sequence = sequence + 1
       WHERE sim_job_id = ${executionId}::uuid`),
     ).rejects.toThrow();
+    await verifyProgressiveEvidenceReuse(db, executionId);
     await verifyProgressiveWorkerEvidenceDelivery(db, executionId);
   } finally {
     await db.execute(sql`UPDATE sim_jobs SET status = ${original.status}::sim_job_status, ingest_lease_token = NULL,

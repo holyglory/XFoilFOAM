@@ -13,6 +13,7 @@ import type { EngineClient, JobResult } from "@aerodb/engine-client";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import { progressiveStagingSelectionSql } from "./progressive-staging-selection";
 import { ingestResult } from "./ingest";
+import { existingProgressiveReportAttempts } from "./progressive-evidence-reuse";
 import {
   DEFAULT_INGEST_LEASE_MS,
   IngestLeaseLostError,
@@ -95,6 +96,7 @@ export async function stageProgressiveWorkerEvidence(
       envelope,
       sequence,
       result,
+      report,
       token,
       signature: String(candidate.content_signature),
     };
@@ -102,30 +104,37 @@ export async function stageProgressiveWorkerEvidence(
   if (!claimed) return { kind: "idle" as const };
   const lease = { jobId: executionId, token: claimed.token };
   try {
-    const ingested = await ingestResult({
+    const reused = await existingProgressiveReportAttempts(
       db,
-      engine,
-      engineJobId: executionId,
-      simJobId: executionId,
-      airfoilId: claimed.job.airfoilId,
-      speedMap: [
-        {
-          speed: claimed.setup.flowState.speedMps,
-          bcId: claimed.setup.preset.legacyBoundaryConditionId!,
-          presetRevisionId: claimed.job.simulationPresetRevisionId,
-          mach: claimed.setup.flowState.mach,
-        },
-      ],
-      jobAoas: claimed.envelope.scope.units.map((unit) => unit.alpha),
-      uransFidelity:
-        claimed.job.wave === 2
-          ? claimed.envelope.request.solver?.urans_fidelity
-          : undefined,
-      result: claimed.result,
-      remoteProgressiveReportSequence: claimed.sequence,
-      ingestLeaseToken: claimed.token,
-      heartbeat: () => renewIngestLeaseOrThrow(db, lease),
-    });
+      claimed.report,
+      claimed.envelope,
+    );
+    const ingested = reused
+      ? { resultAttemptIds: reused }
+      : await ingestResult({
+          db,
+          engine,
+          engineJobId: executionId,
+          simJobId: executionId,
+          airfoilId: claimed.job.airfoilId,
+          speedMap: [
+            {
+              speed: claimed.setup.flowState.speedMps,
+              bcId: claimed.setup.preset.legacyBoundaryConditionId!,
+              presetRevisionId: claimed.job.simulationPresetRevisionId,
+              mach: claimed.setup.flowState.mach,
+            },
+          ],
+          jobAoas: claimed.envelope.scope.units.map((unit) => unit.alpha),
+          uransFidelity:
+            claimed.job.wave === 2
+              ? claimed.envelope.request.solver?.urans_fidelity
+              : undefined,
+          result: claimed.result,
+          remoteProgressiveReportSequence: claimed.sequence,
+          ingestLeaseToken: claimed.token,
+          heartbeat: () => renewIngestLeaseOrThrow(db, lease),
+        });
     await hooks.afterEvidenceStaged?.();
     await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
@@ -194,6 +203,7 @@ export async function stageProgressiveWorkerEvidence(
       sequence: claimed.sequence,
       contentSignature: claimed.signature,
       resultAttemptIds: ingested.resultAttemptIds,
+      ...(reused ? { reusedEvidence: true } : {}),
     };
   } catch (error) {
     await db

@@ -264,6 +264,15 @@ source ownership, transfer-pause, acknowledgement, retry and ingest-lease checks
 and the selected report still passes full immutable-source verification. The
 ordering index avoids sorting the entire backlog; it does not discard history or
 sample a truncated candidate list.
+
+A cumulative report can reuse already staged point attempts only when every source
+matches an earlier acknowledged report, its immutable association, complete point
+signature, projected engine/setup context, coefficients and stored evidence payload.
+Original source warnings must match; an existing appended released-cell quarantine
+warning remains unchanged. Missing, new or ambiguous sources use normal ingestion.
+Reuse records only the new report receipt and associations under the same ingest
+lease. It never modifies solver coefficients, accepted status, artifacts or existing
+receipts, and a lost lease cannot publish the new receipt.
 An older worker's late failure cannot recreate a retry after a replacement has
 already staged that report. Archive references prefer the source report already
 acknowledged by the hub, even if an earlier report is staged later.
