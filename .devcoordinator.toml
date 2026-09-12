@@ -358,6 +358,20 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [test.rae-reference]
 timeout_seconds = 120
 
+[test.rae-sst-reference]
+timeout_seconds = 300
+
+[[test.rae-sst-reference.check]]
+name = "source-boundary-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_rae2822_sst_reference.py", "tests/test_rae2822_reference.py", "-q"]
+
+[[test.rae-sst-reference.check]]
+name = "pinned-nasa-source"
+tier = "development"
+requires = ["source-boundary-contract"]
+command = [".venv/bin/python", "-c", "import json; from scripts.materials.rae2822_sst_reference import load_sst_reference; print(json.dumps(load_sst_reference('/mnt/build-storage/codex/xfoilfoam-verification/rae-study4-reference-20260912', 'tests/fixtures/rae2822')))"]
+
 [test.rae-unsteady-reference]
 timeout_seconds = 180
 
