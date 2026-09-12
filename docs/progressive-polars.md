@@ -248,6 +248,15 @@ defers that exact report with a durable retry deadline, and permits other eligib
 reports to be staged. The selected sequence is passed through the claim boundary;
 the stager must not rediscover an earlier deferred report. Successful staging
 clears only its own retry record.
+
+The staging selector uses ordered acknowledged-report metadata. Active-priority
+passes first select the earliest eligible report from an unexpired active promise;
+only when none exists do they fall back to the earliest eligible retained report.
+FIFO passes retain the original chronological order. Both paths share the same
+source ownership, transfer-pause, acknowledgement, retry and ingest-lease checks,
+and the selected report still passes full immutable-source verification. The
+ordering index avoids sorting the entire backlog; it does not discard history or
+sample a truncated candidate list.
 An older worker's late failure cannot recreate a retry after a replacement has
 already staged that report. Archive references prefer the source report already
 acknowledged by the hub, even if an earlier report is staged later.
