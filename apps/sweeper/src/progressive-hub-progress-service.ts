@@ -18,7 +18,7 @@ export async function runProgressiveHubProgressService(
         const stops = await acknowledgeProgressiveRemoteStops(db);
         const progress = await reconcileProgressiveRemoteProgress(db);
         const admission = signal.aborted
-          ? { prepared: 0, waiting: 0, errors: [] }
+          ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
           : await prepareProgressiveRemoteFleet(db);
         if (
           stops.acknowledged ||
@@ -28,6 +28,7 @@ export async function runProgressiveHubProgressService(
           progress.settled ||
           progress.errors.length ||
           admission.prepared ||
+          admission.deferred ||
           admission.errors.length
         )
           console.log(
@@ -43,7 +44,8 @@ export async function runProgressiveHubProgressService(
             progress.applied +
             progress.indexed +
             progress.settled +
-            admission.prepared >
+            admission.prepared +
+            admission.deferred >
           0
         );
       },

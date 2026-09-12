@@ -1044,6 +1044,13 @@
       "when": 1792368000042,
       "tag": "0148_progressive_delivery_conflict_references",
       "breakpoints": true
+    },
+    {
+      "idx": 149,
+      "version": "7",
+      "when": 1792368000043,
+      "tag": "0149_progressive_claim_deferral",
+      "breakpoints": true
     }
   ]
 }

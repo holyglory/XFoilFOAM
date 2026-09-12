@@ -65,6 +65,7 @@ import {
 import { runProgressiveBaselineBatch } from "../../../apps/sweeper/src/progressive-baselines";
 import { runProgressiveBaselineService } from "../../../apps/sweeper/src/progressive-service";
 import { composeProgressiveCfdJob } from "../../../apps/sweeper/src/progressive-cfd-jobs";
+import { verifyProgressiveClaimDeferral } from "./progressive-claim-deferral-fixture";
 import { admitProgressiveCfdBatch } from "../../../apps/sweeper/src/progressive-admission";
 import { reconcileProgressiveExecutions } from "../../../apps/sweeper/src/progressive-execution";
 import {
@@ -2471,6 +2472,16 @@ describe("progressive CPU admission", () => {
         .where(eq(sweeperState.id, 1));
     }
   }
+
+  it.each(["local", "remote"] as const)(
+    "defers owned result cells without blocking another target on the %s path",
+    async (mode) => {
+      await ready(
+        (scope) => verifyProgressiveClaimDeferral(db, scope, mode),
+        [32.1793],
+      );
+    },
+  );
 
   it("progressive remote dispatch pins one exact request and holds CPU through promise expiry until physical stop", async () => {
     await ready(async () => {

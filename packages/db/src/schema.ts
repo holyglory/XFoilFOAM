@@ -7262,6 +7262,7 @@ export const progressiveCfdUnits = pgTable(
     activeBudgetSeconds: doublePrecision("active_budget_seconds").notNull(),
     activeSeconds: doublePrecision("active_seconds").notNull().default(0),
     state: text("state").notNull().default("pending"),
+    retryAfter: timestamp("retry_after", { withTimezone: true }),
     leaseToken: uuid("lease_token"),
     leaseOwner: text("lease_owner"),
     leaseUntil: timestamp("lease_until", { withTimezone: true }),

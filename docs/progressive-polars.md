@@ -121,6 +121,15 @@ foreign dispatch ownership and a stop for another execution cannot release that
 promise's place. The count uses direct joins rather than a nested historical scan;
 its original lease-expiry, ownership and capacity-lock rules remain unchanged.
 
+If job preparation finds that an exact result cell is already owned, the entire
+preparation transaction rolls back before scheduling a retry. Only its still-pending
+units in the same current scope receive a one-minute deferral. No job, solve attempt,
+compute charge or claim survives the failed preparation, and the original cell and
+its evidence stay unchanged. Both local and remote admission continue with other
+eligible targets within their existing bounded passes. Paused, cancelled, replaced
+or newly claimed scopes cannot be deferred by an obsolete preparation. Expiry permits
+a fresh ownership check, not permission to take another execution's result cell.
+
 Assignment discovery is paged and authenticated with the registered worker's
 existing credential. Fetching an assignment returns the exact sealed request and
 the actual promise/receipt state; it is not permission to restart expired work.

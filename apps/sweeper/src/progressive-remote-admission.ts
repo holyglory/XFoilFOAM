@@ -11,6 +11,10 @@ import {
 } from "@aerodb/db";
 import { isEngineIdentity, type EngineIdentity } from "@aerodb/engine-client";
 import { composeProgressiveCfdJob } from "./progressive-cfd-jobs";
+import {
+  deferProgressiveClaim,
+  ProgressiveEvidenceCellOwned,
+} from "./progressive-claim-deferral";
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 
 export interface ProgressiveRemoteCapabilities {
@@ -64,7 +68,7 @@ export async function prepareProgressiveRemoteDispatch(
   solverId: string,
 ): Promise<
   | { kind: "prepared"; envelope: ProgressiveRemoteExecutionEnvelope }
-  | { kind: "waiting"; reason: string }
+  | { kind: "waiting"; reason: string; deferredUnits?: number }
 > {
   if (
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
@@ -206,6 +210,13 @@ export async function prepareProgressiveRemoteDispatch(
       return { kind: "prepared" as const, envelope: bound.envelope };
     });
   } catch (error) {
+    if (error instanceof ProgressiveEvidenceCellOwned)
+      return {
+        kind: "waiting" as const,
+        reason:
+          "Owned result cells deferred for another preparation opportunity",
+        deferredUnits: await deferProgressiveClaim(db, error),
+      };
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
     throw error;
@@ -226,6 +237,7 @@ export async function prepareProgressiveRemoteFleet(db: DB) {
   `);
   const receipt = {
     prepared: 0,
+    deferred: 0,
     waiting: 0,
     errors: [] as Array<{ solverId: string; reason: string }>,
   };
@@ -236,6 +248,11 @@ export async function prepareProgressiveRemoteFleet(db: DB) {
     for (let admitted = 0; admitted < capacity; admitted += 1) {
       try {
         const result = await prepareProgressiveRemoteDispatch(db, solverId);
+        if (result.kind === "waiting" && result.deferredUnits !== undefined) {
+          receipt.deferred += result.deferredUnits;
+          if (!result.deferredUnits) break;
+          continue;
+        }
         if (result.kind === "waiting") {
           receipt.waiting += 1;
           break;

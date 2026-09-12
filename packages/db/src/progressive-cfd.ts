@@ -257,6 +257,7 @@ export async function claimProgressiveCfdUnit(
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
             AND work.stage = generation.stage AND work.stage IN (2, 3) AND work.state = 'pending'
             AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+            AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
     `);
     if (!campaign) return null;
@@ -290,6 +291,7 @@ export async function claimProgressiveCfdUnit(
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage = generation.stage AND work.stage IN (2, 3) AND work.state = 'pending'
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+        AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (unit.purpose <> 'adaptive' OR NOT EXISTS (
           SELECT 1 FROM progressive_cfd_units initial JOIN progressive_work sibling ON sibling.id = initial.work_id
           WHERE sibling.generation_id = generation.id AND sibling.stage = work.stage
@@ -327,7 +329,8 @@ export async function claimProgressiveCfdUnit(
     const token = randomUUID();
     await connection.execute(sql`
       UPDATE progressive_cfd_units SET state = 'leased', lease_token = ${token}, lease_owner = ${input.owner},
-        lease_until = clock_timestamp() + ${input.leaseSeconds} * interval '1 second', attempts = attempts + 1
+        lease_until = clock_timestamp() + ${input.leaseSeconds} * interval '1 second', attempts = attempts + 1,
+        error = CASE WHEN retry_after IS NOT NULL THEN NULL ELSE error END, retry_after = NULL
       WHERE id = ${unit.id}
     `);
     await connection.execute(sql`

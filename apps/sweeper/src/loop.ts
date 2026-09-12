@@ -863,6 +863,7 @@ export async function tick(
       console.warn(
         JSON.stringify({ component: "progressive-cfd-admission", ...receipt }),
       );
+    if (receipt.kind === "deferred" && receipt.units > 0) continue;
     if (receipt.kind !== "attempted") break;
     console.log(
       JSON.stringify({ component: "progressive-cfd-admission", ...receipt }),

@@ -9,6 +9,10 @@ import {
 import { composeProgressiveCfdJob } from "./progressive-cfd-jobs";
 import { effectiveMaxConcurrentJobs } from "./solver-capacity";
 import {
+  deferProgressiveClaim,
+  ProgressiveEvidenceCellOwned,
+} from "./progressive-claim-deferral";
+import {
   solverQueuePressure,
   submitPendingJobWithLifecycleGuard,
 } from "./submit-lifecycle";
@@ -90,6 +94,11 @@ export async function admitProgressiveCfdBatch(
       };
     });
   } catch (error) {
+    if (error instanceof ProgressiveEvidenceCellOwned)
+      return {
+        kind: "deferred" as const,
+        units: await deferProgressiveClaim(db, error),
+      };
     if (error instanceof ProgressiveCapacityUnavailable)
       return { kind: "capacity_wait" as const, error: error.message };
     throw error;

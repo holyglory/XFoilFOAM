@@ -22,6 +22,7 @@ import {
 } from "./build-request";
 import { claimAoas } from "./claim";
 import { requireExecutionPoolForSetup } from "./engine-pool";
+import { ProgressiveEvidenceCellOwned } from "./progressive-claim-deferral";
 
 export async function composeProgressiveCfdJob(
   db: DB,
@@ -248,9 +249,7 @@ export async function composeProgressiveCfdJob(
         [...claimed].sort((left, right) => left - right),
       ) !== canonicalAnalysisJson(angles)
     )
-      throw new Error(
-        "CFD evidence cells already have another execution owner",
-      );
+      throw new ProgressiveEvidenceCellOwned(leases);
     for (const lease of leases)
       await connection
         .update(progressiveCfdAttempts)

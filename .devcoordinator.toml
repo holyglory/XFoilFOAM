@@ -25,6 +25,42 @@ timeout_seconds = 1800
 [test.reservation-accounting]
 timeout_seconds = 900
 
+[test.progressive-claim-deferral]
+timeout_seconds = 900
+
+[test.progressive-claim-deferral.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-claim-deferral.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.progressive-claim-deferral.check]]
+name = "deferral-drain"
+tier = "development"
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-hub-progress-service.test.ts", "test/disk-admission.test.ts"]
+
+[[test.progressive-claim-deferral.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.progressive-claim-deferral.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-claim-deferral.check]]
+name = "contention-paths"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "defers owned result cells"]
+
 [test.promise-count-query]
 timeout_seconds = 900
 
@@ -788,6 +824,12 @@ name = "promise-count-equivalence"
 tier = "development"
 requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-promise-count-query.test.ts"]
+
+[[test.progressive.check]]
+name = "owned-cell-deferral"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "defers owned result cells"]
 
 [[test.progressive.check]]
 name = "reservation-transitions"
@@ -2364,7 +2406,14 @@ command = ["/usr/bin/corepack", "pnpm", "exec", "node", "--import", "tsx", "scri
 [[test.progressive-ui.check]]
 name = "preview-origin"
 tier = "development"
-command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs", "scripts/dev/prepare-progressive-tsconfig.test.mjs"]
+command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs", "scripts/dev/prepare-progressive-tsconfig.test.mjs", "scripts/dev/verify-progressive-web-delivery.test.mjs"]
+
+[[test.progressive-ui.check]]
+name = "web-delivery-proof"
+tier = "development"
+requires = ["interactions", "comparison-interactions", "real-cfd-evidence"]
+command = ["node", "scripts/dev/verify-progressive-web-delivery.mjs"]
+retained_artifacts = [{ name = "verified-web-route", path = ".codex-artifacts/progressive-web-delivery", max_bytes = 8388608 }]
 
 [[test.progressive-ui.check]]
 name = "preview-ready"
