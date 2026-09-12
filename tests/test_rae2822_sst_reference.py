@@ -60,3 +60,11 @@ def test_reference_source_cannot_be_substituted(tmp_path):
 def test_finite_but_unrepresentable_setup_is_rejected(speed, viscosity):
     with pytest.raises(ValueError, match="represented"):
         boundary_request(parse_sst_boundary(LOG), speed, viscosity)
+
+
+@pytest.mark.parametrize("options", [{}, {"uniform_start": True, "donor": "held"}, {"uniform_start": True, "mapped_donor": "held"}, {"uniform_start": True, "resume_local_pressure": "held"}])
+def test_boundary_comparison_cannot_reuse_an_incompatible_held_source(options):
+    from scripts.materials.verify_rae2822 import run
+
+    with pytest.raises(ValueError, match="fresh uniform"):
+        run(None, None, None, "precise", sst_boundary_source="source", **options)

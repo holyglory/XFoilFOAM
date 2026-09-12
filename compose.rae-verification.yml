@@ -8,6 +8,7 @@ x-verification: &verification
     PYTHONDONTWRITEBYTECODE: "1"
   volumes:
     - ./scripts/materials/rae2822_reference.py:/verification/rae2822_reference.py:ro
+    - ./scripts/materials/rae2822_sst_reference.py:/verification/rae2822_sst_reference.py:ro
     - ./scripts/materials/verify_rae2822.py:/verification/verify_rae2822.py:ro
     - ./scripts/materials/solver_stability.py:/verification/solver_stability.py:ro
     - ./scripts/materials/rae2822_grid.py:/verification/rae2822_grid.py:ro
@@ -158,6 +159,16 @@ services:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
     command: ["python", "/verification/verify_rae2822.py", "--reference", "/verification/reference", "--material", "/verification/material.json", "--destination", "/evidence/enthalpy-upwind-mpi", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--processes", "4"]
+  source-sst-boundary:
+    <<: *verification
+    image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25
+    volumes:
+      - ./scripts/materials:/verification:ro
+      - ./tests/fixtures/rae2822:/reference:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/material.json:ro
+      - /mnt/build-storage/codex/xfoilfoam-verification/rae-study4-reference-20260912:/source:ro
+      - rae-evidence:/evidence
+    command: ["python", "/verification/verify_rae2822.py", "--reference", "/reference", "--material", "/material.json", "--destination", "/evidence/source-sst-boundary", "--tier", "precise", "--wall-functions", "--uniform-start", "--enthalpy", "--first-order", "--processes", "4", "--sst-boundary-source", "/source"]
   enthalpy-consistent-refined:
     <<: *verification
     image: sha256:51d139532e97d49947f2d03210d1bf924fa8558982bdd1b28081f8c742602f25

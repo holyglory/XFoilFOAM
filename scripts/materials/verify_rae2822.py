@@ -15,6 +15,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from rae2822_reference import load_reference, selig_coordinates
+from rae2822_sst_reference import load_sst_reference, boundary_request
 from solver_stability import solver_stability
 from rae2822_grid import write_nasa_grid
 from rae2822_mapping import map_verified_initial_fields
@@ -282,8 +283,11 @@ def restore_verified_donor(source, destination, request, enthalpy, transonic, co
     return {"source": str(source), "report_sha256": hashlib.sha256(report_bytes).hexdigest(), "coordinate": coordinate, "members": members}
 
 
-def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False, research_iteration_allowance=None, tight_inner_solves=False, sst_gradient_limiter=False, density_local_time=False):
+def run(reference_directory, material_path, destination, tier, transonic=False, wall_functions=False, uniform_start=False, enthalpy=False, first_order=False, donor=None, upwind_energy=False, pressure_krylov=False, pressure_equation_relaxation=None, time_budget_seconds=600, limited_nonorthogonal=False, reference_grid=None, mesh_only=False, consistent_pressure=False, processes=1, density_relaxation=None, mapped_donor=None, local_time_pressure=False, resume_local_pressure=None, pressure_advection="upwind", unbound_mpi=False, resume_to_iteration=None, native_steady_check=False, snapshot_audit=False, local_max_courant=0.5, local_step_smoothing=0.02, low_re_k_wall=False, research_iteration_allowance=None, tight_inner_solves=False, sst_gradient_limiter=False, density_local_time=False, sst_boundary_source=None):
     started_at = time.monotonic()
+    if sst_boundary_source is not None and (not uniform_start or donor or mapped_donor or resume_local_pressure):
+        raise ValueError("SST boundary comparison requires a fresh uniform start without a donor")
+    sst_reference = load_sst_reference(sst_boundary_source, reference_directory) if sst_boundary_source is not None else None
     if density_local_time and (not uniform_start or any([
         enthalpy, donor, mapped_donor, resume_local_pressure, local_time_pressure, transonic,
         consistent_pressure, upwind_energy, pressure_krylov, pressure_equation_relaxation is not None,
@@ -326,7 +330,7 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
     from airfoilfoam.config import Settings
     from airfoilfoam.material_domain import check_material_domain
     from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
-    from airfoilfoam.models import PolarRequest
+    from airfoilfoam.models import PolarRequest, TurbulenceParams
     from airfoilfoam.numerical_canary import source_material_for_canary
     from airfoilfoam.openfoam.budget import BudgetedRunner
     from airfoilfoam.openfoam.dialects import dialect_for_runner, find_force_coefficient_files
@@ -360,6 +364,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
                    "momentum_scheme": momentum_scheme, "turbulent_prandtl": 0.85, "n_iterations": dimensions[3],
                    "convergence_tolerance": dimensions[4], "write_images": []},
     })
+    if sst_reference is not None:
+        request.solver.turbulence = TurbulenceParams.model_validate(boundary_request(sst_reference["boundary"], speed, viscosity / density))
     runner = get_runner(Settings())
     if unbound_mpi:
         configure_unbound_mpi(runner)
@@ -392,6 +398,8 @@ def run(reference_directory, material_path, destination, tier, transonic=False, 
               "experimental_pressure_equation_relaxation": pressure_equation_relaxation,
               "resolved_reynolds": density * speed * spec.chord / viscosity,
               "request": request.model_dump(mode="json")}
+    if sst_reference is not None:
+        report["reference_boundary_comparison"] = sst_reference
     try:
         airfoil = Airfoil.from_contour("RAE 2822", parse_airfoil(request.airfoil.coordinates))
         mesh = resolve_mesh_params(request.mesh, spec, request.fluid)
@@ -554,6 +562,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--reference", required=True)
     parser.add_argument("--material", required=True)
+    parser.add_argument("--sst-boundary-source", type=Path)
     parser.add_argument("--destination", required=True)
     parser.add_argument("--tier", choices=["fast", "precise", "refined"], required=True)
     parser.add_argument("--transonic", action="store_true")
@@ -588,4 +597,4 @@ if __name__ == "__main__":
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--limited-nonorthogonal", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall, arguments.research_iteration_allowance, arguments.tight_inner_solves, arguments.sst_gradient_limiter, arguments.density_local_time)
+    run(arguments.reference, arguments.material, arguments.destination, arguments.tier, arguments.transonic, arguments.wall_functions, arguments.uniform_start, arguments.enthalpy, arguments.first_order, arguments.donor, arguments.upwind_energy, arguments.pressure_krylov, arguments.pressure_equation_relaxation, arguments.time_budget_seconds, arguments.limited_nonorthogonal, arguments.reference_grid, arguments.mesh_only, arguments.consistent_pressure, arguments.processes, arguments.density_relaxation, arguments.mapped_donor, arguments.local_time_pressure, arguments.resume_local_pressure, arguments.pressure_advection, arguments.unbound_mpi, arguments.resume_to_iteration, arguments.native_steady_check, arguments.snapshot_audit, arguments.local_max_courant, arguments.local_step_smoothing, arguments.low_re_k_wall, arguments.research_iteration_allowance, arguments.tight_inner_solves, arguments.sst_gradient_limiter, arguments.density_local_time, arguments.sst_boundary_source)

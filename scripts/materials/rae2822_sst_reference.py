@@ -3,7 +3,10 @@ import math
 from pathlib import Path
 import re
 
-from scripts.materials.rae2822_reference import load_reference
+try:
+    from .rae2822_reference import load_reference
+except ImportError:
+    from rae2822_reference import load_reference
 
 
 SOURCE_URL = "https://www.grc.nasa.gov/www/wind/valid/raetaf/raetaf04/"
