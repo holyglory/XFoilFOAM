@@ -47,7 +47,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node"
 name = "selection-equivalence"
 tier = "development"
 requires = ["schema", "types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "test/progressive-inactive-promise.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "test/progressive-delivery-selection.test.ts", "test/progressive-inactive-promise.test.ts"]
 
 [[test.staging-selection.check]]
 name = "seed"
@@ -871,7 +871,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "staging-selection"
 tier = "development"
 requires = ["types", "ingest-seed"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "test/progressive-inactive-promise.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "test/progressive-delivery-selection.test.ts", "test/progressive-inactive-promise.test.ts"]
 
 [[test.progressive.check]]
 name = "reservation-transitions"
