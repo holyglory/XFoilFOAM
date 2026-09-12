@@ -237,6 +237,13 @@ IDs and the original HTTP status, including HTTP 200 conflict responses, then st
 automatic retries for that exact point. Malformed references and missing receipts
 remain retryable. The hub's preserved conflict and immutable reports remain the
 review sources; recording a conflict never accepts or replaces solver evidence.
+If the authenticated hub explicitly rejects an inactive promise, its local mirror
+may leave active priority only after every associated execution has an acknowledged
+exact stop report and no CPU reservation. The current solver identity, credential
+and upstream must still match. Only active/expired promise metadata and active
+promise points become cancelled; fulfilled points, jobs, reports and result
+evidence remain unchanged. Generic conflicts, missing stop proof, foreign execution
+identity and transport errors cannot cause this scheduling update.
 Both compact and full-result imports persist the hub's retained-attempt receipt
 before recording archive custody. A replay keeps the original receipt's report
 sequence, which must resolve to an acknowledged local association for the exact

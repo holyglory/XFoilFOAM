@@ -11,6 +11,7 @@ import {
 import { sql } from "drizzle-orm";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import { progressiveEvidencePriority } from "./progressive-evidence-priority";
+import { recordInactiveStoppedPromise } from "./progressive-inactive-promise";
 
 export async function recordProgressiveWorkerEvidenceReceipt(
   db: DB,
@@ -196,10 +197,27 @@ export async function deliverNextProgressiveWorkerEvidence(
       },
     );
     responseStatus = response.status;
-    if (!response.ok)
+    if (!response.ok) {
+      if (response.status === 409) {
+        const rejected = (await response.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        await recordInactiveStoppedPromise(
+          db,
+          {
+            executionId,
+            promiseId: String(pending.promise_id),
+            solverId: String(pending.remote_solver_registered_id),
+            upstreamBaseUrl: String(pending.upstream_base_url),
+            token: String(pending.remote_solver_auth_token),
+          },
+          { status: response.status, error: rejected?.error },
+        );
+      }
       throw new Error(
         `Progressive evidence delivery failed (${response.status})`,
       );
+    }
     const body = (await response.json()) as {
       progressiveEvidenceReceipts?: unknown;
       conflictIds?: unknown;
