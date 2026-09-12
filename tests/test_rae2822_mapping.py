@@ -60,6 +60,27 @@ def test_mapping_refuses_same_scope_before_any_command(tmp_path):
         map_verified_initial_fields(None, source, source / "nested", target, {})
 
 
+def test_volume_donor_staging_excludes_coarse_flux_and_density(tmp_path):
+    from scripts.materials.rae2822_mapping import authenticated_retained_source, stage_verified_volume_donor
+
+    source, _ = mapping_fixture(tmp_path)
+    verified = authenticated_retained_source(source)[3]
+    for name in ("phi", "rho", "nut", "alphat"):
+        path = source / "2000" / name
+        path.write_text("not selected for volume mapping")
+        verified[f"2000/{name}"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    destination = tmp_path / "selected-volume-source"
+    copied = stage_verified_volume_donor(source, destination, 2000, verified)
+    assert sorted(path.name for path in (destination / "2000").iterdir()) == ["T", "U", "k", "omega", "p"]
+    assert all((destination / name).read_bytes() == (source / name).read_bytes() for name in copied)
+    with pytest.raises(ValueError, match="separate"):
+        stage_verified_volume_donor(source, source / "child", 2000, verified)
+    (source / "2000/T").write_text("changed")
+    with pytest.raises(ValueError, match="changed"):
+        stage_verified_volume_donor(source, tmp_path / "refused-donor", 2000, verified)
+    assert not (tmp_path / "refused-donor").exists()
+
+
 def test_mapping_checks_the_target_mesh_and_preserves_initialization_identity(tmp_path):
     from unittest.mock import Mock
 

@@ -1,9 +1,25 @@
 from dataclasses import asdict
 import math
+from copy import deepcopy
 
 import numpy as np
 
 from airfoilfoam.postprocess.forces import analyze_rans_hold
+
+
+def unsteady_request(held_request, refined=False):
+    if type(refined) is not bool:
+        raise ValueError("Refinement must be explicitly enabled or disabled")
+    request = deepcopy(held_request)
+    if refined:
+        for key in ("n_surface", "n_radial", "n_wake"):
+            value = request.get("mesh", {}).get(key)
+            if type(value) is not int or value <= 0:
+                raise ValueError("Refinement requires explicit positive source resolution")
+            request["mesh"][key] = value * 2
+    request["solver"].update(flow_solver_family="rhoPimpleFoam", force_transient=True,
+                              transient_fallback=False, momentum_scheme="linearUpwind")
+    return request
 
 
 def physical_window(chord, speed):

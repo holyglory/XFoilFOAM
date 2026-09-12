@@ -20,6 +20,9 @@ services:
   unsteady-vanleer-horizon:
     <<: *unsteady-reference
     command: ["python", "/verification/verify_rae2822_unsteady.py", "--source", "/source", "--reference", "/reference", "--destination", "/evidence/physical-unsteady-vanleer-horizon", "--pressure-advection", "vanLeer", "--time-budget-seconds", "1800"]
+  unsteady-refined:
+    <<: *unsteady-reference
+    command: ["python", "/verification/verify_rae2822_unsteady.py", "--source", "/source", "--reference", "/reference", "--destination", "/evidence/physical-unsteady-refined", "--pressure-advection", "vanLeer", "--time-budget-seconds", "3600", "--refined"]
   artifacts:
     image: sha256:1ebe170cd8cae2b2a13cfa2bf4cb1f5b3d00a65dd5e62467c1cff1c2480b7132
     pull_policy: never

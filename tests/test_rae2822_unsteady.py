@@ -112,3 +112,26 @@ def test_pressure_advection_comparison_changes_only_the_selected_entry(tmp_path)
     with pytest.raises(ValueError, match="Unsupported"):
         configure_unsteady_case(builders[0], first, window, "invented")
     assert (first / "system/controlDict").read_bytes() == before
+
+
+def test_refined_physical_request_changes_only_resolution_and_explicit_unsteady_recipe():
+    from scripts.materials.rae2822_unsteady import unsteady_request
+
+    original = {"mesh": {"n_surface": 128, "n_radial": 80, "n_wake": 64, "target_y_plus": 40},
+                "solver": {"flow_solver_family": "rhoSimpleFoam", "momentum_scheme": "upwind", "turbulence": {"model": "SST"}},
+                "flow_state": {"temperature_k": 255.5, "pressure_pa": 108987}, "speeds": [233.7], "airfoil": {"coordinates": "fixture"}}
+    before = deepcopy(original)
+    coarse = unsteady_request(original)
+    fine = unsteady_request(original, True)
+    assert original == before
+    assert fine["mesh"] == {**original["mesh"], "n_surface": 256, "n_radial": 160, "n_wake": 128}
+    assert {**fine, "mesh": coarse["mesh"]} == coarse
+    assert fine["solver"]["force_transient"] is True and fine["solver"]["transient_fallback"] is False
+    assert fine["flow_state"] == original["flow_state"]
+    for value in [None, 0, True, 1.5]:
+        changed = deepcopy(original)
+        changed["mesh"]["n_surface"] = value
+        with pytest.raises(ValueError, match="positive"):
+            unsteady_request(changed, True)
+    with pytest.raises(ValueError, match="explicitly"):
+        unsteady_request(original, 1)

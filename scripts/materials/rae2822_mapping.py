@@ -3,6 +3,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import shlex
+import shutil
 
 import numpy as np
 
@@ -88,6 +89,15 @@ def map_verified_initial_fields(runner, source, destination, request, settings):
     result = runner.application(destination, command, timeout=120)
     (destination / "log.mapFields").write_text(result.stdout)
     result.check()
+    mapped = validate_mapped_fields(destination, request)
+    if receipt != authenticated_mapping_source(source, request, settings):
+        raise ValueError("Mapping changed its immutable source")
+    return {**receipt, "kind": "mapped_initial_conditions_not_solver_evidence", "target_coordinate": 0,
+            "method": "interpolate", "mapped_fields": mapped, "command": command}
+
+
+def validate_mapped_fields(destination, request):
+    destination = Path(destination)
     mapped = {}
     owner = mesh_list(destination / "constant/polyMesh/owner")
     if not len(owner):
@@ -105,7 +115,35 @@ def map_verified_initial_fields(runner, source, destination, request, settings):
             if np.any(values < calorics["minimum_temperature_k"]) or np.any(values > calorics["maximum_temperature_k"]):
                 raise ValueError("Mapped temperature is outside the material domain")
         mapped[name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "cells": count}
-    if receipt != authenticated_mapping_source(source, request, settings):
-        raise ValueError("Mapping changed its immutable source")
-    return {**receipt, "kind": "mapped_initial_conditions_not_solver_evidence", "target_coordinate": 0,
-            "method": "interpolate", "mapped_fields": mapped, "command": command}
+    return mapped
+
+
+def stage_verified_volume_donor(source, destination, coordinate, verified):
+    source, destination = Path(source).resolve(), Path(destination).resolve()
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError("Volume donor staging must preserve a separate source")
+    if type(coordinate) is not int or coordinate <= 0:
+        raise ValueError("Volume donor needs an exact positive source coordinate")
+    names = [f"{coordinate}/{name}" for name in ("U", "p", "T", "k", "omega")]
+    names += [name for name in verified if name.startswith("constant/polyMesh/")]
+    names += ["system/controlDict"]
+    required_mesh = {f"constant/polyMesh/{name}" for name in ("points", "faces", "owner", "neighbour", "boundary")}
+    if not required_mesh.issubset(names) or any(name not in verified for name in names):
+        raise ValueError("Volume donor lacks verified fields, mesh or controls")
+    for name in names:
+        path = PurePosixPath(name)
+        if path.is_absolute() or ".." in path.parts or path.as_posix() != name:
+            raise ValueError("Volume donor has an invalid source path")
+        if hashlib.sha256((source / name).read_bytes()).hexdigest() != verified[name]:
+            raise ValueError("Volume donor source bytes changed")
+    destination.mkdir(parents=True, exist_ok=False)
+    copied = {}
+    for name in names:
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / name, target)
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        if digest != verified[name]:
+            raise ValueError("Volume donor copy differs from its source")
+        copied[name] = digest
+    return copied

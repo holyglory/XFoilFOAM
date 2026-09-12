@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import shlex
 import time
 from uuid import uuid4
 
@@ -20,15 +21,15 @@ from airfoilfoam.openfoam.runner import get_runner
 from airfoilfoam.pipeline import _case_builder, _run_transient_mesh_qa_gate, resolve_mesh_params
 
 try:
-    from .rae2822_mapping import authenticated_retained_source
+    from .rae2822_mapping import authenticated_retained_source, validate_mapped_fields, stage_verified_volume_donor
     from .rae2822_reference import load_reference
-    from .rae2822_unsteady import physical_window, validate_held_report, weighted_pressure_mean
+    from .rae2822_unsteady import physical_window, validate_held_report, weighted_pressure_mean, unsteady_request
     from .verify_rae2822_hold import checkpoint_signatures
     from .verify_rae2822 import benchmark_time_budget, compare_pressure, pressure_iteration, reconstruct_timed_out_parallel_case, wall_pressure
 except ImportError:
-    from rae2822_mapping import authenticated_retained_source
+    from rae2822_mapping import authenticated_retained_source, validate_mapped_fields, stage_verified_volume_donor
     from rae2822_reference import load_reference
-    from rae2822_unsteady import physical_window, validate_held_report, weighted_pressure_mean
+    from rae2822_unsteady import physical_window, validate_held_report, weighted_pressure_mean, unsteady_request
     from verify_rae2822_hold import checkpoint_signatures
     from verify_rae2822 import benchmark_time_budget, compare_pressure, pressure_iteration, reconstruct_timed_out_parallel_case, wall_pressure
 
@@ -56,7 +57,7 @@ def configure_unsteady_case(builder, directory, window, pressure_advection="upwi
         path.write_text(content)
 
 
-def run(source, destination, reference_directory, time_budget_seconds=600, pressure_advection="upwind"):
+def run(source, destination, reference_directory, time_budget_seconds=600, pressure_advection="upwind", refined=False):
     if pressure_advection not in {"upwind", "vanLeer"}:
         raise ValueError("Unsupported reference pressure-advection scheme")
     source, manifest_bytes, manifest, verified, held = authenticated_retained_source(source)
@@ -70,9 +71,7 @@ def run(source, destination, reference_directory, time_budget_seconds=600, press
     reference = load_reference(reference_directory)
     if reference["provenance"] != held["reference"] or held["energy_form"] != "sensibleEnthalpy":
         raise ValueError("Unsteady reference must preserve the exact source and enthalpy recipe")
-    raw_request = json.loads(json.dumps(held["request"]))
-    raw_request["solver"].update(flow_solver_family="rhoPimpleFoam", force_transient=True,
-                                  transient_fallback=False, momentum_scheme="linearUpwind")
+    raw_request = unsteady_request(held["request"], refined)
     request = PolarRequest.model_validate(raw_request)
     if len(request.cases()) != 1:
         raise ValueError("Unsteady reference requires one exact physical case")
@@ -97,6 +96,7 @@ def run(source, destination, reference_directory, time_budget_seconds=600, press
               "reference": reference["provenance"], "physical_window": window, "time_budget_seconds": budget,
               "time_discretization": "Euler", "spatial_transport": "linearUpwind limited", "energy_form": "sensibleEnthalpy",
               "pressure_advection": pressure_advection,
+              "mesh_refinement_factor": 2 if refined else 1,
               "initial_step_policy": "native_compressibleCourantNo_and_setInitialDeltaT_before_time_loop"}
     started = time.monotonic()
     try:
@@ -111,9 +111,9 @@ def run(source, destination, reference_directory, time_budget_seconds=600, press
         copied = {}
         for relative, digest in verified.items():
             path = Path(relative)
-            if relative.startswith("constant/polyMesh/") or relative == "constant/thermophysicalProperties":
+            if relative == "constant/thermophysicalProperties" or (not refined and relative.startswith("constant/polyMesh/")):
                 target = destination / path
-            elif path.parent == Path(str(coordinate)):
+            elif not refined and path.parent == Path(str(coordinate)):
                 target = destination / "0" / path.name
             else:
                 continue
@@ -122,8 +122,13 @@ def run(source, destination, reference_directory, time_budget_seconds=600, press
             if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                 raise ValueError("Unsteady initialization changed its exact held source bytes")
             copied[str(target.relative_to(destination))] = {"source": relative, "sha256": digest}
-        if any(f"0/{name}" not in copied for name in ("U", "p", "T", "k", "omega", "rho", "phi")):
+        if not refined and any(f"0/{name}" not in copied for name in ("U", "p", "T", "k", "omega", "rho", "phi")):
             raise ValueError("Unsteady initialization is incomplete")
+        if refined:
+            BlockMeshCGrid().write_inputs(destination, airfoil, mesh, spec.chord)
+            meshed = budgeted.application(destination, "blockMesh", timeout=120)
+            (destination / "log.blockMesh").write_text(meshed.stdout)
+            meshed.check()
         report["initialization"] = copied
         warnings = []
         quality = _run_transient_mesh_qa_gate(destination, budgeted, warnings)
@@ -131,6 +136,21 @@ def run(source, destination, reference_directory, time_budget_seconds=600, press
             raise ValueError("Unsteady mesh quality is unavailable")
         report["mesh_quality"] = asdict(quality)
         report["mesh_warnings"] = warnings
+        if refined:
+            donor = destination / "initialization-source"
+            donor_members = stage_verified_volume_donor(source, donor, coordinate, verified)
+            command = f"mapFields {shlex.quote(str(donor))} -sourceTime {coordinate} -consistent -mapMethod interpolate"
+            mapped = runner.application(destination, command, timeout=120)
+            (destination / "log.mapFields").write_text(mapped.stdout)
+            mapped.check()
+            report["mapped_initialization"] = {
+                "kind": "mapped_initial_conditions_not_solver_evidence", "source_coordinate": coordinate, "target_coordinate": 0,
+                "method": "interpolate", "mapped_fields": validate_mapped_fields(destination, raw_request),
+                "command": command, "source_manifest_sha256": report["source_manifest_sha256"],
+                "donor_members": donor_members,
+            }
+            if (destination / "0/phi").exists() or (destination / "0/rho").exists():
+                raise ValueError("Refined initialization must not copy coarse flux or density arrays")
         result = budgeted.solver(destination, "rhoPimpleFoam", processes, timeout=budget)
         (destination / "log.rhoPimpleFoam").write_text(result.stdout)
         report["native_returncode"] = result.returncode
@@ -179,5 +199,6 @@ if __name__ == "__main__":
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--time-budget-seconds", type=float, default=600)
     parser.add_argument("--pressure-advection", choices=["upwind", "vanLeer"], default="upwind")
+    parser.add_argument("--refined", action="store_true")
     arguments = parser.parse_args()
-    run(arguments.source, arguments.destination, arguments.reference, arguments.time_budget_seconds, arguments.pressure_advection)
+    run(arguments.source, arguments.destination, arguments.reference, arguments.time_budget_seconds, arguments.pressure_advection, arguments.refined)
