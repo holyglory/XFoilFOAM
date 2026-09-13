@@ -381,7 +381,7 @@ export function CoverageMatrix({
             fontFamily: MONO,
             fontSize: 10,
             letterSpacing: "0.1em",
-            color: C.dim,
+            color: C.muted,
           }}
         >
           COVERAGE
@@ -548,7 +548,7 @@ export function CoverageMatrix({
           borderBottom: `1px solid ${C.borderRow}`,
           fontFamily: MONO,
           fontSize: 9.5,
-          color: C.dimmest,
+          color: C.muted,
         }}
       >
         <span style={{ letterSpacing: "0.1em" }}>AIRFOIL</span>
@@ -664,7 +664,7 @@ export function CoverageMatrix({
                   style={{
                     fontFamily: MONO,
                     fontSize: 10,
-                    color: C.dim,
+                    color: C.muted,
                     textAlign: "right",
                     fontVariantNumeric: "tabular-nums",
                     whiteSpace: "nowrap",
