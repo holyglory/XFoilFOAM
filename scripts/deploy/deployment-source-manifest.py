@@ -38,6 +38,7 @@ EXCLUDED_DIRECTORY_NAMES = {
     "postProcessing",
     ".codex-artifacts",
     ".codex-db-backups",
+    ".devcoordinator",
     "test-results",
 }
 
