@@ -75,6 +75,7 @@ export async function registerRetainedReportRoutes(app: FastifyInstance) {
             `attachment; filename="${report.filename}"`,
           )
           .header("x-content-sha256", report.signature)
+          .header("access-control-expose-headers", "x-content-sha256")
           .type("application/json; charset=utf-8")
           .send(report.content);
       } catch (error) {

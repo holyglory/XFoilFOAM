@@ -3,6 +3,8 @@ import type {
   CategoryNode,
   HashtagDTO,
   MediumDTO,
+  RetainedSolverReport,
+  RetainedSolverReportPage,
   SimulationDetail,
   ViscosityModelName,
   ViscosityTablePointDTO,
@@ -12,6 +14,10 @@ import {
   type ResultReviewRecord,
   type ResultReviewVerdict,
 } from "./result-review";
+import {
+  retainedReportDownloadPath,
+  type RetainedReportFilters,
+} from "./retained-reports";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
@@ -52,6 +58,50 @@ async function aj<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+export function getRetainedReports(
+  filters: RetainedReportFilters,
+  signal?: AbortSignal,
+) {
+  const query = new URLSearchParams({
+    limit: "25",
+    includeDelivered: String(filters.includeDelivered),
+  });
+  if (filters.airfoil) query.set("airfoil", filters.airfoil);
+  if (filters.campaignId) query.set("campaignId", filters.campaignId);
+  if (filters.cursor) query.set("cursor", filters.cursor);
+  return aj<RetainedSolverReportPage>(`/api/admin/retained-reports?${query}`, {
+    signal,
+  });
+}
+
+export async function downloadRetainedReport(
+  report: RetainedSolverReport,
+  signal: AbortSignal,
+) {
+  const response = await fetch(BASE + retainedReportDownloadPath(report), {
+    credentials: "include",
+    signal,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw Object.assign(
+      new Error(body.error || `Report download failed (${response.status})`),
+      { status: response.status, body },
+    );
+  }
+  if (response.headers.get("x-content-sha256") !== report.signature)
+    throw new Error("Report download failed integrity verification");
+  const bytes = await response.arrayBuffer();
+  const digest = Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+    (value) => value.toString(16).padStart(2, "0"),
+  ).join("");
+  if (digest !== report.signature)
+    throw new Error("Report download failed integrity verification");
+  signal.throwIfAborted();
+  return new Blob([bytes], { type: "application/json" });
 }
 
 export interface AdminMe {

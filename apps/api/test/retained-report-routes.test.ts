@@ -120,6 +120,9 @@ it("downloads exact stored bytes and surfaces missing or corrupt evidence withou
     expect(response.statusCode).toBe(200);
     expect(response.body).toBe(content);
     expect(response.headers["x-content-sha256"]).toBe(signature);
+    expect(response.headers["access-control-expose-headers"]).toBe(
+      "x-content-sha256",
+    );
     expect(response.headers["content-disposition"]).toContain(
       'filename="ag24-solver-report-2.json"',
     );

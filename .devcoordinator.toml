@@ -2431,6 +2431,33 @@ timeout_seconds = 300
 [test.evidence-metadata-contrast]
 timeout_seconds = 300
 
+[test.retained-report-ui]
+timeout_seconds = 900
+
+[test.retained-report-browser]
+timeout_seconds = 900
+
+[[test.retained-report-browser.check]]
+name = "rendered-list-and-download"
+tier = "development"
+command = ["node", "scripts/dev/verify-retained-report-ui.mjs"]
+retained_artifacts = [{ name = "retained-report-ui", path = ".codex-artifacts/retained-report-ui", max_bytes = 16777216 }]
+
+[[test.retained-report-ui.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "typecheck"]
+
+[[test.retained-report-ui.check]]
+name = "client-contract"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/retained-reports.test.ts"]
+
+[[test.retained-report-ui.check]]
+name = "protected-api"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/retained-report-routes.test.ts"]
+
 [[test.evidence-metadata-contrast.check]]
 name = "tokens"
 tier = "development"

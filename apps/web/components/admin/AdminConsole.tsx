@@ -122,6 +122,7 @@ import { momentumSchemeSelect } from "./solver-schemes";
 import { CategoriesAdminPanel, HashtagsAdminPanel } from "./CatalogAdminPanels";
 import { UnitNumberField } from "./UnitNumberField";
 import { PointHistoryPanel } from "./PointHistoryPanel";
+import { RetainedReportsPanel } from "./RetainedReportsPanel";
 import {
   SolvedPointsPopover,
   type SolvedPopoverAnchor,
@@ -6065,6 +6066,7 @@ function QueueDashboard({
               </span>
             </summary>
             <div style={{ borderTop: `1px solid ${C.borderSoft}` }}>
+              {finishedLogOpen && <RetainedReportsPanel />}
               {!queue ? (
                 <EmptyQueueLine text="Loading finished jobs…" />
               ) : finishedJobs.length === 0 ? (
