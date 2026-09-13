@@ -44,7 +44,9 @@ EXCLUDED_DIRECTORY_NAMES = {
 
 def _directory_excluded(relative: Path) -> bool:
     return any(
-        part in EXCLUDED_DIRECTORY_NAMES or part.startswith("processor")
+        part in EXCLUDED_DIRECTORY_NAMES
+        or part.startswith(".next-")
+        or part.startswith("processor")
         for part in relative.parts
     )
 
