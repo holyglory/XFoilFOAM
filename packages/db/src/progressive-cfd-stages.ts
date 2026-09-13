@@ -33,6 +33,17 @@ async function finishCampaigns(db: DB, epochId: string): Promise<number> {
 }
 
 export async function advanceProgressiveCfdStages(db: DB) {
+  const initialCoverage = (epochId: string) => sql`initial_coverage AS MATERIALIZED (
+    SELECT generation.id FROM progressive_generations generation
+    WHERE generation.epoch_id = ${epochId} AND generation.status = 'active'
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_work sibling WHERE sibling.generation_id = generation.id AND sibling.stage = 2
+          AND sibling.state NOT IN ('complete', 'gap') AND (
+            NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial')
+            OR EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial' AND unit.state NOT IN ('complete', 'gap'))
+          )
+      )
+  )`;
   const hasEvidence = sql`EXISTS (
     SELECT 1 FROM progressive_cfd_evidence evidence JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
     JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
@@ -47,13 +58,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       WHERE unit.work_id = work.id AND (attempt.outcome = 'running'
         OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL))
     ) AND (work.stage = 3 OR (
-      NOT EXISTS (
-        SELECT 1 FROM progressive_work sibling WHERE sibling.generation_id = generation.id AND sibling.stage = 2
-          AND sibling.state NOT IN ('complete', 'gap') AND (
-            NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial')
-            OR EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial' AND unit.state NOT IN ('complete', 'gap'))
-          )
-      ) AND NOT EXISTS (
+      generation.id IN (SELECT id FROM initial_coverage) AND NOT EXISTS (
         SELECT 1 FROM progressive_work baseline JOIN progressive_prediction_links link ON link.work_id = baseline.id
         JOIN progressive_polar_fit_work fit ON fit.prediction_id = link.prediction_id
         WHERE baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1
@@ -74,6 +79,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const [campaign] = await connection.execute(sql`
+      WITH ${initialCoverage(String(epoch.id))}
       SELECT campaign.id FROM sim_campaigns campaign
       WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
         SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
@@ -93,16 +99,11 @@ export async function advanceProgressiveCfdStages(db: DB) {
       return receipt;
     }
     const scopes = await connection.execute(sql`
+      WITH ${initialCoverage(String(epoch.id))}
       SELECT work.id, work.generation_id, work.target_id, work.stage, scope.angles,
         ${hasEvidence} AS has_cfd_evidence,
         fit.state AS fit_state, model.id AS model_id, model.response,
-        NOT EXISTS (
-          SELECT 1 FROM progressive_work sibling WHERE sibling.generation_id = generation.id AND sibling.stage = 2
-            AND sibling.state NOT IN ('complete', 'gap')
-            AND (NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial')
-              OR EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial'
-                AND unit.state NOT IN ('complete', 'gap')))
-        ) AS initial_coverage_complete
+        generation.id IN (SELECT id FROM initial_coverage) AS initial_coverage_complete
       FROM progressive_work work JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
       LEFT JOIN progressive_work baseline ON baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1
