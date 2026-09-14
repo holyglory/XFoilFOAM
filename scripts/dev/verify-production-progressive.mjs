@@ -7,7 +7,14 @@ const response = await fetch(`${origin}/api/airfoils/${slug}`);
 assert(response.ok, `Public polar request returned ${response.status}`);
 const detail = await response.json();
 assert.equal(detail.slug, slug);
-assert.equal(detail.progressivePolars.length, 15);
+assert(
+  detail.progressivePolars.length >= 15,
+  "Existing polar coverage must remain available",
+);
+const targetIds = detail.progressivePolars
+  .map((series) => series.targetId)
+  .sort();
+assert.equal(new Set(targetIds).size, targetIds.length);
 const prediction = detail.progressivePolars.find(
   (series) => series.kind === "prediction",
 );
@@ -46,7 +53,14 @@ try {
         ).length > 10,
       );
       const conditions = viewer.getByLabel("Polar condition");
-      assert.equal(await conditions.locator("option").count(), 15);
+      assert.deepEqual(
+        (
+          await conditions
+            .locator("option")
+            .evaluateAll((options) => options.map((option) => option.value))
+        ).sort(),
+        targetIds,
+      );
       await conditions.selectOption(prediction.targetId);
       for (const quantity of [
         "Drag",

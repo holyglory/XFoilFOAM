@@ -15,7 +15,7 @@ assert(
 const deployment = JSON.parse(
   execFileSync(
     "/usr/local/bin/devcoordinator2",
-    ["deployment", "status", "--deployment-id", "d22e893b29a0534a6"],
+    ["deployment", "status", "--name", "progressive-engine"],
     { encoding: "utf8", timeout: 30000, maxBuffer: 256 * 1024 },
   ),
 );

@@ -98,12 +98,12 @@ services:
       worker:
         condition: service_started
 
-volumes:
-  results:
-  cache:
-
 networks:
   default:
     ipam:
       config:
-        - subnet: ${PROGRESSIVE_ENGINE_SUBNET:-172.16.84.0/24}
+        - subnet: ${PROGRESSIVE_ENGINE_SUBNET:-10.250.0.0/24}
+
+volumes:
+  results:
+  cache:

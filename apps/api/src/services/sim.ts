@@ -641,7 +641,7 @@ export async function assembleSim(
         JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
         WHERE evidence.result_attempt_id = ${resultAttemptId}::uuid
           AND attempt.sim_job_id = ${resultAttempts.simJobId}
-          AND (generation.status <> 'cancelled' OR EXISTS (
+          AND ((generation.status <> 'cancelled' OR EXISTS (
             SELECT 1 FROM progressive_recipe_adoptions adoption
             JOIN progressive_generations successor ON successor.id=adoption.generation_id
             JOIN progressive_generation_targets inherited ON inherited.generation_id=successor.id AND inherited.target_id=work.target_id
@@ -652,6 +652,24 @@ export async function assembleSim(
               AND successor.plan_revision_id=campaign.current_plan_revision_id AND successor.status<>'cancelled'
           )) AND generation.plan_revision_id = campaign.current_plan_revision_id
           AND campaign.status IN ('active', 'attention', 'paused', 'completed')
+          OR EXISTS (
+            SELECT 1 FROM progressive_polar_model_evidence member
+            JOIN progressive_polar_models model ON model.id = member.model_id
+            JOIN progressive_polar_fit_work fit ON fit.model_id = model.id
+              AND fit.prediction_id = model.prediction_id AND fit.state = 'ready'
+            JOIN neuralfoil_predictions prediction ON prediction.id = model.prediction_id
+              AND prediction.epoch_id = epoch.id AND prediction.target_id = work.target_id
+            WHERE member.result_attempt_id = ${resultAttemptId}::uuid
+              AND member.attempt_token = attempt.token
+              AND prediction.id = (
+                SELECT latest.id FROM neuralfoil_predictions latest
+                WHERE latest.target_id = work.target_id AND latest.epoch_id = epoch.id
+                ORDER BY latest.created_at DESC, latest.id LIMIT 1
+              )
+              AND model.response->'estimate'->'contributors' @> jsonb_build_array(
+                jsonb_build_object('result_id', ${resultId}::text, 'attempt_id', ${resultAttemptId}::text)
+              )
+          ))
       )`,
         ),
       )

@@ -1660,7 +1660,7 @@ timeout_seconds = 900
 
 [deployment.progressive-engine.component.engine]
 type = "compose"
-env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain" }
+env = { COMPOSE_PROGRESS = "plain", BUILDKIT_PROGRESS = "plain", PROGRESSIVE_ENGINE_SUBNET = "10.250.0.0/24" }
 env_file = ".codex-artifacts/progressive-engine.env"
 files = ["compose.progressive-engine.yml", "compose.progressive-preview-engine.yml"]
 services = ["redis", "gateway", "worker"]
