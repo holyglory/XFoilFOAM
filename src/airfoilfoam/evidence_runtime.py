@@ -1070,10 +1070,34 @@ def reclaim_brokered_remote_evidence(
     with guard:
         ack_path = evidence_dir / BROKERED_HUB_BINDING_ACK_NAME
         existing_ack = _read_optional_json(ack_path)
+        completed_custody_replay = False
         if existing_ack is not None and existing_ack.get("authorization") != canonical_authorization:
-            raise EvidenceCleanupError(
-                "existing hub binding acknowledgement conflicts with reclaim request"
-            )
+            previous_authorization = existing_ack.get("authorization")
+            previous = previous_authorization.get("receipt") if isinstance(previous_authorization, dict) else None
+            previous_source = previous.get("source") if isinstance(previous, dict) else None
+            cleanup_names = (*PACKAGED_RAW_DIRS, EVIDENCE_ARCHIVE_NAME, *LEGACY_EVIDENCE_ARCHIVE_NAMES)
+            if (
+                progressive
+                or not acquire_job_lock
+                or not isinstance(previous, dict)
+                or previous.get("kind") != "hub-progressive-evidence-custody"
+                or not isinstance(previous_source, dict)
+                or previous_source.get("engineJobId") != authorization.job_id
+                or previous_source.get("engineCaseSlug") != authorization.case_slug
+                or previous.get("remote") != remote
+                or not previous.get("brokeredUploadId")
+                or previous.get("brokeredUploadId") != receipt.get("brokeredUploadId")
+                or any(previous_authorization.get(key) != canonical_authorization.get(key)
+                       for key in ("schemaVersion", "jobId", "caseSlug", "evidenceBase"))
+                or _read_optional_json(evidence_dir / BROKERED_LOCAL_RECLAIM_INTENT_NAME) is None
+                or _read_optional_json(evidence_dir / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME) is None
+                or any((evidence_dir / name).exists() or (evidence_dir / name).is_symlink() for name in cleanup_names)
+            ):
+                raise EvidenceCleanupError(
+                    "existing hub binding acknowledgement conflicts with reclaim request"
+                )
+            canonical_authorization = previous_authorization
+            completed_custody_replay = True
 
         manifest_path = evidence_dir / "evidence_manifest.json"
         if not manifest_path.is_file() or manifest_path.is_symlink():
@@ -1219,7 +1243,7 @@ def reclaim_brokered_remote_evidence(
             return EvidenceCleanupResult(
                 state="no_local_bytes",
                 evidence_base=authorization.evidence_base,
-                bytes_freed=int(existing_intent["plannedBytes"]),
+                bytes_freed=0 if completed_custody_replay else int(existing_intent["plannedBytes"]),
                 verification=verification,
                 association_count=1,
             )

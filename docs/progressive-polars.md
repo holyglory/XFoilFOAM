@@ -843,6 +843,14 @@ and do not call the implementation complete based on unit tests alone.
 
 ## Verification
 
+A canonical binding that arrives after completed progressive-custody cleanup may
+acknowledge that completed cleanup without another deletion. The original job,
+case, upload and remote generation must match, the retained manifest and immutable
+intent/completion receipt must validate, and every cleanup path must remain absent.
+The old acknowledgement is retained unchanged and this cross-receipt replay reports
+zero newly freed bytes. Incomplete cleanup, conflicting identity and repopulated
+paths remain explicit refusals; this is not authorization to remove retained jobs.
+
 OpenCFD VTK exports use native `-poly-decomp` for both all-time and latest-time
 output so meshes containing polyhedra alongside standard cells remain readable
 by the media renderer. This changes the derived VTK representation, not the

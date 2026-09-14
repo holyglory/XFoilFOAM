@@ -10,7 +10,7 @@ import shutil
 import tarfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import google_crc32c
@@ -553,6 +553,52 @@ def test_brokered_reclaim_intent_recovers_crash_before_and_during_delete(
     assert replay.state == "no_local_bytes"
     assert replay.bytes_freed == completed.bytes_freed
     assert (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).read_bytes() == immutable_receipt
+
+
+def test_canonical_reclaim_acknowledges_completed_progressive_cleanup_without_rewriting(tmp_path, monkeypatch):
+    from airfoilfoam import evidence_runtime
+
+    job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    canonical = _brokered_reclaim_authorization(job_root, evidence, publication)
+    custody = _progressive_reclaim_authorization(canonical)
+    completed = reclaim_brokered_remote_evidence(job_root, evidence, custody)
+    assert completed.bytes_freed > 0
+    retained = {path.name: path.read_bytes() for path in evidence.iterdir() if path.is_file()}
+    monkeypatch.setattr(evidence_runtime, "_remove_path", lambda *args: pytest.fail("No second deletion is permitted"))
+    for _repeat in range(2):
+        replay = reclaim_brokered_remote_evidence(job_root, evidence, canonical)
+        assert replay.state == "no_local_bytes"
+        assert replay.bytes_freed == 0
+        assert {path.name: path.read_bytes() for path in evidence.iterdir() if path.is_file()} == retained
+
+
+@pytest.mark.parametrize("failure", ["remote", "upload", "source", "receipt", "intent", "reappeared", "running"])
+def test_canonical_reclaim_refuses_unproven_prior_cleanup(tmp_path, failure):
+    job_root, evidence, publication, *_rest = _cleanup_fixture(tmp_path)
+    canonical = _brokered_reclaim_authorization(job_root, evidence, publication)
+    custody = _progressive_reclaim_authorization(canonical)
+    reclaim_brokered_remote_evidence(job_root, evidence, custody)
+    receipt = json.loads(json.dumps(canonical.receipt))
+    if failure == "remote":
+        receipt["remote"]["generation"] = "987654321"
+    elif failure == "upload":
+        receipt["brokeredUploadId"] = "another-upload"
+    elif failure == "source":
+        receipt["engineJobId"] = "another-job"
+    elif failure == "receipt":
+        (evidence / BROKERED_LOCAL_RECLAIM_RECEIPT_NAME).unlink()
+    elif failure == "intent":
+        path = evidence / BROKERED_LOCAL_RECLAIM_INTENT_NAME
+        intent = json.loads(path.read_text())
+        intent["plannedBytes"] += 1
+        path.write_text(json.dumps(intent))
+    elif failure == "reappeared":
+        (evidence / EVIDENCE_ARCHIVE_NAME).write_bytes(b"new bytes must survive")
+    before = {path.name: path.read_bytes() for path in evidence.iterdir() if path.is_file()}
+    with pytest.raises(EvidenceCleanupError):
+        reclaim_brokered_remote_evidence(job_root, evidence, replace(canonical, receipt=receipt),
+                                        acquire_job_lock=failure != "running")
+    assert {path.name: path.read_bytes() for path in evidence.iterdir() if path.is_file()} == before
 
 
 def test_brokered_reclaim_can_skip_job_lock_after_api_proves_case_inactive(
