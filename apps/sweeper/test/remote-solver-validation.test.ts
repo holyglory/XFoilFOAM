@@ -46,6 +46,7 @@ const {
   admitRemoteSolverTick,
   brokeredEvidenceIdempotencyKey,
   claimResultDelivery,
+  settleForeignProgressiveDeliveries,
   createProgressAwareAbort,
   persistClaimedRemotePromise,
   processBrokeredRemoteEvidenceReclaims,
@@ -5938,6 +5939,131 @@ describe("remote solver push validation regressions", () => {
       (rows: Array<{ state: string }>) =>
         rows.filter((row) => row.state === "reclaimed").length === 2,
     );
+  });
+
+  it("rejects foreign progressive promise reuse and settles only unclaimed erroneous deliveries", async () => {
+    const job = await seedDoneRemoteJob("foreign-progressive", [849.001]);
+    const sourceId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("original-progressive", [849.001], sourceId);
+    await db
+      .update(syncSweepPromisePoints)
+      .set({ status: "cancelled" })
+      .where(eq(syncSweepPromisePoints.promiseId, sourceId));
+    const foreign = await seedMirroredPromise("foreign-progressive", [849.001]);
+    const inFlight = await seedMirroredPromise(
+      "inflight-progressive",
+      [849.003],
+    );
+    const [settings] = await db
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1));
+    const [result] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, job.id));
+    const [attempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, result.id));
+    const payload = {
+      ...(job.requestPayload as Record<string, unknown>),
+      remoteProgressiveExecution: {
+        promiseId: sourceId,
+        solverId: settings.remoteSolverRegisteredId,
+        scope: { executionId: job.id },
+      },
+    };
+    await db
+      .update(simJobs)
+      .set({ requestPayload: payload })
+      .where(eq(simJobs.id, job.id));
+    const progressiveJob = { ...job, requestPayload: payload };
+    expect(
+      await claimResultDelivery(
+        db,
+        foreign.id,
+        progressiveJob,
+        result,
+        attempt,
+      ),
+    ).toBeNull();
+    const sourceClaim = await claimResultDelivery(
+      db,
+      sourceId,
+      progressiveJob,
+      result,
+      attempt,
+    );
+    expect(sourceClaim).not.toBeNull();
+    const [wrong] = await db
+      .insert(syncRemoteResultDeliveries)
+      .values({
+        promiseId: foreign.id,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg: result.aoaDeg,
+        generationKey: attempt.id,
+        state: "retry_wait",
+      })
+      .returning();
+    const [busy] = await db
+      .insert(syncRemoteResultDeliveries)
+      .values({
+        promiseId: inFlight.id,
+        simJobId: job.id,
+        resultId: result.id,
+        resultAttemptId: attempt.id,
+        aoaDeg: result.aoaDeg,
+        generationKey: attempt.id,
+        state: "pushing",
+        claimToken: randomUUID(),
+        claimedAt: new Date(),
+        claimExpiresAt: new Date(Date.now() + 60000),
+      })
+      .returning();
+    expect(await settleForeignProgressiveDeliveries(db, settings)).toBe(1);
+    expect(await settleForeignProgressiveDeliveries(db, settings)).toBe(0);
+    const [settled] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, wrong.id));
+    expect(settled.state).toBe("superseded");
+    const [preserved] = await db
+      .select()
+      .from(syncRemoteResultDeliveries)
+      .where(eq(syncRemoteResultDeliveries.id, busy.id));
+    expect(preserved).toEqual(busy);
+    expect(
+      await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, attempt.id)),
+    ).toEqual([attempt]);
+    const legacy = await seedDoneRemoteJob("legacy-reuse-preserved", [849.002]);
+    const legacyPromise = await seedMirroredPromise(
+      "legacy-reuse-target",
+      [849.002],
+    );
+    const [legacyResult] = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, legacy.id));
+    const [legacyAttempt] = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, legacyResult.id));
+    expect(
+      await claimResultDelivery(
+        db,
+        legacyPromise.id,
+        legacy,
+        legacyResult,
+        legacyAttempt,
+      ),
+    ).not.toBeNull();
   });
 
   it("renews a delivery claim that has streamed for more than 30 minutes and rejects a stale settlement token", async () => {

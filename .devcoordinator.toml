@@ -428,6 +428,31 @@ timeout_seconds = 120
 [test.engine-maintenance-process-guard]
 timeout_seconds = 600
 
+[test.progressive-delivery-ownership]
+timeout_seconds = 900
+
+[test.progressive-delivery-ownership.postgres]
+database = "aerodb"
+user = "aerodb"
+image = "postgres:16-alpine"
+
+[[test.progressive-delivery-ownership.check]]
+name = "migrations"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.progressive-delivery-ownership.check]]
+name = "seed"
+tier = "development"
+requires = ["migrations"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-delivery-ownership.check]]
+name = "identity-and-reconciliation"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "rejects foreign progressive promise reuse"]
+
 [[test.engine-maintenance-process-guard.check]]
 name = "exact-process-and-maintenance-contracts"
 tier = "development"
@@ -969,6 +994,12 @@ name = "remote-transfer-integration"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "ready evidence delivery cannot suppress independent CPU admission|keeps transfer-heartbeat failures retryable"]
+
+[[test.progressive.check]]
+name = "progressive-promise-reuse"
+tier = "development"
+requires = ["dependencies", "types", "remote-standalone-claims"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "rejects foreign progressive promise reuse"]
 
 [[test.progressive.check]]
 name = "fixture-scope-cleanup"

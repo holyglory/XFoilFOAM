@@ -3296,6 +3296,16 @@ export async function claimResultDelivery(
   result: typeof results.$inferSelect,
   attempt: typeof resultAttempts.$inferSelect,
 ): Promise<DeliveryClaim | null> {
+  const assignment = (job.requestPayload as Record<string, unknown> | null)
+    ?.remoteProgressiveExecution as
+    | { promiseId?: string; scope?: { executionId?: string } }
+    | undefined;
+  if (
+    assignment &&
+    (assignment.promiseId !== promiseId ||
+      assignment.scope?.executionId !== job.id)
+  )
+    return null;
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     await tx.execute(
@@ -6173,11 +6183,38 @@ export async function processBrokeredRemoteEvidenceReclaims(
   return completed.reduce((sum, value) => sum + value, 0);
 }
 
+export async function settleForeignProgressiveDeliveries(
+  db: DB,
+  settings: Settings,
+): Promise<number> {
+  const settled = await db.execute(sql`
+    WITH candidates AS (
+      SELECT delivery.id FROM sync_remote_result_deliveries delivery
+      JOIN sim_jobs job ON job.id=delivery.sim_job_id
+      JOIN sync_sweep_promises remote_promise ON remote_promise.id=delivery.promise_id
+      WHERE remote_promise.source_base_url=${syncBase(settings)}
+        AND ${remotePromiseOwnerSql(settings, "remote_promise")}
+        AND delivery.state IN ('pending','retry_wait') AND delivery.claim_token IS NULL
+        AND jsonb_typeof(job.request_payload->'remoteProgressiveExecution')='object'
+        AND job.request_payload#>>'{remoteProgressiveExecution,scope,executionId}'=job.id::text
+        AND job.request_payload#>>'{remoteProgressiveExecution,promiseId}'=job.request_payload->>'syncPromiseId'
+        AND job.request_payload#>>'{remoteProgressiveExecution,solverId}'=${settings.remoteSolverRegisteredId}::text
+        AND delivery.promise_id::text<>job.request_payload->>'syncPromiseId'
+      ORDER BY delivery."updatedAt",delivery.id LIMIT 50 FOR UPDATE OF delivery SKIP LOCKED
+    ) UPDATE sync_remote_result_deliveries delivery SET state='superseded',
+      last_error='progressive evidence belongs to another immutable promise; original evidence retained',
+      "updatedAt"=clock_timestamp()
+    FROM candidates WHERE delivery.id=candidates.id RETURNING delivery.id
+  `);
+  return settled.length;
+}
+
 async function processReusablePromiseEvidence(
   db: DB,
   engine: EngineClient,
   settings: Settings,
 ): Promise<boolean> {
+  await settleForeignProgressiveDeliveries(db, settings);
   const candidates = (await db.execute(sql`
     SELECT DISTINCT
       remote_promise.id AS promise_id,
@@ -6204,6 +6241,11 @@ async function processReusablePromiseEvidence(
       AND remote_promise.source_base_url = ${syncBase(settings)}
       AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
       AND ${remotePromiseOwnerSql(settings, "remote_promise")}
+      AND (
+        NOT (solved_job.request_payload ? 'remoteProgressiveExecution')
+        OR (solved_job.request_payload#>>'{remoteProgressiveExecution,promiseId}'=remote_promise.id::text
+          AND solved_job.request_payload#>>'{remoteProgressiveExecution,scope,executionId}'=solved_job.id::text)
+      )
       AND NOT (
         solved_job.wave = 1
         AND EXISTS (
