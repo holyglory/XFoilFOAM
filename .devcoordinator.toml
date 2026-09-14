@@ -1456,6 +1456,19 @@ domain = "airfoils-progressive-preview"
 components = ["db", "api", "web", "solver"]
 public = false
 
+[deployment.mixed-cell-export]
+source = ["worktree"]
+components = ["verification"]
+public = false
+
+[deployment.mixed-cell-export.component.verification]
+type = "compose"
+files = ["compose.mixed-cell-export.yml"]
+services = ["verify"]
+finite_services = ["verify"]
+build = false
+timeout_seconds = 180
+
 [deployment.progressive-engine]
 source = ["worktree"]
 components = ["engine"]

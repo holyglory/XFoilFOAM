@@ -843,6 +843,15 @@ and do not call the implementation complete based on unit tests alone.
 
 ## Verification
 
+OpenCFD VTK exports use native `-poly-decomp` for both all-time and latest-time
+output so meshes containing polyhedra alongside standard cells remain readable
+by the media renderer. This changes the derived VTK representation, not the
+original solver mesh or field evidence. The isolated `mixed-cell-export`
+Coordinator deployment reproduces the undecomposed reader failure and checks
+both export paths, pressure/velocity rendering, and unchanged original-file
+hashes. Its synthetic two-cell fixture is never campaign evidence. A passing
+fixture does not replace guarded engine rollout and real-case verification.
+
 New pressure-based fast recipes use curvature-guarded wall-function spacing.
 The original profile coordinates are aligned and normalized using the same
 geometry convention as the native solver. A maximum concave curvature no greater

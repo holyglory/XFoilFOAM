@@ -1,0 +1,17 @@
+services:
+  verify:
+    image: xfoilfoam-progressive-worker:local
+    pull_policy: never
+    network_mode: none
+    environment:
+      PYTHONPATH: /candidate/src
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    command: ["python", "/candidate/verify_mixed_cell_export.py"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts/materials/verify_mixed_cell_export.py:/candidate/verify_mixed_cell_export.py:ro
+      - evidence:/evidence
+volumes:
+  evidence:

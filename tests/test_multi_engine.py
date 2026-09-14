@@ -56,6 +56,13 @@ def _patches() -> list[BoundaryPatch]:
     ]
 
 
+def test_opencfd_export_decomposes_polyhedra_without_changing_foundation_commands():
+    assert OPENCFD_2606.vtk_all_times_command == "foamToVTK -poly-decomp"
+    assert OPENCFD_2606.vtk_latest_time_command == "foamToVTK -poly-decomp -latestTime"
+    assert FOUNDATION_14.vtk_all_times_command == "foamToVTK -useTimeName"
+    assert FOUNDATION_14.vtk_latest_time_command == "foamToVTK -latestTime -useTimeName"
+
+
 def _builder(tmp_path: Path, naca0012_selig_text: str, dialect):
     airfoil = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
     builder = CaseBuilder(
