@@ -1014,6 +1014,24 @@ documented lower-surface and negative-Cp plotting signs. The condition is Mach
 Reynolds number and the value resolved from the selected material are reported
 separately; no measurement uncertainty is invented.
 
+The pinned NACA 0012 source in `tests/fixtures/naca0012` retains the original
+NASA-linked TMR geometry and Ladson force files. Its 53 published rows are three
+separate 80-, 120-, and 180-grit tripped runs at reported Mach 0.15 and Reynolds
+6 million. `scripts.materials.naca0012_reference` verifies source bytes, columns,
+angles and coordinate orientation without creating catalog or solver rows.
+The geometry is the modified TMR benchmark, not as-tested geometry; trip location,
+equivalent roughness and measurement uncertainty are unavailable.
+
+The governed `naca0012-prior-comparison` target records its protocol before real
+NeuralFoil prediction. It predicts the exact union of measured angles using an
+explicit smooth, leading-edge-transition model approximation, then compares each
+grit run separately. It reports coefficient errors, not a calibrated coverage
+claim. The initial whole-range lift RMSE is 0.088–0.141 and drag RMSE is
+0.060–0.098 across the three runs, including their near-stall measurements.
+These geometry, trip and dimensionality limitations make the comparison
+ineligible for exact-target calibration. No production uncertainty policy changes.
+Original reports remain immutable; another study requires a new output directory.
+
 Run `rae-reference` through the coordinator before the isolated `rae-fast`,
 `rae-precise`, `rae-refined` or experimental `rae-transonic` deployments. These
 use separate native jobs so a failed case cannot terminate another deployment.

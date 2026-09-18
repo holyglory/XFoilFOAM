@@ -502,6 +502,21 @@ timeout_seconds = 120
 [test.uiuc-family-calibration]
 timeout_seconds = 600
 
+[test.naca0012-prior-comparison]
+timeout_seconds = 900
+
+[[test.naca0012-prior-comparison.check]]
+name = "reference-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_naca0012_reference.py", "-q"]
+
+[[test.naca0012-prior-comparison.check]]
+name = "real-prior-comparison"
+tier = "development"
+requires = ["reference-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.evaluate_naca0012_prior", "--reference", "tests/fixtures/naca0012", "--output", ".codex-artifacts/naca0012-tripped-prior-v1"]
+retained_artifacts = [{ name = "naca0012-prior-comparison", path = ".codex-artifacts/naca0012-tripped-prior-v1", max_bytes = 2097152 }]
+
 [[test.uiuc-family-calibration.check]]
 name = "protocol-contract"
 tier = "development"
