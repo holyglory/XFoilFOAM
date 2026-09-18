@@ -89,7 +89,8 @@ _CASE_DELETE_DIRS = {
     "dynamicCode",
     "mesh-evidence",
 }
-_CASE_KEEP_DIRS = {"images", "frames", "evidence", "custom_renders"}
+_CASE_KEEP_DIRS = {"images", "frames", "evidence", "custom_renders", "pressure_initialization", "steady_initialization"}
+_CASE_DIAGNOSTIC_FILES = {"pressure-initialization.json", "acoustic-startup.json", "material-domain-diagnostic.json"}
 _TRANSIENT_START_FILENAME = "transient_start.json"
 _TRANSIENT_START_ARCHIVE_MEMBER = "openfoam/transient/transient_start.json"
 _URANS_EARLY_STOP_FILENAME = "urans_early_stop.json"
@@ -437,9 +438,9 @@ def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep
         if _is_aoa_media_dir(child):
             _strip_media_segment(job_root, child, report)
             continue
-        if name in {"images", "frames", "custom_renders"}:
+        if name in _CASE_KEEP_DIRS:
             continue
-        if name in _ROOT_JSON_KEEP:
+        if name in _ROOT_JSON_KEEP or name in _CASE_DIAGNOSTIC_FILES:
             continue
         if _is_transient_solver_dir(child):
             if not keep_case_state:
@@ -591,7 +592,7 @@ def _strip_solver_state_dir(
                 _record_unknown(job_root, child, report)
         elif _is_case_solver_artifact(child):
             _remove_path(child, report)
-        elif child.name in _CASE_KEEP_DIRS:
+        elif child.name in _CASE_KEEP_DIRS or child.name in _CASE_DIAGNOSTIC_FILES:
             continue
         else:
             _record_unknown(job_root, child, report)

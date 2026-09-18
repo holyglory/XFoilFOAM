@@ -189,6 +189,23 @@ def _write_remote_pointer(evidence: Path, archive: Path, *, stored_sha: str | No
     )
 
 
+@pytest.mark.parametrize("keep_case_state", [False, True])
+def test_strip_retains_known_initialization_evidence_without_permanent_unknowns(tmp_path, keep_case_state):
+    job_root = tmp_path / "initialization-evidence"
+    paths = _make_realistic_job(job_root)
+    retained = []
+    for directory in (paths["case"], paths["case"] / "transient_a0"):
+        for name in ("pressure-initialization.json", "acoustic-startup.json", "material-domain-diagnostic.json"):
+            retained.append(_write(directory / name, b'{"fixture":"retained diagnostic"}'))
+        retained.append(_write(directory / "pressure_initialization" / "U.potential", b"initialization velocity"))
+        retained.append(_write(directory / "steady_initialization" / "postProcessing" / "coefficient.dat", b"iteration-based history"))
+    before = {path: path.read_bytes() for path in retained}
+    report = strip_job_dir(job_root, keep_case_state=keep_case_state)
+    assert report.unknown_entries == []
+    assert {path: path.read_bytes() for path in retained} == before
+    assert strip_job_dir(job_root, keep_case_state=keep_case_state).no_op
+
+
 def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):
     job_root = tmp_path / "job-strip"
     paths = _make_realistic_job(job_root)
