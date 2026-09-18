@@ -203,6 +203,49 @@ deployment-owned evidence volumes. The half-step report SHA256 is
 The focused reference/control regression run is
 `t20260918T165614Z-bfbb00`; it is not complete release validation.
 
+## High-angle Mach-3 failure diagnosis
+
+The September 18 FX60-100 diagnosis reproduces a real campaign failure using
+the repository's original `fx60100.dat`: all 97 coordinate pairs match the
+production request's SHA256
+`62678a8b062a9cdd2d0d18fe4791944044cc74f43986759ba7ec646172654b8e`.
+The source case is job `c8827f4c-65d8-4490-bdc8-e84c98529a57`, with a
+0.1 m chord, 1021.025 m/s, 288.15 K, 101325 Pa, smooth wall and fully turbulent
+SST. The diagnostic preserves its mesh dimensions, upwind scheme, 5000-iteration
+limit and 900-second active solver budget. It runs serially from an empty local
+cache without rendering media or publishing campaign data.
+
+The first isolated run starts directly at 13 degrees rather than marching from
+-4 degrees. It fails at iteration 3 with 40 material warnings and attempted
+temperatures of 69.81–90.40 K. Thus the preceding angle is not necessary to
+produce the failure. The raw diagnostic log is retained with SHA256
+`e345ecc6e1b39f6adba4dda1f14c91244819d67d6fd86ccc0695c760d90eba7e`.
+
+Two further isolated runs change only the existing Courant setting in their
+immutable requests, before case generation. Both complete 5000 iterations
+without material warnings, but neither earns the required convergence proof.
+
+| Effective local Courant target | Active solver time | Cl | Cd | Cm | Classification |
+| --- | --- | --- | --- | --- | --- |
+| 0.5 | 1.09 s | unavailable | unavailable | unavailable | Material-domain failure |
+| 0.25 | 246.41 s | 0.25910 | 0.12980 | -0.09081 | Unconverged calculation |
+| 0.1 | 241.52 s | 0.27689 | 0.13293 | -0.09737 | Unconverged calculation |
+
+The coefficient difference is material: avoiding temperature clamps is not
+convergence, physical validation, or a calibrated error bound. The two point
+and attempt collections retain the same underlying outcome; they are not
+independent repeated measurements. These calculations do not establish which
+Courant value should be adopted across the campaign. They justify investigating
+startup stepping before extending material bounds, which remain unchanged.
+
+The sealed deployments are `mach3-failure-diagnosis` generation 1
+(`d060e0517ea1bc6a4`) and `mach3-smaller-steps` generation 1
+(`d20b97ea87530d712`). Reports and source requests are retained under
+`.codex-artifacts/mach3-failure-20260918/`; raw cases remain in their respective
+deployment-owned volumes. Diagnostic completion means an actual case outcome
+and intact material logs were collected, not that the solver converged.
+The protocol regression run is `t20260918T172646Z-54bdca`.
+
 ## Governed checks
 
 - `progressive / air-pressure-audit`: analytic energy/entropy and failure-state

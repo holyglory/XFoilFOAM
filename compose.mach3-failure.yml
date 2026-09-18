@@ -1,0 +1,47 @@
+services:
+  cold: &cold
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: none
+    environment:
+      PYTHONPATH: /candidate/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_DATA_DIR: /evidence/cold
+      AIRFOILFOAM_CACHE_DIR: /evidence/cold/cache
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/cold", "--start", "cold"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts/materials/reproduce_mach3_failure.py:/verification/reproduce_mach3_failure.py:ro
+      - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
+      - mach3-diagnostic-evidence:/evidence
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+  quarter:
+    <<: *cold
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/quarter", "--start", "cold", "--courant", "0.25"]
+  tenth:
+    <<: *cold
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/tenth", "--start", "cold", "--courant", "0.1"]
+  artifacts:
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - mach3-diagnostic-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  mach3-diagnostic-evidence:

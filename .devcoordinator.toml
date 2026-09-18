@@ -508,6 +508,14 @@ timeout_seconds = 900
 [test.thermally-perfect-shock]
 timeout_seconds = 900
 
+[test.mach3-failure-diagnosis]
+timeout_seconds = 300
+
+[[test.mach3-failure-diagnosis.check]]
+name = "protocol"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_mach3_failure_reproduction.py", "-q"]
+
 [[test.thermally-perfect-shock.check]]
 name = "reference-contract"
 tier = "development"
@@ -1595,6 +1603,40 @@ source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
+
+[deployment.mach3-failure-diagnosis]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.mach3-failure-diagnosis.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.mach3-failure.yml"]
+services = ["artifacts", "cold"]
+finite_services = ["cold"]
+build = false
+port = true
+route = true
+timeout_seconds = 1500
+
+[deployment.mach3-smaller-steps]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.mach3-smaller-steps.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.mach3-failure.yml"]
+services = ["artifacts", "quarter", "tenth"]
+finite_services = ["quarter", "tenth"]
+build = false
+port = true
+route = true
+timeout_seconds = 1500
 
 [deployment.rae-verification]
 source = ["worktree"]
