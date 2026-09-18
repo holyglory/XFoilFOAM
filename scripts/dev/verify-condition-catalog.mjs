@@ -76,6 +76,39 @@ try {
       await expect(
         page.getByLabel("Polar condition", { exact: true }),
       ).toHaveValue(alternate.targetId);
+      await page.goto(`${origin}/search?${query}`, {
+        waitUntil: "domcontentloaded",
+      });
+      await expect(page.getByLabel("Metrics for")).toHaveValue(
+        selected.conditionKey,
+      );
+      await page.getByLabel("Metrics for").selectOption(alternate.conditionKey);
+      await expect(page).toHaveURL(
+        new RegExp(`/search\\?condition=${alternate.conditionKey}$`),
+      );
+      const rankedLink = page
+        .locator(
+          `a[href^="/airfoils/"][href$="?condition=${alternate.conditionKey}"]`,
+        )
+        .first();
+      await expect(rankedLink).toBeVisible();
+      const rankedHref = await rankedLink.getAttribute("href");
+      await rankedLink.click();
+      await expect(page).toHaveURL(origin + rankedHref);
+      const searchSelection = await page
+        .getByLabel("Polar condition", { exact: true })
+        .inputValue();
+      const linkedProfile = await page.request.get(
+        `${origin}/api${rankedHref.split("?")[0]}?view=curves`,
+      );
+      assert(linkedProfile.ok());
+      assert(
+        (await linkedProfile.json()).progressivePolars.some(
+          (series) =>
+            series.targetId === searchSelection &&
+            series.conditionKey === alternate.conditionKey,
+        ),
+      );
       await page.goto(
         `${origin}/compare?airfoil=${slug}&condition=${alternate.conditionKey}`,
         { waitUntil: "domcontentloaded" },
