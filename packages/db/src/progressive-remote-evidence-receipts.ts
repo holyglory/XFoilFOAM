@@ -9,6 +9,7 @@ import {
   type ProgressiveRemoteEvidenceReference,
 } from "./progressive-remote-evidence";
 import { progressiveRemotePointProjection } from "./progressive-remote-point-projection";
+import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
 
 export interface ProgressiveRemoteEvidenceDelivery {
   solverId: string;
@@ -32,7 +33,7 @@ async function sourceAndReceipt(
     );
   const [receipt] = await db.execute(sql`
     SELECT receipt.sequence, receipt.result_attempt_id, receipt.remote_result_id, receipt.remote_result_attempt_id,
-      receipt.received_at, attempt.result_id FROM progressive_remote_evidence_receipts receipt
+      receipt.received_at, receipt.storage_only, attempt.result_id FROM progressive_remote_evidence_receipts receipt
     JOIN result_attempts attempt ON attempt.id = receipt.result_attempt_id
     WHERE receipt.sim_job_id = ${input.engineJobId}::uuid AND receipt.point_content_signature = ${source.contentSignature}
   `);
@@ -61,6 +62,7 @@ async function sourceAndReceipt(
           resultAttemptId: String(receipt.result_attempt_id),
           remoteResultId: String(receipt.remote_result_id),
           remoteResultAttemptId: String(receipt.remote_result_attempt_id),
+          storageOnly: receipt.storage_only === true,
           receivedAt: (receipt.received_at instanceof Date
             ? receipt.received_at
             : new Date(String(receipt.received_at))
@@ -79,7 +81,10 @@ export async function readProgressiveRemoteEvidenceReceipt(
 
 export async function recordProgressiveRemoteEvidenceReceipt(
   db: DB,
-  input: ProgressiveRemoteEvidenceDelivery & { resultAttemptId: string },
+  input: ProgressiveRemoteEvidenceDelivery & {
+    resultAttemptId: string;
+    storageOnly?: boolean;
+  },
 ) {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
@@ -145,16 +150,19 @@ export async function recordProgressiveRemoteEvidenceReceipt(
       throw new Error(
         "Progressive local attempt differs from its reported source values",
       );
-    await recordProgressiveCfdEvidence(connection, {
-      simJobId: input.engineJobId,
-      engineJobId: input.engineJobId,
-      resultAttemptIds: [input.resultAttemptId],
-    });
+    if (input.storageOnly)
+      await assertStoppedProgressiveStorage(connection, input);
+    else
+      await recordProgressiveCfdEvidence(connection, {
+        simJobId: input.engineJobId,
+        engineJobId: input.engineJobId,
+        resultAttemptIds: [input.resultAttemptId],
+      });
     await connection.execute(sql`
       INSERT INTO progressive_remote_evidence_receipts
-        (sim_job_id, sequence, point_content_signature, result_attempt_id, remote_result_id, remote_result_attempt_id)
+        (sim_job_id, sequence, point_content_signature, result_attempt_id, remote_result_id, remote_result_attempt_id, storage_only)
       VALUES (${input.engineJobId}::uuid, ${input.progressiveEvidence.sequence}, ${source.contentSignature},
-        ${input.resultAttemptId}::uuid, ${input.remoteResultId}::uuid, ${input.remoteResultAttemptId}::uuid)
+        ${input.resultAttemptId}::uuid, ${input.remoteResultId}::uuid, ${input.remoteResultAttemptId}::uuid, ${input.storageOnly === true})
       ON CONFLICT (sim_job_id, point_content_signature) DO NOTHING
     `);
     const stored = (await sourceAndReceipt(connection, input)).receipt;

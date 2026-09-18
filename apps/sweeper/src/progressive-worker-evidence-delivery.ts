@@ -12,6 +12,10 @@ import { sql } from "drizzle-orm";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import { progressiveDeliverySelectionSql } from "./progressive-delivery-selection";
 import { recordInactiveStoppedPromise } from "./progressive-inactive-promise";
+import {
+  progressiveStoppedStorageEligible,
+  requeueStoppedProgressiveStorage,
+} from "./progressive-stopped-storage";
 
 export async function recordProgressiveWorkerEvidenceReceipt(
   db: DB,
@@ -92,6 +96,7 @@ export async function deliverNextProgressiveWorkerEvidence(
   fetcher: typeof fetch = fetch,
   selection: { preferActive?: boolean } = {},
 ): Promise<boolean> {
+  await requeueStoppedProgressiveStorage(db);
   const [pending] = await db.execute(
     progressiveDeliverySelectionSql(selection.preferActive === true),
   );
@@ -101,6 +106,8 @@ export async function deliverNextProgressiveWorkerEvidence(
   const report = pending.report as unknown as ProgressiveRemoteReport;
   let responseStatus: number | null = null;
   let importConflictIds: string[] = [];
+  let stoppedStorage = false;
+  let inactivePromiseReleased = false;
   try {
     await assertProgressiveWorkerEvidenceJob(db, {
       simJobId: executionId,
@@ -140,8 +147,9 @@ export async function deliverNextProgressiveWorkerEvidence(
       throw new Error(
         "Worker evidence delivery differs from its immutable reported source",
       );
+    stoppedStorage = await progressiveStoppedStorageEligible(db, executionId);
     const response = await fetcher(
-      `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/polars`,
+      `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/${stoppedStorage ? "retained-progressive-evidence" : "polars"}`,
       {
         method: "POST",
         headers: {
@@ -177,7 +185,7 @@ export async function deliverNextProgressiveWorkerEvidence(
         const rejected = (await response.json().catch(() => null)) as {
           error?: unknown;
         } | null;
-        await recordInactiveStoppedPromise(
+        inactivePromiseReleased = await recordInactiveStoppedPromise(
           db,
           {
             executionId,
@@ -190,7 +198,7 @@ export async function deliverNextProgressiveWorkerEvidence(
         );
       }
       throw new Error(
-        `Progressive evidence delivery failed (${response.status})`,
+        `${stoppedStorage ? "Stopped progressive storage" : "Progressive evidence"} delivery failed (${response.status})`,
       );
     }
     const body = (await response.json()) as {
@@ -229,7 +237,9 @@ export async function deliverNextProgressiveWorkerEvidence(
     });
     return true;
   } catch (error) {
-    const conflict = responseStatus === 409 || importConflictIds.length > 0;
+    const conflict =
+      (responseStatus === 409 && !inactivePromiseReleased) ||
+      importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures
         (sim_job_id, sequence, result_attempt_id, point_content_signature, state, attempt_count, retry_after, last_http_status, last_error, remote_conflict_ids)

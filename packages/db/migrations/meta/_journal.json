@@ -1058,6 +1058,13 @@
       "when": 1792368000044,
       "tag": "0150_progressive_staging_order",
       "breakpoints": true
+    },
+    {
+      "idx": 151,
+      "version": "7",
+      "when": 1792368000045,
+      "tag": "0151_progressive_storage_only_receipts",
+      "breakpoints": true
     }
   ]
 }

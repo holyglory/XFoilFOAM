@@ -250,6 +250,17 @@ Unconverged evidence remains distinct from accepted points. The full archive pat
 carries the same source proof; a prior compact receipt must not suppress later
 publication when the complete evidence passes the still-current execution gates.
 Existing receipts may replay after cancellation without reopening that execution.
+New compact evidence from a closed assignment uses the separate registered-worker
+`retained-progressive-evidence` endpoint. It requires the exact immutable dispatch
+and report, a terminal execution with no running attempt or live import owner,
+and both a persisted stop acknowledgement and a validated final report. Its
+immutable `storage_only` receipt is not a CFD contribution and cannot select a
+canonical point, fulfill a promise, reopen campaign work, or change a curve.
+The normal archive broker can then verify and store that exact retained source;
+existing signed custody and fresh generation-pinned readback still gate local
+deletion. Workers may retry an old inactive-promise refusal once through this
+path only after authenticated lease loss and acknowledged stopping. Explicit
+import conflicts, foreign ownership and storage-path refusals remain blocked.
 An explicit import-conflict response is not a successful retained-attempt receipt
 or a transient transport failure. The compact worker records valid remote conflict
 IDs and the original HTTP status, including HTTP 200 conflict responses, then stops

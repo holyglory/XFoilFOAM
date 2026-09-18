@@ -1015,15 +1015,29 @@ function mediumValuesFromPayload(data: Record<string, unknown>) {
   const density = numberWithFallback(data.density, 1);
   const phase: "gas" | "liquid" = data.phase === "liquid" ? "liquid" : "gas";
   const rawGasModel = data.gasThermodynamics ?? data.gas_thermodynamics;
-  const gasThermodynamics = rawGasModel == null ? null : parseGasThermodynamicModel(rawGasModel);
+  const gasThermodynamics =
+    rawGasModel == null ? null : parseGasThermodynamicModel(rawGasModel);
   if (gasThermodynamics != null) {
     const referenceTemperature = data.refTemperatureK ?? data.ref_temperature_k;
     const referencePressure = data.refPressurePa ?? data.ref_pressure_pa;
     const referenceViscosity = data.dynamicViscosity ?? data.dynamic_viscosity;
-    if (data.phase !== "gas" || typeof referenceTemperature !== "number" || typeof referencePressure !== "number" ||
-        ![data.density, referenceViscosity].every((value) => typeof value === "number" && Number.isFinite(value) && value > 0))
-      throw new Error("Explicit gas material sync requires its declared gas phase and reference state");
-    evaluateGasState(gasThermodynamics, referenceTemperature, referencePressure);
+    if (
+      data.phase !== "gas" ||
+      typeof referenceTemperature !== "number" ||
+      typeof referencePressure !== "number" ||
+      ![data.density, referenceViscosity].every(
+        (value) =>
+          typeof value === "number" && Number.isFinite(value) && value > 0,
+      )
+    )
+      throw new Error(
+        "Explicit gas material sync requires its declared gas phase and reference state",
+      );
+    evaluateGasState(
+      gasThermodynamics,
+      referenceTemperature,
+      referencePressure,
+    );
   }
   return {
     slug,
@@ -4239,6 +4253,7 @@ export async function importPolarPush(
   payload: PolarPushPayload,
   files: Map<string, UploadedFileRef>,
   capacityReservation?: SyncUploadCapacityReservation | null,
+  options: { stoppedStorageOnly?: boolean } = {},
 ): Promise<{
   imported: number;
   attempts: number;
@@ -4290,7 +4305,24 @@ export async function importPolarPush(
       db,
       payload,
       promise?.registeredSolverId ?? null,
+      { storageOnly: options.stoppedStorageOnly === true },
     );
+    if (options.stoppedStorageOnly) {
+      if (
+        !progressive.size ||
+        progressive.size !== payload.results.length ||
+        payload.fieldColorScales.length ||
+        payload.results.some(
+          (point) => point.media.length || point.fieldExtents.length,
+        )
+      )
+        throw new ProgressiveRemoteEvidenceConflict(
+          "Stopped storage accepts only exact progressive evidence without presentation updates",
+        );
+      await assertProgressivePolarImportScope(db, progressive);
+      for (const alpha of progressive.keys())
+        retentionOnlyProgressive.add(alpha);
+    }
     const progressiveReplay =
       progressive.size === payload.results.length &&
       [...progressive.values()].every((entry) => entry.receipt !== null);
@@ -4309,6 +4341,7 @@ export async function importPolarPush(
       !promise ||
       (promise.status === "cancelled" &&
         !cancelledEvidenceUpgrade &&
+        !options.stoppedStorageOnly &&
         !progressiveReplay)
     ) {
       throw new PolarPromiseScopeError("promise is not active");
@@ -4493,7 +4526,10 @@ export async function importPolarPush(
           eq(syncSweepPromisePoints.simulationPresetRevisionId, revisionId),
           inArray(syncSweepPromisePoints.aoaDeg, pushedAoas),
           progressive.size &&
-            [...progressive.values()].every((entry) => entry.receipt !== null)
+            (options.stoppedStorageOnly ||
+              [...progressive.values()].every(
+                (entry) => entry.receipt !== null,
+              ))
             ? sql`true`
             : inArray(syncSweepPromisePoints.status, [
                 "active",
@@ -5489,6 +5525,7 @@ export async function importPolarPush(
             await recordProgressiveRemoteEvidenceReceipt(tx, {
               ...entry.delivery,
               resultAttemptId: committed.attemptId,
+              storageOnly: entry.storageOnly,
             }),
           );
           if (committed.brokeredUploadId)
@@ -8201,10 +8238,21 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     }
     try {
       for (const item of body.items)
-        if (item.type === "mediums" && (item.data.gasThermodynamics != null || item.data.gas_thermodynamics != null))
+        if (
+          item.type === "mediums" &&
+          (item.data.gasThermodynamics != null ||
+            item.data.gas_thermodynamics != null)
+        )
           mediumValuesFromPayload(item.data);
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid gas material model" });
+      return reply
+        .code(400)
+        .send({
+          error:
+            error instanceof Error
+              ? error.message
+              : "Invalid gas material model",
+        });
     }
     let imported = 0;
     const conflictIds: string[] = [];
@@ -8248,172 +8296,191 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   // base64 (a single URANS point can carry tens of MB); Fastify's default
   // 1 MiB bodyLimit rejected the very first real push with 413 (validation
   // incident 2026-07-11). Scoped here — public routes keep the default.
-  app.post(
+  for (const polarRoute of [
     "/api/sync/v1/polars",
-    { bodyLimit: SYNC_POLAR_PUSH_BODY_LIMIT_BYTES },
-    async (req, reply) => {
-      let authenticatedSolver:
-        | typeof registeredRemoteSolvers.$inferSelect
-        | null = null;
-      let ctx: Awaited<ReturnType<typeof getSettings>> | null;
-      if (remoteSolverToken(req)) {
-        authenticatedSolver = await requireRegisteredRemoteSolver(req, reply);
-        if (!authenticatedSolver) return;
-        ctx = await getSettings();
-        if (
-          !ctx.settings.enabled ||
-          !ctx.permissions.find((row) => row.dataType === "polars")?.canPush
-        )
-          return reply.code(403).send({ error: "push disabled for polars" });
-      } else {
-        ctx = await requireSync(req, reply, "polars", "push");
-        if (!ctx) return;
-      }
-      let parsed: Awaited<ReturnType<typeof parsePolarRequest>>;
-      try {
-        parsed = await parsePolarRequest(req);
-      } catch (error) {
-        if (error instanceof z.ZodError) {
-          return reply.code(400).send({ error: error.flatten() });
-        }
-        throw error;
-      }
-      const { payload, files, capacityReservation } = parsed;
-      if (!authenticatedSolver && payload.promiseId) {
-        const [promise] = await db
-          .select({ requestPayload: syncSweepPromises.requestPayload })
-          .from(syncSweepPromises)
-          .where(eq(syncSweepPromises.id, payload.promiseId))
-          .limit(1);
-        if (
-          promise &&
-          typeof (promise.requestPayload as Record<string, unknown> | null)
-            ?.solverId === "string"
-        ) {
-          await cleanupMultipartTemps(files);
-          await capacityReservation?.release();
-          return reply
-            .code(401)
-            .send({ error: "remote solver credential required" });
-        }
-      }
-      if (authenticatedSolver) {
-        const [promise] = payload.promiseId
-          ? await db
-              .select()
-              .from(syncSweepPromises)
-              .where(eq(syncSweepPromises.id, payload.promiseId))
-              .limit(1)
-          : [];
-        if (
-          !promise ||
-          payload.sourceInstanceId !== authenticatedSolver.instanceId ||
-          promise.sourceInstanceId !== authenticatedSolver.instanceId ||
-          String(
-            (promise.requestPayload as Record<string, unknown> | null)
-              ?.solverId ?? "",
-          ) !== authenticatedSolver.id
-        ) {
-          await cleanupMultipartTemps(files);
-          await capacityReservation?.release();
-          return reply.code(403).send({
-            error: "remote solver does not own this exact promise payload",
-          });
-        }
-      }
-      let conflictError: string | null = null;
-      let permissionError: string | null = null;
-      let blobLocks: Awaited<ReturnType<typeof acquireSyncBlobLocks>> | null =
-        null;
-      let response: Awaited<ReturnType<typeof importPolarPush>> | null = null;
-      try {
-        const needsArtifacts = payload.results.some(
-          (row) => row.evidenceArtifacts.length > 0,
-        );
-        const needsMedia = payload.results.some((row) => row.media.length > 0);
-        if (
-          needsArtifacts &&
-          !(
-            ctx.permissions.find((p) => p.dataType === "evidence_artifacts")
-              ?.canPush ?? false
+    "/api/sync/v1/retained-progressive-evidence",
+  ])
+    app.post(
+      polarRoute,
+      { bodyLimit: SYNC_POLAR_PUSH_BODY_LIMIT_BYTES },
+      async (req, reply) => {
+        let authenticatedSolver:
+          | typeof registeredRemoteSolvers.$inferSelect
+          | null = null;
+        let ctx: Awaited<ReturnType<typeof getSettings>> | null;
+        if (remoteSolverToken(req)) {
+          authenticatedSolver = await requireRegisteredRemoteSolver(req, reply);
+          if (!authenticatedSolver) return;
+          ctx = await getSettings();
+          if (
+            !ctx.settings.enabled ||
+            !ctx.permissions.find((row) => row.dataType === "polars")?.canPush
           )
-        ) {
-          permissionError = "push disabled for evidence_artifacts";
-        }
-        if (
-          needsMedia &&
-          !(
-            ctx.permissions.find((p) => p.dataType === "result_media")
-              ?.canPush ?? false
-          )
-        ) {
-          permissionError = "push disabled for result_media";
-        }
-        if (!permissionError) {
-          // Hold a shared-process-independent lock from blob publication until
-          // the final reference check. A concurrent importer that observes an
-          // EEXIST blob can therefore never race a failed owner's cleanup and
-          // commit a DB association to bytes that are about to be unlinked.
-          blobLocks = await acquireSyncBlobLocks(payload, files);
-          await commitMultipartFiles(files);
-          response = await importPolarPush(payload, files, capacityReservation);
-        }
-      } catch (error) {
-        if (
-          error instanceof PolarPromiseScopeError ||
-          error instanceof PolarEvidenceBindingError ||
-          error instanceof ProgressiveRemoteEvidenceConflict ||
-          error instanceof ProgressiveCfdEvidenceScopeClosed
-        ) {
-          conflictError = error.message;
+            return reply.code(403).send({ error: "push disabled for polars" });
         } else {
+          if (polarRoute === "/api/sync/v1/retained-progressive-evidence")
+            return reply
+              .code(401)
+              .send({ error: "remote solver credential required" });
+          ctx = await requireSync(req, reply, "polars", "push");
+          if (!ctx) return;
+        }
+        let parsed: Awaited<ReturnType<typeof parsePolarRequest>>;
+        try {
+          parsed = await parsePolarRequest(req);
+        } catch (error) {
+          if (error instanceof z.ZodError) {
+            return reply.code(400).send({ error: error.flatten() });
+          }
           throw error;
         }
-      } finally {
-        await cleanupMultipartTemps(files);
-        try {
-          await cleanupUnreferencedCommittedFiles(files);
-        } finally {
-          try {
-            await blobLocks?.release();
-          } finally {
+        const { payload, files, capacityReservation } = parsed;
+        if (!authenticatedSolver && payload.promiseId) {
+          const [promise] = await db
+            .select({ requestPayload: syncSweepPromises.requestPayload })
+            .from(syncSweepPromises)
+            .where(eq(syncSweepPromises.id, payload.promiseId))
+            .limit(1);
+          if (
+            promise &&
+            typeof (promise.requestPayload as Record<string, unknown> | null)
+              ?.solverId === "string"
+          ) {
+            await cleanupMultipartTemps(files);
             await capacityReservation?.release();
+            return reply
+              .code(401)
+              .send({ error: "remote solver credential required" });
           }
         }
-      }
-      if (permissionError)
-        return reply.code(403).send({ error: permissionError });
-      if (response) {
-        // A later exact delivery can make an earlier replay conflict obsolete.
-        // Reconcile on the successful ingest boundary so the admin review
-        // queue never waits for someone to open the page to become truthful.
-        await reconcileObsoleteExactPolarConflicts();
-        if (!authenticatedSolver) {
+        if (authenticatedSolver) {
+          const [promise] = payload.promiseId
+            ? await db
+                .select()
+                .from(syncSweepPromises)
+                .where(eq(syncSweepPromises.id, payload.promiseId))
+                .limit(1)
+            : [];
+          if (
+            !promise ||
+            payload.sourceInstanceId !== authenticatedSolver.instanceId ||
+            promise.sourceInstanceId !== authenticatedSolver.instanceId ||
+            String(
+              (promise.requestPayload as Record<string, unknown> | null)
+                ?.solverId ?? "",
+            ) !== authenticatedSolver.id
+          ) {
+            await cleanupMultipartTemps(files);
+            await capacityReservation?.release();
+            return reply.code(403).send({
+              error: "remote solver does not own this exact promise payload",
+            });
+          }
+        }
+        let conflictError: string | null = null;
+        let permissionError: string | null = null;
+        let blobLocks: Awaited<ReturnType<typeof acquireSyncBlobLocks>> | null =
+          null;
+        let response: Awaited<ReturnType<typeof importPolarPush>> | null = null;
+        try {
+          const needsArtifacts = payload.results.some(
+            (row) => row.evidenceArtifacts.length > 0,
+          );
+          const needsMedia = payload.results.some(
+            (row) => row.media.length > 0,
+          );
+          if (
+            needsArtifacts &&
+            !(
+              ctx.permissions.find((p) => p.dataType === "evidence_artifacts")
+                ?.canPush ?? false
+            )
+          ) {
+            permissionError = "push disabled for evidence_artifacts";
+          }
+          if (
+            needsMedia &&
+            !(
+              ctx.permissions.find((p) => p.dataType === "result_media")
+                ?.canPush ?? false
+            )
+          ) {
+            permissionError = "push disabled for result_media";
+          }
+          if (!permissionError) {
+            // Hold a shared-process-independent lock from blob publication until
+            // the final reference check. A concurrent importer that observes an
+            // EEXIST blob can therefore never race a failed owner's cleanup and
+            // commit a DB association to bytes that are about to be unlinked.
+            blobLocks = await acquireSyncBlobLocks(payload, files);
+            await commitMultipartFiles(files);
+            response = await importPolarPush(
+              payload,
+              files,
+              capacityReservation,
+              {
+                stoppedStorageOnly:
+                  polarRoute === "/api/sync/v1/retained-progressive-evidence",
+              },
+            );
+          }
+        } catch (error) {
+          if (
+            error instanceof PolarPromiseScopeError ||
+            error instanceof PolarEvidenceBindingError ||
+            error instanceof ProgressiveRemoteEvidenceConflict ||
+            error instanceof ProgressiveCfdEvidenceScopeClosed
+          ) {
+            conflictError = error.message;
+          } else {
+            throw error;
+          }
+        } finally {
+          await cleanupMultipartTemps(files);
+          try {
+            await cleanupUnreferencedCommittedFiles(files);
+          } finally {
+            try {
+              await blobLocks?.release();
+            } finally {
+              await capacityReservation?.release();
+            }
+          }
+        }
+        if (permissionError)
+          return reply.code(403).send({ error: permissionError });
+        if (response) {
+          // A later exact delivery can make an earlier replay conflict obsolete.
+          // Reconcile on the successful ingest boundary so the admin review
+          // queue never waits for someone to open the page to become truthful.
+          await reconcileObsoleteExactPolarConflicts();
+          if (!authenticatedSolver) {
+            return {
+              ...response,
+              bindingReceipts: [],
+              progressiveArchiveReceipts: [],
+            };
+          }
+          const token = remoteSolverToken(req);
+          if (!token) {
+            return reply.code(401).send({
+              error: "remote solver credential required for binding receipt",
+            });
+          }
           return {
             ...response,
-            bindingReceipts: [],
-            progressiveArchiveReceipts: [],
+            bindingReceipts: response.bindingReceipts.map((receipt) =>
+              signHubBindingReceipt(receipt, token),
+            ),
+            progressiveArchiveReceipts: response.progressiveArchiveReceipts.map(
+              (receipt) =>
+                signProgressiveEvidenceCustodyReceipt(receipt, token),
+            ),
           };
         }
-        const token = remoteSolverToken(req);
-        if (!token) {
-          return reply.code(401).send({
-            error: "remote solver credential required for binding receipt",
-          });
-        }
-        return {
-          ...response,
-          bindingReceipts: response.bindingReceipts.map((receipt) =>
-            signHubBindingReceipt(receipt, token),
-          ),
-          progressiveArchiveReceipts: response.progressiveArchiveReceipts.map(
-            (receipt) => signProgressiveEvidenceCustodyReceipt(receipt, token),
-          ),
-        };
-      }
-      return reply.code(409).send({ error: conflictError });
-    },
-  );
+        return reply.code(409).send({ error: conflictError });
+      },
+    );
 
   app.post("/api/sync/v1/conflicts/status", async (req, reply) => {
     let solver: typeof registeredRemoteSolvers.$inferSelect | null = null;

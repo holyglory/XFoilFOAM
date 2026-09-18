@@ -7957,6 +7957,7 @@ export const progressiveRemoteEvidenceReceipts = pgTable(
       .references(() => resultAttempts.id, { onDelete: "cascade" }),
     remoteResultId: uuid("remote_result_id").notNull(),
     remoteResultAttemptId: uuid("remote_result_attempt_id").notNull(),
+    storageOnly: boolean("storage_only").notNull().default(false),
     receivedAt: timestamp("received_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),

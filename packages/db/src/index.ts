@@ -24,6 +24,7 @@ export * from "./progressive-remote-reports";
 export * from "./progressive-remote-evidence";
 export * from "./progressive-remote-point-projection";
 export * from "./progressive-remote-evidence-receipts";
+export * from "./progressive-stopped-storage";
 export * from "./progressive-evidence-custody";
 export * from "./progressive-remote-delivery";
 export * from "./progressive-worker-reports";

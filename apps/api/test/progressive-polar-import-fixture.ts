@@ -5,6 +5,9 @@ import { eq, sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
 import {
   analysisContentHash,
+  acknowledgeProgressiveCfdExecutionStop,
+  storeProgressiveRemoteReport,
+  type ProgressiveRemoteReport,
   progressiveRemotePointProjection,
   resolveProgressiveRemoteEvidence,
   resultAttempts,
@@ -179,6 +182,183 @@ export async function verifyProgressivePolarImport(
         new Map(),
       ),
     ).rejects.toThrow("previously retained progressive source");
+    const storageRollback = new Error(
+      "Rollback isolated stopped storage import",
+    );
+    try {
+      await db.transaction(async (transaction) => {
+        const scoped = transaction as unknown as DB;
+        isolated.connection = scoped;
+        const [latest] =
+          await scoped.execute(sql`SELECT report FROM progressive_remote_reports
+          WHERE sim_job_id=${delivery.engineJobId}::uuid ORDER BY sequence DESC LIMIT 1`);
+        let terminal = latest.report as ProgressiveRemoteReport;
+        if (!terminal.stopProof) {
+          terminal = {
+            ...terminal,
+            sequence: terminal.sequence + 1,
+            status: {
+              ...terminal.status,
+              state: "completed",
+              completed_cases: terminal.status.total_cases,
+            },
+            result: { ...terminal.result!, state: "completed" },
+            stopProof: {
+              version: 1,
+              job_id: delivery.engineJobId,
+              execution_stopped: true,
+              producer_stopped: true,
+              namespace_verified: true,
+              remaining: [],
+              observed_at: new Date().toISOString(),
+              error: null,
+              fence: "terminal_result",
+            },
+          };
+          await storeProgressiveRemoteReport(scoped, {
+            solverId: delivery.solverId,
+            promiseId: delivery.promiseId,
+            executionId: delivery.engineJobId,
+            report: terminal,
+          });
+        }
+        await acknowledgeProgressiveCfdExecutionStop(scoped, {
+          simJobId: delivery.engineJobId,
+          proof: terminal.stopProof!,
+        });
+        await scoped.execute(
+          sql`UPDATE sync_sweep_promises SET status='cancelled' WHERE id=${delivery.promiseId}::uuid`,
+        );
+        await scoped.execute(
+          sql`UPDATE sync_sweep_promise_points SET status='cancelled' WHERE promise_id=${delivery.promiseId}::uuid`,
+        );
+        await scoped.execute(
+          sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${delivery.engineJobId}::uuid`,
+        );
+        await scoped.execute(
+          sql`UPDATE progressive_cfd_attempts SET outcome='cancelled' WHERE sim_job_id=${delivery.engineJobId}::uuid`,
+        );
+        const [before] = await scoped.execute(
+          sql`SELECT to_jsonb(canonical) AS row FROM results canonical WHERE id=${existing.id}::uuid`,
+        );
+        const scopesBefore =
+          await scoped.execute(sql`SELECT unit.id,unit.state,unit.active_seconds FROM progressive_cfd_units unit
+          JOIN progressive_cfd_attempts attempt ON attempt.unit_id=unit.id WHERE attempt.sim_job_id=${delivery.engineJobId}::uuid ORDER BY unit.id`);
+        const storage = (body = payload, credential = token) =>
+          app.inject({
+            method: "POST",
+            url: "/api/sync/v1/retained-progressive-evidence",
+            headers: { "x-xfoilfoam-solver-token": credential },
+            payload: body,
+          });
+        expect((await storage(payload, "wrong-credential")).statusCode).toBe(
+          401,
+        );
+        for (const mutation of [
+          sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${delivery.engineJobId}::uuid`,
+          sql`UPDATE registered_remote_solvers SET revoked_at=clock_timestamp() WHERE id=${delivery.solverId}::uuid`,
+          sql`UPDATE sim_jobs SET engine_job_id=${randomUUID()} WHERE id=${delivery.engineJobId}::uuid`,
+          sql`UPDATE sim_jobs SET status='ingesting' WHERE id=${delivery.engineJobId}::uuid`,
+          sql`UPDATE sim_jobs SET ingest_lease_token=${randomUUID()}::uuid,ingest_lease_expires_at=clock_timestamp()+interval '1 minute'
+            WHERE id=${delivery.engineJobId}::uuid`,
+          sql`UPDATE progressive_cfd_attempts SET outcome='running' WHERE sim_job_id=${delivery.engineJobId}::uuid`,
+          sql`UPDATE sync_sweep_promises SET status='active' WHERE id=${delivery.promiseId}::uuid`,
+        ]) {
+          const rollbackRejection = new Error(
+            "Rollback stopped-storage rejection fixture",
+          );
+          try {
+            await scoped.transaction(async (nested) => {
+              isolated.connection = nested as unknown as DB;
+              await nested.execute(mutation);
+              const rejected = await storage();
+              expect([401, 409], rejected.body).toContain(rejected.statusCode);
+              throw rollbackRejection;
+            });
+          } catch (error) {
+            if (error !== rollbackRejection) throw error;
+          } finally {
+            isolated.connection = scoped;
+          }
+        }
+        expect(
+          (
+            await storage({
+              ...payload,
+              results: [
+                {
+                  ...payload.results[0],
+                  progressiveEvidence: {
+                    ...delivery.progressiveEvidence,
+                    pointContentSignature: "0".repeat(64),
+                  },
+                },
+              ],
+            })
+          ).statusCode,
+        ).toBe(409);
+        await expect(push(payload, new Map())).rejects.toThrow(
+          "promise is not active",
+        );
+        await scoped.execute(
+          sql`UPDATE sim_jobs SET status='running' WHERE id=${delivery.engineJobId}::uuid`,
+        );
+        expect((await storage()).statusCode).toBe(409);
+        await scoped.execute(
+          sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${delivery.engineJobId}::uuid`,
+        );
+        const retained = await storage();
+        expect(retained.statusCode, retained.body).toBe(200);
+        expect(retained.json().conflictIds).toEqual([]);
+        expect(retained.json().fulfilledAoas).toEqual([]);
+        expect(retained.json().progressiveEvidenceReceipts).toMatchObject([
+          { storageOnly: true },
+        ]);
+        const replay = await storage();
+        expect(replay.statusCode, replay.body).toBe(200);
+        expect(replay.json().progressiveEvidenceReceipts).toEqual(
+          retained.json().progressiveEvidenceReceipts,
+        );
+        await verifyProgressivePolarArchiveImport({
+          db: scoped,
+          app,
+          token,
+          payload,
+          delivery,
+          retained: {
+            resultId: retained.json().progressiveEvidenceReceipts[0].resultId,
+            resultAttemptId:
+              retained.json().progressiveEvidenceReceipts[0].resultAttemptId,
+          },
+          storageOnly: true,
+          setConnection: (connection) => {
+            isolated.connection = connection;
+          },
+        });
+        const [after] = await scoped.execute(
+          sql`SELECT to_jsonb(canonical) AS row FROM results canonical WHERE id=${existing.id}::uuid`,
+        );
+        expect(after).toEqual(before);
+        expect(
+          await scoped.execute(sql`SELECT unit.id,unit.state,unit.active_seconds FROM progressive_cfd_units unit
+          JOIN progressive_cfd_attempts attempt ON attempt.unit_id=unit.id WHERE attempt.sim_job_id=${delivery.engineJobId}::uuid ORDER BY unit.id`),
+        ).toEqual(scopesBefore);
+        expect(
+          await scoped.execute(
+            sql`SELECT result_attempt_id FROM progressive_cfd_evidence WHERE result_attempt_id=${retained.json().progressiveEvidenceReceipts[0].resultAttemptId}::uuid`,
+          ),
+        ).toEqual([]);
+        const [closed] = await scoped.execute(
+          sql`SELECT status FROM sync_sweep_promises WHERE id=${delivery.promiseId}::uuid`,
+        );
+        expect(closed.status).toBe("cancelled");
+        throw storageRollback;
+      });
+    } catch (error) {
+      if (error !== storageRollback) throw error;
+    } finally {
+      isolated.connection = db;
+    }
     const imported = await push(payload, new Map());
     expect(imported.conflictIds).toEqual([]);
     expect(imported.attempts).toBe(1);

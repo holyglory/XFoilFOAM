@@ -1,5 +1,6 @@
 import {
   assertProgressiveCfdEvidenceJob,
+  assertStoppedProgressiveStorage,
   progressiveRemotePointProjection,
   ProgressiveRemoteEvidenceConflict,
   ProgressiveCfdEvidenceScopeClosed,
@@ -26,6 +27,7 @@ export async function prepareProgressivePolarImport(
     results: IncomingPoint[];
   },
   solverId: string | null,
+  options: { storageOnly?: boolean } = {},
 ) {
   const prepared = new Map<
     number,
@@ -36,6 +38,7 @@ export async function prepareProgressivePolarImport(
       delivery: ProgressiveRemoteEvidenceDelivery;
       receipt: Awaited<ReturnType<typeof readProgressiveRemoteEvidenceReceipt>>;
       projection: ReturnType<typeof progressiveRemotePointProjection>;
+      storageOnly: boolean;
     }
   >();
   if (
@@ -86,6 +89,7 @@ export async function prepareProgressivePolarImport(
       delivery,
       receipt: await readProgressiveRemoteEvidenceReceipt(db, delivery),
       projection: progressiveRemotePointProjection(source),
+      storageOnly: options.storageOnly === true,
     });
   }
   if (prepared.size && prepared.size !== payload.results.length)
@@ -100,7 +104,11 @@ export async function assertProgressivePolarImportScope(
   prepared: Awaited<ReturnType<typeof prepareProgressivePolarImport>>,
 ) {
   const publishable = new Set<number>();
-  for (const { source, receipt } of prepared.values()) {
+  for (const { source, receipt, delivery, storageOnly } of prepared.values()) {
+    if (storageOnly || receipt?.storageOnly) {
+      await assertStoppedProgressiveStorage(db, delivery);
+      continue;
+    }
     let owned: boolean;
     try {
       owned = await assertProgressiveCfdEvidenceJob(

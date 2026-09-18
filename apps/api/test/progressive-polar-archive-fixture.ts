@@ -33,6 +33,7 @@ export async function verifyProgressivePolarArchiveImport(input: {
   delivery: ProgressiveRemoteEvidenceDelivery;
   retained: { resultId: string; resultAttemptId: string };
   setConnection: (connection: DB) => void;
+  storageOnly?: boolean;
 }) {
   const originalMediaDir = env.mediaDir;
   const mediaDir = await mkdtemp(join(tmpdir(), "progressive-archive-http-"));
@@ -42,7 +43,7 @@ export async function verifyProgressivePolarArchiveImport(input: {
     "verifyRemoteEvidenceManifest",
   );
   try {
-    for (const closed of [false, true]) {
+    for (const closed of input.storageOnly ? [true] : [false, true]) {
       const rollback = new Error("Rollback isolated HTTP archive fixture");
       try {
         await input.db.transaction(async (transaction) => {
