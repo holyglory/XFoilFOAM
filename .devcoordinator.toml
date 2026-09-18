@@ -349,6 +349,11 @@ name = "condition-links"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/metric-condition.test.ts", "test/progressive-comparison.test.ts", "test/search-ranking.test.ts"]
 
+[[test.public-condition-ui.check]]
+name = "layout"
+tier = "development"
+command = ["node", "scripts/dev/verify-condition-layout.mjs"]
+
 [test.public-condition-production]
 timeout_seconds = 900
 
