@@ -36,7 +36,19 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
             "solver_evidence_orphan_quarantines", "progressive_cfd_units", "progressive_cfd_attempts",
             "progressive_cfd_execution_stops", "progressive_cfd_stage_decisions", "progressive_cfd_runtime_progress",
             "progressive_prediction_repairs", "progressive_prediction_repair_attempts", "progressive_recipe_adoptions",
-            "progressive_publication_recoveries", "progressive_publication_recovery_claims"} <= RESET["SOLVER_TABLES"]
+            "progressive_publication_recoveries", "progressive_publication_recovery_claims",
+            "progressive_worker_archive_reclaims"} <= RESET["SOLVER_TABLES"]
+
+
+def test_archive_reclaim_queue_is_disposable_without_widening_configuration_deletion():
+    configuration, solver = RESET["classify_tables"]([
+        *recognized_tables(), {"schema": "public", "name": "progressive_worker_archive_reclaims"},
+    ])
+    assert solver == ["progressive_worker_archive_reclaims"]
+    assert "sim_campaigns" in configuration
+    assert RESET["truncate_statement"](solver) == (
+        'TRUNCATE TABLE public."progressive_worker_archive_reclaims" RESTART IDENTITY RESTRICT;'
+    )
 
 
 def test_preserved_foreign_keys_cannot_retain_solver_dependencies():
