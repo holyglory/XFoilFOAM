@@ -192,7 +192,16 @@ obsolete work, supersede another attempt, or replenish an exhausted budget.
 
 Workers persist ordered immutable reports before delivery. A lost response retries
 the same sequence and bytes; only the hub's matching execution, sequence and content
-signature acknowledge that local outbox row. Both ends retain unconverged attempts
+signature acknowledge that local outbox row.
+
+A repeated terminal report preserves any live evidence-import lease and records
+the latest terminal state to restore afterward. Import completion and failure
+cleanup both restore that stored state instead of an earlier in-memory status.
+An expired import lease remains recoverable, and foreign execution identities
+still fail before projection. A stop report is not permission to interrupt the
+importer's ownership while it is saving the same execution's evidence.
+
+Both ends retain unconverged attempts
 and stop evidence in reports, reject regressions, and keep receipt storage separate
 from canonical evidence ingestion. Pausing new computation does not discard or
 prevent final report delivery; the existing transfer-maintenance pause still stops

@@ -107,6 +107,26 @@ export async function verifyProgressiveWorkerReportDelivery(
       true,
     );
     await checkProjection();
+    const importToken = randomUUID();
+    for (const expiry of ["future", "expired"]) {
+      await db.execute(sql`UPDATE sim_jobs SET status='ingesting',ingest_lease_token=${importToken}::uuid,
+        ingest_lease_previous_status='running',ingest_lease_expires_at=clock_timestamp()+
+          (${expiry === "future" ? 60 : -60} * interval '1 second') WHERE id=${executionId}::uuid`);
+      expect(await settleProgressiveWorkerFinalReport(db, executionId)).toBe(
+        true,
+      );
+      const [during] =
+        await db.execute(sql`SELECT status,ingest_lease_token,ingest_lease_previous_status
+        FROM sim_jobs WHERE id=${executionId}::uuid`);
+      expect(during).toMatchObject({
+        status: expiry === "future" ? "ingesting" : expectedState,
+        ingest_lease_token: importToken,
+        ingest_lease_previous_status:
+          expiry === "future" ? expectedState : "running",
+      });
+    }
+    await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_previous_status=NULL,
+      ingest_lease_expires_at=NULL WHERE id=${executionId}::uuid`);
     const observedEngine = {
       getJob: vi.fn(),
       getResult: vi.fn(),

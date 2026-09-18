@@ -4,7 +4,10 @@ import { expect, vi } from "vitest";
 import type { EngineClient } from "../../engine-client/src";
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
-import { acknowledgeProgressiveWorkerReport } from "../src/progressive-worker-reports";
+import {
+  acknowledgeProgressiveWorkerReport,
+  settleProgressiveWorkerFinalReport,
+} from "../src/progressive-worker-reports";
 import {
   stageProgressiveWorkerEvidence,
   stageNextProgressiveWorkerEvidence,
@@ -97,6 +100,65 @@ export async function verifyProgressiveWorkerEvidence(
       sql`UPDATE sim_jobs SET status = 'cancelled' WHERE id = ${executionId}::uuid`,
     );
     const rollbackRace = new Error("Rollback isolated staging completion race");
+    for (const failAfterProjection of [false, true]) {
+      const rollbackProjection = new Error(
+        "Rollback terminal report projection race",
+      );
+      try {
+        await db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          const [latest] =
+            await connection.execute(sql`SELECT report#>>'{status,state}' AS state
+            FROM progressive_worker_reports WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1`);
+          const terminalState =
+            latest.state === "completed" ? "done" : latest.state;
+          const staging = stageProgressiveWorkerEvidence(
+            connection,
+            engine,
+            executionId,
+            {
+              afterEvidenceStaged: async () => {
+                const [before] = await connection.execute(
+                  sql`SELECT ingest_lease_token FROM sim_jobs WHERE id=${executionId}::uuid`,
+                );
+                expect(
+                  await settleProgressiveWorkerFinalReport(
+                    connection,
+                    executionId,
+                  ),
+                ).toBe(true);
+                const [during] =
+                  await connection.execute(sql`SELECT status,ingest_lease_token,ingest_lease_previous_status
+                FROM sim_jobs WHERE id=${executionId}::uuid`);
+                expect(during).toMatchObject({
+                  status: "ingesting",
+                  ingest_lease_token: before.ingest_lease_token,
+                  ingest_lease_previous_status: terminalState,
+                });
+                if (failAfterProjection)
+                  throw new Error("isolated failure after terminal projection");
+              },
+            },
+          );
+          if (failAfterProjection)
+            await expect(staging).rejects.toThrow(
+              "isolated failure after terminal projection",
+            );
+          else expect((await staging).kind).toBe("staged");
+          const [after] =
+            await connection.execute(sql`SELECT status,ingest_lease_token,ingest_lease_previous_status
+            FROM sim_jobs WHERE id=${executionId}::uuid`);
+          expect(after).toMatchObject({
+            status: terminalState,
+            ingest_lease_token: null,
+            ingest_lease_previous_status: null,
+          });
+          throw rollbackProjection;
+        });
+      } catch (error) {
+        if (error !== rollbackProjection) throw error;
+      }
+    }
     try {
       await db.transaction(async (transaction) => {
         const connection = transaction as unknown as DB;

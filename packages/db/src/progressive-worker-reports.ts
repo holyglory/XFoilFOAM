@@ -21,8 +21,12 @@ async function projectFinalWorkerReport(
     Number.isFinite(Date.parse(report.status.updated_at))
       ? report.status.updated_at
       : null;
+  const importing = sql`status = 'ingesting' AND ingest_lease_token IS NOT NULL
+    AND ingest_lease_expires_at > clock_timestamp()`;
+  const terminalStatus = state === "completed" ? "done" : state;
   const rows = await db.execute(sql`
-    UPDATE sim_jobs SET status = ${state === "completed" ? "done" : state}::sim_job_status,
+    UPDATE sim_jobs SET status = CASE WHEN ${importing} THEN status ELSE ${terminalStatus}::sim_job_status END,
+      ingest_lease_previous_status = CASE WHEN ${importing} THEN ${terminalStatus}::sim_job_status ELSE ingest_lease_previous_status END,
       engine_state = ${state}, total_cases = ${report.status.total_cases}, completed_cases = ${report.status.completed_cases},
       "finishedAt" = coalesce("finishedAt", ${finished}::timestamptz), "updatedAt" = clock_timestamp(),
       error = CASE WHEN ${state} = 'completed' THEN NULL ELSE coalesce(${report.status.message ?? null}, error) END

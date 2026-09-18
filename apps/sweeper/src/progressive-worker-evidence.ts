@@ -188,7 +188,7 @@ export async function stageProgressiveWorkerEvidence(
       await connection
         .update(simJobs)
         .set({
-          status: claimed.restoreStatus,
+          status: sql`coalesce(${simJobs.ingestLeasePreviousStatus}, ${claimed.restoreStatus}::sim_job_status)`,
           ingestLeaseToken: null,
           ingestLeasePreviousStatus: null,
           ingestLeaseClaimedAt: null,
@@ -209,7 +209,7 @@ export async function stageProgressiveWorkerEvidence(
     await db
       .update(simJobs)
       .set({
-        status: claimed.restoreStatus,
+        status: sql`coalesce(${simJobs.ingestLeasePreviousStatus}, ${claimed.restoreStatus}::sim_job_status)`,
         ingestLeaseToken: null,
         ingestLeasePreviousStatus: null,
         ingestLeaseClaimedAt: null,
