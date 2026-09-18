@@ -150,7 +150,7 @@ it("keeps stored catalog summaries equivalent to curve metrics and rejects malfo
   }
 });
 
-it("uses available prediction or composite curves for catalog metrics and exact condition selection", async () => {
+async function verifyPublicCatalog(fullScale: boolean) {
   const rollback = new Error("isolated public catalog proof");
   try {
     await expect(
@@ -368,6 +368,7 @@ it("uses available prediction or composite curves for catalog metrics and exact 
           source: "prediction",
           modelId: first.predictionId,
         });
+        if (!fullScale) throw rollback;
         const scalePrefix = `${prefix}-scale-`;
         await connection.execute(sql`
           INSERT INTO airfoils(slug,name,category_id,points)
@@ -422,7 +423,6 @@ it("uses available prediction or composite curves for catalog metrics and exact 
             (metric) => metric.polarCount === 20 && metric.ldmax === 170,
           ),
         ).toBe(true);
-        expect(elapsed).toBeLessThan(3000);
         console.info(
           JSON.stringify({
             catalogScale: {
@@ -433,10 +433,20 @@ it("uses available prediction or composite curves for catalog metrics and exact 
             },
           }),
         );
+        expect(elapsed).toBeLessThan(3000);
         throw rollback;
       }),
     ).rejects.toBe(rollback);
   } finally {
     isolated.connection = null;
   }
-}, 120000);
+}
+
+it("uses available prediction or composite curves for catalog metrics and exact condition selection", () =>
+  verifyPublicCatalog(false));
+
+it.skipIf(process.env.RUN_CATALOG_SCALE !== "1")(
+  "keeps full campaign catalog reads within their time budget",
+  () => verifyPublicCatalog(true),
+  120000,
+);

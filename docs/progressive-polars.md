@@ -945,6 +945,16 @@ verification separate from physical-model validation. Exercise real public
 wide/narrow UI journeys, method/evidence controls, lifecycle expansion, stale
 delivery rejection, saturated queue responsiveness and recovery after restart.
 
+The complete progressive release check composes both declared targets:
+`devcoordinator2 test start . --target progressive --target public-metrics --tier release`.
+Coordinator gives the catalog scale target its own PostgreSQL instance while
+scheduling both graphs together. The shared progressive database runs the small
+catalog correctness cases; only `public-metrics` enables `RUN_CATALOG_SCALE=1`
+for the 32,000-curve benchmark. Do not insert or analyze that large fixture in
+the database used by concurrent campaign tests. Keep the three-second catalog
+budget and existing campaign-test timeouts unchanged. A progressive-only run
+does not prove the full-size catalog requirement.
+
 `scripts/materials/validate_polar_uncertainty.py` evaluates a fixed model policy
 against supplied held-out references. Its version-1 input records the policy-fit
 profile and condition identities, the holdout axis, and cases containing the

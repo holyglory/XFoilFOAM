@@ -399,6 +399,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
 name = "catalog"
 tier = "development"
 requires = ["types", "seed"]
+env = { RUN_CATALOG_SCALE = "1" }
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/progressive-catalog.test.ts", "test/catalog.test.ts", "-t", "catalog|available prediction"]
 
 [[test.reset.check]]
