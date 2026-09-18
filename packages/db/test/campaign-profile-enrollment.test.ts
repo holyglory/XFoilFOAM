@@ -6981,6 +6981,39 @@ describe("durable progressive CFD units", () => {
     expect(
       (await materializeProgressiveCfdExecution(db, leases[1])).revision.id,
     ).toBe(execution.revision.id);
+    await db.execute(
+      sql`UPDATE progressive_cfd_attempts SET execution_recipe_id=NULL WHERE execution_recipe_id=${execution.recipeId}`,
+    );
+    await db.execute(
+      sql`DELETE FROM progressive_cfd_execution_recipes WHERE id=${execution.recipeId}`,
+    );
+    const restored = await materializeProgressiveCfdExecution(db, leases[0]);
+    expect(restored.revision.id).toBe(execution.revision.id);
+    expect(restored.snapshot).toEqual(execution.snapshot);
+    await db.execute(
+      sql`UPDATE progressive_cfd_attempts SET execution_recipe_id=NULL WHERE execution_recipe_id=${execution.recipeId}`,
+    );
+    await db.execute(
+      sql`DELETE FROM progressive_cfd_execution_recipes WHERE id=${execution.recipeId}`,
+    );
+    const conflict = new Error("isolated retained-preset conflict");
+    await expect(
+      db.transaction(async (transaction) => {
+        await transaction.execute(
+          sql`UPDATE simulation_presets SET enabled=true WHERE id=${execution.revision.presetId}`,
+        );
+        await expect(
+          materializeProgressiveCfdExecution(
+            transaction as unknown as DB,
+            leases[0],
+          ),
+        ).rejects.toThrow("preserved CFD preset conflicts");
+        throw conflict;
+      }),
+    ).rejects.toBe(conflict);
+    expect(
+      (await materializeProgressiveCfdExecution(db, leases[1])).revision.id,
+    ).toBe(execution.revision.id);
     await expect(
       materializeProgressiveCfdExecution(db, {
         ...leases[0],

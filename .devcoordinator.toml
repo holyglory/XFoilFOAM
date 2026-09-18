@@ -852,6 +852,12 @@ tier = "development"
 requires = ["types", "seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/prepare-progressive-reset.test.ts"]
 
+[[test.progressive-reset-preparation.check]]
+name = "numerical-replay"
+tier = "development"
+requires = ["types", "seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "pins a shared execution revision and composes every batch angle with atomic ownership"]
+
 [[test.progressive.check]]
 name = "python-syntax"
 tier = "development"

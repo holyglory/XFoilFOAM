@@ -256,26 +256,43 @@ export async function materializeProgressiveCfdExecution(
         "A content-addressed CFD profile was changed; refusing to overwrite it",
       );
     const slug = `${frozen.preset.slug}-progressive-${identity.slice(0, 16)}`;
-    const [preset] = await connection
+    const presetValues = {
+      slug,
+      name: `${frozen.preset.name} — ${lease.stage === 2 ? "fast" : "precise"} ${family}`,
+      enabled: false,
+      flowConditionId: frozen.flowState.id,
+      referenceGeometryProfileId: frozen.referenceGeometry.id,
+      boundaryProfileId: frozen.boundary.id,
+      meshProfileId: meshRow.id,
+      solverProfileId: solverRow.id,
+      uransMeshProfileId: meshRow.id,
+      uransPrecalcMeshProfileId: meshRow.id,
+      schedulingProfileId: frozen.scheduling.id,
+      outputProfileId: frozen.output.id,
+      sweepDefinitionId: frozen.sweep.id,
+      targetScope: "airfoils" as const,
+      origin: "library" as const,
+    };
+    const [insertedPreset] = await connection
       .insert(simulationPresets)
-      .values({
-        slug,
-        name: `${frozen.preset.name} — ${lease.stage === 2 ? "fast" : "precise"} ${family}`,
-        enabled: false,
-        flowConditionId: frozen.flowState.id,
-        referenceGeometryProfileId: frozen.referenceGeometry.id,
-        boundaryProfileId: frozen.boundary.id,
-        meshProfileId: meshRow.id,
-        solverProfileId: solverRow.id,
-        uransMeshProfileId: meshRow.id,
-        uransPrecalcMeshProfileId: meshRow.id,
-        schedulingProfileId: frozen.scheduling.id,
-        outputProfileId: frozen.output.id,
-        sweepDefinitionId: frozen.sweep.id,
-        targetScope: "airfoils",
-        origin: "library",
-      })
+      .values(presetValues)
+      .onConflictDoNothing({ target: simulationPresets.slug })
       .returning();
+    const [preset] = insertedPreset
+      ? [insertedPreset]
+      : await connection
+          .select()
+          .from(simulationPresets)
+          .where(eq(simulationPresets.slug, slug));
+    if (
+      !preset ||
+      Object.entries(presetValues).some(
+        ([key, value]) => (preset as Record<string, unknown>)[key] !== value,
+      )
+    )
+      throw new Error(
+        "A preserved CFD preset conflicts with its sealed numerical recipe",
+      );
     const snapshot: SimulationSetupSnapshot = {
       ...structuredClone(frozen),
       preset: {
@@ -300,31 +317,72 @@ export async function materializeProgressiveCfdExecution(
     };
     snapshot.uransMesh = snapshot.mesh;
     snapshot.uransPrecalcMesh = snapshot.mesh;
-    const [boundary] = await connection
-      .insert(boundaryConditions)
-      .values({ ...legacyBoundaryValuesFromSnapshot(snapshot), slug })
-      .returning();
+    const boundaryValues = {
+      ...legacyBoundaryValuesFromSnapshot(snapshot),
+      slug,
+    };
+    const [boundary] = insertedPreset
+      ? await connection
+          .insert(boundaryConditions)
+          .values(boundaryValues)
+          .returning()
+      : await connection
+          .select()
+          .from(boundaryConditions)
+          .where(eq(boundaryConditions.id, preset.legacyBoundaryConditionId!));
+    if (
+      !boundary ||
+      Object.entries(boundaryValues).some(
+        ([key, value]) =>
+          canonicalAnalysisJson((boundary as Record<string, unknown>)[key]) !==
+          canonicalAnalysisJson(value),
+      )
+    )
+      throw new Error(
+        "A preserved CFD boundary conflicts with its sealed numerical recipe",
+      );
     snapshot.preset.legacyBoundaryConditionId = boundary.id;
-    await connection
-      .update(simulationPresets)
-      .set({ legacyBoundaryConditionId: boundary.id })
-      .where(eq(simulationPresets.id, preset.id));
-    const [revision] = await connection
-      .insert(simulationPresetRevisions)
-      .values({
-        presetId: preset.id,
-        revisionNumber: 1,
-        signatureHash: simulationSetupSignature(snapshot),
-        reynolds: snapshot.derived.reynolds,
-        mach: snapshot.derived.mach,
-        referenceLengthM: snapshot.referenceGeometry.referenceLengthM,
-        snapshot: snapshot as unknown as Record<string, unknown>,
-        solverImplementationId: frozen.engine.implementationId,
-        physicsHash: physicsHashForSnapshot(snapshot),
-        methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
-        methodCompatibilityHash: methodCompatibilityHashForSnapshot(snapshot),
-      })
-      .returning();
+    if (insertedPreset)
+      await connection
+        .update(simulationPresets)
+        .set({ legacyBoundaryConditionId: boundary.id })
+        .where(eq(simulationPresets.id, preset.id));
+    const [revision] = insertedPreset
+      ? await connection
+          .insert(simulationPresetRevisions)
+          .values({
+            presetId: preset.id,
+            revisionNumber: 1,
+            signatureHash: simulationSetupSignature(snapshot),
+            reynolds: snapshot.derived.reynolds,
+            mach: snapshot.derived.mach,
+            referenceLengthM: snapshot.referenceGeometry.referenceLengthM,
+            snapshot: snapshot as unknown as Record<string, unknown>,
+            solverImplementationId: frozen.engine.implementationId,
+            physicsHash: physicsHashForSnapshot(snapshot),
+            methodCompatibilityHashVersion: METHOD_COMPATIBILITY_HASH_VERSION,
+            methodCompatibilityHash:
+              methodCompatibilityHashForSnapshot(snapshot),
+          })
+          .returning()
+      : await connection
+          .select()
+          .from(simulationPresetRevisions)
+          .where(
+            and(
+              eq(simulationPresetRevisions.presetId, preset.id),
+              eq(simulationPresetRevisions.revisionNumber, 1),
+            ),
+          );
+    if (
+      !revision ||
+      revision.signatureHash !== simulationSetupSignature(snapshot) ||
+      canonicalAnalysisJson(revision.snapshot) !==
+        canonicalAnalysisJson(snapshot)
+    )
+      throw new Error(
+        "A preserved CFD revision conflicts with its sealed numerical recipe",
+      );
     await connection.insert(progressiveCfdExecutionRecipes).values({
       id: identity,
       sourceRevisionId: source.id,
