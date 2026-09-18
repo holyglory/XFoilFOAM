@@ -1,5 +1,4 @@
 import { notFound } from "next/navigation";
-import { Suspense } from "react";
 
 import { DetailHeader } from "@/components/detail/Header";
 import { DetailIsland } from "@/components/detail/DetailIsland";
@@ -8,26 +7,7 @@ import { getAirfoilCurveDetail, getAirfoilDetail } from "@/lib/api";
 import { parsePinnedRevisionParam } from "@/lib/detail-links";
 import { metricConditionParam } from "@/lib/metric-condition";
 
-export default function AirfoilDetailPage(props: {
-  params: Promise<{ slug: string }>;
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
-}) {
-  return (
-    <Suspense
-      fallback={
-        <AppShell active="detail">
-          <main style={{ padding: 24 }}>
-            <p role="status">Loading airfoil polar…</p>
-          </main>
-        </AppShell>
-      }
-    >
-      <AirfoilDetailContent {...props} />
-    </Suspense>
-  );
-}
-
-async function AirfoilDetailContent({
+export default async function AirfoilDetailPage({
   params,
   searchParams,
 }: {

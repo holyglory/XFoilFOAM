@@ -76,6 +76,18 @@ try {
       await expect(
         page.getByLabel("Polar condition", { exact: true }),
       ).toHaveValue(alternate.targetId);
+      await page
+        .getByRole("link", { name: "Compare", exact: true })
+        .last()
+        .click();
+      await expect(
+        page.getByLabel("Comparison condition", { exact: true }),
+      ).toHaveValue(alternate.conditionKey);
+      assert.equal(new URL(page.url()).searchParams.get("airfoil"), slug);
+      assert.equal(
+        new URL(page.url()).searchParams.get("condition"),
+        alternate.conditionKey,
+      );
       await page.goto(`${origin}/search?${query}`, {
         waitUntil: "domcontentloaded",
       });

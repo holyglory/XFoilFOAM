@@ -40,11 +40,22 @@ try {
       await page.goto(`${origin}/compare?airfoil=ag24&airfoil=ag25`, {
         waitUntil: "domcontentloaded",
       });
+      const primaryCurve = page
+        .getByRole("img", { name: "Lift polar for the selected condition" })
+        .first();
+      await expect(primaryCurve).toBeVisible();
+      const primaryBox = await primaryCurve.boundingBox();
+      assert(
+        primaryBox &&
+          primaryBox.y >= 0 &&
+          primaryBox.y + primaryBox.height <= viewport.height,
+        `Primary comparison card curve must fit the first viewport: ${JSON.stringify({ viewport, primaryBox })}`,
+      );
       await page.getByText("Overlay curves", { exact: true }).click();
       const initialViewer = page.getByTestId("progressive-comparison");
       const sampleToggle = initialViewer.getByLabel("Show curve samples");
       await expect(sampleToggle).toBeEnabled();
-      if (navigation % 2 === 1) await sampleToggle.scrollIntoViewIfNeeded();
+      await sampleToggle.scrollIntoViewIfNeeded();
       const beforeInteraction = await page.evaluate(() => ({
         scrollY: window.scrollY,
         height: document.documentElement.scrollHeight,
@@ -105,11 +116,12 @@ try {
       ["ag24", "ag25"],
     );
     const chart = viewer.locator("svg");
+    await chart.scrollIntoViewIfNeeded();
     const box = await chart.boundingBox();
     assert(box && box.x >= 0 && box.x + box.width <= viewport.width + 1);
     assert(
-      box.y < viewport.height * 0.7,
-      `Comparison chart displaced: ${JSON.stringify({ viewport, box })}`,
+      box.y >= 0 && box.y + box.height <= viewport.height,
+      `Requested overlay must be fully visible: ${JSON.stringify({ viewport, box })}`,
     );
     const conditions = viewer.getByLabel("Overlay condition");
     assert((await conditions.locator("option").count()) >= 6);

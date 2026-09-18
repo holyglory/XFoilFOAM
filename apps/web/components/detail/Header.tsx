@@ -1,9 +1,8 @@
 import type { AirfoilDetailPayload } from "@aerodb/core";
-import Link from "next/link";
 
 import { browserUrl } from "@/lib/api";
 import { C, MONO } from "@/lib/tokens";
-import { comparisonHref } from "@/lib/compare-selection";
+import { ConditionComparisonLink } from "./ConditionComparisonLink";
 
 export function DetailHeader({ detail }: { detail: AirfoilDetailPayload }) {
   const { breadcrumb, name, subtitle, tags } = detail;
@@ -71,8 +70,8 @@ export function DetailHeader({ detail }: { detail: AirfoilDetailPayload }) {
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-          <Link
-            href={comparisonHref([detail.slug])}
+          <ConditionComparisonLink
+            slug={detail.slug}
             style={{
               display: "flex",
               alignItems: "center",
@@ -85,9 +84,7 @@ export function DetailHeader({ detail }: { detail: AirfoilDetailPayload }) {
               padding: "9px 14px",
               cursor: "pointer",
             }}
-          >
-            Compare
-          </Link>
+          />
           <a
             href={browserUrl(detail.downloads.selig ?? "#")}
             style={{
