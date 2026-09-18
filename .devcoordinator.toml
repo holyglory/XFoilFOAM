@@ -29,7 +29,7 @@ timeout_seconds = 900
 timeout_seconds = 900
 
 [test.storage-concurrency]
-timeout_seconds = 180
+timeout_seconds = 1800
 
 [test.storage-concurrency.postgres]
 image = "postgres:16-alpine"

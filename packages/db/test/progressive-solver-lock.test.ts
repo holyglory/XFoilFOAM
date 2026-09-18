@@ -47,7 +47,7 @@ it("permits archive foreign keys while preserving admission, revocation and capa
       }),
     ]);
     await observer.db.transaction(async (transaction) => {
-      await transaction.execute(sql`SET LOCAL lock_timeout='1 second'`);
+      await transaction.execute(sql`SET LOCAL lock_timeout='1s'`);
       await transaction.execute(
         sql`INSERT INTO ${child}(solver_id) VALUES(${identity}::uuid)`,
       );
@@ -60,9 +60,7 @@ it("permits archive foreign keys while preserving admission, revocation and capa
     ]) {
       await expect(
         observer.db.transaction(async (transaction) => {
-          await transaction.execute(
-            sql`SET LOCAL lock_timeout='100 milliseconds'`,
-          );
+          await transaction.execute(sql`SET LOCAL lock_timeout='100ms'`);
           await transaction.execute(operation);
         }),
       ).rejects.toMatchObject({ code: "55P03" });
