@@ -43,8 +43,9 @@ profile-switching regions.
 - Runtime font downloads delayed the first paint. Next now self-hosts the
   existing IBM Plex fonts. In the latest run, LCP is 48–348 ms across all 18
   cells, below the unchanged 800 ms threshold.
-- A final compact Clear-label adjustment at intermediate widths still needs
-  its deployment readback. The action's accessible name remains unchanged.
+- The compact Clear-label adjustment is verified on production at 688 pixels
+  in both themes by `t20260918T214322Z-b5e29e`. The action stays in its row and
+  its accessible name remains unchanged.
 - The strict local first-byte benchmark remains open under Coordinator outcome
   `pa7fbd79c1ddd2559`. The latest run has 12 first-byte threshold findings;
   none are layout, contrast, clipping, hierarchy or LCP failures. This is not a
@@ -73,8 +74,22 @@ Condition-link and comparison-selection unit checks also pass.
 
 ## Remaining acceptance
 
-Publish as a preliminary usable increment, not final visual/performance
-readiness. Retest the final source on the public route, confirm intermediate
-width action-row behavior, and resolve the tracked local response-time budget.
+The production Joukowski condition journey passes all six width/theme
+combinations in `t20260918T214322Z-b5e29e`; Search-to-Detail selection also passes
+`t20260918T215633Z-86d7f8`. All twelve catalog/comparison initial captures and
+six comparison full-page captures from the production run were inspected. The
+formal pass still reports one 1132 ms catalog paint against its 800 ms budget
+(`p68518e3c0b911ba6`); the separate local first-byte budget remains open.
+
+The later no-JavaScript check exposed a regression from the Detail streaming
+boundary. Removing that boundary restores visible server-rendered curves;
+`t20260918T220802Z-c547f9` passes the original desktop/mobile assertions and
+sample/evidence interactions. The comparison checks now distinguish the primary
+card curves from the optional overlay, bringing below-fold controls into view
+before testing that their activation preserves scroll.
+
+`t20260918T220930Z-4f105b` additionally verifies that the actual Detail Compare
+action preserves the selected condition. This is functional preview evidence,
+not a claim that the timing budgets or scientific calibration are complete.
 
 final result: blocked
