@@ -1,0 +1,46 @@
+x-verification: &verification
+  image: xfoilfoam-local-steady:verification
+  pull_policy: never
+  network_mode: none
+  environment:
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    PYTHONDONTWRITEBYTECODE: "1"
+  volumes:
+    - ./scripts/materials/oblique_shock.py:/verification/oblique_shock.py:ro
+    - ./scripts/materials/thermally_perfect_shock.py:/verification/thermally_perfect_shock.py:ro
+    - ./scripts/materials/verify_oblique_shock.py:/verification/verify_oblique_shock.py:ro
+    - ./tests/fixtures/oblique-shock:/verification/recipe:ro
+    - ./tests/fixtures/air-thermophysics-audit.json:/verification/material.json:ro
+    - source-air-shock-evidence:/evidence
+
+services:
+  coarse:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/coarse", "--recipe", "/verification/recipe", "--material", "/verification/material.json", "--cells", "64", "--mach", "3"]
+  fine:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/fine", "--recipe", "/verification/recipe", "--material", "/verification/material.json", "--cells", "128", "--mach", "3"]
+  physical:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/physical", "--recipe", "/verification/recipe", "--material", "/verification/material.json", "--cells", "128", "--mach", "3", "--physical-time"]
+  physical-half:
+    <<: *verification
+    command: ["python", "/verification/verify_oblique_shock.py", "--destination", "/evidence/physical-half", "--recipe", "/verification/recipe", "--material", "/verification/material.json", "--cells", "128", "--mach", "3", "--physical-time", "--target-courant", "0.245"]
+  artifacts:
+    image: xfoilfoam-local-steady:verification
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - source-air-shock-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  source-air-shock-evidence:

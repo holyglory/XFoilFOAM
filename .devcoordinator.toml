@@ -505,6 +505,14 @@ timeout_seconds = 600
 [test.naca0012-prior-comparison]
 timeout_seconds = 900
 
+[test.thermally-perfect-shock]
+timeout_seconds = 900
+
+[[test.thermally-perfect-shock.check]]
+name = "reference-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_thermally_perfect_shock.py", "tests/test_oblique_shock.py", "-q"]
+
 [[test.naca0012-prior-comparison.check]]
 name = "reference-contract"
 tier = "development"
@@ -1576,6 +1584,18 @@ components = ["numerics"]
 public = false
 ttl_seconds = 86400
 
+[deployment.source-air-shock]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.source-air-shock-half-step]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
 [deployment.rae-verification]
 source = ["worktree"]
 components = ["numerics"]
@@ -1694,6 +1714,28 @@ env = { COMPOSE_PROGRESS = "plain" }
 files = ["compose.shock-verification.yml"]
 services = ["artifacts", "coarse", "fine", "mach2-coarse", "mach2-fine", "mach3-coarse", "mach3-fine", "physical-mach2", "physical-mach2p5", "physical-mach3"]
 finite_services = ["coarse", "fine", "mach2-coarse", "mach2-fine", "mach3-coarse", "mach3-fine", "physical-mach2", "physical-mach2p5", "physical-mach3"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.source-air-shock.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.source-air-shock.yml"]
+services = ["artifacts", "coarse", "fine", "physical"]
+finite_services = ["coarse", "fine", "physical"]
+build = false
+port = true
+route = true
+timeout_seconds = 900
+
+[deployment.source-air-shock-half-step.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.source-air-shock.yml"]
+services = ["artifacts", "physical-half"]
+finite_services = ["physical-half"]
 build = false
 port = true
 route = true

@@ -148,6 +148,51 @@ neither the temperature interval alone nor these path measurements define a
 validated operating envelope. Material applicability and aerodynamic convergence
 must be checked separately before high-Mach production acceptance.
 
+## Source-air shock verification
+
+The September 18 isolated Mach-3, 15-degree wedge study uses the same
+100–2000 K NASA7/polynomial material fixture as the campaign material audit.
+Its upstream temperature is the original wedge benchmark's 520 degrees Rankine
+(288.8889 K), not the campaign's 288.15 K. The variable-heat-capacity reference
+solves mass, momentum and total enthalpy balances; it is not NASA-tabulated
+experimental data or a frozen-upstream-gamma approximation. Constant-heat-capacity
+limits are checked against the independent closed-form shock relations.
+
+All four native calculations start from uniform upstream fields, use the
+registered thermophysical library, and retain their material-domain, conservation,
+entropy, stationarity and measured Courant checks. No downstream reference
+solution is inserted into the initial fields.
+
+| Resolution parameter | Time integration | Maximum downstream relative discrepancy | Maximum measured Courant number |
+| --- | --- | --- | --- |
+| 64 | Local pseudo-time, 3000 iterations | 1.2211% | 0.500000 |
+| 128 | Local pseudo-time, 3000 iterations | 0.5947% | 0.500000 |
+| 128 | Physical time, target Courant 0.49 | 0.5947% | 0.491019 |
+| 128 | Physical time, target Courant 0.245 | 0.5947% | 0.245237 |
+
+Discrepancies cover pressure, density, temperature and downstream Mach at three
+downstream probes. Halving the physical timestep target changes those saved
+stationary measurements by at most 2.49e-12 relative. The two physical runs
+finish at 0.00297935349 and 0.00298049823 seconds respectively, with 3472 and
+6922 Courant samples. They use the same physical horizon and input dictionaries
+except for the Courant target; their final adaptive steps need not coincide.
+
+These results verify shock coupling for this particular source-air wedge case.
+Two meshes do not establish a formal grid-convergence order. A stationary wedge
+does not validate airfoil geometry, viscous drag, separation, URANS histories,
+or the uncertainty on a Mach-3 polar. Every report explicitly retains
+`airfoil_polar_validation: false`; no benchmark values enter campaign evidence.
+
+The sealed local deployments are `source-air-shock` generation 1
+(`d40417a8caa9d681d`) and `source-air-shock-half-step` generation 1
+(`d2aac3a5104cda832`). Their numerical containers have networking disabled and
+no production credentials. Reports and input dictionaries are retained under
+`.codex-artifacts/source-air-shock-20260918/`; raw cases remain in the separate
+deployment-owned evidence volumes. The half-step report SHA256 is
+`49981de4549ff627cbae6b61b1e90d11e9261522636c270c0ac212dd56d741d6`.
+The focused reference/control regression run is
+`t20260918T165614Z-bfbb00`; it is not complete release validation.
+
 ## Governed checks
 
 - `progressive / air-pressure-audit`: analytic energy/entropy and failure-state

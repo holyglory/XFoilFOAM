@@ -8,6 +8,7 @@ x-verification: &verification
     PYTHONDONTWRITEBYTECODE: "1"
   volumes:
     - ./scripts/materials/oblique_shock.py:/verification/oblique_shock.py:ro
+    - ./scripts/materials/thermally_perfect_shock.py:/verification/thermally_perfect_shock.py:ro
     - ./scripts/materials/verify_oblique_shock.py:/verification/verify_oblique_shock.py:ro
     - ./tests/fixtures/oblique-shock:/verification/recipe:ro
     - shock-evidence:/evidence
