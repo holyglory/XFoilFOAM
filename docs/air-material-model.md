@@ -77,6 +77,21 @@ failure, retaining the exact raw log and diagnostic. A timeout cannot make a
 clamped history eligible, and this failure cannot justify a whole-polar URANS
 promotion or an automatic conservative numerical retry.
 
+The diagnostic parser also reports the minimum and maximum temperatures actually
+printed in clamp warnings and the declared ranges in those warnings. These are
+attempted property-evaluation temperatures, not extrema of an accepted solution.
+Malformed, truncated and nonfinite details remain unparsed, with null extrema
+when no valid numeric warning details can be recovered. They still reject the run. The summary
+retains at most 16 distinct ranges and marks truncation; warning counts, extrema
+and the original checksum-bound log are not truncated. This diagnostic extension
+is locally tested and awaits the next authorized engine rollout.
+
+A read-only production check on September 18 confirmed that campaign revision 5
+and its latest sealed Mach-3 requests select the source-backed 100–2000 K model,
+at 288.15 K and 1021.025 m/s with `rhoCentralFoam`. This rules out the obsolete
+150 K setting for those requests; it is not proof of converged Mach-3 flow, and
+does not authorize widening the model's bounds after a numerical excursion.
+
 Explicit material models now persist on reusable media and in immutable setup
 snapshots. The controller and engine derive operating properties from the same
 selected model; editing a reusable medium does not alter historical revisions.

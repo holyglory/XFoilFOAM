@@ -5,13 +5,13 @@ import json
 from pathlib import Path
 
 from .openfoam.runner import MaterialDomainError
-from .material_warning import MATERIAL_DOMAIN_WARNING
+from .material_warning import material_temperature_diagnostics
 
 
 def material_domain_failure(case_dir: Path, result: object) -> MaterialDomainError | None:
     stdout = str(getattr(result, "stdout", ""))
-    warnings = MATERIAL_DOMAIN_WARNING.findall(stdout)
-    if not warnings:
+    diagnostics = material_temperature_diagnostics(stdout)
+    if not diagnostics["warning_count"]:
         return None
     raw = stdout.encode("utf-8")
     signature = hashlib.sha256(raw).hexdigest()
@@ -21,7 +21,7 @@ def material_domain_failure(case_dir: Path, result: object) -> MaterialDomainErr
     (case_dir / "material-domain-diagnostic.json").write_text(
         json.dumps({
             "kind": "native-material-temperature-clamping",
-            "warning_count": len(warnings),
+            **diagnostics,
             "solver_log": log_name,
             "solver_log_sha256": signature,
             "command": str(getattr(result, "command", "")),
@@ -33,7 +33,7 @@ def material_domain_failure(case_dir: Path, result: object) -> MaterialDomainErr
     )
     return MaterialDomainError(
         f"The native solver clamped temperature outside its material domain "
-        f"({len(warnings)} warnings); retained log {log_name}"
+        f"({diagnostics['warning_count']} warnings); retained log {log_name}"
     )
 
 
