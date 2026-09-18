@@ -59,10 +59,12 @@ export function DetailIsland({
   detail: initialDetail,
   pinnedRevisionId = null,
   openCfdInitially = false,
+  initialConditionKey = "",
 }: {
   detail: AirfoilDetailPayload;
   pinnedRevisionId?: string | null;
   openCfdInitially?: boolean;
+  initialConditionKey?: string;
 }) {
   const [loadedDetail, setLoadedDetail] = useState<AirfoilDetailPayload | null>(
     null,
@@ -407,6 +409,7 @@ export function DetailIsland({
           {!!detail.progressivePolars?.length && (
             <ProgressivePolarViewer
               series={detail.progressivePolars}
+              initialConditionKey={initialConditionKey}
               onOpenResult={openSolverWorkResult}
             />
           )}

@@ -328,6 +328,64 @@ command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "campaig
 [test.reset]
 timeout_seconds = 600
 
+[test.public-metrics]
+timeout_seconds = 1800
+
+[test.public-metrics.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[test.public-condition-ui]
+timeout_seconds = 900
+
+[[test.public-condition-ui.check]]
+name = "journey"
+tier = "development"
+command = ["node", "scripts/dev/verify-condition-catalog.mjs"]
+
+[[test.public-condition-ui.check]]
+name = "condition-links"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/metric-condition.test.ts", "test/progressive-comparison.test.ts", "test/search-ranking.test.ts"]
+
+[test.public-condition-production]
+timeout_seconds = 900
+
+[[test.public-condition-production.check]]
+name = "journey"
+tier = "development"
+command = ["node", "scripts/dev/verify-condition-catalog.mjs", "--production"]
+
+[[test.public-metrics.check]]
+name = "dependencies"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.public-metrics.check]]
+name = "types"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.public-metrics.check]]
+name = "schema"
+tier = "development"
+requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.public-metrics.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.public-metrics.check]]
+name = "catalog"
+tier = "development"
+requires = ["types", "seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/progressive-catalog.test.ts", "test/catalog.test.ts", "-t", "catalog|available prediction"]
+
 [[test.reset.check]]
 name = "boundaries"
 tier = "development"

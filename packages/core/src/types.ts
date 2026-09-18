@@ -201,6 +201,17 @@ export interface Breadcrumb {
   name: string;
 }
 
+export interface PolarMetricCondition {
+  key: string;
+  re: number;
+  mach: number;
+  speedMps: number;
+  temperatureK: number;
+  pressurePa: number;
+  referenceLengthM: number;
+  branch: string;
+}
+
 export interface AirfoilSummary {
   id: string;
   slug: string;
@@ -234,7 +245,10 @@ export interface AirfoilSummary {
   ldmax: number | null;
   clmax: number | null;
   cdmin: number | null;
-  metricsSource: DataSource;
+  metricsSource: DataSource | "prediction" | "estimate";
+  metricCondition?: PolarMetricCondition | null;
+  metricTargetId?: string | null;
+  metricModelId?: string | null;
   fitStatus?: PolarFitStatus | null;
   fitConfidence?: number | null;
 }

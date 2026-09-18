@@ -5,6 +5,7 @@ import { DetailIsland } from "@/components/detail/DetailIsland";
 import { AppShell } from "@/components/shell/AppShell";
 import { getAirfoilCurveDetail, getAirfoilDetail } from "@/lib/api";
 import { parsePinnedRevisionParam } from "@/lib/detail-links";
+import { metricConditionParam } from "@/lib/metric-condition";
 
 export default async function AirfoilDetailPage({
   params,
@@ -36,6 +37,7 @@ export default async function AirfoilDetailPage({
           detail={detail}
           pinnedRevisionId={pinnedRevisionId}
           openCfdInitially={openCfdInitially}
+          initialConditionKey={metricConditionParam(query.condition)}
         />
       </div>
     </AppShell>

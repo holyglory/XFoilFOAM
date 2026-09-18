@@ -6,6 +6,7 @@ import type {
   FieldId,
   FieldTrackPoint,
   HashtagDTO,
+  PolarMetricCondition,
   SimulationDetail,
 } from "@aerodb/core";
 import type { SolverWorkPayload } from "./solver-work";
@@ -85,6 +86,7 @@ export async function listAirfoils(
     category?: string;
     includeSubcategories?: boolean;
     sort?: string;
+    metricConditionKey?: string;
     dir?: "asc" | "desc";
     includePoints?: boolean;
     hashtags?: string[];
@@ -122,6 +124,17 @@ export async function listAirfoils(
   });
   if (!res.ok) throw new Error(`GET /api/airfoils → ${res.status}`);
   return (await res.json()).items as AirfoilSummary[];
+}
+
+export async function getPolarMetricConditions(): Promise<
+  PolarMetricCondition[]
+> {
+  const response = await apiFetch("/api/polar-conditions", {
+    cache: "no-store",
+  });
+  if (!response.ok)
+    throw new Error(`GET /api/polar-conditions → ${response.status}`);
+  return (await response.json()).items;
 }
 
 export async function getCategoriesTree(): Promise<CategoryNode[]> {

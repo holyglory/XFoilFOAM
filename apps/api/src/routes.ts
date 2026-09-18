@@ -6,6 +6,7 @@ import {
 } from "@aerodb/core";
 import {
   airfoils,
+  publicProgressiveConditions,
   boundaryConditions,
   boundaryProfiles,
   categories,
@@ -859,6 +860,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/hashtags", async () => ({ items: await listHashtags() }));
 
   // ---- airfoils ----
+  app.get("/api/polar-conditions", async () => ({
+    items: await publicProgressiveConditions(db),
+  }));
   app.get("/api/airfoils", async (req) => {
     const numeric = z.coerce.number().finite().optional();
     const q = z
@@ -870,6 +874,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
           .transform((v) => (v == null ? undefined : v === "true")),
         q: z.string().optional(),
         sort: z.string().optional(),
+        metricConditionKey: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/)
+          .optional(),
         dir: z.enum(["asc", "desc"]).optional(),
         includePoints: z
           .enum(["true", "false"])

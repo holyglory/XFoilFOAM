@@ -10,6 +10,7 @@ import {
   type PolarQuantity as Chart,
 } from "@/components/PolarQuantitySelector";
 import controls from "@/components/PolarControls.module.css";
+import { withMetricCondition } from "@/lib/metric-condition";
 
 const METHODS = {
   neuralfoil: "NeuralFoil",
@@ -28,8 +29,10 @@ const number = (value: number) => Number(value.toPrecision(4)).toString();
 export function ProgressivePolarViewer({
   series,
   onOpenResult,
+  initialConditionKey = "",
 }: {
   series: ProgressivePolarSeries[];
+  initialConditionKey?: string;
   onOpenResult?: (context: {
     re: number;
     aoa: number;
@@ -37,7 +40,12 @@ export function ProgressivePolarViewer({
     resultAttemptId?: string;
   }) => void;
 }) {
-  const [selectedId, setSelectedId] = useState(series[0]?.targetId ?? "");
+  const [selectedId, setSelectedId] = useState(
+    initialConditionKey
+      ? (series.find((item) => item.conditionKey === initialConditionKey)
+          ?.targetId ?? "")
+      : (series[0]?.targetId ?? ""),
+  );
   const [chart, setChart] = useState<Chart>("cl");
   const [samplesVisible, setSamplesVisible] = useState(false);
   const [methodsVisible, setMethodsVisible] = useState(false);
@@ -45,8 +53,7 @@ export function ProgressivePolarViewer({
   const [width, setWidth] = useState(320);
   const root = useRef<HTMLDivElement>(null);
   const clipId = `progressive-${useId().replaceAll(":", "")}`;
-  const selected =
-    series.find((item) => item.targetId === selectedId) ?? series[0];
+  const selected = series.find((item) => item.targetId === selectedId);
   useEffect(() => {
     let disposed = false;
     let observer: ResizeObserver | undefined;
@@ -113,7 +120,37 @@ export function ProgressivePolarViewer({
         height - 42 - ((value - yMin) / (yMax - yMin)) * (height - 66),
     };
   }, [selected, chart, methodsVisible, width, height]);
-  if (!selected || !projected) return null;
+  if (!selected || !projected)
+    return (
+      <section
+        data-testid="progressive-polar-viewer"
+        style={{
+          padding: 18,
+          border: `1px solid ${C.border}`,
+          borderRadius: 12,
+        }}
+      >
+        <p>No polar is available for this profile at the selected condition.</p>
+        <select
+          aria-label="Polar condition"
+          value=""
+          onChange={(event) => setSelectedId(event.target.value)}
+          style={{
+            maxWidth: "100%",
+            background: C.panel,
+            color: C.text,
+            padding: 10,
+          }}
+        >
+          <option value="">Choose an available condition</option>
+          {series.map((item) => (
+            <option key={item.targetId} value={item.targetId}>
+              Re {fRe(item.re)} · M {number(item.mach)}
+            </option>
+          ))}
+        </select>
+      </section>
+    );
   const primaryCurve =
     selected.curves.find((curve) => curve.method === "composite") ??
     selected.curves.at(-1)!;
@@ -170,7 +207,17 @@ export function ProgressivePolarViewer({
             aria-label="Polar condition"
             disabled={!interactive}
             value={selected.targetId}
-            onChange={(event) => setSelectedId(event.target.value)}
+            onChange={(event) => {
+              setSelectedId(event.target.value);
+              const condition = series.find(
+                (item) => item.targetId === event.target.value,
+              )?.conditionKey;
+              window.history.replaceState(
+                null,
+                "",
+                withMetricCondition(window.location.href, condition),
+              );
+            }}
             style={{
               maxWidth: "100%",
               minWidth: 0,

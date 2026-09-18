@@ -48,11 +48,13 @@ export function CompareView({
   initialSelection = null,
   initialDetails = {},
   initialUnavailable = [],
+  initialConditionKey = "",
 }: {
   items: AirfoilSummary[];
   initialSelection?: string[] | null;
   initialDetails?: Record<string, AirfoilDetailPayload>;
   initialUnavailable?: string[];
+  initialConditionKey?: string;
 }) {
   const items = initialItems;
   const [interactive, setInteractive] = useState(false);
@@ -188,6 +190,7 @@ export function CompareView({
         name: profile.a.name,
         color: profile.color,
         series: profile.detail?.progressivePolars ?? [],
+        geometry: profile.detail?.geometry,
       })),
     [selected],
   );
@@ -377,7 +380,10 @@ export function CompareView({
           </p>
         ))}
       {hasProgressive ? (
-        <ProgressiveCompareView profiles={progressiveProfiles} />
+        <ProgressiveCompareView
+          profiles={progressiveProfiles}
+          initialConditionKey={initialConditionKey}
+        />
       ) : (
         <div
           style={{

@@ -40,6 +40,7 @@ try {
       await page.goto(`${origin}/compare?airfoil=ag24&airfoil=ag25`, {
         waitUntil: "domcontentloaded",
       });
+      await page.getByText("Overlay curves", { exact: true }).click();
       const initialViewer = page.getByTestId("progressive-comparison");
       const sampleToggle = initialViewer.getByLabel("Show curve samples");
       await expect(sampleToggle).toBeEnabled();
@@ -60,7 +61,7 @@ try {
       );
       assert.equal(
         await page.evaluate(() => window.scrollY),
-        0,
+        beforeInteraction.scrollY,
         JSON.stringify({
           viewport,
           navigation,
@@ -79,6 +80,7 @@ try {
       .last()
       .click();
     await expect(page).toHaveURL(/\/compare\?airfoil=ag24$/);
+    await page.getByText("Overlay curves", { exact: true }).click();
     const viewer = page.getByTestId("progressive-comparison");
     await expect(viewer.getByTestId("comparison-curve")).toHaveCount(1);
     await expect(viewer.getByTestId("comparison-sample")).toHaveCount(0);
@@ -147,6 +149,7 @@ try {
     await expect(viewer.locator("details")).toHaveAttribute("open", "");
     await viewer.locator("summary").click();
     await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByText("Overlay curves", { exact: true }).click();
     await expect(viewer.getByTestId("comparison-curve")).toHaveCount(2);
     await page
       .getByRole("button", { name: /^Remove AG25 .* from comparison$/ })

@@ -1,10 +1,14 @@
-import type { ProgressivePolarSeries } from "@aerodb/core";
+import type {
+  AirfoilDetailPayload,
+  ProgressivePolarSeries,
+} from "@aerodb/core";
 
 export interface ProgressiveComparisonProfile {
   slug: string;
   name: string;
   color: string;
   series: ProgressivePolarSeries[];
+  geometry?: AirfoilDetailPayload["geometry"];
 }
 
 export function progressiveComparisonConditions(

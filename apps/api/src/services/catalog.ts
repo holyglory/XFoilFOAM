@@ -4,7 +4,12 @@ import {
   POLAR_FIT_VERSION,
   RELIST,
 } from "@aerodb/core";
-import { airfoils, categories, polarFitSets } from "@aerodb/db";
+import {
+  airfoils,
+  categories,
+  polarFitSets,
+  publicProgressiveCatalog,
+} from "@aerodb/db";
 import {
   and,
   asc,
@@ -95,6 +100,7 @@ export interface ListOpts {
   camberNegativeMin?: number;
   camberNegativeMax?: number;
   includePoints?: boolean;
+  metricConditionKey?: string;
 }
 
 // Default ceiling when no explicit limit is given. The portal is meant to hold a
@@ -238,7 +244,14 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
             : asc(sortCol),
       asc(airfoils.name),
     )
-    .limit(opts.limit ?? DEFAULT_LIMIT)
+    .limit(
+      solvedSort
+        ? Math.max(
+            DEFAULT_LIMIT,
+            (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT),
+          )
+        : (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT),
+    )
     .offset(0);
 
   const tagMap = await hashtagsByAirfoilIds(rows.map((r) => r.id));
@@ -303,12 +316,19 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
     }
   }
 
+  const progressive = await publicProgressiveCatalog(
+    db,
+    candidateIds,
+    opts.metricConditionKey,
+  );
   const summaries = filtered.map((r) => {
     const normalizedTags = tagMap.get(r.id) ?? [];
-    const metric = metricMap.get(r.id);
-    const polarCount = Number(metric?.pointCount ?? 0);
+    const progressiveMetric = progressive.metrics.get(r.id);
+    const metric = opts.metricConditionKey ? undefined : metricMap.get(r.id);
+    const polarCount =
+      progressiveMetric?.polarCount ?? Number(metric?.pointCount ?? 0);
     const metricsSource: AirfoilSummary["metricsSource"] =
-      polarCount > 0 ? "solved" : "queued";
+      progressiveMetric?.source ?? (polarCount > 0 ? "solved" : "queued");
     return {
       id: r.id,
       slug: r.slug,
@@ -341,12 +361,27 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
       reMin: RELIST[0],
       reMax: RELIST[RELIST.length - 1],
       polarCount,
-      ldmax: metric?.ldmax == null ? null : Number(metric.ldmax),
-      clmax: metric?.clmax == null ? null : Number(metric.clmax),
-      cdmin: metric?.cdmin == null ? null : Number(metric.cdmin),
+      ldmax: progressiveMetric
+        ? progressiveMetric.ldmax
+        : metric?.ldmax == null
+          ? null
+          : Number(metric.ldmax),
+      clmax: progressiveMetric
+        ? progressiveMetric.clmax
+        : metric?.clmax == null
+          ? null
+          : Number(metric.clmax),
+      cdmin: progressiveMetric
+        ? progressiveMetric.cdmin
+        : metric?.cdmin == null
+          ? null
+          : Number(metric.cdmin),
       metricsSource,
-      fitStatus: metric?.fitStatus ?? null,
-      fitConfidence: metric?.fitConfidence ?? null,
+      metricCondition: progressiveMetric?.condition ?? null,
+      metricTargetId: progressiveMetric?.targetId ?? null,
+      metricModelId: progressiveMetric?.modelId ?? null,
+      fitStatus: progressiveMetric ? null : (metric?.fitStatus ?? null),
+      fitConfidence: progressiveMetric ? null : (metric?.fitConfidence ?? null),
     };
   });
 

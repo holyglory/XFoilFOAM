@@ -1,7 +1,10 @@
 "use client";
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { fRe } from "@aerodb/core";
+import { fRe, profilePaths } from "@aerodb/core";
+import Link from "next/link";
+import { PolarMiniChart } from "@/components/PolarMiniChart";
+import { withMetricCondition } from "@/lib/metric-condition";
 import {
   progressiveComparisonConditions,
   progressiveComparisonCurve,
@@ -27,11 +30,255 @@ const display = (value: number | null) =>
 
 export function ProgressiveCompareView({
   profiles,
+  initialConditionKey = "",
 }: {
   profiles: ProgressiveComparisonProfile[];
+  initialConditionKey?: string;
+}) {
+  const conditions = useMemo(
+    () => progressiveComparisonConditions(profiles),
+    [profiles],
+  );
+  const [conditionKey, setConditionKey] = useState(
+    initialConditionKey || conditions[0]?.key || "",
+  );
+  const [activeSlug, setActiveSlug] = useState(profiles[0]?.slug ?? "");
+  useEffect(() => {
+    if (!conditionKey && conditions[0]) setConditionKey(conditions[0].key);
+  }, [conditionKey, conditions]);
+  const selectCondition = (key: string) => {
+    setConditionKey(key);
+    window.history.replaceState(
+      null,
+      "",
+      withMetricCondition(window.location.href, key),
+    );
+  };
+  const active = profiles.some((profile) => profile.slug === activeSlug)
+    ? activeSlug
+    : profiles[0]?.slug;
+  const selection = conditions.find(
+    (condition) => condition.key === conditionKey,
+  );
+  return (
+    <section data-testid="condition-comparison" style={{ minWidth: 0 }}>
+      <style jsx>{`
+        .comparison-cards {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+          gap: 16px;
+          margin: 18px 0;
+        }
+        .profile-tabs {
+          display: none;
+        }
+        @media (max-width: 680px) {
+          .comparison-cards {
+            display: block;
+          }
+          .comparison-card[data-selected="false"] {
+            display: none;
+          }
+          .profile-tabs {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            margin-top: 14px;
+          }
+        }
+      `}</style>
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          color: C.muted,
+          fontSize: 13,
+        }}
+      >
+        <span style={{ whiteSpace: "nowrap" }}>Compare at</span>
+        <select
+          aria-label="Comparison condition"
+          value={conditionKey}
+          onChange={(event) => {
+            selectCondition(event.target.value);
+          }}
+          style={{
+            minWidth: 0,
+            maxWidth: "100%",
+            padding: "10px 12px",
+            borderRadius: 10,
+            background: C.panel,
+            color: C.text,
+            border: `1px solid ${C.tealBorder}`,
+          }}
+        >
+          {!selection && (
+            <option value={conditionKey}>Selected condition unavailable</option>
+          )}
+          {conditions.map((condition, index) => (
+            <option key={condition.key} value={condition.key}>
+              Re {fRe(condition.re)} · M {display(condition.mach)} ·{" "}
+              {condition.availableProfiles}/{profiles.length} profiles ·{" "}
+              {index + 1}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="profile-tabs" role="group" aria-label="Compared profiles">
+        {profiles.map((profile) => (
+          <button
+            key={profile.slug}
+            aria-pressed={active === profile.slug}
+            onClick={() => setActiveSlug(profile.slug)}
+            style={{
+              padding: "10px 12px",
+              border: `1px solid ${C.border}`,
+              borderRadius: 8,
+              color: active === profile.slug ? C.teal : C.text,
+              background: C.panel,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {profile.name}
+          </button>
+        ))}
+      </div>
+      <div className="comparison-cards">
+        {profiles.map((profile) => {
+          const selected = progressiveComparisonCurve(profile, conditionKey);
+          const metrics = selected?.curve.metrics;
+          const shape = profile.geometry
+            ? profilePaths(profile.geometry).profilePath
+            : null;
+          return (
+            <article
+              className="comparison-card"
+              data-selected={active === profile.slug}
+              key={profile.slug}
+              style={{
+                minWidth: 0,
+                padding: 20,
+                border: `1px solid ${C.border}`,
+                borderRadius: 16,
+                background: C.panel,
+              }}
+            >
+              <h2
+                style={{
+                  fontSize: 18,
+                  margin: "0 0 8px",
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {profile.name}
+              </h2>
+              {shape && (
+                <svg
+                  role="img"
+                  aria-label={`${profile.name} profile`}
+                  viewBox="0 0 340 150"
+                  style={{ width: "100%", height: 108 }}
+                >
+                  <path
+                    d={shape}
+                    fill={C.tealFill}
+                    stroke={C.text}
+                    strokeWidth="1.5"
+                  />
+                </svg>
+              )}
+              <div style={{ fontSize: 12, color: C.muted }}>Max L/D</div>
+              <div
+                data-testid={`comparison-ld-${profile.slug}`}
+                style={{
+                  fontSize: 34,
+                  fontWeight: 650,
+                  color: C.teal,
+                  margin: "3px 0 16px",
+                }}
+              >
+                {display(metrics?.liftToDragMaximum ?? null)}
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 12,
+                  padding: "12px 0",
+                  borderTop: `1px solid ${C.border}`,
+                  borderBottom: `1px solid ${C.border}`,
+                }}
+              >
+                <div>
+                  <div style={{ color: C.muted, fontSize: 12 }}>Max Cl</div>
+                  <strong>{display(metrics?.liftMaximum ?? null)}</strong>
+                </div>
+                <div>
+                  <div style={{ color: C.muted, fontSize: 12 }}>Min Cd</div>
+                  <strong>{display(metrics?.dragMinimum ?? null)}</strong>
+                </div>
+              </div>
+              <PolarMiniChart series={selected?.series} />
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  fontSize: 12,
+                }}
+              >
+                <span style={{ color: C.muted }}>
+                  {selected ? METHODS[selected.curve.method] : "No data"}
+                </span>
+                <Link
+                  href={withMetricCondition(
+                    `/airfoils/${profile.slug}`,
+                    conditionKey,
+                  )}
+                  style={{ color: C.teal }}
+                >
+                  Open profile →
+                </Link>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      <details>
+        <summary
+          style={{
+            cursor: "pointer",
+            color: C.teal,
+            fontSize: 13,
+            padding: "10px 0",
+          }}
+        >
+          Overlay curves
+        </summary>
+        <ProgressiveCompareOverlay
+          key={conditionKey}
+          profiles={profiles}
+          initialConditionKey={conditionKey}
+          onConditionChange={selectCondition}
+        />
+      </details>
+    </section>
+  );
+}
+
+function ProgressiveCompareOverlay({
+  profiles,
+  initialConditionKey,
+  onConditionChange,
+}: {
+  profiles: ProgressiveComparisonProfile[];
+  initialConditionKey: string;
+  onConditionChange: (key: string) => void;
 }) {
   const [requestedCondition, setRequestedCondition] = useState<string | null>(
-    null,
+    initialConditionKey,
   );
   const [quantity, setQuantity] = useState<Quantity>("cl");
   const [samplesVisible, setSamplesVisible] = useState(false);
@@ -154,7 +401,10 @@ export function ProgressiveCompareView({
               aria-label="Comparison condition"
               disabled={!interactive || !conditions.length}
               value={condition?.key ?? ""}
-              onChange={(event) => setRequestedCondition(event.target.value)}
+              onChange={(event) => {
+                setRequestedCondition(event.target.value);
+                onConditionChange(event.target.value);
+              }}
               style={{
                 color: C.text,
                 background: C.panel2,

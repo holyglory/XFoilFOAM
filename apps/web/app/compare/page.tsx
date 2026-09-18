@@ -2,6 +2,7 @@ import { CompareView } from "@/components/compare/CompareView";
 import { AppShell } from "@/components/shell/AppShell";
 import { getAirfoilCurveDetail, listAirfoils } from "@/lib/api";
 import { parseCompareSelection } from "@/lib/compare-selection";
+import { metricConditionParam } from "@/lib/metric-condition";
 import { C, MONO } from "@/lib/tokens";
 
 export const dynamic = "force-dynamic";
@@ -11,9 +12,15 @@ export default async function ComparePage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  const selection = parseCompareSelection((await searchParams).airfoil);
+  const query = await searchParams;
+  const selection = parseCompareSelection(query.airfoil);
+  const conditionKey = metricConditionParam(query.condition);
   const [items, requestedDetails] = await Promise.all([
-    listAirfoils({ sort: "ldmax", dir: "desc" }),
+    listAirfoils({
+      sort: "ldmax",
+      dir: "desc",
+      metricConditionKey: conditionKey || undefined,
+    }),
     Promise.all(
       (selection ?? []).map(async (slug) => ({
         slug,
@@ -61,6 +68,7 @@ export default async function ComparePage({
           initialSelection={selection}
           initialDetails={initialDetails}
           initialUnavailable={unavailable}
+          initialConditionKey={conditionKey}
         />
       </div>
     </AppShell>
