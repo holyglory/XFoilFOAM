@@ -3,7 +3,10 @@ import { assertProgressiveExecutionIdentity } from "./progressive-execution-iden
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
-import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
+import {
+  progressiveCfdNeverStartedAttemptCountSql,
+  progressiveCfdOrdinaryAttemptCountSql,
+} from "./progressive-attempt-budget";
 
 export function validateProgressiveExecutionStopProof(
   proof: EngineExecutionStopProof,
@@ -208,6 +211,8 @@ export async function settleProgressiveCfdExecution(
         NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
           AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
         ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts,
+        ${progressiveCfdNeverStartedAttemptCountSql()} AS never_started_attempts,
+        (SELECT count(*)::int FROM progressive_cfd_attempts history WHERE history.unit_id = unit.id) AS recorded_attempts,
         work.stage, epoch.current AND generation.status = 'active' AND generation.plan_revision_id = campaign.current_plan_revision_id
           AND campaign.status IN ('active', 'attention', 'paused') AS current_scope,
         evidence.count, evidence.accepted, evidence.infrastructure_only, fitted.state AS fit_state,
@@ -292,6 +297,9 @@ export async function settleProgressiveCfdExecution(
       const retry =
         !complete &&
         !exhausted &&
+        (!neverStarted ||
+          (Number(unit.never_started_attempts) < 1 &&
+            Number(unit.recorded_attempts) === Number(unit.attempts))) &&
         (ordinaryAttempts < 2 ||
           (ordinaryAttempts === 2 &&
             unit.stage === 3 &&
@@ -311,11 +319,13 @@ export async function settleProgressiveCfdExecution(
               : "diagnosed infrastructure failure; bounded retry admitted"
           : exhausted
             ? "active compute budget exhausted"
-            : Number(unit.count) === 0
-              ? "terminal execution has no measured case evidence"
-              : unit.stage === 3
-                ? "precise evidence remains unresolved"
-                : "fast pass has no informative accepted evidence";
+            : neverStarted
+              ? "unstarted submission retry budget exhausted or history incomplete"
+              : Number(unit.count) === 0
+                ? "terminal execution has no measured case evidence"
+                : unit.stage === 3
+                  ? "precise evidence remains unresolved"
+                  : "fast pass has no informative accepted evidence";
       await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome = ${complete ? "complete" : neverStarted ? "cancelled" : "failed"},
         finished_at = clock_timestamp(), error = ${reason} WHERE token = ${unit.token}`);
       await connection.execute(sql`UPDATE progressive_cfd_units SET state = ${complete ? "complete" : retry ? "pending" : "gap"},

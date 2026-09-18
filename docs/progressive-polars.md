@@ -183,7 +183,9 @@ any solver evidence.
 A verified never-started cancellation is classified from the exact attempt's
 measured compute time, not the unit's accumulated time from earlier attempts.
 Such cancellations do not consume an ordinary solver attempt; earlier physical
-work and the shared active-time budget remain unchanged. Explicit recovery of a
+work and the shared active-time budget remain unchanged. Submission failures have
+a separate ceiling of two proven never-started attempts; incomplete attempt
+history cannot justify another retry. Explicit recovery of a
 previously misclassified gap requires the latest exact cancelled execution, no
 case evidence, and the current campaign generation and stage. It cannot reopen
 obsolete work, supersede another attempt, or replenish an exhausted budget.

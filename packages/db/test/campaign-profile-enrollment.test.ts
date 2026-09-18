@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { claimSimJobCancellation } from "../src/job-lifecycle";
 import { loadDiskAdmissionExposure } from "../../../apps/sweeper/src/disk-admission";
 import {
   localPredictionRepairEngines,
@@ -4800,6 +4801,70 @@ describe("bounded progressive numerical recovery", () => {
         .where(eq(sweeperState.id, 1));
     }
   }
+
+  it("caps repeated never-started submissions independently of physical attempts", async () => {
+    const scope = await fitFixture();
+    expect(
+      await claimSimJobCancellation(
+        db,
+        scope.composed.jobId,
+        "isolated maintenance stop",
+      ),
+    ).toMatchObject({ kind: "cancelled" });
+    await db
+      .update(simJobs)
+      .set({ status: "cancelled", ingestedAt: new Date() })
+      .where(eq(simJobs.id, scope.composed.jobId));
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: scope.composed.jobId,
+      proof: {
+        ...executionStopProof(scope.engineJobId),
+        fence: "cancel_marker",
+        ownership_basis: "never_started_cancellation_fence",
+      },
+    });
+    expect(
+      await settleProgressiveCfdExecution(db, scope.composed.jobId),
+    ).toMatchObject({ retry: scope.leases.length });
+    const leases = await claimProgressiveCfdBatch(db, {
+      owner: "second-unstarted-submission",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+    });
+    expect(leases).toHaveLength(scope.leases.length);
+    const next = await composeRecovery(leases);
+    await db
+      .update(simJobs)
+      .set({
+        engineJobId: next.request.execution_id!,
+        status: "cancelled",
+        ingestedAt: new Date(),
+      })
+      .where(eq(simJobs.id, next.jobId));
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: next.jobId,
+      proof: {
+        ...executionStopProof(next.request.execution_id!),
+        fence: "cancel_marker",
+        ownership_basis: "never_started_cancellation_fence",
+      },
+    });
+    expect(await settleProgressiveCfdExecution(db, next.jobId)).toMatchObject({
+      retry: 0,
+      gaps: leases.length,
+    });
+    expect(await claimCfd()).toBeNull();
+    const attempts =
+      await db.execute(sql`SELECT active_seconds,outcome FROM progressive_cfd_attempts
+      WHERE sim_job_id IN (${scope.composed.jobId},${next.jobId})`);
+    expect(attempts).toHaveLength(2 * leases.length);
+    expect(
+      attempts.every(
+        (attempt) =>
+          attempt.active_seconds === 0 && attempt.outcome === "cancelled",
+      ),
+    ).toBe(true);
+  }, 120_000);
 
   async function stopped(
     fixture: Awaited<ReturnType<typeof cfdEvidenceFixture>>,

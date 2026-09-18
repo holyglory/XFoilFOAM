@@ -859,7 +859,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "never-started-settlement"
 tier = "development"
 requires = ["dependencies"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps never-started retry accounting attempt-local|only retries diagnosed infrastructure|requires a persisted exact physical stop"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps never-started retry accounting attempt-local|caps repeated never-started submissions|only retries diagnosed infrastructure|requires a persisted exact physical stop"]
 
 [[test.progressive.check]]
 name = "types"
