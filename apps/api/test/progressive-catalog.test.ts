@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { afterAll, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
+import { progressiveCurveMetrics } from "@aerodb/core";
 import { createClient, type DB } from "@aerodb/db/client";
 import {
   publicProgressiveCatalog,
@@ -30,6 +31,124 @@ import { listAirfoils } from "../src/services/catalog";
 const { db, sql: client } = createClient({ max: 1 });
 afterAll(() => client.end({ timeout: 5 }));
 const signature = () => createHash("sha256").update(randomUUID()).digest("hex");
+
+it("keeps stored catalog summaries equivalent to curve metrics and rejects malformed caches", async () => {
+  const cases = [
+    {
+      alpha: [-2, 0, 2],
+      coefficients: [
+        [-0.2, 0.02, 0],
+        [0, 0.01, -0.01],
+        [1, 0.02, -0.03],
+      ],
+    },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [-1, 0.02, 0],
+        [-0.5, 0.01, 0],
+      ],
+    },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [1e308, 1e-308, 0],
+        [1, 0.02, 0],
+      ],
+    },
+    {
+      alpha: [0, 0],
+      coefficients: [
+        [0, 0.01, 0],
+        [1, 0.02, 0],
+      ],
+    },
+    {
+      alpha: [1, 0],
+      coefficients: [
+        [0, 0.01, 0],
+        [1, 0.02, 0],
+      ],
+    },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [0, 0, 0],
+        [1, 0.02, 0],
+      ],
+    },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [0, -0.01, 0],
+        [1, 0.02, 0],
+      ],
+    },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [0, 0.01, NaN],
+        [1, 0.02, 0],
+      ],
+    },
+  ];
+  for (const fixture of cases) {
+    const expected = progressiveCurveMetrics(
+      fixture.alpha.map((alpha, index) => ({
+        alpha,
+        cl: fixture.coefficients[index][0],
+        cd: fixture.coefficients[index][1],
+        cm: fixture.coefficients[index][2],
+      })),
+    );
+    const [row] = await db.execute(
+      sql`SELECT public_curve_metrics_v1(${JSON.stringify(fixture.alpha)}::jsonb, ${JSON.stringify(fixture.coefficients)}::jsonb) AS metrics`,
+    );
+    expect(row.metrics).toEqual(
+      expected
+        ? {
+            ldmax: expected.liftToDragMaximum,
+            clmax: expected.liftMaximum,
+            cdmin: expected.dragMinimum,
+          }
+        : null,
+    );
+  }
+  for (const fixture of [
+    { alpha: [], coefficients: [] },
+    { alpha: [0], coefficients: [[0, 0.01, 0]] },
+    { alpha: [0, 1], coefficients: [[0, 0.01, 0]] },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [0, 0.01],
+        [1, 0.02, 0],
+      ],
+    },
+    { alpha: [0, 1], coefficients: [null, [1, 0.02, 0]] },
+    {
+      alpha: [0, 1],
+      coefficients: [
+        [0, "0.01", 0],
+        [1, 0.02, 0],
+      ],
+    },
+    {
+      alpha: [0, "1"],
+      coefficients: [
+        [0, 0.01, 0],
+        [1, 0.02, 0],
+      ],
+    },
+    { alpha: {}, coefficients: [] },
+    { alpha: null, coefficients: null },
+  ]) {
+    const [row] = await db.execute(
+      sql`SELECT public_curve_metrics_v1(${JSON.stringify(fixture.alpha)}::jsonb, ${JSON.stringify(fixture.coefficients)}::jsonb) AS metrics`,
+    );
+    expect(row.metrics).toBeNull();
+  }
+});
 
 it("uses available prediction or composite curves for catalog metrics and exact condition selection", async () => {
   const rollback = new Error("isolated public catalog proof");
@@ -249,10 +368,75 @@ it("uses available prediction or composite curves for catalog metrics and exact 
           source: "prediction",
           modelId: first.predictionId,
         });
+        const scalePrefix = `${prefix}-scale-`;
+        await connection.execute(sql`
+          INSERT INTO airfoils(slug,name,category_id,points)
+          SELECT ${scalePrefix} || profile_index, ${scalePrefix} || profile_index, ${category.id}, '[]'
+          FROM generate_series(1,1600) profile_index
+        `);
+        await connection.execute(sql`
+          INSERT INTO polar_analysis_targets(id,airfoil_id,physical)
+          SELECT encode(sha256(jsonb_send(jsonb_build_array(profile.id, condition_index))), 'hex'), profile.id,
+            jsonb_set(jsonb_set(jsonb_set(jsonb_set(template.physical,
+              '{airfoilId}', to_jsonb(profile.id)), '{flow,speedMps}', to_jsonb(condition_index * 30)),
+              '{derived,reynolds}', to_jsonb(condition_index * 300000)), '{derived,mach}', to_jsonb(condition_index * 30.0 / 340))
+          FROM airfoils profile CROSS JOIN generate_series(1,20) condition_index
+          CROSS JOIN polar_analysis_targets template
+          WHERE profile.slug LIKE ${scalePrefix + "%"} AND template.id = ${first.targetId}
+        `);
+        await connection.execute(sql`
+          INSERT INTO progressive_generation_targets(generation_id,target_id,revision_id,angles,recipes)
+          SELECT ${generationId}, target.id, ${fixture.revisionId}, ARRAY[0,2]::float8[], '{}'
+          FROM polar_analysis_targets target JOIN airfoils profile ON profile.id = target.airfoil_id
+          WHERE profile.slug LIKE ${scalePrefix + "%"}
+        `);
+        await connection.execute(sql`
+          INSERT INTO neuralfoil_predictions(id,epoch_id,target_id,payload)
+          SELECT target.id, ${epoch.id}, target.id, jsonb_build_object(
+            'kind','prediction','method','neuralfoil','cfd_evidence',false,
+            'alpha', curve.alpha, 'coefficients', curve.coefficients)
+          FROM polar_analysis_targets target JOIN airfoils profile ON profile.id = target.airfoil_id
+          CROSS JOIN (SELECT jsonb_agg(sample_index * 0.25 ORDER BY sample_index) AS alpha,
+            jsonb_agg(jsonb_build_array(0.5 + sample_index * 0.01, 0.01, -0.02) ORDER BY sample_index) AS coefficients
+            FROM generate_series(0,120) sample_index) curve
+          WHERE profile.slug LIKE ${scalePrefix + "%"}
+        `);
+        const scaleProfiles = (
+          await connection.execute(
+            sql`SELECT id FROM airfoils WHERE slug LIKE ${scalePrefix + "%"}`,
+          )
+        ).map((row) => String(row.id));
+        await connection.execute(
+          sql`ANALYZE neuralfoil_predictions, polar_analysis_targets, progressive_generation_targets, simulation_preset_revisions, airfoils`,
+        );
+        const started = performance.now();
+        const scaled = await publicProgressiveCatalog(
+          connection,
+          scaleProfiles,
+        );
+        const elapsed = performance.now() - started;
+        expect(scaled.metrics.size).toBe(1600);
+        expect(scaled.conditions).toHaveLength(20);
+        expect(
+          [...scaled.metrics.values()].every(
+            (metric) => metric.polarCount === 20 && metric.ldmax === 170,
+          ),
+        ).toBe(true);
+        expect(elapsed).toBeLessThan(3000);
+        console.info(
+          JSON.stringify({
+            catalogScale: {
+              profiles: 1600,
+              curves: 32000,
+              samplesPerCurve: 121,
+              elapsedMs: elapsed,
+            },
+          }),
+        );
         throw rollback;
       }),
     ).rejects.toBe(rollback);
   } finally {
     isolated.connection = null;
   }
-});
+}, 120000);

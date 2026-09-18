@@ -1065,6 +1065,13 @@
       "when": 1792368000045,
       "tag": "0151_progressive_storage_only_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 152,
+      "version": "7",
+      "when": 1792368000046,
+      "tag": "0152_progressive_catalog_metrics",
+      "breakpoints": true
     }
   ]
 }

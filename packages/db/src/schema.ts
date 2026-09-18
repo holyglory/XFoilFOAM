@@ -1097,6 +1097,9 @@ export const simulationPresetRevisions = pgTable(
   },
   (t) => ({
     presetIdx: index("simulation_preset_revisions_preset_idx").on(t.presetId),
+    airCatalogIdx: index("simulation_preset_revisions_air_catalog_idx")
+      .on(t.id)
+      .where(sql`${t.snapshot}->'flowState'->>'mediumSlug' = 'air'`),
     reynoldsIdx: index("simulation_preset_revisions_reynolds_idx").on(
       t.reynolds,
     ),
@@ -6910,6 +6913,9 @@ export const polarAnalysisTargets = pgTable(
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
     physical: jsonb("physical").$type<Record<string, unknown>>().notNull(),
+    conditionGroupId: text("condition_group_id").generatedAlwaysAs(
+      sql`encode(sha256(jsonb_send(physical - 'airfoilId' - 'geometry')), 'hex')`,
+    ),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
@@ -7119,6 +7125,9 @@ export const neuralfoilPredictions = pgTable(
       .notNull()
       .references(() => polarAnalysisTargets.id, { onDelete: "cascade" }),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    catalogMetricsV1: jsonb("catalog_metrics_v1").generatedAlwaysAs(
+      sql`public_curve_metrics_v1(payload->'alpha', payload->'coefficients')`,
+    ),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
@@ -8296,6 +8305,12 @@ export const progressivePolarModels = pgTable("progressive_polar_models", {
   sourceSignature: text("source_signature").notNull(),
   request: jsonb("request").$type<Record<string, unknown>>().notNull(),
   response: jsonb("response").$type<Record<string, unknown>>().notNull(),
+  catalogMetricsV1: jsonb("catalog_metrics_v1").generatedAlwaysAs(
+    sql`public_curve_metrics_v1(response#>'{estimate,alpha}', response#>'{estimate,curves,composite,coefficients}')`,
+  ),
+  catalogCompositePresent: boolean(
+    "catalog_composite_present",
+  ).generatedAlwaysAs(sql`response#>'{estimate,curves,composite}' IS NOT NULL`),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .default(sql`clock_timestamp()`),
