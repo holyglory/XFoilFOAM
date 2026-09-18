@@ -9,7 +9,7 @@ const stoppedOwner = sql`
     AND job.request_payload ? 'remoteProgressiveExecution'
     AND job.engine_job_id=job.id::text AND job.status IN ('done','failed','cancelled')
     AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
-    AND promise.status IN ('cancelled','expired','fulfilled')
+    AND promise.status = 'cancelled'
     AND promise.registered_solver_id=settings.remote_solver_registered_id
     AND promise.source_base_url=settings.upstream_base_url
     AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url

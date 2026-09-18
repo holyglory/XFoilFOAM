@@ -107,7 +107,7 @@ export async function deliverNextProgressiveWorkerEvidence(
   let responseStatus: number | null = null;
   let importConflictIds: string[] = [];
   let stoppedStorage = false;
-  let inactivePromiseReleased = false;
+  let retryStoppedStorage = false;
   try {
     await assertProgressiveWorkerEvidenceJob(db, {
       simJobId: executionId,
@@ -185,7 +185,9 @@ export async function deliverNextProgressiveWorkerEvidence(
         const rejected = (await response.json().catch(() => null)) as {
           error?: unknown;
         } | null;
-        inactivePromiseReleased = await recordInactiveStoppedPromise(
+        retryStoppedStorage =
+          !stoppedStorage && rejected?.error === "promise is not active";
+        await recordInactiveStoppedPromise(
           db,
           {
             executionId,
@@ -238,7 +240,7 @@ export async function deliverNextProgressiveWorkerEvidence(
     return true;
   } catch (error) {
     const conflict =
-      (responseStatus === 409 && !inactivePromiseReleased) ||
+      (responseStatus === 409 && !retryStoppedStorage) ||
       importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures

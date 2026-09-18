@@ -13,7 +13,7 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
   await client.db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     await transaction.execute(sql`CREATE TEMP TABLE fixture_jobs ON COMMIT DROP AS SELECT md5(variant)::uuid AS id,variant
-      FROM unnest(ARRAY['eligible','active','running','lease','wrong-solver','wrong-upstream','not-remote','unacknowledged',
+      FROM unnest(ARRAY['eligible','active','expired','fulfilled','running','lease','wrong-solver','wrong-upstream','not-remote','unacknowledged',
         'not-stopped','wrong-signature','no-loss','review-conflict','storage-rejected','other-http']) variant`);
     await transaction.execute(sql`CREATE TEMP TABLE sync_api_settings ON COMMIT DROP AS SELECT 1 AS id,
       md5('owner')::uuid AS remote_solver_registered_id,'https://fixture.invalid'::text AS upstream_base_url,
@@ -21,7 +21,7 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
     await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS SELECT id,
       CASE WHEN variant='wrong-solver' THEN md5('foreign')::uuid ELSE md5('owner')::uuid END AS registered_solver_id,
       CASE WHEN variant='wrong-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END AS source_base_url,
-      CASE WHEN variant='active' THEN 'active' ELSE 'cancelled' END AS status,
+      CASE WHEN variant IN ('active','expired','fulfilled') THEN variant ELSE 'cancelled' END AS status,
       jsonb_build_object('authoritativeLeaseLoss',variant<>'no-loss') AS response_payload FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS SELECT id,id::text AS engine_job_id,
       CASE WHEN variant='running' THEN 'running' ELSE 'failed' END AS status,
@@ -50,6 +50,13 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
     expect(
       await progressiveStoppedStorageEligible(connection, String(eligible.id)),
     ).toBe(true);
+    const ordinary = await transaction.execute(
+      sql`SELECT id FROM fixture_jobs WHERE variant IN ('active','expired','fulfilled')`,
+    );
+    for (const row of ordinary)
+      expect(
+        await progressiveStoppedStorageEligible(connection, String(row.id)),
+      ).toBe(false);
     expect(await requeueStoppedProgressiveStorage(connection)).toBe(1);
     expect(await requeueStoppedProgressiveStorage(connection)).toBe(0);
     const retries =

@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { PolarRequest } from "../../engine-client/src/types";
 import type { DB } from "./client";
+import { progressiveSolverOwnerLock } from "./progressive-solver-lock";
 import { canonicalAnalysisJson } from "./analysis-target";
 import {
   sealProgressiveRemoteExecution,
@@ -70,7 +71,7 @@ export async function bindProgressiveRemoteDispatch(
       );
     const [solver] = await connection.execute(sql`
       SELECT id, cpu_capacity, cpu_budget, max_active_polar_promises FROM registered_remote_solvers
-      WHERE id = ${input.solverId}::uuid AND revoked_at IS NULL FOR UPDATE
+      WHERE id = ${input.solverId}::uuid AND revoked_at IS NULL ${progressiveSolverOwnerLock}
     `);
     if (!solver)
       throw new Error("Remote execution owner is missing or revoked");
