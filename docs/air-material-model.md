@@ -86,6 +86,16 @@ retains at most 16 distinct ranges and marks truncation; warning counts, extrema
 and the original checksum-bound log are not truncated. This diagnostic extension
 is locally tested and awaits the next authorized engine rollout.
 
+Failure-log preservation must cover early rejected angles with no completed
+evidence archive. Cleanup retains every `log.material-domain-<sha256>` file in
+the case and nested transient directories, not only the latest diagnostic JSON.
+Keeping such a file is preservation, not checksum authentication or acceptance
+as CFD evidence. A September 18 regression reproduced removal of these logs by
+the former generic `log.*` cleanup rule; the correction is local pending rollout.
+Two inspected historical Mach-3 failures have locally missing referenced logs;
+their summaries cannot reconstruct the lost bytes or establish the temperatures
+that triggered the rejection.
+
 A read-only production check on September 18 confirmed that campaign revision 5
 and its latest sealed Mach-3 requests select the source-backed 100–2000 K model,
 at 288.15 K and 1021.025 m/s with `rhoCentralFoam`. This rules out the obsolete

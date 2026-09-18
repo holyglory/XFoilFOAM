@@ -20,6 +20,8 @@ from airfoilfoam.evidence_store import (
     transcode_gzip_tar_to_zst,
 )
 from airfoilfoam.models import CaseSpec, ForceHistory
+from airfoilfoam.material_domain import material_domain_failure
+from airfoilfoam.openfoam.runner import RunResult
 from airfoilfoam.pipeline import CaseOutcome
 from airfoilfoam.retention import JobRetentionRefused, delete_job_dir, strip_job_dir
 
@@ -204,6 +206,55 @@ def test_strip_retains_known_initialization_evidence_without_permanent_unknowns(
     assert report.unknown_entries == []
     assert {path: path.read_bytes() for path in retained} == before
     assert strip_job_dir(job_root, keep_case_state=keep_case_state).no_op
+
+
+@pytest.mark.parametrize("keep_case_state", [False, True])
+def test_strip_preserves_material_failure_logs_without_an_archive(tmp_path, keep_case_state):
+    job_root = tmp_path / "failed-material-job"
+    _write_json(job_root / "status.json", {"state": "failed"})
+    _write_json(job_root / "result.json", {"state": "failed", "polars": []})
+    case = job_root / "cases" / "c1_u1021"
+    retained = {}
+    ordinary_logs = []
+    for directory in (case, case / "transient_a13", case / "transient_a13" / "transient_retry"):
+        for temperature in (92.4, 89.1):
+            stdout = (
+                "Time = 14\n"
+                "attempt to use janafThermo<EquationOfState> out of temperature range "
+                f"100 -> 2000; T = {temperature}\n"
+            )
+            failure = material_domain_failure(directory, RunResult("rhoCentralFoam", -15, stdout))
+            assert failure is not None
+            diagnostic = json.loads((directory / "material-domain-diagnostic.json").read_text())
+            log_path = directory / diagnostic["solver_log"]
+            assert hashlib.sha256(log_path.read_bytes()).hexdigest() == diagnostic["solver_log_sha256"]
+            retained[log_path] = stdout.encode()
+        diagnostic_path = directory / "material-domain-diagnostic.json"
+        retained[diagnostic_path] = diagnostic_path.read_bytes()
+        ordinary_logs.append(_write(directory / "log.rhoCentralFoam", b"ordinary solver output"))
+        ordinary_logs.append(_write(directory / "log.material-domain-unrelated", b"unrelated log"))
+    assert not list(job_root.rglob("evidence_manifest.json"))
+    report = strip_job_dir(job_root, keep_case_state=keep_case_state)
+    assert report.unknown_entries == []
+    assert {path: path.read_bytes() for path in retained} == retained
+    assert all(path.exists() == keep_case_state for path in ordinary_logs)
+    final_report = strip_job_dir(job_root, keep_case_state=False)
+    assert final_report.unknown_entries == []
+    assert {path: path.read_bytes() for path in retained} == retained
+    assert not any(path.exists() for path in ordinary_logs)
+    assert strip_job_dir(job_root).no_op
+
+
+def test_material_log_preservation_does_not_classify_a_directory_as_a_diagnostic(tmp_path):
+    job_root = tmp_path / "material-log-lookalike"
+    _write_json(job_root / "status.json", {"state": "failed"})
+    case = job_root / "cases" / "c1_u1021"
+    lookalike = case / ("log.material-domain-" + "a" * 64)
+    payload = _write(lookalike / "unrecognized", b"keep unknown evidence")
+    report = strip_job_dir(job_root)
+    assert report.unknown_entries == [lookalike.relative_to(job_root).as_posix()]
+    assert payload.read_bytes() == b"keep unknown evidence"
+    assert not (job_root / ".stripped.json").exists()
 
 
 def test_strip_removes_bulk_and_keeps_consumed_files(tmp_path: Path):

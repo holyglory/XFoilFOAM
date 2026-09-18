@@ -58,6 +58,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -440,7 +441,7 @@ def _strip_case_dir(job_root: Path, case_dir: Path, report: StripReport, *, keep
             continue
         if name in _CASE_KEEP_DIRS:
             continue
-        if name in _ROOT_JSON_KEEP or name in _CASE_DIAGNOSTIC_FILES:
+        if name in _ROOT_JSON_KEEP or _is_case_diagnostic(child):
             continue
         if _is_transient_solver_dir(child):
             if not keep_case_state:
@@ -590,9 +591,11 @@ def _strip_solver_state_dir(
                 _remove_path(child, report)
             else:
                 _record_unknown(job_root, child, report)
+        elif _is_case_diagnostic(child):
+            continue
         elif _is_case_solver_artifact(child):
             _remove_path(child, report)
-        elif child.name in _CASE_KEEP_DIRS or child.name in _CASE_DIAGNOSTIC_FILES:
+        elif child.name in _CASE_KEEP_DIRS:
             continue
         else:
             _record_unknown(job_root, child, report)
@@ -722,6 +725,13 @@ def _tar_zst_contains_exact_transient_marker(
     except (OSError, tarfile.TarError, zstandard.ZstdError):
         return False
     return False
+
+
+def _is_case_diagnostic(path: Path) -> bool:
+    return path.name in _CASE_DIAGNOSTIC_FILES or (
+        path.is_file()
+        and re.fullmatch(r"log\.material-domain-[0-9a-f]{64}", path.name) is not None
+    )
 
 
 def _is_case_solver_artifact(path: Path) -> bool:
