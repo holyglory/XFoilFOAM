@@ -1223,6 +1223,17 @@ export async function probeCampaignCompletion(
   db: DB,
   campaignId: string,
 ): Promise<void> {
+  const [progressive] = await db.execute(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM progressive_generations generation
+      JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      WHERE campaign.id = ${campaignId}
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND generation.status <> 'cancelled'
+    ) AS owns_completion
+  `);
+  if (progressive?.owns_completion) return;
   const [probe] = (await db.execute(sql`
     WITH correction_projection AS (
       ${pointCorrectionProjectionSql(sql`EXISTS (

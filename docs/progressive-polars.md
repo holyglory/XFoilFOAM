@@ -927,6 +927,16 @@ serialization and retains the conservative existing fallback. An invalid origin
 cannot contribute evidence. This metadata does not certify convergence or relax
 the retained-coefficient and physical-window checks.
 
+After a solver-domain reset, restore requested angles from the preserved campaign
+intent with `restoreProgressiveCampaignRequests` before resuming scheduling.
+Creating a calculation epoch alone does not reconstruct `sim_campaign_points`.
+Request restoration requires stopped scheduling and no new solver evidence;
+it leaves the current plan and physical setup unchanged and respects explicit
+paused, cancelled and archived states. The legacy completion probe must defer
+to a non-cancelled progressive generation for the current epoch and campaign
+plan. An empty legacy request table is not evidence that progressive work has
+finished.
+
 Validate numerical recipes on representative low-Mach airfoils, RAE 2822 transonic
 cases, a Mach-2 wedge, a viscous supersonic airfoil and Mach-3 cases. Perform mesh and
 time-step studies on these representative recipes, not on every production cell.

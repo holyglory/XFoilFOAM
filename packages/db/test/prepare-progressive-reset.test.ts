@@ -6,9 +6,11 @@ import { createClient, type DB } from "../src/client";
 import { materializeCampaignLaunch } from "../src/campaigns";
 import {
   prepareProgressiveReset,
+  restoreProgressiveCampaignRequests,
   type ProgressiveResetInput,
 } from "../src/prepare-progressive-reset";
 import { cleanupCampaignFixtures } from "../src/test-cleanup";
+import { probeCampaignCompletion } from "../src/campaign-execution";
 import { SEEDED_RUNTIME_PROFILE_SLUGS } from "../seed/runtime-profiles";
 import {
   airfoils,
@@ -142,6 +144,122 @@ afterAll(async () => {
     });
   await client.end({ timeout: 5 });
 });
+
+it.each(["active", "attention", "completed", "paused"])(
+  "restores reset requests from unchanged campaign intent while respecting %s",
+  async (status) => {
+    const rollback = new Error("isolated reset restoration proof");
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        await connection
+          .update(simCampaigns)
+          .set({ status })
+          .where(eq(simCampaigns.id, input.campaignId));
+        const [before] = await connection
+          .select()
+          .from(simCampaigns)
+          .where(eq(simCampaigns.id, input.campaignId));
+        const receipt = await restoreProgressiveCampaignRequests(
+          connection,
+          input,
+        );
+        const [after] = await connection
+          .select()
+          .from(simCampaigns)
+          .where(eq(simCampaigns.id, input.campaignId));
+        expect(receipt).toEqual({
+          campaignId: input.campaignId,
+          planRevisionId: input.expectedPlanRevisionId,
+          points: 3,
+        });
+        expect(after.currentPlanRevisionId).toBe(before.currentPlanRevisionId);
+        expect(after.status).toBe(status === "paused" ? "paused" : "active");
+        const points = await connection
+          .select()
+          .from(simCampaignPoints)
+          .where(eq(simCampaignPoints.campaignId, input.campaignId));
+        expect(
+          points
+            .map((point) => point.aoaDeg)
+            .sort((left, right) => left - right),
+        ).toEqual([-2, 0, 2]);
+        expect(
+          points.every(
+            (point) =>
+              point.state === "requested" &&
+              point.resultId === null &&
+              point.revisionId === previousRevisionId,
+          ),
+        ).toBe(true);
+        await expect(
+          restoreProgressiveCampaignRequests(connection, input),
+        ).rejects.toThrow("must not be overwritten");
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+  },
+);
+
+it.each(["cancelled", "archived"])(
+  "does not restart %s campaigns during request restoration",
+  async (status) => {
+    const rollback = new Error("isolated stopped campaign proof");
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        await connection
+          .update(simCampaigns)
+          .set({ status })
+          .where(eq(simCampaigns.id, input.campaignId));
+        await expect(
+          restoreProgressiveCampaignRequests(connection, input),
+        ).rejects.toThrow("cancelled or archived");
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+  },
+);
+
+it.each(["active", "attention", "complete", "cancelled", "obsolete-epoch"])(
+  "keeps legacy completion separate from a %s progressive generation",
+  async (state) => {
+    const rollback = new Error("isolated completion ownership proof");
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        await connection
+          .update(simCampaigns)
+          .set({ status: "active", completedAt: null })
+          .where(eq(simCampaigns.id, input.campaignId));
+        const [epoch] = await connection.execute(
+          sql`SELECT id FROM calculation_epochs WHERE current`,
+        );
+        const obsoleteEpoch = randomUUID();
+        if (state === "obsolete-epoch")
+          await connection.execute(sql`
+        INSERT INTO calculation_epochs(id,current,reason) VALUES(${obsoleteEpoch},false,'isolated obsolete epoch fixture')
+      `);
+        await connection.execute(sql`
+        INSERT INTO progressive_generations(epoch_id,campaign_id,plan_revision_id,scope_key,scope_signature,status)
+        VALUES(${state === "obsolete-epoch" ? obsoleteEpoch : epoch.id},${input.campaignId},
+          ${input.expectedPlanRevisionId},${prefix + state},${"a".repeat(64)},${state === "obsolete-epoch" ? "active" : state})
+      `);
+        await probeCampaignCompletion(connection, input.campaignId);
+        const [campaign] = await connection
+          .select()
+          .from(simCampaigns)
+          .where(eq(simCampaigns.id, input.campaignId));
+        expect(campaign.status).toBe(
+          ["cancelled", "obsolete-epoch"].includes(state)
+            ? "completed"
+            : "active",
+        );
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+  },
+);
 
 it("refuses changed plans, active admission and cancelled campaigns without mutation", async () => {
   await expect(

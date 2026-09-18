@@ -7,6 +7,7 @@ import {
   campaignEnrollmentScope,
   insertCampaignPoints,
   recomputeCampaignProgress,
+  refreshCampaignCompletion,
 } from "./campaigns";
 import {
   ensureSimulationPresetRevision,
@@ -27,6 +28,87 @@ export interface ProgressiveResetInput {
   mediumId: string;
   gasThermodynamics: unknown;
   sourceReference: string;
+}
+
+export async function restoreProgressiveCampaignRequests(
+  db: DB,
+  input: Pick<ProgressiveResetInput, "campaignId" | "expectedPlanRevisionId">,
+) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [admission] = await connection.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1 FOR UPDATE`,
+    );
+    assert(
+      admission?.enabled === false,
+      "Pause scheduling before restoring reset requests",
+    );
+    const [evidence] = await connection.execute(sql`
+      SELECT EXISTS(SELECT 1 FROM sim_jobs) OR EXISTS(SELECT 1 FROM results)
+        OR EXISTS(SELECT 1 FROM neuralfoil_predictions)
+        OR EXISTS(SELECT 1 FROM progressive_work_attempts) AS present
+    `);
+    assert(
+      !evidence.present,
+      "Request restoration requires an empty solver domain",
+    );
+    const [campaign] = await connection
+      .select()
+      .from(simCampaigns)
+      .where(eq(simCampaigns.id, input.campaignId))
+      .for("update");
+    assert(campaign, "Campaign does not exist");
+    assert.equal(
+      campaign.currentPlanRevisionId,
+      input.expectedPlanRevisionId,
+      "Campaign plan changed before request restoration",
+    );
+    assert(
+      ["active", "attention", "paused", "completed"].includes(campaign.status),
+      "Request restoration does not reactivate cancelled or archived campaigns",
+    );
+    const [existing] = await connection.execute(sql`
+      SELECT count(*)::int AS count FROM sim_campaign_points WHERE campaign_id = ${campaign.id}
+    `);
+    assert.equal(
+      existing.count,
+      0,
+      "Existing campaign requests must not be overwritten",
+    );
+    const [plan] = await connection
+      .select()
+      .from(simCampaignPlanRevisions)
+      .where(eq(simCampaignPlanRevisions.id, input.expectedPlanRevisionId));
+    assert(plan, "Campaign plan is missing");
+    const intent = await campaignEnrollmentScope(connection, campaign.id);
+    assert(
+      intent.cellsByCondition.size > 0,
+      "Campaign has no preserved angle intent",
+    );
+    for (const [conditionId, cell] of intent.cellsByCondition) {
+      await insertCampaignPoints(
+        transaction,
+        campaign.id,
+        plan.revisionNumber,
+        angleSetsFromAngles(cell.angles),
+        { conditionIds: [conditionId] },
+      );
+    }
+    await recomputeCampaignProgress(transaction, campaign.id);
+    await refreshCampaignCompletion(transaction, campaign.id);
+    const [restored] = await connection.execute(sql`
+      SELECT count(*)::int AS count FROM sim_campaign_points WHERE campaign_id = ${campaign.id}
+    `);
+    assert(
+      Number(restored.count) > 0,
+      "Campaign request reconstruction produced no work",
+    );
+    return {
+      campaignId: campaign.id,
+      planRevisionId: plan.id,
+      points: Number(restored.count),
+    };
+  });
 }
 
 export async function prepareProgressiveReset(
