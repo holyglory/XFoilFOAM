@@ -4417,6 +4417,122 @@ describe("progressive execution stop and settlement", () => {
     120_000,
   );
 
+  it.each([
+    "fresh",
+    "recover",
+    "exhausted",
+    "started",
+    "advanced",
+    "obsolete",
+    "superseded",
+  ])(
+    "keeps never-started retry accounting attempt-local: %s",
+    async (mode) => {
+      const fixture = await fitFixture();
+      const simJobId = fixture.composed.jobId;
+      const recovering = [
+        "recover",
+        "advanced",
+        "obsolete",
+        "superseded",
+      ].includes(mode);
+      await db.execute(sql`
+        INSERT INTO progressive_cfd_attempts(token,unit_id,owner,started_at,lease_until,outcome,active_seconds,finished_at)
+        SELECT gen_random_uuid(),unit_id,'earlier-physical-attempt',started_at-interval '1 minute',
+          lease_until,'failed',60,started_at FROM progressive_cfd_attempts WHERE sim_job_id=${simJobId}
+      `);
+      await db.execute(sql`UPDATE progressive_cfd_units SET attempts=2,
+        active_seconds=CASE WHEN ${mode === "exhausted"} THEN active_budget_seconds ELSE 60 END
+        WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${simJobId})`);
+      if (mode === "started")
+        await db.execute(
+          sql`UPDATE progressive_cfd_attempts SET active_seconds=1 WHERE sim_job_id=${simJobId}`,
+        );
+      await acknowledgeProgressiveCfdExecutionStop(db, {
+        simJobId,
+        proof: {
+          ...executionStopProof(fixture.engineJobId),
+          fence: "cancel_marker",
+          ownership_basis: "never_started_cancellation_fence",
+        },
+      });
+      await db
+        .update(simJobs)
+        .set({ status: "cancelled", ingestedAt: new Date() })
+        .where(eq(simJobs.id, simJobId));
+      if (recovering) {
+        await db.execute(
+          sql`UPDATE progressive_cfd_attempts SET outcome='failed' WHERE sim_job_id=${simJobId}`,
+        );
+        await db.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL
+          WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${simJobId})`);
+        await db.execute(sql`UPDATE progressive_work SET state='gap',completed_at=clock_timestamp()
+          WHERE id IN (SELECT work_id FROM progressive_cfd_units WHERE id IN
+            (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${simJobId}))`);
+      }
+      if (mode === "advanced")
+        await db.execute(
+          sql`UPDATE progressive_generations SET stage=3 WHERE id=${fixture.leases[0].generationId}`,
+        );
+      if (mode === "obsolete")
+        await db.execute(
+          sql`UPDATE sim_campaigns SET status='cancelled' WHERE id=${fixture.leases[0].campaignId}`,
+        );
+      if (mode === "superseded")
+        await db.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,started_at,lease_until,outcome)
+          SELECT gen_random_uuid(),unit_id,'newer-attempt',started_at+interval '1 second',lease_until,'failed'
+          FROM progressive_cfd_attempts WHERE sim_job_id=${simJobId}`);
+      const retry = ["fresh", "recover"].includes(mode);
+      const rejected = ["advanced", "obsolete", "superseded"].includes(mode);
+      expect(
+        await settleProgressiveCfdExecution(db, simJobId, {
+          recoverNeverStarted: recovering,
+        }),
+      ).toMatchObject({
+        complete: 0,
+        retry: retry ? fixture.leases.length : 0,
+        gaps: !retry && !rejected ? fixture.leases.length : 0,
+        waiting: 0,
+      });
+      const rows =
+        await db.execute(sql`SELECT unit.active_seconds,unit.active_budget_seconds,unit.state,
+        attempt.outcome,work.state AS work_state FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        JOIN progressive_work work ON work.id=unit.work_id WHERE attempt.sim_job_id=${simJobId}`);
+      for (const row of rows) {
+        expect(Number(row.active_seconds)).toBe(
+          mode === "exhausted" ? Number(row.active_budget_seconds) : 60,
+        );
+        expect(row.state).toBe(retry ? "pending" : "gap");
+        expect(row.outcome).toBe(
+          rejected || mode === "started" ? "failed" : "cancelled",
+        );
+        if (retry) expect(row.work_state).toBe("pending");
+      }
+      expect(
+        await settleProgressiveCfdExecution(db, simJobId, {
+          recoverNeverStarted: true,
+        }),
+      ).toMatchObject({
+        retry: 0,
+        gaps: 0,
+        waiting: 0,
+      });
+      if (retry) {
+        const claim = await claimProgressiveCfdUnit(db, {
+          owner: "after-maintenance",
+          leaseSeconds: 120,
+        });
+        expect(claim).not.toBeNull();
+        expect(fixture.leases.map((lease) => lease.id)).toContain(claim!.id);
+        expect(claim!.remainingActiveSeconds).toBe(
+          Number(rows[0].active_budget_seconds) - 60,
+        );
+      }
+    },
+    120_000,
+  );
+
   it("requires a persisted exact physical stop, retains it immutably, and waits for terminal ingestion", async () => {
     const fixture = await fitFixture();
     const simJobId = fixture.composed.jobId;

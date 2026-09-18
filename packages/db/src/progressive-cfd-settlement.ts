@@ -143,6 +143,7 @@ export async function acknowledgeProgressiveCfdExecutionStop(
 export async function settleProgressiveCfdExecution(
   db: DB,
   simJobId: string,
+  options: { recoverNeverStarted?: boolean } = {},
 ): Promise<{
   complete: number;
   retry: number;
@@ -201,7 +202,11 @@ export async function settleProgressiveCfdExecution(
         "Progressive CFD settlement has changed or unbounded receipt evidence",
       );
     const units = await connection.execute(sql`
-      SELECT attempt.token, attempt.outcome, unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+      SELECT attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
+        unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds, work.id AS work_id,
+        generation.stage = work.stage AND work.state IN ('pending', 'gap') AS recoverable_stage,
+        NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
+          AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
         ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts,
         work.stage, epoch.current AND generation.status = 'active' AND generation.plan_revision_id = campaign.current_plan_revision_id
           AND campaign.status IN ('active', 'attention', 'paused') AS current_scope,
@@ -239,7 +244,21 @@ export async function settleProgressiveCfdExecution(
       WHERE attempt.sim_job_id = ${simJobId} ORDER BY unit.ordinal, unit.id
     `);
     for (const unit of units) {
-      if (unit.outcome !== "running") continue;
+      const neverStarted =
+        (stop.proof as EngineExecutionStopProof).ownership_basis ===
+          "never_started_cancellation_fence" &&
+        Number(unit.count) === 0 &&
+        Number(unit.attempt_active_seconds) === 0;
+      const recovering =
+        options.recoverNeverStarted === true &&
+        job.status === "cancelled" &&
+        unit.outcome === "failed" &&
+        unit.state === "gap" &&
+        unit.current_scope === true &&
+        unit.recoverable_stage === true &&
+        unit.latest_attempt === true &&
+        neverStarted;
+      if (unit.outcome !== "running" && !recovering) continue;
       if (!unit.current_scope || unit.state === "cancelled") {
         await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome = 'cancelled', finished_at = clock_timestamp(),
           error = 'obsolete execution physically stopped' WHERE token = ${unit.token}`);
@@ -248,7 +267,7 @@ export async function settleProgressiveCfdExecution(
         counts.cancelled += 1;
         continue;
       }
-      if (!["leased", "blocked"].includes(String(unit.state)))
+      if (!recovering && !["leased", "blocked"].includes(String(unit.state)))
         throw new Error(
           "Progressive CFD settlement has no exclusive current unit ownership",
         );
@@ -268,16 +287,13 @@ export async function settleProgressiveCfdExecution(
       }
       const exhausted =
         Number(unit.active_seconds) >= Number(unit.active_budget_seconds);
-      const neverStarted =
-        (stop.proof as EngineExecutionStopProof).ownership_basis ===
-          "never_started_cancellation_fence" &&
-        Number(unit.count) === 0 &&
-        Number(unit.active_seconds) === 0;
+      const ordinaryAttempts =
+        Number(unit.ordinary_attempts) - (neverStarted ? 1 : 0);
       const retry =
         !complete &&
         !exhausted &&
-        (Number(unit.ordinary_attempts) < 2 ||
-          (Number(unit.ordinary_attempts) === 2 &&
+        (ordinaryAttempts < 2 ||
+          (ordinaryAttempts === 2 &&
             unit.stage === 3 &&
             unit.precise_verification === true)) &&
         (unit.numerical_recovery === true ||
@@ -304,6 +320,9 @@ export async function settleProgressiveCfdExecution(
         finished_at = clock_timestamp(), error = ${reason} WHERE token = ${unit.token}`);
       await connection.execute(sql`UPDATE progressive_cfd_units SET state = ${complete ? "complete" : retry ? "pending" : "gap"},
         lease_token = NULL, lease_owner = NULL, lease_until = NULL, error = ${reason} WHERE id = ${unit.id}`);
+      if (recovering && retry)
+        await connection.execute(sql`UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
+          WHERE id = ${unit.work_id} AND state = 'gap'`);
       if (complete) counts.complete += 1;
       else if (retry) counts.retry += 1;
       else counts.gaps += 1;

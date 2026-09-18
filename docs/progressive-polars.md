@@ -180,6 +180,14 @@ Cancellation before engine registration can carry a real zero-case engine status
 with a verified never-started fence; it must not invent the requested case count or
 any solver evidence.
 
+A verified never-started cancellation is classified from the exact attempt's
+measured compute time, not the unit's accumulated time from earlier attempts.
+Such cancellations do not consume an ordinary solver attempt; earlier physical
+work and the shared active-time budget remain unchanged. Explicit recovery of a
+previously misclassified gap requires the latest exact cancelled execution, no
+case evidence, and the current campaign generation and stage. It cannot reopen
+obsolete work, supersede another attempt, or replenish an exhausted budget.
+
 Workers persist ordered immutable reports before delivery. A lost response retries
 the same sequence and bytes; only the hub's matching execution, sequence and content
 signature acknowledge that local outbox row. Both ends retain unconverged attempts
