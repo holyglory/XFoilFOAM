@@ -8,10 +8,30 @@ import {
 } from "@/lib/api";
 import { metricConditionParam } from "@/lib/metric-condition";
 import { C, MONO } from "@/lib/tokens";
+import { Suspense } from "react";
 
 export const dynamic = "force-dynamic";
 
-export default async function BrowsePage({
+export default function BrowsePage(props: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  return (
+    <Suspense
+      fallback={
+        <AppShell active="browse">
+          <main style={{ padding: 24 }}>
+            <h1>Airfoil catalog</h1>
+            <p role="status">Loading profiles…</p>
+          </main>
+        </AppShell>
+      }
+    >
+      <BrowseContent {...props} />
+    </Suspense>
+  );
+}
+
+async function BrowseContent({
   searchParams,
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;

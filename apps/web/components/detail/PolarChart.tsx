@@ -14,7 +14,7 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 
-import { VIZ } from "@/lib/tokens";
+import { MONO, VIZ } from "@/lib/tokens";
 import {
   nearestProjectedPoint,
   POLAR_POINT_TARGET_RADIUS,
@@ -212,7 +212,7 @@ export function PolarChart({
             data-ui-verify-svg-overlap="CFD axis labels must remain separated"
             y={t.labelPos}
             textAnchor="end"
-            fontFamily="IBM Plex Mono"
+            fontFamily={MONO}
             fontSize="10"
             fill={VIZ.text}
           >
@@ -236,7 +236,7 @@ export function PolarChart({
             data-ui-verify-svg-overlap="CFD axis labels must remain separated"
             y={PY1 + 18}
             textAnchor="middle"
-            fontFamily="IBM Plex Mono"
+            fontFamily={MONO}
             fontSize="10"
             fill={VIZ.text}
           >
@@ -294,7 +294,7 @@ export function PolarChart({
                 <text
                   x={p.cx + p.r + 2}
                   y={p.cy - p.r - 1}
-                  fontFamily="IBM Plex Mono"
+                  fontFamily={MONO}
                   fontSize="8"
                   fontWeight="700"
                   fill={VIZ.text}
@@ -352,7 +352,7 @@ export function PolarChart({
         x={(PX0 + PX1) / 2}
         y={h - 8}
         textAnchor="middle"
-        fontFamily="IBM Plex Mono"
+        fontFamily={MONO}
         fontSize="11"
         fill={VIZ.text}
       >

@@ -27,11 +27,16 @@ export interface ProgressiveCatalogMetric {
   modelId: string;
 }
 
-function describeCondition(physical: Condition): PolarMetricCondition {
+export function describeCondition(physical: Condition): PolarMetricCondition {
+  const {
+    airfoilId: _airfoilId,
+    geometry: _geometry,
+    ...condition
+  } = physical as AnalysisPhysical;
   return {
     key: analysisContentHash({
       version: "progressive-comparison-condition-v1",
-      physical,
+      physical: condition,
     }),
     re: physical.derived.reynolds,
     mach: physical.derived.mach!,

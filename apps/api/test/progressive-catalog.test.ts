@@ -139,6 +139,11 @@ it("uses available prediction or composite curves for catalog metrics and exact 
         expect(catalog.metrics.has(profiles[2])).toBe(false);
         const detail = await publicProgressivePolars(connection, profiles[0]);
         expect(
+          detail.every(
+            (series) => series.condition?.key === series.conditionKey,
+          ),
+        ).toBe(true);
+        expect(
           Math.max(
             ...detail.map(
               (series) => series.curves[0].metrics!.liftToDragMaximum!,

@@ -529,6 +529,9 @@ export function BrowseView({
           }
         }
         @media (max-width: 560px) {
+          .category-action-label {
+            display: none;
+          }
           .airfoil-row {
             grid-template-columns: 26px minmax(0, 1fr) 64px;
           }
@@ -573,6 +576,7 @@ export function BrowseView({
               }}
             >
               <summary
+                aria-label="Categories"
                 style={{
                   ...toolbarBtn,
                   listStyle: "none",
@@ -580,7 +584,7 @@ export function BrowseView({
                 }}
               >
                 <Folder size={15} />
-                <span>Categories</span>
+                <span className="category-action-label">Categories</span>
               </summary>
               <aside
                 data-ui-contextual-overlay="Category choices opened from the catalog toolbar"
@@ -1742,7 +1746,7 @@ function PreviewPane({
           }}
         >
           <span style={{ fontWeight: 600, fontSize: 14 }}>{detail.name}</span>
-          <span style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>
+          <span style={{ fontFamily: MONO, fontSize: 11, color: C.text2 }}>
             {method}
           </span>
         </div>
@@ -1951,7 +1955,7 @@ function sortButton(numCol: boolean, active: boolean): React.CSSProperties {
     fontFamily: MONO,
     fontSize: 10,
     letterSpacing: "0.06em",
-    color: active ? C.teal : C.dim,
+    color: active ? C.teal : C.text2,
     padding: 0,
   };
 }

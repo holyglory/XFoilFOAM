@@ -280,6 +280,7 @@ export interface AirfoilDetailPayload {
 export interface ProgressivePolarSeries {
   targetId: string;
   conditionKey: string;
+  condition?: PolarMetricCondition;
   modelId: string;
   kind: "prediction" | "estimate";
   re: number;

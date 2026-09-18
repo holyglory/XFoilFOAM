@@ -21,6 +21,7 @@ export function progressiveComparisonConditions(
       re: number;
       mach: number;
       branch: string;
+      descriptor?: ProgressivePolarSeries["condition"];
       profiles: Set<string>;
     }
   >();
@@ -32,6 +33,7 @@ export function progressiveComparisonConditions(
         re: series.re,
         mach: series.mach,
         branch: series.branch,
+        descriptor: series.condition,
         profiles: new Set<string>(),
       };
       condition.profiles.add(profile.slug);

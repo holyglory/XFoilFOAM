@@ -10,6 +10,8 @@ const origin = process.argv.includes("--production")
 const root = resolve(new URL("../../", import.meta.url).pathname);
 const output = mkdtempSync(join(tmpdir(), "airfoil-condition-layout-"));
 const reviewInputs = [
+  "apps/web/app/layout.tsx",
+  "apps/web/app/globals.css",
   "apps/web/app/page.tsx",
   "apps/web/components/browse/BrowseView.tsx",
   "apps/web/components/MetricConditionSelector.tsx",
@@ -77,7 +79,12 @@ const targets = [
       ],
       continuation: {
         kind: "in-page",
-        anchor: target.selector,
+        anchor:
+          target.name === "catalog"
+            ? "select[aria-label='Metrics for']"
+            : target.name === "compare"
+              ? "select[aria-label='Comparison condition']"
+              : "select[aria-label='Polar condition']",
         focusWithin: "button[aria-label='Switch to dark theme']",
         maxScrollDelta: 8,
       },

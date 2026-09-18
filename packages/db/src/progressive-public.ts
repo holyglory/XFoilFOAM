@@ -5,6 +5,7 @@ import {
 import type { ProgressivePolarEstimate } from "../../engine-client/src/progressive-polar";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { describeCondition } from "./progressive-catalog";
 import {
   progressiveComparisonConditionKey,
   type AnalysisPhysical,
@@ -63,6 +64,7 @@ export async function publicProgressivePolars(
       (record): ProgressivePolarSeries => ({
         targetId: record.target_id,
         conditionKey: progressiveComparisonConditionKey(record.physical),
+        condition: describeCondition(record.physical),
         modelId: record.model_id ?? record.id,
         kind: record.estimate ? "estimate" : "prediction",
         re: record.physical.derived.reynolds,

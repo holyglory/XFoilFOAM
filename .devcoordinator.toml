@@ -354,6 +354,11 @@ name = "layout"
 tier = "development"
 command = ["node", "scripts/dev/verify-condition-layout.mjs"]
 
+[[test.public-condition-ui.check]]
+name = "browser-smoke"
+tier = "development"
+command = ["node", "scripts/dev/verify-condition-browser.mjs"]
+
 [test.public-condition-production]
 timeout_seconds = 900
 
@@ -361,6 +366,11 @@ timeout_seconds = 900
 name = "journey"
 tier = "development"
 command = ["node", "scripts/dev/verify-condition-catalog.mjs", "--production"]
+
+[[test.public-condition-production.check]]
+name = "layout"
+tier = "development"
+command = ["node", "scripts/dev/verify-condition-layout.mjs", "--production"]
 
 [[test.public-metrics.check]]
 name = "dependencies"
@@ -1036,6 +1046,12 @@ name = "solver-reference-lock"
 tier = "development"
 requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-solver-lock.test.ts"]
+
+[[test.progressive.check]]
+name = "public-catalog-metrics"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/progressive-catalog.test.ts"]
 
 [[test.progressive.check]]
 name = "reservation-transitions"

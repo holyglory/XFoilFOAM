@@ -99,7 +99,7 @@ body {
   padding: 0;
   background: var(--aero-bg);
   color: var(--aero-text);
-  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  font-family: var(--font-aero-sans), "IBM Plex Sans", system-ui, sans-serif;
 }
 body {
   transition:
@@ -156,7 +156,7 @@ a {
   color: inherit;
 }
 .mono {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
 }
 
 .campaign-card-actions {
@@ -219,7 +219,7 @@ a {
   border: 1px solid var(--aero-stroke);
   border-radius: 8px;
   background: var(--aero-panel2);
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
 }
 
 .campaign-instrument-status-amber {
@@ -299,7 +299,7 @@ a {
   width: 100%;
   display: grid;
   justify-items: center;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
   text-align: center;
   pointer-events: none;
 }
@@ -346,7 +346,7 @@ a {
   border-top: 1px solid var(--aero-stroke);
   border-bottom: 1px solid var(--aero-stroke);
   color: var(--aero-text2);
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
   font-size: 10.5px;
   line-height: 1.4;
 }
@@ -423,7 +423,7 @@ a {
   align-content: start;
   color: var(--aero-dim);
   text-align: center;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
 }
 
 .campaign-instrument-stage-node {
@@ -513,7 +513,7 @@ a {
   gap: 15px;
   padding: 8px 20px;
   color: var(--aero-muted);
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
   text-align: left;
   background: transparent;
   border: 0;
@@ -578,7 +578,7 @@ a {
   color: var(--aero-muted);
   background: transparent;
   border: 0;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
   font-size: 10px;
   cursor: pointer;
 }
@@ -609,7 +609,7 @@ a {
   gap: 14px;
   flex-wrap: wrap;
   color: var(--aero-muted);
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
   font-size: 10px;
 }
 
@@ -629,7 +629,7 @@ a {
   background: transparent;
   border: 1px solid var(--aero-border-row);
   border-radius: 6px;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-aero-mono), "IBM Plex Mono", monospace;
   text-align: left;
 }
 

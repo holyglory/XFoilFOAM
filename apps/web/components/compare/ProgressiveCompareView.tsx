@@ -3,8 +3,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { fRe, profilePaths } from "@aerodb/core";
 import Link from "next/link";
+import { X } from "lucide-react";
 import { PolarMiniChart } from "@/components/PolarMiniChart";
-import { withMetricCondition } from "@/lib/metric-condition";
+import { conditionLabel, withMetricCondition } from "@/lib/metric-condition";
 import {
   progressiveComparisonConditions,
   progressiveComparisonCurve,
@@ -31,9 +32,11 @@ const display = (value: number | null) =>
 export function ProgressiveCompareView({
   profiles,
   initialConditionKey = "",
+  onRemove,
 }: {
   profiles: ProgressiveComparisonProfile[];
   initialConditionKey?: string;
+  onRemove?: (slug: string) => void;
 }) {
   const conditions = useMemo(
     () => progressiveComparisonConditions(profiles),
@@ -72,9 +75,15 @@ export function ProgressiveCompareView({
         .profile-tabs {
           display: none;
         }
+        .card-remove {
+          display: none;
+        }
         @media (max-width: 680px) {
           .comparison-cards {
             display: block;
+          }
+          .card-remove {
+            display: inline-flex;
           }
           .comparison-card[data-selected="false"] {
             display: none;
@@ -118,9 +127,10 @@ export function ProgressiveCompareView({
           )}
           {conditions.map((condition, index) => (
             <option key={condition.key} value={condition.key}>
-              Re {fRe(condition.re)} · M {display(condition.mach)} ·{" "}
-              {condition.availableProfiles}/{profiles.length} profiles ·{" "}
-              {index + 1}
+              {condition.descriptor
+                ? conditionLabel(condition.descriptor)
+                : `M ${display(condition.mach)} · Re ${fRe(condition.re)}`}{" "}
+              · {index + 1}
             </option>
           ))}
         </select>
@@ -164,21 +174,50 @@ export function ProgressiveCompareView({
                 background: C.panel,
               }}
             >
-              <h2
+              <div
                 style={{
-                  fontSize: 18,
-                  margin: "0 0 8px",
-                  overflowWrap: "anywhere",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
                 }}
               >
-                {profile.name}
-              </h2>
+                <h2
+                  style={{
+                    fontSize: 18,
+                    margin: "0 0 8px",
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {profile.name}
+                </h2>
+                {onRemove && (
+                  <button
+                    className="card-remove"
+                    aria-label={`Remove ${profile.name} from comparison`}
+                    onClick={() => onRemove(profile.slug)}
+                    style={{
+                      flexShrink: 0,
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: 36,
+                      height: 36,
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 8,
+                      background: C.panel,
+                      color: C.muted,
+                    }}
+                  >
+                    <X size={16} />
+                  </button>
+                )}
+              </div>
               {shape && (
                 <svg
                   role="img"
                   aria-label={`${profile.name} profile`}
                   viewBox="0 0 340 150"
-                  style={{ width: "100%", height: 108 }}
+                  style={{ width: "100%", height: 72 }}
                 >
                   <path
                     d={shape}
@@ -398,7 +437,7 @@ function ProgressiveCompareOverlay({
           >
             <span className={controls.conditionText}>Condition</span>
             <select
-              aria-label="Comparison condition"
+              aria-label="Overlay condition"
               disabled={!interactive || !conditions.length}
               value={condition?.key ?? ""}
               onChange={(event) => {

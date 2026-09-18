@@ -4,10 +4,30 @@ import { getAirfoilCurveDetail, listAirfoils } from "@/lib/api";
 import { parseCompareSelection } from "@/lib/compare-selection";
 import { metricConditionParam } from "@/lib/metric-condition";
 import { C, MONO } from "@/lib/tokens";
+import { Suspense } from "react";
 
 export const dynamic = "force-dynamic";
 
-export default async function ComparePage({
+export default function ComparePage(props: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  return (
+    <Suspense
+      fallback={
+        <AppShell active="compare">
+          <main style={{ padding: 24 }}>
+            <h1>Compare</h1>
+            <p role="status">Loading selected profiles…</p>
+          </main>
+        </AppShell>
+      }
+    >
+      <CompareContent {...props} />
+    </Suspense>
+  );
+}
+
+async function CompareContent({
   searchParams,
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
@@ -59,8 +79,7 @@ export default async function ComparePage({
             marginBottom: 18,
           }}
         >
-          Overlay polars and cached fit metrics for up to four airfoils at one
-          operating condition.
+          Compare airfoils at the same flow condition.
         </div>
         <CompareView
           key={selection?.join("|") ?? "default"}

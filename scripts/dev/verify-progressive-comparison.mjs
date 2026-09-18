@@ -111,7 +111,7 @@ try {
       box.y < viewport.height * 0.7,
       `Comparison chart displaced: ${JSON.stringify({ viewport, box })}`,
     );
-    const conditions = viewer.getByLabel("Comparison condition");
+    const conditions = viewer.getByLabel("Overlay condition");
     assert((await conditions.locator("option").count()) >= 6);
     const before = await viewer
       .getByTestId("comparison-curve")
@@ -151,6 +151,11 @@ try {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByText("Overlay curves", { exact: true }).click();
     await expect(viewer.getByTestId("comparison-curve")).toHaveCount(2);
+    if (viewport.width <= 680)
+      await page
+        .getByRole("group", { name: "Compared profiles" })
+        .getByRole("button", { name: /^AG25 / })
+        .click();
     await page
       .getByRole("button", { name: /^Remove AG25 .* from comparison$/ })
       .click();

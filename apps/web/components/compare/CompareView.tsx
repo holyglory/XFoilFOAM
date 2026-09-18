@@ -197,6 +197,18 @@ export function CompareView({
 
   return (
     <div>
+      <style jsx>{`
+        @media (max-width: 920px) {
+          .comparison-clear-suffix {
+            display: none;
+          }
+        }
+        @media (max-width: 680px) {
+          .comparison-selected-chip {
+            display: none !important;
+          }
+        }
+      `}</style>
       {/* selection chips + controls */}
       <div
         style={{
@@ -210,6 +222,11 @@ export function CompareView({
         {selected.map((s) => (
           <span
             key={s.a.slug}
+            className={
+              progressiveProfiles.some((profile) => profile.series.length)
+                ? "comparison-selected-chip"
+                : undefined
+            }
             style={{
               display: "flex",
               alignItems: "center",
@@ -263,6 +280,7 @@ export function CompareView({
           <button
             type="button"
             onClick={() => changeSelection([])}
+            aria-label="Clear comparison"
             disabled={!interactive}
             style={{
               color: C.muted,
@@ -271,7 +289,7 @@ export function CompareView({
               cursor: "pointer",
             }}
           >
-            Clear comparison
+            Clear<span className="comparison-clear-suffix"> comparison</span>
           </button>
         )}
         {!hasProgressive && (
@@ -383,6 +401,11 @@ export function CompareView({
         <ProgressiveCompareView
           profiles={progressiveProfiles}
           initialConditionKey={initialConditionKey}
+          onRemove={(slug) =>
+            changeSelection(
+              slugs.filter((selectedSlug) => selectedSlug !== slug),
+            )
+          }
         />
       ) : (
         <div
@@ -515,7 +538,7 @@ function CompareChart({
             x={PX0 - 8}
             y={mapY(v) + 3}
             textAnchor="end"
-            fontFamily="IBM Plex Mono"
+            fontFamily={MONO}
             fontSize="10"
             fill={VIZ.dim}
           >
@@ -539,7 +562,7 @@ function CompareChart({
             x={mapX(v)}
             y={362}
             textAnchor="middle"
-            fontFamily="IBM Plex Mono"
+            fontFamily={MONO}
             fontSize="10"
             fill={VIZ.dim}
           >
@@ -631,19 +654,13 @@ function CompareChart({
         x={361}
         y={372}
         textAnchor="middle"
-        fontFamily="IBM Plex Mono"
+        fontFamily={MONO}
         fontSize="11"
         fill={VIZ.text}
       >
         {xTitle}
       </text>
-      <text
-        x={2}
-        y={14}
-        fontFamily="IBM Plex Mono"
-        fontSize="11"
-        fill={VIZ.text}
-      >
+      <text x={2} y={14} fontFamily={MONO} fontSize="11" fill={VIZ.text}>
         {yTitle}
       </text>
       {selected.every(
@@ -653,7 +670,7 @@ function CompareChart({
           x={(PX0 + PX1) / 2}
           y={(PY0 + PY1) / 2}
           textAnchor="middle"
-          fontFamily="IBM Plex Mono"
+          fontFamily={MONO}
           fontSize="12"
           fill={VIZ.dim}
         >

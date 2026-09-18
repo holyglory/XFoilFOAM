@@ -66,5 +66,5 @@ export const RE_COLORS: Record<number, string> = {
   1000000: "#38bdf8",
 };
 
-export const MONO = "'IBM Plex Mono', monospace";
-export const SANS = "'IBM Plex Sans', system-ui, sans-serif";
+export const MONO = "var(--font-aero-mono), 'IBM Plex Mono', monospace";
+export const SANS = "var(--font-aero-sans), 'IBM Plex Sans', system-ui, sans-serif";
