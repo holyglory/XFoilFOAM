@@ -124,6 +124,23 @@ port = true
 route = true
 timeout_seconds = 1500
 
+[test.retained-polar-cohort]
+timeout_seconds = 1800
+
+[[test.retained-polar-cohort.check]]
+name = "cohort-contract"
+tier = "development"
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_retained_polar_cohort.py", "tests/test_retained_polar_measurement.py", "-q"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.retained-polar-cohort.check]]
+name = "eight-real-profiles"
+tier = "development"
+requires = ["cohort-contract"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.measure_retained_cohort", "--source", "/home/holyglory/XFoilFOAM/.codex-artifacts/history-population-20260919/cohort.json", "--sha256", "a25a1ec79120cd779a04e808328d23560d1839d4806aaf492a94952e4f62a8b6", "--destination", ".codex-artifacts/history-cohort-measurement"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+retained_artifacts = [{ name = "retained-eight-profile-study", path = ".codex-artifacts/history-cohort-measurement", max_bytes = 16777216 }]
+
 [test.pressure-initialization]
 timeout_seconds = 900
 env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
