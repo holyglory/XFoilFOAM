@@ -131,6 +131,7 @@ from .postprocess.images import (
 )
 from .postprocess.aperiodic import reduce_aperiodic_mean
 from .postprocess.residuals import parse_convergence, parse_local_steady_convergence
+from .openfoam.local_startup import solve_cold_steady
 from .openfoam.rans_hold import HOLD_MARKER, complete_rans_hold
 from .postprocess.unsteady import (
     CLEAN_CYCLE_CERTIFICATION_VERSION,
@@ -8349,8 +8350,9 @@ def run_case(
                     case_dir, potential, stage="potentialFoam"
                 )
             _check_cancel(cancel_check)
-            res = runner.solver(
-                case_dir, dialect.steady_solver_command, n_proc, timeout=steady_timeout
+            res = solve_cold_steady(
+                case_dir, runner, sp, n_proc, steady_timeout, seeded=seeded,
+                cancel_check=lambda: _check_cancel(cancel_check),
             )
             _check_cancel(cancel_check)
             check_material_domain(case_dir, res)
@@ -9395,8 +9397,9 @@ def _solve_cold_marched(
                 polar_dir, potential, stage="potentialFoam"
             )
         _check_cancel(cancel_check)
-        res = runner.solver(
-            polar_dir, dialect.steady_solver_command, n_proc, timeout=solver_timeout
+        res = solve_cold_steady(
+            polar_dir, runner, sp, n_proc, solver_timeout, seeded=seeded,
+            cancel_check=lambda: _check_cancel(cancel_check),
         )
         _check_cancel(cancel_check)
         check_material_domain(polar_dir, res)

@@ -9,6 +9,7 @@ from typing import Literal
 
 from .. import physics
 from ..openfoam.foam_dict import Raw, dimensions, vector, write_foam_dict
+from ..openfoam.local_startup import STARTUP_COURANT, STARTUP_ITERATIONS
 from ..thermodynamics import CompressibleTimeWindow, GasThermodynamics, ThermodynamicState
 from .builder import CaseBuilder
 
@@ -68,6 +69,9 @@ class CompressibleCaseBuilder(CaseBuilder):
             "version": 1, "solver_family": self.solver_family,
             "time_coordinate": "local_pseudo_time_iterations" if self.local_steady else "steady_iterations" if self.solver_family == "rhoSimpleFoam" else "physical_time_seconds",
             "physical_time_history": self.solver_family != "rhoSimpleFoam" and not self.local_steady,
+            **({"cold_startup_policy": {"version": 1, "maximum_iterations": STARTUP_ITERATIONS,
+                                        "maximum_courant": STARTUP_COURANT,
+                                        "skip_when_seeded": True}} if self.local_steady else {}),
         }, sort_keys=True) + "\n")
 
     def _force_coeffs_dict(self) -> dict:

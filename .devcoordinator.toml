@@ -23,6 +23,31 @@ default = "python"
 [test.mach3-startup-fields]
 timeout_seconds = 300
 
+[test.local-steady-startup]
+timeout_seconds = 900
+
+[[test.local-steady-startup.check]]
+name = "startup-and-adjacent-contracts"
+tier = "development"
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_local_steady_startup.py", "tests/test_compressible_execution.py", "tests/test_rans_hold_continuation.py", "tests/test_retention.py", "tests/test_local_steady_convergence.py", "tests/test_material_domain.py", "-q"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[deployment.local-steady-startup]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.local-steady-startup.component.numerics]
+type = "compose"
+files = ["compose.mach3-failure.yml", "compose.local-steady-startup.yml"]
+services = ["artifacts", "cold", "marched"]
+finite_services = ["cold", "marched"]
+build = false
+port = true
+route = true
+timeout_seconds = 2400
+
 [test.mach3-startup-continuation]
 timeout_seconds = 300
 

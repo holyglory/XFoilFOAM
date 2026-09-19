@@ -586,6 +586,16 @@ iteration histories may only contribute to the separately labeled estimate.
 An explicitly diagnosed unsteady recovery changes the immutable time coordinate
 to physical time rather than relabeling local iterations as seconds.
 
+Cold density-based local-steady attempts use at most 50 initial updates with
+local Courant capped at 0.25 before returning to the requested effective limit.
+This is part of the same iteration and active-time allocation, not an extra
+calculation budget. Seeded starts, already smaller limits and physical-time
+calculations are unchanged. Stage settings and raw logs are retained, and complete
+control dictionaries are replaced only between stopped solver processes.
+Continuation requires the exact saved iteration and restart fields; missing or
+incompatible state cannot silently restart the allocation. Startup success alone
+does not satisfy any CFD acceptance criterion.
+
 The real high-Mach controller check demonstrates a prior followed by two-angle
 refinement from unconverged numerical histories, not aerodynamic accuracy or
 accepted Mach-3 CFD. Mesh/model validation and uncertainty calibration remain

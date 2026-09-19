@@ -1,0 +1,6 @@
+services:
+  marched:
+    extends:
+      file: compose.mach3-failure.yml
+      service: cold
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/marched", "--start", "marched"]

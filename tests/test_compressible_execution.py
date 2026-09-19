@@ -149,13 +149,26 @@ def test_local_density_keeps_iteration_clock_separate_from_physical_startup(
     monkeypatch.setattr(pipeline, "acoustic_startup_step", unexpected_acoustic)
     monkeypatch.setattr(pipeline, "_link_mesh", lambda *_: None)
     monkeypatch.setattr(pipeline, "_try_seed_initial_field", lambda *args, **kwargs: seeded)
+    calls = []
+    def solve(directory, app, n_proc, timeout, restart=False):
+        control = (directory / "system/controlDict").read_text()
+        end = int(float(root_entry(control, "endTime")))
+        calls.append((end, float(root_entry(control, "deltaT")), restart))
+        state = directory / str(end)
+        (state / "uniform").mkdir(parents=True, exist_ok=True)
+        for name in ("U", "p", "T", "rho", "k", "omega", "nut", "alphat", "rDeltaT"):
+            (state / name).write_text("synthetic restart-contract fixture")
+        (state / "uniform/time").write_text(f"value {end};\nindex {end};\ndeltaT 1;\ndeltaT0 1;\n")
+        return RunResult(app, 0, f"Time = {end}\n")
+    monkeypatch.setattr(runner, "solver", solve)
     case_dir = tmp_path / "case"
     result = pipeline._solve_cold_marched(
         case_dir, mesh_dir, airfoil, patches, request.mesh, request.cases()[0], request.fluid,
         request.roughness, request.solver, runner, 30, SimpleNamespace(first_order_fallback=False),
     )
     assert result.ok
-    assert any("rhoCentralFoam" in command for command in runner.commands)
+    assert calls == ([(request.solver.n_iterations, 1, False)] if seeded else
+                     [(50, 1, False), (request.solver.n_iterations, 1, True)])
     control = (case_dir / "system/controlDict").read_text()
     assert float(root_entry(control, "deltaT")) == 1
     assert float(root_entry(control, "endTime")) == request.solver.n_iterations

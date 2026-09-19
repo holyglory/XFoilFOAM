@@ -269,6 +269,26 @@ are explicitly averages of their vertices, not volume centroids. The private
 `mach3-startup-fields` deployment uses network-isolated solvers and a read-only
 artifact server; it never creates campaign results or an accuracy certificate.
 
+The two full-horizon continuations use the same hash-verified state at iteration
+50. They include the startup's 6.710 seconds in the original 900-second allocation
+and perform exactly 4950 further updates to iteration 5000. Keeping Courant 0.25
+takes 334.990 seconds in total; restoring 0.5 takes 328.487 seconds. Neither
+trajectory reports material warnings, but neither meets field convergence or
+the complete Cl/Cd/Cm hold test. The final normalized field-change measures are
+11558.778 and 1600.227 respectively, not aerodynamic error estimates. Their final
+50-sample means are (Cl, Cd, Cm) = (0.259101, 0.129801, -0.090807) and
+(0.265287, 0.129026, -0.088385). Thus surviving startup is distinct from solving
+the physical steady-flow problem.
+
+The candidate bounded-start implementation caps only the first 50 cold
+local-steady updates at Courant 0.25, then restores the requested effective limit.
+It does not change the global iteration clock, total iteration ceiling, gas
+bounds, convergence criteria, seeded starts, or physical-time integration.
+Both native logs and each stage's complete control dictionary are retained.
+`local-steady-startup` replays the actual isolated job pipeline for both the
+13-degree cold case and the original two-angle request. Its completion is a
+numerical-repair check, not campaign-wide accuracy or uncertainty validation.
+
 - `progressive / air-pressure-audit`: analytic energy/entropy and failure-state
   regressions, then the exact-source pressure comparison with retained artifact
   `source-pressure`. The 2026-09-07 retained report has SHA256
