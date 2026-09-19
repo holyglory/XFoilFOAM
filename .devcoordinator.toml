@@ -859,7 +859,7 @@ retained_artifacts = [{ name = "uiuc-prior-evaluation", path = ".codex-artifacts
 [[test.polar-uncertainty-validation.check]]
 name = "held-out-contract"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_retained_polar_measurement.py", "tests/test_polar_history.py", "tests/test_progressive_polar.py", "tests/test_prediction_api.py", "tests/test_uiuc_volume1_reference.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_retained_polar_measurement.py", "tests/test_retained_polar_cohort.py", "tests/test_polar_history.py", "tests/test_progressive_polar.py", "tests/test_prediction_api.py", "tests/test_uiuc_volume1_reference.py", "-q"]
 
 [test.retained-polar-measurement]
 timeout_seconds = 300
@@ -1748,7 +1748,7 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initializat
 name = "local-steady"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_local_steady_startup.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_mach3_startup_continuation.py", "-q"]
 
 [[test.progressive.check]]
 name = "local-steady-binding"
