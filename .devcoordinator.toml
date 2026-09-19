@@ -1194,9 +1194,15 @@ requires = ["types", "ingest-seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/retention.test.ts", "test/sync-import-retention.test.ts"]
 
 [[test.progressive.check]]
-name = "enrollment"
+name = "fixture-ownership"
 tier = "development"
 requires = ["dependencies"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/fixture-ownership.test.ts"]
+
+[[test.progressive.check]]
+name = "enrollment"
+tier = "development"
+requires = ["dependencies", "fixture-ownership"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "test/polar-compatibility-cache.test.ts"]
 
 [[test.progressive.check]]
@@ -1717,13 +1723,13 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
 [[test.progressive.check]]
 name = "independent-manual"
 tier = "development"
-requires = ["ingest-seed", "types"]
+requires = ["ingest-seed", "types", "fixture-ownership"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/campaign-submit-lifecycle.test.ts", "-t", "promotes manual reuse of an automatic request"]
 
 [[test.progressive.check]]
 name = "current-submission"
 tier = "development"
-requires = ["ingest-seed", "types"]
+requires = ["ingest-seed", "types", "fixture-ownership"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/campaign-submit-lifecycle.test.ts", "-t", "progressive RANS compensation|does not release claims when another submitter|claims the pending job before|retries persisted compensating|promotes manual reuse|stationary budget-stopped|accepted wave-2 task"]
 
 [[test.progressive.check]]
@@ -1789,7 +1795,7 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_worker_control.py", "
 [[test.progressive.check]]
 name = "submission-legacy"
 tier = "development"
-requires = ["ingest-seed", "types"]
+requires = ["ingest-seed", "types", "fixture-ownership"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/campaign-submit-lifecycle.test.ts", "-t", "submission|submit|orphan"]
 
 [[test.progressive.check]]
@@ -1839,8 +1845,14 @@ database = "aerodb"
 user = "aerodb"
 
 [[test.enrollment.check]]
+name = "fixture-ownership"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/fixture-ownership.test.ts"]
+
+[[test.enrollment.check]]
 name = "lifecycle"
 tier = "development"
+requires = ["fixture-ownership"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts"]
 
 [deployment.progressive-preview]

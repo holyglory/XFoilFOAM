@@ -85,6 +85,10 @@ import {
   URANS_BUDGET_STOP_MARKER,
 } from "@aerodb/core";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
+import {
+  cleanupOwnedFixtureIds,
+  fixtureCleanupLifecycle,
+} from "../../../packages/db/test-support/fixture-ownership";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "../src/build-request";
 import { composeProgressiveCfdJob } from "../src/progressive-cfd-jobs";
@@ -103,7 +107,15 @@ import {
   URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
 import { and, asc, eq, inArray, sql as sqlFragment } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
 
 import {
   clearEngineUnreachable,
@@ -394,11 +406,13 @@ beforeAll(async () => {
   profileIds.output = output.id;
 });
 
-afterEach(async () => {
-  await cleanupCampaignFixtures(db, {
-    campaignIds: campaignIds.splice(0),
-    presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
-  });
+const fixtureCleanup = fixtureCleanupLifecycle(async () => {
+  await cleanupOwnedFixtureIds(campaignIds, (owned) =>
+    cleanupCampaignFixtures(db, {
+      campaignIds: owned,
+      presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
+    }),
+  );
   const fence = await enforceSweeperAdmissionFence(db);
   expect(
     fence.hazardPresent,
@@ -411,6 +425,8 @@ afterEach(async () => {
       .where(eq(sweeperState.id, 1));
   resetEngineBackoffForTests();
 });
+beforeEach(fixtureCleanup.beforeEach);
+afterEach(fixtureCleanup.afterEach);
 
 afterAll(async () => {
   await cleanupCampaignFixtures(db, {

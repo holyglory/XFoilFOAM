@@ -34,6 +34,7 @@ import {
   afterAll,
   afterEach,
   beforeAll,
+  beforeEach,
   describe,
   expect,
   it,
@@ -137,6 +138,10 @@ import {
   reconcileCampaignProfileEnrollment,
 } from "../src/campaigns";
 import { cleanupCampaignFixtures } from "../src/test-cleanup";
+import {
+  cleanupOwnedFixtureIds,
+  fixtureCleanupLifecycle,
+} from "../test-support/fixture-ownership";
 import { simCampaignConditions } from "../src/schema";
 import {
   bindProgressiveRemoteDispatch,
@@ -932,17 +937,21 @@ beforeAll(async () => {
   };
 }, 120_000);
 
-afterEach(async () => {
+const fixtureCleanup = fixtureCleanupLifecycle(async () => {
   if (campaignIds.length)
-    await cleanupCampaignFixtures(db, {
-      campaignIds: campaignIds.splice(0),
-      presetSlugPrefix: `campaign-${PREFIX}`,
-    });
+    await cleanupOwnedFixtureIds(campaignIds, (owned) =>
+      cleanupCampaignFixtures(db, {
+        campaignIds: owned,
+        presetSlugPrefix: `campaign-${PREFIX}`,
+      }),
+    );
   if (addedProfileIds.length)
-    await db
-      .delete(airfoils)
-      .where(inArray(airfoils.id, addedProfileIds.splice(0)));
+    await cleanupOwnedFixtureIds(addedProfileIds, (owned) =>
+      db.delete(airfoils).where(inArray(airfoils.id, owned)),
+    );
 });
+beforeEach(fixtureCleanup.beforeEach);
+afterEach(fixtureCleanup.afterEach);
 
 async function progressiveScope(
   campaignId: string,
@@ -7776,21 +7785,21 @@ describe("sealed progressive generations", () => {
     expect(count).toBe(0);
   });
 
-  it("respects paused, cancelled and archived campaigns and reopens only completed additional scope", async () => {
-    for (const status of ["paused", "cancelled", "archived"]) {
+  it.each(["paused", "cancelled", "archived", "completed"] as const)(
+    "respects %s campaigns and reopens only completed additional scope",
+    async (status) => {
       const id = await campaign(status);
       await sealProgressiveGeneration(db, await progressiveScope(id));
-      expect(await claim()).toBeNull();
+      const lease = status === "completed" ? await claim([1]) : await claim();
+      if (status === "completed") expect(lease?.campaignId).toBe(id);
+      else expect(lease).toBeNull();
       const [row] = await db
         .select()
         .from(simCampaigns)
         .where(eq(simCampaigns.id, id));
-      expect(row.status).toBe(status);
-    }
-    const completed = await campaign("completed");
-    await sealProgressiveGeneration(db, await progressiveScope(completed));
-    expect((await claim([1]))?.campaignId).toBe(completed);
-  });
+      expect(row.status).toBe(status === "completed" ? "active" : status);
+    },
+  );
 
   it("does not let a late expansion mutate an existing generation or steal its in-flight lease", async () => {
     const id = await campaign();
