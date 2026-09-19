@@ -1,0 +1,5 @@
+ALTER TABLE progressive_cfd_recovery_claims
+  DROP CONSTRAINT progressive_cfd_recovery_claims_recovery_plan_id_key;
+
+CREATE INDEX progressive_cfd_recovery_claims_plan_idx
+  ON progressive_cfd_recovery_claims (recovery_plan_id);

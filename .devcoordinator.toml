@@ -20,6 +20,26 @@ timeout_seconds = 1200
 [test]
 default = "python"
 
+[test.recovery-plan-retry]
+timeout_seconds = 900
+
+[test.recovery-plan-retry.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.recovery-plan-retry.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--prefer-offline"]
+env = { CI = "true" }
+
+[[test.recovery-plan-retry.check]]
+name = "immutable-plan-retry"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reclaims the same immutable recovery plan"]
+
 [test.mach3-startup-fields]
 timeout_seconds = 300
 

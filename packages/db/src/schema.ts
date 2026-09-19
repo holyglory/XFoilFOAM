@@ -7506,11 +7506,15 @@ export const progressiveCfdRecoveryClaims = pgTable(
       .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
     recoveryPlanId: uuid("recovery_plan_id")
       .notNull()
-      .unique()
       .references(() => progressiveCfdRecoveryPlans.id, {
         onDelete: "cascade",
       }),
   },
+  (table) => ({
+    planIdx: index("progressive_cfd_recovery_claims_plan_idx").on(
+      table.recoveryPlanId,
+    ),
+  }),
 );
 
 export const progressiveCfdExecutionRecipes = pgTable(

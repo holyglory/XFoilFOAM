@@ -4811,6 +4811,116 @@ describe("bounded progressive numerical recovery", () => {
     }
   }
 
+  it("reclaims the same immutable recovery plan after a never-started cancellation", async () => {
+    const fixture = await cfdEvidenceFixture(33.719, 2, [], [0]);
+    const evidence = await fixture.save(70, "rans", 0, {
+      failure_disposition: "hard_solver",
+    });
+    await fixture.record([evidence]);
+    await stopped(fixture);
+    expect(
+      await recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId),
+    ).toBe(1);
+    expect(
+      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+    ).toMatchObject({ retry: 1 });
+    const planned = await claimProgressiveCfdBatch(db, {
+      owner: "unstarted-recovery-plan",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+    });
+    expect(planned).toHaveLength(1);
+    expect(planned[0].recoveryPlanId).toBeTruthy();
+    const [originalPlan] = await db.execute(sql`
+      SELECT * FROM progressive_cfd_recovery_plans WHERE id = ${planned[0].recoveryPlanId}
+    `);
+    const [originalClaim] = await db.execute(sql`
+      SELECT * FROM progressive_cfd_recovery_claims WHERE attempt_token = ${planned[0].token}
+    `);
+    async function cancelBeforeStarting(leases: typeof planned) {
+      const job = await composeRecovery(leases);
+      expect(
+        await claimSimJobCancellation(
+          db,
+          job.jobId,
+          "isolated recovery maintenance",
+        ),
+      ).toMatchObject({ kind: "cancelled" });
+      await db
+        .update(simJobs)
+        .set({
+          engineJobId: job.request.execution_id!,
+          ingestedAt: new Date(),
+        })
+        .where(eq(simJobs.id, job.jobId));
+      await acknowledgeProgressiveCfdExecutionStop(db, {
+        simJobId: job.jobId,
+        proof: {
+          ...executionStopProof(job.request.execution_id!),
+          fence: "cancel_marker",
+          ownership_basis: "never_started_cancellation_fence",
+        },
+      });
+      return settleProgressiveCfdExecution(db, job.jobId);
+    }
+    expect(await cancelBeforeStarting(planned)).toMatchObject({ retry: 1 });
+    const concurrent = await Promise.all(
+      ["first", "second"].map((owner) =>
+        claimProgressiveCfdBatch(db, {
+          owner: `recovery-retry-${owner}`,
+          leaseSeconds: 120,
+          solverBudgetVersion: 2,
+        }),
+      ),
+    );
+    const retried = concurrent.flat();
+    expect(retried).toHaveLength(1);
+    expect(retried[0]).toMatchObject({
+      id: planned[0].id,
+      recoveryPlanId: planned[0].recoveryPlanId,
+      recoveryParentJobId: fixture.composed.jobId,
+      recipe: planned[0].recipe,
+      remainingActiveSeconds: 830,
+    });
+    expect(retried[0].token).not.toBe(planned[0].token);
+    const claims = await db.execute(sql`
+      SELECT * FROM progressive_cfd_recovery_claims WHERE recovery_plan_id = ${planned[0].recoveryPlanId}
+    `);
+    expect(claims).toHaveLength(2);
+    expect(claims).toContainEqual(originalClaim);
+    expect(
+      await db.execute(
+        sql`SELECT * FROM progressive_cfd_recovery_plans WHERE id = ${planned[0].recoveryPlanId}`,
+      ),
+    ).toEqual([originalPlan]);
+    await expect(
+      db.execute(sql`UPDATE progressive_cfd_recovery_claims SET recovery_plan_id = recovery_plan_id
+      WHERE attempt_token = ${planned[0].token}`),
+    ).rejects.toThrow();
+    await expect(
+      db.execute(sql`INSERT INTO progressive_cfd_recovery_claims(attempt_token,recovery_plan_id)
+      VALUES(${retried[0].token},${retried[0].recoveryPlanId})`),
+    ).rejects.toThrow();
+    expect(await cancelBeforeStarting(retried)).toMatchObject({
+      retry: 0,
+      gaps: 1,
+    });
+    expect(await claimCfd()).toBeNull();
+    const [unit] = await db.execute(sql`
+      SELECT attempts,active_seconds,active_budget_seconds FROM progressive_cfd_units WHERE id = ${planned[0].id}
+    `);
+    expect(unit).toEqual({
+      attempts: 3,
+      active_seconds: 70,
+      active_budget_seconds: 900,
+    });
+    const retained = await db.execute(sql`
+      SELECT evidence.result_attempt_id FROM progressive_cfd_evidence evidence
+      JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token WHERE attempt.unit_id = ${planned[0].id}
+    `);
+    expect(retained).toEqual([{ result_attempt_id: evidence }]);
+  }, 120_000);
+
   it("caps repeated never-started submissions independently of physical attempts", async () => {
     const scope = await fitFixture();
     expect(

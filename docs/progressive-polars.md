@@ -190,6 +190,13 @@ previously misclassified gap requires the latest exact cancelled execution, no
 case evidence, and the current campaign generation and stage. It cannot reopen
 obsolete work, supersede another attempt, or replenish an exhausted budget.
 
+Fast-stage retries may reuse the same immutable numerical recovery plan after
+such a verified never-started cancellation. Each attempt retains its own immutable
+claim; the plan is not restricted to one lifetime claim. The retry keeps the exact
+recipe, parent execution owner and remaining compute allocation, while old claims
+and evidence stay unchanged. The existing attempt and no-start ceilings still
+decide whether another execution is permitted.
+
 Workers persist ordered immutable reports before delivery. A lost response retries
 the same sequence and bytes; only the hub's matching execution, sequence and content
 signature acknowledge that local outbox row.
