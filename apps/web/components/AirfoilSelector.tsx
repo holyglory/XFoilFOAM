@@ -1,19 +1,27 @@
 "use client";
 
 import type { AirfoilSummary } from "@aerodb/core";
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { AirfoilGlyph } from "@/components/AirfoilGlyph";
 import { C, MONO } from "@/lib/tokens";
 
 export function AirfoilSelector({
-  items,
+  items: initialItems,
+  loadItems,
   onSelect,
   exclude = [],
   triggerLabel = "＋ add airfoil…",
   disabled = false,
 }: {
   items: AirfoilSummary[];
+  loadItems?: (signal: AbortSignal) => Promise<AirfoilSummary[]>;
   onSelect: (a: AirfoilSummary) => void;
   exclude?: string[];
   triggerLabel?: string;
@@ -23,20 +31,68 @@ export function AirfoilSelector({
   const [query, setQuery] = useState("");
   const [hi, setHi] = useState(0);
   const [showDetails, setShowDetails] = useState(true);
+  const [menuLeft, setMenuLeft] = useState(0);
+  const [catalog, setCatalog] = useState<{
+    loader: typeof loadItems;
+    items: AirfoilSummary[];
+  } | null>(null);
+  const [failure, setFailure] = useState<{
+    loader: typeof loadItems;
+    message: string;
+  } | null>(null);
+  const [retry, setRetry] = useState(0);
+  const loaded = !loadItems || catalog?.loader === loadItems;
+  const error = failure?.loader === loadItems ? failure?.message : null;
+  const items = loadItems ? (loaded ? catalog!.items : []) : initialItems;
+  useEffect(() => {
+    if (!open || !loadItems || loaded) return;
+    const controller = new AbortController();
+    setFailure(null);
+    loadItems(controller.signal)
+      .then((items) => {
+        if (!controller.signal.aborted)
+          setCatalog({ loader: loadItems, items });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted)
+          setFailure({
+            loader: loadItems,
+            message: "Could not load profiles.",
+          });
+      });
+    return () => controller.abort();
+  }, [open, loadItems, loaded, retry]);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const placeMenu = () => {
+      const left = rootRef.current?.getBoundingClientRect().left ?? 0;
+      const width = Math.min(340, window.innerWidth - 32);
+      setMenuLeft(Math.min(0, window.innerWidth - 16 - left - width));
+    };
+    placeMenu();
+    window.addEventListener("resize", placeMenu);
+    return () => window.removeEventListener("resize", placeMenu);
+  }, [open]);
 
   const excludeSet = useMemo(() => new Set(exclude), [exclude]);
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return items;
-    return items.filter((a) => a.name.toLowerCase().includes(q) || a.family.toLowerCase().includes(q));
+    return items.filter(
+      (a) =>
+        a.name.toLowerCase().includes(q) || a.family.toLowerCase().includes(q),
+    );
   }, [items, query]);
 
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      if (rootRef.current && !rootRef.current.contains(e.target as Node))
+        setOpen(false);
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
@@ -69,12 +125,14 @@ export function AirfoilSelector({
       if (a) pick(a);
     } else if (e.key === "Escape") {
       setOpen(false);
+      triggerRef.current?.focus();
     }
   };
 
   return (
     <div ref={rootRef} style={{ position: "relative" }}>
       <button
+        ref={triggerRef}
         type="button"
         disabled={disabled}
         onClick={() => !disabled && setOpen((o) => !o)}
@@ -95,12 +153,15 @@ export function AirfoilSelector({
 
       {open && (
         <div
+          role="region"
+          aria-label="Add airfoil"
+          data-ui-contextual-overlay="Profile picker opened by the user"
           style={{
             position: "absolute",
             top: "calc(100% + 6px)",
-            right: 0,
+            left: menuLeft,
             width: 340,
-            maxWidth: "min(340px, 90vw)",
+            maxWidth: "calc(100vw - 32px)",
             background: C.panel,
             border: `1px solid ${C.stroke}`,
             borderRadius: 12,
@@ -110,7 +171,15 @@ export function AirfoilSelector({
           }}
         >
           {/* search + details toggle */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 10, borderBottom: `1px solid ${C.borderSoft}` }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: 10,
+              borderBottom: `1px solid ${C.borderSoft}`,
+            }}
+          >
             <input
               ref={inputRef}
               value={query}
@@ -120,13 +189,34 @@ export function AirfoilSelector({
               }}
               onKeyDown={onKey}
               placeholder="⌕  search airfoils…"
-              style={{ flex: 1, fontFamily: MONO, fontSize: 12, color: C.text, background: C.panel2, border: `1px solid ${C.stroke}`, borderRadius: 7, padding: "7px 10px", outline: "none" }}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                fontFamily: MONO,
+                fontSize: 12,
+                color: C.text,
+                background: C.panel2,
+                border: `1px solid ${C.stroke}`,
+                borderRadius: 7,
+                padding: "7px 10px",
+                outline: "none",
+              }}
             />
             <button
               type="button"
               onClick={() => setShowDetails((d) => !d)}
               title="Toggle details"
-              style={{ fontFamily: MONO, fontSize: 10, color: showDetails ? C.teal : C.dim, background: "none", border: `1px solid ${showDetails ? C.tealBorder : C.stroke}`, borderRadius: 6, padding: "5px 8px", cursor: "pointer", flex: "none" }}
+              style={{
+                fontFamily: MONO,
+                fontSize: 10,
+                color: showDetails ? C.teal : C.dim,
+                background: "none",
+                border: `1px solid ${showDetails ? C.tealBorder : C.stroke}`,
+                borderRadius: 6,
+                padding: "5px 8px",
+                cursor: "pointer",
+                flex: "none",
+              }}
             >
               details
             </button>
@@ -134,8 +224,39 @@ export function AirfoilSelector({
 
           {/* list */}
           <div style={{ maxHeight: 320, overflowY: "auto" }}>
-            {filtered.length === 0 ? (
-              <div style={{ fontFamily: MONO, fontSize: 12, color: C.dim, padding: "16px 12px" }}>no match</div>
+            {error ? (
+              <div role="alert" style={{ padding: 12, color: C.text }}>
+                {error}{" "}
+                <button
+                  type="button"
+                  onClick={() => setRetry((value) => value + 1)}
+                  style={{
+                    color: C.text,
+                    background: C.panel3,
+                    border: `1px solid ${C.stroke}`,
+                    borderRadius: 6,
+                    padding: "7px 12px",
+                    cursor: "pointer",
+                  }}
+                >
+                  Retry
+                </button>
+              </div>
+            ) : !loaded ? (
+              <div role="status" style={{ padding: 12, color: C.muted }}>
+                Loading profiles…
+              </div>
+            ) : filtered.length === 0 ? (
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 12,
+                  color: C.dim,
+                  padding: "16px 12px",
+                }}
+              >
+                no match
+              </div>
             ) : (
               filtered.map((a, i) => {
                 const added = excludeSet.has(a.slug);
@@ -150,28 +271,74 @@ export function AirfoilSelector({
                       gap: 10,
                       padding: "8px 12px",
                       cursor: added ? "default" : "pointer",
-                      background: hi === i && !added ? C.rowActive : "transparent",
+                      background:
+                        hi === i && !added ? C.rowActive : "transparent",
                       opacity: added ? 0.55 : 1,
                       borderBottom: `1px solid ${C.borderRow}`,
                     }}
                   >
-                    <AirfoilGlyph points={a.points} width={42} height={20} />
+                    {a.points.length > 0 && (
+                      <AirfoilGlyph points={a.points} width={42} height={20} />
+                    )}
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 500, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.name}</div>
-                      <div style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}>{a.family}</div>
+                      <div
+                        style={{
+                          fontSize: 13,
+                          fontWeight: 500,
+                          color: C.text,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {a.name}
+                      </div>
+                      <div
+                        style={{ fontFamily: MONO, fontSize: 10, color: C.dim }}
+                      >
+                        {a.family}
+                      </div>
                     </div>
                     {added ? (
-                      <span style={{ fontFamily: MONO, fontSize: 10, color: C.teal, flex: "none" }}>✓ added</span>
+                      <span
+                        style={{
+                          fontFamily: MONO,
+                          fontSize: 10,
+                          color: C.teal,
+                          flex: "none",
+                        }}
+                      >
+                        ✓ added
+                      </span>
                     ) : (
                       showDetails && (
-                        <div style={{ fontFamily: MONO, fontSize: 10, color: C.muted, textAlign: "right", flex: "none", lineHeight: 1.5 }}>
-                          t/c {a.thicknessPct != null ? `${a.thicknessPct.toFixed(1)}%` : "—"} · cam {a.camberPct != null ? `${a.camberPct.toFixed(1)}%` : "—"}
+                        <div
+                          style={{
+                            fontFamily: MONO,
+                            fontSize: 10,
+                            color: C.muted,
+                            textAlign: "right",
+                            flex: "none",
+                            lineHeight: 1.5,
+                          }}
+                        >
+                          t/c{" "}
+                          {a.thicknessPct != null
+                            ? `${a.thicknessPct.toFixed(1)}%`
+                            : "—"}{" "}
+                          · cam{" "}
+                          {a.camberPct != null
+                            ? `${a.camberPct.toFixed(1)}%`
+                            : "—"}
                           <br />
                           {a.ldmax == null || a.cdmin == null ? (
                             <span style={{ color: C.dim }}>no polar data</span>
                           ) : (
                             <>
-                              <span style={{ color: C.teal }}>L/D {a.ldmax.toFixed(0)}</span> · Cd {a.cdmin.toFixed(4)}
+                              <span style={{ color: C.teal }}>
+                                L/D {a.ldmax.toFixed(0)}
+                              </span>{" "}
+                              · Cd {a.cdmin.toFixed(4)}
                             </>
                           )}
                         </div>

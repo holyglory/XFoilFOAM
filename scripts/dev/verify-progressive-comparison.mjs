@@ -102,6 +102,9 @@ try {
     await add.click();
     const search = page.getByPlaceholder("⌕  search airfoils…");
     await search.fill("ag25");
+    await expect(
+      page.getByText("AG25 Bubble Dancer", { exact: true }),
+    ).toBeVisible();
     await search.press("Enter");
     await search.press("Escape");
     await expect(viewer.getByTestId("comparison-curve")).toHaveCount(2);

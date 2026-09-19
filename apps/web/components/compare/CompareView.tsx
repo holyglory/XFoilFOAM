@@ -15,10 +15,19 @@ import {
   type PolarPointData,
   xyOf,
 } from "@aerodb/core";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useSearchParams } from "next/navigation";
 
 import { AirfoilSelector } from "@/components/AirfoilSelector";
-import { getAirfoilDetail } from "@/lib/api";
+import { getAirfoilCurveDetail, listAirfoils } from "@/lib/api";
+import { metricConditionParam } from "@/lib/metric-condition";
 import {
   activePolarSeriesId,
   formatPolarAoa,
@@ -57,6 +66,23 @@ export function CompareView({
   initialConditionKey?: string;
 }) {
   const items = initialItems;
+  const query = useSearchParams();
+  const conditionKey = metricConditionParam(
+    query.get("condition") ?? undefined,
+  );
+  const loadCatalog = useCallback(
+    (signal: AbortSignal) =>
+      listAirfoils(
+        {
+          sort: "ldmax",
+          dir: "desc",
+          includePoints: false,
+          metricConditionKey: conditionKey || undefined,
+        },
+        signal,
+      ),
+    [conditionKey],
+  );
   const [interactive, setInteractive] = useState(false);
   const [slugs, setSlugs] = useState<string[]>(
     initialSelection ?? initialItems.slice(0, 2).map((a) => a.slug),
@@ -90,7 +116,7 @@ export function CompareView({
         continue;
       const controller = new AbortController();
       controllers.current.set(slug, controller);
-      getAirfoilDetail(slug, null, controller.signal)
+      getAirfoilCurveDetail(slug, controller.signal)
         .then((detail) => {
           if (controllers.current.get(slug) !== controller) return;
           if (detail)
@@ -272,6 +298,7 @@ export function CompareView({
           <AirfoilSelector
             disabled={!interactive}
             items={items}
+            loadItems={loadCatalog}
             exclude={slugs}
             onSelect={(airfoil) => changeSelection([...slugs, airfoil.slug])}
           />

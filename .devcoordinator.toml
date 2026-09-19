@@ -347,7 +347,7 @@ command = ["node", "scripts/dev/verify-condition-catalog.mjs"]
 [[test.public-condition-ui.check]]
 name = "condition-links"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/metric-condition.test.ts", "test/progressive-comparison.test.ts", "test/search-ranking.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/metric-condition.test.ts", "test/progressive-comparison.test.ts", "test/search-ranking.test.ts", "test/compare-loading.test.ts"]
 
 [[test.public-condition-ui.check]]
 name = "layout"
@@ -358,6 +358,12 @@ command = ["node", "scripts/dev/verify-condition-layout.mjs"]
 name = "browser-smoke"
 tier = "development"
 command = ["node", "scripts/dev/verify-condition-browser.mjs"]
+
+[[test.public-condition-ui.check]]
+name = "comparison-catalog"
+tier = "development"
+command = ["node", "scripts/dev/verify-comparison-catalog.mjs"]
+retained_artifacts = [{ name = "comparison-picker", path = ".codex-artifacts/comparison-picker", max_bytes = 8388608 }]
 
 [test.public-condition-production]
 timeout_seconds = 900
@@ -371,6 +377,12 @@ command = ["node", "scripts/dev/verify-condition-catalog.mjs", "--production"]
 name = "layout"
 tier = "development"
 command = ["node", "scripts/dev/verify-condition-layout.mjs", "--production"]
+
+[[test.public-condition-production.check]]
+name = "comparison-catalog"
+tier = "development"
+command = ["node", "scripts/dev/verify-comparison-catalog.mjs", "--production"]
+retained_artifacts = [{ name = "comparison-picker", path = ".codex-artifacts/comparison-picker", max_bytes = 8388608 }]
 
 [[test.public-metrics.check]]
 name = "dependencies"

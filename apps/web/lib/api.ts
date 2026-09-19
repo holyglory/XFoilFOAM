@@ -76,8 +76,8 @@ export async function getAirfoilDetail(
   return res.json();
 }
 
-export function getAirfoilCurveDetail(slug: string) {
-  return getAirfoilDetail(slug, null, undefined, "curves");
+export function getAirfoilCurveDetail(slug: string, signal?: AbortSignal) {
+  return getAirfoilDetail(slug, null, signal, "curves");
 }
 
 export async function listAirfoils(
@@ -89,6 +89,8 @@ export async function listAirfoils(
     metricConditionKey?: string;
     dir?: "asc" | "desc";
     includePoints?: boolean;
+    limit?: number;
+    offset?: number;
     hashtags?: string[];
     thicknessMin?: number;
     thicknessMax?: number;
@@ -113,6 +115,7 @@ export async function listAirfoils(
     camberNegativeMin?: number;
     camberNegativeMax?: number;
   } = {},
+  signal?: AbortSignal,
 ): Promise<AirfoilSummary[]> {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -121,6 +124,7 @@ export async function listAirfoils(
   }
   const res = await apiFetch(`/api/airfoils?${qs.toString()}`, {
     cache: "no-store",
+    signal,
   });
   if (!res.ok) throw new Error(`GET /api/airfoils → ${res.status}`);
   return (await res.json()).items as AirfoilSummary[];

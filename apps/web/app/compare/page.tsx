@@ -1,6 +1,6 @@
 import { CompareView } from "@/components/compare/CompareView";
 import { AppShell } from "@/components/shell/AppShell";
-import { getAirfoilCurveDetail, listAirfoils } from "@/lib/api";
+import { loadComparisonData } from "@/lib/compare-loading";
 import { parseCompareSelection } from "@/lib/compare-selection";
 import { metricConditionParam } from "@/lib/metric-condition";
 import { C, MONO } from "@/lib/tokens";
@@ -35,27 +35,7 @@ async function CompareContent({
   const query = await searchParams;
   const selection = parseCompareSelection(query.airfoil);
   const conditionKey = metricConditionParam(query.condition);
-  const [items, requestedDetails] = await Promise.all([
-    listAirfoils({
-      sort: "ldmax",
-      dir: "desc",
-      metricConditionKey: conditionKey || undefined,
-    }),
-    Promise.all(
-      (selection ?? []).map(async (slug) => ({
-        slug,
-        detail: await getAirfoilCurveDetail(slug),
-      })),
-    ),
-  ]);
-  const initialDetails = Object.fromEntries(
-    requestedDetails.flatMap(({ slug, detail }) =>
-      detail ? [[slug, detail]] : [],
-    ),
-  );
-  const unavailable = requestedDetails
-    .filter(({ detail }) => !detail)
-    .map(({ slug }) => slug);
+  const initial = await loadComparisonData(selection, conditionKey);
   return (
     <AppShell active="compare">
       <div
@@ -83,10 +63,10 @@ async function CompareContent({
         </div>
         <CompareView
           key={selection?.join("|") ?? "default"}
-          items={items}
-          initialSelection={selection}
-          initialDetails={initialDetails}
-          initialUnavailable={unavailable}
+          items={initial.items}
+          initialSelection={initial.selection}
+          initialDetails={initial.details}
+          initialUnavailable={initial.unavailable}
           initialConditionKey={conditionKey}
         />
       </div>
