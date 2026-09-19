@@ -1072,6 +1072,13 @@
       "when": 1792368000046,
       "tag": "0152_progressive_catalog_metrics",
       "breakpoints": true
+    },
+    {
+      "idx": 153,
+      "version": "7",
+      "when": 1792368000047,
+      "tag": "0153_progressive_report_publication_order",
+      "breakpoints": true
     }
   ]
 }

@@ -7907,6 +7907,9 @@ export const progressiveWorkerReports = pgTable(
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NULL`),
+    publicationOrderIdx: index("progressive_worker_reports_publication_order_idx")
+      .on(sql`${table.report}->>'solverId'`, table.createdAt, table.simJobId, table.sequence)
+      .where(sql`${table.acknowledgedAt} IS NULL`),
     stopIdentityIdx: index("progressive_worker_reports_stop_identity_idx")
       .on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
       .where(sql`${table.stoppedEngineJobId} IS NOT NULL`),

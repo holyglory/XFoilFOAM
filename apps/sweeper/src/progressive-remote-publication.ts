@@ -7,6 +7,7 @@ import {
   type DB,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { progressivePublicationSelectionSql } from "./progressive-publication-selection";
 
 export async function publishProgressiveWorkerReport(
   db: DB,
@@ -108,20 +109,7 @@ export async function publishNextProgressiveWorkerReport(
   db: DB,
   fetcher: typeof fetch = fetch,
 ): Promise<boolean> {
-  const [pending] = await db.execute(sql`
-    SELECT report.sim_job_id FROM progressive_worker_reports report
-    JOIN sim_jobs job ON job.id = report.sim_job_id
-    JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
-    JOIN sync_api_settings settings ON settings.id = 1
-    WHERE report.acknowledged_at IS NULL AND NOT settings.remote_solver_transfer_paused
-      AND settings.remote_solver_auth_token <> '' AND settings.upstream_base_url IS NOT NULL
-      AND promise.registered_solver_id = settings.remote_solver_registered_id
-      AND report.report->>'solverId' = settings.remote_solver_registered_id::text
-      AND promise.source_base_url = settings.upstream_base_url
-      AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
-      AND job.request_payload->>'remoteSolver' = 'true'
-    ORDER BY report.created_at, report.sim_job_id, report.sequence LIMIT 1
-  `);
+  const [pending] = await db.execute(progressivePublicationSelectionSql());
   if (!pending) return false;
   return (
     (
