@@ -248,6 +248,27 @@ The protocol regression run is `t20260918T172646Z-54bdca`.
 
 ## Governed checks
 
+The isolated startup-field study retains every saved early field of the same
+FX60-100, Mach-3, 13-degree case. Its diagnostic request uses the existing
+50-iteration minimum, rather than bypassing request validation. The global
+iteration clock stays at `deltaT 1`; only the actual local Courant limit differs.
+Every other generated physical input and mesh file has the same checksum.
+
+At local Courant 0.5, two completed updates leave minimum temperatures of
+161.138 K and 102.637 K in upper aft-surface cells near 0.79–0.80 chord, before
+the third update triggers the material-domain guard. At 0.25, all 50 updates
+finish without material warnings: the minimum over saved frames is 133.635 K,
+and the last frame's minimum is 198.201 K. Neither run is converged. These
+measurements locate the startup problem and support testing smaller local
+updates; they do not establish a generally valid production setting.
+
+`inspect_mach3_startup` preserves the original request alongside the shortened
+diagnostic, hashes the generated inputs and every saved field member, and reports
+missing or corrupt frames rather than substituting another time. Cell locations
+are explicitly averages of their vertices, not volume centroids. The private
+`mach3-startup-fields` deployment uses network-isolated solvers and a read-only
+artifact server; it never creates campaign results or an accuracy certificate.
+
 - `progressive / air-pressure-audit`: analytic energy/entropy and failure-state
   regressions, then the exact-source pressure comparison with retained artifact
   `source-pressure`. The 2026-09-07 retained report has SHA256

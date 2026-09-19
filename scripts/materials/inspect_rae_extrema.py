@@ -36,9 +36,12 @@ def field(path, width=1):
     return values.reshape((-1, width)) if width > 1 else values
 
 
-def inspect(directory):
+def inspect(directory, coordinate=None, chord=None):
     directory = Path(directory)
-    coordinate = max(int(child.name) for child in directory.iterdir() if child.is_dir() and child.name.isdigit() and (child / "T").is_file())
+    if coordinate is None:
+        coordinate = max(int(child.name) for child in directory.iterdir() if child.is_dir() and child.name.isdigit() and (child / "T").is_file())
+    if type(coordinate) is not int or coordinate <= 0:
+        raise ValueError("Measured field coordinate must be a positive iteration")
     state = directory / str(coordinate)
     mesh = directory / "constant/polyMesh"
     points = mesh_list(mesh / "points", 3)
@@ -53,14 +56,24 @@ def inspect(directory):
         raise ValueError("Face ownership differs")
     temperature, pressure, kinetic = field(state / "T"), field(state / "p"), field(state / "k")
     velocity = field(state / "U", 3)
+    omega = field(state / "omega") if (state / "omega").is_file() else None
     if not len(temperature) == len(pressure) == len(kinetic) == len(velocity) == int(owner.max()) + 1:
         raise ValueError("Cell/field dimensions differ")
-    chord = json.loads((directory / "report.json").read_text())["request"]["chord_lengths"][0]
+    if omega is not None and len(omega) != len(temperature):
+        raise ValueError("Turbulence frequency dimensions differ")
+    if chord is None:
+        chord = json.loads((directory / "report.json").read_text())["request"]["chord_lengths"][0]
+    if isinstance(chord, bool) or not isinstance(chord, (int, float)) or not np.isfinite(chord) or chord <= 0:
+        raise ValueError("Measured geometry needs a finite positive chord")
     selected = {}
-    for name, cell in {"minimum_temperature": temperature.argmin(), "minimum_pressure": pressure.argmin(), "maximum_speed": np.linalg.norm(velocity, axis=1).argmax(), "maximum_turbulence_k": kinetic.argmax()}.items():
+    extrema = {"minimum_temperature": temperature.argmin(), "minimum_pressure": pressure.argmin(), "maximum_speed": np.linalg.norm(velocity, axis=1).argmax(), "maximum_turbulence_k": kinetic.argmax()}
+    if omega is not None:
+        extrema["maximum_turbulence_omega"] = omega.argmax()
+    for name, cell in extrema.items():
         face_ids = np.r_[np.flatnonzero(owner == cell), np.flatnonzero(neighbour == cell)]
         vertices = np.unique(np.concatenate([faces[index] for index in face_ids]))
         selected[name] = {"cell": int(cell), "vertex_average_over_chord": (points[vertices].mean(axis=0) / chord).tolist(), "temperature_k": float(temperature[cell]), "pressure_pa": float(pressure[cell]), "speed_mps": float(np.linalg.norm(velocity[cell])), "turbulence_k": float(kinetic[cell])}
+        selected[name]["turbulence_omega_per_s"] = None if omega is None else float(omega[cell])
     return {"source": str(directory), "coordinate": coordinate, "position_kind": "mean_of_cell_vertices_not_volume_centroid", "extrema": selected}
 
 

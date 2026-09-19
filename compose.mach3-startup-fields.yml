@@ -1,0 +1,42 @@
+services:
+  baseline: &diagnostic
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: none
+    environment:
+      PYTHONPATH: /candidate:/candidate/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      AIRFOILFOAM_WORKER_CPU_BUDGET: "1"
+    command: ["python", "-m", "scripts.materials.inspect_mach3_startup", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/baseline", "--courant", "4"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts:/candidate/scripts:ro
+      - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
+      - startup-fields:/evidence
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+  reduced:
+    <<: *diagnostic
+    command: ["python", "-m", "scripts.materials.inspect_mach3_startup", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/reduced", "--courant", "0.25"]
+  artifacts:
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - startup-fields:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+volumes:
+  startup-fields:

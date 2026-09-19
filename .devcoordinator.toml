@@ -20,6 +20,31 @@ timeout_seconds = 1200
 [test]
 default = "python"
 
+[test.mach3-startup-fields]
+timeout_seconds = 300
+
+[[test.mach3-startup-fields.check]]
+name = "startup-observation-contract"
+tier = "development"
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_mach3_startup_fields.py", "tests/test_mach3_failure_reproduction.py", "tests/test_compressible_execution.py", "-q"]
+env = { PYTHONPATH = "src" }
+
+[deployment.mach3-startup-fields]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.mach3-startup-fields.component.numerics]
+type = "compose"
+files = ["compose.mach3-startup-fields.yml"]
+services = ["artifacts", "baseline", "reduced"]
+finite_services = ["baseline", "reduced"]
+build = false
+port = true
+route = true
+timeout_seconds = 1500
+
 [test.pressure-initialization]
 timeout_seconds = 900
 env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
