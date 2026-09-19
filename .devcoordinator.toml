@@ -1031,7 +1031,7 @@ command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev"
 name = "inference"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_force_history_origin.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_force_history_origin.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "tests/test_npl3635_reference.py", "-q"]
 
 [[test.progressive.check]]
 name = "rans-hold-continuation"

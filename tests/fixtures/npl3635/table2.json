@@ -1,0 +1,41 @@
+{
+  "provenance": {
+    "title": "Experiments with Biconvex Aerofoils in Low-Density, and Double-Wedge Supersonic Flow",
+    "authors": ["E. W. E. Rogers", "C. J. Berry"],
+    "report": "Aeronautical Research Council Reports and Memoranda 3635",
+    "year": 1968,
+    "source_locator": "https://reports.aerade.cranfield.ac.uk/handle/1826.2/2904",
+    "source_pdf_locator": "https://reports.aerade.cranfield.ac.uk/bitstream/handle/1826.2/2904/arc-rm-3635.pdf?isAllowed=y&sequence=1",
+    "source_pages": [4, 13, 14],
+    "source_artifact_sha256": null,
+    "source_artifact_status": "remote_primary_source_not_copied",
+    "measurement_kind": "zero_incidence_integrated_pressure_drag",
+    "geometry": "symmetric biconvex and double-wedge sections",
+    "thickness_to_chord": 0.1,
+    "chord_m": 0.0254,
+    "stagnation_temperature_k": 288.0,
+    "measurement_limitations": [
+      "low_density_continuum tests",
+      "pressure drag excludes skin friction",
+      "leading and trailing edge pressure extrapolation contributes uncertainty",
+      "source geometry is described but not supplied as a coordinate file",
+      "Mach 3.95-4.19 is adjacent high-supersonic evidence, not an exact Mach-3 campaign condition"
+    ]
+  },
+  "conditions": [
+    {"mach": 4.19, "pressure_millitorr": 65.0, "reynolds_per_m": 1920.0, "interaction_parameter": 1.68},
+    {"mach": 4.04, "pressure_millitorr": 45.0, "reynolds_per_m": 1170.0, "interaction_parameter": 1.93},
+    {"mach": 3.95, "pressure_millitorr": 33.0, "reynolds_per_m": 790.0, "interaction_parameter": 2.19},
+    {"mach": 2.12, "pressure_millitorr": 64.5, "reynolds_per_m": 254.0, "interaction_parameter": 0.60},
+    {"mach": 2.09, "pressure_millitorr": 52.0, "reynolds_per_m": 204.0, "interaction_parameter": 0.63},
+    {"mach": 1.79, "pressure_millitorr": 33.0, "reynolds_per_m": 93.0, "interaction_parameter": 0.59}
+  ],
+  "biconvex": {
+    "experimental_zero_incidence_pressure_drag": [0.02084, 0.02410, 0.02830, 0.0432, 0.0458, 0.0624],
+    "inviscid_zero_incidence_pressure_drag": [0.01486, 0.01543, 0.01585, 0.0309, 0.0315, 0.0386]
+  },
+  "double_wedge": {
+    "experimental_zero_incidence_pressure_drag": [0.0154, 0.0182, 0.0199, 0.0297, 0.0312, 0.0420],
+    "inviscid_zero_incidence_pressure_drag": [0.0100, 0.0105, 0.0109, 0.0199, 0.0204, 0.0256]
+  }
+}
