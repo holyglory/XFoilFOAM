@@ -7484,6 +7484,10 @@ def _finalize_outcome(
                 logger.warning("oscillating-steady analysis failed for %s: %s", case_dir, exc)
                 osc = None
             if osc is not None and not solver_params.force_transient:
+                history_note = (
+                    "bounded coefficient history with a stable mean; field convergence is not certified"
+                    if local_steady and osc.mean_stable else osc.note
+                )
                 outcome.steady_history = SteadyHistory(
                     iterations=osc.iterations,
                     cl=osc.cl,
@@ -7493,7 +7497,7 @@ def _finalize_outcome(
                         start_iter=osc.window_start_iter, end_iter=osc.window_end_iter
                     ),
                     mean_stable=osc.mean_stable,
-                    note=osc.note,
+                    note=history_note,
                 )
                 if osc.mean_stable and not local_steady:
                     outcome.cl, outcome.cd, outcome.cm = osc.cl_mean, osc.cd_mean, osc.cm_mean

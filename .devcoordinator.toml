@@ -29,8 +29,30 @@ timeout_seconds = 900
 [[test.local-steady-startup.check]]
 name = "startup-and-adjacent-contracts"
 tier = "development"
-command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_local_steady_startup.py", "tests/test_compressible_execution.py", "tests/test_rans_hold_continuation.py", "tests/test_retention.py", "tests/test_local_steady_convergence.py", "tests/test_material_domain.py", "-q"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_local_steady_startup.py", "tests/test_compressible_execution.py", "tests/test_rans_hold_continuation.py", "tests/test_retention.py", "tests/test_local_steady_convergence.py", "tests/test_material_domain.py", "tests/test_oscillating_steady.py", "tests/test_mach3_failure_reproduction.py", "-q"]
 env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.local-steady-startup.check]]
+name = "complete-native-startup-archive"
+tier = "development"
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-c", "import hashlib,json; from pathlib import Path; from airfoilfoam.evidence_store import verify_local_archive_manifest_members; root=Path('/home/holyglory/XFoilFOAM/.codex-artifacts/mach3-startup-study-20260919'); manifest=(root/'cold-evidence_manifest.json').read_bytes(); archive=root/'cold-engine_evidence.tar.zst'; assert hashlib.sha256(manifest).hexdigest()=='05d34fdd77e12986f5ea329414ce1969239675665261496ebc3d707b207532f2'; record,count=verify_local_archive_manifest_members(archive,expected_manifest=manifest); assert record.stored_sha256=='6df963a7c50a36a0a695f64eba703df8a1a31efa7d77bfdb826c76d483c49637'; assert count==46; print(json.dumps({'authenticated_members':count,'archive_sha256':record.stored_sha256,'production_evidence':False}))"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[deployment.local-steady-parallel]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.local-steady-parallel.component.numerics]
+type = "compose"
+files = ["compose.mach3-failure.yml", "compose.local-steady-startup.yml"]
+services = ["artifacts", "parallel"]
+finite_services = ["parallel"]
+build = false
+port = true
+route = true
+timeout_seconds = 1200
 
 [deployment.local-steady-startup]
 source = ["worktree"]

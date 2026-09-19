@@ -64,6 +64,15 @@ def collect_diagnostics(job_dir):
     return diagnostics
 
 
+def execution_request(request, processes, iterations):
+    if type(processes) is not int or processes not in (1, 2) or type(iterations) is not int or iterations not in (100, 5000):
+        raise ValueError("Unsupported diagnostic execution scope")
+    payload = request.model_dump(mode="json")
+    payload["resources"]["solver_processes"] = processes
+    payload["solver"]["n_iterations"] = iterations
+    return PolarRequest.model_validate(payload)
+
+
 def summarize_outcomes(result):
     return [{"aoa_deg": point.aoa_deg, "converged": point.converged, "error": point.error,
              "result_collection": collection, "failure_disposition": point.failure_disposition,
@@ -80,8 +89,11 @@ def main():
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--start", choices=["cold", "marched"], default="cold")
     parser.add_argument("--courant", type=float, choices=[4.0, 0.25, 0.1], default=4.0)
+    parser.add_argument("--processes", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--iterations", type=int, choices=[100, 5000], default=5000)
     args = parser.parse_args()
-    request = diagnostic_request(args.coordinates, args.material, args.start, args.courant)
+    request = execution_request(diagnostic_request(args.coordinates, args.material, args.start, args.courant),
+                                args.processes, args.iterations)
     destination = args.destination / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
     settings = Settings(data_dir=destination / "data", cache_dir=destination / "cache",
@@ -95,8 +107,11 @@ def main():
               "starting_state": args.start, "geometry_points_sha256": POINTS_SHA256,
               "effective_local_courant_target": min(0.5, args.courant),
               "material_sha256": MATERIAL_SHA256, "airfoil_polar_validation": False,
-              "differences_from_production": ["current source", "serial solve", "isolated empty cache", "no rendered media"],
+              "solver_processes": args.processes, "requested_iterations": args.iterations,
+              "differences_from_production": ["current source", f"{args.processes}-process solve", "isolated empty cache", "no rendered media"],
               "diagnostic_completed": False}
+    if args.iterations != 5000:
+        report["differences_from_production"].append("100-iteration restart-handoff diagnostic, not the full production horizon")
     if args.start == "cold":
         report["differences_from_production"].append("13-degree angle without the preceding -4-degree march")
     if args.courant != 4.0:

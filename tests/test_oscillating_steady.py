@@ -342,6 +342,8 @@ def test_local_pseudo_time_cannot_be_certified_by_flat_or_bounded_forces(tmp_pat
         solver_params=SolverParams(transient_fallback=False, force_transient=False, write_images=[]))
     assert not outcome.converged and calls["transient"] == 0
     assert outcome.steady_history is not None
+    assert "field convergence is not certified" in outcome.steady_history.note
+    assert "converged (" not in " ".join(outcome.quality_warnings)
 
 
 # --------------------------------------------------------------------------- #

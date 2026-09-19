@@ -7,12 +7,29 @@ import pytest
 from airfoilfoam.material_domain import material_domain_failure
 from airfoilfoam.models import JobResult, JobState, Polar, PolarPoint
 from airfoilfoam.openfoam.runner import RunResult
-from scripts.materials.reproduce_mach3_failure import collect_diagnostics, diagnostic_request, summarize_outcomes
+from scripts.materials.reproduce_mach3_failure import collect_diagnostics, diagnostic_request, execution_request, summarize_outcomes
 
 
 ROOT = Path(__file__).parents[1]
 COORDINATES = ROOT / "packages/db/seed/selig-database/fx60100.dat"
 MATERIAL = ROOT / "tests/fixtures/air-thermophysics-audit.json"
+
+
+def test_parallel_handoff_changes_only_explicit_execution_controls():
+    original = diagnostic_request(COORDINATES, MATERIAL, "cold")
+    assert execution_request(original, 1, 5000) == original
+    changed = execution_request(original, 2, 100).model_dump()
+    expected = original.model_dump()
+    expected["resources"]["solver_processes"] = 2
+    expected["solver"]["n_iterations"] = 100
+    assert changed == expected
+    assert original.solver.n_iterations == 5000 and original.resources.solver_processes == 1
+
+
+@pytest.mark.parametrize("processes,iterations", [(True, 5000), (0, 5000), (3, 5000), (2, 0), (2, 5050)])
+def test_diagnostic_parallel_scope_cannot_expand(processes, iterations):
+    with pytest.raises(ValueError, match="scope"):
+        execution_request(diagnostic_request(COORDINATES, MATERIAL, "cold"), processes, iterations)
 
 
 @pytest.mark.parametrize("start,angles", [("cold", [13]), ("marched", [-4, 13])])
