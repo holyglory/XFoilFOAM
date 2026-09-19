@@ -1,0 +1,43 @@
+services:
+  fixed: &continuation
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: none
+    environment:
+      PYTHONPATH: /candidate:/candidate/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      AIRFOILFOAM_WORKER_CPU_BUDGET: "1"
+    command: ["python", "-m", "scripts.materials.continue_mach3_startup", "--source", "/checkpoint", "--manifest-sha256", "592a115e33c2a87d344682e456f06666e552376b606542de133034f2c07142c3", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/fixed", "--courant", "0.25"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts:/candidate/scripts:ro
+      - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
+      - /home/holyglory/XFoilFOAM/.codex-artifacts/mach3-startup-study-20260919/gen3-reduced-checkpoint:/checkpoint:ro
+      - continuation-results:/evidence
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+  restored:
+    <<: *continuation
+    command: ["python", "-m", "scripts.materials.continue_mach3_startup", "--source", "/checkpoint", "--manifest-sha256", "592a115e33c2a87d344682e456f06666e552376b606542de133034f2c07142c3", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/restored", "--courant", "0.5"]
+  artifacts:
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - continuation-results:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+volumes:
+  continuation-results:
