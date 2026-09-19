@@ -723,7 +723,29 @@ retained_artifacts = [{ name = "uiuc-prior-evaluation", path = ".codex-artifacts
 [[test.polar-uncertainty-validation.check]]
 name = "held-out-contract"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_progressive_polar.py", "tests/test_uiuc_volume1_reference.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_polar_validation.py", "tests/test_retained_polar_measurement.py", "tests/test_polar_history.py", "tests/test_progressive_polar.py", "tests/test_prediction_api.py", "tests/test_uiuc_volume1_reference.py", "-q"]
+
+[test.retained-polar-measurement]
+timeout_seconds = 300
+
+[[test.retained-polar-measurement.check]]
+name = "replay-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_retained_polar_measurement.py", "tests/test_polar_validation.py", "-q"]
+
+[[test.retained-polar-measurement.check]]
+name = "joint-history-replay"
+tier = "development"
+requires = ["replay-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.measure_retained_polar", "--source", ".codex-artifacts/history-validation-20260919/source.json", "--sha256", "fc6128063809fd40ada90c5a358bf48fb081f0a1809ed02b746cdad2f2e881e0", "--output", ".codex-artifacts/history-validation-20260919/joint-study/report.json"]
+retained_artifacts = [{ name = "real-joint-history", path = ".codex-artifacts/history-validation-20260919/joint-study", max_bytes = 4194304 }]
+
+[[test.retained-polar-measurement.check]]
+name = "held-out-measurement"
+tier = "development"
+requires = ["replay-contract"]
+command = [".venv/bin/python", "-m", "scripts.materials.measure_retained_polar", "--source", ".codex-artifacts/history-validation-20260919/reference-source.json", "--sha256", "0cbb98fad8d7a017c2e2656e14d1f47b9c1f31c2c98e5093f2eb83e923d74a62", "--output", ".codex-artifacts/history-validation-20260919/holdout-study/report.json"]
+retained_artifacts = [{ name = "real-holdout", path = ".codex-artifacts/history-validation-20260919/holdout-study", max_bytes = 4194304 }]
 
 [[test.rae-grid-reference.check]]
 name = "grid-contract"

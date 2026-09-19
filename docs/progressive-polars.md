@@ -463,8 +463,29 @@ content-versioned. Its error floors are working assumptions, not measured solver
 accuracy or a conversion of NeuralFoil confidence into physical uncertainty.
 Displayed intervals remain conditional on that policy. A changed policy queues
 replacement models rather than silently treating an older fit as current.
+The offline held-out evaluator accepts the same history reduction policy and
+bounded joint histories as live fitting. Version-2 measurements retain the
+contributing time windows and rejected sources alongside coverage and interval
+width. Accepted-CFD references must declare their evidence and lineage identities;
+references cannot reuse a fitting result, attempt, lineage or history artifact,
+including across evaluation cases. These checks establish separation of declared
+sources, not statistical independence or a physical accuracy certificate.
+The file loader authenticates reference artifact bytes; a source-specific loader
+must still establish that reference numbers and history samples match those bytes.
+Existing point-only experimental inputs remain supported. Every measurement
+remains explicitly unvalidated until the separate calibration work is complete.
 Main-loop activation, shared Compare/ranking/export integration and real CFD
-deployment verification remain separate outstanding work.
+deployment are verified separately from these offline measurements.
+
+`scripts.materials.measure_retained_polar` rehydrates a checksum-pinned stored
+fit manifest from its exact retained attempt histories. Before measuring anything,
+it reproduces the stored request signature, fit signature, contributors and curves.
+Accepted-reference comparisons remove the reference job and all attempts from
+its unit lineage. Reports retain prior-only and remaining-evidence measurements,
+including worse errors and wider intervals. Shared initialization ancestry,
+reference numerical error and population-wide accuracy are not established by
+this retrospective check. Its isolated output includes the original source
+bytes and never changes campaign data or the production uncertainty policy.
 
 The current model also returns a versioned next-point acquisition estimate.
 It integrates conditional covariance reduction over the requested angle grid,

@@ -1,6 +1,6 @@
 """Held-out measurements of conditional polar intervals, never calibration approval."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
@@ -9,9 +9,10 @@ import re
 import numpy as np
 
 from .progressive_polar import PolarModelPolicy, PolarObservation, PolarPrior, fit_progressive_polar
+from .polar_history import HistoryReductionPolicy, PolarHistory, history_observations
 
 
-VALIDATION_VERSION = "heldout-polar-measurement-v1"
+VALIDATION_VERSION = "heldout-polar-measurement-v2"
 COEFFICIENTS = ("cl", "cd", "cm")
 
 
@@ -25,6 +26,8 @@ class PolarReference:
     alpha: list[float]
     coefficients: list[list[float | None]]
     measurement_uncertainty_known: bool
+    evidence_ids: list[str] = field(default_factory=list)
+    lineage_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,8 @@ class PolarValidationCase:
     prior: PolarPrior
     observations: list[PolarObservation]
     reference: PolarReference
+    histories: list[PolarHistory] = field(default_factory=list)
+    history_policy: HistoryReductionPolicy | None = None
 
 
 def _hash(value):
@@ -52,6 +57,49 @@ def _weights(angles):
     spacing = np.diff(angles)
     weights = np.r_[spacing[0] / 2, (spacing[:-1] + spacing[1:]) / 2, spacing[-1] / 2]
     return weights / weights.sum()
+
+
+def _reference_identities(reference):
+    _identity(reference.reference_id, "reference identity")
+    if not isinstance(reference.source_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", reference.source_sha256):
+        raise ValueError("Reference requires its source artifact checksum")
+    if reference.source_kind not in {"experimental", "accepted_cfd"} or not isinstance(reference.measurement_uncertainty_known, bool):
+        raise ValueError("Reference kind or measurement-uncertainty provenance is invalid")
+    identities = {reference.reference_id}
+    for name in ("evidence_ids", "lineage_ids"):
+        values = getattr(reference, name)
+        if not isinstance(values, list):
+            raise ValueError("Reference source identities must be explicit unique lists")
+        for value in values:
+            _identity(value, "reference source identity")
+        if len(set(values)) != len(values):
+            raise ValueError("Reference source identities must be explicit unique lists")
+        if reference.source_kind == "accepted_cfd" and not values:
+            raise ValueError("Accepted CFD holdout requires exact evidence and lineage identities")
+        identities.update(values)
+    return identities
+
+
+def _case_observations(case, reference_identities, reference_artifacts):
+    if (not isinstance(case.histories, list) or len(case.histories) > 64
+            or sum(max(len(history.coordinate), len(history.coefficients)) for history in case.histories) > 32768):
+        raise ValueError("Validation case exceeds the bounded history sample budget")
+    if case.histories and case.history_policy is None:
+        raise ValueError("Joint histories require an explicit reduction policy")
+    sources = [*case.observations, *(history.observation for history in case.histories)]
+    used = {case.prior.prediction_id}
+    for source in sources:
+        used.update((source.observation_id, source.result_id, source.attempt_id, source.lineage_id))
+    if used & reference_identities or any(history.artifact_sha256 in reference_artifacts for history in case.histories):
+        raise ValueError("Held-out reference was used as fitting evidence or shares its source lineage")
+    observations = list(case.observations)
+    if sum(observation.eligible for observation in observations) > 128:
+        raise ValueError("Validation case exceeds the bounded observation budget")
+    for history in case.histories:
+        observations.extend(history_observations(history, case.history_policy))
+        if sum(observation.eligible for observation in observations) > 128 or len(observations) > 640:
+            raise ValueError("Joint history reduction exceeds the bounded observation budget")
+    return observations
 
 
 def _metrics(angles, truth, predicted, lower, upper):
@@ -90,6 +138,8 @@ def evaluate_held_out_polars(cases, policy, *, fit_profiles, fit_conditions, spl
             _identity(group, f"policy-fit {name}")
         if len(groups) != len(set(groups)):
             raise ValueError(f"Policy-fit {name} must be an explicit unique list")
+    reference_identities = set().union(*(_reference_identities(case.reference) for case in cases))
+    reference_artifacts = {case.reference.source_sha256 for case in cases}
     case_ids, targets, reference_ids = set(), set(), set()
     measured = []
     for case in sorted(cases, key=lambda value: value.case_id):
@@ -110,17 +160,9 @@ def evaluate_held_out_polars(cases, policy, *, fit_profiles, fit_conditions, spl
         if reference.reference_id in reference_ids:
             raise ValueError("Reference evidence is repeated across held-out cases")
         reference_ids.add(reference.reference_id)
-        if not isinstance(reference.source_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", reference.source_sha256):
-            raise ValueError("Reference requires its source artifact checksum")
-        if reference.source_kind not in {"experimental", "accepted_cfd"} or not isinstance(reference.measurement_uncertainty_known, bool):
-            raise ValueError("Reference kind or measurement-uncertainty provenance is invalid")
         if reference.target_signature != case.prior.target_signature or reference.branch != case.prior.branch:
             raise ValueError("Reference differs from the exact physical target or branch")
-        used = {case.prior.prediction_id}
-        for observation in case.observations:
-            used.update((observation.observation_id, observation.result_id, observation.attempt_id, observation.lineage_id))
-        if reference.reference_id in used:
-            raise ValueError("Held-out reference was used as fitting evidence")
+        observations = _case_observations(case, reference_identities, reference_artifacts)
         angles = np.asarray(reference.alpha, dtype=float)
         if angles.ndim != 1 or len(angles) < 1 or not np.isfinite(angles).all() or np.any(np.diff(angles) <= 0):
             raise ValueError("Reference angles must be finite, unique and ordered")
@@ -130,7 +172,7 @@ def evaluate_held_out_polars(cases, policy, *, fit_profiles, fit_conditions, spl
             for index, value in enumerate(row):
                 if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or (index == 1 and value <= 0)):
                     raise ValueError("Reference coefficients must be finite, with positive measured drag")
-        fit = fit_progressive_polar(case.prior, case.observations, policy)
+        fit = fit_progressive_polar(case.prior, observations, policy)
         indices = {alpha: index for index, alpha in enumerate(fit["alpha"])}
         if any(alpha not in indices for alpha in angles):
             raise ValueError("Evaluation cannot interpolate or extrapolate uncomputed reference angles")
@@ -150,7 +192,10 @@ def evaluate_held_out_polars(cases, policy, *, fit_profiles, fit_conditions, spl
                          "target_signature": reference.target_signature, "branch": reference.branch, "reference_id": reference.reference_id,
                          "source_sha256": reference.source_sha256, "source_kind": reference.source_kind,
                          "measurement_uncertainty_known": reference.measurement_uncertainty_known,
-                         "fit_signature": fit["signature"], "reference_alpha_range": [float(angles[0]), float(angles[-1])], "metrics": metrics})
+                         "fit_signature": fit["signature"], "reference_alpha_range": [float(angles[0]), float(angles[-1])], "metrics": metrics,
+                         "evidence": {"history_count": len(case.histories), "observation_count": len(observations),
+                                      "contributors": fit["contributors"], "excluded": fit["excluded"],
+                                      "reference_evidence_ids": reference.evidence_ids, "reference_lineage_ids": reference.lineage_ids}})
     macro = {}
     for name in COEFFICIENTS:
         values = [case["metrics"][name] for case in measured if case["metrics"][name] is not None]
@@ -168,5 +213,6 @@ def evaluate_held_out_polars(cases, policy, *, fit_profiles, fit_conditions, spl
             "policy_signature": _hash(asdict(policy)), "split_axis": split_axis, "interval_probability": 0.95,
             "aggregation": "equal_case_not_sample_count", "reference_integrity": "source_loader_verification_required",
             "holdout_scope": "policy_fitting_not_surrogate_pretraining",
+            "source_separation": "disjoint_declared_evidence_lineages_and_history_artifacts_not_proven_independence",
             "calibration_status": "unvalidated", "acceptance_verdict": "not_evaluated",
             "validation_id": None, "case_count": len(measured), "cases": measured, "macro_metrics": macro}

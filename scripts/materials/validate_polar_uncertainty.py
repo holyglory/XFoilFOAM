@@ -7,6 +7,7 @@ import tempfile
 
 from airfoilfoam.postprocess.polar_validation import PolarReference, PolarValidationCase, evaluate_held_out_polars
 from airfoilfoam.postprocess.progressive_polar import PolarModelPolicy, PolarObservation, PolarPrior
+from airfoilfoam.postprocess.polar_history import HistoryReductionPolicy, PolarHistory
 
 
 def unique_object(pairs):
@@ -43,12 +44,15 @@ def evaluate_file(input_path):
             source["case_id"], source["profile_signature"], source["condition_signature"],
             PolarPrior(**source["prior"]), [PolarObservation(**row) for row in source["observations"]],
             PolarReference(**source["reference"]),
+            [PolarHistory(**{**history, "observation": PolarObservation(**history["observation"])})
+             for history in source.get("histories", [])],
+            HistoryReductionPolicy(**source["history_policy"]) if source.get("history_policy") is not None else None,
         ))
     result = evaluate_held_out_polars(cases, PolarModelPolicy(**payload["policy"]),
                                      fit_profiles=payload["fit_profiles"], fit_conditions=payload["fit_conditions"], split_axis=payload["split_axis"])
     result["input_file_sha256"] = hashlib.sha256(raw).hexdigest()
     result["source_artifacts_verified"] = len(verified)
-    result["reference_integrity"] = "artifact_hashes_verified_numeric_mapping_requires_source_loader"
+    result["reference_integrity"] = "reference_artifact_hashes_verified_numeric_and_history_mapping_requires_source_loader"
     return result
 
 
