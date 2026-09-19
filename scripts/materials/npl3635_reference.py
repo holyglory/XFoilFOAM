@@ -1,17 +1,26 @@
-"""Load the published NPL R&M 3635 high-supersonic reference transcription."""
+"""Read NPL R&M 3635 without treating rarefied-flow data as campaign validation."""
 
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
 import json
 import math
-import tempfile
 from pathlib import Path
 
 
-REFERENCE_VERSION = "npl3635-table2-v1"
-EXPECTED_MACH = [4.19, 4.04, 3.95, 2.12, 2.09, 1.79]
-EXPECTED_BICONVEX_EXPERIMENTAL = [0.02084, 0.02410, 0.02830, 0.0432, 0.0458, 0.0624]
-EXPECTED_DOUBLE_WEDGE_EXPERIMENTAL = [0.0154, 0.0182, 0.0199, 0.0297, 0.0312, 0.0420]
+REFERENCE_VERSION = "npl3635-table2-v2"
+TRANSCRIPTION_SHA256 = "26fdfebed44a028e499591ca42e29b9cd6971bafadd957702a442b98f08916b8"
+SOURCE_PDF_SHA256 = "e152786031338d8ca0df7abac53e1c1fedf807f70e687302e3fec6770dc013d5"
+
+
+def _unique_object(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("Duplicate NPL reference field")
+        result[name] = value
+    return result
 
 
 def _finite_positive(value: object, name: str) -> float:
@@ -20,52 +29,43 @@ def _finite_positive(value: object, name: str) -> float:
     return float(value)
 
 
-def load_reference(path: str | Path) -> dict:
-    source = Path(path)
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    if payload.get("provenance", {}).get("report") != "Aeronautical Research Council Reports and Memoranda 3635":
-        raise ValueError("Unexpected NPL reference report")
-    provenance = payload.get("provenance")
-    required = {"source_locator", "source_pdf_locator", "source_pages", "source_artifact_sha256", "measurement_limitations"}
-    if not isinstance(provenance, dict) or not required <= set(provenance):
-        raise ValueError("NPL reference provenance is incomplete")
-    if provenance["source_artifact_sha256"] is not None:
-        raise ValueError("This transcription must not claim a local PDF checksum")
-    if provenance["source_artifact_status"] != "remote_primary_source_not_copied":
-        raise ValueError("NPL reference source-copy status is ambiguous")
-    if provenance["thickness_to_chord"] != 0.1 or provenance["chord_m"] != 0.0254:
-        raise ValueError("NPL reference geometry metadata changed")
-    conditions = payload.get("conditions")
-    if not isinstance(conditions, list) or len(conditions) != len(EXPECTED_MACH):
-        raise ValueError("NPL reference condition table is incomplete")
-    mach = []
-    for condition in conditions:
-        if not isinstance(condition, dict):
-            raise ValueError("NPL reference condition row is malformed")
-        mach.append(_finite_positive(condition.get("mach"), "Mach"))
-        _finite_positive(condition.get("pressure_millitorr"), "static pressure")
-        _finite_positive(condition.get("reynolds_per_m"), "Reynolds number")
-        _finite_positive(condition.get("interaction_parameter"), "interaction parameter")
-    if mach != EXPECTED_MACH:
-        raise ValueError("NPL reference conditions are reordered or changed")
-    for section, expected in (("biconvex", EXPECTED_BICONVEX_EXPERIMENTAL), ("double_wedge", EXPECTED_DOUBLE_WEDGE_EXPERIMENTAL)):
-        values = payload.get(section, {}).get("experimental_zero_incidence_pressure_drag")
-        inviscid = payload.get(section, {}).get("inviscid_zero_incidence_pressure_drag")
-        if values != expected or not isinstance(inviscid, list) or len(inviscid) != len(expected):
-            raise ValueError(f"NPL {section} pressure-drag transcription changed")
-        if any(not math.isfinite(float(value)) or float(value) <= 0 for value in inviscid):
-            raise ValueError(f"NPL {section} inviscid pressure drag is invalid")
-    return {"version": REFERENCE_VERSION, **payload}
+def load_reference_from_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("NPL reference must be an object")
+    if payload.get("version", REFERENCE_VERSION) != REFERENCE_VERSION:
+        raise ValueError("Unsupported NPL reference version")
+    if payload.get("campaign_compatible", False) is not False:
+        raise ValueError("NPL source is not compatible with the production campaign")
+    original = {name: value for name, value in payload.items()
+                if name not in ("version", "campaign_compatible", "source_artifact_verified")}
+    try:
+        serialized = json.dumps(original, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    except (TypeError, ValueError) as error:
+        raise ValueError("Invalid NPL reference data") from error
+    if hashlib.sha256(serialized).hexdigest() != TRANSCRIPTION_SHA256:
+        raise ValueError("NPL reference transcription or provenance changed")
+    return {"version": REFERENCE_VERSION, **deepcopy(original), "campaign_compatible": False, "source_artifact_verified": False}
+
+
+def load_reference(path: str | Path, source_pdf: str | Path | None = None) -> dict:
+    reference = load_reference_from_payload(json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_unique_object))
+    if source_pdf is not None:
+        with Path(source_pdf).open("rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual != SOURCE_PDF_SHA256:
+            raise ValueError("NPL primary PDF checksum differs")
+        reference["source_artifact_verified"] = True
+    return reference
 
 
 def mach395_zero_incidence(reference: dict) -> dict:
     loaded = load_reference_from_payload(reference)
-    row = loaded["conditions"][2]
     return {
-        "condition": row,
+        "condition": loaded["conditions"][2],
         "biconvex_experimental_cd_pressure": loaded["biconvex"]["experimental_zero_incidence_pressure_drag"][2],
         "double_wedge_experimental_cd_pressure": loaded["double_wedge"]["experimental_zero_incidence_pressure_drag"][2],
-        "validation_scope": "adjacent_high_supersonic_reference_not_exact_mach3",
+        "validation_scope": "out_of_scope_rarefied_flow_not_campaign_validation",
+        "campaign_compatible": False,
     }
 
 
@@ -73,40 +73,32 @@ def compare_zero_incidence_pressure_drag(
     reference: dict,
     section: str,
     mach: float,
-    reynolds_per_m: float,
+    reynolds_chord: float,
     measured_cd_pressure: float,
 ) -> dict:
     loaded = load_reference_from_payload(reference)
     if section not in {"biconvex", "double_wedge"}:
         raise ValueError("Unknown NPL reference section")
-    if not math.isfinite(measured_cd_pressure) or measured_cd_pressure <= 0:
-        raise ValueError("Measured pressure drag must be finite and positive")
-    matches = [
-        (index, condition)
-        for index, condition in enumerate(loaded["conditions"])
-        if math.isclose(condition["mach"], mach, rel_tol=0, abs_tol=1e-9)
-        and math.isclose(condition["reynolds_per_m"], reynolds_per_m, rel_tol=0, abs_tol=1e-9)
-    ]
+    mach = _finite_positive(mach, "Mach")
+    reynolds_chord = _finite_positive(reynolds_chord, "Chord Reynolds number")
+    measured_cd_pressure = _finite_positive(measured_cd_pressure, "Pressure drag")
+    matches = [(index, condition) for index, condition in enumerate(loaded["conditions"])
+               if condition["mach"] == mach and condition["reynolds_chord"] == reynolds_chord]
     if len(matches) != 1:
-        raise ValueError("No unique NPL reference condition matches Mach and Reynolds")
+        raise ValueError("No unique NPL reference row matches Mach and chord Reynolds")
     index, condition = matches[0]
     experimental = loaded[section]["experimental_zero_incidence_pressure_drag"][index]
-    inviscid = loaded[section]["inviscid_zero_incidence_pressure_drag"][index]
+    bias = measured_cd_pressure - experimental
     return {
         "section": section,
         "condition": condition,
         "measured_cd_pressure": measured_cd_pressure,
         "experimental_cd_pressure": experimental,
-        "inviscid_cd_pressure": inviscid,
-        "absolute_error": measured_cd_pressure - experimental,
-        "relative_error": (measured_cd_pressure - experimental) / experimental,
-        "validation_scope": "source-matched-zero-incidence-pressure-drag-comparison",
+        "inviscid_cd_pressure": loaded[section]["inviscid_zero_incidence_pressure_drag"][index],
+        "bias": bias,
+        "absolute_error": abs(bias),
+        "relative_error": abs(bias) / experimental,
+        "validation_scope": "table_row_comparison_not_physical_compatibility",
+        "campaign_compatible": False,
         "acceptance_certificate": False,
     }
-
-
-def load_reference_from_payload(payload: dict) -> dict:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", encoding="utf-8") as temporary:
-        temporary.write(json.dumps(payload))
-        temporary.flush()
-        return load_reference(temporary.name)

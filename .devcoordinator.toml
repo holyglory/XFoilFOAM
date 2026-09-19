@@ -29,6 +29,21 @@ name = "initialization"
 tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initialization.py", "tests/test_compressible_execution.py", "tests/test_targeted_urans_warmstart.py", "tests/test_retention.py", "tests/test_frame_track.py", "-q"]
 
+[test.reference-integrity]
+timeout_seconds = 300
+
+[[test.reference-integrity.check]]
+name = "reference-and-clock-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_npl3635_reference.py", "tests/test_compressible_execution.py", "tests/test_acoustic_startup.py", "-q"]
+
+[[test.reference-integrity.check]]
+name = "primary-source"
+tier = "development"
+requires = ["reference-and-clock-contract"]
+command = [".venv/bin/python", "-c", "import json; from scripts.materials.npl3635_reference import load_reference; reference=load_reference('tests/fixtures/npl3635/table2.json','.codex-artifacts/npl3635-source-20260919/arc-rm-3635.pdf'); assert reference['source_artifact_verified'] and not reference['campaign_compatible']; print(json.dumps({'source_sha256':reference['provenance']['source_artifact_sha256'],'verified':reference['source_artifact_verified'],'campaign_compatible':reference['campaign_compatible']}))"]
+retained_artifacts = [{ name = "primary-npl-source", path = ".codex-artifacts/npl3635-source-20260919", max_bytes = 4194304 }]
+
 [test.python]
 timeout_seconds = 7200
 

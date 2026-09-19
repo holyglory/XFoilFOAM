@@ -1042,16 +1042,20 @@ Family exchangeability is unestablished and seven evaluation families are not
 a calibration certificate. Sparse-CFD refinement, prospective condition holdout and
 compressible accuracy remain separate validation requirements.
 
-The first high-supersonic physical reference fixture is the published NPL R&M
-3635 table for symmetric 10%-thick biconvex and double-wedge sections. It retains
-the exact zero-incidence pressure-drag rows at Mach 4.19, 4.04, 3.95, 2.12, 2.09
-and 1.79, including the low-density Reynolds numbers and separate inviscid
-comparison. The Mach 3.95 row is an adjacent high-supersonic reference, not an
-exact production Mach-3 condition; its source geometry is described by the report
-but not distributed as coordinates. `npl3635_reference` refuses any Mach/Reynolds
-mismatch and never returns an accuracy certificate. A future matched OpenFOAM
-benchmark must supply its own immutable geometry, exact condition and solver
-evidence before this comparison can affect validation.
+The NPL R&M 3635 fixture retains published zero-incidence pressure-drag data for
+10%-thick biconvex and double-wedge sections. Its Reynolds numbers are dimensionless
+and based on the 0.0254 m chord; the reported 288 K is stagnation temperature,
+not freestream static temperature. Table 2 is on printed page 14, PDF page 15.
+The loader authenticates every transcribed value and provenance field, and can
+verify the retained primary PDF when supplied. Merely loading the transcription
+does not claim that the PDF bytes were checked.
+
+This is an out-of-scope comparison, not the campaign's physical validation case:
+the source concerns laminar low-density continuum or transitional flow, pressure
+drag excludes skin friction, and its high-speed rows exceed Mach 3. Matching the
+Mach and chord-Reynolds row alone does not establish physical compatibility with
+the fully turbulent campaign. The helper always reports `campaign_compatible:
+false` and never produces an accuracy certificate or campaign evidence.
 
 `scripts.materials.uiuc_condition_validation` evaluates the same archive with
 retrospective leave-one-Reynolds-group-out folds. Analyst-defined centers of

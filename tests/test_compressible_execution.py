@@ -12,6 +12,7 @@ from airfoilfoam.models import PolarRequest, SolverParams
 from airfoilfoam.openfoam.budget import BudgetedRunner
 from airfoilfoam.openfoam.dialects import OPENCFD_2606, dialect_for_runner
 from airfoilfoam.openfoam.execution import configure_flow_execution, is_compressible, is_density_based
+from airfoilfoam.openfoam.rans_hold import root_entry
 from airfoilfoam.openfoam.runner import InfrastructureError, RunResult, Runner
 from airfoilfoam.thermodynamics import GasThermodynamics, ThermodynamicState
 
@@ -118,6 +119,48 @@ def test_local_density_request_preserves_steady_mode_and_refuses_implicit_urans(
     request_payload["solver"]["transient_fallback"] = True
     with pytest.raises(ValidationError, match="controller-owned"):
         PolarRequest.model_validate(request_payload)
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+def test_local_density_keeps_iteration_clock_separate_from_physical_startup(
+    request_payload, monkeypatch, tmp_path, seeded
+):
+    request_payload["speeds"] = [request_payload["speeds"][0] / 0.72 * 3]
+    request_payload["solver"].update(
+        flow_solver_family="rhoCentralFoam",
+        force_transient=False,
+        transient_fallback=False,
+    )
+    request = PolarRequest.model_validate(request_payload)
+    runner = RecordedRunner()
+    configure_flow_execution(runner, request)
+    airfoil = Airfoil.from_contour("ag24", parse_airfoil(request.airfoil.coordinates))
+    patches = [
+        BoundaryPatch("airfoil", "wall"),
+        BoundaryPatch("inlet", "inlet"),
+        BoundaryPatch("outlet", "outlet"),
+        BoundaryPatch("frontAndBack", "empty"),
+    ]
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+    def unexpected_acoustic(*args):
+        raise AssertionError("Physical acoustic deltaT must not replace a local iteration clock")
+
+    monkeypatch.setattr(pipeline, "acoustic_startup_step", unexpected_acoustic)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *_: None)
+    monkeypatch.setattr(pipeline, "_try_seed_initial_field", lambda *args, **kwargs: seeded)
+    case_dir = tmp_path / "case"
+    result = pipeline._solve_cold_marched(
+        case_dir, mesh_dir, airfoil, patches, request.mesh, request.cases()[0], request.fluid,
+        request.roughness, request.solver, runner, 30, SimpleNamespace(first_order_fallback=False),
+    )
+    assert result.ok
+    assert any("rhoCentralFoam" in command for command in runner.commands)
+    control = (case_dir / "system/controlDict").read_text()
+    assert float(root_entry(control, "deltaT")) == 1
+    assert float(root_entry(control, "endTime")) == request.solver.n_iterations
+    assert "localEuler" in (case_dir / "system/fvSchemes").read_text()
+    assert "local_pseudo_time_iterations" in (case_dir / "constant/numericalExecution.json").read_text()
 
 
 @pytest.mark.parametrize("change", ["density", "viscosity", "mode", "mach", "low_central", "incompressible_gas", "unknown_family"])
