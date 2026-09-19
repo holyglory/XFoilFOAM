@@ -525,8 +525,7 @@ initialization and density-based calculations do not use this continuation.
 Missing hold proof leaves the attempt provisional; it also excludes those fields
 from accepted warm-start donors. Mesh reuse is unchanged.
 
-An experimental, not-yet-deployed guard treats potential-flow initialization as
-only a proposal for the initial velocity, not
+Potential-flow initialization supplies only a proposal for the initial velocity, not
 compressible CFD evidence. Its complete finite vector field must fit the selected
 gas's available stagnation enthalpy above the material's minimum temperature.
 An inadmissible proposal is retained with its checksum and measured peak, while
@@ -534,6 +533,26 @@ the exact original freestream velocity is restored. Pressure, temperature and
 material properties remain unchanged. The producer does not clip velocities or
 extend the gas model's temperature range. This necessary energy check does not
 certify convergence or aerodynamic accuracy.
+
+Pressure-based initialization runs in a separate temporary case, with a fixed
+inlet velocity and gradient outlet used only for the auxiliary potential solve.
+Only an admissible internal velocity field is transferred back atomically; the
+physical CFD velocity boundary entries, pressure, temperature and material remain
+unchanged. A failed native command remains a failure, not a successful fallback.
+Every cold attempt has its own directory under `pressure_initialization`, with
+the proposed/applied velocities, original physical fields, auxiliary dictionaries,
+raw log and receipt. The case-level receipt is a latest-attempt index; immutable
+older receipts remain in their attempt directories. Verified legacy receipts are
+preserved before advancing that index. Corrupt or unrelated earlier evidence is
+not silently replaced.
+
+The native `pressure-init-reproduction` deployment replays the checksum-pinned
+LWK 79-100 production request in an isolated, non-uploading workspace. The fixture
+adds only a trailing newline to the retained JSON export. Its diagnostic can use
+50 or 1500 CFD iterations and continues to the second angle after rejected CFD;
+that diagnostic choice does not change production promotion or acceptance rules.
+Successful initialization or a converged diagnostic case is not an airfoil
+accuracy or uncertainty-calibration certificate.
 
 Local pseudo-time advances individual cells with numerical steps to seek a steady
 solution; its iteration coordinate is never a physical URANS history. The sealed

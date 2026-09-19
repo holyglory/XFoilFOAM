@@ -1,0 +1,588 @@
+{
+  "execution_id": "527fc7c9-7eaf-4d52-a23f-dc6b6b774bb3",
+  "airfoil": {
+    "name": "LWK 79-100",
+    "format": "selig",
+    "coordinates": null,
+    "points": [
+      [
+        1.0,
+        0.0
+      ],
+      [
+        0.99893,
+        0.00007
+      ],
+      [
+        0.99572,
+        0.00028
+      ],
+      [
+        0.99039,
+        0.00063
+      ],
+      [
+        0.98296,
+        0.00113
+      ],
+      [
+        0.97347,
+        0.00175
+      ],
+      [
+        0.96194,
+        0.00251
+      ],
+      [
+        0.94844,
+        0.00339
+      ],
+      [
+        0.93301,
+        0.00439
+      ],
+      [
+        0.91573,
+        0.0055
+      ],
+      [
+        0.89668,
+        0.0067
+      ],
+      [
+        0.87592,
+        0.00799
+      ],
+      [
+        0.85355,
+        0.00939
+      ],
+      [
+        0.82967,
+        0.01091
+      ],
+      [
+        0.80438,
+        0.0126
+      ],
+      [
+        0.77779,
+        0.0145
+      ],
+      [
+        0.75,
+        0.01664
+      ],
+      [
+        0.72114,
+        0.01905
+      ],
+      [
+        0.69134,
+        0.02171
+      ],
+      [
+        0.66072,
+        0.02464
+      ],
+      [
+        0.62941,
+        0.02779
+      ],
+      [
+        0.59755,
+        0.03109
+      ],
+      [
+        0.56526,
+        0.03443
+      ],
+      [
+        0.5327,
+        0.03762
+      ],
+      [
+        0.5,
+        0.04054
+      ],
+      [
+        0.4673,
+        0.0431
+      ],
+      [
+        0.43474,
+        0.04524
+      ],
+      [
+        0.40245,
+        0.04699
+      ],
+      [
+        0.37059,
+        0.04835
+      ],
+      [
+        0.33928,
+        0.04933
+      ],
+      [
+        0.30866,
+        0.04989
+      ],
+      [
+        0.27886,
+        0.04997
+      ],
+      [
+        0.25,
+        0.04961
+      ],
+      [
+        0.22221,
+        0.04886
+      ],
+      [
+        0.19562,
+        0.04777
+      ],
+      [
+        0.17033,
+        0.0463
+      ],
+      [
+        0.14645,
+        0.04447
+      ],
+      [
+        0.12408,
+        0.04225
+      ],
+      [
+        0.10332,
+        0.03968
+      ],
+      [
+        0.08427,
+        0.03675
+      ],
+      [
+        0.06699,
+        0.03348
+      ],
+      [
+        0.05156,
+        0.0299
+      ],
+      [
+        0.03806,
+        0.02606
+      ],
+      [
+        0.02653,
+        0.02201
+      ],
+      [
+        0.01704,
+        0.01782
+      ],
+      [
+        0.00961,
+        0.01341
+      ],
+      [
+        0.00428,
+        0.00883
+      ],
+      [
+        0.00107,
+        0.00434
+      ],
+      [
+        0.0,
+        0.0
+      ],
+      [
+        0.00107,
+        -0.00434
+      ],
+      [
+        0.00428,
+        -0.00883
+      ],
+      [
+        0.00961,
+        -0.01341
+      ],
+      [
+        0.01704,
+        -0.01782
+      ],
+      [
+        0.02653,
+        -0.02201
+      ],
+      [
+        0.03806,
+        -0.02606
+      ],
+      [
+        0.05156,
+        -0.0299
+      ],
+      [
+        0.06699,
+        -0.03348
+      ],
+      [
+        0.08427,
+        -0.03675
+      ],
+      [
+        0.10332,
+        -0.03968
+      ],
+      [
+        0.12408,
+        -0.04225
+      ],
+      [
+        0.14645,
+        -0.04447
+      ],
+      [
+        0.17033,
+        -0.0463
+      ],
+      [
+        0.19562,
+        -0.04777
+      ],
+      [
+        0.22221,
+        -0.04886
+      ],
+      [
+        0.25,
+        -0.04961
+      ],
+      [
+        0.27886,
+        -0.04997
+      ],
+      [
+        0.30866,
+        -0.04989
+      ],
+      [
+        0.33928,
+        -0.04933
+      ],
+      [
+        0.37059,
+        -0.04835
+      ],
+      [
+        0.40245,
+        -0.04699
+      ],
+      [
+        0.43474,
+        -0.04524
+      ],
+      [
+        0.4673,
+        -0.0431
+      ],
+      [
+        0.5,
+        -0.04054
+      ],
+      [
+        0.5327,
+        -0.03762
+      ],
+      [
+        0.56526,
+        -0.03443
+      ],
+      [
+        0.59755,
+        -0.03109
+      ],
+      [
+        0.62941,
+        -0.02779
+      ],
+      [
+        0.66072,
+        -0.02464
+      ],
+      [
+        0.69134,
+        -0.02171
+      ],
+      [
+        0.72114,
+        -0.01905
+      ],
+      [
+        0.75,
+        -0.01664
+      ],
+      [
+        0.77779,
+        -0.0145
+      ],
+      [
+        0.80438,
+        -0.0126
+      ],
+      [
+        0.82967,
+        -0.01091
+      ],
+      [
+        0.85355,
+        -0.00939
+      ],
+      [
+        0.87592,
+        -0.00799
+      ],
+      [
+        0.89668,
+        -0.0067
+      ],
+      [
+        0.91573,
+        -0.0055
+      ],
+      [
+        0.93301,
+        -0.00439
+      ],
+      [
+        0.94844,
+        -0.00339
+      ],
+      [
+        0.96194,
+        -0.00251
+      ],
+      [
+        0.97347,
+        -0.00175
+      ],
+      [
+        0.98296,
+        -0.00113
+      ],
+      [
+        0.99039,
+        -0.00063
+      ],
+      [
+        0.99572,
+        -0.00028
+      ],
+      [
+        0.99893,
+        -0.00007
+      ],
+      [
+        1.0,
+        0.0
+      ]
+    ]
+  },
+  "chord_lengths": [
+    1.0
+  ],
+  "speeds": [
+    90.0
+  ],
+  "aoa": {
+    "angles": [
+      0.0,
+      10.0
+    ],
+    "start": null,
+    "stop": null,
+    "step": null
+  },
+  "fluid": {
+    "gas": {
+      "equation_of_state": "perfect_gas",
+      "heat_capacity_model": "nasa7",
+      "gas_constant": 287.0491267875601,
+      "heat_capacity_cp": null,
+      "nasa7": {
+        "minimum_temperature_k": 100.0,
+        "common_temperature_k": 1000.0,
+        "maximum_temperature_k": 2000.0,
+        "entropy_reference_pressure_pa": 101325.0,
+        "low_coefficients": [
+          3.5277047741397856,
+          -0.000374916446146311,
+          7.431184739424791e-7,
+          9.111020954814551e-10,
+          -8.35763922788758e-13,
+          436.32833906630515,
+          -6.506169487268522
+        ],
+        "high_coefficients": [
+          2.184636548247734,
+          0.0034929485757043423,
+          -2.4525070690057077e-6,
+          8.680841745765986e-10,
+          -1.2191725489431656e-13,
+          778.6577149964178,
+          0.3372425297885826
+        ],
+        "maximum_join_relative_error": 0.0001,
+        "provenance": "Relative least-squares fit to CoolProp 8.0.0 HEOS::Air ideal-gas calorics; source JSON SHA256 905789eaae428ef2bcea594e572509be33107a27a9c0ea53b7602268a0cae5f3; continuous Cp/H/S join; candidate, not validated CFD"
+      },
+      "transport_model": "polynomial",
+      "polynomial_transport": {
+        "minimum_temperature_k": 100.0,
+        "maximum_temperature_k": 2000.0,
+        "dynamic_viscosity_coefficients": [
+          -5.810077775470323e-7,
+          8.631585516281238e-8,
+          -1.0579411304021043e-10,
+          1.2974581639508772e-13,
+          -1.0856642998762702e-16,
+          5.642804454279919e-20,
+          -1.6224078638128142e-23,
+          1.9606160092189868e-27
+        ],
+        "thermal_conductivity_coefficients": [
+          -0.0011932679460919249,
+          0.00011674907644117693,
+          -1.1334292138285875e-7,
+          1.2755217272442072e-10,
+          -9.830175023151184e-14,
+          4.767045061064358e-17,
+          -1.2946598459387396e-20,
+          1.4930026503457874e-24
+        ],
+        "provenance": "Independent viscosity and conductivity fits to CoolProp 8.0.0 HEOS::Air at 101325.0 Pa; source JSON SHA256 905789eaae428ef2bcea594e572509be33107a27a9c0ea53b7602268a0cae5f3; candidate, not installed"
+      },
+      "reference_dynamic_viscosity": 0.000017965642136449674,
+      "reference_temperature_k": 288.15,
+      "sutherland_temperature_k": null,
+      "prandtl": null,
+      "provenance": "CoolProp 8.0.0 HEOS::Air; nonreacting ideal-gas fit; source audit 92e5e59716e71c02dfe1788f85d7774f87cc6cb01788e4e841fad39ab947a4f5; transport reference 101325 Pa; not an airfoil accuracy certification"
+    },
+    "density": 1.2250159925164,
+    "dynamic_viscosity": null,
+    "kinematic_viscosity": 0.000014665638853861052
+  },
+  "flow_state": {
+    "temperature_k": 288.15,
+    "pressure_pa": 101325.0
+  },
+  "roughness": {
+    "sand_grain_height": 0.0,
+    "roughness_constant": 0.5
+  },
+  "mesh": {
+    "mesher": "blockmesh-cgrid",
+    "farfield_radius_chords": 15.0,
+    "wake_length_chords": 12.0,
+    "n_surface": 84,
+    "n_radial": 52,
+    "n_wake": 40,
+    "target_y_plus": 40.0,
+    "first_cell_height_chords": null,
+    "span_chords": 0.1
+  },
+  "urans_mesh": {
+    "mesher": "blockmesh-cgrid",
+    "farfield_radius_chords": 15.0,
+    "wake_length_chords": 12.0,
+    "n_surface": 84,
+    "n_radial": 52,
+    "n_wake": 40,
+    "target_y_plus": 40.0,
+    "first_cell_height_chords": null,
+    "span_chords": 0.1
+  },
+  "urans_precalc_mesh": {
+    "mesher": "blockmesh-cgrid",
+    "farfield_radius_chords": 15.0,
+    "wake_length_chords": 12.0,
+    "n_surface": 84,
+    "n_radial": 52,
+    "n_wake": 40,
+    "target_y_plus": 40.0,
+    "first_cell_height_chords": null,
+    "span_chords": 0.1
+  },
+  "solver": {
+    "flow_solver_family": "rhoSimpleFoam",
+    "turbulent_prandtl": 0.85,
+    "turbulence": {
+      "model": "kOmegaSST",
+      "intensity": 0.001,
+      "viscosity_ratio": 10.0
+    },
+    "n_iterations": 1500,
+    "urans_initialization_iterations": null,
+    "convergence_tolerance": 0.0001,
+    "momentum_scheme": "linearUpwind",
+    "transient_fallback": false,
+    "rans_failure_policy": "abort_for_precalc",
+    "force_transient": false,
+    "urans_quality_recovery": false,
+    "warm_start": true,
+    "transient_cycles": 10.0,
+    "transient_discard_fraction": 0.4,
+    "transient_max_courant": 4.0,
+    "urans_fidelity": "full",
+    "steady_oscillation_window": 400,
+    "urans_min_periods": 7,
+    "urans_drift_tolerance": 0.05,
+    "frame_fields": [
+      "vorticity",
+      "velocity_magnitude",
+      "pressure"
+    ],
+    "transient_auto_refine": true,
+    "write_images": [
+      "velocity_magnitude",
+      "velocity_x",
+      "velocity_y",
+      "pressure",
+      "pressure_coefficient",
+      "vorticity",
+      "turbulent_kinetic_energy",
+      "turbulent_viscosity"
+    ],
+    "image_zoom_chords": 2.0
+  },
+  "resources": {
+    "case_solver_budget_seconds": 900.0,
+    "case_solver_allocations": null,
+    "cpu_budget": 2,
+    "case_concurrency": 1,
+    "solver_processes": null,
+    "queue_pressure": null,
+    "policy": "auto"
+  },
+  "continue_from": null,
+  "budget_override_s": null,
+  "corrective_tail_periods": null,
+  "expected_mesh_recovery_version": 2,
+  "expected_urans_recovery_version": null,
+  "expected_urans_initialization_version": null,
+  "expected_solver_budget_version": 2,
+  "expected_engine": {
+    "family": "openfoam",
+    "distribution": "opencfd",
+    "version": "2606",
+    "numerics_revision": "1",
+    "adapter_contract_version": 1
+  },
+  "expected_execution_pool": "openfoam-opencfd-2606"
+}

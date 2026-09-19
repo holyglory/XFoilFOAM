@@ -6926,6 +6926,12 @@ def _constant_evidence_role(relative_path: Path) -> str:
     )
 
 
+def _initialization_evidence_role(relative_path: Path) -> str:
+    if relative_path.name.startswith("log."):
+        return "log"
+    return "quality_evidence" if relative_path.suffix == ".json" else "dictionary"
+
+
 def _post_processing_evidence_role(relative_path: Path) -> str:
     """Keep force coefficients, y+ output, and other function data distinct."""
     function_name = relative_path.parts[0] if relative_path.parts else ""
@@ -7169,10 +7175,12 @@ def _archive_case_evidence(
             _copy_file_preserving_rel(diagnostic.parent, diagnostic, raw_dir / "logs" / diagnostic.parent.name, entries, "quality_evidence", manifest_base=evidence_dir)
 
     for directory in {case_dir, post_dir}:
-        _copy_tree_files(
+        _copy_tree_files_classified(
             directory / PRESSURE_INITIALIZATION_DIR,
             raw_dir / PRESSURE_INITIALIZATION_DIR / directory.name,
-            entries, "dictionary", manifest_base=evidence_dir,
+            entries,
+            _initialization_evidence_role,
+            manifest_base=evidence_dir,
         )
 
     _copy_tree_files_classified(

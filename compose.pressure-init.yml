@@ -1,0 +1,39 @@
+services:
+  reproduction:
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: none
+    environment:
+      PYTHONPATH: /candidate/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_DATA_DIR: /evidence/data
+      AIRFOILFOAM_CACHE_DIR: /evidence/cache
+    command: ["python", "/verification/reproduce_pressure_initialization.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--iterations", "1500"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts/materials/reproduce_pressure_initialization.py:/verification/reproduce_pressure_initialization.py:ro
+      - ./tests/fixtures/lwk79100-pressure-initialization-request.json:/fixture/request.json:ro
+      - pressure-init-evidence:/evidence
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+  artifacts:
+    image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+    pull_policy: never
+    network_mode: bridge
+    command: ["python", "-m", "http.server", "8080", "--directory", "/evidence"]
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - pressure-init-evidence:/evidence:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080', timeout=2).read(1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+volumes:
+  pressure-init-evidence:

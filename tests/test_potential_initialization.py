@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,10 @@ def fixture(tmp_path, *, change_physics=False, failure=False, family="rhoSimpleF
         assert "[0 2 -2 0 0 0 0]" in temporary
         assert "-pName pXfoilfoamInitial" in command
         assert all(option not in command for option in ["-writep", "-writephi", "-writePhi", "-withFunctionObjects"])
+        assert case_dir != tmp_path
+        auxiliary = (case_dir / "0/U").read_text()
+        assert "freestreamVelocity" not in auxiliary
+        assert "fixedValue" in auxiliary and "zeroGradient" in auxiliary
         if failure:
             raise RuntimeError("isolated initialization failure")
         (case_dir / "0/U").write_text(f"internalField nonuniform List<vector> 2 ((100 0 0) ({proposed_speed} 0 0));")
@@ -42,17 +47,22 @@ def fixture(tmp_path, *, change_physics=False, failure=False, family="rhoSimpleF
     return runner, patches
 
 
+def latest_evidence(case_dir):
+    receipt = json.loads((case_dir / "pressure-initialization.json").read_text())
+    return case_dir / "pressure_initialization" / receipt["attempt_directory"]
+
+
 def test_potential_velocity_preserves_real_pressure_and_temperature(tmp_path):
     runner, patches = fixture(tmp_path)
     initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam -writephi -writep -writePhi -withFunctionObjects -initialiseUBCs")
     assert (tmp_path / "0/p").read_text() == "physical pressure"
     assert (tmp_path / "0/T").read_text() == "physical temperature"
     assert not (tmp_path / "0/pXfoilfoamInitial").exists()
-    assert (tmp_path / "pressure_initialization/pXfoilfoamInitial").is_file()
+    assert (latest_evidence(tmp_path) / "pXfoilfoamInitial").is_file()
     receipt = json.loads((tmp_path / "pressure-initialization.json").read_text())
     assert receipt["aerodynamic_evidence"] is False and receipt["returncode"] == 0
     assert runner.calls[0][1:] == (1, 600)
-    assert receipt["version"] == 2 and receipt["applied"] is True
+    assert receipt["version"] == 3 and receipt["applied"] is True
     assert receipt["fallback_reason"] is None
 
 
@@ -87,8 +97,8 @@ def test_impossible_potential_velocity_restores_exact_freestream_and_retains_pro
     result = initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
     assert result.ok
     assert (tmp_path / "0/U").read_bytes() == original
-    assert (tmp_path / "pressure_initialization/U.freestream").read_bytes() == original
-    assert "1200" in (tmp_path / "pressure_initialization/U.potential").read_text()
+    assert (latest_evidence(tmp_path) / "U.freestream").read_bytes() == original
+    assert "1200" in (latest_evidence(tmp_path) / "U.potential").read_text()
     receipt = json.loads((tmp_path / "pressure-initialization.json").read_text())
     assert receipt["applied"] is False
     assert receipt["fallback_reason"] == "exceeds_available_stagnation_enthalpy"
@@ -154,8 +164,136 @@ def test_failed_native_initializer_is_not_replaced_by_a_successful_fallback(tmp_
     receipt = json.loads((tmp_path / "pressure-initialization.json").read_text())
     assert receipt["applied"] is False and receipt["fallback_reason"] is None
     assert receipt["maximum_proposed_velocity"] is None
-    assert (tmp_path / "pressure_initialization/U.freestream").is_file()
-    assert (tmp_path / "pressure_initialization/U.potential").is_file()
+    assert (latest_evidence(tmp_path) / "U.freestream").is_file()
+    assert (latest_evidence(tmp_path) / "U.potential").is_file()
+    assert (tmp_path / "0/U").read_bytes() == (latest_evidence(tmp_path) / "U.freestream").read_bytes()
+
+
+def test_only_internal_velocity_transfers_back_to_the_exact_physical_boundary(tmp_path):
+    runner, patches = fixture(tmp_path)
+    original = (b"/* internalField uniform (1 2 3); */\ninternalField uniform (100 0 0);\n"
+                b"boundaryField { upstream { type freestreamVelocity; freestreamValue uniform (100 0 0); } }\n")
+    (tmp_path / "0/U").write_bytes(original)
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    updated = (tmp_path / "0/U").read_bytes()
+    assert updated.split(b"boundaryField", 1)[1] == original.split(b"boundaryField", 1)[1]
+    assert updated.startswith(b"/* internalField uniform (1 2 3); */")
+    assert internal_velocity_squared(updated) == 200 ** 2
+    assert (latest_evidence(tmp_path) / "log.potentialFoam").read_text() == "isolated initialization trace"
+    assert not list(tmp_path.glob(".attempt-*"))
+
+
+@pytest.mark.parametrize("first_failure", [False, True])
+def test_a_new_cold_angle_preserves_the_previous_attempt_and_can_initialize(tmp_path, first_failure):
+    runner, patches = fixture(tmp_path, returncode=1 if first_failure else 0)
+    original = (tmp_path / "0/U").read_bytes()
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    previous_dir = latest_evidence(tmp_path)
+    previous = {str(path.relative_to(previous_dir)): path.read_bytes() for path in previous_dir.rglob("*") if path.is_file()}
+    (tmp_path / "0/U").write_bytes(original.replace(b"100 0 0", b"98 17 0"))
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    assert latest_evidence(tmp_path) != previous_dir
+    assert len(runner.calls) == 2
+    assert {str(path.relative_to(previous_dir)): path.read_bytes() for path in previous_dir.rglob("*") if path.is_file()} == previous
+    assert len(list((tmp_path / "pressure_initialization").glob("attempt-*"))) == 2
+
+
+def test_an_exception_is_retained_without_poisoning_the_next_cold_attempt(tmp_path):
+    runner, patches = fixture(tmp_path, failure=True)
+    original = (tmp_path / "0/U").read_bytes()
+    for attempt in range(2):
+        with pytest.raises(RuntimeError, match="isolated initialization failure"):
+            initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+        assert (tmp_path / "0/U").read_bytes() == original
+        receipt = json.loads((latest_evidence(tmp_path) / "pressure-initialization.json").read_text())
+        assert receipt["applied"] is False and receipt["returncode"] is None
+        assert receipt["error"] == "RuntimeError: isolated initialization failure"
+        assert len(list((tmp_path / "pressure_initialization").glob("attempt-*"))) == attempt + 1
+
+
+def test_a_changed_prior_receipt_is_not_silently_replaced(tmp_path):
+    runner, patches = fixture(tmp_path, returncode=1)
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    receipt = tmp_path / "pressure-initialization.json"
+    receipt.write_bytes(receipt.read_bytes().replace(b'"returncode": 1', b'"returncode": 0'))
+    with pytest.raises(InfrastructureError, match="cannot be verified"):
+        initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    assert len(runner.calls) == 1
+
+
+def test_a_verified_legacy_initializer_remains_available_after_a_new_attempt(tmp_path):
+    runner, patches = fixture(tmp_path)
+    original = (tmp_path / "0/U").read_bytes()
+    evidence = tmp_path / "pressure_initialization"
+    evidence.mkdir()
+    (evidence / "U.potential").write_bytes(original)
+    receipt = json.dumps({"version": 2, "kind": "velocity-only-potential-initialization",
+                          "proposed_velocity_sha256": hashlib.sha256(original).hexdigest()}).encode()
+    (tmp_path / "pressure-initialization.json").write_bytes(receipt)
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    assert (evidence / "U.potential").read_bytes() == original
+    assert (evidence / f"legacy-receipt-{hashlib.sha256(receipt).hexdigest()}.json").read_bytes() == receipt
+
+
+@pytest.mark.parametrize("filename", ["U.potential", "U.applied"])
+def test_changed_velocity_evidence_cannot_be_silently_overwritten(tmp_path, filename):
+    runner, patches = fixture(tmp_path, returncode=1)
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    (latest_evidence(tmp_path) / filename).write_bytes(b"changed")
+    with pytest.raises(InfrastructureError, match="cannot be verified"):
+        initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    assert len(runner.calls) == 1
+
+
+def test_material_warning_is_retained_and_does_not_poison_a_fresh_attempt(tmp_path):
+    from airfoilfoam.openfoam.runner import MaterialDomainError
+    runner, patches = fixture(tmp_path)
+    original_solver = runner.solver
+    warning = "attempt to use janafThermo<EquationOfState> out of temperature range 100 -> 2000; T = 90\n"
+    def native_warning(*args, **kwargs):
+        result = original_solver(*args, **kwargs)
+        return RunResult(result.command, 0, warning)
+    runner.solver = native_warning
+    for attempt in range(2):
+        with pytest.raises(MaterialDomainError):
+            initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+        assert (latest_evidence(tmp_path) / "log.potentialFoam").read_text() == warning
+        receipt = json.loads((latest_evidence(tmp_path) / "pressure-initialization.json").read_text())
+        assert receipt["applied"] is False
+        assert receipt["error"].startswith("MaterialDomainError:")
+        assert len(list((tmp_path / "pressure_initialization").glob("attempt-*"))) == attempt + 1
+
+
+def test_initialization_archive_distinguishes_logs_receipts_and_dictionaries(tmp_path):
+    from airfoilfoam import pipeline
+    runner, patches = fixture(tmp_path)
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    source = latest_evidence(tmp_path)
+    archive = tmp_path / "archive"
+    entries = []
+    pipeline._copy_tree_files_classified(source, archive, entries, pipeline._initialization_evidence_role, manifest_base=archive)
+    by_path = {entry["path"]: entry for entry in entries}
+    assert by_path["log.potentialFoam"]["role"] == "log"
+    assert by_path["pressure-initialization.json"]["role"] == "quality_evidence"
+    assert by_path["U.applied"]["role"] == "dictionary"
+    assert by_path["original/0/T"]["role"] == "dictionary"
+    for path in source.rglob("*"):
+        if path.is_file():
+            assert (archive / path.relative_to(source)).read_bytes() == path.read_bytes()
+
+
+def test_auxiliary_initialization_cannot_write_through_a_linked_source_field(tmp_path):
+    runner, patches = fixture(tmp_path)
+    original = (tmp_path / "0/U").read_bytes()
+    donor = tmp_path / "retained-source-U"
+    donor.write_bytes(original)
+    (tmp_path / "0/U").unlink()
+    (tmp_path / "0/U").symlink_to(donor)
+    runner.external_paths_visible = True
+    initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam")
+    assert donor.read_bytes() == original
+    assert not (tmp_path / "0/U").is_symlink()
+    assert internal_velocity_squared((tmp_path / "0/U").read_bytes()) == 200 ** 2
 
 
 @pytest.mark.parametrize("relative", ["pressure-initialization.json", "pressure_initialization"])

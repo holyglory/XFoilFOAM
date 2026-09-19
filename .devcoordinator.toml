@@ -1,7 +1,33 @@
 schema = 2
 
+[deployment.pressure-init-reproduction]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.pressure-init-reproduction.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.pressure-init.yml"]
+services = ["artifacts", "reproduction"]
+finite_services = ["reproduction"]
+build = false
+port = true
+route = true
+timeout_seconds = 1200
+
 [test]
 default = "python"
+
+[test.pressure-initialization]
+timeout_seconds = 900
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.pressure-initialization.check]]
+name = "initialization"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initialization.py", "tests/test_compressible_execution.py", "tests/test_targeted_urans_warmstart.py", "tests/test_retention.py", "tests/test_frame_track.py", "-q"]
 
 [test.python]
 timeout_seconds = 7200
