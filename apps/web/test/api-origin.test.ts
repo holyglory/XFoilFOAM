@@ -55,6 +55,22 @@ describe("same-origin preview API routing", () => {
     );
   });
 
+  it("requests the compact comparison detail view", async () => {
+    vi.stubEnv("API_URL", "http://127.0.0.1:20026");
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ progressivePolars: [] }),
+    });
+    vi.stubGlobal("fetch", fetch);
+    const api = await import("../lib/api");
+    await api.getAirfoilCompareDetail("ag24");
+    expect(fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:20026/api/airfoils/ag24?view=compare",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
   it("forwards all API paths, including sync, to the server-only endpoint", async () => {
     vi.stubEnv("API_URL", "http://127.0.0.1:20026/");
     vi.stubEnv("NEXT_PUBLIC_API_URL", "https://preview.example");
