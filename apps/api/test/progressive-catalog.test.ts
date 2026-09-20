@@ -9,8 +9,12 @@ import {
 } from "@aerodb/db/progressive-catalog";
 import { publicProgressivePolars } from "@aerodb/db/progressive-public";
 import { createMinimalSolverFixture } from "../../../packages/db/test/solver-fixture";
+import { simJobs } from "@aerodb/db";
 
-const isolated = vi.hoisted(() => ({ connection: null as DB | null }));
+const isolated = vi.hoisted(() => ({
+  connection: null as DB | null,
+  selectedTables: [] as unknown[],
+}));
 vi.mock("../src/db", () => ({
   db: new Proxy(
     {},
@@ -19,6 +23,20 @@ vi.mock("../src/db", () => ({
         if (!isolated.connection)
           throw new Error("Missing isolated catalog connection");
         const value = Reflect.get(isolated.connection, key);
+        if (key === "select") {
+          return (...args: unknown[]) =>
+            new Proxy(value.apply(isolated.connection, args), {
+              get(builder, property) {
+                if (property === "from") {
+                  return (table: unknown) => {
+                    isolated.selectedTables.push(table);
+                    return builder.from(table);
+                  };
+                }
+                return Reflect.get(builder, property);
+              },
+            });
+        }
         return typeof value === "function"
           ? value.bind(isolated.connection)
           : value;
@@ -27,6 +45,7 @@ vi.mock("../src/db", () => ({
   ),
 }));
 import { listAirfoils } from "../src/services/catalog";
+import { assembleDetail } from "../src/services/detail";
 
 const { db, sql: client } = createClient({ max: 1 });
 afterAll(() => client.end({ timeout: 5 }));
@@ -257,6 +276,35 @@ async function verifyPublicCatalog(fullScale: boolean) {
         });
         expect(catalog.metrics.has(profiles[2])).toBe(false);
         const detail = await publicProgressivePolars(connection, profiles[0]);
+        isolated.selectedTables = [];
+        const curveDetail = await assembleDetail(prefix + "A", {
+          view: "curves",
+        });
+        expect(curveDetail).toMatchObject({
+          id: profiles[0],
+          cfdPointsDeferred: true,
+          simulationWorksDeferred: true,
+          simulationWorks: [],
+          progressivePolars: detail,
+        });
+        expect(isolated.selectedTables).not.toContain(simJobs);
+        for (const options of [
+          {},
+          { view: "curves" as const, revisionId: fixture.revisionId },
+        ]) {
+          isolated.selectedTables = [];
+          const fullDetail = await assembleDetail(prefix + "A", options);
+          expect(fullDetail?.simulationWorksDeferred).toBeUndefined();
+          expect(fullDetail?.cfdPointsDeferred).toBeUndefined();
+          expect(isolated.selectedTables).toContain(simJobs);
+        }
+        isolated.selectedTables = [];
+        const missingCurves = await assembleDetail(prefix + "Missing", {
+          view: "curves",
+        });
+        expect(missingCurves?.progressivePolars).toEqual([]);
+        expect(missingCurves?.simulationWorksDeferred).toBeUndefined();
+        expect(isolated.selectedTables).toContain(simJobs);
         expect(
           detail.every(
             (series) => series.condition?.key === series.conditionKey,

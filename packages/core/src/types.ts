@@ -274,6 +274,7 @@ export interface AirfoilDetailPayload {
   progressivePolars?: ProgressivePolarSeries[];
   cfdPointsDeferred?: boolean;
   simulationWorks: SimulationWorkItem[];
+  simulationWorksDeferred?: boolean;
   downloads: Record<string, string | null>;
 }
 

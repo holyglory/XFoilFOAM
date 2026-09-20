@@ -788,7 +788,9 @@ export async function assembleDetail(
         .where(eq(categories.id, a.categoryId))
         .limit(1),
       hashtagsByAirfoilIds([a.id]),
-      loadSimulationWorks(a.id),
+      opts.view === "curves" && !opts.revisionId
+        ? Promise.resolve(null)
+        : loadSimulationWorks(a.id),
       publicProgressivePolars(db, a.id, opts.revisionId),
     ]);
   const normalizedTags = tagsByAirfoil.get(a.id) ?? [];
@@ -811,7 +813,7 @@ export async function assembleDetail(
     hashtags: normalizedTags,
     breadcrumb: { db: "database", family, name: a.name },
     geometry: geo,
-    simulationWorks,
+    simulationWorks: simulationWorks ?? [],
     downloads: {
       selig: `/api/airfoils/${a.slug}/coords.dat?format=selig`,
       lednicer: `/api/airfoils/${a.slug}/coords.dat?format=lednicer`,
@@ -830,8 +832,11 @@ export async function assembleDetail(
       polars: [],
       progressivePolars,
       cfdPointsDeferred: true,
+      simulationWorksDeferred: true,
     };
   }
+  const completeSimulationWorks =
+    simulationWorks ?? (await loadSimulationWorks(a.id));
 
   // Public curves are grouped by physics/numerics compatibility, never by a
   // batch/revision name and never by rounded Reynolds alone. Enabled library
@@ -1098,11 +1103,12 @@ export async function assembleDetail(
   const displayedMach =
     polars.find((polar) => polar.points.length > 0)?.mach ??
     progressivePolars[0]?.mach ??
-    simulationWorks.find((work) => work.mach !== null)?.mach ??
+    completeSimulationWorks.find((work) => work.mach !== null)?.mach ??
     0;
 
   return {
     ...metadata,
+    simulationWorks: completeSimulationWorks,
     mach: displayedMach,
     reList,
     polars,
