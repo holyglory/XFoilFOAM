@@ -49,6 +49,7 @@ import {
   ModalOverlay,
   nonNegativeIssue,
   NumberField,
+  OptionalNumberField,
   positiveIntegerIssue,
   positiveIssue,
   primaryBtn,
@@ -102,6 +103,7 @@ const defaultSolverForm = (
   transientCycles: 10,
   transientDiscardFraction: 0.4,
   transientMaxCourant: DEFAULT_TRANSIENT_MAX_COURANT,
+  localTimeStepSmoothing: null,
 });
 const defaultOutputForm = (): OutputProfileInput => ({
   name: "",
@@ -492,6 +494,15 @@ function SolverQuickCreateModal({
             message: "URANS discard must be from 0 to less than 1",
           },
       positiveIssue(form.transientMaxCourant, "URANS max Co"),
+      form.localTimeStepSmoothing == null ||
+      (Number.isFinite(form.localTimeStepSmoothing) &&
+        form.localTimeStepSmoothing >= 0 &&
+        form.localTimeStepSmoothing <= 1)
+        ? null
+        : {
+            field: "Local steady step smoothing",
+            message: "Local steady step smoothing must be from 0 to 1",
+          },
     ]);
   const uransIssue = ["URANS cycles", "URANS discard", "URANS max Co"].some(
     (field) => issueFor(issues, field),
@@ -530,6 +541,14 @@ function SolverQuickCreateModal({
           error={issueFor(issues, "Engine implementation")}
           onChange={(solverImplementationId) =>
             setForm((form) => ({ ...form, solverImplementationId }))
+          }
+        />
+        <OptionalNumberField
+          label="Local steady step smoothing"
+          value={form.localTimeStepSmoothing}
+          error={issueFor(issues, "Local steady step smoothing")}
+          onChange={(localTimeStepSmoothing) =>
+            setForm((f) => ({ ...f, localTimeStepSmoothing }))
           }
         />
         <SelectField

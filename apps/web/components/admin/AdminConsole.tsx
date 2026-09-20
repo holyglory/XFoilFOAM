@@ -1445,7 +1445,9 @@ function MediumsPanel() {
   const openMediumEditor = () => {
     requestAnimationFrame(() => {
       if (!mediumDialog.current?.open) mediumDialog.current?.showModal();
-      mediumDialog.current?.querySelector<HTMLInputElement>('[data-admin-field="Name"] input')?.focus();
+      mediumDialog.current
+        ?.querySelector<HTMLInputElement>('[data-admin-field="Name"] input')
+        ?.focus();
     });
   };
 
@@ -1465,7 +1467,9 @@ function MediumsPanel() {
       sutherlandS: m.sutherlandS,
       viscosityTable: m.viscosityTable,
       speedOfSound: m.speedOfSound,
-      gasThermodynamics: m.gasThermodynamics ? structuredClone(m.gasThermodynamics) : null,
+      gasThermodynamics: m.gasThermodynamics
+        ? structuredClone(m.gasThermodynamics)
+        : null,
       notes: m.notes,
     };
     setForm(next);
@@ -1528,9 +1532,10 @@ function MediumsPanel() {
         })),
         speedOfSound: form.speedOfSound || null,
       };
-      const saved = mode === "update" && selected
-        ? await updateAdminMedium(selected.id, body)
-        : await createAdminMedium(body);
+      const saved =
+        mode === "update" && selected
+          ? await updateAdminMedium(selected.id, body)
+          : await createAdminMedium(body);
       await refresh();
       select(saved, false);
       mediumDialog.current?.close();
@@ -1553,7 +1558,12 @@ function MediumsPanel() {
   };
 
   const removeMedium = async (medium: MediumDTO) => {
-    if (!window.confirm(`Remove medium “${medium.name}”? Referenced media cannot be removed.`)) return;
+    if (
+      !window.confirm(
+        `Remove medium “${medium.name}”? Referenced media cannot be removed.`,
+      )
+    )
+      return;
     setBusy(true);
     setErr(null);
     try {
@@ -1589,7 +1599,9 @@ function MediumsPanel() {
           onSelect={select}
           onNew={() => reset()}
           onRemove={removeMedium}
-          describe={(medium) => `${medium.gasThermodynamics ? "Gas model" : medium.phase} · ${f(medium.refTemperatureK, 1)} K`}
+          describe={(medium) =>
+            `${medium.gasThermodynamics ? "Gas model" : medium.phase} · ${f(medium.refTemperatureK, 1)} K`
+          }
           emptyText="No materials yet"
           busy={busy}
         />
@@ -1597,7 +1609,15 @@ function MediumsPanel() {
           ref={mediumDialog}
           aria-label="Medium editor"
           data-testid="medium-editor"
-          style={{ ...card, margin: "auto", width: "min(560px, calc(100vw - 32px))", maxHeight: "calc(100dvh - 48px)", overflowY: "auto", boxSizing: "border-box", color: C.text }}
+          style={{
+            ...card,
+            margin: "auto",
+            width: "min(560px, calc(100vw - 32px))",
+            maxHeight: "calc(100dvh - 48px)",
+            overflowY: "auto",
+            boxSizing: "border-box",
+            color: C.text,
+          }}
         >
           {err && <ErrorLine text={err} />}
           <div
@@ -1608,7 +1628,9 @@ function MediumsPanel() {
               gap: 10,
             }}
           >
-            <div style={label}>{selected ? "MEDIUM DETAILS" : "ADD MEDIUM"}</div>
+            <div style={label}>
+              {selected ? "MEDIUM DETAILS" : "ADD MEDIUM"}
+            </div>
             <button
               type="button"
               onClick={() => mediumDialog.current?.close()}
@@ -1632,16 +1654,23 @@ function MediumsPanel() {
             />
           )}
           {selected?.gasThermodynamics && (
-            <section aria-label="Gas material model" style={{ marginBlock: 12, fontSize: 13, color: C.text }}>
+            <section
+              aria-label="Gas material model"
+              style={{ marginBlock: 12, fontSize: 13, color: C.text }}
+            >
               <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <input
                   type="checkbox"
                   checked={!!form.gasThermodynamics}
                   disabled={busy}
-                  onChange={(event) => setForm((current) => ({
-                    ...current,
-                    gasThermodynamics: event.target.checked ? structuredClone(selected.gasThermodynamics) : null,
-                  }))}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      gasThermodynamics: event.target.checked
+                        ? structuredClone(selected.gasThermodynamics)
+                        : null,
+                    }))
+                  }
                 />
                 Use selected gas model
               </label>
@@ -1651,10 +1680,18 @@ function MediumsPanel() {
                   : "Saving will use the reference properties below instead of this gas model. Existing calculation snapshots stay unchanged."}
               </p>
               <details>
-                <summary style={{ cursor: "pointer" }}>Model source and temperature range</summary>
-                <p style={{ overflowWrap: "anywhere", lineHeight: 1.5 }}>{selected.gasThermodynamics.provenance}</p>
+                <summary style={{ cursor: "pointer" }}>
+                  Model source and temperature range
+                </summary>
+                <p style={{ overflowWrap: "anywhere", lineHeight: 1.5 }}>
+                  {selected.gasThermodynamics.provenance}
+                </p>
                 {selected.gasThermodynamics.nasa7 && (
-                  <p>{selected.gasThermodynamics.nasa7.minimum_temperature_k}–{selected.gasThermodynamics.nasa7.maximum_temperature_k} K · Temperature-dependent heat capacity</p>
+                  <p>
+                    {selected.gasThermodynamics.nasa7.minimum_temperature_k}–
+                    {selected.gasThermodynamics.nasa7.maximum_temperature_k} K ·
+                    Temperature-dependent heat capacity
+                  </p>
                 )}
               </details>
             </section>
@@ -2109,6 +2146,7 @@ const defaultSolverForm = (
   transientCycles: 10,
   transientDiscardFraction: 0.4,
   transientMaxCourant: DEFAULT_TRANSIENT_MAX_COURANT,
+  localTimeStepSmoothing: null,
 });
 const defaultSchedulingForm = (): SchedulingProfileInput => ({
   name: "",
@@ -2626,6 +2664,15 @@ function SimulationSetupPanel({
             message: "URANS discard must be from 0 to less than 1",
           },
       positiveIssue(solverForm.transientMaxCourant, "URANS max Co"),
+      solverForm.localTimeStepSmoothing == null ||
+      (Number.isFinite(solverForm.localTimeStepSmoothing) &&
+        solverForm.localTimeStepSmoothing >= 0 &&
+        solverForm.localTimeStepSmoothing <= 1)
+        ? null
+        : {
+            field: "Local steady step smoothing",
+            message: "Local steady step smoothing must be from 0 to 1",
+          },
     ]);
 
   const validateScheduling = () =>
@@ -3829,6 +3876,14 @@ function SimulationSetupPanel({
               error={issueFor(validationIssues, "URANS max Co")}
               onChange={(transientMaxCourant) =>
                 setSolverForm((f) => ({ ...f, transientMaxCourant }))
+              }
+            />
+            <OptionalNumberField
+              label="Local steady step smoothing"
+              value={solverForm.localTimeStepSmoothing}
+              error={issueFor(validationIssues, "Local steady step smoothing")}
+              onChange={(localTimeStepSmoothing) =>
+                setSolverForm((f) => ({ ...f, localTimeStepSmoothing }))
               }
             />
           </div>
