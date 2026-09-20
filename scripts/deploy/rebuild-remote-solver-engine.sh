@@ -261,7 +261,9 @@ WITH executable_jobs AS (
 ), activity AS (
   SELECT
     (SELECT count(*) FROM executable_jobs)::int AS live_jobs,
-    (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
+    (SELECT count(*) FROM sync_remote_result_deliveries
+      WHERE state = 'pushing'
+        AND (claim_expires_at IS NULL OR claim_expires_at > clock_timestamp()))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations WHERE state <> 'delivered')::int AS unsettled_cancellations,
     (SELECT count(*) FROM progressive_worker_archive_deliveries WHERE claim_expires_at > clock_timestamp())::int AS progressive_archive_claims,
     (SELECT count(*) FROM progressive_worker_archive_reclaims WHERE claim_expires_at > clock_timestamp() AND completed_at IS NULL)::int AS progressive_reclaim_claims,
@@ -313,8 +315,8 @@ remote_transfer_activity() {
 WITH activity AS (
   SELECT
     (SELECT count(*) FROM sync_remote_result_deliveries
-      WHERE state NOT IN ('delivered','superseded','blocked')
-        AND NOT (state = 'pushing' AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())))::int AS unsettled_deliveries,
+      WHERE state = 'pushing'
+        AND (claim_expires_at IS NULL OR claim_expires_at > clock_timestamp()))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations
       WHERE state <> 'delivered')::int AS unsettled_cancellations,
     (SELECT count(*) FROM progressive_worker_archive_deliveries
