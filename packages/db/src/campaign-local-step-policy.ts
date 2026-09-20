@@ -113,14 +113,25 @@ export async function adoptProgressiveLocalTimeStepPolicy(
           AND generation.plan_revision_id=${campaign.current_plan_revision_id}
           AND generation.status IN ('active','attention')
           AND ${eligibleLocalStepPolicySql()}
-          AND (unit.state='leased' OR EXISTS(
-            SELECT 1 FROM progressive_cfd_attempts attempt
-            LEFT JOIN sim_jobs job ON job.id=attempt.sim_job_id
-            LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
-            WHERE attempt.unit_id=unit.id AND (attempt.outcome='running'
-              OR job.status IN ('pending','submitted','running','ingesting')
-              OR (job.engine_job_id IS NOT NULL AND (stopped.engine_job_id IS DISTINCT FROM job.engine_job_id
-                OR stopped.epoch_id IS DISTINCT FROM generation.epoch_id)))))) AS present
+          AND (
+            (unit.state='leased' AND NOT EXISTS(
+              SELECT 1 FROM progressive_cfd_attempts unattempted
+              WHERE unattempted.unit_id=unit.id
+            ))
+            OR EXISTS(
+              SELECT 1 FROM progressive_cfd_attempts attempt
+              LEFT JOIN sim_jobs job ON job.id=attempt.sim_job_id
+              LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
+              WHERE attempt.unit_id=unit.id AND (
+                (attempt.outcome='running' AND (job.id IS NULL OR job.engine_job_id IS NULL))
+                OR job.status IN ('pending','submitted','running')
+                OR job.ingest_lease_expires_at > clock_timestamp()
+                OR (job.status='ingesting' AND job.engine_state NOT IN ('completed','failed','cancelled'))
+                OR (job.engine_job_id IS NOT NULL AND (stopped.engine_job_id IS DISTINCT FROM job.engine_job_id
+                  OR stopped.epoch_id IS DISTINCT FROM generation.epoch_id))
+              )
+            )
+          )) AS present
     `);
     if (busy?.present)
       throw new Error(

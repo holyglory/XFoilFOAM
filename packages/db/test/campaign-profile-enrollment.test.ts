@@ -819,6 +819,55 @@ describe("durable progressive scope requests", () => {
     await expect(materializeProgressiveCfdExecution(db, { ...high, recipe: { ...high.recipe, solver: { ...(high.recipe.solver as object), localTimeStepSmoothing: 0.5 } } })).rejects.toThrow("sealed scope");
   }, 30_000);
 
+  it("adopts the explicit local-step policy after an exact stopped job leaves only an expired ingest row", async () => {
+    const id = await campaign("active", [32.173, 900], [-2, 0]);
+    await db.execute(sql`DELETE FROM campaign_local_step_policies WHERE campaign_id=${id}`);
+    await reconcileProgressiveGenerationRequest(db);
+    for (let index = 0; index < 2; index++) {
+      const baseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    }
+    await initializeProgressiveCfdWork(db);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    const lease = (await claimProgressiveCfdUnit(db, {
+      owner: "settled-old-job",
+      leaseSeconds: 120,
+      allowedSolverFamilies: ["rhoCentralFoam"],
+      localTimeStepVersion: 1,
+    }))!;
+    const execution = await materializeProgressiveCfdExecution(db, lease);
+    const [pool] = await db
+      .select()
+      .from(solverExecutionPools)
+      .where(eq(solverExecutionPools.solverImplementationId, execution.revision.solverImplementationId!))
+      .limit(1);
+    await db.update(solverExecutionPools).set({ enabled: true }).where(eq(solverExecutionPools.id, pool.id));
+    await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+    let composed: Awaited<ReturnType<typeof composeProgressiveCfdJob>>;
+    try {
+      composed = await composeProgressiveCfdJob(db, [lease], {
+        cpuSlots: 1,
+        meshRecoveryVersion: 2,
+        solverBudgetVersion: 2,
+        localTimeStepVersion: 1,
+      });
+    } finally {
+      await db.update(solverExecutionPools).set({ enabled: pool.enabled }).where(eq(solverExecutionPools.id, pool.id));
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    }
+    const jobId = composed.jobId;
+    await db.execute(sql`UPDATE sim_jobs SET engine_job_id=${jobId},status='ingesting',engine_state='completed',ingest_lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=${jobId}`);
+    const proof = executionStopProof(jobId);
+    await db.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+      VALUES(${jobId},${jobId},${lease.epochId},${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())`);
+
+    const adopted = await adoptProgressiveLocalTimeStepPolicy(db, id);
+    expect(adopted.kind).toBe("adopted");
+    expect(await db.execute(sql`SELECT status,engine_state FROM sim_jobs WHERE id=${jobId}`)).toEqual([
+      { status: "ingesting", engine_state: "completed" },
+    ]);
+  }, 30_000);
+
   it("adopts the explicit local-step policy for completed campaign enrollment without replaying completed work", async () => {
     const id = await campaign("active", [900], [-2, 0, 2]);
     const initial = (await reconcileProgressiveGenerationRequest(db))!;
