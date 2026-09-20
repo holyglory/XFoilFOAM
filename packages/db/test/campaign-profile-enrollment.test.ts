@@ -6172,11 +6172,28 @@ describe("persistent progressive polar cache", () => {
     });
     const response = await fitUsingPython(request);
     expect(response.estimate.best_method).toBe("openfoam_fast");
-    await storeProgressivePolarFit(db, lease, request, response);
+    const publishedId = await storeProgressivePolarFit(
+      db,
+      lease,
+      request,
+      response,
+    );
+    await invalidateProgressiveFitPolicy(db, "isolated-pending-review-policy");
+    const [refreshing] = await db.execute(
+      sql`SELECT policy_refresh_model_id FROM progressive_polar_fit_work WHERE prediction_id=${fixture.predictionId}`,
+    );
+    expect(refreshing.policy_refresh_model_id).toBe(publishedId);
     const [review] = await db.execute(sql`
       INSERT INTO result_review_verdicts(result_id, verdict, reviewer)
       VALUES (${lease.source.evidence[0].resultId}, 'exclude', 'isolated-progressive-test') RETURNING id
     `);
+    const [invalidated] = await db.execute(
+      sql`SELECT model_id, policy_refresh_model_id FROM progressive_polar_fit_work WHERE prediction_id=${fixture.predictionId}`,
+    );
+    expect(invalidated).toMatchObject({
+      model_id: null,
+      policy_refresh_model_id: null,
+    });
     const excludedLease = (await fixture.acquire())!;
     expect(excludedLease.source.signature).not.toBe(lease.source.signature);
     expect(excludedLease.source.evidence[0].review?.verdict).toBe("exclude");
@@ -6242,9 +6259,20 @@ describe("persistent progressive polar cache", () => {
     );
     await storeProgressivePolarFit(db, lease, request, response);
     expect(await fixture.acquire()).toBeNull();
+    await invalidateProgressiveFitPolicy(
+      db,
+      "isolated-pending-classification-policy",
+    );
     await db.execute(
       sql`UPDATE result_classifications SET state = 'superseded_by_urans' WHERE id = ${classification.id}`,
     );
+    const [invalidated] = await db.execute(
+      sql`SELECT model_id, policy_refresh_model_id FROM progressive_polar_fit_work WHERE prediction_id=${fixture.predictionId}`,
+    );
+    expect(invalidated).toMatchObject({
+      model_id: null,
+      policy_refresh_model_id: null,
+    });
     const superseded = (await fixture.acquire())!;
     expect(
       buildProgressiveFitRequest(superseded).observations[0].exclusion_reason,
@@ -6412,6 +6440,108 @@ describe("persistent progressive polar cache", () => {
     await expect(
       storeProgressivePolarFit(db, lease, request, response),
     ).rejects.toThrow("Obsolete fitted polar calculation epoch");
+  }, 120_000);
+
+  it("keeps the same-evidence published curve visible through policy refresh and replaces it atomically", async () => {
+    const fixture = await fitFixture();
+    const evidence = await fixture.save(40);
+    await db
+      .update(resultAttempts)
+      .set({
+        evidencePayload: {
+          solver_active_seconds: 40,
+          cl: 0.4,
+          cd: 0.03,
+          cm: -0.02,
+          converged: true,
+        },
+      })
+      .where(eq(resultAttempts.id, evidence));
+    await fixture.record([evidence]);
+    const original = (await fixture.acquire())!;
+    const request = buildProgressiveFitRequest(original);
+    const response = await fitUsingPython(request);
+    const modelId = await storeProgressivePolarFit(
+      db,
+      original,
+      request,
+      response,
+    );
+    const readCurve = async () =>
+      (
+        await publicProgressivePolars(
+          db,
+          originalId,
+          fixture.leases[0].revisionId,
+        )
+      ).find((polar) => polar.targetId === original.source.targetId);
+    const published = await readCurve();
+    expect(published?.modelId).toBe(modelId);
+    expect(
+      await invalidateProgressiveFitPolicy(db, request.policy.policy_id),
+    ).toBe(0);
+    expect(
+      await invalidateProgressiveFitPolicy(db, "isolated-policy-replacement"),
+    ).toBe(1);
+    expect(await readCurve()).toEqual(published);
+    const superseded = (await fixture.acquire())!;
+    expect(
+      await invalidateProgressiveFitPolicy(db, "isolated-policy-replacement"),
+    ).toBe(0);
+    expect(
+      await invalidateProgressiveFitPolicy(
+        db,
+        "isolated-policy-replacement-next",
+      ),
+    ).toBe(1);
+    expect(
+      await failProgressivePolarFit(
+        db,
+        superseded,
+        "late superseded policy failure",
+      ),
+    ).toBe(false);
+    const replacement = (await fixture.acquire())!;
+    expect(await readCurve()).toEqual(published);
+    expect(replacement.source.signature).toBe(original.source.signature);
+    expect(replacement.sourceVersion).toBeGreaterThan(original.sourceVersion);
+    const nextRequest = buildProgressiveFitRequest(replacement);
+    const wrongResponse = await fitUsingPython(nextRequest);
+    await expect(
+      storeProgressivePolarFit(db, replacement, nextRequest, wrongResponse),
+    ).rejects.toThrow("requested refresh policy");
+    expect(await readCurve()).toEqual(published);
+    nextRequest.policy = {
+      ...nextRequest.policy,
+      policy_id: "isolated-policy-replacement-next",
+      correlation_length_deg: 2.5,
+    };
+    const nextResponse = await fitUsingPython(nextRequest);
+    const nextModelId = await storeProgressivePolarFit(
+      db,
+      replacement,
+      nextRequest,
+      nextResponse,
+    );
+    expect(nextModelId).not.toBe(modelId);
+    expect((await readCurve())?.modelId).toBe(nextModelId);
+    const [ready] = await db.execute(
+      sql`SELECT state, model_id, policy_refresh_model_id FROM progressive_polar_fit_work WHERE prediction_id=${fixture.predictionId}`,
+    );
+    expect(ready).toMatchObject({
+      state: "ready",
+      model_id: nextModelId,
+      policy_refresh_model_id: null,
+    });
+    await invalidateProgressiveFitPolicy(db, "isolated-next-policy");
+    await db.execute(
+      sql`DELETE FROM progressive_polar_model_evidence WHERE model_id=${nextModelId}`,
+    );
+    expect((await readCurve())?.kind).toBe("prediction");
+    const [invalidated] = await db.execute(
+      sql`SELECT policy_refresh_model_id FROM progressive_polar_fit_work WHERE prediction_id=${fixture.predictionId}`,
+    );
+    expect(invalidated.policy_refresh_model_id).toBeNull();
   }, 120_000);
 
   it("caps fit retries and prevents a stale worker from failing its replacement", async () => {

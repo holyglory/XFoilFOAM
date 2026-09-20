@@ -150,11 +150,14 @@ export async function invalidateProgressiveFitPolicy(
   const updated = await db.execute(sql`
     UPDATE progressive_polar_fit_work work SET source_version = work.source_version + 1,
       state = 'pending', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-      model_id = NULL, attempts = 0, error = NULL, updated_at = clock_timestamp()
+      policy_refresh_model_id = model.id, policy_refresh_policy_id = ${policyId}, model_id = NULL,
+      attempts = 0, error = NULL, updated_at = clock_timestamp()
     FROM progressive_polar_models model, neuralfoil_predictions prediction, calculation_epochs epoch
-    WHERE work.model_id = model.id AND prediction.id = work.prediction_id
-      AND epoch.id = prediction.epoch_id AND epoch.current AND work.state = 'ready'
-      AND model.response->'estimate'->>'policy_id' IS DISTINCT FROM ${policyId}
+    WHERE coalesce(work.model_id, work.policy_refresh_model_id) = model.id AND prediction.id = work.prediction_id
+      AND epoch.id = prediction.epoch_id AND epoch.current AND (
+        (work.state = 'ready' AND model.response->'estimate'->>'policy_id' IS DISTINCT FROM ${policyId})
+        OR (work.policy_refresh_model_id IS NOT NULL AND work.policy_refresh_policy_id IS DISTINCT FROM ${policyId})
+      )
     RETURNING work.prediction_id
   `);
   return updated.length;
@@ -223,7 +226,9 @@ export async function claimProgressivePolarFit(
       if (!(error instanceof ProgressiveFitSourceError)) throw error;
       await connection.execute(sql`
         UPDATE progressive_polar_fit_work SET state = 'gap', error = ${error.message},
-          lease_token = NULL, lease_owner = NULL, lease_until = NULL WHERE prediction_id = ${work.prediction_id}
+          policy_refresh_model_id = NULL, policy_refresh_policy_id = NULL,
+          lease_token = NULL, lease_owner = NULL,
+          lease_until = NULL WHERE prediction_id = ${work.prediction_id}
       `);
       return null;
     }
@@ -569,6 +574,11 @@ export async function storeProgressivePolarFit(
       !work.lease_live
     )
       throw new Error("Obsolete or expired fitted polar lease");
+    if (
+      work.policy_refresh_policy_id != null &&
+      work.policy_refresh_policy_id !== request.policy.policy_id
+    )
+      throw new Error("Fitted polar does not use its requested refresh policy");
     const current = await sourceForPrediction(connection, lease.predictionId);
     if (current.signature !== lease.source.signature)
       throw new Error("Fitted polar evidence changed during calculation");
@@ -595,7 +605,8 @@ export async function storeProgressivePolarFit(
       `);
     }
     await connection.execute(sql`
-      UPDATE progressive_polar_fit_work SET state = 'ready', model_id = ${id}, error = NULL,
+      UPDATE progressive_polar_fit_work SET state = 'ready', model_id = ${id},
+        policy_refresh_model_id = NULL, policy_refresh_policy_id = NULL, error = NULL,
         lease_token = NULL, lease_owner = NULL, lease_until = NULL, updated_at = clock_timestamp()
       WHERE prediction_id = ${lease.predictionId}
     `);

@@ -496,6 +496,15 @@ content-versioned. Its error floors are working assumptions, not measured solver
 accuracy or a conversion of NeuralFoil confidence into physical uncertainty.
 Displayed intervals remain conditional on that policy. A changed policy queues
 replacement models rather than silently treating an older fit as current.
+An assumptions-only refresh retains a separate reference to the last model whose
+evidence is unchanged, together with the requested replacement policy. Public
+curves and catalog metrics use that same model, with its original timestamp and
+provenance, until replacement commits atomically. Internal stage admission still
+requires a ready fit. Repeated requests for the same pending policy do not reset
+bounded retries; a different policy supersedes the earlier lease explicitly.
+Any source-evidence, classification, review, or interpretation change clears this
+display reference immediately, as does a source-integrity failure. Ordinary
+pending work never inherits a model through this policy-only path.
 The offline held-out evaluator accepts the same history reduction policy and
 bounded joint histories as live fitting. Version-2 measurements retain the
 contributing time windows and rejected sources alongside coverage and interval

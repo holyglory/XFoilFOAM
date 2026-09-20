@@ -1100,6 +1100,13 @@
       "when": 1792368000050,
       "tag": "0156_progressive_attempt_storage_bound",
       "breakpoints": true
+    },
+    {
+      "idx": 157,
+      "version": "7",
+      "when": 1792368000051,
+      "tag": "0157_progressive_policy_refresh_display",
+      "breakpoints": true
     }
   ]
 }

@@ -8341,6 +8341,11 @@ export const progressivePolarFitWork = pgTable(
     modelId: text("model_id").references(() => progressivePolarModels.id, {
       onDelete: "set null",
     }),
+    policyRefreshModelId: text("policy_refresh_model_id").references(
+      () => progressivePolarModels.id,
+      { onDelete: "set null" },
+    ),
+    policyRefreshPolicyId: text("policy_refresh_policy_id"),
     error: text("error"),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
@@ -8350,6 +8355,10 @@ export const progressivePolarFitWork = pgTable(
     pendingIdx: index("progressive_polar_fit_work_pending_idx").on(
       table.state,
       table.updatedAt,
+    ),
+    policyRefreshPointerCheck: check(
+      "progressive_fit_policy_refresh_pointer_check",
+      sql`${table.policyRefreshModelId} IS NULL OR (${table.state} <> 'ready' AND ${table.modelId} IS NULL AND ${table.policyRefreshPolicyId} IS NOT NULL AND length(trim(${table.policyRefreshPolicyId})) > 0)`,
     ),
   }),
 );

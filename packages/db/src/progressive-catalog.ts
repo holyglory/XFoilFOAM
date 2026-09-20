@@ -50,8 +50,9 @@ function latestCatalogCurves(airfoilIds?: string[], groupId?: string) {
     JOIN calculation_epochs epoch ON epoch.id = prediction.epoch_id AND epoch.current
     JOIN polar_analysis_targets target ON target.id = prediction.target_id
     JOIN airfoils airfoil ON airfoil.id = target.airfoil_id
-    LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = prediction.id AND fit.state = 'ready'
-    LEFT JOIN progressive_polar_models model ON model.id = fit.model_id AND model.prediction_id = prediction.id
+    LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = prediction.id
+    LEFT JOIN progressive_polar_models model ON model.id = CASE WHEN fit.state = 'ready'
+      THEN fit.model_id ELSE fit.policy_refresh_model_id END AND model.prediction_id = prediction.id
     WHERE airfoil."deletedAt" IS NULL AND airfoil."archivedAt" IS NULL
       AND ${
         airfoilIds

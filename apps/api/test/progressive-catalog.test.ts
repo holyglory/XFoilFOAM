@@ -8,6 +8,11 @@ import {
   publicProgressiveConditions,
 } from "@aerodb/db/progressive-catalog";
 import { publicProgressivePolars } from "@aerodb/db/progressive-public";
+import {
+  claimProgressivePolarFit,
+  failProgressivePolarFit,
+  invalidateProgressiveFitPolicy,
+} from "@aerodb/db/progressive-polar-cache";
 import { createMinimalSolverFixture } from "../../../packages/db/test/solver-fixture";
 import { simJobs } from "@aerodb/db";
 
@@ -400,8 +405,93 @@ async function verifyPublicCatalog(fullScale: boolean) {
           modelId,
           targetId: first.targetId,
         });
+        const published = (
+          await publicProgressivePolars(connection, profiles[0])
+        ).find((polar) => polar.targetId === first.targetId)!;
+        for (const policyId of [null, "", "  "]) {
+          await expect(
+            connection.transaction(async (savepoint) => {
+              await savepoint.execute(sql`UPDATE progressive_polar_fit_work SET state='pending',
+              model_id=NULL, policy_refresh_model_id=${modelId}, policy_refresh_policy_id=${policyId}
+              WHERE prediction_id=${first.predictionId}`);
+            }),
+          ).rejects.toThrow("progressive_fit_policy_refresh_pointer_check");
+        }
+        expect(
+          await invalidateProgressiveFitPolicy(
+            connection,
+            "test-policy-refresh",
+          ),
+        ).toBe(1);
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const lease = await claimProgressivePolarFit(connection, {
+            predictionId: first.predictionId,
+            owner: "isolated-catalog-policy-refresh",
+            leaseSeconds: 120,
+          });
+          expect(lease).not.toBeNull();
+          expect(
+            (await publicProgressivePolars(connection, profiles[0])).find(
+              (polar) => polar.targetId === first.targetId,
+            ),
+          ).toEqual(published);
+          expect(
+            (
+              await publicProgressiveCatalog(
+                connection,
+                profiles,
+                firstCondition.key,
+              )
+            ).metrics.get(profiles[0]),
+          ).toMatchObject({ ldmax: 20, source: "estimate", modelId });
+          expect(
+            await failProgressivePolarFit(
+              connection,
+              lease!,
+              "isolated temporary failure",
+            ),
+          ).toBe(true);
+        }
+        expect(
+          (
+            await publicProgressiveCatalog(
+              connection,
+              profiles,
+              firstCondition.key,
+            )
+          ).metrics.get(profiles[0]),
+        ).toMatchObject({ ldmax: 20, source: "estimate", modelId });
+        expect(
+          await invalidateProgressiveFitPolicy(
+            connection,
+            "test-policy-refresh",
+          ),
+        ).toBe(0);
+        expect(
+          await invalidateProgressiveFitPolicy(
+            connection,
+            "test-policy-refresh-next",
+          ),
+        ).toBe(1);
+        expect(
+          (
+            await publicProgressiveCatalog(
+              connection,
+              profiles,
+              firstCondition.key,
+            )
+          ).metrics.get(profiles[0]),
+        ).toMatchObject({ ldmax: 20, source: "estimate", modelId });
         await connection.execute(
-          sql`UPDATE progressive_polar_fit_work SET state='pending' WHERE prediction_id=${first.predictionId}`,
+          sql`SELECT invalidate_progressive_polar_target(${first.targetId}, ${epoch.id})`,
+        );
+        expect(
+          (await publicProgressivePolars(connection, profiles[0])).find(
+            (polar) => polar.targetId === first.targetId,
+          )?.kind,
+        ).toBe("prediction");
+        await connection.execute(
+          sql`UPDATE progressive_polar_fit_work SET state='pending', model_id=${modelId} WHERE prediction_id=${first.predictionId}`,
         );
         expect(
           (
