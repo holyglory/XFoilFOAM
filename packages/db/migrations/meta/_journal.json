@@ -1114,6 +1114,13 @@
       "when": 1792368000052,
       "tag": "0158_local_time_step_smoothing",
       "breakpoints": true
+    },
+    {
+      "idx": 159,
+      "version": "7",
+      "when": 1792368000053,
+      "tag": "0159_campaign_local_step_policies",
+      "breakpoints": true
     }
   ]
 }

@@ -11,6 +11,7 @@ import {
 } from "./analysis-target";
 import { legacyBoundaryValuesFromSnapshot } from "./campaigns";
 import type { DB } from "./client";
+import { localStepRecipeSql } from "./campaign-local-step-policy";
 import type { ProgressiveCfdLease } from "./progressive-cfd";
 import {
   boundaryConditions,
@@ -64,7 +65,9 @@ export async function lockProgressiveCfdExecution(
   if (!campaign || !["active", "attention"].includes(String(campaign.status)))
     throw new Error("Campaign does not admit new CFD execution");
   const [unit] = await db.execute(sql`
-    SELECT coalesce(recovery.recipe, unit.recipe) AS recipe, recovery.id AS recovery_plan_id,
+    SELECT coalesce(recovery.recipe, CASE WHEN local_policy.id IS NOT NULL
+      THEN ${localStepRecipeSql(sql`unit.recipe`, sql`local_policy.smoothing`)} END, unit.recipe) AS recipe,
+      local_policy.id AS local_step_policy_id, recovery.id AS recovery_plan_id,
       recovery.parent_job_id AS recovery_parent_job_id, target.physical, scope.revision_id, attempt.sim_job_id, attempt.execution_recipe_id,
       unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
     FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
@@ -74,6 +77,9 @@ export async function lockProgressiveCfdExecution(
     JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
     LEFT JOIN progressive_cfd_recovery_claims recovery_claim ON recovery_claim.attempt_token = attempt.token
     LEFT JOIN progressive_cfd_recovery_plans recovery ON recovery.id = recovery_claim.recovery_plan_id AND recovery.unit_id = unit.id
+    LEFT JOIN progressive_cfd_local_step_claims local_claim ON local_claim.attempt_token=attempt.token
+    LEFT JOIN campaign_local_step_policies local_policy ON local_policy.id=local_claim.policy_id
+      AND local_policy.campaign_id=generation.campaign_id AND local_policy.plan_revision_id=generation.plan_revision_id
     WHERE unit.id = ${lease.id} AND unit.work_id = ${lease.workId} AND unit.aoa_deg = ${lease.alpha}
       AND unit.state = 'leased' AND unit.lease_token = ${lease.token} AND unit.lease_owner = ${lease.owner}
       AND unit.lease_until > clock_timestamp() AND attempt.outcome = 'running'
@@ -91,6 +97,7 @@ export async function lockProgressiveCfdExecution(
     throw new Error("CFD lease budget differs from its remaining allocation");
   if (
     (unit.recovery_plan_id ?? null) !== (lease.recoveryPlanId ?? null) ||
+    (unit.local_step_policy_id ?? null) !== (lease.localStepPolicyId ?? null) ||
     (unit.recovery_parent_job_id ?? null) !==
       (lease.recoveryParentJobId ?? null) ||
     canonicalAnalysisJson(unit.recipe) !==

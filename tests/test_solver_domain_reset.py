@@ -51,6 +51,17 @@ def test_archive_reclaim_queue_is_disposable_without_widening_configuration_dele
     )
 
 
+def test_numerical_policy_survives_solver_reset_but_attempt_claims_do_not():
+    configuration, solver = RESET["classify_tables"]([
+        *recognized_tables(), {"schema": "public", "name": "campaign_local_step_policies"},
+        {"schema": "public", "name": "progressive_cfd_local_step_claims"},
+    ])
+    assert "campaign_local_step_policies" in configuration
+    assert solver == ["progressive_cfd_local_step_claims"]
+    with pytest.raises(ValueError, match="explicit solver domain"):
+        RESET["truncate_statement"](["campaign_local_step_policies"])
+
+
 def test_preserved_foreign_keys_cannot_retain_solver_dependencies():
     with pytest.raises(ValueError, match="Configuration depends"):
         RESET["validate_foreign_keys"]([{"source": "sim_campaigns", "target": "results"}], ["sim_campaigns"])

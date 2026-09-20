@@ -12,10 +12,8 @@ import {
   storeRepairedPrediction,
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
-import {
-  adoptProgressiveLocalTimeStepPolicy,
-  adoptProgressiveWallPolicy,
-} from "../src/progressive-recipe-adoption";
+import { adoptProgressiveWallPolicy } from "../src/progressive-recipe-adoption";
+import { adoptProgressiveLocalTimeStepPolicy, inheritLocalStepPolicy } from "../src/campaign-local-step-policy";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -744,53 +742,6 @@ describe("durable progressive scope requests", () => {
     expect(cancelled.state).toBe("cancelled");
   }, 30_000);
 
-  it("adopts the explicit local-step policy for existing and newly enrolled profiles", async () => {
-    const id = await campaign("active", [900], [-2, 0, 2, 4]);
-    const initial = (await reconcileProgressiveGenerationRequest(db))!;
-    const [before] = await db.execute(sql`
-      SELECT recipes FROM progressive_generation_targets
-      WHERE generation_id=${initial.generationId}
-    `);
-    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
-    try {
-      const adopted = await adoptProgressiveLocalTimeStepPolicy(db, id, 0.2);
-      expect(adopted.kind).toBe("adopted");
-      const [after] = await db.execute(sql`
-        SELECT recipes FROM progressive_generation_targets
-        WHERE generation_id=${adopted.generation_id}
-      `);
-      expect(after.recipes).toMatchObject({
-        fast: {
-          recipe_id: "openfoam-fast-density-local-v2",
-          solver: { localTimeStepSmoothing: 0.2 },
-        },
-      });
-      expect(before.recipes).toMatchObject({
-        fast: { recipe_id: "openfoam-fast-density-local-v1" },
-      });
-      expect(
-        await adoptProgressiveLocalTimeStepPolicy(db, id, 0.2),
-      ).toMatchObject({ kind: "replayed", generation_id: adopted.generation_id });
-
-      const added = await newProfile();
-      await reconcileCampaignProfileEnrollment(db);
-      const enrolled = (await reconcileProgressiveGenerationRequest(db))!;
-      const [newTarget] = await db.execute(sql`
-        SELECT scope.recipes FROM progressive_generation_targets scope
-        JOIN polar_analysis_targets target ON target.id=scope.target_id
-        WHERE scope.generation_id=${enrolled.generationId} AND target.airfoil_id=${added}
-      `);
-      expect(newTarget.recipes).toMatchObject({
-        fast: {
-          recipe_id: "openfoam-fast-density-local-v2",
-          solver: { localTimeStepSmoothing: 0.2 },
-        },
-      });
-    } finally {
-      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
-    }
-  }, 30_000);
-
   it("coalesces concurrent requests without duplicate generations", async () => {
     const id = await campaign();
     const receipts = await Promise.all([
@@ -802,6 +753,132 @@ describe("durable progressive scope requests", () => {
       sql`SELECT count(*)::int AS count FROM progressive_generations WHERE campaign_id = ${id}`,
     );
     expect(count.count).toBe(1);
+  });
+
+  it("adopts the explicit local-step policy without changing current work or legacy attempts", async () => {
+    const id = await campaign("active", [32.173, 900], [-2, 0, 2, 4]);
+    await db.execute(sql`DELETE FROM campaign_local_step_policies WHERE campaign_id=${id}`);
+    await reconcileProgressiveGenerationRequest(db);
+    for (let index = 0; index < 2; index++) {
+      const baseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    }
+    await initializeProgressiveCfdWork(db);
+    const low = await claimProgressiveCfdUnit(db, { owner: "unchanged-low-mach", leaseSeconds: 120, allowedSolverFamilies: ["simpleFoam", "rhoSimpleFoam"] });
+    expect(low).toBeTruthy();
+    const lowExecution = await materializeProgressiveCfdExecution(db, low!);
+    const [pool] = await db.select().from(solverExecutionPools).where(eq(solverExecutionPools.solverImplementationId, lowExecution.revision.solverImplementationId!));
+    await db.update(solverExecutionPools).set({ enabled: true }).where(eq(solverExecutionPools.id, pool.id));
+    await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+    let lowJob: Awaited<ReturnType<typeof composeProgressiveCfdJob>>;
+    try {
+      lowJob = await composeProgressiveCfdJob(db, [low!], { cpuSlots: 1, meshRecoveryVersion: 2, solverBudgetVersion: 2 });
+    } finally {
+      await db.update(solverExecutionPools).set({ enabled: pool.enabled }).where(eq(solverExecutionPools.id, pool.id));
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    }
+    await heartbeatProgressiveCfdUnit(db, low!, { attemptActiveSeconds: 120, leaseSeconds: 120 });
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    const snapshot = () => db.execute(sql`
+      SELECT jsonb_build_object('generation',to_jsonb(generation),'work',to_jsonb(work),'unit',to_jsonb(unit)) AS value
+      FROM progressive_generations generation JOIN progressive_work work ON work.generation_id=generation.id
+      LEFT JOIN progressive_cfd_units unit ON unit.work_id=work.id
+      WHERE generation.campaign_id=${id} ORDER BY generation.id,work.id,unit.id
+    `);
+    const before = await snapshot();
+    const beforeRequest = await db.execute(sql`SELECT request_payload FROM sim_jobs WHERE id=${lowJob.jobId}`);
+    const beforePredictions = await db.execute(sql`SELECT prediction.* FROM neuralfoil_predictions prediction
+      JOIN progressive_prediction_links link ON link.prediction_id=prediction.id
+      JOIN progressive_work work ON work.id=link.work_id
+      JOIN progressive_generations generation ON generation.id=work.generation_id
+      WHERE generation.campaign_id=${id} ORDER BY prediction.id`);
+    const rollback = new Error("isolated-numerical-policy-dry-run");
+    await expect(db.transaction(async (transaction) => {
+      expect((await adoptProgressiveLocalTimeStepPolicy(transaction as unknown as DB, id)).kind).toBe("adopted");
+      throw rollback;
+    })).rejects.toBe(rollback);
+    expect(await db.execute(sql`SELECT id FROM campaign_local_step_policies WHERE campaign_id=${id}`)).toHaveLength(0);
+    const adopted = await adoptProgressiveLocalTimeStepPolicy(db, id);
+    expect(adopted.kind).toBe("adopted");
+    expect(await adoptProgressiveLocalTimeStepPolicy(db, id)).toEqual({ ...adopted, kind: "replayed" });
+    expect(await snapshot()).toEqual(before);
+    expect(await db.execute(sql`SELECT request_payload FROM sim_jobs WHERE id=${lowJob.jobId}`)).toEqual(beforeRequest);
+    expect(await db.execute(sql`SELECT prediction.* FROM neuralfoil_predictions prediction
+      JOIN progressive_prediction_links link ON link.prediction_id=prediction.id
+      JOIN progressive_work work ON work.id=link.work_id
+      JOIN progressive_generations generation ON generation.id=work.generation_id
+      WHERE generation.campaign_id=${id} ORDER BY prediction.id`)).toEqual(beforePredictions);
+    expect(await claimProgressiveCfdUnit(db, { owner: "old-engine", leaseSeconds: 120, allowedSolverFamilies: ["rhoCentralFoam"] })).toBeNull();
+    const high = (await claimProgressiveCfdUnit(db, { owner: "new-engine", leaseSeconds: 120, allowedSolverFamilies: ["rhoCentralFoam"], localTimeStepVersion: 1 }))!;
+    expect(high).toMatchObject({ localStepPolicyId: adopted.policyId, recipe: { solver: { localTimeStepSmoothing: 0.2 } } });
+    const resolved = await materializeProgressiveCfdExecution(db, high);
+    expect(resolved.snapshot.solver.localTimeStepSmoothing).toBe(0.2);
+    await expect(adoptProgressiveLocalTimeStepPolicy(db, id, 0.5)).rejects.toThrow("physically stopped and settled");
+    expect((await materializeProgressiveCfdExecution(db, low!)).snapshot.solver.localTimeStepSmoothing).toBeUndefined();
+    await expect(materializeProgressiveCfdExecution(db, { ...high, localStepPolicyId: randomUUID() })).rejects.toThrow("sealed scope");
+    await expect(materializeProgressiveCfdExecution(db, { ...high, recipe: { ...high.recipe, solver: { ...(high.recipe.solver as object), localTimeStepSmoothing: 0.5 } } })).rejects.toThrow("sealed scope");
+  }, 30_000);
+
+  it("adopts the explicit local-step policy for completed campaign enrollment without replaying completed work", async () => {
+    const id = await campaign("active", [900], [-2, 0, 2]);
+    const initial = (await reconcileProgressiveGenerationRequest(db))!;
+    const [policy] = await db.execute(sql`SELECT id,smoothing,source FROM campaign_local_step_policies WHERE campaign_id=${id}`);
+    expect(policy).toMatchObject({ smoothing: 0.2, source: "default" });
+    await db.execute(sql`UPDATE progressive_generations SET status='complete' WHERE id=${initial.generationId}`);
+    await db.update(simCampaigns).set({ status: "completed" }).where(eq(simCampaigns.id, id));
+    const original = await db.execute(sql`SELECT * FROM progressive_generation_targets WHERE generation_id=${initial.generationId} ORDER BY target_id`);
+    const added = await newProfile();
+    await reconcileCampaignProfileEnrollment(db);
+    const expanded = (await reconcileProgressiveGenerationRequest(db))!;
+    const baseline = (await claim([1]))!;
+    expect(baseline.generationId).toBe(expanded.generationId);
+    expect(baseline.physical.airfoilId).toBe(added);
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await initializeProgressiveCfdWork(db);
+    const lease = (await claimProgressiveCfdUnit(db, { owner: "new-profile", leaseSeconds: 120, localTimeStepVersion: 1 }))!;
+    expect(lease.generationId).toBe(expanded.generationId);
+    expect(lease.recipe).toMatchObject({ solver: { localTimeStepSmoothing: 0.2 } });
+    expect(lease.localStepPolicyId).toBe(policy.id);
+    expect(await db.execute(sql`SELECT * FROM progressive_generation_targets WHERE generation_id=${initial.generationId} ORDER BY target_id`)).toEqual(original);
+  }, 30_000);
+
+  it("adopts the explicit local-step policy only with typed inputs and permitted campaign state", async () => {
+    const id = await campaign("active", [900]);
+    await db.execute(sql`DELETE FROM campaign_local_step_policies WHERE campaign_id=${id}`);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+    await expect(adoptProgressiveLocalTimeStepPolicy(db, id)).rejects.toThrow("Pause new solver admissions");
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    for (const value of [true, "0.2", NaN, Infinity, -1, 1.01])
+      await expect(adoptProgressiveLocalTimeStepPolicy(db, id, value as number)).rejects.toThrow("finite smoothing");
+    for (const status of ["cancelled", "archived"]) {
+      await db.update(simCampaigns).set({ status }).where(eq(simCampaigns.id, id));
+      await expect(adoptProgressiveLocalTimeStepPolicy(db, id)).rejects.toThrow("unavailable");
+    }
+    await db.update(simCampaigns).set({ status: "paused" }).where(eq(simCampaigns.id, id));
+    expect((await adoptProgressiveLocalTimeStepPolicy(db, id)).kind).toBe("adopted");
+    const [campaignState] = await db.execute(sql`SELECT status FROM sim_campaigns WHERE id=${id}`);
+    expect(campaignState.status).toBe("paused");
+  });
+
+  it("adopts the explicit local-step policy through plan inheritance and a fresh calculation epoch", async () => {
+    const id = await campaign("active", [900]);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    const adopted = await adoptProgressiveLocalTimeStepPolicy(db, id, 0.5);
+    const [original] = await db.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`);
+    const [next] = await db.execute(sql`
+      INSERT INTO sim_campaign_plan_revisions(campaign_id,revision_number,kind,plan,summary)
+      SELECT campaign_id,revision_number+1,'edit',plan,summary FROM sim_campaign_plan_revisions
+      WHERE id=${original.current_plan_revision_id} RETURNING id
+    `);
+    await db.execute(sql`UPDATE sim_campaigns SET current_plan_revision_id=${next.id} WHERE id=${id}`);
+    await inheritLocalStepPolicy(db,id,String(original.current_plan_revision_id),String(next.id));
+    await inheritLocalStepPolicy(db,id,String(original.current_plan_revision_id),String(next.id));
+    const inherited = await db.execute(sql`SELECT id,smoothing,source FROM campaign_local_step_policies WHERE plan_revision_id=${next.id}`);
+    expect(inherited).toHaveLength(1);
+    expect(inherited[0]).toMatchObject({ smoothing: 0.5, source: "inherited" });
+    expect(inherited[0].id).not.toBe(adopted.policyId);
+    await rotateCalculationEpoch(db,"isolated local-step preservation fixture");
+    expect(await db.execute(sql`SELECT id,smoothing,source FROM campaign_local_step_policies WHERE plan_revision_id=${next.id}`)).toEqual(inherited);
   });
 
   it("keeps paused work sealed but dormant and inactive campaigns dormant until reactivation", async () => {
@@ -1072,7 +1149,7 @@ const claim = (stages: (1 | 2 | 3)[] = [1, 2, 3]) =>
   });
 
 const claimCfd = () =>
-  claimProgressiveCfdUnit(db, { owner: "isolated-cfd", leaseSeconds: 120 });
+  claimProgressiveCfdUnit(db, { owner: "isolated-cfd", leaseSeconds: 120, localTimeStepVersion: 1 });
 
 async function fastCfdGeneration(twoProfiles = false) {
   const id = await campaign();
@@ -1136,6 +1213,7 @@ async function cfdEvidenceFixture(
     owner: "evidence-fixture",
     leaseSeconds: 120,
     solverBudgetVersion: 2,
+    localTimeStepVersion: 1,
   });
   const execution = await materializeProgressiveCfdExecution(db, leases[0]);
   const [pool] = await db
@@ -1162,6 +1240,7 @@ async function cfdEvidenceFixture(
       cpuSlots: 1,
       meshRecoveryVersion: 1,
       solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
     });
   } finally {
     await db
@@ -3318,6 +3397,7 @@ describe("progressive CPU admission", () => {
             solverBudgetVersion: 2,
             meshRecoveryVersion: 1,
             uransRecoveryVersion,
+            localTimeStepVersion: 1,
           }),
         ).toMatchObject({ kind: "attempted", outcome: { kind: "submitted" } });
         expect(submit).toHaveBeenCalledTimes(1);
@@ -7261,9 +7341,7 @@ describe("durable progressive CFD units", () => {
         selection: { solver: "rhoCentralFoam" },
       });
       const execution = await materializeProgressiveCfdExecution(db, leases[0]);
-      expect(execution.snapshot.solver.localTimeStepSmoothing ?? null).toBe(
-        smoothing,
-      );
+      expect(execution.snapshot.solver.localTimeStepSmoothing).toBe(smoothing ?? 0.2);
       if (smoothing != null) {
         const recovered = progressiveUnsteadyRecipe(
           leases[0].recipe,
@@ -7310,12 +7388,8 @@ describe("durable progressive CFD units", () => {
           cpuSlots: 1,
           meshRecoveryVersion: 2,
         });
-        expect(composed.request.solver?.local_time_step_smoothing ?? null).toBe(
-          smoothing,
-        );
-        expect(composed.request.expected_local_time_step_version).toBe(
-          smoothing == null ? undefined : 1,
-        );
+      expect(composed.request.solver?.local_time_step_smoothing).toBe(smoothing ?? 0.2);
+      expect(composed.request.expected_local_time_step_version).toBe(1);
         expect(composed.request.solver).toMatchObject({
           flow_solver_family: "rhoCentralFoam",
           force_transient: false,

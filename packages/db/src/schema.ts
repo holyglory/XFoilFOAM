@@ -7549,6 +7549,33 @@ export const progressiveCfdExecutionRecipes = pgTable(
   }),
 );
 
+export const campaignLocalStepPolicies = pgTable(
+  "campaign_local_step_policies",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sequence: bigint("sequence", { mode: "number" }).generatedAlwaysAsIdentity().notNull().unique(),
+    campaignId: uuid("campaign_id").notNull().references(() => simCampaigns.id, { onDelete: "cascade" }),
+    planRevisionId: uuid("plan_revision_id").notNull().references(() => simCampaignPlanRevisions.id, { onDelete: "cascade" }),
+    smoothing: doublePrecision("smoothing").notNull(),
+    source: text("source").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    currentIdx: index("campaign_local_step_policies_current_idx").on(table.campaignId, table.planRevisionId, table.sequence.desc()),
+    smoothingCheck: check("campaign_local_step_policies_smoothing_check", sql`${table.smoothing} BETWEEN 0 AND 1`),
+    sourceCheck: check("campaign_local_step_policies_source_check", sql`${table.source} IN ('default','adopted','inherited')`),
+  }),
+);
+
+export const progressiveCfdLocalStepClaims = pgTable(
+  "progressive_cfd_local_step_claims",
+  {
+    attemptToken: uuid("attempt_token").primaryKey().references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    policyId: uuid("policy_id").notNull().references(() => campaignLocalStepPolicies.id),
+  },
+  (table) => ({ policyIdx: index("progressive_cfd_local_step_claims_policy_idx").on(table.policyId) }),
+);
+
 export const progressiveCfdRuntimeProgress = pgTable(
   "progressive_cfd_runtime_progress",
   {

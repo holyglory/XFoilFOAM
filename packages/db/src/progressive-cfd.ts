@@ -12,6 +12,10 @@ import {
 } from "./analysis-target";
 import type { DB } from "./client";
 import {
+  currentLocalStepPolicySql,
+  localStepRecipeSql,
+} from "./campaign-local-step-policy";
+import {
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
@@ -49,6 +53,7 @@ export interface ProgressiveCfdLease {
   remainingActiveSeconds: number;
   recoveryPlanId?: string | null;
   recoveryParentJobId?: string | null;
+  localStepPolicyId?: string | null;
 }
 
 export async function initializeProgressiveCfdWork(db: DB): Promise<number> {
@@ -196,7 +201,9 @@ export async function claimProgressiveCfdUnit(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
-    const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1), unit.recipe)`;
+    const localStepPolicy = currentLocalStepPolicySql();
+    const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
+      (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
     const recoveryParent = sql`(SELECT recovery.parent_job_id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1)`;
     const recoveryOwner = input.remoteSolverId
       ? sql`(${recoveryParent} IS NULL OR EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = ${recoveryParent} AND dispatch.solver_id = ${input.remoteSolverId}::uuid))`
@@ -308,6 +315,7 @@ export async function claimProgressiveCfdUnit(
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
         work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
+        (${localStepPolicy}) AS local_step_policy_id,
         ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
         unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
       FROM selected JOIN progressive_cfd_units unit ON unit.id = selected.id
@@ -327,6 +335,7 @@ export async function claimProgressiveCfdUnit(
       physical: AnalysisPhysical;
       remaining_active_seconds: number;
       recovery_plan_id: string | null;
+      local_step_policy_id: string | null;
       recovery_parent_job_id: string | null;
       publication_recovery: boolean;
     }>;
@@ -346,6 +355,11 @@ export async function claimProgressiveCfdUnit(
       await connection.execute(sql`
         INSERT INTO progressive_cfd_recovery_claims (attempt_token, recovery_plan_id)
         VALUES (${token}, ${unit.recovery_plan_id})
+      `);
+    if (unit.local_step_policy_id)
+      await connection.execute(sql`
+        INSERT INTO progressive_cfd_local_step_claims(attempt_token,policy_id)
+        VALUES(${token},${unit.local_step_policy_id})
       `);
     if (unit.publication_recovery)
       await connection.execute(sql`INSERT INTO progressive_publication_recovery_claims(unit_id,attempt_token)
@@ -367,6 +381,7 @@ export async function claimProgressiveCfdUnit(
       remainingActiveSeconds: unit.remaining_active_seconds,
       recoveryPlanId: unit.recovery_plan_id,
       recoveryParentJobId: unit.recovery_parent_job_id,
+      localStepPolicyId: unit.local_step_policy_id,
     };
   });
 }

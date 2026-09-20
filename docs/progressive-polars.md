@@ -611,15 +611,26 @@ The option alone does not change existing sealed campaign recipes. It does not
 increase the Courant ceiling, iteration/time allocation, thermodynamic bounds or
 convergence tolerance, and numerical convergence is not physical validation.
 
-For an existing active preliminary campaign, the reviewed operator command
-`adopt-progressive-local-time-step CAMPAIGN_UUID 0.2 --dry-run` previews a
-transactional successor generation. Applying it requires admissions paused,
-settled old work and no precise generation; accepted NeuralFoil baselines are
-reused only after exact validation. The old generation and evidence remain
-immutable. The adoption record also makes later automatic profile enrollment
-use the same explicit setting. Completed/paused/cancelled/archived campaigns
-remain dormant until their normal lifecycle permits work; no campaign is
-silently rewritten by changing a reusable profile.
+New campaigns record an explicit fast local-step policy: the selected profile's
+value, or 0.2 when it is unspecified. Existing campaigns do not receive this
+default silently. The operator command
+`adopt-progressive-local-time-step CAMPAIGN_UUID 0.2 --dry-run` previews an
+append-only policy record; `--apply` requires admissions paused and affected
+attempts physically stopped and settled. It changes no generation, completed
+calculation, evidence, prediction, curve, attempt count or time budget. Unrelated
+low-Mach work and unsteady recovery remain untouched.
+
+Each future eligible fast density-solver attempt pins the exact policy record
+when leased. Job materialization reads that immutable claim rather than the
+latest policy, so a later policy change cannot retarget an older request.
+Numerical recovery derives from the actual executed recipe and removes this
+local-steady setting before physical-time URANS. Normal plan edits inherit the
+policy; selecting a different solver profile resolves its explicit value or the
+new-campaign default. Later profile enrollment, including completed campaigns,
+uses the policy without replaying previously completed work. Cancelled/archived
+campaigns cannot adopt a new policy, and adopting on a paused campaign does not
+resume it. Numerical policies are preserved configuration during a solver reset;
+individual execution claims remain disposable solver data.
 
 Every density-based cold angle clears only mutable time, processor and
 postprocessing directories before writing its own initial state. The shared mesh,

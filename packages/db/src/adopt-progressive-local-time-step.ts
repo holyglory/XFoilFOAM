@@ -1,7 +1,8 @@
 import { createClient } from "./client";
-import { adoptProgressiveLocalTimeStepPolicy } from "./progressive-recipe-adoption";
+import { adoptProgressiveLocalTimeStepPolicy } from "./campaign-local-step-policy";
 
-const [campaignId, smoothingText = "0.2", mode = "--dry-run"] = process.argv.slice(2);
+const [campaignId, smoothingText = "0.2", mode = "--dry-run"] =
+  process.argv.slice(2);
 const smoothing = Number(smoothingText);
 if (
   !campaignId ||
@@ -14,7 +15,9 @@ if (
   );
 const { db, sql } = createClient({ max: 1 });
 const rollback = new Error("reviewed dry-run rollback");
-let result: Awaited<ReturnType<typeof adoptProgressiveLocalTimeStepPolicy>> | undefined;
+let result:
+  | Awaited<ReturnType<typeof adoptProgressiveLocalTimeStepPolicy>>
+  | undefined;
 try {
   await db
     .transaction(async (transaction) => {

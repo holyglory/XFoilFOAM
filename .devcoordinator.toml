@@ -27,7 +27,7 @@ command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev"
 name = "python-contract"
 tier = "development"
 requires = ["python"]
-command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--extra", "dev", "-m", "pytest", "tests/test_compressible_execution.py", "tests/test_local_time_step_smoothing.py", "tests/test_mach3_failure_reproduction.py", "tests/test_cache.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--extra", "dev", "-m", "pytest", "tests/test_compressible_execution.py", "tests/test_local_time_step_smoothing.py", "tests/test_mach3_failure_reproduction.py", "tests/test_cache.py", "tests/test_solver_domain_reset.py", "-q"]
 
 [[test.local-step-policy.check]]
 name = "types"

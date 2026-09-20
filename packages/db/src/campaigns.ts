@@ -30,6 +30,7 @@ import {
 } from "./campaign-execution";
 import { readCampaignDerivedSummaryMetrics } from "./campaign-summary-metrics";
 import type { DB } from "./client";
+import { inheritLocalStepPolicy, recordDefaultLocalStepPolicy } from "./campaign-local-step-policy";
 import { resolveMaterialSnapshot } from "./material-snapshot";
 import {
   exactValidSolverManifestSql,
@@ -2644,6 +2645,8 @@ export async function materializeCampaignLaunch(
       .set({ currentPlanRevisionId: planRevision.id })
       .where(eq(simCampaigns.id, campaign.id));
 
+    await recordDefaultLocalStepPolicy(asDb(tx), campaign.id, planRevision.id);
+
     await asDb(tx)
       .insert(simCampaignAirfoils)
       .values(
@@ -3525,6 +3528,9 @@ async function applyPlanEditCore(
     .update(simCampaigns)
     .set({ currentPlanRevisionId: planRevision.id })
     .where(eq(simCampaigns.id, campaign.id));
+
+  if (campaign.currentPlanRevisionId)
+    await inheritLocalStepPolicy(asDb(tx), campaign.id, campaign.currentPlanRevisionId, planRevision.id);
 
   // New conditions (value-level find-or-create + physics pinning, §5 machinery).
   if (cls.internal.addedCombos.length > 0) {
@@ -5167,6 +5173,7 @@ export async function forceReleaseCondition(
       .update(simCampaigns)
       .set({ currentPlanRevisionId: planRevision.id })
       .where(eq(simCampaigns.id, campaign.id));
+    await inheritLocalStepPolicy(asDb(tx), campaign.id, revision.id, planRevision.id);
     await asDb(tx)
       .update(simCampaignConditions)
       .set({

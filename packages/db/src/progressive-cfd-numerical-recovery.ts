@@ -101,7 +101,7 @@ export async function recordProgressiveCfdRecoveryPlans(
         "Numerical recovery requires a progressive parent execution",
       );
     const units = (await connection.execute(sql`
-      SELECT unit.id, attempt.token, unit.aoa_deg, unit.recipe, recipe.execution_revision_id,
+      SELECT unit.id, attempt.token, unit.aoa_deg, recipe.recipe, recipe.execution_revision_id,
         claim.recovery_plan_id, work.stage, unit.policy_version, recovery.ordinal AS recovery_ordinal,
         recovery.scope AS recovery_scope, recovery.recipe AS recovery_recipe
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id

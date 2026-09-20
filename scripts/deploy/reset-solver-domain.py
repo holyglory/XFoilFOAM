@@ -30,6 +30,7 @@ solver_runtime_builds sweep_definitions sweeper_state sync_api_permissions
 sync_api_settings
 catalog_profile_events campaign_catalog_boundaries campaign_profile_expansions
 campaign_condition_scopes campaign_catalog_snapshot
+campaign_local_step_policies
 """.split())
 
 SOLVER_TABLES = frozenset("""
@@ -67,6 +68,7 @@ progressive_generation_targets progressive_work neuralfoil_predictions
 progressive_prediction_links
 progressive_prediction_repairs progressive_prediction_repair_attempts
 progressive_scope_requests progressive_recipe_adoptions
+progressive_cfd_local_step_claims
 progressive_publication_recovery_claims progressive_publication_recoveries
 progressive_cfd_units progressive_cfd_attempts
 progressive_cfd_execution_recipes

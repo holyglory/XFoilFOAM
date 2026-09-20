@@ -10,6 +10,7 @@ import {
   type CampaignTx,
 } from "./campaigns";
 import type { DB } from "./client";
+import { inheritLocalStepPolicy } from "./campaign-local-step-policy";
 import { claimSimJobCancellation } from "./job-lifecycle";
 import {
   ensureOpenCfd2606ContinuationCheck,
@@ -1368,6 +1369,12 @@ export async function finalizeOpenCfd2606Cutover(
           completedAt: null,
         })
         .where(eq(simCampaigns.id, campaign.id));
+      await inheritLocalStepPolicy(
+        asDb(tx),
+        campaign.id,
+        cutover.sourcePlanRevisionId,
+        targetPlan.id,
+      );
       await createTargetLanes(
         tx,
         campaign.id,
