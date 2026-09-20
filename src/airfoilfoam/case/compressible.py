@@ -44,6 +44,11 @@ class CompressibleCaseBuilder(CaseBuilder):
         self.turbulent_prandtl = turbulent_prandtl
         self.time_window = time_window
         self.local_steady = solver_family == "rhoCentralFoam" and not self.solver.force_transient
+        if self.solver.local_time_step_smoothing is not None and not self.local_steady:
+            raise ValueError("Local time-step smoothing requires local-steady rhoCentralFoam")
+        self.local_time_step_smoothing = (
+            0.02 if self.solver.local_time_step_smoothing is None else self.solver.local_time_step_smoothing
+        )
         self.dialect = replace(
             self.dialect, steady_solver_command=solver_family,
             transient_solver_command="rhoCentralFoam" if solver_family == "rhoCentralFoam" else "rhoPimpleFoam",
@@ -69,6 +74,7 @@ class CompressibleCaseBuilder(CaseBuilder):
             "version": 1, "solver_family": self.solver_family,
             "time_coordinate": "local_pseudo_time_iterations" if self.local_steady else "steady_iterations" if self.solver_family == "rhoSimpleFoam" else "physical_time_seconds",
             "physical_time_history": self.solver_family != "rhoSimpleFoam" and not self.local_steady,
+            **({"local_time_step_smoothing": self.local_time_step_smoothing} if self.local_steady else {}),
             **({"cold_startup_policy": {"version": 1, "maximum_iterations": STARTUP_ITERATIONS,
                                         "maximum_courant": STARTUP_COURANT,
                                         "skip_when_seeded": True}} if self.local_steady else {}),
@@ -90,7 +96,7 @@ class CompressibleCaseBuilder(CaseBuilder):
                 "stopAt": "endTime", "endTime": self.solver.n_iterations, "deltaT": 1,
                 "adjustTimeStep": "no", "maxCo": min(0.5, self.solver.transient_max_courant),
                 "maxDeltaT": self.spec.chord / self.spec.speed,
-                "rDeltaTSmoothingCoeff": 0.02, "writeControl": "timeStep", "writeInterval": 100,
+                "rDeltaTSmoothingCoeff": self.local_time_step_smoothing, "writeControl": "timeStep", "writeInterval": 100,
                 "purgeWrite": 2, "writeFormat": "ascii", "writePrecision": 12, "writeCompression": "off",
                 "timeFormat": "general", "timePrecision": 12, "runTimeModifiable": "true",
                 "functions": {"forceCoeffs1": self._force_coeffs_dict(), "steadyConvergence": {

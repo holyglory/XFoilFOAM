@@ -409,6 +409,10 @@ ALL_IMAGE_FIELDS: tuple[ImageField, ...] = tuple(ImageField)
 class SolverParams(BaseModel):
     flow_solver_family: Optional[Literal["simpleFoam", "pimpleFoam", "rhoSimpleFoam", "rhoPimpleFoam", "rhoCentralFoam"]] = None
     turbulent_prandtl: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    local_time_step_smoothing: Optional[float] = Field(
+        default=None, strict=True, ge=0, le=1, allow_inf_nan=False,
+        description="Local-steady density-solver inverse-step smoothing. Omission preserves 0.02.",
+    )
     turbulence: TurbulenceParams = Field(default_factory=TurbulenceParams)
     n_iterations: int = Field(default=3000, ge=50, le=20000, description="Max SIMPLE iterations.")
     urans_initialization_iterations: Optional[int] = Field(
@@ -529,6 +533,13 @@ class SolverParams(BaseModel):
     image_zoom_chords: float = Field(
         default=2.0, gt=0, description="Half-window (in chords) around the airfoil for contour images."
     )
+
+    @model_serializer(mode="wrap")
+    def serialize_explicit_local_smoothing(self, handler):
+        payload = handler(self)
+        if self.local_time_step_smoothing is None:
+            payload.pop("local_time_step_smoothing", None)
+        return payload
 
 
 def urans_budget_seconds(solver: "SolverParams", override_s: Optional[int] = None) -> int:
@@ -786,6 +797,7 @@ class PolarRequest(BaseModel):
     )
     expected_urans_initialization_version: Optional[int] = Field(default=None, strict=True, ge=0)
     expected_solver_budget_version: Optional[int] = Field(default=None, strict=True, ge=0)
+    expected_local_time_step_version: Optional[int] = Field(default=None, strict=True, ge=0)
     expected_engine: Optional[EngineIdentity] = Field(
         default=None,
         description="Exact logical solver implementation required by the controller. "
@@ -810,6 +822,11 @@ class PolarRequest(BaseModel):
             if len(requested) != len(set(requested)) or set(requested) != set(allocated):
                 raise ValueError("Solver case allocations must cover exactly the requested physical cases")
         family = self.solver.flow_solver_family
+        if self.solver.local_time_step_smoothing is not None:
+            if family != "rhoCentralFoam" or self.solver.force_transient:
+                raise ValueError("Local time-step smoothing requires local-steady rhoCentralFoam")
+            if self.expected_local_time_step_version is None:
+                raise ValueError("Explicit local time-step smoothing requires expected_local_time_step_version")
         compressible = family is not None and family.startswith("rho")
         if compressible:
             gas, state = self.fluid.gas, self.flow_state
@@ -887,6 +904,14 @@ class PolarRequest(BaseModel):
                 for aoa in self.aoa.expand():
                     specs.append(CaseSpec(chord=chord, speed=speed, aoa_deg=aoa))
         return specs
+
+
+    @model_serializer(mode="wrap")
+    def serialize_explicit_local_time_step_version(self, handler):
+        payload = handler(self)
+        if self.expected_local_time_step_version is None:
+            payload.pop("expected_local_time_step_version", None)
+        return payload
 
 
 class CaseSpec(BaseModel):

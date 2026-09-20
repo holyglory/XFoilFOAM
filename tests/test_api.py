@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from airfoilfoam import jobs
-from airfoilfoam.capabilities import SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
+from airfoilfoam.capabilities import LOCAL_TIME_STEP_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from airfoilfoam.celery_app import celery_app
 from airfoilfoam.api.main import app
 from airfoilfoam.storage import JobStore
@@ -289,6 +289,34 @@ def test_initializer_health_is_separate_from_scientific_recovery_version(client)
     health = client.get("/health").json()
     assert health["urans_initialization_version"] == URANS_INITIALIZATION_VERSION == 1
     assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION == 14
+
+
+def test_local_step_capability_is_advertised_separately(client):
+    assert client.get("/health").json()["local_time_step_version"] == LOCAL_TIME_STEP_VERSION == 1
+    assert client.get("/capabilities").json()["local_time_step_version"] == 1
+
+
+@pytest.mark.parametrize("version", [0, 2])
+def test_polar_submit_rejects_local_step_mismatch_before_queueing(client, version):
+    response = client.post("/polars", json={
+        "airfoil": {"name": "invalid-on-purpose", "coordinates": "not geometry"},
+        "aoa": {"angles": [0]}, "expected_local_time_step_version": version,
+    })
+    assert response.status_code == 409
+    assert response.json()["detail"] == {"code": "local_time_step_version_mismatch",
+                                         "requested_version": version, "actual_version": 1}
+
+
+@pytest.mark.parametrize("version", [None, 0, 2])
+def test_worker_rejects_local_step_mismatch_before_geometry(version):
+    from scripts.materials.reproduce_mach3_failure import diagnostic_request
+    root = Path(__file__).parents[1]
+    request = diagnostic_request(root / "packages/db/seed/selig-database/fx60100.dat",
+                                 root / "tests/fixtures/air-thermophysics-audit.json",
+                                 "cold", smoothing=0.2)
+    request = request.model_copy(update={"expected_local_time_step_version": version})
+    with pytest.raises(RuntimeError, match="local-time-step capability mismatch"):
+        jobs.execute_job("local-step-mismatch", request, store=JobStore())
 
 
 def test_polar_submit_rejects_urans_initialization_mismatch_before_queueing(client, naca0012_selig_text):

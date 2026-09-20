@@ -29,7 +29,7 @@ from ..archive_reduction import (
     reduce_remote_archive_clean_cycles,
 )
 from ..cache import EngineCache
-from ..capabilities import MESH_RECOVERY_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
+from ..capabilities import LOCAL_TIME_STEP_VERSION, MESH_RECOVERY_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from ..config import Settings, get_settings
 from ..evidence_runtime import (
     ARCHIVE_MIME_TYPE,
@@ -918,6 +918,7 @@ def create_app() -> FastAPI:
             "urans_recovery_version": URANS_RECOVERY_VERSION,
             "urans_initialization_version": URANS_INITIALIZATION_VERSION,
             "solver_budget_version": SOLVER_BUDGET_VERSION,
+            "local_time_step_version": LOCAL_TIME_STEP_VERSION,
             "neuralfoil_geometry_fit_version": 2,
             "package_file": __file__,
             # A gateway advertises logical routing targets only. Exact runtime
@@ -959,6 +960,7 @@ def create_app() -> FastAPI:
         ]
         return {
             "meshers": list_meshers(),
+            "local_time_step_version": LOCAL_TIME_STEP_VERSION,
             "solver_budget_version": SOLVER_BUDGET_VERSION,
             "turbulence_models": [m.value for m in TurbulenceModel],
             "openfoam_image": settings.openfoam_image,
@@ -1053,6 +1055,12 @@ def create_app() -> FastAPI:
                     ),
                 },
             )
+        if request.expected_local_time_step_version is not None and request.expected_local_time_step_version != LOCAL_TIME_STEP_VERSION:
+            raise HTTPException(status_code=409, detail={
+                "code": "local_time_step_version_mismatch",
+                "requested_version": request.expected_local_time_step_version,
+                "actual_version": LOCAL_TIME_STEP_VERSION,
+            })
         if request.expected_solver_budget_version is not None and request.expected_solver_budget_version != SOLVER_BUDGET_VERSION:
             raise HTTPException(status_code=409, detail={
                 "code": "solver_budget_version_mismatch",

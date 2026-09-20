@@ -52,20 +52,26 @@ def window():
                                   maximum_delta_t=1e-5, write_interval=1e-4, maximum_courant=0.3)
 
 
-def test_density_local_steady_is_explicit_iteration_time_and_conserved_residual_gated(tmp_path, gas, state):
+@pytest.mark.parametrize("smoothing,effective", [(None, 0.02), (0.2, 0.2), (0, 0), (1, 1)])
+def test_density_local_steady_is_explicit_iteration_time_and_conserved_residual_gated(tmp_path, gas, state, smoothing, effective):
     case = builder(gas, state, "rhoCentralFoam", 3,
-                   solver=SolverParams(force_transient=False, transient_fallback=False, n_iterations=1500))
+                   solver=SolverParams(force_transient=False, transient_fallback=False, n_iterations=1500,
+                                       local_time_step_smoothing=smoothing))
     case.write(tmp_path)
     control = " ".join((tmp_path / "system/controlDict").read_text().split())
     schemes = (tmp_path / "system/fvSchemes").read_text()
     assert "localEuler" in schemes and "endTime 1500;" in control
     assert "deltaT 1;" in control and "writeControl timeStep;" in control
+    assert f"rDeltaTSmoothingCoeff {effective:g};" in control
+    assert "maxCo 0.5;" in control
+    assert "tolerance 1e-05;" in control
     assert "xfoilfoamSteadyConvergence" in control and "consecutiveSteps 100;" in control
     assert "referenceDensity" in control and "referenceSpecificEnergy" in control
     assert "libxfoilfoamSteadyConvergence.so" in control
     identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
     assert identity["time_coordinate"] == "local_pseudo_time_iterations"
     assert identity["physical_time_history"] is False
+    assert identity["local_time_step_smoothing"] == effective
     with pytest.raises(ValueError, match="physical-time"):
         case.write_transient(tmp_path, 0, 1, 0.01)
 

@@ -12,7 +12,7 @@ from . import physics
 from .airfoil import load_airfoil
 from .cache import EngineCache
 from .cancellation import JobCancelled
-from .capabilities import MESH_RECOVERY_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
+from .capabilities import LOCAL_TIME_STEP_VERSION, MESH_RECOVERY_VERSION, SOLVER_BUDGET_VERSION, URANS_INITIALIZATION_VERSION, URANS_RECOVERY_VERSION
 from .config import Settings, get_settings
 from .meshing.base import Mesher, get_mesher
 from .models import (
@@ -212,6 +212,14 @@ def execute_job(
         and request.expected_solver_budget_version != SOLVER_BUDGET_VERSION
     ):
         raise RuntimeError("worker solver-budget capability mismatch before staging or CFD")
+    if (
+        request.solver.local_time_step_smoothing is not None
+        and request.expected_local_time_step_version != LOCAL_TIME_STEP_VERSION
+    ) or (
+        request.expected_local_time_step_version is not None
+        and request.expected_local_time_step_version != LOCAL_TIME_STEP_VERSION
+    ):
+        raise RuntimeError("worker local-time-step capability mismatch before staging or CFD")
     airfoil = load_airfoil(
         request.airfoil.name, request.airfoil.coordinates, request.airfoil.points,
         request.airfoil.format,

@@ -18,11 +18,13 @@ POINTS_SHA256 = "62678a8b062a9cdd2d0d18fe4791944044cc74f43986759ba7ec646172654b8
 MATERIAL_SHA256 = "fc174fc87eb50300a2e5412bcc86e5b334bb7ba20a3645c365b0e55f81013766"
 
 
-def diagnostic_request(coordinates_path, material_path, start, courant=4.0):
+def diagnostic_request(coordinates_path, material_path, start, courant=4.0, smoothing=None):
     if start not in ("cold", "marched"):
         raise ValueError("Unknown diagnostic starting state")
     if isinstance(courant, bool) or courant not in (4.0, 0.25, 0.1):
         raise ValueError("Unsupported diagnostic Courant comparison")
+    if smoothing is not None and (isinstance(smoothing, bool) or smoothing not in (0.02, 0.2)):
+        raise ValueError("Unsupported diagnostic smoothing comparison")
     points = parse_airfoil(Path(coordinates_path).read_text()).tolist()
     points_hash = hashlib.sha256(json.dumps(points, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     if points_hash != POINTS_SHA256:
@@ -32,6 +34,7 @@ def diagnostic_request(coordinates_path, material_path, start, courant=4.0):
     gas = source_material_for_canary(material_path)
     return PolarRequest.model_validate({
         "airfoil": {"name": "FX 60-100 AIRFOIL", "points": points},
+        **({"expected_local_time_step_version": 1} if smoothing is not None else {}),
         "chord_lengths": [0.1], "speeds": [1021.025],
         "aoa": {"angles": [13] if start == "cold" else [-4, 13]},
         "fluid": {"density": 1.2250159925164, "kinematic_viscosity": 1.4665638853861052e-05,
@@ -41,6 +44,7 @@ def diagnostic_request(coordinates_path, material_path, start, courant=4.0):
         "mesh": {"mesher": "blockmesh-cgrid", "farfield_radius_chords": 15, "wake_length_chords": 12,
                  "n_surface": 84, "n_radial": 52, "n_wake": 40, "target_y_plus": 40, "span_chords": 0.1},
         "solver": {"flow_solver_family": "rhoCentralFoam", "turbulent_prandtl": 0.85,
+                   **({"local_time_step_smoothing": smoothing} if smoothing is not None else {}),
                    "turbulence": {"model": "kOmegaSST", "intensity": 0.001, "viscosity_ratio": 10},
                    "n_iterations": 5000, "convergence_tolerance": 0.0001, "momentum_scheme": "upwind",
                    "force_transient": False, "transient_fallback": False, "rans_failure_policy": "abort_for_precalc",
@@ -91,8 +95,9 @@ def main():
     parser.add_argument("--courant", type=float, choices=[4.0, 0.25, 0.1], default=4.0)
     parser.add_argument("--processes", type=int, choices=[1, 2], default=1)
     parser.add_argument("--iterations", type=int, choices=[100, 5000], default=5000)
+    parser.add_argument("--smoothing", type=float, choices=[0.02, 0.2])
     args = parser.parse_args()
-    request = execution_request(diagnostic_request(args.coordinates, args.material, args.start, args.courant),
+    request = execution_request(diagnostic_request(args.coordinates, args.material, args.start, args.courant, args.smoothing),
                                 args.processes, args.iterations)
     destination = args.destination / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
@@ -106,6 +111,8 @@ def main():
     report = {"kind": "mach3-failure-diagnosis", "source_job": SOURCE_JOB, "local_job": job_id,
               "starting_state": args.start, "geometry_points_sha256": POINTS_SHA256,
               "effective_local_courant_target": min(0.5, args.courant),
+              "local_time_step_smoothing": args.smoothing if args.smoothing is not None else 0.02,
+              "request_sha256": hashlib.sha256(request.model_dump_json().encode()).hexdigest(),
               "material_sha256": MATERIAL_SHA256, "airfoil_polar_validation": False,
               "solver_processes": args.processes, "requested_iterations": args.iterations,
               "differences_from_production": ["current source", f"{args.processes}-process solve", "isolated empty cache", "no rendered media"],
@@ -116,6 +123,8 @@ def main():
         report["differences_from_production"].append("13-degree angle without the preceding -4-degree march")
     if args.courant != 4.0:
         report["differences_from_production"].append("smaller local pseudo-time Courant target")
+    if args.smoothing is not None and args.smoothing != 0.02:
+        report["differences_from_production"].append("explicit local inverse-step smoothing 0.2")
     try:
         result = execute_job(job_id, request, store=store, settings=settings)
         report.update({"solver_state": result.state.value, "solver_message": result.message,

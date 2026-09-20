@@ -1,0 +1,31 @@
+services:
+  baseline: &baseline
+    image: xfoilfoam-progressive-preview-worker:local
+    pull_policy: never
+    network_mode: none
+    environment:
+      PYTHONPATH: /candidate/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/baseline", "--start", "cold"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts/materials/reproduce_mach3_failure.py:/verification/reproduce_mach3_failure.py:ro
+      - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
+      - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
+      - ./.codex-artifacts/local-step-smoothing:/evidence
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+  cold:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/cold", "--start", "cold", "--smoothing", "0.2"]
+  marched:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/marched", "--start", "marched", "--smoothing", "0.2"]
+  parallel:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/parallel", "--start", "cold", "--smoothing", "0.2", "--processes", "2"]
