@@ -79,4 +79,9 @@ it("keeps evidence captions and stored track scales readable in both themes", ()
       modal.slice(modal.indexOf(`data-testid="${id}"`)).split("</")[0],
     ).toContain("color: C.muted");
   }
+  const mediaEmpty = modal
+    .slice(modal.indexOf("function MediaEmpty("))
+    .split("function fmt(")[0];
+  expect(mediaEmpty).toContain("background: VIZ.bg");
+  expect(mediaEmpty).toContain("color: VIZ.text");
 });
