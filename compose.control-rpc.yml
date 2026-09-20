@@ -28,7 +28,11 @@ x-engine: &engine
   volumes:
     - ./src:/candidate/src:ro
     - ./pyproject.toml:/candidate/pyproject.toml:ro
-    - control-data:/data
+    - type: volume
+      source: control-data
+      target: /data
+      volume:
+        nocopy: true
   depends_on:
     redis:
       condition: service_healthy

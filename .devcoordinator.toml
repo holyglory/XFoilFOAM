@@ -873,6 +873,17 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_domain_reset.p
 [test.progressive]
 timeout_seconds = 7200
 
+[[test.progressive.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.progressive.check]]
+name = "graph-prerequisites"
+tier = "development"
+requires = ["dependencies"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_progressive_graph_dependencies.py", "-q"]
+
 [test.prediction-repair-live]
 timeout_seconds = 300
 
@@ -1432,13 +1443,13 @@ command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev"
 name = "inference"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_force_history_origin.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "tests/test_npl3635_reference.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_force_history_origin.py", "tests/test_neuralfoil_solver.py", "tests/test_prediction_api.py", "tests/test_npl3635_reference.py", "-q"]
 
 [[test.progressive.check]]
 name = "rans-hold-continuation"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_rans_hold_continuation.py", "tests/test_rans_hold_certificate.py", "tests/test_targeted_urans_warmstart.py", "tests/test_warm_boundary_velocity.py", "tests/test_unsteady.py", "tests/test_cache.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_rans_hold_continuation.py", "tests/test_rans_hold_certificate.py", "tests/test_targeted_urans_warmstart.py", "tests/test_warm_boundary_velocity.py", "tests/test_unsteady.py", "tests/test_cache.py", "-q"]
 
 [[test.progressive.check]]
 name = "detail-reads"
@@ -1450,7 +1461,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vite
 name = "remote-maintenance"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_remote_solver_2606_deploy.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_remote_solver_2606_deploy.py", "-q"]
 
 [[test.progressive.check]]
 name = "retention-policy"
@@ -1461,7 +1472,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [[test.progressive.check]]
 name = "fixture-ownership"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/fixture-ownership.test.ts"]
 
 [[test.progressive.check]]
@@ -1473,11 +1484,12 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 [[test.progressive.check]]
 name = "never-started-settlement"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps never-started retry accounting attempt-local|caps repeated never-started submissions|only retries diagnosed infrastructure|requires a persisted exact physical stop"]
 
 [[test.progressive.check]]
 name = "types"
+requires = ["workspace"]
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
 
@@ -1495,6 +1507,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vite
 
 [[test.progressive.check]]
 name = "services"
+requires = ["workspace"]
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/service-lifecycle.test.ts", "test/progressive-report-service.test.ts", "test/progressive-evidence-service.test.ts", "test/progressive-tick.test.ts", "test/progressive-capabilities.test.ts", "test/retention-service.test.ts", "test/progressive-intake-service.test.ts", "test/progressive-hub-progress-service.test.ts"]
 
@@ -1506,8 +1519,9 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 
 [[test.progressive.check]]
 name = "restart-retention-native"
+requires = ["dependencies"]
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_retention.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_retention.py", "-q"]
 
 [[test.progressive.check]]
 name = "reservation-equivalence"
@@ -1553,12 +1567,14 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 
 [[test.progressive.check]]
 name = "queued-disk-forecast"
+requires = ["workspace"]
 tier = "development"
 env = { VITEST_PURE_REDUCER_TEST = "1" }
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/queued-disk-exposure.test.ts", "test/disk-admission.test.ts"]
 
 [[test.progressive.check]]
 name = "parallel-lease-renewal"
+requires = ["workspace"]
 tier = "development"
 env = { VITEST_PURE_REDUCER_TEST = "1" }
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-promise-renewal.test.ts", "test/remote-reconciliation-timing.test.ts", "test/remote-transfer-steps.test.ts"]
@@ -1571,8 +1587,9 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 
 [[test.progressive.check]]
 name = "progressive-archive-reclaim-native"
+requires = ["dependencies"]
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "tests/test_ubuntu_apt_https.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_evidence_store.py", "tests/test_brokered_reclaim_running_job.py", "tests/test_ubuntu_apt_https.py", "-q"]
 
 [[test.progressive.check]]
 name = "retained-report-api"
@@ -1643,43 +1660,43 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 [[test.progressive.check]]
 name = "execution"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive execution stop and settlement"]
 
 [[test.progressive.check]]
 name = "execution-budget-stop"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reconciles budget stops without releasing work"]
 
 [[test.progressive.check]]
 name = "runtime-budget"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive live solver accounting"]
 
 [[test.progressive.check]]
 name = "numerical-recovery"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "bounded progressive numerical recovery"]
 
 [[test.progressive.check]]
 name = "recovery-mesh"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_shared_mesh_recovery.py", "tests/test_targeted_urans_warmstart.py", "tests/test_jobs_mesh_resolution.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_shared_mesh_recovery.py", "tests/test_targeted_urans_warmstart.py", "tests/test_jobs_mesh_resolution.py", "-q"]
 
 [[test.progressive.check]]
 name = "submission"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive submission recovery"]
 
 [[test.progressive.check]]
 name = "admission"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive CPU admission|progressive submission recovery|pins a shared execution revision|separates retry budgets"]
 
 [[test.progressive.check]]
@@ -1721,24 +1738,25 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 [[test.progressive.check]]
 name = "stages"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive durable stage transitions"]
 
 [[test.progressive.check]]
 name = "reset"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_domain_reset.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_solver_domain_reset.py", "-q"]
 
 [[test.progressive.check]]
 name = "scheduling"
+requires = ["workspace"]
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "exec", "vitest", "run", "test/progressive-scheduling.test.ts", "test/gas-thermodynamics.test.ts", "test/progressive-curve-metrics.test.ts", "test/polar-publication.test.ts"]
 
 [[test.progressive.check]]
 name = "public-curve"
 tier = "development"
-requires = ["dependencies"]
+requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "publishes a real fitted curve|matches comparison conditions"]
 
 [[test.progressive.check]]
@@ -1749,6 +1767,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 
 [[test.progressive.check]]
 name = "comparison-model"
+requires = ["workspace"]
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/compare-selection.test.ts", "test/progressive-comparison.test.ts"]
 
@@ -1763,7 +1782,7 @@ retained_artifacts = [{ name = "source-fit", path = ".codex-artifacts/material-f
 name = "air-pressure-contract"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_air_pressure_audit.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_air_pressure_audit.py", "-q"]
 
 [[test.progressive.check]]
 name = "air-pressure-audit"
@@ -1776,13 +1795,13 @@ retained_artifacts = [{ name = "source-pressure", path = ".codex-artifacts/mater
 name = "compressible"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_calorics.py", "tests/test_material_fitting.py", "tests/test_transport.py", "tests/test_material_domain.py", "tests/test_native_thermophysics_verifier.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "tests/test_images_extra.py", "tests/test_media_grind_guardrails.py", "tests/test_cache.py", "tests/test_warm_boundary_velocity.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_calorics.py", "tests/test_material_fitting.py", "tests/test_transport.py", "tests/test_material_domain.py", "tests/test_native_thermophysics_verifier.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "tests/test_images_extra.py", "tests/test_media_grind_guardrails.py", "tests/test_cache.py", "tests/test_warm_boundary_velocity.py", "-q"]
 
 [[test.progressive.check]]
 name = "warm-boundaries"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_warm_boundary_velocity.py", "tests/test_cache.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_warm_boundary_velocity.py", "tests/test_cache.py", "-q"]
 
 [[test.progressive.check]]
 name = "material-domain"
@@ -1955,16 +1974,17 @@ retained_artifacts = [{ name = "real-high-mach-journey", path = ".codex-artifact
 name = "budget"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_budget.py", "tests/test_runner.py", "tests/test_jobs_mesh_resolution.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_solver_budget.py", "tests/test_runner.py", "tests/test_jobs_mesh_resolution.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "-q"]
 
 [[test.progressive.check]]
 name = "case-allocations"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_solver_budget.py", "tests/test_api.py", "-k", "budget or health_and_capabilities", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_solver_budget.py", "tests/test_api.py", "-k", "budget or health_and_capabilities", "-q"]
 
 [[test.progressive.check]]
 name = "allocation-contract"
+requires = ["workspace"]
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/solver-budget.test.ts"]
 
@@ -1972,10 +1992,11 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "ex
 name = "gateway"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_api.py", "tests/test_execution_stop.py", "tests/test_submission.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_api.py", "tests/test_execution_stop.py", "tests/test_submission.py", "-q"]
 
 [[test.progressive.check]]
 name = "ingest-schema"
+requires = ["workspace"]
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
 
@@ -2007,19 +2028,19 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "acoustic-startup"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_acoustic_startup.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_acoustic_startup.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "-q"]
 
 [[test.progressive.check]]
 name = "pressure-initialization"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initialization.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_cache.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_potential_initialization.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_cache.py", "-q"]
 
 [[test.progressive.check]]
 name = "local-steady"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_local_steady_startup.py", "tests/test_local_time_step_smoothing.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_mach3_startup_continuation.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_local_steady_startup.py", "tests/test_local_time_step_smoothing.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_mach3_startup_continuation.py", "-q"]
 
 [[test.progressive.check]]
 name = "local-step-client"
@@ -2049,25 +2070,25 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "image-locks"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_frozen_python_images.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_frozen_python_images.py", "-q"]
 
 [[test.progressive.check]]
 name = "shock-reference"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_oblique_shock.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_oblique_shock.py", "-q"]
 
 [[test.progressive.check]]
 name = "material-abort"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_material_abort.py", "tests/test_runner.py", "tests/test_acoustic_startup.py", "tests/test_numerical_canary.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_material_abort.py", "tests/test_runner.py", "tests/test_acoustic_startup.py", "tests/test_numerical_canary.py", "-q"]
 
 [[test.progressive.check]]
 name = "worker-control"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_control_rpc_pool.py", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "tests/test_api.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_control_rpc_pool.py", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "tests/test_api.py", "-q"]
 
 [[test.progressive.check]]
 name = "submission-legacy"
