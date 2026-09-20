@@ -121,6 +121,7 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
         flowSolverFamily: "rhoCentralFoam",
         turbulentPrandtl: 0.85,
         timeCoordinate: "local_pseudo_time_iterations",
+        localTimeStepSmoothing: 0.2,
       },
     };
     const { request } = buildPolarRequest({
@@ -133,11 +134,21 @@ describe("wave-1 transient flags (in-job escalation OFF — payload-shape pin)",
       flow_solver_family: "rhoCentralFoam",
       force_transient: false,
       transient_fallback: false,
+      local_time_step_smoothing: 0.2,
     });
+    expect(request.expected_local_time_step_version).toBe(1);
     expect(() =>
       buildPolarRequest({ airfoil, setup: snapshot, aoaList: [-2], wave: 2 }),
     ).toThrow("time coordinate");
     snapshot.solver.timeCoordinate = "physical_time_seconds";
+    const physical = buildPolarRequest({
+      airfoil,
+      setup: snapshot,
+      aoaList: [-2],
+      wave: 2,
+    }).request;
+    expect(physical.solver).not.toHaveProperty("local_time_step_smoothing");
+    expect(physical).not.toHaveProperty("expected_local_time_step_version");
     expect(
       buildPolarRequest({ airfoil, setup: snapshot, aoaList: [-2], wave: 2 })
         .request.solver?.force_transient,

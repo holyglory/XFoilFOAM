@@ -1112,6 +1112,13 @@ const meshProfileBody = z.object({
 });
 
 const solverProfileBody = z.object({
+  localTimeStepSmoothing: z
+    .number()
+    .finite()
+    .min(0)
+    .max(1)
+    .nullable()
+    .optional(),
   slug: z.string().trim().min(1).optional(),
   name: z.string().trim().min(1),
   solverImplementationId: z.string().uuid().optional(),
@@ -2756,7 +2763,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     "/api/admin/solver-profiles",
     { preHandler: requireAdmin },
     async (req, reply) => {
-      const b = solverProfileBody.parse(req.body);
+      const parsed = solverProfileBody.safeParse(req.body);
+      if (!parsed.success)
+        return reply
+          .code(400)
+          .send({
+            error: parsed.error.issues[0]?.message ?? "invalid solver profile",
+          });
+      const b = parsed.data;
       if (
         b.solverImplementationId &&
         !(await activeSolverImplementation(b.solverImplementationId))
@@ -2781,7 +2795,14 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     { preHandler: requireAdmin },
     async (req, reply) => {
       const { id } = req.params as { id: string };
-      const b = solverProfileBody.partial().parse(req.body);
+      const parsed = solverProfileBody.partial().safeParse(req.body);
+      if (!parsed.success)
+        return reply
+          .code(400)
+          .send({
+            error: parsed.error.issues[0]?.message ?? "invalid solver profile",
+          });
+      const b = parsed.data;
       if (
         b.solverImplementationId &&
         !(await activeSolverImplementation(b.solverImplementationId))

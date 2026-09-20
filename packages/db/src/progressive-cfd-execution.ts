@@ -38,9 +38,15 @@ function numericalValues<T extends Record<string, unknown>>(profile: T) {
     updatedAt: _updatedAt,
     isSeeded: _isSeeded,
     solverImplementationId: _implementation,
+    localTimeStepSmoothing,
     ...values
   } = profile;
-  return values;
+  return {
+    ...values,
+    ...(localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
+      ? { localTimeStepSmoothing }
+      : {}),
+  };
 }
 
 export async function lockProgressiveCfdExecution(
@@ -203,9 +209,26 @@ export async function materializeProgressiveCfdExecution(
       throw new Error(
         "Compressible CFD requires a pinned turbulent Prandtl number",
       );
+    if (
+      solver.localTimeStepSmoothing != null &&
+      (family !== "rhoCentralFoam" ||
+        timeCoordinate !== "local_pseudo_time_iterations" ||
+        !Number.isFinite(solver.localTimeStepSmoothing) ||
+        solver.localTimeStepSmoothing < 0 ||
+        solver.localTimeStepSmoothing > 1)
+    )
+      throw new Error(
+        "Local time-step smoothing requires a finite local-steady numerical recipe",
+      );
     for (const [values, template] of [
       [mesh, numericalValues(frozen.mesh)],
-      [solver, numericalValues(frozen.solver)],
+      [
+        {
+          ...solver,
+          localTimeStepSmoothing: solver.localTimeStepSmoothing ?? null,
+        },
+        { ...numericalValues(frozen.solver), localTimeStepSmoothing: null },
+      ],
     ] as const) {
       if (
         Object.keys(values).some((key) => !(key in template)) ||
@@ -246,11 +269,13 @@ export async function materializeProgressiveCfdExecution(
       canonicalAnalysisJson(numericalValues(meshRow)) !==
         canonicalAnalysisJson(mesh) ||
       canonicalAnalysisJson(numericalValues(solverRow)) !==
-        canonicalAnalysisJson({
-          ...solver,
-          uransInitializationIterations:
-            solver.uransInitializationIterations ?? null,
-        })
+        canonicalAnalysisJson(
+          numericalValues({
+            ...solver,
+            uransInitializationIterations:
+              solver.uransInitializationIterations ?? null,
+          }),
+        )
     )
       throw new Error(
         "A content-addressed CFD profile was changed; refusing to overwrite it",

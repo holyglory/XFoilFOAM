@@ -30,3 +30,15 @@ services:
   parallel:
     <<: *baseline
     command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/parallel", "--start", "marched", "--smoothing", "0.2", "--processes", "2"]
+  mach12-baseline:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/mach12-baseline", "--mach", "1.2"]
+  mach12-candidate:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/mach12-candidate", "--mach", "1.2", "--smoothing", "0.2"]
+  mach2-baseline:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/mach2-baseline", "--mach", "2"]
+  mach2-candidate:
+    <<: *baseline
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/mach2-candidate", "--mach", "2", "--smoothing", "0.2"]

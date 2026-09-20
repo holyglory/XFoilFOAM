@@ -86,6 +86,10 @@ export async function refreshProgressiveWorkerCapabilities(
         capabilities = parseProgressiveRemoteCapabilities({
           version: 1,
           solverBudgetVersion: 2,
+          ...(health.local_time_step_version === 1 &&
+          inventory.local_time_step_version === 1
+            ? { localTimeStepVersion: 1 }
+            : {}),
           meshRecoveryVersion: health.mesh_recovery_version,
           uransRecoveryVersion: routes.every((route) => route.transient)
             ? (health.urans_recovery_version ?? null)

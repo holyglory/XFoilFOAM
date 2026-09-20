@@ -48,8 +48,14 @@ export function progressiveUnsteadyRecipe(
     recipe.timeCoordinate === "local_pseudo_time_iterations";
   if (family !== "simpleFoam" && family !== "rhoSimpleFoam" && !localDensity)
     return null;
+  const solver = { ...(recipe.solver as Record<string, unknown>) };
+  delete solver.localTimeStepSmoothing;
   return {
     ...recipe,
+    ...(localDensity &&
+    Object.hasOwn(recipe.solver ?? {}, "localTimeStepSmoothing")
+      ? { solver }
+      : {}),
     ...(localDensity ? { timeCoordinate: "physical_time_seconds" } : {}),
     selection: {
       ...selection,

@@ -9858,7 +9858,7 @@ def solve_polar_marched(
                     (polar_dir / f"log.a{case_index}").write_text(log)
                     conv = parse_local_steady_convergence(log, rans_solver.convergence_tolerance) if is_density_based(runner) else parse_convergence(log)
                     outcome.converged = conv.converged
-                    outcome.iterations = log.count("\nTime = ") or conv.iterations
+                    outcome.iterations = conv.iterations if is_density_based(runner) else log.count("\nTime = ") or conv.iterations
                     outcome.final_residual = conv.final_residual
                 _check_cancel(cancel_check)
                 _finalize_outcome(

@@ -332,6 +332,36 @@ describe("physics compatibility hash contract", () => {
     density.solver.timeCoordinate = "local_pseudo_time_iterations";
     expect(physicsHashForSnapshot(density)).not.toBe(physicalTimeHash);
   });
+  it("normalizes the legacy local-step default but separates new numerical values", () => {
+    const legacy = physicsHashForSnapshot(snapshot);
+    const withSmoothing = (
+      localTimeStepSmoothing: number | null | undefined,
+    ) => ({
+      ...snapshot,
+      solver: { ...snapshot.solver, localTimeStepSmoothing },
+    });
+    for (const value of [undefined, null, 0.02])
+      expect(physicsHashForSnapshot(withSmoothing(value))).toBe(legacy);
+    expect(physicsHashForSnapshot(withSmoothing(0.2))).not.toBe(legacy);
+    expect(physicsHashForSnapshot(withSmoothing(0.2))).not.toBe(
+      physicsHashForSnapshot(withSmoothing(0.5)),
+    );
+    const configured = withSmoothing(0.2);
+    configured.derived = { ...configured.derived, mach: 3 };
+    const original = structuredClone(configured);
+    const recipes = progressiveRecipes(configured);
+    expect(recipes.fast).toMatchObject({
+      recipe_id: "openfoam-fast-density-local-v2",
+      solver: { localTimeStepSmoothing: 0.2 },
+    });
+    expect(recipes.precise.solver).not.toHaveProperty("localTimeStepSmoothing");
+    configured.derived.mach = 0.2;
+    expect(progressiveRecipes(configured).fast.solver).not.toHaveProperty(
+      "localTimeStepSmoothing",
+    );
+    configured.derived.mach = 3;
+    expect(configured).toEqual(original);
+  });
   it("ignores batch/preset metadata, sweep, scheduling, and output policy", () => {
     const changed: SimulationSetupSnapshot = {
       ...snapshot,

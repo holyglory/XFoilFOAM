@@ -588,6 +588,30 @@ initialization and density-based calculations do not use this continuation.
 Missing hold proof leaves the attempt provisional; it also excludes those fields
 from accepted warm-start donors. Mesh reuse is unchanged.
 
+Local-steady density recipes may explicitly set `localTimeStepSmoothing` on the
+solver profile. This finite numerical value lies between zero and one; omission
+or null preserves the historical inverse-step smoothing coefficient of 0.02.
+The fast recipe, immutable execution snapshot and generated `numericalExecution.json`
+record the value. Non-default values have a separate numerical compatibility
+identity, while omitted, null and explicit 0.02 remain physically/numerically
+compatible with the legacy default. This is not a material or boundary condition.
+Profile copies preserve the setting without modifying the source profile.
+
+An explicit value travels as `solver.local_time_step_smoothing` with
+`expected_local_time_step_version: 1`. Hub and remote admission wait for that
+capability without consuming an attempt; the client rechecks it before submitting,
+and the API and worker reject mismatches before CFD. Physical-time and other
+solver recipes do not inherit this local-steady setting, including URANS recovery.
+The option alone does not change existing sealed campaign recipes. It does not
+increase the Courant ceiling, iteration/time allocation, thermodynamic bounds or
+convergence tolerance, and numerical convergence is not physical validation.
+
+Every density-based cold angle clears only mutable time, processor and
+postprocessing directories before writing its own initial state. The shared mesh,
+previous angle archives and raw logs survive; pressure-based warm marching is
+unchanged. Parallel local-steady iteration counts come from the conserved-field
+residual coordinate, not the preparation/reconstruction program's `Time` lines.
+
 Potential-flow initialization supplies only a proposal for the initial velocity, not
 compressible CFD evidence. Its complete finite vector field must fit the selected
 gas's available stagnation enthalpy above the material's minimum temperature.

@@ -1307,6 +1307,7 @@ export interface AdminSolverExecutionPool {
 }
 
 export interface AdminSolverProfile {
+  localTimeStepSmoothing?: number | null;
   id: string;
   solverImplementationId: string;
   implementation: AdminSolverImplementation | null;
@@ -1451,6 +1452,7 @@ export type SolverProfileInput = Pick<
   | "transientCycles"
   | "transientDiscardFraction"
   | "transientMaxCourant"
+  | "localTimeStepSmoothing"
 > & { slug?: string };
 export type SchedulingProfileInput = Pick<
   AdminSchedulingProfile,

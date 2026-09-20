@@ -802,6 +802,7 @@ export const solverProfiles = pgTable(
      * evidence-backed policy decision promotes it. */
     uransPrecalcBudgetS: integer("urans_precalc_budget_s"),
     uransInitializationIterations: integer("urans_initialization_iterations"),
+    localTimeStepSmoothing: doublePrecision("local_time_step_smoothing"),
     isSeeded: boolean("is_seeded").notNull().default(false),
     createdAt: ts().notNull().defaultNow(),
     updatedAt: ts()
@@ -820,6 +821,10 @@ export const solverProfiles = pgTable(
     uransInitializationIterationsCheck: check(
       "solver_profiles_urans_initialization_iterations_check",
       sql`${t.uransInitializationIterations} IS NULL OR ${t.uransInitializationIterations} BETWEEN 50 AND 20000`,
+    ),
+    localTimeStepSmoothingCheck: check(
+      "solver_profiles_local_time_step_smoothing_check",
+      sql`${t.localTimeStepSmoothing} IS NULL OR ${t.localTimeStepSmoothing} BETWEEN 0 AND 1`,
     ),
   }),
 );

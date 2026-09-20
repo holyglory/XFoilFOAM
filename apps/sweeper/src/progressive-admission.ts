@@ -26,6 +26,7 @@ export async function admitProgressiveCfdBatch(
     meshRecoveryVersion: number;
     uransRecoveryVersion?: number | null;
     solverBudgetVersion?: number | null;
+    localTimeStepVersion?: number | null;
     owner?: string;
   },
 ) {
@@ -73,6 +74,7 @@ export async function admitProgressiveCfdBatch(
         leaseSeconds: 120,
         requireSweeperEnabled: true,
         solverBudgetVersion: input.solverBudgetVersion,
+        localTimeStepVersion: input.localTimeStepVersion,
         allowPhysicalTime:
           input.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
@@ -82,6 +84,7 @@ export async function admitProgressiveCfdBatch(
         cpuSlots: available,
         meshRecoveryVersion: input.meshRecoveryVersion,
         solverBudgetVersion: input.solverBudgetVersion,
+        localTimeStepVersion: input.localTimeStepVersion,
       });
       if (admissionCpuSlotsForRequest(composed.request) > available)
         throw new ProgressiveCapacityUnavailable(

@@ -31,6 +31,7 @@ export async function composeProgressiveCfdJob(
     cpuSlots: number;
     meshRecoveryVersion: number;
     solverBudgetVersion?: number | null;
+    localTimeStepVersion?: number | null;
   },
 ): Promise<{ jobId: string; request: PolarRequest; replayed: boolean }> {
   if (
@@ -43,6 +44,17 @@ export async function composeProgressiveCfdJob(
   )
     throw new Error("Invalid CFD batch composition");
   const first = leases[0];
+  if (
+    leases.some(
+      (lease) =>
+        (lease.recipe.solver as Record<string, unknown> | undefined)
+          ?.localTimeStepSmoothing != null,
+    ) &&
+    input.localTimeStepVersion !== 1
+  )
+    throw new Error(
+      "Progressive CFD composition requires a known local-time-step capability",
+    );
   if (input.solverBudgetVersion !== 2)
     throw new Error(
       "Progressive CFD composition requires a known solver-budget capability",

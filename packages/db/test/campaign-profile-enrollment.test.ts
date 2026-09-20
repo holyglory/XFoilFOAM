@@ -7169,85 +7169,136 @@ describe("durable progressive CFD units", () => {
     expect(attempts.map((unit) => unit.attempts)).toEqual([1, 2]);
   });
 
-  it("composes high-Mach fast local-time work as immutable RANS rather than URANS", async () => {
-    const id = await campaign("active", [900], [-2, 0, 2, 4]);
-    await materializeProgressiveCampaignScope(db, id);
-    const baseline = (await claim([1]))!;
-    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
-    await initializeProgressiveCfdWork(db);
-    const leases = await claimProgressiveCfdBatch(db, {
-      owner: "local-density-fixture",
-      leaseSeconds: 120,
-    });
-    expect(leases).toHaveLength(2);
-    expect(leases[0].recipe).toMatchObject({
-      timeCoordinate: "local_pseudo_time_iterations",
-      selection: { solver: "rhoCentralFoam" },
-    });
-    const execution = await materializeProgressiveCfdExecution(db, leases[0]);
-    expect(execution.snapshot.solver.timeCoordinate).toBe(
-      "local_pseudo_time_iterations",
-    );
-    const [pool] = await db
-      .select()
-      .from(solverExecutionPools)
-      .where(
-        eq(
-          solverExecutionPools.solverImplementationId,
-          execution.revision.solverImplementationId!,
-        ),
+  it.each([null, 0.02, 0.2])(
+    "composes high-Mach fast local-time work as immutable RANS with smoothing %s",
+    async (smoothing) => {
+      let id: string;
+      await db
+        .update(solverProfiles)
+        .set({ localTimeStepSmoothing: smoothing })
+        .where(eq(solverProfiles.id, numerics.solverProfileId));
+      try {
+        id = await campaign("active", [900], [-2, 0, 2, 4]);
+      } finally {
+        await db
+          .update(solverProfiles)
+          .set({ localTimeStepSmoothing: null })
+          .where(eq(solverProfiles.id, numerics.solverProfileId));
+      }
+      await materializeProgressiveCampaignScope(db, id);
+      const baseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(
+        db,
+        baseline,
+        predictionFixture(baseline),
       );
-    expect(pool).toBeTruthy();
-    const [previous] = await db
-      .select()
-      .from(sweeperState)
-      .where(eq(sweeperState.id, 1));
-    try {
-      await db
-        .update(solverExecutionPools)
-        .set({ enabled: true })
-        .where(eq(solverExecutionPools.id, pool.id));
-      await db
-        .insert(sweeperState)
-        .values({ id: 1, enabled: true })
-        .onConflictDoUpdate({
-          target: sweeperState.id,
-          set: { enabled: true },
-        });
-      const composed = await composeProgressiveCfdJob(db, leases, {
-        solverBudgetVersion: 2,
-        cpuSlots: 1,
-        meshRecoveryVersion: 2,
+      await initializeProgressiveCfdWork(db);
+      if (smoothing != null)
+        expect(
+          await claimProgressiveCfdBatch(db, {
+            owner: "legacy-local-density-fixture",
+            leaseSeconds: 120,
+          }),
+        ).toEqual([]);
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "local-density-fixture",
+        leaseSeconds: 120,
+        localTimeStepVersion: 1,
       });
-      expect(composed.request.solver).toMatchObject({
-        flow_solver_family: "rhoCentralFoam",
-        force_transient: false,
-        transient_fallback: false,
-        momentum_scheme: "upwind",
-        n_iterations: 5000,
+      expect(leases).toHaveLength(2);
+      expect(leases[0].recipe).toMatchObject({
+        timeCoordinate: "local_pseudo_time_iterations",
+        selection: { solver: "rhoCentralFoam" },
       });
-      const [job] = await db
+      const execution = await materializeProgressiveCfdExecution(db, leases[0]);
+      expect(execution.snapshot.solver.localTimeStepSmoothing ?? null).toBe(
+        smoothing,
+      );
+      if (smoothing != null) {
+        const recovered = progressiveUnsteadyRecipe(
+          leases[0].recipe,
+          "needs_urans",
+        )!;
+        expect(recovered.solver).not.toHaveProperty("localTimeStepSmoothing");
+        expect(leases[0].recipe.solver).toHaveProperty(
+          "localTimeStepSmoothing",
+          smoothing,
+        );
+      }
+      expect(execution.snapshot.solver.timeCoordinate).toBe(
+        "local_pseudo_time_iterations",
+      );
+      const [pool] = await db
         .select()
-        .from(simJobs)
-        .where(eq(simJobs.id, composed.jobId));
-      expect(job).toMatchObject({
-        wave: 1,
-        methodKey: "openfoam.rans",
-        simulationPresetRevisionId: execution.revision.id,
-      });
-      expect(composed.request.resources?.case_solver_budget_seconds).toBe(900);
-      expect(execution.snapshot.mesh.targetYPlus).toBe(40);
-    } finally {
-      await db
-        .update(solverExecutionPools)
-        .set({ enabled: pool.enabled })
-        .where(eq(solverExecutionPools.id, pool.id));
-      await db
-        .update(sweeperState)
-        .set({ enabled: previous?.enabled ?? false })
+        .from(solverExecutionPools)
+        .where(
+          eq(
+            solverExecutionPools.solverImplementationId,
+            execution.revision.solverImplementationId!,
+          ),
+        );
+      expect(pool).toBeTruthy();
+      const [previous] = await db
+        .select()
+        .from(sweeperState)
         .where(eq(sweeperState.id, 1));
-    }
-  }, 120_000);
+      try {
+        await db
+          .update(solverExecutionPools)
+          .set({ enabled: true })
+          .where(eq(solverExecutionPools.id, pool.id));
+        await db
+          .insert(sweeperState)
+          .values({ id: 1, enabled: true })
+          .onConflictDoUpdate({
+            target: sweeperState.id,
+            set: { enabled: true },
+          });
+        const composed = await composeProgressiveCfdJob(db, leases, {
+          solverBudgetVersion: 2,
+          localTimeStepVersion: 1,
+          cpuSlots: 1,
+          meshRecoveryVersion: 2,
+        });
+        expect(composed.request.solver?.local_time_step_smoothing ?? null).toBe(
+          smoothing,
+        );
+        expect(composed.request.expected_local_time_step_version).toBe(
+          smoothing == null ? undefined : 1,
+        );
+        expect(composed.request.solver).toMatchObject({
+          flow_solver_family: "rhoCentralFoam",
+          force_transient: false,
+          transient_fallback: false,
+          momentum_scheme: "upwind",
+          n_iterations: 5000,
+        });
+        const [job] = await db
+          .select()
+          .from(simJobs)
+          .where(eq(simJobs.id, composed.jobId));
+        expect(job).toMatchObject({
+          wave: 1,
+          methodKey: "openfoam.rans",
+          simulationPresetRevisionId: execution.revision.id,
+        });
+        expect(composed.request.resources?.case_solver_budget_seconds).toBe(
+          900,
+        );
+        expect(execution.snapshot.mesh.targetYPlus).toBe(40);
+      } finally {
+        await db
+          .update(solverExecutionPools)
+          .set({ enabled: pool.enabled })
+          .where(eq(solverExecutionPools.id, pool.id));
+        await db
+          .update(sweeperState)
+          .set({ enabled: previous?.enabled ?? false })
+          .where(eq(sweeperState.id, 1));
+      }
+    },
+    120_000,
+  );
 
   it("pins a shared execution revision and composes every batch angle with atomic ownership", async () => {
     const id = await campaign();

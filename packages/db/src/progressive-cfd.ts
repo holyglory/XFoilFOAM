@@ -149,6 +149,7 @@ export async function claimProgressiveCfdUnit(
     allowedSolverFamilies?: readonly ProgressiveSolverFamily[];
     allowPhysicalTime?: boolean;
     solverBudgetVersion?: number | null;
+    localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     sameTarget?: {
       generationId: string;
@@ -219,7 +220,9 @@ export async function claimProgressiveCfdUnit(
           sql`, `,
         )})`
       : sql`true`;
-    const familyFilter = sql`(${selectedFamilies}) AND (${input.allowPhysicalTime !== false}
+    const familyFilter = sql`(${selectedFamilies})
+      AND (${input.localTimeStepVersion === 1} OR NULLIF((${effectiveRecipe})->'solver'->'localTimeStepSmoothing', 'null'::jsonb) IS NULL)
+      AND (${input.allowPhysicalTime !== false}
       OR (${effectiveRecipe})->'selection'->>'solver' IN ('simpleFoam', 'rhoSimpleFoam')
       OR ((${effectiveRecipe})->'selection'->>'solver' = 'rhoCentralFoam'
         AND (${effectiveRecipe})->>'timeCoordinate' = 'local_pseudo_time_iterations'))`;
@@ -378,6 +381,7 @@ export async function claimProgressiveCfdBatch(
     allowedSolverFamilies?: readonly ProgressiveSolverFamily[];
     allowPhysicalTime?: boolean;
     solverBudgetVersion?: number | null;
+    localTimeStepVersion?: number | null;
     remoteSolverId?: string;
   },
 ): Promise<ProgressiveCfdLease[]> {

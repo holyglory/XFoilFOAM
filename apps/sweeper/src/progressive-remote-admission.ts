@@ -19,6 +19,7 @@ import {
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 
 export interface ProgressiveRemoteCapabilities {
+  localTimeStepVersion?: number | null;
   version: 1;
   solverBudgetVersion: 2;
   meshRecoveryVersion: number;
@@ -35,6 +36,9 @@ export function parseProgressiveRemoteCapabilities(
   if (
     raw.version !== 1 ||
     raw.solverBudgetVersion !== 2 ||
+    (raw.localTimeStepVersion != null &&
+      (!Number.isSafeInteger(raw.localTimeStepVersion) ||
+        Number(raw.localTimeStepVersion) < 0)) ||
     !Number.isSafeInteger(raw.meshRecoveryVersion) ||
     Number(raw.meshRecoveryVersion) < 0 ||
     !(
@@ -55,6 +59,9 @@ export function parseProgressiveRemoteCapabilities(
   return {
     version: 1,
     solverBudgetVersion: 2,
+    ...(raw.localTimeStepVersion != null
+      ? { localTimeStepVersion: Number(raw.localTimeStepVersion) }
+      : {}),
     meshRecoveryVersion: Number(raw.meshRecoveryVersion),
     uransRecoveryVersion: raw.uransRecoveryVersion as number | null,
     engine: { ...raw.engine },
@@ -164,6 +171,7 @@ export async function prepareProgressiveRemoteDispatch(
         leaseSeconds: 120,
         requireSweeperEnabled: true,
         solverBudgetVersion: 2,
+        localTimeStepVersion: capabilities.localTimeStepVersion,
         allowPhysicalTime:
           capabilities.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
@@ -176,6 +184,7 @@ export async function prepareProgressiveRemoteDispatch(
         cpuSlots: available,
         meshRecoveryVersion: capabilities.meshRecoveryVersion,
         solverBudgetVersion: 2,
+        localTimeStepVersion: capabilities.localTimeStepVersion,
       });
       if (
         canonicalAnalysisJson(composed.request.expected_engine) !==

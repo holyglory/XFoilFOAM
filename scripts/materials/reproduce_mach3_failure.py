@@ -14,6 +14,7 @@ from airfoilfoam.models import PolarRequest
 from airfoilfoam.numerical_canary import source_material_for_canary
 from airfoilfoam.provenance import application_source_sha256, installed_application_source_sha256
 from airfoilfoam.storage import JobStore
+from airfoilfoam.thermodynamics import ThermodynamicState
 
 
 SOURCE_JOB = "c8827f4c-65d8-4490-bdc8-e84c98529a57"
@@ -39,13 +40,15 @@ def native_image_fingerprints(root=Path("/etc")):
     return fingerprints
 
 
-def diagnostic_request(coordinates_path, material_path, start, courant=4.0, smoothing=None):
+def diagnostic_request(coordinates_path, material_path, start, courant=4.0, smoothing=None, mach=None):
     if start not in ("cold", "marched"):
         raise ValueError("Unknown diagnostic starting state")
     if isinstance(courant, bool) or courant not in (4.0, 0.25, 0.1):
         raise ValueError("Unsupported diagnostic Courant comparison")
     if smoothing is not None and (isinstance(smoothing, bool) or smoothing not in (0.02, 0.2)):
         raise ValueError("Unsupported diagnostic smoothing comparison")
+    if mach is not None and (isinstance(mach, bool) or mach not in (1.2, 2)):
+        raise ValueError("Unsupported diagnostic Mach comparison")
     points = parse_airfoil(Path(coordinates_path).read_text()).tolist()
     points_hash = hashlib.sha256(json.dumps(points, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     if points_hash != POINTS_SHA256:
@@ -53,10 +56,12 @@ def diagnostic_request(coordinates_path, material_path, start, courant=4.0, smoo
     if hashlib.sha256(Path(material_path).read_bytes()).hexdigest() != MATERIAL_SHA256:
         raise ValueError("The diagnostic requires the pinned source-air fixture")
     gas = source_material_for_canary(material_path)
+    state = ThermodynamicState(temperature_k=288.15, pressure_pa=101325)
+    speed = 1021.025 if mach is None else mach * gas.speed_of_sound(state)
     return PolarRequest.model_validate({
         "airfoil": {"name": "FX 60-100 AIRFOIL", "points": points},
         **({"expected_local_time_step_version": 1} if smoothing is not None else {}),
-        "chord_lengths": [0.1], "speeds": [1021.025],
+        "chord_lengths": [0.1], "speeds": [speed],
         "aoa": {"angles": [13] if start == "cold" else [-4, 13]},
         "fluid": {"density": 1.2250159925164, "kinematic_viscosity": 1.4665638853861052e-05,
                   "gas": gas.model_dump(mode="json")},
@@ -130,8 +135,9 @@ def main():
     parser.add_argument("--processes", type=int, choices=[1, 2], default=1)
     parser.add_argument("--iterations", type=int, choices=[100, 5000], default=5000)
     parser.add_argument("--smoothing", type=float, choices=[0.02, 0.2])
+    parser.add_argument("--mach", type=float, choices=[1.2, 2])
     args = parser.parse_args()
-    request = execution_request(diagnostic_request(args.coordinates, args.material, args.start, args.courant, args.smoothing),
+    request = execution_request(diagnostic_request(args.coordinates, args.material, args.start, args.courant, args.smoothing, args.mach),
                                 args.processes, args.iterations)
     destination = args.destination / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
@@ -144,7 +150,8 @@ def main():
     store = JobStore(settings)
     job_id = str(uuid4())
     store.create(job_id, request)
-    report = {"kind": "mach3-failure-diagnosis", "source_job": SOURCE_JOB, "local_job": job_id,
+    report = {"kind": "mach3-failure-diagnosis" if args.mach is None else "local-steady-density-regime-diagnosis",
+              "source_job": SOURCE_JOB, "local_job": job_id, "mach_comparison": args.mach,
               "base_image_application_source_sha256": installed_application_source_sha256(),
               "execution_runtime": settings.engine_runtime_identity().model_dump(mode="json"),
               "starting_state": args.start, "geometry_points_sha256": POINTS_SHA256,
@@ -163,6 +170,8 @@ def main():
         report["differences_from_production"].append("smaller local pseudo-time Courant target")
     if args.smoothing is not None and args.smoothing != 0.02:
         report["differences_from_production"].append("explicit local inverse-step smoothing 0.2")
+    if args.mach is not None:
+        report["differences_from_production"].append(f"speed changed to compare Mach {args.mach:g}; not the original production physical target")
     try:
         result = execute_job(job_id, request, store=store, settings=settings)
         report.update({"solver_state": result.state.value, "solver_message": result.message,

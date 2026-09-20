@@ -2770,6 +2770,7 @@ function SimulationSetupPanel({
   const selectSolver = (row: AdminSolverProfile) => {
     setSolverId(row.id);
     setSolverForm({
+      localTimeStepSmoothing: row.localTimeStepSmoothing,
       name: row.name,
       solverImplementationId: row.solverImplementationId,
       turbulenceModel: row.turbulenceModel,

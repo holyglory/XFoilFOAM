@@ -104,8 +104,10 @@ export interface SimulationSetupSnapshot {
     | "isSeeded"
     | "solverImplementationId"
     | "uransInitializationIterations"
+    | "localTimeStepSmoothing"
   > & {
     uransInitializationIterations?: number | null;
+    localTimeStepSmoothing?: number | null;
     flowSolverFamily?: ProgressiveSolverFamily;
     timeCoordinate?: import("@aerodb/core").ProgressiveTimeCoordinate;
     turbulentPrandtl?: number;
@@ -194,12 +196,16 @@ export function physicsHashForSnapshot(
     slug: _solverSlug,
     name: _solverName,
     uransInitializationIterations,
+    localTimeStepSmoothing,
     ...solverPhysics
   } = solver;
   const resolvedSolverPhysics = {
     ...solverPhysics,
     ...(uransInitializationIterations != null
       ? { uransInitializationIterations }
+      : {}),
+    ...(localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
+      ? { localTimeStepSmoothing }
       : {}),
   };
   const subset = {
@@ -469,6 +475,7 @@ export async function resolveSimulationPresetSnapshot(
     isSeeded: _solSeeded,
     solverImplementationId: _solverImplementationId,
     uransInitializationIterations,
+    localTimeStepSmoothing,
     ...legacySolverPayload
   } = solver;
   const solverPayload = {
@@ -476,6 +483,7 @@ export async function resolveSimulationPresetSnapshot(
     ...(uransInitializationIterations != null
       ? { uransInitializationIterations }
       : {}),
+    ...(localTimeStepSmoothing != null ? { localTimeStepSmoothing } : {}),
   };
   const {
     createdAt: _schedCreated,

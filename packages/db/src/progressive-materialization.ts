@@ -33,6 +33,7 @@ export function progressiveRecipes(
     id: _solverId,
     slug: _solverSlug,
     name: _solverName,
+    localTimeStepSmoothing,
     ...solver
   } = snapshot.solver;
   const common = {
@@ -58,7 +59,9 @@ export function progressiveRecipes(
     fast: {
       ...common,
       recipe_id: localDensity
-        ? "openfoam-fast-density-local-v1"
+        ? localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
+          ? "openfoam-fast-density-local-v2"
+          : "openfoam-fast-density-local-v1"
         : "openfoam-fast-wall-v2",
       ...(!localDensity ? { wallSpacing } : {}),
       ...(localDensity
@@ -82,6 +85,9 @@ export function progressiveRecipes(
       },
       solver: {
         ...solver,
+        ...(localDensity && localTimeStepSmoothing != null
+          ? { localTimeStepSmoothing }
+          : {}),
         nIterations: localDensity ? 5000 : Math.min(solver.nIterations, 1500),
         ...(localDensity ? { momentumScheme: "upwind" } : {}),
         convergenceTolerance: Math.max(solver.convergenceTolerance, 1e-4),

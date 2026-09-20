@@ -827,7 +827,7 @@ export async function tick(
     await markTickCompleted(db);
     return;
   }
-  const { uransRecoveryVersion, solverBudgetVersion } =
+  const { uransRecoveryVersion, solverBudgetVersion, localTimeStepVersion } =
     await engineProgressiveCapabilities(engine);
   if (remoteAdmissionReady) {
     await admitRemoteSolverTick(db, engine, {
@@ -858,6 +858,7 @@ export async function tick(
       meshRecoveryVersion,
       uransRecoveryVersion,
       solverBudgetVersion,
+      localTimeStepVersion,
     });
     if (receipt.kind === "capability_wait")
       console.warn(

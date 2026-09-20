@@ -1,5 +1,77 @@
 schema = 2
 
+[test.local-step-policy]
+timeout_seconds = 900
+
+[test.local-step-policy.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.local-step-policy.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.local-step-policy.check]]
+name = "python"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
+
+[[test.local-step-policy.check]]
+name = "python-contract"
+tier = "development"
+requires = ["python"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--extra", "dev", "-m", "pytest", "tests/test_compressible_execution.py", "tests/test_local_time_step_smoothing.py", "tests/test_mach3_failure_reproduction.py", "tests/test_cache.py", "-q"]
+
+[[test.local-step-policy.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.local-step-policy.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.local-step-policy.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.local-step-policy.check]]
+name = "engine-contract"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/local-time-step.test.ts", "test/solver-budget.test.ts", "test/progressive-execution.test.ts"]
+
+[[test.local-step-policy.check]]
+name = "numeric-identity"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/polar-compatibility-cache.test.ts"]
+
+[[test.local-step-policy.check]]
+name = "immutable-execution"
+tier = "development"
+requires = ["types", "schema", "python"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "composes high-Mach fast local-time|local density"]
+
+[[test.local-step-policy.check]]
+name = "capability-routing"
+tier = "development"
+requires = ["types", "schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/build-request-transient-pin.test.ts", "test/progressive-capabilities.test.ts", "test/progressive-remote-admission.test.ts", "test/engine-capabilities.test.ts"]
+
+[[test.local-step-policy.check]]
+name = "profile-lifecycle"
+tier = "development"
+requires = ["types", "seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/local-time-step-profile.test.ts"]
+
 [test.local-step-smoothing]
 timeout_seconds = 900
 
@@ -19,6 +91,22 @@ source = ["worktree"]
 components = ["numerics"]
 public = false
 ttl_seconds = 86400
+
+[deployment.local-step-regimes]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.local-step-regimes.component.numerics]
+type = "compose"
+files = ["compose.local-step-smoothing.yml"]
+services = ["mach12-baseline", "mach12-candidate", "mach2-baseline", "mach2-candidate", "parallel"]
+finite_services = ["mach12-baseline", "mach12-candidate", "mach2-baseline", "mach2-candidate", "parallel"]
+build = false
+port = false
+route = false
+timeout_seconds = 2400
 
 [deployment.local-step-smoothing.component.numerics]
 type = "compose"
@@ -1921,7 +2009,19 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_potential_initializat
 name = "local-steady"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_local_steady_startup.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_mach3_startup_continuation.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_convergence.py", "tests/test_local_steady_startup.py", "tests/test_local_time_step_smoothing.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_oscillating_steady.py", "tests/test_cache.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_mach3_startup_continuation.py", "-q"]
+
+[[test.progressive.check]]
+name = "local-step-client"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/local-time-step.test.ts"]
+
+[[test.progressive.check]]
+name = "local-step-profile"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/local-time-step-profile.test.ts"]
 
 [[test.progressive.check]]
 name = "local-steady-binding"

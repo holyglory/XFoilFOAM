@@ -494,12 +494,39 @@ export class EngineClient {
     );
   }
 
-  submitPolar(
+  async submitPolar(
     request: PolarRequest,
     opts?: EngineCallOptions,
   ): Promise<JobStatus> {
     const requestWithExpectedEngine = this.requestWithExpectedEngine(request);
     const expectedEngine = requestWithExpectedEngine.expected_engine!;
+    const smoothing = request.solver?.local_time_step_smoothing;
+    if (smoothing != null || request.expected_local_time_step_version != null) {
+      if (
+        request.expected_local_time_step_version !== 1 ||
+        (smoothing != null &&
+          (typeof smoothing !== "number" ||
+            !Number.isFinite(smoothing) ||
+            smoothing < 0 ||
+            smoothing > 1 ||
+            request.solver?.flow_solver_family !== "rhoCentralFoam" ||
+            request.solver?.force_transient !== false))
+      )
+        throw new EngineError(
+          "Invalid explicit local time-step contract",
+          undefined,
+          "local_time_step_version_mismatch",
+        );
+      const health = await this.healthDetails({
+        timeoutMs: Math.min(opts?.timeoutMs ?? 5000, 5000),
+      });
+      if (health.status !== "ok" || health.local_time_step_version !== 1)
+        throw new EngineError(
+          "Engine does not support the explicit local time-step contract",
+          undefined,
+          "local_time_step_version_mismatch",
+        );
+    }
     return this.json<JobStatus>(
       "/polars",
       opts?.timeoutMs ?? ENGINE_SUBMIT_TIMEOUT_MS,

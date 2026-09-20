@@ -108,6 +108,11 @@ export function supportsDurableUransRecovery(
 export async function engineProgressiveCapabilities(engine: EngineClient) {
   const health = await engineHealthDetails(engine);
   return {
+    localTimeStepVersion: health
+      ? "local_time_step_version" in health
+        ? parsedUransRecoveryVersion(health.local_time_step_version)
+        : 0
+      : null,
     uransRecoveryVersion: health
       ? "urans_recovery_version" in health
         ? parsedUransRecoveryVersion(health.urans_recovery_version)

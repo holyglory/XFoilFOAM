@@ -54,6 +54,22 @@ def test_parallel_handoff_changes_only_explicit_execution_controls():
     assert original.solver.n_iterations == 5000 and original.resources.solver_processes == 1
 
 
+@pytest.mark.parametrize("mach", [1.2, 2])
+def test_regime_comparison_changes_only_the_explicit_speed(mach):
+    original = diagnostic_request(COORDINATES, MATERIAL, "cold", smoothing=0.2)
+    variant = diagnostic_request(COORDINATES, MATERIAL, "cold", smoothing=0.2, mach=mach)
+    expected = original.model_dump(mode="json")
+    expected["speeds"] = [mach * original.fluid.gas.speed_of_sound(original.flow_state)]
+    assert variant.model_dump(mode="json") == expected
+    assert original.speeds == [1021.025]
+
+
+@pytest.mark.parametrize("mach", [True, 0, 1.1, 1.5, 3, float("nan")])
+def test_unplanned_regime_comparisons_are_rejected(mach):
+    with pytest.raises(ValueError, match="Mach comparison"):
+        diagnostic_request(COORDINATES, MATERIAL, "cold", mach=mach)
+
+
 @pytest.mark.parametrize("processes,iterations", [(True, 5000), (0, 5000), (3, 5000), (2, 0), (2, 5050)])
 def test_diagnostic_parallel_scope_cannot_expand(processes, iterations):
     with pytest.raises(ValueError, match="scope"):

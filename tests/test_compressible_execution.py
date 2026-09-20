@@ -197,7 +197,7 @@ def test_accepted_density_angle_cannot_contaminate_the_next_cold_start(request_p
         if calls:
             assert state.exists() is not density_based
             assert (directory / "a0/evidence/raw.txt").read_text() == "immutable prior-angle fixture"
-            assert (directory / "log.a0").read_text() == "accepted prior-angle fixture"
+            assert (directory / "log.a0").read_text().startswith("accepted prior-angle fixture")
         if density_based:
             assert not (directory / "processor0").exists()
             assert not (directory / "postProcessing").exists()
@@ -206,7 +206,8 @@ def test_accepted_density_angle_cannot_contaminate_the_next_cold_start(request_p
         (directory / "processor0").mkdir(exist_ok=True)
         (directory / "postProcessing").mkdir(exist_ok=True)
         calls.append(directory)
-        return RunResult("rhoCentralFoam" if density_based else "rhoSimpleFoam", 0, "accepted prior-angle fixture")
+        return RunResult("rhoCentralFoam" if density_based else "rhoSimpleFoam", 0,
+                         "accepted prior-angle fixture\nTime = 0\nTime = 50\nTime = 0\nTime = 3926\n")
 
     def finalize(directory, outcome, *args, **kwargs):
         evidence = directory / f"a{len(calls) - 1}" / "evidence"
@@ -230,6 +231,8 @@ def test_accepted_density_angle_cannot_contaminate_the_next_cold_start(request_p
     assert len(calls) == 2
     assert len(result.attempts) == 2
     assert all(attempt.outcome.converged and attempt.outcome.error is None for attempt in result.attempts)
+    if density_based:
+        assert all(attempt.outcome.iterations == 3926 for attempt in result.attempts)
     assert mesh_file.read_text() == "shared mesh unit fixture"
     assert (polar_dir / "a0/evidence/raw.txt").read_text() == "immutable prior-angle fixture"
 

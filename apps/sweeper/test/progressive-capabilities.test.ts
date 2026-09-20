@@ -19,6 +19,7 @@ describe("progressive allocation capability", () => {
     expect(await engineProgressiveCapabilities(engine)).toEqual({
       uransRecoveryVersion: 14,
       solverBudgetVersion: 2,
+      localTimeStepVersion: 0,
     });
     expect(calls).toBe(1);
   });
@@ -36,6 +37,7 @@ describe("progressive allocation capability", () => {
       expect(await engineProgressiveCapabilities(engine)).toEqual({
         uransRecoveryVersion: 0,
         solverBudgetVersion: null,
+        localTimeStepVersion: 0,
       });
     },
   );
@@ -45,13 +47,45 @@ describe("progressive allocation capability", () => {
       await engineProgressiveCapabilities({
         healthDetails: async () => ({ status: "ok", version: "old" }),
       } as unknown as EngineClient),
-    ).toEqual({ uransRecoveryVersion: 0, solverBudgetVersion: 0 });
+    ).toEqual({
+      uransRecoveryVersion: 0,
+      solverBudgetVersion: 0,
+      localTimeStepVersion: 0,
+    });
     expect(
       await engineProgressiveCapabilities({
         healthDetails: async () => {
           throw new Error("offline");
         },
       } as unknown as EngineClient),
-    ).toEqual({ uransRecoveryVersion: null, solverBudgetVersion: null });
+    ).toEqual({
+      uransRecoveryVersion: null,
+      solverBudgetVersion: null,
+      localTimeStepVersion: null,
+    });
   });
+  it.each([
+    [undefined, 0],
+    [null, null],
+    ["1", null],
+    [1, 1],
+    [2, 2],
+    [-1, null],
+  ])(
+    "reads local stepping capability %s without inventing support",
+    async (version, expected) => {
+      const engine = {
+        healthDetails: async () => ({
+          status: "ok",
+          version: "test",
+          ...(version === undefined
+            ? {}
+            : { local_time_step_version: version }),
+        }),
+      } as unknown as EngineClient;
+      expect(
+        (await engineProgressiveCapabilities(engine)).localTimeStepVersion,
+      ).toBe(expected);
+    },
+  );
 });

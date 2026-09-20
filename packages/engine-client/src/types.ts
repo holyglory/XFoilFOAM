@@ -85,6 +85,7 @@ export interface EngineCapabilityDescriptor {
  * Legacy single-adapter fields remain optional during the rolling cutover. */
 export interface EngineCapabilities {
   solver_budget_version?: number;
+  local_time_step_version?: number;
   engine?: EngineRuntimeIdentity | null;
   /** Queue/routing key accepted by this adapter API. */
   routing_key?: string;
@@ -177,6 +178,7 @@ export const ALL_IMAGE_FIELDS: ImageFieldName[] = [
 export interface SolverParams {
   flow_solver_family?: ProgressiveSolverFamily;
   turbulent_prandtl?: number;
+  local_time_step_smoothing?: number;
   turbulence?: TurbulenceParams;
   n_iterations?: number;
   urans_initialization_iterations?: number;
@@ -250,6 +252,7 @@ export interface PolarRequest {
   execution_id?: string;
   expected_urans_initialization_version?: number;
   expected_solver_budget_version?: number;
+  expected_local_time_step_version?: number;
   /** Exact logical implementation requested by the control plane. New clients
    * always send this field; omission remains accepted only for legacy callers. */
   expected_engine?: EngineIdentity;
@@ -400,6 +403,7 @@ export interface EngineHealth {
    * zero and must not authorize continuation or corrective final recovery. */
   urans_recovery_version?: number;
   urans_initialization_version?: number;
+  local_time_step_version?: number;
   solver_budget_version?: number;
   /** Structured engine/runtime identity. Top-level version/build_id remain for
    * legacy control-plane and operator compatibility during rollout. */

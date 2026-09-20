@@ -74,6 +74,36 @@ function serviceFixture() {
   };
 }
 
+it.each([
+  [1, 1, 1],
+  [1, undefined, undefined],
+  [undefined, 1, undefined],
+  [2, 1, undefined],
+])(
+  "advertises explicit local stepping only when both observations agree (%s, %s)",
+  async (healthVersion, inventoryVersion, expected) => {
+    const fixture = serviceFixture();
+    const health = await fixture.healthDetails();
+    const inventory = await fixture.inventory();
+    fixture.healthDetails.mockResolvedValue({
+      ...health,
+      local_time_step_version: healthVersion,
+    });
+    fixture.inventory.mockResolvedValue({
+      ...inventory,
+      local_time_step_version: inventoryVersion,
+    });
+    await refreshProgressiveWorkerCapabilities(fixture.db, fixture.engine);
+    const observed = progressiveWorkerCapabilityMetadata(
+      fixture.db,
+    ).progressiveExecution;
+    expect(observed).toBeTruthy();
+    expect(
+      (observed as { localTimeStepVersion?: number }).localTimeStepVersion,
+    ).toBe(expected);
+  },
+);
+
 it("refreshes remote eligibility beyond sixty seconds without a controller tick and stops cleanly", async () => {
   vi.useFakeTimers();
   vi.spyOn(performance, "now").mockImplementation(() => Date.now());

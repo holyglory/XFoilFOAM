@@ -461,6 +461,7 @@ function SolverQuickCreateModal({
       ? {
           name: "",
           solverImplementationId: startImplementationId,
+          localTimeStepSmoothing: startFrom.localTimeStepSmoothing,
           turbulenceModel: startFrom.turbulenceModel,
           nIterations: startFrom.nIterations,
           convergenceTolerance: startFrom.convergenceTolerance,

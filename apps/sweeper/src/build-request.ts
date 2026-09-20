@@ -139,6 +139,11 @@ export function buildPolarRequest(opts: {
     span_chords: mesh.spanChords,
   });
   const request: PolarRequest = {
+    ...(setup.solver.flowSolverFamily === "rhoCentralFoam" &&
+    setup.solver.timeCoordinate === "local_pseudo_time_iterations" &&
+    setup.solver.localTimeStepSmoothing != null
+      ? { expected_local_time_step_version: 1 }
+      : {}),
     ...(wave === 2 && setup.solver.uransInitializationIterations != null
       ? {
           expected_urans_initialization_version:
@@ -199,6 +204,11 @@ export function buildPolarRequest(opts: {
         viscosity_ratio: setup.boundary.viscosityRatio,
       },
       n_iterations: setup.solver.nIterations,
+      ...(setup.solver.flowSolverFamily === "rhoCentralFoam" &&
+      setup.solver.timeCoordinate === "local_pseudo_time_iterations" &&
+      setup.solver.localTimeStepSmoothing != null
+        ? { local_time_step_smoothing: setup.solver.localTimeStepSmoothing }
+        : {}),
       ...(wave === 2 && setup.solver.uransInitializationIterations != null
         ? {
             urans_initialization_iterations:
