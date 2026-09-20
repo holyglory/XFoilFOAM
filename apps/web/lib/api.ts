@@ -65,7 +65,7 @@ export async function getAirfoilDetail(
 ): Promise<AirfoilDetailPayload | null> {
   const query = new URLSearchParams();
   if (revisionId) query.set("revisionId", revisionId);
-  if (view === "curves") query.set("view", view);
+  if (view === "curves" || view === "compare") query.set("view", view);
   const qs = query.size ? `?${query}` : "";
   const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}${qs}`, {
     cache: "no-store",
