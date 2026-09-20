@@ -89,10 +89,6 @@ export function resolveProgressiveReportedPoint(
 export function isFinalProgressiveRemoteReport(
   report: ProgressiveRemoteReport,
 ): boolean {
-  const cancelledAfterMeasuredStop =
-    report.status.state === "cancelled" &&
-    report.stopProof?.execution_stopped === true &&
-    report.result?.state === "running";
   return (
     report.stopProof !== null &&
     ["completed", "failed", "cancelled"].includes(report.status.state) &&
@@ -104,7 +100,6 @@ export function isFinalProgressiveRemoteReport(
         ["deterministic_mesh", "infrastructure"].includes(
           String(report.status.failure_disposition),
         )) ||
-      cancelledAfterMeasuredStop ||
       (report.result !== null &&
         ["completed", "failed", "cancelled"].includes(report.result.state)))
   );

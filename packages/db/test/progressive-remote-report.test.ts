@@ -393,7 +393,7 @@ describe("remote progressive incremental report validation", () => {
     );
   });
 
-  it("closes a cancelled execution with a measured stop and partial result", () => {
+  it("keeps cancelled partial evidence open for a later sealed result", () => {
     const { assignment, report } = fixture();
     report.status.state = "cancelled";
     report.result!.state = "running";
@@ -413,7 +413,22 @@ describe("remote progressive incremental report validation", () => {
     expect(validateProgressiveRemoteReport(report, assignment).report).toEqual(
       report,
     );
-    expect(isFinalProgressiveRemoteReport(report)).toBe(true);
+    expect(isFinalProgressiveRemoteReport(report)).toBe(false);
+    const sealed = structuredClone(report);
+    sealed.sequence += 1;
+    sealed.result!.state = "cancelled";
+    expect(isFinalProgressiveRemoteReport(sealed)).toBe(true);
+    expect(() => validateProgressiveRemoteReportOrder(sealed, report)).not.toThrow();
+    expect(() => validateProgressiveRemoteReportOrder({
+      ...sealed,
+      status: { ...sealed.status, state: "running" },
+      stopProof: null,
+    }, report)).toThrow("cannot resume");
+    const replay = { ...sealed, sequence: sealed.sequence + 1 };
+    expect(() => validateProgressiveRemoteReportOrder(replay, sealed)).not.toThrow();
+    expect(() => validateProgressiveRemoteReportOrder({
+      ...replay, result: { ...sealed.result!, state: "running" },
+    }, sealed)).toThrow("Final remote execution evidence cannot change");
   });
 
   it.each([
