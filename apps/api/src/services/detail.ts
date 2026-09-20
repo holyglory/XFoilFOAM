@@ -766,7 +766,10 @@ async function loadCompatibilityCache(
  *  setup anchors; internal batch/revision names never define a curve. */
 export async function assembleDetail(
   slug: string,
-  opts: { revisionId?: string | null; view?: "curves" | "full" } = {},
+  opts: {
+    revisionId?: string | null;
+    view?: "curves" | "compare" | "full";
+  } = {},
 ): Promise<AirfoilDetailPayload | null> {
   const [a] = await db
     .select()
@@ -788,10 +791,16 @@ export async function assembleDetail(
         .where(eq(categories.id, a.categoryId))
         .limit(1),
       hashtagsByAirfoilIds([a.id]),
-      opts.view === "curves" && !opts.revisionId
+      (opts.view === "curves" || opts.view === "compare") &&
+      !opts.revisionId
         ? Promise.resolve(null)
         : loadSimulationWorks(a.id),
-      publicProgressivePolars(db, a.id, opts.revisionId),
+      publicProgressivePolars(
+        db,
+        a.id,
+        opts.revisionId,
+        opts.view === "compare",
+      ),
     ]);
   const normalizedTags = tagsByAirfoil.get(a.id) ?? [];
 
@@ -822,7 +831,11 @@ export async function assembleDetail(
       dxf: null,
     },
   };
-  if (opts.view === "curves" && !opts.revisionId && progressivePolars.length) {
+  if (
+    (opts.view === "curves" || opts.view === "compare") &&
+    !opts.revisionId &&
+    progressivePolars.length
+  ) {
     return {
       ...metadata,
       mach: progressivePolars[0].mach,

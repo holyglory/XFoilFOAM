@@ -964,7 +964,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const query = z
       .object({
         revisionId: z.string().uuid().optional(),
-        view: z.enum(["curves", "full"]).optional(),
+        view: z.enum(["curves", "compare", "full"]).optional(),
       })
       .safeParse(req.query);
     if (!query.success)

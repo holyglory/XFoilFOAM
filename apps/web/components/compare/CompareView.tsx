@@ -26,7 +26,7 @@ import {
 import { useSearchParams } from "next/navigation";
 
 import { AirfoilSelector } from "@/components/AirfoilSelector";
-import { getAirfoilCurveDetail, listAirfoils } from "@/lib/api";
+import { getAirfoilCompareDetail, listAirfoils } from "@/lib/api";
 import { metricConditionParam } from "@/lib/metric-condition";
 import {
   activePolarSeriesId,
@@ -116,7 +116,7 @@ export function CompareView({
         continue;
       const controller = new AbortController();
       controllers.current.set(slug, controller);
-      getAirfoilCurveDetail(slug, controller.signal)
+      getAirfoilCompareDetail(slug, controller.signal)
         .then((detail) => {
           if (controllers.current.get(slug) !== controller) return;
           if (detail)

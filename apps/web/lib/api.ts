@@ -61,7 +61,7 @@ export async function getAirfoilDetail(
   slug: string,
   revisionId?: string | null,
   signal?: AbortSignal,
-  view: "curves" | "full" = "full",
+  view: "curves" | "compare" | "full" = "full",
 ): Promise<AirfoilDetailPayload | null> {
   const query = new URLSearchParams();
   if (revisionId) query.set("revisionId", revisionId);
@@ -78,6 +78,10 @@ export async function getAirfoilDetail(
 
 export function getAirfoilCurveDetail(slug: string, signal?: AbortSignal) {
   return getAirfoilDetail(slug, null, signal, "curves");
+}
+
+export function getAirfoilCompareDetail(slug: string, signal?: AbortSignal) {
+  return getAirfoilDetail(slug, null, signal, "compare");
 }
 
 export async function listAirfoils(

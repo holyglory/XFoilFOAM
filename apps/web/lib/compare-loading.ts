@@ -1,4 +1,4 @@
-import { getAirfoilCurveDetail, listAirfoils } from "./api";
+import { getAirfoilCompareDetail, listAirfoils } from "./api";
 
 export async function loadComparisonData(
   selection: string[] | null,
@@ -18,7 +18,7 @@ export async function loadComparisonData(
   const requested = await Promise.all(
     selected.map(async (slug) => ({
       slug,
-      detail: await getAirfoilCurveDetail(slug),
+      detail: await getAirfoilCompareDetail(slug),
     })),
   );
   return {

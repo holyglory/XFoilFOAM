@@ -17,10 +17,137 @@ function curveWithMetrics(
   return { ...curve, metrics: progressiveCurveMetrics(curve.samples) };
 }
 
+type ProgressivePublicRecord = {
+  id: string;
+  target_id: string;
+  created_at: Date;
+  physical: AnalysisPhysical;
+  model_id: string | null;
+  model_created_at: Date | null;
+  source_signature: string | null;
+  estimate: ProgressivePolarEstimate | null;
+  evidence_angles: Record<string, number> | null;
+  payload: {
+    alpha: number[];
+    coefficients: number[][];
+    model: Record<string, unknown>;
+    geometry_fit: { rms_chord: number; maximum_chord: number };
+  };
+};
+
+function neuralfoilCurve(
+  record: ProgressivePublicRecord,
+): ProgressivePolarSeries["curves"][number] {
+  return curveWithMetrics({
+    method: "neuralfoil",
+    samples: record.payload.alpha.map((alpha, index) => ({
+      alpha,
+      cl: record.payload.coefficients[index][0],
+      cd: record.payload.coefficients[index][1],
+      cm: record.payload.coefficients[index][2],
+    })),
+  });
+}
+
+function progressiveCurves(
+  record: ProgressivePublicRecord,
+  compact: boolean,
+): ProgressivePolarSeries["curves"] {
+  const neuralfoil = neuralfoilCurve(record);
+  if (compact) {
+    const method = record.estimate
+      ? (["composite", "openfoam_precise", "openfoam_fast"] as const).find(
+          (candidate) => record.estimate?.curves[candidate] != null,
+        )
+      : undefined;
+    if (!method || !record.estimate) return [neuralfoil];
+    const curve = record.estimate.curves[method]!;
+    return [
+      curveWithMetrics({
+        method,
+        samples: record.estimate.alpha.map((alpha, index) => ({
+          alpha,
+          cl: curve.coefficients[index][0],
+          cd: curve.coefficients[index][1],
+          cm: curve.coefficients[index][2],
+        })),
+      }),
+    ];
+  }
+  return [
+    neuralfoil,
+    ...(record.estimate
+      ? Object.entries(record.estimate.curves).map(([method, curve]) =>
+          curveWithMetrics({
+            method: method as
+              | "composite"
+              | "openfoam_fast"
+              | "openfoam_precise",
+            samples: record.estimate!.alpha.map((alpha, index) => ({
+              alpha,
+              cl: curve.coefficients[index][0],
+              cd: curve.coefficients[index][1],
+              cm: curve.coefficients[index][2],
+              lower: {
+                cl: curve.lower[index][0],
+                cd: curve.lower[index][1],
+                cm: curve.lower[index][2],
+              },
+              upper: {
+                cl: curve.upper[index][0],
+                cd: curve.upper[index][1],
+                cm: curve.upper[index][2],
+              },
+            })),
+          }),
+        )
+      : []),
+  ];
+}
+
+function progressiveExplanation(
+  record: ProgressivePublicRecord,
+  compact: boolean,
+): ProgressivePolarSeries["explanation"] {
+  const explanation: ProgressivePolarSeries["explanation"] = {
+    calibration: record.estimate?.calibration_status ?? "unvalidated",
+    modelVersions: {
+      NeuralFoil: String(record.payload.model.neuralfoil),
+      AeroSandbox: String(record.payload.model.aerosandbox),
+      ...(record.estimate
+        ? { "Polar model": record.estimate.version }
+        : {}),
+    },
+    geometryRms: record.payload.geometry_fit.rms_chord,
+    geometryMaximumError: record.payload.geometry_fit.maximum_chord,
+  };
+  if (compact || !record.estimate) return explanation;
+  return {
+    ...explanation,
+    sourceSignature: record.source_signature!,
+    modelSignature: record.estimate.signature,
+    contributors: record.estimate.contributors.map((row) => ({
+      observationId: row.observation_id,
+      resultId: row.result_id,
+      attemptId: row.attempt_id,
+      alpha: record.evidence_angles?.[row.attempt_id] ?? null,
+      method: row.method,
+      window: row.window ?? null,
+      numericalConvergence: row.numerical_convergence,
+      statisticalCertification: row.statistical_certification,
+    })),
+    exclusions: record.estimate.excluded.map((row) => ({
+      observationId: row.observation_id,
+      reason: row.reason,
+    })),
+  };
+}
+
 export async function publicProgressivePolars(
   db: DB,
   airfoilId: string,
   revisionId?: string | null,
+  compact = false,
 ): Promise<ProgressivePolarSeries[]> {
   const records = (await db.execute(sql`
     SELECT DISTINCT ON (prediction.target_id) prediction.id, prediction.target_id, prediction.created_at,
@@ -43,23 +170,7 @@ export async function publicProgressivePolars(
       WHERE scope.target_id = target.id
         AND ${revisionId ? sql`revision.id = ${revisionId}` : sql`revision.snapshot->'flowState'->>'mediumSlug' = 'air'`}
     ) ORDER BY prediction.target_id, prediction.created_at DESC, prediction.id
-  `)) as unknown as Array<{
-    id: string;
-    target_id: string;
-    created_at: Date;
-    physical: AnalysisPhysical;
-    model_id: string | null;
-    model_created_at: Date | null;
-    source_signature: string | null;
-    estimate: ProgressivePolarEstimate | null;
-    evidence_angles: Record<string, number> | null;
-    payload: {
-      alpha: number[];
-      coefficients: number[][];
-      model: Record<string, unknown>;
-      geometry_fit: { rms_chord: number; maximum_chord: number };
-    };
-  }>;
+  `)) as unknown as ProgressivePublicRecord[];
   return records
     .map(
       (record): ProgressivePolarSeries => ({
@@ -74,75 +185,8 @@ export async function publicProgressivePolars(
         updatedAt: new Date(
           record.model_created_at ?? record.created_at,
         ).toISOString(),
-        curves: [
-          curveWithMetrics({
-            method: "neuralfoil",
-            samples: record.payload.alpha.map((alpha, index) => ({
-              alpha,
-              cl: record.payload.coefficients[index][0],
-              cd: record.payload.coefficients[index][1],
-              cm: record.payload.coefficients[index][2],
-            })),
-          }),
-          ...(record.estimate
-            ? Object.entries(record.estimate.curves).map(([method, curve]) =>
-                curveWithMetrics({
-                  method: method as
-                    | "composite"
-                    | "openfoam_fast"
-                    | "openfoam_precise",
-                  samples: record.estimate!.alpha.map((alpha, index) => ({
-                    alpha,
-                    cl: curve.coefficients[index][0],
-                    cd: curve.coefficients[index][1],
-                    cm: curve.coefficients[index][2],
-                    lower: {
-                      cl: curve.lower[index][0],
-                      cd: curve.lower[index][1],
-                      cm: curve.lower[index][2],
-                    },
-                    upper: {
-                      cl: curve.upper[index][0],
-                      cd: curve.upper[index][1],
-                      cm: curve.upper[index][2],
-                    },
-                  })),
-                }),
-              )
-            : []),
-        ],
-        explanation: {
-          calibration: record.estimate?.calibration_status ?? "unvalidated",
-          modelVersions: {
-            NeuralFoil: String(record.payload.model.neuralfoil),
-            AeroSandbox: String(record.payload.model.aerosandbox),
-            ...(record.estimate
-              ? { "Polar model": record.estimate.version }
-              : {}),
-          },
-          geometryRms: record.payload.geometry_fit.rms_chord,
-          geometryMaximumError: record.payload.geometry_fit.maximum_chord,
-          ...(record.estimate
-            ? {
-                sourceSignature: record.source_signature!,
-                modelSignature: record.estimate.signature,
-                contributors: record.estimate.contributors.map((row) => ({
-                  observationId: row.observation_id,
-                  resultId: row.result_id,
-                  attemptId: row.attempt_id,
-                  alpha: record.evidence_angles?.[row.attempt_id] ?? null,
-                  method: row.method,
-                  window: row.window ?? null,
-                  numericalConvergence: row.numerical_convergence,
-                  statisticalCertification: row.statistical_certification,
-                })),
-                exclusions: record.estimate.excluded.map((row) => ({
-                  observationId: row.observation_id,
-                  reason: row.reason,
-                })),
-              }
-            : {}),
-        },
+        curves: progressiveCurves(record, compact),
+        explanation: progressiveExplanation(record, compact),
       }),
     )
     .sort(
