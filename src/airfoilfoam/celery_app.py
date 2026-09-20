@@ -69,7 +69,8 @@ def task_hard_time_limit_s(
 
 def make_celery() -> Celery:
     settings = get_settings()
-    app = Celery("airfoilfoam", broker=settings.broker_url, backend=settings.result_backend)
+    app = Celery("airfoilfoam", broker=settings.broker_url, backend=settings.result_backend,
+                 control="airfoilfoam.control_rpc:SingleConnectionControl")
     # This deliberately public worker record is returned by Celery's live
     # ``inspect.conf()`` command. The gateway correlates one cached snapshot
     # with the exact ``inspect.active_queues()`` worker/queue binding and

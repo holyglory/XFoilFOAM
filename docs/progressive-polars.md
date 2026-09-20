@@ -210,6 +210,14 @@ Workers persist ordered immutable reports before delivery. A lost response retri
 the same sequence and bytes; only the hub's matching execution, sequence and content
 signature acknowledge that local outbox row.
 
+Worker-control publication uses the connection already held by its control call.
+It must not borrow a second connection through the task producer pool: concurrent
+control calls can otherwise hold every connection while waiting for another.
+The ordinary task publisher, pool size, command routing, cancellation fences and
+exact namespace-backed stop-proof requirements remain unchanged. The isolated
+`control-rpc` check exercises concurrent cancellation and independent health
+requests against Redis, then inspects and cancels a genuinely busy CFD case.
+
 After acknowledgement, evidence staging alternates between the freshest eligible
 report for an active promise and the oldest eligible report overall. New histories
 can therefore reach polar refinement without waiting for the entire historical

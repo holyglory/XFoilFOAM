@@ -20,6 +20,37 @@ timeout_seconds = 1200
 [test]
 default = "python"
 
+[test.control-rpc-pool]
+timeout_seconds = 180
+
+[[test.control-rpc-pool.check]]
+name = "installed-pool-reproduction"
+tier = "development"
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_control_rpc_pool.py", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "tests/test_api.py", "-q"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.control-rpc-pool.check]]
+name = "remote-source-maintenance"
+tier = "development"
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_remote_solver_2606_deploy.py", "-k", "completed_remote", "-q"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[deployment.control-rpc]
+source = ["worktree"]
+components = ["verification"]
+public = false
+ttl_seconds = 86400
+
+[deployment.control-rpc.component.verification]
+type = "compose"
+files = ["compose.control-rpc.yml"]
+services = ["redis", "gateway", "worker", "verify"]
+finite_services = ["verify"]
+build = false
+port = false
+route = false
+timeout_seconds = 420
+
 [test.fresh-staging]
 timeout_seconds = 900
 
@@ -1848,7 +1879,7 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_material_abort.py", "
 name = "worker-control"
 tier = "development"
 requires = ["dependencies"]
-command = [".venv/bin/python", "-m", "pytest", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "tests/test_api.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_control_rpc_pool.py", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_execution_stop.py", "tests/test_multi_engine.py", "tests/test_api.py", "-q"]
 
 [[test.progressive.check]]
 name = "submission-legacy"

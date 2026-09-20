@@ -1,0 +1,60 @@
+x-engine: &engine
+  image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+  pull_policy: never
+  network_mode: service:redis
+  environment: &environment
+    PYTHONPATH: /candidate/src
+    PYTHONDONTWRITEBYTECODE: "1"
+    AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:6379/0
+    AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
+    AIRFOILFOAM_CACHE_DIR: /data/cache
+    AIRFOILFOAM_OPENFOAM_RUNNER: local
+    AIRFOILFOAM_EVIDENCE_BUCKET: ""
+    AIRFOILFOAM_CONTROL_PLANE_TOKEN: isolated-control-rpc-test-token-not-a-production-secret
+    AIRFOILFOAM_WORKER_CPU_BUDGET: "1"
+    AIRFOILFOAM_CELERY_CONCURRENCY: "1"
+    AIRFOILFOAM_CASE_CONCURRENCY: "1"
+  volumes:
+    - ./src:/candidate/src:ro
+    - control-data:/data
+  depends_on:
+    redis:
+      condition: service_healthy
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 524288
+
+services:
+  redis:
+    image: redis:7-alpine
+    network_mode: none
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  gateway:
+    <<: *engine
+    command: ["uvicorn", "airfoilfoam.api.main:app", "--host", "127.0.0.1", "--port", "8000"]
+  worker:
+    <<: *engine
+    command: ["celery", "-A", "airfoilfoam.celery_app", "worker", "--loglevel=info", "--concurrency=1", "-Q", "openfoam-opencfd-2606"]
+  verify:
+    <<: *engine
+    command: ["python", "/verification/verify_control_pool_native.py"]
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts/dev/verify_control_pool_native.py:/verification/verify_control_pool_native.py:ro
+      - ./packages/db/seed/selig-database/ag24.dat:/fixture/ag24.dat:ro
+      - ./.codex-artifacts/control-rpc-native:/verification-output
+    depends_on:
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+      worker:
+        condition: service_started
+
+volumes:
+  control-data:

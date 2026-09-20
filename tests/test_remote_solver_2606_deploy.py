@@ -578,6 +578,7 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
         "compose up -d --no-build --no-deps --force-recreate api worker node-api",
         env_update,
     )
+    assert '"OPENCFD2606_ENGINE_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION"' in maintenance[env_update:recreate]
     live_proof = maintenance.index(
         'validate_live_2606_volume_runtime "$ACTION"', recreate
     )
@@ -614,6 +615,47 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     assert "unsettled_cancellations" in maintenance_db
     assert "running_media_repairs" in maintenance_db
     assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
+
+
+def test_completed_remote_maintenance_moves_source_label_with_build_ids(tmp_path: Path) -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text()
+    start = source.index("perform_complete_runtime_maintenance()")
+    end = source.index("\nmain() {", start)
+    script = """
+set -euo pipefail
+ACTION=test-build
+DEPLOY_SOURCE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OPENCFD_2406_POOL_ID=3f8bc764-09ae-4ff3-8fd2-240600000001
+OPENCFD_2606_POOL_ID=3f8bc764-09ae-4ff3-8fd2-260600000001
+current_engine_version() { echo 2606; }
+read_env_var() { echo old-build; }
+validate_live_2606_volume_runtime() { echo "verify:$1"; }
+writer_state() { echo 1; }
+remote_transfer_paused() { echo false; }
+set_remote_transfer_paused() { :; }
+wait_remote_transfer_quiescence() { :; }
+stop_writers() { :; }
+disable_all_opencfd_pools() { :; }
+require_maintenance_safe() { :; }
+sleep() { :; }
+wait_http() { :; }
+restore_writers() { :; }
+set_env_vars_atomic() { printf 'identity:%s\\n' "$@"; }
+compose() {
+  if [[ "$1" == exec && "$*" == *concat_ws* ]]; then echo 'false|true';
+  elif [[ "$1" == ps && "${2:-}" == -q ]]; then echo isolated-worker;
+  elif [[ "$1" == up ]]; then echo recreated;
+  fi
+}
+docker() { printf '[{"HostConfig":{"Ulimits":[{"Name":"nofile","Soft":65536,"Hard":524288}]}}]'; }
+""" + source[start:end] + "\nperform_complete_runtime_maintenance\n"
+    result = subprocess.run(["bash", "-c", script], cwd=tmp_path, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    identities = [line for line in lines if line.startswith("identity:")]
+    assert identities == ["identity:AIRFOILFOAM_BUILD_ID=test-build", "identity:ENGINE_EXPECTED_BUILD_ID=test-build",
+                          f"identity:OPENCFD2606_ENGINE_SOURCE_REVISION={REVISION}"]
+    assert lines.index(identities[-1]) < lines.index("recreated") < lines.index("verify:test-build")
 
 
 @pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="Requires governed PostgreSQL")

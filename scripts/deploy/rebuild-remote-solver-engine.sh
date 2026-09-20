@@ -1076,7 +1076,8 @@ SELECT concat_ws('|',
 
   set_env_vars_atomic \
     "AIRFOILFOAM_BUILD_ID=$ACTION" \
-    "ENGINE_EXPECTED_BUILD_ID=$ACTION"
+    "ENGINE_EXPECTED_BUILD_ID=$ACTION" \
+    "OPENCFD2606_ENGINE_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION"
   compose up -d --no-build --no-deps --force-recreate api worker node-api
   wait_http "maintained engine API" http://127.0.0.1:8000/health
   wait_http "maintained node API" http://127.0.0.1:4000/health
