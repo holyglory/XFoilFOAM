@@ -3055,6 +3055,15 @@ requires = ["tokens", "types", "verifier-self-test"]
 command = ["node", "scripts/dev/verify-evidence-metadata-contrast.mjs"]
 retained_artifacts = [{ name = "metadata-contrast", path = ".codex-artifacts/evidence-metadata-contrast", max_bytes = 16777216 }]
 
+[test.evidence-metadata-production]
+timeout_seconds = 900
+
+[[test.evidence-metadata-production.check]]
+name = "rendered-metadata"
+tier = "development"
+command = ["node", "scripts/dev/verify-evidence-metadata-contrast.mjs", "--production", "--slug", "sc20712"]
+retained_artifacts = [{ name = "metadata-contrast", path = ".codex-artifacts/evidence-metadata-contrast", max_bytes = 16777216 }]
+
 [[test.cfd-curve-display.check]]
 name = "types"
 tier = "development"

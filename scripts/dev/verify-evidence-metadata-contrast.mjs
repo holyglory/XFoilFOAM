@@ -13,7 +13,12 @@ const { pageVerifier } = await import(pathToFileURL(verifierPath).href);
 const verifierSha256 = createHash("sha256")
   .update(await readFile(verifierPath))
   .digest("hex");
-const origin = progressivePreviewOrigin();
+const origin = process.argv.includes("--production")
+  ? "https://airfoils.pro"
+  : progressivePreviewOrigin();
+const slugArgument = process.argv.indexOf("--slug");
+const slug = slugArgument < 0 ? "ag24" : process.argv[slugArgument + 1];
+assert(/^[a-z0-9][a-z0-9-]*$/.test(slug));
 const output = fileURLToPath(
   new URL(
     "../../.codex-artifacts/evidence-metadata-contrast/",
@@ -32,7 +37,7 @@ try {
   if (error.code !== "ENOENT") throw error;
 }
 await mkdir(output, { recursive: true });
-const response = await fetch(`${origin}/api/airfoils/ag24`, {
+const response = await fetch(`${origin}/api/airfoils/${slug}`, {
   signal: AbortSignal.timeout(15000),
 });
 assert(response.ok);
@@ -48,11 +53,13 @@ for (const series of detail.progressivePolars) {
       resultId: contributor.resultId,
       resultAttemptId: contributor.attemptId,
     });
-    const stored = await fetch(`${origin}/api/airfoils/ag24/sim?${query}`, {
+    const stored = await fetch(`${origin}/api/airfoils/${slug}/sim?${query}`, {
       signal: AbortSignal.timeout(15000),
     });
     assert(stored.ok);
     const sim = await stored.json();
+    assert.equal(sim.resultId, contributor.resultId);
+    assert.equal(sim.resultAttemptId, contributor.attemptId);
     if (sim.media?.velocity_magnitude && sim.observation) {
       fixture = { series, contributor, media: sim.media.velocity_magnitude };
       break;
@@ -105,7 +112,7 @@ try {
         );
         let injectScale = false;
         let interceptions = 0;
-        await page.route("**/api/airfoils/ag24/sim?*", async (route) => {
+        await page.route(`**/api/airfoils/${slug}/sim?*`, async (route) => {
           const url = new URL(route.request().url());
           if (
             url.searchParams.get("resultId") !== fixture.contributor.resultId ||
@@ -118,8 +125,10 @@ try {
           const actual = await route.fetch();
           assert(actual.ok());
           const sim = await actual.json();
+          assert.equal(sim.resultId, fixture.contributor.resultId);
+          assert.equal(sim.resultAttemptId, fixture.contributor.attemptId);
           if (injectScale) {
-            sim.media.velocity_magnitude.scale = {
+            sim.media.velocity_magnitude.scale ??= {
               mode: "track",
               vmin: -2,
               vmax: 35,
@@ -131,7 +140,7 @@ try {
           }
           await route.fulfill({ response: actual, json: sim });
         });
-        await page.goto(`${origin}/airfoils/ag24`, {
+        await page.goto(`${origin}/airfoils/${slug}`, {
           waitUntil: "domcontentloaded",
         });
         const viewer = page.getByTestId("progressive-polar-viewer");
@@ -159,7 +168,12 @@ try {
         await expect(dialog.getByTestId("sim-coefficient-caption")).toHaveCount(
           3,
         );
-        await expect(dialog.getByTestId("sim-active-scale")).toHaveCount(0);
+        await dialog
+          .getByRole("button", { name: "velocity |U|", exact: true })
+          .click();
+        await expect(dialog.getByTestId("sim-active-scale")).toHaveCount(
+          fixture.media.scale ? 1 : 0,
+        );
         await page.keyboard.press("Escape");
         await expect(trigger).toBeFocused();
         injectScale = true;
@@ -180,8 +194,12 @@ try {
         assert.equal(interceptions, 1);
         await expect(dialog.getByTestId("sim-active-scale")).toBeVisible();
         await expect(dialog.getByTestId("sim-active-scale")).toContainText(
-          "-2",
+          "track scale",
         );
+        if (!fixture.media.scale)
+          await expect(dialog.getByTestId("sim-active-scale")).toContainText(
+            "-2",
+          );
         await page.evaluate(
           ({ theme }) => {
             window.__FORMAL_WEB_UI_CONFIG__ = {
@@ -259,6 +277,15 @@ try {
         mediaMode = "pass";
         await page.clock.fastForward(30_001);
         await expect(dialog.getByTestId("sim-frame-image")).toBeVisible();
+        const loadedImage = await dialog
+          .getByTestId("sim-frame-image")
+          .evaluate((element) => ({
+            src: element.currentSrc,
+            width: element.naturalWidth,
+            height: element.naturalHeight,
+          }));
+        assert(mediaUrls.has(loadedImage.src));
+        assert(loadedImage.width > 0 && loadedImage.height > 0);
         await expect(dialog.getByTestId("sim-media-unavailable")).toHaveCount(
           0,
         );
@@ -364,11 +391,12 @@ try {
           status: failures.length ? "failed" : "passed",
           theme,
           viewport,
-          fixtureOnlyScale: true,
+          fixtureOnlyScale: !fixture.media.scale,
           actualEvidenceIdentityPreserved: true,
           metadata,
           mediaStates,
           automaticMediaRetry: "passed",
+          loadedImage,
           failures,
           targetedContrastFindings: targeted.length,
           originalDefectDetected: mustCatch.length === 1,
@@ -405,7 +433,19 @@ try {
 }
 const report = {
   kind: "targeted-evidence-metadata-contrast",
-  source: "real-detail-and-evidence-with-isolated-scale-response-fixture",
+  origin,
+  slug,
+  evidence: {
+    resultId: fixture.contributor.resultId,
+    resultAttemptId: fixture.contributor.attemptId,
+    targetId: fixture.series.targetId,
+    conditionKey: fixture.series.conditionKey,
+    field: "velocity_magnitude",
+    mediaUrls: [...mediaUrls],
+  },
+  source: fixture.media.scale
+    ? "real-detail-evidence-media-and-scale-with-isolated-transport-failure"
+    : "real-detail-evidence-and-media-with-isolated-scale-and-transport-fixtures",
   noDatabaseWrites: true,
   fullFormalJourneyCertification: false,
   verifierSha256,
@@ -422,7 +462,7 @@ console.log(
       (total, outcome) => total + (outcome.targetedContrastFindings ?? 0),
       0,
     ),
-    fixtureOnlyScale: true,
+    fixtureOnlyScale: !fixture.media.scale,
     fullFormalJourneyCertification: false,
     output,
   }),
