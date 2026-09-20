@@ -204,6 +204,35 @@ export async function verifyProgressiveEvidenceReuse(
           reportSequence: repeated.sequence,
         }),
       ).toEqual({ kind: "idle" });
+      const earlier = source.report as unknown as ProgressiveRemoteReport;
+      expect(
+        await existingProgressiveReportAttempts(connection, earlier, envelope),
+      ).toEqual(before.map((row) => String(row.id)));
+      const rollbackOrder = new Error("Restore out-of-order staging fixture");
+      await expect(
+        connection.transaction(async (nested) => {
+          const scoped = nested as unknown as DB;
+          await scoped.execute(sql`DELETE FROM progressive_worker_evidence_receipts
+          WHERE sim_job_id=${executionId}::uuid AND sequence=${earlier.sequence}`);
+          const restaged = await stageProgressiveWorkerEvidence(
+            scoped,
+            engine,
+            executionId,
+            { reportSequence: earlier.sequence },
+          );
+          expect(restaged).toMatchObject({
+            kind: "staged",
+            sequence: earlier.sequence,
+            reusedEvidence: true,
+            resultAttemptIds: before.map((row) => row.id),
+          });
+          expect(
+            await scoped.execute(sql`SELECT * FROM result_attempts
+          WHERE sim_job_id=${executionId}::uuid ORDER BY id`),
+          ).toEqual(before);
+          throw rollbackOrder;
+        }),
+      ).rejects.toBe(rollbackOrder);
       throw rollback;
     }),
   ).rejects.toBe(rollback);

@@ -210,6 +210,15 @@ Workers persist ordered immutable reports before delivery. A lost response retri
 the same sequence and bytes; only the hub's matching execution, sequence and content
 signature acknowledge that local outbox row.
 
+After acknowledgement, evidence staging alternates between the freshest eligible
+report for an active promise and the oldest eligible report overall. New histories
+can therefore reach polar refinement without waiting for the entire historical
+backlog, while older reports continue to make progress. Report publication order,
+ownership checks, retry delays and live import leases are unchanged. Identical
+evidence may be reused from another acknowledged report in either sequence
+direction only after its exact content, projected fields and execution identity
+match; changed evidence still requires its own import and immutable attempt.
+
 A repeated terminal report preserves any live evidence-import lease and records
 the latest terminal state to restore afterward. Import completion and failure
 cleanup both restore that stored state instead of an earlier in-memory status.

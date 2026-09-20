@@ -43,7 +43,12 @@ export async function existingProgressiveReportAttempts(
   report: ProgressiveRemoteReport,
   envelope: ProgressiveRemoteExecutionEnvelope,
 ): Promise<string[] | null> {
-  if (!report.result) return null;
+  if (
+    !report.result ||
+    !Number.isSafeInteger(report.sequence) ||
+    report.sequence < 1
+  )
+    return null;
   const sources = progressiveReportedPointSources(report.result);
   if (!sources.length || sources.length > 512) return null;
   const rows =
@@ -55,7 +60,7 @@ export async function existingProgressiveReportAttempts(
       AND original.content_signature=receipt.content_signature AND original.acknowledged_at IS NOT NULL
     JOIN result_attempts attempt ON attempt.id=association.result_attempt_id AND attempt.sim_job_id=association.sim_job_id
       AND attempt.engine_job_id=association.sim_job_id::text
-    WHERE association.sim_job_id=${report.executionId}::uuid AND association.sequence<${report.sequence}
+    WHERE association.sim_job_id=${report.executionId}::uuid AND association.sequence<>${report.sequence}
       AND association.point_content_signature IN (${sql.join(
         sources.map((source) => sql`${source.contentSignature}`),
         sql`, `,
