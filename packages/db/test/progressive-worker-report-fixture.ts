@@ -5,6 +5,8 @@ import type { EngineClient } from "../../engine-client/src";
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
+import { isFinalProgressiveRemoteReport } from "../src/progressive-remote-report";
+import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import {
   acknowledgeProgressiveWorkerReport,
@@ -66,6 +68,60 @@ export async function verifyProgressiveWorkerReportDelivery(
     await expect(
       capture({ ...reports[0], solverId: randomUUID() }),
     ).rejects.toThrow("owned local");
+    const partialRollback = new Error("Restore cancelled partial publication fixture");
+    await expect(db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.execute(sql`DELETE FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid`);
+      await connection.execute(sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=false WHERE id=1`);
+      const partial = structuredClone(reports[2]);
+      partial.status.state = "cancelled";
+      partial.result!.state = "running";
+      for (const progress of partial.status.solver_budget_progress?.cases ?? [])
+        progress.solver_running = false;
+      const enqueue = (report: ProgressiveRemoteReport) => {
+        const { version: _version, sequence: _sequence, ...input } = report;
+        return enqueueProgressiveWorkerReport(connection, input);
+      };
+      const publish: typeof fetch = async (_url, options) => {
+        const body = JSON.parse(String(options?.body));
+        return Response.json({ received: true, receipt: await storeProgressiveRemoteReport(connection, {
+          solverId: envelope.solverId, promiseId: envelope.promiseId, executionId, report: body.report,
+        }) });
+      };
+      const importToken = randomUUID();
+      await connection.execute(sql`UPDATE sim_jobs SET status='ingesting',ingest_lease_token=${importToken}::uuid,
+        ingest_lease_previous_status='running',ingest_lease_expires_at=clock_timestamp()+interval '1 minute'
+        WHERE id=${executionId}::uuid`);
+      expect(await enqueue(partial)).toMatchObject({ sequence: 1, replayed: false });
+      expect(await connection.execute(sql`SELECT status,engine_state,ingest_lease_token,ingest_lease_previous_status,
+        "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`)).toMatchObject([{
+        status: "ingesting", engine_state: "cancelled", ingest_lease_token: importToken,
+        ingest_lease_previous_status: "cancelled", ingestedAt: null,
+      }]);
+      await connection.execute(sql`UPDATE sim_jobs SET ingest_lease_expires_at=clock_timestamp()-interval '1 second'
+        WHERE id=${executionId}::uuid`);
+      expect(await settleProgressiveWorkerFinalReport(connection, executionId)).toBe(true);
+      expect(await connection.execute(sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`))
+        .toMatchObject([{ status: "cancelled", ingestedAt: null }]);
+      const before = await connection.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=1`);
+      expect(isFinalProgressiveRemoteReport(before[0].report as unknown as ProgressiveRemoteReport)).toBe(false);
+      expect(await publishProgressiveWorkerReport(connection, executionId, publish)).toEqual({ kind: "published", sequence: 1 });
+      expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "waiting", reason: "final_report" });
+      expect(await enqueue(partial)).toMatchObject({ sequence: 1, replayed: true });
+      const sealed = structuredClone(partial);
+      sealed.result!.state = "cancelled";
+      expect(await enqueue(sealed)).toMatchObject({ sequence: 2, replayed: false });
+      expect(await publishProgressiveWorkerReport(connection, executionId, publish)).toEqual({ kind: "published", sequence: 2 });
+      const retained = await readProgressiveRemoteRetention(connection, executionId);
+      expect(retained).toMatchObject({ kind: "waiting", reason: "raw_evidence" });
+      expect(await connection.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=1`)).toEqual(before);
+      expect(await connection.execute(sql`SELECT report,content_signature FROM progressive_remote_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=1`)).toEqual(before);
+      await expect(enqueue(partial)).rejects.toThrow("Final remote execution evidence cannot change");
+      throw partialRollback;
+    })).rejects.toBe(partialRollback);
     const initial = await Promise.all([
       capture(reports[0]),
       capture(reports[0]),

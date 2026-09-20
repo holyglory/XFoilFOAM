@@ -5,10 +5,32 @@ import { canonicalAnalysisJson } from "./analysis-target";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import {
   isFinalProgressiveRemoteReport,
+  isMeasuredCancelledProgressiveRemoteReport,
   validateProgressiveRemoteReport,
   validateProgressiveRemoteReportOrder,
   type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
+
+async function projectMeasuredCancellation(
+  db: DB,
+  report: ProgressiveRemoteReport,
+): Promise<boolean> {
+  if (!isMeasuredCancelledProgressiveRemoteReport(report)) return false;
+  const importing = sql`status = 'ingesting' AND ingest_lease_token IS NOT NULL
+    AND ingest_lease_expires_at > clock_timestamp()`;
+  const rows = await db.execute(sql`
+    UPDATE sim_jobs SET status = CASE WHEN ${importing} THEN status ELSE 'cancelled'::sim_job_status END,
+      ingest_lease_previous_status = CASE WHEN ${importing} THEN 'cancelled'::sim_job_status ELSE ingest_lease_previous_status END,
+      engine_state = 'cancelled',
+      "finishedAt" = coalesce("finishedAt", clock_timestamp()), "updatedAt" = clock_timestamp(),
+      error = coalesce(${report.status.message ?? null}, error)
+    WHERE id = ${report.executionId}::uuid AND (engine_job_id IS NULL OR engine_job_id = ${report.executionId})
+    RETURNING id
+  `);
+  if (rows.length !== 1)
+    throw new Error("Measured cancellation report has a foreign engine identity");
+  return true;
+}
 
 async function projectFinalWorkerReport(
   db: DB,
@@ -81,7 +103,15 @@ export async function settleProgressiveWorkerFinalReport(
     const validated = validateProgressiveRemoteReport(report, envelope);
     if (validated.contentSignature !== owned.content_signature)
       throw new Error("Final worker report content signature changed");
-    return projectFinalWorkerReport(connection, validated.report);
+    const projectedCancellation = await projectMeasuredCancellation(
+      connection,
+      validated.report,
+    );
+    const projectedFinal = await projectFinalWorkerReport(
+      connection,
+      validated.report,
+    );
+    return projectedCancellation || projectedFinal;
   });
 }
 
@@ -139,6 +169,10 @@ export async function enqueueProgressiveWorkerReport(
         envelope,
       );
       if (replay.contentSignature === latest.content_signature) {
+        await projectMeasuredCancellation(
+          connection,
+          latest.report as unknown as ProgressiveRemoteReport,
+        );
         await projectFinalWorkerReport(
           connection,
           latest.report as unknown as ProgressiveRemoteReport,
@@ -165,6 +199,10 @@ export async function enqueueProgressiveWorkerReport(
         latest.report as unknown as ProgressiveRemoteReport,
       )
     ) {
+      await projectMeasuredCancellation(
+        connection,
+        latest.report as unknown as ProgressiveRemoteReport,
+      );
       await projectFinalWorkerReport(
         connection,
         latest.report as unknown as ProgressiveRemoteReport,
@@ -180,6 +218,7 @@ export async function enqueueProgressiveWorkerReport(
       INSERT INTO progressive_worker_reports (sim_job_id, sequence, content_signature, report)
       VALUES (${input.executionId}::uuid, ${next.report.sequence}, ${next.contentSignature}, ${JSON.stringify(next.report)}::jsonb)
     `);
+    await projectMeasuredCancellation(connection, next.report);
     await projectFinalWorkerReport(connection, next.report);
     await connection.execute(
       sql`SELECT pg_notify('progressive_worker_report_changed', ${input.executionId})`,

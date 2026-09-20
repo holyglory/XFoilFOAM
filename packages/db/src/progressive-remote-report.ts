@@ -105,6 +105,16 @@ export function isFinalProgressiveRemoteReport(
   );
 }
 
+export function isMeasuredCancelledProgressiveRemoteReport(
+  report: ProgressiveRemoteReport,
+): boolean {
+  return (
+    report.status.state === "cancelled" &&
+    report.stopProof?.execution_stopped === true &&
+    report.stopProof.ownership_basis !== "never_started_cancellation_fence"
+  );
+}
+
 export function validateProgressiveRemoteReportOrder(
   report: ProgressiveRemoteReport,
   previous: ProgressiveRemoteReport | null,
