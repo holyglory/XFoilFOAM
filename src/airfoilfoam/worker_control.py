@@ -4,6 +4,7 @@ import json
 
 from celery.worker.control import control_command
 
+from .capabilities import LOCAL_TIME_STEP_VERSION
 from .config import get_settings
 from .execution_stop import _namespace_identity, execution_stop_proof
 from .models import EngineIdentity
@@ -35,6 +36,12 @@ def execute_worker_control(action: str, job_id: str, execution_pool: str, expect
 
 
 def register_worker_controls() -> None:
+    @control_command(name="airfoilfoam_numerical_capabilities", visible=False)
+    def numerical_capabilities(_state, **_kwargs):
+        settings = get_settings()
+        return {"engine": settings.engine_identity().model_dump(mode="json"),
+                "execution_pool": settings.celery_queue, "local_time_step_version": LOCAL_TIME_STEP_VERSION}
+
     @control_command(name="airfoilfoam_inspect_execution", visible=False)
     def inspect_execution(_state, job_id, execution_pool, expected_engine, **_kwargs):
         return execute_worker_control("inspect", job_id, execution_pool, expected_engine)
@@ -85,3 +92,38 @@ def request_worker_control(action: str, job_id: str, execution_pool: str, expect
         proof = receipt.get("stop_proof") if action == "reap" else receipt
         return isinstance(proof, dict) and proof.get("job_id") == job_id and proof.get("execution_stopped") is True
     return next((receipt for receipt in receipts if stopped(receipt)), receipts[0])
+
+
+def require_local_time_step_workers(execution_pool: str, expected_engine: EngineIdentity) -> None:
+    from .celery_app import celery_app
+
+    queues = celery_app.control.inspect(timeout=1).active_queues()
+    if not isinstance(queues, dict):
+        raise RuntimeError("Worker pool bindings are unavailable")
+    if any(not isinstance(worker, str) or not worker.strip() or not isinstance(bindings, list)
+           or any(not isinstance(binding, dict) or not isinstance(binding.get("name"), str)
+                  or not binding["name"].strip() for binding in bindings)
+           for worker, bindings in queues.items()):
+        raise RuntimeError("Worker pool bindings are malformed")
+    workers = sorted(worker for worker, bindings in queues.items()
+                     if isinstance(worker, str) and isinstance(bindings, list)
+                     and any(isinstance(binding, dict) and binding.get("name") == execution_pool for binding in bindings))
+    if not workers:
+        raise RuntimeError("No live worker serves the requested local time-step pool")
+    replies = celery_app.control.broadcast("airfoilfoam_numerical_capabilities", destination=workers,
+                                          reply=True, timeout=3, limit=len(workers))
+    confirmed = set()
+    for reply in replies or []:
+        if not isinstance(reply, dict) or len(reply) != 1:
+            raise RuntimeError("Malformed worker numerical capability reply")
+        worker, value = next(iter(reply.items()))
+        if worker not in workers or worker in confirmed or not isinstance(value, dict):
+            raise RuntimeError("Unmatched or duplicate worker numerical capability reply")
+        if (value.get("execution_pool") != execution_pool
+                or type(value.get("local_time_step_version")) is not int
+                or value["local_time_step_version"] != LOCAL_TIME_STEP_VERSION
+                or value.get("engine") != expected_engine.model_dump(mode="json")):
+            raise RuntimeError("A serving worker has not confirmed the requested local time-step contract")
+        confirmed.add(worker)
+    if confirmed != set(workers):
+        raise RuntimeError("Not every serving worker confirmed local time-step support")

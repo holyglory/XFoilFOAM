@@ -1105,6 +1105,15 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=422, detail=f"Invalid airfoil: {exc}")
 
+        def worker_preflight() -> None:
+            if request.solver.local_time_step_smoothing is not None:
+                from ..worker_control import require_local_time_step_workers
+                try:
+                    require_local_time_step_workers(dialect.queue_name, requested_engine)
+                except Exception as error:
+                    raise SubmissionError("local_time_step_version_mismatch",
+                                          "The serving worker pool has not confirmed explicit local time-step support") from error
+
         if request.execution_id is not None:
             from ..celery_app import task_hard_time_limit_s
             from ..tasks import run_polar
@@ -1119,12 +1128,16 @@ def create_app() -> FastAPI:
                 return task.id
 
             try:
-                return register_stable_submission(store, request, enqueue_registered)
+                return register_stable_submission(store, request, enqueue_registered, preflight=worker_preflight)
             except SubmissionError as error:
                 raise HTTPException(status_code=error.status_code, detail={
                     "code": error.code, "job_id": str(request.execution_id), "message": str(error),
                 }) from error
 
+        try:
+            worker_preflight()
+        except SubmissionError as error:
+            raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error)}) from error
         job_id = uuid.uuid4().hex
         store.create(job_id, request)
         # import here so the API can start even if the broker is unavailable at import time

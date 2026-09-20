@@ -48,6 +48,27 @@ def test_stable_replay_enqueues_once_and_preserves_an_already_completed_worker_s
     assert len(calls) == 1
 
 
+def test_worker_preflight_fails_before_registration_and_does_not_block_later_replay(submission):
+    store, request = submission
+    calls = []
+
+    def unavailable():
+        raise SubmissionError("local_time_step_version_mismatch", "isolated old-worker fixture")
+
+    def enqueue(identity, queued):
+        calls.append(identity)
+        return identity
+
+    with pytest.raises(SubmissionError, match="old-worker"):
+        register_stable_submission(store, request, enqueue, preflight=unavailable)
+    assert not store.exists(str(request.execution_id))
+    assert not (store.submission_dir(str(request.execution_id)) / ".submission-dispatching.json").exists()
+    assert calls == []
+    accepted = register_stable_submission(store, request, enqueue, preflight=lambda: None)
+    assert register_stable_submission(store, request, enqueue, preflight=unavailable) == accepted
+    assert calls == [str(request.execution_id)]
+
+
 def test_concurrent_registration_and_cancel_do_not_cross_a_dispatch_in_progress(submission):
     store, request = submission
     entered = threading.Event()

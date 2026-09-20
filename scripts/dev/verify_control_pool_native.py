@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from airfoilfoam.control_canary import verify_control
+from airfoilfoam.config import Settings
 from airfoilfoam.openfoam.dialects import OPENCFD_2606
 
 
@@ -29,6 +30,7 @@ def verify():
     directory = Path("/verification-output") / str(uuid4())
     directory.mkdir(parents=True, exist_ok=False)
     report = {"kind": "isolated-concurrent-control-verification-v1", "outcome": "incomplete",
+              "execution_runtime": Settings().engine_runtime_identity().model_dump(mode="json"),
               "production_mutated": False, "aerodynamic_result_claimed": False, "health_samples": []}
 
     def request(path, payload=None, timeout=30):
@@ -68,7 +70,7 @@ def verify():
                 report["health_samples"].append(elapsed)
                 time.sleep(0.2)
             report["cancellations"] = [future.result() for future in futures]
-        report["busy_native_control"] = verify_control(origin, Path("/fixture/ag24.dat"), token)
+        report["busy_native_control"] = verify_control(origin, Path("/fixture/ag24.dat"), token, verify_local_time_step=True)
         report["outcome"] = "passed"
         return report
     except Exception as error:

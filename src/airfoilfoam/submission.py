@@ -46,7 +46,8 @@ def _receipt(store: JobStore, job_id: str, state: str, **details) -> None:
     }, sort_keys=True))
 
 
-def register_stable_submission(store: JobStore, request: PolarRequest, enqueue: Callable[[str, PolarRequest], str]) -> JobStatus:
+def register_stable_submission(store: JobStore, request: PolarRequest, enqueue: Callable[[str, PolarRequest], str],
+                               *, preflight: Callable[[], None] | None = None) -> JobStatus:
     if request.execution_id is None:
         raise ValueError("Stable submission requires an execution identity")
     job_id = str(request.execution_id)
@@ -72,6 +73,8 @@ def register_stable_submission(store: JobStore, request: PolarRequest, enqueue: 
             raise SubmissionError("execution_retired", "Execution registration survives removal of its job artifacts; the identity cannot be reused", 410)
         if store.job_dir(job_id).exists() and any(store.job_dir(job_id).iterdir()):
             raise SubmissionError("submission_metadata_unavailable", "Execution scope contains artifacts without its request", 503)
+        if preflight is not None:
+            preflight()
         store.create(job_id, request)
         status = store.read_status(job_id)
         if status is None:

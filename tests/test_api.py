@@ -296,6 +296,33 @@ def test_local_step_capability_is_advertised_separately(client):
     assert client.get("/capabilities").json()["local_time_step_version"] == 1
 
 
+@pytest.mark.parametrize("stable_identity", [False, True])
+def test_new_gateway_refuses_explicit_numerics_when_a_serving_worker_is_old(client, monkeypatch, stable_identity):
+    from uuid import uuid4
+    from airfoilfoam import tasks, worker_control
+    from scripts.materials.reproduce_mach3_failure import diagnostic_request
+    root = Path(__file__).parents[1]
+    payload = diagnostic_request(root / "packages/db/seed/selig-database/fx60100.dat",
+                                 root / "tests/fixtures/air-thermophysics-audit.json",
+                                 "cold", smoothing=0.2).model_dump(mode="json")
+    identity = str(uuid4())
+    if stable_identity:
+        payload["execution_id"] = identity
+    calls = []
+
+    def unavailable(pool, engine):
+        calls.append((pool, engine))
+        raise RuntimeError("isolated legacy worker lacks the capability")
+
+    monkeypatch.setattr(worker_control, "require_local_time_step_workers", unavailable)
+    monkeypatch.setattr(tasks.run_polar, "apply_async", lambda **kwargs: pytest.fail("Unsupported worker must never receive CFD"))
+    response = client.post("/polars", json=payload)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "local_time_step_version_mismatch"
+    assert len(calls) == 1
+    assert not JobStore().exists(identity)
+
+
 @pytest.mark.parametrize("version", [0, 2])
 def test_polar_submit_rejects_local_step_mismatch_before_queueing(client, version):
     response = client.post("/polars", json={

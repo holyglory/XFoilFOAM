@@ -11,7 +11,7 @@ from .models import PolarRequest
 from .openfoam.dialects import OPENCFD_2606
 
 
-def verify_control(base_url: str, coordinates: Path, token: str) -> dict:
+def verify_control(base_url: str, coordinates: Path, token: str, *, verify_local_time_step: bool = False) -> dict:
     if not token:
         raise RuntimeError("The private control credential is required")
 
@@ -65,6 +65,11 @@ def verify_control(base_url: str, coordinates: Path, token: str) -> dict:
                 raise RuntimeError("The control canary did not observe an occupied real CFD slot")
             time.sleep(0.1)
         report["busy_status"] = status
+        if verify_local_time_step:
+            from .worker_control import require_local_time_step_workers
+            started = time.monotonic()
+            require_local_time_step_workers(OPENCFD_2606.queue_name, OPENCFD_2606.identity)
+            report["local_time_step_worker_contract"] = {"version": 1, "seconds": time.monotonic() - started}
         started = time.monotonic()
         inspection = call(f"/jobs/{job_id}/execution-stop-proof", {})
         report["inspection_seconds"] = time.monotonic() - started

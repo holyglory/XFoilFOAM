@@ -600,7 +600,12 @@ Profile copies preserve the setting without modifying the source profile.
 An explicit value travels as `solver.local_time_step_smoothing` with
 `expected_local_time_step_version: 1`. Hub and remote admission wait for that
 capability without consuming an attempt; the client rechecks it before submitting,
-and the API and worker reject mismatches before CFD. Physical-time and other
+and the API and worker reject mismatches before CFD. Before a new dispatch, the
+gateway also requires matching numerical-capability replies from every worker
+currently serving the exact engine pool. An old, missing or mismatched worker
+cannot authorize the new setting merely because the gateway is up to date.
+This check precedes durable registration and dispatch; an already registered
+idempotent replay does not require currently available workers. Physical-time and other
 solver recipes do not inherit this local-steady setting, including URANS recovery.
 The option alone does not change existing sealed campaign recipes. It does not
 increase the Courant ceiling, iteration/time allocation, thermodynamic bounds or
@@ -611,6 +616,12 @@ postprocessing directories before writing its own initial state. The shared mesh
 previous angle archives and raw logs survive; pressure-based warm marching is
 unchanged. Parallel local-steady iteration counts come from the conserved-field
 residual coordinate, not the preparation/reconstruction program's `Time` lines.
+
+The isolated local-step test graphs prepare owner-writable output directories
+before the native deployments run. Compose must not create those host paths as a
+different user. Source-mounted native verification fingerprints the loaded source
+tree separately from its base image and authenticates every archived manifest
+member; its solver histories remain private diagnostics, never campaign results.
 
 Potential-flow initialization supplies only a proposal for the initial velocity, not
 compressible CFD evidence. Its complete finite vector field must fit the selected

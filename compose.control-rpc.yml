@@ -1,7 +1,18 @@
 x-engine: &engine
-  image: sha256:d0a5fd5f9723be5c92d7713df3d12b89675045477d6dbed8924f5e598e51ab46
+  image: sha256:8a45eeefa364606aac98804e1f9aa48bd051830ff8731e15a7750f0754e48d09
   pull_policy: never
   network_mode: service:redis
+  entrypoint:
+    - /bin/sh
+    - -ec
+    - |
+      export AIRFOILFOAM_ENGINE_APPLICATION_SOURCE_SHA256="$$(python -c 'from pathlib import Path; from airfoilfoam.provenance import application_source_sha256; print(application_source_sha256(Path("/candidate")))')"
+      export AIRFOILFOAM_ENGINE_SOURCE_REVISION=""
+      export AIRFOILFOAM_BUILD_ID="isolated-local-step-worker-contract"
+      export AIRFOILFOAM_ENGINE_PACKAGE_SHA256="$$(cat /etc/airfoilfoam-engine-package-sha256)"
+      export AIRFOILFOAM_ENGINE_BINARY_SHA256="$$(cat /etc/airfoilfoam-engine-binary-sha256)"
+      exec "$$@"
+    - source-overlay
   environment: &environment
     PYTHONPATH: /candidate/src
     PYTHONDONTWRITEBYTECODE: "1"
@@ -16,6 +27,7 @@ x-engine: &engine
     AIRFOILFOAM_CASE_CONCURRENCY: "1"
   volumes:
     - ./src:/candidate/src:ro
+    - ./pyproject.toml:/candidate/pyproject.toml:ro
     - control-data:/data
   depends_on:
     redis:
@@ -45,9 +57,14 @@ services:
     command: ["python", "/verification/verify_control_pool_native.py"]
     volumes:
       - ./src:/candidate/src:ro
+      - ./pyproject.toml:/candidate/pyproject.toml:ro
       - ./scripts/dev/verify_control_pool_native.py:/verification/verify_control_pool_native.py:ro
       - ./packages/db/seed/selig-database/ag24.dat:/fixture/ag24.dat:ro
-      - ./.codex-artifacts/control-rpc-native:/verification-output
+      - type: bind
+        source: ./.codex-artifacts/control-rpc-native
+        target: /verification-output
+        bind:
+          create_host_path: false
     depends_on:
       redis:
         condition: service_healthy

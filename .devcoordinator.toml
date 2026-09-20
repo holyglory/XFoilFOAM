@@ -9,6 +9,11 @@ database = "aerodb"
 user = "aerodb"
 
 [[test.local-step-policy.check]]
+name = "native-artifact-directory"
+tier = "development"
+command = ["/bin/bash", "-euc", "mkdir -p .codex-artifacts/local-step-smoothing .codex-artifacts/control-rpc-native; test -w .codex-artifacts; test -w .codex-artifacts/local-step-smoothing; test -w .codex-artifacts/control-rpc-native"]
+
+[[test.local-step-policy.check]]
 name = "workspace"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
@@ -76,6 +81,11 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vite
 timeout_seconds = 900
 
 [[test.local-step-smoothing.check]]
+name = "native-artifact-directory"
+tier = "development"
+command = ["/bin/bash", "-euc", "mkdir -p .codex-artifacts/local-step-smoothing .codex-artifacts/control-rpc-native; test -w .codex-artifacts; test -w .codex-artifacts/local-step-smoothing; test -w .codex-artifacts/control-rpc-native"]
+
+[[test.local-step-smoothing.check]]
 name = "python"
 tier = "development"
 command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
@@ -84,7 +94,7 @@ command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev"
 name = "contract"
 tier = "development"
 requires = ["python"]
-command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3", "-m", "pytest", "tests/test_local_time_step_smoothing.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_local_steady_startup.py", "tests/test_mach3_failure_reproduction.py", "tests/test_models.py", "tests/test_api.py", "tests/test_cache.py", "tests/test_unsteady.py", "-q"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3", "-m", "pytest", "tests/test_local_time_step_smoothing.py", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_local_steady_startup.py", "tests/test_mach3_failure_reproduction.py", "tests/test_models.py", "tests/test_api.py", "tests/test_cache.py", "tests/test_unsteady.py", "tests/test_submission.py", "tests/test_worker_control.py", "tests/test_control_canary.py", "tests/test_control_rpc_pool.py", "-q"]
 
 [deployment.local-step-smoothing]
 source = ["worktree"]

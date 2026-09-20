@@ -16,7 +16,11 @@ services:
       - ./scripts/materials/reproduce_mach3_failure.py:/verification/reproduce_mach3_failure.py:ro
       - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
       - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
-      - ./.codex-artifacts/local-step-smoothing:/evidence
+      - type: bind
+        source: ./.codex-artifacts/local-step-smoothing
+        target: /evidence
+        bind:
+          create_host_path: false
     ulimits:
       nofile:
         soft: 65536
