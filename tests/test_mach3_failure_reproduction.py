@@ -7,12 +7,40 @@ import pytest
 from airfoilfoam.material_domain import material_domain_failure
 from airfoilfoam.models import JobResult, JobState, Polar, PolarPoint
 from airfoilfoam.openfoam.runner import RunResult
-from scripts.materials.reproduce_mach3_failure import collect_diagnostics, diagnostic_request, execution_request, summarize_outcomes
+from scripts.materials.reproduce_mach3_failure import collect_diagnostics, diagnostic_request, diagnostic_source_identity, execution_request, native_image_fingerprints, summarize_outcomes
+from airfoilfoam.provenance import application_source_sha256
 
 
 ROOT = Path(__file__).parents[1]
 COORDINATES = ROOT / "packages/db/seed/selig-database/fx60100.dat"
 MATERIAL = ROOT / "tests/fixtures/air-thermophysics-audit.json"
+
+
+def test_diagnostic_fingerprints_the_loaded_adapter_not_the_base_image(tmp_path):
+    package = tmp_path / "src/airfoilfoam/__init__.py"
+    package.parent.mkdir(parents=True)
+    package.write_text("version = 'isolated test fixture'\n")
+    with pytest.raises(ValueError, match="complete actually loaded"):
+        diagnostic_source_identity(tmp_path, package)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'isolated-test-fixture'\n")
+    original = diagnostic_source_identity(tmp_path, package)
+    assert original["engine_application_source_sha256"] == application_source_sha256(tmp_path)
+    assert original["engine_source_revision"] is None
+    package.write_text("version = 'changed isolated test fixture'\n")
+    assert diagnostic_source_identity(tmp_path, package) != original
+    with pytest.raises(ValueError, match="complete actually loaded"):
+        diagnostic_source_identity(tmp_path, ROOT / "src/airfoilfoam/__init__.py")
+
+
+def test_diagnostic_requires_the_image_native_fingerprints(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        native_image_fingerprints(tmp_path)
+    for name in ("package", "binary"):
+        (tmp_path / f"airfoilfoam-engine-{name}-sha256").write_text("a" * 64 + "\n")
+    assert native_image_fingerprints(tmp_path) == {"engine_package_sha256": "a" * 64, "engine_binary_sha256": "a" * 64}
+    (tmp_path / "airfoilfoam-engine-binary-sha256").write_text("not a digest")
+    with pytest.raises(ValueError, match="native image fingerprint"):
+        native_image_fingerprints(tmp_path)
 
 
 def test_parallel_handoff_changes_only_explicit_execution_controls():

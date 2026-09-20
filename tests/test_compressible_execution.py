@@ -176,6 +176,64 @@ def test_local_density_keeps_iteration_clock_separate_from_physical_startup(
     assert "local_pseudo_time_iterations" in (case_dir / "constant/numericalExecution.json").read_text()
 
 
+@pytest.mark.parametrize("density_based", [True, False])
+def test_accepted_density_angle_cannot_contaminate_the_next_cold_start(request_payload, monkeypatch, tmp_path, density_based):
+    if density_based:
+        request_payload["speeds"] = [request_payload["speeds"][0] / 0.72 * 3]
+        request_payload["solver"].update(flow_solver_family="rhoCentralFoam", transient_fallback=False)
+    request = PolarRequest.model_validate(request_payload)
+    runner = RecordedRunner()
+    configure_flow_execution(runner, request)
+    airfoil = Airfoil.from_contour("ag24", parse_airfoil(request.airfoil.coordinates))
+    polar_dir = tmp_path / "polar"
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+    mesh_file = mesh_dir / "points"
+    mesh_file.write_text("shared mesh unit fixture")
+    calls = []
+
+    def solve(directory, *args, **kwargs):
+        state = directory / "3926"
+        if calls:
+            assert state.exists() is not density_based
+            assert (directory / "a0/evidence/raw.txt").read_text() == "immutable prior-angle fixture"
+            assert (directory / "log.a0").read_text() == "accepted prior-angle fixture"
+        if density_based:
+            assert not (directory / "processor0").exists()
+            assert not (directory / "postProcessing").exists()
+        state.mkdir(exist_ok=True)
+        (state / "U").write_text("accepted field unit fixture")
+        (directory / "processor0").mkdir(exist_ok=True)
+        (directory / "postProcessing").mkdir(exist_ok=True)
+        calls.append(directory)
+        return RunResult("rhoCentralFoam" if density_based else "rhoSimpleFoam", 0, "accepted prior-angle fixture")
+
+    def finalize(directory, outcome, *args, **kwargs):
+        evidence = directory / f"a{len(calls) - 1}" / "evidence"
+        evidence.mkdir(parents=True)
+        (evidence / "raw.txt").write_text("immutable prior-angle fixture")
+        outcome.cl, outcome.cd, outcome.cm = 0.1, 0.02, 0
+
+    monkeypatch.setattr(pipeline, "_solve_cold_marched", solve)
+    monkeypatch.setattr(pipeline, "_solve_warm", solve)
+    monkeypatch.setattr(pipeline, "_finalize_outcome", finalize)
+    monkeypatch.setattr(pipeline, "_steady_seed_accepted", lambda outcome: outcome.converged)
+    monkeypatch.setattr(pipeline, "complete_rans_hold", lambda directory, result, *args: result)
+    convergence = lambda *args: SimpleNamespace(converged=True, iterations=3926, final_residual=1e-5)
+    monkeypatch.setattr(pipeline, "parse_local_steady_convergence", convergence)
+    monkeypatch.setattr(pipeline, "parse_convergence", convergence)
+    result = pipeline.solve_polar_marched(
+        polar_dir, mesh_dir, airfoil, 1, request.speeds[0], request.fluid,
+        request.roughness, request.mesh, request.solver, SimpleNamespace(patches=lambda mesh: []),
+        runner, [-4, 13], render_images=False,
+    )
+    assert len(calls) == 2
+    assert len(result.attempts) == 2
+    assert all(attempt.outcome.converged and attempt.outcome.error is None for attempt in result.attempts)
+    assert mesh_file.read_text() == "shared mesh unit fixture"
+    assert (polar_dir / "a0/evidence/raw.txt").read_text() == "immutable prior-angle fixture"
+
+
 @pytest.mark.parametrize("change", ["density", "viscosity", "mode", "mach", "low_central", "incompressible_gas", "unknown_family"])
 def test_inconsistent_requests_fail_before_case_staging(request_payload, change):
     if change == "density":

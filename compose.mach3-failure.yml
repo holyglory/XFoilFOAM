@@ -14,6 +14,7 @@ services:
     command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/cold", "--start", "cold"]
     volumes:
       - ./src:/candidate/src:ro
+      - ./pyproject.toml:/candidate/pyproject.toml:ro
       - ./scripts/materials/reproduce_mach3_failure.py:/verification/reproduce_mach3_failure.py:ro
       - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
       - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro

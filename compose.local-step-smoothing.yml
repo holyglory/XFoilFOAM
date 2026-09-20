@@ -1,6 +1,6 @@
 services:
   baseline: &baseline
-    image: xfoilfoam-progressive-preview-worker:local
+    image: sha256:8a45eeefa364606aac98804e1f9aa48bd051830ff8731e15a7750f0754e48d09
     pull_policy: never
     network_mode: none
     environment:
@@ -12,6 +12,7 @@ services:
     command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/baseline", "--start", "cold"]
     volumes:
       - ./src:/candidate/src:ro
+      - ./pyproject.toml:/candidate/pyproject.toml:ro
       - ./scripts/materials/reproduce_mach3_failure.py:/verification/reproduce_mach3_failure.py:ro
       - ./packages/db/seed/selig-database/fx60100.dat:/fixture/fx60100.dat:ro
       - ./tests/fixtures/air-thermophysics-audit.json:/fixture/air.json:ro
@@ -28,4 +29,4 @@ services:
     command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/marched", "--start", "marched", "--smoothing", "0.2"]
   parallel:
     <<: *baseline
-    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/parallel", "--start", "cold", "--smoothing", "0.2", "--processes", "2"]
+    command: ["python", "/verification/reproduce_mach3_failure.py", "--coordinates", "/fixture/fx60100.dat", "--material", "/fixture/air.json", "--destination", "/evidence/parallel", "--start", "marched", "--smoothing", "0.2", "--processes", "2"]

@@ -9839,6 +9839,8 @@ def solve_polar_marched(
                     _link_mesh(polar_dir, mesh_dir, runner)
                 else:
                     if use_cold_start or is_density_based(runner):
+                        if is_density_based(runner):
+                            _clear_steady_march_working_state(polar_dir)
                         res = _solve_cold_marched(
                             polar_dir, mesh_dir, airfoil, patches, resolved, spec, fluid, roughness,
                             rans_solver, runner, steady_timeout, outcome, n_proc=n_proc,
