@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -6,6 +7,7 @@ import type { DB } from "./client";
 import {
   progressiveCfdNeverStartedAttemptCountSql,
   progressiveCfdOrdinaryAttemptCountSql,
+  progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 
 export function validateProgressiveExecutionStopProof(
@@ -220,6 +222,8 @@ export async function settleProgressiveCfdExecution(
           WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token) AS numerical_recovery,
         EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans recovery
           WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token AND recovery.ordinal = 2) AS precise_verification,
+        (unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
+          AND ${progressiveCfdPreciseVerificationAvailableSql("unit", "attempt")}) AS unused_precise_verification,
         EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt,
           jsonb_array_elements(coalesce(fitted.response->'estimate'->'contributors', '[]'::jsonb)) contributor
           WHERE receipt.attempt_token = attempt.token AND receipt.result_attempt_id::text = contributor->>'attempt_id') AS informative
@@ -303,7 +307,8 @@ export async function settleProgressiveCfdExecution(
         (ordinaryAttempts < 2 ||
           (ordinaryAttempts === 2 &&
             unit.stage === 3 &&
-            unit.precise_verification === true)) &&
+            (unit.precise_verification === true ||
+              (neverStarted && unit.unused_precise_verification === true)))) &&
         (unit.numerical_recovery === true ||
           neverStarted ||
           (Number(unit.count) > 0 && unit.infrastructure_only === true));

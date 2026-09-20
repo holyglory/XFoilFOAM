@@ -11,7 +11,10 @@ import {
   type AnalysisPhysical,
 } from "./analysis-target";
 import type { DB } from "./client";
-import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
+import {
+  progressiveCfdOrdinaryAttemptCountSql,
+  progressiveCfdPreciseVerificationAvailableSql,
+} from "./progressive-attempt-budget";
 import type { SealedPolarTarget } from "./progressive-campaigns";
 
 interface WorkScope {
@@ -201,10 +204,9 @@ export async function claimProgressiveCfdUnit(
       WHERE recovery.unit_id=unit.id AND recovery.attempts_before=unit.attempts AND unit.active_seconds>=recovery.active_seconds
         AND NOT EXISTS(SELECT 1 FROM progressive_publication_recovery_claims claimed WHERE claimed.unit_id=recovery.unit_id))`;
     const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
-    const attemptAvailable = sql`(${ordinaryAttempts} < 2 OR ${publicationRecovery} OR (${ordinaryAttempts} = 2 AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version} AND EXISTS (
-      SELECT 1 FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id AND recovery.ordinal = 2
-        AND NOT EXISTS (SELECT 1 FROM progressive_cfd_recovery_claims claimed WHERE claimed.recovery_plan_id = recovery.id)
-    )))`;
+    const attemptAvailable = sql`(${ordinaryAttempts} < 2 OR ${publicationRecovery} OR (${ordinaryAttempts} = 2
+      AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
+      AND ${progressiveCfdPreciseVerificationAvailableSql()}))`;
     const targetFilter = input.sameTarget
       ? sql`generation.id = ${input.sameTarget.generationId} AND work.target_id = ${input.sameTarget.targetId}
           AND ${effectiveRecipe} = ${JSON.stringify(input.sameTarget.recipe)}::jsonb

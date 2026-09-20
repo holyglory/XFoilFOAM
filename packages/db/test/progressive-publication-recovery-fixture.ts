@@ -6,6 +6,11 @@ import { recoverProgressivePublicationLosses } from "../src/progressive-publicat
 import { claimProgressiveCfdUnit } from "../src/progressive-cfd";
 import { composeProgressiveCfdJob } from "../../../apps/sweeper/src/progressive-cfd-jobs";
 import { progressiveCfdOrdinaryAttemptCountSql } from "../src/progressive-attempt-budget";
+import { claimSimJobCancellation } from "../src/job-lifecycle";
+import {
+  acknowledgeProgressiveCfdExecutionStop,
+  settleProgressiveCfdExecution,
+} from "../src/progressive-cfd-settlement";
 
 export async function verifyPublicationRecovery(db: DB, executionId: string) {
   const restore = new Error("Restore isolated publication recovery fixture");
@@ -172,6 +177,100 @@ export async function verifyPublicationRecovery(db: DB, executionId: string) {
       );
       expect(result.count).toBe(0);
       expect((await recover()).queuedUnits).toBe(0);
+      const savedGrants = await connection.execute(sql`
+        SELECT * FROM progressive_publication_recovery_claims WHERE unit_id IN
+          (SELECT unit_id FROM progressive_publication_recoveries WHERE sim_job_id=${executionId}::uuid)
+        ORDER BY unit_id
+      `);
+      async function cancelBeforeStarting(jobId: string) {
+        expect(
+          await claimSimJobCancellation(
+            connection,
+            jobId,
+            "isolated corrective maintenance stop",
+          ),
+        ).toMatchObject({ kind: "cancelled" });
+        await connection.execute(sql`UPDATE sim_jobs SET engine_job_id=id::text,"ingestedAt"=clock_timestamp()
+          WHERE id=${jobId}::uuid`);
+        await acknowledgeProgressiveCfdExecutionStop(connection, {
+          simJobId: jobId,
+          proof: {
+            version: 1,
+            job_id: jobId,
+            execution_stopped: true,
+            producer_stopped: true,
+            namespace_verified: true,
+            remaining: [],
+            observed_at: new Date().toISOString(),
+            error: null,
+            fence: "cancel_marker",
+            ownership_basis: "never_started_cancellation_fence",
+          },
+        });
+        return settleProgressiveCfdExecution(connection, jobId);
+      }
+      expect(await cancelBeforeStarting(composed.jobId)).toMatchObject({
+        retry: original.length,
+        gaps: 0,
+      });
+      const retried = [];
+      for (const previous of leases) {
+        const next = await claimProgressiveCfdUnit(connection, {
+          owner: "isolated-corrective-retry",
+          leaseSeconds: 120,
+          solverBudgetVersion: 2,
+          sameTarget: {
+            generationId: String(scope.generation_id),
+            targetId: String(scope.target_id),
+            recipe: scope.recipe as Record<string, unknown>,
+            remainingActiveSeconds: Number(scope.remaining),
+            recoveryParentJobId: null,
+          },
+        });
+        expect(next).not.toBeNull();
+        expect(next!.remainingActiveSeconds).toBe(
+          previous.remainingActiveSeconds,
+        );
+        retried.push(next!);
+      }
+      const counts = await connection.execute(sql`
+        SELECT unit.attempts,${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary
+        FROM progressive_cfd_units unit JOIN progressive_publication_recoveries recovery ON recovery.unit_id=unit.id
+        WHERE recovery.sim_job_id=${executionId}::uuid
+      `);
+      expect(
+        counts.every((unit) => unit.attempts === 4 && unit.ordinary === 2),
+      ).toBe(true);
+      expect(
+        await connection.execute(sql`
+        SELECT * FROM progressive_publication_recovery_claims WHERE unit_id IN
+          (SELECT unit_id FROM progressive_publication_recoveries WHERE sim_job_id=${executionId}::uuid)
+        ORDER BY unit_id
+      `),
+      ).toEqual(savedGrants);
+      const retryJob = await composeProgressiveCfdJob(connection, retried, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      expect(await cancelBeforeStarting(retryJob.jobId)).toMatchObject({
+        retry: 0,
+        gaps: original.length,
+      });
+      expect(
+        await claimProgressiveCfdUnit(connection, {
+          owner: "no-third-zero-work-claim",
+          leaseSeconds: 120,
+          solverBudgetVersion: 2,
+          sameTarget: {
+            generationId: String(scope.generation_id),
+            targetId: String(scope.target_id),
+            recipe: scope.recipe as Record<string, unknown>,
+            remainingActiveSeconds: Number(scope.remaining),
+            recoveryParentJobId: null,
+          },
+        }),
+      ).toBeNull();
       throw restore;
     });
   } catch (error) {

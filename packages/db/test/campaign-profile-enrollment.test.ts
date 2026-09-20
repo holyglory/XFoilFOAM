@@ -5126,265 +5126,316 @@ describe("bounded progressive numerical recovery", () => {
     120_000,
   );
 
-  it("verifies only accepted preliminary sweep recovery within the original time allocation", async () => {
-    const fixture = await cfdEvidenceFixture(33.119, 3, [], [0, 5]);
-    const failure = await fixture.save(10, "rans", 5, {
-      failure_disposition: "hard_solver",
-    });
-    const acceptedRans = await fixture.save(10, "rans", 0, { converged: true });
-    await db
-      .update(resultAttempts)
-      .set({ status: "done", validForPolar: true })
-      .where(eq(resultAttempts.id, acceptedRans));
-    await db.execute(sql`
+  it.each([false, true])(
+    "verifies only accepted preliminary sweep recovery within the original time allocation (cancel first=%s)",
+    async (cancelFirst) => {
+      const fixture = await cfdEvidenceFixture(33.119, 3, [], [0, 5]);
+      const failure = await fixture.save(10, "rans", 5, {
+        failure_disposition: "hard_solver",
+      });
+      const acceptedRans = await fixture.save(10, "rans", 0, {
+        converged: true,
+      });
+      await db
+        .update(resultAttempts)
+        .set({ status: "done", validForPolar: true })
+        .where(eq(resultAttempts.id, acceptedRans));
+      await db.execute(sql`
       UPDATE results SET current_result_attempt_id = ${acceptedRans} WHERE id = (SELECT result_id FROM result_attempts WHERE id = ${acceptedRans})
     `);
-    await db.execute(sql`
+      await db.execute(sql`
       INSERT INTO result_classifications(result_attempt_id, airfoil_id, simulation_preset_revision_id,
         aoa_deg, classifier_version, regime, state, reasons)
       SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg, 'isolated-recovery-test', regime, 'accepted', '{}'
       FROM result_attempts WHERE id = ${acceptedRans}
     `);
-    await db.execute(sql`
+      await db.execute(sql`
       INSERT INTO result_classifications(result_id, airfoil_id, simulation_preset_revision_id,
         aoa_deg, classifier_version, regime, state, reasons)
       SELECT result_id, airfoil_id, simulation_preset_revision_id, aoa_deg, 'isolated-recovery-test', regime, 'accepted', '{}'
       FROM result_attempts WHERE id = ${acceptedRans}
     `);
-    await fixture.record([acceptedRans, failure]);
-    await stopped(fixture);
-    await recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId, [
-      {
-        revisionId: fixture.execution.revision.id,
-        triggerResultAttemptId: failure,
-        triggerAoaDeg: 5,
-        attemptedAoas: [0, 5],
-        intentionallyOmittedAoas: [],
-      },
-    ]);
-    expect(
-      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
-    ).toMatchObject({ retry: 2 });
-    const preliminaryLeases = await claimProgressiveCfdBatch(db, {
-      owner: "preliminary-recovery",
-      leaseSeconds: 120,
-      solverBudgetVersion: 2,
-    });
-    const preliminary = await composeRecovery(preliminaryLeases);
-    expect(preliminary.request.solver).toMatchObject({
-      flow_solver_family: "rhoPimpleFoam",
-      urans_fidelity: "precalc",
-      warm_start: true,
-    });
-    expect(preliminary.request.aoa.angles).toEqual([0, 5]);
-    expect(preliminary.request.urans_precalc_mesh).toEqual(
-      preliminary.request.mesh,
-    );
-    expect(preliminary.request.urans_mesh).toEqual(preliminary.request.mesh);
-    const [preliminaryJob] = await db
-      .select()
-      .from(simJobs)
-      .where(eq(simJobs.id, preliminary.jobId));
-    expect(preliminaryJob.parentJobId).toBe(fixture.composed.jobId);
-
-    async function finish(job: typeof preliminary, duration: number) {
-      await db
-        .update(simJobs)
-        .set({ engineJobId: job.jobId, status: "running" })
-        .where(eq(simJobs.id, job.jobId));
-      const cells = await db
+      await fixture.record([acceptedRans, failure]);
+      await stopped(fixture);
+      await recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId, [
+        {
+          revisionId: fixture.execution.revision.id,
+          triggerResultAttemptId: failure,
+          triggerAoaDeg: 5,
+          attemptedAoas: [0, 5],
+          intentionallyOmittedAoas: [],
+        },
+      ]);
+      expect(
+        await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+      ).toMatchObject({ retry: 2 });
+      const preliminaryLeases = await claimProgressiveCfdBatch(db, {
+        owner: "preliminary-recovery",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+      });
+      const preliminary = await composeRecovery(preliminaryLeases);
+      expect(preliminary.request.solver).toMatchObject({
+        flow_solver_family: "rhoPimpleFoam",
+        urans_fidelity: "precalc",
+        warm_start: true,
+      });
+      expect(preliminary.request.aoa.angles).toEqual([0, 5]);
+      expect(preliminary.request.urans_precalc_mesh).toEqual(
+        preliminary.request.mesh,
+      );
+      expect(preliminary.request.urans_mesh).toEqual(preliminary.request.mesh);
+      const [preliminaryJob] = await db
         .select()
-        .from(results)
-        .where(eq(results.simJobId, job.jobId));
-      const evidenceIds = [];
-      for (const cell of cells) {
-        const accepted = cell.aoaDeg === 0;
-        const [raw] = await db
-          .insert(resultAttempts)
-          .values({
-            resultId: cell.id,
-            airfoilId: cell.airfoilId,
-            bcId: cell.bcId,
-            simulationPresetRevisionId: cell.simulationPresetRevisionId,
-            simJobId: job.jobId,
-            engineJobId: job.jobId,
-            aoaDeg: cell.aoaDeg,
-            regime: "urans",
-            status: accepted ? "done" : "failed",
-            source: "queued",
-            validForPolar: accepted,
-            evidencePayload: {
-              solver_active_seconds: duration,
-              fidelity:
-                job.request.solver?.urans_fidelity === "precalc"
-                  ? "urans_precalc"
-                  : "urans_full",
-            },
-          })
-          .returning();
-        evidenceIds.push(raw.id);
-        if (accepted)
-          await db.execute(sql`
+        .from(simJobs)
+        .where(eq(simJobs.id, preliminary.jobId));
+      expect(preliminaryJob.parentJobId).toBe(fixture.composed.jobId);
+
+      async function finish(job: typeof preliminary, duration: number) {
+        await db
+          .update(simJobs)
+          .set({ engineJobId: job.jobId, status: "running" })
+          .where(eq(simJobs.id, job.jobId));
+        const cells = await db
+          .select()
+          .from(results)
+          .where(eq(results.simJobId, job.jobId));
+        const evidenceIds = [];
+        for (const cell of cells) {
+          const accepted = cell.aoaDeg === 0;
+          const [raw] = await db
+            .insert(resultAttempts)
+            .values({
+              resultId: cell.id,
+              airfoilId: cell.airfoilId,
+              bcId: cell.bcId,
+              simulationPresetRevisionId: cell.simulationPresetRevisionId,
+              simJobId: job.jobId,
+              engineJobId: job.jobId,
+              aoaDeg: cell.aoaDeg,
+              regime: "urans",
+              status: accepted ? "done" : "failed",
+              source: "queued",
+              validForPolar: accepted,
+              evidencePayload: {
+                solver_active_seconds: duration,
+                fidelity:
+                  job.request.solver?.urans_fidelity === "precalc"
+                    ? "urans_precalc"
+                    : "urans_full",
+              },
+            })
+            .returning();
+          evidenceIds.push(raw.id);
+          if (accepted)
+            await db.execute(sql`
           INSERT INTO result_classifications(result_attempt_id, airfoil_id, simulation_preset_revision_id,
             aoa_deg, classifier_version, state, reasons)
           SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg, 'isolated-recovery-test', 'accepted', '{}'
           FROM result_attempts WHERE id = ${raw.id}
         `);
+        }
+        await recordProgressiveCfdEvidence(db, {
+          simJobId: job.jobId,
+          engineJobId: job.jobId,
+          resultAttemptIds: evidenceIds,
+        });
+        await acknowledgeProgressiveCfdExecutionStop(db, {
+          simJobId: job.jobId,
+          proof: executionStopProof(job.jobId),
+        });
+        await db
+          .update(simJobs)
+          .set({ status: "done", ingestedAt: new Date() })
+          .where(eq(simJobs.id, job.jobId));
+        return evidenceIds;
       }
-      await recordProgressiveCfdEvidence(db, {
-        simJobId: job.jobId,
-        engineJobId: job.jobId,
-        resultAttemptIds: evidenceIds,
-      });
-      await acknowledgeProgressiveCfdExecutionStop(db, {
-        simJobId: job.jobId,
-        proof: executionStopProof(job.jobId),
-      });
-      await db
-        .update(simJobs)
-        .set({ status: "done", ingestedAt: new Date() })
-        .where(eq(simJobs.id, job.jobId));
-      return evidenceIds;
-    }
-    await finish(preliminary, 100);
-    expect(await recordProgressiveCfdRecoveryPlans(db, preliminary.jobId)).toBe(
-      1,
-    );
-    expect(await recordProgressiveCfdRecoveryPlans(db, preliminary.jobId)).toBe(
-      0,
-    );
-    expect(
-      await settleProgressiveCfdExecution(db, preliminary.jobId),
-    ).toMatchObject({ retry: 1, gaps: 1, complete: 0 });
-    const verificationLeases = await claimProgressiveCfdBatch(db, {
-      owner: "precise-verification",
-      leaseSeconds: 120,
-      solverBudgetVersion: 2,
-    });
-    expect(verificationLeases).toHaveLength(1);
-    expect(verificationLeases[0]).toMatchObject({
-      alpha: 0,
-      remainingActiveSeconds: 43_090,
-      recoveryParentJobId: preliminary.jobId,
-    });
-    const verification = await composeRecovery(verificationLeases);
-    expect(verification.request.solver?.urans_fidelity).toBe("full");
-    expect(verification.request.mesh).toEqual(preliminary.request.mesh);
-    await finish(verification, 50);
-    expect(
-      await recordProgressiveCfdRecoveryPlans(db, verification.jobId),
-    ).toBe(0);
-    expect(
-      await settleProgressiveCfdExecution(db, verification.jobId),
-    ).toMatchObject({ complete: 1, retry: 0 });
-    const [unit] = await db.execute(
-      sql`SELECT attempts, active_seconds, active_budget_seconds, state FROM progressive_cfd_units WHERE id = ${verificationLeases[0].id}`,
-    );
-    expect(unit).toEqual({
-      attempts: 3,
-      active_seconds: 160,
-      active_budget_seconds: 43_200,
-      state: "complete",
-    });
-    expect(
-      await claimProgressiveCfdBatch(db, {
-        owner: "no-fourth-attempt",
+      await finish(preliminary, 100);
+      expect(
+        await recordProgressiveCfdRecoveryPlans(db, preliminary.jobId),
+      ).toBe(1);
+      expect(
+        await recordProgressiveCfdRecoveryPlans(db, preliminary.jobId),
+      ).toBe(0);
+      expect(
+        await settleProgressiveCfdExecution(db, preliminary.jobId),
+      ).toMatchObject({ retry: 1, gaps: 1, complete: 0 });
+      let verificationLeases = await claimProgressiveCfdBatch(db, {
+        owner: "precise-verification",
         leaseSeconds: 120,
-      }),
-    ).toEqual([]);
-    const [preliminaryRaw] = await db
-      .select()
-      .from(resultAttempts)
-      .where(
-        and(
-          eq(resultAttempts.simJobId, preliminary.jobId),
-          eq(resultAttempts.aoaDeg, 0),
-        ),
+        solverBudgetVersion: 2,
+      });
+      expect(verificationLeases).toHaveLength(1);
+      expect(verificationLeases[0]).toMatchObject({
+        alpha: 0,
+        remainingActiveSeconds: 43_090,
+        recoveryParentJobId: preliminary.jobId,
+      });
+      if (cancelFirst) {
+        const allocated = verificationLeases[0];
+        const unstarted = await composeRecovery(verificationLeases);
+        await claimSimJobCancellation(
+          db,
+          unstarted.jobId,
+          "isolated precise maintenance stop",
+        );
+        await db
+          .update(simJobs)
+          .set({ engineJobId: unstarted.jobId, ingestedAt: new Date() })
+          .where(eq(simJobs.id, unstarted.jobId));
+        await acknowledgeProgressiveCfdExecutionStop(db, {
+          simJobId: unstarted.jobId,
+          proof: {
+            ...executionStopProof(unstarted.jobId),
+            fence: "cancel_marker",
+            ownership_basis: "never_started_cancellation_fence",
+          },
+        });
+        expect(
+          await settleProgressiveCfdExecution(db, unstarted.jobId),
+        ).toMatchObject({ retry: 1, gaps: 0 });
+        verificationLeases = await claimProgressiveCfdBatch(db, {
+          owner: "precise-verification-retry",
+          leaseSeconds: 120,
+          solverBudgetVersion: 2,
+        });
+        expect(verificationLeases).toHaveLength(1);
+        expect(verificationLeases[0]).toMatchObject({
+          id: allocated.id,
+          recoveryPlanId: allocated.recoveryPlanId,
+          recoveryParentJobId: preliminary.jobId,
+          recipe: allocated.recipe,
+          remainingActiveSeconds: 43_090,
+        });
+        expect(verificationLeases[0].token).not.toBe(allocated.token);
+        const [claimCount] =
+          await db.execute(sql`SELECT count(*)::integer AS count FROM progressive_cfd_recovery_claims
+        WHERE recovery_plan_id = ${allocated.recoveryPlanId}`);
+        expect(claimCount.count).toBe(2);
+      }
+      const verification = await composeRecovery(verificationLeases);
+      expect(verification.request.solver?.urans_fidelity).toBe("full");
+      expect(verification.request.mesh).toEqual(preliminary.request.mesh);
+      await finish(verification, 50);
+      expect(
+        await recordProgressiveCfdRecoveryPlans(db, verification.jobId),
+      ).toBe(0);
+      expect(
+        await settleProgressiveCfdExecution(db, verification.jobId),
+      ).toMatchObject({ complete: 1, retry: 0 });
+      const [unit] = await db.execute(
+        sql`SELECT attempts, active_seconds, active_budget_seconds, state FROM progressive_cfd_units WHERE id = ${verificationLeases[0].id}`,
       );
-    const [verifiedRaw] = await db
-      .select()
-      .from(resultAttempts)
-      .where(eq(resultAttempts.simJobId, verification.jobId));
-    expect(
-      await progressiveParentRevisionIds(
-        db,
-        originalId,
-        verifiedRaw.simulationPresetRevisionId!,
-      ),
-    ).toEqual([preliminaryRaw.simulationPresetRevisionId]);
-    expect(
-      await progressiveParentRevisionIds(
-        db,
-        originalId,
-        preliminaryRaw.simulationPresetRevisionId!,
-      ),
-    ).toEqual([fixture.execution.revision.id]);
-    expect(
-      await progressiveParentRevisionIds(
+      expect(unit).toEqual({
+        attempts: cancelFirst ? 4 : 3,
+        active_seconds: 160,
+        active_budget_seconds: 43_200,
+        state: "complete",
+      });
+      expect(
+        await claimProgressiveCfdBatch(db, {
+          owner: "no-fourth-attempt",
+          leaseSeconds: 120,
+        }),
+      ).toEqual([]);
+      const [preliminaryRaw] = await db
+        .select()
+        .from(resultAttempts)
+        .where(
+          and(
+            eq(resultAttempts.simJobId, preliminary.jobId),
+            eq(resultAttempts.aoaDeg, 0),
+          ),
+        );
+      const [verifiedRaw] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.simJobId, verification.jobId));
+      expect(
+        await progressiveParentRevisionIds(
+          db,
+          originalId,
+          verifiedRaw.simulationPresetRevisionId!,
+        ),
+      ).toEqual([preliminaryRaw.simulationPresetRevisionId]);
+      expect(
+        await progressiveParentRevisionIds(
+          db,
+          originalId,
+          preliminaryRaw.simulationPresetRevisionId!,
+        ),
+      ).toEqual([fixture.execution.revision.id]);
+      expect(
+        await progressiveParentRevisionIds(
+          db,
+          randomUUID(),
+          verifiedRaw.simulationPresetRevisionId!,
+        ),
+      ).toEqual([]);
+      await supersedeProgressivePriorEvidence(
         db,
         randomUUID(),
-        verifiedRaw.simulationPresetRevisionId!,
-      ),
-    ).toEqual([]);
-    await supersedeProgressivePriorEvidence(
-      db,
-      randomUUID(),
-      fixture.execution.revision.id,
-    );
-    const classes = () =>
-      db.execute(sql`
+        fixture.execution.revision.id,
+      );
+      const classes = () =>
+        db.execute(sql`
       SELECT state, superseded_by_result_id FROM result_classifications
       WHERE result_attempt_id = ${acceptedRans} OR result_id = (SELECT result_id FROM result_attempts WHERE id = ${acceptedRans})
     `);
-    expect((await classes()).every((row) => row.state === "accepted")).toBe(
-      true,
-    );
-    await supersedeProgressivePriorEvidence(
-      db,
-      originalId,
-      preliminaryRaw.simulationPresetRevisionId!,
-    );
-    await supersedeProgressivePriorEvidence(
-      db,
-      originalId,
-      fixture.execution.revision.id,
-    );
-    const superseded = await classes();
-    expect(superseded).toHaveLength(2);
-    expect(
-      superseded.every(
-        (row) =>
-          row.state === "superseded_by_urans" &&
-          row.superseded_by_result_id === verifiedRaw.resultId,
-      ),
-    ).toBe(true);
-    const [retainedRans] = await db
-      .select()
-      .from(resultAttempts)
-      .where(eq(resultAttempts.id, acceptedRans));
-    expect(retainedRans).toMatchObject({ status: "done", validForPolar: true });
-    await db.execute(
-      sql`INSERT INTO result_review_verdicts(result_id, verdict, reviewer) VALUES (${verifiedRaw.resultId}, 'exclude', 'isolated-recovery-test')`,
-    );
-    await db.execute(
-      sql`UPDATE result_classifications SET state = 'accepted', superseded_by_result_id = NULL WHERE result_attempt_id = ${preliminaryRaw.id}`,
-    );
-    await supersedeProgressivePriorEvidence(
-      db,
-      originalId,
-      preliminaryRaw.simulationPresetRevisionId!,
-    );
-    await supersedeProgressivePriorEvidence(
-      db,
-      originalId,
-      fixture.execution.revision.id,
-    );
-    expect(
-      (await classes()).every(
-        (row) => row.superseded_by_result_id === preliminaryRaw.resultId,
-      ),
-    ).toBe(true);
-  }, 120_000);
+      expect((await classes()).every((row) => row.state === "accepted")).toBe(
+        true,
+      );
+      await supersedeProgressivePriorEvidence(
+        db,
+        originalId,
+        preliminaryRaw.simulationPresetRevisionId!,
+      );
+      await supersedeProgressivePriorEvidence(
+        db,
+        originalId,
+        fixture.execution.revision.id,
+      );
+      const superseded = await classes();
+      expect(superseded).toHaveLength(2);
+      expect(
+        superseded.every(
+          (row) =>
+            row.state === "superseded_by_urans" &&
+            row.superseded_by_result_id === verifiedRaw.resultId,
+        ),
+      ).toBe(true);
+      const [retainedRans] = await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.id, acceptedRans));
+      expect(retainedRans).toMatchObject({
+        status: "done",
+        validForPolar: true,
+      });
+      await db.execute(
+        sql`INSERT INTO result_review_verdicts(result_id, verdict, reviewer) VALUES (${verifiedRaw.resultId}, 'exclude', 'isolated-recovery-test')`,
+      );
+      await db.execute(
+        sql`UPDATE result_classifications SET state = 'accepted', superseded_by_result_id = NULL WHERE result_attempt_id = ${preliminaryRaw.id}`,
+      );
+      await supersedeProgressivePriorEvidence(
+        db,
+        originalId,
+        preliminaryRaw.simulationPresetRevisionId!,
+      );
+      await supersedeProgressivePriorEvidence(
+        db,
+        originalId,
+        fixture.execution.revision.id,
+      );
+      expect(
+        (await classes()).every(
+          (row) => row.superseded_by_result_id === preliminaryRaw.resultId,
+        ),
+      ).toBe(true);
+    },
+    120_000,
+  );
 
   it.each([-2, 6])(
     "keeps hard failure outside the promotion interval targeted at %s degrees",

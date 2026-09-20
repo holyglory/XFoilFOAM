@@ -197,6 +197,15 @@ recipe, parent execution owner and remaining compute allocation, while old claim
 and evidence stay unchanged. The existing attempt and no-start ceilings still
 decide whether another execution is permitted.
 
+Precise verification retains its allowance when the claimed verification was
+provably cancelled before starting, with zero measured compute and no evidence.
+A started, unproven or evidence-bearing claim consumes that allowance. The stored
+attempt counter permits four records to accommodate the existing three physical
+allocations plus one retryable zero-work cancellation; it does not grant a fourth
+physical attempt. A second proven zero-work cancellation ends the retry chain.
+The separate publication-correction grant stays unit-scoped and immutable when
+its allocated attempt never starts; no duplicate grant is created.
+
 Workers persist ordered immutable reports before delivery. A lost response retries
 the same sequence and bytes; only the hub's matching execution, sequence and content
 signature acknowledge that local outbox row.

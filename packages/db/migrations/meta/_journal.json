@@ -1093,6 +1093,13 @@
       "when": 1792368000049,
       "tag": "0155_progressive_recovery_attempt_claims",
       "breakpoints": true
+    },
+    {
+      "idx": 156,
+      "version": "7",
+      "when": 1792368000050,
+      "tag": "0156_progressive_attempt_storage_bound",
+      "breakpoints": true
     }
   ]
 }
