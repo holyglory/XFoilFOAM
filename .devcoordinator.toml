@@ -2241,7 +2241,7 @@ files = ["compose.progressive-engine.yml", "compose.progressive-preview-engine.y
 services = ["redis", "gateway", "worker"]
 finite_services = []
 independent_services = ["worker"]
-build = false
+build = true
 port = true
 route = true
 timeout_seconds = 900
@@ -3057,6 +3057,14 @@ retained_artifacts = [{ name = "metadata-contrast", path = ".codex-artifacts/evi
 
 [test.evidence-metadata-production]
 timeout_seconds = 900
+
+[test.preview-source]
+timeout_seconds = 180
+
+[[test.preview-source.check]]
+name = "build-context"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_frozen_python_images.py", "-q"]
 
 [[test.evidence-metadata-production.check]]
 name = "rendered-metadata"

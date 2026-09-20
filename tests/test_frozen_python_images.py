@@ -18,6 +18,12 @@ EXPECTED_STORAGE_VERSIONS = {
 }
 
 
+def test_docker_context_excludes_nested_generated_package_metadata():
+    patterns = (ROOT / ".dockerignore").read_text().splitlines()
+    assert "*.egg-info/" in patterns
+    assert "**/*.egg-info/" in patterns
+
+
 def _package_blocks(lockfile: Path) -> dict[str, str]:
     lines = lockfile.read_text().splitlines()
     starts = [

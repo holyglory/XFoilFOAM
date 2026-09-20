@@ -1,6 +1,10 @@
 services:
   worker:
-    image: sha256:6e39ed099259d1e29220523d4c26ad2bee5a9b3b248533a0133296c3d3d7acff
-    pull_policy: never
+    image: xfoilfoam-progressive-preview-worker:local
+    pull_policy: build
+    environment:
+      AIRFOILFOAM_ENGINE_SOURCE_REVISION: bc772972f7fa23a0a437de0df7ac2fe9d6ff3f48
   gateway:
-    pull_policy: never
+    pull_policy: build
+    environment:
+      AIRFOILFOAM_ENGINE_SOURCE_REVISION: bc772972f7fa23a0a437de0df7ac2fe9d6ff3f48
