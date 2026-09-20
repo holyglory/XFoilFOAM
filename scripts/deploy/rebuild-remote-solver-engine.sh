@@ -237,16 +237,30 @@ if any(row.values()):
 }
 
 maintenance_database_activity() {
-  # An active remote promise is a durable scheduling lease, not executable
-  # work. Once both writers are stopped it remains inert and must survive an
-  # ordinary engine maintenance window unchanged. Live jobs, retryable or
-  # claimed deliveries, unsettled cancellations, and active media repair still
-  # fail closed. A blocked delivery is already terminal in the remote writer
-  # state machine; its reviewable hub conflict ids remain durable and inert.
+  # A stopped progressive remote execution with an acknowledged stop proof is
+  # retained evidence, not executable work. It must survive maintenance while
+  # the normal controller resumes its delivery/recovery path afterwards.
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
-WITH activity AS (
+WITH executable_jobs AS (
+  SELECT job.id
+  FROM sim_jobs job
+  WHERE job.status IN ('pending','submitted','running','ingesting')
+    AND NOT (
+      job.request_payload ? 'remoteProgressiveExecution'
+      AND job.engine_job_id = job.id::text
+      AND (job.ingest_lease_expires_at IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
+      AND EXISTS (
+        SELECT 1
+        FROM progressive_worker_reports report
+        WHERE report.sim_job_id = job.id
+          AND report.stopped_engine_job_id = job.engine_job_id
+          AND report.acknowledged_at IS NOT NULL
+          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+      )
+    )
+), activity AS (
   SELECT
-    (SELECT count(*) FROM sim_jobs WHERE status IN ('pending','submitted','running','ingesting'))::int AS live_jobs,
+    (SELECT count(*) FROM executable_jobs)::int AS live_jobs,
     (SELECT count(*) FROM sync_remote_result_deliveries WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations WHERE state <> 'delivered')::int AS unsettled_cancellations,
     (SELECT count(*) FROM progressive_worker_archive_deliveries WHERE claim_expires_at > clock_timestamp())::int AS progressive_archive_claims,
@@ -299,7 +313,8 @@ remote_transfer_activity() {
 WITH activity AS (
   SELECT
     (SELECT count(*) FROM sync_remote_result_deliveries
-      WHERE state NOT IN ('delivered','superseded','blocked'))::int AS unsettled_deliveries,
+      WHERE state NOT IN ('delivered','superseded','blocked')
+        AND NOT (state = 'pushing' AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())))::int AS unsettled_deliveries,
     (SELECT count(*) FROM sync_remote_promise_cancellations
       WHERE state <> 'delivered')::int AS unsettled_cancellations,
     (SELECT count(*) FROM progressive_worker_archive_deliveries
@@ -929,6 +944,7 @@ fail_safe() {
   exit "$rc"
 }
 trap fail_safe EXIT
+trap 'exit 130' INT TERM HUP
 
 perform_rollback() {
   local state live2606 api_image worker_image api_ref worker_ref old_build old_expected old_keys old_2406_enabled old_2606_enabled

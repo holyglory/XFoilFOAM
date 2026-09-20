@@ -393,6 +393,29 @@ describe("remote progressive incremental report validation", () => {
     );
   });
 
+  it("closes a cancelled execution with a measured stop and partial result", () => {
+    const { assignment, report } = fixture();
+    report.status.state = "cancelled";
+    report.result!.state = "running";
+    report.stopProof = {
+      version: 1,
+      job_id: report.executionId,
+      execution_stopped: true,
+      producer_stopped: true,
+      namespace_verified: true,
+      remaining: [],
+      observed_at: "2026-09-07T09:03:00Z",
+      error: null,
+      fence: "cancel_marker",
+      ownership_basis: "recorded_execution_namespace",
+    };
+
+    expect(validateProgressiveRemoteReport(report, assignment).report).toEqual(
+      report,
+    );
+    expect(isFinalProgressiveRemoteReport(report)).toBe(true);
+  });
+
   it.each([
     [
       "foreign execution",
