@@ -193,3 +193,127 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
     };
   });
 }
+
+const LOCAL_TIME_STEP_POLICY_PREFIX = "local-time-step-smoothing:";
+
+export async function adoptProgressiveLocalTimeStepPolicy(
+  db: DB,
+  campaignId: string,
+  smoothing = 0.2,
+) {
+  if (
+    !Number.isFinite(smoothing) ||
+    smoothing < 0 ||
+    smoothing > 1 ||
+    smoothing === 0.02
+  )
+    throw new Error(
+      "Local time-step adoption requires a finite non-legacy smoothing value between zero and one",
+    );
+  const policy = `${LOCAL_TIME_STEP_POLICY_PREFIX}${smoothing}`;
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [epoch] = await connection.execute(
+      sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+    );
+    const [admission] = await connection.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id=1 FOR SHARE`,
+    );
+    const [campaign] = await connection.execute(sql`
+      SELECT id,status,current_plan_revision_id FROM sim_campaigns
+      WHERE id=${campaignId}::uuid FOR UPDATE
+    `);
+    if (!epoch || !campaign?.current_plan_revision_id)
+      throw new Error("Campaign and calculation epoch must exist");
+    const [receipt] = await connection.execute(sql`
+      SELECT generation_id,previous_generation_ids FROM progressive_recipe_adoptions
+      WHERE epoch_id=${epoch.id} AND campaign_id=${campaignId}::uuid
+        AND plan_revision_id=${campaign.current_plan_revision_id} AND policy=${policy}
+    `);
+    if (receipt) return { kind: "replayed" as const, campaignId, ...receipt };
+    if (!['active', 'attention'].includes(String(campaign.status)))
+      throw new Error("Only active preliminary campaigns may adopt a numerical policy");
+    if (admission?.enabled !== false)
+      throw new Error("Pause new solver admissions before adopting recipes");
+    const generations = await connection.execute(sql`
+      SELECT id,stage FROM progressive_generations
+      WHERE campaign_id=${campaignId}::uuid AND epoch_id=${epoch.id}
+        AND plan_revision_id=${campaign.current_plan_revision_id}
+        AND status IN ('active','attention') ORDER BY id FOR UPDATE
+    `);
+    if (generations.some((generation) => Number(generation.stage) >= 3))
+      throw new Error("A precise generation must not be restarted by preliminary recipe adoption");
+    if (!generations.length) return { kind: "not_required" as const, campaignId };
+    const generationIds = generations.map((generation) => String(generation.id));
+    const ids = sql.join(
+      generationIds.map((id) => sql`${id}::uuid`),
+      sql`, `,
+    );
+    const [outdated] = await connection.execute(sql`
+      SELECT EXISTS(
+        SELECT 1 FROM progressive_generation_targets
+        WHERE generation_id IN (${ids})
+          AND recipes#>>'{fast,timeCoordinate}' = 'local_pseudo_time_iterations'
+          AND recipes#>>'{fast,solver,localTimeStepSmoothing}' IS DISTINCT FROM ${String(smoothing)}
+      ) AS present
+    `);
+    if (!outdated?.present)
+      return { kind: "not_required" as const, campaignId };
+    const [busy] = await connection.execute(sql`
+      SELECT EXISTS(
+        SELECT 1 FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        JOIN progressive_work work ON work.id=unit.work_id
+        JOIN sim_jobs job ON job.id=attempt.sim_job_id
+        LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
+        WHERE work.generation_id IN (${ids}) AND (
+          attempt.outcome='running' OR job.status IN ('pending','submitted','running','ingesting') OR
+          (job.engine_job_id IS NOT NULL AND (stopped.engine_job_id IS DISTINCT FROM job.engine_job_id
+            OR stopped.epoch_id IS DISTINCT FROM ${epoch.id}::uuid))
+        )
+      ) OR EXISTS(
+        SELECT 1 FROM progressive_work WHERE generation_id IN (${ids}) AND state='leased'
+      ) AS present
+    `);
+    if (busy?.present)
+      throw new Error("Old solver work must be physically stopped and settled before recipe adoption");
+    const profiles = await connection.execute(sql`
+      SELECT DISTINCT target.airfoil_id
+      FROM progressive_generation_targets scope
+      JOIN polar_analysis_targets target ON target.id=scope.target_id
+      WHERE scope.generation_id IN (${ids}) ORDER BY target.airfoil_id
+    `);
+    await connection.execute(
+      sql`UPDATE progressive_generations SET status='cancelled' WHERE id IN (${ids})`,
+    );
+    await cancelObsoleteProgressiveCfdUnits(connection, campaignId);
+    await connection.execute(sql`
+      UPDATE progressive_work SET state='gap', completed_at=clock_timestamp(),
+        error='superseded by explicit local time-step policy adoption'
+      WHERE generation_id IN (${ids}) AND state IN ('pending','leased')
+    `);
+    const successor = await materializeProgressiveCampaignScope(
+      connection,
+      campaignId,
+      profiles.map((profile) => String(profile.airfoil_id)),
+      `adopt-${policy}`,
+      { localTimeStepSmoothing: smoothing },
+    );
+    if (!successor)
+      throw new Error("Local time-step adoption has no current eligible profile scope");
+    await reusePreviousBaselines(connection, successor.id, generationIds, String(epoch.id));
+    await connection.execute(sql`
+      INSERT INTO progressive_recipe_adoptions(
+        epoch_id,campaign_id,plan_revision_id,policy,previous_generation_ids,generation_id
+      ) VALUES(${epoch.id},${campaignId}::uuid,${campaign.current_plan_revision_id},
+        ${policy},ARRAY[${ids}],${successor.id})
+    `);
+    return {
+      kind: "adopted" as const,
+      campaignId,
+      generation_id: successor.id,
+      previous_generation_ids: generationIds,
+      policy,
+    };
+  });
+}

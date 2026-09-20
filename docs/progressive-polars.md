@@ -611,6 +611,16 @@ The option alone does not change existing sealed campaign recipes. It does not
 increase the Courant ceiling, iteration/time allocation, thermodynamic bounds or
 convergence tolerance, and numerical convergence is not physical validation.
 
+For an existing active preliminary campaign, the reviewed operator command
+`adopt-progressive-local-time-step CAMPAIGN_UUID 0.2 --dry-run` previews a
+transactional successor generation. Applying it requires admissions paused,
+settled old work and no precise generation; accepted NeuralFoil baselines are
+reused only after exact validation. The old generation and evidence remain
+immutable. The adoption record also makes later automatic profile enrollment
+use the same explicit setting. Completed/paused/cancelled/archived campaigns
+remain dormant until their normal lifecycle permits work; no campaign is
+silently rewritten by changing a reusable profile.
+
 Every density-based cold angle clears only mutable time, processor and
 postprocessing directories before writing its own initial state. The shared mesh,
 previous angle archives and raw logs survive; pressure-based warm marching is

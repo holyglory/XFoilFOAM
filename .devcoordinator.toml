@@ -66,6 +66,12 @@ requires = ["types", "schema", "python"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "composes high-Mach fast local-time|local density"]
 
 [[test.local-step-policy.check]]
+name = "local-step-adoption"
+tier = "development"
+requires = ["types", "schema", "python"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "adopts the explicit local-step policy"]
+
+[[test.local-step-policy.check]]
 name = "capability-routing"
 tier = "development"
 requires = ["types", "schema"]

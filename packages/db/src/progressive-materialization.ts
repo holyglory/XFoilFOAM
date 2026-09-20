@@ -18,6 +18,7 @@ import type { SimulationSetupSnapshot } from "./simulation-setup";
 export function progressiveRecipes(
   snapshot: SimulationSetupSnapshot,
   maximumConcaveCurvature: number | null = null,
+  explicitLocalTimeStepSmoothing?: number | null,
 ): SealedPolarTarget["recipes"] {
   if (snapshot.solver.turbulenceModel !== "kOmegaSST")
     throw new Error(
@@ -36,6 +37,17 @@ export function progressiveRecipes(
     localTimeStepSmoothing,
     ...solver
   } = snapshot.solver;
+  const resolvedLocalTimeStepSmoothing =
+    explicitLocalTimeStepSmoothing === undefined
+      ? localTimeStepSmoothing ?? null
+      : explicitLocalTimeStepSmoothing;
+  if (
+    resolvedLocalTimeStepSmoothing != null &&
+    (!Number.isFinite(resolvedLocalTimeStepSmoothing) ||
+      resolvedLocalTimeStepSmoothing < 0 ||
+      resolvedLocalTimeStepSmoothing > 1)
+  )
+    throw new Error("Local time-step smoothing must be finite and between zero and one");
   const common = {
     engine: snapshot.engine ?? null,
     transition: "fully_turbulent",
@@ -59,7 +71,8 @@ export function progressiveRecipes(
     fast: {
       ...common,
       recipe_id: localDensity
-        ? localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
+        ? resolvedLocalTimeStepSmoothing != null &&
+            resolvedLocalTimeStepSmoothing !== 0.02
           ? "openfoam-fast-density-local-v2"
           : "openfoam-fast-density-local-v1"
         : "openfoam-fast-wall-v2",
@@ -85,8 +98,8 @@ export function progressiveRecipes(
       },
       solver: {
         ...solver,
-        ...(localDensity && localTimeStepSmoothing != null
-          ? { localTimeStepSmoothing }
+        ...(localDensity && resolvedLocalTimeStepSmoothing != null
+          ? { localTimeStepSmoothing: resolvedLocalTimeStepSmoothing }
           : {}),
         nIterations: localDensity ? 5000 : Math.min(solver.nIterations, 1500),
         ...(localDensity ? { momentumScheme: "upwind" } : {}),
@@ -102,6 +115,7 @@ export async function materializeProgressiveCampaignScope(
   campaignId: string,
   profileIds?: string[],
   requestVersion?: string,
+  numericalPolicy?: { localTimeStepSmoothing?: number | null },
 ) {
   if (profileIds?.length === 0) return null;
   return db.transaction(async (transaction) => {
@@ -168,6 +182,7 @@ export async function materializeProgressiveCampaignScope(
         const recipes = progressiveRecipes(
           snapshot,
           profileCurvature.get(profile.id) ?? null,
+          numericalPolicy?.localTimeStepSmoothing,
         );
         const target = createAnalysisTarget({
           airfoilId: profile.id,
@@ -201,6 +216,9 @@ export async function materializeProgressiveCampaignScope(
       planRevisionId: intent.revisionId,
       scopeKey: analysisContentHash({
         fastWallSpacingPolicy: FAST_WALL_SPACING_POLICY,
+        ...(numericalPolicy?.localTimeStepSmoothing !== undefined
+          ? { numericalPolicy }
+          : {}),
         plan: intent.revisionId,
         profiles: profiles.map((profile) => profile.id),
         ...(requestVersion ? { requestVersion } : {}),
@@ -288,11 +306,29 @@ export async function reconcileProgressiveGenerationRequest(db: DB) {
     let generationId: string | null = null;
     let error: string | null = null;
     try {
+      const [adoption] = await connection.execute(sql`
+        SELECT policy FROM progressive_recipe_adoptions
+        WHERE epoch_id = ${epoch.id} AND campaign_id = ${request.campaign_id}::uuid
+          AND plan_revision_id = ${request.plan_revision_id}::uuid
+          AND policy LIKE 'local-time-step-smoothing:%'
+        ORDER BY created_at DESC LIMIT 1
+      `);
+      const policyText = adoption?.policy;
+      const policyMatch =
+        typeof policyText === "string"
+          ? /^local-time-step-smoothing:(0(?:\.\d+)?|1(?:\.0+)?)$/.exec(policyText)
+          : null;
+      const localTimeStepSmoothing = policyMatch
+        ? Number(policyMatch[1])
+        : undefined;
       const generation = await materializeProgressiveCampaignScope(
         connection,
         request.campaign_id,
         profiles.map((profile) => profile.airfoil_id),
         request.requested_version,
+        localTimeStepSmoothing === undefined
+          ? undefined
+          : { localTimeStepSmoothing },
       );
       generationId = generation?.id ?? null;
     } catch (failure) {

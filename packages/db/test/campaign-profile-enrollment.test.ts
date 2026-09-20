@@ -12,7 +12,10 @@ import {
   storeRepairedPrediction,
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
-import { adoptProgressiveWallPolicy } from "../src/progressive-recipe-adoption";
+import {
+  adoptProgressiveLocalTimeStepPolicy,
+  adoptProgressiveWallPolicy,
+} from "../src/progressive-recipe-adoption";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -739,6 +742,53 @@ describe("durable progressive scope requests", () => {
       sql`SELECT state FROM progressive_cfd_units WHERE id=${cfd.id}`,
     );
     expect(cancelled.state).toBe("cancelled");
+  }, 30_000);
+
+  it("adopts the explicit local-step policy for existing and newly enrolled profiles", async () => {
+    const id = await campaign("active", [900], [-2, 0, 2, 4]);
+    const initial = (await reconcileProgressiveGenerationRequest(db))!;
+    const [before] = await db.execute(sql`
+      SELECT recipes FROM progressive_generation_targets
+      WHERE generation_id=${initial.generationId}
+    `);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    try {
+      const adopted = await adoptProgressiveLocalTimeStepPolicy(db, id, 0.2);
+      expect(adopted.kind).toBe("adopted");
+      const [after] = await db.execute(sql`
+        SELECT recipes FROM progressive_generation_targets
+        WHERE generation_id=${adopted.generation_id}
+      `);
+      expect(after.recipes).toMatchObject({
+        fast: {
+          recipe_id: "openfoam-fast-density-local-v2",
+          solver: { localTimeStepSmoothing: 0.2 },
+        },
+      });
+      expect(before.recipes).toMatchObject({
+        fast: { recipe_id: "openfoam-fast-density-local-v1" },
+      });
+      expect(
+        await adoptProgressiveLocalTimeStepPolicy(db, id, 0.2),
+      ).toMatchObject({ kind: "replayed", generation_id: adopted.generation_id });
+
+      const added = await newProfile();
+      await reconcileCampaignProfileEnrollment(db);
+      const enrolled = (await reconcileProgressiveGenerationRequest(db))!;
+      const [newTarget] = await db.execute(sql`
+        SELECT scope.recipes FROM progressive_generation_targets scope
+        JOIN polar_analysis_targets target ON target.id=scope.target_id
+        WHERE scope.generation_id=${enrolled.generationId} AND target.airfoil_id=${added}
+      `);
+      expect(newTarget.recipes).toMatchObject({
+        fast: {
+          recipe_id: "openfoam-fast-density-local-v2",
+          solver: { localTimeStepSmoothing: 0.2 },
+        },
+      });
+    } finally {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    }
   }, 30_000);
 
   it("coalesces concurrent requests without duplicate generations", async () => {
