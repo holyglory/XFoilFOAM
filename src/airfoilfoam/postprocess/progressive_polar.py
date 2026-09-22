@@ -11,6 +11,7 @@ import numpy as np
 
 
 MODEL_VERSION = "progressive-polar-gp-v2"
+BIAS_MODEL_VERSION = "progressive-polar-gp-v3"
 ACQUISITION_VERSION = "fixed-posterior-coverage-v1"
 Method = Literal["openfoam_fast", "openfoam_precise"]
 
@@ -43,6 +44,7 @@ class PolarObservation:
     statistical_certification: str
     exclusion_reason: str | None = None
     window: tuple[float, float] | None = None
+    accepted_cfd: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,21 @@ class PolarModelPolicy:
     lineage_correlation: float
     calibration_status: Literal["unvalidated", "validated"]
     validation_id: str | None = None
+    uncertified_fast_bias_std: list[float] | None = None
+
+
+def observation_payload(observation):
+    payload = asdict(observation)
+    if observation.accepted_cfd is None:
+        payload.pop("accepted_cfd")
+    return payload
+
+
+def policy_payload(policy):
+    payload = asdict(policy)
+    if policy.uncertified_fast_bias_std is None:
+        payload.pop("uncertified_fast_bias_std")
+    return payload
 
 
 def _matrix(values, shape, name: str, positive: bool = False) -> np.ndarray:
@@ -92,6 +109,12 @@ def _validate(prior: PolarPrior, observations: list[PolarObservation], policy: P
         raise ValueError("Unknown calibration status")
     if policy.calibration_status == "validated" and not policy.validation_id:
         raise ValueError("Validated uncertainty requires a validation evidence identifier")
+    if policy.uncertified_fast_bias_std is not None:
+        bias = _matrix(policy.uncertified_fast_bias_std, (3,), "uncertified fast bias uncertainty")
+        if np.any(bias < 0):
+            raise ValueError("Uncertified fast bias uncertainty cannot be negative")
+        if policy.calibration_status != "unvalidated":
+            raise ValueError("The optional bias allowance has no physical validation certificate")
     if not policy.policy_id:
         raise ValueError("A model policy needs an immutable identity")
     eligible = []
@@ -111,6 +134,10 @@ def _validate(prior: PolarPrior, observations: list[PolarObservation], policy: P
             continue
         if observation.exclusion_reason:
             raise ValueError("Excluded evidence cannot inform an estimate")
+        if observation.accepted_cfd is not None and type(observation.accepted_cfd) is not bool:
+            raise ValueError("CFD acceptance metadata must be explicit boolean evidence")
+        if policy.uncertified_fast_bias_std is not None and observation.accepted_cfd is None:
+            raise ValueError("Bias policy requires source-backed CFD acceptance metadata")
         if observation.target_signature != prior.target_signature or observation.branch != prior.branch:
             raise ValueError("Cannot fuse incompatible physical targets or hysteresis branches")
         if observation.method not in {"openfoam_fast", "openfoam_precise"}:
@@ -167,8 +194,9 @@ def _acquisition_reduction(angles, current_variance, posterior_cross, candidate_
 def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation], policy: PolarModelPolicy) -> dict:
     angles, coefficients, uncertainty, eligible, excluded = _validate(prior, observations, policy)
     prior_mean, prior_std = _transformed(coefficients, uncertainty)
-    serialized = json.dumps({"version": MODEL_VERSION, "prior": asdict(prior), "policy": asdict(policy),
-                             "observations": [asdict(row) for row in sorted(observations, key=lambda row: row.observation_id)]},
+    model_version = MODEL_VERSION if policy.uncertified_fast_bias_std is None else BIAS_MODEL_VERSION
+    serialized = json.dumps({"version": model_version, "prior": asdict(prior), "policy": policy_payload(policy),
+                             "observations": [observation_payload(row) for row in sorted(observations, key=lambda row: row.observation_id)]},
                             sort_keys=True, separators=(",", ":"), allow_nan=False)
     signature = hashlib.sha256(serialized.encode()).hexdigest()
     means = {method: prior_mean.copy() for method in ("openfoam_fast", "openfoam_precise")}
@@ -183,6 +211,14 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
             np.array([row.coefficients for row in eligible]),
             np.array([row.standard_error for row in eligible]),
         )
+        if policy.uncertified_fast_bias_std is not None:
+            uncertain = np.array([row.method == "openfoam_fast" and row.accepted_cfd is False
+                                  and row.statistical_certification not in {"steady", "periodic", "aperiodic"}
+                                  for row in eligible])
+            observed_errors = np.hypot(
+                observed_errors,
+                uncertain[:, None] * np.asarray(policy.uncertified_fast_bias_std),
+            )
         precise = np.array([row.method == "openfoam_precise" for row in eligible], dtype=float)
         lineage = np.array([[left.lineage_id == right.lineage_id for right in eligible] for left in eligible])
         noise_floors = np.array([policy.precise_noise_floor if row.method == "openfoam_precise"
@@ -269,7 +305,7 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
     for method in methods_present:
         displayed_curves[method] = curves[method]
     return {
-        "version": MODEL_VERSION, "signature": signature, "kind": "estimate",
+        "version": model_version, "signature": signature, "kind": "estimate",
         "target_signature": prior.target_signature, "branch": prior.branch, "alpha": angles.tolist(),
         "prior_prediction_id": prior.prediction_id, "policy_id": policy.policy_id,
         "calibration_status": policy.calibration_status, "validation_id": policy.validation_id,

@@ -287,6 +287,11 @@ function exactObservation(
         row.payload.converged !== true))
   )
     throw new Error("Polar observation overstates its evidence eligibility");
+  if (
+    observation.accepted_cfd != null &&
+    observation.accepted_cfd !== (row.classification?.state === "accepted")
+  )
+    throw new Error("Polar observation changes its recorded CFD acceptance");
   return row;
 }
 
@@ -294,6 +299,17 @@ function validateFitInput(
   source: ProgressiveFitSource,
   request: ProgressivePolarFitRequest,
 ) {
+  if (
+    request.policy.uncertified_fast_bias_std != null &&
+    [
+      ...request.observations,
+      ...request.histories.map((history) => history.observation),
+    ].some(
+      (observation) =>
+        observation.eligible && typeof observation.accepted_cfd !== "boolean",
+    )
+  )
+    throw new Error("Bias policy requires exact source acceptance metadata");
   const accounted = new Set([
     ...request.observations.map((row) => row.attempt_id),
     ...request.histories.map((row) => row.observation.attempt_id),
@@ -384,7 +400,10 @@ function validateFitOutput(
     response.lease_token !== request.lease_token ||
     !/^[a-f0-9]{64}$/.test(response.request_signature) ||
     !/^[a-f0-9]{64}$/.test(estimate.signature) ||
-    estimate.version !== "progressive-polar-gp-v2" ||
+    estimate.version !==
+      (request.policy.uncertified_fast_bias_std == null
+        ? "progressive-polar-gp-v2"
+        : "progressive-polar-gp-v3") ||
     estimate.kind !== "estimate" ||
     estimate.target_signature !== request.prior.target_signature ||
     estimate.branch !== request.prior.branch ||

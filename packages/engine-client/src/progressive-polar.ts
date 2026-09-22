@@ -27,6 +27,7 @@ export interface ProgressivePolarObservation {
   statistical_certification: string;
   exclusion_reason?: string | null;
   window?: [number, number] | null;
+  accepted_cfd?: boolean | null;
 }
 
 export interface ProgressivePolarHistory {
@@ -52,6 +53,7 @@ export interface ProgressivePolarModelPolicy {
   lineage_correlation: number;
   calibration_status: "unvalidated" | "validated";
   validation_id?: string | null;
+  uncertified_fast_bias_std?: ProgressiveCoefficientVector | null;
 }
 
 export interface ProgressivePolarFitRequest {

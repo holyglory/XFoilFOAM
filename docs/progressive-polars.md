@@ -505,6 +505,18 @@ bounded retries; a different policy supersedes the earlier lease explicitly.
 Any source-evidence, classification, review, or interpretation change clears this
 display reference immediately, as does a source-integrity failure. Ordinary
 pending work never inherits a model through this policy-only path.
+The optional version-3 estimator contract accepts `uncertified_fast_bias_std` in
+Cl, log(Cd), and Cm units. It adds numerical-bias variance before the existing
+method-noise floors for eligible, unaccepted, uncertified fast observations only.
+Accepted CFD, precise observations, excluded evidence, and certified statistical
+observations retain their existing treatment. Source acceptance is a separate
+`accepted_cfd` field and must agree with stored classification; it is never inferred
+from a stable force mean or a display label. The production request builder does
+not enable this option, so requests without it retain the version-2 model and
+legacy signatures, including old manifests that have no acceptance field.
+Version 3 remains explicitly unvalidated; the current low-Mach transfer study is
+not permission to apply it to all angles, numerical recipes, compressible flow,
+or Mach-3 targets.
 The offline held-out evaluator accepts the same history reduction policy and
 bounded joint histories as live fitting. Version-2 measurements retain the
 contributing time windows and rejected sources alongside coverage and interval

@@ -50,6 +50,11 @@ def calculate_progressive_polar(request: ProgressivePolarRequest) -> dict:
             raise ValueError("Joint history reduction exceeds the bounded observation budget")
     estimate = fit_progressive_polar(request.prior, observations, request.policy)
     payload = request.model_dump(mode="json", exclude={"epoch_id", "lease_token"})
+    if payload["policy"].get("uncertified_fast_bias_std") is None:
+        payload["policy"].pop("uncertified_fast_bias_std", None)
+    for observation in [*payload["observations"], *(history["observation"] for history in payload["histories"])]:
+        if observation.get("accepted_cfd") is None:
+            observation.pop("accepted_cfd", None)
     signature = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
     ).hexdigest()
