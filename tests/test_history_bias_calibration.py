@@ -75,7 +75,13 @@ def test_frozen_groups_reject_overlap_or_changed_selection(tmp_path, monkeypatch
         expected[name] = (1, hashlib.sha256(raw).hexdigest())
     monkeypatch.setattr(calibration, "GROUPS", expected)
     if mutation == "checksum":
-        (tmp_path / "heldout.json").write_bytes(b"changed source")
+        (tmp_path / "heldout.json").write_bytes(b"{}")
+    from scripts.materials.validate_history_transfer import pinned_json
+    if mutation == "checksum":
+        with pytest.raises(ValueError, match="preregistered checksum"):
+            pinned_json(tmp_path / "heldout.json", expected["heldout"][1])
+    else:
+        assert pinned_json(tmp_path / "heldout.json", expected["heldout"][1]) == json.loads((tmp_path / "heldout.json").read_text())
     if mutation == "none":
         assert list(calibration.load_groups(tmp_path)) == ["fit", "calibration", "heldout"]
     else:
