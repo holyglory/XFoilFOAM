@@ -35,7 +35,7 @@ for (const target of config.targets) {
       kind: "in-page",
       anchor:
         target.name === "progressive-comparison"
-          ? `${target.regions[0].selector} svg[aria-label='Lift polar for the selected condition']`
+          ? `${target.regions[0].selector} select[aria-label='Comparison condition']`
           : `${target.regions[0].selector} svg`,
       focusWithin: "button[aria-label='Switch to dark theme']",
       maxScrollDelta: 8,

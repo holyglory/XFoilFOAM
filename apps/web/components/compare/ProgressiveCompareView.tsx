@@ -100,7 +100,7 @@ export function ProgressiveCompareView({
         style={{
           display: "flex",
           alignItems: "center",
-          gap: 12,
+          gap: 6,
           color: C.muted,
           fontSize: 13,
         }}
@@ -115,7 +115,7 @@ export function ProgressiveCompareView({
           style={{
             minWidth: 0,
             maxWidth: "100%",
-            padding: "10px 12px",
+            padding: "10px 6px",
             borderRadius: 10,
             background: C.panel,
             color: C.text,
