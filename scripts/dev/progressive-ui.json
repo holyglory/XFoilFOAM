@@ -86,7 +86,7 @@
       "name": "progressive-comparison",
       "url": "/compare?airfoil=ag24&airfoil=ag25",
       "waitFor": {
-        "selector": "[data-testid='progressive-comparison'][aria-busy='false']"
+        "selector": "[data-testid='condition-comparison']"
       },
       "journeys": [
         {
@@ -94,14 +94,14 @@
           "name": "Compare profiles at the same condition",
           "frequencyPercent": 100,
           "risk": "normal",
-          "rationale": "Actual cached curves appear before numerical summaries"
+          "rationale": "Comparison cards show real condition-matched curves and metrics; the optional overlay opens on request"
         }
       ],
       "primaryJourney": "compare-polars",
       "regions": [
         {
-          "name": "Polars",
-          "selector": "[data-testid='progressive-comparison']",
+          "name": "Comparison cards",
+          "selector": "[data-testid='condition-comparison']",
           "role": "primary-content",
           "journey": "compare-polars"
         }
@@ -146,15 +146,35 @@
           "name": "curve-samples",
           "actions": [
             {
+              "action": "click",
+              "selector": "[data-testid='condition-comparison'] > details > summary"
+            },
+            {
+              "action": "focus",
+              "selector": "[data-testid='progressive-comparison'] input[type='checkbox']"
+            },
+            {
               "action": "check",
               "selector": "[data-testid='progressive-comparison'] input[type='checkbox']"
+            }
+          ],
+          "waitFor": {
+            "selector": "[data-testid='progressive-comparison'][aria-busy='false'] [data-testid='comparison-sample']"
+          },
+          "regions": [
+            {
+              "name": "Overlay curves",
+              "selector": "[data-testid='progressive-comparison']",
+              "role": "primary-content",
+              "journey": "compare-polars"
             }
           ],
           "continuation": {
             "kind": "in-page",
             "anchor": "[data-testid='progressive-comparison'] svg",
             "focusWithin": "[data-testid='progressive-comparison']",
-            "maxScrollDelta": 8
+            "maxScrollDelta": 8,
+            "triggerActionIndex": 2
           }
         }
       ]
