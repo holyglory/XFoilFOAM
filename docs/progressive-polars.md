@@ -1255,3 +1255,43 @@ exact retained sources independently of legacy transfer housekeeping, reusing
 the existing claims, oldest-due ordering, custody verification, transfer pause
 and persisted retry deadlines. It does not create additional CFD jobs or relax
 the remote promise cap.
+
+### Frozen history-weighting transfer study
+
+The September 22 study freezes seven previously unused compressible profiles at
+Mach 0.4877444 and twenty separate low-speed controls. The selection uses stored
+model identity, an included fast-method history, and an accepted reference from
+another job and unit. All sixty earlier study profiles are excluded, and exact
+geometry overlap is checked against their retained sources. No coefficient error
+is used to select a profile. The stored fit must reproduce before measurement;
+invalid cases remain reported and cannot be replaced to improve the result.
+
+The existing candidate adds a numerical-bias allowance to uncertified fast
+observations, without changing their coefficients or accepted classifications.
+Its multipliers remain `[1, 1, 1]`, chosen before this transfer study. Each
+reference's entire job and unit lineage are excluded from its prediction.
+
+| Cohort | Mean absolute Cl error, baseline → candidate | Mean absolute Cd error, baseline → candidate | Mean absolute Cm error, baseline → candidate |
+| --- | --- | --- | --- |
+| Seven compressible profiles | 0.08711 → 0.08896 | 0.01897 → 0.00615 | 0.02477 → 0.02341 |
+| Twenty low-speed controls | 0.10328 → 0.09385 | 0.03174 → 0.00657 | 0.03156 → 0.02105 |
+
+With the unchanged 1.96 interval multiplier, all seven compressible and twenty
+control profiles fall inside the candidate intervals, compared with six and
+sixteen for the baseline. These candidate intervals are generally wider. The
+earlier frozen multiplier 1.6591635087577563 is also reported separately; it is
+not recalibrated on these cases and is not installed as a public policy.
+
+These are errors against accepted CFD, not experimental truth. The seven-profile
+compressible group is too small for population calibration; independent
+initialization ancestry and reference error are not established. Positive-angle
+histories, transonic/Mach-3 flow and precise-stage transfer remain unvalidated.
+Production weighting and `calibration_status` are unchanged.
+
+`devcoordinator2 test start --test history-transfer --tier development` reproduces
+the frozen study when its private, checksum-pinned inputs are present. The
+`frozen-history-transfer` artifact retains every selected source and the report.
+Existing study directories are immutable; a repeated study needs a new output
+directory through the measurement command's `--destination` argument.
+The initial complete run is `t20260922T212652Z-143a98`; its artifact SHA-256 is
+`7d53eba427e7137c68612103a31c97c4889981bd657af809d4420c36ba0c619d`.

@@ -1,5 +1,21 @@
 schema = 2
 
+[test.history-transfer]
+timeout_seconds = 600
+
+[[test.history-transfer.check]]
+name = "frozen-production-cohort"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.validate_history_transfer", "--source", ".codex-artifacts/history-transfer-export-20260922.json", "--selection", ".codex-artifacts/history-transfer-selection-20260922.json", "--parameters", ".codex-artifacts/history-diagnostics-worktree/.codex-artifacts/history-bias-comparison/frozen-parameters.json", "--prior-directory", ".codex-artifacts/independent-history-cohort-20260920", "--pilot", ".codex-artifacts/history-population-20260919/cohort.json", "--destination", ".codex-artifacts/history-transfer-study-20260922-v2"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+retained_artifacts = [{ name = "frozen-history-transfer", path = ".codex-artifacts/history-transfer-study-20260922-v2", max_bytes = 33554432 }]
+
+[[test.history-transfer.check]]
+name = "existing-bias-and-replay-contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_history_bias_calibration.py", "tests/test_retained_polar_measurement.py", "tests/test_retained_polar_cohort.py", "-q"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
 [test.local-step-policy]
 timeout_seconds = 900
 
