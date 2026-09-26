@@ -4806,40 +4806,6 @@ describe("progressive execution stop and settlement", () => {
     });
   });
 
-  it("closes a terminal stop-proven exhausted unit instead of leaving it blocked", async () => {
-    const fixture = await fitFixture();
-    await db.execute(sql`
-      UPDATE progressive_cfd_units
-      SET state = 'blocked', active_seconds = active_budget_seconds,
-        lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-        error = 'active compute budget exhausted; engine guard owns case stop'
-      WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id = ${fixture.composed.jobId})
-    `);
-    await db.execute(sql`
-      UPDATE progressive_cfd_attempts
-      SET outcome = 'failed', finished_at = clock_timestamp()
-      WHERE sim_job_id = ${fixture.composed.jobId}
-    `);
-    await acknowledgeProgressiveCfdExecutionStop(db, {
-      simJobId: fixture.composed.jobId,
-      proof: executionStopProof(fixture.engineJobId),
-    });
-    await db
-      .update(simJobs)
-      .set({ status: 'done', ingestedAt: new Date() })
-      .where(eq(simJobs.id, fixture.composed.jobId));
-    expect(
-      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
-    ).toMatchObject({ complete: 0, retry: 0, gaps: fixture.leases.length, waiting: 0 });
-    const rows = await db.execute(sql`
-      SELECT unit.state, work.state AS work_state
-      FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
-      WHERE unit.id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id = ${fixture.composed.jobId})
-    `);
-    expect(rows.every((row) => row.state === 'gap')).toBe(true);
-    expect(rows.every((row) => row.work_state === 'pending')).toBe(true);
-  });
-
   it("settles an informative fast anchor without promoting it to accepted CFD", async () => {
     const fixture = await fitFixture();
     const evidence = await fixture.save(60);

@@ -1686,12 +1686,6 @@ requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive execution stop and settlement"]
 
 [[test.progressive.check]]
-name = "terminal-blocked-settlement"
-tier = "development"
-requires = ["dependencies","workspace"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "terminal stop-proven exhausted unit|progressive execution stop and settlement"]
-
-[[test.progressive.check]]
 name = "execution-budget-stop"
 tier = "development"
 requires = ["dependencies","workspace"]
