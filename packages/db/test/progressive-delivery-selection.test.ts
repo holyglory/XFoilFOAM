@@ -2,9 +2,109 @@ import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
 import { progressiveDeliverySelectionSql } from "../../../apps/sweeper/src/progressive-delivery-selection";
+import {
+  nextProgressiveArchiveWakeAt,
+  progressiveArchiveSelectionSql,
+} from "../../../apps/sweeper/src/progressive-worker-archive-delivery";
+import type { DB } from "../src/client";
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+it("selects only pending owned archives in due order and preserves retry wake deadlines", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE fixture_archives ON COMMIT DROP AS
+      SELECT md5(variant)::uuid id,variant,ordinal FROM unnest(ARRAY['ordinary','due-retry','expired-claim',
+        'unselected-accepted','selected-accepted','already-retained','future-retry','live-claim',
+        'wrong-solver','wrong-upstream','wrong-job-upstream','not-remote','not-progressive',
+        'wrong-attempt-job','wrong-engine','missing-result','missing-manifest','malformed-manifest'])
+        WITH ORDINALITY AS variants(variant,ordinal)`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_api_settings ON COMMIT DROP AS
+      SELECT 1 id,false remote_solver_transfer_paused,'fixture-token'::text remote_solver_auth_token,
+        'https://fixture.invalid'::text upstream_base_url,md5('solver')::uuid remote_solver_registered_id`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',variant<>'not-remote',
+        'upstreamBaseUrl',CASE WHEN variant='wrong-job-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END)
+        || CASE WHEN variant='not-progressive' THEN '{}'::jsonb ELSE '{"remoteProgressiveExecution":{}}'::jsonb END request_payload
+      FROM fixture_archives`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
+      SELECT id,CASE WHEN variant='wrong-solver' THEN md5('foreign')::uuid ELSE md5('solver')::uuid END registered_solver_id,
+        CASE WHEN variant='wrong-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END source_base_url
+      FROM fixture_archives`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
+      SELECT md5('attempt'||variant)::uuid id,
+        CASE WHEN variant='wrong-attempt-job' THEN md5('foreign')::uuid ELSE id END sim_job_id,
+        CASE WHEN variant='wrong-engine' THEN 'foreign' ELSE id::text END engine_job_id,
+        CASE WHEN variant='missing-result' THEN NULL ELSE md5('result'||variant)::uuid END result_id,
+        CASE WHEN variant='missing-manifest' THEN '{"evidence_artifacts":[{"kind":"log"}]}'::jsonb
+          WHEN variant='malformed-manifest' THEN '{"evidence_artifacts":{"kind":"manifest"}}'::jsonb
+          ELSE '{"evidence_artifacts":[{"kind":"manifest"}]}'::jsonb END evidence_payload
+      FROM fixture_archives`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_hub_receipts ON COMMIT DROP AS
+      SELECT id sim_job_id,md5(variant)::text point_content_signature,md5('attempt'||variant)::uuid result_attempt_id,
+        timestamptz '2026-01-01' + ordinal * interval '1 second' delivered_at FROM fixture_archives`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_archive_receipts ON COMMIT DROP AS
+      SELECT id sim_job_id,md5(variant)::text point_content_signature FROM fixture_archives WHERE variant='already-retained'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_archive_deliveries ON COMMIT DROP AS
+      SELECT id sim_job_id,md5(variant)::text point_content_signature,
+        CASE WHEN variant='live-claim' THEN clock_timestamp()+interval '2 days'
+          WHEN variant='expired-claim' THEN clock_timestamp()-interval '1 day' END claim_expires_at,
+        CASE WHEN variant='future-retry' THEN clock_timestamp()+interval '1 day'
+          WHEN variant='due-retry' THEN clock_timestamp()-interval '1 minute' END retry_after
+      FROM fixture_archives WHERE variant IN ('future-retry','due-retry','live-claim','expired-claim')`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_classifications ON COMMIT DROP AS
+      SELECT md5('attempt'||variant)::uuid result_attempt_id,'accepted'::text state
+      FROM fixture_archives WHERE variant IN ('selected-accepted','unselected-accepted')`);
+    await transaction.execute(sql`CREATE TEMP TABLE results ON COMMIT DROP AS
+      SELECT md5('attempt'||variant)::uuid current_result_attempt_id FROM fixture_archives WHERE variant='selected-accepted'`);
+    const connection = transaction as unknown as DB;
+    for (const variant of [
+      "ordinary",
+      "expired-claim",
+      "unselected-accepted",
+      "due-retry",
+    ]) {
+      const selected = await transaction.execute(
+        progressiveArchiveSelectionSql(),
+      );
+      const expected =
+        await transaction.execute(sql`SELECT id sim_job_id,md5(variant)::text point_content_signature,
+        md5('attempt'||variant)::uuid result_attempt_id FROM fixture_archives WHERE variant=${variant}`);
+      expect(selected).toEqual(expected);
+      await transaction.execute(sql`INSERT INTO progressive_worker_archive_receipts VALUES
+        (${selected[0].sim_job_id}::uuid,${selected[0].point_content_signature})`);
+    }
+    expect(await transaction.execute(progressiveArchiveSelectionSql())).toEqual(
+      [],
+    );
+    const [deadline] =
+      await transaction.execute(sql`SELECT retry_after FROM progressive_worker_archive_deliveries
+      WHERE sim_job_id=(SELECT id FROM fixture_archives WHERE variant='future-retry')`);
+    expect(
+      (await nextProgressiveArchiveWakeAt(connection))?.toISOString(),
+    ).toBe(new Date(String(deadline.retry_after)).toISOString());
+    for (const statement of [
+      sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true`,
+      sql`UPDATE sync_api_settings SET remote_solver_auth_token=''`,
+      sql`UPDATE sync_api_settings SET upstream_base_url=NULL`,
+      sql`UPDATE sync_api_settings SET remote_solver_registered_id=md5('unregistered')::uuid`,
+    ]) {
+      const rollback = new Error("Rollback isolated archive settings");
+      await expect(
+        transaction.transaction(async (nested) => {
+          await nested.execute(statement);
+          expect(
+            await nested.execute(progressiveArchiveSelectionSql()),
+          ).toEqual([]);
+          expect(
+            await nextProgressiveArchiveWakeAt(nested as unknown as DB),
+          ).toBeNull();
+          throw rollback;
+        }),
+      ).rejects.toBe(rollback);
+    }
+  });
+});
 
 it("preserves exact eligible deliveries, active priority, fallback and cumulative-report ordering", async () => {
   await client.db.transaction(async (transaction) => {

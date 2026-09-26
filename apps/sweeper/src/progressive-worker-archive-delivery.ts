@@ -2,6 +2,28 @@ import { randomUUID } from "node:crypto";
 import type { DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 
+function archiveCandidates(waiting: boolean) {
+  return sql`SELECT retained.sim_job_id, retained.point_content_signature, retained.result_attempt_id,
+      retained.delivered_at, delivery.claim_expires_at, delivery.retry_after,
+      coalesce(delivery.retry_after, retained.delivered_at) AS due_at
+    FROM progressive_worker_hub_receipts retained
+    LEFT JOIN progressive_worker_archive_receipts custody ON custody.sim_job_id = retained.sim_job_id
+      AND custody.point_content_signature = retained.point_content_signature
+    LEFT JOIN progressive_worker_archive_deliveries delivery ON delivery.sim_job_id = retained.sim_job_id
+      AND delivery.point_content_signature = retained.point_content_signature
+    WHERE custody.sim_job_id IS NULL
+      AND ${
+        waiting
+          ? sql`(delivery.claim_expires_at > clock_timestamp() OR delivery.retry_after > clock_timestamp())`
+          : sql`(delivery.claim_expires_at IS NULL OR delivery.claim_expires_at <= clock_timestamp())
+          AND (delivery.retry_after IS NULL OR delivery.retry_after <= clock_timestamp())`
+      }
+      AND NOT EXISTS (SELECT 1 FROM result_classifications classification
+        JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
+        WHERE classification.result_attempt_id = retained.result_attempt_id AND classification.state = 'accepted')
+    ORDER BY due_at, retained.delivered_at, retained.sim_job_id, retained.point_content_signature OFFSET 0`;
+}
+
 const archiveCandidateScope = sql`
       FROM progressive_worker_hub_receipts retained
       JOIN result_attempts attempt ON attempt.id = retained.result_attempt_id AND attempt.sim_job_id = retained.sim_job_id
@@ -9,11 +31,10 @@ const archiveCandidateScope = sql`
       JOIN sim_jobs job ON job.id = retained.sim_job_id
       JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
       JOIN sync_api_settings settings ON settings.id = 1
-      LEFT JOIN progressive_worker_archive_receipts custody ON custody.sim_job_id = retained.sim_job_id
-        AND custody.point_content_signature = retained.point_content_signature
-      LEFT JOIN progressive_worker_archive_deliveries delivery ON delivery.sim_job_id = retained.sim_job_id
-        AND delivery.point_content_signature = retained.point_content_signature
-      WHERE custody.sim_job_id IS NULL AND attempt.result_id IS NOT NULL
+      WHERE retained.sim_job_id = candidate.sim_job_id
+        AND retained.point_content_signature = candidate.point_content_signature
+        AND retained.result_attempt_id = candidate.result_attempt_id
+        AND attempt.result_id IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM jsonb_array_elements(CASE
             WHEN jsonb_typeof(attempt.evidence_payload->'evidence_artifacts') = 'array'
@@ -27,18 +48,24 @@ const archiveCandidateScope = sql`
         AND promise.registered_solver_id = settings.remote_solver_registered_id
         AND promise.source_base_url = settings.upstream_base_url
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
-        AND NOT EXISTS (SELECT 1 FROM result_classifications classification
-          JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
-          WHERE classification.result_attempt_id = attempt.id AND classification.state = 'accepted')
 `;
+
+export function progressiveArchiveSelectionSql() {
+  return sql`SELECT candidate.sim_job_id, candidate.point_content_signature, candidate.result_attempt_id
+    FROM (${archiveCandidates(false)}) candidate
+    JOIN LATERAL (SELECT retained.sim_job_id ${archiveCandidateScope}
+      FOR UPDATE OF retained SKIP LOCKED OFFSET 0) eligible ON true
+    ORDER BY candidate.due_at, candidate.delivered_at, candidate.sim_job_id, candidate.point_content_signature
+    LIMIT 1`;
+}
 
 export async function nextProgressiveArchiveWakeAt(
   db: DB,
 ): Promise<Date | null> {
   const [pending] = await db.execute(sql`
-    SELECT min(greatest(delivery.claim_expires_at, delivery.retry_after)) AS wake_at
-    ${archiveCandidateScope}
-      AND (delivery.claim_expires_at > clock_timestamp() OR delivery.retry_after > clock_timestamp())
+    SELECT min(greatest(candidate.claim_expires_at, candidate.retry_after)) AS wake_at
+    FROM (${archiveCandidates(true)}) candidate
+    JOIN LATERAL (SELECT retained.sim_job_id ${archiveCandidateScope} OFFSET 0) eligible ON true
   `);
   return pending?.wake_at == null
     ? null
@@ -58,14 +85,9 @@ export async function claimProgressiveWorkerArchive(
   db: DB,
 ): Promise<ProgressiveArchiveClaim | null> {
   return db.transaction(async (transaction) => {
-    const [source] = await transaction.execute(sql`
-      SELECT retained.sim_job_id, retained.point_content_signature, retained.result_attempt_id
-      ${archiveCandidateScope}
-        AND (delivery.claim_expires_at IS NULL OR delivery.claim_expires_at <= clock_timestamp())
-        AND (delivery.retry_after IS NULL OR delivery.retry_after <= clock_timestamp())
-      ORDER BY coalesce(delivery.retry_after, retained.delivered_at), retained.delivered_at, retained.sim_job_id, retained.point_content_signature
-      LIMIT 1 FOR UPDATE OF retained SKIP LOCKED
-    `);
+    const [source] = await transaction.execute(
+      progressiveArchiveSelectionSql(),
+    );
     if (!source) return null;
     const token = randomUUID();
     const acquired = await transaction.execute(sql`

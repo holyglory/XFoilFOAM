@@ -1268,6 +1268,13 @@ the existing claims, oldest-due ordering, custody verification, transfer pause
 and persisted retry deadlines. It does not create additional CFD jobs or relax
 the remote promise cap.
 
+Archive selection filters narrow receipt identities before reading full solver
+histories and job requests. Exact source, manifest and upstream ownership checks
+still precede a claim, and a locked candidate cannot prevent another eligible
+archive from being selected. Future retry and claim deadlines use the same
+eligibility checks. This keeps an expanding completed-results catalog from
+dominating every archive-transfer pass without changing evidence acceptance.
+
 ### Frozen history-weighting transfer study
 
 The September 22 study freezes seven previously unused compressible profiles at
