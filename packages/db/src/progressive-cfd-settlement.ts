@@ -267,7 +267,13 @@ export async function settleProgressiveCfdExecution(
         unit.recoverable_stage === true &&
         unit.latest_attempt === true &&
         neverStarted;
-      if (unit.outcome !== "running" && !recovering) continue;
+      const terminalBlocked =
+        unit.state === "blocked" &&
+        unit.outcome !== "running" &&
+        ["done", "failed", "cancelled"].includes(String(job.status)) &&
+        job.ingestedAt != null;
+      if (unit.outcome !== "running" && !recovering && !terminalBlocked)
+        continue;
       if (!unit.current_scope || unit.state === "cancelled") {
         await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome = 'cancelled', finished_at = clock_timestamp(),
           error = 'obsolete execution physically stopped' WHERE token = ${unit.token}`);
