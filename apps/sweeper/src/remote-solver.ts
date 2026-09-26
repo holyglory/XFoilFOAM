@@ -2849,6 +2849,71 @@ export async function persistClaimedRemotePromise(
       );
     }
 
+    const conflictAngles = [...new Set(input.claim.aoas)].sort(
+      (left, right) => left - right,
+    );
+    const conflicts = await tx.execute(sql`
+      SELECT point.promise_id,
+        EXISTS (
+          SELECT 1 FROM sim_jobs live_job
+          WHERE live_job.request_payload->>'syncPromiseId' = point.promise_id::text
+            AND live_job.status IN ('pending', 'submitted', 'running', 'ingesting')
+        ) AS live
+      FROM sync_sweep_promise_points point
+      JOIN sync_sweep_promises promise ON promise.id = point.promise_id
+      WHERE point.promise_id <> ${claim.id}::uuid
+        AND point.status = 'active'
+        AND point.airfoil_id = ${input.airfoilId}::uuid
+        AND point.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
+        AND point.aoa_deg IN (${sql.join(
+          conflictAngles.map((angle) => sql`${angle}`),
+          sql`, `,
+        )})
+        AND promise.status = 'active'
+        AND promise.source_base_url = ${input.sourceBaseUrl}
+        AND promise.registered_solver_id = ${solverId}::uuid
+      FOR UPDATE OF promise
+    `);
+    const liveConflicts = conflicts.filter((row) => Boolean(row.live));
+    if (liveConflicts.length)
+      throw new Error(
+        "claimed remote promise conflicts with a live local promise cell",
+      );
+    const conflictIds = [
+      ...new Set(conflicts.map((row) => String(row.promise_id))),
+    ];
+    if (conflictIds.length) {
+      await tx.execute(sql`
+        UPDATE sync_sweep_promises
+        SET status = 'cancelled', "cancelledAt" = clock_timestamp(),
+          response_payload = coalesce(response_payload, '{}'::jsonb) ||
+            jsonb_build_object('localMirrorCleanup', 'stale_upstream_promise'),
+          "updatedAt" = clock_timestamp()
+        WHERE id IN (${sql.join(
+          conflictIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}) AND status = 'active'
+      `);
+      await tx.execute(sql`
+        UPDATE sync_sweep_promise_points
+        SET status = 'cancelled', "updatedAt" = clock_timestamp()
+        WHERE promise_id IN (${sql.join(
+          conflictIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}) AND status = 'active'
+      `);
+      await tx.execute(sql`
+        UPDATE sync_remote_result_deliveries
+        SET state = 'superseded', claim_token = NULL, claimed_at = NULL,
+          claim_expires_at = NULL, last_error = 'stale local mirror retired',
+          "updatedAt" = clock_timestamp()
+        WHERE promise_id IN (${sql.join(
+          conflictIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}) AND state IN ('pending', 'pushing', 'retry_wait', 'blocked')
+      `);
+    }
+
     await tx
       .insert(syncSweepPromises)
       .values({

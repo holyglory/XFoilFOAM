@@ -1133,6 +1133,7 @@ async function seedMirroredPromise(label: string, aoas: number[], id?: string) {
       sourceInstanceId: "upstream",
       sourceInstanceName: `Up-tier ${label}`,
       sourceBaseUrl: UPSTREAM,
+      registeredSolverId: settings?.remoteSolverRegisteredId ?? undefined,
       airfoilId,
       simulationPresetRevisionId: revisionId,
       aoaCount: aoas.length,
@@ -2149,6 +2150,68 @@ describe("remote solver submit lifecycle", () => {
         requestPayload: { syncPromiseId: claimId },
       },
     ]);
+  });
+
+  it("retires a stale local promise mirror before persisting an exact replacement scope", async () => {
+    const [settings] = await db
+      .select({
+        registeredSolverId: syncApiSettings.remoteSolverRegisteredId,
+        instanceId: syncApiSettings.instanceId,
+        instanceName: syncApiSettings.instanceName,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settings?.registeredSolverId)
+      throw new Error("registered remote fixture required");
+    await db.insert(registeredRemoteSolvers).values({
+      id: settings.registeredSolverId,
+      instanceId: settings.instanceId!,
+      instanceName: settings.instanceName!,
+      cpuCapacity: 2,
+      cpuBudget: 2,
+      maxActivePolarPromises: 2,
+    });
+    const stale = await seedMirroredPromise("stale-local-mirror", [901.25]);
+    const replacementId = randomUUID();
+    const [revision] = await db
+      .select({
+        signatureHash: simulationPresetRevisions.signatureHash,
+        snapshot: simulationPresetRevisions.snapshot,
+      })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId))
+      .limit(1);
+    expect(revision).toBeTruthy();
+    await persistClaimedRemotePromise(db, {
+      claim: {
+        id: replacementId,
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        airfoil: {
+          slug: airfoilSlug,
+          name: `${PREFIX} replacement`,
+          source: null,
+          pointFormat: "normalized",
+          points: contour,
+        },
+        setupRevision: {
+          signatureHash: revision!.signatureHash,
+          snapshot: revision!.snapshot as unknown as SimulationSetupSnapshot,
+        },
+        aoas: [901.25],
+      },
+      solverId: settings!.registeredSolverId!,
+      sourceBaseUrl: UPSTREAM,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+    });
+    expect((await readPromise(stale.id)).promise.status).toBe("cancelled");
+    expect(
+      (await readPromise(stale.id)).points.map((row) => row.status),
+    ).toEqual(["cancelled"]);
+    expect(
+      (await readPromise(replacementId)).points.map((row) => row.status),
+    ).toEqual(["active"]);
   });
 
   it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {

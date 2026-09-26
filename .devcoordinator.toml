@@ -1674,6 +1674,12 @@ requires = ["dependencies", "types", "remote-standalone-claims"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "rejects foreign progressive promise reuse"]
 
 [[test.progressive.check]]
+name = "stale-progressive-mirror"
+tier = "development"
+requires = ["dependencies", "types", "remote-standalone-claims"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "stale local promise mirror"]
+
+[[test.progressive.check]]
 name = "fixture-scope-cleanup"
 tier = "development"
 requires = ["dependencies", "types"]
