@@ -7468,6 +7468,7 @@ export const progressiveCfdRecoveryPlans = pgTable(
     scope: text("scope").notNull(),
     reason: text("reason").notNull(),
     recipe: jsonb("recipe").notNull(),
+    activeBudgetSeconds: doublePrecision("active_budget_seconds").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
@@ -7499,6 +7500,10 @@ export const progressiveCfdRecoveryPlans = pgTable(
     recipeCheck: check(
       "progressive_cfd_recovery_plans_recipe_check",
       sql`jsonb_typeof(${table.recipe}) = 'object'`,
+    ),
+    activeBudgetCheck: check(
+      "progressive_cfd_recovery_plans_active_budget_seconds_check",
+      sql`${table.activeBudgetSeconds} > 0 AND ${table.activeBudgetSeconds} <= 43200`,
     ),
   }),
 );

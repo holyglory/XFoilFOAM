@@ -208,7 +208,12 @@ export async function settleProgressiveCfdExecution(
       );
     const units = await connection.execute(sql`
       SELECT attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
-        unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds, work.id AS work_id,
+        unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        coalesce((SELECT recovery.active_budget_seconds
+          FROM progressive_cfd_recovery_claims claim
+          JOIN progressive_cfd_recovery_plans recovery ON recovery.id = claim.recovery_plan_id
+          WHERE claim.attempt_token = attempt.token), unit.active_budget_seconds) AS effective_budget_seconds,
+        work.id AS work_id,
         generation.stage = work.stage AND work.state IN ('pending', 'gap') AS recoverable_stage,
         NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
           AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
@@ -295,7 +300,7 @@ export async function settleProgressiveCfdExecution(
         continue;
       }
       const exhausted =
-        Number(unit.active_seconds) >= Number(unit.active_budget_seconds);
+        Number(unit.active_seconds) >= Number(unit.effective_budget_seconds);
       const ordinaryAttempts =
         Number(unit.ordinary_attempts) - (neverStarted ? 1 : 0);
       const retry =

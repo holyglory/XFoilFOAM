@@ -5059,7 +5059,7 @@ describe("bounded progressive numerical recovery", () => {
       recoveryPlanId: planned[0].recoveryPlanId,
       recoveryParentJobId: fixture.composed.jobId,
       recipe: planned[0].recipe,
-      remainingActiveSeconds: 830,
+      remainingActiveSeconds: 14_330,
     });
     expect(retried[0].token).not.toBe(planned[0].token);
     const claims = await db.execute(sql`
