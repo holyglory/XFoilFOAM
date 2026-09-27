@@ -174,7 +174,9 @@ export async function reconcileProgressiveRemoteProgress(
         SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
         WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'
       )))
-    GROUP BY report.sim_job_id, job.campaign_id, job."polledAt", job."updatedAt" ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
+    GROUP BY report.sim_job_id, job.campaign_id, job.status, job.engine_state, job."polledAt", job."updatedAt"
+    ORDER BY CASE WHEN job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled') THEN 0 ELSE 1 END,
+      coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
   const selectedJobs = jobs as unknown as Array<{
     sim_job_id: string;
     campaign_id: string;
