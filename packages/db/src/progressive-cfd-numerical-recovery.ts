@@ -24,7 +24,6 @@ interface RecoveryUnit {
   recovery_ordinal: number | null;
   recovery_scope: string | null;
   recovery_recipe: Record<string, unknown> | null;
-  recovery_active_budget_seconds: number | null;
 }
 
 interface RecoveryEvidence {
@@ -104,8 +103,7 @@ export async function recordProgressiveCfdRecoveryPlans(
     const units = (await connection.execute(sql`
       SELECT unit.id, attempt.token, unit.aoa_deg, recipe.recipe, recipe.execution_revision_id,
         claim.recovery_plan_id, work.stage, unit.policy_version, recovery.ordinal AS recovery_ordinal,
-        recovery.scope AS recovery_scope, recovery.recipe AS recovery_recipe,
-        recovery.active_budget_seconds AS recovery_active_budget_seconds
+        recovery.scope AS recovery_scope, recovery.recipe AS recovery_recipe
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_cfd_execution_recipes recipe ON recipe.id = attempt.execution_recipe_id
@@ -265,13 +263,9 @@ export async function recordProgressiveCfdRecoveryPlans(
         scope,
         reason,
         recipe,
-        active_budget_seconds:
-          recipe.uransFidelity === "precalc"
-            ? PROGRESSIVE_COMPUTE_POLICY.fastUransActiveSeconds
-            : PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
       };
       const [existing] = await connection.execute(sql`
-        SELECT unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe, active_budget_seconds
+        SELECT unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe
         FROM progressive_cfd_recovery_plans WHERE unit_id = ${unit.id} AND ordinal = ${ordinal}
       `);
       if (existing) {
@@ -283,9 +277,9 @@ export async function recordProgressiveCfdRecoveryPlans(
       }
       await connection.execute(sql`
         INSERT INTO progressive_cfd_recovery_plans
-          (unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe, active_budget_seconds)
+          (unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe)
         VALUES (${unit.id}, ${ordinal}, ${unit.token}, ${simJobId}, ${diagnostic.id}, ${diagnostic.evidence_signature},
-          ${scope}, ${reason}, ${canonicalAnalysisJson(recipe)}::jsonb, ${values.active_budget_seconds})
+          ${scope}, ${reason}, ${canonicalAnalysisJson(recipe)}::jsonb)
       `);
       inserted += 1;
     }

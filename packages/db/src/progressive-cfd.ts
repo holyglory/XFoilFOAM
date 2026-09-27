@@ -204,11 +204,6 @@ export async function claimProgressiveCfdUnit(
     const localStepPolicy = currentLocalStepPolicySql();
     const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
       (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
-    const effectiveBudget = sql`coalesce((SELECT recovery.active_budget_seconds
-      FROM progressive_cfd_recovery_plans recovery
-      WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
-      unit.active_budget_seconds)`;
-    const budgetRecoveryAvailable = sql`(${effectiveBudget} > unit.active_budget_seconds)`;
     const recoveryParent = sql`(SELECT recovery.parent_job_id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1)`;
     const recoveryOwner = input.remoteSolverId
       ? sql`(${recoveryParent} IS NULL OR EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = ${recoveryParent} AND dispatch.solver_id = ${input.remoteSolverId}::uuid))`
@@ -219,8 +214,7 @@ export async function claimProgressiveCfdUnit(
     const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
     const attemptAvailable = sql`(${ordinaryAttempts} < 2 OR ${publicationRecovery} OR (${ordinaryAttempts} = 2
       AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
-      AND ${progressiveCfdPreciseVerificationAvailableSql()}) OR
-      (${ordinaryAttempts} >= 2 AND ${budgetRecoveryAvailable}))`;
+      AND ${progressiveCfdPreciseVerificationAvailableSql()}))`;
     const targetFilter = input.sameTarget
       ? sql`generation.id = ${input.sameTarget.generationId} AND work.target_id = ${input.sameTarget.targetId}
           AND ${effectiveRecipe} = ${JSON.stringify(input.sameTarget.recipe)}::jsonb
@@ -274,8 +268,7 @@ export async function claimProgressiveCfdUnit(
             AND ${previousExecutionStopped}
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
             AND work.stage = generation.stage AND work.stage IN (2, 3) AND work.state = 'pending'
-            AND (unit.state = 'pending' OR (unit.state = 'blocked' AND ${budgetRecoveryAvailable}))
-            AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
+            AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
             AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
     `);
@@ -309,8 +302,7 @@ export async function claimProgressiveCfdUnit(
         AND ${previousExecutionStopped}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage = generation.stage AND work.stage IN (2, 3) AND work.state = 'pending'
-        AND (unit.state = 'pending' OR (unit.state = 'blocked' AND ${budgetRecoveryAvailable}))
-        AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
+        AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (unit.purpose <> 'adaptive' OR NOT EXISTS (
           SELECT 1 FROM progressive_cfd_units initial JOIN progressive_work sibling ON sibling.id = initial.work_id
@@ -325,7 +317,7 @@ export async function claimProgressiveCfdUnit(
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
         (${localStepPolicy}) AS local_step_policy_id,
         ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
-        ${effectiveBudget} - unit.active_seconds AS remaining_active_seconds
+        unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
       FROM selected JOIN progressive_cfd_units unit ON unit.id = selected.id
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id

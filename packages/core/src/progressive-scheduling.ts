@@ -8,7 +8,6 @@ export const PROGRESSIVE_COMPUTE_POLICY = {
   maximumFastAnchors: 8,
   minimumMarginalGain: 0.05,
   fastAnchorActiveSeconds: 900,
-  fastUransActiveSeconds: 14_400,
   maximumFastAttempts: 2,
   preciseInitialActiveSeconds: 43_200,
   turbulentPrandtl: 0.85,

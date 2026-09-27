@@ -69,10 +69,7 @@ export async function lockProgressiveCfdExecution(
       THEN ${localStepRecipeSql(sql`unit.recipe`, sql`local_policy.smoothing`)} END, unit.recipe) AS recipe,
       local_policy.id AS local_step_policy_id, recovery.id AS recovery_plan_id,
       recovery.parent_job_id AS recovery_parent_job_id, target.physical, scope.revision_id, attempt.sim_job_id, attempt.execution_recipe_id,
-      coalesce((SELECT recovery.active_budget_seconds
-        FROM progressive_cfd_recovery_claims claim
-        JOIN progressive_cfd_recovery_plans recovery ON recovery.id = claim.recovery_plan_id
-        WHERE claim.attempt_token = attempt.token), unit.active_budget_seconds) - unit.active_seconds AS remaining_active_seconds
+      unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
     FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
     JOIN progressive_generations generation ON generation.id = work.generation_id
     JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id

@@ -1,4 +1,3 @@
-import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { isEngineIdentity } from "./engine-identity";
 import {
   resolveSolverCaseAllocations,
@@ -124,10 +123,7 @@ export function validateProgressiveExecutionScope(
       typeof unit.activeBudgetSeconds !== "number" ||
       !Number.isFinite(unit.activeBudgetSeconds) ||
       unit.activeBudgetSeconds <= 0 ||
-      unit.activeBudgetSeconds >
-        (value.stage === 2
-          ? PROGRESSIVE_COMPUTE_POLICY.fastUransActiveSeconds
-          : PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds)
+      unit.activeBudgetSeconds > (value.stage === 2 ? 900 : 43200)
     )
       throw new Error(
         "Progressive execution contains an invalid or unbounded unit",

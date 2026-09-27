@@ -1121,13 +1121,6 @@
       "when": 1792368000053,
       "tag": "0159_campaign_local_step_policies",
       "breakpoints": true
-    },
-    {
-      "idx": 160,
-      "version": "7",
-      "when": 1792368000054,
-      "tag": "0160_progressive_recovery_budgets",
-      "breakpoints": true
     }
   ]
 }

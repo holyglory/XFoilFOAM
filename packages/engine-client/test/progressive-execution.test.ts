@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { OPENCFD_2606_ENGINE } from "../src/engine-identity";
 import {
   validateProgressiveExecutionScope,
@@ -63,15 +62,6 @@ describe("shared progressive execution ownership", () => {
     expect(validated.units[0].activeBudgetSeconds).toBe(740);
     expect(validated.tokens[0]).toBe(validated.units[0].token);
     expect(request).toEqual(before);
-  });
-
-  it("accepts the extended precalc URANS recovery allocation", () => {
-    const { request, scope } = fixture();
-    scope.units[0].activeBudgetSeconds =
-      PROGRESSIVE_COMPUTE_POLICY.fastUransActiveSeconds;
-    request.resources!.case_solver_allocations![0]!.limit_seconds =
-      PROGRESSIVE_COMPUTE_POLICY.fastUransActiveSeconds;
-    expect(validateProgressiveExecutionScope(request, scope)).toEqual(scope);
   });
 
   it("preserves uniform precise allocations and all supported pressure conventions", () => {
