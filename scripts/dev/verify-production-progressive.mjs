@@ -15,12 +15,14 @@ const targetIds = detail.progressivePolars
   .map((series) => series.targetId)
   .sort();
 assert.equal(new Set(targetIds).size, targetIds.length);
-const prediction = detail.progressivePolars.find(
-  (series) => series.kind === "prediction",
-);
+const prediction =
+  detail.progressivePolars.find((series) => series.kind === "prediction") ??
+  detail.progressivePolars.find((series) =>
+    series.curves.some((curve) => curve.method === "neuralfoil"),
+  );
 assert(
   prediction,
-  "The prediction-only condition fixture is no longer available",
+  "No NeuralFoil-backed public polar condition is available",
 );
 const browser = await chromium.launch({ headless: true });
 const receipts = [];
@@ -76,17 +78,31 @@ try {
         await button.click();
         assert.equal(await button.getAttribute("aria-pressed"), "true");
       }
-      await viewer.getByLabel("Show prediction samples").check();
+      const sampleLabel =
+        prediction.kind === "estimate"
+          ? "Show curve samples"
+          : "Show prediction samples";
+      await viewer.getByLabel(sampleLabel).check();
       assert.equal(await viewer.getByTestId("prediction-sample").count(), 26);
-      await viewer.getByLabel("Show prediction samples").uncheck();
+      await viewer.getByLabel(sampleLabel).uncheck();
       await viewer.locator("summary").click();
       await viewer
-        .getByText("It is not a completed OpenFOAM calculation.", {
-          exact: false,
-        })
+        .getByText(
+          prediction.kind === "estimate"
+            ? "This curve combines the stored NeuralFoil prediction"
+            : "It is not a completed OpenFOAM calculation.",
+          { exact: false },
+        )
         .waitFor({ state: "visible" });
       await viewer.locator("summary").click();
-      assert.equal(await viewer.getByLabel("Compare methods").count(), 0);
+      const compareMethods = viewer.getByLabel("Compare methods");
+      if (prediction.curves.length > 1) {
+        assert.equal(await compareMethods.count(), 1);
+        await compareMethods.check();
+        await compareMethods.uncheck();
+      } else {
+        assert.equal(await compareMethods.count(), 0);
+      }
       await page.reload({ waitUntil: "load" });
       await viewer.waitFor({ state: "visible" });
       assert.equal(await viewer.getByTestId("prediction-sample").count(), 0);
@@ -99,7 +115,7 @@ try {
       assert.deepEqual(errors, []);
       receipts.push({
         viewport,
-        curves: 15,
+        curves: detail.progressivePolars.length,
         samples: 26,
         controls: "passed",
         reload: "passed",
