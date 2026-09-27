@@ -5,6 +5,7 @@ import { sql } from "drizzle-orm";
 function archiveCandidates(waiting: boolean) {
   return sql`SELECT retained.sim_job_id, retained.point_content_signature, retained.result_attempt_id,
       retained.delivered_at, delivery.claim_expires_at, delivery.retry_after,
+      CASE WHEN delivery.attempt_count > 0 OR delivery.claim_token IS NOT NULL THEN 0 ELSE 1 END AS transfer_priority,
       coalesce(delivery.retry_after, retained.delivered_at) AS due_at
     FROM progressive_worker_hub_receipts retained
     LEFT JOIN progressive_worker_archive_receipts custody ON custody.sim_job_id = retained.sim_job_id
@@ -21,7 +22,7 @@ function archiveCandidates(waiting: boolean) {
       AND NOT EXISTS (SELECT 1 FROM result_classifications classification
         JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
         WHERE classification.result_attempt_id = retained.result_attempt_id AND classification.state = 'accepted')
-    ORDER BY due_at, retained.delivered_at, retained.sim_job_id, retained.point_content_signature OFFSET 0`;
+    ORDER BY transfer_priority, due_at, retained.delivered_at, retained.sim_job_id, retained.point_content_signature OFFSET 0`;
 }
 
 const archiveCandidateScope = sql`
@@ -55,7 +56,7 @@ export function progressiveArchiveSelectionSql() {
     FROM (${archiveCandidates(false)}) candidate
     JOIN LATERAL (SELECT retained.sim_job_id ${archiveCandidateScope}
       FOR UPDATE OF retained SKIP LOCKED OFFSET 0) eligible ON true
-    ORDER BY candidate.due_at, candidate.delivered_at, candidate.sim_job_id, candidate.point_content_signature
+    ORDER BY candidate.transfer_priority, candidate.due_at, candidate.delivered_at, candidate.sim_job_id, candidate.point_content_signature
     LIMIT 1`;
 }
 

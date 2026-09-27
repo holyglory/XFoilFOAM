@@ -87,7 +87,7 @@ export async function verifyProgressiveWorkerArchiveDelivery(
           await ordering.execute(sql`
           INSERT INTO progressive_worker_hub_receipts(sim_job_id, sequence, result_attempt_id, point_content_signature, receipt, delivered_at)
           SELECT sim_job_id, sequence, result_attempt_id, ${freshSignature},
-            jsonb_set(receipt, '{pointContentSignature}', to_jsonb(${freshSignature}::text)), clock_timestamp()
+            jsonb_set(receipt, '{pointContentSignature}', to_jsonb(${freshSignature}::text)), clock_timestamp() - interval '2 days'
           FROM progressive_worker_hub_receipts WHERE sim_job_id = ${executionId}::uuid
             AND point_content_signature = ${source.point_content_signature}
         `);

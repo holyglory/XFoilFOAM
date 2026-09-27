@@ -11,7 +11,7 @@ import type { DB } from "../src/client";
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
 
-it("selects only pending owned archives in due order and preserves retry wake deadlines", async () => {
+it("resumes due archive retries and expired claims before untouched work while preserving ownership and deadlines", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_archives ON COMMIT DROP AS
       SELECT md5(variant)::uuid id,variant,ordinal FROM unnest(ARRAY['ordinary','due-retry','expired-claim',
@@ -47,6 +47,8 @@ it("selects only pending owned archives in due order and preserves retry wake de
       SELECT id sim_job_id,md5(variant)::text point_content_signature FROM fixture_archives WHERE variant='already-retained'`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_archive_deliveries ON COMMIT DROP AS
       SELECT id sim_job_id,md5(variant)::text point_content_signature,
+        CASE WHEN variant IN ('live-claim','expired-claim') THEN md5(variant||'claim')::uuid END claim_token,
+        CASE WHEN variant IN ('future-retry','due-retry') THEN 1 ELSE 0 END attempt_count,
         CASE WHEN variant='live-claim' THEN clock_timestamp()+interval '2 days'
           WHEN variant='expired-claim' THEN clock_timestamp()-interval '1 day' END claim_expires_at,
         CASE WHEN variant='future-retry' THEN clock_timestamp()+interval '1 day'
@@ -59,10 +61,10 @@ it("selects only pending owned archives in due order and preserves retry wake de
       SELECT md5('attempt'||variant)::uuid current_result_attempt_id FROM fixture_archives WHERE variant='selected-accepted'`);
     const connection = transaction as unknown as DB;
     for (const variant of [
-      "ordinary",
       "expired-claim",
-      "unselected-accepted",
       "due-retry",
+      "ordinary",
+      "unselected-accepted",
     ]) {
       const selected = await transaction.execute(
         progressiveArchiveSelectionSql(),
