@@ -906,6 +906,11 @@ tier = "development"
 requires = ["dependencies"]
 command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_progressive_graph_dependencies.py", "-q"]
 
+[[test.progressive.check]]
+name = "short-budget-march-guard"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_march_guard.py", "-q"]
+
 [test.prediction-repair-live]
 timeout_seconds = 300
 
