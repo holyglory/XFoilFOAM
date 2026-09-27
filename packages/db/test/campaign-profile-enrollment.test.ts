@@ -4947,6 +4947,23 @@ describe("progressive execution stop and settlement", () => {
           remainingActiveSeconds: 870,
         });
         expect(replacement!.token).not.toBe(fixture.leases[0].token);
+        for (const exhausted of [false, true]) {
+          if (exhausted)
+            await heartbeatProgressiveCfdUnit(db, replacement!, {
+              attemptActiveSeconds: replacement!.remainingActiveSeconds,
+              leaseSeconds: 120,
+            });
+          const currentOwnership = () => db.execute(sql`
+            SELECT to_jsonb(unit) AS unit, to_jsonb(attempt) AS attempt
+            FROM progressive_cfd_units unit JOIN progressive_cfd_attempts attempt ON attempt.unit_id=unit.id
+            WHERE unit.id=${replacement!.id} AND attempt.token=${replacement!.token}
+          `);
+          const beforeReplay = await currentOwnership();
+          expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId)).toEqual({
+            complete: 0, retry: 0, gaps: 0, cancelled: 0, waiting: 0,
+          });
+          expect(await currentOwnership()).toEqual(beforeReplay);
+        }
       } else expect(replacement).toBeNull();
     },
     120_000,

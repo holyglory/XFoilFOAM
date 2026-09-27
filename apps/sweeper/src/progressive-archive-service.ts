@@ -8,27 +8,9 @@ import {
 import { runNotificationDrain } from "./notification-drain";
 import { nextProgressiveArchiveWakeAt } from "./progressive-worker-archive-delivery";
 import { deliverNextProgressiveWorkerArchive } from "./remote-solver";
+import { runSweeperServices } from "./service-lifecycle";
 
-const PROGRESSIVE_ARCHIVE_TRANSFER_LANES = 16;
-
-async function drainProgressiveArchives(
-  db: DB,
-  engine: EngineClient,
-): Promise<boolean> {
-  const results = await Promise.allSettled(
-    Array.from({ length: PROGRESSIVE_ARCHIVE_TRANSFER_LANES }, () =>
-      deliverNextProgressiveWorkerArchive(db, engine),
-    ),
-  );
-  const errors = results.filter(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
-  );
-  if (errors.length) throw errors[0]!.reason;
-  return results.some(
-    (result): result is PromiseFulfilledResult<boolean> =>
-      result.status === "fulfilled" && result.value,
-  );
-}
+const PROGRESSIVE_ARCHIVE_TRANSFER_LANES = 8;
 
 export async function runProgressiveArchiveService(
   db: DB,
@@ -41,36 +23,43 @@ export async function runProgressiveArchiveService(
     reportError?: (error: unknown) => void;
   } = {},
 ) {
-  await runNotificationDrain(
-    notifications,
-    "progressive_worker_archive_changed",
+  await runSweeperServices(
     signal,
-    {
-      drain:
-        options.drain ??
-        (async () => {
-          const [settings] = await db
-            .select({
-              upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
-              remoteSolverEnabled: syncApiSettings.remoteSolverEnabled,
-            })
-            .from(syncApiSettings)
-            .where(eq(syncApiSettings.id, 1));
-          assertRemoteSolverHubUrlContract(settings?.upstreamBaseUrl);
-          assertRemoteSolverNodeEvidenceContract(
-            settings?.remoteSolverEnabled ?? false,
-          );
-          return drainProgressiveArchives(db, engine);
-        }),
-      nextWakeAt:
-        options.nextWakeAt ?? (() => nextProgressiveArchiveWakeAt(db)),
-      reportError:
-        options.reportError ??
-        ((error) =>
-          console.error(
-            "[sweeper] progressive archive delivery failed:",
-            error instanceof Error ? error.message : String(error),
-          )),
-    },
+    Array.from({ length: PROGRESSIVE_ARCHIVE_TRANSFER_LANES }, (_, lane) => ({
+      name: `progressive-archive-${lane}`,
+      run: (laneSignal) =>
+        runNotificationDrain(
+          notifications,
+          "progressive_worker_archive_changed",
+          laneSignal,
+          {
+            drain:
+              options.drain ??
+              (async () => {
+                const [settings] = await db
+                  .select({
+                    upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
+                    remoteSolverEnabled: syncApiSettings.remoteSolverEnabled,
+                  })
+                  .from(syncApiSettings)
+                  .where(eq(syncApiSettings.id, 1));
+                assertRemoteSolverHubUrlContract(settings?.upstreamBaseUrl);
+                assertRemoteSolverNodeEvidenceContract(
+                  settings?.remoteSolverEnabled ?? false,
+                );
+                return deliverNextProgressiveWorkerArchive(db, engine);
+              }),
+            nextWakeAt:
+              options.nextWakeAt ?? (() => nextProgressiveArchiveWakeAt(db)),
+            reportError:
+              options.reportError ??
+              ((error) =>
+                console.error(
+                  "[sweeper] progressive archive delivery failed:",
+                  error instanceof Error ? error.message : String(error),
+                )),
+          },
+        ),
+    })),
   );
 }

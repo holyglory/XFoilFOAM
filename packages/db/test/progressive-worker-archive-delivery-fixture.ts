@@ -35,10 +35,9 @@ export async function verifyProgressiveWorkerArchiveDelivery(
       sql`UPDATE sync_api_settings SET remote_solver_enabled = true, remote_solver_transfer_paused = false WHERE id = 1`,
     );
     ownedClaims.push(
-      ...(await Promise.all([
-        claimProgressiveWorkerArchive(db),
-        claimProgressiveWorkerArchive(db),
-      ])),
+      ...(await Promise.all(
+        Array.from({ length: 8 }, () => claimProgressiveWorkerArchive(db)),
+      )),
     );
     expect(ownedClaims.filter(Boolean)).toHaveLength(1);
     expect(ownedClaims.find(Boolean)).toMatchObject({ executionId });
