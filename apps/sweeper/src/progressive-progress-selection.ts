@@ -1,5 +1,7 @@
 import { sql } from "drizzle-orm";
 
+const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 128;
+
 const unappliedReports = sql`EXISTS (
   SELECT 1 FROM progressive_remote_reports report
   WHERE report.sim_job_id = job.id AND (
@@ -21,7 +23,7 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
     FROM sim_jobs job
     WHERE ${executionScope(jobIds)} AND ${unappliedReports}
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id LIMIT 32`;
+    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_SETTLEMENT_JOB_LIMIT}`;
 }
 
 export function progressiveSettlementJobsSql(jobIds?: string[]) {
