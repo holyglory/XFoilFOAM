@@ -22,11 +22,13 @@ export async function runProgressiveArchiveService(
   } = {},
 ) {
   const lanes = Number(
-    process.env.REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER ?? 8,
+    process.env.REMOTE_EVIDENCE_ARCHIVE_LANES ??
+      process.env.REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER ??
+      8,
   );
   if (!Number.isSafeInteger(lanes) || lanes < 1 || lanes > 32)
     throw new Error(
-      "REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER must be an integer from 1 through 32",
+      "REMOTE_EVIDENCE_ARCHIVE_LANES must be an integer from 1 through 32",
     );
   await runSweeperServices(
     signal,

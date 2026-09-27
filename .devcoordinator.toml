@@ -1796,7 +1796,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "archive-compose-config"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/compose-sync-import-volume.test.ts", "-t", "production archive concurrency wiring"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/compose-sync-import-volume.test.ts", "-t", "production archive concurrency wiring|production archive lane wiring"]
 
 [[test.progressive.check]]
 name = "remote-cancellation-transfer"

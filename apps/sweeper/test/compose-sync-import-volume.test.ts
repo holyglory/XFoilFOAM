@@ -95,6 +95,47 @@ describe("production disk admission wiring", () => {
   );
 });
 
+describe("production archive lane wiring", () => {
+  it.each([undefined, "10"])(
+    "passes the archive lane count %s only to the sweeper",
+    (configured) => {
+      const environment = {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        ...(configured ? { REMOTE_EVIDENCE_ARCHIVE_LANES: configured } : {}),
+      };
+      const compose = JSON.parse(
+        execFileSync(
+          "docker",
+          [
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            "docker-compose.deploy.yml",
+            "config",
+            "--format",
+            "json",
+          ],
+          {
+            cwd: repoRoot,
+            env: environment,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ),
+      );
+      expect(
+        compose.services.sweeper.environment.REMOTE_EVIDENCE_ARCHIVE_LANES,
+      ).toBe(configured ?? "8");
+      for (const name of ["node-api", "api", "worker", "web", "media-repair"])
+        expect(compose.services[name].environment).not.toHaveProperty(
+          "REMOTE_EVIDENCE_ARCHIVE_LANES",
+        );
+    },
+  );
+});
+
 function serviceBlock(source: string, service: string): string {
   const match = new RegExp(
     `^  ${service}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|^volumes:|(?![\\s\\S]))`,
