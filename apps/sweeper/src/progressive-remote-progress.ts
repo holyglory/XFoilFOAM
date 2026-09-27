@@ -16,6 +16,7 @@ import { settleProgressiveRemoteJob } from "./progressive-remote-settlement";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 4;
+const MAX_TERMINAL_PROGRESSIVE_EXECUTIONS = 4;
 
 export async function applyProgressiveRemoteProgress(
   db: DB,
@@ -176,7 +177,16 @@ export async function reconcileProgressiveRemoteProgress(
       )))
     GROUP BY report.sim_job_id, job.campaign_id, job."polledAt", job."updatedAt"
     ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
-  const selectedJobs = jobs as unknown as Array<{
+  const terminalJobs = await db.execute(sql`
+    SELECT job.id AS sim_job_id, job.campaign_id
+    FROM sim_jobs job
+    WHERE ${options.jobIds ? sql`job.id IN (${sql.join(options.jobIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`true`}
+      AND job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled')
+      AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
+    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id
+    LIMIT ${MAX_TERMINAL_PROGRESSIVE_EXECUTIONS}
+  `);
+  const selectedJobs = [...jobs, ...terminalJobs] as unknown as Array<{
     sim_job_id: string;
     campaign_id: string;
   }>;
