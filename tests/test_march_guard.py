@@ -131,6 +131,28 @@ def test_must_catch_prod_shaped_hopeless_march_is_stopped():
     assert f">{MARCH_HOPELESS_FACTOR:g}x" in fired[0]
 
 
+def test_short_fast_budget_scales_guard_before_budget_exhaustion():
+    wd = MarchRateWatchdog()
+    budget_s = 900.0
+    verdicts = []
+    for i in range(30):
+        now = 30.0 * (i + 1)
+        verdicts.append(
+            wd.observe(
+                "short",
+                HOPELESS_RATE * now,
+                now,
+                end_t=END_T,
+                budget_s=budget_s,
+                wall_start=0.0,
+                stop_marker_present=False,
+            )
+        )
+    fired = [verdict for verdict in verdicts if verdict is not None]
+    assert fired
+    assert (verdicts.index(fired[0]) + 1) * 30.0 < budget_s
+
+
 def test_never_judges_during_warmup():
     wd = MarchRateWatchdog()
     beats = int(MARCH_WARMUP_WALL_S / 60.0) - 1

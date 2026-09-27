@@ -606,14 +606,24 @@ class MarchRateWatchdog:
             state.samples.clear()
         if not state.samples or t_sim > state.samples[-1][1] or now > state.samples[-1][0]:
             state.samples.append((now, t_sim))
-        while state.samples and now - state.samples[0][0] > self.window_s:
+        # Short progressive FAST attempts can have a wall budget below the
+        # historical 30-minute warmup. Keep the long-horizon defaults for
+        # ordinary runs, but scale the guard inside a bounded attempt so a
+        # hopeless march is detected before the budget is fully consumed.
+        effective_warmup = min(self.warmup_s, max(60.0, budget_s * 0.25))
+        effective_min_span = min(self.min_span_s, max(30.0, budget_s * 0.15))
+        effective_window = min(
+            self.window_s,
+            max(effective_min_span, budget_s * 0.2),
+        )
+        while state.samples and now - state.samples[0][0] > effective_window:
             state.samples.popleft()
         elapsed = now - wall_start
-        if elapsed < self.warmup_s:
+        if elapsed < effective_warmup:
             return None
         oldest_wall, oldest_t = state.samples[0]
         span = now - oldest_wall
-        if span < self.min_span_s:
+        if span < effective_min_span:
             return None
         rate = (t_sim - oldest_t) / span
         if rate <= 0.0 or not math.isfinite(rate):
