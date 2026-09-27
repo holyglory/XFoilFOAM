@@ -1674,6 +1674,12 @@ requires = ["dependencies", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "transfers a terminal stopped local recovery parent"]
 
 [[test.progressive.check]]
+name = "remote-stage-advance"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-hub-progress-service.test.ts"]
+
+[[test.progressive.check]]
 name = "progressive-promise-reuse"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]

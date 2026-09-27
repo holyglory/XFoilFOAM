@@ -4,9 +4,14 @@ import { acknowledgeProgressiveRemoteStops } from "../src/progressive-remote-sto
 import { reconcileProgressiveRemoteProgress } from "../src/progressive-remote-progress";
 import { runProgressiveHubProgressService } from "../src/progressive-hub-progress-service";
 import { prepareProgressiveRemoteFleet } from "../src/progressive-remote-admission";
+import { advanceProgressiveCfdStages } from "@aerodb/db";
 vi.mock("../src/progressive-remote-admission", () => ({
   prepareProgressiveRemoteFleet: vi.fn(),
 }));
+vi.mock("@aerodb/db", async () => {
+  const actual = await vi.importActual<typeof import("@aerodb/db")>("@aerodb/db");
+  return { ...actual, advanceProgressiveCfdStages: vi.fn() };
+});
 
 vi.mock("../src/progressive-remote-stop-receipt", () => ({
   acknowledgeProgressiveRemoteStops: vi.fn(),
@@ -49,6 +54,12 @@ function fixture() {
     waiting: 1,
     errors: [],
   });
+  vi.mocked(advanceProgressiveCfdStages).mockResolvedValue({
+    admitted: 0,
+    closed: 0,
+    waiting: 0,
+    campaignsCompleted: 0,
+  });
   return { notifications, unlisten, notify: () => notify() };
 }
 
@@ -86,6 +97,14 @@ it("releases exact stop receipts before replay and drains available ordered repo
         errors: [],
       };
     });
+  vi.mocked(advanceProgressiveCfdStages).mockImplementationOnce(async () => {
+    order.push("stages");
+    return { admitted: 0, closed: 1, waiting: 0, campaignsCompleted: 0 };
+  });
+  vi.mocked(advanceProgressiveCfdStages).mockImplementation(async () => {
+    order.push("stages");
+    return { admitted: 0, closed: 0, waiting: 1, campaignsCompleted: 0 };
+  });
   const owner = new AbortController();
   const running = runProgressiveHubProgressService(
     {} as DB,
@@ -96,16 +115,18 @@ it("releases exact stop receipts before replay and drains available ordered repo
   expect(order).toEqual([
     "stop",
     "progress",
+    "stages",
     "admission",
     "stop",
     "progress",
+    "stages",
     "admission",
   ]);
   await vi.advanceTimersByTimeAsync(4999);
-  expect(order).toHaveLength(6);
+  expect(order).toHaveLength(8);
   scope.notify();
   await vi.advanceTimersByTimeAsync(0);
-  expect(order).toHaveLength(9);
+  expect(order).toHaveLength(12);
   owner.abort();
   await running;
   expect(scope.unlisten).toHaveBeenCalledOnce();

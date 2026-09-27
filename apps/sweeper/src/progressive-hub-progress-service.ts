@@ -3,6 +3,7 @@ import { acknowledgeProgressiveRemoteStops } from "./progressive-remote-stop-rec
 import { reconcileProgressiveRemoteProgress } from "./progressive-remote-progress";
 import { runNotificationDrain } from "./notification-drain";
 import { prepareProgressiveRemoteFleet } from "./progressive-remote-admission";
+import { advanceProgressiveCfdStages } from "@aerodb/db";
 
 export async function runProgressiveHubProgressService(
   db: DB,
@@ -17,6 +18,7 @@ export async function runProgressiveHubProgressService(
       drain: async () => {
         const stops = await acknowledgeProgressiveRemoteStops(db);
         const progress = await reconcileProgressiveRemoteProgress(db);
+        const stages = await advanceProgressiveCfdStages(db);
         const admission = signal.aborted
           ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
           : await prepareProgressiveRemoteFleet(db);
@@ -27,6 +29,9 @@ export async function runProgressiveHubProgressService(
           progress.indexed ||
           progress.settled ||
           progress.errors.length ||
+          stages.admitted ||
+          stages.closed ||
+          stages.campaignsCompleted ||
           admission.prepared ||
           admission.deferred ||
           admission.errors.length
@@ -36,6 +41,7 @@ export async function runProgressiveHubProgressService(
               component: "progressive-hub-progress",
               stops,
               progress,
+              stages,
               admission,
             }),
           );
@@ -44,6 +50,9 @@ export async function runProgressiveHubProgressService(
             progress.applied +
             progress.indexed +
             progress.settled +
+            stages.admitted +
+            stages.closed +
+            stages.campaignsCompleted +
             admission.prepared +
             admission.deferred >
           0
