@@ -81,7 +81,10 @@ import {
   prepareProgressiveRemoteDispatch,
   prepareProgressiveRemoteFleet,
 } from "../../../apps/sweeper/src/progressive-remote-admission";
-import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
+import {
+  applyProgressiveRemoteProgress,
+  reconcileProgressiveRemoteProgress,
+} from "../../../apps/sweeper/src/progressive-remote-progress";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { verifyProgressiveWorkerReportDelivery } from "./progressive-worker-report-fixture";
 import { verifyProgressiveAcceptedArchiveReplay } from "./progressive-accepted-archive-fixture";
@@ -3027,21 +3030,37 @@ describe("progressive CPU admission", () => {
         await db.execute(
           sql`UPDATE sim_jobs SET engine_job_id = ${job.id} WHERE id = ${job.id}::uuid`,
         );
-        for (const sequence of [1, 2, 3]) {
-          if (sequence === 3)
-            await db.execute(
-              sql`UPDATE sim_campaigns SET status = 'cancelled' WHERE id = ${job.campaignId}::uuid`,
+        await db.execute(
+          sql`UPDATE sim_campaigns SET status = 'active' WHERE id = ${job.campaignId}::uuid`,
+        );
+        const drainRollback = new Error(
+          "Restore isolated progressive report drain state",
+        );
+        await expect(
+          db.transaction(async (transaction) => {
+            const drained = await reconcileProgressiveRemoteProgress(
+              transaction as unknown as DB,
+              { jobIds: [job.id] },
             );
+            expect(drained).toMatchObject({
+              applied: 3,
+              stopped: 1,
+              errors: [],
+            });
+            throw drainRollback;
+          }),
+        ).rejects.toBe(drainRollback);
+        for (const sequence of [1, 2])
           expect(
             await applyProgressiveRemoteProgress(db, job.id),
-          ).toMatchObject({
-            kind: "applied",
-            sequence,
-            stopped: sequence === 3,
-          });
-        }
-        expect(await applyProgressiveRemoteProgress(db, job.id)).toEqual({
-          kind: "idle",
+          ).toMatchObject({ kind: "applied", sequence });
+        await db.execute(
+          sql`UPDATE sim_campaigns SET status = 'cancelled' WHERE id = ${job.campaignId}::uuid`,
+        );
+        expect(await applyProgressiveRemoteProgress(db, job.id)).toMatchObject({
+          kind: "applied",
+          sequence: 3,
+          stopped: true,
         });
         await verifyProgressiveRemoteReportInventory(db, terminal);
         const [projected] = await db.execute(sql`SELECT job.status,
