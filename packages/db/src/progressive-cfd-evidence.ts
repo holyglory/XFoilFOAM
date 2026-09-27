@@ -10,6 +10,8 @@ import { assertProgressiveExecutionIdentity } from "./progressive-execution-iden
 
 export class ProgressiveCfdEvidenceScopeClosed extends Error {}
 
+export class ProgressiveCfdEvidenceScopePending extends Error {}
+
 interface BoundUnit {
   token: string;
   unit_id: string;
@@ -46,6 +48,10 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
       "Solver evidence job is missing",
     );
   if (job.progressive == null && !job.bound) return null;
+  if (job.bound && job.progressive && job.engine_job_id === null)
+    throw new ProgressiveCfdEvidenceScopePending(
+      "Progressive CFD execution ownership is awaiting report processing",
+    );
   if (!job.bound || !job.progressive || job.engine_job_id !== engineJobId)
     throw new ProgressiveCfdEvidenceScopeClosed(
       "Progressive CFD evidence has no exact engine/job ownership",

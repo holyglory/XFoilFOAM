@@ -152,6 +152,14 @@ export async function verifyProgressivePolarImport(
       payload: { ...payload, sourceInstanceId: randomUUID() },
     });
     expect(foreignInstance.statusCode).toBe(403);
+    const pendingOwnership = await app.inject({
+      method: "POST",
+      url: "/api/sync/v1/polars",
+      headers: { "x-xfoilfoam-solver-token": token },
+      payload,
+    });
+    expect(pendingOwnership.statusCode, pendingOwnership.body).toBe(503);
+    expect(pendingOwnership.headers["retry-after"]).toBe("2");
     await db.execute(
       sql`UPDATE sim_jobs SET engine_job_id = id::text WHERE id = ${delivery.engineJobId}::uuid`,
     );

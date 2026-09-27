@@ -24,6 +24,7 @@ import {
   progressiveRemoteDispatches,
   ProgressiveRemoteEvidenceConflict,
   ProgressiveCfdEvidenceScopeClosed,
+  ProgressiveCfdEvidenceScopePending,
   assertProgressiveReportedManifest,
   recordProgressiveRemoteEvidenceReceipt,
   readProgressiveRemoteEvidenceReceipt,
@@ -8378,6 +8379,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           }
         }
         let conflictError: string | null = null;
+        let pendingError: string | null = null;
         let permissionError: string | null = null;
         let blobLocks: Awaited<ReturnType<typeof acquireSyncBlobLocks>> | null =
           null;
@@ -8425,7 +8427,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             );
           }
         } catch (error) {
-          if (
+          if (error instanceof ProgressiveCfdEvidenceScopePending) {
+            pendingError = error.message;
+          } else if (
             error instanceof PolarPromiseScopeError ||
             error instanceof PolarEvidenceBindingError ||
             error instanceof ProgressiveRemoteEvidenceConflict ||
@@ -8449,6 +8453,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         }
         if (permissionError)
           return reply.code(403).send({ error: permissionError });
+        if (pendingError)
+          return reply
+            .header("retry-after", "2")
+            .code(503)
+            .send({ error: pendingError });
         if (response) {
           // A later exact delivery can make an earlier replay conflict obsolete.
           // Reconcile on the successful ingest boundary so the admin review
