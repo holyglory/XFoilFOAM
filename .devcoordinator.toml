@@ -1776,6 +1776,12 @@ requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-transfer-steps.test.ts", "test/progressive-archive-service.test.ts"]
 
 [[test.progressive.check]]
+name = "archive-compose-config"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/compose-sync-import-volume.test.ts", "-t", "production archive concurrency wiring"]
+
+[[test.progressive.check]]
 name = "remote-cancellation-transfer"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]

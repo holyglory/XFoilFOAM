@@ -25,6 +25,54 @@ it("preserves fractional-millisecond input dates at JavaScript clock precision",
   }
 });
 
+it.each([
+  [undefined, 8],
+  ["1", 1],
+  ["16", 16],
+  ["32", 32],
+] as const)(
+  "uses the configured archive lane count %s",
+  async (configured, expected) => {
+    vi.useFakeTimers();
+    vi.stubEnv("REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER", configured);
+    const channel = notificationFixture();
+    const owner = new AbortController();
+    const drain = vi.fn().mockResolvedValue(false);
+    const running = runProgressiveArchiveService(
+      {} as DB,
+      channel.connection,
+      {} as EngineClient,
+      owner.signal,
+      { drain, nextWakeAt: async () => null },
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(drain).toHaveBeenCalledTimes(expected);
+    owner.abort();
+    await running;
+    expect(channel.unlisten).toHaveBeenCalledTimes(expected);
+  },
+);
+
+it.each(["", "0", "-1", "1.5", "33", "NaN", "Infinity", "unlimited"])(
+  "rejects invalid archive concurrency %s before claiming work",
+  async (configured) => {
+    vi.stubEnv("REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER", configured);
+    const channel = notificationFixture();
+    const drain = vi.fn();
+    await expect(
+      runProgressiveArchiveService(
+        {} as DB,
+        channel.connection,
+        {} as EngineClient,
+        new AbortController().signal,
+        { drain },
+      ),
+    ).rejects.toThrow("integer from 1 through 32");
+    expect(channel.connection.listen).not.toHaveBeenCalled();
+    expect(drain).not.toHaveBeenCalled();
+  },
+);
+
 function notificationFixture() {
   const listeners = new Set<() => void>();
   const unlisten = vi.fn(async () => {});

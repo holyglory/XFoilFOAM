@@ -105,6 +105,17 @@ replacement canary work.
 
 ## Post-cutover verification
 
+Archive upload concurrency is separate from solver CPU capacity. Set
+`REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER` in each host's private
+deployment environment when changing the default eight archive lanes. The
+remote sweeper accepts an integer from 1 through 32; its value must not exceed
+the upstream hub's broker limit. The production Compose file passes the value
+to `node-api` and `sweeper`, not to the OpenFOAM workers. Deploy the hub first,
+verify the value inside `app-node-api-1`, then deploy the remote control plane
+and verify it inside `hz-solver2-sweeper-1`. A changed `.env.deploy` alone does
+not prove container configuration. The separate 64 GiB active-byte quota and
+archive identity/verification checks remain unchanged.
+
 Use the same two Compose files for every check:
 
 ```bash

@@ -1,10 +1,56 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+
+describe("production archive concurrency wiring", () => {
+  it.each([undefined, "16"])(
+    "resolves the upload limit %s into both control-plane containers",
+    (configured) => {
+      const environment = {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        ...(configured
+          ? { REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER: configured }
+          : {}),
+      };
+      const compose = JSON.parse(
+        execFileSync(
+          "docker",
+          [
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            "docker-compose.deploy.yml",
+            "config",
+            "--format",
+            "json",
+          ],
+          {
+            cwd: repoRoot,
+            env: environment,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ),
+      );
+      for (const name of ["node-api", "sweeper"])
+        expect(
+          compose.services[name].environment
+            .REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER,
+        ).toBe(configured ?? "8");
+      for (const name of ["api", "worker", "web", "media-repair"])
+        expect(compose.services[name].environment).not.toHaveProperty(
+          "REMOTE_EVIDENCE_MAX_ACTIVE_UPLOADS_PER_SOLVER",
+        );
+    },
+  );
+});
 
 function serviceBlock(source: string, service: string): string {
   const match = new RegExp(
