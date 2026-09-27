@@ -9,6 +9,27 @@ import { runNotificationDrain } from "./notification-drain";
 import { nextProgressiveArchiveWakeAt } from "./progressive-worker-archive-delivery";
 import { deliverNextProgressiveWorkerArchive } from "./remote-solver";
 
+const PROGRESSIVE_ARCHIVE_TRANSFER_LANES = 2;
+
+async function drainProgressiveArchives(
+  db: DB,
+  engine: EngineClient,
+): Promise<boolean> {
+  const results = await Promise.allSettled(
+    Array.from({ length: PROGRESSIVE_ARCHIVE_TRANSFER_LANES }, () =>
+      deliverNextProgressiveWorkerArchive(db, engine),
+    ),
+  );
+  const errors = results.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (errors.length) throw errors[0]!.reason;
+  return results.some(
+    (result): result is PromiseFulfilledResult<boolean> =>
+      result.status === "fulfilled" && result.value,
+  );
+}
+
 export async function runProgressiveArchiveService(
   db: DB,
   notifications: Pick<Sql, "listen">,
@@ -39,7 +60,7 @@ export async function runProgressiveArchiveService(
           assertRemoteSolverNodeEvidenceContract(
             settings?.remoteSolverEnabled ?? false,
           );
-          return deliverNextProgressiveWorkerArchive(db, engine);
+          return drainProgressiveArchives(db, engine);
         }),
       nextWakeAt:
         options.nextWakeAt ?? (() => nextProgressiveArchiveWakeAt(db)),
