@@ -37,5 +37,5 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active')))
-    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id LIMIT 4`;
+    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id LIMIT 32`;
 }
