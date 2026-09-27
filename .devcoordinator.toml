@@ -1686,6 +1686,12 @@ requires = ["dependencies", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "recovers only expired unbound claims, bounds retries, and advances an evidence-free fast gap"]
 
 [[test.progressive.check]]
+name = "remote-role-admission"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "does not require a local campaign epoch for remote-worker admission"]
+
+[[test.progressive.check]]
 name = "progressive-promise-reuse"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]

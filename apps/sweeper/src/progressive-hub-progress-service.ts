@@ -23,8 +23,8 @@ export async function runProgressiveHubProgressService(
           sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
         )) as unknown as Array<{ remote_solver_enabled: boolean }>;
         const stages = role?.remote_solver_enabled
-          ? await advanceProgressiveCfdStages(db)
-          : { admitted: 0, closed: 0, waiting: 0, campaignsCompleted: 0 };
+          ? { admitted: 0, closed: 0, waiting: 0, campaignsCompleted: 0 }
+          : await advanceProgressiveCfdStages(db);
         const admission = signal.aborted
           ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
           : await prepareProgressiveRemoteFleet(db);

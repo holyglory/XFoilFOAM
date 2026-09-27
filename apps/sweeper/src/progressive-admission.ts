@@ -46,6 +46,10 @@ export async function admitProgressiveCfdBatch(
   try {
     prepared = await db.transaction(async (raw) => {
       const connection = raw as unknown as DB;
+      const [role] = await connection.execute(
+        sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
+      );
+      if (role?.remote_solver_enabled) return null;
       const [epoch] = await connection.execute(
         sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
       );
@@ -53,14 +57,10 @@ export async function admitProgressiveCfdBatch(
       const [state] =
         await connection.execute(sql`SELECT enabled, cpu_slots, max_concurrent_jobs,
         admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1 FOR UPDATE`);
-      const [role] = await connection.execute(
-        sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
-      );
       if (
         !state?.enabled ||
         state.admission_fence_active ||
-        state.disk_admission_blocked ||
-        role?.remote_solver_enabled
+        state.disk_admission_blocked
       )
         return null;
       const capacity = effectiveMaxConcurrentJobs(

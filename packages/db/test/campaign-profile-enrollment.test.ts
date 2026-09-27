@@ -3359,6 +3359,24 @@ describe("progressive CPU admission", () => {
     });
   });
 
+  it("does not require a local campaign epoch for remote-worker admission", async () => {
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        await connection.execute(sql`UPDATE sync_api_settings SET remote_solver_enabled=true WHERE id=1`);
+        await connection.execute(sql`UPDATE calculation_epochs SET current=false WHERE current`);
+        const engine = new EngineClient("http://unused.invalid");
+        const submit = vi.spyOn(engine, "submitPolar");
+        expect(await admitProgressiveCfdBatch(connection, engine, {
+          meshRecoveryVersion: 1,
+          solverBudgetVersion: 2,
+        })).toEqual({ kind: "idle" });
+        expect(submit).not.toHaveBeenCalled();
+        throw new Error("remote admission rollback");
+      }),
+    ).rejects.toThrow("remote admission rollback");
+  });
+
   it("retains transient cases without spending attempts until the exact engine contract is available", async () => {
     await ready(
       async ({ generationId }) => {

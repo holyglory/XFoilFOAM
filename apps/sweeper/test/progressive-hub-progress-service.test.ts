@@ -43,7 +43,7 @@ function fixture() {
     }),
   } as unknown as Pick<Sql, "listen">;
   const db = {
-    execute: vi.fn().mockResolvedValue([{ remote_solver_enabled: true }]),
+    execute: vi.fn().mockResolvedValue([{ remote_solver_enabled: false }]),
   } as unknown as DB;
   vi.mocked(acknowledgeProgressiveRemoteStops).mockResolvedValue({
     acknowledged: 0,
@@ -130,6 +130,27 @@ it("releases exact stop receipts before replay and drains available ordered repo
   scope.notify();
   await vi.advanceTimersByTimeAsync(0);
   expect(order).toHaveLength(12);
+  owner.abort();
+  await running;
+  expect(scope.unlisten).toHaveBeenCalledOnce();
+});
+
+it("leaves campaign stage advancement on the hub while a remote node has no local epoch", async () => {
+  const scope = fixture();
+  vi.mocked(scope.db.execute).mockResolvedValue([
+    { remote_solver_enabled: true },
+  ] as never);
+  const owner = new AbortController();
+  const running = runProgressiveHubProgressService(
+    scope.db,
+    scope.notifications,
+    owner.signal,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  expect(advanceProgressiveCfdStages).not.toHaveBeenCalled();
+  expect(reconcileProgressiveRemoteProgress).toHaveBeenCalledOnce();
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(advanceProgressiveCfdStages).not.toHaveBeenCalled();
   owner.abort();
   await running;
   expect(scope.unlisten).toHaveBeenCalledOnce();
