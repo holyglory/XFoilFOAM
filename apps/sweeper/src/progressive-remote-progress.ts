@@ -164,7 +164,7 @@ export async function reconcileProgressiveRemoteProgress(
   };
   if (options.jobIds?.length === 0) return receipt;
   const jobs =
-    await db.execute(sql`SELECT report.sim_job_id FROM progressive_remote_reports report JOIN sim_jobs job ON job.id = report.sim_job_id
+    await db.execute(sql`SELECT report.sim_job_id, job.campaign_id FROM progressive_remote_reports report JOIN sim_jobs job ON job.id = report.sim_job_id
     WHERE ${options.jobIds ? sql`job.id IN (${sql.join(options.jobIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`true`}
       AND (NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
       OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
@@ -174,46 +174,94 @@ export async function reconcileProgressiveRemoteProgress(
         SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
         WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'
       )))
-    GROUP BY report.sim_job_id, job."polledAt", job."updatedAt" ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
-  await runWithConcurrency(jobs, activeReconcileConcurrency(), async (job) => {
-    const executionId = String(job.sim_job_id);
-    try {
-      for (
-        let reportPass = 0;
-        reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
-        reportPass += 1
-      ) {
-        const result = await applyProgressiveRemoteProgress(db, executionId);
-        if (result.kind === "indexed") receipt.indexed += 1;
-        if (result.kind === "applied") {
-          receipt.applied += 1;
-          if (result.stopped) receipt.stopped += 1;
-        }
-        if (result.kind === "idle") {
-          const terminal = await settleProgressiveRemoteJob(db, executionId);
-          if (terminal.kind === "settled") receipt.settled += 1;
-          else receipt.waiting += 1;
-          break;
-        }
+    GROUP BY report.sim_job_id, job.campaign_id, job."polledAt", job."updatedAt" ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
+  const selectedJobs = jobs as unknown as Array<{
+    sim_job_id: string;
+    campaign_id: string;
+  }>;
+  const jobsByCampaign = new Map<
+    string,
+    Array<(typeof selectedJobs)[number]>
+  >();
+  for (const job of selectedJobs) {
+    const campaignId = String(job.campaign_id);
+    const campaignJobs = jobsByCampaign.get(campaignId) ?? [];
+    campaignJobs.push(job);
+    jobsByCampaign.set(campaignId, campaignJobs);
+  }
+  await runWithConcurrency(
+    [...jobsByCampaign.values()],
+    activeReconcileConcurrency(),
+    async (campaignJobs) => {
+      const campaignReceipt = {
+        applied: 0,
+        indexed: 0,
+        stopped: 0,
+        settled: 0,
+        waiting: 0,
+        errors: [] as Array<{ executionId: string; reason: string }>,
+      };
+      try {
+        await db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          for (const job of campaignJobs) {
+            const executionId = String(job.sim_job_id);
+            try {
+              for (
+                let reportPass = 0;
+                reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
+                reportPass += 1
+              ) {
+                const result = await applyProgressiveRemoteProgress(
+                  connection,
+                  executionId,
+                );
+                if (result.kind === "indexed") campaignReceipt.indexed += 1;
+                if (result.kind === "applied") {
+                  campaignReceipt.applied += 1;
+                  if (result.stopped) campaignReceipt.stopped += 1;
+                }
+                if (result.kind === "idle") {
+                  const terminal = await settleProgressiveRemoteJob(
+                    connection,
+                    executionId,
+                  );
+                  if (terminal.kind === "settled") campaignReceipt.settled += 1;
+                  else campaignReceipt.waiting += 1;
+                  break;
+                }
+              }
+            } catch (error) {
+              campaignReceipt.errors.push({
+                executionId,
+                reason: error instanceof Error ? error.message : String(error),
+              });
+            } finally {
+              await connection.execute(
+                sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+              );
+            }
+          }
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        campaignReceipt.errors = campaignJobs.map((job) => ({
+          executionId: String(job.sim_job_id),
+          reason,
+        }));
+        campaignReceipt.applied = 0;
+        campaignReceipt.indexed = 0;
+        campaignReceipt.stopped = 0;
+        campaignReceipt.settled = 0;
+        campaignReceipt.waiting = 0;
       }
-    } catch (error) {
-      receipt.errors.push({
-        executionId,
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    }
-    try {
-      await db.transaction(async (transaction) => {
-        await transaction.execute(
-          sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-        );
-      });
-    } catch (error) {
-      receipt.errors.push({
-        executionId,
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    }
-  });
+      receipt.applied += campaignReceipt.applied;
+      receipt.indexed += campaignReceipt.indexed;
+      receipt.stopped += campaignReceipt.stopped;
+      receipt.settled += campaignReceipt.settled;
+      receipt.waiting += campaignReceipt.waiting;
+      receipt.errors.push(...campaignReceipt.errors);
+    },
+  );
   return receipt;
 }
