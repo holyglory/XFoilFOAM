@@ -41,10 +41,13 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
       EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt WHERE attempt.sim_job_id = job.id) AS bound
     FROM sim_jobs job WHERE job.id = ${simJobId}
   `);
-  if (!job) throw new Error("Solver evidence job is missing");
+  if (!job)
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Solver evidence job is missing",
+    );
   if (job.progressive == null && !job.bound) return null;
   if (!job.bound || !job.progressive || job.engine_job_id !== engineJobId)
-    throw new Error(
+    throw new ProgressiveCfdEvidenceScopeClosed(
       "Progressive CFD evidence has no exact engine/job ownership",
     );
   const metadata = job.progressive as Record<string, unknown>;
