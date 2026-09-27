@@ -16,6 +16,9 @@ DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-sourc
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
 OPENCFD2606_CANARY_RECEIPT_FILE="${OPENCFD2606_CANARY_RECEIPT_FILE:-$AIRFOILS_PRO_STATE_DIR/openfoam-2606-canary-receipt.pending.json}"
+DEPLOY_SWEEPER_INITIAL_STATE=""
+DEPLOY_SWEEPER_QUIESCED=0
+DEPLOY_SWEEPER_RESTORED=0
 
 cd "$APP_DIR"
 
@@ -177,6 +180,19 @@ restore_sweeper_state() {
   fi
 }
 
+restore_sweeper_on_error() {
+  local exit_code=$?
+  trap - EXIT
+  if ((DEPLOY_SWEEPER_QUIESCED && !DEPLOY_SWEEPER_RESTORED)); then
+    echo "Deployment failed after writer quiescence; restoring sweeper state..." >&2
+    if ! restore_sweeper_state "$DEPLOY_SWEEPER_INITIAL_STATE"; then
+      echo "Could not restore the sweeper's pre-deploy state." >&2
+      exit_code=1
+    fi
+  fi
+  exit "$exit_code"
+}
+
 known_engine_worker_services() {
   compose --profile '*' config --services | awk '$0 == "worker" || $0 ~ /^worker-/'
 }
@@ -282,9 +298,9 @@ main() {
     echo "Compose override: $COMPOSE_OVERRIDE_FILE"
   fi
 
-  local sweeper_initial_state
-  sweeper_initial_state="$(capture_sweeper_state)"
-  echo "Sweeper state before deploy: $sweeper_initial_state"
+  DEPLOY_SWEEPER_INITIAL_STATE="$(capture_sweeper_state)"
+  echo "Sweeper state before deploy: $DEPLOY_SWEEPER_INITIAL_STATE"
+  trap restore_sweeper_on_error EXIT
 
   if [[ "${DEPLOY_OPENFOAM_SERVICES:-0}" == "1" ]]; then
     echo "Refusing DEPLOY_OPENFOAM_SERVICES=1 in the control-plane deploy." >&2
@@ -316,6 +332,7 @@ main() {
   # plane scheduling/derived media work; the engine gateway, all engine workers,
   # and live OpenFOAM child processes remain untouched.
   echo "Quiescing old control-plane writers before database migration..."
+  DEPLOY_SWEEPER_QUIESCED=1
   compose stop sweeper
   # A missing service name is possible only while first introducing this
   # worker. Distinguish that harmless absence from a real stop failure: an old
@@ -338,11 +355,12 @@ main() {
 
   echo "Restarting web..."
   compose up -d --no-deps web
-  restore_sweeper_state "$sweeper_initial_state"
+  restore_sweeper_state "$DEPLOY_SWEEPER_INITIAL_STATE"
+  DEPLOY_SWEEPER_RESTORED=1
   echo "Starting durable media repair worker..."
   compose up -d --no-deps media-repair
   wait_http "web" "http://127.0.0.1:3100/health" 90
-  if [[ "$sweeper_initial_state" == "running" ]]; then
+  if [[ "$DEPLOY_SWEEPER_INITIAL_STATE" == "running" ]]; then
     wait_for_stable_background_service sweeper "sweeper"
   fi
   wait_for_stable_background_service media-repair "media-repair"

@@ -979,7 +979,7 @@ def test_control_plane_deploy_fails_before_migration_when_media_repair_cannot_st
 ) -> None:
     env = _deploy_harness(
         tmp_path,
-        sweeper_state="stopped",
+        sweeper_state="running",
         media_repair_stop_fails=True,
     )
 
@@ -995,6 +995,7 @@ def test_control_plane_deploy_fails_before_migration_when_media_repair_cannot_st
     assert "simulated media-repair stop failure" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert any(" stop media-repair" in call for call in calls)
+    assert any(" up -d --no-deps sweeper" in call for call in calls)
     assert not any(" up --no-deps storage-init" in call for call in calls)
     assert not any(" up -d --no-deps node-api" in call for call in calls)
 
