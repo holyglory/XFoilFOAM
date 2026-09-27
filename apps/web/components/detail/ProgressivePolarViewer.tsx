@@ -205,7 +205,7 @@ export function ProgressivePolarViewer({
           <span className={controls.conditionText}>Condition</span>
           <select
             aria-label="Polar condition"
-            disabled={!interactive}
+            disabled={!series.length}
             value={selected.targetId}
             onChange={(event) => {
               setSelectedId(event.target.value);

@@ -447,7 +447,7 @@ function ProgressiveCompareOverlay({
             <span className={controls.conditionText}>Condition</span>
             <select
               aria-label="Overlay condition"
-              disabled={!interactive || !conditions.length}
+              disabled={!conditions.length}
               value={condition?.key ?? ""}
               onChange={(event) => {
                 setRequestedCondition(event.target.value);
