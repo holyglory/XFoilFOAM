@@ -4807,17 +4807,6 @@ describe("progressive execution stop and settlement", () => {
       waiting: 1,
       gaps: 0,
     });
-    await db.execute(sql`
-      UPDATE progressive_cfd_attempts
-      SET outcome = 'failed', finished_at = clock_timestamp(), error = 'active compute budget exhausted'
-      WHERE sim_job_id = ${simJobId}
-    `);
-    await db.execute(sql`
-      UPDATE progressive_cfd_units
-      SET state = 'blocked', active_seconds = active_budget_seconds,
-        lease_token = NULL, lease_owner = NULL, lease_until = NULL
-      WHERE work_id = ${fixture.leases[0].workId}
-    `);
     await db
       .update(simJobs)
       .set({ ingestedAt: new Date() })
