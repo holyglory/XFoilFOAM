@@ -14,9 +14,12 @@ import { indexProgressiveRemoteReport } from "@aerodb/db/progressive-remote-inve
 import { persistEngineRuntimeForJob } from "./engine-provenance";
 import { settleProgressiveRemoteJob } from "./progressive-remote-settlement";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
+import {
+  progressiveReportJobsSql,
+  progressiveSettlementJobsSql,
+} from "./progressive-progress-selection";
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 4;
-const MAX_TERMINAL_PROGRESSIVE_EXECUTIONS = 4;
 
 export async function applyProgressiveRemoteProgress(
   db: DB,
@@ -164,28 +167,10 @@ export async function reconcileProgressiveRemoteProgress(
     errors: [] as Array<{ executionId: string; reason: string }>,
   };
   if (options.jobIds?.length === 0) return receipt;
-  const jobs =
-    await db.execute(sql`SELECT report.sim_job_id, job.campaign_id FROM progressive_remote_reports report JOIN sim_jobs job ON job.id = report.sim_job_id
-    WHERE ${options.jobIds ? sql`job.id IN (${sql.join(options.jobIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`true`}
-      AND (NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-      OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
-      OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
-        AND EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt WHERE attempt.sim_job_id = job.id AND attempt.outcome = 'running'))
-      OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
-        SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-        WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'
-      )))
-    GROUP BY report.sim_job_id, job.campaign_id, job."polledAt", job."updatedAt"
-    ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
-  const terminalJobs = await db.execute(sql`
-    SELECT job.id AS sim_job_id, job.campaign_id
-    FROM sim_jobs job
-    WHERE ${options.jobIds ? sql`job.id IN (${sql.join(options.jobIds.map((id) => sql`${id}::uuid`), sql`, `)})` : sql`true`}
-      AND job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled')
-      AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id
-    LIMIT ${MAX_TERMINAL_PROGRESSIVE_EXECUTIONS}
-  `);
+  const jobs = await db.execute(progressiveReportJobsSql(options.jobIds));
+  const terminalJobs = await db.execute(
+    progressiveSettlementJobsSql(options.jobIds),
+  );
   const selectedJobs = [...jobs, ...terminalJobs] as unknown as Array<{
     sim_job_id: string;
     campaign_id: string;
