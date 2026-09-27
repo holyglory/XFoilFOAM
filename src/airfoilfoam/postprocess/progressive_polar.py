@@ -45,6 +45,8 @@ class PolarObservation:
     exclusion_reason: str | None = None
     window: tuple[float, float] | None = None
     accepted_cfd: bool | None = None
+    physical_identity: str | None = None
+    numerical_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,10 @@ def observation_payload(observation):
     payload = asdict(observation)
     if observation.accepted_cfd is None:
         payload.pop("accepted_cfd")
+    if observation.physical_identity is None:
+        payload.pop("physical_identity")
+    if observation.numerical_identity is None:
+        payload.pop("numerical_identity")
     return payload
 
 
@@ -115,6 +121,23 @@ def _validate(prior: PolarPrior, observations: list[PolarObservation], policy: P
             raise ValueError("Uncertified fast bias uncertainty cannot be negative")
         if policy.calibration_status != "unvalidated":
             raise ValueError("The optional bias allowance has no physical validation certificate")
+        applicability = prior.provenance.get("bias_applicability")
+        if not isinstance(applicability, dict):
+            raise ValueError("Bias policy requires an applicability contract")
+        physical_identity = applicability.get("physical_identity")
+        numerical_identity = applicability.get("numerical_identity")
+        angle_scope = applicability.get("angle_scope")
+        if (
+            not isinstance(physical_identity, str)
+            or not physical_identity
+            or not isinstance(numerical_identity, str)
+            or not numerical_identity
+            or not isinstance(angle_scope, list)
+            or len(angle_scope) != 2
+            or not all(isinstance(value, (int, float)) and np.isfinite(value) for value in angle_scope)
+            or angle_scope[0] >= angle_scope[1]
+        ):
+            raise ValueError("Bias policy requires physical, numerical and angle applicability")
     if not policy.policy_id:
         raise ValueError("A model policy needs an immutable identity")
     eligible = []
@@ -138,6 +161,13 @@ def _validate(prior: PolarPrior, observations: list[PolarObservation], policy: P
             raise ValueError("CFD acceptance metadata must be explicit boolean evidence")
         if policy.uncertified_fast_bias_std is not None and observation.accepted_cfd is None:
             raise ValueError("Bias policy requires source-backed CFD acceptance metadata")
+        if policy.uncertified_fast_bias_std is not None:
+            if (
+                observation.physical_identity != physical_identity
+                or observation.numerical_identity != numerical_identity
+                or not angle_scope[0] <= observation.alpha <= angle_scope[1]
+            ):
+                raise ValueError("Observation is outside the bias applicability contract")
         if observation.target_signature != prior.target_signature or observation.branch != prior.branch:
             raise ValueError("Cannot fuse incompatible physical targets or hysteresis branches")
         if observation.method not in {"openfoam_fast", "openfoam_precise"}:

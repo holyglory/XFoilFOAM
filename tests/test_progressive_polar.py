@@ -148,3 +148,41 @@ def test_signature_is_order_independent_and_sensitive_to_evidence_and_policy():
     assert fitted["signature"] != fit_progressive_polar(prior(), rows, replace(policy(), correlation_length_deg=3))["signature"]
     with pytest.raises(ValueError, match="validation evidence"):
         fit_progressive_polar(prior(), rows, replace(policy(), calibration_status="validated"))
+
+
+def test_bias_policy_requires_exact_physical_numerical_and_angle_applicability():
+    bias = replace(policy(), uncertified_fast_bias_std=[0.1, 0.01, 0.02])
+    source = observation("source", alpha=0, accepted_cfd=False)
+    with pytest.raises(ValueError, match="applicability contract"):
+        fit_progressive_polar(prior(), [source], bias)
+
+    scoped_prior = replace(
+        prior(),
+        provenance={
+            "fixture": True,
+            "bias_applicability": {
+                "physical_identity": "mach-0487-re-2m",
+                "numerical_identity": "fast-v1",
+                "angle_scope": [-2, 2],
+            },
+        },
+    )
+    scoped = replace(
+        source,
+        physical_identity="mach-0487-re-2m",
+        numerical_identity="fast-v1",
+    )
+    fitted = fit_progressive_polar(scoped_prior, [scoped], bias)
+    assert fitted["contributors"][0]["observation_id"] == "source"
+    with pytest.raises(ValueError, match="applicability contract"):
+        fit_progressive_polar(
+            scoped_prior,
+            [replace(scoped, numerical_identity="fast-v2")],
+            bias,
+        )
+    with pytest.raises(ValueError, match="applicability contract"):
+        fit_progressive_polar(
+            scoped_prior,
+            [replace(scoped, alpha=4)],
+            bias,
+        )
