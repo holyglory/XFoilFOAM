@@ -232,6 +232,51 @@ const heartbeatBodySchema = z.object({
     .optional(),
 });
 
+export async function expireStaleRemotePromiseLeases(
+  connection: DB,
+  ownerId: string,
+): Promise<number> {
+  const stale = await connection.execute(sql`
+    UPDATE sync_sweep_promises promise
+    SET status = 'expired', "expiredAt" = now(), "updatedAt" = now()
+    WHERE promise.registered_solver_id = ${ownerId}::uuid
+      AND promise.status = 'active'
+      AND promise.request_payload ->> 'remoteSolver' = 'true'
+      AND promise."expiresAt" > now()
+      AND coalesce(promise."lastHeartbeatAt", promise."updatedAt", promise."createdAt")
+        <= now() - interval '15 minutes'
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_jobs job
+        WHERE job.request_payload ->> 'syncPromiseId' = promise.id::text
+          AND (job.status IN ('pending', 'submitted', 'running', 'ingesting')
+            OR (job.status = 'cancelled' AND job.engine_state IN ('cancelling', 'cancel_pending')))
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM sync_remote_result_deliveries delivery
+        WHERE delivery.promise_id = promise.id
+          AND delivery.state IN ('pending', 'pushing', 'retry_wait', 'blocked')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM sync_brokered_evidence_uploads upload
+        WHERE upload.promise_id = promise.id
+          AND (upload.state IN ('issued', 'issuing', 'verifying')
+            OR upload.upload_url IS NOT NULL)
+      )
+    RETURNING promise.id
+  `);
+  if (!stale.length) return 0;
+  await connection.execute(sql`
+    UPDATE sync_sweep_promise_points point
+    SET status = 'expired', "updatedAt" = now()
+    WHERE point.promise_id IN (${sql.join(
+      stale.map((row) => sql`${String(row.id)}::uuid`),
+      sql`, `,
+    )})
+      AND point.status = 'active'
+  `);
+  return stale.length;
+}
+
 const promiseCancellationBodySchema = z.object({
   disposition: z
     .enum(["terminal_local_state", "operator_release", "authority_rejected"])
@@ -7647,6 +7692,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           .limit(1);
         if (!locked) throw new Error("registered solver not found");
         owner = locked;
+
+        await expireStaleRemotePromiseLeases(tx, owner.id);
 
         const expired = await tx
           .update(syncSweepPromises)

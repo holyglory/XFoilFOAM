@@ -54,6 +54,7 @@ const { advisoryLockSql, db, sql } = await import("../src/db");
 const { buildServer } = await import("../src/server");
 const {
   assertMultipartDiskReserveAvailableBytes,
+  expireStaleRemotePromiseLeases,
   lockAndFilterRemoteClaimAoas,
 } = await import("../src/sync-routes");
 
@@ -1011,6 +1012,108 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("expires stale remote promises before cap counting but preserves a live job", async () => {
+    const solverId = randomUUID();
+    const stalePromiseId = randomUUID();
+    const livePromiseId = randomUUID();
+    let liveJobId: string | null = null;
+    await db.insert(registeredRemoteSolvers).values({
+      id: solverId,
+      instanceId: `${PREFIX}-stale-promise-solver`,
+      instanceName: `${PREFIX} stale promise solver`,
+      maxActivePolarPromises: 2,
+    });
+    try {
+      await db.insert(syncSweepPromises).values([
+        {
+          id: stalePromiseId,
+          sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+          sourceInstanceName: `${PREFIX} stale promise solver`,
+          sourceBaseUrl: `${PREFIX}-hub`,
+          registeredSolverId: solverId,
+          status: "active",
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaCount: 1,
+          expiresAt: new Date(Date.now() + 3_600_000),
+          lastHeartbeatAt: new Date(Date.now() - 20 * 60_000),
+          requestPayload: { remoteSolver: true },
+        },
+        {
+          id: livePromiseId,
+          sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+          sourceInstanceName: `${PREFIX} stale promise solver`,
+          sourceBaseUrl: `${PREFIX}-hub`,
+          registeredSolverId: solverId,
+          status: "active",
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaCount: 1,
+          expiresAt: new Date(Date.now() + 3_600_000),
+          lastHeartbeatAt: new Date(),
+          requestPayload: { remoteSolver: true },
+        },
+      ]);
+      await db.insert(syncSweepPromisePoints).values([
+        {
+          promiseId: stalePromiseId,
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: 733.001,
+          status: "active",
+        },
+        {
+          promiseId: livePromiseId,
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: 733.002,
+          status: "active",
+        },
+      ]);
+      [{ id: liveJobId }] = await db
+        .insert(simJobs)
+        .values({
+          airfoilId,
+          bcIds: [legacyBcId],
+          simulationPresetRevisionId: revisionId,
+          referenceChordM: CHORD,
+          status: "running",
+          requestPayload: { syncPromiseId: livePromiseId },
+        })
+        .returning({ id: simJobs.id });
+
+      expect(await expireStaleRemotePromiseLeases(db, solverId)).toBe(1);
+      const rows = await db
+        .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
+        .from(syncSweepPromises)
+        .where(inArray(syncSweepPromises.id, [stalePromiseId, livePromiseId]));
+      expect(rows).toEqual(
+        expect.arrayContaining([
+          { id: stalePromiseId, status: "expired" },
+          { id: livePromiseId, status: "active" },
+        ]),
+      );
+      const points = await db
+        .select({ promiseId: syncSweepPromisePoints.promiseId, status: syncSweepPromisePoints.status })
+        .from(syncSweepPromisePoints)
+        .where(inArray(syncSweepPromisePoints.promiseId, [stalePromiseId, livePromiseId]));
+      expect(points).toEqual(
+        expect.arrayContaining([
+          { promiseId: stalePromiseId, status: "expired" },
+          { promiseId: livePromiseId, status: "active" },
+        ]),
+      );
+    } finally {
+      if (liveJobId) await db.delete(simJobs).where(eq(simJobs.id, liveJobId));
+      await db
+        .delete(syncSweepPromises)
+        .where(inArray(syncSweepPromises.id, [stalePromiseId, livePromiseId]));
+      await db
+        .delete(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, solverId));
+    }
+  });
+
   it("preserves explicit gas material through import, export, replay and conflict review", async () => {
     const gas = sourceAirModel();
     const slug = `${PREFIX}-gas-model`;
