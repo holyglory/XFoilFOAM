@@ -5,6 +5,22 @@ import { runNotificationDrain } from "./notification-drain";
 import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evidence-delivery";
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
 
+const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 2;
+
+export async function drainProgressiveWorkerEvidencePass(
+  deliver: (preferActive: boolean) => Promise<boolean>,
+  preferActive: boolean,
+  maximum = MAX_SEQUENTIAL_EVIDENCE_DELIVERIES,
+): Promise<boolean> {
+  let changed = false;
+  for (let pass = 0; pass < maximum; pass += 1) {
+    const delivered = await deliver(preferActive);
+    changed ||= delivered;
+    if (!delivered) break;
+  }
+  return changed;
+}
+
 export function progressiveEvidenceDrain(
   stage: (preferActive: boolean) => Promise<boolean>,
   deliver: (preferActive: boolean) => Promise<boolean>,
@@ -96,7 +112,13 @@ export async function runProgressiveEvidenceService(
           (preferActive) =>
             stageNextProgressiveWorkerEvidence(db, engine, { preferActive }),
           (preferActive) =>
-            deliverNextProgressiveWorkerEvidence(db, fetch, { preferActive }),
+            drainProgressiveWorkerEvidencePass(
+              (active) =>
+                deliverNextProgressiveWorkerEvidence(db, fetch, {
+                  preferActive: active,
+                }),
+              preferActive,
+            ),
         ),
       nextWakeAt:
         options.nextWakeAt ?? (() => nextProgressiveEvidenceWakeAt(db)),

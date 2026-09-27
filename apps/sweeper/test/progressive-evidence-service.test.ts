@@ -2,6 +2,7 @@ import type { DB, Sql } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  drainProgressiveWorkerEvidencePass,
   progressiveEvidenceDrain,
   runProgressiveEvidenceService,
 } from "../src/progressive-evidence-service";
@@ -23,6 +24,18 @@ function notifications() {
 }
 
 afterEach(() => vi.useRealTimers());
+
+it("performs bounded sequential evidence deliveries without starting duplicates", async () => {
+  const deliver = vi
+    .fn<(preferActive: boolean) => Promise<boolean>>()
+    .mockResolvedValueOnce(true)
+    .mockResolvedValueOnce(true)
+    .mockResolvedValueOnce(false);
+  await expect(drainProgressiveWorkerEvidencePass(deliver, true)).resolves.toBe(
+    true,
+  );
+  expect(deliver.mock.calls).toEqual([[true], [true]]);
+});
 
 it("alternates current-work priority with oldest-first while both stages progress", async () => {
   const stage = vi.fn().mockResolvedValue(true);
