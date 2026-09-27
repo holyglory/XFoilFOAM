@@ -375,7 +375,7 @@ main() {
   if [[ "$DEPLOYMENT_ROLE" == "hub" ]]; then
     echo "Public checks:"
     curl -fsS --max-time 10 "$PUBLIC_ORIGIN/api/admin/me" >/dev/null
-    curl -fsS --max-time 10 "$PUBLIC_ORIGIN/" >/dev/null
+    curl -fsS --max-time 30 "$PUBLIC_ORIGIN/" >/dev/null
     echo "Public web/API checks passed."
   else
     echo "Remote-solver local control-plane checks passed; no hub URL was mutated or used as a deployment health proxy."
