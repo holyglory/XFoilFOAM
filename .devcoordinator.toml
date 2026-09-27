@@ -2188,7 +2188,7 @@ requires = ["fixture-ownership"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts"]
 
 [deployment.progressive-preview]
-source = ["checkout"]
+source = ["worktree"]
 domain = "airfoils-progressive-preview"
 components = ["db", "api", "web", "solver"]
 public = false
