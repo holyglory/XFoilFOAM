@@ -5774,6 +5774,42 @@ describe("bounded progressive numerical recovery", () => {
     120_000,
   );
 
+  it("transfers a terminal stopped local recovery parent to the remote solver", async () => {
+    const fixture = await cfdEvidenceFixture(33.419, 3, [], [0]);
+    const evidence = await fixture.save(20, "rans", 0);
+    await fixture.record([evidence]);
+    await db.execute(sql`INSERT INTO result_classifications(result_attempt_id, airfoil_id, simulation_preset_revision_id,
+      aoa_deg, classifier_version, state, reasons)
+      SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg, 'isolated-terminal-transfer-test', 'needs_urans', '{}'
+      FROM result_attempts WHERE id = ${evidence}`);
+    const solverId = randomUUID();
+    try {
+      await db.execute(sql`INSERT INTO registered_remote_solvers(id, instance_id, instance_name, cpu_capacity, cpu_budget)
+        VALUES (${solverId}::uuid, ${randomUUID()}, 'isolated terminal transfer owner', 96, 96)`);
+      await stopped(fixture);
+      await db.execute(sql`UPDATE sim_jobs SET status='done', engine_job_id=id::text
+        WHERE id=${fixture.composed.jobId}::uuid`);
+      await expect(
+        recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId),
+      ).resolves.toBe(1);
+      await expect(
+        settleProgressiveCfdExecution(db, fixture.composed.jobId),
+      ).resolves.toMatchObject({ retry: 1 });
+      const recovery = await claimProgressiveCfdBatch(db, {
+        owner: "isolated-terminal-transfer",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+        remoteSolverId: solverId,
+      });
+      expect(recovery).toHaveLength(1);
+      expect(recovery[0].recoveryParentJobId).toBe(fixture.composed.jobId);
+    } finally {
+      await db.execute(
+        sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`,
+      );
+    }
+  }, 120_000);
+
   it.each(["infrastructure", "deterministic_mesh", "material_domain"])(
     "does not convert %s into an unsteady diagnosis",
     async (failure) => {

@@ -1668,6 +1668,12 @@ requires = ["dependencies", "types", "remote-standalone-claims"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "ready evidence delivery cannot suppress independent CPU admission|keeps transfer-heartbeat failures retryable"]
 
 [[test.progressive.check]]
+name = "remote-terminal-recovery"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "transfers a terminal stopped local recovery parent"]
+
+[[test.progressive.check]]
 name = "progressive-promise-reuse"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]
