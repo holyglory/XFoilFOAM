@@ -91,7 +91,8 @@ export function ProgressiveCompareView({
           .profile-tabs {
             display: flex;
             gap: 6px;
-            overflow-x: auto;
+            flex-wrap: wrap;
+            overflow-x: hidden;
             margin-top: 14px;
           }
         }
@@ -147,7 +148,10 @@ export function ProgressiveCompareView({
               borderRadius: 8,
               color: active === profile.slug ? C.teal : C.text,
               background: C.panel,
-              whiteSpace: "nowrap",
+              flex: "1 1 calc(50% - 3px)",
+              minWidth: 0,
+              overflowWrap: "anywhere",
+              textAlign: "left",
             }}
           >
             {profile.name}
