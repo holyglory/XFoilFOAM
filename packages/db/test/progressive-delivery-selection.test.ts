@@ -169,6 +169,7 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         AND NOT EXISTS(SELECT 1 FROM progressive_worker_hub_receipts delivered
           WHERE delivered.sim_job_id=source.sim_job_id AND delivered.point_content_signature=source.point_content_signature)
       ORDER BY CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
+        CASE WHEN fixture.variant='due-retry' THEN 1 ELSE 0 END,
         report.created_at,source.sim_job_id,source.sequence,attempt.aoa_deg,source.result_attempt_id LIMIT 1`);
     for (const active of [true, false]) {
       const rollback = new Error(

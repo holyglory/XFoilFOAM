@@ -13,7 +13,8 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
       AND failure.point_content_signature = source.point_content_signature
     WHERE delivered.sim_job_id IS NULL AND report.acknowledged_at IS NOT NULL AND attempt.result_id IS NOT NULL
       AND (failure.sim_job_id IS NULL OR (failure.state = 'retry' AND failure.retry_after <= clock_timestamp()))
-    ORDER BY report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id OFFSET 0`;
+    ORDER BY CASE WHEN failure.state = 'retry' THEN 1 ELSE 0 END,
+      report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id OFFSET 0`;
   const owned = (
     active: boolean,
   ) => sql`SELECT job.request_payload, settings.upstream_base_url,
