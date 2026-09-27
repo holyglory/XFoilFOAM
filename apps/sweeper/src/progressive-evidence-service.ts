@@ -65,6 +65,20 @@ export async function nextProgressiveEvidenceWakeAt(
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
     )
     SELECT min(wake_at) AS wake_at FROM (
+      (SELECT clock_timestamp() AS wake_at
+      FROM owned_reports owned
+      JOIN progressive_worker_evidence_receipts staged
+        ON staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence
+      JOIN progressive_worker_evidence_attempts association
+        ON association.sim_job_id = staged.sim_job_id AND association.sequence = staged.sequence
+      WHERE NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
+        WHERE delivered.sim_job_id = association.sim_job_id
+          AND delivered.point_content_signature = association.point_content_signature)
+        AND NOT EXISTS (SELECT 1 FROM progressive_worker_delivery_failures failure
+          WHERE failure.sim_job_id = association.sim_job_id
+            AND failure.point_content_signature = association.point_content_signature)
+      LIMIT 1)
+      UNION ALL
       SELECT owned.ingest_lease_expires_at AS wake_at FROM owned_reports owned
       WHERE owned.ingest_lease_expires_at > clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
