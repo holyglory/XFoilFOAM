@@ -52,6 +52,49 @@ describe("production archive concurrency wiring", () => {
   );
 });
 
+describe("production disk admission wiring", () => {
+  it.each([undefined, "20"])(
+    "passes the idle-slot reserve %s only to the sweeper",
+    (configured) => {
+      const environment = {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        ...(configured
+          ? { SWEEPER_DISK_IDLE_SLOT_RESERVE_GIB: configured }
+          : {}),
+      };
+      const compose = JSON.parse(
+        execFileSync(
+          "docker",
+          [
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            "docker-compose.deploy.yml",
+            "config",
+            "--format",
+            "json",
+          ],
+          {
+            cwd: repoRoot,
+            env: environment,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ),
+      );
+      expect(
+        compose.services.sweeper.environment.SWEEPER_DISK_IDLE_SLOT_RESERVE_GIB,
+      ).toBe(configured ?? "30");
+      for (const name of ["node-api", "api", "worker", "web", "media-repair"])
+        expect(compose.services[name].environment).not.toHaveProperty(
+          "SWEEPER_DISK_IDLE_SLOT_RESERVE_GIB",
+        );
+    },
+  );
+});
+
 function serviceBlock(source: string, service: string): string {
   const match = new RegExp(
     `^  ${service}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:|^volumes:|(?![\\s\\S]))`,
