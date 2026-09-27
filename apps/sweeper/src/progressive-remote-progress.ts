@@ -13,7 +13,6 @@ import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { indexProgressiveRemoteReport } from "@aerodb/db/progressive-remote-inventory";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
 import { settleProgressiveRemoteJob } from "./progressive-remote-settlement";
-import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 
 export async function applyProgressiveRemoteProgress(
   db: DB,
@@ -149,7 +148,7 @@ export async function reconcileProgressiveRemoteProgress(db: DB) {
     errors: [] as Array<{ executionId: string; reason: string }>,
   };
   const jobs =
-    await db.execute(sql`SELECT report.sim_job_id FROM progressive_remote_reports report JOIN sim_jobs job ON job.id = report.sim_job_id
+    await db.execute(sql`SELECT report.sim_job_id, job.campaign_id FROM progressive_remote_reports report JOIN sim_jobs job ON job.id = report.sim_job_id
     WHERE NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
       OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
       OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
@@ -158,38 +157,62 @@ export async function reconcileProgressiveRemoteProgress(db: DB) {
         SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
         WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'
       ))
-    GROUP BY report.sim_job_id, job."polledAt", job."updatedAt" ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
-  await runWithConcurrency(
-    jobs,
-    activeReconcileConcurrency(),
-    async (job) => {
-      const executionId = String(job.sim_job_id);
-      try {
-        const result = await applyProgressiveRemoteProgress(db, executionId);
-        if (result.kind === "indexed") receipt.indexed += 1;
-        if (result.kind === "applied") {
-          receipt.applied += 1;
-          if (result.stopped) receipt.stopped += 1;
+    GROUP BY report.sim_job_id, job.campaign_id, job."polledAt", job."updatedAt" ORDER BY coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
+  const selectedJobs = jobs as unknown as Array<{
+    sim_job_id: string;
+    campaign_id: string;
+  }>;
+  const jobsByCampaign = new Map<string, Array<(typeof selectedJobs)[number]>>();
+  for (const job of selectedJobs) {
+    const campaignId = String(job.campaign_id);
+    const campaignJobs = jobsByCampaign.get(campaignId) ?? [];
+    campaignJobs.push(job);
+    jobsByCampaign.set(campaignId, campaignJobs);
+  }
+  for (const campaignJobs of jobsByCampaign.values()) {
+    try {
+      await db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        for (const job of campaignJobs) {
+          const executionId = String(job.sim_job_id);
+          try {
+            const result = await applyProgressiveRemoteProgress(
+              connection,
+              executionId,
+            );
+            if (result.kind === "indexed") receipt.indexed += 1;
+            if (result.kind === "applied") {
+              receipt.applied += 1;
+              if (result.stopped) receipt.stopped += 1;
+            }
+            if (result.kind === "idle") {
+              const terminal = await settleProgressiveRemoteJob(
+                connection,
+                executionId,
+              );
+              if (terminal.kind === "settled") receipt.settled += 1;
+              else receipt.waiting += 1;
+            }
+          } catch (error) {
+            await connection.execute(
+              sql`UPDATE sim_jobs SET "updatedAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+            );
+            receipt.errors.push({
+              executionId,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          } finally {
+            await connection.execute(
+              sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+            );
+          }
         }
-        if (result.kind === "idle") {
-          const terminal = await settleProgressiveRemoteJob(db, executionId);
-          if (terminal.kind === "settled") receipt.settled += 1;
-          else receipt.waiting += 1;
-        }
-      } catch (error) {
-        await db.execute(
-          sql`UPDATE sim_jobs SET "updatedAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-        );
-        receipt.errors.push({
-          executionId,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      } finally {
-        await db.execute(
-          sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-        );
-      }
-    },
-  );
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      for (const job of campaignJobs)
+        receipt.errors.push({ executionId: String(job.sim_job_id), reason });
+    }
+  }
   return receipt;
 }
