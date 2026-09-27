@@ -2,9 +2,10 @@ import { sql } from "drizzle-orm";
 
 export function progressiveDeliverySelectionSql(preferActive: boolean) {
   const points = sql`SELECT source.sim_job_id, source.sequence, source.result_attempt_id,
-      source.point_content_signature, report.created_at, attempt.aoa_deg
-    FROM progressive_worker_evidence_attempts source
-    JOIN progressive_worker_reports report ON report.sim_job_id = source.sim_job_id AND report.sequence = source.sequence
+      source.point_content_signature, report.created_at, attempt.aoa_deg,
+      COALESCE(failure.state = 'retry', false) AS is_retry
+    FROM progressive_worker_reports report
+    JOIN progressive_worker_evidence_attempts source ON source.sim_job_id = report.sim_job_id AND source.sequence = report.sequence
     JOIN result_attempts attempt ON attempt.id = source.result_attempt_id AND attempt.sim_job_id = source.sim_job_id
       AND attempt.engine_job_id = source.sim_job_id::text
     LEFT JOIN progressive_worker_hub_receipts delivered ON delivered.sim_job_id = source.sim_job_id
@@ -33,7 +34,7 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
     active: boolean,
   ) => sql`SELECT point.*, owned.* FROM (${points}) point
     JOIN LATERAL (${owned(active)}) owned ON true`;
-  const order = sql`ORDER BY point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
+  const order = sql`ORDER BY point.is_retry, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
   const selected = preferActive
     ? sql`WITH active AS MATERIALIZED (${candidate(true)} ${order}),
         fallback AS (${candidate(false)} WHERE NOT EXISTS (SELECT 1 FROM active) ${order})
