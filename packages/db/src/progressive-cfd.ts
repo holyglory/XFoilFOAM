@@ -205,8 +205,12 @@ export async function claimProgressiveCfdUnit(
     const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
       (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
     const recoveryParent = sql`(SELECT recovery.parent_job_id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1)`;
+    const remoteOwner = input.remoteSolverId
+      ? sql`EXISTS (SELECT 1 FROM registered_remote_solvers solver
+          WHERE solver.id = ${input.remoteSolverId}::uuid AND solver.revoked_at IS NULL)`
+      : sql`true`;
     const recoveryOwner = input.remoteSolverId
-      ? sql`(${recoveryParent} IS NULL
+      ? sql`(${remoteOwner} AND (${recoveryParent} IS NULL
           OR EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = ${recoveryParent} AND dispatch.solver_id = ${input.remoteSolverId}::uuid)
           OR EXISTS (SELECT 1 FROM sim_jobs parent
             WHERE parent.id = ${recoveryParent} AND parent.engine_job_id = parent.id::text
@@ -214,7 +218,7 @@ export async function claimProgressiveCfdUnit(
               AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
                 WHERE stopped.sim_job_id = parent.id AND stopped.engine_job_id = parent.engine_job_id)
               AND NOT EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch
-                WHERE dispatch.sim_job_id = parent.id)))`
+                WHERE dispatch.sim_job_id = parent.id))) )`
       : sql`(${recoveryParent} IS NULL OR NOT EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = ${recoveryParent}))`;
     const publicationRecovery = sql`EXISTS(SELECT 1 FROM progressive_publication_recoveries recovery
       WHERE recovery.unit_id=unit.id AND recovery.attempts_before=unit.attempts AND unit.active_seconds>=recovery.active_seconds
