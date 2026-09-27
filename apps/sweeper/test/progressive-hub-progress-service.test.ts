@@ -42,6 +42,9 @@ function fixture() {
       return { unlisten };
     }),
   } as unknown as Pick<Sql, "listen">;
+  const db = {
+    execute: vi.fn().mockResolvedValue([{ remote_solver_enabled: true }]),
+  } as unknown as DB;
   vi.mocked(acknowledgeProgressiveRemoteStops).mockResolvedValue({
     acknowledged: 0,
     errors: [],
@@ -60,7 +63,7 @@ function fixture() {
     waiting: 0,
     campaignsCompleted: 0,
   });
-  return { notifications, unlisten, notify: () => notify() };
+  return { db, notifications, unlisten, notify: () => notify() };
 }
 
 it("releases exact stop receipts before replay and drains available ordered reports without controller ticks", async () => {
@@ -107,7 +110,7 @@ it("releases exact stop receipts before replay and drains available ordered repo
   });
   const owner = new AbortController();
   const running = runProgressiveHubProgressService(
-    {} as DB,
+    scope.db,
     scope.notifications,
     owner.signal,
   );
@@ -144,7 +147,7 @@ it("retains notifications and drains an in-flight acknowledgement on shutdown", 
   const owner = new AbortController();
   let finished = false;
   const running = runProgressiveHubProgressService(
-    {} as DB,
+    scope.db,
     scope.notifications,
     owner.signal,
   ).then(() => {
@@ -173,7 +176,7 @@ it("keeps filling available assignments without waiting for another controller t
   });
   const owner = new AbortController();
   const running = runProgressiveHubProgressService(
-    {} as DB,
+    scope.db,
     scope.notifications,
     owner.signal,
   );
@@ -195,7 +198,7 @@ it("continues after deferring an owned target, then sleeps when no further progr
   });
   const owner = new AbortController();
   const running = runProgressiveHubProgressService(
-    {} as DB,
+    scope.db,
     scope.notifications,
     owner.signal,
   );
