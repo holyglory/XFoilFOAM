@@ -11,6 +11,24 @@ import {
   type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
 
+async function projectRunningWorkerReport(
+  db: DB,
+  report: ProgressiveRemoteReport,
+): Promise<void> {
+  if (report.status.state !== "running") return;
+  await db.execute(sql`
+    UPDATE sim_jobs SET
+      status = CASE WHEN status = 'ingesting' THEN status ELSE 'running'::sim_job_status END,
+      ingest_lease_previous_status = CASE WHEN status = 'ingesting' THEN 'running'::sim_job_status ELSE ingest_lease_previous_status END,
+      engine_state = 'running', total_cases = ${report.status.total_cases}, completed_cases = ${report.status.completed_cases},
+      "polledAt" = clock_timestamp(), "updatedAt" = clock_timestamp()
+    WHERE id = ${report.executionId}::uuid AND engine_job_id = ${report.executionId}
+      AND status IN ('pending', 'submitted', 'running', 'ingesting')
+      AND coalesce(engine_state, '') NOT IN ('completed', 'failed', 'cancelled', 'cancelling', 'cancel_pending')
+      AND (ingest_lease_previous_status IS NULL OR ingest_lease_previous_status IN ('pending', 'submitted', 'running'))
+  `);
+}
+
 async function projectMeasuredCancellation(
   db: DB,
   report: ProgressiveRemoteReport,
@@ -169,6 +187,10 @@ export async function enqueueProgressiveWorkerReport(
         envelope,
       );
       if (replay.contentSignature === latest.content_signature) {
+        await projectRunningWorkerReport(
+          connection,
+          latest.report as unknown as ProgressiveRemoteReport,
+        );
         await projectMeasuredCancellation(
           connection,
           latest.report as unknown as ProgressiveRemoteReport,
@@ -218,6 +240,7 @@ export async function enqueueProgressiveWorkerReport(
       INSERT INTO progressive_worker_reports (sim_job_id, sequence, content_signature, report)
       VALUES (${input.executionId}::uuid, ${next.report.sequence}, ${next.contentSignature}, ${JSON.stringify(next.report)}::jsonb)
     `);
+    await projectRunningWorkerReport(connection, next.report);
     await projectMeasuredCancellation(connection, next.report);
     await projectFinalWorkerReport(connection, next.report);
     await connection.execute(

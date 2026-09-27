@@ -104,6 +104,9 @@ export async function verifyProgressiveWorkerObservation(
     await expect(
       db.transaction(async (transaction) => {
         const connection = transaction as unknown as DB;
+        await connection.execute(sql`
+          UPDATE sim_jobs SET status = 'submitted', engine_state = 'pending' WHERE id = ${executionId}::uuid
+        `);
         engine.getJob.mockResolvedValueOnce({ ...status, completed_cases: 0 });
         engine.getResult.mockRejectedValueOnce(
           new EngineError("first result not ready", 409),
@@ -123,6 +126,10 @@ export async function verifyProgressiveWorkerObservation(
           result: null,
           stopProof: null,
         });
+        const [running] = await connection.execute(sql`
+          SELECT status, engine_state, completed_cases FROM sim_jobs WHERE id = ${executionId}::uuid
+        `);
+        expect(running).toMatchObject({ status: "running", engine_state: "running", completed_cases: 0 });
         expect(
           await solverQueuePressure(connection, { jobIds: [executionId] }),
         ).toBe(1);
@@ -157,6 +164,63 @@ export async function verifyProgressiveWorkerObservation(
     expect(
       await observeProgressiveRemoteJob(db, engine, executionId),
     ).toMatchObject({ sequence: 1, replayed: true });
+    const projectionRollback = new Error("Restore running-report projection fixture");
+    await expect(db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.execute(sql`
+        UPDATE sim_jobs SET status = 'submitted', engine_state = 'pending' WHERE id = ${executionId}::uuid
+      `);
+      expect(await observeProgressiveRemoteJob(connection, engine, executionId)).toMatchObject({ replayed: true });
+      const [running] = await connection.execute(sql`
+        SELECT status, engine_state, completed_cases, total_cases FROM sim_jobs WHERE id = ${executionId}::uuid
+      `);
+      expect(running).toMatchObject({
+        status: "running", engine_state: "running", completed_cases: 1, total_cases: status.total_cases,
+      });
+      const token = randomUUID();
+      await connection.execute(sql`
+        UPDATE sim_jobs SET status = 'ingesting', engine_state = 'pending', ingest_lease_token = ${token},
+          ingest_lease_previous_status = 'submitted', ingest_lease_expires_at = clock_timestamp() + interval '10 minutes'
+        WHERE id = ${executionId}::uuid
+      `);
+      expect(await observeProgressiveRemoteJob(connection, engine, executionId)).toMatchObject({ replayed: true });
+      const [importing] = await connection.execute(sql`
+        SELECT status, engine_state, ingest_lease_token, ingest_lease_previous_status FROM sim_jobs WHERE id = ${executionId}::uuid
+      `);
+      expect(importing).toMatchObject({
+        status: "ingesting", engine_state: "running", ingest_lease_token: token, ingest_lease_previous_status: "running",
+      });
+      await connection.execute(sql`
+        UPDATE sim_jobs SET engine_state = 'cancelled', ingest_lease_previous_status = 'cancelled'
+        WHERE id = ${executionId}::uuid
+      `);
+      await observeProgressiveRemoteJob(connection, engine, executionId);
+      const [terminalImport] = await connection.execute(sql`
+        SELECT status, engine_state, ingest_lease_previous_status FROM sim_jobs WHERE id = ${executionId}::uuid
+      `);
+      expect(terminalImport).toMatchObject({
+        status: "ingesting", engine_state: "cancelled", ingest_lease_previous_status: "cancelled",
+      });
+      for (const terminalState of ["cancelled", "failed", "done"] as const) {
+        await connection.execute(sql`
+          UPDATE sim_jobs SET status = ${terminalState}::sim_job_status WHERE id = ${executionId}::uuid
+        `);
+        await observeProgressiveRemoteJob(connection, engine, executionId);
+        const [unchanged] = await connection.execute(sql`SELECT status FROM sim_jobs WHERE id = ${executionId}::uuid`);
+        expect(unchanged.status).toBe(terminalState);
+      }
+      await connection.execute(sql`
+        UPDATE sim_jobs SET status = 'submitted', engine_state = 'cancel_pending' WHERE id = ${executionId}::uuid
+      `);
+      await observeProgressiveRemoteJob(connection, engine, executionId);
+      const [cancelling] = await connection.execute(sql`SELECT status,engine_state FROM sim_jobs WHERE id = ${executionId}::uuid`);
+      expect(cancelling).toMatchObject({ status: "submitted", engine_state: "cancel_pending" });
+      await connection.execute(sql`
+        UPDATE sim_jobs SET engine_job_id = ${randomUUID()} WHERE id = ${executionId}::uuid
+      `);
+      await expect(observeProgressiveRemoteJob(connection, engine, executionId)).rejects.toThrow("Foreign engine identity");
+      throw projectionRollback;
+    })).rejects.toBe(projectionRollback);
     const [stored] = await db.execute(
       sql`SELECT report FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid AND sequence = 1`,
     );
