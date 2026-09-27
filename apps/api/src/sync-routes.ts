@@ -242,8 +242,7 @@ export async function expireStaleRemotePromiseLeases(
     WHERE promise.registered_solver_id = ${ownerId}::uuid
       AND promise.status = 'active'
       AND promise."expiresAt" > now()
-      AND coalesce(promise."lastHeartbeatAt", promise."updatedAt", promise."createdAt")
-        <= now() - interval '15 minutes'
+      AND promise."createdAt" <= now() - interval '15 minutes'
       AND NOT EXISTS (
         SELECT 1 FROM sim_jobs job
         WHERE job.request_payload ->> 'syncPromiseId' = promise.id::text

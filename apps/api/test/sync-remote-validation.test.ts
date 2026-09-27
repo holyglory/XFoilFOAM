@@ -1036,6 +1036,7 @@ describe("remote solver sync validation regressions", () => {
           simulationPresetRevisionId: revisionId,
           aoaCount: 1,
           expiresAt: new Date(Date.now() + 3_600_000),
+          createdAt: new Date(Date.now() - 20 * 60_000),
           lastHeartbeatAt: new Date(Date.now() - 20 * 60_000),
           requestPayload: { remoteSolver: true },
         },
