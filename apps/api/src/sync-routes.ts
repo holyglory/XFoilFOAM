@@ -241,7 +241,6 @@ export async function expireStaleRemotePromiseLeases(
     SET status = 'expired', "expiredAt" = now(), "updatedAt" = now()
     WHERE promise.registered_solver_id = ${ownerId}::uuid
       AND promise.status = 'active'
-      AND promise.request_payload ->> 'remoteSolver' = 'true'
       AND promise."expiresAt" > now()
       AND coalesce(promise."lastHeartbeatAt", promise."updatedAt", promise."createdAt")
         <= now() - interval '15 minutes'
