@@ -932,6 +932,12 @@ requires = ["types", "ingest-seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/sync-remote-validation.test.ts", "-t", "rechecks remote claim"]
 
 [[test.progressive.check]]
+name = "stale-promise-cleanup"
+tier = "development"
+requires = ["types", "ingest-seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/sync-remote-validation.test.ts", "-t", "expires stale remote promises before cap counting"]
+
+[[test.progressive.check]]
 name = "prediction-repair"
 tier = "development"
 requires = ["types"]
