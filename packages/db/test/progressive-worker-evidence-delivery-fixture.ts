@@ -86,6 +86,9 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     expect(unused).not.toHaveBeenCalled();
     await db.execute(sql`UPDATE progressive_worker_delivery_failures SET retry_after = clock_timestamp() - interval '1 second'
       WHERE sim_job_id = ${executionId}::uuid`);
+    expect((await nextProgressiveEvidenceWakeAt(db))?.getTime()).toBeLessThanOrEqual(
+      Date.now() + 1000,
+    );
     const rejected = vi.fn(
       async () => new Response("conflict", { status: 409 }),
     );

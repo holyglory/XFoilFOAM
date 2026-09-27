@@ -95,6 +95,13 @@ export async function nextProgressiveEvidenceWakeAt(
       WHERE failure.state = 'retry' AND failure.retry_after > clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
           WHERE delivered.sim_job_id = failure.sim_job_id AND delivered.point_content_signature = failure.point_content_signature)
+      UNION ALL
+      SELECT clock_timestamp() AS wake_at FROM owned_reports owned
+      JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = owned.sim_job_id
+        AND failure.sequence = owned.sequence
+      WHERE failure.state = 'retry' AND failure.retry_after <= clock_timestamp()
+        AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
+          WHERE delivered.sim_job_id = failure.sim_job_id AND delivered.point_content_signature = failure.point_content_signature)
     ) pending
   `);
   return pending?.wake_at == null
