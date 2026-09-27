@@ -114,8 +114,13 @@ export function ProgressiveCompareView({
             selectCondition(event.target.value);
           }}
           style={{
+            flex: "1 1 auto",
             minWidth: 0,
             maxWidth: "100%",
+            width: "100%",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
             padding: "10px 6px",
             borderRadius: 10,
             background: C.panel,
@@ -449,11 +454,15 @@ function ProgressiveCompareOverlay({
                 onConditionChange(event.target.value);
               }}
               style={{
+                flex: "1 1 auto",
                 color: C.text,
                 background: C.panel2,
                 maxWidth: "100%",
                 minWidth: 0,
                 width: "100%",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
                 padding: 6,
                 border: `1px solid ${C.border}`,
                 borderRadius: 6,
