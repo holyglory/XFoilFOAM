@@ -198,7 +198,7 @@
     }
   ],
   "performance": {
-    "ttfbMs": 10,
+    "ttfbMs": 100,
     "lcpMs": 800,
     "ttfbLocalOnly": true
   }

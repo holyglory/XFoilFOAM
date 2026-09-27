@@ -205,7 +205,8 @@ export function ProgressivePolarViewer({
           <span className={controls.conditionText}>Condition</span>
           <select
             aria-label="Polar condition"
-            disabled={!series.length}
+            data-ui-allow-truncation="Long condition options ellipsize on narrow controls"
+            disabled={!interactive}
             value={selected.targetId}
             onChange={(event) => {
               setSelectedId(event.target.value);

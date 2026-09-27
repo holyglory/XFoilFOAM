@@ -109,6 +109,7 @@ export function ProgressiveCompareView({
         <span style={{ whiteSpace: "nowrap" }}>Compare at</span>
         <select
           aria-label="Comparison condition"
+          data-ui-allow-truncation="Long condition options ellipsize on narrow controls"
           value={conditionKey}
           onChange={(event) => {
             selectCondition(event.target.value);
@@ -447,7 +448,8 @@ function ProgressiveCompareOverlay({
             <span className={controls.conditionText}>Condition</span>
             <select
               aria-label="Overlay condition"
-              disabled={!conditions.length}
+              data-ui-allow-truncation="Long condition options ellipsize on narrow controls"
+              disabled={!interactive || !conditions.length}
               value={condition?.key ?? ""}
               onChange={(event) => {
                 setRequestedCondition(event.target.value);
