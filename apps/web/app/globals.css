@@ -2,6 +2,8 @@
 /* Dark is the default (:root); the header toggle sets data-theme="light". */
 :root,
 [data-theme="dark"] {
+  --font-aero-sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-aero-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
   color-scheme: dark;
   --aero-bg: #070a0e;
   --aero-panel: #0c1219;
