@@ -258,8 +258,7 @@ export async function expireStaleRemotePromiseLeases(
       AND NOT EXISTS (
         SELECT 1 FROM sync_brokered_evidence_uploads upload
         WHERE upload.promise_id = promise.id
-          AND (upload.state IN ('issued', 'issuing', 'verifying')
-            OR upload.upload_url IS NOT NULL)
+          AND upload.state IN ('issued', 'issuing', 'verifying')
       )
     RETURNING promise.id
   `);
