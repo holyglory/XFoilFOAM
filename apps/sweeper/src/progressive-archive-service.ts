@@ -9,7 +9,7 @@ import { runNotificationDrain } from "./notification-drain";
 import { nextProgressiveArchiveWakeAt } from "./progressive-worker-archive-delivery";
 import { deliverNextProgressiveWorkerArchive } from "./remote-solver";
 
-const PROGRESSIVE_ARCHIVE_TRANSFER_LANES = 2;
+const PROGRESSIVE_ARCHIVE_TRANSFER_LANES = 8;
 
 async function drainProgressiveArchives(
   db: DB,
