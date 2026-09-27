@@ -173,7 +173,9 @@ export async function reconcileProgressiveRemoteProgress(
       OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
         SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
         WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'
-      )))
+      ))
+      OR (job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled')
+        AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)))
     GROUP BY report.sim_job_id, job.campaign_id, job.status, job.engine_state, job."polledAt", job."updatedAt"
     ORDER BY CASE WHEN job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled') THEN 0 ELSE 1 END,
       coalesce(job."polledAt", job."updatedAt"), report.sim_job_id LIMIT 32`);
