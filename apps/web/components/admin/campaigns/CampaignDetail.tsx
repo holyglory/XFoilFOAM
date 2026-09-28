@@ -59,6 +59,7 @@ import {
   assemblePipelineModel,
   assembleProgressivePipelineModel,
   campaignThroughputPresentation,
+  campaignCompletionProgress,
   progressBarSegments,
   stageEta,
   sweepChipLabel,
@@ -381,10 +382,14 @@ export function CampaignDetail({
   const stageRailProgress = pipeline
     ? Math.min(2, pipeline.stages.filter((stage) => stage.settled).length)
     : 0;
+  const completion = campaignCompletionProgress(
+    totals,
+    progressive.requestedPoints > 0 ? progressive : null,
+  );
   const barSegments = progressBarSegments(totals, reviewBuckets);
   const completionPercent =
-    totals.requested > 0
-      ? Math.min(100, (barSegments.doneCount / totals.requested) * 100)
+    completion.requested > 0
+      ? Math.min(100, (completion.complete / completion.requested) * 100)
       : 0;
   const completionPercentLabel =
     completionPercent > 0 && completionPercent < 0.01
@@ -676,11 +681,11 @@ export function CampaignDetail({
         aria-label="Campaign progress"
       >
         <CampaignProgressGauge
-          value={barSegments.doneCount}
-          max={totals.requested}
-          valueLabel={fCount(barSegments.doneCount)}
-          stateLabel="CFD points complete"
-          totalLabel={fCount(totals.requested)}
+          value={completion.complete}
+          max={completion.requested}
+          valueLabel={fCount(completion.complete)}
+          stateLabel={completion.label}
+          totalLabel={fCount(completion.requested)}
           percentLabel={completionPercentLabel}
         />
 
@@ -787,7 +792,9 @@ export function CampaignDetail({
             <span>
               <strong>
                 {fCount(
-                  progressive.activeJobs || scheduler.campaignJobsRunning,
+                  progressive.requestedPoints > 0
+                    ? progressive.activeJobs
+                    : scheduler.campaignJobsRunning,
                 )}
               </strong>
               <small>active campaign jobs</small>

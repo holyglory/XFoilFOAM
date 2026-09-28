@@ -59,13 +59,40 @@ export interface CampaignInstrumentStatus {
   action: "enable_sweeper" | null;
 }
 
+export function progressiveActiveDetail(
+  s: Pick<AdminCampaignSummary, "progressive"> | null | undefined,
+): string | null {
+  const progressive = s?.progressive;
+  if (!progressive || progressive.requestedPoints <= 0) return null;
+  const stage: { label: string; open: number } =
+    progressive.stage === 1
+      ? { label: "NeuralFoil", open: progressive.openPoints.neuralfoil }
+      : progressive.stage === 2
+        ? { label: "fast OpenFOAM", open: progressive.openPoints.fast }
+        : progressive.stage === 3
+          ? { label: "precise OpenFOAM", open: progressive.openPoints.precise }
+          : { label: "progressive", open: progressive.openPoints.precise };
+  const parts = [
+    `${fCount(progressive.preliminaryPoints)} preliminary curve points`,
+  ];
+  if (stage.open > 0)
+    parts.push(`${fCount(stage.open)} ${stage.label} points open`);
+  if (progressive.gapPoints > 0)
+    parts.push(`${fCount(progressive.gapPoints)} gaps`);
+  return parts.join(" · ");
+}
+
 export function campaignInstrumentStatus(
   s: AdminCampaignSummary,
   line: CampaignStatusView = campaignStatusLine(s),
 ): CampaignInstrumentStatus {
   const { campaign, scheduler, totals } = s;
-  const jobs = scheduler.campaignJobsRunning;
+  const jobs =
+    s.progressive && s.progressive.requestedPoints > 0
+      ? s.progressive.activeJobs
+      : scheduler.campaignJobsRunning;
   const remaining = fCount(totals.remaining);
+  const progressiveDetail = progressiveActiveDetail(s);
 
   if (campaign.status === "active" && scheduler.diskAdmissionBlocked) {
     return {
@@ -163,8 +190,9 @@ export function campaignInstrumentStatus(
         title: "Campaign running",
         detail:
           jobs > 0
-            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} · ${remaining} points remain`
-            : `${remaining} points remain · ready for the next scheduler tick`,
+            ? `${fCount(jobs)} active job${jobs === 1 ? "" : "s"} · ${progressiveDetail ?? `${remaining} points remain`}`
+            : progressiveDetail ??
+              `${remaining} points remain · ready for the next scheduler tick`,
         tone: "teal",
         action: null,
       };

@@ -9,6 +9,7 @@ import {
   PIPELINE_STAGE_NOTES,
   assemblePipelineModel,
   assembleProgressivePipelineModel,
+  campaignCompletionProgress,
   campaignThroughputPresentation,
   formatEtaHours,
   progressBarSegments,
@@ -192,6 +193,38 @@ describe("assembleProgressivePipelineModel", () => {
       false,
     ]);
     expect(model.stages.map((stage) => stage.open)).toEqual([0, 100, 100]);
+  });
+});
+
+describe("campaignCompletionProgress", () => {
+  it("uses preliminary progressive curves instead of legacy CFD counters", () => {
+    expect(
+      campaignCompletionProgress(totals({ solved: 0, derived: 0 }), {
+        requestedPoints: 841_880,
+        preliminaryPoints: 840_320,
+        cfdEvidencePoints: 1_625,
+        activeJobs: 1_200,
+        stage: 2,
+        openPoints: { neuralfoil: 1_560, fast: 841_880, precise: 841_880 },
+        gapPoints: 1_560,
+      }),
+    ).toEqual({
+      requested: 841_880,
+      complete: 840_320,
+      label: "preliminary curve points complete",
+      progressive: true,
+    });
+  });
+
+  it("keeps legacy CFD completion for campaigns without progressive data", () => {
+    expect(
+      campaignCompletionProgress(totals({ solved: 12, derived: 3 }), null),
+    ).toEqual({
+      requested: 1_750,
+      complete: 15,
+      label: "CFD points complete",
+      progressive: false,
+    });
   });
 });
 

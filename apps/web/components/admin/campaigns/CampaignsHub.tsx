@@ -28,7 +28,9 @@ import {
   campaignHubSchedulerStatusText,
   gateFromSolverState,
   pausedCampaignStatusText,
+  progressiveActiveDetail,
 } from "./campaign-status";
+import { campaignCompletionProgress } from "./campaign-pipeline";
 import { stashDuplicatePrefill } from "./wizard-draft";
 import { usePoll } from "./usePoll";
 import {
@@ -126,6 +128,11 @@ export function campaignHubStatusLine(
   // the gate badge is the headline and the small lifecycle chip says active.
   const schedulerGate = campaignHubSchedulerStatusText(solverState, scheduler);
   if (schedulerGate) return schedulerGate;
+  const progressiveDetail = progressiveActiveDetail(summary);
+  if (progressiveDetail) {
+    const jobs = summary?.progressive?.activeJobs ?? 0;
+    return `Active — ${jobs > 0 ? `${fCount(jobs)} active jobs · ` : ""}${progressiveDetail}.`;
+  }
   const parts = [`${fCount(totals.remaining)} points remaining`];
   if (totals.running > 0) parts.push(`${fCount(totals.running)} running`);
   if (automaticFast > 0)
@@ -448,14 +455,18 @@ export function CampaignsHub({
             const automaticFast = campaignAutomaticFastCount(item);
             const repairing =
               summary?.remediation.repairing ?? item.remediation.repairing;
-            const settled = totals.solved + totals.derived;
+            const completion = campaignCompletionProgress(
+              totals,
+              summary?.progressive,
+            );
+            const settled = completion.complete;
             const progress =
-              totals.requested > 0
-                ? Math.min(1, settled / totals.requested)
+              completion.requested > 0
+                ? Math.min(1, settled / completion.requested)
                 : 0;
             const blockedProgress =
-              totals.requested > 0
-                ? Math.min(1 - progress, blocked / totals.requested)
+              completion.requested > 0
+                ? Math.min(1 - progress, blocked / completion.requested)
                 : 0;
             const chip = kindChip(summary);
             const reValues = summary
@@ -698,7 +709,7 @@ export function CampaignsHub({
                   }}
                 >
                   <div
-                    aria-label={`progress ${settled} completed and ${blocked} not published of ${totals.requested}`}
+                    aria-label={`progress ${settled} ${completion.label} and ${blocked} not published of ${completion.requested}`}
                     style={{
                       height: 6,
                       borderRadius: 4,
@@ -735,7 +746,7 @@ export function CampaignsHub({
                       whiteSpace: "nowrap",
                     }}
                   >
-                    {fCount(settled)} / {fCount(totals.requested)}
+                    {fCount(settled)} / {fCount(completion.requested)}
                     {/* Only typed states belong in the campaign summary. Raw
                         failed/rejected attempts stay in technical Solver logs. */}
                     {blocked > 0 && (

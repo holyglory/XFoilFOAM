@@ -43,6 +43,7 @@ function summary(overrides: {
   closedWithRejectedCount?: number | null;
   reviewBuckets?: { awaitingUrans: number; needsReview: number };
   tierCounts?: { ransOpen: number; precalcOpen: number; verifyOpen: number };
+  progressive?: AdminCampaignSummary["progressive"];
 }): AdminCampaignSummary {
   const now = new Date().toISOString();
   return {
@@ -50,6 +51,7 @@ function summary(overrides: {
       ? { reviewBuckets: overrides.reviewBuckets }
       : {}),
     ...(overrides.tierCounts ? { tierCounts: overrides.tierCounts } : {}),
+    ...(overrides.progressive ? { progressive: overrides.progressive } : {}),
     campaign: {
       status: overrides.status ?? "active",
       closedWithFailedCount: overrides.closedWithFailedCount ?? null,
@@ -397,6 +399,28 @@ describe("campaignInstrumentStatus — one truthful hero message", () => {
       tone: "teal",
       action: null,
     });
+  });
+
+  it("uses progressive curve and stage counters instead of legacy remaining points", () => {
+    const view = campaignInstrumentStatus(
+      summary({
+        jobs: 8_193,
+        remaining: 842_920,
+        progressive: {
+          requestedPoints: 841_880,
+          preliminaryPoints: 840_320,
+          cfdEvidencePoints: 1_625,
+          activeJobs: 1_369,
+          stage: 2,
+          openPoints: { neuralfoil: 1_560, fast: 841_880, precise: 841_880 },
+          gapPoints: 1_560,
+        },
+      }),
+    );
+    expect(view.detail).toBe(
+      "1,369 active jobs · 840,320 preliminary curve points · 841,880 fast OpenFOAM points open · 1,560 gaps",
+    );
+    expect(view.detail).not.toContain("842,920 points remain");
   });
 
   it("MUST-CATCH: service failure copy does not repeat the same sentence", () => {

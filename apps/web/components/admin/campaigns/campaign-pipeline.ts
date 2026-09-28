@@ -25,6 +25,39 @@ function fCount(v: number): string {
   return v.toLocaleString("en-US");
 }
 
+export interface CampaignCompletionProgress {
+  requested: number;
+  complete: number;
+  label: string;
+  progressive: boolean;
+}
+
+export function campaignCompletionProgress(
+  totals: AdminCampaignSummary["totals"],
+  progressive: AdminCampaignSummary["progressive"] | null | undefined,
+): CampaignCompletionProgress {
+  if (progressive && progressive.requestedPoints > 0) {
+    return {
+      requested: progressive.requestedPoints,
+      complete: Math.min(
+        progressive.requestedPoints,
+        Math.max(0, progressive.preliminaryPoints),
+      ),
+      label: "preliminary curve points complete",
+      progressive: true,
+    };
+  }
+  return {
+    requested: totals.requested,
+    complete: Math.min(
+      totals.requested,
+      Math.max(0, totals.solved + totals.derived),
+    ),
+    label: "CFD points complete",
+    progressive: false,
+  };
+}
+
 export interface CampaignThroughputPresentation {
   value: string;
   detail: string;
