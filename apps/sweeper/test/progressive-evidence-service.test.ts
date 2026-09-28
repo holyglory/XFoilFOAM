@@ -34,7 +34,7 @@ it("performs bounded sequential evidence deliveries without starting duplicates"
   await expect(drainProgressiveWorkerEvidencePass(deliver, true)).resolves.toBe(
     true,
   );
-  expect(deliver.mock.calls).toEqual([[true], [true]]);
+  expect(deliver.mock.calls).toEqual([[true], [true], [true]]);
 });
 
 it("alternates current-work priority with oldest-first while both stages progress", async () => {

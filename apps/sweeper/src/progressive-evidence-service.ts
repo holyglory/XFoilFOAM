@@ -5,7 +5,7 @@ import { runNotificationDrain } from "./notification-drain";
 import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evidence-delivery";
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
 
-const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 2;
+const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 8;
 
 export async function drainProgressiveWorkerEvidencePass(
   deliver: (preferActive: boolean) => Promise<boolean>,
