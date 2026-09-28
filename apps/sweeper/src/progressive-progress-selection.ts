@@ -42,5 +42,5 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
     ORDER BY CASE WHEN job.status = 'ingesting'
       AND job.engine_state IN ('completed', 'failed', 'cancelled')
       THEN 0 ELSE 1 END,
-      coalesce(job."polledAt", job."updatedAt"), job.id LIMIT 32`;
+      job."updatedAt", job.id LIMIT 32`;
 }
