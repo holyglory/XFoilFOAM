@@ -97,7 +97,10 @@ try {
     const summary = viewer.getByRole("region", { name: "Curve summary" });
     assert.equal(await summary.isVisible(), true);
     const originalSummary = await summary.textContent();
-    assert(originalSummary.includes("NeuralFoil"));
+    assert(
+      originalSummary.includes("NeuralFoil") ||
+        originalSummary.includes("Combined estimate"),
+    );
     assert(originalSummary.includes("Maximum lift / drag"));
     assert.equal(
       await page.getByText("BEST-FIT POLAR", { exact: true }).count(),

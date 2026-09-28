@@ -26,6 +26,9 @@ try {
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(origin + target.path, { waitUntil: "domcontentloaded" });
+    if (target.viewer === "progressive-comparison") {
+      await page.getByText("Overlay curves", { exact: true }).click();
+    }
     const viewer = page.getByTestId(target.viewer);
     const group = viewer.getByRole("group", { name: target.group });
     const buttons = group.getByRole("button");
