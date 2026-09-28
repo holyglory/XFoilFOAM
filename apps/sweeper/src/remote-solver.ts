@@ -7342,6 +7342,9 @@ export async function admitRemoteSolverTick(
     // promise), while independent promises fill every available token.
     const MAX_ADMISSIONS_PER_TICK = 16;
     let admitted = false;
+    let assignedCount = 0;
+    let submittedCount = 0;
+    let lastOutcome: string | null = null;
     const attemptedAssignments = new Set<string>();
     for (let attempt = 0; attempt < MAX_ADMISSIONS_PER_TICK; attempt++) {
       if ((await remoteReservedCpuSlots(db, settings)) >= remoteCap) break;
@@ -7376,6 +7379,7 @@ export async function admitRemoteSolverTick(
         ORDER BY job."updatedAt", job.id LIMIT ${concurrency}
       `);
       if (assigned.length) {
+        assignedCount += assigned.length;
         for (const job of assigned) attemptedAssignments.add(String(job.id));
         await runWithConcurrency(assigned, concurrency, async (job) => {
           const jobId = String(job.id);
@@ -7385,7 +7389,10 @@ export async function admitRemoteSolverTick(
               engine,
               jobId,
             );
-            if (submitted.kind === "submitted") admitted = true;
+            if (submitted.kind === "submitted") {
+              admitted = true;
+              submittedCount += 1;
+            } else lastOutcome = `${submitted.kind}: ${submitted.reason}`;
             if (submitted.kind === "stop_required") {
               await db
                 .update(simJobs)
@@ -7468,6 +7475,7 @@ export async function admitRemoteSolverTick(
       }
       if (outcome?.kind === "submitted") {
         admitted = true;
+        submittedCount += 1;
         continue;
       }
       // `busy` is an idempotent race on an already-composed promise. It does
@@ -7477,8 +7485,19 @@ export async function admitRemoteSolverTick(
         admitted = true;
         break;
       }
+      if (outcome && "reason" in outcome)
+        lastOutcome = `${outcome.kind}: ${outcome.reason}`;
       break;
     }
+    if (assignedCount || submittedCount || lastOutcome)
+      console.log(
+        JSON.stringify({
+          component: "progressive-remote-admission",
+          assigned: assignedCount,
+          submitted: submittedCount,
+          lastOutcome,
+        }),
+      );
     return admitted;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));
