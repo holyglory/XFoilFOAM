@@ -320,9 +320,11 @@ the stager must not rediscover an earlier deferred report. Successful staging
 clears only its own retry record.
 
 The staging selector uses ordered acknowledged-report metadata. Active-priority
-passes first select the earliest eligible report from an unexpired active promise;
+passes first select the newest eligible report from an unexpired active promise;
 only when none exists do they fall back to the earliest eligible retained report.
-FIFO passes retain the original chronological order. Both paths share the same
+That fallback first releases terminal reports from expired, cancelled or fulfilled
+promises when they carry an exact stop proof, then retains chronological order for
+the remaining backlog. Both paths share the same
 source ownership, transfer-pause, acknowledgement, retry and ingest-lease checks,
 and the selected report still passes full immutable-source verification. The
 ordering index avoids sorting the entire backlog; it does not discard history or

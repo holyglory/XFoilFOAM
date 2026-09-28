@@ -21,14 +21,14 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
         CASE WHEN variant='live-ingest' THEN clock_timestamp()+interval '1 day' WHEN variant='expired-ingest' THEN clock_timestamp()-interval '1 day' END AS ingest_lease_expires_at
       FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
-      SELECT id,CASE WHEN variant='eligible-cancelled' THEN 'cancelled' ELSE 'active' END AS status,
+      SELECT id,CASE WHEN variant='eligible-cancelled' THEN 'cancelled' WHEN variant='eligible-expired' THEN 'expired' ELSE 'active' END AS status,
         CASE WHEN variant='eligible-expired' THEN clock_timestamp()-interval '1 day' ELSE clock_timestamp()+interval '1 day' END AS "expiresAt",
         CASE WHEN variant='wrong-solver' THEN md5('foreign')::uuid ELSE md5('solver')::uuid END AS registered_solver_id,
         CASE WHEN variant='wrong-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END AS source_base_url
       FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
       SELECT id AS sim_job_id,sequence,CASE WHEN variant='unacknowledged' THEN NULL ELSE clock_timestamp() END AS acknowledged_at,
-        CASE WHEN variant='null-result' THEN '{"result":null}'::jsonb WHEN variant='missing-result' THEN '{}'::jsonb ELSE '{"result":{}}'::jsonb END AS report,
+        CASE WHEN variant='null-result' THEN '{"result":null}'::jsonb WHEN variant='missing-result' THEN '{}'::jsonb WHEN variant='eligible-expired' THEN '{"result":{},"stopProof":{"execution_stopped":"true"}}'::jsonb ELSE '{"result":{}}'::jsonb END AS report,
         timestamptz '2026-01-01T00:00:00Z' + CASE WHEN variant='eligible-cancelled' THEN interval '0 seconds' ELSE interval '1 second' END AS created_at
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures ON COMMIT DROP AS
@@ -59,7 +59,8 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       transaction.execute(sql`SELECT report.sim_job_id,report.sequence,report.created_at FROM progressive_worker_reports report
       JOIN fixture_jobs fixture ON fixture.id=report.sim_job_id JOIN sync_sweep_promises promise ON promise.id=fixture.id
       WHERE fixture.variant IN ('eligible-active','eligible-cancelled','eligible-expired','expired-ingest')
-      ORDER BY CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
+      ORDER BY CASE WHEN NOT ${active} AND fixture.variant='eligible-expired' THEN 0 ELSE 1 END,
+        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
         CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.created_at END DESC,
         CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.sim_job_id END DESC,
         CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.sequence END DESC,
@@ -79,7 +80,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       sim_jobs,sync_sweep_promises,progressive_worker_staging_failures,sync_api_settings`);
     expect(await select(true)).toEqual(fresh);
     const backlogHead = await select(false);
-    expect(backlogHead[0].sequence).toBe(3);
+    expect(backlogHead[0].sequence).toBe(1);
     for (const active of [true, false]) {
       const [measured] = await transaction.execute(
         sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${progressiveStagingSelectionSql(active)}`,
