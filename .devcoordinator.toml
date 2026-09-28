@@ -484,6 +484,19 @@ command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "node-su
 [test.types]
 timeout_seconds = 1800
 
+[test.reconcile-budget]
+timeout_seconds = 300
+
+[test.reconcile-budget.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.reconcile-budget.check]]
+name = "priority-contract"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/reconcile-budget.test.ts"]
+
 [test.reservation-accounting]
 timeout_seconds = 900
 

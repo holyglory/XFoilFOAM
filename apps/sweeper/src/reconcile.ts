@@ -4344,7 +4344,13 @@ export async function reconcile(
     .select()
     .from(simJobs)
     .where(and(...activeFilters))
-    .orderBy(asc(simJobs.updatedAt), asc(simJobs.id));
+    .orderBy(
+      sql`CASE WHEN ${simJobs.requestPayload}->'progressive' IS NOT NULL
+        AND ${simJobs.engineState} IN ('completed', 'failed', 'cancelled')
+        THEN 0 ELSE 1 END`,
+      asc(simJobs.updatedAt),
+      asc(simJobs.id),
+    );
   const candidates = options.jobIds?.length
     ? await activeJobQuery
     : await activeJobQuery.limit(MAX_ACTIVE_RECONCILE_JOB_LIMIT);
