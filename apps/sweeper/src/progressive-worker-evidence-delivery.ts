@@ -96,7 +96,7 @@ export async function deliverNextProgressiveWorkerEvidence(
   fetcher: typeof fetch = fetch,
   selection: { preferActive?: boolean } = {},
 ): Promise<boolean> {
-  await requeueStoppedProgressiveStorage(db);
+  await requeueStoppedProgressiveStorage(db, { retryStoppedStorage: true });
   const [pending] = await db.execute(
     progressiveDeliverySelectionSql(selection.preferActive === true),
   );

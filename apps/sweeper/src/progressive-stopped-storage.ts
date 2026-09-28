@@ -33,12 +33,20 @@ export async function progressiveStoppedStorageEligible(
 
 export async function requeueStoppedProgressiveStorage(
   db: DB,
+  options: { retryStoppedStorage?: boolean } = {},
 ): Promise<number> {
   const rows = await db.execute(sql`
     WITH candidates AS (
       SELECT failure.sim_job_id,failure.point_content_signature FROM progressive_worker_delivery_failures failure
       WHERE failure.state='conflict' AND failure.last_http_status=409
-        AND failure.last_error='Progressive evidence delivery failed (409)'
+        AND (
+          failure.last_error='Progressive evidence delivery failed (409)'
+          OR (
+            ${options.retryStoppedStorage === true}
+            AND failure.last_error='Stopped progressive storage delivery failed (409)'
+            AND failure.attempt_count=1
+          )
+        )
         AND failure.remote_conflict_ids='[]'::jsonb
         AND EXISTS (SELECT 1 ${stoppedOwner} AND job.id=failure.sim_job_id
           AND promise.response_payload->>'authoritativeLeaseLoss'='true')

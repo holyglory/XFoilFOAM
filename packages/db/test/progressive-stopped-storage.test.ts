@@ -36,7 +36,7 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
       CASE WHEN variant<>'not-stopped' THEN id::text END AS stopped_engine_job_id,
       CASE WHEN variant<>'unacknowledged' THEN clock_timestamp() END AS acknowledged_at,'{"result":{}}'::jsonb AS report FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_delivery_failures ON COMMIT DROP AS SELECT id AS sim_job_id,
-      md5(variant) AS point_content_signature,'conflict'::text AS state,NULL::timestamptz AS retry_after,
+      md5(variant) AS point_content_signature,'conflict'::text AS state,1::integer AS attempt_count,NULL::timestamptz AS retry_after,
       CASE WHEN variant='other-http' THEN 500 ELSE 409 END AS last_http_status,
       CASE WHEN variant='storage-rejected' THEN 'Stopped progressive storage delivery failed (409)' ELSE 'Progressive evidence delivery failed (409)' END AS last_error,
       CASE WHEN variant='review-conflict' THEN '["review"]' ELSE '[]' END::jsonb AS remote_conflict_ids,
@@ -66,6 +66,11 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
     await transaction.execute(sql`UPDATE progressive_worker_delivery_failures SET state='conflict',last_error='Stopped progressive storage delivery failed (409)'
       WHERE sim_job_id=${eligible.id}::uuid`);
     expect(await requeueStoppedProgressiveStorage(connection)).toBe(0);
+    expect(
+      await requeueStoppedProgressiveStorage(connection, {
+        retryStoppedStorage: true,
+      }),
+    ).toBe(2);
     expect(
       await transaction.execute(sql`SELECT to_jsonb(job) AS job,to_jsonb(promise) AS promise,to_jsonb(report) AS report
       FROM sim_jobs job JOIN sync_sweep_promises promise USING(id) JOIN progressive_worker_reports report ON report.sim_job_id=job.id ORDER BY job.id`),
