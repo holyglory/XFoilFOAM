@@ -305,6 +305,7 @@ export async function registerCampaignRoutes(
                 id,
                 summary.campaign.rateBaselineAt,
                 summary.totals.remaining,
+                summary.progressive.requestedPoints,
               )
             : null;
         return {

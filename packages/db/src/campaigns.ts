@@ -8425,8 +8425,52 @@ export async function campaignRate(
   campaignId: string,
   baselineAt: string | null,
   remainingPoints: number,
+  progressiveRequestedPoints = 0,
 ): Promise<CampaignRate | null> {
   const baselineIso = baselineAt ?? new Date(0).toISOString();
+  if (progressiveRequestedPoints > 0) {
+    const [progressiveRow] = (await db.execute(sql`
+      WITH current_generation AS MATERIALIZED (
+        SELECT generation.id
+        FROM progressive_generations generation
+        JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+        JOIN calculation_epochs epoch
+          ON epoch.id = generation.epoch_id AND epoch.current
+        WHERE generation.campaign_id = ${campaignId}
+          AND generation.plan_revision_id = campaign.current_plan_revision_id
+          AND generation.status = 'active'
+        ORDER BY generation.created_at DESC, generation.id DESC
+        LIMIT 1
+      ), unit_first_evidence AS (
+        SELECT unit.id, min(receipt.created_at) AS first_seen
+        FROM progressive_cfd_evidence receipt
+        JOIN progressive_cfd_attempts attempt
+          ON attempt.token = receipt.attempt_token
+        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN current_generation generation
+          ON generation.id = work.generation_id
+        GROUP BY unit.id
+      )
+      SELECT count(*)::int AS n, min(first_seen) AS since
+      FROM unit_first_evidence
+      WHERE first_seen > GREATEST(
+        ${baselineIso}::timestamptz,
+        now() - interval '24 hours'
+      )
+    `)) as unknown as Array<{ n: number; since: Date | string | null }>;
+    const progressivePointsLast24h = Number(progressiveRow?.n ?? 0);
+    if (progressivePointsLast24h > 0) {
+      return {
+        pointsLast24h: progressivePointsLast24h,
+        windowHours: 24,
+        baselineAt,
+        measuredSince:
+          isoOf(progressiveRow?.since ?? null) ?? new Date().toISOString(),
+        remainingPoints,
+      };
+    }
+  }
   const [row] = (await db.execute(sql`
     SELECT count(*)::int AS n, min(r."solvedAt") AS since
     FROM results r
