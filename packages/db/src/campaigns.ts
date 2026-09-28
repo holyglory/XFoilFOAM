@@ -2229,7 +2229,9 @@ async function campaignProgressiveSnapshot(
               WHERE dispatch.sim_job_id = job.id
                 AND EXISTS (SELECT 1 FROM sync_sweep_promises promise
                   WHERE promise.id = dispatch.promise_id
-                    AND promise.campaign_id = ${campaignId})))) AS active_jobs,
+                    AND EXISTS (SELECT 1 FROM sync_sweep_promise_points promise_point
+                      WHERE promise_point.promise_id = promise.id
+                        AND promise_point.campaign_id = ${campaignId})))) AS active_jobs,
       (SELECT count(DISTINCT unit.id)::int
         FROM progressive_cfd_units unit
         JOIN progressive_work work ON work.id = unit.work_id
