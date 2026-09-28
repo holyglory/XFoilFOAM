@@ -6026,6 +6026,37 @@ describe("bounded progressive numerical recovery", () => {
 });
 
 describe("persistent progressive polar cache", () => {
+  it("fits a NeuralFoil-only preliminary polar before CFD evidence exists", async () => {
+    const fixture = await fitFixture();
+    const engine = new EngineClient("http://unused.invalid");
+    const fitting = vi
+      .spyOn(engine, "fitProgressivePolar")
+      .mockImplementation(fitUsingPython);
+    await db
+      .update(sweeperState)
+      .set({ enabled: true })
+      .where(eq(sweeperState.id, 1));
+    try {
+      expect(
+        await runProgressiveFitBatch(db, engine, "preliminary-fitting", {
+          requireCfdEvidence: false,
+          requireSweeperEnabled: true,
+        }),
+      ).toMatchObject({ claimed: 1, stored: 1, errors: [] });
+      expect(fitting).toHaveBeenCalledTimes(1);
+      const [stored] = await db.execute(
+        sql`SELECT state FROM progressive_polar_fit_work WHERE prediction_id = ${fixture.predictionId}`,
+      );
+      expect(stored.state).toBe("ready");
+    } finally {
+      fitting.mockRestore();
+      await db
+        .update(sweeperState)
+        .set({ enabled: false })
+        .where(eq(sweeperState.id, 1));
+    }
+  }, 120_000);
+
   it("automatically fits notified CFD receipts while respecting the global stop gate", async () => {
     const fixture = await fitFixture();
     const engine = new EngineClient("http://unused.invalid");

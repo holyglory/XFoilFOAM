@@ -95,7 +95,10 @@ export async function runProgressiveBaselineService(
           report({ component: "progressive-baseline", ...batch });
         }
         if (signal.aborted) break;
-        const fitting = await runProgressiveFitBatch(db, engine, owner);
+        const fitting = await runProgressiveFitBatch(db, engine, owner, {
+          requireCfdEvidence: false,
+          requireSweeperEnabled: true,
+        });
         if (fitting.claimed) {
           pending = true;
           report({ component: "progressive-fitting", ...fitting });

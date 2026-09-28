@@ -338,12 +338,15 @@ export async function runProgressiveFitBatch(
   db: DB,
   engine: Pick<EngineClient, "fitProgressivePolar">,
   owner: string,
-  options: { requireSweeperEnabled?: boolean } = {},
+  options: {
+    requireSweeperEnabled?: boolean;
+    requireCfdEvidence?: boolean;
+  } = {},
 ): Promise<{ claimed: number; stored: number; errors: string[] }> {
   const lease = await claimProgressivePolarFit(db, {
     owner,
     leaseSeconds: 180,
-    requireCfdEvidence: true,
+    requireCfdEvidence: options.requireCfdEvidence ?? true,
     requireSweeperEnabled: options.requireSweeperEnabled ?? true,
   });
   if (!lease) return { claimed: 0, stored: 0, errors: [] };

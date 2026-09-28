@@ -198,6 +198,19 @@ tier = "development"
 requires = ["types", "python", "seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "policy refresh|invalidates it on review changes|invalidates changed classification|quarantines a mismatched source"]
 
+[test.progressive-preliminary-fit]
+timeout_seconds = 900
+
+[test.progressive-preliminary-fit.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-preliminary-fit.check]]
+name = "preliminary-fit"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "fits a NeuralFoil-only preliminary polar"]
+
 [deployment.pressure-init-reproduction]
 source = ["worktree"]
 components = ["numerics"]
