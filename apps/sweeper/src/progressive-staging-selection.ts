@@ -30,7 +30,8 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
     ORDER BY report.created_at, report.sim_job_id, report.sequence OFFSET 0`;
   const owned = (active: boolean) => sql`SELECT job.id, promise.status AS promise_status,
-      promise.response_payload->>'authoritativeLeaseLoss' AS authoritative_lease_loss
+      promise.response_payload->>'authoritativeLeaseLoss' AS authoritative_lease_loss,
+      promise.request_payload->>'progressiveCampaignStatus' AS campaign_status
     FROM sim_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
@@ -69,12 +70,13 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
   ) => sql`SELECT report.sim_job_id, report.sequence, report.created_at, report.is_terminal,
       owned.promise_status FROM (${reports(active)}) report
     JOIN LATERAL (${owned(active)}) owned ON true`;
-  const terminalCandidate = sql`SELECT report.sim_job_id, report.sequence, report.created_at
-      ,owned.authoritative_lease_loss
+  const terminalCandidate = sql`SELECT report.sim_job_id, report.sequence, report.created_at,
+      owned.authoritative_lease_loss, owned.campaign_status
     FROM (${terminalReports}) report
     JOIN LATERAL (${owned(false)}) owned ON true
     WHERE owned.promise_status IN ('expired', 'cancelled', 'fulfilled')
-    ORDER BY (owned.authoritative_lease_loss = 'true') DESC,
+    ORDER BY (owned.campaign_status IN ('active', 'attention', 'paused')) DESC,
+      (owned.authoritative_lease_loss = 'true') DESC,
       report.created_at, report.sim_job_id, report.sequence LIMIT 1`;
   const terminal = sql`SELECT sim_job_id, sequence, created_at
     FROM (${terminalCandidate}) report`;

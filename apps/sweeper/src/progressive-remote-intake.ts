@@ -106,6 +106,9 @@ async function receiveAssignmentPage(
     executionId: string;
     promiseId: string;
     contentSignature: string;
+    campaignId: string | null;
+    campaignStatus: string | null;
+    executionStopped: boolean;
   }> = [];
   let previous = after;
   for (const item of page.items) {
@@ -115,6 +118,8 @@ async function receiveAssignmentPage(
       !uuid(item.promiseId) ||
       typeof item.contentSignature !== "string" ||
       !/^[a-f0-9]{64}$/.test(item.contentSignature) ||
+      (item.campaignId != null && !uuid(item.campaignId)) ||
+      (item.campaignStatus != null && typeof item.campaignStatus !== "string") ||
       (previous !== null && item.executionId <= previous)
     )
       throw new Error(
@@ -124,6 +129,10 @@ async function receiveAssignmentPage(
       executionId: item.executionId,
       promiseId: item.promiseId,
       contentSignature: item.contentSignature,
+      campaignId: item.campaignId == null ? null : item.campaignId,
+      campaignStatus:
+        item.campaignStatus == null ? null : item.campaignStatus,
+      executionStopped: item.executionStopped === true,
     });
     previous = item.executionId;
   }
@@ -149,7 +158,20 @@ async function receiveAssignmentPage(
     activeReconcileConcurrency(),
     async (identity) => {
       receipt.seen += 1;
-      try {
+    try {
+        if (identity.campaignId !== null || identity.campaignStatus !== null) {
+          await db.execute(sql`
+            UPDATE sync_sweep_promises SET request_payload = coalesce(request_payload, '{}'::jsonb)
+              || ${JSON.stringify({
+                progressiveCampaignId: identity.campaignId,
+                progressiveCampaignStatus: identity.campaignStatus,
+                progressiveExecutionStopped: identity.executionStopped,
+              })}::jsonb
+            WHERE id = ${identity.promiseId}::uuid
+              AND registered_solver_id = ${solverId}::uuid
+              AND source_base_url = ${baseUrl}
+          `);
+        }
         if (await mirrored(identity)) {
           receipt.existing += 1;
           return;
