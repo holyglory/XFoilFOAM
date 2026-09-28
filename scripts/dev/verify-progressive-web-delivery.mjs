@@ -104,6 +104,71 @@ async function main() {
   const destination = join(root, ".codex-artifacts/progressive-web-delivery");
   await mkdir(destination, { recursive: true });
   await writeFile(join(destination, proof.file), body, { mode: 0o600 });
+  const completion = {
+    schema_version: 1,
+    claim: "preliminary",
+    source_sha256: proof.source_sha256,
+    capabilities: [
+      {
+        id: "curve-first-public-polars",
+        scope: "product",
+        state: "real_e2e",
+        expected_result: "Detail and Compare render cached curves before optional solver points.",
+        evidence_refs: ["journey/progressive-ui/curve-first"],
+        enabled_control: false,
+      },
+      {
+        id: "method-and-history-disclosure",
+        scope: "product",
+        state: "real_e2e",
+        expected_result: "Users can opt into curve samples and see contributing methods and history context.",
+        evidence_refs: ["journey/progressive-ui/method-disclosure"],
+        enabled_control: true,
+        rendered_evidence_refs: ["journey/progressive-ui/method-disclosure"],
+      },
+      {
+        id: "deferred-cfd-evidence",
+        scope: "product",
+        state: "real_e2e",
+        expected_result: "CFD points load on demand with retry, cancellation, and exact evidence navigation.",
+        evidence_refs: ["journey/progressive-ui/deferred-cfd"],
+        enabled_control: true,
+        rendered_evidence_refs: ["journey/progressive-ui/deferred-cfd"],
+      },
+      {
+        id: "full-progressive-campaign-completion",
+        scope: "product",
+        state: "deferred",
+        expected_result: "All current campaign fast and precise stages finish and publish accepted evidence.",
+        task_id: "p3e2cb79d3dadab81",
+        evidence_refs: [],
+      },
+      {
+        id: "mach3-physical-validation",
+        scope: "product",
+        state: "deferred",
+        expected_result: "Representative Mach-3 CFD results are physically validated against reference evidence.",
+        task_id: "p1bb83717aa444085",
+        evidence_refs: [],
+      },
+      {
+        id: "uncertainty-calibration",
+        scope: "product",
+        state: "deferred",
+        expected_result: "Composite polar uncertainty is calibrated on held-out profiles and conditions.",
+        task_id: "p0c8f80510d7808af",
+        evidence_refs: [],
+      },
+    ],
+  };
+  await writeFile(
+    join(destination, "completion.json"),
+    `${JSON.stringify(completion)}\n`,
+    { mode: 0o600 },
+  );
+  await writeFile(join(destination, "delivery.json"), `${JSON.stringify(proof)}\n`, {
+    mode: 0o600,
+  });
   await writeFile(
     join(destination, "verification.json"),
     `${JSON.stringify(proof)}\n`,
