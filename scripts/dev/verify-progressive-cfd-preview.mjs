@@ -11,7 +11,7 @@ if (
   );
 const production = process.argv[2] === "--production";
 const origin = production ? "https://airfoils.pro" : progressivePreviewOrigin();
-const slug = production ? "naca-652415" : "ag24";
+const slug = "ag24";
 const browser = await chromium.launch({ headless: true });
 const outcomes = [];
 try {
