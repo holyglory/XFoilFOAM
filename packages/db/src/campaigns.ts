@@ -8191,34 +8191,36 @@ export async function campaignAirfoilRows(
         ids.map((id) => sql`${id}::uuid`),
         sql`,`,
       )})
+    ), progressive_stats AS MATERIALIZED (
+      SELECT target_cells.target_id,
+        count(DISTINCT evidence.result_attempt_id)::int AS cfd_evidence,
+        count(DISTINCT unit.id) FILTER (
+          WHERE work.stage = 2 AND unit.state = 'complete'
+        )::int AS fast_complete,
+        count(DISTINCT unit.id) FILTER (
+          WHERE work.stage = 3 AND unit.state = 'complete'
+        )::int AS precise_complete
+      FROM target_cells
+      LEFT JOIN progressive_work work
+        ON work.target_id = target_cells.target_id
+       AND work.stage IN (2, 3)
+      LEFT JOIN progressive_cfd_units unit ON unit.work_id = work.id
+      LEFT JOIN progressive_cfd_attempts attempt
+        ON attempt.unit_id = unit.id
+      LEFT JOIN progressive_cfd_evidence evidence
+        ON evidence.attempt_token = attempt.token
+      GROUP BY target_cells.target_id
     )
-    SELECT target_id, airfoil_id, condition_id, requested,
-      CASE WHEN baseline_state = 'complete' THEN requested ELSE 0 END AS preliminary,
-      (
-        SELECT count(DISTINCT evidence.result_attempt_id)::int
-        FROM progressive_cfd_evidence evidence
-        JOIN progressive_cfd_attempts attempt
-          ON attempt.token = evidence.attempt_token
-        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
-        JOIN progressive_work work ON work.id = unit.work_id
-        WHERE work.target_id = target_cells.target_id
-          AND work.stage IN (2, 3)
-      ) AS cfd_evidence,
-      (
-        SELECT count(*)::int
-        FROM progressive_cfd_units unit
-        JOIN progressive_work work ON work.id = unit.work_id
-        WHERE work.target_id = target_cells.target_id
-          AND work.stage = 2 AND unit.state = 'complete'
-      ) AS fast_complete,
-      (
-        SELECT count(*)::int
-        FROM progressive_cfd_units unit
-        JOIN progressive_work work ON work.id = unit.work_id
-        WHERE work.target_id = target_cells.target_id
-          AND work.stage = 3 AND unit.state = 'complete'
-      ) AS precise_complete
+    SELECT target_cells.target_id, target_cells.airfoil_id,
+      target_cells.condition_id, target_cells.requested,
+      CASE WHEN target_cells.baseline_state = 'complete'
+        THEN target_cells.requested ELSE 0 END AS preliminary,
+      coalesce(progressive_stats.cfd_evidence, 0)::int AS cfd_evidence,
+      coalesce(progressive_stats.fast_complete, 0)::int AS fast_complete,
+      coalesce(progressive_stats.precise_complete, 0)::int AS precise_complete
     FROM target_cells
+    LEFT JOIN progressive_stats
+      ON progressive_stats.target_id = target_cells.target_id
   `)) as unknown as Array<{
     airfoil_id: string;
     condition_id: string;
