@@ -143,7 +143,7 @@ export async function runProgressiveEvidenceService(
 ): Promise<void> {
   await runNotificationDrain(
     notifications,
-    "progressive_worker_evidence_changed",
+    "progressive_worker_report_changed",
     signal,
     {
       drain:

@@ -13,7 +13,7 @@ function notifications() {
   let notify: () => void = () => undefined;
   const unlisten = vi.fn(async () => undefined);
   const listen = vi.fn(async (channel: string, callback: () => void) => {
-    expect(channel).toBe("progressive_worker_evidence_changed");
+    expect(channel).toBe("progressive_worker_report_changed");
     notify = callback;
     return { unlisten };
   });
