@@ -4,56 +4,28 @@ import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution
 
 export async function listProgressiveRemoteAssignments(
   db: DB,
-  input: {
-    solverId: string;
-    after?: string;
-    limit?: number;
-    currentCampaignOnly?: boolean;
-  },
+  input: { solverId: string; after?: string; limit?: number },
 ) {
   const limit = input.limit ?? 25;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50)
     throw new Error("Remote assignment page size must be between 1 and 50");
   const rows = await db.execute(sql`
     SELECT dispatch.sim_job_id AS "executionId", dispatch.promise_id AS "promiseId",
-      dispatch.content_signature AS "contentSignature", dispatch.cpu_slots AS "cpuSlots",
-      job.campaign_id AS "campaignId", campaign.status AS "campaignStatus",
-      EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
-        WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text) AS "executionStopped"
+      dispatch.content_signature AS "contentSignature", dispatch.cpu_slots AS "cpuSlots"
     FROM progressive_remote_dispatches dispatch
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
-    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-    JOIN sim_jobs job ON job.id = dispatch.sim_job_id
-    LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     WHERE dispatch.solver_id = ${input.solverId}::uuid
       ${input.after ? sql`AND dispatch.sim_job_id > ${input.after}::uuid` : sql``}
-      ${input.currentCampaignOnly ? sql`AND campaign.status IN ('active', 'attention', 'paused')` : sql``}
-    ORDER BY ${
-      input.currentCampaignOnly
-        ? sql`CASE WHEN promise.response_payload->>'authoritativeLeaseLoss' = 'true' THEN 0 ELSE 1 END,
-          CASE WHEN EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
-            WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
-            THEN 0 ELSE 1 END, dispatch.sim_job_id`
-        : sql`dispatch.sim_job_id`
-    } LIMIT ${limit + 1}
+      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+        WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
+    ORDER BY dispatch.sim_job_id LIMIT ${limit + 1}
   `);
-  const items = rows.slice(0, limit).map((row) => {
-    const item = {
-      executionId: String(row.executionId),
-      promiseId: String(row.promiseId),
-      contentSignature: String(row.contentSignature),
-      cpuSlots: Number(row.cpuSlots),
-    };
-    return row.campaignId != null || row.executionStopped
-      ? {
-          ...item,
-          campaignId: row.campaignId == null ? null : String(row.campaignId),
-          campaignStatus:
-            row.campaignStatus == null ? null : String(row.campaignStatus),
-          executionStopped: Boolean(row.executionStopped),
-        }
-      : item;
-  });
+  const items = rows.slice(0, limit).map((row) => ({
+    executionId: String(row.executionId),
+    promiseId: String(row.promiseId),
+    contentSignature: String(row.contentSignature),
+    cpuSlots: Number(row.cpuSlots),
+  }));
   return {
     items,
     nextCursor: rows.length > limit ? items.at(-1)!.executionId : null,
@@ -69,7 +41,6 @@ export async function readProgressiveRemoteAssignment(
       promise.status AS promise_status, promise."expiresAt" AS expires_at,
       promise."expiresAt" <= clock_timestamp() AS expired,
       job.status AS job_status, job.engine_state,
-      job.campaign_id AS campaign_id, campaign.status AS campaign_status,
       airfoil.id AS airfoil_id, airfoil.slug, airfoil.name, airfoil.source, airfoil.point_format, airfoil.points,
       revision.id AS revision_id, revision.signature_hash, revision.snapshot,
       EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
@@ -80,7 +51,6 @@ export async function readProgressiveRemoteAssignment(
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
     JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
     JOIN sim_jobs job ON job.id = dispatch.sim_job_id
-    LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     JOIN airfoils airfoil ON airfoil.id = job.airfoil_id
     JOIN simulation_preset_revisions revision ON revision.id = job.simulation_preset_revision_id
     WHERE dispatch.solver_id = ${input.solverId}::uuid AND dispatch.sim_job_id = ${input.executionId}::uuid
@@ -103,9 +73,6 @@ export async function readProgressiveRemoteAssignment(
       status: String(row.promise_status),
       expiresAt: new Date(row.expires_at as string | Date).toISOString(),
       expired: Boolean(row.expired),
-      campaignId: row.campaign_id == null ? null : String(row.campaign_id),
-      campaignStatus:
-        row.campaign_status == null ? null : String(row.campaign_status),
       airfoil: {
         id: String(row.airfoil_id),
         slug: String(row.slug),

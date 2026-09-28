@@ -95,60 +95,41 @@ async function receiveAssignmentPage(
   const page = await request(
     `/progressive-executions?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`,
   );
-  const priorityPage = await request(
-    "/progressive-executions?limit=50&currentCampaignOnly=true",
-  );
+  if (
+    !record(page) ||
+    !Array.isArray(page.items) ||
+    page.items.length > 50 ||
+    !(page.nextCursor === null || uuid(page.nextCursor))
+  )
+    throw new Error("The hub returned an invalid assignment page");
   const identities: Array<{
     executionId: string;
     promiseId: string;
     contentSignature: string;
-    campaignId: string | null;
-    campaignStatus: string | null;
-    executionStopped: boolean;
   }> = [];
-  const parseItems = (value: unknown, previous: string | null, ordered: boolean) => {
-    if (!record(value) || !Array.isArray(value.items) || value.items.length > 50)
-      throw new Error("The hub returned an invalid assignment page");
-    const parsed = value.items.map((item) => {
-      if (
-        !record(item) ||
-        !uuid(item.executionId) ||
-        !uuid(item.promiseId) ||
-        typeof item.contentSignature !== "string" ||
-        !/^[a-f0-9]{64}$/.test(item.contentSignature) ||
-        (item.campaignId != null && !uuid(item.campaignId)) ||
-        (item.campaignStatus != null && typeof item.campaignStatus !== "string") ||
-        (ordered && previous !== null && item.executionId <= previous)
-      )
-        throw new Error(
-          ordered
-            ? "The hub returned unordered or malformed assignment identities"
-            : "The hub returned malformed priority assignment identities",
-        );
-      return {
-        executionId: item.executionId,
-        promiseId: item.promiseId,
-        contentSignature: item.contentSignature,
-        campaignId: item.campaignId == null ? null : item.campaignId,
-        campaignStatus:
-          item.campaignStatus == null ? null : item.campaignStatus,
-        executionStopped: item.executionStopped === true,
-      };
+  let previous = after;
+  for (const item of page.items) {
+    if (
+      !record(item) ||
+      !uuid(item.executionId) ||
+      !uuid(item.promiseId) ||
+      typeof item.contentSignature !== "string" ||
+      !/^[a-f0-9]{64}$/.test(item.contentSignature) ||
+      (previous !== null && item.executionId <= previous)
+    )
+      throw new Error(
+        "The hub returned unordered or malformed assignment identities",
+      );
+    identities.push({
+      executionId: item.executionId,
+      promiseId: item.promiseId,
+      contentSignature: item.contentSignature,
     });
-    return {
-      items: parsed,
-      nextCursor: value.nextCursor === null || uuid(value.nextCursor) ? value.nextCursor : null,
-    };
-  };
-  const normal = parseItems(page, after, true);
-  const priority = parseItems(priorityPage, null, false);
-  const identityMap = new Map(normal.items.map((item) => [item.executionId, item]));
-  for (const item of priority.items) identityMap.set(item.executionId, item);
-  identities.push(...identityMap.values());
-  const normalNextCursor = normal.nextCursor;
+    previous = item.executionId;
+  }
   if (
-    normalNextCursor !== null &&
-    normalNextCursor !== normal.items.at(-1)?.executionId
+    page.nextCursor !== null &&
+    page.nextCursor !== identities.at(-1)?.executionId
   )
     throw new Error(
       "The hub assignment cursor would skip unreceived executions",
@@ -168,20 +149,7 @@ async function receiveAssignmentPage(
     activeReconcileConcurrency(),
     async (identity) => {
       receipt.seen += 1;
-    try {
-        if (identity.campaignId !== null || identity.campaignStatus !== null) {
-          await db.execute(sql`
-            UPDATE sync_sweep_promises SET request_payload = coalesce(request_payload, '{}'::jsonb)
-              || ${JSON.stringify({
-                progressiveCampaignId: identity.campaignId,
-                progressiveCampaignStatus: identity.campaignStatus,
-                progressiveExecutionStopped: identity.executionStopped,
-              })}::jsonb
-            WHERE id = ${identity.promiseId}::uuid
-              AND registered_solver_id = ${solverId}::uuid
-              AND source_base_url = ${baseUrl}
-          `);
-        }
+      try {
         if (await mirrored(identity)) {
           receipt.existing += 1;
           return;
@@ -226,7 +194,7 @@ async function receiveAssignmentPage(
   );
   const [advanced] = await db.execute(sql`
     INSERT INTO progressive_worker_assignment_cursors (settings_id, solver_id, upstream_base_url, after_execution_id)
-    SELECT 1, ${solverId}::uuid, ${baseUrl}, ${normalNextCursor}::uuid FROM sync_api_settings settings
+    SELECT 1, ${solverId}::uuid, ${baseUrl}, ${page.nextCursor}::uuid FROM sync_api_settings settings
     WHERE settings.id = 1 AND settings.remote_solver_registered_id = ${solverId}::uuid
       AND settings.upstream_base_url = ${settings.upstream_base_url}
     ON CONFLICT (settings_id) DO UPDATE SET solver_id = EXCLUDED.solver_id, upstream_base_url = EXCLUDED.upstream_base_url,

@@ -6973,7 +6973,6 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       .object({
         after: z.string().uuid().optional(),
         limit: z.coerce.number().int().min(1).max(50).optional(),
-        currentCampaignOnly: z.coerce.boolean().optional(),
       })
       .strict()
       .safeParse(req.query);

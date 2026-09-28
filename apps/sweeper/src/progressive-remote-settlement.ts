@@ -21,9 +21,16 @@ async function settleInactiveUndeliveredExecution(
   executionId: string,
   promiseId: string,
 ) {
-  const [promise] = await db.execute(sql`SELECT status FROM sync_sweep_promises
+  const [promise] = await db.execute(sql`SELECT status, response_payload FROM sync_sweep_promises
     WHERE id = ${promiseId}::uuid FOR UPDATE`);
-  if (!promise || !["cancelled", "expired"].includes(String(promise.status)))
+  const authoritativeLeaseLoss =
+    (promise?.response_payload as Record<string, unknown> | null | undefined)
+      ?.authoritativeLeaseLoss === true;
+  if (
+    !promise ||
+    promise.status !== "cancelled" &&
+      !(promise.status === "expired" && authoritativeLeaseLoss)
+  )
     return null;
   const [stopped] =
     await db.execute(sql`SELECT proof FROM progressive_cfd_execution_stops

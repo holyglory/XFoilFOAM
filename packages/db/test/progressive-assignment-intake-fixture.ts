@@ -44,6 +44,8 @@ export async function verifyProgressiveAssignmentIntake(
     expect(options?.redirect).toBe("error");
     expect(options?.headers).toHaveProperty("x-xfoilfoam-solver-token");
     if (url.pathname.endsWith("/progressive-executions")) {
+      expect(url.searchParams.get("limit")).toBe("50");
+      expect(url.searchParams.has("currentCampaignOnly")).toBe(false);
       const after = url.searchParams.get("after");
       const remaining = assignments.filter(
         (item) => after === null || item.scope.executionId > after,
@@ -57,7 +59,7 @@ export async function verifyProgressiveAssignmentIntake(
           cpuSlots: item.request.resources?.solver_processes ?? 1,
         })),
         nextCursor:
-          remaining.length > 25 ? page.at(-1)!.scope.executionId : null,
+          remaining.length > 50 ? page.at(-1)!.scope.executionId : null,
       });
     }
     const assignedId = url.pathname.split("/").at(-1)!;
@@ -129,6 +131,29 @@ export async function verifyProgressiveAssignmentIntake(
     expect(repeated.reduce((total, item) => total + item.existing, 0)).toBe(1);
     expect(receive).toHaveBeenCalledTimes(1);
     expect(fullReads.filter((id) => id === executionId)).toHaveLength(1);
+    const readCursor = () => db.execute(sql`SELECT * FROM progressive_worker_assignment_cursors
+      WHERE settings_id = 1`);
+    const pageItems = assignments.slice(0, 2).map((item) => ({
+      executionId: item.scope.executionId,
+      promiseId: item.promiseId,
+      contentSignature: item.contentSignature,
+    }));
+    for (const malformed of [
+      { items: pageItems.toReversed(), nextCursor: null },
+      { items: [pageItems[0], pageItems[0]], nextCursor: null },
+      { items: [], nextCursor: 123 },
+      { items: [] },
+      { items: Array.from({ length: 51 }, () => pageItems[0]), nextCursor: null },
+    ]) {
+      const beforeCursor = await readCursor();
+      const received = receive.mock.calls.length;
+      const fetchPage = vi.fn(async () => Response.json(malformed));
+      await expect(receiveProgressiveAssignmentPage(db, receive, fetchPage))
+        .rejects.toThrow(/invalid assignment page|unordered or malformed/);
+      expect(fetchPage).toHaveBeenCalledOnce();
+      expect(receive).toHaveBeenCalledTimes(received);
+      expect(await readCursor()).toEqual(beforeCursor);
+    }
     const [source] =
       await db.execute(sql`SELECT airfoil.slug, airfoil.name, airfoil.source, airfoil.point_format, airfoil.points,
       revision.signature_hash, revision.snapshot FROM sim_jobs job JOIN airfoils airfoil ON airfoil.id = job.airfoil_id

@@ -128,6 +128,29 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       sql`UPDATE sync_sweep_promises SET status='cancelled'`,
     );
     expect(await select(true)).toEqual(await select(false));
+    const retryRollback = new Error("Restore terminal retry fixture");
+    await expect(transaction.transaction(async (nested) => {
+      await nested.execute(sql`UPDATE progressive_worker_reports
+        SET stopped_engine_job_id=sim_job_id::text,created_at=timestamptz '2024-01-01T00:00:00Z'
+        WHERE sim_job_id=md5('future-retry')::uuid`);
+      for (const active of [true, false]) {
+        const [selected] = await nested.execute(progressiveStagingSelectionSql(active));
+        expect(selected.sim_job_id).not.toBe(
+          (await nested.execute(sql`SELECT md5('future-retry')::uuid AS id`))[0].id,
+        );
+      }
+      await nested.execute(sql`UPDATE progressive_worker_staging_failures
+        SET retry_after=clock_timestamp()-interval '1 second'
+        WHERE sim_job_id=md5('future-retry')::uuid AND sequence=2`);
+      for (const active of [true, false]) {
+        const [selected] = await nested.execute(progressiveStagingSelectionSql(active));
+        expect(selected.sequence).toBe(2);
+        expect(selected.sim_job_id).toBe(
+          (await nested.execute(sql`SELECT md5('future-retry')::uuid AS id`))[0].id,
+        );
+      }
+      throw retryRollback;
+    })).rejects.toBe(retryRollback);
     for (const statement of [
       sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true`,
       sql`UPDATE sync_api_settings SET remote_solver_auth_token=''`,
