@@ -11,8 +11,6 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     await transaction.execute(sql`CREATE TEMP TABLE fixture_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['eligible-active','eligible-cancelled','eligible-expired','future-retry',
         'wrong-solver','wrong-upstream','wrong-job-upstream','not-remote','live-ingest','expired-ingest','unacknowledged','null-result','missing-result','already-staged']) variant`);
-    await transaction.execute(sql`CREATE TEMP TABLE sim_campaigns ON COMMIT DROP AS
-      SELECT id,'active'::text AS status FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE sync_api_settings ON COMMIT DROP AS
       SELECT 1 AS id,false AS remote_solver_transfer_paused,'fixture-token'::text AS remote_solver_auth_token,
         'https://fixture.invalid'::text AS upstream_base_url,md5('solver')::uuid AS remote_solver_registered_id`);
@@ -58,7 +56,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     const select = (active: boolean) =>
       transaction.execute(progressiveStagingSelectionSql(active));
     const expected = async (active: boolean) =>
-      transaction.execute(sql`SELECT report.sim_job_id,report.sequence,'active'::text AS campaign_status FROM progressive_worker_reports report
+      transaction.execute(sql`SELECT report.sim_job_id,report.sequence,report.created_at FROM progressive_worker_reports report
       JOIN fixture_jobs fixture ON fixture.id=report.sim_job_id JOIN sync_sweep_promises promise ON promise.id=fixture.id
       WHERE fixture.variant IN ('eligible-active','eligible-cancelled','eligible-expired','expired-ingest')
       ORDER BY CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
