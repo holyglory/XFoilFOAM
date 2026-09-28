@@ -2223,8 +2223,13 @@ async function campaignProgressiveSnapshot(
       COALESCE(sum(point_count) FILTER (WHERE neuralfoil_state = 'gap' OR fast_state = 'gap' OR precise_state = 'gap'), 0)::int AS gap_points,
       (SELECT stage::int FROM current_generation) AS stage,
       (SELECT count(*)::int FROM sim_jobs job
-        WHERE job.campaign_id = ${campaignId}
-          AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) AS active_jobs,
+        WHERE job.status IN ('pending', 'submitted', 'running', 'ingesting')
+          AND (job.campaign_id = ${campaignId}
+            OR EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch
+              WHERE dispatch.sim_job_id = job.id
+                AND EXISTS (SELECT 1 FROM sync_sweep_promises promise
+                  WHERE promise.id = dispatch.promise_id
+                    AND promise.campaign_id = ${campaignId})))) AS active_jobs,
       (SELECT count(DISTINCT unit.id)::int
         FROM progressive_cfd_units unit
         JOIN progressive_work work ON work.id = unit.work_id
