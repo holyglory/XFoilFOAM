@@ -113,6 +113,17 @@ def test_progressive_signature_is_independent_of_delivery_lease_but_pins_history
     assert post_progressive(request).json()["request_signature"] != first["request_signature"]
 
 
+def test_progressive_signature_keeps_legacy_optional_observation_fields_replayable():
+    current = progressive_request()
+    current["observations"] = [asdict(observation())]
+    legacy = progressive_request()
+    legacy_observation = asdict(observation())
+    for field in ("accepted_cfd", "physical_identity", "numerical_identity"):
+        legacy_observation.pop(field, None)
+    legacy["observations"] = [legacy_observation]
+    assert post_progressive(current).json()["request_signature"] == post_progressive(legacy).json()["request_signature"]
+
+
 @pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}])
 def test_progressive_endpoint_preserves_control_plane_authentication(headers):
     assert post_progressive(progressive_request(), headers).status_code == 401

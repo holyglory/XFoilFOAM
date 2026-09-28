@@ -55,6 +55,10 @@ def calculate_progressive_polar(request: ProgressivePolarRequest) -> dict:
     for observation in [*payload["observations"], *(history["observation"] for history in payload["histories"])]:
         if observation.get("accepted_cfd") is None:
             observation.pop("accepted_cfd", None)
+        if observation.get("physical_identity") is None:
+            observation.pop("physical_identity", None)
+        if observation.get("numerical_identity") is None:
+            observation.pop("numerical_identity", None)
     signature = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
     ).hexdigest()
