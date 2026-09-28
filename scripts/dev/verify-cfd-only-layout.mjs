@@ -45,6 +45,7 @@ target.reviewInputs.push(
   { path: "apps/web/components/detail/PolarViewer.tsx", kind: "ui-code" },
   { path: "apps/web/components/detail/PolarChart.tsx", kind: "ui-code" },
 );
+target.performance = { ttfbMs: 250, lcpMs: 800, ttfbLocalOnly: true };
 const points = { action: "click", selector: toggle };
 const light = {
   action: "click",

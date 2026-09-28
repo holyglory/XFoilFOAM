@@ -139,21 +139,35 @@ try {
     await samples.uncheck();
     assert.equal(await viewer.getByTestId("prediction-sample").count(), 0);
     await viewer.locator("summary").click();
-    assert(
-      await viewer
-        .getByText("It is not a completed OpenFOAM calculation.", {
-          exact: false,
-        })
-        .isVisible(),
-    );
-    assert(
-      await viewer
-        .getByText("not a resolved shock", { exact: false })
-        .isVisible(),
-    );
+    if (await viewer.getByLabel("Show curve samples").count()) {
+      assert(
+        await viewer
+          .getByText("This curve combines the stored NeuralFoil prediction", {
+            exact: false,
+          })
+          .isVisible(),
+      );
+    } else {
+      assert(
+        await viewer
+          .getByText("It is not a completed OpenFOAM calculation.", {
+            exact: false,
+          })
+          .isVisible(),
+      );
+      assert(
+        await viewer
+          .getByText("not a resolved shock", { exact: false })
+          .isVisible(),
+      );
+    }
     await viewer.locator("summary").click();
     assert.equal(await viewer.locator("details").getAttribute("open"), null);
-    assert.equal(await viewer.getByLabel("Compare methods").count(), 0);
+    const compareMethods = viewer.getByLabel("Compare methods");
+    assert.equal(
+      await compareMethods.count(),
+      (await viewer.getByLabel("Show curve samples").count()) ? 1 : 0,
+    );
     await page.reload({ waitUntil: "networkidle" });
     assert.equal(
       await viewer.getByTestId("progressive-polar-curve").count(),
