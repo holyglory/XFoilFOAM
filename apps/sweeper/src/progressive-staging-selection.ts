@@ -10,7 +10,7 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
     active: boolean,
   ) => sql`SELECT report.sim_job_id, report.sequence, report.created_at, campaign.status AS campaign_status FROM progressive_worker_reports report
     JOIN sim_jobs job ON job.id = report.sim_job_id
-    JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
+    LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     LEFT JOIN progressive_worker_staging_failures failure ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
     WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
       AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
