@@ -3,6 +3,7 @@ import type { EngineClient } from "@aerodb/engine-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   drainProgressiveWorkerEvidencePass,
+  drainProgressiveWorkerEvidenceStages,
   progressiveEvidenceDrain,
   runProgressiveEvidenceService,
 } from "../src/progressive-evidence-service";
@@ -35,6 +36,23 @@ it("performs bounded sequential evidence deliveries without starting duplicates"
     true,
   );
   expect(deliver.mock.calls).toEqual([[true], [true], [true]]);
+});
+
+it("stages a bounded batch concurrently while preserving aggregate failures", async () => {
+  let active = 0;
+  let peak = 0;
+  const stage = vi.fn(async () => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    return true;
+  });
+  await expect(drainProgressiveWorkerEvidenceStages(stage, true, 4)).resolves.toBe(
+    true,
+  );
+  expect(stage).toHaveBeenCalledTimes(4);
+  expect(peak).toBe(4);
 });
 
 it("alternates current-work priority with oldest-first while both stages progress", async () => {

@@ -6,6 +6,25 @@ import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evide
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
 
 const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 8;
+const MAX_PARALLEL_EVIDENCE_STAGES = 4;
+
+export async function drainProgressiveWorkerEvidenceStages(
+  stage: (preferActive: boolean) => Promise<boolean>,
+  preferActive: boolean,
+  maximum = MAX_PARALLEL_EVIDENCE_STAGES,
+): Promise<boolean> {
+  const results = await Promise.allSettled(
+    Array.from({ length: maximum }, () => stage(preferActive)),
+  );
+  const errors = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (errors.length)
+    throw new AggregateError(errors, "Progressive evidence staging failed");
+  return results.some(
+    (result) => result.status === "fulfilled" && result.value,
+  );
+}
 
 export async function drainProgressiveWorkerEvidencePass(
   deliver: (preferActive: boolean) => Promise<boolean>,
@@ -131,7 +150,13 @@ export async function runProgressiveEvidenceService(
         options.drain ??
         progressiveEvidenceDrain(
           (preferActive) =>
-            stageNextProgressiveWorkerEvidence(db, engine, { preferActive }),
+            drainProgressiveWorkerEvidenceStages(
+              (active) =>
+                stageNextProgressiveWorkerEvidence(db, engine, {
+                  preferActive: active,
+                }),
+              preferActive,
+            ),
           (preferActive) =>
             drainProgressiveWorkerEvidencePass(
               (active) =>
