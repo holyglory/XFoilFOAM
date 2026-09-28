@@ -31,10 +31,10 @@ try {
         await initialViewer.getByLabel("Polar condition").isDisabled(),
         true,
       );
-      assert.equal(
-        await initialViewer.getByLabel("Show prediction samples").isDisabled(),
-        true,
-      );
+      const initialSamples = initialViewer
+        .getByLabel("Show curve samples")
+        .or(initialViewer.getByLabel("Show prediction samples"));
+      assert.equal(await initialSamples.isDisabled(), true);
     } finally {
       await initialContext.close();
     }
@@ -61,7 +61,9 @@ try {
     await page
       .locator('[data-testid="progressive-polar-viewer"][aria-busy="false"]')
       .waitFor();
-    const samples = viewer.getByLabel("Show prediction samples");
+    const samples = viewer
+      .getByLabel("Show curve samples")
+      .or(viewer.getByLabel("Show prediction samples"));
     assert.equal(await samples.isEnabled(), true);
     const sampleControl = await samples.boundingBox();
     assert(
@@ -84,11 +86,12 @@ try {
         initialChart: box,
         chart: await chart.boundingBox(),
         toggle: await viewer
-          .getByLabel("Show prediction samples")
+        .getByLabel("Show curve samples")
+        .or(viewer.getByLabel("Show prediction samples"))
           .boundingBox(),
       }),
     );
-    await viewer.getByLabel("Show prediction samples").uncheck();
+    await samples.uncheck();
     const conditions = viewer.getByLabel("Polar condition");
     assert((await conditions.locator("option").count()) >= 6);
     const summary = viewer.getByRole("region", { name: "Curve summary" });
@@ -128,9 +131,9 @@ try {
         ),
       );
     }
-    await viewer.getByLabel("Show prediction samples").check();
+    await samples.check();
     assert.equal(await viewer.getByTestId("prediction-sample").count(), 26);
-    await viewer.getByLabel("Show prediction samples").uncheck();
+    await samples.uncheck();
     assert.equal(await viewer.getByTestId("prediction-sample").count(), 0);
     await viewer.locator("summary").click();
     assert(

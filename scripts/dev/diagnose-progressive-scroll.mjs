@@ -40,7 +40,9 @@ try {
     const viewer = page.getByTestId("progressive-polar-viewer");
     await viewer.waitFor();
     await page.evaluate(() => window.__polarScrollDiagnosis.snapshot("before-check"));
-    const samples = viewer.getByLabel("Show prediction samples");
+    const samples = viewer.getByLabel("Show curve samples").or(
+      viewer.getByLabel("Show prediction samples"),
+    );
     if (direct) {
       await page.locator('[data-testid="progressive-polar-viewer"][aria-busy="false"]').waitFor();
       const bounds = await samples.boundingBox();

@@ -60,7 +60,7 @@ describe("campaign completion dial geometry", () => {
       resolve(process.cwd(), "components/admin/campaigns/CampaignDetail.tsx"),
       "utf8",
     );
-    expect(source).toContain('stateLabel="current-plan points complete"');
+    expect(source).toContain('stateLabel="CFD points complete"');
     expect(source).toContain("Current campaign plan · all solver sources");
     expect(source).toContain("summary.completionSources.remoteSolved");
     expect(source).toContain("summary.completionSources.hubSolved");
