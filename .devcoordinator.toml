@@ -1877,9 +1877,20 @@ database = "aerodb"
 user = "aerodb"
 
 [[test.progressive-missing-baseline.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.progressive-missing-baseline.check]]
 name = "stage-transition"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "closes settled fast anchors without a NeuralFoil prior"]
+
+[[test.progressive-missing-baseline.check]]
+name = "worker-staging-selection"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts"]
 
 [[test.progressive.check]]
 name = "reset"

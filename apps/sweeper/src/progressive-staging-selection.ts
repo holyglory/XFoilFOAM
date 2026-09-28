@@ -1,19 +1,22 @@
 import { sql } from "drizzle-orm";
 
 export function progressiveStagingSelectionSql(preferActive: boolean) {
-  const order = (active: boolean) => {
+  const order = (active: boolean, campaignStatus = sql`report.campaign_status`) => {
     const direction = active ? sql`DESC` : sql`ASC`;
-    return sql`ORDER BY report.created_at ${direction}, report.sim_job_id ${direction}, report.sequence ${direction}`;
+    return sql`ORDER BY CASE WHEN ${campaignStatus} IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
+      report.created_at ${direction}, report.sim_job_id ${direction}, report.sequence ${direction}`;
   };
   const reports = (
     active: boolean,
-  ) => sql`SELECT report.sim_job_id, report.sequence, report.created_at FROM progressive_worker_reports report
+  ) => sql`SELECT report.sim_job_id, report.sequence, report.created_at, campaign.status AS campaign_status FROM progressive_worker_reports report
+    JOIN sim_jobs job ON job.id = report.sim_job_id
+    JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     LEFT JOIN progressive_worker_staging_failures failure ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
     WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
       AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-    ${order(active)} OFFSET 0`;
+    ${order(active, sql`campaign.status`)} OFFSET 0`;
   const owned = (active: boolean) => sql`SELECT job.id FROM sim_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
@@ -26,7 +29,7 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       AND (${!active} OR (promise.status = 'active' AND promise."expiresAt" > clock_timestamp())) OFFSET 0`;
   const candidate = (
     active: boolean,
-  ) => sql`SELECT report.sim_job_id, report.sequence FROM (${reports(active)}) report
+  ) => sql`SELECT report.sim_job_id, report.sequence, report.campaign_status FROM (${reports(active)}) report
     JOIN LATERAL (${owned(active)}) owned ON true`;
   if (!preferActive) return sql`${candidate(false)} ${order(false)} LIMIT 1`;
   return sql`WITH active AS MATERIALIZED (
