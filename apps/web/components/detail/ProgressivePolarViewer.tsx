@@ -257,6 +257,11 @@ export function ProgressivePolarViewer({
         <label>
           <input
             type="checkbox"
+            aria-label={
+              selected.kind === "estimate"
+                ? "Show curve samples"
+                : "Show prediction samples"
+            }
             disabled={!interactive}
             checked={samplesVisible}
             onChange={(event) => setSamplesVisible(event.target.checked)}

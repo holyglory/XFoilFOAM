@@ -70,7 +70,7 @@
           "actions": [
             {
               "action": "check",
-              "selector": "[data-testid='progressive-polar-viewer'] input[type='checkbox']:first-of-type"
+              "selector": "[data-testid='progressive-polar-viewer'] input[aria-label='Show curve samples']"
             }
           ],
           "continuation": {
