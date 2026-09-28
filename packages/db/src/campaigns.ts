@@ -8159,23 +8159,22 @@ export async function campaignAirfoilRows(
       ),
     );
   const progressiveRows = (await db.execute(sql`
-    WITH current_generation AS MATERIALIZED (
-      SELECT generation.id
+    WITH current_generations AS MATERIALIZED (
+      SELECT generation.id, generation.epoch_id, generation.created_at
       FROM progressive_generations generation
       JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       JOIN calculation_epochs epoch
         ON epoch.id = generation.epoch_id AND epoch.current
       WHERE generation.campaign_id = ${campaignId}
         AND generation.plan_revision_id = campaign.current_plan_revision_id
-        AND generation.status = 'active'
-      ORDER BY generation.created_at DESC, generation.id DESC
-      LIMIT 1
+        AND generation.status IN ('active', 'complete', 'attention')
     ), target_cells AS MATERIALIZED (
-      SELECT target.id AS target_id, target.airfoil_id,
+      SELECT DISTINCT ON (condition.id, target.airfoil_id)
+        target.id AS target_id, target.airfoil_id, generation.id AS generation_id,
+        generation.epoch_id, scope.angles,
         condition.id AS condition_id,
-        cardinality(scope.angles)::int AS requested,
-        baseline.state AS baseline_state
-      FROM current_generation generation
+        cardinality(scope.angles)::int AS requested
+      FROM current_generations generation
       JOIN progressive_generation_targets scope
         ON scope.generation_id = generation.id
       JOIN polar_analysis_targets target ON target.id = scope.target_id
@@ -8183,14 +8182,12 @@ export async function campaignAirfoilRows(
         ON condition.campaign_id = ${campaignId}
        AND condition.generation = ${campaign.currentConditionGeneration}
        AND condition.simulation_preset_revision_id = scope.revision_id
-      LEFT JOIN progressive_work baseline
-        ON baseline.generation_id = generation.id
-       AND baseline.target_id = target.id
-       AND baseline.stage = 1
+       AND condition.status IN ('active', 'kept')
       WHERE target.airfoil_id IN (${sql.join(
         ids.map((id) => sql`${id}::uuid`),
         sql`,`,
       )})
+      ORDER BY condition.id, target.airfoil_id, generation.created_at DESC, generation.id DESC
     ), progressive_stats AS MATERIALIZED (
       SELECT target_cells.target_id,
         count(DISTINCT evidence.result_attempt_id)::int AS cfd_evidence,
@@ -8203,6 +8200,7 @@ export async function campaignAirfoilRows(
       FROM target_cells
       LEFT JOIN progressive_work work
         ON work.target_id = target_cells.target_id
+       AND work.generation_id = target_cells.generation_id
        AND work.stage IN (2, 3)
       LEFT JOIN progressive_cfd_units unit ON unit.work_id = work.id
       LEFT JOIN progressive_cfd_attempts attempt
@@ -8213,12 +8211,19 @@ export async function campaignAirfoilRows(
     )
     SELECT target_cells.target_id, target_cells.airfoil_id,
       target_cells.condition_id, target_cells.requested,
-      CASE WHEN target_cells.baseline_state = 'complete'
-        THEN target_cells.requested ELSE 0 END AS preliminary,
+      (SELECT count(*)::int FROM unnest(target_cells.angles) requested(alpha)
+        WHERE prediction.payload->'alpha' @> to_jsonb(requested.alpha)) AS preliminary,
       coalesce(progressive_stats.cfd_evidence, 0)::int AS cfd_evidence,
       coalesce(progressive_stats.fast_complete, 0)::int AS fast_complete,
       coalesce(progressive_stats.precise_complete, 0)::int AS precise_complete
     FROM target_cells
+    LEFT JOIN LATERAL (
+      SELECT prediction.payload FROM neuralfoil_predictions prediction
+      WHERE prediction.target_id = target_cells.target_id
+        AND prediction.epoch_id = target_cells.epoch_id
+        AND prediction.catalog_metrics_v1 IS NOT NULL
+      ORDER BY prediction.created_at DESC, prediction.id LIMIT 1
+    ) prediction ON true
     LEFT JOIN progressive_stats
       ON progressive_stats.target_id = target_cells.target_id
   `)) as unknown as Array<{

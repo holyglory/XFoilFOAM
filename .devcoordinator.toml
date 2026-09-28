@@ -3499,6 +3499,27 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vite
 [test.progressive-production-ui]
 timeout_seconds = 180
 
+[test.campaign-coverage-production]
+timeout_seconds = 180
+
+[test.campaign-coverage-scope]
+timeout_seconds = 300
+
+[test.campaign-coverage-scope.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.campaign-coverage-scope.check]]
+name = "scope"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps campaign coverage tied"]
+
+[[test.campaign-coverage-production.check]]
+name = "rendered-coverage"
+tier = "development"
+command = ["node", "scripts/dev/verify-production-campaign-coverage.mjs"]
+
 [test.prediction-repair-production]
 timeout_seconds = 180
 

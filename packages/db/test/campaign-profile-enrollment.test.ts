@@ -138,6 +138,7 @@ import {
 import { createClient, type DB } from "../src/client";
 import { databaseUrl } from "../src/env";
 import {
+  campaignAirfoilRows,
   materializeCampaignLaunch,
   reconcileCampaignProfileEnrollment,
 } from "../src/campaigns";
@@ -1504,6 +1505,52 @@ function executionStopProof(engineJobId: string): EngineExecutionStopProof {
 }
 
 describe("progressive durable stage transitions", () => {
+  it("keeps campaign coverage tied to stored predictions and each current target scope", async () => {
+    const fixture = await cfdEvidenceFixture(32.713, 2, [42.713]);
+    const source = fixture.leases[0];
+    const evidence = await fixture.save(10);
+    await fixture.record([evidence]);
+    const read = async () => {
+      const page = await campaignAirfoilRows(db, fixture.campaignId);
+      const row = page.items.find((item) => item.airfoilId === originalId)!;
+      const [condition] = await db.execute(sql`SELECT id FROM sim_campaign_conditions
+        WHERE campaign_id=${fixture.campaignId} AND simulation_preset_revision_id=${source.revisionId}`);
+      return row.perCondition.find((cell) => cell.conditionId === condition.id)!;
+    };
+    expect((await read()).progressive).toMatchObject({ requested: 3, preliminary: 3, cfdEvidence: 1 });
+    expect((await read()).solved).toBe(0);
+    await db.execute(sql`UPDATE progressive_generations SET status='complete' WHERE id=${source.generationId}`);
+    expect((await read()).progressive?.cfdEvidence).toBe(1);
+    await db.execute(sql`UPDATE progressive_generations SET status='active' WHERE id=${source.generationId}`);
+    await db.execute(sql`UPDATE progressive_work SET state='gap' WHERE generation_id=${source.generationId} AND stage=1`);
+    expect((await read()).progressive?.preliminary).toBe(3);
+
+    const expansionId = randomUUID();
+    await db.execute(sql`INSERT INTO progressive_generations(id,epoch_id,campaign_id,plan_revision_id,scope_key,scope_signature)
+      SELECT ${expansionId},epoch_id,campaign_id,plan_revision_id,${expansionId},scope_signature
+      FROM progressive_generations WHERE id=${source.generationId}`);
+    await db.execute(sql`INSERT INTO progressive_generation_targets(generation_id,target_id,revision_id,angles,recipes)
+      SELECT ${expansionId},target_id,revision_id,angles,recipes FROM progressive_generation_targets
+      WHERE generation_id=${source.generationId} AND target_id<>${source.targetId}`);
+    expect((await read()).progressive?.cfdEvidence).toBe(1);
+
+    await db.execute(sql`INSERT INTO progressive_generation_targets(generation_id,target_id,revision_id,angles,recipes)
+      SELECT ${expansionId},target_id,revision_id,angles,recipes FROM progressive_generation_targets
+      WHERE generation_id=${source.generationId} AND target_id=${source.targetId}`);
+    expect((await read()).progressive).toMatchObject({ preliminary: 3, cfdEvidence: 0, fastComplete: 0, preciseComplete: 0 });
+    const rollback = new Error("restore missing-prediction fixture");
+    await expect(db.transaction(async (transaction) => {
+      await transaction.execute(sql`DELETE FROM neuralfoil_predictions WHERE target_id=${source.targetId}`);
+      await transaction.execute(sql`UPDATE progressive_work SET state='complete' WHERE generation_id=${source.generationId} AND stage=1`);
+      const page = await campaignAirfoilRows(transaction as unknown as DB, fixture.campaignId);
+      expect(page.items[0].perCondition.filter((cell) => cell.progressive?.preliminary === 0)).toHaveLength(1);
+      throw rollback;
+    })).rejects.toBe(rollback);
+    await db.execute(sql`UPDATE sim_campaign_conditions SET status='released'
+      WHERE campaign_id=${fixture.campaignId} AND simulation_preset_revision_id=${source.revisionId}`);
+    expect((await read()).progressive).toBeUndefined();
+  }, 120_000);
+
   it.skipIf(process.env.PROGRESSIVE_PREDICTION_REPAIR_LIVE !== "1")(
     "repairs real old-engine geometry gaps through the new prediction engine without CFD replay",
     async () => {
