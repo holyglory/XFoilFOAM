@@ -21,6 +21,10 @@ const engine = {
 
 function source(overrides: Record<string, unknown> = {}) {
   return {
+    predictionId: "prediction",
+    targetId: "target",
+    epochId: "epoch",
+    signature: "signature",
     physical: {
       branch: "increasing",
       derived: { mach: 0.48774443656347544, reynolds: 1_131_898 },
@@ -41,7 +45,7 @@ function source(overrides: Record<string, unknown> = {}) {
       },
     ],
     ...overrides,
-  } as never;
+  } as unknown as Parameters<typeof progressiveBiasApplicability>[0];
 }
 
 describe("progressive source-bound uncertainty scope", () => {
