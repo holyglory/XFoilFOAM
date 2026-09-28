@@ -20,6 +20,7 @@ import {
   groupConditionsByChord,
   needsChordGrouping,
   rowDoneFraction,
+  rowProgressiveFraction,
   segmentFillHeight,
   segmentTitle,
   segmentView,
@@ -379,6 +380,41 @@ describe("rowDoneFraction (DONE column)", () => {
     expect(
       rowDoneFraction({ ...row, perCondition: [] }, new Set(["c1"])),
     ).toEqual({ done: 0, total: 0 });
+  });
+
+  it("keeps progressive curves and CFD evidence separate from accepted DONE", () => {
+    const progressiveRow = {
+      ...row,
+      perCondition: [
+        {
+          ...row.perCondition[0],
+          progressive: {
+            requested: 26,
+            preliminary: 26,
+            cfdEvidence: 4,
+            fastComplete: 2,
+            preciseComplete: 0,
+          },
+        },
+        {
+          ...row.perCondition[1],
+          progressive: {
+            requested: 26,
+            preliminary: 13,
+            cfdEvidence: 0,
+            fastComplete: 0,
+            preciseComplete: 0,
+          },
+        },
+      ],
+    };
+    expect(rowDoneFraction(progressiveRow, new Set(["c1", "c2"]))).toEqual({
+      done: 31 + 22,
+      total: 62,
+    });
+    expect(
+      rowProgressiveFraction(progressiveRow, new Set(["c1", "c2"])),
+    ).toEqual({ preliminary: 39, evidence: 4, requested: 52 });
   });
 });
 

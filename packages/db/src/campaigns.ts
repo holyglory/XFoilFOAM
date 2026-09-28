@@ -30,7 +30,10 @@ import {
 } from "./campaign-execution";
 import { readCampaignDerivedSummaryMetrics } from "./campaign-summary-metrics";
 import type { DB } from "./client";
-import { inheritLocalStepPolicy, recordDefaultLocalStepPolicy } from "./campaign-local-step-policy";
+import {
+  inheritLocalStepPolicy,
+  recordDefaultLocalStepPolicy,
+} from "./campaign-local-step-policy";
 import { resolveMaterialSnapshot } from "./material-snapshot";
 import {
   exactValidSolverManifestSql,
@@ -3614,7 +3617,12 @@ async function applyPlanEditCore(
     .where(eq(simCampaigns.id, campaign.id));
 
   if (campaign.currentPlanRevisionId)
-    await inheritLocalStepPolicy(asDb(tx), campaign.id, campaign.currentPlanRevisionId, planRevision.id);
+    await inheritLocalStepPolicy(
+      asDb(tx),
+      campaign.id,
+      campaign.currentPlanRevisionId,
+      planRevision.id,
+    );
 
   // New conditions (value-level find-or-create + physics pinning, §5 machinery).
   if (cls.internal.addedCombos.length > 0) {
@@ -5257,7 +5265,12 @@ export async function forceReleaseCondition(
       .update(simCampaigns)
       .set({ currentPlanRevisionId: planRevision.id })
       .where(eq(simCampaigns.id, campaign.id));
-    await inheritLocalStepPolicy(asDb(tx), campaign.id, revision.id, planRevision.id);
+    await inheritLocalStepPolicy(
+      asDb(tx),
+      campaign.id,
+      revision.id,
+      planRevision.id,
+    );
     await asDb(tx)
       .update(simCampaignConditions)
       .set({
@@ -8031,8 +8044,20 @@ export interface CampaignAirfoilRow {
   name: string;
   isSymmetric: boolean;
   perCondition: Array<
-    { conditionId: string } & CampaignProgressTotals & CampaignReviewBuckets
+    {
+      conditionId: string;
+      progressive?: ProgressiveCoverageCell;
+    } & CampaignProgressTotals &
+      CampaignReviewBuckets
   >;
+}
+
+export interface ProgressiveCoverageCell {
+  requested: number;
+  preliminary: number;
+  cfdEvidence: number;
+  fastComplete: number;
+  preciseComplete: number;
 }
 
 /** Keyset matrix rows by airfoil slug (spec §10, cursor = last slug). */
@@ -8133,6 +8158,86 @@ export async function campaignAirfoilRows(
         inArray(simCampaignProgress.conditionId, currentConditionIds),
       ),
     );
+  const progressiveRows = (await db.execute(sql`
+    WITH current_generation AS MATERIALIZED (
+      SELECT generation.id
+      FROM progressive_generations generation
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      JOIN calculation_epochs epoch
+        ON epoch.id = generation.epoch_id AND epoch.current
+      WHERE generation.campaign_id = ${campaignId}
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND generation.status = 'active'
+      ORDER BY generation.created_at DESC, generation.id DESC
+      LIMIT 1
+    ), target_cells AS MATERIALIZED (
+      SELECT target.id AS target_id, target.airfoil_id,
+        condition.id AS condition_id,
+        cardinality(scope.angles)::int AS requested,
+        baseline.state AS baseline_state
+      FROM current_generation generation
+      JOIN progressive_generation_targets scope
+        ON scope.generation_id = generation.id
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      JOIN sim_campaign_conditions condition
+        ON condition.campaign_id = ${campaignId}
+       AND condition.generation = ${campaign.currentConditionGeneration}
+       AND condition.simulation_preset_revision_id = scope.revision_id
+      LEFT JOIN progressive_work baseline
+        ON baseline.generation_id = generation.id
+       AND baseline.target_id = target.id
+       AND baseline.stage = 1
+      WHERE target.airfoil_id IN (${sql.join(
+        ids.map((id) => sql`${id}::uuid`),
+        sql`,`,
+      )})
+    )
+    SELECT target_id, airfoil_id, condition_id, requested,
+      CASE WHEN baseline_state = 'complete' THEN requested ELSE 0 END AS preliminary,
+      (
+        SELECT count(DISTINCT evidence.result_attempt_id)::int
+        FROM progressive_cfd_evidence evidence
+        JOIN progressive_cfd_attempts attempt
+          ON attempt.token = evidence.attempt_token
+        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        JOIN progressive_work work ON work.id = unit.work_id
+        WHERE work.target_id = target_cells.target_id
+          AND work.stage IN (2, 3)
+      ) AS cfd_evidence,
+      (
+        SELECT count(*)::int
+        FROM progressive_cfd_units unit
+        JOIN progressive_work work ON work.id = unit.work_id
+        WHERE work.target_id = target_cells.target_id
+          AND work.stage = 2 AND unit.state = 'complete'
+      ) AS fast_complete,
+      (
+        SELECT count(*)::int
+        FROM progressive_cfd_units unit
+        JOIN progressive_work work ON work.id = unit.work_id
+        WHERE work.target_id = target_cells.target_id
+          AND work.stage = 3 AND unit.state = 'complete'
+      ) AS precise_complete
+    FROM target_cells
+  `)) as unknown as Array<{
+    airfoil_id: string;
+    condition_id: string;
+    requested: number;
+    preliminary: number;
+    cfd_evidence: number;
+    fast_complete: number;
+    precise_complete: number;
+  }>;
+  const progressiveByCell = new Map<string, ProgressiveCoverageCell>();
+  for (const row of progressiveRows) {
+    progressiveByCell.set(`${row.airfoil_id}:${row.condition_id}`, {
+      requested: Number(row.requested),
+      preliminary: Number(row.preliminary),
+      cfdEvidence: Number(row.cfd_evidence),
+      fastComplete: Number(row.fast_complete),
+      preciseComplete: Number(row.precise_complete),
+    });
+  }
   // Per-cell machine-owned awaiting-URANS work. The legacy needsReview field
   // remains for rolling compatibility but its canonical predicate is empty.
   const reviewRows = await campaignReviewBucketRows(db, campaignId, {
@@ -8173,6 +8278,7 @@ export async function campaignAirfoilRows(
       ),
       awaitingUrans: review.awaitingUrans,
       needsReview: review.needsReview,
+      progressive: progressiveByCell.get(`${row.airfoilId}:${row.conditionId}`),
     });
     byAirfoil.set(row.airfoilId, bucket);
   }

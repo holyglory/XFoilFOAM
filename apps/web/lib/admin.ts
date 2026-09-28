@@ -2006,8 +2006,18 @@ export interface AdminCampaignAirfoilRow {
   /** Per-cell rolling-compatibility counters; optional for older payloads. */
   perCondition: Array<
     { conditionId: string } & CampaignProgressTotals &
-      Partial<CampaignReviewBuckets>
+      Partial<CampaignReviewBuckets> & {
+        progressive?: CampaignProgressiveCoverageCell;
+      }
   >;
+}
+
+export interface CampaignProgressiveCoverageCell {
+  requested: number;
+  preliminary: number;
+  cfdEvidence: number;
+  fastComplete: number;
+  preciseComplete: number;
 }
 
 export interface AdminCampaignFailureGroup {

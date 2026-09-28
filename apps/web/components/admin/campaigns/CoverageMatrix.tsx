@@ -37,6 +37,8 @@ import {
   segmentTitle,
   segmentView,
   segmentWorkflowFillHeight,
+  rowProgressiveFraction,
+  type CoverageCell,
 } from "./coverage-segments";
 import { fCount, ghostBtn, inputStyle } from "./ui";
 
@@ -46,6 +48,7 @@ const BAR_H = 16;
 const VIEWPORT_H = 520;
 const OVERSCAN = 6;
 const FRAC_COL = 64;
+const PROG_COL = 92;
 const COL_GAP = 10;
 const ROW_PAD_X = 12;
 
@@ -286,10 +289,7 @@ export function CoverageMatrix({
   }, [blockedFirst, loadedRows, resultsCurrent]);
 
   const cellByCondition = useCallback((row: AdminCampaignAirfoilRow) => {
-    const map = new Map<
-      string,
-      CampaignProgressTotals & { conditionId: string }
-    >();
+    const map = new Map<string, CoverageCell & { conditionId: string }>();
     for (const c of row.perCondition) map.set(c.conditionId, c);
     return map;
   }, []);
@@ -298,9 +298,9 @@ export function CoverageMatrix({
   const nameCol = rootWidth >= 720 ? 220 : 170;
   const barWidth = Math.max(
     0,
-    rootWidth - 2 * ROW_PAD_X - nameCol - FRAC_COL - 2 * COL_GAP,
+    rootWidth - 2 * ROW_PAD_X - nameCol - FRAC_COL - PROG_COL - 3 * COL_GAP,
   );
-  const gridColumns = `${nameCol}px ${FRAC_COL}px minmax(0, 1fr)`;
+  const gridColumns = `${nameCol}px ${FRAC_COL}px ${PROG_COL}px minmax(0, 1fr)`;
 
   // Chord grouping fallback: only when the measured bar cannot give every
   // visible condition MIN_SEGMENT_PX (threshold documented in
@@ -553,6 +553,9 @@ export function CoverageMatrix({
       >
         <span style={{ letterSpacing: "0.1em" }}>AIRFOIL</span>
         <span style={{ letterSpacing: "0.1em", textAlign: "right" }}>DONE</span>
+        <span style={{ letterSpacing: "0.1em", textAlign: "right" }}>
+          CURVE / CFD
+        </span>
         <span
           style={{
             whiteSpace: "nowrap",
@@ -561,9 +564,11 @@ export function CoverageMatrix({
           }}
         >
           CONDITIONS → fill = accepted results ·{" "}
-          <span style={{ color: C.violet }}>violet</span> = awaiting fast URANS
-          · <span style={{ color: C.redText }}>red</span> = critical · hover for
-          detail · click opens the point flow
+          <span style={{ color: C.violet }}>violet stripe</span> = preliminary
+          curve · <span style={{ color: C.amber }}>amber stripe</span> = CFD
+          evidence · <span style={{ color: C.violet }}>violet overlay</span> =
+          awaiting fast URANS · <span style={{ color: C.redText }}>red</span> =
+          critical · hover for detail · click opens the point flow
         </span>
       </div>
 
@@ -607,6 +612,10 @@ export function CoverageMatrix({
             const i = start + sliceIdx;
             const byId = cellByCondition(row);
             const frac = rowDoneFraction(row, renderedConditionIds);
+            const progressive = rowProgressiveFraction(
+              row,
+              renderedConditionIds,
+            );
             return (
               <div
                 key={row.slug}
@@ -672,6 +681,22 @@ export function CoverageMatrix({
                 >
                   {fCount(frac.done)}/{fCount(frac.total)}
                 </span>
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 9,
+                    color: progressive.preliminary > 0 ? C.violet : C.dimmest,
+                    textAlign: "right",
+                    fontVariantNumeric: "tabular-nums",
+                    whiteSpace: "nowrap",
+                    lineHeight: 1.25,
+                  }}
+                  title="Progressive curve angles and CFD evidence points; these do not inflate accepted DONE."
+                >
+                  {progressive.requested > 0
+                    ? `P ${fCount(progressive.preliminary)}/${fCount(progressive.requested)} · E ${fCount(progressive.evidence)}`
+                    : "—"}
+                </span>
                 <div
                   style={{
                     display: "flex",
@@ -702,6 +727,20 @@ export function CoverageMatrix({
                     const fillColor = red ? C.red : C.teal;
                     const workflowColor =
                       view.state === "awaiting_urans" ? C.violet : C.amber;
+                    const curveFraction = cell?.progressive
+                      ? Math.min(
+                          1,
+                          cell.progressive.preliminary /
+                            Math.max(1, cell.progressive.requested),
+                        )
+                      : 0;
+                    const evidenceFraction = cell?.progressive
+                      ? Math.min(
+                          1,
+                          cell.progressive.cfdEvidence /
+                            Math.max(1, cell.progressive.requested),
+                        )
+                      : 0;
                     return (
                       <button
                         key={c.id}
@@ -744,6 +783,34 @@ export function CoverageMatrix({
                               bottom: 0,
                               height: `${fillH * 100}%`,
                               background: fillColor,
+                              display: "block",
+                            }}
+                          />
+                        )}
+                        {curveFraction > 0 && (
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              position: "absolute",
+                              left: 0,
+                              top: 0,
+                              width: `${curveFraction * 100}%`,
+                              height: 2,
+                              background: C.violet,
+                              display: "block",
+                            }}
+                          />
+                        )}
+                        {evidenceFraction > 0 && (
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              position: "absolute",
+                              right: 0,
+                              top: 0,
+                              width: `${evidenceFraction * 100}%`,
+                              height: 2,
+                              background: C.amber,
                               display: "block",
                             }}
                           />

@@ -30,6 +30,7 @@ import {
   type AdminCampaignConditionSummary,
   type AdminCampaignPreliminaryOutcomes,
   type AdminUransRequest,
+  type CampaignProgressiveCoverageCell,
   type CampaignProgressTotals,
   getCampaignPreliminaryOutcomes,
   getPointAttemptSim,
@@ -55,6 +56,7 @@ import { AirfoilGlyph } from "../../AirfoilGlyph";
 import { AirfoilProfilePlot } from "../../AirfoilProfilePlot";
 import type { HoverState } from "../../detail/DetailIsland";
 import { PolarViewer } from "../../detail/PolarViewer";
+import { ProgressivePolarViewer } from "../../detail/ProgressivePolarViewer";
 import { SimModal } from "../../detail/SimModal";
 import { type CampaignPointEvidenceTarget } from "./CampaignPointManagement";
 import {
@@ -95,7 +97,11 @@ export function CellSidePanel({
   campaignId: string;
   airfoil: CellPanelAirfoil;
   condition: AdminCampaignConditionSummary;
-  cell: CampaignProgressTotals | null;
+  cell:
+    | (CampaignProgressTotals & {
+        progressive?: CampaignProgressiveCoverageCell;
+      })
+    | null;
   campaignCreatedAt: string | null;
   onClose: () => void;
   onChanged: () => void;
@@ -445,6 +451,31 @@ export function CellSidePanel({
     setSimOpen(true);
   }, []);
 
+  const onProgressiveResult = useCallback(
+    (target: {
+      re: number;
+      aoa: number;
+      resultId: string;
+      resultAttemptId?: string;
+    }) => {
+      simTriggerRef.current =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : panelRef.current;
+      setSimCtx({
+        re: target.re,
+        aoa: target.aoa,
+        resultId: target.resultId,
+        resultAttemptId: target.resultAttemptId,
+      });
+      setSimDetail(null);
+      setSimMessage(null);
+      setPlaying(true);
+      setSimOpen(true);
+    },
+    [],
+  );
+
   const onPreliminaryResultClick = useCallback(
     (target: PreliminaryResultTarget) => {
       simTriggerRef.current =
@@ -547,6 +578,7 @@ export function CellSidePanel({
   }, [simOpen, simTrack, airfoil.slug, simField]);
 
   const counters = cell ?? null;
+  const progressiveSeries = detail?.progressivePolars ?? [];
   const openFinalVerification = ladder?.requests.find(
     (request) =>
       request.aoaDeg == null &&
@@ -696,7 +728,13 @@ export function CellSidePanel({
         </div>
 
         {/* stored artifact FIRST: the pinned-revision polar */}
-        {detail && projection ? (
+        {progressiveSeries.length > 0 ? (
+          <ProgressivePolarViewer
+            series={progressiveSeries}
+            initialConditionKey={progressiveSeries[0]?.conditionKey ?? ""}
+            onOpenResult={onProgressiveResult}
+          />
+        ) : detail && projection ? (
           <PolarViewer
             chartType={chartType}
             onChartType={changeChartType}
@@ -780,6 +818,19 @@ export function CellSidePanel({
               <span style={chip(C.amber, "rgba(245,158,11,0.45)")}>
                 {fCount(counters.running)} running
               </span>
+            )}
+            {counters.progressive && (
+              <>
+                <span style={chip(C.violet, C.violetBorder)}>
+                  {fCount(counters.progressive.preliminary)}/
+                  {fCount(counters.progressive.requested)} curve angles
+                </span>
+                {counters.progressive.cfdEvidence > 0 && (
+                  <span style={chip(C.amber, "rgba(245,158,11,0.45)")}>
+                    {fCount(counters.progressive.cfdEvidence)} CFD evidence
+                  </span>
+                )}
+              </>
             )}
             <span style={chip(C.muted, C.stroke)}>
               {fCount(counters.remaining)} remaining of{" "}

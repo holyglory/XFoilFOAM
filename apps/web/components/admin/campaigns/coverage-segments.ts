@@ -11,13 +11,16 @@
 import type {
   AdminCampaignAirfoilRow,
   AdminCampaignConditionSummary,
+  CampaignProgressiveCoverageCell,
   CampaignProgressTotals,
   CampaignReviewBuckets,
 } from "../../../lib/admin";
 
 /** Matrix cell payload: real counters + the optional amendment-A split. */
 export type CoverageCell = CampaignProgressTotals &
-  Partial<CampaignReviewBuckets>;
+  Partial<CampaignReviewBuckets> & {
+    progressive?: CampaignProgressiveCoverageCell;
+  };
 
 // Local copies of ui.tsx's formatRe/fCount: importing ui.tsx here would drag
 // the React component tree into node vitest, defeating the point of this
@@ -172,6 +175,14 @@ export function segmentTitle(
     if (cell.running > 0) parts.push(`${fCount(cell.running)} running`);
     const sync = syncPromisedCount(cell);
     if (sync > 0) parts.push(`${fCount(sync)} sync-promised`);
+    const progressive = (cell as CoverageCell).progressive;
+    if (progressive) {
+      parts.push(
+        `curve ${fCount(progressive.preliminary)}/${fCount(progressive.requested)}`,
+      );
+      if (progressive.cfdEvidence > 0)
+        parts.push(`${fCount(progressive.cfdEvidence)} CFD evidence`);
+    }
   }
   if (stateLabel && stateLabel !== "active") parts.push(stateLabel);
   return parts.join(" · ");
@@ -196,6 +207,23 @@ export function rowDoneFraction(
     total += cell.requested;
   }
   return { done, total };
+}
+
+export function rowProgressiveFraction(
+  row: AdminCampaignAirfoilRow,
+  renderedConditionIds: ReadonlySet<string>,
+): { preliminary: number; evidence: number; requested: number } {
+  let preliminary = 0;
+  let evidence = 0;
+  let requested = 0;
+  for (const cell of row.perCondition) {
+    if (!renderedConditionIds.has(cell.conditionId) || !cell.progressive)
+      continue;
+    preliminary += cell.progressive.preliminary;
+    evidence += cell.progressive.cfdEvidence;
+    requested += cell.progressive.requested;
+  }
+  return { preliminary, evidence, requested };
 }
 
 // ---------------------------------------------------------------------------
