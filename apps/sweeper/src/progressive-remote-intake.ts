@@ -93,12 +93,12 @@ async function receiveAssignmentPage(
     return response.json() as Promise<unknown>;
   };
   const page = await request(
-    `/progressive-executions?limit=25${after ? `&after=${encodeURIComponent(after)}` : ""}`,
+    `/progressive-executions?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`,
   );
   if (
     !record(page) ||
     !Array.isArray(page.items) ||
-    page.items.length > 25 ||
+    page.items.length > 50 ||
     !(page.nextCursor === null || uuid(page.nextCursor))
   )
     throw new Error("The hub returned an invalid assignment page");

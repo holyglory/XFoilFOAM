@@ -48,7 +48,7 @@ export async function verifyProgressiveAssignmentIntake(
       const remaining = assignments.filter(
         (item) => after === null || item.scope.executionId > after,
       );
-      const page = remaining.slice(0, 25);
+      const page = remaining.slice(0, 50);
       return Response.json({
         items: page.map((item) => ({
           executionId: item.scope.executionId,
@@ -98,7 +98,7 @@ export async function verifyProgressiveAssignmentIntake(
       await db.execute(sql`DELETE FROM sim_jobs WHERE id = ${executionId}::uuid
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_submission_intents WHERE sim_job_id = ${executionId}::uuid) RETURNING id`);
     expect(removed).toHaveLength(1);
-    for (const expectedSeen of [25, 25, 2]) {
+    for (const expectedSeen of [50, 2]) {
       const receipt = await receiveProgressiveAssignmentPage(
         db,
         receive,
@@ -117,7 +117,7 @@ export async function verifyProgressiveAssignmentIntake(
     );
     expect(wrapped.after_execution_id).toBeNull();
     const repeated = [];
-    for (const expectedSeen of [25, 25, 2]) {
+    for (const expectedSeen of [50, 2]) {
       const receipt = await receiveProgressiveAssignmentPage(
         db,
         receive,
