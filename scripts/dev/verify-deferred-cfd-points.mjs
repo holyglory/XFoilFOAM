@@ -18,6 +18,7 @@ try {
   );
   const curves = await curvesResponse.json();
   assert.equal(curves.cfdPointsDeferred, true);
+  assert.equal(curves.simulationWorksDeferred, true);
   assert.deepEqual(curves.polars, []);
   assert.deepEqual(curves.progressivePolars, full.progressivePolars);
   for (const property of [
@@ -25,9 +26,9 @@ try {
     "geometry",
     "downloads",
     "hashtags",
-    "simulationWorks",
   ])
     assert.deepEqual(curves[property], full[property]);
+  assert.deepEqual(curves.simulationWorks, []);
   const invalid = await api.request.get(
     `${origin}/api/airfoils/ag24?view=invalid`,
   );
