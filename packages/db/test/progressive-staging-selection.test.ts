@@ -29,6 +29,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
       SELECT id AS sim_job_id,sequence,CASE WHEN variant='unacknowledged' THEN NULL ELSE clock_timestamp() END AS acknowledged_at,
         CASE WHEN variant='null-result' THEN '{"result":null}'::jsonb WHEN variant='missing-result' THEN '{}'::jsonb WHEN variant='eligible-expired' THEN '{"result":{},"stopProof":{"execution_stopped":"true"}}'::jsonb ELSE '{"result":{}}'::jsonb END AS report,
+        CASE WHEN variant='eligible-expired' THEN id::text END AS stopped_engine_job_id,
         timestamptz '2026-01-01T00:00:00Z' + CASE WHEN variant='eligible-cancelled' THEN interval '0 seconds' ELSE interval '1 second' END AS created_at
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures ON COMMIT DROP AS
