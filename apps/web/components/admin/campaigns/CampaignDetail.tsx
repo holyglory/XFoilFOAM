@@ -57,6 +57,7 @@ export { campaignStatusLine };
 import { AddAirfoilsDialog } from "./AddAirfoilsDialog";
 import {
   assemblePipelineModel,
+  assembleProgressivePipelineModel,
   campaignThroughputPresentation,
   progressBarSegments,
   stageEta,
@@ -369,12 +370,14 @@ export function CampaignDetail({
   const reviewBuckets = summary.reviewBuckets ?? null;
   const blocked = totals.blocked ?? 0;
   const remediationCopy = campaignRemediationCopy(summary.remediation);
-  const pipeline = assemblePipelineModel({
-    tierCounts: summary.tierCounts ?? null,
-    reviewBuckets,
-    phase: summary.phase,
-    jobsRunning: scheduler.campaignJobsRunning,
-  });
+  const pipeline = progressive.requestedPoints
+    ? assembleProgressivePipelineModel({ progressive })
+    : assemblePipelineModel({
+        tierCounts: summary.tierCounts ?? null,
+        reviewBuckets,
+        phase: summary.phase,
+        jobsRunning: scheduler.campaignJobsRunning,
+      });
   const stageRailProgress = pipeline
     ? Math.min(2, pipeline.stages.filter((stage) => stage.settled).length)
     : 0;
@@ -750,11 +753,13 @@ export function CampaignDetail({
                     stage.active ? "campaign-phase-badge" : undefined
                   }
                 >
-                  {stage.key === "steady"
-                    ? "RANS"
-                    : stage.key === "unsteady"
-                      ? "FAST URANS"
-                      : "FINAL URANS"}
+                  {progressive.requestedPoints
+                    ? stage.title.split(" · ")[1]
+                    : stage.key === "steady"
+                      ? "RANS"
+                      : stage.key === "unsteady"
+                        ? "FAST URANS"
+                        : "FINAL URANS"}
                 </strong>
                 <span>
                   {stage.settled
@@ -780,7 +785,11 @@ export function CampaignDetail({
           >
             <Clock3 size={30} strokeWidth={1.6} aria-hidden />
             <span>
-              <strong>{fCount(scheduler.campaignJobsRunning)}</strong>
+              <strong>
+                {fCount(
+                  progressive.activeJobs || scheduler.campaignJobsRunning,
+                )}
+              </strong>
               <small>active campaign jobs</small>
             </span>
           </div>

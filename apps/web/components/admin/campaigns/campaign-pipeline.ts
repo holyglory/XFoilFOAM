@@ -84,6 +84,55 @@ export interface PipelineModel {
   jobsRunning: number;
 }
 
+export function assembleProgressivePipelineModel(input: {
+  progressive: NonNullable<AdminCampaignSummary["progressive"]>;
+}): PipelineModel {
+  const { progressive } = input;
+  const stages: Array<
+    PipelineStage & { open: number }
+  > = [
+    {
+      key: "steady",
+      title: "1 · NeuralFoil",
+      open: progressive.openPoints.neuralfoil,
+      detail:
+        progressive.openPoints.neuralfoil > 0
+          ? `${fCount(progressive.openPoints.neuralfoil)} open`
+          : null,
+      active: progressive.stage === 1,
+      settled: progressive.openPoints.neuralfoil === 0,
+    },
+    {
+      key: "unsteady",
+      title: "2 · OpenFOAM fast",
+      open: progressive.openPoints.fast,
+      detail:
+        progressive.openPoints.fast > 0
+          ? `${fCount(progressive.openPoints.fast)} open`
+          : null,
+      active: progressive.stage === 2,
+      settled:
+        progressive.openPoints.fast === 0 &&
+        progressive.openPoints.neuralfoil === 0,
+    },
+    {
+      key: "verify",
+      title: "3 · OpenFOAM precise",
+      open: progressive.openPoints.precise,
+      detail:
+        progressive.openPoints.precise > 0
+          ? `${fCount(progressive.openPoints.precise)} open`
+          : null,
+      active: progressive.stage === 3,
+      settled:
+        progressive.openPoints.precise === 0 &&
+        progressive.openPoints.fast === 0 &&
+        progressive.openPoints.neuralfoil === 0,
+    },
+  ];
+  return { stages, jobsRunning: progressive.activeJobs };
+}
+
 /** null = the payload has no tierCounts (older API): render no pipeline strip
  *  rather than invented zeros. The stage-2 open count is the sum of two
  *  DISJOINT real counters: precalcOpen (needs_urans terminal + live urans

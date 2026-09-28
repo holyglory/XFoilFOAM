@@ -8,6 +8,7 @@ import {
   ETA_MIN_WINDOW_MS,
   PIPELINE_STAGE_NOTES,
   assemblePipelineModel,
+  assembleProgressivePipelineModel,
   campaignThroughputPresentation,
   formatEtaHours,
   progressBarSegments,
@@ -163,6 +164,34 @@ describe("assemblePipelineModel", () => {
     expect(PIPELINE_STAGE_NOTES.unsteady).toContain(
       "starts when stage 1 finishes",
     );
+  });
+});
+
+describe("assembleProgressivePipelineModel", () => {
+  it("names the real NeuralFoil and OpenFOAM stages", () => {
+    const model = assembleProgressivePipelineModel({
+      progressive: {
+        requestedPoints: 100,
+        preliminaryPoints: 100,
+        cfdEvidencePoints: 8,
+        activeJobs: 3,
+        stage: 2,
+        openPoints: { neuralfoil: 0, fast: 100, precise: 100 },
+        gapPoints: 0,
+      },
+    });
+    expect(model.jobsRunning).toBe(3);
+    expect(model.stages.map((stage) => stage.title)).toEqual([
+      "1 · NeuralFoil",
+      "2 · OpenFOAM fast",
+      "3 · OpenFOAM precise",
+    ]);
+    expect(model.stages.map((stage) => stage.active)).toEqual([
+      false,
+      true,
+      false,
+    ]);
+    expect(model.stages.map((stage) => stage.open)).toEqual([0, 100, 100]);
   });
 });
 
