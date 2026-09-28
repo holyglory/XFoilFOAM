@@ -13,6 +13,9 @@ import type { SolverWorkPayload } from "./solver-work";
 
 const SERVER_BASE = process.env.API_URL ?? "http://localhost:4000";
 const CLIENT_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
+type ApiFetchInit = RequestInit & {
+  next?: { revalidate?: number; tags?: string[] };
+};
 
 /** API origin: server-side uses the internal URL, browser uses the public one. */
 export function apiBase(): string {
@@ -39,13 +42,13 @@ function isConnError(err: unknown): boolean {
  */
 async function apiFetch(
   path: string,
-  init?: RequestInit,
+  init?: ApiFetchInit,
   retries = 4,
 ): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await fetch(`${apiBase()}${path}`, init);
+      return await fetch(`${apiBase()}${path}`, init as RequestInit);
     } catch (err) {
       lastErr = err;
       if (!isConnError(err) || attempt === retries) break;
@@ -68,7 +71,9 @@ export async function getAirfoilDetail(
   if (view === "curves" || view === "compare") query.set("view", view);
   const qs = query.size ? `?${query}` : "";
   const res = await apiFetch(`/api/airfoils/${encodeURIComponent(slug)}${qs}`, {
-    cache: "no-store",
+    ...(view === "curves" && !revisionId
+      ? { cache: "force-cache" as const, next: { revalidate: 5 } }
+      : { cache: "no-store" as const }),
     signal,
   });
   if (res.status === 404) return null;
