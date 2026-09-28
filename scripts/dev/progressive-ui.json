@@ -66,11 +66,11 @@
       ],
       "states": [
         {
-          "name": "prediction-samples",
+          "name": "curve-samples",
           "actions": [
             {
               "action": "check",
-              "selector": "[data-testid='progressive-polar-viewer'] input[type='checkbox']"
+              "selector": "[data-testid='progressive-polar-viewer'] input[type='checkbox']:first-of-type"
             }
           ],
           "continuation": {
