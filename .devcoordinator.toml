@@ -811,6 +811,19 @@ name = "main"
 tier = "development"
 command = ["/usr/bin/python3", ".codex/devcoordinator_test_harness.py", "campaign-performance-regression"]
 
+[test.progressive-profile-enrollment]
+timeout_seconds = 900
+
+[test.progressive-profile-enrollment.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-profile-enrollment.check]]
+name = "lifecycle"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reopens completed campaigns|enrolls paused campaigns|leaves cancelled|leaves archived"]
+
 [test.reset]
 timeout_seconds = 600
 
