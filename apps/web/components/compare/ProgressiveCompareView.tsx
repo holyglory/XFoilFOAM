@@ -185,7 +185,6 @@ export function ProgressiveCompareView({
               }}
             >
               <div
-                data-ui-allow-overlap="Sticky header may overlay preceding card metrics while the overlay chart is in view"
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -251,6 +250,7 @@ export function ProgressiveCompareView({
                 {display(metrics?.liftToDragMaximum ?? null)}
               </div>
               <div
+                data-ui-allow-overlap="Sticky header may overlay preceding card metrics while the overlay chart is in view"
                 style={{
                   display: "grid",
                   gridTemplateColumns: "1fr 1fr",
