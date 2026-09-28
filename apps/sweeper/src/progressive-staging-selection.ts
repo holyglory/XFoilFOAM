@@ -39,6 +39,29 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
       AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
       AND (${!active} OR (promise.status = 'active' AND promise."expiresAt" > clock_timestamp())) OFFSET 0`;
+  const activeOwned = sql`SELECT job.id
+    FROM sim_jobs job
+    JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
+    JOIN sync_api_settings settings ON settings.id = 1
+    WHERE NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''
+      AND settings.upstream_base_url IS NOT NULL AND job.request_payload->>'remoteSolver' = 'true'
+      AND promise.registered_solver_id = settings.remote_solver_registered_id
+      AND promise.source_base_url = settings.upstream_base_url
+      AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
+      AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
+      AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()`;
+  const activeCandidate = sql`SELECT report.sim_job_id, report.sequence, report.created_at
+    FROM (${activeOwned}) owned
+    JOIN progressive_worker_reports report ON report.sim_job_id = owned.id
+    LEFT JOIN progressive_worker_staging_failures failure
+      ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
+    WHERE report.acknowledged_at IS NOT NULL
+      AND jsonb_typeof(report.report->'result') = 'object'
+      AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
+        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+    ORDER BY report.created_at DESC, report.sim_job_id DESC, report.sequence DESC
+    LIMIT 1`;
   const candidate = (
     active: boolean,
   ) => sql`SELECT report.sim_job_id, report.sequence, report.created_at, report.is_terminal,
@@ -58,7 +81,7 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       UNION ALL SELECT sim_job_id, sequence, created_at FROM fallback
       WHERE NOT EXISTS (SELECT 1 FROM terminal)`;
   return sql`WITH active AS MATERIALIZED (
-    ${candidate(true)} ${order(true)} LIMIT 1
+    ${activeCandidate}
   ), terminal AS MATERIALIZED (${terminal}), fallback AS MATERIALIZED (
     ${candidate(false)} ${order(false)} LIMIT 1
   )
