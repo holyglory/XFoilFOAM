@@ -29,6 +29,7 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
 export function progressiveSettlementJobsSql(jobIds?: string[]) {
   return sql`SELECT job.id AS sim_job_id, job.campaign_id
     FROM sim_jobs job
+    LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     WHERE ${executionScope(jobIds)} AND NOT ${unappliedReports}
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
       AND (
@@ -39,7 +40,8 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active')))
-    ORDER BY CASE WHEN job.status = 'ingesting'
+    ORDER BY CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
+      CASE WHEN job.status = 'ingesting'
       AND job.engine_state IN ('completed', 'failed', 'cancelled')
       THEN 0 ELSE 1 END,
       job."updatedAt", job.id LIMIT 32`;
