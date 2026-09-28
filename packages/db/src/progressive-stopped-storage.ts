@@ -32,11 +32,26 @@ export async function assertStoppedProgressiveStorage(
     JOIN LATERAL (SELECT report,content_signature FROM progressive_remote_reports
       WHERE sim_job_id=job.id ORDER BY sequence DESC LIMIT 1) latest ON true
     WHERE job.id=${delivery.engineJobId}::uuid
-      AND job.status IN ('done','failed','cancelled')
+      AND (
+        (
+          job.status IN ('done','failed','cancelled')
+          AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
+            WHERE attempt.sim_job_id=job.id AND attempt.outcome='running')
+        )
+        OR (
+          job.status='ingesting'
+          AND EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
+            JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+            WHERE attempt.sim_job_id=job.id AND attempt.outcome='running'
+              AND unit.state='blocked' AND unit.lease_token IS NULL AND unit.lease_until IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
+            JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+            WHERE attempt.sim_job_id=job.id AND attempt.outcome='running'
+              AND NOT (unit.state='blocked' AND unit.lease_token IS NULL AND unit.lease_until IS NULL))
+        )
+      )
       AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
       AND promise.status IN ('cancelled','expired','fulfilled')
-      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
-        WHERE attempt.sim_job_id=job.id AND attempt.outcome='running')
     FOR SHARE OF job,promise
   `);
   if (

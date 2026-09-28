@@ -289,6 +289,36 @@ export async function verifyProgressivePolarImport(
             isolated.connection = scoped;
           }
         }
+        const pendingEvidenceRollback = new Error(
+          "Rollback pending stopped-evidence acceptance fixture",
+        );
+        try {
+          await scoped.transaction(async (nested) => {
+            isolated.connection = nested as unknown as DB;
+            await nested.execute(
+              sql`UPDATE sim_jobs SET status='ingesting', ingest_lease_token=NULL, ingest_lease_expires_at=NULL
+                WHERE id=${delivery.engineJobId}::uuid`,
+            );
+            await nested.execute(
+              sql`UPDATE progressive_cfd_attempts SET outcome='running'
+                WHERE sim_job_id=${delivery.engineJobId}::uuid`,
+            );
+            await nested.execute(
+              sql`UPDATE progressive_cfd_units SET state='blocked', lease_token=NULL, lease_owner=NULL, lease_until=NULL
+                WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${delivery.engineJobId}::uuid)`,
+            );
+            const pendingEvidence = await storage();
+            expect(pendingEvidence.statusCode, pendingEvidence.body).toBe(200);
+            expect(pendingEvidence.json().progressiveEvidenceReceipts).toMatchObject([
+              { storageOnly: true },
+            ]);
+            throw pendingEvidenceRollback;
+          });
+        } catch (error) {
+          if (error !== pendingEvidenceRollback) throw error;
+        } finally {
+          isolated.connection = scoped;
+        }
         expect(
           (
             await storage({
