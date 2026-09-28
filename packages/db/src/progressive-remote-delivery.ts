@@ -4,7 +4,12 @@ import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution
 
 export async function listProgressiveRemoteAssignments(
   db: DB,
-  input: { solverId: string; after?: string; limit?: number },
+  input: {
+    solverId: string;
+    after?: string;
+    limit?: number;
+    currentCampaignOnly?: boolean;
+  },
 ) {
   const limit = input.limit ?? 25;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50)
@@ -17,11 +22,20 @@ export async function listProgressiveRemoteAssignments(
         WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text) AS "executionStopped"
     FROM progressive_remote_dispatches dispatch
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
+    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
     JOIN sim_jobs job ON job.id = dispatch.sim_job_id
     LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     WHERE dispatch.solver_id = ${input.solverId}::uuid
       ${input.after ? sql`AND dispatch.sim_job_id > ${input.after}::uuid` : sql``}
-    ORDER BY dispatch.sim_job_id LIMIT ${limit + 1}
+      ${input.currentCampaignOnly ? sql`AND campaign.status IN ('active', 'attention', 'paused')` : sql``}
+    ORDER BY ${
+      input.currentCampaignOnly
+        ? sql`CASE WHEN promise.response_payload->>'authoritativeLeaseLoss' = 'true' THEN 0 ELSE 1 END,
+          CASE WHEN EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
+            THEN 0 ELSE 1 END, dispatch.sim_job_id`
+        : sql`dispatch.sim_job_id`
+    } LIMIT ${limit + 1}
   `);
   const items = rows.slice(0, limit).map((row) => {
     const item = {
