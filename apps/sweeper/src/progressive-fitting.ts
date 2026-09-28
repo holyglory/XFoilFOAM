@@ -42,7 +42,51 @@ const ASSUMPTIONS = {
   } satisfies Omit<ProgressivePolarModelPolicy, "policy_id">,
 };
 
+const HISTORY_BIAS_STD: ProgressiveCoefficientVector = [0.3, 0.5, 0.1];
+const HISTORY_BIAS_ANGLE_SCOPE: readonly [number, number] = [-5, 20];
+const HISTORY_BIAS_MACHES = [
+  0.08814658492111002,
+  0.26443975476333004,
+  0.48774443656347544,
+];
+const HISTORY_BIAS_REYNOLDS = new Set([
+  102280,
+  204560,
+  306840,
+  613679,
+  1022799,
+  3068397,
+  4091196,
+  565949,
+  1131898,
+  11318975,
+  22637950,
+]);
+const HISTORY_BIAS_ENGINE = {
+  adapter_contract_version: 1,
+  application_source_sha256:
+    "000c67ccc21bc286cd189ff82c063c0ca497fee3bb2d99790d4d848e71708f6e",
+  binary_sha256:
+    "36b5e8b213ab5b968cd94bbbf464ea9681619192fe71550cfbd4bdb678108f6e",
+  build_id: "progressive-7f2af74-20260919",
+  distribution: "opencfd",
+  family: "openfoam",
+  numerics_revision: "1",
+  package_sha256:
+    "aa20712a33e41ad7cbe5ee895355aedd7fcbdaf456ae1d4f33db3135827bc07d",
+  source_revision:
+    "481094fdf34f11ed6d0d603ee59a858a0124236d",
+  version: "2606",
+};
+
 export const PROGRESSIVE_FIT_POLICY_ID = `${ASSUMPTIONS.version}-${analysisContentHash(ASSUMPTIONS)}`;
+export const PROGRESSIVE_FIT_BIAS_POLICY_ID = `${ASSUMPTIONS.version}-source-bound-bias-v1-${analysisContentHash({
+  angleScope: HISTORY_BIAS_ANGLE_SCOPE,
+  engine: HISTORY_BIAS_ENGINE,
+  mach: HISTORY_BIAS_MACHES,
+  multipliers: [1, 1, 1],
+  reynolds: [...HISTORY_BIAS_REYNOLDS].sort((left, right) => left - right),
+})}`;
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -72,6 +116,78 @@ interface Candidate {
   history: ProgressivePolarHistory | null;
 }
 
+export interface ProgressiveBiasApplicability {
+  physicalIdentity: string;
+  numericalIdentity: string;
+  angleScope: [number, number];
+}
+
+function engineIdentity(value: unknown): Record<string, unknown> | null {
+  const engine = record(value);
+  if (!engine) return null;
+  const identity = Object.fromEntries(
+    Object.keys(HISTORY_BIAS_ENGINE).map((key) => [key, engine[key]]),
+  );
+  return Object.entries(HISTORY_BIAS_ENGINE).every(
+    ([key, expected]) => identity[key] === expected,
+  )
+    ? identity
+    : null;
+}
+
+export function progressiveBiasApplicability(
+  source: ProgressiveFitLease["source"],
+): ProgressiveBiasApplicability | null {
+  const mach = source.physical.derived.mach;
+  const reynolds = source.physical.derived.reynolds;
+  const alpha = Array.isArray(source.prediction.alpha)
+    ? source.prediction.alpha.filter(finite)
+    : [];
+  if (
+    source.physical.branch !== "increasing" ||
+    mach === null ||
+    !HISTORY_BIAS_MACHES.some((candidate) => Math.abs(mach - candidate) < 1e-12) ||
+    !Number.isFinite(reynolds) ||
+    !HISTORY_BIAS_REYNOLDS.has(Math.round(reynolds)) ||
+    alpha.length !== (source.prediction.alpha as unknown[]).length ||
+    alpha.length < 2 ||
+    Math.min(...alpha) < HISTORY_BIAS_ANGLE_SCOPE[0] ||
+    Math.max(...alpha) > HISTORY_BIAS_ANGLE_SCOPE[1] ||
+    source.evidence.length === 0 ||
+    source.evidence.some((evidence) => evidence.stage !== 2)
+  )
+    return null;
+  const numerical = source.evidence.map((evidence) => {
+    const engine = engineIdentity(evidence.payload.engine);
+    const methodKey = evidence.payload.method_key;
+    const fidelity = evidence.payload.fidelity;
+    if (
+      !engine ||
+      (methodKey !== "openfoam.rans" && methodKey !== "openfoam.urans") ||
+      (fidelity !== "trans" && fidelity !== "urans_precalc")
+    )
+      return null;
+    return analysisContentHash({
+      engine,
+      fidelity,
+      methodKey,
+      version: "history-bias-numerical-v1",
+    });
+  });
+  if (!numerical[0] || numerical.some((identity) => identity !== numerical[0]))
+    return null;
+  const { airfoilId: _airfoilId, geometry: _geometry, ...condition } =
+    source.physical;
+  return {
+    physicalIdentity: analysisContentHash({
+      condition,
+      version: "history-bias-physical-v1",
+    }),
+    numericalIdentity: numerical[0],
+    angleScope: [...HISTORY_BIAS_ANGLE_SCOPE],
+  };
+}
+
 function excluded(candidate: Candidate, reason: string): Candidate {
   return {
     ...candidate,
@@ -89,6 +205,7 @@ function excluded(candidate: Candidate, reason: string): Candidate {
 function candidateFor(
   lease: ProgressiveFitLease,
   evidence: ProgressiveFitEvidence,
+  applicability: ProgressiveBiasApplicability | null,
 ): Candidate {
   const payload = evidence.payload;
   const observation: ProgressivePolarObservation = {
@@ -107,6 +224,12 @@ function candidateFor(
       payload.converged === true ? "converged" : "unconverged",
     statistical_certification: "informative_uncertified",
     exclusion_reason: null,
+    ...(applicability
+      ? {
+          physical_identity: applicability.physicalIdentity,
+          numerical_identity: applicability.numericalIdentity,
+        }
+      : {}),
   };
   const candidate: Candidate = { evidence, observation, history: null };
   if (["exclude", "defer"].includes(evidence.review?.verdict ?? ""))
@@ -247,6 +370,7 @@ export function buildProgressiveFitRequest(
   const alpha = source.prediction.alpha as number[];
   const coefficients = source.prediction
     .coefficients as ProgressiveCoefficientVector[];
+  const biasApplicability = progressiveBiasApplicability(source);
   if (
     !Array.isArray(alpha) ||
     !Array.isArray(coefficients) ||
@@ -255,7 +379,7 @@ export function buildProgressiveFitRequest(
   )
     throw new Error("Stored NeuralFoil prior is malformed");
   const ordered = source.evidence
-    .map((evidence) => candidateFor(lease, evidence))
+    .map((evidence) => candidateFor(lease, evidence, biasApplicability))
     .sort(
       (left, right) =>
         right.evidence.createdAt.localeCompare(left.evidence.createdAt) ||
@@ -314,10 +438,13 @@ export function buildProgressiveFitRequest(
         ),
         ASSUMPTIONS.priorMomentStd,
       ]),
-      provenance: {
-        model: source.prediction.model,
-        geometry_fit: source.prediction.geometry_fit,
-        geometry_provenance: source.prediction.geometry_provenance,
+    provenance: {
+      model: source.prediction.model,
+      geometry_fit: source.prediction.geometry_fit,
+      geometry_provenance: source.prediction.geometry_provenance,
+      ...(biasApplicability
+        ? { bias_applicability: biasApplicability }
+        : {}),
       },
     },
     observations,
@@ -330,7 +457,15 @@ export function buildProgressiveFitRequest(
           noise_floor: ASSUMPTIONS.historyNoiseFloor,
         }
       : null,
-    policy: { ...ASSUMPTIONS.model, policy_id: PROGRESSIVE_FIT_POLICY_ID },
+    policy: {
+      ...ASSUMPTIONS.model,
+      policy_id: biasApplicability
+        ? PROGRESSIVE_FIT_BIAS_POLICY_ID
+        : PROGRESSIVE_FIT_POLICY_ID,
+      ...(biasApplicability
+        ? { uncertified_fast_bias_std: HISTORY_BIAS_STD }
+        : {}),
+    },
   };
 }
 

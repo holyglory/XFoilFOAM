@@ -824,6 +824,19 @@ name = "lifecycle"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reopens completed campaigns|enrolls paused campaigns|leaves cancelled|leaves archived"]
 
+[test.progressive-fit-policy]
+timeout_seconds = 300
+
+[test.progressive-fit-policy.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-fit-policy.check]]
+name = "scope"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-fitting-policy.test.ts"]
+
 [test.reset]
 timeout_seconds = 600
 
