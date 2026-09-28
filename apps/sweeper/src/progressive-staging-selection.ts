@@ -29,7 +29,9 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
     ORDER BY report.created_at, report.sim_job_id, report.sequence OFFSET 0`;
-  const owned = (active: boolean) => sql`SELECT job.id, promise.status AS promise_status FROM sim_jobs job
+  const owned = (active: boolean) => sql`SELECT job.id, promise.status AS promise_status,
+      promise.response_payload->>'authoritativeLeaseLoss' AS authoritative_lease_loss
+    FROM sim_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
     WHERE job.id = report.sim_job_id AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''
@@ -68,10 +70,14 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       owned.promise_status FROM (${reports(active)}) report
     JOIN LATERAL (${owned(active)}) owned ON true`;
   const terminalCandidate = sql`SELECT report.sim_job_id, report.sequence, report.created_at
+      ,owned.authoritative_lease_loss
     FROM (${terminalReports}) report
     JOIN LATERAL (${owned(false)}) owned ON true
-    WHERE owned.promise_status IN ('expired', 'cancelled', 'fulfilled')`;
-  const terminal = sql`SELECT * FROM (${terminalCandidate}) report LIMIT 1`;
+    WHERE owned.promise_status IN ('expired', 'cancelled', 'fulfilled')
+    ORDER BY (owned.authoritative_lease_loss = 'true') DESC,
+      report.created_at, report.sim_job_id, report.sequence LIMIT 1`;
+  const terminal = sql`SELECT sim_job_id, sequence, created_at
+    FROM (${terminalCandidate}) report`;
   if (!preferActive)
     return sql`WITH terminal AS MATERIALIZED (${terminal}), fallback AS MATERIALIZED (
         SELECT sim_job_id, sequence, created_at FROM (${candidate(false)}) report

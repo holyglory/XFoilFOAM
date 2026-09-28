@@ -22,6 +22,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
       SELECT id,CASE WHEN variant='eligible-cancelled' THEN 'cancelled' WHEN variant='eligible-expired' THEN 'expired' ELSE 'active' END AS status,
+        CASE WHEN variant='eligible-expired' THEN '{"authoritativeLeaseLoss":true}'::jsonb ELSE NULL::jsonb END AS response_payload,
         CASE WHEN variant='eligible-expired' THEN clock_timestamp()-interval '1 day' ELSE clock_timestamp()+interval '1 day' END AS "expiresAt",
         CASE WHEN variant='wrong-solver' THEN md5('foreign')::uuid ELSE md5('solver')::uuid END AS registered_solver_id,
         CASE WHEN variant='wrong-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END AS source_base_url
