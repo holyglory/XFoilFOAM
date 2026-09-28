@@ -2184,6 +2184,45 @@ describe("progressive durable stage transitions", () => {
     expect(generation.stage).toBe(3);
   }, 120_000);
 
+  it("closes settled fast anchors without a NeuralFoil prior and opens precise work", async () => {
+    const campaignId = await campaign();
+    await materializeProgressiveCampaignScope(db, campaignId);
+    const baseline = (await claim([1]))!;
+    await failProgressiveWork(db, baseline, "geometry fit unavailable", false);
+    expect(await initializeProgressiveCfdWork(db)).toBe(2);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units unit
+      SET state = 'complete', lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      FROM progressive_work work
+      WHERE unit.work_id = work.id AND work.generation_id = ${baseline.generationId}
+    `);
+
+    expect(await advanceProgressiveCfdStages(db)).toMatchObject({
+      admitted: 0,
+      closed: 1,
+    });
+    const [fast] = await db.execute(sql`
+      SELECT id, state, error FROM progressive_work
+      WHERE generation_id = ${baseline.generationId} AND stage = 2
+    `);
+    expect(fast).toMatchObject({
+      state: "complete",
+      error: null,
+    });
+    const [decision] = await db.execute(sql`
+      SELECT reason FROM progressive_cfd_stage_decisions
+      WHERE work_id = ${fast.id}
+    `);
+    expect(decision).toMatchObject({
+      reason: "fast_prior_unavailable_after_initial_coverage",
+    });
+    const [generation] = await db.execute(sql`
+      SELECT stage FROM progressive_generations WHERE id = ${baseline.generationId}
+    `);
+    expect(generation.stage).toBe(3);
+    expect(await initializeProgressiveCfdWork(db)).toBe(3);
+  }, 120_000);
+
   it("never advances evidence from a previous calculation epoch", async () => {
     const fixture = await finishedFixture();
     await rotateCalculationEpoch(db, "isolated stage transition epoch reset");

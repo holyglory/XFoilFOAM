@@ -1853,7 +1853,20 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "
 name = "stages"
 tier = "development"
 requires = ["dependencies","workspace"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive durable stage transitions"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive durable stage transitions|closes settled fast anchors without a NeuralFoil prior"]
+
+[test.progressive-missing-baseline]
+timeout_seconds = 900
+
+[test.progressive-missing-baseline.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-missing-baseline.check]]
+name = "stage-transition"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "closes settled fast anchors without a NeuralFoil prior"]
 
 [[test.progressive.check]]
 name = "reset"

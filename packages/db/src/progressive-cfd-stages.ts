@@ -102,13 +102,21 @@ export async function advanceProgressiveCfdStages(db: DB) {
       WITH ${initialCoverage(String(epoch.id))}
       SELECT work.id, work.generation_id, work.target_id, work.stage, scope.angles,
         ${hasEvidence} AS has_cfd_evidence,
+        EXISTS (
+          SELECT 1
+          FROM progressive_prediction_links baseline_link
+          JOIN neuralfoil_predictions baseline_prediction
+            ON baseline_prediction.id = baseline_link.prediction_id
+          WHERE baseline_link.work_id = baseline.id
+            AND baseline_prediction.epoch_id = generation.epoch_id
+        ) AS has_neuralfoil_baseline,
         fit.state AS fit_state, model.id AS model_id, model.response,
         generation.id IN (SELECT id FROM initial_coverage) AS initial_coverage_complete
       FROM progressive_work work JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
       LEFT JOIN progressive_work baseline ON baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1
       LEFT JOIN progressive_prediction_links link ON link.work_id = baseline.id
-      LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = link.prediction_id
+        LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = link.prediction_id
       LEFT JOIN progressive_polar_models model ON model.id = fit.model_id AND fit.state = 'ready'
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
@@ -171,7 +179,11 @@ export async function advanceProgressiveCfdStages(db: DB) {
           model.target_signature !== scope.target_id ||
           model.acquisition?.version !== "fixed-posterior-coverage-v1"
         ) {
-          if (
+          if (!scope.has_neuralfoil_baseline) {
+            reason = units.some((unit) => unit.state === "gap")
+              ? "fast_prior_unavailable_with_gaps"
+              : "fast_prior_unavailable_after_initial_coverage";
+          } else if (
             scope.fit_state === "gap" ||
             units.every((unit) => unit.state === "gap")
           )
@@ -270,10 +282,11 @@ export async function advanceProgressiveCfdStages(db: DB) {
         `);
         receipt.admitted += 1;
       } else {
-        const gap =
-          units.some((unit) => unit.state === "gap") ||
-          reason.startsWith("fast_model_unavailable") ||
-          reason === "fast_evidence_uninformative";
+          const gap =
+            units.some((unit) => unit.state === "gap") ||
+            reason.startsWith("fast_model_unavailable") ||
+            reason === "fast_evidence_uninformative" ||
+            reason === "fast_prior_unavailable_with_gaps";
         await connection.execute(sql`
           UPDATE progressive_work SET state = ${gap ? "gap" : "complete"}, error = ${gap ? reason : null}, completed_at = clock_timestamp()
           WHERE id = ${scope.id}
