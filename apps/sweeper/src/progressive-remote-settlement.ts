@@ -16,14 +16,15 @@ import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-re
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 
-async function settleCancelledUndeliveredExecution(
+async function settleInactiveUndeliveredExecution(
   db: DB,
   executionId: string,
   promiseId: string,
 ) {
   const [promise] = await db.execute(sql`SELECT status FROM sync_sweep_promises
     WHERE id = ${promiseId}::uuid FOR UPDATE`);
-  if (promise?.status !== "cancelled") return null;
+  if (!promise || !["cancelled", "expired"].includes(String(promise.status)))
+    return null;
   const [stopped] =
     await db.execute(sql`SELECT proof FROM progressive_cfd_execution_stops
     WHERE sim_job_id = ${executionId}::uuid`);
@@ -51,17 +52,17 @@ async function settleCancelledUndeliveredExecution(
     )
   )
     throw new Error(
-      "Cancelled remote execution no longer owns its pending units",
+      "Inactive remote execution no longer owns its pending units",
     );
   for (const unit of units) {
     await db.execute(sql`UPDATE progressive_cfd_attempts SET outcome='cancelled',finished_at=clock_timestamp(),
-      error='Scheduling promise cancelled before evidence delivery; retained reports remain unresolved'
+      error='Scheduling promise became inactive before evidence delivery; retained reports remain unresolved'
       WHERE token=${unit.token}::uuid`);
     await db.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL,
-      error='Cancelled remote delivery has unresolved evidence' WHERE id=${unit.id}::uuid`);
+      error='Inactive remote delivery has unresolved evidence' WHERE id=${unit.id}::uuid`);
   }
   await db.execute(sql`UPDATE sim_jobs SET status='cancelled',"finishedAt"=coalesce("finishedAt",clock_timestamp()),
-    error='Scheduling promise cancelled; evidence delivery remains unresolved'
+    error='Scheduling promise became inactive; evidence delivery remains unresolved'
     WHERE id=${executionId}::uuid`);
   await releaseResultClaimsForJob(db, executionId, ["queued", "running"]);
   return {
@@ -225,12 +226,12 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     );
     if (retained.kind === "waiting") {
       if (retained.reason === "raw_evidence") {
-        const cancelled = await settleCancelledUndeliveredExecution(
+        const inactive = await settleInactiveUndeliveredExecution(
           connection,
           executionId,
           String(dispatch.promise_id),
         );
-        if (cancelled) return cancelled;
+        if (inactive) return inactive;
       }
       return retained;
     }

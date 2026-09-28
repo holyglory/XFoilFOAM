@@ -202,7 +202,7 @@ export async function verifyProgressiveRemoteReportInventory(
             const evidenceBefore =
               await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports
               WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
-            if (status !== "cancelled") {
+            if (status !== "cancelled" && status !== "expired") {
               expect(
                 await settleProgressiveRemoteJob(scoped, executionId),
               ).toMatchObject({ kind: "waiting", reason: "raw_evidence" });
