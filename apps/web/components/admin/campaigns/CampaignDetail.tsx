@@ -347,6 +347,15 @@ export function CampaignDetail({
   }
 
   const { campaign, totals, scheduler, rate, conditions } = summary;
+  const progressive = summary.progressive ?? {
+    requestedPoints: 0,
+    preliminaryPoints: 0,
+    cfdEvidencePoints: 0,
+    activeJobs: 0,
+    stage: null,
+    openPoints: { neuralfoil: 0, fast: 0, precise: 0 },
+    gapPoints: 0,
+  };
   const status = campaign.status;
   const line = campaignStatusLine(summary);
   const instrumentStatus = campaignInstrumentStatus(summary, line);
@@ -667,7 +676,7 @@ export function CampaignDetail({
           value={barSegments.doneCount}
           max={totals.requested}
           valueLabel={fCount(barSegments.doneCount)}
-          stateLabel="current-plan points complete"
+          stateLabel="CFD points complete"
           totalLabel={fCount(totals.requested)}
           percentLabel={completionPercentLabel}
         />
@@ -686,6 +695,18 @@ export function CampaignDetail({
             <strong>{fCount(summary.completionSources.remoteSolved)}</strong>
             remote solver
           </span>
+          {progressive.preliminaryPoints > 0 && (
+            <span className="is-preliminary">
+              <strong>{fCount(progressive.preliminaryPoints)}</strong>
+              preliminary curve points
+            </span>
+          )}
+          {progressive.cfdEvidencePoints > 0 && (
+            <span className="is-cfd-evidence">
+              <strong>{fCount(progressive.cfdEvidencePoints)}</strong>
+              CFD evidence points
+            </span>
+          )}
           <span>
             <strong>{fCount(summary.completionSources.hubSolved)}</strong>
             hub solver

@@ -1925,6 +1925,15 @@ export interface AdminCampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  progressive?: {
+    requestedPoints: number;
+    preliminaryPoints: number;
+    cfdEvidencePoints: number;
+    activeJobs: number;
+    stage: 1 | 2 | 3 | null;
+    openPoints: { neuralfoil: number; fast: number; precise: number };
+    gapPoints: number;
+  };
   completionSources: {
     hubSolved: number;
     remoteSolved: number;

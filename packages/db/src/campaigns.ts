@@ -2168,6 +2168,90 @@ interface CampaignProgressSnapshot {
   remediation: CampaignRemediationSummary;
 }
 
+export interface CampaignProgressiveSnapshot {
+  requestedPoints: number;
+  preliminaryPoints: number;
+  cfdEvidencePoints: number;
+  activeJobs: number;
+  stage: 1 | 2 | 3 | null;
+  openPoints: { neuralfoil: number; fast: number; precise: number };
+  gapPoints: number;
+}
+
+async function campaignProgressiveSnapshot(
+  db: DbTx,
+  campaignId: string,
+): Promise<CampaignProgressiveSnapshot> {
+  const [row] = (await asDb(db).execute(sql`
+    WITH current_generation AS MATERIALIZED (
+      SELECT generation.id, generation.epoch_id, generation.stage
+      FROM progressive_generations generation
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+      WHERE generation.campaign_id = ${campaignId}
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND generation.status = 'active'
+      ORDER BY generation.created_at DESC, generation.id DESC
+      LIMIT 1
+    ), targets AS MATERIALIZED (
+      SELECT scope.generation_id, scope.target_id,
+        cardinality(scope.angles)::int AS point_count,
+        EXISTS (
+          SELECT 1
+          FROM progressive_work baseline
+          JOIN progressive_prediction_links link ON link.work_id = baseline.id
+          JOIN neuralfoil_predictions prediction ON prediction.id = link.prediction_id
+          JOIN current_generation generation ON generation.id = baseline.generation_id
+          WHERE baseline.target_id = scope.target_id AND baseline.stage = 1
+            AND prediction.epoch_id = generation.epoch_id
+        ) AS preliminary,
+        COALESCE((SELECT work.state FROM progressive_work work
+          WHERE work.generation_id = scope.generation_id AND work.target_id = scope.target_id AND work.stage = 1), 'pending') AS neuralfoil_state,
+        COALESCE((SELECT work.state FROM progressive_work work
+          WHERE work.generation_id = scope.generation_id AND work.target_id = scope.target_id AND work.stage = 2), 'pending') AS fast_state,
+        COALESCE((SELECT work.state FROM progressive_work work
+          WHERE work.generation_id = scope.generation_id AND work.target_id = scope.target_id AND work.stage = 3), 'pending') AS precise_state
+      FROM progressive_generation_targets scope
+      JOIN current_generation generation ON generation.id = scope.generation_id
+    )
+    SELECT
+      COALESCE(sum(point_count), 0)::int AS requested_points,
+      COALESCE(sum(point_count) FILTER (WHERE preliminary), 0)::int AS preliminary_points,
+      COALESCE(sum(point_count) FILTER (WHERE neuralfoil_state NOT IN ('complete', 'gap')), 0)::int AS neuralfoil_open,
+      COALESCE(sum(point_count) FILTER (WHERE fast_state NOT IN ('complete', 'gap')), 0)::int AS fast_open,
+      COALESCE(sum(point_count) FILTER (WHERE precise_state NOT IN ('complete', 'gap')), 0)::int AS precise_open,
+      COALESCE(sum(point_count) FILTER (WHERE neuralfoil_state = 'gap' OR fast_state = 'gap' OR precise_state = 'gap'), 0)::int AS gap_points,
+      (SELECT stage::int FROM current_generation) AS stage,
+      (SELECT count(*)::int FROM sim_jobs job
+        WHERE job.campaign_id = ${campaignId}
+          AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) AS active_jobs,
+      (SELECT count(DISTINCT unit.id)::int
+        FROM progressive_cfd_units unit
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN current_generation generation ON generation.id = work.generation_id
+        WHERE EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
+          JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
+          WHERE attempt.unit_id = unit.id)) AS cfd_evidence_points
+    FROM targets
+  `)) as unknown as Array<Record<string, unknown>>;
+  return {
+    requestedPoints: Number(row?.requested_points ?? 0),
+    preliminaryPoints: Number(row?.preliminary_points ?? 0),
+    cfdEvidencePoints: Number(row?.cfd_evidence_points ?? 0),
+    activeJobs: Number(row?.active_jobs ?? 0),
+    stage:
+      row?.stage === 1 || row?.stage === 2 || row?.stage === 3
+        ? row.stage
+        : null,
+    openPoints: {
+      neuralfoil: Number(row?.neuralfoil_open ?? 0),
+      fast: Number(row?.fast_open ?? 0),
+      precise: Number(row?.precise_open ?? 0),
+    },
+    gapPoints: Number(row?.gap_points ?? 0),
+  };
+}
+
 async function campaignProgressSnapshot(
   db: DbTx,
   campaignId: string,
@@ -7595,6 +7679,7 @@ export interface CampaignSummary {
     rateBaselineAt: string | null;
   };
   totals: CampaignProgressTotals;
+  progressive: CampaignProgressiveSnapshot;
   /** Exact source split for the same completed physical points in `totals`.
    * Remote ownership requires the selected campaign attempt to be bound to a
    * fulfilled Sync promise point; every other solved point was produced by
@@ -7707,6 +7792,7 @@ export async function campaignSummary(
     campaignId,
   );
   const progress = await campaignProgressSnapshot(db, campaignId);
+  const progressivePromise = campaignProgressiveSnapshot(db, campaignId);
   const totals = progress.totals;
   const completionSourcesPromise = campaignCompletionSources(
     db,
@@ -7804,6 +7890,7 @@ export async function campaignSummary(
     lifecycleRows,
     conditionRows,
     laneRows,
+    progressive,
   ] = await Promise.all([
     completionSourcesPromise,
     derivedMetricsPromise,
@@ -7812,6 +7899,7 @@ export async function campaignSummary(
     lifecycleRowsPromise,
     conditionRowsPromise,
     laneRowsPromise,
+    progressivePromise,
   ]);
   const { tierCounts, reviewBucketRows } = derivedMetricsSnapshot.value;
   const reviewBuckets: CampaignReviewBuckets = reviewBucketRows.reduce(
@@ -7866,6 +7954,7 @@ export async function campaignSummary(
           : isoOf(revision.createdAt),
     },
     totals,
+    progressive,
     completionSources,
     remediation: progress.remediation,
     reviewBuckets,

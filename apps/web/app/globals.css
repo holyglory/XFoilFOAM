@@ -370,6 +370,14 @@ a {
   color: var(--aero-teal);
 }
 
+.campaign-completion-sources .is-preliminary strong {
+  color: var(--aero-teal);
+}
+
+.campaign-completion-sources .is-cfd-evidence strong {
+  color: var(--aero-violet);
+}
+
 .campaign-completion-sources .is-derived strong {
   color: var(--aero-violet);
 }
