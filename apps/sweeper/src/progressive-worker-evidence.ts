@@ -21,23 +21,19 @@ import {
   renewIngestLeaseOrThrow,
 } from "./ingest-lease";
 
-export async function stageProgressiveWorkerEvidence(
+async function claimProgressiveWorkerEvidence(
   db: DB,
-  engine: EngineClient,
   executionId: string,
-  hooks: {
-    afterEvidenceStaged?: () => Promise<void>;
-    reportSequence?: number;
-  } = {},
+  reportSequence?: number,
 ) {
-  const claimed = await db.transaction(async (transaction) => {
+  return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [candidate] = await connection.execute(sql`
       SELECT job.id, report.sequence, report.content_signature, report.report
       FROM sim_jobs job JOIN sync_api_settings settings ON settings.id = 1
       JOIN progressive_worker_reports report ON report.sim_job_id = job.id
       WHERE job.id = ${executionId}::uuid AND NOT settings.remote_solver_transfer_paused
-        AND (${hooks.reportSequence ?? null}::bigint IS NULL OR report.sequence = ${hooks.reportSequence ?? null}::bigint)
+        AND (${reportSequence ?? null}::bigint IS NULL OR report.sequence = ${reportSequence ?? null}::bigint)
         AND report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
           WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
@@ -101,9 +97,41 @@ export async function stageProgressiveWorkerEvidence(
       signature: String(candidate.content_signature),
     };
   });
+}
+
+export async function stageProgressiveWorkerEvidence(
+  db: DB,
+  engine: EngineClient,
+  executionId: string,
+  hooks: {
+    afterEvidenceStaged?: () => Promise<void>;
+    reportSequence?: number;
+  } = {},
+) {
+  const claimed = await claimProgressiveWorkerEvidence(
+    db,
+    executionId,
+    hooks.reportSequence,
+  );
   if (!claimed) return { kind: "idle" as const };
+  return stageClaimedProgressiveWorkerEvidence(db, engine, claimed, hooks);
+}
+
+async function stageClaimedProgressiveWorkerEvidence(
+  db: DB,
+  engine: EngineClient,
+  claimed: NonNullable<
+    Awaited<ReturnType<typeof claimProgressiveWorkerEvidence>>
+  >,
+  hooks: {
+    afterEvidenceStaged?: () => Promise<void>;
+    afterEvidenceClaimed?: (executionId: string) => Promise<void>;
+  },
+) {
+  const executionId = claimed.job.id;
   const lease = { jobId: executionId, token: claimed.token };
   try {
+    await hooks.afterEvidenceClaimed?.(executionId);
     const reused = await existingProgressiveReportAttempts(
       db,
       claimed.report,
@@ -226,35 +254,49 @@ export async function stageNextProgressiveWorkerEvidence(
   engine: EngineClient,
   hooks: {
     afterEvidenceStaged?: () => Promise<void>;
+    afterEvidenceClaimed?: (executionId: string) => Promise<void>;
     preferActive?: boolean;
   } = {},
 ): Promise<boolean> {
-  const [pending] = await db.execute(
-    progressiveStagingSelectionSql(hooks.preferActive === true),
-  );
-  if (!pending) return false;
+  let pending: { sim_job_id: string; sequence: number } | undefined;
   try {
+    const claimed = await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended('progressive-worker-evidence-admission', 0))`,
+      );
+      const [selected] = await connection.execute(
+        progressiveStagingSelectionSql(hooks.preferActive === true),
+      );
+      if (!selected) return null;
+      pending = {
+        sim_job_id: String(selected.sim_job_id),
+        sequence: Number(selected.sequence),
+      };
+      return claimProgressiveWorkerEvidence(
+        connection,
+        pending.sim_job_id,
+        pending.sequence,
+      );
+    });
+    if (!claimed) return false;
     return (
-      (
-        await stageProgressiveWorkerEvidence(
-          db,
-          engine,
-          String(pending.sim_job_id),
-          { ...hooks, reportSequence: Number(pending.sequence) },
-        )
-      ).kind === "staged"
+      (await stageClaimedProgressiveWorkerEvidence(db, engine, claimed, hooks))
+        .kind === "staged"
     );
   } catch (error) {
+    if (!pending) throw error;
+    const failed = pending;
     await db.transaction(async (transaction) => {
       await transaction.execute(
-        sql`SELECT id FROM sim_jobs WHERE id = ${pending.sim_job_id}::uuid FOR UPDATE`,
+        sql`SELECT id FROM sim_jobs WHERE id = ${failed.sim_job_id}::uuid FOR UPDATE`,
       );
       await transaction.execute(sql`
       INSERT INTO progressive_worker_staging_failures(sim_job_id, sequence, attempt_count, retry_after, last_error)
-      SELECT ${pending.sim_job_id}::uuid, ${pending.sequence}::bigint, 1, clock_timestamp() + interval '2 seconds',
+      SELECT ${failed.sim_job_id}::uuid, ${failed.sequence}::bigint, 1, clock_timestamp() + interval '2 seconds',
         ${(error instanceof Error ? error.message : String(error)).slice(0, 1000)}
       WHERE NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
-        WHERE staged.sim_job_id = ${pending.sim_job_id}::uuid AND staged.sequence = ${pending.sequence}::bigint)
+        WHERE staged.sim_job_id = ${failed.sim_job_id}::uuid AND staged.sequence = ${failed.sequence}::bigint)
       ON CONFLICT (sim_job_id, sequence) DO UPDATE SET
         attempt_count = progressive_worker_staging_failures.attempt_count + 1,
         retry_after = clock_timestamp() + make_interval(secs => LEAST(60, power(2, LEAST(6, progressive_worker_staging_failures.attempt_count + 1)))::double precision),

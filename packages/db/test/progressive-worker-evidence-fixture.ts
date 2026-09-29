@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
 import type { EngineClient } from "../../engine-client/src";
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
+import { sealProgressiveRemoteExecution } from "../src/progressive-remote-execution";
+import { validateProgressiveRemoteReport } from "../src/progressive-remote-report";
+import {
+  simJobs,
+  syncSweepPromises,
+  progressiveWorkerSubmissionIntents,
+  progressiveWorkerReports,
+} from "../src/schema";
 import {
   acknowledgeProgressiveWorkerReport,
   settleProgressiveWorkerFinalReport,
@@ -16,6 +24,196 @@ import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progres
 import { verifyProgressiveWorkerEvidenceDelivery } from "./progressive-worker-evidence-delivery-fixture";
 import { progressiveEvidencePriority } from "../../../apps/sweeper/src/progressive-evidence-priority";
 import { verifyProgressiveEvidenceReuse } from "./progressive-evidence-reuse-fixture";
+
+async function verifyParallelStagingClaims(
+  db: DB,
+  engine: EngineClient,
+  source: ProgressiveRemoteExecutionEnvelope,
+) {
+  const [originalJob] = await db
+    .select()
+    .from(simJobs)
+    .where(eq(simJobs.id, source.scope.executionId));
+  const [originalPromise] = await db
+    .select()
+    .from(syncSweepPromises)
+    .where(eq(syncSweepPromises.id, source.promiseId));
+  const [originalReport] = await db
+    .select()
+    .from(progressiveWorkerReports)
+    .where(eq(progressiveWorkerReports.simJobId, source.scope.executionId))
+    .orderBy(progressiveWorkerReports.sequence)
+    .limit(1);
+  const jobIds: string[] = [];
+  const promiseIds: string[] = [];
+  try {
+    await db
+      .update(simJobs)
+      .set({
+        ingestLeaseToken: randomUUID(),
+        ingestLeaseExpiresAt: new Date(Date.now() + 60000),
+      })
+      .where(eq(simJobs.id, originalJob.id));
+    for (let slot = 0; slot < 4; slot += 1) {
+      const executionId = randomUUID();
+      const promiseId = randomUUID();
+      const envelope = sealProgressiveRemoteExecution({
+        solverId: source.solverId,
+        promiseId,
+        scope: { ...source.scope, executionId },
+        request: { ...source.request, execution_id: executionId },
+      });
+      await db
+        .insert(syncSweepPromises)
+        .values({
+          ...originalPromise,
+          id: promiseId,
+          status: "active",
+          expiresAt: new Date(Date.now() + 60000),
+        });
+      promiseIds.push(promiseId);
+      await db.insert(simJobs).values({
+        ...originalJob,
+        id: executionId,
+        engineJobId: executionId,
+        status: "done",
+        requestPayload: {
+          ...(originalJob.requestPayload as Record<string, unknown>),
+          syncPromiseId: promiseId,
+          engineRequest: envelope.request,
+          remoteProgressiveExecution: envelope,
+        },
+        ingestLeaseToken: null,
+        ingestLeaseExpiresAt: null,
+        ingestLeaseClaimedAt: null,
+        ingestLeasePreviousStatus: null,
+      });
+      jobIds.push(executionId);
+      await db
+        .insert(progressiveWorkerSubmissionIntents)
+        .values({
+          simJobId: executionId,
+          token: randomUUID(),
+          assignmentSignature: envelope.contentSignature,
+          authorization: {
+            kind: "authorized",
+            executionId,
+            contentSignature: envelope.contentSignature,
+          },
+        });
+      const report = JSON.parse(
+        JSON.stringify(originalReport.report).replaceAll(
+          source.scope.executionId,
+          executionId,
+        ),
+      );
+      report.promiseId = promiseId;
+      report.assignmentSignature = envelope.contentSignature;
+      report.sequence = 1;
+      const validated = validateProgressiveRemoteReport(report, envelope);
+      await db
+        .insert(progressiveWorkerReports)
+        .values({
+          simJobId: executionId,
+          sequence: 1,
+          contentSignature: validated.contentSignature,
+          report,
+          acknowledgedAt: new Date(),
+        });
+    }
+    let release: () => void = () => {};
+    let allClaimed: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      allClaimed = resolve;
+    });
+    const claimed = new Set<string>();
+    const interruption = new Error(
+      "Finish isolated parallel claim observation",
+    );
+    const stages = Promise.allSettled(
+      Array.from({ length: 4 }, () =>
+        stageNextProgressiveWorkerEvidence(db, engine, {
+          afterEvidenceClaimed: async (executionId) => {
+            claimed.add(executionId);
+            if (claimed.size === 4) allClaimed();
+            await gate;
+            throw interruption;
+          },
+        }),
+      ),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        ready,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Parallel staging failed to claim four distinct jobs",
+                ),
+              ),
+            15000,
+          );
+        }),
+      ]);
+      expect(claimed).toEqual(new Set(jobIds));
+      const leased = await db
+        .select({ token: simJobs.ingestLeaseToken })
+        .from(simJobs)
+        .where(inArray(simJobs.id, jobIds));
+      expect(new Set(leased.map((row) => row.token)).size).toBe(4);
+      expect(leased.every((row) => row.token !== null)).toBe(true);
+    } finally {
+      clearTimeout(timer);
+      release();
+      const completed = await stages;
+      expect(
+        completed.every(
+          (result) =>
+            result.status === "rejected" && result.reason === interruption,
+        ),
+      ).toBe(true);
+    }
+    const released = await db
+      .select({ token: simJobs.ingestLeaseToken })
+      .from(simJobs)
+      .where(inArray(simJobs.id, jobIds));
+    expect(released.every((row) => row.token === null)).toBe(true);
+    console.info(
+      JSON.stringify({
+        parallelStagingClaims: claimed.size,
+        uniqueJobs: jobIds.length,
+        leasesReleased: true,
+      }),
+    );
+  } finally {
+    if (jobIds.length) {
+      await db
+        .delete(progressiveWorkerReports)
+        .where(inArray(progressiveWorkerReports.simJobId, jobIds));
+      await db
+        .delete(progressiveWorkerSubmissionIntents)
+        .where(inArray(progressiveWorkerSubmissionIntents.simJobId, jobIds));
+      await db.delete(simJobs).where(inArray(simJobs.id, jobIds));
+    }
+    if (promiseIds.length)
+      await db
+        .delete(syncSweepPromises)
+        .where(inArray(syncSweepPromises.id, promiseIds));
+    await db
+      .update(simJobs)
+      .set({
+        ingestLeaseToken: originalJob.ingestLeaseToken,
+        ingestLeaseExpiresAt: originalJob.ingestLeaseExpiresAt,
+      })
+      .where(eq(simJobs.id, originalJob.id));
+  }
+}
 
 export async function verifyProgressiveWorkerEvidence(
   db: DB,
@@ -99,6 +297,7 @@ export async function verifyProgressiveWorkerEvidence(
     await db.execute(
       sql`UPDATE sim_jobs SET status = 'cancelled' WHERE id = ${executionId}::uuid`,
     );
+    await verifyParallelStagingClaims(db, engine, envelope);
     const rollbackRace = new Error("Rollback isolated staging completion race");
     for (const failAfterProjection of [false, true]) {
       const rollbackProjection = new Error(
