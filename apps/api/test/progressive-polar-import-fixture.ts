@@ -297,7 +297,7 @@ export async function verifyProgressivePolarImport(
           await scoped.transaction(async (nested) => {
             isolated.connection = nested as unknown as DB;
             await nested.execute(
-              sql`UPDATE sim_jobs SET status='ingesting', ingest_lease_token=NULL, ingest_lease_expires_at=NULL
+              sql`UPDATE sim_jobs SET status='ingesting', "ingestedAt"=NULL, ingest_lease_token=NULL, ingest_lease_expires_at=NULL
                 WHERE id=${delivery.engineJobId}::uuid`,
             );
             await nested.execute(

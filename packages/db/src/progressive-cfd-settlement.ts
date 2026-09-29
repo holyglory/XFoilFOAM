@@ -177,8 +177,8 @@ export async function settleProgressiveCfdExecution(
       return { ...counts, waiting: 1 };
     if (!job.ingestedAt) {
       const [current] = await connection.execute(sql`
-        SELECT EXISTS (
-          SELECT 1 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+      SELECT EXISTS (
+        SELECT 1 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
           JOIN progressive_work work ON work.id = unit.work_id
           JOIN progressive_generations generation ON generation.id = work.generation_id
           JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id
@@ -186,9 +186,27 @@ export async function settleProgressiveCfdExecution(
           WHERE attempt.sim_job_id = ${simJobId} AND attempt.outcome = 'running' AND epoch.current
             AND generation.status = 'active' AND generation.plan_revision_id = campaign.current_plan_revision_id
             AND campaign.status IN ('active', 'attention', 'paused')
-        ) AS value
+        ) AS value,
+        EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+          WHERE attempt.sim_job_id = ${simJobId} AND attempt.outcome = 'running'
+            AND unit.state = 'blocked' AND unit.lease_token IS NULL AND unit.lease_until IS NULL
+        ) AS stopped_pending,
+        NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+          WHERE attempt.sim_job_id = ${simJobId} AND attempt.outcome = 'running'
+            AND NOT (unit.state = 'blocked' AND unit.lease_token IS NULL AND unit.lease_until IS NULL)
+        ) AS no_active_running_lease
       `);
-      if (current?.value) return { ...counts, waiting: 1 };
+      if (
+        current?.value &&
+        !(
+          job.status === 'ingesting' &&
+          current.stopped_pending &&
+          current.no_active_running_lease
+        )
+      )
+        return { ...counts, waiting: 1 };
     }
     const sources = await connection.execute(sql`
       SELECT receipt.evidence_signature, raw.evidence_payload FROM progressive_cfd_attempts attempt
