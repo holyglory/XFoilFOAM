@@ -8293,14 +8293,10 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         )
           mediumValuesFromPayload(item.data);
     } catch (error) {
-      return reply
-        .code(400)
-        .send({
-          error:
-            error instanceof Error
-              ? error.message
-              : "Invalid gas material model",
-        });
+      return reply.code(400).send({
+        error:
+          error instanceof Error ? error.message : "Invalid gas material model",
+      });
     }
     let imported = 0;
     const conflictIds: string[] = [];
@@ -8552,6 +8548,9 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       .select({
         id: syncImportConflicts.id,
         status: syncImportConflicts.status,
+        exactGenerationAccepted: sql<boolean>`coalesce(
+          ${syncImportConflicts.status} = 'archived'
+          AND ${syncImportConflicts.resolutionNote} = 'automatically cleared: exact promised generation was subsequently accepted', false)`,
       })
       .from(syncImportConflicts)
       .where(

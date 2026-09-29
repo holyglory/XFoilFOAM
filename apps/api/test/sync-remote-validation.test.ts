@@ -989,8 +989,15 @@ afterAll(async () => {
   await deleteIds(airfoils, airfoils.id, [airfoilId].filter(Boolean));
   await deleteIds(categories, categories.id, [categoryId].filter(Boolean));
   if (cleanupMaterialSlugs.size) {
-    const owned = await db.select({ id: mediums.id }).from(mediums).where(inArray(mediums.slug, [...cleanupMaterialSlugs]));
-    await deleteIds(mediums, mediums.id, owned.map((row) => row.id));
+    const owned = await db
+      .select({ id: mediums.id })
+      .from(mediums)
+      .where(inArray(mediums.slug, [...cleanupMaterialSlugs]));
+    await deleteIds(
+      mediums,
+      mediums.id,
+      owned.map((row) => row.id),
+    );
   }
   await restoreSync();
   await advisoryLockSql.end();
@@ -1095,9 +1102,17 @@ describe("remote solver sync validation regressions", () => {
         ]),
       );
       const points = await db
-        .select({ promiseId: syncSweepPromisePoints.promiseId, status: syncSweepPromisePoints.status })
+        .select({
+          promiseId: syncSweepPromisePoints.promiseId,
+          status: syncSweepPromisePoints.status,
+        })
         .from(syncSweepPromisePoints)
-        .where(inArray(syncSweepPromisePoints.promiseId, [stalePromiseId, livePromiseId]));
+        .where(
+          inArray(syncSweepPromisePoints.promiseId, [
+            stalePromiseId,
+            livePromiseId,
+          ]),
+        );
       expect(points).toEqual(
         expect.arrayContaining([
           { promiseId: stalePromiseId, status: "expired" },
@@ -1121,39 +1136,68 @@ describe("remote solver sync validation regressions", () => {
     cleanupMaterialSlugs.add(slug);
     const since = new Date().toISOString();
     const payload = {
-      slug, name: "Isolated sourced gas model", phase: "gas", density: 1.225539021373505,
-      refTemperatureK: 288.15, refPressurePa: 101325, speedOfSound: 340.40998328942305,
-      viscosityModel: "constant", constantDynamicViscosity: 1.7961537371721837e-5,
+      slug,
+      name: "Isolated sourced gas model",
+      phase: "gas",
+      density: 1.225539021373505,
+      refTemperatureK: 288.15,
+      refPressurePa: 101325,
+      speedOfSound: 340.40998328942305,
+      viscosityModel: "constant",
+      constantDynamicViscosity: 1.7961537371721837e-5,
       dynamicViscosity: 1.7961537371721837e-5,
-      kinematicViscosity: 1.4656030577950679e-5, viscosityTable: [],
-      gasThermodynamics: gas, notes: "Isolated source fixture, not an installed production material",
+      kinematicViscosity: 1.4656030577950679e-5,
+      viscosityTable: [],
+      gasThermodynamics: gas,
+      notes: "Isolated source fixture, not an installed production material",
     };
     const imported = await postJson("/api/sync/v1/import", {
-      sourceInstanceId: `${PREFIX}-source`, items: [{ type: "mediums", data: payload }],
+      sourceInstanceId: `${PREFIX}-source`,
+      items: [{ type: "mediums", data: payload }],
     });
     expect(imported.statusCode, imported.body).toBe(200);
     expect(imported.json()).toMatchObject({ imported: 1, conflicts: [] });
-    const [stored] = await db.select().from(mediums).where(eq(mediums.slug, slug));
+    const [stored] = await db
+      .select()
+      .from(mediums)
+      .where(eq(mediums.slug, slug));
     expect(stored.gasThermodynamics).toEqual(gas);
     const exported = await app.inject({
-      method: "GET", url: `/api/sync/v1/export?types=mediums&limit=500&since=${encodeURIComponent(since)}`,
+      method: "GET",
+      url: `/api/sync/v1/export?types=mediums&limit=500&since=${encodeURIComponent(since)}`,
       headers: { "x-xfoilfoam-sync-secret": SECRET },
     });
     expect(exported.statusCode, exported.body).toBe(200);
-    const item = exported.json().items.find((entry: { data: { slug: string } }) => entry.data.slug === slug);
+    const item = exported
+      .json()
+      .items.find(
+        (entry: { data: { slug: string } }) => entry.data.slug === slug,
+      );
     expect(item?.data.gasThermodynamics).toEqual(gas);
     const replay = await postJson("/api/sync/v1/import", { items: [item] });
     expect(replay.statusCode, replay.body).toBe(200);
     expect(replay.json()).toMatchObject({ imported: 0, conflicts: [] });
-    for (const incomingModel of [{ ...gas, gas_constant: gas.gas_constant * 1.0001 }, null]) {
+    for (const incomingModel of [
+      { ...gas, gas_constant: gas.gas_constant * 1.0001 },
+      null,
+    ]) {
       const conflicting = await postJson("/api/sync/v1/import", {
-        sourceInstanceId: `${PREFIX}-source`, items: [{ type: "mediums", data: { ...payload, gasThermodynamics: incomingModel } }],
+        sourceInstanceId: `${PREFIX}-source`,
+        items: [
+          {
+            type: "mediums",
+            data: { ...payload, gasThermodynamics: incomingModel },
+          },
+        ],
       });
       expect(conflicting.statusCode, conflicting.body).toBe(200);
       const conflicts: string[] = conflicting.json().conflicts;
       for (const conflictId of conflicts) cleanupConflictIds.add(conflictId);
       expect(conflicts).toHaveLength(1);
-      const [preserved] = await db.select().from(mediums).where(eq(mediums.id, stored.id));
+      const [preserved] = await db
+        .select()
+        .from(mediums)
+        .where(eq(mediums.id, stored.id));
       expect(preserved.gasThermodynamics).toEqual(gas);
     }
   });
@@ -1161,20 +1205,40 @@ describe("remote solver sync validation regressions", () => {
   it("rejects invalid explicit gas material before any item in its import batch is written", async () => {
     const prefix = `${PREFIX}-invalid-gas-model`;
     const valid = {
-      slug: `${prefix}-valid`, name: "Isolated valid gas model", phase: "gas", density: 1.225539021373505,
-      refTemperatureK: 288.15, refPressurePa: 101325, speedOfSound: 340.40998328942305,
-      viscosityModel: "constant", constantDynamicViscosity: 1.7961537371721837e-5,
-      kinematicViscosity: 1.4656030577950679e-5, viscosityTable: [],
-      dynamicViscosity: 1.7961537371721837e-5, gasThermodynamics: sourceAirModel(),
+      slug: `${prefix}-valid`,
+      name: "Isolated valid gas model",
+      phase: "gas",
+      density: 1.225539021373505,
+      refTemperatureK: 288.15,
+      refPressurePa: 101325,
+      speedOfSound: 340.40998328942305,
+      viscosityModel: "constant",
+      constantDynamicViscosity: 1.7961537371721837e-5,
+      kinematicViscosity: 1.4656030577950679e-5,
+      viscosityTable: [],
+      dynamicViscosity: 1.7961537371721837e-5,
+      gasThermodynamics: sourceAirModel(),
     };
-    const invalid = { ...valid, slug: `${prefix}-invalid`, gasThermodynamics: { ...sourceAirModel(), gas_constant: -1 } };
+    const invalid = {
+      ...valid,
+      slug: `${prefix}-invalid`,
+      gasThermodynamics: { ...sourceAirModel(), gas_constant: -1 },
+    };
     cleanupMaterialSlugs.add(valid.slug);
     cleanupMaterialSlugs.add(invalid.slug);
     const response = await postJson("/api/sync/v1/import", {
-      items: [{ type: "mediums", data: valid }, { type: "mediums", data: invalid }],
+      items: [
+        { type: "mediums", data: valid },
+        { type: "mediums", data: invalid },
+      ],
     });
     expect(response.statusCode, response.body).toBe(400);
-    expect(await db.select({ id: mediums.id }).from(mediums).where(inArray(mediums.slug, [valid.slug, invalid.slug]))).toEqual([]);
+    expect(
+      await db
+        .select({ id: mediums.id })
+        .from(mediums)
+        .where(inArray(mediums.slug, [valid.slug, invalid.slug])),
+    ).toEqual([]);
   });
 
   it("separates live promise bundles, individual AoA states, and accepted-result scope", async () => {
@@ -1310,14 +1374,12 @@ describe("remote solver sync validation regressions", () => {
       .from(simulationPresetRevisions)
       .where(eq(simulationPresetRevisions.id, revisionId));
     const copyId = randomUUID();
-    await db
-      .insert(simulationPresetRevisions)
-      .values({
-        ...original,
-        id: copyId,
-        revisionNumber: original.revisionNumber + 1000,
-        signatureHash: createHash("sha256").update(copyId).digest("hex"),
-      });
+    await db.insert(simulationPresetRevisions).values({
+      ...original,
+      id: copyId,
+      revisionNumber: original.revisionNumber + 1000,
+      signatureHash: createHash("sha256").update(copyId).digest("hex"),
+    });
     let release!: () => void;
     let notify!: (pid: number) => void;
     const ready = new Promise<number>((resolve) => {
@@ -2904,6 +2966,30 @@ describe("remote solver sync validation regressions", () => {
       .from(syncImportConflicts)
       .where(eq(syncImportConflicts.id, conflict.id));
     expect(archived?.status).toBe("archived");
+    const conflictStatus = await app.inject({
+      method: "POST",
+      url: "/api/sync/v1/conflicts/status",
+      headers: { "x-xfoilfoam-sync-secret": SECRET },
+      payload: { ids: [conflict.id] },
+    });
+    expect(conflictStatus.statusCode, conflictStatus.body).toBe(200);
+    expect(conflictStatus.json().conflicts).toEqual([
+      { id: conflict.id, status: "archived", exactGenerationAccepted: true },
+    ]);
+    await db
+      .update(syncImportConflicts)
+      .set({ resolutionNote: "Manually retained local evidence" })
+      .where(eq(syncImportConflicts.id, conflict.id));
+    const manualStatus = await app.inject({
+      method: "POST",
+      url: "/api/sync/v1/conflicts/status",
+      headers: { "x-xfoilfoam-sync-secret": SECRET },
+      payload: { ids: [conflict.id] },
+    });
+    expect(manualStatus.statusCode, manualStatus.body).toBe(200);
+    expect(manualStatus.json().conflicts).toEqual([
+      { id: conflict.id, status: "archived", exactGenerationAccepted: false },
+    ]);
   });
 
   it("strips base64 from sync conflict incoming_payload for non-equivalent existing polar rows", async () => {

@@ -573,6 +573,12 @@ tier = "development"
 requires = ["seed", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
 
+[[test.staging-selection.check]]
+name = "api-conflict-recovery"
+tier = "development"
+requires = ["exact-ingestion"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/sync-remote-validation.test.ts"]
+
 [test.progressive-claim-deferral]
 timeout_seconds = 900
 

@@ -13,7 +13,10 @@ const unappliedReports = sql`EXISTS (
 function executionScope(jobIds?: string[]) {
   return jobIds
     ? jobIds.length
-      ? sql`job.id IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})`
+      ? sql`job.id IN (${sql.join(
+          jobIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )})`
       : sql`false`
     : sql`true`;
 }
@@ -42,10 +45,6 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active')))
     ORDER BY CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
-      CASE WHEN promise.status IN ('expired', 'cancelled')
-        AND job.status = 'ingesting'
-        AND job.engine_state IN ('completed', 'failed', 'cancelled')
-        THEN 0 ELSE 1 END,
       CASE WHEN job.status = 'ingesting'
       AND job.engine_state IN ('completed', 'failed', 'cancelled')
       THEN 0 ELSE 1 END,

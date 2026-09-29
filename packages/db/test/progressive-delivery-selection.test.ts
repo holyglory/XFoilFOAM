@@ -2,6 +2,7 @@ import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
 import { progressiveDeliverySelectionSql } from "../../../apps/sweeper/src/progressive-delivery-selection";
+import { progressiveSettlementJobsSql } from "../../../apps/sweeper/src/progressive-progress-selection";
 import {
   nextProgressiveArchiveWakeAt,
   progressiveArchiveSelectionSql,
@@ -10,6 +11,65 @@ import type { DB } from "../src/client";
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+it("settles fulfilled and active jobs fairly while expired work keeps arriving", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE fixture_settlement_jobs ON COMMIT DROP AS
+      SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['fulfilled','active','unapplied','unindexed','executing','not-dispatched']) variant
+      UNION ALL SELECT md5('expired-'||ordinal)::uuid,'expired-'||ordinal FROM generate_series(1,36) ordinal`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_campaigns ON COMMIT DROP AS
+      SELECT md5('campaign')::uuid AS id,'active'::text AS status`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT id,md5('campaign')::uuid AS campaign_id,
+        CASE WHEN variant='executing' THEN 'running' ELSE 'ingesting' END AS status,
+        CASE WHEN variant='executing' THEN 'running' ELSE 'completed' END AS engine_state,
+        clock_timestamp()-interval '2 days' AS "updatedAt",
+        clock_timestamp()-CASE WHEN variant='fulfilled' THEN interval '1 day' ELSE interval '1 hour' END AS "polledAt"
+      FROM fixture_settlement_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id AS sim_job_id,id AS promise_id FROM fixture_settlement_jobs WHERE variant<>'not-dispatched'`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
+      SELECT id,CASE WHEN variant LIKE 'expired-%' THEN 'expired' WHEN variant='fulfilled' THEN 'fulfilled' ELSE 'active' END AS status
+      FROM fixture_settlement_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts ON COMMIT DROP AS
+      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs WHERE variant<>'unapplied'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories ON COMMIT DROP AS
+      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs WHERE variant<>'unindexed'`);
+    await transaction.execute(
+      sql`CREATE TEMP TABLE progressive_cfd_execution_stops (sim_job_id uuid) ON COMMIT DROP`,
+    );
+    await transaction.execute(
+      sql`CREATE TEMP TABLE progressive_cfd_attempts (sim_job_id uuid,outcome text) ON COMMIT DROP`,
+    );
+    const [fulfilled] = await transaction.execute(
+      sql`SELECT id FROM fixture_settlement_jobs WHERE variant='fulfilled'`,
+    );
+    const first = await transaction.execute(progressiveSettlementJobsSql());
+    expect(first).toHaveLength(32);
+    expect(first[0].sim_job_id).toBe(fulfilled.id);
+    for (const row of first) {
+      await transaction.execute(
+        sql`UPDATE sim_jobs SET "polledAt"=clock_timestamp() WHERE id=${row.sim_job_id}::uuid`,
+      );
+    }
+    const second = await transaction.execute(progressiveSettlementJobsSql());
+    const visited = new Set([...first, ...second].map((row) => row.sim_job_id));
+    expect(visited.size).toBe(38);
+    const excluded =
+      await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
+      WHERE variant IN ('unapplied','unindexed','executing','not-dispatched')`);
+    for (const row of excluded) expect(visited.has(row.id)).toBe(false);
+    expect(
+      await transaction.execute(
+        progressiveSettlementJobsSql([String(fulfilled.id)]),
+      ),
+    ).toEqual([
+      { sim_job_id: fulfilled.id, campaign_id: first[0].campaign_id },
+    ]);
+  });
+});
 
 it("resumes due archive retries and expired claims before untouched work while preserving ownership and deadlines", async () => {
   await client.db.transaction(async (transaction) => {

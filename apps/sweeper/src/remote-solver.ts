@@ -66,6 +66,7 @@ import { observeProgressiveRemoteJob } from "./progressive-remote-observation";
 import { receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
 import { recordProgressiveWorkerEvidenceReceipt } from "./progressive-worker-evidence-delivery";
+import { reopenResolvedProgressiveConflicts } from "./progressive-conflict-recovery";
 import {
   reclaimProgressiveArchives,
   runArchiveReclaimPass,
@@ -6919,6 +6920,7 @@ async function reopenResolvedConflictDeliveries(
   db: DB,
   settings: Settings,
 ): Promise<void> {
+  await reopenResolvedProgressiveConflicts(db);
   const blocked = await db
     .select({
       id: syncRemoteResultDeliveries.id,

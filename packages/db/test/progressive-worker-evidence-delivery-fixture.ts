@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { verifyProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody-fixture";
 import { verifyProgressiveWorkerArchiveDelivery } from "./progressive-worker-archive-delivery-fixture";
 import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progressive-evidence-service";
+import { reopenResolvedProgressiveConflicts } from "../../../apps/sweeper/src/progressive-conflict-recovery";
 import { sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
 import type { DB } from "../src/client";
@@ -86,9 +87,9 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     expect(unused).not.toHaveBeenCalled();
     await db.execute(sql`UPDATE progressive_worker_delivery_failures SET retry_after = clock_timestamp() - interval '1 second'
       WHERE sim_job_id = ${executionId}::uuid`);
-    expect((await nextProgressiveEvidenceWakeAt(db))?.getTime()).toBeLessThanOrEqual(
-      Date.now() + 1000,
-    );
+    expect(
+      (await nextProgressiveEvidenceWakeAt(db))?.getTime(),
+    ).toBeLessThanOrEqual(Date.now() + 1000);
     const rejected = vi.fn(
       async () => new Response("conflict", { status: 409 }),
     );
@@ -131,6 +132,74 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     expect(await deliverNextProgressiveWorkerEvidence(db, unused)).toBe(false);
     expect(importConflict).toHaveBeenCalledTimes(1);
     expect(unused).not.toHaveBeenCalled();
+    for (const conflicts of [
+      [{ id: remoteConflictId, status: "pending" }],
+      [{ id: remoteConflictId, status: "archived" }],
+      [
+        {
+          id: remoteConflictId,
+          status: "archived",
+          exactGenerationAccepted: false,
+        },
+      ],
+      [{ id: randomUUID(), status: "archived", exactGenerationAccepted: true }],
+      [
+        {
+          id: remoteConflictId,
+          status: "archived",
+          exactGenerationAccepted: "true",
+        },
+      ],
+      [],
+      null,
+    ]) {
+      await db.execute(sql`UPDATE progressive_worker_delivery_failures SET updated_at=clock_timestamp()-interval '6 minutes'
+        WHERE sim_job_id=${executionId}::uuid`);
+      expect(
+        await reopenResolvedProgressiveConflicts(db, async () =>
+          Response.json({ conflicts }),
+        ),
+      ).toBe(0);
+      const [stillBlocked] =
+        await db.execute(sql`SELECT state,updated_at>clock_timestamp()-interval '5 minutes' AS delayed
+        FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`);
+      expect(stillBlocked).toMatchObject({ state: "conflict", delayed: true });
+      expect(await reopenResolvedProgressiveConflicts(db, unused)).toBe(0);
+      expect(unused).not.toHaveBeenCalled();
+    }
+    for (const resolution of [
+      { status: "archived", exactGenerationAccepted: true },
+      { status: "promoted" },
+    ]) {
+      await db.execute(sql`UPDATE progressive_worker_delivery_failures
+        SET state='conflict',retry_after=NULL,updated_at=clock_timestamp()-interval '6 minutes',remote_conflict_ids=${JSON.stringify([remoteConflictId])}::jsonb
+        WHERE sim_job_id=${executionId}::uuid`);
+      const resolved = vi.fn(
+        async (url: string | URL | Request, init?: RequestInit) => {
+          expect(String(url)).toMatch(/\/conflicts\/status$/);
+          expect(JSON.parse(String(init?.body))).toEqual({
+            ids: [remoteConflictId],
+          });
+          return Response.json({
+            conflicts: [{ id: remoteConflictId, ...resolution }],
+          });
+        },
+      );
+      expect(await reopenResolvedProgressiveConflicts(db, resolved)).toBe(1);
+      expect(await reopenResolvedProgressiveConflicts(db, unused)).toBe(0);
+      const [reopened] =
+        await db.execute(sql`SELECT state,retry_after<=clock_timestamp() AS due,remote_conflict_ids
+        FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`);
+      expect(reopened).toMatchObject({
+        state: "retry",
+        due: true,
+        remote_conflict_ids: [],
+      });
+      expect(
+        await db.execute(sql`SELECT 1 FROM progressive_worker_hub_receipts
+        WHERE sim_job_id=${executionId}::uuid`),
+      ).toHaveLength(0);
+    }
     await db.execute(
       sql`DELETE FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`,
     );
