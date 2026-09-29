@@ -30,9 +30,9 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
   return sql`SELECT job.id AS sim_job_id, job.campaign_id
     FROM sim_jobs job
     LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
-    LEFT JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
+    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
+    LEFT JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
     WHERE ${executionScope(jobIds)} AND NOT ${unappliedReports}
-      AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
       AND (
         (job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled'))
         OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
