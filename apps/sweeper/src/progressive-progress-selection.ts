@@ -49,5 +49,5 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
       CASE WHEN job.status = 'ingesting'
       AND job.engine_state IN ('completed', 'failed', 'cancelled')
       THEN 0 ELSE 1 END,
-      job."updatedAt", job.id LIMIT 32`;
+      coalesce(job."polledAt", job."updatedAt"), job.id LIMIT 32`;
 }
