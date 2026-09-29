@@ -338,6 +338,9 @@ can see only committed staging receipts and wakes on the evidence notification
 channel. Staging and delivery wait on their own retry deadlines, so a delivery
 backlog cannot make an idle staging slot spin. Failure in one operation does not
 cancel its safe siblings, and shutdown waits for all started operations.
+Within each delivery priority lane, due retries precede untouched sources.
+Their existing retry deadlines still apply, and conflicts remain excluded;
+continuous new results cannot indefinitely postpone a recoverable transfer.
 
 A cumulative report can reuse already staged point attempts only when every source
 matches an earlier acknowledged report, its immutable association, complete point

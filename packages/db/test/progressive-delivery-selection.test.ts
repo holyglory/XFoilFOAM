@@ -231,7 +231,7 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         AND NOT EXISTS(SELECT 1 FROM progressive_worker_hub_receipts delivered
           WHERE delivered.sim_job_id=source.sim_job_id AND delivered.point_content_signature=source.point_content_signature)
       ORDER BY CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
-        CASE WHEN fixture.variant='due-retry' THEN 1 ELSE 0 END,
+        CASE WHEN fixture.variant='due-retry' THEN 0 ELSE 1 END,
         report.created_at,source.sim_job_id,source.sequence,attempt.aoa_deg,source.result_attempt_id LIMIT 1`);
     for (const active of [true, false]) {
       const rollback = new Error(
@@ -258,6 +258,19 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         }),
       ).rejects.toBe(rollback);
     }
+    const [due] = await transaction.execute(
+      sql`SELECT id FROM fixture_jobs WHERE variant='due-retry'`,
+    );
+    await transaction.execute(sql`UPDATE progressive_worker_reports SET created_at=timestamptz '2020-01-01T00:00:00Z'
+      WHERE sim_job_id IN (SELECT id FROM fixture_jobs WHERE variant IN ('eligible-active','eligible-cancelled','eligible-expired'))`);
+    for (const active of [true, false])
+      expect((await selected(active))[0].sim_job_id).toBe(due.id);
+    await transaction.execute(sql`UPDATE progressive_worker_delivery_failures SET retry_after=clock_timestamp()+interval '1 day'
+      WHERE sim_job_id=${due.id}::uuid`);
+    for (const active of [true, false])
+      expect((await selected(active))[0].sim_job_id).not.toBe(due.id);
+    await transaction.execute(sql`UPDATE progressive_worker_delivery_failures SET retry_after=clock_timestamp()-interval '1 second'
+      WHERE sim_job_id=${due.id}::uuid`);
     await transaction.execute(
       sql`UPDATE sync_sweep_promises SET status='cancelled'`,
     );

@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import { expect } from "vitest";
 import type { DB } from "../src/client";
 import {
@@ -88,6 +89,109 @@ export async function verifyProgressiveEvidenceReuse(
       expect(
         await existingProgressiveReportAttempts(connection, repeated, envelope),
       ).toEqual(before.map((row) => String(row.id)));
+      const restoreRepeatedHistory = new Error(
+        "Restore repeated-history volume fixture",
+      );
+      await expect(
+        transaction.transaction(async (nested) => {
+          const scoped = nested as unknown as DB;
+          for (const table of [
+            "progressive_worker_reports",
+            "progressive_worker_evidence_receipts",
+            "progressive_worker_evidence_attempts",
+            "result_attempts",
+          ]) {
+            await nested.execute(
+              sql.raw(
+                `CREATE TEMP TABLE ${table} ON COMMIT DROP AS SELECT * FROM public.${table} WHERE sim_job_id='${executionId}'::uuid`,
+              ),
+            );
+          }
+          const reports = Array.from({ length: 2050 }, (_, ordinal) => {
+            const next = {
+              ...repeated,
+              sequence: repeated.sequence + ordinal + 10,
+            };
+            return {
+              sequence: next.sequence,
+              report: next,
+              signature: validateProgressiveRemoteReport(next, envelope)
+                .contentSignature,
+            };
+          });
+          const pointSignature = progressiveReportedPointSources(
+            repeated.result!,
+          )[0].contentSignature;
+          const append = async (entries: typeof reports) => {
+            await nested.execute(sql`WITH incoming AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(entries)}::jsonb)
+            AS item(sequence bigint,report jsonb,signature text))
+            INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
+            SELECT ${executionId}::uuid,sequence,signature,report,clock_timestamp() FROM incoming`);
+            await nested.execute(sql`WITH incoming AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(entries.map(({ sequence, signature }) => ({ sequence, signature })))}::jsonb)
+            AS item(sequence bigint,signature text))
+            INSERT INTO progressive_worker_evidence_receipts(sim_job_id,sequence,content_signature)
+            SELECT ${executionId}::uuid,sequence,signature FROM incoming`);
+            await nested.execute(sql`INSERT INTO progressive_worker_evidence_attempts(sim_job_id,sequence,result_attempt_id,point_content_signature)
+            SELECT ${executionId}::uuid,sequence::bigint,${before[0].id}::uuid,${pointSignature}
+            FROM jsonb_array_elements_text(${JSON.stringify(entries.map((row) => row.sequence))}::jsonb) incoming(sequence)`);
+          };
+          await append(reports.slice(0, 128));
+          let loadedRows = 0;
+          const measured = new Proxy(scoped, {
+            get(target, property, receiver) {
+              if (property === "execute")
+                return async (query: Parameters<DB["execute"]>[0]) => {
+                  const rows = await target.execute(query);
+                  loadedRows = rows.length;
+                  return rows;
+                };
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          expect(
+            await existingProgressiveReportAttempts(
+              measured,
+              repeated,
+              envelope,
+            ),
+          ).toEqual(before.map((row) => String(row.id)));
+          expect(loadedRows).toBe(1);
+          const conflictRollback = new Error(
+            "Restore conflicting repeated attempt",
+          );
+          await expect(
+            nested.transaction(async (competing) => {
+              const otherAttempt = randomUUID();
+              await competing.execute(sql`INSERT INTO result_attempts SELECT (jsonb_populate_record(NULL::result_attempts,
+            to_jsonb(attempt)||jsonb_build_object('id',${otherAttempt}::text))).*
+            FROM result_attempts attempt WHERE id=${before[0].id}::uuid`);
+              await competing.execute(sql`UPDATE progressive_worker_evidence_attempts SET result_attempt_id=${otherAttempt}::uuid
+            WHERE sim_job_id=${executionId}::uuid AND sequence=${reports[0].sequence}`);
+              expect(
+                await existingProgressiveReportAttempts(
+                  competing as unknown as DB,
+                  repeated,
+                  envelope,
+                ),
+              ).toBeNull();
+              throw conflictRollback;
+            }),
+          ).rejects.toBe(conflictRollback);
+          await append(reports.slice(128));
+          expect(
+            await existingProgressiveReportAttempts(scoped, repeated, envelope),
+          ).toBeNull();
+          console.info(
+            JSON.stringify({
+              repeatedSourceReports: 128,
+              loadedEvidenceRows: loadedRows,
+              conflictingAttemptRejected: true,
+              associationLimitPreserved: true,
+            }),
+          );
+          throw restoreRepeatedHistory;
+        }),
+      ).rejects.toBe(restoreRepeatedHistory);
       const changed = structuredClone(repeated);
       const changedPoint = progressiveReportedPointSources(changed.result!)[0]
         .point;

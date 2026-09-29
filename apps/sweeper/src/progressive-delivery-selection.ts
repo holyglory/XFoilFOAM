@@ -14,7 +14,7 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
       AND failure.point_content_signature = source.point_content_signature
     WHERE delivered.sim_job_id IS NULL AND report.acknowledged_at IS NOT NULL AND attempt.result_id IS NOT NULL
       AND (failure.sim_job_id IS NULL OR (failure.state = 'retry' AND failure.retry_after <= clock_timestamp()))
-    ORDER BY CASE WHEN failure.state = 'retry' THEN 1 ELSE 0 END,
+    ORDER BY CASE WHEN failure.state = 'retry' THEN 0 ELSE 1 END,
       report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id OFFSET 0`;
   const owned = (
     active: boolean,
@@ -34,7 +34,7 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
     active: boolean,
   ) => sql`SELECT point.*, owned.* FROM (${points}) point
     JOIN LATERAL (${owned(active)}) owned ON true`;
-  const order = sql`ORDER BY point.is_retry, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
+  const order = sql`ORDER BY point.is_retry DESC, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
   const selected = preferActive
     ? sql`WITH active AS MATERIALIZED (${candidate(true)} ${order}),
         fallback AS (${candidate(false)} WHERE NOT EXISTS (SELECT 1 FROM active) ${order})

@@ -51,9 +51,9 @@ export async function existingProgressiveReportAttempts(
     return null;
   const sources = progressiveReportedPointSources(report.result);
   if (!sources.length || sources.length > 512) return null;
-  const rows =
-    await db.execute(sql`SELECT association.point_content_signature,association.result_attempt_id,
-      original.report,original.content_signature,to_jsonb(attempt) AS attempt
+  const rows = await db.execute(sql`WITH candidates AS MATERIALIZED (
+    SELECT association.sim_job_id,association.sequence,association.point_content_signature,association.result_attempt_id,
+      original.content_signature
     FROM progressive_worker_evidence_attempts association
     JOIN progressive_worker_evidence_receipts receipt ON receipt.sim_job_id=association.sim_job_id AND receipt.sequence=association.sequence
     JOIN progressive_worker_reports original ON original.sim_job_id=association.sim_job_id AND original.sequence=association.sequence
@@ -65,7 +65,24 @@ export async function existingProgressiveReportAttempts(
         sources.map((source) => sql`${source.contentSignature}`),
         sql`, `,
       )})
-    ORDER BY association.sequence DESC LIMIT 2049`);
+    ORDER BY association.sequence DESC LIMIT 2049
+    ), chosen AS MATERIALIZED (
+      SELECT DISTINCT ON (candidate.point_content_signature) candidate.*
+      FROM candidates candidate
+      WHERE (SELECT count(*) FROM candidates) <= 2048
+        AND NOT EXISTS (SELECT 1 FROM candidates other
+          WHERE other.point_content_signature=candidate.point_content_signature
+            AND other.result_attempt_id<>candidate.result_attempt_id)
+      ORDER BY candidate.point_content_signature,candidate.sequence DESC
+    )
+    SELECT chosen.point_content_signature,chosen.result_attempt_id,
+      original.report,chosen.content_signature,to_jsonb(attempt) AS attempt
+    FROM chosen
+    JOIN progressive_worker_reports original ON original.sim_job_id=chosen.sim_job_id
+      AND original.sequence=chosen.sequence AND original.content_signature=chosen.content_signature
+      AND original.acknowledged_at IS NOT NULL
+    JOIN result_attempts attempt ON attempt.id=chosen.result_attempt_id AND attempt.sim_job_id=chosen.sim_job_id
+      AND attempt.engine_job_id=chosen.sim_job_id::text`);
   if (rows.length > 2048) return null;
   const attempts: string[] = [];
   for (const source of sources) {
