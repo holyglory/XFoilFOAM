@@ -41,7 +41,7 @@ export async function readProgressiveRemoteRetention(
     return { kind: "waiting" as const, reason: "source_inventory" as const };
   const sources =
     await db.execute(sql`SELECT DISTINCT source.point_content_signature, source.aoa_deg, source.case_slug,
-      receipt.sequence, receipt.remote_result_id, receipt.remote_result_attempt_id, receipt.result_attempt_id,
+      receipt.sequence, receipt.remote_result_id, receipt.remote_result_attempt_id, receipt.result_attempt_id, receipt.storage_only,
       owned_report.content_signature AS report_content_signature, raw.evidence_payload, evidence.evidence_signature
     FROM progressive_remote_report_sources source
     LEFT JOIN progressive_remote_evidence_receipts receipt
@@ -74,8 +74,9 @@ export async function readProgressiveRemoteRetention(
   let pendingArchives = 0;
   for (const source of sources) {
     if (
-      !source.evidence_signature ||
-      analysisContentHash(source.evidence_payload) !== source.evidence_signature
+      source.storage_only !== true &&
+      (!source.evidence_signature ||
+        analysisContentHash(source.evidence_payload) !== source.evidence_signature)
     )
       throw new Error(
         "Remote retention differs from its immutable CFD evidence receipt",

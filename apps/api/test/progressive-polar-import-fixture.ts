@@ -20,6 +20,7 @@ import { registerSyncRoutes, type importPolarPush } from "../src/sync-routes";
 import { verifyProgressivePolarArchiveImport } from "./progressive-polar-archive-fixture";
 import { assembleSim } from "../src/services/sim";
 import { verifyAdoptedEvidenceAccess } from "./progressive-adopted-evidence-fixture";
+import { readProgressiveRemoteRetention } from "../../../packages/db/src/progressive-remote-retention";
 
 const isolated = vi.hoisted(() => ({
   connection: null as DB | null,
@@ -312,6 +313,12 @@ export async function verifyProgressivePolarImport(
             expect(pendingEvidence.json().progressiveEvidenceReceipts).toMatchObject([
               { storageOnly: true },
             ]);
+            expect(
+              await readProgressiveRemoteRetention(
+                nested as unknown as DB,
+                delivery.engineJobId,
+              ),
+            ).toMatchObject({ kind: "waiting", reason: "archives" });
             throw pendingEvidenceRollback;
           });
         } catch (error) {
