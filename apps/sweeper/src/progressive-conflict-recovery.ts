@@ -1,21 +1,27 @@
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import type { DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { recordProgressiveWorkerEvidenceReceipt } from "./progressive-worker-evidence-delivery";
 
 export async function reopenResolvedProgressiveConflicts(
   db: DB,
   fetcher: typeof fetch = fetch,
 ): Promise<number> {
-  const blocked = await db.execute(sql`
+  const candidates = await db.execute(sql`
     SELECT failure.sim_job_id, failure.point_content_signature, failure.remote_conflict_ids,
-      settings.upstream_base_url, settings.remote_solver_auth_token
+      settings.upstream_base_url, settings.remote_solver_auth_token,
+      failure.result_attempt_id, attempt.result_id, delivered.receipt
     FROM progressive_worker_delivery_failures failure
     JOIN sim_jobs job ON job.id = failure.sim_job_id
+    JOIN result_attempts attempt ON attempt.id = failure.result_attempt_id
+    LEFT JOIN progressive_worker_hub_receipts delivered ON delivered.sim_job_id = failure.sim_job_id
+      AND delivered.point_content_signature = failure.point_content_signature
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
-    WHERE failure.state = 'conflict' AND failure.last_http_status = 200
+    WHERE (delivered.sim_job_id IS NOT NULL OR (
+      failure.state = 'conflict' AND failure.last_http_status = 200
       AND jsonb_array_length(failure.remote_conflict_ids) > 0
-      AND failure.updated_at <= clock_timestamp() - interval '5 minutes'
+      AND failure.updated_at <= clock_timestamp() - interval '5 minutes'))
       AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''
       AND settings.upstream_base_url IS NOT NULL
       AND job.request_payload->>'remoteSolver' = 'true'
@@ -25,7 +31,22 @@ export async function reopenResolvedProgressiveConflicts(
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
     ORDER BY failure.updated_at, failure.sim_job_id, failure.point_content_signature LIMIT 16
   `);
-  if (!blocked.length) return 0;
+  let reopened = 0;
+  const blocked: (typeof candidates)[number][] = [];
+  for (const row of candidates) {
+    if (row.receipt) {
+      await recordProgressiveWorkerEvidenceReceipt(db, row.receipt, {
+        executionId: String(row.sim_job_id),
+        pointContentSignature: String(row.point_content_signature),
+        resultId: String(row.result_id),
+        resultAttemptId: String(row.result_attempt_id),
+      });
+      reopened += 1;
+    } else {
+      blocked.push(row);
+    }
+  }
+  if (!blocked.length) return reopened;
   for (const row of blocked) {
     await db.execute(sql`UPDATE progressive_worker_delivery_failures
       SET updated_at = clock_timestamp()
@@ -48,9 +69,9 @@ export async function reopenResolvedProgressiveConflicts(
       signal: AbortSignal.timeout(10000),
     },
   );
-  if (!response.ok) return 0;
+  if (!response.ok) return reopened;
   const payload = (await response.json()) as { conflicts?: unknown } | null;
-  if (!Array.isArray(payload?.conflicts)) return 0;
+  if (!Array.isArray(payload?.conflicts)) return reopened;
   const replayable = new Set<string>();
   for (const value of payload.conflicts) {
     if (!value || typeof value !== "object") continue;
@@ -64,7 +85,6 @@ export async function reopenResolvedProgressiveConflicts(
       replayable.add(conflict.id);
     }
   }
-  let reopened = 0;
   for (const row of blocked) {
     if (
       !(row.remote_conflict_ids as string[]).every((id) => replayable.has(id))

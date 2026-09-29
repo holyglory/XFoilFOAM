@@ -303,6 +303,24 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
       sql`SELECT * FROM progressive_worker_delivery_failures WHERE sim_job_id = ${executionId}::uuid`,
     );
     expect(failures).toHaveLength(0);
+    for (const state of ["conflict", "retry"]) {
+      await db.execute(sql`INSERT INTO progressive_worker_delivery_failures
+        (sim_job_id,sequence,result_attempt_id,point_content_signature,state,attempt_count,retry_after,last_http_status,last_error,remote_conflict_ids)
+        VALUES (${executionId}::uuid,${Number(source.sequence)},${source.result_attempt_id}::uuid,${source.point_content_signature},
+          ${state},1,${state === "retry" ? sql`clock_timestamp()` : sql`NULL`},200,'Delayed failure after exact receipt',
+          ${JSON.stringify(state === "conflict" ? [remoteConflictId] : [])}::jsonb)`);
+      expect(await reopenResolvedProgressiveConflicts(db, unused)).toBe(1);
+      expect(unused).not.toHaveBeenCalled();
+      expect(
+        await db.execute(
+          sql`SELECT 1 FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`,
+        ),
+      ).toHaveLength(0);
+      const [preserved] = await db.execute(
+        sql`SELECT receipt FROM progressive_worker_hub_receipts WHERE sim_job_id=${executionId}::uuid`,
+      );
+      expect(preserved.receipt).toEqual(receipt);
+    }
     await verifyProgressiveWorkerArchiveDelivery(db, executionId);
     await verifyProgressiveWorkerArchiveCustody(db, executionId);
     const [unchanged] = await db.execute(

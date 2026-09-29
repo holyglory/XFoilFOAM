@@ -293,38 +293,62 @@ export async function verifyProgressivePolarImport(
         const pendingEvidenceRollback = new Error(
           "Rollback pending stopped-evidence acceptance fixture",
         );
-        try {
-          await scoped.transaction(async (nested) => {
-            isolated.connection = nested as unknown as DB;
-            await nested.execute(
-              sql`UPDATE sim_jobs SET status='ingesting', "ingestedAt"=NULL, ingest_lease_token=NULL, ingest_lease_expires_at=NULL
+        for (const ownership of [
+          "blocked",
+          "expired",
+          "live",
+          "foreign",
+        ]) {
+          try {
+            await scoped.transaction(async (nested) => {
+              isolated.connection = nested as unknown as DB;
+              await nested.execute(
+                sql`UPDATE sim_jobs SET status='ingesting', "ingestedAt"=NULL, ingest_lease_token=NULL, ingest_lease_expires_at=NULL
                 WHERE id=${delivery.engineJobId}::uuid`,
-            );
-            await nested.execute(
-              sql`UPDATE progressive_cfd_attempts SET outcome='running'
+              );
+              await nested.execute(
+                sql`UPDATE progressive_cfd_attempts SET outcome='running'
                 WHERE sim_job_id=${delivery.engineJobId}::uuid`,
-            );
-            await nested.execute(
-              sql`UPDATE progressive_cfd_units SET state='blocked', lease_token=NULL, lease_owner=NULL, lease_until=NULL
+              );
+              await nested.execute(
+                sql`UPDATE progressive_cfd_units SET state='blocked', lease_token=NULL, lease_owner=NULL, lease_until=NULL
                 WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${delivery.engineJobId}::uuid)`,
-            );
-            const pendingEvidence = await storage();
-            expect(pendingEvidence.statusCode, pendingEvidence.body).toBe(200);
-            expect(pendingEvidence.json().progressiveEvidenceReceipts).toMatchObject([
-              { storageOnly: true },
-            ]);
-            expect(
-              await readProgressiveRemoteRetention(
-                nested as unknown as DB,
-                delivery.engineJobId,
-              ),
-            ).toMatchObject({ kind: "waiting", reason: "archives" });
-            throw pendingEvidenceRollback;
-          });
-        } catch (error) {
-          if (error !== pendingEvidenceRollback) throw error;
-        } finally {
-          isolated.connection = scoped;
+              );
+              if (ownership !== "blocked") {
+                await nested.execute(sql`UPDATE progressive_cfd_units unit SET state='leased',
+                lease_token=CASE WHEN ${ownership}='foreign' THEN ${randomUUID()}::uuid ELSE attempt.token END,
+                lease_owner='stopped-storage-fixture',
+                lease_until=CASE WHEN ${ownership}='live' THEN clock_timestamp()+interval '1 minute'
+                  ELSE clock_timestamp()-interval '1 minute' END
+                FROM progressive_cfd_attempts attempt
+                WHERE attempt.unit_id=unit.id AND attempt.sim_job_id=${delivery.engineJobId}::uuid`);
+              }
+              const pendingEvidence = await storage();
+              if (!["blocked", "expired"].includes(ownership)) {
+                expect(pendingEvidence.statusCode, pendingEvidence.body).toBe(
+                  409,
+                );
+                throw pendingEvidenceRollback;
+              }
+              expect(pendingEvidence.statusCode, pendingEvidence.body).toBe(
+                200,
+              );
+              expect(
+                pendingEvidence.json().progressiveEvidenceReceipts,
+              ).toMatchObject([{ storageOnly: true }]);
+              expect(
+                await readProgressiveRemoteRetention(
+                  nested as unknown as DB,
+                  delivery.engineJobId,
+                ),
+              ).toMatchObject({ kind: "waiting", reason: "archives" });
+              throw pendingEvidenceRollback;
+            });
+          } catch (error) {
+            if (error !== pendingEvidenceRollback) throw error;
+          } finally {
+            isolated.connection = scoped;
+          }
         }
         expect(
           (
