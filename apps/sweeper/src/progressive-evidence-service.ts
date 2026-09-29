@@ -4,35 +4,20 @@ import { sql } from "drizzle-orm";
 import { runNotificationDrain } from "./notification-drain";
 import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evidence-delivery";
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
+import { runSweeperServices } from "./service-lifecycle";
 
 const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 8;
 const MAX_PARALLEL_EVIDENCE_STAGES = 4;
-
-export async function drainProgressiveWorkerEvidenceStages(
-  stage: (preferActive: boolean) => Promise<boolean>,
-  preferActive: boolean,
-  maximum = MAX_PARALLEL_EVIDENCE_STAGES,
-): Promise<boolean> {
-  const results = await Promise.allSettled(
-    Array.from({ length: maximum }, () => stage(preferActive)),
-  );
-  const errors = results.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : [],
-  );
-  if (errors.length)
-    throw new AggregateError(errors, "Progressive evidence staging failed");
-  return results.some(
-    (result) => result.status === "fulfilled" && result.value,
-  );
-}
 
 export async function drainProgressiveWorkerEvidencePass(
   deliver: (preferActive: boolean) => Promise<boolean>,
   preferActive: boolean,
   maximum = MAX_SEQUENTIAL_EVIDENCE_DELIVERIES,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   let changed = false;
   for (let pass = 0; pass < maximum; pass += 1) {
+    if (signal?.aborted) break;
     const delivered = await deliver(preferActive);
     changed ||= delivered;
     if (!delivered) break;
@@ -40,35 +25,9 @@ export async function drainProgressiveWorkerEvidencePass(
   return changed;
 }
 
-export function progressiveEvidenceDrain(
-  stage: (preferActive: boolean) => Promise<boolean>,
-  deliver: (preferActive: boolean) => Promise<boolean>,
-) {
-  let preferActive = true;
-  return async () => {
-    const preference = preferActive;
-    preferActive = !preferActive;
-    const results = await Promise.allSettled(
-      [stage, deliver].map((operation) =>
-        Promise.resolve().then(() => operation(preference)),
-      ),
-    );
-    const errors = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
-    );
-    if (errors.length)
-      throw new AggregateError(
-        errors,
-        "Progressive evidence pass has retryable or conflicting work",
-      );
-    return results.some(
-      (result) => result.status === "fulfilled" && result.value,
-    );
-  };
-}
-
 export async function nextProgressiveEvidenceWakeAt(
   db: DB,
+  scope: "staging" | "delivery" | "all" = "all",
 ): Promise<Date | null> {
   const [pending] = await db.execute(sql`
     WITH owned_reports AS (
@@ -90,7 +49,7 @@ export async function nextProgressiveEvidenceWakeAt(
         ON staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence
       JOIN progressive_worker_evidence_attempts association
         ON association.sim_job_id = staged.sim_job_id AND association.sequence = staged.sequence
-      WHERE NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
+      WHERE ${scope !== "staging"} AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
         WHERE delivered.sim_job_id = association.sim_job_id
           AND delivered.point_content_signature = association.point_content_signature)
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_delivery_failures failure
@@ -99,26 +58,26 @@ export async function nextProgressiveEvidenceWakeAt(
       LIMIT 1)
       UNION ALL
       SELECT owned.ingest_lease_expires_at AS wake_at FROM owned_reports owned
-      WHERE owned.ingest_lease_expires_at > clock_timestamp()
+      WHERE ${scope !== "delivery"} AND owned.ingest_lease_expires_at > clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
           WHERE staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence)
       UNION ALL
       SELECT failure.retry_after FROM owned_reports owned
       JOIN progressive_worker_staging_failures failure ON failure.sim_job_id = owned.sim_job_id AND failure.sequence = owned.sequence
-      WHERE failure.retry_after > clock_timestamp()
+      WHERE ${scope !== "delivery"} AND failure.retry_after > clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
           WHERE staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence)
       UNION ALL
       SELECT failure.retry_after FROM owned_reports owned
       JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = owned.sim_job_id AND failure.sequence = owned.sequence
-      WHERE failure.state = 'retry' AND failure.retry_after > clock_timestamp()
+      WHERE ${scope !== "staging"} AND failure.state = 'retry' AND failure.retry_after > clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
           WHERE delivered.sim_job_id = failure.sim_job_id AND delivered.point_content_signature = failure.point_content_signature)
       UNION ALL
       SELECT clock_timestamp() AS wake_at FROM owned_reports owned
       JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = owned.sim_job_id
         AND failure.sequence = owned.sequence
-      WHERE failure.state = 'retry' AND failure.retry_after <= clock_timestamp()
+      WHERE ${scope !== "staging"} AND failure.state = 'retry' AND failure.retry_after <= clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
           WHERE delivered.sim_job_id = failure.sim_job_id AND delivered.point_content_signature = failure.point_content_signature)
     ) pending
@@ -136,45 +95,60 @@ export async function runProgressiveEvidenceService(
   engine: EngineClient,
   signal: AbortSignal,
   options: {
-    drain?: () => Promise<boolean>;
-    nextWakeAt?: () => Promise<Date | null>;
+    stage?: (preferActive: boolean) => Promise<boolean>;
+    deliver?: (preferActive: boolean) => Promise<boolean>;
+    nextWakeAt?: (scope: "staging" | "delivery") => Promise<Date | null>;
     reportError?: (error: unknown) => void;
   } = {},
 ): Promise<void> {
-  await runNotificationDrain(
-    notifications,
-    "progressive_worker_report_changed",
-    signal,
-    {
-      drain:
-        options.drain ??
-        progressiveEvidenceDrain(
-          (preferActive) =>
-            drainProgressiveWorkerEvidenceStages(
-              (active) =>
-                stageNextProgressiveWorkerEvidence(db, engine, {
-                  preferActive: active,
-                }),
-              preferActive,
-            ),
-          (preferActive) =>
-            drainProgressiveWorkerEvidencePass(
-              (active) =>
-                deliverNextProgressiveWorkerEvidence(db, fetch, {
-                  preferActive: active,
-                }),
-              preferActive,
-            ),
-        ),
-      nextWakeAt:
-        options.nextWakeAt ?? (() => nextProgressiveEvidenceWakeAt(db)),
-      reportError:
-        options.reportError ??
-        ((error) =>
-          console.error(
-            "[sweeper] progressive compact evidence delivery failed:",
-            error instanceof Error ? error.message : String(error),
-          )),
+  const stage =
+    options.stage ??
+    ((preferActive: boolean) =>
+      stageNextProgressiveWorkerEvidence(db, engine, { preferActive }));
+  const deliver =
+    options.deliver ??
+    ((preferActive: boolean) =>
+      deliverNextProgressiveWorkerEvidence(db, fetch, { preferActive }));
+  const service = (scope: "staging" | "delivery", lane: number) => ({
+    name: `progressive-evidence-${scope}-${lane}`,
+    run: async (childSignal: AbortSignal) => {
+      let preferActive = lane % 2 === 0;
+      await runNotificationDrain(
+        notifications,
+        "progressive_worker_evidence_changed",
+        childSignal,
+        {
+          drain: async () => {
+            const preference = preferActive;
+            preferActive = !preferActive;
+            return scope === "staging"
+              ? stage(preference)
+              : drainProgressiveWorkerEvidencePass(
+                  deliver,
+                  preference,
+                  MAX_SEQUENTIAL_EVIDENCE_DELIVERIES,
+                  childSignal,
+                );
+          },
+          nextWakeAt: () =>
+            options.nextWakeAt
+              ? options.nextWakeAt(scope)
+              : nextProgressiveEvidenceWakeAt(db, scope),
+          reportError:
+            options.reportError ??
+            ((error) =>
+              console.error(
+                `[sweeper] progressive evidence ${scope} failed:`,
+                error instanceof Error ? error.message : String(error),
+              )),
+        },
+      );
     },
-  );
+  });
+  await runSweeperServices(signal, [
+    ...Array.from({ length: MAX_PARALLEL_EVIDENCE_STAGES }, (_, lane) =>
+      service("staging", lane),
+    ),
+    service("delivery", 0),
+  ]);
 }

@@ -330,12 +330,14 @@ and the selected report still passes full immutable-source verification. The
 ordering index avoids sorting the entire backlog; it does not discard history or
 sample a truncated candidate list.
 
-The single evidence drain overlaps one staging operation with one independently
-ready delivery. It waits for both before another pass and preserves alternating
-current-work/FIFO priority and existing database capacity. Delivery can see only
-committed staging receipts; newly staged evidence can be picked up on the next
-immediate pass. Failure in one operation does not cancel its safe sibling, and
-shutdown waits for both started operations.
+Four staging slots refill independently, alongside one serial delivery stream.
+Each slot alternates current-work and backlog priority; selection and acquisition
+of its durable import lease share a short transaction so slots claim different
+jobs. A free slot does not wait for another import or network delivery. Delivery
+can see only committed staging receipts and wakes on the evidence notification
+channel. Staging and delivery wait on their own retry deadlines, so a delivery
+backlog cannot make an idle staging slot spin. Failure in one operation does not
+cancel its safe siblings, and shutdown waits for all started operations.
 
 A cumulative report can reuse already staged point attempts only when every source
 matches an earlier acknowledged report, its immutable association, complete point

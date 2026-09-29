@@ -83,6 +83,10 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
       sql`UPDATE progressive_worker_delivery_failures SET retry_after = ${retryAt.toISOString()}::timestamptz WHERE sim_job_id = ${executionId}::uuid`,
     );
     expect(await nextProgressiveEvidenceWakeAt(db)).toEqual(retryAt);
+    expect(await nextProgressiveEvidenceWakeAt(db, "delivery")).toEqual(
+      retryAt,
+    );
+    expect(await nextProgressiveEvidenceWakeAt(db, "staging")).toBeNull();
     expect(await deliverNextProgressiveWorkerEvidence(db, unused)).toBe(false);
     expect(unused).not.toHaveBeenCalled();
     await db.execute(sql`UPDATE progressive_worker_delivery_failures SET retry_after = clock_timestamp() - interval '1 second'

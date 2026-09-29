@@ -1,301 +1,267 @@
 import type { DB, Sql } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   drainProgressiveWorkerEvidencePass,
-  drainProgressiveWorkerEvidenceStages,
-  progressiveEvidenceDrain,
   runProgressiveEvidenceService,
 } from "../src/progressive-evidence-service";
-import { runSweeperServices } from "../src/service-lifecycle";
 
 function notifications() {
-  let notify: () => void = () => undefined;
-  const unlisten = vi.fn(async () => undefined);
+  const callbacks = new Map<string, Set<() => void>>();
+  const unlisten = vi.fn(async () => {});
   const listen = vi.fn(async (channel: string, callback: () => void) => {
-    expect(channel).toBe("progressive_worker_report_changed");
-    notify = callback;
-    return { unlisten };
+    const listeners = callbacks.get(channel) ?? new Set();
+    listeners.add(callback);
+    callbacks.set(channel, listeners);
+    return {
+      unlisten: async () => {
+        listeners.delete(callback);
+        await unlisten();
+      },
+    };
   });
   return {
     connection: { listen } as unknown as Pick<Sql, "listen">,
-    notify: () => notify(),
+    notify: (channel: string) =>
+      callbacks.get(channel)?.forEach((callback) => callback()),
     unlisten,
+    listen,
   };
+}
+
+function gate() {
+  let release: () => void = () => {};
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { pending, release };
 }
 
 afterEach(() => vi.useRealTimers());
 
-it("performs bounded sequential evidence deliveries without starting duplicates", async () => {
+it("bounds serial deliveries and stops when no eligible evidence remains", async () => {
   const deliver = vi
-    .fn<(preferActive: boolean) => Promise<boolean>>()
+    .fn()
     .mockResolvedValueOnce(true)
     .mockResolvedValueOnce(true)
-    .mockResolvedValueOnce(false);
-  await expect(drainProgressiveWorkerEvidencePass(deliver, true)).resolves.toBe(
-    true,
-  );
+    .mockResolvedValue(false);
+  expect(await drainProgressiveWorkerEvidencePass(deliver, true)).toBe(true);
   expect(deliver.mock.calls).toEqual([[true], [true], [true]]);
+  const busy = vi.fn().mockResolvedValue(true);
+  expect(await drainProgressiveWorkerEvidencePass(busy, false)).toBe(true);
+  expect(busy).toHaveBeenCalledTimes(8);
 });
 
-it("stages a bounded batch concurrently while preserving aggregate failures", async () => {
+it("refills a free staging slot while other imports and delivery remain pending", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const imports = Array.from({ length: 4 }, gate);
+  const network = gate();
   let active = 0;
   let peak = 0;
-  const stage = vi.fn(async () => {
+  let started = 0;
+  const stage = vi.fn(async (_preferActive: boolean) => {
+    const ordinal = started++;
     active += 1;
     peak = Math.max(peak, active);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    active -= 1;
-    return true;
+    try {
+      if (ordinal < imports.length) {
+        await imports[ordinal].pending;
+        return true;
+      }
+      return false;
+    } finally {
+      active -= 1;
+    }
   });
-  await expect(drainProgressiveWorkerEvidenceStages(stage, true, 4)).resolves.toBe(
-    true,
+  const deliver = vi.fn(async () => {
+    await network.pending;
+    return false;
+  });
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt: async () => null },
   );
-  expect(stage).toHaveBeenCalledTimes(4);
-  expect(peak).toBe(4);
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(4);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    imports[0].release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(5);
+    expect(active).toBe(3);
+    expect(peak).toBe(4);
+    expect(stage.mock.calls.slice(0, 4).map((call) => call[0])).toEqual([
+      true,
+      false,
+      true,
+      false,
+    ]);
+    expect(stage.mock.calls[4][0]).toBe(false);
+  } finally {
+    owner.abort();
+    imports.forEach((importing) => importing.release());
+    network.release();
+    await running;
+  }
+  expect(channel.unlisten).toHaveBeenCalledTimes(5);
 });
 
-it("alternates current-work priority with oldest-first while both stages progress", async () => {
-  const stage = vi.fn().mockResolvedValue(true);
-  const deliver = vi.fn().mockResolvedValue(true);
-  const drain = progressiveEvidenceDrain(stage, deliver);
-  for (let pass = 0; pass < 4; pass += 1) expect(await drain()).toBe(true);
-  expect(stage.mock.calls).toEqual([[true], [false], [true], [false]]);
-  expect(deliver.mock.calls).toEqual(stage.mock.calls);
+it("continues delivery while all four staging slots wait", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const imports = gate();
+  const stage = vi.fn(async () => {
+    await imports.pending;
+    return false;
+  });
+  const deliver = vi
+    .fn()
+    .mockResolvedValueOnce(true)
+    .mockResolvedValueOnce(true)
+    .mockResolvedValue(false);
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt: async () => null },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(4);
+    expect(deliver).toHaveBeenCalledTimes(4);
+    channel.notify("progressive_worker_evidence_changed");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliver).toHaveBeenCalledTimes(5);
+    expect(stage).toHaveBeenCalledTimes(4);
+  } finally {
+    owner.abort();
+    imports.release();
+    await running;
+  }
 });
 
-it("does not let permanent delivery errors prevent staging or vice versa", async () => {
-  const stage = vi.fn().mockResolvedValue(true);
-  const deliver = vi.fn().mockRejectedValue(new Error("old receipt conflict"));
-  const drain = progressiveEvidenceDrain(stage, deliver);
-  for (let pass = 0; pass < 3; pass += 1)
-    await expect(drain()).rejects.toThrow(AggregateError);
-  expect(stage).toHaveBeenCalledTimes(3);
-  expect(stage.mock.calls).toEqual([[true], [false], [true]]);
-  stage.mockRejectedValue(new Error("retained source staging error"));
-  deliver.mockResolvedValue(true);
-  await expect(drain()).rejects.toThrow(AggregateError);
-  expect(deliver).toHaveBeenCalledTimes(4);
+it("keeps staging moving during delivery failures without bypassing delivery backoff", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const reportError = vi.fn();
+  let staged = 0;
+  const stage = vi.fn(async () => staged++ < 4);
+  const deliver = vi.fn(async () => {
+    channel.notify("progressive_worker_evidence_changed");
+    throw new Error("isolated network failure");
+  });
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt: async () => null, reportError },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(8);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(reportError).toHaveBeenCalledTimes(2);
+  } finally {
+    owner.abort();
+    await running;
+  }
+  expect(vi.getTimerCount()).toBe(0);
 });
 
-it("sleeps only when neither staging nor delivery made progress", async () => {
+it("keeps retry deadlines independent and wakes all slots for acknowledged evidence", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const deadlines = { staging: Date.now() + 2057, delivery: Date.now() + 1033 };
   const stage = vi.fn().mockResolvedValue(false);
-  const deliver = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
-  const drain = progressiveEvidenceDrain(stage, deliver);
-  expect(await drain()).toBe(true);
-  expect(await drain()).toBe(false);
-});
-
-it("starts delivery while staging is pending and waits for both before another pass", async () => {
-  let finishStage: (progress: boolean) => void = () => {};
-  let finishDelivery: (progress: boolean) => void = () => {};
-  const stage = vi.fn(
-    () =>
-      new Promise<boolean>((resolve) => {
-        finishStage = resolve;
-      }),
-  );
-  const deliver = vi.fn(
-    () =>
-      new Promise<boolean>((resolve) => {
-        finishDelivery = resolve;
-      }),
-  );
-  const drain = progressiveEvidenceDrain(stage, deliver);
-  let settled = false;
-  const result = drain().then((value) => {
-    settled = true;
-    return value;
-  });
-  await Promise.resolve();
-  expect(stage).toHaveBeenCalledWith(true);
-  expect(deliver).toHaveBeenCalledWith(true);
-  finishDelivery(true);
-  await Promise.resolve();
-  expect(settled).toBe(false);
-  finishStage(false);
-  expect(await result).toBe(true);
-  expect(stage).toHaveBeenCalledTimes(1);
-  expect(deliver).toHaveBeenCalledTimes(1);
-});
-
-it("retains input-order errors and observes a pending sibling after an early failure", async () => {
-  const first = new Error("stage failed");
-  const second = new Error("delivery failed");
-  let rejectStage: (error: Error) => void = () => {};
-  let settled = false;
-  const drain = progressiveEvidenceDrain(
-    () =>
-      new Promise<boolean>((_, reject) => {
-        rejectStage = reject;
-      }),
-    () => {
-      throw second;
+  const deliver = vi.fn().mockResolvedValue(false);
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    {
+      stage,
+      deliver,
+      nextWakeAt: async (scope) =>
+        Date.now() < deadlines[scope] ? new Date(deadlines[scope]) : null,
     },
   );
-  const result = drain().catch((error) => {
-    settled = true;
-    return error;
-  });
-  await Promise.resolve();
-  await Promise.resolve();
-  expect(settled).toBe(false);
-  rejectStage(first);
-  const error = await result;
-  expect(error).toBeInstanceOf(AggregateError);
-  expect(error.errors).toEqual([first, second]);
-});
-
-it("picks up newly staged evidence on the next pass without inventing a receipt", async () => {
-  let staged = false;
-  const stage = async () => {
-    await Promise.resolve();
-    const changed = !staged;
-    staged = true;
-    return changed;
-  };
-  const delivered: boolean[] = [];
-  const drain = progressiveEvidenceDrain(stage, async () => {
-    delivered.push(staged);
-    return staged;
-  });
-  expect(await drain()).toBe(true);
-  expect(delivered).toEqual([false]);
-  expect(await drain()).toBe(true);
-  expect(delivered).toEqual([false, true]);
-});
-
-describe("independent compact evidence delivery", () => {
-  it("stages and delivers new evidence while the bulk transfer is blocked", async () => {
-    vi.useFakeTimers();
-    const channel = notifications();
-    const owner = new AbortController();
-    let releaseArchive: () => void = () => undefined;
-    const archive = new Promise<void>((resolve) => {
-      releaseArchive = resolve;
-    });
-    let finished = false;
-    const drain = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
-    const running = runSweeperServices(owner.signal, [
-      {
-        name: "bulk-transfer",
-        run: async () => {
-          await archive;
-          finished = true;
-        },
-      },
-      {
-        name: "compact-evidence",
-        run: (signal) =>
-          runProgressiveEvidenceService(
-            {} as DB,
-            channel.connection,
-            {} as EngineClient,
-            signal,
-            { drain, nextWakeAt: async () => null },
-          ),
-      },
-    ]);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(drain).toHaveBeenCalledTimes(2);
-    expect(finished).toBe(false);
-    channel.notify();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(drain).toHaveBeenCalledTimes(3);
-    owner.abort();
-    releaseArchive();
-    await running;
-    expect(channel.unlisten).toHaveBeenCalledTimes(1);
-  });
-
-  it("sleeps until the exact durable retry deadline but immediately responds to new work", async () => {
-    vi.useFakeTimers();
-    const channel = notifications();
-    const owner = new AbortController();
-    const deadline = new Date(Date.now() + 2057);
-    const drain = vi.fn().mockResolvedValue(false);
-    const nextWakeAt = vi
-      .fn()
-      .mockResolvedValueOnce(deadline)
-      .mockResolvedValueOnce(deadline)
-      .mockResolvedValue(null);
-    const running = runProgressiveEvidenceService(
-      {} as DB,
-      channel.connection,
-      {} as EngineClient,
-      owner.signal,
-      { drain, nextWakeAt },
-    );
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(drain).toHaveBeenCalledTimes(1);
-    channel.notify();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(drain).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(1056);
-    expect(drain).toHaveBeenCalledTimes(2);
+  try {
+    await vi.advanceTimersByTimeAsync(1032);
+    expect(stage).toHaveBeenCalledTimes(4);
+    expect(deliver).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
-    expect(drain).toHaveBeenCalledTimes(3);
+    expect(stage).toHaveBeenCalledTimes(4);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1024);
+    expect(stage).toHaveBeenCalledTimes(8);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    channel.notify("progressive_worker_evidence_changed");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(12);
+    expect(deliver).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(10000);
-    expect(drain).toHaveBeenCalledTimes(3);
+    expect(stage).toHaveBeenCalledTimes(12);
+  } finally {
     owner.abort();
     await running;
-  });
+  }
+  expect(vi.getTimerCount()).toBe(0);
+});
 
-  it("does not let self-notifications bypass failure backoff or delay cancellation", async () => {
-    vi.useFakeTimers();
-    const channel = notifications();
-    const owner = new AbortController();
-    const reportError = vi.fn();
-    const drain = vi.fn(async () => {
-      channel.notify();
-      throw new Error("isolated staging failure");
-    });
-    const running = runProgressiveEvidenceService(
-      {} as DB,
-      channel.connection,
-      {} as EngineClient,
-      owner.signal,
-      { drain, nextWakeAt: async () => null, reportError },
-    );
-    await vi.advanceTimersByTimeAsync(0);
-    channel.notify();
-    channel.notify();
-    await vi.advanceTimersByTimeAsync(99);
-    expect(drain).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(drain).toHaveBeenCalledTimes(2);
-    owner.abort();
-    await running;
-    expect(reportError).toHaveBeenCalledTimes(2);
-    expect(vi.getTimerCount()).toBe(0);
+it("awaits every in-flight operation on shutdown and never restarts after abort", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const imports = gate();
+  const network = gate();
+  const stage = vi.fn(async () => {
+    await imports.pending;
+    return true;
   });
-
-  it("awaits its in-flight evidence operation before releasing the subscription", async () => {
-    vi.useFakeTimers();
-    const channel = notifications();
-    const owner = new AbortController();
-    let release: () => void = () => undefined;
-    const pending = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const running = runProgressiveEvidenceService(
-      {} as DB,
-      channel.connection,
-      {} as EngineClient,
-      owner.signal,
-      {
-        drain: async () => {
-          await pending;
-          return false;
-        },
-        nextWakeAt: async () => null,
-      },
-    );
+  const deliver = vi.fn(async () => {
+    await network.pending;
+    return true;
+  });
+  let finished = false;
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt: async () => null },
+  ).then(() => {
+    finished = true;
+  });
+  try {
     await vi.advanceTimersByTimeAsync(0);
     owner.abort();
-    expect(channel.unlisten).not.toHaveBeenCalled();
-    release();
+    imports.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toBe(false);
+    expect(channel.unlisten).toHaveBeenCalledTimes(4);
+    expect(stage).toHaveBeenCalledTimes(4);
+  } finally {
+    owner.abort();
+    imports.release();
+    network.release();
     await running;
-    expect(channel.unlisten).toHaveBeenCalledTimes(1);
-  });
+  }
+  expect(finished).toBe(true);
+  expect(channel.unlisten).toHaveBeenCalledTimes(5);
+  expect(deliver).toHaveBeenCalledTimes(1);
 });

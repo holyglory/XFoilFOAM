@@ -579,6 +579,12 @@ tier = "development"
 requires = ["exact-ingestion"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/sync-remote-validation.test.ts"]
 
+[[test.staging-selection.check]]
+name = "evidence-services"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-evidence-service.test.ts", "test/service-lifecycle.test.ts"]
+
 [test.progressive-claim-deferral]
 timeout_seconds = 900
 
