@@ -2797,6 +2797,115 @@ describe("remote solver sync validation regressions", () => {
     expect(byId.get(inserted[2]!.id)).toMatchObject({ status: "pending" });
   });
 
+  it("clears progressive conflicts whose accepted attempt keeps the raw engine job id", async () => {
+    const aoaDeg = 703.961;
+    const engineJobId = `${PREFIX}-progressive-accepted-generation`;
+    const [canonical] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: legacyBcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        reynolds,
+        speed,
+        chord: CHORD,
+        mach,
+        cl: 0.64,
+        cd: 0.041,
+        cm: -0.08,
+        converged: true,
+        engineJobId,
+        solvedAt: new Date(),
+      })
+      .returning({ id: results.id });
+    const [attempt] = await db
+      .insert(resultAttempts)
+      .values({
+        resultId: canonical.id,
+        airfoilId,
+        bcId: legacyBcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        regime: "rans",
+        fidelity: "rans",
+        cl: 0.64,
+        cd: 0.041,
+        cm: -0.08,
+        converged: true,
+        engineJobId,
+        solvedAt: new Date(),
+      })
+      .returning({ id: resultAttempts.id });
+    await db
+      .update(results)
+      .set({ currentResultAttemptId: attempt.id })
+      .where(eq(results.id, canonical.id));
+    await db.insert(resultClassifications).values({
+      resultId: canonical.id,
+      resultAttemptId: attempt.id,
+      airfoilId,
+      simulationPresetRevisionId: revisionId,
+      aoaDeg,
+      regime: "rans",
+      classifierVersion: `${PREFIX}-progressive-accepted`,
+      state: "accepted",
+      region: "attached",
+    });
+    const promiseId = await createPromise("fulfilled", aoaDeg);
+    await db
+      .update(syncSweepPromisePoints)
+      .set({
+        resultId: canonical.id,
+        resultAttemptId: attempt.id,
+        updatedAt: new Date(),
+      })
+      .where(eq(syncSweepPromisePoints.promiseId, promiseId));
+    const [conflict] = await db
+      .insert(syncImportConflicts)
+      .values({
+        dataType: "polars",
+        naturalKey: `${airfoilId}:${revisionId}:${aoaDeg}`,
+        sourceInstanceId: `${PREFIX}-source`,
+        incomingPayload: {
+          aoaDeg,
+          engineJobId,
+          cl: 0.64,
+          cd: 0.041,
+          cm: -0.08,
+          fidelity: "rans",
+        },
+        localSnapshot: {
+          id: canonical.id,
+          currentResultAttemptId: attempt.id,
+          cl: 0.64,
+          cd: 0.041,
+          cm: -0.08,
+        },
+        artifactManifest: { promiseId },
+      })
+      .returning({ id: syncImportConflicts.id });
+    cleanupConflictIds.add(conflict.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/sync",
+      headers: { "x-xfoilfoam-sync-secret": SECRET },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const [archived] = await db
+      .select({ status: syncImportConflicts.status })
+      .from(syncImportConflicts)
+      .where(eq(syncImportConflicts.id, conflict.id));
+    expect(archived?.status).toBe("archived");
+  });
+
   it("strips base64 from sync conflict incoming_payload for non-equivalent existing polar rows", async () => {
     const aoaDeg = 704.001;
     await db.insert(results).values({
@@ -3351,6 +3460,7 @@ describe("remote solver sync validation regressions", () => {
 
   it.each([
     ["pending", 709.001],
+    ["queued", 709.501],
     ["stale", 710.001],
   ] as const)(
     "promotes a %s no-truth placeholder at the same result id without a conflict",

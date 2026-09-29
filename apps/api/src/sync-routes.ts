@@ -1365,11 +1365,14 @@ export async function reconcileObsoleteExactPolarConflicts(
         THEN (conflict.incoming_payload ->> 'aoaDeg')::float8
         ELSE NULL
       END
-      AND attempt.engine_job_id = concat(
-        'sync:',
-        COALESCE(conflict.source_instance_id, promise.source_instance_id),
-        ':',
-        conflict.incoming_payload ->> 'engineJobId'
+      AND attempt.engine_job_id IN (
+        conflict.incoming_payload ->> 'engineJobId',
+        concat(
+          'sync:',
+          COALESCE(conflict.source_instance_id, promise.source_instance_id),
+          ':',
+          conflict.incoming_payload ->> 'engineJobId'
+        )
       )
       AND attempt.engine_case_slug IS NOT DISTINCT FROM
         NULLIF(conflict.incoming_payload ->> 'engineCaseSlug', '')
@@ -5032,7 +5035,7 @@ export async function importPolarPush(
         }
         const scheduledPlaceholder =
           existing.currentResultAttemptId == null &&
-          ["pending", "stale"].includes(existing.status) &&
+          ["pending", "queued", "stale"].includes(existing.status) &&
           noCoefficientTruth;
         if (!ownedContinuation && !scheduledPlaceholder) {
           return { kind: "conflict" as const, existing };
