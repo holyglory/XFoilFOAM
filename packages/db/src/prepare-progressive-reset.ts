@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { evaluateGasState, parseGasThermodynamicModel } from "@aerodb/core";
 import { and, eq, sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { inheritLocalStepPolicy } from "./campaign-local-step-policy";
 import {
   angleSetsFromAngles,
   campaignEnrollmentScope,
@@ -326,6 +327,7 @@ export async function prepareProgressiveReset(
       .update(simCampaigns)
       .set({ currentPlanRevisionId: revision.id })
       .where(eq(simCampaigns.id, campaign.id));
+    await inheritLocalStepPolicy(connection, campaign.id, plan.id, revision.id);
     for (const condition of active) {
       await insertCampaignPoints(
         transaction,

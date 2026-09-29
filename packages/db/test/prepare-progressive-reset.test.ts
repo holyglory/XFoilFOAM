@@ -26,6 +26,7 @@ import {
   simulationPresetRevisions,
   sweeperState,
   solverExecutionPools,
+  campaignLocalStepPolicies,
 } from "../src/schema";
 
 const { db, sql: client } = createClient({ max: 2 });
@@ -126,6 +127,12 @@ beforeAll(async () => {
     gasThermodynamics: sourceAirModel(),
     sourceReference: "Isolated source audit reset rehearsal",
   };
+  await db.insert(campaignLocalStepPolicies).values({
+    campaignId: campaign.id,
+    planRevisionId: plan.id,
+    smoothing: 0.35,
+    source: "adopted",
+  });
   await db
     .delete(simCampaignPoints)
     .where(eq(simCampaignPoints.campaignId, campaign.id));
@@ -322,6 +329,15 @@ it("rehearses with complete rollback then restores requested points without chan
         input,
       );
       expect(receipt).toMatchObject({ profiles: 1, conditions: 1, points: 3 });
+      const policies = await transaction
+        .select()
+        .from(campaignLocalStepPolicies)
+        .where(
+          eq(campaignLocalStepPolicies.planRevisionId, receipt.planRevisionId),
+        );
+      expect(policies).toMatchObject([
+        { smoothing: 0.35, source: "inherited" },
+      ]);
       throw new Error("rehearsal rollback");
     }),
   ).rejects.toThrow("rehearsal rollback");
@@ -330,6 +346,15 @@ it("rehearses with complete rollback then restores requested points without chan
     .from(simCampaigns)
     .where(eq(simCampaigns.id, input.campaignId));
   expect(unchanged.currentPlanRevisionId).toBe(input.expectedPlanRevisionId);
+  const beforePolicies = await db
+    .select()
+    .from(campaignLocalStepPolicies)
+    .where(eq(campaignLocalStepPolicies.campaignId, input.campaignId));
+  expect(
+    beforePolicies.every(
+      (policy) => policy.planRevisionId === input.expectedPlanRevisionId,
+    ),
+  ).toBe(true);
   const receipt = await prepareProgressiveReset(db, input);
   const [campaign] = await db
     .select()
@@ -345,6 +370,20 @@ it("rehearses with complete rollback then restores requested points without chan
     .from(simCampaignPlanRevisions)
     .where(eq(simCampaignPlanRevisions.id, receipt.planRevisionId));
   expect(plan.plan).toEqual(originalPlan);
+  const afterPolicies = await db
+    .select()
+    .from(campaignLocalStepPolicies)
+    .where(eq(campaignLocalStepPolicies.campaignId, input.campaignId));
+  expect(
+    afterPolicies.filter(
+      (policy) => policy.planRevisionId === input.expectedPlanRevisionId,
+    ),
+  ).toEqual(beforePolicies);
+  expect(
+    afterPolicies.filter(
+      (policy) => policy.planRevisionId === receipt.planRevisionId,
+    ),
+  ).toMatchObject([{ smoothing: 0.35, source: "inherited" }]);
   expect(plan.summary).toMatchObject({
     operation: "progressive-solver-domain-reset-v1",
     previousPlanRevisionId: input.expectedPlanRevisionId,
