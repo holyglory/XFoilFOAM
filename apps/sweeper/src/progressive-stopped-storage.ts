@@ -44,7 +44,7 @@ export async function requeueStoppedProgressiveStorage(
           OR (
             ${options.retryStoppedStorage === true}
             AND failure.last_error='Stopped progressive storage delivery failed (409)'
-            AND failure.attempt_count=1
+            AND failure.attempt_count < 5
           )
         )
         AND failure.remote_conflict_ids='[]'::jsonb
