@@ -1380,6 +1380,7 @@ command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", 
 [[test.progressive.check]]
 name = "short-budget-march-guard"
 tier = "development"
+requires = ["dependencies"]
 command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_march_guard.py", "-q"]
 
 [test.prediction-repair-live]
