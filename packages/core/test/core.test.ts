@@ -1,13 +1,61 @@
 import { describe, expect, it } from "vitest";
 import { baseRejectionReasons } from "../src/polar-fit";
 
+it.each([false, true, undefined])(
+  "keeps source-geometry acceptance separate from finite converged coefficients: %s",
+  (sourceGeometryCompatible) => {
+    const evidence = [-2, 0, 2].map((alpha) => ({
+      a: alpha,
+      cl: 0.3 + 0.1 * alpha,
+      cd: 0.02,
+      cm: -0.01,
+      status: "done",
+      source: "solved",
+      regime: "rans" as const,
+      converged: true,
+      stalled: false,
+      validForPolar: true,
+      sourceGeometryCompatible,
+    }));
+    const classified = classifyPolarEvidence(evidence);
+    const fit = buildPolarFit(classified.classifications);
+    expect(classified.classifications.map((row) => row.evidence.cl)).toEqual(
+      evidence.map((row) => row.cl),
+    );
+    if (sourceGeometryCompatible === false) {
+      expect(
+        classified.classifications.every(
+          (row) =>
+            row.state === "rejected" &&
+            row.reasons.includes("unverified-source-geometry"),
+        ),
+      ).toBe(true);
+      expect(fit.acceptedPointCount).toBe(0);
+      expect(fit.points).toEqual([]);
+      expect(fit.metrics).toBeNull();
+    } else {
+      expect(fit.acceptedPointCount).toBe(3);
+      expect(fit.metrics).not.toBeNull();
+    }
+  },
+);
+
 it("rejects clamped material evidence even with nominally converged finite coefficients", () => {
-  expect(baseRejectionReasons({
-    a: 2, cl: 0.4, cd: 0.02, cm: -0.01,
-    status: "done", source: "solved", regime: "rans",
-    converged: true, stalled: false, error: null,
-    failureDisposition: "material_domain",
-  })).toContain("material-domain");
+  expect(
+    baseRejectionReasons({
+      a: 2,
+      cl: 0.4,
+      cd: 0.02,
+      cm: -0.01,
+      status: "done",
+      source: "solved",
+      regime: "rans",
+      converged: true,
+      stalled: false,
+      error: null,
+      failureDisposition: "material_domain",
+    }),
+  ).toContain("material-domain");
 });
 
 import {

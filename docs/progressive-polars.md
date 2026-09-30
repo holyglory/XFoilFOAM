@@ -98,6 +98,21 @@ reference dimensions, boundary inputs, transition assumptions or sweep branch.
 
 ## Evidence and identities
 
+CFD-only curves and opt-in CFD points apply the same source-contour preservation
+rule as progressive estimates. The requested catalog geometry and any linked
+immutable progressive target are checked by exact attempt identity. Evidence for
+a finite trailing edge requires the engine's numeric mesh-recovery contract 3 or
+later; an absent, malformed or older contract cannot support that curve. This
+contract concerns input-coordinate preservation, not physical accuracy or mesh
+convergence. Other acceptance checks still apply.
+
+CFD fits use `evidence-lowess-v8` so older caches cannot bypass this rule. Rebuild
+existing fits through `backfill:polar-cache`; until refreshed, their metrics remain
+unavailable. Reclassification may retire the selected public generation, but the
+immutable attempts, coefficients and artifacts remain in Point History and its
+exact-attempt evidence viewer. Do not restore a rejected generation merely to
+make a chart nonempty.
+
 Remote execution uses the same versioned physical-case request as local execution.
 The hub composes the request before assignment; workers do not select a numerical
 method, change the angle list, replace mesh settings or enlarge the remaining time

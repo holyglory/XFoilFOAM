@@ -36,6 +36,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { db, sql as pgClient } from "../src/db";
 import { assembleDetail, decoratePublicPolars } from "../src/services/detail";
 import { assembleSolverWork } from "../src/services/solver-work";
+import { assembleAdminSim } from "../src/services/sim";
 
 const PREFIX = `detail-compat-${process.pid}-${Date.now().toString(36)}`;
 
@@ -83,8 +84,10 @@ describe("public polar compatibility series", () => {
     snapshot: Record<string, unknown>;
   } | null = null;
   let refreshBaseCache: () => Promise<void> = async () => undefined;
-  let bindAcceptedResults: (rows: Result[]) => Promise<void> = async () =>
-    undefined;
+  let bindAcceptedResults: (
+    rows: Result[],
+    meshRecoveryVersion?: unknown,
+  ) => Promise<void> = async () => undefined;
 
   beforeAll(async () => {
     const [air] = await db
@@ -390,7 +393,10 @@ describe("public polar compatibility series", () => {
     expect(differentMesh.revision.reynolds).toBe(reynolds);
     expect(differentSolver.revision.reynolds).toBe(reynolds);
 
-    bindAcceptedResults = async (rows: Result[]) => {
+    bindAcceptedResults = async (
+      rows: Result[],
+      meshRecoveryVersion?: unknown,
+    ) => {
       if (!rows.length) return;
       const attempts = await db
         .insert(resultAttempts)
@@ -428,6 +434,9 @@ describe("public polar compatibility series", () => {
             error: row.error,
             qualityWarnings: row.qualityWarnings,
             evidencePayload: {
+              ...(meshRecoveryVersion === undefined
+                ? {}
+                : { mesh_recovery_version: meshRecoveryVersion }),
               fidelity: row.fidelity,
               frame_track: row.frameTrack,
               steady_history: row.steadyHistory,
@@ -462,7 +471,7 @@ describe("public polar compatibility series", () => {
         })),
         ...attempts.map((attempt) => ({
           resultAttemptId: attempt.id,
-          airfoilId,
+          airfoilId: rows.find((row) => row.id === attempt.resultId)!.airfoilId,
           simulationPresetRevisionId: rows.find(
             (row) => row.id === attempt.resultId,
           )!.simulationPresetRevisionId!,
@@ -563,10 +572,12 @@ describe("public polar compatibility series", () => {
   }, 60_000);
 
   afterAll(async () => {
-    if (airfoilId) {
+    if (cleanup.airfoilIds.length) {
       await db
         .delete(polarCompatibilityFitSets)
-        .where(eq(polarCompatibilityFitSets.airfoilId, airfoilId));
+        .where(
+          inArray(polarCompatibilityFitSets.airfoilId, cleanup.airfoilIds),
+        );
     }
     if (cleanup.resultIds.length) {
       await db
@@ -592,6 +603,131 @@ describe("public polar compatibility series", () => {
     await deleteIds(categories, cleanup.categoryIds);
     await pgClient.end();
   }, 30_000);
+
+  it.each([undefined, 2, 3, "3", 2.5, true, 2147483648])(
+    "guards finite-edge CFD-only curves and pinned points for mesh contract %s",
+    async (meshRecoveryVersion) => {
+      const [base] = await db
+        .select()
+        .from(airfoils)
+        .where(eq(airfoils.id, airfoilId));
+      const [profile] = await db
+        .insert(airfoils)
+        .values({
+          slug: `${PREFIX}-finite-${typeof meshRecoveryVersion}-${String(meshRecoveryVersion)}`,
+          name: `${PREFIX} finite-edge fixture`,
+          categoryId: base.categoryId,
+          source: "test",
+          points: contour.map((point, index) => ({
+            ...point,
+            y:
+              index === 0
+                ? 0.005
+                : index === contour.length - 1
+                  ? -0.005
+                  : point.y,
+          })),
+          isSymmetric: false,
+        })
+        .returning();
+      cleanup.airfoilIds.push(profile.id);
+      const [reference] = await db
+        .select()
+        .from(results)
+        .where(eq(results.id, baseResultIds[0]));
+      const inserted = await db
+        .insert(results)
+        .values(
+          [-2, 0, 2].map((aoaDeg) => ({
+            airfoilId: profile.id,
+            bcId: reference.bcId,
+            simulationPresetRevisionId: reference.simulationPresetRevisionId,
+            reynolds: reference.reynolds,
+            aoaDeg,
+            status: "done" as const,
+            source: "solved" as const,
+            regime: "rans" as const,
+            converged: true,
+            stalled: false,
+            unsteady: false,
+            cl: 0.3 + aoaDeg * 0.1,
+            cd: 0.02,
+            cm: -0.02,
+          })),
+        )
+        .returning();
+      cleanup.resultIds.push(...inserted.map((row) => row.id));
+      await bindAcceptedResults(inserted, meshRecoveryVersion);
+      const originals = await db
+        .select()
+        .from(resultAttempts)
+        .where(
+          inArray(
+            resultAttempts.resultId,
+            inserted.map((row) => row.id),
+          ),
+        )
+        .orderBy(resultAttempts.id);
+      await refreshPolarCompatibilityCache(db, profile.id, baseHash);
+      const compatible = meshRecoveryVersion === 3;
+      const detail = await assembleDetail(profile.slug, { view: "full" });
+      expect(detail!.progressivePolars).toEqual([]);
+      const series = detail!.polars.find(
+        (polar) => polar.seriesId === polarCompatibilitySeriesId(baseHash),
+      );
+      if (compatible) {
+        expect(series!.points.map((point) => point.a)).toEqual([-2, 0, 2]);
+        expect(series!.fit!.acceptedPointCount).toBe(3);
+        expect(series!.fit!.metrics).not.toBeNull();
+      } else {
+        expect(series).toBeUndefined();
+      }
+      const pinned = await assembleDetail(profile.slug, {
+        revisionId: reference.simulationPresetRevisionId!,
+        view: "full",
+      });
+      expect(pinned!.polars[0].points).toHaveLength(compatible ? 3 : 0);
+      const work = await assembleSolverWork(profile.slug);
+      const eligibleWork = work!.conditions
+        .flatMap((condition) => condition.points)
+        .filter(
+          (point) =>
+            point.state === "verified" || point.state === "provisional",
+        );
+      expect(eligibleWork).toHaveLength(compatible ? 3 : 0);
+      if (!compatible) {
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: null })
+          .where(
+            inArray(
+              results.id,
+              inserted.map((row) => row.id),
+            ),
+          );
+        const original = originals[0];
+        expect(
+          await assembleAdminSim(original.resultId!, original.id),
+        ).toMatchObject({
+          resultId: original.resultId,
+          cl: original.cl,
+          cd: original.cd,
+          cm: original.cm,
+        });
+      }
+      const after = await db
+        .select()
+        .from(resultAttempts)
+        .where(
+          inArray(
+            resultAttempts.id,
+            originals.map((row) => row.id),
+          ),
+        )
+        .orderBy(resultAttempts.id);
+      expect(after).toEqual(originals);
+    },
+  );
 
   it("MUST-CATCH: merges e387 disjoint sweeps without exposing batch identity", async () => {
     const detail = await assembleDetail(slug);

@@ -7,6 +7,8 @@ import {
   refreshPolarCompatibilityCache,
 } from "../src/polar-cache";
 import { resolveRevisionMethodCompatibilityHash } from "../src/polar-compatibility-cache";
+import { pointStory } from "../src/point-history";
+import { solverGeometryCompatibility } from "../src/solver-evidence-geometry";
 import {
   airfoils,
   boundaryProfiles,
@@ -2214,4 +2216,124 @@ describe("revision polar cache transaction boundary", () => {
     `)) as unknown as Array<{ count: number }>;
     expect(currentRows[0]?.count).toBe(1);
   }, 60_000);
+
+  it("rejects incompatible source geometry while keeping immutable attempts inspectable", async () => {
+    const [profile] = await db
+      .select()
+      .from(airfoils)
+      .where(eq(airfoils.id, airfoilId));
+    const cells = await db
+      .select()
+      .from(results)
+      .where(eq(results.airfoilId, airfoilId));
+    const before = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.airfoilId, airfoilId))
+      .orderBy(resultAttempts.id);
+    const artifactRows = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.airfoilId, airfoilId))
+      .orderBy(solverEvidenceArtifacts.id);
+    expect(before.some((attempt) => attempt.source === "solved")).toBe(true);
+    for (const missingGeometry of [[], [null]] as unknown as Array<
+      typeof profile.points
+    >) {
+      const compatibility = await solverGeometryCompatibility(
+        db,
+        airfoilId,
+        missingGeometry,
+        before.map((attempt) => ({
+          attemptId: attempt.id,
+          source: attempt.source,
+          meshRecoveryVersion: 3,
+        })),
+      );
+      expect(
+        [...compatibility.values()].every((value) => value === false),
+      ).toBe(true);
+    }
+    try {
+      await db
+        .update(airfoils)
+        .set({
+          points: profile.points.map((point, index) => ({
+            ...point,
+            y:
+              index === 0
+                ? 0.005
+                : index === profile.points.length - 1
+                  ? -0.005
+                  : point.y,
+          })),
+        })
+        .where(eq(airfoils.id, airfoilId));
+      await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+      const classifications = await db
+        .select()
+        .from(resultClassifications)
+        .where(eq(resultClassifications.airfoilId, airfoilId));
+      const solvedIds = new Set(
+        before
+          .filter((attempt) => attempt.source === "solved")
+          .map((attempt) => attempt.id),
+      );
+      const rejected = classifications.filter(
+        (row) => row.resultAttemptId && solvedIds.has(row.resultAttemptId),
+      );
+      expect(rejected.length).toBe(solvedIds.size);
+      expect(
+        rejected.every(
+          (row) =>
+            row.state === "rejected" &&
+            row.reasons.includes("unverified-source-geometry"),
+        ),
+      ).toBe(true);
+      const [fit] = await db
+        .select()
+        .from(polarFitSets)
+        .where(
+          and(
+            eq(polarFitSets.airfoilId, airfoilId),
+            eq(polarFitSets.isCurrent, true),
+          ),
+        );
+      expect(fit.acceptedPointCount).toBe(0);
+      expect(fit.provisionalPointCount).toBe(0);
+      expect(fit.ldmax).toBeNull();
+      expect(
+        await db
+          .select()
+          .from(resultAttempts)
+          .where(eq(resultAttempts.airfoilId, airfoilId))
+          .orderBy(resultAttempts.id),
+      ).toEqual(before);
+      expect(
+        await db
+          .select()
+          .from(solverEvidenceArtifacts)
+          .where(eq(solverEvidenceArtifacts.airfoilId, airfoilId))
+          .orderBy(solverEvidenceArtifacts.id),
+      ).toEqual(artifactRows);
+      const sample = before.find(
+        (attempt) => attempt.source === "solved" && attempt.resultId,
+      )!;
+      const story = await pointStory(db, sample.resultId!);
+      expect(
+        story.attempts.find((attempt) => attempt.id === sample.id),
+      ).toMatchObject({ id: sample.id, cl: sample.cl, cd: sample.cd });
+    } finally {
+      await db
+        .update(airfoils)
+        .set({ points: profile.points })
+        .where(eq(airfoils.id, airfoilId));
+      for (const cell of cells)
+        await db
+          .update(results)
+          .set({ currentResultAttemptId: cell.currentResultAttemptId })
+          .where(eq(results.id, cell.id));
+      await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+    }
+  });
 });

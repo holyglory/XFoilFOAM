@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { solverGeometryCompatibility } from "../src/solver-evidence-geometry";
 import { claimSimJobCancellation } from "../src/job-lifecycle";
 import { loadDiskAdmissionExposure } from "../../../apps/sweeper/src/disk-admission";
 import {
@@ -6181,6 +6182,33 @@ describe("persistent progressive polar cache", () => {
           cl: 0.7,
           mesh_recovery_version: meshVersion,
         });
+        const geometryEvidence = [
+          {
+            attemptId: evidence,
+            source: "solved",
+            meshRecoveryVersion: meshVersion,
+          },
+        ];
+        expect(
+          (
+            await solverGeometryCompatibility(
+              db,
+              originalId,
+              finitePoints,
+              geometryEvidence,
+            )
+          ).get(evidence),
+        ).toBe(meshVersion >= 3);
+        expect(
+          (
+            await solverGeometryCompatibility(
+              db,
+              originalId,
+              points,
+              geometryEvidence,
+            )
+          ).get(evidence),
+        ).toBe(meshVersion >= 3);
         if (meshVersion < 3) {
           const curve = (
             await publicProgressivePolars(

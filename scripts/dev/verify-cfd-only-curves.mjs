@@ -2,10 +2,20 @@ import assert from "node:assert/strict";
 import { chromium, expect } from "@playwright/test";
 import { projectChart } from "../../packages/core/src/index.ts";
 import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 
-const origin = progressivePreviewOrigin();
+const sourceGeometry = process.argv.includes("--source-geometry");
+const origin = sourceGeometry
+  ? "https://airfoils.pro"
+  : progressivePreviewOrigin();
+const evidenceDirectory = sourceGeometry
+  ? `.codex-artifacts/cfd-source-geometry-browser/${randomUUID()}`
+  : null;
+if (evidenceDirectory) await mkdir(evidenceDirectory, { recursive: true });
 const browser = await chromium.launch({ headless: true });
 const outcomes = [];
+const acceptanceFailures = [];
 try {
   const discovery = await browser.newContext();
   const worksResponse = await discovery.request.get(
@@ -14,13 +24,62 @@ try {
   assert(worksResponse.ok());
   const works = await worksResponse.json();
   const scopes = [];
-  for (const condition of works.conditions.slice(0, 24)) {
+  const conditions = sourceGeometry
+    ? [
+        {
+          slug: "ah21-7",
+          presetRevisionId: "7c9de43b-29ab-4a94-ac81-76f16ded2c12",
+          expectedResultId: "0b072fbd-03bf-47b5-b25c-4604edf0ce00",
+          expectedAvailable: true,
+        },
+        {
+          slug: "naca-16006",
+          presetRevisionId: "1ffc088a-5703-4322-96a3-ff3d8cb36d14",
+          expectedResultId: "235d9907-9ba5-4c28-9e40-f9aebe442052",
+          expectedAvailable: false,
+        },
+      ]
+    : works.conditions
+        .slice(0, 24)
+        .map((condition) => ({ ...condition, slug: "ag24" }));
+  for (const condition of conditions) {
     const revision = condition.presetRevisionId;
     const response = await discovery.request.get(
-      `${origin}/api/airfoils/ag24?revisionId=${revision}`,
+      `${origin}/api/airfoils/${condition.slug}?revisionId=${revision}`,
     );
     assert(response.ok());
     const detail = await response.json();
+    if (sourceGeometry) {
+      const pointAvailable = detail.polars
+        .flatMap((polar) => polar.points)
+        .some((point) => point.resultId === condition.expectedResultId);
+      if (pointAvailable !== condition.expectedAvailable)
+        acceptanceFailures.push({
+          slug: condition.slug,
+          surface: "polar",
+          expectedAvailable: condition.expectedAvailable,
+          actualAvailable: pointAvailable,
+        });
+      const workResponse = await discovery.request.get(
+        `${origin}/api/airfoils/${condition.slug}/solver-work?revisionId=${revision}`,
+      );
+      assert(workResponse.ok());
+      const work = await workResponse.json();
+      const workAvailable = work.conditions
+        .flatMap((entry) => entry.points)
+        .some(
+          (point) =>
+            point.resultId === condition.expectedResultId &&
+            ["verified", "provisional"].includes(point.state),
+        );
+      if (workAvailable !== condition.expectedAvailable)
+        acceptanceFailures.push({
+          slug: condition.slug,
+          surface: "solver-work",
+          expectedAvailable: condition.expectedAvailable,
+          actualAvailable: workAvailable,
+        });
+    }
     if (detail.progressivePolars?.length) continue;
     const projection = projectChart({
       chartType: "cla",
@@ -31,6 +90,7 @@ try {
       hoverKey: null,
     });
     scopes.push({
+      slug: condition.slug,
       revision,
       fit: projection.curves.some((curve) => curve.kind === "fit"),
       evidence: detail.polars.flatMap((polar) => polar.points),
@@ -42,8 +102,12 @@ try {
       break;
   }
   await discovery.close();
-  const fitted = scopes.find((scope) => scope.evidence.length);
-  const missing = scopes.find((scope) => !scope.evidence.length);
+  const fitted = sourceGeometry
+    ? scopes.find((scope) => scope.slug === "ah21-7")
+    : scopes.find((scope) => scope.evidence.length);
+  const missing = sourceGeometry
+    ? scopes.find((scope) => scope.slug === "naca-16006")
+    : scopes.find((scope) => !scope.evidence.length);
   assert(fitted && missing, "Both real evidence and empty scopes are required");
   for (const width of [320, 390, 1440]) {
     const page = await browser.newPage({
@@ -53,7 +117,7 @@ try {
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     for (const scope of [fitted, missing]) {
-      const url = `${origin}/airfoils/ag24?revision=${scope.revision}`;
+      const url = `${origin}/airfoils/${scope.slug}?revision=${scope.revision}`;
       await page.goto(url, { waitUntil: "networkidle" });
       const viewer = page.getByTestId("polar-viewer");
       const chart = viewer.getByTestId("polar-chart-svg");
@@ -140,6 +204,11 @@ try {
       assert(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 1);
       await toggle.click();
       await expect(toggle).toHaveAttribute("aria-pressed", "true");
+      if (evidenceDirectory)
+        await page.screenshot({
+          path: `${evidenceDirectory}/${width}-${scope.slug}-points.png`,
+          fullPage: true,
+        });
       if (scope.evidence.length) {
         const point = chart.locator('circle[role="button"]').first();
         await expect(point).toBeVisible();
@@ -152,7 +221,8 @@ try {
         assert(target && target.width >= 43 && target.height >= 43);
         const storedResponse = page.waitForResponse(
           (response) =>
-            new URL(response.url()).pathname === "/api/airfoils/ag24/sim" &&
+            new URL(response.url()).pathname ===
+              `/api/airfoils/${scope.slug}/sim` &&
             new URL(response.url()).searchParams.has("resultId"),
         );
         if (width < 500) await point.tap();
@@ -201,11 +271,17 @@ try {
       await expect(chart.locator('circle[role="button"]')).toHaveCount(0);
       await page.reload({ waitUntil: "networkidle" });
       await expect(toggle).toHaveAttribute("aria-pressed", "false");
+      if (evidenceDirectory)
+        await page.screenshot({
+          path: `${evidenceDirectory}/${width}-${scope.slug}.png`,
+          fullPage: true,
+        });
       await unpin.click();
       await expect(page.getByTestId("progressive-polar-viewer")).toBeVisible();
       assert.equal(new URL(page.url()).search, "");
       outcomes.push({
         width,
+        slug: scope.slug,
         revision: scope.revision,
         cachedCurve: scope.fit,
       });
@@ -215,7 +291,9 @@ try {
   }
   const noScript = await browser.newContext({ javaScriptEnabled: false });
   const page = await noScript.newPage();
-  await page.goto(`${origin}/airfoils/ag24?revision=${fitted.revision}`);
+  await page.goto(
+    `${origin}/airfoils/${fitted.slug}?revision=${fitted.revision}`,
+  );
   if (fitted.fit)
     await expect(
       page.getByTestId("polar-chart-svg").locator("polyline").first(),
@@ -234,11 +312,32 @@ try {
   await noScript.close();
 } finally {
   await browser.close();
+  if (evidenceDirectory)
+    await writeFile(
+      `${evidenceDirectory}/report.json`,
+      JSON.stringify(
+        {
+          origin,
+          sourceGeometry,
+          observeOnly: true,
+          outcomes,
+          acceptanceFailures,
+        },
+        null,
+        2,
+      ),
+    );
 }
 console.log(
   JSON.stringify({
     operation: "real-cfd-only-curve-first",
     observeOnly: true,
     outcomes,
+    acceptanceFailures,
   }),
+);
+assert.deepEqual(
+  acceptanceFailures,
+  [],
+  "Source-incompatible CFD must not be presented as accepted",
 );

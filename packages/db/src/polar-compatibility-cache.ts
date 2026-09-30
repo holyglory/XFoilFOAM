@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
 import { activeReviewVerdicts } from "./review-verdicts";
+import { solverGeometryCompatibility } from "./solver-evidence-geometry";
 import {
   airfoils,
   polarCompatibilityFitMembers,
@@ -102,7 +103,14 @@ export function compatibilityClassificationWithQualityGate(row: {
   reasons: string[];
   regime: "rans" | "urans" | null;
   qualityWarnings: string[] | null;
+  sourceGeometryCompatible?: boolean;
 }): Pick<CompatibilityEvidenceRow, "state" | "region" | "reasons"> {
+  if (row.sourceGeometryCompatible === false)
+    return {
+      state: "rejected",
+      region: "unknown",
+      reasons: [...new Set([...row.reasons, "unverified-source-geometry"])],
+    };
   const incompleteUrans =
     row.regime === "urans" &&
     hasIncompleteUransIntegrationWarning(row.qualityWarnings);
@@ -628,6 +636,7 @@ export async function refreshPolarCompatibilityCache(
       .select({
         resultId: results.id,
         resultAttemptId: resultAttempts.id,
+        meshRecoveryVersion: sql<unknown>`${resultAttempts.evidencePayload}->'mesh_recovery_version'`,
         simulationPresetRevisionId: results.simulationPresetRevisionId,
         // Compatibility caches are public evidence read models. Every
         // solver-derived value and verdict therefore comes from the one
@@ -704,6 +713,21 @@ export async function refreshPolarCompatibilityCache(
           ),
         ),
       );
+    const [airfoil] = await tx
+      .select({ isSymmetric: airfoils.isSymmetric, points: airfoils.points })
+      .from(airfoils)
+      .where(eq(airfoils.id, airfoilId))
+      .limit(1);
+    const geometryCompatibility = await solverGeometryCompatibility(
+      tx,
+      airfoilId,
+      airfoil?.points ?? [],
+      rawRows.map((row) => ({
+        attemptId: row.resultAttemptId,
+        source: row.source,
+        meshRecoveryVersion: row.meshRecoveryVersion,
+      })),
+    );
     const verdicts = await activeReviewVerdicts(
       tx,
       rawRows.map((row) => row.resultId),
@@ -713,7 +737,11 @@ export async function refreshPolarCompatibilityCache(
       if (!row.simulationPresetRevisionId) continue;
       const review = verdicts.get(row.resultId);
       if (review?.verdict === "exclude") continue;
-      const gated = compatibilityClassificationWithQualityGate(row);
+      const gated = compatibilityClassificationWithQualityGate({
+        ...row,
+        sourceGeometryCompatible:
+          geometryCompatibility.get(row.resultAttemptId) === true,
+      });
       rows.push({
         ...row,
         simulationPresetRevisionId: row.simulationPresetRevisionId,
@@ -727,11 +755,6 @@ export async function refreshPolarCompatibilityCache(
         (candidate): candidate is CompatibilityCandidate => candidate != null,
       );
     const resolved = resolvePolarCompatibilityMembers(candidates);
-    const [airfoil] = await tx
-      .select({ isSymmetric: airfoils.isSymmetric })
-      .from(airfoils)
-      .where(eq(airfoils.id, airfoilId))
-      .limit(1);
     const symmetric = airfoil?.isSymmetric ?? false;
     let fitInput = resolved.selected.map(asClassification);
     if (symmetric) {

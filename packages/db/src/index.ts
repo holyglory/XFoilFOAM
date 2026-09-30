@@ -14,6 +14,7 @@ export * from "./progressive-public";
 export * from "./progressive-catalog";
 export * from "./progressive-polar-cache";
 export * from "./progressive-evidence-geometry";
+export * from "./solver-evidence-geometry";
 export * from "./progressive-cfd-settlement";
 export * from "./progressive-cfd-numerical-recovery";
 export * from "./progressive-cfd-stages";

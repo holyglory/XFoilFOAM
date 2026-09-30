@@ -13,6 +13,7 @@ import {
   POLAR_FIT_VERSION,
   type PolarEvidenceClassification,
   type PolarEvidencePoint,
+  type Point,
 } from "@aerodb/core";
 import { and, eq, inArray, isNotNull, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -24,6 +25,7 @@ import {
   supersedeProgressivePriorEvidence,
 } from "./progressive-cfd-numerical-recovery";
 import { activeReviewVerdicts } from "./review-verdicts";
+import { solverGeometryCompatibility } from "./solver-evidence-geometry";
 import {
   airfoils,
   polarCompatibilityFitSets,
@@ -144,6 +146,8 @@ function toEvidence(row: {
   iterations: number | null;
   firstOrderFallback: boolean | null;
   validForPolar?: boolean | null;
+  sourceGeometryCompatible?: boolean;
+  meshRecoveryVersion?: unknown;
   hasForceHistory?: boolean | null;
   hasVideo?: boolean | null;
   frameTrack?: unknown;
@@ -199,6 +203,7 @@ function toEvidence(row: {
     iterations: row.iterations,
     firstOrderFallback: row.firstOrderFallback,
     validForPolar: row.validForPolar,
+    sourceGeometryCompatible: row.sourceGeometryCompatible,
     hasForceHistory: row.hasForceHistory ?? false,
     hasVideo: row.hasVideo ?? false,
     // Raw jsonb passthrough: null/undefined = legacy pre-contract evidence →
@@ -249,10 +254,47 @@ function toEvidence(row: {
   };
 }
 
+async function sourceAwareEvidence(
+  db: DB,
+  airfoilId: string,
+  points: readonly Point[],
+  rows: Parameters<typeof toEvidence>[0][],
+): Promise<EvidenceWithDbIds[]> {
+  const attempts = rows.flatMap((row) => {
+    const attemptId = row.attemptId ?? row.currentGenerationAttemptId;
+    return attemptId
+      ? [
+          {
+            attemptId,
+            source: row.source,
+            meshRecoveryVersion: row.meshRecoveryVersion,
+          },
+        ]
+      : [];
+  });
+  const compatibility = await solverGeometryCompatibility(
+    db,
+    airfoilId,
+    points,
+    attempts,
+  );
+  return rows.map((row) =>
+    toEvidence({
+      ...row,
+      sourceGeometryCompatible:
+        row.source !== "solved" ||
+        compatibility.get(
+          row.attemptId ?? row.currentGenerationAttemptId ?? "",
+        ) === true,
+    }),
+  );
+}
+
 async function loadResultEvidence(
   db: DB,
   airfoilId: string,
   simulationPresetRevisionId: string,
+  points: readonly Point[],
 ): Promise<EvidenceWithDbIds[]> {
   const currentAttemptForce = hasAttemptForceHistory(
     sql.raw('"current_attempt"."evidence_payload"'),
@@ -284,6 +326,7 @@ async function loadResultEvidence(
     .select({
       id: results.id,
       currentGenerationAttemptId: results.currentResultAttemptId,
+      meshRecoveryVersion: sql<unknown>`${resultAttempts.evidencePayload}->'mesh_recovery_version'`,
       selectedArchiveInterpretationCurrent: selectedArchiveProjection,
       selectedArchiveInterpretationId: currentResultInterpretation.id,
       selectedArchiveInterpretationSource: currentResultInterpretation.source,
@@ -525,13 +568,14 @@ async function loadResultEvidence(
         eq(results.simulationPresetRevisionId, simulationPresetRevisionId),
       ),
     );
-  return rows.map(toEvidence);
+  return sourceAwareEvidence(db, airfoilId, points, rows);
 }
 
 async function loadAttemptEvidence(
   db: DB,
   airfoilId: string,
   simulationPresetRevisionId: string,
+  points: readonly Point[],
 ): Promise<EvidenceWithDbIds[]> {
   const exactAttemptForce = hasAttemptForceHistory(
     sql.raw('"result_attempts"."evidence_payload"'),
@@ -540,6 +584,7 @@ async function loadAttemptEvidence(
     .select({
       id: resultAttempts.resultId,
       attemptId: resultAttempts.id,
+      meshRecoveryVersion: sql<unknown>`${resultAttempts.evidencePayload}->'mesh_recovery_version'`,
       aoaDeg: resultAttempts.aoaDeg,
       cl: resultAttempts.cl,
       cd: resultAttempts.cd,
@@ -633,7 +678,7 @@ async function loadAttemptEvidence(
         ),
       ),
     );
-  return rows.map(toEvidence);
+  return sourceAwareEvidence(db, airfoilId, points, rows);
 }
 
 async function upsertClassification(
@@ -1194,7 +1239,7 @@ export async function refreshPolarCacheForRevision(
     }
     await hooks?.beforeEvidenceLoad?.(tx);
     const [airfoilRow] = await tx
-      .select({ isSymmetric: airfoils.isSymmetric })
+      .select({ isSymmetric: airfoils.isSymmetric, points: airfoils.points })
       .from(airfoils)
       .where(eq(airfoils.id, airfoilId))
       .limit(1);
@@ -1203,6 +1248,7 @@ export async function refreshPolarCacheForRevision(
       tx,
       airfoilId,
       simulationPresetRevisionId,
+      airfoilRow?.points ?? [],
     );
     const attemptEvidenceByJob = new Map<string, EvidenceWithDbIds[]>();
     for (const evidence of attemptEvidence) {
@@ -1264,6 +1310,7 @@ export async function refreshPolarCacheForRevision(
       tx,
       airfoilId,
       simulationPresetRevisionId,
+      airfoilRow?.points ?? [],
     );
     // Result rows can assemble the current public polar from several solver
     // jobs. The alternate low-angle branch detector is meaningful only within
@@ -1314,6 +1361,7 @@ export async function refreshPolarCacheForRevision(
         tx,
         airfoilId,
         simulationPresetRevisionId,
+        airfoilRow?.points ?? [],
       );
       resultClassified = classifyPolarEvidence(resultEvidence, {
         detectLowAngleAttachedBranch: false,

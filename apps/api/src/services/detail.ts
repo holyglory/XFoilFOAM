@@ -10,6 +10,7 @@ import {
   type ResultClassificationRegion,
   type ResultClassificationState,
   type SimulationWorkItem,
+  type Point,
 } from "@aerodb/core";
 import {
   airfoils,
@@ -29,6 +30,7 @@ import {
   polarFitSets,
   resultAttempts,
   results,
+  solverGeometryCompatibility,
   simCampaignConditions,
   simJobs,
   simulationPresetRevisions,
@@ -376,19 +378,57 @@ export async function loadSimulationWorks(
 
   const attemptStatsRows = await db
     .select({
+      attemptId: resultAttempts.id,
       simJobId: resultAttempts.simJobId,
-      acceptedRansCount: sql<number>`count(*) filter (where ${resultAttempts.regime} = 'rans' and ${resultAttempts.validForPolar} = true)::int`,
-      rejectedRansCount: sql<number>`count(*) filter (where ${resultAttempts.regime} = 'rans' and ${resultAttempts.validForPolar} = false)::int`,
-      uransAttemptCount: sql<number>`count(*) filter (where ${resultAttempts.regime} = 'urans')::int`,
+      regime: resultAttempts.regime,
+      source: resultAttempts.source,
+      validForPolar: resultAttempts.validForPolar,
+      state: resultClassifications.state,
+      meshRecoveryVersion: sql<unknown>`${resultAttempts.evidencePayload}->'mesh_recovery_version'`,
     })
     .from(resultAttempts)
-    .where(inArray(resultAttempts.simJobId, jobIds))
-    .groupBy(resultAttempts.simJobId);
-  const attemptStats = new Map(
-    attemptStatsRows
-      .filter((row) => row.simJobId)
-      .map((row) => [row.simJobId!, row]),
+    .leftJoin(
+      resultClassifications,
+      eq(resultClassifications.resultAttemptId, resultAttempts.id),
+    )
+    .where(inArray(resultAttempts.simJobId, jobIds));
+  const [profile] = await db
+    .select({ points: airfoils.points })
+    .from(airfoils)
+    .where(eq(airfoils.id, airfoilId))
+    .limit(1);
+  const geometryCompatibility = await solverGeometryCompatibility(
+    db,
+    airfoilId,
+    profile?.points ?? [],
+    attemptStatsRows,
   );
+  const attemptStats = new Map<
+    string,
+    {
+      acceptedRansCount: number;
+      rejectedRansCount: number;
+      uransAttemptCount: number;
+    }
+  >();
+  for (const row of attemptStatsRows) {
+    if (!row.simJobId) continue;
+    const counts = attemptStats.get(row.simJobId) ?? {
+      acceptedRansCount: 0,
+      rejectedRansCount: 0,
+      uransAttemptCount: 0,
+    };
+    const compatible = geometryCompatibility.get(row.attemptId) === true;
+    if (row.regime === "urans") counts.uransAttemptCount += 1;
+    if (row.regime === "rans" && compatible && row.state === "accepted")
+      counts.acceptedRansCount += 1;
+    else if (
+      row.regime === "rans" &&
+      (!compatible || row.state === "rejected" || row.validForPolar === false)
+    )
+      counts.rejectedRansCount += 1;
+    attemptStats.set(row.simJobId, counts);
+  }
 
   return jobs.map((job) => {
     const payload = (job.requestPayload ?? {}) as WorkPayload;
@@ -437,6 +477,7 @@ export async function loadSimulationWorks(
 async function loadSolvedRows(
   airfoilId: string,
   revisionIds: string[],
+  points: readonly Point[],
 ): Promise<Map<string, SolvedRow[]>> {
   const solvedByRevision = new Map<string, SolvedRow[]>();
   if (revisionIds.length === 0) return solvedByRevision;
@@ -481,7 +522,20 @@ async function loadSolvedRows(
         inArray(resultClassifications.state, ["accepted", "needs_urans"]),
       ),
     );
+  const geometryCompatibility = await solverGeometryCompatibility(
+    db,
+    airfoilId,
+    points,
+    rows.map((row) => ({
+      attemptId: row.attempt.id,
+      source: row.attempt.source,
+      meshRecoveryVersion: (
+        row.attempt.evidencePayload as Record<string, unknown> | null
+      )?.mesh_recovery_version,
+    })),
+  );
   for (const row of rows) {
+    if (geometryCompatibility.get(row.attempt.id) !== true) continue;
     const revisionId = row.result.simulationPresetRevisionId;
     if (!revisionId) continue;
     const payload =
@@ -689,6 +743,7 @@ async function loadCompatibilityCache(
         ),
         inArray(polarCompatibilityFitSets.compatibilityHash, hashes),
         eq(polarCompatibilityFitSets.isCurrent, true),
+        eq(polarCompatibilityFitSets.fitVersion, POLAR_FIT_VERSION),
       ),
     );
   const fitIds = fitRows.map((row) => row.id);
@@ -791,8 +846,7 @@ export async function assembleDetail(
         .where(eq(categories.id, a.categoryId))
         .limit(1),
       hashtagsByAirfoilIds([a.id]),
-      (opts.view === "curves" || opts.view === "compare") &&
-      !opts.revisionId
+      (opts.view === "curves" || opts.view === "compare") && !opts.revisionId
         ? Promise.resolve(null)
         : loadSimulationWorks(a.id),
       publicProgressivePolars(
@@ -993,7 +1047,7 @@ export async function assembleDetail(
   }
 
   const revisionIds = [...revisionById.keys()];
-  const solvedByRevision = await loadSolvedRows(a.id, revisionIds);
+  const solvedByRevision = await loadSolvedRows(a.id, revisionIds, a.points);
   let polars: Polar[];
   if (pinnedRevision) {
     const rows = (solvedByRevision.get(pinnedRevision.id) ?? []).sort(

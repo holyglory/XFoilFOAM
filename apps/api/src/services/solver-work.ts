@@ -5,8 +5,13 @@ import {
   canonicalAoa,
   frameTrackMinPeriodsFor,
   type SimulationWorkItem,
+  type Point,
 } from "@aerodb/core";
-import { airfoils, simulationPresetRevisions } from "@aerodb/db";
+import {
+  airfoils,
+  simulationPresetRevisions,
+  solverGeometryCompatibility,
+} from "@aerodb/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
@@ -206,6 +211,7 @@ export function solverWorkStateForPoint(
 type ResultPointRow = {
   result_id: string;
   result_attempt_id: string | null;
+  mesh_recovery_version: unknown;
   revision_id: string;
   aoa_deg: number | string;
   status: string | null;
@@ -251,6 +257,10 @@ type CampaignPointRow = ResultPointRow & {
 };
 
 type AttemptRow = {
+  id: string;
+  source: string;
+  mesh_recovery_version: unknown;
+  source_geometry_compatible?: boolean;
   result_id: string;
   regime: string | null;
   fidelity: string | null;
@@ -725,7 +735,10 @@ function chainForPoint(
   if (attempts.length > 0) {
     return attempts.map((attempt, index) => {
       const labelBase = attemptLabelBase(attempt);
-      if (attempt.valid_for_polar) {
+      if (
+        attempt.valid_for_polar &&
+        attempt.source_geometry_compatible !== false
+      ) {
         return { label: `${labelBase} accepted`, tone: "ok" };
       }
 
@@ -967,6 +980,7 @@ async function loadResultRows(
     SELECT
       r.id AS result_id,
       selected_attempt.id AS result_attempt_id,
+      selected_attempt.evidence_payload -> 'mesh_recovery_version' AS mesh_recovery_version,
       r.simulation_preset_revision_id AS revision_id,
       r.aoa_deg::float8 AS aoa_deg,
       COALESCE(selected_attempt.status, r.status)::text AS status,
@@ -1063,6 +1077,7 @@ async function loadCampaignPointRows(
       p."updatedAt" AS point_updated_at,
       r.id AS result_id,
       selected_attempt.id AS result_attempt_id,
+      selected_attempt.evidence_payload -> 'mesh_recovery_version' AS mesh_recovery_version,
       r.aoa_deg::float8 AS source_aoa_deg,
       COALESCE(selected_attempt.status, r.status)::text AS status,
       CASE WHEN selected_attempt.id IS NOT NULL
@@ -1169,10 +1184,13 @@ async function loadJobActivityRows(
 
 async function loadAttempts(
   resultIds: string[],
+  airfoilId: string,
+  points: readonly Point[],
 ): Promise<Map<string, AttemptRow[]>> {
   if (resultIds.length === 0) return new Map();
   const rows = (await db.execute(sql`
-    SELECT result_id, regime::text AS regime,
+    SELECT id, source::text AS source, evidence_payload -> 'mesh_recovery_version' AS mesh_recovery_version,
+           result_id, regime::text AS regime,
            evidence_payload ->> 'fidelity' AS fidelity,
            status::text AS status, valid_for_polar,
            error, quality_warnings, "createdAt" AS created_at
@@ -1180,8 +1198,19 @@ async function loadAttempts(
     WHERE result_id = ANY(${`{${resultIds.join(",")}}`}::uuid[])
     ORDER BY "createdAt" ASC
   `)) as unknown as AttemptRow[];
+  const geometryCompatibility = await solverGeometryCompatibility(
+    db,
+    airfoilId,
+    points,
+    rows.map((row) => ({
+      attemptId: row.id,
+      source: row.source,
+      meshRecoveryVersion: row.mesh_recovery_version,
+    })),
+  );
   const byResult = new Map<string, AttemptRow[]>();
   for (const row of rows) {
+    row.source_geometry_compatible = geometryCompatibility.get(row.id) === true;
     (
       byResult.get(row.result_id) ??
       byResult.set(row.result_id, []).get(row.result_id)!
@@ -1215,7 +1244,7 @@ export async function assembleSolverWork(
   opts: { revisionId?: string | null } = {},
 ): Promise<SolverWorkPayload | null> {
   const [a] = await db
-    .select({ id: airfoils.id })
+    .select({ id: airfoils.id, points: airfoils.points })
     .from(airfoils)
     .where(
       and(
@@ -1233,6 +1262,39 @@ export async function assembleSolverWork(
     loadJobActivityRows(a.id, opts.revisionId),
   ]);
 
+  const selectedRows = [...resultRows, ...campaignRows];
+  const geometryCompatibility = await solverGeometryCompatibility(
+    db,
+    a.id,
+    a.points,
+    selectedRows.flatMap((row) =>
+      row.result_attempt_id
+        ? [
+            {
+              attemptId: row.result_attempt_id,
+              source: row.source ?? "",
+              meshRecoveryVersion: row.mesh_recovery_version,
+            },
+          ]
+        : [],
+    ),
+  );
+  for (const row of selectedRows) {
+    if (
+      row.result_attempt_id &&
+      geometryCompatibility.get(row.result_attempt_id) !== true
+    ) {
+      row.classification_state = "rejected";
+      row.classification_reasons = [
+        ...new Set([
+          ...(row.classification_reasons ?? []),
+          "unverified-source-geometry",
+        ]),
+      ];
+      row.continuable = false;
+    }
+  }
+
   const revisionIds = new Set<string>();
   for (const row of resultRows) revisionIds.add(row.revision_id);
   for (const row of campaignRows) revisionIds.add(row.revision_id);
@@ -1243,7 +1305,7 @@ export async function assembleSolverWork(
   for (const row of campaignRows)
     if (row.result_id) resultIds.add(row.result_id);
   const [attemptsByResult, revisions] = await Promise.all([
-    loadAttempts([...resultIds]),
+    loadAttempts([...resultIds], a.id, a.points),
     loadRevisions([...revisionIds]),
   ]);
 

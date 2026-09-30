@@ -55,7 +55,7 @@ import { parseAperiodicMeanCertificate } from "./aperiodic-mean-certificate";
 // v8 (aperiodic statistical mean): a strict current certificate may replace
 // phase-periodic frame/cycle stationarity, but never solved/media/identity or
 // finite-coefficient gates.
-export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v8";
+export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v9";
 
 /** A derived-media absence, not an aerodynamic verdict. The point remains
  * rejected until real stored video exists, but it belongs to automatic media
@@ -63,7 +63,7 @@ export const POLAR_CLASSIFIER_VERSION = "fidelity-ladder-v8";
 export const MISSING_URANS_VIDEO_REASON = "missing-urans-video";
 // v6 invalidates fits whose selected RANS evidence may contain an alternate
 // low-angle branch that now requires preliminary URANS confirmation.
-export const POLAR_FIT_VERSION = "evidence-lowess-v7";
+export const POLAR_FIT_VERSION = "evidence-lowess-v8";
 
 /** Canonical classifier reason for restartable but incomplete URANS evidence. */
 export const INCOMPLETE_URANS_INTEGRATION_REASON =
@@ -246,6 +246,7 @@ export interface PolarEvidencePoint {
   iterations?: number | null;
   firstOrderFallback?: boolean | null;
   validForPolar?: boolean | null;
+  sourceGeometryCompatible?: boolean;
   hasForceHistory?: boolean;
   hasVideo?: boolean;
   /** Engine frame_track payload (results.frame_track / attempt evidence
@@ -411,6 +412,8 @@ export function isOscillatingSteadyStable(p: PolarEvidencePoint): boolean {
  *  drift-prone re-implementation. */
 export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
   const reasons: string[] = [];
+  if (p.sourceGeometryCompatible === false)
+    reasons.push("unverified-source-geometry");
   // A selected archive interpretation is the current, authenticated
   // coefficient reduction for this exact periodic URANS attempt.  It may
   // supersede stale engine-summary *quality* gates, but never basic result
@@ -430,7 +433,8 @@ export function baseRejectionReasons(p: PolarEvidencePoint): string[] {
     reasons.push("non-physical-coefficients");
   }
   if (p.error) reasons.push("solver-error");
-  if (p.failureDisposition === "material_domain") reasons.push("material-domain");
+  if (p.failureDisposition === "material_domain")
+    reasons.push("material-domain");
   // Oscillating-steady acceptance (v4, ladder contract 2): a steady solve that
   // settled into a bounded oscillation and was mean-averaged over a stable
   // window (steady_history.mean_stable === true) IS valid RANS evidence — the

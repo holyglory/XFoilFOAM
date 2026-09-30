@@ -1,5 +1,58 @@
 schema = 2
 
+[test.cfd-source-geometry]
+timeout_seconds = 1800
+
+[test.cfd-source-geometry.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.cfd-source-geometry.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.cfd-source-geometry.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.cfd-source-geometry.check]]
+name = "api-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "typecheck"]
+
+[[test.cfd-source-geometry.check]]
+name = "public-and-pinned-detail"
+tier = "development"
+requires = ["seed", "api-types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/detail-polar-compatibility.test.ts", "test/pinned-detail.test.ts", "test/symmetry-detail.test.ts"]
+
+[[test.cfd-source-geometry.check]]
+name = "catalog-metrics"
+tier = "development"
+requires = ["seed", "api-types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/catalog.test.ts", "-t", "catalog solved-metric evidence"]
+
+[[test.cfd-source-geometry.check]]
+name = "cache-writers"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/polar-cache-atomicity.test.ts", "test/polar-compatibility-cache.test.ts"]
+
+[[test.cfd-source-geometry.check]]
+name = "classifier"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/core", "exec", "vitest", "run", "test/core.test.ts"]
+
+[[test.cfd-source-geometry.check]]
+name = "immutable-target-and-raw-ingestion"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "requires source-preserving CFD|conserves rejected evidence and charges cumulative"]
+
 [test.mach3-cartesian-diagnosis]
 timeout_seconds = 300
 
@@ -3639,6 +3692,12 @@ name = "reported-polar"
 tier = "development"
 command = ["node", "scripts/dev/verify-production-progressive.mjs", "--source-geometry"]
 retained_artifacts = [{ name = "source-geometry-public", path = ".codex-artifacts/source-geometry-public", max_bytes = 33554432 }]
+
+[[test.source-geometry-production.check]]
+name = "cfd-only-curves-and-evidence"
+tier = "development"
+command = ["node", "--import", "tsx", "scripts/dev/verify-cfd-only-curves.mjs", "--source-geometry"]
+retained_artifacts = [{ name = "cfd-geometry-browser", path = ".codex-artifacts/cfd-source-geometry-browser", max_bytes = 33554432 }]
 
 [[test.source-geometry-production.check]]
 name = "selected-condition-metrics"
