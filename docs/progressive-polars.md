@@ -49,6 +49,21 @@ were still disposable verification state.
 
 ## User-visible outcome
 
+### Prompt refinement without starving preliminary caches
+
+The existing fitting service alternates a current-campaign CFD-evidence turn
+with an unrestricted oldest-first turn. Evidence from a cancelled or superseded
+plan cannot take the priority turn; it may still be processed normally by the
+oldest-first path. An empty priority turn falls back immediately, without
+waiting for another solver report. The global stop and remote-worker role gates
+remain unchanged, and no additional fitting worker is started.
+
+This is publication ordering, not a change to the campaign stage barrier or
+scientific acceptance. Fast RANS iteration histories and unsteady histories can
+refine preliminary curves during stage 2; they do not have to wait for the
+precise stage. Eligibility for a fresh validation cohort must be measured from
+current, source-linked model evidence rather than inferred from queue counts.
+
 ### Optional related-history covariance
 
 The fitting engine supports an opt-in `lineage_conflict_probability` policy

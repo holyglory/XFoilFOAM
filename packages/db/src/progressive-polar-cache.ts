@@ -180,6 +180,7 @@ export async function claimProgressivePolarFit(
     leaseSeconds: number;
     predictionId?: string;
     requireCfdEvidence?: boolean;
+    currentCampaignEvidenceOnly?: boolean;
     requireSweeperEnabled?: boolean;
   },
 ): Promise<ProgressiveFitLease | null> {
@@ -197,22 +198,26 @@ export async function claimProgressivePolarFit(
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const [work] = await connection.execute(sql`
+      ${input.requireCfdEvidence || input.currentCampaignEvidenceOnly ? sql`WITH evidence_targets AS MATERIALIZED (
+        SELECT DISTINCT source_work.target_id FROM progressive_cfd_evidence receipt
+        JOIN progressive_cfd_attempts attempt ON attempt.token=receipt.attempt_token
+        JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        JOIN progressive_work source_work ON source_work.id=unit.work_id
+        JOIN progressive_generations generation ON generation.id=source_work.generation_id
+        ${input.currentCampaignEvidenceOnly ? sql`JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
+          AND campaign.current_plan_revision_id=generation.plan_revision_id
+          AND campaign.status IN ('active','attention','paused','completed')` : sql``}
+        WHERE generation.epoch_id=${epoch.id}
+          ${input.currentCampaignEvidenceOnly ? sql`AND generation.status<>'cancelled'` : sql``}
+      )` : sql``}
       SELECT work.prediction_id, work.source_version, work.attempts FROM progressive_polar_fit_work work
       JOIN neuralfoil_predictions prediction ON prediction.id = work.prediction_id
+      ${input.requireCfdEvidence || input.currentCampaignEvidenceOnly ? sql`JOIN evidence_targets ON evidence_targets.target_id=prediction.target_id` : sql``}
       WHERE prediction.epoch_id = ${epoch.id}
         AND (NOT ${input.requireSweeperEnabled ?? false} OR (
           EXISTS (SELECT 1 FROM sweeper_state WHERE id = 1 AND enabled)
           AND NOT EXISTS (SELECT 1 FROM sync_api_settings WHERE remote_solver_enabled)))
         AND ${input.predictionId ? sql`prediction.id = ${input.predictionId}` : sql`true`}
-        AND ${
-          input.requireCfdEvidence
-            ? sql`EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt
-          JOIN progressive_cfd_attempts attempt ON attempt.token = receipt.attempt_token
-          JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id JOIN progressive_work source_work ON source_work.id = unit.work_id
-          JOIN progressive_generations generation ON generation.id = source_work.generation_id
-          WHERE source_work.target_id = prediction.target_id AND generation.epoch_id = prediction.epoch_id)`
-            : sql`true`
-        }
         AND EXISTS (SELECT 1 FROM progressive_generation_targets scope JOIN progressive_generations generation ON generation.id = scope.generation_id
           WHERE scope.target_id = prediction.target_id AND generation.epoch_id = prediction.epoch_id)
         AND (work.state = 'pending' OR (work.state = 'leased' AND work.lease_until <= clock_timestamp()))

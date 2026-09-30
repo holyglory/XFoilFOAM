@@ -6617,6 +6617,74 @@ describe("bounded progressive numerical recovery", () => {
 });
 
 describe("persistent progressive polar cache", () => {
+  it("publishes recent CFD histories before old empty fits without starving oldest-first work", async () => {
+    const preliminary = await fitFixture();
+    const superseded = await fitFixture();
+    const supersededEvidence = await superseded.save(20);
+    await superseded.record([supersededEvidence]);
+    await db.execute(sql`UPDATE progressive_generations SET status='cancelled' WHERE id=${superseded.leases[0].generationId}::uuid`);
+    await db.execute(sql`UPDATE progressive_polar_fit_work SET updated_at=clock_timestamp()-interval '2 days'
+      WHERE prediction_id=${superseded.predictionId}`);
+    const refined = await fitFixture();
+    const evidence = await refined.save(40,"rans",refined.leases[0].alpha,{
+      mesh_recovery_version:3,converged:false,
+      steady_history:{iterations:[100,101,102,103,104],cl:[0.2,0.21,0.22,0.21,0.2],
+        cd:[0.02,0.021,0.02,0.021,0.02],cm:[-0.03,-0.031,-0.03,-0.031,-0.03],window:{start_iter:100,end_iter:104}},
+    });
+    await refined.record([evidence]);
+    await db.execute(sql`UPDATE progressive_polar_fit_work SET updated_at=clock_timestamp()-interval '1 day'
+      WHERE prediction_id=${preliminary.predictionId}`);
+    const original = await db.select().from(resultAttempts).where(eq(resultAttempts.id,evidence));
+    const engine = new EngineClient("http://unused.invalid");
+    const order: string[] = [];
+    const fitting = vi.spyOn(engine,"fitProgressivePolar").mockImplementation(async request => {
+      order.push(request.prior.prediction_id);
+      return fitUsingPython(request);
+    });
+    const abort = new AbortController();
+    const timeout = setTimeout(()=>abort.abort(),30000);
+    let stored = 0;
+    try {
+      await db.update(sweeperState).set({enabled:true}).where(eq(sweeperState.id,1));
+      await runProgressiveBaselineService(db,client.sql,engine,abort.signal,receipt=>{
+        if(receipt.component==="progressive-fitting" && receipt.stored===1 && ++stored===3) abort.abort();
+      });
+      expect(order).toEqual([refined.predictionId,superseded.predictionId,preliminary.predictionId]);
+      const [current] = await db.execute(sql`SELECT model.request,model.response FROM progressive_polar_fit_work work
+        JOIN progressive_polar_models model ON model.id=work.model_id
+        WHERE work.prediction_id=${refined.predictionId} AND work.state='ready'`);
+      expect((current.request as ProgressivePolarFitRequest).histories).toHaveLength(1);
+      expect((current.response as ProgressivePolarFitResponse).estimate.contributors).toHaveLength(1);
+      const publicCurves = await publicProgressivePolars(db,originalId,refined.leases[0].revisionId);
+      expect(publicCurves.find(curve=>curve.targetId===refined.leases[0].targetId)?.curves.some(curve=>curve.method==="openfoam_fast")).toBe(true);
+      expect(await db.select().from(resultAttempts).where(eq(resultAttempts.id,evidence))).toEqual(original);
+    } finally {
+      abort.abort();clearTimeout(timeout);fitting.mockRestore();
+      await db.update(sweeperState).set({enabled:false}).where(eq(sweeperState.id,1));
+    }
+  },120000);
+
+  it("falls back to preliminary-only fitting when the CFD lane has no evidence", async () => {
+    const fixture = await fitFixture();
+    const engine = new EngineClient("http://unused.invalid");
+    const fitting = vi.spyOn(engine,"fitProgressivePolar").mockImplementation(fitUsingPython);
+    const abort = new AbortController();
+    const timeout = setTimeout(()=>abort.abort(),30000);
+    let stored = 0;
+    try {
+      await db.update(sweeperState).set({enabled:true}).where(eq(sweeperState.id,1));
+      await runProgressiveBaselineService(db,client.sql,engine,abort.signal,receipt=>{
+        if(receipt.component==="progressive-fitting" && receipt.stored===1){stored++;abort.abort();}
+      });
+      expect(stored).toBe(1);
+      expect(fitting).toHaveBeenCalledTimes(1);
+      expect(fitting.mock.calls[0][0].prior.prediction_id).toBe(fixture.predictionId);
+      expect(fitting.mock.calls[0][0].observations).toEqual([]);
+    } finally {
+      abort.abort();clearTimeout(timeout);fitting.mockRestore();
+      await db.update(sweeperState).set({enabled:false}).where(eq(sweeperState.id,1));
+    }
+  },120000);
   it.each([2, 3])(
     "requires source-preserving CFD on a finite trailing edge (mesh version %s)",
     async (meshVersion) => {

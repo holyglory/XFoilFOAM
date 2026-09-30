@@ -27,6 +27,7 @@ export async function runProgressiveBaselineService(
   const owner = `neuralfoil-${randomUUID()}`;
   let pending = true;
   let policyReconciled = false;
+  let cfdFitTurn = true;
   let wake: (() => void) | null = null;
   let deadline: ReturnType<typeof setTimeout> | null = null;
   const notify = () => {
@@ -95,11 +96,18 @@ export async function runProgressiveBaselineService(
           report({ component: "progressive-baseline", ...batch });
         }
         if (signal.aborted) break;
-        const fitting = await runProgressiveFitBatch(db, engine, owner, {
-          requireCfdEvidence: false,
+        let fitting = await runProgressiveFitBatch(db, engine, owner, {
+          requireCfdEvidence: cfdFitTurn,
+          currentCampaignEvidenceOnly: cfdFitTurn,
           requireSweeperEnabled: true,
         });
+        if (!fitting.claimed && cfdFitTurn && !signal.aborted)
+          fitting = await runProgressiveFitBatch(db, engine, owner, {
+            requireCfdEvidence: false,
+            requireSweeperEnabled: true,
+          });
         if (fitting.claimed) {
+          cfdFitTurn = !cfdFitTurn;
           pending = true;
           report({ component: "progressive-fitting", ...fitting });
         }

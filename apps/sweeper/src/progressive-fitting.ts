@@ -481,12 +481,14 @@ export async function runProgressiveFitBatch(
   options: {
     requireSweeperEnabled?: boolean;
     requireCfdEvidence?: boolean;
+    currentCampaignEvidenceOnly?: boolean;
   } = {},
 ): Promise<{ claimed: number; stored: number; errors: string[] }> {
   const lease = await claimProgressivePolarFit(db, {
     owner,
     leaseSeconds: 180,
     requireCfdEvidence: options.requireCfdEvidence ?? true,
+    currentCampaignEvidenceOnly: options.currentCampaignEvidenceOnly ?? false,
     requireSweeperEnabled: options.requireSweeperEnabled ?? true,
   });
   if (!lease) return { claimed: 0, stored: 0, errors: [] };
