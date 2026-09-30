@@ -210,15 +210,32 @@ try {
           fullPage: true,
         });
       if (scope.evidence.length) {
-        const point = chart.locator('circle[role="button"]').first();
-        await expect(point).toBeVisible();
+        const firstPoint = chart.locator('circle[role="button"]').first();
+        await expect(firstPoint).toBeVisible();
         await expect(chart).toHaveAttribute("role", "group");
-        const expectedResultId = await point.getAttribute("data-result-id");
+        const expectedResultId = await firstPoint.getAttribute("data-result-id");
+        assert(expectedResultId);
+        const point = chart.locator(`circle[role="button"][data-result-id="${expectedResultId}"]`);
+        await expect(point).toHaveCount(1);
         assert(
           scope.evidence.some((entry) => entry.resultId === expectedResultId),
         );
         const target = await point.boundingBox();
         assert(target && target.width >= 43 && target.height >= 43);
+        await chart.evaluate((element) => {
+          element.__selectionEvents = [];
+          for (const type of ["pointerdown", "pointerup", "click"]) {
+            element.addEventListener(type, (event) => {
+              const bounds = element.getBoundingClientRect();
+              element.__selectionEvents.push({
+                type, clientX: event.clientX, clientY: event.clientY,
+                targetResultId: event.target.getAttribute("data-result-id"),
+                bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+                viewBox: element.getAttribute("viewBox"),
+              });
+            }, { capture: true });
+          }
+        });
         const storedResponse = page.waitForResponse(
           (response) =>
             new URL(response.url()).pathname ===
@@ -233,7 +250,20 @@ try {
         const stored = await storedResponse;
         assert(stored.ok());
         const result = await stored.json();
-        assert.equal(result.resultId, expectedResultId);
+        if (result.resultId !== expectedResultId) {
+          const selection = {
+            width, slug: scope.slug, surface: "point-selection", expectedResultId,
+            actualResultId: result.resultId, requestUrl: stored.url(), target,
+            events: await chart.evaluate((element) => element.__selectionEvents),
+          };
+          acceptanceFailures.push(selection);
+          if (evidenceDirectory)
+            await writeFile(`${evidenceDirectory}/${width}-${scope.slug}-selection.json`, JSON.stringify(selection, null, 2));
+          await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+          await page.keyboard.press("Escape");
+          await expect(page.getByTestId("sim-modal-dialog")).not.toBeVisible();
+          continue;
+        }
         assert(
           scope.evidence.some(
             (evidence) => evidence.resultId === result.resultId,

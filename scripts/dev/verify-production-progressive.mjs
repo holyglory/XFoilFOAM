@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "@playwright/test";
-import { mkdir, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 
 const origin = "https://airfoils.pro";
 const sourceGeometry = process.argv.includes("--source-geometry");
@@ -37,6 +37,66 @@ const evidenceDirectory = sourceGeometry
   : null;
 if (evidenceDirectory) await mkdir(evidenceDirectory, { recursive: true });
 try {
+  if (process.argv.includes("--survey-reversals")) {
+    assert(sourceGeometry, "The reversal survey requires source-geometry evidence");
+    const source = await readFile(
+      ".codex-artifacts/sg6051-polar-diagnosis-20260930/report.json",
+    );
+    const sourceSha256 = createHash("sha256").update(source).digest("hex");
+    assert.equal(
+      sourceSha256,
+      "fce6165a32066ee40d7ee13bbea77a30b56cd8c6b6c99179de465306a2226fc9",
+      "The original screening population changed",
+    );
+    const selected = JSON.parse(source).baseline_to_composite_reversals.records;
+    const profiles = [...new Set(selected.map((record) => record.slug))];
+    const observed = await Promise.all(profiles.map(async (profile) => {
+      try {
+        const fetched = await fetch(`${origin}/api/airfoils/${profile}?view=curves`, {
+          signal: AbortSignal.timeout(30000),
+        });
+        assert(fetched.ok, `${profile}: HTTP ${fetched.status}`);
+        const bytes = await fetched.text();
+        await writeFile(`${evidenceDirectory}/${profile}-curves.json`, bytes);
+        const current = JSON.parse(bytes);
+        assert.equal(current.slug, profile);
+        const rows = selected.filter((record) => record.slug === profile).map((record) => {
+          const series = current.progressivePolars.find((item) => item.targetId === record.target);
+          assert(series, `${profile}: original physical target is unavailable`);
+          const curve = series.curves.find((item) => item.method === "composite")
+            ?? series.curves.find((item) => item.method === "neuralfoil");
+          assert(curve, `${profile}: no real curve is available`);
+          const zero = curve.samples.find((sample) => sample.alpha === 0);
+          const five = curve.samples.find((sample) => sample.alpha === 5);
+          assert(zero && five, `${profile}: requested angle samples are missing`);
+          if (record.source_trailing_edge_gap > 0 && series.modelId === record.model) {
+            failures.push({ profile, target: record.target, message: "Original incompatible geometry model remains public" });
+          }
+          return {
+            profile, target: record.target, originalModel: record.model,
+            currentModel: series.modelId, kind: series.kind,
+            sourceTrailingEdgeGap: record.source_trailing_edge_gap,
+            beforeDeltaCl: record.composite_delta_cl_0_to_5,
+            afterDeltaCl: five.cl - zero.cl,
+            stillReversed: five.cl < zero.cl,
+          };
+        });
+        return { profile, rows, responseSha256: createHash("sha256").update(bytes).digest("hex") };
+      } catch (error) {
+        failures.push({ profile, message: String(error) });
+        return { profile, rows: [], error: String(error) };
+      }
+    }));
+    const rows = observed.flatMap((record) => record.rows);
+    const survey = {
+      kind: "reported-polar-reversal-followup-v1", checkedAt: new Date().toISOString(),
+      sourceSha256, originalConditions: selected.length, originalProfiles: profiles.length,
+      checkedConditions: rows.length, stillReversed: rows.filter((row) => row.stillReversed).length,
+      physicalValidation: false, observations: observed,
+    };
+    await writeFile(`${evidenceDirectory}/reversal-survey.json`, JSON.stringify(survey, null, 2));
+    receipts.push({ survey: "reversal-survey.json", checkedConditions: rows.length, stillReversed: survey.stillReversed });
+  }
   for (const viewport of [
     { width: 1440, height: 1000 },
     { width: 390, height: 844 },

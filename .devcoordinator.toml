@@ -3718,7 +3718,7 @@ timeout_seconds = 240
 [[test.source-geometry-production.check]]
 name = "reported-polar"
 tier = "development"
-command = ["node", "scripts/dev/verify-production-progressive.mjs", "--source-geometry"]
+command = ["node", "scripts/dev/verify-production-progressive.mjs", "--source-geometry", "--survey-reversals"]
 retained_artifacts = [{ name = "source-geometry-public", path = ".codex-artifacts/source-geometry-public", max_bytes = 33554432 }]
 
 [[test.source-geometry-production.check]]
