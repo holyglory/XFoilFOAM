@@ -277,8 +277,8 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_shared_mesh_recovery.
 [[test.precise-source-repair.check]]
 name = "retained-precise-native-comparisons"
 tier = "development"
-command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/precise-native-repair-20260930", "--groups", "mach3-precise-cold", "mach3-precise-coordinates", "mach3-precise-features", "mach3-precise-cadence", "mach3-precise-initialized", "--require-driver"]
-retained_artifacts = [{ name = "precise-native-comparisons", path = ".codex-artifacts/precise-native-repair-20260930", max_bytes = 1073741824 }]
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/precise-native-repair-20260930-rerun1", "--groups", "mach3-precise-cold", "mach3-precise-coordinates", "mach3-precise-features", "mach3-precise-cadence", "mach3-precise-initialized", "--require-driver"]
+retained_artifacts = [{ name = "precise-native-comparisons", path = ".codex-artifacts/precise-native-repair-20260930-rerun1", max_bytes = 1073741824 }]
 
 [[test.source-preserved-fast-startup.check]]
 name = "startup-and-generated-policy"
