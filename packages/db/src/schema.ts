@@ -4135,6 +4135,11 @@ export const simJobs = pgTable(
       sql`${t.ingestLeasePreviousStatus} IS NULL OR ${t.ingestLeasePreviousStatus} <> 'ingesting'`,
     ),
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
+    directTerminalRetentionIdx: index("sim_jobs_direct_terminal_retention_idx")
+      .on(sql`COALESCE(${t.finishedAt}, ${t.ingestedAt}, ${t.updatedAt}, ${t.createdAt})`, t.id)
+      .where(sql`${t.status} IN ('done', 'failed', 'cancelled')
+        AND ${t.engineJobId} IS NOT NULL
+        AND NOT coalesce(${t.requestPayload} ? 'remoteProgressiveExecution', false)`),
     solverImplementationIdx: index("sim_jobs_solver_implementation_idx").on(
       t.solverImplementationId,
     ),

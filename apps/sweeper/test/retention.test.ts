@@ -4,6 +4,7 @@ import {
   boundaryProfiles,
   categories,
   createClient,
+  type DB,
   flowConditions,
   materializeCampaignLaunch,
   mediums,
@@ -473,6 +474,34 @@ afterAll(async () => {
 });
 
 describe("retention schema", () => {
+  it("uses the direct terminal index while preserving progressive ownership exclusion", async () => {
+    const ownedIds: string[] = [];
+    try {
+      const direct = await insertTerminalJob(`${PREFIX}-indexed-direct`);
+      ownedIds.push(direct.id);
+      const progressive = await insertTerminalJob(`${PREFIX}-indexed-progressive`, {
+        requestPayload: { remoteProgressiveExecution: { fixture: true } },
+      });
+      ownedIds.push(progressive.id);
+      let selection: Parameters<DB["execute"]>[0] | undefined;
+      const inspect = { execute: async (query: Parameters<DB["execute"]>[0]) => { selection=query; return []; } } as unknown as DB;
+      await stripTerminalJobs(inspect, fakeEngine(), { now: NOW, stripMinAgeMs: THIRTY_MIN, stripMaxPerTick: 500 });
+      expect(selection).toBeDefined();
+      const restore = new Error("Restore direct retention planner flags");
+      await expect(db.transaction(async transaction => {
+        await transaction.execute(dsql`SET LOCAL enable_seqscan=off`);
+        const plan = await transaction.execute(dsql`EXPLAIN(FORMAT JSON) ${selection!}`);
+        expect(JSON.stringify(plan)).toContain("sim_jobs_direct_terminal_retention_idx");
+        const selected = await transaction.execute(selection!);
+        expect(selected.some(row => row.id===direct.id)).toBe(true);
+        expect(selected.some(row => row.id===progressive.id)).toBe(false);
+        throw restore;
+      })).rejects.toBe(restore);
+    } finally {
+      if(ownedIds.length) await db.delete(simJobs).where(inArray(simJobs.id,ownedIds));
+    }
+  });
+
   it("pins migration 0039 sim_jobs strip columns", async () => {
     const cols = (await db.execute(dsql`
       SELECT column_name FROM information_schema.columns
