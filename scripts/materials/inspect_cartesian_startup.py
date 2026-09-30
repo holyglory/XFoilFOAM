@@ -11,6 +11,7 @@ from urllib.request import urlopen
 import numpy as np
 
 from scripts.materials.inspect_rae_extrema import content, field, mesh_list
+from airfoilfoam.evidence_store import verify_local_archive_manifest_members
 
 
 def saved_scalar(path, cell_count):
@@ -118,12 +119,48 @@ def inspect_saved_case(directory):
     }
 
 
+def inspect_production_replay(directory):
+    report = json.loads((directory / "report.json").read_text())
+    if report.get("kind") != "source-bound-production-numerical-replay-v1" or report.get("production_evidence") is not False:
+        raise ValueError("Expected an explicitly isolated production replay")
+    driver = directory / "replay-driver.py"
+    driver_verified = driver.is_file() and hashlib.sha256(driver.read_bytes()).hexdigest() == report.get("driver_sha256")
+    if driver.exists() and not driver_verified:
+        raise ValueError("Retained replay driver differs from the executed source")
+    captures = []
+    for location in report.get("early_captures", []):
+        captured = directory / "early-fields" / Path(location).name
+        receipt = json.loads((captured / "capture.json").read_text())
+        for name, expected in receipt["files"].items():
+            source = captured / name
+            if not source.resolve().is_relative_to(captured.resolve()) or source.is_symlink() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+                raise ValueError("Retained startup field identity changed")
+        captures.append(inspect_saved_case(captured))
+    if report.get("capture_errors"):
+        raise ValueError("The native replay reported an incomplete field capture")
+    archives = []
+    for proof in report.get("archive_proofs", []):
+        job = directory / "data/jobs" / report["local_job"]
+        archive = job / proof["archive"]
+        if not archive.resolve().is_relative_to(job.resolve()):
+            raise ValueError("Replay archive escapes its owned job")
+        manifest = archive.parent / "evidence_manifest.json"
+        record, members = verify_local_archive_manifest_members(archive, expected_manifest=manifest.read_bytes())
+        if record.stored_sha256 != proof["archive_sha256"] or members != proof["authenticated_members"]:
+            raise ValueError("Retained replay archive differs from the native receipt")
+        archives.append({"archive": proof["archive"], "sha256": record.stored_sha256, "members": members})
+    return {"case": directory.name, "kind": report["kind"], "source_job": report["source_job"],
+            "case_outcomes": report.get("case_outcomes", []), "material_diagnostics": report.get("material_diagnostics", []),
+            "early_captures": captures, "archives": archives, "driver_source_verified": driver_verified, "physical_validation": False}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--groups", nargs="+", default=["mach2", "mach3"])
     parser.add_argument("--thermal-only", action="store_true")
     parser.add_argument("--probe-build")
+    parser.add_argument("--require-driver", action="store_true")
     args = parser.parse_args()
     status = json.loads(subprocess.check_output(["devcoordinator2", "deployment", "status", "--name", "progressive-numerics", "--client", "codex"], text=True))
     if not status.get("ok") or status["data"]["deployment_id"] != "dec54282d9f0719c8":
@@ -146,12 +183,18 @@ def main():
         for directory in sorted((args.destination / name).iterdir()):
             if directory.is_dir() and (directory / "system/controlDict").is_file():
                 reports.append({"group": name, **inspect_saved_case(directory)})
+            elif directory.is_dir() and (directory / "report.json").is_file():
+                replay = inspect_production_replay(directory)
+                if args.require_driver and not replay["driver_source_verified"]:
+                    raise ValueError("The replay lacks its exact executed driver source")
+                reports.append({"group": name, **replay})
     report = {"kind": "retained-cartesian-startup-diagnosis-v1", "production_evidence": False,
               "source_deployment": "dec54282d9f0719c8", "source_origin": origin,
               "retained_selection": "thermal_fields_and_mesh" if args.thermal_only else "complete_case", "cases": reports}
     (args.destination / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-    print(json.dumps({"cases": [{"group": row["group"], "case": row["case"], "cells": row["cells"], "frames": len(row["frames"]),
-                                "validated_smoke": row["receipt"] is not None} for row in reports], "output": str(args.destination / "report.json")}))
+    print(json.dumps({"cases": [{"group": row["group"], "case": row["case"], "cells": row.get("cells"), "frames": len(row.get("frames", [])),
+                                "early_captures": len(row.get("early_captures", [])),
+                                "validated_smoke": row.get("receipt") is not None} for row in reports], "output": str(args.destination / "report.json")}))
 
 
 if __name__ == "__main__":

@@ -66,7 +66,7 @@ def test_two_stages_share_original_clock_budget_and_keep_raw_settings(tmp_path):
     result = local_startup.solve_cold_steady(tmp_path, runner, parameters, 1, 900)
     assert result.ok
     assert [(call["end"], call["courant"], call["restart"], call["clock"]) for call in inner.calls] == [
-        (50, 0.25, False, 1), (5000, 0.5, True, 1)]
+        (50, 0.1, False, 1), (5000, 0.5, True, 1)]
     assert 0 < inner.calls[1]["timeout"] <= 900
     assert runner.limit(spec) == 900 and runner.consumed(spec) > 0
     assert result.stdout.count("XFOILFOAM_LOCAL_STEADY_RESIDUAL") == 2
@@ -77,6 +77,8 @@ def test_two_stages_share_original_clock_budget_and_keep_raw_settings(tmp_path):
     assert len(records) == 1
     assert json.loads((records[0] / "receipt.json").read_text())["continuation_launched"]
     request = json.loads((records[0] / "request.json").read_text())
+    assert request["startup_courant"] == 0.1
+    assert request["continuation_courant"] == 0.5
     assert request["maximum_iteration"] == 5000 and not request["physical_time_history"]
     assert len(list(tmp_path.glob("log.localSteadyStartup.*"))) == 1
     assert len(list(tmp_path.glob("log.localSteadyContinuation.*"))) == 1

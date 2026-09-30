@@ -15,7 +15,7 @@ from .runner import InfrastructureError, RunResult
 
 
 STARTUP_ITERATIONS = 50
-STARTUP_COURANT = 0.25
+STARTUP_COURANT = 0.1
 
 
 def solve_cold_steady(directory, runner, parameters, n_proc, timeout, *, seeded=False, cancel_check=None):

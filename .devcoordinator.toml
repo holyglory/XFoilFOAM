@@ -62,6 +62,34 @@ tier = "development"
 command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-cartesian-diagnosis-20260930"]
 retained_artifacts = [{ name = "cartesian-startup-fields", path = ".codex-artifacts/mach3-cartesian-diagnosis-20260930", max_bytes = 536870912 }]
 
+[test.mach3-fast-field-evidence]
+timeout_seconds = 900
+
+[[test.mach3-fast-field-evidence.check]]
+name = "protocol"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "-q"]
+
+[[test.mach3-fast-field-evidence.check]]
+name = "retained-native-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-fast-fields-20260930", "--groups", "mach3-production-fields"]
+retained_artifacts = [{ name = "fast-startup-fields", path = ".codex-artifacts/mach3-fast-fields-20260930", max_bytes = 1073741824 }]
+
+[test.source-preserved-fast-startup]
+timeout_seconds = 900
+
+[[test.source-preserved-fast-startup.check]]
+name = "startup-and-generated-policy"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_local_steady_startup.py", "tests/test_compressible_case.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_numerical_canary.py", "-q"]
+
+[[test.source-preserved-fast-startup.check]]
+name = "canonical-native-evidence"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-canonical-fixed-20260930", "--groups", "mach3-production-fixed", "--require-driver"]
+retained_artifacts = [{ name = "canonical-fast-evidence", path = ".codex-artifacts/mach3-canonical-fixed-20260930", max_bytes = 1073741824 }]
+
 [test.mach3-startup-controls]
 timeout_seconds = 300
 
@@ -2620,12 +2648,12 @@ ttl_seconds = 86400
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain" }
 files = ["compose.mach3-failure.yml"]
-services = ["artifacts", "cold"]
-finite_services = ["cold"]
+services = ["artifacts", "cold", "marched"]
+finite_services = ["cold", "marched"]
 build = false
 port = true
 route = true
-timeout_seconds = 1500
+timeout_seconds = 2700
 
 [deployment.mach3-smaller-steps]
 source = ["worktree"]
@@ -3561,12 +3589,12 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "mach3-pressure", "mach3-finite-pressure"]
-finite_services = ["mach3-pressure", "mach3-finite-pressure"]
+services = ["artifacts", "mach3-production-fixed"]
+finite_services = ["mach3-production-fixed"]
 build = false
 port = true
 route = true
-timeout_seconds = 600
+timeout_seconds = 2700
 
 [deployment.progressive-preview.component.db]
 type = "postgres"

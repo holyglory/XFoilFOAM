@@ -20,6 +20,42 @@ x-canary: &canary
     - numerical-results:/canary-output
 
 services:
+  mach3-production: &production-replay
+    <<: *canary
+    environment:
+      PYTHONPATH: /candidate/src:/candidate
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./pyproject.toml:/candidate/pyproject.toml:ro
+      - ./scripts/materials:/candidate/scripts/materials:ro
+      - ./.codex-artifacts/mach3-production-replay-20260930/ag24-request.json:/fixture/request.json:ro
+      - numerical-results:/canary-output
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-production"]
+  mach3-anchor:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-anchor", "--anchor-zero"]
+  mach3-quiescent:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-quiescent", "--quiescent-start"]
+  mach3-finite-production:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-finite-production", "--finite-edge-mesh"]
+  mach3-production-fields:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-production-fields", "--early-fields"]
+  mach3-production-fixed:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-production-fixed"]
+  mach3-startup-tenth:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-startup-tenth", "--startup-courant", "0.1", "--early-fields"]
+  mach3-startup-twentieth:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-startup-twentieth", "--startup-courant", "0.05", "--early-fields"]
   energy-probe-build:
     build:
       context: .

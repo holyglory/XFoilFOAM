@@ -72,6 +72,8 @@ def test_density_local_steady_is_explicit_iteration_time_and_conserved_residual_
     assert identity["time_coordinate"] == "local_pseudo_time_iterations"
     assert identity["physical_time_history"] is False
     assert identity["local_time_step_smoothing"] == effective
+    assert identity["cold_startup_policy"]["maximum_courant"] == 0.1
+    assert identity["cold_startup_policy"]["maximum_iterations"] == 50
     with pytest.raises(ValueError, match="physical-time"):
         case.write_transient(tmp_path, 0, 1, 0.01)
 

@@ -8,12 +8,109 @@ from airfoilfoam.material_domain import material_domain_failure
 from airfoilfoam.models import JobResult, JobState, Polar, PolarPoint
 from airfoilfoam.openfoam.runner import RunResult
 from scripts.materials.reproduce_mach3_failure import collect_diagnostics, diagnostic_request, diagnostic_source_identity, execution_request, native_image_fingerprints, summarize_outcomes
+from scripts.materials.replay_production_numerics import initialize_quiescent_velocity, replay_request, retain_failed_startup
 from airfoilfoam.provenance import application_source_sha256
 
 
 ROOT = Path(__file__).parents[1]
 COORDINATES = ROOT / "packages/db/seed/selig-database/fx60100.dat"
 MATERIAL = ROOT / "tests/fixtures/air-thermophysics-audit.json"
+
+
+def test_quiescent_initial_guess_preserves_boundaries_and_physical_fields(tmp_path):
+    velocity = b"FoamFile { format ascii; }\ninternalField uniform (1021 0 0);\nboundaryField { inlet { type fixedValue; value uniform (1021 0 0); } airfoil { type noSlip; } }\n"
+    protected = {"0/p": b"pressure fixture", "0/T": b"temperature fixture", "constant/thermophysicalProperties": b"unchanged material fixture"}
+    for name, content in {**protected, "0/U": velocity}.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    receipt = initialize_quiescent_velocity(tmp_path)
+    expected = velocity.replace(b"internalField uniform (1021 0 0);", b"internalField uniform (0 0 0);")
+    assert (tmp_path / "0/U").read_bytes() == expected
+    assert all((tmp_path / name).read_bytes() == content for name, content in protected.items())
+    assert receipt["aerodynamic_evidence"] is False
+    assert receipt["original_sha256"] == hashlib.sha256(velocity).hexdigest()
+    first = next((tmp_path / "system/quiescentInitialization").glob("*/receipt.json"))
+    original_receipt = first.read_bytes()
+    initialize_quiescent_velocity(tmp_path)
+    assert first.read_bytes() == original_receipt
+    assert len(list((tmp_path / "system/quiescentInitialization").glob("*/receipt.json"))) == 2
+
+
+def test_quiescent_initial_guess_never_overwrites_a_carried_velocity_field(tmp_path):
+    velocity = tmp_path / "0/U"
+    velocity.parent.mkdir()
+    content = b"internalField nonuniform List<vector> 1 ((10 0 0));"
+    velocity.write_bytes(content)
+    with pytest.raises(ValueError, match="must not replace a carried field"):
+        initialize_quiescent_velocity(tmp_path)
+    assert velocity.read_bytes() == content
+
+
+def test_failed_startup_capture_is_bounded_and_preserves_actual_field_bytes(tmp_path):
+    source = tmp_path / "case"
+    for name in ("0/U", "constant/thermophysicalProperties", "system/controlDict", "1/T", "2/T"):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"isolated original field {name}".encode())
+    (source / "material-domain-diagnostic.json").write_text('{"kind":"fixture"}')
+    output = Path(retain_failed_startup(source, tmp_path / "captures"))
+    receipt = json.loads((output / "capture.json").read_text())
+    assert receipt["frames"] == [1, 2]
+    assert receipt["coordinate_kind"] == "iteration"
+    assert receipt["production_evidence"] is False
+    assert (output / "2/T").read_bytes() == (source / "2/T").read_bytes()
+    assert receipt["files"]["2/T"] == hashlib.sha256((source / "2/T").read_bytes()).hexdigest()
+    (source / "5000").mkdir()
+    assert retain_failed_startup(source, tmp_path / "captures") is None
+
+
+def test_production_replay_preserves_the_complete_physical_and_numerical_request(tmp_path):
+    original = diagnostic_request(COORDINATES, MATERIAL, "marched").model_dump(mode="json")
+    original["execution_id"] = "11111111-1111-4111-8111-111111111111"
+    original["expected_mesh_recovery_version"] = 2
+    source_job = "22222222-2222-4222-8222-222222222222"
+    source = tmp_path / "request.json"
+    source.write_text(json.dumps({"source_job": source_job, "engine_request": original}))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    job_id, preserved, request = replay_request(source, digest)
+    assert job_id == source_job
+    assert preserved.model_dump(mode="json") == original
+    expected = dict(original)
+    for name in ("execution_id", "expected_engine", "expected_execution_pool", "expected_mesh_recovery_version"):
+        expected[name] = None
+    expected["resources"] = {**original["resources"], "cpu_budget": 1, "solver_processes": 1, "case_concurrency": 1}
+    expected["solver"] = {**original["solver"], "write_images": [], "frame_fields": []}
+    assert request.model_dump(mode="json") == expected
+    assert request.aoa.expand() == [-4, 13]
+    assert request.resources.case_solver_budget_seconds == 900
+    _, mesh_original, finite_mesh = replay_request(source, digest, finite_edge_mesh=True)
+    assert mesh_original == preserved
+    mesh_expected = {**expected, "mesh": {**expected["mesh"], "mesher": "blockmesh-cgrid-finite-edge"}}
+    assert finite_mesh.model_dump(mode="json") == mesh_expected
+    with pytest.raises(ValueError, match="original multi-angle sweep"):
+        replay_request(source, digest, finite_edge_mesh=True, anchor_zero=True)
+    _, anchor_original, anchor = replay_request(source, digest, anchor_zero=True)
+    assert anchor_original == preserved
+    expected["aoa"] = {**original["aoa"], "angles": [0]}
+    assert anchor.model_dump(mode="json") == expected
+    with pytest.raises(ValueError, match="zero-anchor comparison must be explicit"):
+        replay_request(source, digest, anchor_zero=1)
+    source.write_text(source.read_text() + " ")
+    with pytest.raises(ValueError, match="retained production request changed"):
+        replay_request(source, digest)
+
+
+@pytest.mark.parametrize("changes", [
+    {"force_transient": True}, {"momentum_scheme": "linearUpwind"}, {"flow_solver_family": "rhoPimpleFoam", "force_transient": True},
+])
+def test_production_replay_does_not_silently_substitute_another_method(tmp_path, changes):
+    original = diagnostic_request(COORDINATES, MATERIAL, "cold").model_dump(mode="json")
+    original["solver"].update(changes)
+    source = tmp_path / "request.json"
+    source.write_text(json.dumps({"source_job": "22222222-2222-4222-8222-222222222222", "engine_request": original}))
+    with pytest.raises(ValueError, match="production density-based fast recipe"):
+        replay_request(source, hashlib.sha256(source.read_bytes()).hexdigest())
 
 
 def test_diagnostic_fingerprints_the_loaded_adapter_not_the_base_image(tmp_path):
