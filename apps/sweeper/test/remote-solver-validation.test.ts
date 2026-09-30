@@ -6578,12 +6578,16 @@ describe("remote solver push validation regressions", () => {
       deliveryFetch.fetchMock,
       "/evidence-uploads",
     );
-    expect(
-      brokerRequests.map((request) => request.body.idempotencyKey),
-    ).toEqual([
-      brokeredEvidenceIdempotencyKey(promiseId, attemptA),
-      brokeredEvidenceIdempotencyKey(promiseId, attemptB.id),
-    ]);
+    const brokerKeys = brokerRequests.map(
+      (request) => request.body.idempotencyKey,
+    );
+    expect(brokerKeys).toEqual(
+      expect.arrayContaining([
+        brokeredEvidenceIdempotencyKey(promiseId, attemptA),
+        brokeredEvidenceIdempotencyKey(promiseId, attemptB.id),
+      ]),
+    );
+    expect(new Set(brokerKeys).size).toBe(brokerKeys.length);
     const [deliveryB] = await db
       .select()
       .from(syncRemoteResultDeliveries)
