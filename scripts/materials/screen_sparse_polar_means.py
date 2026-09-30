@@ -16,7 +16,7 @@ from scripts.materials.validate_history_transfer import pinned_json
 from scripts.materials.validate_polar_uncertainty import write_result
 
 
-CANDIDATES = ("unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor")
+CANDIDATES = ("unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor", "grouped_reversal_floor")
 MODEL_TAIL_PROBABILITY = 0.01
 CONFLICT_CUTOFF = 1 + 2 * math.sqrt(-math.log(MODEL_TAIL_PROBABILITY)) - 2 * math.log(MODEL_TAIL_PROBABILITY)
 SG_SHA256 = "06da59e93dbb969b3dcc1091c486d19aed176fd634c3a74f44c77c5464417654"
@@ -48,11 +48,20 @@ def candidate_fit(prior, observations, policy, candidate):
     cutoff = CONFLICT_CUTOFF if "conservative" in candidate else 1.0
     methods = {row.method for row in observations if row.eligible}
     scores = {}
+    grouped = grouped_conflict_diagnostics(prior, observations, policy)
+    grouped_factors = {}
+    if candidate == "grouped_reversal_floor":
+        for method in methods:
+            reversals = [row for row in grouped["reversals"] if row["method"] == method and row["reversal"]]
+            groups = [row for row in grouped["groups"] if row["method"] == method]
+            grouped_factors[method] = 16.0 * max([row["related_window_count"] // 2 for row in reversals] or [0])
     for method in methods:
         diagnostic = fit_progressive_polar(prior, [row for row in observations if row.method == method], policy) \
             if candidate == "method_conservative_floor" else baseline
         scores[method] = [row["disagreement_variance_multiplier"] for row in diagnostic["diagnostics"]]
-    multipliers = {method: np.ones(3) if candidate == "method_floor" else np.maximum(np.asarray(score)/cutoff-1,0)
+    multipliers = {method: (np.full(3, grouped_factors.get(method, 0.0)) if candidate == "grouped_reversal_floor"
+                            else np.ones(3) if candidate == "method_floor"
+                            else np.maximum(np.asarray(score)/cutoff-1,0))
                    for method, score in scores.items()}
     changed = []
     for observation in observations:
@@ -75,7 +84,8 @@ def candidate_fit(prior, observations, policy, candidate):
     result["research_only"] = {"candidate": candidate, "not_production_policy": True,
                                "original_observations_sha256": identity([row.__dict__ for row in observations]),
                                "added_variance_multipliers": {method: value.tolist() for method,value in multipliers.items()},
-                               "disagreement_scores_before": scores, "model_cutoff": cutoff,
+                               "disagreement_scores_before": scores, "grouped_conflicts": grouped,
+                               "model_cutoff": cutoff,
                                "tail_probability_per_method_coefficient": MODEL_TAIL_PROBABILITY if "conservative" in candidate else None}
     result["research_only"]["grouped_conflicts"] = grouped_conflict_diagnostics(prior, observations, policy)
     return result
@@ -116,6 +126,7 @@ def grouped_conflict_diagnostics(prior, observations, policy):
             "group_error_transformed": group_error.tolist(),
             "standardized_residual": standardized.tolist(),
             "group_squared_score": float(np.mean(standardized ** 2)),
+            "cl_value": float(np.mean(values[:, 0])),
         })
     reversals = []
     for method in sorted({row["method"] for row in diagnostics}):
@@ -130,13 +141,18 @@ def grouped_conflict_diagnostics(prior, observations, policy):
         prior_left = float(np.interp(left["alpha_center"], prior_angles, prior_values[:, 0]))
         prior_right = float(np.interp(right["alpha_center"], prior_angles, prior_values[:, 0]))
         prior_delta = prior_right - prior_left
+        cl_values = [row["cl_value"] for row in method_groups]
+        peak_index = int(np.argmax(cl_values))
+        stall_like = (len(method_groups) >= 3 and 0 < peak_index < len(method_groups)-1
+                      and cl_values[peak_index] - cl_values[-1] > 0.05)
         reversals.append({
             "method": method,
             "left_lineage_id": left["lineage_id"],
             "right_lineage_id": right["lineage_id"],
             "observed_cl_delta": float(observed_delta),
             "prior_cl_delta": prior_delta,
-            "reversal": bool(prior_delta * observed_delta < 0 and abs(observed_delta) > 0.1),
+            "reversal": bool(prior_delta * observed_delta < 0 and abs(observed_delta) > 0.1 and not stall_like),
+            "stall_like": stall_like,
             "related_window_count": left["window_count"] + right["window_count"],
         })
     return {"groups": diagnostics, "reversals": reversals,

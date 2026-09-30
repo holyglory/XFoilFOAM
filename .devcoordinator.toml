@@ -86,8 +86,15 @@ command = [".venv/bin/python", "-m", "pytest", "tests/test_history_bias_calibrat
 name = "frozen-screening"
 tier = "development"
 requires = ["research-contracts"]
-command = [".venv/bin/python", "-m", "scripts.materials.screen_sparse_polar_means", "--sg6051", ".codex-artifacts/sg6051-polar-diagnosis-20260930/model.json", "--native", ".codex-artifacts/numerics2-native-sg6051-20260930/report.json", "--cohort", ".codex-artifacts/history-population-20260919/cohort.json", "--producing-api", ".codex-artifacts/production-engine-383b2fc/src/airfoilfoam/api/predictions.py", "--destination", ".codex-artifacts/sparse-mean-study-20260930-r9"]
-retained_artifacts = [{ name = "sparse-mean-screening", path = ".codex-artifacts/sparse-mean-study-20260930-r9", max_bytes = 16777216 }]
+command = [".venv/bin/python", "-m", "scripts.materials.screen_sparse_polar_means", "--sg6051", ".codex-artifacts/sg6051-polar-diagnosis-20260930/model.json", "--native", ".codex-artifacts/numerics2-native-sg6051-20260930/report.json", "--cohort", ".codex-artifacts/history-population-20260919/cohort.json", "--producing-api", ".codex-artifacts/production-engine-383b2fc/src/airfoilfoam/api/predictions.py", "--destination", ".codex-artifacts/sparse-mean-study-20260930-r13"]
+retained_artifacts = [{ name = "sparse-mean-screening", path = ".codex-artifacts/sparse-mean-study-20260930-r13", max_bytes = 16777216 }]
+
+[[test.sparse-mean-study.check]]
+name = "independent-cohort-screening"
+tier = "development"
+requires = ["research-contracts"]
+command = [".venv/bin/python", "-m", "scripts.materials.validate_grouped_history_cohort", "--fit", ".codex-artifacts/independent-history-cohort-20260920/fit.json", "--calibration", ".codex-artifacts/independent-history-cohort-20260920/calibration.json", "--heldout", ".codex-artifacts/independent-history-cohort-20260920/heldout.json", "--destination", ".codex-artifacts/grouped-history-cohort-study-20260930-r4"]
+retained_artifacts = [{ name = "grouped-history-cohort", path = ".codex-artifacts/grouped-history-cohort-study-20260930-r4", max_bytes = 67108864 }]
 
 [test.source-numerics-adoption]
 timeout_seconds = 1800

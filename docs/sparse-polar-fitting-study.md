@@ -99,3 +99,11 @@ counterfactual it flags a reversal even though each anchor is a separate
 lineage; in the repeated-window control it shows the two four-window lineages
 as related groups. That distinction is the required input to the next grouped
 covariance candidate.
+
+The prespecified independent split was also screened without selecting on its
+held-out errors: 12 fit, 20 calibration, and 20 held-out profiles, excluding
+the original eight-profile pilot. The grouped reversal candidate produced the
+same held-out mean absolute errors as the unchanged estimator (`Cl 0.111102`,
+`Cd 0.024698`, `Cm 0.028845` in the retained report). It is therefore a
+targeted protection for detected reversal patterns, not a generally better
+estimator, and remains offline and unvalidated.

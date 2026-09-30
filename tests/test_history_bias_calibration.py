@@ -14,7 +14,7 @@ from scripts.materials.screen_sparse_polar_means import candidate_fit, measure_c
 from test_progressive_polar import prior, policy
 
 
-@pytest.mark.parametrize("candidate", ["unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor"])
+@pytest.mark.parametrize("candidate", ["unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor", "grouped_reversal_floor"])
 def test_sparse_mean_candidate_preserves_sources_and_excludes_reference_lineage(tmp_path, candidate):
     path, _ = fixture_source(tmp_path)
     source, request, replayed = replay_source(path, hashlib.sha256(path.read_bytes()).hexdigest())
@@ -123,6 +123,24 @@ def test_grouped_diagnostic_exposes_related_windows_without_dropping_them():
     assert diagnostic["reversals"][0]["related_window_count"] == 8
     assert diagnostic["interpretation"].endswith("not_independent_confirmations")
     assert len(rows) == 8
+
+
+def test_grouped_reversal_candidate_handles_shared_bad_anchors_but_not_stall_controls():
+    rows = [replace(observation(f"{alpha}-{window}", alpha=alpha, cl=cl),
+                    lineage_id=f"lineage-{alpha}", window=(float(window), float(window + 1)))
+            for alpha, cl in [(-2, 1.5), (2, -0.3)] for window in range(4)]
+    guarded = candidate_fit(prior(), rows, policy(), "grouped_reversal_floor")
+    coefficients = np.asarray(guarded["curves"]["composite"]["coefficients"])
+    assert np.interp(4, prior().alpha, coefficients[:, 0]) > np.interp(0, prior().alpha, coefficients[:, 0])
+    expanded = replace(prior(), alpha=list(range(-5, 21)),
+                       coefficients=[[0.333 + 0.105 * min(angle, 12) - 0.06 * max(angle - 12, 0), 0.02, -0.03]
+                                     for angle in range(-5, 21)],
+                       standard_deviation=[[0.3, 0.02, 0.1] for _ in range(26)])
+    controls = manufactured_controls(expanded, policy())
+    stall = [row for row in controls if row["fixture"] == "earlier_stall" and row["candidate"] == "grouped_reversal_floor"]
+    unchanged = [row for row in controls if row["fixture"] == "earlier_stall" and row["candidate"] == "unchanged"]
+    assert stall and unchanged
+    assert stall[0]["candidate_cl_rmse"] == pytest.approx(unchanged[0]["candidate_cl_rmse"], abs=1e-12)
 
 
 def test_uncertified_bias_adds_transformed_variance_without_changing_values():
