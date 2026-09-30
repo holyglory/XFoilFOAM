@@ -1122,10 +1122,31 @@ async function seedMirroredPromise(label: string, aoas: number[], id?: string) {
   const [settings] = await db
     .select({
       remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+      instanceId: syncApiSettings.instanceId,
+      instanceName: syncApiSettings.instanceName,
     })
     .from(syncApiSettings)
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
+  if (
+    !settings?.remoteSolverRegisteredId ||
+    !settings.instanceId ||
+    !settings.instanceName
+  )
+    throw new Error(
+      "A mirrored promise fixture requires its registered worker identity",
+    );
+  await db
+    .insert(registeredRemoteSolvers)
+    .values({
+      id: settings.remoteSolverRegisteredId,
+      instanceId: settings.instanceId,
+      instanceName: settings.instanceName,
+      cpuCapacity: 2,
+      cpuBudget: 2,
+      maxActivePolarPromises: 3,
+    })
+    .onConflictDoNothing();
   const [promise] = await db
     .insert(syncSweepPromises)
     .values({
