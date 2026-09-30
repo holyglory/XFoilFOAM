@@ -108,6 +108,19 @@ export interface ProgressivePolarEstimate {
     coefficient: string;
     disagreement_variance_multiplier: number;
   }>;
+  publication?: {
+    primary_method:
+      | "neuralfoil"
+      | "openfoam_fast"
+      | "openfoam_precise"
+      | "composite";
+    status: "preliminary";
+    reason: string | null;
+    matched_full_polar_reference: boolean;
+    angle_scope?: [number, number];
+    prior_trend_cl?: number;
+    observed_trend_cl?: number;
+  };
   conflict_diagnostics?: ProgressivePolarConflictDiagnostics;
   acquisition: {
     version: "fixed-posterior-coverage-v1";

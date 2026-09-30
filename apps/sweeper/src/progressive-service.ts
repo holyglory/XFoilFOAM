@@ -83,6 +83,7 @@ export async function runProgressiveBaselineService(
           const invalidated = await invalidateProgressiveFitPolicy(
             db,
             PROGRESSIVE_FIT_POLICY_ID,
+            { preserveCurrent: false },
           );
           policyReconciled = true;
           if (invalidated)

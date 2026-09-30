@@ -232,6 +232,35 @@ def _acquisition_reduction(angles, current_variance, posterior_cross, candidate_
     return np.clip(covariance, 0, 1), np.clip(coverage, 0, 1)
 
 
+def _sparse_low_angle_conflict(prior_angles, prior_mean, observations):
+    if not observations or any(row.method == "openfoam_precise" for row in observations):
+        return None
+    groups: dict[float, list[float]] = {}
+    for row in observations:
+        if -5 <= row.alpha <= 10:
+            groups.setdefault(float(row.alpha), []).append(float(row.coefficients[0]))
+    if len(groups) < 2:
+        return None
+    low, high = min(groups), max(groups)
+    if high - low < 2:
+        return None
+    prior_trend = float(np.interp(high, prior_angles, prior_mean[:, 0]) -
+                        np.interp(low, prior_angles, prior_mean[:, 0]))
+    observed_trend = float(np.median(groups[high]) - np.median(groups[low]))
+    if (abs(prior_trend) < 0.2 or abs(observed_trend) < 0.2 or
+            prior_trend * observed_trend >= 0):
+        return None
+    return {
+        "primary_method": "neuralfoil",
+        "status": "preliminary",
+        "reason": "conflicting_sparse_fast_cfd_trend",
+        "matched_full_polar_reference": False,
+        "angle_scope": [low, high],
+        "prior_trend_cl": prior_trend,
+        "observed_trend_cl": observed_trend,
+    }
+
+
 def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation], policy: PolarModelPolicy) -> dict:
     angles, coefficients, uncertainty, eligible, excluded = _validate(prior, observations, policy)
     prior_mean, prior_std = _transformed(coefficients, uncertainty)
@@ -353,9 +382,34 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
             raise ValueError("Posterior is not finite; no publishable estimate")
         curves[method] = {"coefficients": central.tolist(), "lower": lower.tolist(), "upper": upper.tolist()}
     methods_present = {row.method for row in eligible}
+    publication = {
+        "primary_method": "composite" if eligible else "neuralfoil",
+        "status": "preliminary",
+        "reason": None,
+        "matched_full_polar_reference": False,
+    }
+    sparse_conflict = _sparse_low_angle_conflict(angles, prior_mean, eligible)
+    if sparse_conflict is not None:
+        publication.update(sparse_conflict)
+        fallback = {
+            "coefficients": prior_mean.copy(),
+            "lower": prior_mean - 1.96 * prior_std,
+            "upper": prior_mean + 1.96 * prior_std,
+        }
+        for values in (fallback["coefficients"], fallback["lower"], fallback["upper"]):
+            values[:, 1] = np.exp(values[:, 1])
+        curves["composite"] = {
+            "coefficients": fallback["coefficients"].tolist(),
+            "lower": fallback["lower"].tolist(),
+            "upper": fallback["upper"].tolist(),
+        }
     best_method = ("openfoam_precise" if "openfoam_precise" in methods_present
                    else "openfoam_fast" if methods_present else "neuralfoil")
+    if sparse_conflict is not None:
+        best_method = "neuralfoil"
     displayed_curves = {"composite": curves["openfoam_precise"]}
+    if sparse_conflict is not None:
+        displayed_curves["composite"] = curves["composite"]
     for method in methods_present:
         displayed_curves[method] = curves[method]
     result = {
@@ -365,6 +419,7 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
         "calibration_status": policy.calibration_status, "validation_id": policy.validation_id,
         "interval": {"probability": 0.95, "interpretation": "conditional_model_uncertainty"},
         "curves": displayed_curves, "best_method": best_method,
+        "publication": publication,
         "contributors": [{"observation_id": row.observation_id, "result_id": row.result_id,
                           "attempt_id": row.attempt_id, "method": row.method, "window": row.window,
                           "numerical_convergence": row.numerical_convergence,

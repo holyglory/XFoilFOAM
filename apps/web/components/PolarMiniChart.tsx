@@ -9,6 +9,7 @@ export function PolarMiniChart({
   color?: string;
 }) {
   const curve =
+    series?.curves.find((item) => item.method === series.primaryMethod) ??
     series?.curves.find((item) => item.method === "composite") ??
     series?.curves.find((item) => item.method === "neuralfoil");
   if (!curve || curve.samples.length < 2)

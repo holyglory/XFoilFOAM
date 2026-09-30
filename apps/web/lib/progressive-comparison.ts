@@ -64,6 +64,7 @@ export function progressiveComparisonCurve(
   if (matching.length !== 1) return null;
   const series = matching[0];
   const curve =
+    series.curves.find((candidate) => candidate.method === series.primaryMethod) ??
     series.curves.find((candidate) => candidate.method === "composite") ??
     series.curves.find(
       (candidate) => candidate.method === "openfoam_precise",

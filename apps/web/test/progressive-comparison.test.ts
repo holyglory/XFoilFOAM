@@ -76,6 +76,17 @@ describe("progressive comparison read model", () => {
     expect(selected.series.modelId).toBe(cached.modelId);
   });
 
+  it("uses the declared NeuralFoil primary when sparse CFD is withheld", () => {
+    const cached = series("fallback", "composite");
+    cached.primaryMethod = "neuralfoil";
+    cached.curves.unshift(series("fallback").curves[0]);
+    const selected = progressiveComparisonCurve(
+      profile("first", [cached]),
+      "fallback",
+    )!;
+    expect(selected.curve.method).toBe("neuralfoil");
+  });
+
   it("does not silently choose between competing geometry targets for one profile", () => {
     const original = series("same");
     const changed = { ...series("same"), targetId: "another-geometry" };

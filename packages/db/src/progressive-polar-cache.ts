@@ -149,14 +149,15 @@ async function sourceForPrediction(
 export async function invalidateProgressiveFitPolicy(
   db: DB,
   policyId: string,
+  options: { preserveCurrent?: boolean } = {},
 ): Promise<number> {
   if (!policyId.trim())
     throw new Error("A fit policy must have a stable identity");
   const updated = await db.execute(sql`
     UPDATE progressive_polar_fit_work work SET source_version = work.source_version + 1,
       state = 'pending', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-      policy_refresh_model_id = CASE WHEN verification.source_geometry_compatible THEN model.id ELSE NULL END,
-      policy_refresh_policy_id = CASE WHEN verification.source_geometry_compatible THEN ${policyId} ELSE NULL END,
+      policy_refresh_model_id = CASE WHEN ${options.preserveCurrent ?? true} AND verification.source_geometry_compatible THEN model.id ELSE NULL END,
+      policy_refresh_policy_id = CASE WHEN ${options.preserveCurrent ?? true} AND verification.source_geometry_compatible THEN ${policyId} ELSE NULL END,
       model_id = NULL,
       attempts = 0, error = NULL, updated_at = clock_timestamp()
     FROM progressive_polar_models model
@@ -537,8 +538,13 @@ function validateFitOutput(
     : methods.has("openfoam_fast")
       ? "openfoam_fast"
       : "neuralfoil";
+  const neuralfoilFallback =
+    estimate.publication?.primary_method === "neuralfoil" &&
+    estimate.publication.status === "preliminary" &&
+    estimate.publication.reason === "conflicting_sparse_fast_cfd_trend" &&
+    estimate.publication.matched_full_polar_reference === false;
   if (
-    estimate.best_method !== best ||
+    (estimate.best_method !== best && !neuralfoilFallback) ||
     !estimate.curves.composite ||
     !sameJson(
       Object.keys(estimate.curves).sort(),

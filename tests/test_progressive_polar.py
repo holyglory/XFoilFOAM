@@ -93,6 +93,18 @@ def test_two_distinct_anchors_also_adjust_slope():
     assert corrected[-1, 0] - corrected[0, 0] > 0.9
 
 
+def test_reversed_sparse_fast_anchors_keep_neuralfoil_primary_until_full_reference():
+    rows = [observation("wrong-left", -2, 1.5), observation("wrong-right", 2, -0.3)]
+    fitted = fit_progressive_polar(prior(), rows, policy())
+    assert fitted["best_method"] == "neuralfoil"
+    assert fitted["publication"]["primary_method"] == "neuralfoil"
+    assert fitted["publication"]["reason"] == "conflicting_sparse_fast_cfd_trend"
+    np.testing.assert_allclose(
+        fitted["curves"]["composite"]["coefficients"], prior().coefficients,
+    )
+    assert fitted["curves"]["openfoam_fast"]["coefficients"][0][0] > 1
+
+
 def test_precise_observation_does_not_relabel_fast_evidence():
     rows = [observation("fast", cl=0.25), observation("precise", cl=0.4, method="openfoam_precise")]
     fitted = fit_progressive_polar(prior(), rows, policy())

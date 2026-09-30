@@ -36,6 +36,45 @@ type ProgressivePublicRecord = {
   };
 };
 
+function trend(samples: Array<{ alpha: number; cl: number }>): number | null {
+  const scoped = samples.filter((sample) => sample.alpha >= -5 && sample.alpha <= 10);
+  if (scoped.length < 2) return null;
+  return scoped.at(-1)!.cl - scoped[0].cl;
+}
+
+function primaryMethod(record: ProgressivePublicRecord):
+  | "neuralfoil"
+  | "openfoam_fast"
+  | "openfoam_precise"
+  | "composite" {
+  const declared = record.estimate?.publication?.primary_method;
+  if (declared) return declared;
+  const contributors = record.estimate?.contributors ?? [];
+  if (contributors.length && contributors.every((row) => row.method === "openfoam_fast")) {
+    const neuralfoil = record.payload.alpha.map((alpha, index) => ({
+      alpha,
+      cl: record.payload.coefficients[index][0],
+    }));
+    const composite = record.estimate
+      ? record.estimate.alpha.map((alpha, index) => ({
+          alpha,
+          cl: record.estimate!.curves.composite.coefficients[index][0],
+        }))
+      : [];
+    const priorTrend = trend(neuralfoil);
+    const fittedTrend = trend(composite);
+    if (
+      priorTrend !== null &&
+      fittedTrend !== null &&
+      Math.abs(priorTrend) >= 0.2 &&
+      Math.abs(fittedTrend) >= 0.2 &&
+      priorTrend * fittedTrend < 0
+    )
+      return "neuralfoil";
+  }
+  return record.estimate ? "composite" : "neuralfoil";
+}
+
 function neuralfoilCurve(
   record: ProgressivePublicRecord,
 ): ProgressivePolarSeries["curves"][number] {
@@ -53,15 +92,16 @@ function neuralfoilCurve(
 function progressiveCurves(
   record: ProgressivePublicRecord,
   compact: boolean,
+  selectedMethod: ReturnType<typeof primaryMethod>,
 ): ProgressivePolarSeries["curves"] {
   const neuralfoil = neuralfoilCurve(record);
   if (compact) {
-    const method = record.estimate
-      ? (["composite", "openfoam_precise", "openfoam_fast"] as const).find(
+    const method = record.estimate && selectedMethod !== "neuralfoil"
+      ? ([selectedMethod, "composite", "openfoam_precise", "openfoam_fast"] as const).find(
           (candidate) => record.estimate?.curves[candidate] != null,
         )
       : undefined;
-    if (!method || !record.estimate) return [neuralfoil];
+    if (selectedMethod === "neuralfoil" || !method || !record.estimate) return [neuralfoil];
     const curve = record.estimate.curves[method]!;
     return [
       curveWithMetrics({
@@ -109,6 +149,7 @@ function progressiveCurves(
 function progressiveExplanation(
   record: ProgressivePublicRecord,
   compact: boolean,
+  selectedMethod: ReturnType<typeof primaryMethod>,
 ): ProgressivePolarSeries["explanation"] {
   const explanation: ProgressivePolarSeries["explanation"] = {
     calibration: record.estimate?.calibration_status ?? "unvalidated",
@@ -121,6 +162,12 @@ function progressiveExplanation(
     },
     geometryRms: record.payload.geometry_fit.rms_chord,
     geometryMaximumError: record.payload.geometry_fit.maximum_chord,
+    primaryMethod: selectedMethod,
+    publicationReason:
+      record.estimate?.publication?.reason ??
+      (selectedMethod === "neuralfoil" && record.estimate
+        ? "conflicting_sparse_fast_cfd_trend"
+        : null),
   };
   if (compact || !record.estimate) return explanation;
   return {
@@ -175,7 +222,9 @@ export async function publicProgressivePolars(
   `)) as unknown as ProgressivePublicRecord[];
   return records
     .map(
-      (record): ProgressivePolarSeries => ({
+      (record): ProgressivePolarSeries => {
+        const selectedMethod = primaryMethod(record);
+        return {
         targetId: record.target_id,
         conditionKey: progressiveComparisonConditionKey(record.physical),
         condition: describeCondition(record.physical),
@@ -187,9 +236,11 @@ export async function publicProgressivePolars(
         updatedAt: new Date(
           record.model_created_at ?? record.created_at,
         ).toISOString(),
-        curves: progressiveCurves(record, compact),
-        explanation: progressiveExplanation(record, compact),
-      }),
+        primaryMethod: selectedMethod,
+        curves: progressiveCurves(record, compact, selectedMethod),
+        explanation: progressiveExplanation(record, compact, selectedMethod),
+      };
+      },
     )
     .sort(
       (left, right) =>

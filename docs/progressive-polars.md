@@ -518,6 +518,13 @@ offset; two distinct angles support a slope correction; further points support
 local changes. Drag is modeled in log space. Unsupported regions remain uncertain;
 contradictions increase uncertainty rather than forcing an apparently exact fit.
 
+When sparse fast-only anchors reverse the NeuralFoil low-angle lift trend, the
+fit remains stored for method comparison but the public primary curve stays on
+NeuralFoil. The publication state records the conflict and keeps the curve
+preliminary until a matched full-polar reference is supplied; a precise anchor
+or a source-preserving full-polar reference can replace that fallback through a
+new fit generation.
+
 Multiple real URANS histories across angles contribute jointly through disjoint
 physical-time blocks. Weight irregular samples by elapsed time; account for
 temporal correlation, drift and shared continuation lineage. More saved frames do

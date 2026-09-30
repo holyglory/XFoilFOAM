@@ -288,6 +288,11 @@ export interface ProgressivePolarSeries {
   mach: number;
   branch: string;
   updatedAt: string;
+  primaryMethod?:
+    | "neuralfoil"
+    | "openfoam_fast"
+    | "openfoam_precise"
+    | "composite";
   curves: Array<{
     method: "neuralfoil" | "openfoam_fast" | "openfoam_precise" | "composite";
     metrics:
@@ -320,6 +325,12 @@ export interface ProgressivePolarSeries {
       statisticalCertification: string;
     }>;
     exclusions?: Array<{ observationId: string; reason: string }>;
+    primaryMethod?:
+      | "neuralfoil"
+      | "openfoam_fast"
+      | "openfoam_precise"
+      | "composite";
+    publicationReason?: string | null;
   };
 }
 
