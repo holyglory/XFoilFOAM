@@ -293,7 +293,7 @@ export async function adoptProgressiveNumerics2(
           AND stopped.engine_job_id=job.engine_job_id AND stopped.epoch_id=${epoch.id}::uuid
         WHERE ${options.deferStoppedArchives === true} AND job.campaign_id=${campaignId}::uuid
           AND job.solver_implementation_id=${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid
-          AND job.status='ingesting' AND job.engine_state IN ('completed','failed','cancelled')
+          AND job.status IN ('ingesting','cancelled') AND job.engine_state IN ('completed','failed','cancelled')
           AND coalesce(job.ingest_lease_expires_at<=clock_timestamp(),true)
           AND job.engine_job_id=job.id::text
           AND job.request_payload->'engineRequest'=dispatch.envelope->'request'

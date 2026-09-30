@@ -3107,7 +3107,7 @@ describe("progressive CPU admission", () => {
     },
   );
 
-  it("numerical revision transition hands off only stopped remote archives and retains evidence through settlement", async () => {
+  it.each(["ingesting", "cancelled"])("numerical revision transition hands off only stopped remote archives (%s) and retains evidence through settlement", async (status) => {
     await ready(async (scope) => {
       const leases = await claimProgressiveCfdBatch(db, {
         owner: "numerics-archive-handoff-fixture",
@@ -3178,6 +3178,8 @@ describe("progressive CPU admission", () => {
           adoptProgressiveNumerics2(db, scope.campaignId, plan, handoff),
         ).rejects.toThrow("physically stopped and settled");
         await applyProgressiveRemoteProgress(db, job.id);
+        if (status === "cancelled")
+          await db.execute(sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${job.id}::uuid`);
         await expect(
           adoptProgressiveNumerics2(db, scope.campaignId, plan),
         ).rejects.toThrow("physically stopped and settled");
