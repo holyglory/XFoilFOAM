@@ -311,6 +311,7 @@ interface RemotePromiseWorkState {
   busy: boolean;
   completed: boolean;
   terminal: boolean;
+  terminalLocalEvidence: boolean;
   activePointCount: number;
 }
 
@@ -1341,6 +1342,7 @@ async function remotePromiseWorkState(
   let busy = false;
   let completed = false;
   let terminal = false;
+  let terminalLocalEvidence = false;
   for (const row of activeRows) {
     // A physical preliminary obligation is the scheduling authority for this
     // natural cell. Never downgrade it back into a mirrored wave-1 RANS shell;
@@ -1414,6 +1416,12 @@ async function remotePromiseWorkState(
       completed = true;
       continue;
     }
+    if (
+      row.resultId &&
+      ["failed", "cancelled"].includes(row.resultStatus ?? "")
+    ) {
+      terminalLocalEvidence = true;
+    }
     terminal = true;
   }
   return {
@@ -1425,6 +1433,7 @@ async function remotePromiseWorkState(
     busy,
     completed,
     terminal,
+    terminalLocalEvidence,
     activePointCount: activeRows.length,
   };
 }
@@ -2475,6 +2484,10 @@ async function submitMirroredRemotePromise(
     return { kind: "busy" };
   }
   if (composition.kind === "terminal") {
+    if (composition.state.terminalLocalEvidence) {
+      await setStatus(db, "solving", null);
+      return { kind: "busy" };
+    }
     const error = `remote promise ${promiseId} has no retryable claimed cells`;
     await cancelMirroredRemotePromise(
       db,
