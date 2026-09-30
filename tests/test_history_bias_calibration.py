@@ -10,6 +10,107 @@ from test_progressive_polar import observation
 from scripts.materials.calibrate_history_bias import bias_observation, curve_measurement, measure_profile
 from scripts.materials import calibrate_history_bias as calibration
 from scripts.materials.measure_retained_polar import replay_source
+from scripts.materials.screen_sparse_polar_means import candidate_fit, measure_candidate_profile, verify_replay, producing_request_signature, manufactured_controls, assess_candidates, CANDIDATES, CONFLICT_CUTOFF
+from test_progressive_polar import prior, policy
+
+
+@pytest.mark.parametrize("candidate", ["unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor"])
+def test_sparse_mean_candidate_preserves_sources_and_excludes_reference_lineage(tmp_path, candidate):
+    path, _ = fixture_source(tmp_path)
+    source, request, replayed = replay_source(path, hashlib.sha256(path.read_bytes()).hexdigest())
+    original = request.model_dump_json()
+    measured = measure_candidate_profile(source, request, candidate)
+    assert measured["references"]
+    for reference in measured["references"]:
+        assert all(row["attempt_id"] != reference["reference_attempt_id"] for row in reference["contributors"])
+    assert request.model_dump_json() == original
+    assert verify_replay(replayed, source["model"]["response"])["passed"]
+    changed = json.loads(json.dumps(replayed))
+    changed["estimate"]["curves"]["composite"]["coefficients"][0][0] += 1e-6
+    assert not verify_replay(changed, source["model"]["response"])["passed"]
+
+
+def test_sparse_mean_screening_is_not_a_new_production_policy_or_evidence_label():
+    row = observation("left", -2, 1.5)
+    second = observation("right", 2, -0.3)
+    original = json.dumps([row.__dict__, second.__dict__], sort_keys=True)
+    for candidate in ("method_floor", "disagreement_floor"):
+        estimate = candidate_fit(prior(), [row, second], policy(), candidate)
+        assert estimate["research_only"]["not_production_policy"] is True
+        assert estimate["calibration_status"] == "unvalidated"
+        assert [item["attempt_id"] for item in estimate["contributors"]] == [row.attempt_id, second.attempt_id]
+        assert json.dumps([row.__dict__, second.__dict__], sort_keys=True) == original
+    rejected = replace(row, eligible=False, exclusion_reason="diagnosed bad source")
+    estimate = candidate_fit(prior(), [rejected], policy(), "disagreement_floor")
+    assert estimate["contributors"] == []
+    assert estimate["excluded"] == [{"observation_id":row.observation_id,"reason":"diagnosed bad source"}]
+    np.testing.assert_allclose(estimate["curves"]["composite"]["coefficients"],prior().coefficients)
+    with pytest.raises(ValueError, match="Unknown frozen"):
+        candidate_fit(prior(), [row], policy(), "unfrozen")
+
+
+def test_producer_replay_distinguishes_numeric_json_normalization_from_unknown_transport(tmp_path):
+    path, _ = fixture_source(tmp_path)
+    source, request, replayed = replay_source(path, hashlib.sha256(path.read_bytes()).hexdigest())
+    stored = json.loads(json.dumps(replayed))
+    stored["estimate"]["alpha"] = [int(value) for value in stored["estimate"]["alpha"]]
+    assert verify_replay(replayed, stored)["passed"]
+    stored["request_signature"] = "a" * 64
+    assert not verify_replay(replayed, stored)["passed"]
+    assert not verify_replay(replayed, stored, "b" * 64)["passed"]
+    invalid_source = tmp_path / "unrecognized-producing-api.py"
+    invalid_source.write_text("unrecognized producer")
+    with pytest.raises(ValueError, match="producing API source changed"):
+        producing_request_signature(request, invalid_source)
+
+
+def test_conservative_candidate_influence_falls_for_increasing_isolated_outliers():
+    shifts = []
+    for magnitude in (30, 300, 3000):
+        estimate = candidate_fit(prior(), [observation("extreme", cl=magnitude)], policy(), "method_conservative_floor")
+        shifts.append(max(abs(row[0]-base[0]) for row,base in zip(estimate["curves"]["composite"]["coefficients"],prior().coefficients)))
+    assert shifts[0] > shifts[1] > shifts[2]
+    assert shifts[-1] < 0.001
+
+
+def test_method_scoped_conflict_preserves_a_coherent_precise_correction():
+    rows = [observation("fast-left", -2, 3), observation("fast-right", 2, -3),
+            observation("precise-left", -2, 0, method="openfoam_precise"),
+            observation("precise-right", 2, 0.4, method="openfoam_precise")]
+    estimate = candidate_fit(prior(), rows, policy(), "method_conservative_floor")
+    precise = candidate_fit(prior(), rows[2:], policy(), "unchanged")
+    np.testing.assert_allclose(estimate["curves"]["composite"]["coefficients"], precise["curves"]["composite"]["coefficients"], atol=0.02)
+    assert estimate["curves"]["composite"]["coefficients"][2][0] > 0.15
+    assert estimate["research_only"]["added_variance_multipliers"]["openfoam_precise"] == [0,0,0]
+
+
+def test_conservative_guard_does_not_suppress_manufactured_camber_slope_or_stall():
+    angles=list(range(-5,21))
+    reference=replace(prior(),alpha=angles,
+        coefficients=[[0.333+0.105*min(angle,12)-0.06*max(angle-12,0),0.02,-0.03] for angle in angles],
+        standard_deviation=[[0.3,0.02,0.1] for _ in angles])
+    controls=manufactured_controls(reference,policy())
+    for name in ("camber_offset","slope_change","earlier_stall","large_coherent_offset"):
+        unchanged=next(row for row in controls if row["fixture"]==name and row["candidate"]=="unchanged")
+        guarded=next(row for row in controls if row["fixture"]==name and row["candidate"]=="method_conservative_floor")
+        assert guarded["candidate_cl_rmse"] == pytest.approx(unchanged["candidate_cl_rmse"],abs=1e-12)
+    diagnostics={"original_bad_mesh_counterfactual":{candidate:{"cl_zero":0,"cl_five":1} for candidate in CANDIDATES}}
+    verdict=assess_candidates(diagnostics,controls)["method_conservative_floor"]
+    assert verdict["checks"]["severe_sparse_reversal"] is True
+    assert verdict["checks"]["repeated_bad_lineage"] is False
+    assert verdict["passes_required_controls"] is False
+    assert verdict["production_ready"] is False
+
+
+@pytest.mark.parametrize("count",[1,2,8])
+@pytest.mark.parametrize("correlation",[0,0.8,0.99])
+def test_model_tail_threshold_is_conservative_for_correlated_gaussian_controls(count,correlation):
+    random=np.random.default_rng(74301)
+    shared=random.normal(size=(50000,1))
+    independent=random.normal(size=(50000,count))
+    samples=np.sqrt(correlation)*shared+np.sqrt(1-correlation)*independent
+    scores=np.mean(samples**2,axis=1)
+    assert np.mean(scores>CONFLICT_CUTOFF)<0.01
 
 
 def test_uncertified_bias_adds_transformed_variance_without_changing_values():

@@ -74,6 +74,21 @@ timeout_seconds = 900
 [test.source-numerics-identity]
 timeout_seconds = 1800
 
+[test.sparse-mean-study]
+timeout_seconds = 900
+
+[[test.sparse-mean-study.check]]
+name = "research-contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_history_bias_calibration.py", "tests/test_retained_polar_measurement.py", "tests/test_retained_polar_cohort.py", "-q"]
+
+[[test.sparse-mean-study.check]]
+name = "frozen-screening"
+tier = "development"
+requires = ["research-contracts"]
+command = [".venv/bin/python", "-m", "scripts.materials.screen_sparse_polar_means", "--sg6051", ".codex-artifacts/sg6051-polar-diagnosis-20260930/model.json", "--native", ".codex-artifacts/numerics2-native-sg6051-20260930/report.json", "--cohort", ".codex-artifacts/history-population-20260919/cohort.json", "--producing-api", ".codex-artifacts/production-engine-383b2fc/src/airfoilfoam/api/predictions.py", "--destination", ".codex-artifacts/sparse-mean-study-20260930-r8"]
+retained_artifacts = [{ name = "sparse-mean-screening", path = ".codex-artifacts/sparse-mean-study-20260930-r8", max_bytes = 16777216 }]
+
 [test.source-numerics-adoption]
 timeout_seconds = 1800
 
