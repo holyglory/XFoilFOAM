@@ -1,5 +1,23 @@
 schema = 2
 
+[test.mach3-cartesian-diagnosis]
+timeout_seconds = 300
+
+[[test.mach3-cartesian-diagnosis.check]]
+name = "retained-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-cartesian-diagnosis-20260930"]
+retained_artifacts = [{ name = "cartesian-startup-fields", path = ".codex-artifacts/mach3-cartesian-diagnosis-20260930", max_bytes = 536870912 }]
+
+[test.mach3-startup-controls]
+timeout_seconds = 300
+
+[[test.mach3-startup-controls.check]]
+name = "thermal-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-startup-controls-20260930", "--groups", "mach3-small-step", "mach3-first-order", "mach3-limited-correction", "--thermal-only"]
+retained_artifacts = [{ name = "startup-control-fields", path = ".codex-artifacts/mach3-startup-controls-20260930", max_bytes = 1073741824 }]
+
 [test.source-geometry]
 timeout_seconds = 300
 
@@ -7,6 +25,34 @@ timeout_seconds = 300
 name = "geometry-and-recovery"
 tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_airfoil.py", "tests/test_cartesian2d.py", "tests/test_blockmesh.py", "tests/test_shared_mesh_recovery.py", "tests/test_jobs_mesh_resolution.py", "tests/test_api.py", "tests/test_numerical_canary.py", "-q"]
+
+[test.finite-edge-diagnosis]
+timeout_seconds = 300
+
+[[test.finite-edge-diagnosis.check]]
+name = "geometry-and-canary"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_blockmesh.py", "tests/test_numerical_canary.py", "-q"]
+
+[[test.finite-edge-diagnosis.check]]
+name = "native-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-finite-edge-diagnosis-20260930", "--groups", "mach3-finite-edge", "mach3-startup-handoff", "--thermal-only"]
+retained_artifacts = [{ name = "finite-edge-native-fields", path = ".codex-artifacts/mach3-finite-edge-diagnosis-20260930", max_bytes = 1073741824 }]
+
+[test.mach3-reconstruction-diagnosis]
+timeout_seconds = 300
+
+[[test.mach3-reconstruction-diagnosis.check]]
+name = "geometry-canary-and-reader"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_airfoil.py", "tests/test_cartesian2d.py", "tests/test_blockmesh.py", "tests/test_shared_mesh_recovery.py", "tests/test_jobs_mesh_resolution.py", "tests/test_api.py", "tests/test_numerical_canary.py", "tests/test_mach3_startup_fields.py", "-q"]
+
+[[test.mach3-reconstruction-diagnosis.check]]
+name = "native-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-reconstruction-diagnosis-20260930", "--groups", "mach3-tadmor", "mach3-minmod", "mach3-finite-minmod", "--thermal-only"]
+retained_artifacts = [{ name = "reconstruction-native-fields", path = ".codex-artifacts/mach3-reconstruction-diagnosis-20260930", max_bytes = 1073741824 }]
 
 [test.source-geometry-baseline]
 timeout_seconds = 300
@@ -3434,8 +3480,8 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "subsonic", "transonic", "mach2", "mach3"]
-finite_services = ["subsonic", "transonic", "mach2", "mach3"]
+services = ["artifacts", "mach3-tadmor", "mach3-minmod", "mach3-finite-minmod"]
+finite_services = ["mach3-tadmor", "mach3-minmod", "mach3-finite-minmod"]
 build = false
 port = true
 route = true

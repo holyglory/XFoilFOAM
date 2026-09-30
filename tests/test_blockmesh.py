@@ -1,9 +1,11 @@
 import math
 from pathlib import Path
+import re
 
+import numpy as np
 import pytest
 
-from airfoilfoam.airfoil import load_airfoil
+from airfoilfoam.airfoil import Airfoil, load_airfoil
 from airfoilfoam.meshing import get_mesher, list_meshers
 from airfoilfoam.meshing.blockmesh import (
     SEGMENTED_CAMBER_VARIANTS,
@@ -11,6 +13,7 @@ from airfoilfoam.meshing.blockmesh import (
     SEGMENTED_TE_NORMAL_COUNTS,
     SURFACE_BLOCK_SEGMENTS,
     BlockMeshCGrid,
+    FINITE_EDGE_TOPOLOGY,
     _normal_aligned_outer_angles,
     solve_expansion,
 )
@@ -95,6 +98,54 @@ def test_candidate_constructor_rejects_unfingerprinted_variants():
         BlockMeshCGrid(surface_segments=20)
     with pytest.raises(ValueError, match="does not accept"):
         BlockMeshCGrid(camber_variant="c150-a200-s5")
+    with pytest.raises(ValueError, match="does not accept"):
+        BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY, surface_segments=24)
+
+
+@pytest.mark.parametrize("name", ["ag24", "sg6051"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_finite_edge_trial_preserves_both_endpoints_and_closes_the_base(name, reverse):
+    airfoil = load_airfoil(name, (SELIG_SEED_DIR / f"{name}.dat").read_text(), None, AirfoilFormat.auto)
+    if reverse:
+        airfoil = Airfoil.from_contour(name, airfoil.contour[::-1])
+    mesh = MeshParams(n_surface=140, n_radial=60, n_wake=50, first_cell_height_chords=1e-4)
+    mesher = BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY)
+    text = mesher.build_dict(airfoil, mesh, chord=0.1)
+    vertices_body = re.search(r"vertices\s*\((.*?)\);", text, re.S)[1]
+    vertices = np.array([[float(value) for value in match.split()]
+                         for match in re.findall(r"\(([^()]+)\)", vertices_body)])
+    surfaces = airfoil.resampled_surfaces(mesh.n_surface)
+    upper, lower = sorted(surfaces, key=lambda surface: float(np.mean(surface[:, 1])), reverse=True)
+    np.testing.assert_allclose(vertices[0, :2], upper[-1], atol=1e-10, rtol=0)
+    np.testing.assert_allclose(vertices[61, :2], lower[-1], atol=1e-10, rtol=0)
+    np.testing.assert_allclose(vertices[[83, 84], 1], [upper[-1, 1], lower[-1, 1]], atol=1e-10, rtol=0)
+    assert "(61 0 86 147)" in text
+    assert "(84 83 169 170)" in text
+    assert "wakeUpper" not in text and "wakeLower" not in text
+    assert text.count("hex (") == 43
+    edge_cells = math.ceil((upper[-1, 1] - lower[-1, 1]) / mesh.first_cell_height_chords)
+    assert f"hex (61 84 83 0 147 170 169 86) (50 {edge_cells} 1)" in text
+    assert mesher.cache_version == "finite-edge-central-wake-v1"
+    assert mesher.user_selectable is False
+    assert mesher.name not in list_meshers(include_internal=True)
+
+
+def test_finite_edge_trial_refuses_a_zero_thickness_wake(sharp_naca0012_selig_text):
+    airfoil = load_airfoil("naca0012", sharp_naca0012_selig_text, None, AirfoilFormat.auto)
+    with pytest.raises(DeterministicMeshError, match="requires a real trailing-edge gap"):
+        BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY).build_dict(airfoil, MeshParams(), 1)
+
+
+def test_finite_edge_cell_counts_come_from_the_generated_mesh(tmp_path):
+    mesher = BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY)
+    mesh = MeshParams()
+    with pytest.raises(ValueError, match="requires the source geometry"):
+        mesher.cell_count(mesh)
+    missing_count = _BlockMeshResultRunner(RunResult("blockMesh", 0, "End\n"))
+    with pytest.raises(InfrastructureError, match="actual cell count"):
+        mesher.run_mesh(tmp_path, mesh, missing_count)
+    measured_count = _BlockMeshResultRunner(RunResult("blockMesh", 0, "nCells: 24150\nEnd\n"))
+    assert mesher.run_mesh(tmp_path, mesh, measured_count).n_cells == 24150
 
 
 def test_solve_expansion_reproduces_length():

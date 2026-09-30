@@ -11,7 +11,7 @@ from uuid import uuid4
 from .airfoil import Airfoil, parse_airfoil
 from .config import Settings
 from .material_domain import check_material_domain
-from .meshing.blockmesh import BlockMeshCGrid
+from .meshing.blockmesh import BlockMeshCGrid, FINITE_EDGE_TOPOLOGY
 from .meshing.cartesian2d import Cartesian2DExternalMesh
 from .models import MeshParams, PolarRequest
 from .openfoam.budget import BudgetedRunner
@@ -36,7 +36,16 @@ def source_material_for_canary(fixture_path):
         provenance=f"Isolated source-derived canary, audit {fixture['source_audit_sha256']}; not installed as catalog data")
 
 
-def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
+def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None, *, maximum_courant=0.2,
+               momentum_scheme="linearUpwind", limited_nonorthogonal=False, save_every_step=False,
+               first_order_startup=False, finite_edge_mesh=False, tadmor_flux=False,
+               minmod_reconstruction=False):
+    if maximum_courant not in (0.05, 0.2) or momentum_scheme not in {"linearUpwind", "upwind"}:
+        raise ValueError("Unsupported isolated startup comparison")
+    if first_order_startup and (family != "rhoCentralFoam" or momentum_scheme != "linearUpwind" or limited_nonorthogonal or tadmor_flux or minmod_reconstruction):
+        raise ValueError("The startup handoff requires the unchanged high-order density recipe")
+    if (tadmor_flux or minmod_reconstruction) and (family != "rhoCentralFoam" or momentum_scheme != "linearUpwind"):
+        raise ValueError("The flux comparison requires the high-order density recipe")
     coordinates = Path(coordinates_path).read_text()
     case_dir = Path(case_dir)
     case_dir.mkdir(parents=True, exist_ok=False)
@@ -52,22 +61,25 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
         "fluid": {"density": gas.density(state), "dynamic_viscosity": gas.dynamic_viscosity(state.temperature_k), "gas": gas.model_dump()},
         "flow_state": state.model_dump(),
         "solver": {"flow_solver_family": family, "force_transient": family != "rhoSimpleFoam", "turbulent_prandtl": 0.85,
-                   "n_iterations": 50, "transient_max_courant": 0.2, "write_images": []},
+                   "n_iterations": 50, "transient_max_courant": maximum_courant,
+                   "momentum_scheme": momentum_scheme, "write_images": []},
     })
     configure_flow_execution(runner, request)
-    budgeted = BudgetedRunner(runner, 120)
+    budgeted = BudgetedRunner(runner, 300 if first_order_startup else 120)
     spec = request.cases()[0]
     budgeted.begin_case(spec)
     airfoil = Airfoil.from_contour("ag24", parse_airfoil(coordinates))
     mesh = resolve_mesh_params(MeshParams(n_surface=140, n_radial=60, n_wake=50, target_y_plus=40,
                                           farfield_radius_chords=18, wake_length_chords=12), spec, request.fluid)
     mesher = Cartesian2DExternalMesh() if airfoil.has_finite_trailing_edge else BlockMeshCGrid()
+    if finite_edge_mesh:
+        mesher = BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY)
     mesh = mesh.model_copy(update={"mesher": mesher.name})
     builder = _case_builder(budgeted, airfoil, mesher.patches(mesh), mesh, spec, request.fluid,
                             request.roughness, request.solver, dialect=dialect_for_runner(budgeted))
     builder.write(case_dir)
     mesher.write_inputs(case_dir, airfoil, mesh, spec.chord)
-    mesh_command = "cartesian2DMesh" if airfoil.has_finite_trailing_edge else "blockMesh"
+    mesh_command = "cartesian2DMesh" if isinstance(mesher, Cartesian2DExternalMesh) else "blockMesh"
     meshed = budgeted.application(case_dir, mesh_command, timeout=120)
     (case_dir / f"log.{mesh_command}").write_text(meshed.stdout)
     meshed.check()
@@ -77,6 +89,40 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
         raise RuntimeError("Numerical canary requires a complete mesh quality verdict")
     if family != "rhoSimpleFoam":
         builder.write_transient(case_dir, 0, 1e-6, 1e-8, write_interval=1e-7, max_delta_t=1e-7)
+    if limited_nonorthogonal:
+        scheme_path = case_dir / "system/fvSchemes"
+        original = scheme_path.read_text()
+        changed, laplacians = re.subn(r"(\blaplacianSchemes\s*\{\s*default\s+)Gauss linear corrected(\s*;\s*\})", r"\g<1>Gauss linear limited 0.5\2", original)
+        changed, gradients = re.subn(r"(\bsnGradSchemes\s*\{\s*default\s+)corrected(\s*;\s*\})", r"\g<1>limited 0.5\2", changed)
+        if laplacians != 1 or gradients != 1:
+            raise ValueError("The startup comparison requires the exact generated correction blocks")
+        scheme_path.write_text(changed)
+    if save_every_step:
+        _set_control_dict_entries(case_dir / "system/controlDict", {"writeControl":"timeStep", "writeInterval":1, "purgeWrite":0})
+    if tadmor_flux or minmod_reconstruction:
+        scheme_path = case_dir / "system/fvSchemes"
+        schemes = scheme_path.read_text()
+        replacements = {"fluxScheme": ("Kurganov", "Tadmor")} if tadmor_flux else {}
+        if minmod_reconstruction:
+            replacements.update({"reconstruct(rho)": ("vanLeer", "Minmod"),
+                                 "reconstruct(T)": ("vanLeer", "Minmod"),
+                                 "reconstruct(U)": ("vanLeerV", "MinmodV")})
+        for entry, (original, selected) in replacements.items():
+            schemes, count = re.subn(r"(?m)^(\s*" + re.escape(entry) + r"\s+)" + original + r"(\s*;)",
+                                     lambda match: match[1] + selected + match[2], schemes)
+            if count != 1:
+                raise ValueError(f"The comparison requires the exact generated {entry}")
+        scheme_path.write_text(schemes)
+    protocol = {"maximum_courant":maximum_courant,"momentum_scheme":momentum_scheme,
+                "limited_nonorthogonal":limited_nonorthogonal,"save_every_step":save_every_step,
+                "first_order_startup":first_order_startup, "finite_edge_mesh":finite_edge_mesh,
+                "tadmor_flux":tadmor_flux, "minmod_reconstruction":minmod_reconstruction}
+    (case_dir / "startup-comparison.json").write_text(json.dumps(protocol, allow_nan=False) + "\n")
+    if first_order_startup:
+        (case_dir / "fvSchemes.requested").write_bytes((case_dir / "system/fvSchemes").read_bytes())
+        builder.solver = request.solver.model_copy(update={"momentum_scheme":"upwind"})
+        builder._write_fv_schemes(builder._turbulence())
+        (case_dir / "fvSchemes.startup").write_bytes((case_dir / "system/fvSchemes").read_bytes())
     startup = None
     if family == "rhoCentralFoam":
         timestep = acoustic_startup_step(case_dir, budgeted, request.solver.transient_max_courant)
@@ -87,10 +133,25 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
     check_material_domain(case_dir, solved)
     solved.check()
     if startup is not None:
-        measured = re.search(r"Mean and max Courant Numbers =\s+\S+\s+(\S+)", solved.stdout)
-        if measured is None or not math.isfinite(float(measured[1])) or float(measured[1]) > startup["maximum_courant"] * (1 + 1e-8):
-            raise RuntimeError("The native first-step Courant ceiling was not respected")
-        startup["measured_first_courant"] = float(measured[1])
+        verify_startup_courant(solved.stdout, startup)
+    initial_startup = None
+    if first_order_startup:
+        if "End" not in solved.stdout or "Time =" not in solved.stdout:
+            raise RuntimeError("The first-order startup did not complete")
+        (case_dir / f"log.{family}.startup").write_text(solved.stdout)
+        initial_startup = startup
+        (case_dir / "acoustic-startup.initial.json").write_bytes((case_dir / "acoustic-startup.json").read_bytes())
+        (case_dir / "system/fvSchemes").write_bytes((case_dir / "fvSchemes.requested").read_bytes())
+        _set_control_dict_entries(case_dir / "system/controlDict", {"startFrom":"latestTime", "endTime":1e-5})
+        timestep = acoustic_startup_step(case_dir, budgeted, maximum_courant)
+        _set_control_dict_entries(case_dir / "system/controlDict", {"deltaT":timestep})
+        startup = json.loads((case_dir / "acoustic-startup.json").read_text())
+        solved = budgeted.solver(case_dir, family, 1, timeout=300)
+        (case_dir / f"log.{family}").write_text(solved.stdout)
+        check_material_domain(case_dir, solved)
+        solved.check()
+    if startup is not None:
+        verify_startup_courant(solved.stdout, startup)
     if "End" not in solved.stdout or "Time =" not in solved.stdout:
         raise RuntimeError("The actual numerical solver did not finish its integration smoke")
     force_files = find_force_coefficient_files(case_dir)
@@ -103,13 +164,22 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
         raise RuntimeError("Compressible reference metadata does not match the executed case")
     receipt = {"kind": "integration_smoke_only", "family": family, "mach": mach,
                "acoustic_startup": startup,
+               "initial_first_order_startup": initial_startup,
                "gas_model": gas.model_dump(mode="json"),
                "mesher": {"name": mesher.name, "cache_version": mesher.cache_version},
+               "startup_comparison": protocol,
                "force_samples": len(rows), "solver_active_seconds": budgeted.consumed(spec),
                "mesh_quality": asdict(mesh_qa), "quality_warnings": quality_warnings,
                "converged_polar_validated": False}
     (case_dir / "receipt.json").write_text(json.dumps(receipt, allow_nan=False) + "\n")
     return receipt
+
+
+def verify_startup_courant(stdout, startup):
+    measured = re.search(r"Mean and max Courant Numbers =\s+\S+\s+(\S+)", stdout)
+    if measured is None or not math.isfinite(float(measured[1])) or float(measured[1]) > startup["maximum_courant"] * (1 + 1e-8):
+        raise RuntimeError("The native first-step Courant ceiling was not respected")
+    startup["measured_first_courant"] = float(measured[1])
 
 
 def main():
@@ -119,9 +189,21 @@ def main():
     parser.add_argument("--coordinates", type=Path, required=True)
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--material-fixture", type=Path)
+    parser.add_argument("--maximum-courant", type=float, choices=[0.05, 0.2], default=0.2)
+    parser.add_argument("--momentum-scheme", choices=["linearUpwind", "upwind"], default="linearUpwind")
+    parser.add_argument("--limited-nonorthogonal", action="store_true")
+    parser.add_argument("--save-every-step", action="store_true")
+    parser.add_argument("--first-order-startup", action="store_true")
+    parser.add_argument("--finite-edge-mesh", action="store_true")
+    parser.add_argument("--tadmor-flux", action="store_true")
+    parser.add_argument("--minmod-reconstruction", action="store_true")
     args = parser.parse_args()
     material = source_material_for_canary(args.material_fixture) if args.material_fixture else None
-    receipt = run_canary(args.family, args.mach, args.coordinates, args.case_dir / str(uuid4()), get_runner(Settings()), gas=material)
+    receipt = run_canary(args.family, args.mach, args.coordinates, args.case_dir / str(uuid4()), get_runner(Settings()), gas=material,
+                         maximum_courant=args.maximum_courant, momentum_scheme=args.momentum_scheme,
+                         limited_nonorthogonal=args.limited_nonorthogonal, save_every_step=args.save_every_step,
+                         first_order_startup=args.first_order_startup, finite_edge_mesh=args.finite_edge_mesh,
+                         tadmor_flux=args.tadmor_flux, minmod_reconstruction=args.minmod_reconstruction)
     print(json.dumps(receipt, allow_nan=False), flush=True)
 
 

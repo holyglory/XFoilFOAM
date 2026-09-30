@@ -9,6 +9,7 @@ from airfoilfoam.openfoam.rans_hold import root_entry
 from airfoilfoam.pipeline import _case_builder
 from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
 from scripts.materials.inspect_mach3_startup import measured_frames, preserve_early_frames, startup_request
+from scripts.materials.inspect_cartesian_startup import inspect_saved_case, saved_scalar
 from test_compressible_execution import RecordedRunner
 
 
@@ -104,3 +105,29 @@ def test_changed_clock_or_horizon_is_not_misreported_as_iteration_evidence(tmp_p
     (tmp_path / coordinate).mkdir()
     with pytest.raises(ValueError, match="coordinate"):
         measured_frames(tmp_path, 1)
+
+
+def test_retained_transient_frames_keep_real_coordinates_and_uniform_values(tmp_path):
+    field_fixture(tmp_path)
+    write_ascii(tmp_path / "system/controlDict", "endTime 1e-6;")
+    write_ascii(tmp_path / "system/fvSchemes", "ddtSchemes { default Euler; }")
+    (tmp_path / "1").rename(tmp_path / "1e-8")
+    (tmp_path / "2").rename(tmp_path / "2e-8")
+    write_ascii(tmp_path / "2e-8/T", "internalField uniform 200;")
+    report = inspect_saved_case(tmp_path)
+    assert report["coordinate_kind"] == "physical_time"
+    assert [frame["coordinate"] for frame in report["frames"]] == [1e-8, 2e-8]
+    assert [frame["fields"]["T"]["minimum"] for frame in report["frames"]] == [250, 200]
+    assert report["receipt"] is None
+    assert report["startup"] is None
+    assert report["frames"][1]["fields"]["T"]["sha256"] == hashlib.sha256((tmp_path / "2e-8/T").read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("body", [
+    "internalField uniform nan;", "internalField uniform inf;",
+    "internalField nonuniform List<scalar> 2 (200 250);",
+])
+def test_retained_thermal_fields_reject_nonfinite_or_wrong_cell_counts(tmp_path, body):
+    write_ascii(tmp_path / "T", body)
+    with pytest.raises(ValueError):
+        saved_scalar(tmp_path / "T", 1)

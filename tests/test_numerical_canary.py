@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -30,21 +31,22 @@ class CanaryRunner(Runner):
         if command.startswith("checkMesh"):
             return RunResult(command, self.mesh_code, self.mesh_output)
         if command.endswith("xfoilfoamAcousticStartup"):
+            ceiling = float(re.search(r"\bmaxCo\s+(\S+);", (case_dir / "system/controlDict").read_text())[1])
             return RunResult(command, 0, "XFOILFOAM_ACOUSTIC_STARTUP " + json.dumps({
-                "version": 1, "courant_rate": 1e8, "maximum_courant": 0.2,
-                "requested_delta_t": 1e-8, "safe_delta_t": 0.2 / 1.2e8,
+                "version": 1, "courant_rate": 1e8, "maximum_courant": ceiling,
+                "requested_delta_t": 1e-8, "safe_delta_t": ceiling / 1.2e8,
             }) + "\n")
         if command == "rhoCentralFoam":
             coefficients = case_dir / "postProcessing/forceCoeffs1/0/coefficient.dat"
-            coefficients.parent.mkdir(parents=True)
+            coefficients.parent.mkdir(parents=True, exist_ok=True)
             coefficients.write_text("# Time Cd Cl CmPitch\n0 0.1 0.2 -0.03\n1 0.1 0.2 -0.03\n2 0.1 0.2 -0.03\n")
             return RunResult(command, 0, f"Mean and max Courant Numbers = 0.01 {self.first_courant}\nTime = 1\nTime = 2\nEnd\n" + self.solver_suffix)
         return RunResult(command, 0, "")
 
 
-def canary(tmp_path, runner):
+def canary(tmp_path, runner, **options):
     coordinates = Path(__file__).parents[1] / "packages/db/seed/selig-database/ag24.dat"
-    return run_canary("rhoCentralFoam", 3, coordinates, tmp_path / "case", runner)
+    return run_canary("rhoCentralFoam", 3, coordinates, tmp_path / "case", runner, **options)
 
 
 @pytest.mark.parametrize("returncode", [0, 1])
@@ -110,3 +112,51 @@ def test_canary_rejects_first_step_courant_violation(tmp_path, first_courant):
     with pytest.raises(RuntimeError, match="first-step Courant"):
         canary(tmp_path, CanaryRunner(ASPECT_ONLY, 0, first_courant=first_courant))
     assert not (tmp_path / "case/receipt.json").exists()
+
+
+def test_canary_handoff_checks_both_real_invocations(tmp_path):
+    runner = CanaryRunner(ASPECT_ONLY, 0)
+    receipt = canary(tmp_path, runner, first_order_startup=True)
+    assert runner.commands.count("rhoCentralFoam") == 2
+    assert receipt["initial_first_order_startup"]["measured_first_courant"] == 0.1
+    assert receipt["acoustic_startup"]["measured_first_courant"] == 0.1
+    directory = tmp_path / "case"
+    assert (directory / "system/fvSchemes").read_bytes() == (directory / "fvSchemes.requested").read_bytes()
+    assert "upwind" in (directory / "fvSchemes.startup").read_text()
+    assert "vanLeerV" in (directory / "fvSchemes.requested").read_text()
+    assert (directory / "log.rhoCentralFoam.startup").is_file()
+
+
+def test_canary_does_not_handoff_after_a_first_stage_courant_violation(tmp_path):
+    runner = CanaryRunner(ASPECT_ONLY, 0, first_courant=0.21)
+    with pytest.raises(RuntimeError, match="first-step Courant"):
+        canary(tmp_path, runner, first_order_startup=True)
+    assert runner.commands.count("rhoCentralFoam") == 1
+    assert not (tmp_path / "case/receipt.json").exists()
+
+
+@pytest.mark.parametrize("options", [
+    {"maximum_courant": 0.05}, {"momentum_scheme": "upwind"},
+    {"limited_nonorthogonal": True}, {"finite_edge_mesh": True},
+    {"tadmor_flux": True}, {"minmod_reconstruction": True},
+])
+def test_canary_comparison_records_the_actual_recipe(tmp_path, options):
+    runner = CanaryRunner(ASPECT_ONLY, 0, first_courant=0.04)
+    receipt = canary(tmp_path, runner, save_every_step=True, **options)
+    for key, value in options.items():
+        assert receipt["startup_comparison"][key] == value
+    assert receipt["converged_polar_validated"] is False
+    schemes = (tmp_path / "case/system/fvSchemes").read_text()
+    if options.get("limited_nonorthogonal"):
+        assert "Gauss linear limited 0.5" in schemes
+    if options.get("finite_edge_mesh"):
+        assert receipt["mesher"]["cache_version"] == "finite-edge-central-wake-v1"
+        assert "blockMesh" in runner.commands and "cartesian2DMesh" not in runner.commands
+    if options.get("tadmor_flux"):
+        assert re.search(r"fluxScheme\s+Tadmor;", schemes)
+        assert "vanLeerV" in schemes
+    if options.get("minmod_reconstruction"):
+        assert re.search(r"reconstruct\(U\)\s+MinmodV;", schemes)
+        assert re.search(r"reconstruct\(T\)\s+Minmod;", schemes)
+        assert re.search(r"reconstruct\(rho\)\s+Minmod;", schemes)
+        assert re.search(r"fluxScheme\s+Kurganov;", schemes)

@@ -46,6 +46,30 @@ services:
   mach3:
     <<: *canary
     command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3"]
+  mach3-small-step:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-small-step", "--maximum-courant", "0.05", "--save-every-step"]
+  mach3-first-order:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-first-order", "--momentum-scheme", "upwind", "--save-every-step"]
+  mach3-limited-correction:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-limited-correction", "--limited-nonorthogonal", "--save-every-step"]
+  mach3-startup-handoff:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-startup-handoff", "--first-order-startup"]
+  mach3-finite-edge:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-finite-edge", "--finite-edge-mesh", "--save-every-step"]
+  mach3-tadmor:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-tadmor", "--tadmor-flux", "--save-every-step"]
+  mach3-minmod:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-minmod", "--minmod-reconstruction", "--save-every-step"]
+  mach3-finite-minmod:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-finite-minmod", "--finite-edge-mesh", "--minmod-reconstruction", "--save-every-step"]
 
 volumes:
   numerical-results:

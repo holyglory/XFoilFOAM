@@ -61,6 +61,7 @@ LEGACY_TOPOLOGY = "legacy"
 SEGMENTED_NORMAL_TOPOLOGY = "segmented-normal"
 SEGMENTED_TE_NORMAL_TOPOLOGY = "segmented-te-normal"
 SEGMENTED_CAMBER_TOPOLOGY = "segmented-camber"
+FINITE_EDGE_TOPOLOGY = "finite-edge"
 _SEGMENTED_PREFLIGHT_EPSILON = 1e-10
 _PROCESS_KILL_RETURN_CODES = frozenset({137, 143, -9, -15})
 _LAUNCH_FAILURE_RETURN_CODES = frozenset({125, 126, 127})
@@ -310,6 +311,7 @@ class BlockMeshCGrid(Mesher):
             SEGMENTED_NORMAL_TOPOLOGY,
             SEGMENTED_TE_NORMAL_TOPOLOGY,
             SEGMENTED_CAMBER_TOPOLOGY,
+            FINITE_EDGE_TOPOLOGY,
         }:
             raise ValueError(f"unknown blockMesh C-grid topology {topology!r}")
         if topology == LEGACY_TOPOLOGY:
@@ -346,6 +348,14 @@ class BlockMeshCGrid(Mesher):
             self.name = f"blockmesh-cgrid-segmented-te-normal-{surface_segments}"
             self.cache_version = f"segmented-te-normal-{surface_segments}-v1"
             self.surface_segments = int(surface_segments)
+            self.camber_variant = None
+            self.user_selectable = False
+        elif topology == FINITE_EDGE_TOPOLOGY:
+            if surface_segments is not None or camber_variant is not None:
+                raise ValueError("finite-edge does not accept variant overrides")
+            self.name = "blockmesh-cgrid-finite-edge"
+            self.cache_version = "finite-edge-central-wake-v1"
+            self.surface_segments = SURFACE_BLOCK_SEGMENTS
             self.camber_variant = None
             self.user_selectable = False
         else:
@@ -420,10 +430,13 @@ class BlockMeshCGrid(Mesher):
             raise
         except OpenFOAMError as exc:
             raise DeterministicMeshError(f"blockMesh rejected the requested geometry: {exc}") from exc
-        n_cells = self.cell_count(params)
         m = re.search(r"nCells:\s*(\d+)", res.stdout)
         if m:
             n_cells = int(m.group(1))
+        elif self.topology == FINITE_EDGE_TOPOLOGY:
+            raise InfrastructureError("Finite-edge blockMesh did not report its actual cell count")
+        else:
+            n_cells = self.cell_count(params)
         return MeshResult(
             patches=self.patches(params),
             span_chords=params.span_chords,
@@ -432,11 +445,16 @@ class BlockMeshCGrid(Mesher):
         )
 
     def cell_count(self, params: MeshParams) -> int:
+        if self.topology == FINITE_EDGE_TOPOLOGY:
+            raise ValueError("Finite-edge cell count requires the source geometry and generated mesh")
         return 2 * params.n_surface * params.n_radial + 2 * params.n_wake * params.n_radial
 
     # -- dictionary generation --------------------------------------------- #
     def build_dict(self, airfoil: Airfoil, params: MeshParams, chord: float) -> str:
-        if airfoil.has_finite_trailing_edge:
+        if self.topology == FINITE_EDGE_TOPOLOGY:
+            if not airfoil.has_finite_trailing_edge:
+                raise DeterministicMeshError("Finite-edge topology requires a real trailing-edge gap")
+        elif airfoil.has_finite_trailing_edge:
             raise DeterministicMeshError(
                 "Structured C-grid requires coincident trailing-edge endpoints; "
                 "the source contour must not be pinched to fit this topology"
@@ -567,7 +585,7 @@ class BlockMeshCGrid(Mesher):
         # requested upstream extent (-R), makes the TE connector wall-normal,
         # and keeps the authoritative airfoil contour and requested cell
         # counts unchanged.
-        if self.topology == SEGMENTED_TE_NORMAL_TOPOLOGY:
+        if self.topology in {SEGMENTED_TE_NORMAL_TOPOLOGY, FINITE_EDGE_TOPOLOGY}:
             outer_center_x = 1.0
             le_outer_angle = math.pi
         elif self.topology == SEGMENTED_CAMBER_TOPOLOGY:
@@ -623,6 +641,13 @@ class BlockMeshCGrid(Mesher):
         )
         upper_path = upper[::-1]  # TE -> LE
         lower_path = lower  # LE -> TE
+        finite_edge = self.topology == FINITE_EDGE_TOPOLOGY
+        if finite_edge:
+            edge_height = float(upper_path[0, 1] - lower_path[-1, 1])
+            if edge_height <= _SEGMENTED_PREFLIGHT_EPSILON:
+                raise DeterministicMeshError("Finite-edge wake requires vertically separated source endpoints")
+            edge_cells = max(1, math.ceil(edge_height / params.first_cell_height_chords))
+            wake_grading = f"{solve_expansion(params.first_cell_height_chords, params.wake_length_chords, n_wake):.8g}"
         upper_outer_angles = _normal_aligned_outer_angles(
             upper_path, cuts, math.pi / 2, le_outer_angle
         )
@@ -678,15 +703,16 @@ class BlockMeshCGrid(Mesher):
             for angle in lower_outer_angles[1:]
         ]
         outlet_top = add((Xo, outer_radius))
-        outlet_wake_top = add((Xo, 0.0))
-        outlet_wake_bottom = add((Xo, 0.0))
+        outlet_wake_top = add((Xo, float(upper_path[0, 1]) if finite_edge else 0.0))
+        outlet_wake_bottom = add((Xo, float(lower_path[-1, 1]) if finite_edge else 0.0))
         outlet_bottom = add((Xo, -outer_radius))
 
         # --- vertices (z=0 then z=span) ------------------------------------ #
         vert_lines = []
+        vertex_precision = 17 if finite_edge else 10
         for z in (0.0, span):
             for (x, y) in base:
-                vert_lines.append(f"    ({x:.10g} {y:.10g} {z:.10g})")
+                vert_lines.append(f"    ({x:.{vertex_precision}g} {y:.{vertex_precision}g} {z:.{vertex_precision}g})")
 
         # --- edges (short airfoil splines + inlet arcs) -------------------- #
         z_offset = len(base)
@@ -795,6 +821,15 @@ class BlockMeshCGrid(Mesher):
             )
             block_quads.append(quad)
 
+        if finite_edge:
+            wake_quad = [lower_inner[-1], outlet_wake_bottom, outlet_wake_top, upper_inner[0]]
+            wake_vertices = " ".join(str(vertex) for vertex in wake_quad + [vertex + z_offset for vertex in wake_quad])
+            block_lines.append(
+                f"    hex ({wake_vertices}) ({n_wake} {edge_cells} 1) "
+                f"simpleGrading ({wake_grading} 1 1)"
+            )
+            block_quads.append(wake_quad)
+
         # --- boundary ------------------------------------------------------ #
         def face(v0: int, v1: int) -> str:
             return f"            ({v0} {v1} {v1 + z_offset} {v0 + z_offset})"
@@ -813,20 +848,23 @@ class BlockMeshCGrid(Mesher):
             for j in range(n_segments)
         ] + [face(upper_outer[0], outlet_top), face(lower_outer[-1], outlet_bottom)]
         outlet_faces = [face(outlet_wake_top, outlet_top), face(outlet_wake_bottom, outlet_bottom)]
+        if finite_edge:
+            airfoil_faces.append(face(lower_inner[-1], upper_inner[0]))
+            outlet_faces.append(face(outlet_wake_bottom, outlet_wake_top))
         front_back: list[str] = []
         for quad in block_quads:
             front_back.append("            (" + " ".join(str(v) for v in quad) + ")")
             front_back.append(
                 "            (" + " ".join(str(v + z_offset) for v in quad) + ")"
             )
-        wake_upper = [face(upper_inner[0], outlet_wake_top)]
-        wake_lower = [face(lower_inner[-1], outlet_wake_bottom)]
+        wake_upper = [] if finite_edge else [face(upper_inner[0], outlet_wake_top)]
+        wake_lower = [] if finite_edge else [face(lower_inner[-1], outlet_wake_bottom)]
 
         boundary = self._boundary_block(
             airfoil_faces, inlet_faces, outlet_faces, front_back, wake_upper, wake_lower
         )
 
-        return self._assemble(chord, vert_lines, edge_lines, block_lines, boundary)
+        return self._assemble(chord, vert_lines, edge_lines, block_lines, boundary, merge_wake=not finite_edge)
 
     @staticmethod
     def _boundary_block(airfoil, inlet, outlet, front_back, wake_upper, wake_lower) -> str:
@@ -842,12 +880,12 @@ class BlockMeshCGrid(Mesher):
             + patch("inlet", "patch", inlet)
             + patch("outlet", "patch", outlet)
             + patch("frontAndBack", "empty", front_back)
-            + patch("wakeUpper", "patch", wake_upper)
-            + patch("wakeLower", "patch", wake_lower)
+            + (patch("wakeUpper", "patch", wake_upper) if wake_upper else "")
+            + (patch("wakeLower", "patch", wake_lower) if wake_lower else "")
         )
 
     @staticmethod
-    def _assemble(chord, vert_lines, edge_lines, block_lines, boundary) -> str:
+    def _assemble(chord, vert_lines, edge_lines, block_lines, boundary, *, merge_wake=True) -> str:
         from ..openfoam.foam_dict import foam_file_header
 
         header = foam_file_header("dictionary", "blockMeshDict", "system")
@@ -866,7 +904,7 @@ class BlockMeshCGrid(Mesher):
             + "boundary\n(\n"
             + boundary
             + ");\n\n"
-            + "mergePatchPairs\n(\n    (wakeUpper wakeLower)\n);\n"
+            + ("mergePatchPairs\n(\n    (wakeUpper wakeLower)\n);\n" if merge_wake else "mergePatchPairs ();\n")
         )
 
 
