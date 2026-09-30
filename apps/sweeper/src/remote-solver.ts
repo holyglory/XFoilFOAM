@@ -7389,7 +7389,7 @@ export async function admitRemoteSolverTick(
         await setStatus(db, "solving", null, {
           remoteSolverLastPromiseAt: new Date(),
         });
-        continue;
+        break;
       }
       const concurrency = Math.min(
         activeReconcileConcurrency(),
