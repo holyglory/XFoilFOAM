@@ -1,5 +1,39 @@
 schema = 2
 
+[test.source-geometry]
+timeout_seconds = 300
+
+[[test.source-geometry.check]]
+name = "geometry-and-recovery"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_airfoil.py", "tests/test_cartesian2d.py", "tests/test_blockmesh.py", "tests/test_shared_mesh_recovery.py", "tests/test_jobs_mesh_resolution.py", "tests/test_api.py", "tests/test_numerical_canary.py", "-q"]
+
+[test.source-geometry-baseline]
+timeout_seconds = 300
+
+[[test.source-geometry-baseline.check]]
+name = "unchanged-baseline-failures"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", ".codex-artifacts/geometry-baseline-complete-b306ebf/tests/test_established_oscillation.py", ".codex-artifacts/geometry-baseline-complete-b306ebf/tests/test_progressive_bias_policy.py", ".codex-artifacts/geometry-baseline-complete-b306ebf/tests/test_progressive_graph_dependencies.py", ".codex-artifacts/geometry-baseline-complete-b306ebf/tests/test_deploy_sweeper_state.py", "-q"]
+env = { PYTHONPATH = ".codex-artifacts/geometry-baseline-complete-b306ebf/src:.codex-artifacts/geometry-baseline-complete-b306ebf/tests" }
+
+[deployment.trailing-edge-reproduction]
+source = ["worktree"]
+components = ["numerics"]
+public = false
+ttl_seconds = 86400
+
+[deployment.trailing-edge-reproduction.component.numerics]
+type = "compose"
+env = { COMPOSE_PROGRESS = "plain" }
+files = ["compose.trailing-edge-reproduction.yml"]
+services = ["artifacts", "fixed"]
+finite_services = ["fixed"]
+build = false
+port = true
+route = true
+timeout_seconds = 2400
+
 [test.history-transfer]
 timeout_seconds = 600
 

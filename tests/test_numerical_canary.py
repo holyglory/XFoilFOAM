@@ -53,6 +53,9 @@ def test_canary_uses_production_mesh_qa_and_discloses_anisotropy(tmp_path, retur
     receipt = canary(tmp_path, runner)
     assert receipt["mesh_quality"]["aspect_ratio_only_failure"] is True
     assert receipt["mesh_quality"]["max_aspect_ratio"] == 25716.220065
+    assert receipt["mesher"]["name"] == "cartesian2d-external-boundary-layer"
+    assert "cartesian2DMesh" in runner.commands
+    assert "blockMesh" not in runner.commands
     assert receipt["quality_warnings"]
     assert receipt["converged_polar_validated"] is False
     assert (tmp_path / "case/log.checkMesh").read_text() == ASPECT_ONLY

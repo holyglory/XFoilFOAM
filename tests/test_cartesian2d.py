@@ -1,5 +1,7 @@
 from pathlib import Path
+import re
 
+import numpy as np
 import pytest
 
 from airfoilfoam.airfoil import load_airfoil
@@ -66,7 +68,7 @@ def test_cartesian2d_mesher_is_internal_and_fingerprinted():
 
     assert isinstance(mesher, Cartesian2DExternalMesh)
     assert mesher.user_selectable is False
-    assert mesher.cache_version == "cfmesh-cartesian2d-external-layers-v1"
+    assert mesher.cache_version == "cfmesh-cartesian2d-source-contour-v2"
     assert CARTESIAN2D_EXTERNAL_MESHER not in list_meshers()
     assert CARTESIAN2D_EXTERNAL_MESHER in list_meshers(include_internal=True)
     assert [(patch.name, patch.role) for patch in mesher.patches(MeshParams())] == [
@@ -78,8 +80,9 @@ def test_cartesian2d_mesher_is_internal_and_fingerprinted():
     ]
 
 
-def test_cartesian2d_inputs_preserve_trusted_notch_and_physical_domain(tmp_path):
-    airfoil = _airfoil("goe451")
+@pytest.mark.parametrize("name", ["goe451", "sg6051"])
+def test_cartesian2d_inputs_preserve_trusted_notch_and_physical_domain(tmp_path, name):
+    airfoil = _airfoil(name)
     params = MeshParams(
         farfield_radius_chords=15,
         wake_length_chords=10,
@@ -95,9 +98,17 @@ def test_cartesian2d_inputs_preserve_trusted_notch_and_physical_domain(tmp_path)
 
     surface = (tmp_path / CARTESIAN2D_SURFACE_FILE).read_text()
     mesh_dict = (tmp_path / "system" / "meshDict").read_text()
-    # Authoritative GOE451 upper-surface notch, scaled only by the real chord.
-    assert "(0.0012475 0 0)" in surface
-    assert "(0.000623 0.000602 0)" in surface
+    if name == "goe451":
+        assert "(0.0012475 0 0)" in surface
+        assert "(0.000623 0.000602 0)" in surface
+    vertices = np.array([
+        [float(value) for value in match.split()]
+        for match in re.findall(r"^\(([^()\n]+)\)$", surface, re.MULTILINE)
+        if len(match.split()) == 3
+    ])
+    contour = airfoil.contour if airfoil.has_finite_trailing_edge else airfoil.contour[:-1]
+    assert len(vertices) == 2 * (4 + len(contour))
+    np.testing.assert_allclose(vertices[4:4 + len(contour), :2], contour[::-1] * 0.05, rtol=0, atol=1e-12)
     # Exact requested farfield, outlet and span extents in metres.
     assert "(-0.75 -0.75 0)" in surface
     assert "(0.55 0.75 0)" in surface

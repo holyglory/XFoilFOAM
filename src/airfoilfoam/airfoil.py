@@ -1,7 +1,7 @@
 """Airfoil geometry: parse Selig/Lednicer files, normalise, chord-align, resample.
 
-The output is a chord-aligned, unit-chord airfoil with a *sharp* (closed) trailing
-edge at (1, 0) and leading edge at (0, 0). Angle of attack is applied later by
+The output is a chord-aligned, unit-chord airfoil retaining its source trailing
+edge and leading edge at (0, 0). Angle of attack is applied later by
 rotating the freestream, so chord-aligning the geometry is the correct convention.
 """
 from __future__ import annotations
@@ -163,11 +163,11 @@ def max_concave_curvature(
 
 @dataclass
 class Airfoil:
-    """A chord-aligned, unit-chord airfoil with a closed (sharp) trailing edge."""
+    """A chord-aligned, unit-chord airfoil retaining every source vertex."""
 
     name: str
-    contour: np.ndarray  # (N, 2) Selig order, LE=(0,0), TE=(1,0)
-    te_gap_original: float  # trailing-edge gap before closing (unit-chord scale)
+    contour: np.ndarray
+    te_gap_original: float
 
     # -- construction ------------------------------------------------------- #
     @classmethod
@@ -200,19 +200,16 @@ class Airfoil:
         pts = pts / chord
         te_gap_original /= chord
 
-        # Close the trailing edge to a sharp point at (1, 0): force endpoints.
-        pts[0] = np.array([1.0, 0.0])
-        pts[-1] = np.array([1.0, 0.0])
-        # Snap the leading edge exactly to the origin.
-        le_idx = int(np.argmin(pts[:, 0]))
-        pts[le_idx] = np.array([0.0, 0.0])
-
         return cls(name=name, contour=pts, te_gap_original=te_gap_original)
 
     # -- queries ------------------------------------------------------------ #
     @property
     def le_index(self) -> int:
         return int(np.argmin(self.contour[:, 0]))
+
+    @property
+    def has_finite_trailing_edge(self) -> bool:
+        return float(np.linalg.norm(self.contour[0] - self.contour[-1])) > 1e-10
 
     def split_surfaces(self) -> tuple[np.ndarray, np.ndarray]:
         """Return (upper, lower) each ordered LE->TE with x increasing."""
@@ -261,8 +258,8 @@ class Airfoil:
         x = np.interp(s_target, s, surface[:, 0])
         y = np.interp(s_target, s, surface[:, 1])
         out = np.column_stack([x, y])
-        out[0] = np.array([0.0, 0.0])
-        out[-1] = np.array([1.0, 0.0])
+        out[0] = surface[0]
+        out[-1] = surface[-1]
         return out
 
     def resampled_surfaces(self, n: int) -> tuple[np.ndarray, np.ndarray]:

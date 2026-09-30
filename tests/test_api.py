@@ -75,7 +75,7 @@ def client():
 def test_health_and_capabilities(client):
     health = client.get("/health").json()
     assert health["status"] == "ok"
-    assert health["mesh_recovery_version"] == 2
+    assert health["mesh_recovery_version"] == 3
     assert health["urans_recovery_version"] == URANS_RECOVERY_VERSION
     assert health["solver_budget_version"] == SOLVER_BUDGET_VERSION == 2
     assert health["evidence_storage"]["backend"] == "volume"
@@ -128,10 +128,10 @@ def test_full_polar_job(client, fake_run_case, naca0012_selig_text):
     assert status["state"] == "completed"
     assert status["total_cases"] == 3
     assert status["completed_cases"] == 3
-    assert status["mesh_recovery_version"] == 2
+    assert status["mesh_recovery_version"] == 3
     result = client.get(f"/jobs/{job_id}/result").json()
     assert result["state"] == "completed"
-    assert result["mesh_recovery_version"] == 2
+    assert result["mesh_recovery_version"] == 3
     assert len(result["polars"]) == 1
     polar = result["polars"][0]
     assert polar["reynolds"] == pytest.approx(50 * 1.0 / 1.5e-5)
@@ -251,7 +251,7 @@ def test_polar_submit_rejects_capability_cutover_before_queueing(
         json={
             "airfoil": {"name": "n12", "coordinates": naca0012_selig_text},
             "aoa": {"angles": [0]},
-            "expected_mesh_recovery_version": 3,
+            "expected_mesh_recovery_version": 4,
         },
     )
 
@@ -259,11 +259,11 @@ def test_polar_submit_rejects_capability_cutover_before_queueing(
     detail = response.json()["detail"]
     assert detail == {
         "code": "mesh_recovery_version_mismatch",
-        "requested_version": 3,
-        "actual_version": 2,
+        "requested_version": 4,
+        "actual_version": 3,
         "message": (
             "Engine mesh-recovery capability changed before submission: "
-            "requested v3, API is v2. Refresh capability and retry."
+            "requested v4, API is v3. Refresh capability and retry."
         ),
     }
 
@@ -273,11 +273,11 @@ def test_worker_rejects_capability_mismatch_before_geometry_or_solver(tmp_path):
         {
             "airfoil": {"name": "bad-on-purpose", "coordinates": "not geometry"},
             "aoa": {"angles": [0]},
-            "expected_mesh_recovery_version": 3,
+            "expected_mesh_recovery_version": 4,
         }
     )
 
-    with pytest.raises(RuntimeError, match="requested v3, worker is v2"):
+    with pytest.raises(RuntimeError, match="requested v4, worker is v3"):
         jobs.execute_job(
             "capability-mismatch",
             request,

@@ -12,6 +12,7 @@ from .airfoil import Airfoil, parse_airfoil
 from .config import Settings
 from .material_domain import check_material_domain
 from .meshing.blockmesh import BlockMeshCGrid
+from .meshing.cartesian2d import Cartesian2DExternalMesh
 from .models import MeshParams, PolarRequest
 from .openfoam.budget import BudgetedRunner
 from .openfoam.acoustic_startup import acoustic_startup_step
@@ -60,13 +61,15 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
     airfoil = Airfoil.from_contour("ag24", parse_airfoil(coordinates))
     mesh = resolve_mesh_params(MeshParams(n_surface=140, n_radial=60, n_wake=50, target_y_plus=40,
                                           farfield_radius_chords=18, wake_length_chords=12), spec, request.fluid)
-    mesher = BlockMeshCGrid()
+    mesher = Cartesian2DExternalMesh() if airfoil.has_finite_trailing_edge else BlockMeshCGrid()
+    mesh = mesh.model_copy(update={"mesher": mesher.name})
     builder = _case_builder(budgeted, airfoil, mesher.patches(mesh), mesh, spec, request.fluid,
                             request.roughness, request.solver, dialect=dialect_for_runner(budgeted))
     builder.write(case_dir)
     mesher.write_inputs(case_dir, airfoil, mesh, spec.chord)
-    meshed = budgeted.application(case_dir, "blockMesh", timeout=120)
-    (case_dir / "log.blockMesh").write_text(meshed.stdout)
+    mesh_command = "cartesian2DMesh" if airfoil.has_finite_trailing_edge else "blockMesh"
+    meshed = budgeted.application(case_dir, mesh_command, timeout=120)
+    (case_dir / f"log.{mesh_command}").write_text(meshed.stdout)
     meshed.check()
     quality_warnings = []
     mesh_qa = _run_transient_mesh_qa_gate(case_dir, budgeted, quality_warnings)
@@ -101,6 +104,7 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None):
     receipt = {"kind": "integration_smoke_only", "family": family, "mach": mach,
                "acoustic_startup": startup,
                "gas_model": gas.model_dump(mode="json"),
+               "mesher": {"name": mesher.name, "cache_version": mesher.cache_version},
                "force_samples": len(rows), "solver_active_seconds": budgeted.consumed(spec),
                "mesh_quality": asdict(mesh_qa), "quality_warnings": quality_warnings,
                "converged_polar_validated": False}

@@ -1,6 +1,6 @@
-"""Rare-profile external-flow fallback using OpenFOAM's ``cartesian2DMesh``.
+"""Source-preserving external-flow meshing using OpenFOAM's ``cartesian2DMesh``.
 
-The ordinary production path remains the faster structured C-grid. Some valid
+Finite trailing edges use this topology without collapsing their base. Some valid
 catalog contours, however, are not homeomorphic to a well-behaved transfinite
 C-grid passage: a sharp concave notch can invert the structured blocks and an
 extremely thick/blunt profile can exceed the non-orthogonality gate even after
@@ -122,7 +122,7 @@ class Cartesian2DExternalMesh(Mesher):
     """Internal source-preserving fallback for structured-topology exhaustion."""
 
     name = CARTESIAN2D_EXTERNAL_MESHER
-    cache_version = "cfmesh-cartesian2d-external-layers-v1"
+    cache_version = "cfmesh-cartesian2d-source-contour-v2"
     user_selectable = False
 
     def patches(self, params: MeshParams) -> list[BoundaryPatch]:
@@ -211,19 +211,13 @@ class Cartesian2DExternalMesh(Mesher):
             or not np.isfinite(contour).all()
         ):
             raise DeterministicMeshError(
-                "cartesian2DMesh requires a finite closed airfoil contour"
+                "cartesian2DMesh requires a finite airfoil contour"
             )
 
-        # Airfoil.from_contour closes both endpoints at the exact same sharp TE.
-        # Keep that point once, then reverse the contour so the side triangles'
-        # normals point from the fluid into the hole. No coordinate is moved.
-        if float(np.linalg.norm(contour[0] - contour[-1])) > 1e-10:
-            raise DeterministicMeshError(
-                "cartesian2DMesh requires the solver-normalized closed contour"
-            )
+        vertices = contour if airfoil.has_finite_trailing_edge else contour[:-1]
         airfoil_loop = [
             (float(point[0]), float(point[1]))
-            for point in contour[:-1][::-1]
+            for point in vertices[::-1]
         ]
         radius = float(params.farfield_radius_chords)
         outlet_x = 1.0 + float(params.wake_length_chords)

@@ -436,6 +436,11 @@ class BlockMeshCGrid(Mesher):
 
     # -- dictionary generation --------------------------------------------- #
     def build_dict(self, airfoil: Airfoil, params: MeshParams, chord: float) -> str:
+        if airfoil.has_finite_trailing_edge:
+            raise DeterministicMeshError(
+                "Structured C-grid requires coincident trailing-edge endpoints; "
+                "the source contour must not be pinched to fit this topology"
+            )
         if self.topology == LEGACY_TOPOLOGY:
             return self._build_legacy_dict(airfoil, params, chord)
         return self._build_segmented_dict(airfoil, params, chord)

@@ -38,10 +38,26 @@ def test_chord_alignment_normalisation(naca0012_selig_text):
     xs = af.contour[:, 0]
     assert xs.min() == pytest.approx(0.0, abs=1e-9)
     assert xs.max() == pytest.approx(1.0, abs=1e-9)
-    # leading edge at origin, trailing edge closed at (1, 0)
     assert af.contour[af.le_index] == pytest.approx([0.0, 0.0], abs=1e-9)
-    assert af.contour[0] == pytest.approx([1.0, 0.0], abs=1e-9)
-    assert af.contour[-1] == pytest.approx([1.0, 0.0], abs=1e-9)
+    assert af.contour[0] == pytest.approx([1.0, 0.00126], abs=1e-9)
+    assert af.contour[-1] == pytest.approx([1.0, -0.00126], abs=1e-9)
+    assert af.has_finite_trailing_edge
+
+
+@pytest.mark.parametrize("name", ["sg6051", "naca4412", "goe451"])
+def test_normalization_preserves_source_vertices_and_resampling_endpoints(name):
+    original = parse_airfoil((SELIG_SEED_DIR / f"{name}.dat").read_text())
+    airfoil = Airfoil.from_contour(name, original)
+    leading_edge = original[np.argmin(original[:, 0])]
+    chord = (original[0] + original[-1]) / 2 - leading_edge
+    angle = math.atan2(chord[1], chord[0])
+    inverse = np.array([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]])
+    reconstructed = airfoil.contour @ inverse.T * np.linalg.norm(chord) + leading_edge
+    np.testing.assert_allclose(reconstructed, original, rtol=0, atol=1e-12)
+    original_upper, original_lower = airfoil.split_surfaces()
+    upper, lower = airfoil.resampled_surfaces(84)
+    np.testing.assert_array_equal(upper[[0, -1]], original_upper[[0, -1]])
+    np.testing.assert_array_equal(lower[[0, -1]], original_lower[[0, -1]])
 
 
 def test_naca0012_thickness(naca0012_selig_text):
@@ -99,7 +115,8 @@ def test_resample_endpoints_and_count(naca0012_selig_text):
     assert upper.shape == (61, 2)
     assert lower.shape == (61, 2)
     assert upper[0] == pytest.approx([0.0, 0.0])
-    assert upper[-1] == pytest.approx([1.0, 0.0])
+    assert upper[-1] == pytest.approx([1.0, 0.00126])
+    assert lower[-1] == pytest.approx([1.0, -0.00126])
 
 
 def test_points_input_rotated_airfoil():

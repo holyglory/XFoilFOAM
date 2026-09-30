@@ -1040,6 +1040,23 @@ and do not call the implementation complete based on unit tests alone.
 
 ## Verification
 
+Mesh recovery version 3 keeps the source contour under rigid chord alignment and
+normalization; neither preparation nor resampling collapses a finite trailing
+edge. Sharp-edge C-grid topologies refuse these contours before mesh execution.
+The existing bounded recovery path selects the Cartesian mesher, retains both
+trailing-edge vertices and their base face, and still requires the ordinary mesh
+quality and immutable-evidence gates. Actual mesher identity and its versioned
+cache key remain distinct from the originally requested topology.
+
+The isolated `trailing-edge-reproduction` surface replays the retained SG6051
+request at Re 204560 and Mach 0.0881466. The original C-grid reproduces the two
+wrong production lift values; Cartesian controls with pinched and source-preserved
+contours separate mesher effects from endpoint changes. Its `production-fixed`
+variant uses normal product geometry preparation and recovery without overriding
+either function. These two-angle calculations establish a regression boundary,
+not complete-polar accuracy or calibrated uncertainty. Existing production
+evidence, fit refresh and campaign correction remain separate rollout work.
+
 A canonical binding that arrives after completed progressive-custody cleanup may
 acknowledge that completed cleanup without another deletion. The original job,
 case, upload and remote generation must match, the retained manifest and immutable

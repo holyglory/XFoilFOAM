@@ -14,14 +14,15 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 
-def naca4(code: str = "0012", n: int = 120) -> np.ndarray:
+def naca4(code: str = "0012", n: int = 120, closed_trailing_edge: bool = False) -> np.ndarray:
     """Generate NACA 4-digit coordinates in Selig order (TE -> top -> LE -> bottom -> TE)."""
     m = int(code[0]) / 100
     p = int(code[1]) / 10
     t = int(code[2:]) / 100
     beta = np.linspace(0, np.pi, n + 1)
     x = 0.5 * (1 - np.cos(beta))
-    yt = 5 * t * (0.2969 * np.sqrt(x) - 0.1260 * x - 0.3516 * x**2 + 0.2843 * x**3 - 0.1015 * x**4)
+    final_coefficient = 0.1036 if closed_trailing_edge else 0.1015
+    yt = 5 * t * (0.2969 * np.sqrt(x) - 0.1260 * x - 0.3516 * x**2 + 0.2843 * x**3 - final_coefficient * x**4)
     if m == 0:
         yc = np.zeros_like(x)
         dyc = np.zeros_like(x)
@@ -48,6 +49,12 @@ def naca0012_selig_text() -> str:
 @pytest.fixture
 def naca2412_points() -> list[tuple[float, float]]:
     return [tuple(p) for p in naca4("2412", 80)]
+
+
+@pytest.fixture
+def sharp_naca0012_selig_text() -> str:
+    coordinates = naca4("0012", 100, closed_trailing_edge=True)
+    return "\n".join(["NACA 0012 closed-TE test fixture", *(f"{point[0]:.6f} {point[1]:.6f}" for point in coordinates)])
 
 
 @pytest.fixture

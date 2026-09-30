@@ -75,6 +75,10 @@ class CountingMesher(Mesher):
     def write_inputs(self, case_dir, airfoil, params, chord) -> None:
         (case_dir / "system").mkdir(parents=True, exist_ok=True)
         (case_dir / "system" / "blockMeshDict").write_text("// test\n")
+        if self.name == "cartesian2d-external-boundary-layer":
+            from airfoilfoam.meshing.cartesian2d import Cartesian2DExternalMesh
+
+            Cartesian2DExternalMesh().write_inputs(case_dir, airfoil, params, chord)
 
     def patches(self, params):
         return [
@@ -89,6 +93,8 @@ class CountingMesher(Mesher):
         if self.events is not None:
             self.events.append((self.name, params.first_cell_height_chords))
         _fake_polymesh(case_dir, f"build-{self.runs}")
+        if self.name == "cartesian2d-external-boundary-layer":
+            (case_dir / "log.cartesian2DMesh").write_text("isolated counting-mesher fixture\n")
         return MeshResult(
             self.patches(params),
             params.span_chords,
@@ -119,9 +125,9 @@ def _ladder_meshers(monkeypatch, events: list[tuple[str, float | None]]):
 
 
 def test_shared_mesh_is_validated_before_publish_and_revalidated_on_cache_hit(
-    tmp_path, naca0012_selig_text
+    tmp_path, sharp_naca0012_selig_text
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     resolved = MeshParams(first_cell_height_chords=0.002)
     cache = _cache(tmp_path)
     mesher = CountingMesher()
@@ -149,9 +155,9 @@ def test_shared_mesh_is_validated_before_publish_and_revalidated_on_cache_hit(
 
 
 def test_deterministic_rejection_of_cached_mesh_evicts_it(
-    tmp_path, naca0012_selig_text
+    tmp_path, sharp_naca0012_selig_text
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     resolved = MeshParams(first_cell_height_chords=0.002)
     cache = _cache(tmp_path)
     mesher = CountingMesher()
@@ -174,9 +180,9 @@ def test_deterministic_rejection_of_cached_mesh_evicts_it(
 
 
 def test_unavailable_quality_probe_neither_publishes_nor_triggers_recovery(
-    tmp_path, naca0012_selig_text
+    tmp_path, sharp_naca0012_selig_text
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     resolved = MeshParams(first_cell_height_chords=0.02)
     cache = _cache(tmp_path)
     mesher = CountingMesher()
@@ -218,10 +224,10 @@ def test_unavailable_quality_probe_neither_publishes_nor_triggers_recovery(
     ids=["benign-nonzero", "timeout-with-benign-partial-output"],
 )
 def test_failed_checkmesh_process_neither_marks_nor_caches_mesh(
-    tmp_path, naca0012_selig_text, result
+    tmp_path, sharp_naca0012_selig_text, result
 ):
     """Process failure must not become a verified/cached geometry verdict."""
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     resolved = MeshParams(first_cell_height_chords=0.002)
     cache = _cache(tmp_path)
     mesher = CountingMesher()
@@ -263,10 +269,12 @@ def test_malformed_shared_mesh_qa_marker_is_unverified(tmp_path, failed_checks):
     assert pipeline.shared_mesh_qa_verified(tmp_path) is False
 
 
+@pytest.mark.parametrize("finite_trailing_edge", [False, True])
 def test_recovery_tries_segmented_candidates_in_order_and_stops_on_early_success(
-    tmp_path, naca0012_selig_text, monkeypatch
+    tmp_path, sharp_naca0012_selig_text, naca0012_selig_text, monkeypatch, finite_trailing_edge
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(naca0012_selig_text if finite_trailing_edge else sharp_naca0012_selig_text)
+    expected_mesher = "cartesian2d-external-boundary-layer" if finite_trailing_edge else pipeline.MESH_RECOVERY_MESHER_CANDIDATES[0]
     initial = MeshParams(first_cell_height_chords=0.01575)
     cache = _cache(tmp_path)
     events: list[tuple[str, float | None]] = []
@@ -292,11 +300,11 @@ def test_recovery_tries_segmented_candidates_in_order_and_stops_on_early_success
 
     assert result.n_cells == 7600
     assert recovered is True
-    assert actual.mesher == pipeline.MESH_RECOVERY_MESHER_CANDIDATES[0]
+    assert actual.mesher == expected_mesher
     assert actual.first_cell_height_chords == pytest.approx(0.01575)
     assert events == [
         (pipeline.MESH_RECOVERY_PUBLIC_MESHER, 0.01575),
-        (pipeline.MESH_RECOVERY_MESHER_CANDIDATES[0], 0.01575),
+        (expected_mesher, 0.01575),
     ]
     assert any(actual.mesher in warning for warning in warnings)
     initial_key = EngineCache.mesh_key(airfoil, 0.05, initial, mesher=mesher)
@@ -308,10 +316,10 @@ def test_recovery_tries_segmented_candidates_in_order_and_stops_on_early_success
 
 
 def test_recovery_retries_each_candidate_at_bounded_wall_height_only_after_typed_failure(
-    tmp_path, naca0012_selig_text, monkeypatch
+    tmp_path, sharp_naca0012_selig_text, monkeypatch
 ):
     """Production-shaped recall: low-speed 20-32C needed the 0.006c cap."""
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     initial = MeshParams(first_cell_height_chords=0.01575)
     events: list[tuple[str, float | None]] = []
     mesher, _meshers = _ladder_meshers(monkeypatch, events)
@@ -349,10 +357,10 @@ def test_recovery_retries_each_candidate_at_bounded_wall_height_only_after_typed
 
 
 def test_recovered_mesh_evidence_is_checksummed_cached_and_archived_per_point(
-    tmp_path, naca0012_selig_text, monkeypatch
+    tmp_path, sharp_naca0012_selig_text, monkeypatch
 ):
     """A repaired point retains exact setup, QA, and failed-attempt proof."""
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     initial = MeshParams(first_cell_height_chords=0.01575)
     events: list[tuple[str, float | None]] = []
     mesher, meshers = _ladder_meshers(monkeypatch, events)
@@ -396,7 +404,7 @@ def test_recovered_mesh_evidence_is_checksummed_cached_and_archived_per_point(
     expected_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     checksum = evidence_dir / pipeline.SHARED_MESH_EVIDENCE_CHECKSUM
     assert checksum.read_text().split()[0] == expected_digest
-    assert manifest["meshRecoveryVersion"] == 2
+    assert manifest["meshRecoveryVersion"] == 3
     assert manifest["status"] == "verified"
     assert manifest["actualMesh"]["params"]["mesher"] == actual.mesher
     assert manifest["actualMesh"]["params"]["first_cell_height_chords"] == pytest.approx(
@@ -531,9 +539,9 @@ def test_link_mesh_replaces_stale_evidence_symlink_with_verified_copy(tmp_path):
 
 
 def test_all_deterministic_candidates_exhaust_in_exact_order_with_real_diagnostics(
-    tmp_path, naca0012_selig_text, monkeypatch
+    tmp_path, sharp_naca0012_selig_text, monkeypatch
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     initial = MeshParams(first_cell_height_chords=0.01575)
     events: list[tuple[str, float | None]] = []
     mesher, _meshers = _ladder_meshers(monkeypatch, events)
@@ -573,9 +581,9 @@ def test_all_deterministic_candidates_exhaust_in_exact_order_with_real_diagnosti
 
 
 def test_infrastructure_failure_stops_ladder_without_cap_or_next_candidate(
-    tmp_path, naca0012_selig_text, monkeypatch
+    tmp_path, sharp_naca0012_selig_text, monkeypatch
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     initial = MeshParams(first_cell_height_chords=0.01575)
     events: list[tuple[str, float | None]] = []
     mesher, _meshers = _ladder_meshers(monkeypatch, events)
@@ -726,9 +734,9 @@ def test_worker_cancellation_preserves_incrementally_published_cases(
 
 
 def test_non_default_mesher_deterministic_failure_does_not_change_user_strategy(
-    tmp_path, naca0012_selig_text, monkeypatch
+    tmp_path, sharp_naca0012_selig_text, monkeypatch
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     actual = MeshParams(mesher="custom-public", first_cell_height_chords=0.01575)
     events: list[tuple[str, float | None]] = []
     mesher = CountingMesher("custom-public", events)
@@ -755,9 +763,9 @@ def test_non_default_mesher_deterministic_failure_does_not_change_user_strategy(
 
 
 def test_cached_candidate_rejection_evicts_only_that_candidate(
-    tmp_path, naca0012_selig_text
+    tmp_path, sharp_naca0012_selig_text
 ):
-    airfoil = _airfoil(naca0012_selig_text)
+    airfoil = _airfoil(sharp_naca0012_selig_text)
     cache = _cache(tmp_path)
     first_name, other_name = pipeline.MESH_RECOVERY_MESHER_CANDIDATES[:2]
     first = CountingMesher(first_name)

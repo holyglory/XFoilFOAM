@@ -1,4 +1,8 @@
-"""Monotonic engine capabilities consumed by the durable control plane."""
+"""Monotonic engine capabilities consumed by the durable control plane.
+
+Mesh recovery version 3 preserves finite trailing edges and routes their exact
+contours through the quality-gated Cartesian mesher instead of pinching them.
+"""
 
 # Version 2 extends the quality-gated segmented recovery ladder with
 # trailing-edge-centred and camber-aware C-grids, followed by a rare-profile
@@ -8,7 +12,7 @@
 # topology without changing source coordinates or quality thresholds.
 # Increment only when a deployed engine can produce a materially newer mesh
 # repair for obligations that were terminal under the previous version.
-MESH_RECOVERY_VERSION = 2
+MESH_RECOVERY_VERSION = 3
 
 # Version 1 records the exact mesh that produced every new result as a stable
 # content fingerprint plus a separate resolved-recipe fingerprint.  The mesh

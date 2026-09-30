@@ -9108,7 +9108,12 @@ def prepare_mesh_with_recovery(
 
     original_height = resolved.first_cell_height_chords
     last_error: Optional[DeterministicMeshError] = None
-    for candidate_name in MESH_RECOVERY_MESHER_CANDIDATES:
+    candidates_for_geometry = (
+        ("cartesian2d-external-boundary-layer",)
+        if airfoil.has_finite_trailing_edge
+        else MESH_RECOVERY_MESHER_CANDIDATES
+    )
+    for candidate_name in candidates_for_geometry:
         candidate_mesher = get_mesher(candidate_name)
         heights: list[float | None] = [original_height]
         caps = [MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS]

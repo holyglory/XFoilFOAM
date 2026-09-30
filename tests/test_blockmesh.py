@@ -77,6 +77,13 @@ def test_mesher_registered():
         assert name in list_meshers(include_internal=True)
 
 
+@pytest.mark.parametrize("mesher", [BlockMeshCGrid(), *SEGMENTED_CANDIDATES])
+def test_structured_mesh_refuses_to_collapse_a_real_finite_trailing_edge(mesher):
+    airfoil = load_airfoil("sg6051", (SELIG_SEED_DIR / "sg6051.dat").read_text(), None, AirfoilFormat.auto)
+    with pytest.raises(DeterministicMeshError, match="must not be pinched"):
+        mesher.build_dict(airfoil, MeshParams(first_cell_height_chords=0.003), chord=0.1)
+
+
 def test_candidate_constructor_rejects_unfingerprinted_variants():
     with pytest.raises(ValueError, match="must be one of"):
         BlockMeshCGrid.segmented_normal(21)
@@ -100,8 +107,8 @@ def test_solve_expansion_reproduces_length():
     assert g > 1.0
 
 
-def test_default_build_dict_preserves_legacy_four_block_structure(naca0012_selig_text):
-    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+def test_default_build_dict_preserves_legacy_four_block_structure(sharp_naca0012_selig_text):
+    af = load_airfoil("naca0012", sharp_naca0012_selig_text, None, AirfoilFormat.auto)
     mp = MeshParams(n_surface=60, n_radial=50, n_wake=40, first_cell_height_chords=1e-4)
     text = BlockMeshCGrid().build_dict(af, mp, chord=0.5)
 
@@ -118,9 +125,9 @@ def test_default_build_dict_preserves_legacy_four_block_structure(naca0012_selig
 
 @pytest.mark.parametrize("segments", SEGMENTED_NORMAL_COUNTS)
 def test_segmented_candidate_structure_is_explicit_and_fingerprinted(
-    naca0012_selig_text, segments
+    sharp_naca0012_selig_text, segments
 ):
-    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    af = load_airfoil("naca0012", sharp_naca0012_selig_text, None, AirfoilFormat.auto)
     mp = MeshParams(n_surface=65, n_radial=40, n_wake=30, first_cell_height_chords=1e-4)
     mesher = BlockMeshCGrid.segmented_normal(segments)
     text = mesher.build_dict(af, mp, chord=0.5)
@@ -141,9 +148,9 @@ def test_segmented_candidate_structure_is_explicit_and_fingerprinted(
 
 @pytest.mark.parametrize("segments", SEGMENTED_TE_NORMAL_COUNTS)
 def test_te_centered_candidate_preserves_upstream_extent_and_rectangular_wake(
-    naca0012_selig_text, segments
+    sharp_naca0012_selig_text, segments
 ):
-    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    af = load_airfoil("naca0012", sharp_naca0012_selig_text, None, AirfoilFormat.auto)
     mp = MeshParams(
         farfield_radius_chords=15,
         n_surface=65,
@@ -169,13 +176,13 @@ def test_te_centered_candidate_preserves_upstream_extent_and_rectangular_wake(
     ),
 )
 def test_camber_candidate_is_explicit_shifted_and_fingerprinted(
-    naca0012_selig_text,
+    sharp_naca0012_selig_text,
     variant,
     center_x,
     le_angle_deg,
     segments,
 ):
-    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    af = load_airfoil("naca0012", sharp_naca0012_selig_text, None, AirfoilFormat.auto)
     mp = MeshParams(
         farfield_radius_chords=15,
         n_surface=65,
@@ -204,14 +211,14 @@ def test_camber_candidate_is_explicit_shifted_and_fingerprinted(
 )
 @pytest.mark.parametrize("n_surface", [40, 61, 130])
 def test_segmented_surface_blocks_conserve_requested_cells(
-    naca0012_selig_text, n_surface, candidate
+    sharp_naca0012_selig_text, n_surface, candidate
 ):
     """A topology repair must not silently add/drop streamwise cells.
 
     The non-divisible 61-cell case is a false-positive guard against assuming
     every real mesh count is an exact multiple of the topology segment count.
     """
-    af = load_airfoil("naca0012", naca0012_selig_text, None, AirfoilFormat.auto)
+    af = load_airfoil("naca0012", sharp_naca0012_selig_text, None, AirfoilFormat.auto)
     mp = MeshParams(
         n_surface=n_surface,
         n_radial=40,
@@ -284,7 +291,7 @@ def test_segmented_preflight_rejects_authoritative_open_catalog_contours(name, s
     )
     mp = MeshParams(n_surface=65, n_radial=40, n_wake=30, first_cell_height_chords=0.003)
 
-    with pytest.raises(DeterministicMeshError, match="segmented topology preflight failed"):
+    with pytest.raises(DeterministicMeshError, match="must not be pinched"):
         BlockMeshCGrid.segmented_normal(segments).build_dict(af, mp, chord=0.05)
 
 
@@ -308,13 +315,16 @@ def test_segmented_preflight_scans_every_seed_without_silent_fold(candidate):
     mp = MeshParams(n_surface=65, n_radial=40, n_wake=30, first_cell_height_chords=0.003)
     emitted: set[str] = set()
     rejected: set[str] = set()
+    finite_edges: set[str] = set()
 
     for path in paths:
         af = load_airfoil(path.stem, path.read_text(), None, AirfoilFormat.auto)
+        if af.has_finite_trailing_edge:
+            finite_edges.add(path.stem)
         try:
             text = mesher.build_dict(af, mp, chord=0.05)
         except DeterministicMeshError as exc:
-            assert "segmented topology preflight failed" in str(exc)
+            assert ("must not be pinched" if af.has_finite_trailing_edge else "segmented topology preflight failed") in str(exc)
             rejected.add(path.stem)
         else:
             assert text.count("hex (") == 2 * candidate.surface_segments + 2
@@ -325,10 +335,12 @@ def test_segmented_preflight_scans_every_seed_without_silent_fold(candidate):
     # Later candidates are deliberately specialised fallbacks and need not
     # accept every profile that an earlier ladder rung already handles. They
     # must still remain usable for the representative closed geometries below.
-    assert {"2032c", "n0012", "clarky", "s1223", "sd8020"} <= emitted
+    assert finite_edges <= rejected
+    assert {"naca1", "ua79sfm"} <= rejected
+    assert {"2032c", "n0012", "clarky", "s1223", "sd8020"} <= emitted | finite_edges
 
 
-def test_cell_count(naca0012_selig_text):
+def test_cell_count(sharp_naca0012_selig_text):
     mp = MeshParams(n_surface=100, n_radial=60, n_wake=40)
     assert BlockMeshCGrid().cell_count(mp) == 2 * 100 * 60 + 2 * 40 * 60
 
