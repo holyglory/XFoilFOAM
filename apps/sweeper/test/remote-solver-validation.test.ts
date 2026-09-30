@@ -1100,21 +1100,34 @@ function stubFetch(
 
 function requests(fetchMock: ReturnType<typeof vi.fn>, suffix: string) {
   return fetchMock.mock.calls
-    .map(([url, init]) => ({
-      url: String(url),
-      headers: new Headers(init?.headers),
-      bodyByteLength: (
-        init as
-          | (RequestInit & {
-              __bodyByteLength?: number;
-            })
-          | undefined
-      )?.__bodyByteLength,
-      body:
-        (init as (RequestInit & { __parsedBody?: unknown }) | undefined)
-          ?.__parsedBody ??
-        (typeof init?.body === "string" ? JSON.parse(init.body) : null),
-    }))
+    .map(([url, init]) => {
+      const streamed = typeof init?.body !== "string" && init?.body != null;
+      const call: {
+        url: string;
+        body: any;
+        headers: Headers;
+        bodyByteLength?: number;
+      } = {
+        url: String(url),
+        body:
+          (init as (RequestInit & { __parsedBody?: unknown }) | undefined)
+            ?.__parsedBody ??
+          (typeof init?.body === "string" ? JSON.parse(init.body) : null),
+        headers: new Headers(init?.headers),
+      };
+      Object.defineProperty(call, "headers", {
+        value: call.headers,
+        enumerable: false,
+      });
+      if (streamed)
+        Object.defineProperty(call, "bodyByteLength", {
+          value: (
+            init as RequestInit & { __bodyByteLength?: number }
+          ).__bodyByteLength,
+          enumerable: false,
+        });
+      return call;
+    })
     .filter((call) => call.url.endsWith(suffix));
 }
 
