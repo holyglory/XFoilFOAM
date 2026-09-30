@@ -7955,6 +7955,17 @@ export const progressiveWorkerReports = pgTable(
     stopIdentityIdx: index("progressive_worker_reports_stop_identity_idx")
       .on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
       .where(sql`${table.stoppedEngineJobId} IS NOT NULL`),
+    finalStopIdentityIdx: index("progressive_worker_reports_final_stop_identity_idx")
+      .on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
+      .where(sql`${table.stoppedEngineJobId} IS NOT NULL AND (
+        ${table.report}#>>'{stopProof,ownership_basis}' = 'never_started_cancellation_fence'
+        OR ${table.report}#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
+        OR (${table.report}->'result' = 'null'::jsonb
+          AND ${table.report}#>>'{status,state}' = 'failed'
+          AND ${table.report}#>>'{status,total_cases}' = '0'
+          AND ${table.report}#>>'{status,completed_cases}' = '0'
+          AND ${table.report}#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure'))
+      )`),
     sequenceCheck: check(
       "progressive_worker_reports_sequence_check",
       sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
