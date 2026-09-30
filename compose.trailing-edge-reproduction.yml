@@ -31,6 +31,9 @@ services:
   numerics2:
     <<: *experiment
     command: ["python", "/verification/reproduce.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--variant", "production-fixed", "--verify-numerical-transition"]
+  full-polar:
+    <<: *experiment
+    command: ["python", "/verification/reproduce.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--variant", "production-fixed", "--verify-numerical-transition", "--full-polar-reference"]
   legacy:
     <<: *experiment
     command: ["python", "/verification/reproduce.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--variant", "legacy"]

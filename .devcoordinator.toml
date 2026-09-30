@@ -306,7 +306,12 @@ timeout_seconds = 300
 [[test.source-geometry.check]]
 name = "geometry-and-recovery"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_airfoil.py", "tests/test_cartesian2d.py", "tests/test_blockmesh.py", "tests/test_shared_mesh_recovery.py", "tests/test_jobs_mesh_resolution.py", "tests/test_api.py", "tests/test_numerical_canary.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_airfoil.py", "tests/test_cartesian2d.py", "tests/test_blockmesh.py", "tests/test_shared_mesh_recovery.py", "tests/test_jobs_mesh_resolution.py", "tests/test_api.py", "tests/test_numerical_canary.py", "tests/test_source_geometry_reproduction.py", "-q"]
+
+[[test.source-geometry.check]]
+name = "source-request-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_source_geometry_reproduction.py", "-q"]
 
 [test.finite-edge-diagnosis]
 timeout_seconds = 300
@@ -383,8 +388,8 @@ ttl_seconds = 86400
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain" }
 files = ["compose.trailing-edge-reproduction.yml"]
-services = ["artifacts", "numerics2"]
-finite_services = ["numerics2"]
+services = ["artifacts", "full-polar"]
+finite_services = ["full-polar"]
 build = false
 port = true
 route = true

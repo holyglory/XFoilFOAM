@@ -22,6 +22,23 @@ from airfoilfoam.openfoam.runner import EngineIdentityMismatch
 SOURCE_SHA256 = "0e10c995bbb34aacbcdadc06a8cf57916ff4f9891fd01397f4ab789422cce488"
 
 
+def reproduction_request(original, variant, full_polar_reference=False):
+    if hashlib.sha256(original).hexdigest() != SOURCE_SHA256:
+        raise ValueError("The retained SG6051 production request changed")
+    if full_polar_reference and variant != "production-fixed":
+        raise ValueError("A full reference requires the source-preserving production method")
+    source = json.loads(original)["engineRequest"]
+    for key in ("execution_id", "expected_engine", "expected_execution_pool", "expected_mesh_recovery_version", "expected_solver_budget_version"):
+        source[key] = None
+    source["resources"].update(cpu_budget=1, solver_processes=1, case_concurrency=1)
+    source["solver"].update(write_images=[], frame_fields=[], rans_failure_policy="continue")
+    if variant in {"pinched-cartesian", "source-cartesian"}:
+        source["mesh"]["mesher"] = "cartesian2d-external-boundary-layer"
+    if full_polar_reference:
+        source["aoa"] = {"angles": list(range(-5, 21))}
+    return PolarRequest.model_validate(source)
+
+
 def source_preserving_airfoil(cls, name, contour):
     points = np.asarray(contour, dtype=float).copy()
     leading_edge = points[np.argmin(points[:, 0])].copy()
@@ -54,19 +71,12 @@ def main():
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--variant", choices=["legacy", "pinched-cartesian", "source-cartesian", "production-fixed"], required=True)
     parser.add_argument("--verify-numerical-transition", action="store_true")
+    parser.add_argument("--full-polar-reference", action="store_true")
     args = parser.parse_args()
     original = args.request.read_bytes()
-    if hashlib.sha256(original).hexdigest() != SOURCE_SHA256:
-        raise ValueError("The retained SG6051 production request changed")
-    source = json.loads(original)["engineRequest"]
-    for key in ("execution_id", "expected_engine", "expected_execution_pool", "expected_mesh_recovery_version", "expected_solver_budget_version"):
-        source[key] = None
-    source["resources"].update(cpu_budget=1, solver_processes=1, case_concurrency=1)
-    source["solver"].update(write_images=[], frame_fields=[], rans_failure_policy="continue")
-    if args.variant in {"pinched-cartesian", "source-cartesian"}:
-        source["mesh"]["mesher"] = "cartesian2d-external-boundary-layer"
-    request = PolarRequest.model_validate(source)
-    destination = args.destination / args.variant / str(uuid4())
+    request = reproduction_request(original, args.variant, args.full_polar_reference)
+    group = "full-polar-reference" if args.full_polar_reference else args.variant
+    destination = args.destination / group / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
     driver = Path(__file__).read_bytes()
     (destination / "replay-driver.py").write_bytes(driver)
@@ -102,6 +112,7 @@ def main():
     report = {
         "kind": "sg6051-trailing-edge-reproduction-v1", "production_evidence": False,
         "accuracy_certified": False, "variant": args.variant, "source_sha256": SOURCE_SHA256,
+        "full_polar_reference": args.full_polar_reference,
         "driver_sha256": hashlib.sha256(driver).hexdigest(),
         "source_engine_job": "94246be7-3823-435f-8742-cf361a84bba1", "local_job": job_id,
         "request": request.model_dump(mode="json"), "engine": settings.engine_identity().model_dump(mode="json"),
@@ -109,7 +120,8 @@ def main():
         "differences": ["isolated current-source runtime", "one solver process", "empty mesh and field cache",
                         "no rendered media", "continue to the second requested angle after rejected evidence",
                         "production mesh admission" if args.variant == "production-fixed" else request.mesh.mesher,
-                        "original finite trailing edge retained" if args.variant in {"source-cartesian", "production-fixed"} else "original pinching transformation"],
+                        "original finite trailing edge retained" if args.variant in {"source-cartesian", "production-fixed"} else "original pinching transformation",
+                        *(["separate cold full sweep at all26 prior angles; not experimental truth"] if args.full_polar_reference else [])],
         "outcomes": [],
     }
     transformation = (
