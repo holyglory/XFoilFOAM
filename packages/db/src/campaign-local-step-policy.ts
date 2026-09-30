@@ -41,11 +41,12 @@ export async function inheritLocalStepPolicy(
   campaignId: string,
   previousRevisionId: string,
   revisionId: string,
+  preserveSolverPolicy = false,
 ) {
   await db.execute(sql`
     INSERT INTO campaign_local_step_policies(campaign_id,plan_revision_id,smoothing,source)
     SELECT campaign.id, revision.id,
-      CASE WHEN revision.plan#>>'{numerics,solverProfileId}' IS DISTINCT FROM prior.plan#>>'{numerics,solverProfileId}'
+      CASE WHEN NOT ${preserveSolverPolicy} AND revision.plan#>>'{numerics,solverProfileId}' IS DISTINCT FROM prior.plan#>>'{numerics,solverProfileId}'
         THEN coalesce(solver.local_time_step_smoothing, 0.2) ELSE policy.smoothing END,
       'inherited'
     FROM sim_campaigns campaign JOIN sim_campaign_plan_revisions revision ON revision.campaign_id=campaign.id

@@ -1340,6 +1340,17 @@ successor setup revisions, verify the exact new worker/route, then restore the
 recorded admission state. Unchanged physical targets can retain real NeuralFoil
 predictions; CFD compatibility remains separate across numerical revisions.
 
+`packages/db/src/adopt-progressive-numerics.ts CAMPAIGN_UUID SOURCE_PLAN_UUID`
+rehearses the campaign transition in a transaction that is rolled back by
+default; `--apply` commits it. Both paths require paused admission and fully
+stopped, settled prior execution. A stale source plan is refused. The transition
+copies exact immutable setup values into revision-2 successors, preserves kept
+condition angles and the campaign's local-step policy, and retains original
+solver evidence unchanged. Repeating the same committed transition is a no-op.
+Completed campaigns reopen for the new numerical work; paused campaigns stay
+paused, and cancelled or archived campaigns are not changed. Normal catalog
+enrollment uses the successor conditions when later profiles arrive.
+
 Source-preserving finite-edge meshing retains the real trailing-edge endpoints
 as explicit Cartesian surface features. Shared mesh files use 17-digit ASCII
 coordinates; this precision participates in mesh and downstream seed identities

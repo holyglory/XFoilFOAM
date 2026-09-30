@@ -10,7 +10,7 @@ import {
   validateNeuralFoilPredictionPayload,
 } from "./progressive-campaigns";
 
-async function reusePreviousBaselines(
+export async function reusePreviousBaselines(
   db: DB,
   generationId: string,
   previousIds: string[],

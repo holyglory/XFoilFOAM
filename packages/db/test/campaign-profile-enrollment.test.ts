@@ -14,6 +14,7 @@ import {
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
 import { adoptProgressiveWallPolicy } from "../src/progressive-recipe-adoption";
+import { adoptProgressiveNumerics2 } from "../src/progressive-numerics-transition";
 import { adoptProgressiveLocalTimeStepPolicy, inheritLocalStepPolicy } from "../src/campaign-local-step-policy";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { execFileSync, spawn } from "node:child_process";
@@ -241,6 +242,291 @@ const points = [
 ];
 
 describe("durable progressive scope requests", () => {
+  it.each(["active", "paused", "completed"])(
+    "numerical revision transition preserves scope and predictions for %s campaigns",
+    async (status) => {
+      const id = await campaign("active", [32.173, 900]);
+      const [sourcePlan] = await db.execute(
+        sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+      );
+      const planId = String(sourcePlan.current_plan_revision_id);
+      const originalConditions = await db.execute(
+        sql`SELECT id,simulation_preset_revision_id FROM sim_campaign_conditions WHERE campaign_id=${id} ORDER BY ord`,
+      );
+      const kept = originalConditions[1];
+      await db.execute(
+        sql`UPDATE sim_campaign_conditions SET status='kept' WHERE id=${kept.id}`,
+      );
+      await db.execute(
+        sql`INSERT INTO campaign_condition_scopes(condition_id,angles,source_plan_revision_id) VALUES(${kept.id},ARRAY[-2,0]::float8[],${planId})`,
+      );
+      await db.execute(
+        sql`UPDATE sim_campaign_points SET state='released' WHERE condition_id=${kept.id} AND aoa_deg=2`,
+      );
+      await adoptProgressiveLocalTimeStepPolicy(db, id, 0.35);
+      const initial = (await reconcileProgressiveGenerationRequest(db))!;
+      for (let index = 0; index < 2; index++) {
+        const lease = (await claim([1]))!;
+        await storeNeuralFoilPrediction(db, lease, predictionFixture(lease));
+      }
+      const previous =
+        await db.execute(sql`SELECT scope.target_id,scope.angles,scope.recipes,revision.snapshot
+      FROM progressive_generation_targets scope JOIN simulation_preset_revisions revision ON revision.id=scope.revision_id
+      WHERE generation_id=${initial.generationId} ORDER BY target_id`);
+      const predictions =
+        await db.execute(sql`SELECT prediction.* FROM neuralfoil_predictions prediction
+      JOIN progressive_prediction_links link ON link.prediction_id=prediction.id
+      JOIN progressive_work work ON work.id=link.work_id WHERE work.generation_id=${initial.generationId} ORDER BY prediction.id`);
+      await db
+        .update(simCampaigns)
+        .set({ status })
+        .where(eq(simCampaigns.id, id));
+      const rollback = new Error("isolated numerical transition rollback");
+      await expect(
+        db.transaction(async (transaction) => {
+          await adoptProgressiveNumerics2(
+            transaction as unknown as DB,
+            id,
+            planId,
+          );
+          throw rollback;
+        }),
+      ).rejects.toBe(rollback);
+      expect(
+        (
+          await db.execute(
+            sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+          )
+        )[0],
+      ).toEqual(sourcePlan);
+      const adopted = await adoptProgressiveNumerics2(db, id, planId);
+      expect(adopted).toMatchObject({
+        kind: "adopted",
+        conditions: 2,
+        points: 5,
+        conditionGeneration: 2,
+      });
+      if (adopted.kind !== "adopted")
+        throw new Error("Expected a real transition");
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      try {
+        expect(await adoptProgressiveNumerics2(db, id, planId)).toMatchObject({
+          kind: "replayed",
+          planRevisionId: adopted.planRevisionId,
+        });
+      } finally {
+        await db.execute(
+          sql`UPDATE sweeper_state SET enabled=false WHERE id=1`,
+        );
+      }
+      const [current] = await db.execute(
+        sql`SELECT status,current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+      );
+      expect(current).toEqual({
+        status: status === "completed" ? "active" : status,
+        current_plan_revision_id: adopted.planRevisionId,
+      });
+      const scopes =
+        await db.execute(sql`SELECT scope.target_id,scope.angles,scope.recipes,revision.snapshot
+      FROM progressive_generation_targets scope JOIN simulation_preset_revisions revision ON revision.id=scope.revision_id
+      WHERE generation_id=${adopted.generationId} ORDER BY target_id`);
+      expect(scopes.map((scope) => [scope.target_id, scope.angles])).toEqual(
+        previous.map((scope) => [scope.target_id, scope.angles]),
+      );
+      for (let index = 0; index < scopes.length; index++) {
+        const snapshot = scopes[index].snapshot as SimulationSetupSnapshot;
+        const prior = previous[index].snapshot as SimulationSetupSnapshot;
+        expect(snapshot.engine?.numericsRevision).toBe("2");
+        expect(snapshot.flowState).toEqual(prior.flowState);
+        expect(snapshot.referenceGeometry).toEqual(prior.referenceGeometry);
+        expect(snapshot.boundary).toEqual(prior.boundary);
+        expect(snapshot.mesh).toEqual(prior.mesh);
+        expect(snapshot.material).toEqual(prior.material);
+        expect(physicsHashForSnapshot(snapshot)).toBe(
+          physicsHashForSnapshot(prior),
+        );
+        expect(methodCompatibilityHashForSnapshot(snapshot)).not.toBe(
+          methodCompatibilityHashForSnapshot(prior),
+        );
+      }
+      expect(
+        await db.execute(sql`SELECT scope.target_id,scope.angles,scope.recipes,revision.snapshot
+      FROM progressive_generation_targets scope JOIN simulation_preset_revisions revision ON revision.id=scope.revision_id
+      WHERE generation_id=${initial.generationId} ORDER BY target_id`),
+      ).toEqual(previous);
+      expect(
+        await db.execute(sql`SELECT prediction.* FROM neuralfoil_predictions prediction
+      JOIN progressive_prediction_links link ON link.prediction_id=prediction.id
+      JOIN progressive_work work ON work.id=link.work_id WHERE work.generation_id=${adopted.generationId} ORDER BY prediction.id`),
+      ).toEqual(predictions);
+      expect(
+        (
+          await db.execute(
+            sql`SELECT smoothing FROM campaign_local_step_policies WHERE plan_revision_id=${adopted.planRevisionId}`,
+          )
+        )[0].smoothing,
+      ).toBe(0.35);
+      expect(
+        (
+          await db.execute(
+            sql`SELECT stage FROM progressive_generations WHERE id=${adopted.generationId}`,
+          )
+        )[0].stage,
+      ).toBe(2);
+      expect(
+        (
+          await db.execute(
+            sql`SELECT count(*)::int AS count FROM sim_campaign_points WHERE campaign_id=${id} AND plan_revision_number=2 AND result_id IS NOT NULL`,
+          )
+        )[0].count,
+      ).toBe(0);
+      await reconcileProgressiveGenerationRequest(db);
+      const added = await newProfile();
+      await reconcileCampaignProfileEnrollment(db);
+      const expanded = await reconcileProgressiveGenerationRequest(db);
+      expect(expanded?.profiles).toBe(1);
+      expect(
+        (
+          await db.execute(sql`SELECT count(*)::int AS count FROM sim_campaign_points point JOIN sim_campaign_conditions condition ON condition.id=point.condition_id
+      JOIN simulation_preset_revisions revision ON revision.id=point.revision_id WHERE point.campaign_id=${id} AND point.airfoil_id=${added}
+      AND condition.generation=2 AND revision.snapshot#>>'{engine,numericsRevision}'='2'`)
+        )[0].count,
+      ).toBe(5);
+      expect(
+        (
+          await db.execute(sql`SELECT status FROM sim_campaigns WHERE id=${id}`)
+        )[0].status,
+      ).toBe(status === "paused" ? "paused" : "active");
+    },
+  );
+
+  it("numerical revision transition refuses new admissions, stale plans and live ownership without changing scope", async () => {
+    const id = await campaign();
+    const initial = (await reconcileProgressiveGenerationRequest(db))!;
+    const [source] = await db.execute(
+      sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+    );
+    const plan = String(source.current_plan_revision_id);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+    try {
+      await expect(adoptProgressiveNumerics2(db, id, plan)).rejects.toThrow(
+        "Pause new solver admissions",
+      );
+    } finally {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    }
+    await expect(
+      adoptProgressiveNumerics2(db, id, randomUUID()),
+    ).rejects.toThrow("plan changed");
+    const lease = (await claim([1]))!;
+    await expect(adoptProgressiveNumerics2(db, id, plan)).rejects.toThrow(
+      "physically stopped and settled",
+    );
+    await storeNeuralFoilPrediction(db, lease, predictionFixture(lease));
+    for (const status of ["cancelled", "archived"]) {
+      await db
+        .update(simCampaigns)
+        .set({ status })
+        .where(eq(simCampaigns.id, id));
+      expect(await adoptProgressiveNumerics2(db, id, plan)).toEqual({
+        kind: "not_required",
+        campaignId: id,
+      });
+    }
+    expect(
+      (
+        await db.execute(
+          sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`,
+        )
+      )[0],
+    ).toEqual(source);
+    expect(
+      (
+        await db.execute(
+          sql`SELECT count(*)::int AS count FROM progressive_generations WHERE campaign_id=${id}`,
+        )
+      )[0].count,
+    ).toBe(1);
+    expect(initial.campaignId).toBe(id);
+  });
+
+  it("numerical revision transition waits for exact CFD stop and preserves stored attempts and retry history", async () => {
+    const fixture = await fitFixture();
+    const [source] = await db.execute(
+      sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${fixture.campaignId}`,
+    );
+    const plan = String(source.current_plan_revision_id);
+    const attempt = await fixture.save(10, "rans", fixture.leases[0].alpha, {
+      cl: 0.3,
+      cd: 0.04,
+      cm: -0.02,
+    });
+    await fixture.record([attempt]);
+    await expect(
+      adoptProgressiveNumerics2(db, fixture.campaignId, plan),
+    ).rejects.toThrow("physically stopped and settled");
+    await db
+      .update(simJobs)
+      .set({ status: "done", ingestedAt: new Date() })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    await expect(
+      adoptProgressiveNumerics2(db, fixture.campaignId, plan),
+    ).rejects.toThrow("physically stopped and settled");
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    await expect(
+      adoptProgressiveNumerics2(db, fixture.campaignId, plan),
+    ).rejects.toThrow("physically stopped and settled");
+    const fit = (await fixture.acquire())!;
+    const request = buildProgressiveFitRequest(fit);
+    await storeProgressivePolarFit(
+      db,
+      fit,
+      request,
+      await fitUsingPython(request),
+    );
+    expect(
+      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+    ).toMatchObject({ waiting: 0 });
+    const oldResults = await db
+      .select()
+      .from(results)
+      .where(eq(results.simJobId, fixture.composed.jobId));
+    const oldAttempts = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, fixture.composed.jobId));
+    const receipts = await Promise.all([
+      adoptProgressiveNumerics2(db, fixture.campaignId, plan),
+      adoptProgressiveNumerics2(db, fixture.campaignId, plan),
+    ]);
+    expect(receipts.map((receipt) => receipt.kind).sort()).toEqual([
+      "adopted",
+      "replayed",
+    ]);
+    expect(
+      await db
+        .select()
+        .from(results)
+        .where(eq(results.simJobId, fixture.composed.jobId)),
+    ).toEqual(oldResults);
+    expect(
+      await db
+        .select()
+        .from(resultAttempts)
+        .where(eq(resultAttempts.simJobId, fixture.composed.jobId)),
+    ).toEqual(oldAttempts);
+    expect(
+      (
+        await db.execute(
+          sql`SELECT count(*)::int AS count FROM progressive_recipe_adoptions WHERE campaign_id=${fixture.campaignId}`,
+        )
+      )[0].count,
+    ).toBe(1);
+  });
+
   it("freezes explicit gas material in campaign revisions and preserves prior physical targets after edits", async () => {
     const [originalMedium] = await db
       .select()

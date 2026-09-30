@@ -74,6 +74,25 @@ timeout_seconds = 900
 [test.source-numerics-identity]
 timeout_seconds = 1800
 
+[test.source-numerics-adoption]
+timeout_seconds = 1800
+
+[test.source-numerics-adoption.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.source-numerics-adoption.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.source-numerics-adoption.check]]
+name = "campaign-transition-and-enrollment"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "numerical revision transition|adopts an old preliminary recipe|adopts the explicit local-step policy|reopens completed campaigns|enrolls paused campaigns|leaves cancelled|leaves archived"]
+
 [test.source-numerics-identity.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
