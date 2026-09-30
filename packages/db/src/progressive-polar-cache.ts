@@ -11,6 +11,7 @@ import {
   type AnalysisPhysical,
 } from "./analysis-target";
 import type { DB } from "./client";
+import { validatePolarConflictDiagnostics } from "./progressive-polar-conflicts";
 import {
   progressiveEvidencePreservesGeometry,
   SOURCE_GEOMETRY_POLICY_VERSION,
@@ -411,7 +412,9 @@ function validateFitOutput(
     !/^[a-f0-9]{64}$/.test(response.request_signature) ||
     !/^[a-f0-9]{64}$/.test(estimate.signature) ||
     estimate.version !==
-      (request.policy.uncertified_fast_bias_std == null
+      (request.policy.lineage_conflict_probability != null
+        ? "progressive-polar-gp-v4"
+        : request.policy.uncertified_fast_bias_std == null
         ? "progressive-polar-gp-v2"
         : "progressive-polar-gp-v3") ||
     estimate.kind !== "estimate" ||
@@ -462,6 +465,7 @@ function validateFitOutput(
       throw new Error("Fitted polar contributor has no exact eligible source");
     observedAngles.add(original.alpha);
   }
+  validatePolarConflictDiagnostics(request, estimate);
   const acquisition = estimate.acquisition;
   const hasEvidence = estimate.contributors.length > 0;
   if (

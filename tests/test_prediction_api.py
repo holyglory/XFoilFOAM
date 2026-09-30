@@ -1,5 +1,7 @@
 from dataclasses import asdict, replace
 from uuid import uuid4
+import copy
+import numpy as np
 
 import pytest
 from fastapi import FastAPI
@@ -121,7 +123,60 @@ def test_progressive_signature_keeps_legacy_optional_observation_fields_replayab
     for field in ("accepted_cfd", "physical_identity", "numerical_identity"):
         legacy_observation.pop(field, None)
     legacy["observations"] = [legacy_observation]
+    legacy["policy"].pop("lineage_conflict_probability", None)
     assert post_progressive(current).json()["request_signature"] == post_progressive(legacy).json()["request_signature"]
+
+
+def test_opt_in_group_covariance_reduces_bad_joint_histories_without_relabelling_them():
+    request = progressive_request()
+    for alpha, name, lift in [(-2,"left",1.5),(2,"right",-0.3)]:
+        source=history(alpha,name)
+        coefficients=[[lift,row[1],row[2]] for row in source.coefficients]
+        request["histories"].append(asdict(replace(source,coefficients=coefficients)))
+    request["observations"]=[asdict(replace(observation("excluded"),eligible=False,exclusion_reason="known_bad_geometry"))]
+    original=copy.deepcopy(request)
+    baseline=post_progressive(request).json()
+    request["policy"]["lineage_conflict_probability"]=0.01
+    request["policy"]["policy_id"]="isolated-lineage-covariance-policy"
+    response=post_progressive(request)
+    assert response.status_code==200
+    estimate=response.json()["estimate"]
+    assert estimate["version"]=="progressive-polar-gp-v4"
+    assert estimate["signature"]!=baseline["estimate"]["signature"]
+    assert estimate["contributors"]==baseline["estimate"]["contributors"]
+    assert len(estimate["contributors"])==6
+    assert estimate["excluded"]==baseline["estimate"]["excluded"]
+    assert all(row["numerical_convergence"]=="unconverged" for row in estimate["contributors"])
+    assert estimate["calibration_status"]=="unvalidated"
+    curve=np.array(estimate["curves"]["composite"]["coefficients"])
+    assert curve[-1,0]>curve[0,0]
+    groups=estimate["conflict_diagnostics"]["groups"]
+    assert len(groups)==2 and all(group["window_count"]==3 for group in groups)
+    assert all(group["coefficients"][0]["shared_variance"]>0 for group in groups)
+    assert request["histories"]==original["histories"]
+    assert request["observations"]==original["observations"]
+    assert "job_id" not in response.json()
+    for curve in estimate["curves"].values():
+        assert np.isfinite(np.array(list(curve.values()))).all()
+        assert all(lower[1]>0 for lower in curve["lower"])
+
+
+@pytest.mark.parametrize("probability",[0,-0.01,0.051,True])
+def test_lineage_covariance_rejects_invalid_policy_through_real_endpoint(probability):
+    request=progressive_request()
+    request["policy"]["lineage_conflict_probability"]=probability
+    assert post_progressive(request).status_code==422
+
+
+def test_lineage_covariance_cannot_claim_physical_validation_or_fabricate_contributors():
+    request=progressive_request()
+    request["policy"]["lineage_conflict_probability"]=0.01
+    result=post_progressive(request).json()["estimate"]
+    assert result["best_method"]=="neuralfoil" and result["contributors"]==[]
+    assert result["conflict_diagnostics"]["groups"]==[]
+    np.testing.assert_allclose(result["curves"]["composite"]["coefficients"],request["prior"]["coefficients"])
+    request["policy"].update(calibration_status="validated",validation_id="unrelated-existing-proof")
+    assert post_progressive(request).status_code==422
 
 
 @pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}])

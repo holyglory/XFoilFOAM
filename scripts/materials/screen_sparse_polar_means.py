@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
@@ -14,9 +15,10 @@ from scripts.materials.calibrate_history_bias import curve_measurement
 from scripts.materials.measure_retained_polar import identity, replay_source
 from scripts.materials.validate_history_transfer import pinned_json
 from scripts.materials.validate_polar_uncertainty import write_result
+from scripts.materials.grouped_polar_conflicts import grouped_covariance_diagnostics
 
 
-CANDIDATES = ("unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor", "grouped_reversal_floor")
+CANDIDATES = ("unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor", "grouped_reversal_floor", "group_conditional_floor", "group_shared_covariance")
 MODEL_TAIL_PROBABILITY = 0.01
 CONFLICT_CUTOFF = 1 + 2 * math.sqrt(-math.log(MODEL_TAIL_PROBABILITY)) - 2 * math.log(MODEL_TAIL_PROBABILITY)
 SG_SHA256 = "06da59e93dbb969b3dcc1091c486d19aed176fd634c3a74f44c77c5464417654"
@@ -29,6 +31,9 @@ def producing_request_signature(request, source_path):
     if hashlib.sha256(Path(source_path).read_bytes()).hexdigest() != PRODUCER_SHA256:
         raise ValueError("The pinned producing API source changed")
     payload = request.model_dump(mode="json", exclude={"epoch_id", "lease_token"})
+    if payload["policy"].get("lineage_conflict_probability") is not None:
+        raise ValueError("The historical producer did not support lineage conflict covariance")
+    payload["policy"].pop("lineage_conflict_probability", None)
     if payload["policy"].get("uncertified_fast_bias_std") is None:
         payload["policy"].pop("uncertified_fast_bias_std", None)
     for observation in [*payload["observations"], *(history["observation"] for history in payload["histories"])]:
@@ -42,6 +47,12 @@ def producing_request_signature(request, source_path):
 def candidate_fit(prior, observations, policy, candidate):
     if candidate not in CANDIDATES:
         raise ValueError("Unknown frozen sparse-mean candidate")
+    if candidate == "group_shared_covariance":
+        fitted = fit_progressive_polar(prior, observations, replace(policy, lineage_conflict_probability=MODEL_TAIL_PROBABILITY))
+        fitted["research_only"] = {"candidate": candidate, "not_production_policy": True,
+                                  "original_observations_sha256": identity([row.__dict__ for row in observations]),
+                                  "conditional_groups": fitted["conflict_diagnostics"]}
+        return fitted
     baseline = fit_progressive_polar(prior, observations, policy)
     if candidate == "unchanged" or not baseline["contributors"]:
         return baseline
@@ -49,11 +60,15 @@ def candidate_fit(prior, observations, policy, candidate):
     methods = {row.method for row in observations if row.eligible}
     scores = {}
     grouped = grouped_conflict_diagnostics(prior, observations, policy)
+    conditional = grouped_covariance_diagnostics(prior, observations, policy, MODEL_TAIL_PROBABILITY) \
+        if candidate == "group_conditional_floor" else None
+    conditional_multipliers = {(group["method"], group["lineage_id"]): np.array([
+        coefficient["variance_multiplier"] for coefficient in group["coefficients"]])
+        for group in conditional["groups"]} if conditional else {}
     grouped_factors = {}
     if candidate == "grouped_reversal_floor":
         for method in methods:
             reversals = [row for row in grouped["reversals"] if row["method"] == method and row["reversal"]]
-            groups = [row for row in grouped["groups"] if row["method"] == method]
             grouped_factors[method] = 16.0 * max([row["related_window_count"] // 2 for row in reversals] or [0])
     for method in methods:
         diagnostic = fit_progressive_polar(prior, [row for row in observations if row.method == method], policy) \
@@ -68,7 +83,8 @@ def candidate_fit(prior, observations, policy, candidate):
         if not observation.eligible:
             changed.append(observation)
             continue
-        multiplier = multipliers[observation.method]
+        multiplier = conditional_multipliers[observation.method, observation.lineage_id] \
+            if conditional is not None else multipliers[observation.method]
         if not multiplier.any():
             changed.append(observation)
             continue
@@ -87,7 +103,12 @@ def candidate_fit(prior, observations, policy, candidate):
                                "disagreement_scores_before": scores, "grouped_conflicts": grouped,
                                "model_cutoff": cutoff,
                                "tail_probability_per_method_coefficient": MODEL_TAIL_PROBABILITY if "conservative" in candidate else None}
-    result["research_only"]["grouped_conflicts"] = grouped_conflict_diagnostics(prior, observations, policy)
+    if conditional is not None:
+        result["research_only"]["added_variance_multipliers"] = [
+            {"method": method, "lineage_id": lineage, "values": values.tolist()}
+            for (method, lineage), values in sorted(conditional_multipliers.items())]
+        result["research_only"]["conditional_groups"] = conditional
+        result["research_only"]["model_cutoff"] = None
     return result
 
 
@@ -184,6 +205,8 @@ def measure_candidate_profile(source, request, candidate):
         measurement = curve_measurement(estimate, reference)
         measurement["contributors"] = estimate["contributors"]
         measurement["estimate_signature"] = estimate["signature"]
+        conditional = estimate.get("research_only", {}).get("conditional_groups", {})
+        measurement["conditional_groups"] = conditional.get("groups", [])
         predicted = np.array(measurement["mean_transformed"])
         predicted[1] = math.exp(predicted[1])
         actual = np.array([reference["payload"][name] for name in ("cl", "cd", "cm")])
@@ -296,6 +319,10 @@ def run_study(sg_path, native_path, cohort_path, producer_path, destination):
     native = pinned_json(native_path, NATIVE_SHA256)
     cohort = pinned_json(cohort_path, PILOT_SHA256)
     destination.mkdir(parents=True, exist_ok=False)
+    (destination / "screening-driver.py").write_bytes(Path(__file__).read_bytes())
+    (destination / "grouped-diagnostic.py").write_bytes(Path(__file__).with_name("grouped_polar_conflicts.py").read_bytes())
+    for filename in ("polar_conflicts.py", "progressive_polar.py"):
+        (destination / filename).write_bytes(Path(__file__).resolve().parents[2].joinpath("src/airfoilfoam/postprocess",filename).read_bytes())
     for name, path in (("sg6051-source.json", sg_path), ("native-source.json", native_path), ("pilot-source.json", cohort_path)):
         (destination / name).write_bytes(Path(path).read_bytes())
     manifest = sg["model"]["request"]
@@ -368,14 +395,28 @@ def run_study(sg_path, native_path, cohort_path, producer_path, destination):
     return summary
 
 
+def study_destination(destination, runs_directory):
+    if (destination is None) == (runs_directory is None):
+        raise ValueError("Specify exactly one immutable destination or run directory")
+    if destination is not None:
+        return Path(destination)
+    root = Path(runs_directory)
+    root.mkdir(parents=True, exist_ok=True)
+    return root / str(uuid4())
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sg6051", type=Path, required=True)
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--cohort", type=Path, required=True)
     parser.add_argument("--producing-api", type=Path, required=True)
-    parser.add_argument("--destination", type=Path, required=True)
+    destinations = parser.add_mutually_exclusive_group(required=True)
+    destinations.add_argument("--destination", type=Path)
+    destinations.add_argument("--runs-directory", type=Path)
     arguments = parser.parse_args()
-    summary = run_study(arguments.sg6051, arguments.native, arguments.cohort, arguments.producing_api, arguments.destination)
-    print(json.dumps({name: summary[name] for name in ("complete", "diagnostics", "cohort_mean_absolute_error", "failures")}))
+    destination = study_destination(arguments.destination, arguments.runs_directory)
+    summary = run_study(arguments.sg6051, arguments.native, arguments.cohort, arguments.producing_api, destination)
+    print(json.dumps({"destination": str(destination), "complete": summary["complete"],
+                      "candidate_acceptance": summary["candidate_acceptance"], "failures": summary["failures"]}))
     raise SystemExit(0 if summary["complete"] else 1)

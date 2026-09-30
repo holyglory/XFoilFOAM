@@ -54,6 +54,7 @@ export interface ProgressivePolarModelPolicy {
   calibration_status: "unvalidated" | "validated";
   validation_id?: string | null;
   uncertified_fast_bias_std?: ProgressiveCoefficientVector | null;
+  lineage_conflict_probability?: number | null;
 }
 
 export interface ProgressivePolarFitRequest {
@@ -107,6 +108,7 @@ export interface ProgressivePolarEstimate {
     coefficient: string;
     disagreement_variance_multiplier: number;
   }>;
+  conflict_diagnostics?: ProgressivePolarConflictDiagnostics;
   acquisition: {
     version: "fixed-posterior-coverage-v1";
     method: "openfoam_fast";
@@ -120,6 +122,33 @@ export interface ProgressivePolarEstimate {
       coverage_reduction_fraction: ProgressiveCoefficientVector;
     }>;
   };
+}
+
+export interface ProgressivePolarConflictDiagnostics {
+  version: "conditional-lineage-subspaces-v1";
+  model_family_tail_probability: number;
+  per_test_tail_probability: number;
+  interpretation: "fixed_gaussian_model_not_physical_validation";
+  groups: Array<{
+    method: "openfoam_fast" | "openfoam_precise";
+    lineage_id: string;
+    window_count: number;
+    observation_ids: string[];
+    alpha: number[];
+    coefficients: Array<{
+      coefficient: "cl" | "log_cd" | "cm";
+      mean_score: number;
+      mean_dimension: number;
+      mean_cutoff: number;
+      contrast_score: number;
+      contrast_dimension: number;
+      contrast_cutoff: number | null;
+      variance_multiplier: number;
+      total_score: number;
+      shared_variance: number;
+      independent_variance: number;
+    }>;
+  }>;
 }
 
 export interface ProgressivePolarCurve {

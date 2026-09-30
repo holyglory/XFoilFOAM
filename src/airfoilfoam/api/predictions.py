@@ -52,6 +52,8 @@ def calculate_progressive_polar(request: ProgressivePolarRequest) -> dict:
     payload = request.model_dump(mode="json", exclude={"epoch_id", "lease_token"})
     if payload["policy"].get("uncertified_fast_bias_std") is None:
         payload["policy"].pop("uncertified_fast_bias_std", None)
+    if payload["policy"].get("lineage_conflict_probability") is None:
+        payload["policy"].pop("lineage_conflict_probability", None)
     for observation in [*payload["observations"], *(history["observation"] for history in payload["histories"])]:
         if observation.get("accepted_cfd") is None:
             observation.pop("accepted_cfd", None)

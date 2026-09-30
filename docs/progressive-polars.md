@@ -49,6 +49,24 @@ were still disposable verification state.
 
 ## User-visible outcome
 
+### Optional related-history covariance
+
+The fitting engine supports an opt-in `lineage_conflict_probability` policy
+field, with values greater than zero and no greater than 0.05. It holds out
+related observations together, distinguishes shared errors from within-history
+disagreement, and retains every original window in the joint fit. Model version
+`progressive-polar-gp-v4` records the exact source groups and added uncertainty;
+stored CFD coefficients and acceptance classifications remain unchanged.
+
+The field is absent from production request-builder defaults. When absent or
+null, historical v2/v3 identities and numerical replay are preserved. Requesting
+it requires `calibration_status: unvalidated`; a statistical tail threshold is
+not physical validation. Engine API and database-cache tests cover response
+identity, source conservation, tamper rejection and unchanged-policy replay.
+Activation, public explanation of its effects and independent physical
+validation remain separate unfinished work. See
+`docs/sparse-polar-fitting-study.md` for the measured limits and comparisons.
+
 ### Supplemental prediction repair
 
 Missing NeuralFoil predictions may be retried after their original campaign stage

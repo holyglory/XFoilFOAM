@@ -12,6 +12,7 @@ import numpy as np
 
 MODEL_VERSION = "progressive-polar-gp-v2"
 BIAS_MODEL_VERSION = "progressive-polar-gp-v3"
+GROUP_MODEL_VERSION = "progressive-polar-gp-v4"
 ACQUISITION_VERSION = "fixed-posterior-coverage-v1"
 Method = Literal["openfoam_fast", "openfoam_precise"]
 
@@ -65,6 +66,7 @@ class PolarModelPolicy:
     calibration_status: Literal["unvalidated", "validated"]
     validation_id: str | None = None
     uncertified_fast_bias_std: list[float] | None = None
+    lineage_conflict_probability: float | None = None
 
 
 def observation_payload(observation):
@@ -82,6 +84,8 @@ def policy_payload(policy):
     payload = asdict(policy)
     if policy.uncertified_fast_bias_std is None:
         payload.pop("uncertified_fast_bias_std")
+    if policy.lineage_conflict_probability is None:
+        payload.pop("lineage_conflict_probability")
     return payload
 
 
@@ -115,6 +119,13 @@ def _validate(prior: PolarPrior, observations: list[PolarObservation], policy: P
         raise ValueError("Unknown calibration status")
     if policy.calibration_status == "validated" and not policy.validation_id:
         raise ValueError("Validated uncertainty requires a validation evidence identifier")
+    if policy.lineage_conflict_probability is not None:
+        if (isinstance(policy.lineage_conflict_probability, bool)
+                or not np.isfinite(policy.lineage_conflict_probability)
+                or not 0 < policy.lineage_conflict_probability <= 0.05):
+            raise ValueError("Lineage conflict probability must be finite and between zero and 0.05")
+        if policy.calibration_status != "unvalidated":
+            raise ValueError("Lineage conflict covariance has no physical validation certificate")
     if policy.uncertified_fast_bias_std is not None:
         bias = _matrix(policy.uncertified_fast_bias_std, (3,), "uncertified fast bias uncertainty")
         if np.any(bias < 0):
@@ -225,6 +236,8 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
     angles, coefficients, uncertainty, eligible, excluded = _validate(prior, observations, policy)
     prior_mean, prior_std = _transformed(coefficients, uncertainty)
     model_version = MODEL_VERSION if policy.uncertified_fast_bias_std is None else BIAS_MODEL_VERSION
+    if policy.lineage_conflict_probability is not None:
+        model_version = GROUP_MODEL_VERSION
     serialized = json.dumps({"version": model_version, "prior": asdict(prior), "policy": policy_payload(policy),
                              "observations": [observation_payload(row) for row in sorted(observations, key=lambda row: row.observation_id)]},
                             sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -235,6 +248,7 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
     acquisition_covariance = np.zeros((len(angles), 3))
     acquisition_coverage = np.zeros((len(angles), 3))
     acquisition_noise = []
+    conflict_diagnostics = None
     if eligible:
         observed_angles = np.array([row.alpha for row in eligible])
         observed_values, observed_errors = _transformed(
@@ -253,6 +267,12 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
         lineage = np.array([[left.lineage_id == right.lineage_id for right in eligible] for left in eligible])
         noise_floors = np.array([policy.precise_noise_floor if row.method == "openfoam_precise"
                                  else policy.fast_noise_floor for row in eligible])
+        extra_covariance = None
+        if policy.lineage_conflict_probability is not None:
+            from .polar_conflicts import grouped_covariance_diagnostics, shared_discrepancy_covariance
+
+            conflict_diagnostics = grouped_covariance_diagnostics(prior, observations, policy, policy.lineage_conflict_probability)
+            extra_covariance = shared_discrepancy_covariance(eligible, conflict_diagnostics, policy)
         for coefficient in range(3):
             reference = np.interp(observed_angles, angles, prior_mean[:, coefficient])
             residuals = observed_values[:, coefficient] - reference
@@ -276,6 +296,8 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
             noise_covariance = policy.lineage_correlation * np.outer(noise_std, noise_std) * lineage
             noise_covariance += np.diag((1 - policy.lineage_correlation) * noise_std ** 2)
             data_covariance += noise_covariance
+            if extra_covariance is not None:
+                data_covariance += extra_covariance[coefficient]
             jitter = max(float(np.max(np.diag(data_covariance))), 1.0) * 1e-10
             data_covariance += np.eye(len(eligible)) * jitter
             cholesky = np.linalg.cholesky(data_covariance)
@@ -289,6 +311,8 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
             fast_covariance = kernel(angles, angles, "fast")
             fast_conditional_variance = np.maximum(np.diag(fast_covariance) - np.sum(fast_projection ** 2, axis=0), 0)
             fast_errors = noise_std[precise == 0]
+            if extra_covariance is not None:
+                fast_errors = np.sqrt(noise_std[precise == 0] ** 2 + np.diag(extra_covariance[coefficient])[precise == 0])
             prospective_noise = max(policy.fast_noise_floor[coefficient], float(np.median(fast_errors)) if len(fast_errors) else 0)
             acquisition_noise.append(prospective_noise)
             for method in means:
@@ -334,7 +358,7 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
     displayed_curves = {"composite": curves["openfoam_precise"]}
     for method in methods_present:
         displayed_curves[method] = curves[method]
-    return {
+    result = {
         "version": model_version, "signature": signature, "kind": "estimate",
         "target_signature": prior.target_signature, "branch": prior.branch, "alpha": angles.tolist(),
         "prior_prediction_id": prior.prediction_id, "policy_id": policy.policy_id,
@@ -359,3 +383,10 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
             } for index, alpha in enumerate(angles) if eligible and alpha not in observed_angles],
         },
     }
+    if policy.lineage_conflict_probability is not None:
+        if conflict_diagnostics is None:
+            from .polar_conflicts import grouped_covariance_diagnostics
+
+            conflict_diagnostics = grouped_covariance_diagnostics(prior, observations, policy, policy.lineage_conflict_probability)
+        result["conflict_diagnostics"] = conflict_diagnostics
+    return result

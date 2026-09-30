@@ -4,6 +4,7 @@ import json
 import pytest
 
 from scripts.materials import measure_retained_cohort as cohort
+from scripts.materials import validate_grouped_history_cohort as grouped
 
 
 def source_file(directory, sources=None):
@@ -64,3 +65,44 @@ def test_invalid_cohort_fails_before_creating_output(tmp_path, bad):
     with pytest.raises(ValueError):
         cohort.measure_cohort(path, "0" * 64 if bad == "checksum" else signature, tmp_path / "evidence")
     assert not (tmp_path / "evidence").exists()
+
+
+@pytest.mark.parametrize("bad",[None,"pilot_profile","pilot_geometry","count","selection","checksum","partition","missing"])
+def test_grouped_cohort_verifies_pilot_exclusion_and_every_partition_before_execution(tmp_path,monkeypatch,bad):
+    def row(index):
+        return {"model":{"id":f"{index:064x}"},"physical":{"airfoilId":f"profile-{index}","geometry":[[0,0],[1,index/100]]}}
+    pilot={"kind":"retained-polar-cohort-export-v1","sources":[row(index) for index in range(8)]}
+    pilot_path=tmp_path/"pilot.json"
+    pilot_path.write_text(json.dumps(pilot))
+    monkeypatch.setattr(grouped,"PILOT_SHA256",hashlib.sha256(pilot_path.read_bytes()).hexdigest())
+    paths,signatures={},{}
+    for index,partition in enumerate(("fit","calibration","heldout")):
+        source=row(index+10)
+        if partition=="heldout" and bad=="pilot_profile":
+            source["physical"]["airfoilId"]="profile-0"
+        if partition=="heldout" and bad=="pilot_geometry":
+            source["physical"]["geometry"]=pilot["sources"][0]["physical"]["geometry"]
+        payload={"kind":"retained-polar-cohort-export-v1","partition":partition,
+                 "selectionSha256":grouped.SELECTION_SHA256,"sources":[source]}
+        if partition=="heldout" and bad=="count":
+            payload["sources"]=[]
+        if partition=="heldout" and bad=="selection":
+            payload["selectionSha256"]="wrong"
+        if partition=="heldout" and bad=="partition":
+            payload["partition"]="fit"
+        path=tmp_path/f"{partition}.json"
+        path.write_text(json.dumps(payload))
+        paths[partition]=path
+        signatures[partition]=hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(grouped,"COHORTS",signatures)
+    monkeypatch.setattr(grouped,"COUNTS",dict.fromkeys(signatures,1))
+    if bad=="checksum":
+        paths["heldout"].write_text("{}")
+    if bad=="missing":
+        paths.pop("heldout")
+    if bad is None:
+        assert set(grouped.verify_sources(paths,pilot_path))==set(signatures)
+    else:
+        with pytest.raises(ValueError):
+            grouped.run(paths,pilot_path,tmp_path/"output")
+        assert not (tmp_path/"output").exists()

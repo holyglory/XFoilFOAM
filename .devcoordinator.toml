@@ -77,24 +77,53 @@ timeout_seconds = 1800
 [test.sparse-mean-study]
 timeout_seconds = 900
 
+[test.grouped-polar-integration]
+timeout_seconds = 900
+
+[test.grouped-polar-integration.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.grouped-polar-integration.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.grouped-polar-integration.check]]
+name = "real-engine-api"
+tier = "development"
+env = { OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1" }
+command = [".venv/bin/python", "-m", "pytest", "tests/test_prediction_api.py", "tests/test_progressive_polar.py", "tests/test_polar_history.py", "tests/test_progressive_bias_policy.py", "-q"]
+
+[[test.grouped-polar-integration.check]]
+name = "stored-history-to-cache"
+tier = "development"
+requires = ["types", "real-engine-api"]
+env = { OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "persistent progressive polar cache"]
+
 [[test.sparse-mean-study.check]]
 name = "research-contracts"
 tier = "development"
 command = [".venv/bin/python", "-m", "pytest", "tests/test_history_bias_calibration.py", "tests/test_retained_polar_measurement.py", "tests/test_retained_polar_cohort.py", "-q"]
+env = { OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1" }
 
 [[test.sparse-mean-study.check]]
 name = "frozen-screening"
 tier = "development"
 requires = ["research-contracts"]
-command = [".venv/bin/python", "-m", "scripts.materials.screen_sparse_polar_means", "--sg6051", ".codex-artifacts/sg6051-polar-diagnosis-20260930/model.json", "--native", ".codex-artifacts/numerics2-native-sg6051-20260930/report.json", "--cohort", ".codex-artifacts/history-population-20260919/cohort.json", "--producing-api", ".codex-artifacts/production-engine-383b2fc/src/airfoilfoam/api/predictions.py", "--destination", ".codex-artifacts/sparse-mean-study-20260930-r13"]
-retained_artifacts = [{ name = "sparse-mean-screening", path = ".codex-artifacts/sparse-mean-study-20260930-r13", max_bytes = 16777216 }]
+env = { OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1" }
+command = [".venv/bin/python", "-m", "scripts.materials.screen_sparse_polar_means", "--sg6051", ".codex-artifacts/sg6051-polar-diagnosis-20260930/model.json", "--native", ".codex-artifacts/numerics2-native-sg6051-20260930/report.json", "--cohort", ".codex-artifacts/history-population-20260919/cohort.json", "--producing-api", ".codex-artifacts/production-engine-383b2fc/src/airfoilfoam/api/predictions.py", "--runs-directory", ".codex-artifacts/group-conditional-screening-20260930"]
+retained_artifacts = [{ name = "sparse-mean-screening", path = ".codex-artifacts/group-conditional-screening-20260930", max_bytes = 67108864 }]
 
 [[test.sparse-mean-study.check]]
 name = "independent-cohort-screening"
 tier = "development"
 requires = ["research-contracts"]
-command = [".venv/bin/python", "-m", "scripts.materials.validate_grouped_history_cohort", "--fit", ".codex-artifacts/independent-history-cohort-20260920/fit.json", "--calibration", ".codex-artifacts/independent-history-cohort-20260920/calibration.json", "--heldout", ".codex-artifacts/independent-history-cohort-20260920/heldout.json", "--destination", ".codex-artifacts/grouped-history-cohort-study-20260930-r4"]
-retained_artifacts = [{ name = "grouped-history-cohort", path = ".codex-artifacts/grouped-history-cohort-study-20260930-r4", max_bytes = 67108864 }]
+env = { OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1" }
+command = [".venv/bin/python", "-m", "scripts.materials.validate_grouped_history_cohort", "--fit", ".codex-artifacts/independent-history-cohort-20260920/fit.json", "--calibration", ".codex-artifacts/independent-history-cohort-20260920/calibration.json", "--heldout", ".codex-artifacts/independent-history-cohort-20260920/heldout.json", "--pilot", ".codex-artifacts/history-population-20260919/cohort.json", "--runs-directory", ".codex-artifacts/group-conditional-cohort-20260930"]
+retained_artifacts = [{ name = "grouped-history-cohort", path = ".codex-artifacts/group-conditional-cohort-20260930", max_bytes = 268435456 }]
 
 [test.source-numerics-adoption]
 timeout_seconds = 1800

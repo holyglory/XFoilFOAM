@@ -6843,9 +6843,21 @@ describe("persistent progressive polar cache", () => {
       expect(
         await invalidateProgressiveFitPolicy(db, PROGRESSIVE_FIT_POLICY_ID),
       ).toBe(0);
+      const readyModels = await db.execute(sql`SELECT work.prediction_id,work.source_version
+        FROM progressive_polar_fit_work work JOIN neuralfoil_predictions prediction ON prediction.id=work.prediction_id
+        JOIN calculation_epochs epoch ON epoch.id=prediction.epoch_id AND epoch.current
+        JOIN progressive_polar_models model ON model.id=work.model_id
+        WHERE work.state='ready' AND model.response->'estimate'->>'policy_id'=${PROGRESSIVE_FIT_POLICY_ID}`);
+      expect(readyModels.map(row => row.prediction_id)).toContain(fixture.predictionId);
       expect(
         await invalidateProgressiveFitPolicy(db, "isolated-revised-fit-policy"),
-      ).toBe(1);
+      ).toBe(readyModels.length);
+      for (const model of readyModels) {
+        const [invalidated] = await db.execute(sql`SELECT state,model_id,source_version FROM progressive_polar_fit_work
+          WHERE prediction_id=${model.prediction_id}::text`);
+        expect(invalidated).toMatchObject({state:"pending",model_id:null});
+        expect(Number(invalidated.source_version)).toBe(Number(model.source_version)+1);
+      }
       expect((await fixture.acquire())!.source.evidence).toHaveLength(1);
     } finally {
       clearTimeout(timeout);
@@ -7600,7 +7612,7 @@ describe("persistent progressive polar cache", () => {
     expect(await fixture.acquire()).toBeNull();
   });
 
-  it("fits exact stored unsteady samples without duplicating raw histories in the model cache", async () => {
+  it.each([false, true])("fits exact stored unsteady samples without duplicating raw histories in the model cache (lineage guard %s)", async (lineageGuard) => {
     const fixture = await fitFixture();
     const evidence = await fixture.save(60);
     const coordinate = Array.from({ length: 161 }, (_, index) => index / 20);
@@ -7656,8 +7668,29 @@ describe("persistent progressive polar cache", () => {
       minimum_samples: 4,
       noise_floor: [0.01, 0.001, 0.002],
     };
+    if (lineageGuard) {
+      request.policy.lineage_conflict_probability = 0.01;
+      request.policy.policy_id = "isolated-group-conflict-policy";
+    }
     const response = await fitUsingPython(request);
     expect(response.estimate.contributors).toHaveLength(3);
+    const originalAttempts = await db.select().from(resultAttempts).where(eq(resultAttempts.id, evidence));
+    if (lineageGuard) {
+      expect(response.estimate.version).toBe("progressive-polar-gp-v4");
+      expect(response.estimate.conflict_diagnostics?.groups).toHaveLength(1);
+      for (const change of ["missing", "foreign", "cutoff", "dimension", "variance", "grouping", "probability"]) {
+        const tampered = structuredClone(response);
+        const diagnostic = tampered.estimate.conflict_diagnostics!;
+        if (change === "missing") delete tampered.estimate.conflict_diagnostics;
+        if (change === "foreign") diagnostic.groups[0].observation_ids[0] = "foreign-window";
+        if (change === "cutoff") diagnostic.groups[0].coefficients[0].mean_cutoff += 1;
+        if (change === "dimension") diagnostic.groups[0].coefficients[0].mean_dimension += 1;
+        if (change === "variance") diagnostic.groups[0].coefficients[0].shared_variance += 1;
+        if (change === "grouping") diagnostic.groups[0].lineage_id = "foreign-lineage";
+        if (change === "probability") diagnostic.model_family_tail_probability = 0.05;
+        await expect(storeProgressivePolarFit(db, lease, request, tampered)).rejects.toThrow("conflict diagnostics");
+      }
+    }
     const changed = structuredClone(request);
     changed.histories[0].coefficients[0][0] += 1;
     await expect(
@@ -7673,7 +7706,7 @@ describe("persistent progressive polar cache", () => {
     ).rejects.toThrow("every source attempt");
     const id = await storeProgressivePolarFit(db, lease, request, response);
     const [stored] = await db.execute(
-      sql`SELECT request FROM progressive_polar_models WHERE id = ${id}`,
+      sql`SELECT request,response FROM progressive_polar_models WHERE id = ${id}`,
     );
     const manifest = stored.request as {
       kind: string;
@@ -7683,6 +7716,8 @@ describe("persistent progressive polar cache", () => {
     expect(manifest.histories[0].sample_count).toBe(161);
     expect(manifest.histories[0]).not.toHaveProperty("coordinate");
     expect(manifest.histories[0]).not.toHaveProperty("coefficients");
+    expect(stored.response).toEqual(response);
+    expect(await db.select().from(resultAttempts).where(eq(resultAttempts.id, evidence))).toEqual(originalAttempts);
   }, 120_000);
 });
 

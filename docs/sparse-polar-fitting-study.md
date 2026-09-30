@@ -3,7 +3,8 @@
 This is an offline research harness, not an activated fitting policy or physical
 calibration. Run it through the `sparse-mean-study` Coordinator check graph.
 `complete` means the measurements ran; `candidate_acceptance` separately records
-whether each candidate passes the required controls. No current candidate does.
+whether each candidate passes the required controls. Passing manufactured
+controls does not establish production readiness or physical accuracy.
 
 ## Retained inputs
 
@@ -52,6 +53,18 @@ they never rewrite stored solver observations.
 4. `conservative_floor`: instead use `max(0, score / cutoff - 1)`.
 5. `method_conservative_floor`: compute that score separately for fast and
    precise evidence, so suspect fast data do not reduce precise-data influence.
+6. `grouped_reversal_floor`: a retained heuristic comparison using a lift-trend
+   rule, an arbitrary variance factor, and a stall exemption. It is not the
+   selected covariance implementation.
+7. `group_conditional_floor`: hold out whole lineages using the existing
+   Gaussian covariance and test angle means separately from window contrasts;
+   add resulting error to individual observation standard errors. Stronger
+   repeated-window tests rejected this approach because its added error can
+   still be averaged away.
+8. `group_shared_covariance`: use the same group tests but represent detected
+   shared error as a separate covariance block for each lineage and exact angle.
+   Keep within-window excess variance independent. This is implemented behind
+   the absent-by-default `lineage_conflict_probability` policy field.
 
 The existing score is the mean squared standardized leave-one-observation-out
 residual. Under its declared fixed Gaussian covariance, the standardized vector
@@ -92,8 +105,8 @@ windows, retain source identities, and preserve useful independent and precise
 evidence. Full-polar physical validation remains a separate requirement.
 
 The artifact also records a lineage-group diagnostic for every research fit. It
-reports window count, alpha span, transformed residual, model-conditional group
-score, and whether the group-to-group lift change reverses the prior. This
+reports window count, alpha span, transformed residual, an uncalibrated
+residual-to-error summary, and whether the group-to-group lift change reverses the prior. This
 diagnostic does not change weights or discard a history. In the SG6051
 counterfactual it flags a reversal even though each anchor is a separate
 lineage; in the repeated-window control it shows the two four-window lineages
@@ -107,3 +120,67 @@ same held-out mean absolute errors as the unchanged estimator (`Cl 0.111102`,
 `Cd 0.024698`, `Cm 0.028845` in the retained report). It is therefore a
 targeted protection for detected reversal patterns, not a generally better
 estimator, and remains offline and unvalidated.
+
+## Shared-covariance implementation
+
+The numerical model uses a separate, covariance-based diagnostic rather than
+the descriptive reversal heuristic. For each method, construct the unchanged
+declared covariance of all eligible observations, including correlated sampling
+noise. Hold out all observations of one lineage together and condition on the
+other lineages. Fast and precise diagnostics remain separate.
+
+Project the conditional residual onto its mean at each exact observed angle.
+Measure its squared Mahalanobis distance using the projected covariance. The
+remaining orthogonal distance measures contrasts between windows. Each
+subspace's dimension determines its Gaussian quadratic-form threshold:
+
+```text
+per_test_probability = policy_probability / (6 * lineage_group_count)
+tail_parameter = -log(per_test_probability)
+threshold = dimension + 2 * sqrt(dimension * tail_parameter) + 2 * tail_parameter
+```
+
+The factor six covers three coefficients and two subspaces. This bounds the
+family of tests only under the fixed Gaussian/error assumptions, not real
+aerodynamic errors. When a subspace exceeds its threshold, its excess variance
+factor is `max(0, score / dimension - 1)`. Otherwise the factor is zero.
+
+Multiply the mean excess by the declared method-discrepancy variance and add a
+block constant across windows sharing the same lineage and angle. Multiply the
+contrast excess by the same variance and add it on the diagonal. The final
+joint fit still receives every original coefficient and history window. It does
+not reduce an entire URANS trajectory to one solver point or rewrite a
+convergence/acceptance label. Prospective sampling scores account for the added
+uncertainty as well.
+
+This implementation removes the manufactured repeated-window reversal even
+with 128 observations or shared cross-angle ancestry. The original fixture's
+lift RMSE drops from about 2.479 to 0.00150. Camber, slope, stall and large
+coherent-shift controls are unchanged; coherent precise evidence remains
+effective against conflicting fast evidence. These controls demonstrate the
+specified behavior, not physical accuracy.
+
+On the retained 52-profile comparison, the three groups remain disjoint from
+the original pilot in both profile and geometry. The 20-profile held-out
+partition from the earlier study now has mean absolute drag error 0.017544
+versus 0.024698 unchanged; lift and moment errors remain 0.111102 and 0.028845.
+The guard activates on three profiles in that partition. These profiles have
+been examined in earlier studies; this is not a new blind validation result.
+References are accepted CFD, not experimental measurements.
+
+The fitting endpoint returns model version `progressive-polar-gp-v4` when the
+option is requested, with exact lineage membership, subspace statistics and
+shared/independent variance diagnostics. The cache validator checks those
+diagnostics against the request and contributing source identities. Missing,
+altered or unsolicited diagnostics are rejected. Absent or null configuration
+preserves older request/model signatures and v2/v3 behavior. The option cannot
+claim validated uncertainty, and production request builders do not enable it.
+
+## Repeated verification
+
+Governed runs use `--runs-directory` to create unique immutable child artifacts,
+rather than manually incrementing output paths. Previous artifacts are never
+overwritten. Each child retains input files, exact implementation source,
+replay checks and all candidate results, including failures. Cohort metadata
+explicitly says this is a previously examined comparison. Pilot exclusion is
+verified from the actual pinned pilot file, not merely reported as a checksum.

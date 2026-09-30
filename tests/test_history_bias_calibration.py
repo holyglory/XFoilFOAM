@@ -12,9 +12,15 @@ from scripts.materials import calibrate_history_bias as calibration
 from scripts.materials.measure_retained_polar import replay_source
 from scripts.materials.screen_sparse_polar_means import candidate_fit, measure_candidate_profile, verify_replay, producing_request_signature, manufactured_controls, assess_candidates, grouped_conflict_diagnostics, CANDIDATES, CONFLICT_CUTOFF
 from test_progressive_polar import prior, policy
+from scripts.materials.grouped_polar_conflicts import (
+    conditional_group, gaussian_tail_cutoff, group_subspace_scores,
+    grouped_covariance_diagnostics, method_moments,
+)
+from scripts.materials.screen_sparse_polar_means import study_destination
+from airfoilfoam.postprocess.progressive_polar import fit_progressive_polar
 
 
-@pytest.mark.parametrize("candidate", ["unchanged", "method_floor", "disagreement_floor", "conservative_floor", "method_conservative_floor", "grouped_reversal_floor"])
+@pytest.mark.parametrize("candidate", CANDIDATES)
 def test_sparse_mean_candidate_preserves_sources_and_excludes_reference_lineage(tmp_path, candidate):
     path, _ = fixture_source(tmp_path)
     source, request, replayed = replay_source(path, hashlib.sha256(path.read_bytes()).hexdigest())
@@ -141,6 +147,107 @@ def test_grouped_reversal_candidate_handles_shared_bad_anchors_but_not_stall_con
     unchanged = [row for row in controls if row["fixture"] == "earlier_stall" and row["candidate"] == "unchanged"]
     assert stall and unchanged
     assert stall[0]["candidate_cl_rmse"] == pytest.approx(unchanged[0]["candidate_cl_rmse"], abs=1e-12)
+
+
+def test_group_conditional_covariance_matches_gaussian_schur_complement():
+    covariance = np.array([[2.0, 0.4, 0.6], [0.4, 3.0, 0.8], [0.6, 0.8, 4.0]])
+    residual = np.array([1.0, -2.0, 3.0])
+    actual_residual, actual_covariance = conditional_group(covariance, residual, [0, 1])
+    cross = covariance[:2, 2]
+    np.testing.assert_allclose(actual_residual, residual[:2]-cross*residual[2]/4)
+    np.testing.assert_allclose(actual_covariance, covariance[:2, :2]-np.outer(cross, cross)/4)
+    whole_residual, whole_covariance = conditional_group(covariance, residual, [0, 1, 2])
+    np.testing.assert_array_equal(whole_residual, residual)
+    np.testing.assert_array_equal(whole_covariance, covariance)
+    with pytest.raises(ValueError):
+        conditional_group(covariance, residual, [0, 0])
+
+
+@pytest.mark.parametrize("method", ["openfoam_fast", "openfoam_precise"])
+def test_group_model_covariance_reproduces_existing_observation_leave_out_scores(method):
+    rows = [observation("left", -2, 0.4, method), observation("center", 0, -0.3, method), observation("right", 2, 0.7, method)]
+    eligible, moments = method_moments(prior(), rows, policy())
+    fitted = fit_progressive_polar(prior(), rows, policy())
+    for index, (covariance, residual) in enumerate(moments):
+        singleton_scores = []
+        for position in range(len(eligible)):
+            conditional_residual, conditional_covariance = conditional_group(covariance, residual, [position])
+            singleton_scores.append(float(conditional_residual[0]**2/conditional_covariance[0, 0]))
+        assert max(1.0, np.mean(singleton_scores)) == pytest.approx(
+            fitted["diagnostics"][index]["disagreement_variance_multiplier"], rel=1e-9)
+
+
+@pytest.mark.parametrize("correlation", [0.0, 0.8, 1.0])
+def test_group_means_and_contrasts_detect_shared_and_opposing_errors(correlation):
+    covariance = correlation*np.ones((4,4))+(1-correlation)*np.eye(4)+np.eye(4)*1e-10
+    shared = group_subspace_scores(np.full(4,20.0), covariance, np.zeros(4), 0.001)
+    opposing = group_subspace_scores(np.array([20.0,-20.0,20.0,-20.0]), covariance, np.zeros(4), 0.001)
+    assert shared["mean_score"] > shared["mean_cutoff"]
+    assert shared["contrast_score"] < shared["contrast_cutoff"]
+    assert opposing["contrast_score"] > opposing["contrast_cutoff"]
+    assert opposing["mean_score"] < 1e-10
+    assert shared["mean_dimension"] == 1
+    assert opposing["contrast_dimension"] == 3
+
+
+@pytest.mark.parametrize("count", [1,4,16,64])
+@pytest.mark.parametrize("shared_lineage", [False,True])
+def test_group_conditioning_retains_windows_and_resists_duplicate_masking(count,shared_lineage):
+    rows = [replace(observation(f"{alpha}-{window}", alpha=alpha, cl=cl),
+                    lineage_id="shared" if shared_lineage else f"lineage-{alpha}",
+                    window=(float(window), float(window+1)))
+            for alpha,cl in [(-2,1.5),(2,-0.3)] for window in range(count)]
+    fitted = candidate_fit(prior(), rows, policy(), "group_shared_covariance")
+    reordered = candidate_fit(prior(), list(reversed(rows)), policy(), "group_shared_covariance")
+    assert fitted["signature"] == reordered["signature"]
+    np.testing.assert_allclose(fitted["curves"]["composite"]["coefficients"],reordered["curves"]["composite"]["coefficients"])
+    assert len(fitted["contributors"]) == len(rows)
+    values = np.asarray(fitted["curves"]["composite"]["coefficients"])
+    assert values[-1,0] > values[0,0]
+    assert max(abs(values[:,0]-np.asarray(prior().coefficients)[:,0])) < 0.4
+    assert all(item["observation_id"] in {row.observation_id for row in rows} for item in fitted["contributors"])
+
+
+def test_group_conflict_distinguishes_real_shift_and_precise_data_from_bad_fast_data():
+    precise = [observation("precise-left",-2,0,method="openfoam_precise"),
+               observation("precise-right",2,0.4,method="openfoam_precise")]
+    wrong = [observation("wrong-left",-2,1.5),observation("wrong-right",2,-0.3)]
+    fitted = candidate_fit(prior(), precise+wrong, policy(), "group_shared_covariance")
+    reference = fit_progressive_polar(prior(),precise,policy())
+    np.testing.assert_allclose(fitted["curves"]["composite"]["coefficients"],reference["curves"]["composite"]["coefficients"],atol=0.02)
+    assert fitted["curves"]["composite"]["coefficients"][2][0] > 0.15
+    groups = fitted["research_only"]["conditional_groups"]["groups"]
+    assert all(coefficient["variance_multiplier"] == 0 for group in groups if group["method"]=="openfoam_precise"
+               for coefficient in group["coefficients"])
+    assert any(coefficient["variance_multiplier"] > 0 for group in groups if group["method"]=="openfoam_fast"
+               for coefficient in group["coefficients"])
+
+
+def test_group_diagnostic_interpolates_each_angle_without_inventing_shape_conflicts():
+    reference=replace(prior(),coefficients=[[-0.5,0.08,-0.05],[-0.2,0.03,-0.02],[0.3,0.01,-0.03],
+                                          [0.6,0.02,-0.06],[0.1,0.04,-0.01]])
+    rows=[replace(observation(f"angle-{alpha}",alpha=alpha),coefficients=coefficient,lineage_id="same-sweep")
+          for alpha,coefficient in zip(reference.alpha,reference.coefficients)]
+    diagnostic=grouped_covariance_diagnostics(reference,rows,policy())
+    assert all(item["mean_score"] < 1e-10 and item["variance_multiplier"] == 0
+               for group in diagnostic["groups"] for item in group["coefficients"])
+
+
+def test_unique_research_run_destinations_preserve_earlier_artifacts(tmp_path):
+    first=study_destination(None,tmp_path)
+    first.mkdir()
+    (first/"proof.json").write_text("retained")
+    second=study_destination(None,tmp_path)
+    assert first!=second and first.parent==second.parent==tmp_path
+    assert (first/"proof.json").read_text()=="retained"
+    with pytest.raises(ValueError):
+        study_destination(first,tmp_path)
+
+
+@pytest.mark.parametrize("dimension",[1,4,16])
+def test_group_chi_squared_cutoff_keeps_false_alarms_below_declared_model_bound(dimension):
+    samples=np.random.default_rng(7783).normal(size=(40000,dimension))
+    assert np.mean(np.sum(samples**2,axis=1)>gaussian_tail_cutoff(dimension,0.001)) < 0.001
 
 
 def test_uncertified_bias_adds_transformed_variance_without_changing_values():
