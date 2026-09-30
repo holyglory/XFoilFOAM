@@ -184,3 +184,32 @@ overwritten. Each child retains input files, exact implementation source,
 replay checks and all candidate results, including failures. Cohort metadata
 explicitly says this is a previously examined comparison. Pilot exclusion is
 verified from the actual pinned pilot file, not merely reported as a checksum.
+
+## Fresh source-preserving selection
+
+`freeze_fresh_history_selection.py` emits the reviewed
+`fresh_history_selection.sql` inside a repeatable-read, read-only transaction.
+It does not accept arbitrary SQL templates. Prior profile UUIDs and finite
+coordinate geometry are validated before interpolation. Both prior profile and
+exact geometry exclusions are applied in SQL, including aliases of the named
+diagnosed profiles. Supply all three older partitions, the eight-profile pilot,
+the 27-profile transfer export, the SG6051 source model and its diagnosis report;
+the protocol states precisely which input files and hashes it includes. The
+earlier version-1 profile-only replacement utility did not prove all of these
+exclusions and must not be used as validation evidence.
+
+Version 2 requires a current ready fit with a source-geometry verification,
+included numerical-revision-2/mesh-version-3 history, and an accepted reference
+from a different job and evidence lineage with the same source-preserving
+implementation. Iteration histories and physical-time histories form separate
+cohorts. It selects by a fixed identity ordering, never by coefficient values or
+prediction errors. Each selected row pins the model, prior, target, geometry,
+epoch, signatures and eligible source/reference identities for the later export.
+
+An empty selection is retained, not expanded by weakening criteria. Current
+ready histories can exist while independent accepted reference pairs are still
+missing. Lack of a linked ready model is not evidence that a raw history is
+waiting only for the precise stage: the fast stage also supplies informative
+histories. The September 30 fitting-priority repair removed a real publication
+delay behind prediction-only refreshes; it did not change any statistical
+acceptance rule or supply an experimental reference.

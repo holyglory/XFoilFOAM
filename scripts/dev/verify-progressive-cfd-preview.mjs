@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
 import { chromium, expect } from "@playwright/test";
 import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
+import { parseArgs } from "node:util";
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 
-if (
-  process.argv.length > 3 ||
-  (process.argv[2] && process.argv[2] !== "--production")
-)
-  throw new Error(
-    "Only the declared preview or --production read-only journey is supported",
-  );
-const production = process.argv[2] === "--production";
+const { values } = parseArgs({options:{production:{type:"boolean"},profile:{type:"string"},target:{type:"string"}}});
+const production = values.production === true;
+if ((values.profile || values.target) && !production)
+  throw new Error("Explicit evidence scope is available only for the production read-only journey");
+if (values.profile && !/^[a-z0-9][a-z0-9-]{0,127}$/.test(values.profile)) throw new Error("Invalid airfoil slug");
+if (values.target && !/^[a-f0-9]{64}$/.test(values.target)) throw new Error("Invalid exact physical target");
 const origin = production ? "https://airfoils.pro" : progressivePreviewOrigin();
-const slug = "ag24";
+const slug = values.profile ?? "ag24";
+const evidenceDirectory = values.target ? `.codex-artifacts/fair-fit-browser-20260930/${randomUUID()}` : null;
+if (evidenceDirectory) await mkdir(evidenceDirectory,{recursive:true});
 const browser = await chromium.launch({ headless: true });
 const outcomes = [];
 try {
@@ -32,6 +35,7 @@ try {
     const detail = await response.json();
     const series = detail.progressivePolars.find(
       (item) =>
+        (!values.target || item.targetId === values.target) &&
         item.curves.some((curve) => curve.method === "composite") &&
         item.explanation.contributors?.some((entry) =>
           Number.isFinite(entry.alpha),
@@ -45,6 +49,10 @@ try {
     await expect(viewer.getByTestId("progressive-polar-curve")).toHaveCount(1);
     await expect(viewer.getByTestId("prediction-sample")).toHaveCount(0);
     await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
+    if (evidenceDirectory) {
+      await writeFile(`${evidenceDirectory}/${viewport.width}-series.json`,JSON.stringify(series));
+      await viewer.screenshot({path:`${evidenceDirectory}/${viewport.width}-curve.png`});
+    }
     await viewer.getByLabel("Compare methods").check();
     await expect(viewer.getByTestId("progressive-polar-curve")).toHaveCount(
       series.curves.length,
@@ -121,6 +129,7 @@ try {
     );
     assert.equal(await page.evaluate(() => window.scrollY), scrollBeforeDialog);
     await expect(dialog.getByTestId("sim-attempt-evidence")).toBeVisible();
+    if(evidenceDirectory) await dialog.screenshot({path:`${evidenceDirectory}/${viewport.width}-evidence.png`});
     await page.locator(".topbar-brand").evaluate((element) => element.focus());
     assert.equal(
       await dialog.evaluate((element) =>
@@ -178,6 +187,7 @@ try {
 } finally {
   await browser.close();
 }
+if(evidenceDirectory) await writeFile(`${evidenceDirectory}/verification.json`,JSON.stringify({origin,slug,observeOnly:true,outcomes}));
 console.log(
   JSON.stringify({
     kind: "real-cfd-journey",

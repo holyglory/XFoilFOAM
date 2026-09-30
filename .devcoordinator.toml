@@ -80,6 +80,19 @@ timeout_seconds = 900
 [test.grouped-polar-integration]
 timeout_seconds = 900
 
+[test.fresh-history-selection]
+timeout_seconds = 180
+
+[test.fresh-history-selection.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.fresh-history-selection.check]]
+name = "real-read-only-selection"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_fresh_history_selection.py", "-q"]
+
 [test.grouped-polar-integration.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
@@ -3902,6 +3915,15 @@ timeout_seconds = 180
 
 [test.source-geometry-production]
 timeout_seconds = 240
+
+[test.fair-fit-production]
+timeout_seconds = 240
+
+[[test.fair-fit-production.check]]
+name = "new-history-backed-curve"
+tier = "development"
+command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs", "--production", "--profile=s6063", "--target=f1b35fdf6003770d8d459713bc0e0c5b57791dcf28d28e983e9bcf90317a3f01"]
+retained_artifacts = [{ name = "new-history-public-curve", path = ".codex-artifacts/fair-fit-browser-20260930", max_bytes = 33554432 }]
 
 [[test.source-geometry-production.check]]
 name = "reported-polar"
