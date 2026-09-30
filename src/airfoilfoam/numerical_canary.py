@@ -1,9 +1,11 @@
 """Isolated real OpenFOAM integration smoke; never publishes polar evidence."""
 
 import argparse
+import hashlib
 import json
 import math
 import re
+import shlex
 from dataclasses import asdict
 from pathlib import Path
 from uuid import uuid4
@@ -39,13 +41,18 @@ def source_material_for_canary(fixture_path):
 def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None, *, maximum_courant=0.2,
                momentum_scheme="linearUpwind", limited_nonorthogonal=False, save_every_step=False,
                first_order_startup=False, finite_edge_mesh=False, tadmor_flux=False,
-               minmod_reconstruction=False):
+               minmod_reconstruction=False, energy_probe=None, density_farfield=False):
     if maximum_courant not in (0.05, 0.2) or momentum_scheme not in {"linearUpwind", "upwind"}:
         raise ValueError("Unsupported isolated startup comparison")
     if first_order_startup and (family != "rhoCentralFoam" or momentum_scheme != "linearUpwind" or limited_nonorthogonal or tadmor_flux or minmod_reconstruction):
         raise ValueError("The startup handoff requires the unchanged high-order density recipe")
     if (tadmor_flux or minmod_reconstruction) and (family != "rhoCentralFoam" or momentum_scheme != "linearUpwind"):
         raise ValueError("The flux comparison requires the high-order density recipe")
+    if energy_probe is not None and family != "rhoCentralFoam":
+        raise ValueError("The energy probe implements only the pinned density solver")
+    if density_farfield and (family != "rhoPimpleFoam" or mach < 1.2):
+        raise ValueError("Matched density far-field inputs require a supersonic pressure-solver comparison")
+    solver_command = family if energy_probe is None else shlex.quote(str(Path(energy_probe).resolve(strict=True)))
     coordinates = Path(coordinates_path).read_text()
     case_dir = Path(case_dir)
     case_dir.mkdir(parents=True, exist_ok=False)
@@ -78,6 +85,10 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None, *, ma
     builder = _case_builder(budgeted, airfoil, mesher.patches(mesh), mesh, spec, request.fluid,
                             request.roughness, request.solver, dialect=dialect_for_runner(budgeted))
     builder.write(case_dir)
+    if density_farfield:
+        builder.solver_family = "rhoCentralFoam"
+        builder._write_zero(builder._turbulence())
+        builder.solver_family = family
     mesher.write_inputs(case_dir, airfoil, mesh, spec.chord)
     mesh_command = "cartesian2DMesh" if isinstance(mesher, Cartesian2DExternalMesh) else "blockMesh"
     meshed = budgeted.application(case_dir, mesh_command, timeout=120)
@@ -117,6 +128,9 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None, *, ma
                 "limited_nonorthogonal":limited_nonorthogonal,"save_every_step":save_every_step,
                 "first_order_startup":first_order_startup, "finite_edge_mesh":finite_edge_mesh,
                 "tadmor_flux":tadmor_flux, "minmod_reconstruction":minmod_reconstruction}
+    protocol["density_farfield"] = density_farfield
+    if energy_probe is not None:
+        protocol["energy_probe_sha256"] = hashlib.sha256(Path(energy_probe).read_bytes()).hexdigest()
     (case_dir / "startup-comparison.json").write_text(json.dumps(protocol, allow_nan=False) + "\n")
     if first_order_startup:
         (case_dir / "fvSchemes.requested").write_bytes((case_dir / "system/fvSchemes").read_bytes())
@@ -128,7 +142,7 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None, *, ma
         timestep = acoustic_startup_step(case_dir, budgeted, request.solver.transient_max_courant)
         _set_control_dict_entries(case_dir / "system/controlDict", {"deltaT": timestep})
         startup = json.loads((case_dir / "acoustic-startup.json").read_text())
-    solved = budgeted.solver(case_dir, family, 1, timeout=120)
+    solved = budgeted.solver(case_dir, solver_command, 1, timeout=120)
     (case_dir / f"log.{family}").write_text(solved.stdout)
     check_material_domain(case_dir, solved)
     solved.check()
@@ -146,7 +160,7 @@ def run_canary(family, mach, coordinates_path, case_dir, runner, gas=None, *, ma
         timestep = acoustic_startup_step(case_dir, budgeted, maximum_courant)
         _set_control_dict_entries(case_dir / "system/controlDict", {"deltaT":timestep})
         startup = json.loads((case_dir / "acoustic-startup.json").read_text())
-        solved = budgeted.solver(case_dir, family, 1, timeout=300)
+        solved = budgeted.solver(case_dir, solver_command, 1, timeout=300)
         (case_dir / f"log.{family}").write_text(solved.stdout)
         check_material_domain(case_dir, solved)
         solved.check()
@@ -197,13 +211,16 @@ def main():
     parser.add_argument("--finite-edge-mesh", action="store_true")
     parser.add_argument("--tadmor-flux", action="store_true")
     parser.add_argument("--minmod-reconstruction", action="store_true")
+    parser.add_argument("--energy-probe", type=Path)
+    parser.add_argument("--density-farfield", action="store_true")
     args = parser.parse_args()
     material = source_material_for_canary(args.material_fixture) if args.material_fixture else None
     receipt = run_canary(args.family, args.mach, args.coordinates, args.case_dir / str(uuid4()), get_runner(Settings()), gas=material,
                          maximum_courant=args.maximum_courant, momentum_scheme=args.momentum_scheme,
                          limited_nonorthogonal=args.limited_nonorthogonal, save_every_step=args.save_every_step,
                          first_order_startup=args.first_order_startup, finite_edge_mesh=args.finite_edge_mesh,
-                         tadmor_flux=args.tadmor_flux, minmod_reconstruction=args.minmod_reconstruction)
+                         tadmor_flux=args.tadmor_flux, minmod_reconstruction=args.minmod_reconstruction,
+                         energy_probe=args.energy_probe, density_farfield=args.density_farfield)
     print(json.dumps(receipt, allow_nan=False), flush=True)
 
 

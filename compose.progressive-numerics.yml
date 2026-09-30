@@ -20,6 +20,45 @@ x-canary: &canary
     - numerical-results:/canary-output
 
 services:
+  energy-probe-build:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: thermophysics-build
+    network_mode: none
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >-
+        source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1 || exit 1;
+        set -e;
+        export FOAM_USER_APPBIN=/canary-output/energy-probe-build-r1/bin;
+        mkdir -p "$$FOAM_USER_APPBIN";
+        python3 /diagnostic/build_energy_probe.py
+        --source /usr/lib/openfoam/openfoam2606/applications/solvers/compressible/rhoCentralFoam
+        --header /diagnostic/energyDiagnostic.H
+        --destination /canary-output/energy-probe-build-r1/source
+    volumes:
+      - ./scripts/materials/build_energy_probe.py:/diagnostic/build_energy_probe.py:ro
+      - ./src/airfoilfoam/native/energy-probe/energyDiagnostic.H:/diagnostic/energyDiagnostic.H:ro
+      - numerical-results:/canary-output
+  mach3-energy:
+    <<: *canary
+    depends_on:
+      energy-probe-build:
+        condition: service_completed_successfully
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-energy", "--energy-probe", "/canary-output/energy-probe-build-r1/bin/xfoilfoamEnergyProbe", "--save-every-step"]
+  mach3-finite-energy:
+    <<: *canary
+    depends_on:
+      energy-probe-build:
+        condition: service_completed_successfully
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoCentralFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-finite-energy", "--finite-edge-mesh", "--energy-probe", "/canary-output/energy-probe-build-r1/bin/xfoilfoamEnergyProbe", "--save-every-step"]
+  mach3-pressure:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoPimpleFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-pressure", "--density-farfield", "--save-every-step"]
+  mach3-finite-pressure:
+    <<: *canary
+    command: ["python", "-m", "airfoilfoam.numerical_canary", "--family", "rhoPimpleFoam", "--mach", "3", "--coordinates", "/canary/ag24.dat", "--case-dir", "/canary-output/mach3-finite-pressure", "--finite-edge-mesh", "--density-farfield", "--save-every-step"]
   artifacts:
     image: xfoilfoam-progressive-worker:local
     pull_policy: never

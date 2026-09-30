@@ -54,6 +54,34 @@ tier = "development"
 command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-reconstruction-diagnosis-20260930", "--groups", "mach3-tadmor", "mach3-minmod", "mach3-finite-minmod", "--thermal-only"]
 retained_artifacts = [{ name = "reconstruction-native-fields", path = ".codex-artifacts/mach3-reconstruction-diagnosis-20260930", max_bytes = 1073741824 }]
 
+[test.mach3-energy-diagnosis]
+timeout_seconds = 300
+
+[[test.mach3-energy-diagnosis.check]]
+name = "instrumentation-and-reader"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_numerical_canary.py", "tests/test_mach3_startup_fields.py", "-q"]
+
+[[test.mach3-energy-diagnosis.check]]
+name = "native-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-energy-diagnosis-20260930", "--groups", "mach3-energy", "mach3-finite-energy", "--thermal-only", "--probe-build", "energy-probe-build-r1"]
+retained_artifacts = [{ name = "native-energy-balance", path = ".codex-artifacts/mach3-energy-diagnosis-20260930", max_bytes = 1073741824 }]
+
+[test.mach3-pressure-diagnosis]
+timeout_seconds = 300
+
+[[test.mach3-pressure-diagnosis.check]]
+name = "boundary-and-diagnostic-regressions"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "tests/test_mach3_startup_fields.py", "-q"]
+
+[[test.mach3-pressure-diagnosis.check]]
+name = "native-fields"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-pressure-diagnosis-20260930", "--groups", "mach3-pressure", "mach3-finite-pressure", "--thermal-only"]
+retained_artifacts = [{ name = "pressure-startup-fields", path = ".codex-artifacts/mach3-pressure-diagnosis-20260930", max_bytes = 1073741824 }]
+
 [test.source-geometry-baseline]
 timeout_seconds = 300
 
@@ -3480,8 +3508,8 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "mach3-tadmor", "mach3-minmod", "mach3-finite-minmod"]
-finite_services = ["mach3-tadmor", "mach3-minmod", "mach3-finite-minmod"]
+services = ["artifacts", "mach3-pressure", "mach3-finite-pressure"]
+finite_services = ["mach3-pressure", "mach3-finite-pressure"]
 build = false
 port = true
 route = true

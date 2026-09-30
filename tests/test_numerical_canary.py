@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import hashlib
 import re
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 from airfoilfoam.numerical_canary import run_canary, source_material_for_canary
 from airfoilfoam.openfoam.dialects import OPENCFD_2606
 from airfoilfoam.openfoam.runner import DeterministicMeshError, InfrastructureError, RunResult, Runner
+from scripts.materials.build_energy_probe import instrument
 
 
 ASPECT_ONLY = (
@@ -160,3 +162,66 @@ def test_canary_comparison_records_the_actual_recipe(tmp_path, options):
         assert re.search(r"reconstruct\(T\)\s+Minmod;", schemes)
         assert re.search(r"reconstruct\(rho\)\s+Minmod;", schemes)
         assert re.search(r"fluxScheme\s+Kurganov;", schemes)
+
+
+def test_energy_probe_instrumentation_preserves_the_original_operations():
+    source = '\n'.join([
+        '#include "fvcSmooth.H"',
+        '        volTensorField tauMC("tauMC", muEff*dev2(Foam::T(fvc::grad(U))));',
+        '        rhoU.boundaryFieldRef() == rho.boundaryField()*U.boundaryField();',
+        '        e.correctBoundaryConditions();',
+        '        thermo.correct();',
+    ])
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    result = instrument(source, digest)
+    assert result.count("reportEnergyBalance(runTime") == 1
+    assert result.index("reportEnergyBalance(runTime") < result.index("thermo.correct();")
+    original_lines = [line for line in result.splitlines() if line in source.splitlines()]
+    assert original_lines == source.splitlines()
+    with pytest.raises(ValueError, match="exact pinned solver source"):
+        instrument(source)
+    with pytest.raises(ValueError, match="exact pinned solver source"):
+        instrument(source + " ", digest)
+    changed = source.replace('        e.correctBoundaryConditions();', '')
+    with pytest.raises(ValueError, match="insertion point changed"):
+        instrument(changed, hashlib.sha256(changed.encode()).hexdigest())
+    duplicated = source + '\n        e.correctBoundaryConditions();'
+    with pytest.raises(ValueError, match="insertion point changed"):
+        instrument(duplicated, hashlib.sha256(duplicated.encode()).hexdigest())
+
+
+def test_energy_probe_execution_is_explicit_and_fingerprinted(tmp_path):
+    class ProbeRunner(CanaryRunner):
+        def run(self, case_dir, command, timeout=7200, monitor=None):
+            if command.endswith("xfoilfoamEnergyProbe'"):
+                self.commands.append(command)
+                command = "rhoCentralFoam"
+            return super().run(case_dir, command, timeout, monitor)
+
+    executable = tmp_path / "test fixture" / "xfoilfoamEnergyProbe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"isolated executable identity fixture, not native CFD")
+    runner = ProbeRunner(ASPECT_ONLY, 0)
+    receipt = canary(tmp_path, runner, energy_probe=executable)
+    assert receipt["startup_comparison"]["energy_probe_sha256"] == hashlib.sha256(executable.read_bytes()).hexdigest()
+    assert any(command.startswith("'") and command.endswith("xfoilfoamEnergyProbe'") for command in runner.commands)
+    assert receipt["converged_polar_validated"] is False
+
+
+def test_matched_farfield_is_isolated_to_the_requested_numerical_comparison(tmp_path):
+    class PressureRunner(CanaryRunner):
+        def run(self, case_dir, command, timeout=7200, monitor=None):
+            return super().run(case_dir, "rhoCentralFoam" if command == "rhoPimpleFoam" else command, timeout, monitor)
+
+    coordinates = Path(__file__).parents[1] / "packages/db/seed/selig-database/ag24.dat"
+    canary(tmp_path, CanaryRunner(ASPECT_ONLY, 0))
+    for matched in (False, True):
+        directory = tmp_path / str(matched)
+        receipt = run_canary("rhoPimpleFoam", 3, coordinates, directory, PressureRunner(ASPECT_ONLY, 0), density_farfield=matched)
+        assert receipt["startup_comparison"]["density_farfield"] is matched
+        for name in ("U", "p", "T"):
+            pressure_source = (directory / "0" / name).read_bytes()
+            density_source = (tmp_path / "case/0" / name).read_bytes()
+            assert (pressure_source == density_source) is matched
+        assert "rhoPimpleFoam" in (directory / "system/controlDict").read_text()
+        assert "PIMPLE" in (directory / "system/fvSolution").read_text()

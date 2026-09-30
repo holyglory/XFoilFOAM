@@ -166,7 +166,14 @@ def test_compressible_pressure_energy_and_force_normalization(tmp_path, gas, sta
     assert "U 0.3;" in solution
 
 
-@pytest.mark.parametrize("family,mach", [("rhoPimpleFoam", 0.8), ("rhoCentralFoam", 2), ("rhoCentralFoam", 3)])
+@pytest.mark.parametrize("mach", [0.72, 0.9, 1])
+def test_subsonic_and_sonic_pressure_cases_retain_open_farfield(tmp_path, gas, state, mach):
+    builder(gas, state, "rhoPimpleFoam", mach, time_window=window()).write(tmp_path)
+    assert "freestreamVelocity" in (tmp_path / "0/U").read_text()
+    assert "freestreamPressure" in (tmp_path / "0/p").read_text()
+
+
+@pytest.mark.parametrize("family,mach", [("rhoPimpleFoam", 0.8), ("rhoPimpleFoam", 3), ("rhoCentralFoam", 2), ("rhoCentralFoam", 3)])
 def test_transient_gas_cases_use_real_physical_time_and_shock_schemes(tmp_path, gas, state, family, mach):
     case = builder(gas, state, family, mach, time_window=window())
     case.write(tmp_path)

@@ -21,6 +21,25 @@ def saved_scalar(path, cell_count):
     return values
 
 
+def energy_balances(path, cell_count):
+    records = []
+    with path.open() as stream:
+        for line in stream:
+            if not line.startswith("XFOILFOAM_ENERGY_BALANCE "):
+                continue
+            record = json.loads(line.removeprefix("XFOILFOAM_ENERGY_BALANCE "))
+            if (type(record.get("cell")) is not int or not 0 <= record["cell"] < cell_count
+                    or type(record.get("time")) not in {int, float} or not np.isfinite(record["time"])
+                    or record["time"] <= 0 or (records and record["time"] <= records[-1]["time"])
+                    or any(value is not None and (type(value) not in {int, float} or not np.isfinite(value))
+                           for value in record.values())):
+                raise ValueError("Invalid native energy-balance record")
+            records.append(record)
+            if len(records) > 10000:
+                raise ValueError("Native energy-balance records exceed the diagnostic bound")
+    return records
+
+
 class DirectoryLinks(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -95,6 +114,7 @@ def inspect_saved_case(directory):
         "frames": sorted(frames, key=lambda row: row["coordinate"]),
         "startup": json.loads((directory / "acoustic-startup.json").read_text()) if (directory / "acoustic-startup.json").is_file() else None,
         "receipt": json.loads((directory / "receipt.json").read_text()) if (directory / "receipt.json").is_file() else None,
+        "energy_balance": energy_balances(directory / "log.rhoCentralFoam", cell_count) if (directory / "log.rhoCentralFoam").is_file() else [],
     }
 
 
@@ -103,6 +123,7 @@ def main():
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--groups", nargs="+", default=["mach2", "mach3"])
     parser.add_argument("--thermal-only", action="store_true")
+    parser.add_argument("--probe-build")
     args = parser.parse_args()
     status = json.loads(subprocess.check_output(["devcoordinator2", "deployment", "status", "--name", "progressive-numerics", "--client", "codex"], text=True))
     if not status.get("ok") or status["data"]["deployment_id"] != "dec54282d9f0719c8":
@@ -114,6 +135,10 @@ def main():
     args.destination.mkdir(parents=True, exist_ok=False)
     reports = []
     budget = [1024 * 1024 * 1024]
+    if args.probe_build:
+        if not re.fullmatch(r"energy-probe-build-r[1-9][0-9]*", args.probe_build):
+            raise ValueError("Expected an owned energy-probe build")
+        copy_directory(origin + f"/{args.probe_build}/", args.destination / args.probe_build, budget)
     for name in args.groups:
         if not re.fullmatch(r"mach[23](?:-[a-z]+)*", name):
             raise ValueError("Expected an owned Mach-2/Mach-3 case group")

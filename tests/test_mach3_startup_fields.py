@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from airfoilfoam.openfoam.rans_hold import root_entry
 from airfoilfoam.pipeline import _case_builder
 from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
 from scripts.materials.inspect_mach3_startup import measured_frames, preserve_early_frames, startup_request
-from scripts.materials.inspect_cartesian_startup import inspect_saved_case, saved_scalar
+from scripts.materials.inspect_cartesian_startup import energy_balances, inspect_saved_case, saved_scalar
 from test_compressible_execution import RecordedRunner
 
 
@@ -131,3 +132,28 @@ def test_retained_thermal_fields_reject_nonfinite_or_wrong_cell_counts(tmp_path,
     write_ascii(tmp_path / "T", body)
     with pytest.raises(ValueError):
         saved_scalar(tmp_path / "T", 1)
+
+
+def test_energy_diagnostics_preserve_negative_energy_and_explicit_nonfinite_values(tmp_path):
+    source = tmp_path / "log.rhoCentralFoam"
+    record = {"cell": 0, "time": 1e-8, "internal_energy_after_viscous_work": -30, "optional_value": None}
+    source.write_text("Time = 1e-8\nXFOILFOAM_ENERGY_BALANCE " + json.dumps(record) + "\nsolver failed\n")
+    assert energy_balances(source, 1) == [record]
+
+
+@pytest.mark.parametrize("change", [
+    {"cell": -1}, {"cell": 2}, {"cell": True}, {"time": float("nan")},
+    {"time": 0}, {"energy": float("inf")}, {"energy": "unmeasured"},
+])
+def test_energy_diagnostics_reject_wrong_cells_or_invalid_measurements(tmp_path, change):
+    source = tmp_path / "log.rhoCentralFoam"
+    source.write_text("XFOILFOAM_ENERGY_BALANCE " + json.dumps({"cell": 0, "time": 1e-8, **change}) + "\n")
+    with pytest.raises(ValueError, match="Invalid native energy-balance"):
+        energy_balances(source, 1)
+
+
+def test_energy_diagnostics_do_not_merge_overlapping_solver_invocations(tmp_path):
+    source = tmp_path / "log.rhoCentralFoam"
+    source.write_text(('XFOILFOAM_ENERGY_BALANCE {"cell":0,"time":1e-8}\n') * 2)
+    with pytest.raises(ValueError, match="Invalid native energy-balance"):
+        energy_balances(source, 1)
