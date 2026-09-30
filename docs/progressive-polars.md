@@ -1351,6 +1351,16 @@ Completed campaigns reopen for the new numerical work; paused campaigns stay
 paused, and cancelled or archived campaigns are not changed. Normal catalog
 enrollment uses the successor conditions when later profiles arrive.
 
+The explicit `--defer-stopped-archives` option separates already-stopped remote
+execution from archive uploads still in progress. It requires paused admission,
+the exact recorded physical stop, immutable dispatch scope, fully applied report
+inventories and no active ingestion lease. It only supersedes scheduling scope;
+it does not mark evidence complete, delete archives or change stored results.
+Normal obsolete-execution settlement releases the old jobs and promises while
+the existing stopped-storage path retains outstanding evidence. The new plan
+records the number of handed-off jobs. Worker activation still waits for old
+scheduling ownership to settle; active calculations are never exempted.
+
 After all eligible campaigns have successors, run
 `packages/db/src/prepare-numerics-defaults.ts --dry-run`, then `--apply` while
 admission remains paused. This changes reusable solver profiles for future

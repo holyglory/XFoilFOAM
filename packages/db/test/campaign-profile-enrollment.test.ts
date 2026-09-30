@@ -89,6 +89,7 @@ import {
   reconcileProgressiveRemoteProgress,
 } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
+import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
 import { verifyProgressiveWorkerReportDelivery } from "./progressive-worker-report-fixture";
 import { verifyProgressiveAcceptedArchiveReplay } from "./progressive-accepted-archive-fixture";
 import { verifyProgressiveRemoteReportInventory } from "./progressive-remote-inventory-fixture";
@@ -3105,6 +3106,151 @@ describe("progressive CPU admission", () => {
       );
     },
   );
+
+  it("numerical revision transition hands off only stopped remote archives and retains evidence through settlement", async () => {
+    await ready(async (scope) => {
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "numerics-archive-handoff-fixture",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+      });
+      const composed = await composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      const [job] = await db
+        .select()
+        .from(simJobs)
+        .where(eq(simJobs.id, composed.jobId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      await db.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+        VALUES(${solverId}::uuid,${randomUUID()},'isolated numerical handoff',96,96,96)`);
+      await db.execute(sql`INSERT INTO sync_sweep_promises(id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+        VALUES(${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${leases.length},clock_timestamp()+interval '1 hour')`);
+      for (const lease of leases)
+        await db.execute(sql`INSERT INTO sync_sweep_promise_points(promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+          VALUES(${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
+      try {
+        const bound = await bindProgressiveRemoteDispatch(db, {
+          simJobId: job.id,
+          solverId,
+          promiseId,
+        });
+        const report: ProgressiveRemoteReport = {
+          version: 1,
+          solverId,
+          promiseId,
+          executionId: job.id,
+          assignmentSignature: bound.envelope.contentSignature,
+          sequence: 1,
+          status: {
+            job_id: job.id,
+            state: "failed",
+            total_cases: leases.length,
+            completed_cases: 1,
+          },
+          result: {
+            ...progressiveRemoteEvidenceResult(bound.envelope),
+            state: "failed",
+          },
+          stopProof: executionStopProof(job.id),
+        };
+        await storeProgressiveRemoteReport(db, {
+          solverId,
+          promiseId,
+          executionId: job.id,
+          report,
+        });
+        const [campaignRow] = await db.execute(
+          sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${scope.campaignId}::uuid`,
+        );
+        const plan = String(campaignRow.current_plan_revision_id);
+        const handoff = { deferStoppedArchives: true };
+        await expect(
+          adoptProgressiveNumerics2(db, scope.campaignId, plan, handoff),
+        ).rejects.toThrow("Pause new solver admissions");
+        await db.execute(
+          sql`UPDATE sweeper_state SET enabled=false WHERE id=1`,
+        );
+        await expect(
+          adoptProgressiveNumerics2(db, scope.campaignId, plan, handoff),
+        ).rejects.toThrow("physically stopped and settled");
+        await applyProgressiveRemoteProgress(db, job.id);
+        await expect(
+          adoptProgressiveNumerics2(db, scope.campaignId, plan),
+        ).rejects.toThrow("physically stopped and settled");
+        for (const mutation of [
+          sql`UPDATE sim_jobs SET ingest_lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=${job.id}::uuid`,
+          sql`UPDATE sim_jobs SET engine_state='running' WHERE id=${job.id}::uuid`,
+          sql`DELETE FROM progressive_remote_progress_receipts WHERE sim_job_id=${job.id}::uuid`,
+        ]) {
+          const rollback = new Error("isolated handoff refusal rollback");
+          await expect(
+            db.transaction(async (transaction) => {
+              await transaction.execute(mutation);
+              await expect(
+                adoptProgressiveNumerics2(
+                  transaction as unknown as DB,
+                  scope.campaignId,
+                  plan,
+                  handoff,
+                ),
+              ).rejects.toThrow("physically stopped and settled");
+              throw rollback;
+            }),
+          ).rejects.toBe(rollback);
+        }
+        for (const mutation of [
+          sql`UPDATE progressive_cfd_execution_stops SET engine_job_id=${randomUUID()} WHERE sim_job_id=${job.id}::uuid`,
+          sql`UPDATE progressive_remote_report_inventories SET source_count=source_count+1 WHERE sim_job_id=${job.id}::uuid`,
+        ]) await expect(db.execute(mutation)).rejects.toThrow("immutable");
+        const before = await db.execute(
+          sql`SELECT * FROM progressive_remote_reports WHERE sim_job_id=${job.id}::uuid`,
+        );
+        const adopted = await adoptProgressiveNumerics2(
+          db,
+          scope.campaignId,
+          plan,
+          handoff,
+        );
+        expect(adopted).toMatchObject({
+          kind: "adopted",
+          stoppedArchiveHandoffJobs: 1,
+        });
+        expect(await settleProgressiveRemoteJob(db, job.id)).toMatchObject({
+          kind: "settled",
+          counts: { cancelled: leases.length, complete: 0 },
+        });
+        expect(
+          await db.execute(
+            sql`SELECT * FROM progressive_remote_reports WHERE sim_job_id=${job.id}::uuid`,
+          ),
+        ).toEqual(before);
+        const [retired] =
+          await db.execute(sql`SELECT job.status,job."ingestedAt" AS ingested,promise.status AS promise_status,
+          (SELECT count(*)::int FROM result_attempts WHERE sim_job_id=job.id) AS fabricated
+          FROM sim_jobs job JOIN sync_sweep_promises promise ON promise.id=${promiseId}::uuid WHERE job.id=${job.id}::uuid`);
+        expect(retired).toEqual({
+          status: "cancelled",
+          ingested: null,
+          promise_status: "cancelled",
+          fabricated: 0,
+        });
+      } finally {
+        await db.execute(
+          sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`,
+        );
+        await db.execute(
+          sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`,
+        );
+        await db.execute(
+          sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`,
+        );
+      }
+    });
+  });
 
   it("progressive remote dispatch pins one exact request and holds CPU through promise expiry until physical stop", async () => {
     await ready(async () => {

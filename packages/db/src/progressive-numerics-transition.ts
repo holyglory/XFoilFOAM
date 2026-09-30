@@ -206,6 +206,7 @@ export async function adoptProgressiveNumerics2(
   db: DB,
   campaignId: string,
   expectedPlanRevisionId: string,
+  options: { deferStoppedArchives?: boolean } = {},
 ) {
   const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
   if (!uuid.test(campaignId) || !uuid.test(expectedPlanRevisionId))
@@ -221,6 +222,10 @@ export async function adoptProgressiveNumerics2(
     const [admission] = await connection.execute(
       sql`SELECT enabled FROM sweeper_state WHERE id=1 FOR SHARE`,
     );
+    if (options.deferStoppedArchives && admission?.enabled !== false)
+      throw new Error(
+        "Pause new solver admissions before handing off stopped archives",
+      );
     const [campaign] = await connection.execute(
       sql`SELECT id,status,current_plan_revision_id,current_condition_generation FROM sim_campaigns WHERE id=${campaignId}::uuid FOR UPDATE`,
     );
@@ -281,6 +286,33 @@ export async function adoptProgressiveNumerics2(
       sql`SELECT id FROM progressive_generations WHERE campaign_id=${campaignId}::uuid AND epoch_id=${epoch.id}::uuid AND plan_revision_id=${plan.id}::uuid ORDER BY id FOR UPDATE`,
     );
     const [busy] = await connection.execute(sql`
+      WITH stopped_archives AS MATERIALIZED (
+        SELECT job.id FROM sim_jobs job
+        JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=job.id
+        JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
+          AND stopped.engine_job_id=job.engine_job_id AND stopped.epoch_id=${epoch.id}::uuid
+        WHERE ${options.deferStoppedArchives === true} AND job.campaign_id=${campaignId}::uuid
+          AND job.solver_implementation_id=${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid
+          AND job.status='ingesting' AND job.engine_state IN ('completed','failed','cancelled')
+          AND coalesce(job.ingest_lease_expires_at<=clock_timestamp(),true)
+          AND job.engine_job_id=job.id::text
+          AND job.request_payload->'engineRequest'=dispatch.envelope->'request'
+          AND job.request_payload->'progressive'=dispatch.envelope->'scope'
+          AND stopped.proof->>'job_id'=job.engine_job_id
+          AND stopped.proof->>'execution_stopped'='true' AND stopped.proof->>'producer_stopped'='true'
+          AND stopped.proof->>'namespace_verified'='true' AND stopped.proof->'remaining'='[]'::jsonb
+          AND stopped.proof->'error'='null'::jsonb
+          AND EXISTS(SELECT 1 FROM progressive_remote_reports report WHERE report.sim_job_id=job.id
+            AND report.report->'stopProof'=stopped.proof)
+          AND NOT EXISTS(SELECT 1 FROM progressive_remote_reports report
+            LEFT JOIN progressive_remote_progress_receipts receipt USING(sim_job_id,sequence)
+            LEFT JOIN progressive_remote_report_inventories inventory USING(sim_job_id,sequence)
+            WHERE report.sim_job_id=job.id AND (receipt.sequence IS NULL OR inventory.sequence IS NULL
+              OR receipt.content_signature<>report.content_signature
+              OR inventory.report_content_signature<>report.content_signature
+              OR inventory.source_count<>(SELECT count(*) FROM progressive_remote_report_sources source
+                WHERE source.sim_job_id=report.sim_job_id AND source.sequence=report.sequence)))
+      )
       SELECT EXISTS(SELECT 1 FROM progressive_cfd_attempts attempt
         JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
         JOIN progressive_work work ON work.id=unit.work_id
@@ -288,11 +320,14 @@ export async function adoptProgressiveNumerics2(
         JOIN sim_jobs job ON job.id=attempt.sim_job_id
         LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
         WHERE generation.campaign_id=${campaignId}::uuid AND generation.epoch_id=${epoch.id}::uuid
+          AND NOT EXISTS(SELECT 1 FROM stopped_archives deferred WHERE deferred.id=job.id)
           AND (attempt.outcome='running' OR job.status IN ('pending','submitted','running','ingesting')
             OR (job.engine_job_id IS NOT NULL AND (stopped.engine_job_id IS DISTINCT FROM job.engine_job_id OR stopped.epoch_id IS DISTINCT FROM ${epoch.id}::uuid))))
-        OR EXISTS(SELECT 1 FROM sim_jobs WHERE campaign_id=${campaignId}::uuid AND status IN ('pending','submitted','running','ingesting'))
+        OR EXISTS(SELECT 1 FROM sim_jobs job WHERE campaign_id=${campaignId}::uuid AND status IN ('pending','submitted','running','ingesting')
+          AND NOT EXISTS(SELECT 1 FROM stopped_archives deferred WHERE deferred.id=job.id))
         OR EXISTS(SELECT 1 FROM progressive_work work JOIN progressive_generations generation ON generation.id=work.generation_id
-          WHERE generation.campaign_id=${campaignId}::uuid AND generation.epoch_id=${epoch.id}::uuid AND work.state='leased') AS present
+          WHERE generation.campaign_id=${campaignId}::uuid AND generation.epoch_id=${epoch.id}::uuid AND work.state='leased') AS present,
+        (SELECT count(*)::int FROM stopped_archives) AS deferred_archives
     `);
     if (busy?.present)
       throw new Error(
@@ -334,6 +369,7 @@ export async function adoptProgressiveNumerics2(
           toNumerics: "2",
           sourceConditionGeneration: campaign.current_condition_generation,
           priorStatus: campaign.status,
+          stoppedArchiveHandoffJobs: Number(busy.deferred_archives),
         })}::jsonb) RETURNING id`);
     let points = 0;
     for (const condition of conditions) {
@@ -425,6 +461,7 @@ export async function adoptProgressiveNumerics2(
       generationId: successor.id,
       conditions: conditions.length,
       points,
+      stoppedArchiveHandoffJobs: Number(busy.deferred_archives),
     };
   });
 }
