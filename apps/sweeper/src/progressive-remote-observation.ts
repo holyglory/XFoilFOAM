@@ -74,6 +74,7 @@ export async function observeProgressiveRemoteJob(
     timeoutMs: 10_000,
   };
   let measuredStop: EngineExecutionStopProof | null = null;
+  let cancellationRequested = false;
   if (options.stop) {
     try {
       measuredStop = await engine.getExecutionStopProof(executionId, route);
@@ -97,6 +98,7 @@ export async function observeProgressiveRemoteJob(
       throw new Error(
         "Engine did not acknowledge cancellation of the exact progressive execution",
       );
+    cancellationRequested = true;
     measuredStop = await engine.getExecutionStopProof(executionId, route);
   }
   if (measuredStop && measuredStop.job_id !== executionId)
@@ -159,6 +161,24 @@ export async function observeProgressiveRemoteJob(
       )
         throw error;
       result = null;
+    }
+    if (
+      status.state === "cancelled" &&
+      result?.state === "running" &&
+      !cancellationRequested
+    ) {
+      const cancellation = await engine.cancelJob(executionId, {
+        ...route,
+        unregisteredExecution: {
+          expected_engine: route.expectedEngine,
+          expected_execution_pool: route.expectedExecutionPool,
+        },
+      });
+      if (cancellation.job_id !== executionId || !cancellation.cancelled)
+        throw new Error(
+          "Engine did not acknowledge cancellation of the exact progressive execution",
+        );
+      result = await engine.getResult(executionId, route);
     }
   }
   const receipt = await enqueueProgressiveWorkerReport(db, {
