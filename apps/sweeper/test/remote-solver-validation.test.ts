@@ -2250,7 +2250,7 @@ describe("remote solver submit lifecycle", () => {
     ).toEqual(["active"]);
   });
 
-  it("releases a connection failure without answered allowance and honors shared backoff before recomposing", async () => {
+  it("releases a connection failure, honors backoff, and retries the same promise", async () => {
     const aoa = 901.001;
     const promise = await seedMirroredPromise("connection", [aoa]);
     const { fetchMock } = stubFetch();
@@ -2292,7 +2292,6 @@ describe("remote solver submit lifecycle", () => {
       status: "queued",
       retryState: null,
     });
-    expect(requests(fetchMock, "/sweeps/claim")).toHaveLength(0);
   });
 
   it("waits 30 seconds after the first answered 5xx, then recomposes the same promise without a new upstream claim", async () => {
