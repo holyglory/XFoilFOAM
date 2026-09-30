@@ -122,6 +122,7 @@ import { createSingleFlightBackgroundRunner } from "./single-flight";
 import { parsedMeshRecoveryVersion } from "./engine-capabilities";
 import { retryScopeForRequestedPolar } from "./retry-plan";
 import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
+import { submitRemotePromisePrecalcRecoveries } from "./urans-ladder";
 import { parseEvidenceManifest } from "./evidence-manifest";
 
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
@@ -332,7 +333,11 @@ export type RemoteEngineAdmissionHoldReason =
  * OpenFOAM work. The allow branch carries the exact live mesh-recovery
  * capability that the engine request and durable job payload must pin. */
 export type RemoteEngineAdmissionDecision =
-  | { kind: "allow"; meshRecoveryVersion: number }
+  | {
+      kind: "allow";
+      meshRecoveryVersion: number;
+      uransRecoveryVersion?: number | null;
+    }
   | { kind: "hold"; reason: RemoteEngineAdmissionHoldReason };
 
 function syncBase(settings: Settings): string {
@@ -7370,6 +7375,21 @@ export async function admitRemoteSolverTick(
           "remote solver is waiting for the shared engine connection backoff",
         );
         break;
+      }
+      if (
+        await submitRemotePromisePrecalcRecoveries(
+          db,
+          engine,
+          meshRecoveryVersion,
+          decision.uransRecoveryVersion,
+        )
+      ) {
+        admitted = true;
+        submittedCount += 1;
+        await setStatus(db, "solving", null, {
+          remoteSolverLastPromiseAt: new Date(),
+        });
+        continue;
       }
       const concurrency = Math.min(
         activeReconcileConcurrency(),

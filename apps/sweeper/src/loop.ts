@@ -833,6 +833,7 @@ export async function tick(
     await admitRemoteSolverTick(db, engine, {
       kind: "allow",
       meshRecoveryVersion,
+      uransRecoveryVersion,
     });
     await markTickCompleted(db);
     return;

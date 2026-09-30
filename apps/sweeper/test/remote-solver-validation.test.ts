@@ -66,6 +66,8 @@ const { backfillLegacyBrokeredEvidence } =
 const { resetEngineBackoffForTests } = await import("../src/engine-backoff");
 const { submitPendingJobWithLifecycleGuard } =
   await import("../src/submit-lifecycle");
+const { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } =
+  await import("../src/build-request");
 const { submitUransRetryForJob } = await import("../src/reconcile");
 const { submitRemotePromisePrecalcRecoveries } =
   await import("../src/urans-ladder");
@@ -3234,7 +3236,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       parent,
       {
         meshRecoveryVersion: 4,
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
         cpuSlots: 1,
       },
     );
@@ -3322,7 +3324,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       parent,
       {
         meshRecoveryVersion: 4,
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
         cpuSlots: 1,
       },
     );
@@ -3422,7 +3424,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       current.parent,
       {
         meshRecoveryVersion: 4,
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
         cpuSlots: 1,
       },
     );
@@ -3573,7 +3575,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       parent,
       {
         meshRecoveryVersion: 4,
-        uransRecoveryVersion: 1,
+        uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
         cpuSlots: 1,
       },
     );
@@ -3642,7 +3644,11 @@ describe("remote-owned derived PRECALC lifecycle", () => {
     const remoteAdmissionConsumed = await admitRemoteSolverTick(
       db,
       { submitPolar: forbiddenRansSubmit } as unknown as EngineClient,
-      { kind: "allow", meshRecoveryVersion: 4 },
+      {
+        kind: "allow",
+        meshRecoveryVersion: 4,
+        uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+      },
     );
     const [admissionStatus] = await db
       .select({
@@ -3747,7 +3753,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         parent,
         {
           meshRecoveryVersion: 4,
-          uransRecoveryVersion: 1,
+          uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
           cpuSlots: 64,
         },
       );
