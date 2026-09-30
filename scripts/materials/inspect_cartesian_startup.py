@@ -216,6 +216,16 @@ def main():
                 reports.append({"group": name, **inspect_saved_case(directory)})
             elif directory.is_dir() and (directory / "report.json").is_file():
                 kind = json.loads((directory / "report.json").read_text()).get("kind")
+                if kind == "exact-production-engine-baseline-v1":
+                    baseline = json.loads((directory / "report.json").read_text())
+                    if (baseline.get("production_evidence") is not False
+                            or baseline.get("source_sha256") != "2503ff74b56acc3a2eaff6d74ca87a230b5add1898787bf01dfc397302d686b3"
+                            or hashlib.sha256((directory / "source-request.json").read_bytes()).hexdigest() != "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed"
+                            or not (directory / "driver.py").is_file()):
+                        raise ValueError("The baseline does not match the observed production implementation/request")
+                    reports.append({"group": name, "case": directory.name, "kind": kind,
+                                    "state": baseline.get("state"), "case_outcomes": baseline.get("outcomes", []), "physical_validation": False})
+                    continue
                 if kind == "native-acoustic-classification-v1":
                     native = json.loads((directory / "report.json").read_text())
                     receipts = native.get("receipts", [])

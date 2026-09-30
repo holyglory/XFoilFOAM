@@ -24,6 +24,9 @@ export const OPENCFD_2606_ENGINE: Readonly<EngineIdentity> = Object.freeze({
   adapter_contract_version: ENGINE_ADAPTER_CONTRACT_VERSION,
 });
 
+export const OPENCFD_2606_NUMERICS2_ENGINE: Readonly<EngineIdentity> =
+  Object.freeze({ ...OPENCFD_2606_ENGINE, numerics_revision: "2" });
+
 export const FOUNDATION_OPENFOAM_14_ENGINE: Readonly<EngineIdentity> =
   Object.freeze({
     family: "openfoam",

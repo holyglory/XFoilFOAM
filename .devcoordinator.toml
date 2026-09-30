@@ -71,6 +71,41 @@ timeout_seconds = 900
 [test.acoustic-classification]
 timeout_seconds = 900
 
+[test.source-numerics-identity]
+timeout_seconds = 1800
+
+[test.source-numerics-identity.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.source-numerics-identity.check]]
+name = "native-handshake-and-provenance"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_multi_engine.py", "tests/test_compressible_execution.py", "tests/test_compressible_case.py", "tests/test_control_rpc_pool.py", "-q"]
+
+[[test.source-numerics-identity.check]]
+name = "numerical-identity-separation"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-engine-identity.test.ts", "test/opencfd-2606-campaign-cutover.test.ts"]
+
+[[test.source-numerics-identity.check]]
+name = "client-routing"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/engine-identity.test.ts"]
+
+[[test.source-numerics-identity.check]]
+name = "native-numerical-transition"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.retain_sg6051_verification", "--case", "33068f66-bd81-416f-9658-c33e77b80004", "--destination", ".codex-artifacts/numerics2-native-sg6051-20260930", "--numerics2"]
+retained_artifacts = [{ name = "numerics2-native-sg6051", path = ".codex-artifacts/numerics2-native-sg6051-20260930", max_bytes = 536870912 }]
+
+[[test.source-numerics-identity.check]]
+name = "exact-production-baseline"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/exact-production-baseline-20260930", "--groups", "mach3-production-baseline"]
+retained_artifacts = [{ name = "exact-production-baseline", path = ".codex-artifacts/exact-production-baseline-20260930", max_bytes = 536870912 }]
+
 [test.precise-diffusion]
 timeout_seconds = 900
 
@@ -250,8 +285,8 @@ ttl_seconds = 86400
 type = "compose"
 env = { COMPOSE_PROGRESS = "plain" }
 files = ["compose.trailing-edge-reproduction.yml"]
-services = ["artifacts", "fixed"]
-finite_services = ["fixed"]
+services = ["artifacts", "numerics2"]
+finite_services = ["numerics2"]
 build = false
 port = true
 route = true
@@ -3657,8 +3692,8 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "mach3-precise-bounded"]
-finite_services = ["mach3-precise-bounded"]
+services = ["artifacts", "mach3-production-baseline"]
+finite_services = ["mach3-production-baseline"]
 build = false
 port = true
 route = true

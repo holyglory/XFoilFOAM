@@ -104,7 +104,7 @@ class Settings(BaseSettings):
         description="Upstream solver release executed by this worker.",
     )
     engine_numerics_revision: str = Field(
-        default="1",
+        default="2",
         description="Explicit revision of numerically significant adapter behaviour/defaults.",
     )
     engine_adapter_contract_version: int = Field(
@@ -137,11 +137,11 @@ class Settings(BaseSettings):
         description="Runtime architecture included in immutable provenance.",
     )
     celery_queue: str = Field(
-        default="openfoam-opencfd-2606",
+        default="openfoam-opencfd-2606-numerics-2",
         description="Exact implementation-owned Celery queue this worker consumes.",
     )
     enabled_engine_keys: str = Field(
-        default="openfoam:opencfd:2606:numerics-1:adapter-1",
+        default="openfoam:opencfd:2606:numerics-2:adapter-1",
         description="Comma-separated exact engine handshake keys the API gateway is allowed to route. "
         "Registered but disabled adapters are rejected before queueing.",
     )
@@ -243,6 +243,14 @@ class Settings(BaseSettings):
 
     # --- Messaging ---
     redis_url: str = Field(default="redis://localhost:6379/0")
+
+    @model_validator(mode="after")
+    def preserve_other_engine_numerics_default(self) -> "Settings":
+        if "engine_numerics_revision" not in self.model_fields_set and (
+            self.engine_family, self.engine_distribution, self.engine_version
+        ) != ("openfoam", "opencfd", "2606"):
+            self.engine_numerics_revision = "1"
+        return self
 
     @model_validator(mode="after")
     def require_remote_cleanup_authentication(self) -> "Settings":

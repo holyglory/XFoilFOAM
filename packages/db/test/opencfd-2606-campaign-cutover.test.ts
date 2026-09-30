@@ -81,6 +81,8 @@ import {
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   OPENCFD_2606_EXECUTION_POOL_ID,
   OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID,
 } from "../src/solver-implementations";
 import { campaignReviewBuckets } from "../src/urans-ladder";
 
@@ -749,6 +751,40 @@ afterAll(async () => {
 });
 
 describe("0066 OpenCFD 2606 campaign cutover", () => {
+  it("registers corrected numerics without relabelling or enabling the historical implementation", async () => {
+    const identities = await db
+      .select()
+      .from(solverImplementations)
+      .where(
+        sql`${solverImplementations.id} IN (${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid, ${OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID}::uuid)`,
+      );
+    expect(identities).toHaveLength(2);
+    expect(
+      identities.find((row) => row.id === OPENCFD_2606_SOLVER_IMPLEMENTATION_ID)
+        ?.numericsRevision,
+    ).toBe("1");
+    expect(
+      identities.find(
+        (row) => row.id === OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+      )?.numericsRevision,
+    ).toBe("2");
+    const [pool] = await db
+      .select()
+      .from(solverExecutionPools)
+      .where(
+        eq(solverExecutionPools.id, OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID),
+      );
+    expect(pool.enabled).toBe(false);
+    expect(pool.solverImplementationId).toBe(
+      OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+    );
+    expect(pool.routingKey).toBe("openfoam-opencfd-2606-numerics-2");
+    await expect(
+      db.execute(
+        sql`UPDATE solver_implementations SET numerics_revision='1' WHERE id=${OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID}::uuid`,
+      ),
+    ).rejects.toThrow(/immutable/);
+  });
   it("seeds a disabled distinct 2606 route and generation-aware campaign schema", async () => {
     if (!client) throw new Error("migration test database is unavailable");
     const [implementation] = await client<

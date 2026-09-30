@@ -1326,6 +1326,20 @@ dominating every archive-transfer pass without changing evidence acceptance.
 
 ### Source-preserving precise execution
 
+The source-preserving adapter uses OpenCFD 2606 numerical revision 2 and the
+separate `openfoam-opencfd-2606-numerics-2` execution route. Revision 1 remains a
+historical database identity; the corrected adapter rejects revision-1 execution
+requests rather than silently changing their numerical method. Historical wire
+records that omitted a numerical revision retain their original revision-1
+interpretation. Foundation 14 is unchanged.
+
+Registration alone leaves the new pool disabled and does not rewrite profiles,
+campaigns, snapshots, jobs or evidence. Activation requires a coordinated campaign
+and worker transition: close new admission, settle old ownership, create immutable
+successor setup revisions, verify the exact new worker/route, then restore the
+recorded admission state. Unchanged physical targets can retain real NeuralFoil
+predictions; CFD compatibility remains separate across numerical revisions.
+
 Source-preserving finite-edge meshing retains the real trailing-edge endpoints
 as explicit Cartesian surface features. Shared mesh files use 17-digit ASCII
 coordinates; this precision participates in mesh and downstream seed identities

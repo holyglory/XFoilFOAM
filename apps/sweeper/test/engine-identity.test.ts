@@ -6,6 +6,7 @@ import {
   FOUNDATION_OPENFOAM_14_ENGINE,
   LEGACY_OPENCFD_2406_ENGINE,
   OPENCFD_2606_ENGINE,
+  OPENCFD_2606_NUMERICS2_ENGINE,
   engineIdentityKey,
   engineNumericalCompatibilityKey,
   isEngineRuntimeIdentity,
@@ -76,6 +77,12 @@ describe("engine identity contract", () => {
     expect(engineNumericalCompatibilityKey(adapter2)).toBe(
       engineNumericalCompatibilityKey(FOUNDATION_OPENFOAM_14_ENGINE),
     );
+    expect(engineIdentityKey(OPENCFD_2606_NUMERICS2_ENGINE)).not.toBe(
+      engineIdentityKey(OPENCFD_2606_ENGINE),
+    );
+    expect(
+      engineNumericalCompatibilityKey(OPENCFD_2606_NUMERICS2_ENGINE),
+    ).not.toBe(engineNumericalCompatibilityKey(OPENCFD_2606_ENGINE));
   });
 
   it("uses OpenCFD 2606 for new OpenFOAM identities and client submissions", async () => {
@@ -154,6 +161,32 @@ describe("engine identity contract", () => {
     } as PolarRequest);
     expect(sent[0]?.expected_engine).toEqual(FOUNDATION_OPENFOAM_14_ENGINE);
     expect(sent[0]?.expected_execution_pool).toBe("openfoam-foundation-14");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sent.push(JSON.parse(String(init?.body)));
+        return response({
+          job_id: "corrected-job",
+          state: "pending",
+          total_cases: 1,
+          completed_cases: 0,
+          requested_engine: OPENCFD_2606_NUMERICS2_ENGINE,
+          requested_execution_pool: "openfoam-opencfd-2606-numerics-2",
+          engine: null,
+          execution_pool: null,
+        });
+      }),
+    );
+    await client.submitPolar({
+      airfoil: {},
+      aoa: {},
+      expected_engine: OPENCFD_2606_NUMERICS2_ENGINE,
+      expected_execution_pool: "openfoam-opencfd-2606-numerics-2",
+    } as PolarRequest);
+    expect(sent[1]?.expected_engine).toEqual(OPENCFD_2606_NUMERICS2_ENGINE);
+    expect(sent[1]?.expected_execution_pool).toBe(
+      "openfoam-opencfd-2606-numerics-2",
+    );
   });
 
   it("requires the actual running worker runtime and execution-pool acknowledgement", async () => {
@@ -440,10 +473,7 @@ describe("engine identity contract", () => {
           worker_queues: [
             {
               ...binding,
-              queues: [
-                "openfoam-opencfd-2606",
-                "openfoam-foundation-14",
-              ],
+              queues: ["openfoam-opencfd-2606", "openfoam-foundation-14"],
             },
           ],
         },

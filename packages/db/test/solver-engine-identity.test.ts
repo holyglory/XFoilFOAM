@@ -13,6 +13,10 @@ import {
   LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_KEY,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_KEY,
+  OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_KEY,
   type SolverImplementationSnapshot,
 } from "../src/solver-implementations";
 import { solverRuntimeProvenanceKey } from "../src/solver-runtime-provenance";
@@ -157,6 +161,36 @@ describe("versioned solver-method compatibility", () => {
     expect(legacySnapshot.engine).toBeUndefined();
     expect(LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID).not.toBe(
       OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+    );
+    const current = {
+      ...legacySnapshot,
+      engine: {
+        ...openCfd,
+        releaseVersion: "2606",
+        implementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+        key: OPENCFD_2606_SOLVER_IMPLEMENTATION_KEY,
+      },
+    };
+    const corrected = {
+      ...current,
+      engine: {
+        ...current.engine,
+        numericsRevision: "2",
+        implementationId: OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+        key: OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_KEY,
+      },
+    };
+    expect(physicsHashForSnapshot(corrected)).toBe(
+      physicsHashForSnapshot(current),
+    );
+    expect(methodCompatibilityHashForSnapshot(corrected)).not.toBe(
+      methodCompatibilityHashForSnapshot(current),
+    );
+    expect(simulationSetupSignature(corrected)).not.toBe(
+      simulationSetupSignature(current),
+    );
+    expect(campaignBatchGroupKey(corrected)).not.toBe(
+      campaignBatchGroupKey(current),
     );
   });
 

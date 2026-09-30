@@ -85,10 +85,10 @@ ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
     AIRFOILFOAM_ENGINE_FAMILY=openfoam \
     AIRFOILFOAM_ENGINE_DISTRIBUTION=opencfd \
     AIRFOILFOAM_ENGINE_VERSION=2606 \
-    AIRFOILFOAM_ENGINE_NUMERICS_REVISION=1 \
+    AIRFOILFOAM_ENGINE_NUMERICS_REVISION=2 \
     AIRFOILFOAM_ENGINE_ADAPTER_CONTRACT_VERSION=1 \
     AIRFOILFOAM_ENGINE_SOURCE_REVISION=481094fdf34f11ed6d0d603ee59a858a0124236d \
-    AIRFOILFOAM_CELERY_QUEUE=openfoam-opencfd-2606 \
+    AIRFOILFOAM_CELERY_QUEUE=openfoam-opencfd-2606-numerics-2 \
     AIRFOILFOAM_DATA_DIR=/data/airfoilfoam \
     AIRFOILFOAM_BUILD_ID=${AIRFOILFOAM_BUILD_ID} \
     AIRFOILFOAM_CELERY_CONCURRENCY=8 \
@@ -119,4 +119,4 @@ RUN mkdir -p /data/airfoilfoam
 # The OpenCFD runtime image runs as root; MPI runs use --allow-run-as-root.
 # -A airfoilfoam.celery_app imports tasks; worker-local CPU tokens coordinate
 # OpenFOAM solves across these Celery processes.
-CMD ["sh", "-c", "export AIRFOILFOAM_ENGINE_PACKAGE_SHA256=$(cat /etc/airfoilfoam-engine-package-sha256); export AIRFOILFOAM_ENGINE_BINARY_SHA256=$(cat /etc/airfoilfoam-engine-binary-sha256); celery -A airfoilfoam.celery_app worker --loglevel=info --concurrency=${AIRFOILFOAM_CELERY_CONCURRENCY:-8} -Q ${AIRFOILFOAM_CELERY_QUEUE:-openfoam-opencfd-2606}"]
+CMD ["sh", "-c", "export AIRFOILFOAM_ENGINE_PACKAGE_SHA256=$(cat /etc/airfoilfoam-engine-package-sha256); export AIRFOILFOAM_ENGINE_BINARY_SHA256=$(cat /etc/airfoilfoam-engine-binary-sha256); celery -A airfoilfoam.celery_app worker --loglevel=info --concurrency=${AIRFOILFOAM_CELERY_CONCURRENCY:-8} -Q ${AIRFOILFOAM_CELERY_QUEUE:-openfoam-opencfd-2606-numerics-2}"]

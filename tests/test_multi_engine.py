@@ -280,6 +280,17 @@ def test_opencfd_2406_identity_is_historical_but_not_executable_or_routable():
         get_openfoam_dialect(OPENCFD_2406_IDENTITY)
     assert get_openfoam_dialect().identity == OPENCFD_2606_IDENTITY
     assert Settings().engine_identity() == OPENCFD_2606_IDENTITY
+    previous = OPENCFD_2606_IDENTITY.model_copy(update={"numerics_revision": "1"})
+    assert previous not in supported_openfoam_identities()
+    with pytest.raises(UnsupportedEngineIdentity, match="numerics 1"):
+        get_openfoam_dialect(previous)
+    assert OPENCFD_2606_IDENTITY.numerics_revision == "2"
+    assert Settings().celery_queue == OPENCFD_2606.queue_name == "openfoam-opencfd-2606-numerics-2"
+    assert Settings().enabled_engine_keys == OPENCFD_2606_IDENTITY.handshake_key
+    assert EngineIdentity().numerics_revision == "1"
+    assert Settings(engine_distribution="foundation", engine_version="14").engine_identity() == FOUNDATION_14_IDENTITY
+    assert Settings(engine_distribution="foundation", engine_version="14").engine_numerics_revision == "1"
+    assert Settings(engine_numerics_revision="1").engine_identity() == previous
 
 
 def test_foundation_force_header_and_legacy_vtk_layout_are_read(tmp_path):
@@ -434,6 +445,19 @@ def test_gateway_advertises_routing_keys_and_routes_foundation_submission(
     assert body["requested_execution_pool"] == FOUNDATION_14.queue_name
     assert body["engine"] is None
     assert body["execution_pool"] is None
+    old_request = _request_payload(naca0012_selig_text)
+    old_request["expected_engine"] = {**OPENCFD_2606_IDENTITY.model_dump(mode="json"), "numerics_revision": "1"}
+    old_request["expected_execution_pool"] = "openfoam-opencfd-2606"
+    refused = client.post("/polars", json=old_request)
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["code"] == "unsupported_engine_identity"
+    assert len(calls) == 1
+    new_request = {**old_request, "expected_engine": OPENCFD_2606_IDENTITY.model_dump(mode="json"),
+                   "expected_execution_pool": OPENCFD_2606.queue_name}
+    accepted = client.post("/polars", json=new_request)
+    assert accepted.status_code == 202
+    assert calls[1]["queue"] == OPENCFD_2606.queue_name
+    assert accepted.json()["requested_engine"]["numerics_revision"] == "2"
 
 
 def test_gateway_rejects_stale_execution_pool_before_queueing(
@@ -512,6 +536,7 @@ def test_queue_reports_all_registered_routes_and_live_worker_consumers(
                             update={
                                 "distribution": "foundation",
                                 "version": "14",
+                                "numerics_revision": FOUNDATION_14_IDENTITY.numerics_revision,
                             }
                         )
                         .model_dump(mode="json"),

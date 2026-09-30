@@ -8,10 +8,14 @@ x-experiment: &experiment
     AIRFOILFOAM_EVIDENCE_BUCKET: ""
     AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
     AIRFOILFOAM_OPENFOAM_RUNNER: local
+    AIRFOILFOAM_ENGINE_NUMERICS_REVISION: "2"
+    AIRFOILFOAM_CELERY_QUEUE: openfoam-opencfd-2606-numerics-2
+    AIRFOILFOAM_ENABLED_ENGINE_KEYS: openfoam:opencfd:2606:numerics-2:adapter-1
     AIRFOILFOAM_WORKER_CPU_BUDGET: "1"
     OMP_NUM_THREADS: "1"
   volumes:
     - ./src:/candidate/src:ro
+    - ./pyproject.toml:/candidate/pyproject.toml:ro
     - ./scripts/materials/reproduce_blunt_trailing_edge.py:/verification/reproduce.py:ro
     - ./.codex-artifacts/sg6051-polar-diagnosis-20260930/job-request.json:/fixture/request.json:ro
     - trailing-edge-evidence:/evidence
@@ -24,6 +28,9 @@ services:
   fixed:
     <<: *experiment
     command: ["python", "/verification/reproduce.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--variant", "production-fixed"]
+  numerics2:
+    <<: *experiment
+    command: ["python", "/verification/reproduce.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--variant", "production-fixed", "--verify-numerical-transition"]
   legacy:
     <<: *experiment
     command: ["python", "/verification/reproduce.py", "--request", "/fixture/request.json", "--destination", "/evidence", "--variant", "legacy"]

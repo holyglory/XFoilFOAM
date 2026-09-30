@@ -2,9 +2,12 @@ x-canary: &canary
   image: xfoilfoam-progressive-worker:local
   pull_policy: never
   network_mode: none
-  environment:
+  environment: &candidate-environment
     PYTHONPATH: /candidate/src
     AIRFOILFOAM_OPENFOAM_RUNNER: local
+    AIRFOILFOAM_ENGINE_NUMERICS_REVISION: "2"
+    AIRFOILFOAM_CELERY_QUEUE: openfoam-opencfd-2606-numerics-2
+    AIRFOILFOAM_ENABLED_ENGINE_KEYS: openfoam:opencfd:2606:numerics-2:adapter-1
     AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
     AIRFOILFOAM_DATA_DIR: /canary-output/data
     AIRFOILFOAM_CACHE_DIR: /canary-output/cache
@@ -20,6 +23,20 @@ x-canary: &canary
     - numerical-results:/canary-output
 
 services:
+  mach3-production-baseline:
+    <<: *canary
+    environment:
+      PYTHONPATH: /baseline/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    volumes:
+      - ./.codex-artifacts/production-engine-383b2fc:/baseline:ro
+      - ./scripts/materials/replay_production_baseline.py:/diagnostic/replay.py:ro
+      - ./.codex-artifacts/mach3-production-replay-20260930/ag24-precise-request.json:/fixture/request.json:ro
+      - numerical-results:/canary-output
+    command: ["python", "/diagnostic/replay.py"]
   mach3-classification:
     <<: *canary
     command:
@@ -65,6 +82,7 @@ services:
   mach3-density-gradients: &saved-state-replay
     <<: *canary
     environment:
+      <<: *candidate-environment
       PYTHONPATH: /candidate/src:/candidate
       PYTHONDONTWRITEBYTECODE: "1"
       AIRFOILFOAM_OPENFOAM_RUNNER: local
@@ -176,6 +194,7 @@ services:
   mach3-precise-cold: &precise-replay
     <<: *canary
     environment:
+      <<: *candidate-environment
       PYTHONPATH: /candidate/src:/candidate
       PYTHONDONTWRITEBYTECODE: "1"
       AIRFOILFOAM_OPENFOAM_RUNNER: local
@@ -209,6 +228,7 @@ services:
   mach3-production: &production-replay
     <<: *canary
     environment:
+      <<: *candidate-environment
       PYTHONPATH: /candidate/src:/candidate
       PYTHONDONTWRITEBYTECODE: "1"
       AIRFOILFOAM_OPENFOAM_RUNNER: local

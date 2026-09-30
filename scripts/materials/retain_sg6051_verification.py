@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", required=True)
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--numerics2", action="store_true")
     args = parser.parse_args()
     case = str(UUID(args.case))
     status = json.loads(subprocess.check_output([
@@ -43,8 +44,25 @@ def main():
     archives = authenticate_archives(args.destination / "data/jobs" / report["local_job"])
     if len(archives) != 2:
         raise ValueError("Both original angles need authenticated raw archives")
+    if args.numerics2:
+        identity = report["engine"]
+        runtime = report["runtime"]
+        transition = report["numerical_transition"]
+        if (identity["numerics_revision"] != "2" or transition["historical_numerics_rejected"] is not True
+                or transition["expected_engine"] != identity
+                or transition["execution_pool"] != "openfoam-opencfd-2606-numerics-2"
+                or report["request"]["expected_engine"] != identity
+                or runtime["source_revision"] is not None
+                or not runtime["application_source_sha256"]):
+            raise ValueError("The numerical transition lacks its exact new request/runtime identity")
+        for proof in archives:
+            manifest = args.destination / "data/jobs" / report["local_job"] / Path(proof["archive"]).parent / "evidence_manifest.json"
+            evidence = json.loads(manifest.read_text())
+            if evidence["engine"] != runtime or evidence["engineNamespace"] != "openfoam:opencfd:2606:numerics-2":
+                raise ValueError("Raw solver evidence differs from the executing numerical revision")
     verification = {"case": case, "source_sha256": SOURCE_SHA256, "production_evidence": False,
-                    "physical_validation": False, "points": points, "archives": archives}
+                    "physical_validation": False, "points": points, "archives": archives,
+                    "numerical_transition_verified": args.numerics2}
     (args.destination / "verification.json").write_text(json.dumps(verification, indent=2, allow_nan=False) + "\n")
     print(json.dumps({"case": case, "archive_count": len(archives),
                       "points": [{name: row[name] for name in ("alpha", "cl", "cd", "converged")} for row in points],

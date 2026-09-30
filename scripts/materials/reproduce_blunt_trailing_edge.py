@@ -8,12 +8,15 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import numpy as np
+import airfoilfoam
 
 from airfoilfoam.airfoil import Airfoil
 from airfoilfoam.config import Settings
 from airfoilfoam.jobs import execute_job
 from airfoilfoam.models import PolarRequest
 from airfoilfoam.storage import JobStore
+from airfoilfoam.provenance import application_source_sha256
+from airfoilfoam.openfoam.runner import EngineIdentityMismatch
 
 
 SOURCE_SHA256 = "0e10c995bbb34aacbcdadc06a8cf57916ff4f9891fd01397f4ab789422cce488"
@@ -50,6 +53,7 @@ def main():
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--variant", choices=["legacy", "pinched-cartesian", "source-cartesian", "production-fixed"], required=True)
+    parser.add_argument("--verify-numerical-transition", action="store_true")
     args = parser.parse_args()
     original = args.request.read_bytes()
     if hashlib.sha256(original).hexdigest() != SOURCE_SHA256:
@@ -67,11 +71,32 @@ def main():
     driver = Path(__file__).read_bytes()
     (destination / "replay-driver.py").write_bytes(driver)
     (destination / "source-request.json").write_bytes(original)
+    source_root = Path(airfoilfoam.__file__).resolve().parents[2]
+    if not (source_root / "pyproject.toml").is_file():
+        raise ValueError("The geometry experiment requires its actually loaded source manifest")
     settings = Settings(data_dir=destination / "data", cache_dir=destination / "cache",
-                        cpu_token_state_path=destination / "cpu-tokens.json")
+                        cpu_token_state_path=destination / "cpu-tokens.json",
+                        engine_application_source_sha256=application_source_sha256(source_root),
+                        engine_source_revision=None, build_id="isolated-geometry-verification")
     if settings.evidence_bucket:
         raise ValueError("This isolated geometry experiment must not publish production evidence")
     store = JobStore(settings)
+    transition = None
+    if args.verify_numerical_transition:
+        identity = settings.engine_identity()
+        if args.variant != "production-fixed" or identity.numerics_revision != "2":
+            raise ValueError("The transition check requires the corrected canonical numerical implementation")
+        old_request = request.model_copy(update={"expected_engine": identity.model_copy(update={"numerics_revision": "1"})})
+        rejected = False
+        try:
+            execute_job(str(uuid4()), old_request, store=store, settings=settings)
+        except EngineIdentityMismatch:
+            rejected = True
+        if not rejected or list((settings.data_dir / "jobs").glob("*")):
+            raise ValueError("Historical requests must be rejected before geometry, queue ownership or solver work")
+        request = request.model_copy(update={"expected_engine": identity, "expected_execution_pool": settings.celery_queue})
+        transition = {"historical_numerics_rejected": True, "expected_engine": identity.model_dump(mode="json"),
+                      "execution_pool": settings.celery_queue}
     job_id = str(uuid4())
     store.create(job_id, request)
     report = {
@@ -80,6 +105,7 @@ def main():
         "driver_sha256": hashlib.sha256(driver).hexdigest(),
         "source_engine_job": "94246be7-3823-435f-8742-cf361a84bba1", "local_job": job_id,
         "request": request.model_dump(mode="json"), "engine": settings.engine_identity().model_dump(mode="json"),
+        "runtime": settings.engine_runtime_identity().model_dump(mode="json"), "numerical_transition": transition,
         "differences": ["isolated current-source runtime", "one solver process", "empty mesh and field cache",
                         "no rendered media", "continue to the second requested angle after rejected evidence",
                         "production mesh admission" if args.variant == "production-fixed" else request.mesh.mesher,

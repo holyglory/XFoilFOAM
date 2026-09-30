@@ -166,7 +166,7 @@ OPENCFD_2606_IDENTITY = EngineIdentity(
     family="openfoam",
     distribution="opencfd",
     version="2606",
-    numerics_revision="1",
+    numerics_revision="2",
     adapter_contract_version=1,
 )
 
@@ -180,7 +180,7 @@ FOUNDATION_14_IDENTITY = EngineIdentity(
 
 OPENCFD_2606 = OpenCfdDialect(
     identity=OPENCFD_2606_IDENTITY,
-    queue_name="openfoam-opencfd-2606",
+    queue_name="openfoam-opencfd-2606-numerics-2",
     coefficient_filename="coefficient.dat",
     force_libraries=("forces",),
     force_interval_key="writeInterval",

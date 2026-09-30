@@ -10,12 +10,16 @@ export const OPENCFD_2406_SOLVER_IMPLEMENTATION_ID =
   "2f8bc764-09ae-4ff3-8fd2-240600000001";
 export const OPENCFD_2606_SOLVER_IMPLEMENTATION_ID =
   "2f8bc764-09ae-4ff3-8fd2-260600000001";
+export const OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID =
+  "2f8bc764-09ae-4ff3-8fd2-260600000002";
 export const FOUNDATION_14_SOLVER_IMPLEMENTATION_ID =
   "2f8bc764-09ae-4ff3-8fd2-001400000001";
 export const OPENCFD_2406_EXECUTION_POOL_ID =
   "3f8bc764-09ae-4ff3-8fd2-240600000001";
 export const OPENCFD_2606_EXECUTION_POOL_ID =
   "3f8bc764-09ae-4ff3-8fd2-260600000001";
+export const OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID =
+  "3f8bc764-09ae-4ff3-8fd2-260600000002";
 export const FOUNDATION_14_EXECUTION_POOL_ID =
   "3f8bc764-09ae-4ff3-8fd2-001400000001";
 
@@ -25,6 +29,8 @@ export const OPENCFD_2406_SOLVER_IMPLEMENTATION_KEY =
   "openfoam:opencfd:2406:adapter-v1:numerics-v1";
 export const OPENCFD_2606_SOLVER_IMPLEMENTATION_KEY =
   "openfoam:opencfd:2606:adapter-v1:numerics-v1";
+export const OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_KEY =
+  "openfoam:opencfd:2606:adapter-v1:numerics-v2";
 export const FOUNDATION_14_SOLVER_IMPLEMENTATION_KEY =
   "openfoam:foundation:14:adapter-v1:numerics-v1";
 
