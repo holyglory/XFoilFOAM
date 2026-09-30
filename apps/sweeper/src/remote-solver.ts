@@ -7473,6 +7473,8 @@ export async function admitRemoteSolverTick(
         outcome?.kind === "submitted" ? outcome : (occupiedOutcome ?? outcome);
       if (
         outcome?.kind !== "submitted" &&
+        !engineBackoffActive() &&
+        outcome?.kind !== "waiting" &&
         (await remoteReservedCpuSlots(db, settings)) < remoteCap
       ) {
         // Busy mirrored polars are serial only within their own promise. They
