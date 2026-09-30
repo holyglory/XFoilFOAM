@@ -284,6 +284,9 @@ fi
 if [[ "$joined" == *" up -d --no-deps sweeper"* && "$FAKE_SWEEPER_DIES_AFTER_RESTORE" == "1" ]]; then
   : >"$SWEEPER_RESTORED"
 fi
+if [[ "$joined" == *" up -d --no-deps media-repair"* && "${FAKE_MEDIA_REPAIR_STARTABLE:-0}" == "1" ]]; then
+  : >"$CALL_LOG.media-started"
+fi
 if [[ "$joined" == *" ps -a -q sweeper"* ]]; then
   printf 'fake-sweeper-container\n'
   exit 0
@@ -302,7 +305,7 @@ if [[ "$joined" == *" ps --status running -q sweeper"* ]]; then
   exit 0
 fi
 if [[ "$joined" == *" ps --status running -q media-repair"* ]]; then
-  if [[ "$FAKE_MEDIA_REPAIR_RUNNING" == "1" ]]; then
+  if [[ "$FAKE_MEDIA_REPAIR_RUNNING" == "1" || -f "$CALL_LOG.media-started" ]]; then
     printf 'fake-media-repair-container\n'
   fi
   exit 0
@@ -324,6 +327,10 @@ fi
 if [[ "$joined" == *" stop media-repair"* && "$FAKE_MEDIA_REPAIR_STOP_FAILS" == "1" ]]; then
   printf 'simulated media-repair stop failure\n' >&2
   exit 41
+fi
+if [[ "$joined" == *" run --rm --no-deps node-api node --import tsx packages/db/src/migrate.ts"* && "${FAKE_MIGRATION_FAIL:-0}" == "1" ]]; then
+  printf 'simulated migration failure\n' >&2
+  exit 43
 fi
 if [[ "$joined" == *" ps --status running -q worker" && "$FAKE_ENGINE_VERSION" == "2406" && ! -f "$ENGINE_RECREATED" ]]; then
   printf 'fake-legacy-worker-container\n'
@@ -951,8 +958,12 @@ def test_canary_receipt_default_is_outside_replaceable_application_tree() -> Non
     assert '$APP_DIR/.openfoam-2606-canary-receipt.pending.json' not in script
 
 
-def test_control_plane_deploy_initializes_nested_sync_mountpoint_before_node_api(tmp_path: Path) -> None:
-    env = _deploy_harness(tmp_path, sweeper_state="stopped")
+@pytest.mark.parametrize("migration_fails", [False, True])
+@pytest.mark.parametrize("initial_state", ["running", "stopped"])
+def test_control_plane_deploy_initializes_nested_sync_mountpoint_before_node_api(tmp_path: Path, migration_fails: bool, initial_state: str) -> None:
+    env = _deploy_harness(tmp_path, sweeper_state=initial_state, media_repair_running=initial_state == "running")
+    env["FAKE_MIGRATION_FAIL"] = "1" if migration_fails else "0"
+    env["FAKE_MEDIA_REPAIR_STARTABLE"] = "1"
 
     completed = subprocess.run(
         [str(ROOT / "scripts" / "deploy" / "vps-redeploy.sh")],
@@ -962,15 +973,26 @@ def test_control_plane_deploy_initializes_nested_sync_mountpoint_before_node_api
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.returncode == (43 if migration_fails else 0), completed.stdout + completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     storage_init_index = next(
         index for index, call in enumerate(calls) if " up --no-deps storage-init" in call
     )
+    migration_index = next(
+        index for index, call in enumerate(calls) if " run --rm --no-deps node-api node --import tsx packages/db/src/migrate.ts" in call
+    )
+    assert storage_init_index < migration_index
+    if migration_fails:
+        assert not any(" up -d --no-deps node-api" in call for call in calls)
+        assert not any(" up -d --no-deps web" in call for call in calls)
+        assert not any(" up -d --no-deps sweeper" in call for call in calls)
+        assert any(" start sweeper" in call for call in calls) == (initial_state == "running")
+        assert any(" start media-repair" in call for call in calls) == (initial_state == "running")
+        return
     node_api_index = next(
         index for index, call in enumerate(calls) if " up -d --no-deps node-api" in call
     )
-    assert storage_init_index < node_api_index
+    assert migration_index < node_api_index
     assert "Initializing the nested sync-imports mountpoint" in completed.stdout
 
 
@@ -995,7 +1017,7 @@ def test_control_plane_deploy_fails_before_migration_when_media_repair_cannot_st
     assert "simulated media-repair stop failure" in completed.stderr
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert any(" stop media-repair" in call for call in calls)
-    assert any(" up -d --no-deps sweeper" in call for call in calls)
+    assert any(" start sweeper" in call for call in calls)
     assert not any(" up --no-deps storage-init" in call for call in calls)
     assert not any(" up -d --no-deps node-api" in call for call in calls)
 

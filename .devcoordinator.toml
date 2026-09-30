@@ -209,9 +209,21 @@ requires = ["workspace"]
 command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
 
 [[test.policy-refresh.check]]
-name = "schema"
+name = "migration-session"
 tier = "development"
 requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/migration-session.test.ts"]
+
+[[test.policy-refresh.check]]
+name = "deployment-migration-boundary"
+tier = "development"
+requires = ["python"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_deploy_sweeper_state.py", "-q", "-k", "control_plane_deploy or deploy_scripts_preserve_sweeper_state"]
+
+[[test.policy-refresh.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace", "migration-session"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
 
 [[test.policy-refresh.check]]

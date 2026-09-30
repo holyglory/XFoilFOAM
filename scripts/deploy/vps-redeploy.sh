@@ -19,6 +19,8 @@ OPENCFD2606_CANARY_RECEIPT_FILE="${OPENCFD2606_CANARY_RECEIPT_FILE:-$AIRFOILS_PR
 DEPLOY_SWEEPER_INITIAL_STATE=""
 DEPLOY_SWEEPER_QUIESCED=0
 DEPLOY_SWEEPER_RESTORED=0
+DEPLOY_MIGRATION_COMPLETED=0
+DEPLOY_MEDIA_WAS_RUNNING=0
 
 cd "$APP_DIR"
 
@@ -185,7 +187,14 @@ restore_sweeper_on_error() {
   trap - EXIT
   if ((DEPLOY_SWEEPER_QUIESCED && !DEPLOY_SWEEPER_RESTORED)); then
     echo "Deployment failed after writer quiescence; restoring sweeper state..." >&2
-    if ! restore_sweeper_state "$DEPLOY_SWEEPER_INITIAL_STATE"; then
+    if (( !DEPLOY_MIGRATION_COMPLETED )); then
+      if [[ "$DEPLOY_SWEEPER_INITIAL_STATE" == "running" ]]; then
+        compose start sweeper || exit_code=1
+      fi
+      if ((DEPLOY_MEDIA_WAS_RUNNING)); then
+        compose start media-repair || exit_code=1
+      fi
+    elif ! restore_sweeper_state "$DEPLOY_SWEEPER_INITIAL_STATE"; then
       echo "Could not restore the sweeper's pre-deploy state." >&2
       exit_code=1
     fi
@@ -299,6 +308,10 @@ main() {
   fi
 
   DEPLOY_SWEEPER_INITIAL_STATE="$(capture_sweeper_state)"
+  if compose config --services | grep -Fxq media-repair; then
+    media_running_ids="$(compose ps --status running -q media-repair)"
+    if [[ -n "$media_running_ids" ]]; then DEPLOY_MEDIA_WAS_RUNNING=1; fi
+  fi
   echo "Sweeper state before deploy: $DEPLOY_SWEEPER_INITIAL_STATE"
   trap restore_sweeper_on_error EXIT
 
@@ -348,6 +361,10 @@ main() {
   # before Docker can attach the writable volume there.
   echo "Initializing the nested sync-imports mountpoint..."
   compose up --no-deps storage-init
+
+  echo "Applying database migrations before replacing the serving API..."
+  compose run --rm --no-deps node-api node --import tsx packages/db/src/migrate.ts
+  DEPLOY_MIGRATION_COMPLETED=1
 
   echo "Restarting node-api only..."
   compose up -d --no-deps node-api
