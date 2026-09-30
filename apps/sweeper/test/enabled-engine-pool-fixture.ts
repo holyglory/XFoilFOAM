@@ -19,6 +19,8 @@ vi.mock("../src/engine-pool", async (importOriginal) => {
     OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
     OPENCFD_2606_EXECUTION_POOL_ID,
     OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+    OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID,
+    OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
   } = await import("@aerodb/db");
 
   const pools: Readonly<Record<string, ResolvedSolverExecutionPool>> = {
@@ -33,6 +35,13 @@ vi.mock("../src/engine-pool", async (importOriginal) => {
       id: OPENCFD_2606_EXECUTION_POOL_ID,
       solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
       routingKey: "openfoam-opencfd-2606",
+      capacityKind: "cpu_slots",
+      capacityLimit: null,
+    },
+    [OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID]: {
+      id: OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID,
+      solverImplementationId: OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+      routingKey: "openfoam-opencfd-2606-numerics-2",
       capacityKind: "cpu_slots",
       capacityLimit: null,
     },
