@@ -106,7 +106,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 [[test.sparse-mean-study.check]]
 name = "research-contracts"
 tier = "development"
-command = [".venv/bin/python", "-m", "pytest", "tests/test_history_bias_calibration.py", "tests/test_retained_polar_measurement.py", "tests/test_retained_polar_cohort.py", "-q"]
+command = [".venv/bin/python", "-m", "pytest", "tests/test_history_bias_calibration.py", "tests/test_retained_polar_measurement.py", "tests/test_retained_polar_cohort.py", "tests/test_fresh_history_selection.py", "-q"]
 env = { OPENBLAS_NUM_THREADS = "1", OMP_NUM_THREADS = "1" }
 
 [[test.sparse-mean-study.check]]
