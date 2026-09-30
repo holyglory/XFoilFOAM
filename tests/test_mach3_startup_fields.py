@@ -10,7 +10,7 @@ from airfoilfoam.openfoam.rans_hold import root_entry
 from airfoilfoam.pipeline import _case_builder
 from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
 from scripts.materials.inspect_mach3_startup import measured_frames, preserve_early_frames, startup_request
-from scripts.materials.inspect_cartesian_startup import energy_balances, inspect_production_replay, inspect_saved_case, saved_scalar
+from scripts.materials.inspect_cartesian_startup import energy_balances, inspect_production_replay, inspect_saved_case, inspect_state_comparison, saved_scalar
 from test_compressible_execution import RecordedRunner
 
 
@@ -38,6 +38,36 @@ def test_retained_native_replay_binds_its_actual_driver_and_source_request(tmp_p
     driver.write_text("changed driver")
     with pytest.raises(ValueError, match="executed source"):
         inspect_production_replay(tmp_path)
+
+
+def test_saved_state_comparison_verifies_physical_inputs_without_accepting_failed_flow(tmp_path):
+    source = tmp_path / "source.json"
+    source.write_text('{"isolated":"initial-state-fixture"}')
+    directory = tmp_path / "comparison"
+    case = directory / "case"
+    fields = ["0/" + name for name in ("U", "p", "T", "rho", "k", "omega", "nut", "alphat")]
+    for name in fields:
+        path = case / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original " + name)
+    report = {"kind": "retained-precise-state-comparison-v1", "production_evidence": False, "variant": "minmod-all",
+              "source_report_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+              "source_files": {name: hashlib.sha256((case / name).read_bytes()).hexdigest() for name in fields},
+              "probe_returncode": 0, "integration": {"returncode": -15, "accepted_cfd": False}}
+    receipt = directory / "report.json"
+    receipt.write_text(json.dumps(report))
+    result = inspect_state_comparison(directory, source)
+    assert result["physical_files_verified"] == 8 and result["physical_validation"] is False
+    with pytest.raises(ValueError, match="exact retained"):
+        inspect_state_comparison(directory, None)
+    (case / "0/T").write_text("changed temperature")
+    with pytest.raises(ValueError, match="physical input"):
+        inspect_state_comparison(directory, source)
+    (case / "0/T").write_text("original 0/T")
+    report["probe_returncode"] = 2
+    receipt.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="bypassed its preflight"):
+        inspect_state_comparison(directory, source)
 
 
 @pytest.mark.parametrize("courant", [4.0, 0.25])

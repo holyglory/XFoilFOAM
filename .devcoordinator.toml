@@ -65,6 +65,46 @@ retained_artifacts = [{ name = "cartesian-startup-fields", path = ".codex-artifa
 [test.mach3-fast-field-evidence]
 timeout_seconds = 900
 
+[test.precise-reconstruction-study]
+timeout_seconds = 900
+
+[test.acoustic-classification]
+timeout_seconds = 900
+
+[[test.acoustic-classification.check]]
+name = "failure-routing-and-source-contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_acoustic_startup.py", "tests/test_material_domain.py", "tests/test_compressible_execution.py", "tests/test_numerical_canary.py", "tests/test_mach3_startup_fields.py", "-q"]
+
+[[test.acoustic-classification.check]]
+name = "retained-native-classification"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/native-acoustic-classification-20260930", "--groups", "mach3-classification", "--probe-build", "acoustic-probe-build-r2"]
+retained_artifacts = [{ name = "native-acoustic-classification", path = ".codex-artifacts/native-acoustic-classification-20260930", max_bytes = 536870912 }]
+
+[[test.precise-reconstruction-study.check]]
+name = "reconstruction-protocol"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_numerical_canary.py", "tests/test_mach3_startup_fields.py", "tests/test_mach3_failure_reproduction.py", "tests/test_compressible_execution.py", "-q"]
+
+[[test.precise-reconstruction-study.check]]
+name = "retained-comparisons"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/precise-reconstruction-20260930", "--groups", "mach3-density-gradients", "mach3-all-gradients", "mach3-density-minmod", "mach3-all-minmod", "mach3-all-minmod-guarded", "mach3-precise-pressure", "--probe-build", "acoustic-probe-build-r1", "--comparison-source", ".codex-artifacts/precise-native-repair-20260930/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d/report.json"]
+retained_artifacts = [{ name = "precise-reconstruction", path = ".codex-artifacts/precise-reconstruction-20260930", max_bytes = 1073741824 }]
+
+[[test.precise-reconstruction-study.check]]
+name = "fast-feature-regression"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/mach3-fast-features-20260930", "--groups", "mach3-fast-features", "--require-driver"]
+retained_artifacts = [{ name = "fast-feature-regression", path = ".codex-artifacts/mach3-fast-features-20260930", max_bytes = 536870912 }]
+
+[[test.precise-reconstruction-study.check]]
+name = "sg6051-feature-regression"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.retain_sg6051_verification", "--case", "10ee9c36-f3d0-4374-8e2f-7f2387d48ba4", "--destination", ".codex-artifacts/sg6051-fast-features-20260930"]
+retained_artifacts = [{ name = "sg6051-feature-regression", path = ".codex-artifacts/sg6051-fast-features-20260930", max_bytes = 536870912 }]
+
 [[test.mach3-fast-field-evidence.check]]
 name = "protocol"
 tier = "development"
@@ -3603,8 +3643,8 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "mach3-precise-preflight"]
-finite_services = ["mach3-precise-preflight"]
+services = ["artifacts", "mach3-classification"]
+finite_services = ["mach3-classification"]
 build = false
 port = true
 route = true

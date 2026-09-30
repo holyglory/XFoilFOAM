@@ -159,6 +159,31 @@ def inspect_production_replay(directory):
             "source_request_verified": source_verified, "physical_validation": False}
 
 
+def inspect_state_comparison(directory, source_report):
+    report = json.loads((directory / "report.json").read_text())
+    if report.get("kind") != "retained-precise-state-comparison-v1" or report.get("production_evidence") is not False:
+        raise ValueError("Expected an explicitly isolated saved-state comparison")
+    if source_report is None or hashlib.sha256(source_report.read_bytes()).hexdigest() != report.get("source_report_sha256"):
+        raise ValueError("The comparison lacks its exact retained initial-state source")
+    case = directory / "case"
+    verified = 0
+    for name, expected in report["source_files"].items():
+        path = case / name
+        if not path.resolve().is_relative_to(case.resolve()) or path.is_symlink():
+            raise ValueError("Comparison source file escaped its retained case")
+        if name.startswith(("0/", "constant/")) and name != "constant/numericalExecution.json":
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise ValueError("A saved comparison changed its physical input or initial field")
+            verified += 1
+    if verified < 8:
+        raise ValueError("The comparison lacks its physical input files")
+    if report["integration"] is not None and (report["probe_returncode"] != 0 or report["integration"].get("accepted_cfd") is not False):
+        raise ValueError("The saved-state comparison bypassed its preflight or claimed accepted CFD")
+    return {"kind": report["kind"], "case": directory.name, "variant": report["variant"],
+            "probe_returncode": report["probe_returncode"], "integration": report["integration"],
+            "source_report_verified": True, "physical_files_verified": verified, "physical_validation": False}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", type=Path, required=True)
@@ -166,6 +191,7 @@ def main():
     parser.add_argument("--thermal-only", action="store_true")
     parser.add_argument("--probe-build")
     parser.add_argument("--require-driver", action="store_true")
+    parser.add_argument("--comparison-source", type=Path)
     args = parser.parse_args()
     status = json.loads(subprocess.check_output(["devcoordinator2", "deployment", "status", "--name", "progressive-numerics", "--client", "codex"], text=True))
     if not status.get("ok") or status["data"]["deployment_id"] != "dec54282d9f0719c8":
@@ -178,7 +204,7 @@ def main():
     reports = []
     budget = [1024 * 1024 * 1024]
     if args.probe_build:
-        if not re.fullmatch(r"energy-probe-build-r[1-9][0-9]*", args.probe_build):
+        if not re.fullmatch(r"(?:energy|acoustic)-probe-build-r[1-9][0-9]*", args.probe_build):
             raise ValueError("Expected an owned energy-probe build")
         copy_directory(origin + f"/{args.probe_build}/", args.destination / args.probe_build, budget)
     for name in args.groups:
@@ -189,10 +215,28 @@ def main():
             if directory.is_dir() and (directory / "system/controlDict").is_file():
                 reports.append({"group": name, **inspect_saved_case(directory)})
             elif directory.is_dir() and (directory / "report.json").is_file():
+                kind = json.loads((directory / "report.json").read_text()).get("kind")
+                if kind == "native-acoustic-classification-v1":
+                    native = json.loads((directory / "report.json").read_text())
+                    receipts = native.get("receipts", [])
+                    if (native.get("production_evidence") is not False or len(receipts) != 2
+                            or receipts[0].get("case") != "invalid" or receipts[0].get("classified") != "hard_solver"
+                            or receipts[1].get("case") != "admissible" or receipts[1].get("classified") is not None
+                            or not isinstance(receipts[1].get("timestep"), (int, float))
+                            or not 0 < receipts[1]["timestep"] < 1):
+                        raise ValueError("The native classification comparison is incomplete or changed")
+                    reports.append({"group": name, "case": directory.name, "kind": kind, "receipts": receipts,
+                                    "physical_validation": False})
+                    continue
+                if kind == "retained-precise-state-comparison-v1":
+                    reports.append({"group": name, **inspect_state_comparison(directory, args.comparison_source)})
+                    continue
                 replay = inspect_production_replay(directory)
                 if args.require_driver and not replay["driver_source_verified"]:
                     raise ValueError("The replay lacks its exact executed driver source")
                 reports.append({"group": name, **replay})
+    if args.comparison_source is not None:
+        (args.destination / "initial-state-source.json").write_bytes(args.comparison_source.read_bytes())
     report = {"kind": "retained-cartesian-startup-diagnosis-v1", "production_evidence": False,
               "source_deployment": "dec54282d9f0719c8", "source_origin": origin,
               "retained_selection": "thermal_fields_and_mesh" if args.thermal_only else "complete_case", "cases": reports}

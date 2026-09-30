@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 from ..material_domain import check_material_domain
-from .runner import InfrastructureError
+from .runner import DeterministicMeshError, HardSolverError, InfrastructureError
 
 
 def acoustic_startup_step(case_dir: Path, runner, maximum_courant: float) -> float:
@@ -19,7 +19,13 @@ def acoustic_startup_step(case_dir: Path, runner, maximum_courant: float) -> flo
     (case_dir / "log.acoustic-startup").write_text(result.stdout, encoding="utf-8")
     check_material_domain(case_dir, result)
     if not result.ok:
-        raise InfrastructureError("Native acoustic startup preflight failed; retained log.acoustic-startup")
+        code = getattr(result, "returncode", None)
+        if not getattr(result, "timed_out", False):
+            if code == 2:
+                raise HardSolverError("Native acoustic startup rejected nonpositive reconstructed density (exit 2); retained log.acoustic-startup")
+            if code == 4:
+                raise DeterministicMeshError("Native acoustic startup rejected nonpositive cell volume (exit 4); retained log.acoustic-startup")
+        raise InfrastructureError(f"Native acoustic startup preflight failed (exit {code}); retained log.acoustic-startup")
     records = [line.removeprefix("XFOILFOAM_ACOUSTIC_STARTUP ") for line in result.stdout.splitlines()
                if line.startswith("XFOILFOAM_ACOUSTIC_STARTUP ")]
     try:

@@ -10,6 +10,8 @@ from airfoilfoam.numerical_canary import run_canary, source_material_for_canary
 from airfoilfoam.openfoam.dialects import OPENCFD_2606
 from airfoilfoam.openfoam.runner import DeterministicMeshError, InfrastructureError, RunResult, Runner
 from scripts.materials.build_energy_probe import instrument
+from scripts.materials.build_acoustic_probe import instrument as instrument_acoustic
+from scripts.materials.replay_precise_state import bounded_gradients
 
 
 ASPECT_ONLY = (
@@ -188,6 +190,33 @@ def test_energy_probe_instrumentation_preserves_the_original_operations():
     duplicated = source + '\n        e.correctBoundaryConditions();'
     with pytest.raises(ValueError, match="insertion point changed"):
         instrument(duplicated, hashlib.sha256(duplicated.encode()).hexdigest())
+
+
+def test_density_probe_preserves_the_exact_preflight_and_exit_conditions():
+    source = (Path(__file__).parents[1] / "src/airfoilfoam/native/acoustic-startup/acousticStartup.C").read_text()
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    probed = instrument_acoustic(source, digest)
+    original = probed.replace('\n#include "densityDiagnostic.H"', '').replace(
+        "    reportDensityReconstruction(mesh, density, material->p(), material->T(), forwardDensity, backwardDensity);\n", "")
+    assert original == source
+    assert "return 2;" in probed
+    with pytest.raises(ValueError, match="exact acoustic source"):
+        instrument_acoustic(source + " ", digest)
+    changed = source.replace("    if (gMin(forwardDensity)", "    if (gMin(changedDensity)")
+    with pytest.raises(ValueError, match="insertion points"):
+        instrument_acoustic(changed, hashlib.sha256(changed.encode()).hexdigest())
+
+
+def test_saved_state_gradient_comparison_retains_original_transport_schemes():
+    original = "gradSchemes { default Gauss linear; grad(U) cellLimited Gauss linear 1; }\ninterpolationSchemes { reconstruct(rho) vanLeer; reconstruct(U) vanLeerV; reconstruct(T) vanLeer; }"
+    assert bounded_gradients(original, "original") == original
+    density = bounded_gradients(original, "density")
+    assert density.replace("\n    grad(rho) cellLimited Gauss linear 1;", "") == original
+    assert bounded_gradients(original, "all").replace("default cellLimited Gauss linear 1;", "default Gauss linear;") == original
+    assert bounded_gradients(original, "minmod-density").replace("reconstruct(rho) Minmod;", "reconstruct(rho) vanLeer;") == original
+    assert bounded_gradients(original, "minmod-all").replace("MinmodV", "vanLeerV").replace("Minmod", "vanLeer") == original
+    with pytest.raises(ValueError, match="settings changed"):
+        bounded_gradients(original.replace("default Gauss linear;", "default leastSquares;"), "density")
 
 
 def test_energy_probe_execution_is_explicit_and_fingerprinted(tmp_path):

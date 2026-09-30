@@ -64,6 +64,9 @@ def main():
     request = PolarRequest.model_validate(source)
     destination = args.destination / args.variant / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
+    driver = Path(__file__).read_bytes()
+    (destination / "replay-driver.py").write_bytes(driver)
+    (destination / "source-request.json").write_bytes(original)
     settings = Settings(data_dir=destination / "data", cache_dir=destination / "cache",
                         cpu_token_state_path=destination / "cpu-tokens.json")
     if settings.evidence_bucket:
@@ -74,6 +77,7 @@ def main():
     report = {
         "kind": "sg6051-trailing-edge-reproduction-v1", "production_evidence": False,
         "accuracy_certified": False, "variant": args.variant, "source_sha256": SOURCE_SHA256,
+        "driver_sha256": hashlib.sha256(driver).hexdigest(),
         "source_engine_job": "94246be7-3823-435f-8742-cf361a84bba1", "local_job": job_id,
         "request": request.model_dump(mode="json"), "engine": settings.engine_identity().model_dump(mode="json"),
         "differences": ["isolated current-source runtime", "one solver process", "empty mesh and field cache",

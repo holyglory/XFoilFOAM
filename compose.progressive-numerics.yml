@@ -20,6 +20,122 @@ x-canary: &canary
     - numerical-results:/canary-output
 
 services:
+  mach3-classification:
+    <<: *canary
+    command:
+      - python
+      - -c
+      - |
+        import hashlib,json,shutil
+        from pathlib import Path
+        from uuid import uuid4
+        from airfoilfoam.config import Settings
+        from airfoilfoam.models import PolarRequest
+        from airfoilfoam.openfoam.acoustic_startup import acoustic_startup_step
+        from airfoilfoam.openfoam.execution import configure_flow_execution
+        from airfoilfoam.openfoam.runner import get_runner,HardSolverError
+        from airfoilfoam.pipeline import CaseOutcome,_record_outcome_failure
+        parent=Path('/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d')
+        request=PolarRequest.model_validate(json.loads((parent/'report.json').read_text())['effective_request'])
+        original=parent/'data/jobs/3b08adeb-7ab1-48fa-9496-2b7cad25cf4d/cases/c2_u1021p02/transient_a0'
+        bounded=Path('/canary-output/mach3-all-minmod/fa6f637c-b55c-4b44-ad69-0c0624412313/case')
+        output=Path('/canary-output/mach3-classification')/str(uuid4())
+        receipts=[]
+        for label,source in [('invalid',original),('admissible',bounded)]:
+            case=output/label
+            for name in ('0','constant','system'): shutil.copytree(source/name,case/name)
+            files={path:hashlib.sha256(path.read_bytes()).hexdigest() for folder in ('0','constant') for path in (case/folder).rglob('*') if path.is_file()}
+            runner=get_runner(Settings())
+            configure_flow_execution(runner,request)
+            try:
+                step=acoustic_startup_step(case,runner,0.5)
+                assert label=='admissible' and step>0
+                receipts.append({'case':label,'timestep':step,'classified':None})
+            except HardSolverError as error:
+                assert label=='invalid'
+                outcome=CaseOutcome(spec=request.cases()[0],reynolds=request.cases()[0].speed*request.cases()[0].chord/request.fluid.nu)
+                _record_outcome_failure(outcome,error)
+                classification=outcome.failure_disposition.value
+                assert classification=='hard_solver'
+                receipts.append({'case':label,'classified':classification,'error':str(error)})
+            assert all(hashlib.sha256(path.read_bytes()).hexdigest()==checksum for path,checksum in files.items())
+        report={'kind':'native-acoustic-classification-v1','production_evidence':False,'receipts':receipts}
+        (output/'report.json').write_text(json.dumps(report))
+        print(json.dumps(report),flush=True)
+  mach3-density-gradients: &saved-state-replay
+    <<: *canary
+    environment:
+      PYTHONPATH: /candidate/src:/candidate
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./scripts/materials:/candidate/scripts/materials:ro
+      - numerical-results:/canary-output
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-density-gradients", "--variant", "density", "--integrate"]
+  mach3-all-gradients:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-all-gradients", "--variant", "all", "--integrate"]
+  mach3-density-minmod:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-density-minmod", "--variant", "minmod-density", "--integrate"]
+  mach3-all-minmod:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-all-minmod", "--variant", "minmod-all", "--integrate"]
+  mach3-precise-pressure:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-precise-pressure", "--variant", "minmod-all", "--integrate", "--pressure-transient"]
+  mach3-all-minmod-guarded:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-all-minmod-guarded", "--variant", "minmod-all", "--integrate"]
+  acoustic-probe-build:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: thermophysics-build
+    network_mode: none
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >-
+        source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1 || exit 1;
+        set -e;
+        export FOAM_USER_APPBIN=/canary-output/acoustic-probe-build-r2/bin FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib;
+        mkdir -p "$$FOAM_USER_APPBIN";
+        python3 /diagnostic/build_acoustic_probe.py
+        --source /source
+        --sha256 3158e942992e8e77516fda8c3b47fd0d5f67aacd8d01ff35a451cb4336fb3236
+        --header /diagnostic/densityDiagnostic.H
+        --destination /canary-output/acoustic-probe-build-r2/source
+    volumes:
+      - ./scripts/materials/build_acoustic_probe.py:/diagnostic/build_acoustic_probe.py:ro
+      - ./src/airfoilfoam/native/acoustic-startup:/source:ro
+      - ./src/airfoilfoam/native/acoustic-probe/densityDiagnostic.H:/diagnostic/densityDiagnostic.H:ro
+      - numerical-results:/canary-output
+  mach3-density-probe:
+    <<: *canary
+    depends_on:
+      acoustic-probe-build:
+        condition: service_completed_successfully
+    command:
+      - python
+      - -c
+      - |
+        import json
+        from pathlib import Path
+        from uuid import uuid4
+        from airfoilfoam.config import Settings
+        from airfoilfoam.openfoam.runner import get_runner
+        source = Path('/canary-output/mach3-all-minmod/fa6f637c-b55c-4b44-ad69-0c0624412313/case')
+        output = Path('/canary-output/mach3-velocity-probe') / str(uuid4())
+        output.mkdir(parents=True)
+        result = get_runner(Settings()).application(source, '/canary-output/acoustic-probe-build-r2/bin/xfoilfoamDensityProbe', timeout=60)
+        (output / 'stdout.txt').write_text(result.stdout)
+        report = {'source': str(source), 'returncode': result.returncode, 'timed_out': result.timed_out, 'production_evidence': False,
+          'density': [json.loads(line.removeprefix('XFOILFOAM_DENSITY_RECONSTRUCTION ')) for line in result.stdout.splitlines() if line.startswith('XFOILFOAM_DENSITY_RECONSTRUCTION ')]}
+        (output / 'report.json').write_text(json.dumps(report))
+        print(json.dumps(report), flush=True)
   mach3-precise-preflight:
     <<: *canary
     command:
@@ -96,6 +212,9 @@ services:
   mach3-production-fixed:
     <<: *production-replay
     command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-production-fixed"]
+  mach3-fast-features:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-fast-features"]
   mach3-startup-tenth:
     <<: *production-replay
     command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-startup-tenth", "--startup-courant", "0.1", "--early-fields"]

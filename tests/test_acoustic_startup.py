@@ -4,7 +4,9 @@ from types import SimpleNamespace
 import pytest
 
 from airfoilfoam.openfoam.acoustic_startup import acoustic_startup_step
-from airfoilfoam.openfoam.runner import InfrastructureError, MaterialDomainError
+from airfoilfoam.openfoam.runner import DeterministicMeshError, HardSolverError, InfrastructureError, MaterialDomainError
+from airfoilfoam.pipeline import CaseOutcome, _record_outcome_failure
+from airfoilfoam.models import CaseSpec
 
 
 def receipt(**changes):
@@ -12,13 +14,14 @@ def receipt(**changes):
             "requested_delta_t": 5e-7, "safe_delta_t": 0.2 / 1.2e9, **changes}
 
 
-def runner(payload, *, ok=True, prefix="", repeat=False):
+def runner(payload, *, ok=True, prefix="", repeat=False, returncode=None, timed_out=False):
     calls = []
 
     def application(case_dir, command, timeout):
         calls.append((case_dir, command, timeout))
         output = "XFOILFOAM_ACOUSTIC_STARTUP " + json.dumps(payload) + "\n"
-        return SimpleNamespace(ok=ok, stdout=prefix + output * (2 if repeat else 1))
+        return SimpleNamespace(ok=ok, stdout=prefix + output * (2 if repeat else 1),
+                               returncode=(0 if ok else 1) if returncode is None else returncode, timed_out=timed_out)
 
     return SimpleNamespace(application=application, calls=calls)
 
@@ -48,14 +51,27 @@ def test_rejects_nonfinite_or_unbounded_native_receipts(tmp_path, changes):
     assert not (tmp_path / "acoustic-startup.json").exists()
 
 
-@pytest.mark.parametrize("options", [{"ok": False}, {"repeat": True}])
-def test_rejects_failed_or_ambiguous_preflight(tmp_path, options):
-    with pytest.raises(InfrastructureError):
+@pytest.mark.parametrize("options,expected", [
+    ({"ok": False}, InfrastructureError), ({"repeat": True}, InfrastructureError),
+    ({"ok": False, "returncode": 2}, HardSolverError),
+    ({"ok": False, "returncode": 4}, DeterministicMeshError),
+    *[({"ok": False, "returncode": code}, InfrastructureError) for code in (3, 5, 124, 125, 126, 127, -9, -15)],
+    ({"ok": False, "returncode": 2, "timed_out": True}, InfrastructureError),
+])
+def test_rejects_failed_or_ambiguous_preflight(tmp_path, options, expected):
+    with pytest.raises(expected) as failure:
         acoustic_startup_step(tmp_path, runner(receipt(), **options), 0.2)
+    outcome = CaseOutcome(spec=CaseSpec(chord=1, speed=30, aoa_deg=2), reynolds=2_000_000)
+    _record_outcome_failure(outcome, failure.value)
+    assert outcome.failure_disposition.value == {
+        HardSolverError: "hard_solver", DeterministicMeshError: "deterministic_mesh", InfrastructureError: "infrastructure",
+    }[expected]
+    assert (tmp_path / "log.acoustic-startup").is_file()
+    assert not (tmp_path / "acoustic-startup.json").exists()
 
 
 def test_material_clamping_cannot_validate_startup(tmp_path):
-    native = runner(receipt(), prefix="attempt to use janafThermo<EquationOfState> out of temperature range\n")
+    native = runner(receipt(), ok=False, returncode=2, prefix="attempt to use janafThermo<EquationOfState> out of temperature range\n")
     with pytest.raises(MaterialDomainError):
         acoustic_startup_step(tmp_path, native, 0.2)
     assert (tmp_path / "material-domain-diagnostic.json").is_file()
