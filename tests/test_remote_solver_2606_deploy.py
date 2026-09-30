@@ -614,7 +614,8 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
 
 
-def test_completed_remote_maintenance_moves_source_label_with_build_ids(tmp_path: Path) -> None:
+@pytest.mark.parametrize("runtime_valid", [True, False])
+def test_completed_remote_maintenance_moves_source_label_with_build_ids(tmp_path: Path, runtime_valid: bool) -> None:
     source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text()
     start = source.index("perform_complete_runtime_maintenance()")
     end = source.index("\nmain() {", start)
@@ -626,6 +627,10 @@ OPENCFD_2406_POOL_ID=3f8bc764-09ae-4ff3-8fd2-240600000001
 OPENCFD_2606_POOL_ID=3f8bc764-09ae-4ff3-8fd2-260600000001
 current_engine_version() { echo 2606; }
 read_env_var() { echo old-build; }
+numerics2_preflight() { echo numerical-preflight; }
+numerics2_enabled_keys() { echo openfoam:opencfd:2606:numerics-2:adapter-1; }
+numerics2_verify_runtime() { echo runtime-proof; [[ "$RUNTIME_VALID" == true ]]; }
+numerics2_restore_pool() { echo restore-corrected-pool; }
 validate_live_2606_volume_runtime() { echo "verify:$1"; }
 writer_state() { echo 1; }
 remote_transfer_paused() { echo false; }
@@ -636,7 +641,7 @@ disable_all_opencfd_pools() { :; }
 require_maintenance_safe() { :; }
 sleep() { :; }
 wait_http() { :; }
-restore_writers() { :; }
+restore_writers() { echo restore-writers; }
 set_env_vars_atomic() { printf 'identity:%s\\n' "$@"; }
 compose() {
   if [[ "$1" == exec && "$*" == *concat_ws* ]]; then echo 'false|true';
@@ -646,13 +651,144 @@ compose() {
 }
 docker() { printf '[{"HostConfig":{"Ulimits":[{"Name":"nofile","Soft":65536,"Hard":524288}]}}]'; }
 """ + source[start:end] + "\nperform_complete_runtime_maintenance\n"
-    result = subprocess.run(["bash", "-c", script], cwd=tmp_path, text=True, capture_output=True, timeout=10)
+    result = subprocess.run(["bash", "-c", script], cwd=tmp_path, text=True, capture_output=True, timeout=10,
+                            env={**os.environ, "RUNTIME_VALID": str(runtime_valid).lower()})
+    if not runtime_valid:
+        assert result.returncode != 0
+        assert "runtime-proof" in result.stdout
+        assert "restore-corrected-pool" not in result.stdout
+        assert "restore-writers" not in result.stdout
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     lines = result.stdout.splitlines()
     identities = [line for line in lines if line.startswith("identity:")]
     assert identities == ["identity:AIRFOILFOAM_BUILD_ID=test-build", "identity:ENGINE_EXPECTED_BUILD_ID=test-build",
-                          f"identity:OPENCFD2606_ENGINE_SOURCE_REVISION={REVISION}"]
+                          f"identity:OPENCFD2606_ENGINE_SOURCE_REVISION={REVISION}",
+                          "identity:OPENCFD2606_NUMERICS_REVISION=2",
+                          "identity:OPENCFD2606_EXECUTION_POOL=openfoam-opencfd-2606-numerics-2",
+                          "identity:AIRFOILFOAM_ENABLED_ENGINE_KEYS=openfoam:opencfd:2606:numerics-2:adapter-1"]
     assert lines.index(identities[-1]) < lines.index("recreated") < lines.index("verify:test-build")
+    assert lines.index("runtime-proof") < lines.index("restore-corrected-pool") < lines.index("restore-writers")
+
+
+@pytest.mark.parametrize("fault", [
+    None, "source", "build", "revision", "alias", "missing-runtime", "missing-errors",
+    "inspection-error", "duplicate", "missing-worker", "foreign-route",
+])
+def test_numerics2_worker_proof_requires_exact_loaded_source_and_route(fault):
+    verifier = _module("numerics2_workers", "verify-numerics2-workers.py")
+    corrected_queue = "openfoam-opencfd-2606-numerics-2"
+    worker = {
+        "worker": "celery@opencfd", "queues": [corrected_queue], "execution_pool": corrected_queue,
+        "engine": {"family": "openfoam", "distribution": "opencfd", "version": "2606",
+                   "numerics_revision": "2", "adapter_contract_version": 1,
+                   "build_id": BUILD_ID, "application_source_sha256": TREE},
+    }
+    foundation = {
+        "worker": "celery@foundation", "queues": ["openfoam-foundation-14"],
+        "execution_pool": "openfoam-foundation-14", "engine": {"distribution": "foundation"},
+    }
+    queue = {"inspection_errors": {}, "worker_runtime_error": None, "worker_queues_error": None,
+             "worker_queues": [worker, foundation]}
+    if fault == "source":
+        worker["engine"]["application_source_sha256"] = "d" * 64
+    elif fault == "build":
+        worker["engine"]["build_id"] = "old-build"
+    elif fault == "revision":
+        worker["engine"]["numerics_revision"] = "1"
+    elif fault == "alias":
+        worker["queues"].append("celery")
+    elif fault == "missing-runtime":
+        worker["engine"] = None
+    elif fault == "missing-errors":
+        del queue["worker_runtime_error"]
+    elif fault == "inspection-error":
+        queue["inspection_errors"] = {"active": "timeout"}
+    elif fault == "duplicate":
+        foundation["worker"] = worker["worker"]
+    elif fault == "missing-worker":
+        queue["worker_queues"].pop()
+    elif fault == "foreign-route":
+        foundation["queues"] = [corrected_queue]
+    if fault is not None:
+        with pytest.raises(ValueError):
+            verifier.verify(queue, BUILD_ID, TREE, 2)
+    else:
+        assert verifier.verify(queue, BUILD_ID, TREE, 2)["workers"] == 1
+
+
+@pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="Requires governed PostgreSQL")
+def test_numerics2_preflight_and_pool_restore_use_prepared_database_state():
+    schema = "numerics_handoff_" + uuid4().hex
+    environment = {**os.environ, "PGOPTIONS": f"-c search_path={schema}"}
+    old_pool = "3f8bc764-09ae-4ff3-8fd2-260600000001"
+    new_pool = "3f8bc764-09ae-4ff3-8fd2-260600000002"
+    old_implementation = "2f8bc764-09ae-4ff3-8fd2-260600000001"
+    new_implementation = "2f8bc764-09ae-4ff3-8fd2-260600000002"
+
+    def query(statement):
+        return subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c", statement],
+                              env=environment, check=True, text=True, capture_output=True).stdout.strip()
+
+    harness = f"""
+set -euo pipefail
+source '{DEPLOY / 'numerics2-maintenance.sh'}'
+OPENCFD_2606_POOL_ID={old_pool}
+NUMERICS2_TRANSITION=true
+read_env_var() {{ echo 1; }}
+compose() {{ psql -X -qAt -v ON_ERROR_STOP=1 -c "${{@: -1}}"; }}
+numerics2_preflight
+printf 'prior:%s\\n' "$NUMERICS2_PRIOR_ENABLED"
+"""
+
+    def preflight(extra="", transition=True):
+        script = harness if transition else harness.replace("NUMERICS2_TRANSITION=true", "NUMERICS2_TRANSITION=false")
+        return subprocess.run(["bash", "-c", script + extra], env=environment, text=True, capture_output=True, timeout=10)
+
+    try:
+        query(f"""
+CREATE SCHEMA {schema};
+CREATE TABLE sweeper_state (id int, enabled boolean);
+CREATE TABLE solver_execution_pools (id uuid, solver_implementation_id uuid, routing_key text, enabled boolean, "updatedAt" timestamptz);
+CREATE TABLE solver_profiles (solver_implementation_id uuid);
+CREATE TABLE sim_campaigns (id int, current_condition_generation int, status text);
+CREATE TABLE sim_campaign_conditions (campaign_id int, generation int, simulation_preset_revision_id int, status text);
+CREATE TABLE simulation_preset_revisions (id int, solver_implementation_id uuid);
+CREATE TABLE sim_jobs (solver_implementation_id uuid, status text);
+INSERT INTO sweeper_state VALUES (1, false);
+INSERT INTO solver_execution_pools VALUES ('{old_pool}', '{old_implementation}', 'openfoam-opencfd-2606', true, now()),
+('{new_pool}', '{new_implementation}', 'openfoam-opencfd-2606-numerics-2', false, now());
+INSERT INTO sim_campaigns VALUES (1, 1, 'active');
+INSERT INTO sim_campaign_conditions VALUES (1, 1, 1, 'active');
+INSERT INTO simulation_preset_revisions VALUES (1, '{new_implementation}');
+""")
+        assert preflight().returncode == 0
+        assert preflight(transition=False).returncode == 14
+        for unsafe, restore in [
+            ("UPDATE sweeper_state SET enabled=true", "UPDATE sweeper_state SET enabled=false"),
+            (f"INSERT INTO solver_profiles VALUES ('{old_implementation}')", "DELETE FROM solver_profiles"),
+            (f"INSERT INTO sim_jobs VALUES ('{old_implementation}', 'running')", "DELETE FROM sim_jobs"),
+            (f"UPDATE simulation_preset_revisions SET solver_implementation_id='{old_implementation}'",
+             f"UPDATE simulation_preset_revisions SET solver_implementation_id='{new_implementation}'"),
+            (f"UPDATE solver_execution_pools SET routing_key='celery' WHERE id='{new_pool}'",
+             f"UPDATE solver_execution_pools SET routing_key='openfoam-opencfd-2606-numerics-2' WHERE id='{new_pool}'"),
+        ]:
+            query(unsafe)
+            refusal = preflight()
+            assert refusal.returncode == 14, refusal.stdout + refusal.stderr
+            query(restore)
+        query(f"UPDATE simulation_preset_revisions SET solver_implementation_id='{old_implementation}'; UPDATE sim_campaigns SET status='archived'")
+        assert preflight().returncode == 0
+        query("UPDATE sim_campaigns SET status='cancelled'")
+        assert preflight().returncode == 0
+        for enabled in ("false", "true"):
+            query(f"UPDATE solver_execution_pools SET enabled={enabled} WHERE id='{old_pool}'")
+            restored = preflight("numerics2_restore_pool\n")
+            assert restored.returncode == 0, restored.stdout + restored.stderr
+            assert query(f"SELECT enabled::text FROM solver_execution_pools WHERE id='{old_pool}'") == "false"
+            assert query(f"SELECT enabled::text FROM solver_execution_pools WHERE id='{new_pool}'") == enabled
+    finally:
+        query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
 @pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="Requires governed PostgreSQL")

@@ -34,7 +34,15 @@ ACTION="${1:-}"
 DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTIFY_CONTINUATION_ONLY=false
 HANDOFF_UNMANAGED_RECOVERY_GATEWAY=false
-if [[ "$ACTION" == "--handoff-unmanaged-recovery-gateway" ]]; then
+NUMERICS2_TRANSITION=false
+if [[ "$ACTION" == "--numerics-2" ]]; then
+  NUMERICS2_TRANSITION=true
+  BUILD_ID="${2:-}"
+  if (($# != 2)); then
+    echo "Usage: $0 --numerics-2 <BUILD_ID>" >&2
+    exit 2
+  fi
+elif [[ "$ACTION" == "--handoff-unmanaged-recovery-gateway" ]]; then
   HANDOFF_UNMANAGED_RECOVERY_GATEWAY=true
   BUILD_ID="${2:-}"
   if (($# != 2)); then
@@ -74,6 +82,7 @@ LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
 DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-source.json}"
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
+source "$DEPLOY_SCRIPT_DIR/numerics2-maintenance.sh"
 ADMIN_COOKIE="${ADMIN_COOKIE:-}"
 CUTOVER_DRAIN_TIMEOUT_SECONDS="${CUTOVER_DRAIN_TIMEOUT_SECONDS:-7200}"
 CUTOVER_CONTINUATION_TIMEOUT_SECONDS="${CUTOVER_CONTINUATION_TIMEOUT_SECONDS:-3600}"
@@ -2224,6 +2233,12 @@ main() {
   # attestation state detect bucket/prefix/codec drift first.
   validate_certified_evidence_contract "$certified_contract_required"
   validate_normal_rebuild_cutover_markers
+  if [[ "$cutover_complete" == "1" ]]; then
+    numerics2_preflight || exit $?
+  elif [[ "$NUMERICS2_TRANSITION" == "true" ]]; then
+    echo "Numerical revision 2 requires completed OpenCFD 2606 installation." >&2
+    exit 14
+  fi
   if [[ "$cutover_pending" == "1" ]]; then
     case "$(read_env_var OPENCFD2606_CUTOVER_SWEEPER_WAS_RUNNING || true)" in
       1) sweeper_restore_state="running" ;;
@@ -2355,6 +2370,13 @@ main() {
     "ENGINE_EXPECTED_BUILD_ID=$BUILD_ID"
     "OPENCFD2606_ENGINE_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION"
   )
+  if [[ "$cutover_active" != "true" ]]; then
+    engine_identity_updates+=(
+      "OPENCFD2606_NUMERICS_REVISION=2"
+      "OPENCFD2606_EXECUTION_POOL=openfoam-opencfd-2606-numerics-2"
+      "AIRFOILFOAM_ENABLED_ENGINE_KEYS=$(numerics2_enabled_keys)"
+    )
+  fi
   if [[ "$HANDOFF_UNMANAGED_RECOVERY_GATEWAY" == "true" ]]; then
     # The service DNS name is owned by the reviewed Compose `api` service.
     # This is intentionally in the same atomic env write as both build ids,
@@ -2430,6 +2452,8 @@ main() {
 
   if [[ "$cutover_active" == "true" ]]; then
     verify_opencfd_2606_runtime
+  else
+    numerics2_verify_runtime "$BUILD_ID" || exit $?
   fi
 
   if ! compose up -d --no-deps --force-recreate node-api; then
@@ -2467,6 +2491,8 @@ main() {
   fi
   if [[ "$cutover_active" == "true" ]]; then
     finish_opencfd_2606_cutover
+  else
+    numerics2_restore_pool || exit $?
   fi
   restore_media_repair_after_rebuild "$media_repair_initial_state" "$writers_prepared_without_start"
   restore_sweeper_after_rebuild "$sweeper_restore_state" "$writers_prepared_without_start"

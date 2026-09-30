@@ -1351,6 +1351,30 @@ Completed campaigns reopen for the new numerical work; paused campaigns stay
 paused, and cancelled or archived campaigns are not changed. Normal catalog
 enrollment uses the successor conditions when later profiles arrive.
 
+After all eligible campaigns have successors, run
+`packages/db/src/prepare-numerics-defaults.ts --dry-run`, then `--apply` while
+admission remains paused. This changes reusable solver profiles for future
+requests, not their immutable submitted snapshots. Migration 0165 changes the
+default implementation for newly created profiles without activating a pool.
+Cancelled and archived campaigns remain untouched; explicit reactivation after
+the worker transition creates their successors through normal reconciliation.
+
+Production control-plane deployment retains numerical revision 1 until an
+explicit engine transition. On an already-completed OpenCFD 2606 installation,
+use the canonical hub or remote rebuild script with `--numerics-2 BUILD_ID`.
+It refuses unprepared campaigns, profiles or running revision-1 jobs, and
+requires paused admission. Build identity, numerical revision, queue and gateway
+allowlist change atomically in the deployment environment. Every expected live
+worker must then report the exact corrected source digest, build and execution
+route before the prior pool-enabled state is transferred to revision 2 and the
+writers resume. Unknown or mismatched workers leave admission closed. Restore
+the separately recorded global admission state only after both hosts pass.
+
+Subsequent maintenance of revision 2 retains these worker checks and restores
+the recorded pool state. It never silently executes historical revision-1 jobs
+with the corrected adapter. The pre-2606 cutover and its rollback remain separate
+historical workflows, not substitutes for this numerical transition.
+
 Source-preserving finite-edge meshing retains the real trailing-edge endpoints
 as explicit Cartesian surface features. Shared mesh files use 17-digit ASCII
 coordinates; this precision participates in mesh and downstream seed identities

@@ -86,7 +86,18 @@ describe("engine identity contract", () => {
   });
 
   it("uses OpenCFD 2606 for new OpenFOAM identities and client submissions", async () => {
-    expect(openFoamEngineIdentity("opencfd")).toEqual(OPENCFD_2606_ENGINE);
+    expect(openFoamEngineIdentity("opencfd")).toEqual(
+      OPENCFD_2606_NUMERICS2_ENGINE,
+    );
+    expect(
+      openFoamEngineIdentity("opencfd", { numericsRevision: "1" }),
+    ).toEqual(OPENCFD_2606_ENGINE);
+    expect(openFoamEngineIdentity("opencfd", { version: "2406" })).toEqual(
+      LEGACY_OPENCFD_2406_ENGINE,
+    );
+    expect(openFoamEngineIdentity("foundation")).toEqual(
+      FOUNDATION_OPENFOAM_14_ENGINE,
+    );
 
     const sent: Record<string, unknown>[] = [];
     vi.stubGlobal(
@@ -98,8 +109,8 @@ describe("engine identity contract", () => {
           state: "pending",
           total_cases: 1,
           completed_cases: 0,
-          requested_engine: OPENCFD_2606_ENGINE,
-          requested_execution_pool: "openfoam-opencfd-2606",
+          requested_engine: OPENCFD_2606_NUMERICS2_ENGINE,
+          requested_execution_pool: "openfoam-opencfd-2606-numerics-2",
           execution_pool: null,
           engine: null,
         });
@@ -107,9 +118,9 @@ describe("engine identity contract", () => {
     );
 
     const client = new EngineClient("http://engine.test");
-    expect(client.expectedEngine).toEqual(OPENCFD_2606_ENGINE);
+    expect(client.expectedEngine).toEqual(OPENCFD_2606_NUMERICS2_ENGINE);
     await client.submitPolar({ airfoil: {}, aoa: {} } as PolarRequest);
-    expect(sent[0]?.expected_engine).toEqual(OPENCFD_2606_ENGINE);
+    expect(sent[0]?.expected_engine).toEqual(OPENCFD_2606_NUMERICS2_ENGINE);
   });
 
   it("resolves an immutable setup engine and defaults only missing legacy snapshots to OpenCFD 2406", () => {

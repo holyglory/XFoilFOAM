@@ -14,7 +14,8 @@ import {
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
 import { adoptProgressiveWallPolicy } from "../src/progressive-recipe-adoption";
-import { adoptProgressiveNumerics2 } from "../src/progressive-numerics-transition";
+import { adoptProgressiveNumerics2, prepareSourcePreservingDefaults } from "../src/progressive-numerics-transition";
+import { OPENCFD_2606_SOLVER_IMPLEMENTATION_ID, OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID, OPENCFD_2606_EXECUTION_POOL_ID, OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID } from "../src/solver-implementations";
 import { adoptProgressiveLocalTimeStepPolicy, inheritLocalStepPolicy } from "../src/campaign-local-step-policy";
 import { progressiveRemoteActivePromiseCount } from "../src/progressive-remote-dispatch";
 import { execFileSync, spawn } from "node:child_process";
@@ -242,6 +243,57 @@ const points = [
 ];
 
 describe("durable progressive scope requests", () => {
+  it("numerical revision transition defaults protect old snapshots and select corrected numerics for a new campaign", async () => {
+    const id = await campaign();
+    const [source] = await db.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`);
+    await expect(prepareSourcePreservingDefaults(db)).rejects.toThrow("Transition existing campaigns");
+    const snapshots = await db.execute(sql`SELECT revision.id,revision.snapshot FROM sim_campaign_conditions condition
+      JOIN simulation_preset_revisions revision ON revision.id=condition.simulation_preset_revision_id WHERE condition.campaign_id=${id}`);
+    try {
+      await adoptProgressiveNumerics2(db,id,String(source.current_plan_revision_id));
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      await expect(prepareSourcePreservingDefaults(db)).rejects.toThrow("Pause new solver admissions");
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+      expect((await prepareSourcePreservingDefaults(db)).profilesUpdated).toBeGreaterThan(0);
+      expect((await prepareSourcePreservingDefaults(db)).profilesUpdated).toBe(0);
+      const next = await campaign();
+      const [scope] = await db.execute(sql`SELECT revision.solver_implementation_id FROM sim_campaign_conditions condition
+        JOIN simulation_preset_revisions revision ON revision.id=condition.simulation_preset_revision_id WHERE condition.campaign_id=${next}`);
+      expect(scope.solver_implementation_id).toBe(OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID);
+      expect(await db.execute(sql`SELECT id,snapshot FROM simulation_preset_revisions WHERE id=${snapshots[0].id}`)).toEqual(snapshots);
+    } finally {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+      await db.update(solverProfiles).set({solverImplementationId:OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}).where(eq(solverProfiles.id,numerics.solverProfileId));
+    }
+  });
+
+  it.each(["cancelled","archived"])("numerical revision transition upgrades %s campaigns only after explicit reactivation", async (status) => {
+    const id=await campaign();
+    await reconcileProgressiveGenerationRequest(db);
+    const baseline=(await claim([1]))!;
+    await storeNeuralFoilPrediction(db,baseline,predictionFixture(baseline));
+    await db.update(simCampaigns).set({status}).where(eq(simCampaigns.id,id));
+    await reconcileProgressiveGenerationRequest(db);
+    const [source]=await db.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`);
+    const pools=await db.select().from(solverExecutionPools).where(inArray(solverExecutionPools.id,[OPENCFD_2606_EXECUTION_POOL_ID,OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID]));
+    try {
+      await db.update(solverExecutionPools).set({enabled:false}).where(eq(solverExecutionPools.id,OPENCFD_2606_EXECUTION_POOL_ID));
+      await db.update(solverExecutionPools).set({enabled:true}).where(eq(solverExecutionPools.id,OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID));
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      expect(await reconcileProgressiveGenerationRequest(db)).toBeNull();
+      expect((await db.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${id}`))[0]).toEqual(source);
+      await db.update(simCampaigns).set({status:"active"}).where(eq(simCampaigns.id,id));
+      const resumed=await reconcileProgressiveGenerationRequest(db);
+      expect(resumed).toMatchObject({campaignId:id,error:null});
+      const [current]=await db.execute(sql`SELECT current_condition_generation FROM sim_campaigns WHERE id=${id}`);
+      expect(current.current_condition_generation).toBe(2);
+      expect((await db.execute(sql`SELECT prediction_id FROM progressive_prediction_links link JOIN progressive_work work ON work.id=link.work_id WHERE work.generation_id=${resumed!.generationId}`))).toHaveLength(1);
+    } finally {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+      for(const pool of pools) await db.update(solverExecutionPools).set({enabled:pool.enabled}).where(eq(solverExecutionPools.id,pool.id));
+    }
+  });
+
   it.each(["active", "paused", "completed"])(
     "numerical revision transition preserves scope and predictions for %s campaigns",
     async (status) => {
@@ -498,10 +550,17 @@ describe("durable progressive scope requests", () => {
       .select()
       .from(resultAttempts)
       .where(eq(resultAttempts.simJobId, fixture.composed.jobId));
-    const receipts = await Promise.all([
+    const transitions = await Promise.allSettled([
       adoptProgressiveNumerics2(db, fixture.campaignId, plan),
       adoptProgressiveNumerics2(db, fixture.campaignId, plan),
     ]);
+    const rejected = transitions.filter((result) => result.status === "rejected");
+    for (const result of rejected) {
+      if (result.status === "rejected")
+        console.error(JSON.stringify({code:result.reason.code,detail:result.reason.detail,where:result.reason.where}));
+    }
+    const receipts = transitions.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    expect(rejected).toHaveLength(0);
     expect(receipts.map((receipt) => receipt.kind).sort()).toEqual([
       "adopted",
       "replayed",
@@ -1390,7 +1449,7 @@ beforeAll(async () => {
     .returning();
   const [solver] = await db
     .insert(solverProfiles)
-    .values({ slug: PREFIX, name: PREFIX })
+    .values({ slug: PREFIX, name: PREFIX, solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID })
     .returning();
   const [output] = await db
     .insert(outputProfiles)

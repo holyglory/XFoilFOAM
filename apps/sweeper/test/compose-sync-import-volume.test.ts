@@ -7,6 +7,67 @@ import { describe, expect, it } from "vitest";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
+describe("production numerical revision handoff", () => {
+  it.each([undefined, "2"])(
+    "resolves numerical identity %s consistently",
+    (revision) => {
+      const selected = revision ?? "1";
+      const queue =
+        selected === "2"
+          ? "openfoam-opencfd-2606-numerics-2"
+          : "openfoam-opencfd-2606";
+      const key = `openfoam:opencfd:2606:numerics-${selected}:adapter-1`;
+      const compose = JSON.parse(
+        execFileSync(
+          "docker",
+          [
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            "docker-compose.deploy.yml",
+            "config",
+            "--format",
+            "json",
+          ],
+          {
+            cwd: repoRoot,
+            env: {
+              PATH: process.env.PATH,
+              HOME: process.env.HOME,
+              ...(revision
+                ? {
+                    OPENCFD2606_NUMERICS_REVISION: revision,
+                    OPENCFD2606_EXECUTION_POOL: queue,
+                    AIRFOILFOAM_ENABLED_ENGINE_KEYS: key,
+                  }
+                : {}),
+            },
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ),
+      );
+      for (const name of ["api", "worker"]) {
+        expect(
+          compose.services[name].environment
+            .AIRFOILFOAM_ENGINE_NUMERICS_REVISION,
+        ).toBe(selected);
+        expect(
+          compose.services[name].environment.AIRFOILFOAM_CELERY_QUEUE,
+        ).toBe(queue);
+      }
+      expect(
+        compose.services.api.environment.AIRFOILFOAM_ENABLED_ENGINE_KEYS,
+      ).toBe(key);
+      for (const name of ["node-api", "sweeper", "media-repair"])
+        expect(
+          compose.services[name].environment.ENGINE_NUMERICS_REVISION,
+        ).toBe(selected);
+    },
+  );
+});
+
 describe("production archive concurrency wiring", () => {
   it.each([undefined, "16"])(
     "resolves the upload limit %s into both control-plane containers",
@@ -248,7 +309,9 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
       const source = readFileSync(resolve(repoRoot, filename), "utf8");
       const api = serviceBlock(source, "api");
 
-      expect(api).toContain("openfoam:opencfd:2606:numerics-1:adapter-1");
+      expect(api).toContain(
+        `openfoam:opencfd:2606:numerics-${filename === "docker-compose.yml" ? "2" : "1"}:adapter-1`,
+      );
       expect(api).not.toMatch(
         /AIRFOILFOAM_ENABLED_ENGINE_KEYS:[^\n]*foundation/,
       );
@@ -263,7 +326,9 @@ describe.each(["docker-compose.yml", "docker-compose.deploy.yml"])(
       expect(openCfd).toContain('AIRFOILFOAM_ENGINE_VERSION: "2606"');
       expect(openCfd).not.toContain('AIRFOILFOAM_ENGINE_VERSION: "2406"');
       expect(openCfd).toContain(
-        "AIRFOILFOAM_CELERY_QUEUE: openfoam-opencfd-2606",
+        filename === "docker-compose.yml"
+          ? "AIRFOILFOAM_CELERY_QUEUE: openfoam-opencfd-2606-numerics-2"
+          : "AIRFOILFOAM_CELERY_QUEUE: ${OPENCFD2606_EXECUTION_POOL:-openfoam-opencfd-2606}",
       );
       expect(openCfd).not.toContain("AIRFOILFOAM_CELERY_QUEUE: celery");
       expect(foundation).toContain('profiles: ["foundation14"]');

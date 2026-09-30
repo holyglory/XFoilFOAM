@@ -19,6 +19,8 @@ import {
 import {
   METHOD_COMPATIBILITY_HASH_VERSION,
   OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID,
+  OPENCFD_2606_EXECUTION_POOL_ID,
   OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
 } from "./solver-implementations";
 import {
@@ -245,10 +247,21 @@ export async function adoptProgressiveNumerics2(
       throw new Error(
         "The campaign plan changed before the numerical transition",
       );
-    if (admission?.enabled !== false)
-      throw new Error(
-        "Pause new solver admissions before changing numerical revisions",
-      );
+    if (admission?.enabled !== false) {
+      const pools =
+        await connection.execute(sql`SELECT id,enabled FROM solver_execution_pools
+        WHERE id IN (${OPENCFD_2606_EXECUTION_POOL_ID}::uuid,${OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID}::uuid) ORDER BY id FOR SHARE`);
+      if (
+        pools.find((pool) => pool.id === OPENCFD_2606_EXECUTION_POOL_ID)
+          ?.enabled !== false ||
+        pools.find(
+          (pool) => pool.id === OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID,
+        )?.enabled !== true
+      )
+        throw new Error(
+          "Pause new solver admissions before changing numerical revisions",
+        );
+    }
     const [implementation] = await connection
       .select()
       .from(solverImplementations)
@@ -265,7 +278,7 @@ export async function adoptProgressiveNumerics2(
     )
       throw new Error("The corrected numerical implementation is unavailable");
     const generations = await connection.execute(
-      sql`SELECT id FROM progressive_generations WHERE campaign_id=${campaignId}::uuid AND epoch_id=${epoch.id}::uuid AND plan_revision_id=${plan.id}::uuid AND status<>'cancelled' ORDER BY id FOR UPDATE`,
+      sql`SELECT id FROM progressive_generations WHERE campaign_id=${campaignId}::uuid AND epoch_id=${epoch.id}::uuid AND plan_revision_id=${plan.id}::uuid ORDER BY id FOR UPDATE`,
     );
     const [busy] = await connection.execute(sql`
       SELECT EXISTS(SELECT 1 FROM progressive_cfd_attempts attempt
@@ -412,6 +425,41 @@ export async function adoptProgressiveNumerics2(
       generationId: successor.id,
       conditions: conditions.length,
       points,
+    };
+  });
+}
+
+export async function prepareSourcePreservingDefaults(db: DB) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [admission] = await connection.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id=1 FOR SHARE`,
+    );
+    if (admission?.enabled !== false)
+      throw new Error("Pause new solver admissions before updating defaults");
+    const [target] = await connection.execute(
+      sql`SELECT id FROM solver_implementations WHERE id=${OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID}::uuid AND retired_at IS NULL AND numerics_revision='2'`,
+    );
+    if (!target)
+      throw new Error("The corrected numerical implementation is unavailable");
+    const [pending] = await connection.execute(sql`SELECT
+      EXISTS(SELECT 1 FROM sim_campaigns campaign JOIN sim_campaign_conditions condition
+        ON condition.campaign_id=campaign.id AND condition.generation=campaign.current_condition_generation
+        JOIN simulation_preset_revisions revision ON revision.id=condition.simulation_preset_revision_id
+        WHERE campaign.status IN ('active','attention','paused','completed') AND condition.status IN ('active','kept')
+          AND revision.solver_implementation_id=${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid) AS campaigns,
+      EXISTS(SELECT 1 FROM sim_jobs WHERE solver_implementation_id=${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid
+        AND status IN ('pending','submitted','running','ingesting')) AS jobs`);
+    if (pending.campaigns || pending.jobs)
+      throw new Error(
+        "Transition existing campaigns and settle old jobs before updating defaults",
+      );
+    const profiles =
+      await connection.execute(sql`UPDATE solver_profiles SET solver_implementation_id=${OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID}::uuid,"updatedAt"=clock_timestamp()
+      WHERE solver_implementation_id=${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid RETURNING id`);
+    return {
+      profilesUpdated: profiles.length,
+      solverImplementationId: OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID,
     };
   });
 }

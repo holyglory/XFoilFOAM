@@ -6,6 +6,15 @@
 set -Eeuo pipefail
 
 ACTION="${1:-}"
+NUMERICS2_TRANSITION=false
+if [[ "$ACTION" == "--numerics-2" ]]; then
+  NUMERICS2_TRANSITION=true
+  ACTION="${2:-}"
+  if (($# != 2)); then
+    echo "Usage: $0 --numerics-2 <BUILD_ID>" >&2
+    exit 2
+  fi
+fi
 if [[ -z "$ACTION" ]]; then
   echo "Usage: $0 <BUILD_ID> | --rollback" >&2
   exit 2
@@ -26,6 +35,7 @@ LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
 DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-source.json}"
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
+source "$DEPLOY_SCRIPT_DIR/numerics2-maintenance.sh"
 RECEIPT_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-canary-receipt.json"
 ATTESTATION_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-attestation.json"
 BACKUP_MANIFEST_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-backup-manifest.json"
@@ -520,7 +530,7 @@ print(engine.get("version") or "")
 
 disable_all_opencfd_pools() {
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
-    "UPDATE solver_execution_pools SET enabled=false, \"updatedAt\"=now() WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID');" >/dev/null
+    "UPDATE solver_execution_pools SET enabled=false, \"updatedAt\"=now() WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID','$NUMERICS2_POOL_ID');" >/dev/null
 }
 
 enable_pool() {
@@ -1036,6 +1046,7 @@ perform_complete_runtime_maintenance() {
   local sweeper_was_running media_was_running old_build old_expected pool_state
   local transfer_pause_was
   local old_2406_enabled old_2606_enabled worker_container
+  numerics2_preflight
 
   [[ "$(current_engine_version)" == "2606" ]] || {
     echo "Ordinary remote maintenance requires the already-attested OpenCFD 2606 runtime." >&2
@@ -1095,11 +1106,15 @@ SELECT concat_ws('|',
   set_env_vars_atomic \
     "AIRFOILFOAM_BUILD_ID=$ACTION" \
     "ENGINE_EXPECTED_BUILD_ID=$ACTION" \
-    "OPENCFD2606_ENGINE_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION"
+    "OPENCFD2606_ENGINE_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION" \
+    "OPENCFD2606_NUMERICS_REVISION=2" \
+    "OPENCFD2606_EXECUTION_POOL=openfoam-opencfd-2606-numerics-2" \
+    "AIRFOILFOAM_ENABLED_ENGINE_KEYS=$(numerics2_enabled_keys)"
   compose up -d --no-build --no-deps --force-recreate api worker node-api
   wait_http "maintained engine API" http://127.0.0.1:8000/health
   wait_http "maintained node API" http://127.0.0.1:4000/health
   validate_live_2606_volume_runtime "$ACTION"
+  numerics2_verify_runtime "$ACTION"
 
   worker_container="$(compose ps -q worker)"
   [[ -n "$worker_container" ]] || {
@@ -1119,7 +1134,8 @@ if limits.get("nofile") != (65536, 524288):
 '
 
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
-    "UPDATE solver_execution_pools SET enabled=CASE id WHEN '$OPENCFD_2406_POOL_ID' THEN $old_2406_enabled WHEN '$OPENCFD_2606_POOL_ID' THEN $old_2606_enabled ELSE enabled END, \"updatedAt\"=now() WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID');" >/dev/null
+    "UPDATE solver_execution_pools SET enabled=$old_2406_enabled, \"updatedAt\"=now() WHERE id='$OPENCFD_2406_POOL_ID';" >/dev/null
+  numerics2_restore_pool
   restore_writers "$sweeper_was_running" "$media_was_running"
   set_remote_transfer_paused "$transfer_pause_was"
   FAIL_SAFE_ARMED=false
@@ -1141,6 +1157,10 @@ main() {
   if [[ "$state" == "complete" ]]; then
     perform_complete_runtime_maintenance
     return
+  fi
+  if [[ "$NUMERICS2_TRANSITION" == "true" ]]; then
+    echo "Numerical revision 2 requires completed OpenCFD 2606 installation." >&2
+    exit 14
   fi
   if [[ "$state" == "pristine" ]]; then
     version="$(current_engine_version)"

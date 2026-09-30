@@ -6,6 +6,11 @@ import {
   PROGRESSIVE_COMPUTE_POLICY,
 } from "@aerodb/core";
 import type { DB } from "./client";
+import {
+  OPENCFD_2606_EXECUTION_POOL_ID,
+  OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+} from "./solver-implementations";
 import { cancelObsoleteProgressiveCfdUnits } from "./progressive-cfd";
 import { campaignEnrollmentScope } from "./campaigns";
 import { createAnalysisTarget, analysisContentHash } from "./analysis-target";
@@ -231,6 +236,40 @@ export async function reconcileProgressiveGenerationRequest(db: DB) {
       requested_version: string;
     }>;
     if (!request) return null;
+    if (!["cancelled", "archived"].includes(request.status)) {
+      const [transition] = await connection.execute(sql`SELECT EXISTS(
+        SELECT 1 FROM sim_campaign_conditions condition JOIN simulation_preset_revisions revision ON revision.id=condition.simulation_preset_revision_id
+        JOIN sim_campaigns campaign ON campaign.id=condition.campaign_id
+        WHERE campaign.id=${request.campaign_id}::uuid AND condition.generation=campaign.current_condition_generation
+          AND condition.status IN ('active','kept') AND revision.solver_implementation_id=${OPENCFD_2606_SOLVER_IMPLEMENTATION_ID}::uuid
+      ) AND EXISTS(SELECT 1 FROM solver_execution_pools WHERE id=${OPENCFD_2606_EXECUTION_POOL_ID}::uuid AND NOT enabled)
+        AND EXISTS(SELECT 1 FROM solver_execution_pools WHERE id=${OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID}::uuid AND enabled) AS required`);
+      if (transition?.required) {
+        const { adoptProgressiveNumerics2, SOURCE_PRESERVING_NUMERICS_POLICY } =
+          await import("./progressive-numerics-transition");
+        const [available] = await connection.execute(
+          sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${SOURCE_PRESERVING_NUMERICS_POLICY},0)) AS available`,
+        );
+        if (!available?.available) return null;
+        const adopted = await adoptProgressiveNumerics2(
+          connection,
+          request.campaign_id,
+          request.plan_revision_id,
+        );
+        if (adopted.kind !== "adopted")
+          throw new Error(
+            "The resumed campaign numerical transition did not create its successor",
+          );
+        await connection.execute(sql`UPDATE progressive_scope_requests SET processed_version=${request.requested_version},processed_at=clock_timestamp(),generation_id=${adopted.generationId}::uuid,error=NULL
+          WHERE campaign_id=${request.campaign_id}::uuid`);
+        return {
+          campaignId: request.campaign_id,
+          generationId: adopted.generationId,
+          profiles: 0,
+          error: null,
+        };
+      }
+    }
     await connection.execute(sql`
       UPDATE progressive_generations SET status = 'cancelled'
       WHERE campaign_id = ${request.campaign_id} AND epoch_id = ${epoch.id}

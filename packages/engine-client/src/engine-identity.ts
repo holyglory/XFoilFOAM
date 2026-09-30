@@ -282,11 +282,15 @@ export function openFoamEngineIdentity(
     adapterContractVersion?: number;
   } = {},
 ): EngineIdentity {
+  const version =
+    options.version ?? (distribution === "foundation" ? "14" : "2606");
   return {
     family: "openfoam",
     distribution,
-    version: options.version ?? (distribution === "foundation" ? "14" : "2606"),
-    numerics_revision: options.numericsRevision ?? "1",
+    version,
+    numerics_revision:
+      options.numericsRevision ??
+      (distribution === "opencfd" && version === "2606" ? "2" : "1"),
     adapter_contract_version:
       options.adapterContractVersion ?? ENGINE_ADAPTER_CONTRACT_VERSION,
   };

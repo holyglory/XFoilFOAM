@@ -93,6 +93,21 @@ tier = "development"
 requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "numerical revision transition|adopts an old preliminary recipe|adopts the explicit local-step policy|reopens completed campaigns|enrolls paused campaigns|leaves cancelled|leaves archived"]
 
+[[test.source-numerics-adoption.check]]
+name = "default-client-routing"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/engine-identity.test.ts"]
+
+[[test.source-numerics-adoption.check]]
+name = "maintenance-identity-and-recovery"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_deploy_sweeper_state.py", "tests/test_remote_solver_2606_deploy.py", "-q"]
+
+[[test.source-numerics-adoption.check]]
+name = "compose-identity-wiring"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/compose-sync-import-volume.test.ts", "-t", "solver engine isolation|numerical revision handoff"]
+
 [test.source-numerics-identity.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"

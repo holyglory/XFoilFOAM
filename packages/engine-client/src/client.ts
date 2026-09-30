@@ -39,7 +39,7 @@ import type {
 import { parseArchiveCleanCycleRecoveryProgress } from "./types";
 import {
   LEGACY_OPENCFD_2406_ENGINE,
-  OPENCFD_2606_ENGINE,
+  OPENCFD_2606_NUMERICS2_ENGINE,
   isEngineCapabilityDescriptor,
   isEngineIdentity,
   isEngineRuntimeIdentity,
@@ -149,7 +149,7 @@ export class EngineClient {
   constructor(baseUrl: string, options: EngineClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.expectedEngine = {
-      ...(options.expectedEngine ?? OPENCFD_2606_ENGINE),
+      ...(options.expectedEngine ?? OPENCFD_2606_NUMERICS2_ENGINE),
     };
     this.allowLegacyMissingIdentity =
       options.allowLegacyMissingIdentity ?? true;

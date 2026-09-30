@@ -144,6 +144,7 @@ def _deploy_harness(
     recovery_gateway_queue_active: bool = False,
     recovery_gateway_stop_fails: bool = False,
     recovery_gateway_remove_fails: bool = False,
+    numerics_revision: str = "2",
 ) -> dict[str, str]:
     app_dir = tmp_path / "app"
     fake_bin = tmp_path / "bin"
@@ -156,6 +157,7 @@ def _deploy_harness(
         + REMOTE_EVIDENCE_ENV
         + "OPENCFD2606_CUTOVER_PENDING=0\n"
         + f"OPENCFD2606_CUTOVER_COMPLETE={1 if cutover_complete else 0}\n"
+        + f"OPENCFD2606_NUMERICS_REVISION={numerics_revision}\n"
         + "OPENCFD2606_CANARY_ATTESTATION_ID=\n"
         + "OPENCFD2606_CANARY_RECEIPT_EXPECTED=0\n"
         + "OPENCFD2606_CUTOVER_SOURCE_REVISION=\n"
@@ -178,6 +180,10 @@ def _deploy_harness(
     (app_dir / "docker-compose.deploy.yml").write_text("services: {}\n")
     deploy_scripts = app_dir / "scripts" / "deploy"
     deploy_scripts.mkdir(parents=True)
+    source_dir = app_dir / "src" / "airfoilfoam"
+    source_dir.mkdir(parents=True)
+    for filename in ("__init__.py", "provenance.py"):
+        shutil.copy2(ROOT / "src" / "airfoilfoam" / filename, source_dir / filename)
     shutil.copy2(
         ROOT / "scripts" / "deploy" / "deployment-source-manifest.py",
         deploy_scripts / "deployment-source-manifest.py",
@@ -208,6 +214,31 @@ if [[ "${1:-}" == "compose" && "${2:-}" == "version" ]]; then
   exit 0
 fi
 joined="$*"
+if [[ "$joined" == *" exec -T postgres "* && "$joined" == *"SELECT enabled::text FROM solver_execution_pools"* ]]; then
+  printf 'true\n'
+  exit 0
+fi
+if [[ "$joined" == *" exec -T api python -" ]]; then
+  "$REAL_PYTHON" - <<'PY'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(os.environ['APP_DIR']) / 'src'))
+from airfoilfoam.provenance import application_source_sha256
+worker = {'worker': 'celery@test', 'queues': ['openfoam-opencfd-2606-numerics-2'],
+          'execution_pool': 'openfoam-opencfd-2606-numerics-2',
+          'engine': {'family': 'openfoam', 'distribution': 'opencfd', 'version': '2606',
+                     'numerics_revision': '2', 'adapter_contract_version': 1,
+                     'build_id': os.environ['FAKE_BUILD_ID'],
+                     'application_source_sha256': application_source_sha256(Path(os.environ['APP_DIR']))}}
+workers = [worker]
+if os.environ['FAKE_FOUNDATION_PROFILE'] == '1':
+    workers.append({'worker': 'celery@foundation', 'engine': {'distribution': 'foundation'},
+                    'execution_pool': 'openfoam-foundation-14', 'queues': ['openfoam-foundation-14']})
+print(json.dumps({'inspection_errors': {}, 'worker_runtime_error': None,
+                  'worker_queues_error': None, 'worker_queues': workers}))
+PY
+  exit 0
+fi
 if [[ "$joined" == "ps --filter status=running --format "* ]]; then
   if [[ "${FAKE_UNMANAGED_RECOVERY_GATEWAY:-0}" == "1" && ! -f "$RECOVERY_RETIRED" ]]; then
     printf 'fake-recovery-gateway\tapp-api-recovery\tapp\tapi\n'
