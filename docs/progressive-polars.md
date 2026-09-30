@@ -1324,6 +1324,24 @@ archive from being selected. Future retry and claim deadlines use the same
 eligibility checks. This keeps an expanding completed-results catalog from
 dominating every archive-transfer pass without changing evidence acceptance.
 
+### Source-preserving precise execution
+
+Source-preserving finite-edge meshing retains the real trailing-edge endpoints
+as explicit Cartesian surface features. Shared mesh files use 17-digit ASCII
+coordinates; this precision participates in mesh and downstream seed identities
+so previously rounded meshes are not silently reused. The native quality gate
+remains unchanged. Preserving the input contour alone is not proof of the
+generated wall geometry: the isolated precise Mach-3 comparison also measures
+the resulting boundary endpoints.
+
+Compressible physical-time attempts always receive explicit field-output and
+maximum-timestep values. When no measured cadence is available, the controller
+uses its existing period-acquisition cadence and bounded initial timestep;
+explicit caller values are preserved. These corrections permit execution but
+do not certify the resulting flow. The retained precise Mach-3 cold-start and
+developed-initial-guess comparisons still fail their material or reconstructed
+density checks and remain diagnostic evidence, not accepted polar data.
+
 ### Frozen history-weighting transfer study
 
 The September 22 study freezes seven previously unused compressible profiles at

@@ -79,6 +79,20 @@ retained_artifacts = [{ name = "fast-startup-fields", path = ".codex-artifacts/m
 [test.source-preserved-fast-startup]
 timeout_seconds = 900
 
+[test.precise-source-repair]
+timeout_seconds = 900
+
+[[test.precise-source-repair.check]]
+name = "mesh-transient-and-replay-contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_shared_mesh_recovery.py", "tests/test_cache.py", "tests/test_cartesian2d.py", "tests/test_compressible_execution.py", "tests/test_compressible_case.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "tests/test_local_steady_startup.py", "-q"]
+
+[[test.precise-source-repair.check]]
+name = "retained-precise-native-comparisons"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/precise-native-repair-20260930", "--groups", "mach3-precise-cold", "mach3-precise-coordinates", "mach3-precise-features", "mach3-precise-cadence", "mach3-precise-initialized", "--require-driver"]
+retained_artifacts = [{ name = "precise-native-comparisons", path = ".codex-artifacts/precise-native-repair-20260930", max_bytes = 1073741824 }]
+
 [[test.source-preserved-fast-startup.check]]
 name = "startup-and-generated-policy"
 tier = "development"
@@ -3589,8 +3603,8 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "mach3-production-fixed"]
-finite_services = ["mach3-production-fixed"]
+services = ["artifacts", "mach3-precise-preflight"]
+finite_services = ["mach3-precise-preflight"]
 build = false
 port = true
 route = true

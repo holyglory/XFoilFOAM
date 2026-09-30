@@ -8,7 +8,7 @@ from airfoilfoam.material_domain import material_domain_failure
 from airfoilfoam.models import JobResult, JobState, Polar, PolarPoint
 from airfoilfoam.openfoam.runner import RunResult
 from scripts.materials.reproduce_mach3_failure import collect_diagnostics, diagnostic_request, diagnostic_source_identity, execution_request, native_image_fingerprints, summarize_outcomes
-from scripts.materials.replay_production_numerics import initialize_quiescent_velocity, replay_request, retain_failed_startup
+from scripts.materials.replay_production_numerics import copy_local_initial_fields, initialize_quiescent_velocity, replay_request, retain_failed_startup
 from airfoilfoam.provenance import application_source_sha256
 
 
@@ -65,6 +65,30 @@ def test_failed_startup_capture_is_bounded_and_preserves_actual_field_bytes(tmp_
     assert retain_failed_startup(source, tmp_path / "captures") is None
 
 
+def test_precise_initial_guess_copies_real_fields_but_not_iteration_clock_or_history(tmp_path):
+    source, destination = tmp_path / "3000", tmp_path / "transient"
+    source.mkdir()
+    (destination / "0").mkdir(parents=True)
+    fields = ("U", "p", "T", "k", "omega", "nut", "alphat")
+    for name in fields:
+        (source / name).write_text(f"actual fixture {name}")
+    (source / "rho").write_text("actual fixture rho")
+    (source / "rDeltaT").write_text("iteration-only field")
+    (source / "uniform").mkdir()
+    (source / "uniform/time").write_text("value3000;")
+    result = copy_local_initial_fields(source, destination)
+    assert set(result) == set(fields) | {"rho"}
+    assert set(path.name for path in (destination / "0").iterdir()) == set(fields) | {"rho"}
+    assert all((destination / "0" / name).read_bytes() == (source / name).read_bytes() for name in set(fields) | {"rho"})
+    (source / "T").unlink()
+    with pytest.raises(ValueError, match="complete primitive"):
+        copy_local_initial_fields(source, destination)
+    (source / "T").write_text("retained temperature")
+    (destination / "1").mkdir()
+    with pytest.raises(ValueError, match="existing physical-time"):
+        copy_local_initial_fields(source, destination)
+
+
 def test_production_replay_preserves_the_complete_physical_and_numerical_request(tmp_path):
     original = diagnostic_request(COORDINATES, MATERIAL, "marched").model_dump(mode="json")
     original["execution_id"] = "11111111-1111-4111-8111-111111111111"
@@ -111,6 +135,30 @@ def test_production_replay_does_not_silently_substitute_another_method(tmp_path,
     source.write_text(json.dumps({"source_job": "22222222-2222-4222-8222-222222222222", "engine_request": original}))
     with pytest.raises(ValueError, match="production density-based fast recipe"):
         replay_request(source, hashlib.sha256(source.read_bytes()).hexdigest())
+
+
+def test_precise_replay_keeps_science_and_declares_its_shorter_diagnostic_budget(tmp_path):
+    original = diagnostic_request(COORDINATES, MATERIAL, "cold").model_dump(mode="json")
+    original["solver"].update(force_transient=True, momentum_scheme="linearUpwind", urans_fidelity="full")
+    original["resources"]["case_solver_budget_seconds"] = 43200
+    source = tmp_path / "request.json"
+    record = {"source_job": "22222222-2222-4222-8222-222222222222", "engine_request": original,
+              "source_kind": "sealed-precise-recipe-not-executed", "source_recipe_sha256": "1" * 64}
+    source.write_text(json.dumps(record))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    _, preserved, request = replay_request(source, digest, precise_startup=True)
+    assert preserved.model_dump(mode="json") == original
+    assert request.mesh == preserved.mesh and request.fluid == preserved.fluid
+    assert request.flow_state == preserved.flow_state and request.aoa == preserved.aoa
+    assert request.solver == preserved.solver.model_copy(update={"write_images": [], "frame_fields": []})
+    assert request.resources.case_solver_budget_seconds == 900
+    assert request.resources.case_solver_allocations is None
+    with pytest.raises(ValueError, match="sealed angle and mesh"):
+        replay_request(source, digest, precise_startup=True, anchor_zero=True)
+    record.pop("source_kind")
+    source.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="sealed full transient recipe"):
+        replay_request(source, hashlib.sha256(source.read_bytes()).hexdigest(), precise_startup=True)
 
 
 def test_diagnostic_fingerprints_the_loaded_adapter_not_the_base_image(tmp_path):

@@ -311,12 +311,13 @@ def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_
     assert runner.commands == []
 
 
+@pytest.mark.parametrize("timing", [(None, None), (1e-4, 1e-5)])
 @pytest.mark.parametrize("family,fallback,expected", [
     ("rhoPimpleFoam", False, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial", "rhoSimpleFoam"]),
     ("rhoPimpleFoam", True, []),
     ("rhoCentralFoam", False, []),
 ])
-def test_transient_preparation_preserves_compressible_state_during_velocity_initialization(request_payload, monkeypatch, tmp_path, family, fallback, expected):
+def test_transient_preparation_preserves_compressible_state_during_velocity_initialization(request_payload, monkeypatch, tmp_path, family, fallback, expected, timing):
     request_payload["solver"].update(flow_solver_family=family, force_transient=True)
     if family == "rhoCentralFoam":
         request_payload["speeds"] = [request_payload["speeds"][0] / 0.72 * 2]
@@ -345,3 +346,18 @@ def test_transient_preparation_preserves_compressible_state_during_velocity_init
     assert family in control
     assert "rhoSimpleFoam" not in control
     assert "0.02" in control
+    protected = {name: (case_dir / name).read_bytes() for name in ("0/p", "0/T", "constant/thermophysicalProperties")}
+    monkeypatch.setattr(pipeline, "acoustic_startup_step", lambda *_: 1e-7)
+    monkeypatch.setattr(pipeline, "_make_urans_monitor", lambda *args, **kwargs: None)
+    pipeline._run_transient_attempt(
+        case_dir, airfoil, request.mesh, patches, request.cases()[0], request.fluid, request.roughness,
+        request.solver, runner, 1, 30, run_time=0.02, delta_t=1e-7,
+        write_interval=timing[0], max_delta_t=timing[1],
+    )
+    control = (case_dir / "system/controlDict").read_text()
+    expected_cadence = timing[0] or pipeline._period_acquisition_write_interval(
+        pipeline.physics.shedding_period(request.speeds[0], 1, strouhal=pipeline.TRANSIENT_INITIAL_STROUHAL)
+    )
+    assert float(root_entry(control, "writeInterval")) == pytest.approx(expected_cadence)
+    assert float(root_entry(control, "maxDeltaT")) == pytest.approx(timing[1] or 2e-7)
+    assert all((case_dir / name).read_bytes() == value for name, value in protected.items())

@@ -20,6 +20,52 @@ x-canary: &canary
     - numerical-results:/canary-output
 
 services:
+  mach3-precise-preflight:
+    <<: *canary
+    command:
+      - python
+      - -c
+      - |
+        import json
+        from pathlib import Path
+        from uuid import uuid4
+        from airfoilfoam.config import Settings
+        from airfoilfoam.openfoam.runner import get_runner
+        source = Path('/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d/data/jobs/3b08adeb-7ab1-48fa-9496-2b7cad25cf4d/cases/c2_u1021p02/transient_a0')
+        output = Path('/canary-output/mach3-precise-preflight') / str(uuid4())
+        output.mkdir(parents=True)
+        result = get_runner(Settings()).application(source, '/opt/xfoilfoam-thermophysics/bin/xfoilfoamAcousticStartup', timeout=60)
+        (output / 'stdout.txt').write_text(result.stdout)
+        report = {'source': str(source), 'returncode': result.returncode, 'timed_out': result.timed_out, 'production_evidence': False}
+        (output / 'report.json').write_text(json.dumps(report))
+        print(json.dumps(report), flush=True)
+  mach3-precise-cold: &precise-replay
+    <<: *canary
+    environment:
+      PYTHONPATH: /candidate/src:/candidate
+      PYTHONDONTWRITEBYTECODE: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+    volumes:
+      - ./src:/candidate/src:ro
+      - ./pyproject.toml:/candidate/pyproject.toml:ro
+      - ./scripts/materials:/candidate/scripts/materials:ro
+      - ./.codex-artifacts/mach3-production-replay-20260930/ag24-precise-request.json:/fixture/request.json:ro
+      - numerical-results:/canary-output
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-cold", "--precise-startup"]
+  mach3-precise-coordinates:
+    <<: *precise-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-coordinates", "--precise-startup"]
+  mach3-precise-features:
+    <<: *precise-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-features", "--precise-startup"]
+  mach3-precise-cadence:
+    <<: *precise-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-cadence", "--precise-startup"]
+  mach3-precise-initialized:
+    <<: *precise-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-initialized", "--precise-startup", "--precise-local-initializer"]
   mach3-production: &production-replay
     <<: *canary
     environment:

@@ -68,7 +68,7 @@ def test_cartesian2d_mesher_is_internal_and_fingerprinted():
 
     assert isinstance(mesher, Cartesian2DExternalMesh)
     assert mesher.user_selectable is False
-    assert mesher.cache_version == "cfmesh-cartesian2d-source-contour-v2"
+    assert mesher.cache_version == "cfmesh-cartesian2d-source-features-v3"
     assert CARTESIAN2D_EXTERNAL_MESHER not in list_meshers()
     assert CARTESIAN2D_EXTERNAL_MESHER in list_meshers(include_internal=True)
     assert [(patch.name, patch.role) for patch in mesher.patches(MeshParams())] == [
@@ -109,6 +109,14 @@ def test_cartesian2d_inputs_preserve_trusted_notch_and_physical_domain(tmp_path,
     contour = airfoil.contour if airfoil.has_finite_trailing_edge else airfoil.contour[:-1]
     assert len(vertices) == 2 * (4 + len(contour))
     np.testing.assert_allclose(vertices[4:4 + len(contour), :2], contour[::-1] * 0.05, rtol=0, atol=1e-12)
+    features = [tuple(map(int, pair)) for pair in re.findall(r"^\((\d+) (\d+)\)$", surface, re.MULTILINE)]
+    if airfoil.has_finite_trailing_edge:
+        assert len(features) == 2
+        for edge, source in zip(features, (airfoil.contour[-1], airfoil.contour[0])):
+            np.testing.assert_allclose(vertices[list(edge), :2], [source * 0.05, source * 0.05], rtol=0, atol=1e-12)
+            np.testing.assert_allclose(vertices[list(edge), 2], [0, params.span_chords * 0.05], rtol=0, atol=1e-12)
+    else:
+        assert features == []
     # Exact requested farfield, outlet and span extents in metres.
     assert "(-0.75 -0.75 0)" in surface
     assert "(0.55 0.75 0)" in surface

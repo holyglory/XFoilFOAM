@@ -16,7 +16,7 @@ from airfoilfoam.models import PolarRequest
 from airfoilfoam.meshing.base import register_mesher
 from airfoilfoam.meshing.blockmesh import BlockMeshCGrid, FINITE_EDGE_TOPOLOGY
 from airfoilfoam.openfoam.potential_initialization import velocity_internal_entry
-from airfoilfoam.openfoam.rans_hold import root_entry
+from airfoilfoam.openfoam.rans_hold import latest_iteration, root_entry
 from airfoilfoam.openfoam.runner import LocalRunner
 from airfoilfoam.openfoam import local_startup
 from airfoilfoam.storage import JobStore
@@ -30,18 +30,28 @@ from scripts.materials.reproduce_mach3_failure import (
 from scripts.materials.inspect_mach3_startup import preserve_early_frames
 
 
-def replay_request(path, expected_sha256, *, anchor_zero=False, finite_edge_mesh=False):
+def replay_request(path, expected_sha256, *, anchor_zero=False, finite_edge_mesh=False, precise_startup=False):
     if type(anchor_zero) is not bool:
         raise ValueError("The zero-anchor comparison must be explicit")
     if type(finite_edge_mesh) is not bool or (finite_edge_mesh and anchor_zero):
         raise ValueError("The finite-edge comparison requires the original multi-angle sweep")
+    if type(precise_startup) is not bool or (precise_startup and (anchor_zero or finite_edge_mesh)):
+        raise ValueError("Precise startup must retain its sealed angle and mesh")
     content = Path(path).read_bytes()
     if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256) or hashlib.sha256(content).hexdigest() != expected_sha256:
         raise ValueError("The retained production request changed")
     source = json.loads(content)
     source_job = str(UUID(source["source_job"]))
     original = PolarRequest.model_validate(source["engine_request"])
-    if original.solver.flow_solver_family != "rhoCentralFoam" or original.solver.force_transient or original.solver.momentum_scheme != "upwind":
+    if precise_startup:
+        if (source.get("source_kind") != "sealed-precise-recipe-not-executed"
+                or not re.fullmatch(r"[0-9a-f]{64}", source.get("source_recipe_sha256", ""))
+                or original.solver.flow_solver_family != "rhoCentralFoam"
+                or not original.solver.force_transient or original.solver.urans_fidelity != "full"
+                or original.solver.momentum_scheme != "linearUpwind"
+                or len(original.aoa.expand()) != 1):
+            raise ValueError("Precise startup requires its sealed full transient recipe")
+    elif original.solver.flow_solver_family != "rhoCentralFoam" or original.solver.force_transient or original.solver.momentum_scheme != "upwind":
         raise ValueError("This replay requires the production density-based fast recipe")
     if original.fluid.gas is None or original.flow_state is None:
         raise ValueError("The production replay requires its actual gas and flow state")
@@ -49,6 +59,8 @@ def replay_request(path, expected_sha256, *, anchor_zero=False, finite_edge_mesh
     for key in ("execution_id", "expected_engine", "expected_execution_pool", "expected_mesh_recovery_version"):
         payload[key] = None
     payload["resources"].update(cpu_budget=1, solver_processes=1, case_concurrency=1)
+    if precise_startup:
+        payload["resources"].update(case_solver_budget_seconds=900, case_solver_allocations=None)
     payload["solver"].update(write_images=[], frame_fields=[])
     if anchor_zero:
         payload["aoa"] = {"angles": [0]}
@@ -106,6 +118,23 @@ def retain_failed_startup(directory, destination):
     return str(destination)
 
 
+def copy_local_initial_fields(source, destination):
+    source, destination = Path(source), Path(destination)
+    fields = ("U", "p", "T", "k", "omega", "nut", "alphat")
+    if any(not (source / name).is_file() or (source / name).is_symlink() for name in fields):
+        raise ValueError("The local initializer lacks a complete primitive/turbulence state")
+    if any(path.is_dir() and path.name.replace(".", "", 1).isdigit() and float(path.name) != 0
+           for path in destination.iterdir()):
+        raise ValueError("The initializer cannot overwrite an existing physical-time trajectory")
+    copied_fields = fields + (("rho",) if (source / "rho").is_file() and not (source / "rho").is_symlink() else ())
+    hashes = {}
+    for name in copied_fields:
+        content = (source / name).read_bytes()
+        (destination / "0" / name).write_bytes(content)
+        hashes[name] = hashlib.sha256(content).hexdigest()
+    return hashes
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", type=Path, required=True)
@@ -116,15 +145,25 @@ def main():
     parser.add_argument("--finite-edge-mesh", action="store_true")
     parser.add_argument("--early-fields", action="store_true")
     parser.add_argument("--startup-courant", type=float, choices=[0.1, 0.05])
+    parser.add_argument("--precise-startup", action="store_true")
+    parser.add_argument("--precise-local-initializer", action="store_true")
     arguments = parser.parse_args()
+    if arguments.precise_startup and (arguments.quiescent_start or arguments.early_fields or arguments.startup_courant is not None):
+        raise ValueError("Precise startup cannot use a fast-path numerical override")
+    if arguments.precise_local_initializer and not arguments.precise_startup:
+        raise ValueError("The local initial-guess study requires the precise startup recipe")
     source_job, original, request = replay_request(arguments.request, arguments.sha256, anchor_zero=arguments.anchor_zero,
-                                                   finite_edge_mesh=arguments.finite_edge_mesh)
+                                                   finite_edge_mesh=arguments.finite_edge_mesh, precise_startup=arguments.precise_startup)
     if arguments.finite_edge_mesh:
         register_mesher(BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY))
     destination = arguments.destination / str(uuid4())
     destination.mkdir(parents=True, exist_ok=False)
     driver_source = Path(__file__).read_bytes()
     (destination / "replay-driver.py").write_bytes(driver_source)
+    source_bytes = arguments.request.read_bytes()
+    if hashlib.sha256(source_bytes).hexdigest() != arguments.sha256:
+        raise ValueError("The source request changed before execution")
+    (destination / "source-request.json").write_bytes(source_bytes)
     settings = Settings(
         data_dir=destination / "data", cache_dir=destination / "cache",
         cpu_token_state_path=destination / "cpu-tokens.json",
@@ -144,16 +183,55 @@ def main():
         "execution_runtime": settings.engine_runtime_identity().model_dump(mode="json"),
         "differences": ["current source-preserving engine code", "isolated identity and empty cache",
                         "one solver process", "no rendered media or publication"],
+        "source_kind": json.loads(source_bytes).get("source_kind", "stored-production-request"),
         "diagnostic_completed": False,
     }
+    if arguments.precise_startup:
+        report["differences"].append("900second startup diagnostic ceiling; not completion of the original precise allocation")
     if arguments.anchor_zero:
         report["differences"].append("zero-degree starting-anchor diagnostic instead of the original requested angles")
     if arguments.finite_edge_mesh:
         report["differences"].append("explicit finite-edge-central-wake-v1 body-fitted mesh; original physical contour retained")
     original_solve = pipeline.solve_cold_steady
     original_native_solver = LocalRunner.solver
+    original_prepare = pipeline._prepare_transient_case
+    original_transient_attempt = pipeline._run_transient_attempt
     captures = []
     capture_errors = []
+    initializations = []
+    pending_initializations = {}
+
+    def prepare_with_local_initial_guess(directory, airfoil, resolved, spec, fluid, roughness, solver, runner, processes, timeout, **kwargs):
+        mesh, patches = original_prepare(directory, airfoil, resolved, spec, fluid, roughness, solver, runner, processes, timeout, **kwargs)
+        initializer = Path(directory).with_name(Path(directory).name + "-local-initialization")
+        shutil.copytree(directory, initializer)
+        local_solver = solver.model_copy(update={"force_transient": False, "transient_fallback": False, "momentum_scheme": "upwind"})
+        pipeline._case_builder(runner, airfoil, patches, mesh, spec, fluid, roughness, local_solver, n_proc=processes).write(initializer)
+        started = local_startup.solve_cold_steady(initializer, runner, local_solver, processes, timeout, cancel_check=kwargs.get("cancel_check"))
+        started.check()
+        coordinate = latest_iteration(initializer)
+        if coordinate is None or coordinate <= 0:
+            raise ValueError("The local initializer retained no real state")
+        fields = copy_local_initial_fields(initializer / str(coordinate), directory)
+        pending_initializations[str(directory)] = (initializer / str(coordinate), fields)
+        target_hashes = {name: hashlib.sha256((directory / "0" / name).read_bytes()).hexdigest() for name in fields}
+        if target_hashes != fields:
+            raise ValueError("The local initializer did not reach the transient zero-time state")
+        initializations.append({"directory": str(initializer), "iteration": coordinate,
+                                "field_sha256": fields, "target_field_sha256": target_hashes,
+                                "purpose": "numerical_initial_guess_only", "accepted_cfd": False})
+        return mesh, patches
+
+    def attempt_with_local_initial_guess(*args, **kwargs):
+        if pending_initializations:
+            tcase = str(args[0])
+            source = pending_initializations.pop(tcase, None)
+            if source is not None:
+                source_dir, expected = source
+                copied = copy_local_initial_fields(source_dir, Path(tcase))
+                if copied != expected:
+                    raise ValueError("The transient initial state changed during handoff")
+        return original_transient_attempt(*args, **kwargs)
 
     def solver_with_early_fields(runner, directory, command, processes, *args, **kwargs):
         if command == "rhoCentralFoam":
@@ -179,14 +257,18 @@ def main():
     initialization = patch.object(pipeline, "solve_cold_steady", solve_with_initial_guess) if arguments.quiescent_start or arguments.early_fields else nullcontext()
     output_capture = patch.object(LocalRunner, "solver", solver_with_early_fields) if arguments.early_fields else nullcontext()
     startup_control = patch.object(local_startup, "STARTUP_COURANT", arguments.startup_courant) if arguments.startup_courant is not None else nullcontext()
+    precise_initialization = patch.object(pipeline, "_prepare_transient_case", prepare_with_local_initial_guess) if arguments.precise_local_initializer else nullcontext()
+    precise_attempt = patch.object(pipeline, "_run_transient_attempt", attempt_with_local_initial_guess) if arguments.precise_local_initializer else nullcontext()
     if arguments.quiescent_start:
         report["differences"].append("quiescent internal velocity initial guess only; physical boundaries, pressure and temperature unchanged")
     if arguments.early_fields:
         report["differences"].append("retain every first-phase iteration and snapshot failed startup fields; no stepping or physical changes")
     if arguments.startup_courant is not None:
         report["differences"].append(f"startup Courant{arguments.startup_courant} for the existing50updates; original continuation ceiling and full horizon retained")
+    if arguments.precise_local_initializer:
+        report["differences"].append("isolated same-mesh upwind local-steady initial guess for original iteration allocation, then original high-order physical-time solve; one shared diagnostic budget")
     try:
-        with initialization, output_capture, startup_control:
+        with initialization, output_capture, startup_control, precise_initialization, precise_attempt:
             result = execute_job(job_id, request, store=store, settings=settings)
         report.update(solver_state=result.state.value, solver_message=result.message,
                       case_outcomes=summarize_outcomes(result),
@@ -203,6 +285,7 @@ def main():
     finally:
         report["early_captures"] = captures
         report["capture_errors"] = capture_errors
+        report["initializations"] = initializations
         (destination / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         print(json.dumps({"report": str(destination / "report.json"), "source_job": source_job,
                           "diagnostic_completed": report["diagnostic_completed"],

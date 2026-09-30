@@ -43,6 +43,7 @@ from airfoilfoam.openfoam.runner import (
     Runner,
 )
 from airfoilfoam.storage import JobStore
+from airfoilfoam.openfoam.rans_hold import root_entry
 
 
 FLUID = FluidProperties(density=1.225, dynamic_viscosity=1.81e-5)
@@ -136,6 +137,7 @@ def test_shared_mesh_is_validated_before_publish_and_revalidated_on_cache_hit(
     def validate(mesh_dir: Path, actual: MeshParams) -> bool:
         assert actual == resolved
         assert (mesh_dir / "constant" / "polyMesh" / "points").is_file()
+        assert root_entry((mesh_dir / "system/controlDict").read_text(), "writePrecision") == "17"
         checked.append(mesh_dir)
         return True
 

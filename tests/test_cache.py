@@ -188,7 +188,7 @@ def test_mesh_key_stable_for_identical_inputs(naca0012_selig_text):
     assert EngineCache.mesh_key(af1, 1.0, resolved) == EngineCache.mesh_key(af2, 1.0, resolved)
 
 
-def test_mesh_key_changes_with_chord_params_and_geometry(naca0012_selig_text, naca2412_points):
+def test_mesh_key_changes_with_chord_params_and_geometry(naca0012_selig_text, naca2412_points, monkeypatch):
     af = _airfoil(naca0012_selig_text)
     other = load_airfoil("naca2412", None, naca2412_points, AirfoilFormat.auto)
     resolved = _resolved()
@@ -199,6 +199,10 @@ def test_mesh_key_changes_with_chord_params_and_geometry(naca0012_selig_text, na
     # resolved first-cell height (sized from y+/speed) is part of the key
     finer = _resolved(speed=25.0)
     assert EngineCache.mesh_key(af, 1.0, finer) != base
+    monkeypatch.setattr(cache_module, "MESH_WRITE_PRECISION", 6)
+    rounded = EngineCache.mesh_key(af, 1.0, resolved)
+    assert rounded != base
+    assert EngineCache.seed_key(rounded, FLUID, 50.0) != EngineCache.seed_key(base, FLUID, 50.0)
 
 
 def test_mesh_key_changes_with_mesher_topology_version(naca0012_selig_text):

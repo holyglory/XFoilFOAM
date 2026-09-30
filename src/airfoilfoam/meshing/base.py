@@ -15,6 +15,8 @@ from ..airfoil import Airfoil
 from ..models import MeshParams
 from ..openfoam.runner import Runner
 
+MESH_WRITE_PRECISION = 17
+
 
 @dataclass
 class BoundaryPatch:

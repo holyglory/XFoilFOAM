@@ -122,7 +122,7 @@ class Cartesian2DExternalMesh(Mesher):
     """Internal source-preserving fallback for structured-topology exhaustion."""
 
     name = CARTESIAN2D_EXTERNAL_MESHER
-    cache_version = "cfmesh-cartesian2d-source-contour-v2"
+    cache_version = "cfmesh-cartesian2d-source-features-v3"
     user_selectable = False
 
     def patches(self, params: MeshParams) -> list[BoundaryPatch]:
@@ -238,6 +238,10 @@ class Cartesian2DExternalMesh(Mesher):
             (x * chord, y * chord, z_top)
             for x, y in base_points
         ]
+        feature_edges = (
+            [(index, index + top_offset) for index in (len(outer_loop), top_offset - 1)]
+            if airfoil.has_finite_trailing_edge else []
+        )
         faces = _side_triangles(
             outer_loop,
             [0, 1, 0, 0],
@@ -282,7 +286,10 @@ class Cartesian2DExternalMesh(Mesher):
             ),
             ")",
             "",
-            "0()",
+            str(len(feature_edges)),
+            "(",
+            *(f"({start} {end})" for start, end in feature_edges),
+            ")",
             "",
             "0",
             "(",

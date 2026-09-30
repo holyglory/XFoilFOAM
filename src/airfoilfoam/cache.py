@@ -35,7 +35,7 @@ from typing import Optional
 
 from .airfoil import Airfoil
 from .config import Settings
-from .meshing.base import Mesher, get_mesher
+from .meshing.base import MESH_WRITE_PRECISION, Mesher, get_mesher
 from .models import EngineIdentity, FluidProperties, MeshParams, RoughnessParams, SolverParams
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,7 @@ class EngineCache:
             {
                 "airfoil": contour,
                 "chord": _canon(chord),
+                "writePrecision": MESH_WRITE_PRECISION,
                 "mesh": json.loads(resolved_mesh.model_dump_json()),
                 "actualMesher": {
                     "name": actual_mesher.name,

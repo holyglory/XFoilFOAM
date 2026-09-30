@@ -48,7 +48,7 @@ from .evidence_store import (
     EvidenceStoreError,
     EvidenceUnavailableError,
 )
-from .meshing.base import Mesher, MeshResult, get_mesher
+from .meshing.base import MESH_WRITE_PRECISION, Mesher, MeshResult, get_mesher
 from .material_domain import check_material_domain, material_domain_failure
 from .models import (
     AperiodicMeanCertificate,
@@ -5320,6 +5320,13 @@ def _run_transient_attempt(
 ) -> Optional[TransientResult]:
     _check_cancel(cancel_check)
     dialect = dialect_for_runner(runner)
+    if is_compressible(runner):
+        if write_interval is None:
+            write_interval = _period_acquisition_write_interval(
+                physics.shedding_period(spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL)
+            )
+        if max_delta_t is None:
+            max_delta_t = STARTUP_MAX_DELTA_T_FACTOR * delta_t
     # Fresh attempt = fresh verdict: a marker left by a condemned earlier stage
     # (e.g. the steady init) must not poison this pimpleFoam pass.
     clear_divergence_condemnation(tcase)
@@ -8447,7 +8454,7 @@ def _write_minimal_controldict(case_dir: Path) -> None:
             "application": "blockMesh", "startFrom": "startTime", "startTime": 0,
             "stopAt": "endTime", "endTime": 1, "deltaT": 1,
             "writeControl": "timeStep", "writeInterval": 1,
-            "writeFormat": "ascii",
+            "writeFormat": "ascii", "writePrecision": MESH_WRITE_PRECISION,
         },
     )
 

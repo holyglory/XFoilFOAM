@@ -10,13 +10,34 @@ from airfoilfoam.openfoam.rans_hold import root_entry
 from airfoilfoam.pipeline import _case_builder
 from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
 from scripts.materials.inspect_mach3_startup import measured_frames, preserve_early_frames, startup_request
-from scripts.materials.inspect_cartesian_startup import energy_balances, inspect_saved_case, saved_scalar
+from scripts.materials.inspect_cartesian_startup import energy_balances, inspect_production_replay, inspect_saved_case, saved_scalar
 from test_compressible_execution import RecordedRunner
 
 
 ROOT = Path(__file__).parents[1]
 GEOMETRY = ROOT / "packages/db/seed/selig-database/fx60100.dat"
 MATERIAL = ROOT / "tests/fixtures/air-thermophysics-audit.json"
+
+
+def test_retained_native_replay_binds_its_actual_driver_and_source_request(tmp_path):
+    driver = tmp_path / "replay-driver.py"
+    source = tmp_path / "source-request.json"
+    driver.write_text("isolated driver source")
+    source.write_text('{"source_kind":"sealed-precise-recipe-not-executed"}')
+    report = {"kind": "source-bound-production-numerical-replay-v1", "production_evidence": False,
+              "source_job": "22222222-2222-4222-8222-222222222222",
+              "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+              "driver_sha256": hashlib.sha256(driver.read_bytes()).hexdigest()}
+    (tmp_path / "report.json").write_text(json.dumps(report))
+    result = inspect_production_replay(tmp_path)
+    assert result["driver_source_verified"] and result["source_request_verified"]
+    assert result["physical_validation"] is False
+    source.write_text(source.read_text() + " ")
+    with pytest.raises(ValueError, match="executed input"):
+        inspect_production_replay(tmp_path)
+    driver.write_text("changed driver")
+    with pytest.raises(ValueError, match="executed source"):
+        inspect_production_replay(tmp_path)
 
 
 @pytest.mark.parametrize("courant", [4.0, 0.25])

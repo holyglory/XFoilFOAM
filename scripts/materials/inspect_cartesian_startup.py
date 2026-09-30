@@ -127,6 +127,10 @@ def inspect_production_replay(directory):
     driver_verified = driver.is_file() and hashlib.sha256(driver.read_bytes()).hexdigest() == report.get("driver_sha256")
     if driver.exists() and not driver_verified:
         raise ValueError("Retained replay driver differs from the executed source")
+    source_request = directory / "source-request.json"
+    source_verified = source_request.is_file() and hashlib.sha256(source_request.read_bytes()).hexdigest() == report.get("source_sha256")
+    if source_request.exists() and not source_verified:
+        raise ValueError("Retained source request differs from the executed input")
     captures = []
     for location in report.get("early_captures", []):
         captured = directory / "early-fields" / Path(location).name
@@ -151,7 +155,8 @@ def inspect_production_replay(directory):
         archives.append({"archive": proof["archive"], "sha256": record.stored_sha256, "members": members})
     return {"case": directory.name, "kind": report["kind"], "source_job": report["source_job"],
             "case_outcomes": report.get("case_outcomes", []), "material_diagnostics": report.get("material_diagnostics", []),
-            "early_captures": captures, "archives": archives, "driver_source_verified": driver_verified, "physical_validation": False}
+            "early_captures": captures, "archives": archives, "driver_source_verified": driver_verified,
+            "source_request_verified": source_verified, "physical_validation": False}
 
 
 def main():
