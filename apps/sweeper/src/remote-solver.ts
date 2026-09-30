@@ -6401,6 +6401,7 @@ async function processReusablePromiseEvidence(
         FROM sync_remote_result_deliveries delivery
         WHERE delivery.promise_id = remote_promise.id
           AND delivery.result_id = solved_result.id
+          AND delivery.generation_key = solved_attempt.id::text
           AND (
             delivery.state IN ('delivered', 'blocked', 'superseded')
             OR (delivery.state = 'retry_wait' AND delivery.next_attempt_at > now())
