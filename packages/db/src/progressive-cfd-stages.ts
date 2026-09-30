@@ -4,6 +4,7 @@ import { sql } from "drizzle-orm";
 import { canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
 import { advanceGeneration } from "./progressive-campaigns";
+import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 
 async function finishCampaigns(db: DB, epochId: string): Promise<number> {
   const completed = await db.execute(sql`
@@ -117,7 +118,9 @@ export async function advanceProgressiveCfdStages(db: DB) {
       LEFT JOIN progressive_work baseline ON baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1
       LEFT JOIN progressive_prediction_links link ON link.work_id = baseline.id
         LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = link.prediction_id
-      LEFT JOIN progressive_polar_models model ON model.id = fit.model_id AND fit.state = 'ready'
+      LEFT JOIN progressive_polar_geometry_verifications verification ON verification.model_id = fit.model_id
+        AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION} AND verification.source_geometry_compatible
+      LEFT JOIN progressive_polar_models model ON model.id = verification.model_id AND fit.state = 'ready'
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND generation.stage IN (2, 3) AND work.stage = generation.stage AND work.state = 'pending'

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { afterAll, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import { progressiveCurveMetrics } from "@aerodb/core";
@@ -14,7 +15,11 @@ import {
   invalidateProgressiveFitPolicy,
 } from "@aerodb/db/progressive-polar-cache";
 import { createMinimalSolverFixture } from "../../../packages/db/test/solver-fixture";
-import { simJobs } from "@aerodb/db";
+import {
+  geometryRequiresPreservation,
+  progressiveEvidencePreservesGeometry,
+  simJobs,
+} from "@aerodb/db";
 
 const isolated = vi.hoisted(() => ({
   connection: null as DB | null,
@@ -55,6 +60,184 @@ import { assembleDetail } from "../src/services/detail";
 const { db, sql: client } = createClient({ max: 1 });
 afterAll(() => client.end({ timeout: 5 }));
 const signature = () => createHash("sha256").update(randomUUID()).digest("hex");
+
+it("backfills the source geometry publication guard without trusting old writers or excluded evidence", async () => {
+  const rollback = new Error("isolated source geometry migration proof");
+  const sharp = [
+    [1, 0],
+    [0.5, 0.1],
+    [0, 0],
+    [0.5, -0.1],
+    [1, 0],
+  ];
+  const blunt = [
+    [1, 0.005],
+    [0.5, 0.1],
+    [0, 0],
+    [0.5, -0.1],
+    [1, -0.005],
+  ];
+  await expect(
+    db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      for (const geometry of [
+        sharp,
+        blunt,
+        blunt.map(([horizontal, vertical]) => [
+          horizontal * 1000 + 5,
+          vertical * 1000 - 10,
+        ]),
+        [
+          [1, 1e-12],
+          [0, 0],
+          [1, -1e-12],
+        ],
+      ]) {
+        const [result] = await connection.execute(
+          sql`SELECT polar_geometry_requires_preservation(${JSON.stringify(geometry)}::jsonb) AS required`,
+        );
+        expect
+          .soft(result.required)
+          .toBe(geometryRequiresPreservation(geometry));
+        for (const version of [
+          undefined,
+          null,
+          "3",
+          0,
+          2,
+          3,
+          4,
+          3.5,
+          2147483648,
+        ]) {
+          const payload = { mesh_recovery_version: version };
+          const [compatible] =
+            await connection.execute(sql`SELECT NOT polar_geometry_requires_preservation(${JSON.stringify(geometry)}::jsonb)
+          OR progressive_preserves_source_geometry(${JSON.stringify(payload)}::jsonb) AS accepted`);
+          expect
+            .soft(compatible.accepted)
+            .toBe(progressiveEvidencePreservesGeometry({ geometry }, payload));
+        }
+      }
+      for (const geometry of [null, {}, [null, null, null], [[1], [0], [1]]]) {
+        const [result] = await connection.execute(
+          sql`SELECT polar_geometry_requires_preservation(${JSON.stringify(geometry)}::jsonb) AS required`,
+        );
+        expect.soft(result.required).toBeNull();
+      }
+      await connection.execute(
+        sql.raw(`
+      CREATE TEMP TABLE progressive_polar_models(id text PRIMARY KEY, prediction_id text, response jsonb) ON COMMIT DROP;
+      CREATE TEMP TABLE progressive_polar_geometry_verifications(model_id text,policy_version integer,source_geometry_compatible boolean NOT NULL,PRIMARY KEY(model_id,policy_version)) ON COMMIT DROP;
+      CREATE TEMP TABLE progressive_polar_fit_work(model_id text, policy_refresh_model_id text) ON COMMIT DROP;
+      CREATE TEMP TABLE neuralfoil_predictions(id text PRIMARY KEY, target_id text) ON COMMIT DROP;
+      CREATE TEMP TABLE polar_analysis_targets(id text PRIMARY KEY, physical jsonb) ON COMMIT DROP;
+      CREATE TEMP TABLE result_attempts(id uuid PRIMARY KEY, evidence_payload jsonb) ON COMMIT DROP;
+    `),
+      );
+      const cases = [
+        {
+          name: "sharp-old",
+          geometry: sharp,
+          version: 2,
+          used: true,
+          compatible: true,
+        },
+        {
+          name: "blunt-old",
+          geometry: blunt,
+          version: 2,
+          used: true,
+          compatible: false,
+        },
+        {
+          name: "blunt-current",
+          geometry: blunt,
+          version: 3,
+          used: true,
+          compatible: true,
+        },
+        {
+          name: "blunt-unknown",
+          geometry: blunt,
+          version: null,
+          used: true,
+          compatible: false,
+        },
+        {
+          name: "blunt-missing",
+          geometry: blunt,
+          version: 3,
+          used: true,
+          compatible: false,
+          missing: true,
+        },
+        {
+          name: "blunt-excluded",
+          geometry: blunt,
+          version: 2,
+          used: false,
+          compatible: true,
+        },
+      ];
+      for (const item of cases) {
+        const attemptId = randomUUID();
+        const response = {
+          estimate: {
+            contributors: item.used ? [{ attempt_id: attemptId }] : [],
+            excluded: item.used
+              ? []
+              : [{ observation_id: attemptId, reason: "excluded" }],
+          },
+        };
+        await connection.execute(
+          sql`INSERT INTO polar_analysis_targets VALUES(${item.name},${JSON.stringify({ geometry: item.geometry })}::jsonb)`,
+        );
+        await connection.execute(
+          sql`INSERT INTO neuralfoil_predictions VALUES(${item.name},${item.name})`,
+        );
+        await connection.execute(
+          sql`INSERT INTO progressive_polar_models(id,prediction_id,response) VALUES(${item.name},${item.name},${JSON.stringify(response)}::jsonb)`,
+        );
+        await connection.execute(
+          sql`INSERT INTO progressive_polar_fit_work VALUES(${item.name === "blunt-old" ? null : item.name},${item.name === "blunt-old" ? item.name : null})`,
+        );
+        if (!item.missing)
+          await connection.execute(
+            sql`INSERT INTO result_attempts VALUES(${attemptId}::uuid,${JSON.stringify({ mesh_recovery_version: item.version })}::jsonb)`,
+          );
+      }
+      const migration = readFileSync(
+        new URL(
+          "../../../packages/db/migrations/0163_progressive_source_geometry.sql",
+          import.meta.url,
+        ),
+        "utf8",
+      );
+      await connection.execute(
+        sql.raw(migration.split("--> statement-breakpoint").at(-1)!),
+      );
+      const rows = await connection.execute(
+        sql`SELECT model_id AS id,source_geometry_compatible FROM progressive_polar_geometry_verifications ORDER BY model_id`,
+      );
+      for (const item of cases)
+        expect
+          .soft(
+            rows.find((row) => row.id === item.name)
+              ?.source_geometry_compatible,
+          )
+          .toBe(item.compatible);
+      await connection.execute(
+        sql`INSERT INTO progressive_polar_models(id,prediction_id,response) VALUES('old-writer-after-migration','blunt-old','{}')`,
+      );
+      const [oldWriter] = await connection.execute(
+        sql`SELECT EXISTS(SELECT 1 FROM progressive_polar_geometry_verifications WHERE model_id='old-writer-after-migration' AND source_geometry_compatible) AS published`,
+      );
+      expect.soft(oldWriter.published).toBe(false);
+      throw rollback;
+    }),
+  ).rejects.toBe(rollback);
+});
 
 it("keeps stored catalog summaries equivalent to curve metrics and rejects malformed caches", async () => {
   const cases = [
@@ -386,6 +569,9 @@ async function verifyPublicCatalog(fullScale: boolean) {
           sql`INSERT INTO progressive_polar_models(id,prediction_id,source_signature,request,response) VALUES(${modelId},${first.predictionId},${modelId},'{}',${JSON.stringify(response)}::jsonb)`,
         );
         await connection.execute(
+          sql`INSERT INTO progressive_polar_geometry_verifications(model_id,source_geometry_compatible) VALUES(${modelId},true)`,
+        );
+        await connection.execute(
           sql`INSERT INTO progressive_polar_fit_work(prediction_id,state,model_id) VALUES(${first.predictionId},'ready',${modelId}) ON CONFLICT(prediction_id) DO UPDATE SET state='ready',model_id=EXCLUDED.model_id`,
         );
         const firstCondition = catalog.conditions.find(
@@ -408,6 +594,67 @@ async function verifyPublicCatalog(fullScale: boolean) {
         const published = (
           await publicProgressivePolars(connection, profiles[0])
         ).find((polar) => polar.targetId === first.targetId)!;
+        const unsafeModelId = signature();
+        await connection.execute(sql`INSERT INTO progressive_polar_models(id,prediction_id,source_signature,request,response)
+          VALUES(${unsafeModelId},${first.predictionId},${unsafeModelId},'{}',${JSON.stringify({ ...response, estimate: { ...response.estimate, signature: unsafeModelId } })}::jsonb)`);
+        await connection.execute(
+          sql`INSERT INTO progressive_polar_geometry_verifications(model_id,source_geometry_compatible) VALUES(${unsafeModelId},false)`,
+        );
+        await expect(
+          connection.transaction(async (savepoint) => {
+            await savepoint.execute(
+              sql`UPDATE progressive_polar_models SET response=response WHERE id=${unsafeModelId}`,
+            );
+          }),
+        ).rejects.toThrow("immutable");
+        await expect(
+          connection.transaction(async (savepoint) => {
+            await savepoint.execute(
+              sql`UPDATE progressive_polar_geometry_verifications SET source_geometry_compatible=true WHERE model_id=${unsafeModelId}`,
+            );
+          }),
+        ).rejects.toThrow("immutable");
+        await connection.execute(
+          sql`UPDATE progressive_polar_fit_work SET model_id=${unsafeModelId} WHERE prediction_id=${first.predictionId}`,
+        );
+        const baseline = (
+          await publicProgressivePolars(connection, profiles[0])
+        ).find((polar) => polar.targetId === first.targetId)!;
+        expect(baseline.kind).toBe("prediction");
+        expect(baseline.modelId).toBe(first.predictionId);
+        const baselineMetrics = (
+          await publicProgressiveCatalog(
+            connection,
+            profiles,
+            firstCondition.key,
+          )
+        ).metrics.get(profiles[0])!;
+        expect(baselineMetrics.source).toBe("prediction");
+        expect(baselineMetrics.ldmax).toBe(
+          baseline.curves[0].metrics.liftToDragMaximum,
+        );
+        expect(
+          await invalidateProgressiveFitPolicy(
+            connection,
+            "unsafe-geometry-refresh",
+          ),
+        ).toBe(1);
+        const [hidden] = await connection.execute(
+          sql`SELECT model_id,policy_refresh_model_id,policy_refresh_policy_id FROM progressive_polar_fit_work WHERE prediction_id=${first.predictionId}`,
+        );
+        expect(hidden).toMatchObject({
+          model_id: null,
+          policy_refresh_model_id: null,
+          policy_refresh_policy_id: null,
+        });
+        expect(
+          (await publicProgressivePolars(connection, profiles[0])).find(
+            (polar) => polar.targetId === first.targetId,
+          ),
+        ).toEqual(baseline);
+        await connection.execute(
+          sql`UPDATE progressive_polar_fit_work SET state='ready',model_id=${modelId} WHERE prediction_id=${first.predictionId}`,
+        );
         for (const policyId of [null, "", "  "]) {
           await expect(
             connection.transaction(async (savepoint) => {

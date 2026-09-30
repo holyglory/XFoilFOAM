@@ -8377,6 +8377,27 @@ export const progressivePolarModels = pgTable("progressive_polar_models", {
     .default(sql`clock_timestamp()`),
 });
 
+export const progressivePolarGeometryVerifications = pgTable(
+  "progressive_polar_geometry_verifications",
+  {
+    modelId: text("model_id")
+      .notNull()
+      .references(() => progressivePolarModels.id, { onDelete: "cascade" }),
+    policyVersion: integer("policy_version").notNull().default(1),
+    sourceGeometryCompatible: boolean("source_geometry_compatible").notNull(),
+    checkedAt: timestamp("checked_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    key: primaryKey({ columns: [table.modelId, table.policyVersion] }),
+    policyCheck: check(
+      "progressive_polar_geometry_verifications_policy_version_check",
+      sql`${table.policyVersion} > 0`,
+    ),
+  }),
+);
+
 export const progressivePolarFitWork = pgTable(
   "progressive_polar_fit_work",
   {

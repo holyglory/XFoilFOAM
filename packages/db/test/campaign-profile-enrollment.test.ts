@@ -6112,6 +6112,101 @@ describe("bounded progressive numerical recovery", () => {
 });
 
 describe("persistent progressive polar cache", () => {
+  it.each([2, 3])(
+    "requires source-preserving CFD on a finite trailing edge (mesh version %s)",
+    async (meshVersion) => {
+      const finitePoints = points.map((point, index) => ({
+        ...point,
+        y: index === 0 ? 0.005 : index === points.length - 1 ? -0.005 : point.y,
+      }));
+      await db
+        .update(airfoils)
+        .set({ points: finitePoints })
+        .where(eq(airfoils.id, originalId));
+      try {
+        const fixture = await fitFixture();
+        const evidence = await fixture.save(40);
+        await db
+          .update(resultAttempts)
+          .set({
+            evidencePayload: {
+              solver_active_seconds: 40,
+              cl: 0.7,
+              cd: 0.025,
+              cm: -0.03,
+              converged: true,
+              mesh_recovery_version: meshVersion,
+            },
+          })
+          .where(eq(resultAttempts.id, evidence));
+        await fixture.record([evidence]);
+        const lease = (await fixture.acquire())!;
+        const request = buildProgressiveFitRequest(lease);
+        expect(request.observations).toHaveLength(1);
+        expect(request.observations[0].eligible).toBe(meshVersion >= 3);
+        if (meshVersion < 3) {
+          expect(request.observations[0].exclusion_reason).toBe(
+            "unverified_source_geometry",
+          );
+          const forged = structuredClone(request);
+          Object.assign(forged.observations[0], {
+            eligible: true,
+            exclusion_reason: null,
+            coefficients: [0.7, 0.025, -0.03],
+            standard_error: [0.03, 0.00075, 0.005],
+          });
+          const forgedResponse = await fitUsingPython(forged);
+          await expect(
+            storeProgressivePolarFit(db, lease, forged, forgedResponse),
+          ).rejects.toThrow("overstates its evidence eligibility");
+        }
+        const response = await fitUsingPython(request);
+        const modelId = await storeProgressivePolarFit(
+          db,
+          lease,
+          request,
+          response,
+        );
+        expect(response.estimate.contributors).toHaveLength(
+          meshVersion >= 3 ? 1 : 0,
+        );
+        const [model] = await db.execute(
+          sql`SELECT source_geometry_compatible FROM progressive_polar_geometry_verifications WHERE model_id=${modelId} AND policy_version=1`,
+        );
+        expect(model.source_geometry_compatible).toBe(true);
+        const [retained] = await db.execute(
+          sql`SELECT evidence_payload FROM result_attempts WHERE id=${evidence}`,
+        );
+        expect(retained.evidence_payload).toMatchObject({
+          cl: 0.7,
+          mesh_recovery_version: meshVersion,
+        });
+        if (meshVersion < 3) {
+          const curve = (
+            await publicProgressivePolars(
+              db,
+              originalId,
+              fixture.leases[0].revisionId,
+            )
+          ).find((polar) => polar.targetId === lease.source.targetId)!;
+          expect(curve.explanation.exclusions).toContainEqual({
+            observationId: request.observations[0].observation_id,
+            reason: "unverified_source_geometry",
+          });
+          expect(curve.curves.map((item) => item.method)).not.toContain(
+            "openfoam_fast",
+          );
+        }
+      } finally {
+        await db
+          .update(airfoils)
+          .set({ points })
+          .where(eq(airfoils.id, originalId));
+      }
+    },
+    120_000,
+  );
+
   it("fits a NeuralFoil-only preliminary polar before CFD evidence exists", async () => {
     const fixture = await fitFixture();
     const engine = new EngineClient("http://unused.invalid");

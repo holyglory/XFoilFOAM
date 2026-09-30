@@ -2,6 +2,7 @@ import type { PolarMetricCondition } from "@aerodb/core";
 import { sql } from "drizzle-orm";
 import { analysisContentHash, type AnalysisPhysical } from "./analysis-target";
 import type { DB } from "./client";
+import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 
 type Condition = Omit<AnalysisPhysical, "airfoilId" | "geometry">;
 type CatalogCondition = { groupId: string; condition: PolarMetricCondition };
@@ -51,8 +52,9 @@ function latestCatalogCurves(airfoilIds?: string[], groupId?: string) {
     JOIN polar_analysis_targets target ON target.id = prediction.target_id
     JOIN airfoils airfoil ON airfoil.id = target.airfoil_id
     LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = prediction.id
-    LEFT JOIN progressive_polar_models model ON model.id = CASE WHEN fit.state = 'ready'
-      THEN fit.model_id ELSE fit.policy_refresh_model_id END AND model.prediction_id = prediction.id
+    LEFT JOIN progressive_polar_geometry_verifications verification ON verification.model_id = CASE WHEN fit.state = 'ready'
+      THEN fit.model_id ELSE fit.policy_refresh_model_id END AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION} AND verification.source_geometry_compatible
+    LEFT JOIN progressive_polar_models model ON model.id = verification.model_id AND model.prediction_id = prediction.id
     WHERE airfoil."deletedAt" IS NULL AND airfoil."archivedAt" IS NULL
       AND ${
         airfoilIds

@@ -3,6 +3,8 @@ import {
   analysisContentHash,
   claimProgressivePolarFit,
   failProgressivePolarFit,
+  progressiveEvidencePreservesGeometry,
+  SOURCE_GEOMETRY_MESH_VERSION,
   storeProgressivePolarFit,
   type DB,
   type ProgressiveFitEvidence,
@@ -18,7 +20,8 @@ import type {
 } from "@aerodb/engine-client";
 
 const ASSUMPTIONS = {
-  version: "progressive-fit-assumptions-v6",
+  version: "progressive-fit-assumptions-v7",
+  sourceGeometryMeshVersion: SOURCE_GEOMETRY_MESH_VERSION,
   historyOrigin: "recorded-source-before-windowing-v1",
   informativeWindow: "post-startup-suffix-v1",
   minimumUncertifiedConvectiveTransits: 1,
@@ -255,6 +258,8 @@ function candidateFor(
     )
   )
     return excluded(candidate, "divergent_or_fatal_solver_evidence");
+  if (!progressiveEvidencePreservesGeometry(lease.source.physical, payload))
+    return excluded(candidate, "unverified_source_geometry");
   const transient = record(payload.force_history);
   const steady = record(payload.steady_history);
   const raw = transient ?? steady;

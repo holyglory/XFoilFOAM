@@ -93,6 +93,7 @@ export async function verifyAdoptedEvidenceAccess(
       };
       await connection.execute(sql`INSERT INTO progressive_polar_models(id,prediction_id,source_signature,request,response)
         VALUES(${modelId},${predictionId},${modelId},'{}'::jsonb,${JSON.stringify(response)}::jsonb)`);
+      await connection.execute(sql`INSERT INTO progressive_polar_geometry_verifications(model_id,source_geometry_compatible) VALUES(${modelId},true)`);
       await connection.execute(sql`INSERT INTO progressive_polar_model_evidence(model_id,attempt_token,result_attempt_id)
         SELECT ${modelId},attempt_token,result_attempt_id FROM progressive_cfd_evidence
         WHERE result_attempt_id=${source.attemptId}::uuid LIMIT 1`);

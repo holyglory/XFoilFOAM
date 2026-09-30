@@ -5,14 +5,26 @@ import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
 const origin = process.argv.includes("--production")
   ? "https://airfoils.pro"
   : progressivePreviewOrigin();
-const slug = process.argv.includes("--production") ? "joukowsk" : "ag24";
+const sourceGeometry = process.argv.includes("--source-geometry");
+const slug = sourceGeometry
+  ? "sg6051"
+  : process.argv.includes("--production")
+    ? "joukowsk"
+    : "ag24";
 const detailResponse = await fetch(
   `${origin}/api/airfoils/${slug}?view=curves`,
 );
 assert(detailResponse.ok);
 const detail = await detailResponse.json();
 assert(detail.progressivePolars.length >= 2);
-const selected = detail.progressivePolars[0];
+const selected = sourceGeometry
+  ? detail.progressivePolars.find(
+      (series) =>
+        series.targetId ===
+        "a60be87737f0579927b96872c9074bdd52f116550dda162ddcb6e6d158fd4eb2",
+    )
+  : detail.progressivePolars[0];
+assert(selected);
 const alternate = detail.progressivePolars.find(
   (series) => series.conditionKey !== selected.conditionKey,
 );

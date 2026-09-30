@@ -1057,6 +1057,16 @@ either function. These two-angle calculations establish a regression boundary,
 not complete-polar accuracy or calibrated uncertainty. Existing production
 evidence, fit refresh and campaign correction remain separate rollout work.
 
+Progressive publication uses versioned, immutable source-geometry verification
+receipts without changing stored fitted models or solver attempts. A finite
+trailing edge requires CFD evidence from mesh-recovery contract 3 or later.
+Older or unverified evidence stays in history but cannot correct the prediction.
+Public Detail, Browse/Search/Compare metrics and adaptive selection share this
+gate. Missing or incompatible verification falls back to the real cached
+prediction, including while a replacement fit is pending; an unsafe old fit is
+not served as a stale curve during policy refresh. This checks the known geometry
+compatibility contract, not complete aerodynamic accuracy or calibrated error.
+
 A canonical binding that arrives after completed progressive-custody cleanup may
 acknowledge that completed cleanup without another deletion. The original job,
 case, upload and remote generation must match, the retained manifest and immutable

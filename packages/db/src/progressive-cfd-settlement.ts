@@ -4,6 +4,7 @@ import { assertProgressiveExecutionIdentity } from "./progressive-execution-iden
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
+import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 import {
   progressiveCfdNeverStartedAttemptCountSql,
   progressiveCfdOrdinaryAttemptCountSql,
@@ -264,7 +265,9 @@ export async function settleProgressiveCfdExecution(
       LEFT JOIN LATERAL (
         SELECT fit.state, model.response FROM neuralfoil_predictions prediction
         JOIN progressive_polar_fit_work fit ON fit.prediction_id = prediction.id
-        LEFT JOIN progressive_polar_models model ON model.id = fit.model_id AND fit.state = 'ready'
+        LEFT JOIN progressive_polar_geometry_verifications verification ON verification.model_id = fit.model_id
+          AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION} AND verification.source_geometry_compatible
+        LEFT JOIN progressive_polar_models model ON model.id = verification.model_id AND fit.state = 'ready'
         WHERE prediction.target_id = work.target_id AND prediction.epoch_id = generation.epoch_id
         ORDER BY prediction.created_at DESC, prediction.id DESC LIMIT 1
       ) fitted ON true

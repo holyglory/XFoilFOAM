@@ -6,6 +6,7 @@ import type { ProgressivePolarEstimate } from "../../engine-client/src/progressi
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { describeCondition } from "./progressive-catalog";
+import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 import {
   progressiveComparisonConditionKey,
   type AnalysisPhysical,
@@ -161,8 +162,9 @@ export async function publicProgressivePolars(
     JOIN calculation_epochs epoch ON epoch.id = prediction.epoch_id AND epoch.current
     JOIN polar_analysis_targets target ON target.id = prediction.target_id
     LEFT JOIN progressive_polar_fit_work fit ON fit.prediction_id = prediction.id
-    LEFT JOIN progressive_polar_models model ON model.id = CASE WHEN fit.state = 'ready'
-      THEN fit.model_id ELSE fit.policy_refresh_model_id END AND model.prediction_id = prediction.id
+    LEFT JOIN progressive_polar_geometry_verifications verification ON verification.model_id = CASE WHEN fit.state = 'ready'
+      THEN fit.model_id ELSE fit.policy_refresh_model_id END AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION} AND verification.source_geometry_compatible
+    LEFT JOIN progressive_polar_models model ON model.id = verification.model_id AND model.prediction_id = prediction.id
     WHERE target.airfoil_id = ${airfoilId} AND EXISTS (
       SELECT 1 FROM progressive_generation_targets scope
       JOIN progressive_generations generation ON generation.id = scope.generation_id AND generation.epoch_id = epoch.id

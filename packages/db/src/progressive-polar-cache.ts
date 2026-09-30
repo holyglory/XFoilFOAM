@@ -11,6 +11,10 @@ import {
   type AnalysisPhysical,
 } from "./analysis-target";
 import type { DB } from "./client";
+import {
+  progressiveEvidencePreservesGeometry,
+  SOURCE_GEOMETRY_POLICY_VERSION,
+} from "./progressive-evidence-geometry";
 
 export interface ProgressiveFitEvidence {
   attemptToken: string;
@@ -150,9 +154,14 @@ export async function invalidateProgressiveFitPolicy(
   const updated = await db.execute(sql`
     UPDATE progressive_polar_fit_work work SET source_version = work.source_version + 1,
       state = 'pending', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-      policy_refresh_model_id = model.id, policy_refresh_policy_id = ${policyId}, model_id = NULL,
+      policy_refresh_model_id = CASE WHEN verification.source_geometry_compatible THEN model.id ELSE NULL END,
+      policy_refresh_policy_id = CASE WHEN verification.source_geometry_compatible THEN ${policyId} ELSE NULL END,
+      model_id = NULL,
       attempts = 0, error = NULL, updated_at = clock_timestamp()
-    FROM progressive_polar_models model, neuralfoil_predictions prediction, calculation_epochs epoch
+    FROM progressive_polar_models model
+    LEFT JOIN progressive_polar_geometry_verifications verification
+      ON verification.model_id = model.id AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION},
+      neuralfoil_predictions prediction, calculation_epochs epoch
     WHERE coalesce(work.model_id, work.policy_refresh_model_id) = model.id AND prediction.id = work.prediction_id
       AND epoch.id = prediction.epoch_id AND epoch.current AND (
         (work.state = 'ready' AND model.response->'estimate'->>'policy_id' IS DISTINCT FROM ${policyId})
@@ -275,6 +284,7 @@ function exactObservation(
   if (
     observation.eligible &&
     (observation.exclusion_reason ||
+      !progressiveEvidencePreservesGeometry(source.physical, row.payload) ||
       ["exclude", "defer"].includes(row.review?.verdict ?? "") ||
       row.classification?.state === "superseded_by_urans" ||
       row.classification?.reasons.some((reason) =>
@@ -617,6 +627,13 @@ export async function storeProgressivePolarFit(
       VALUES (${id}, ${lease.predictionId}, ${current.signature}, ${canonicalAnalysisJson(manifest)}::jsonb, ${canonicalAnalysisJson(response)}::jsonb)
       ON CONFLICT (id) DO NOTHING
     `);
+    await connection.execute(sql`INSERT INTO progressive_polar_geometry_verifications(model_id,policy_version,source_geometry_compatible)
+      VALUES(${id},${SOURCE_GEOMETRY_POLICY_VERSION},true) ON CONFLICT (model_id,policy_version) DO NOTHING`);
+    const [verification] =
+      await connection.execute(sql`SELECT source_geometry_compatible FROM progressive_polar_geometry_verifications
+      WHERE model_id=${id} AND policy_version=${SOURCE_GEOMETRY_POLICY_VERSION}`);
+    if (verification?.source_geometry_compatible !== true)
+      throw new Error("Fitted polar lacks source-geometry verification");
     for (const evidence of current.evidence) {
       await connection.execute(sql`
         INSERT INTO progressive_polar_model_evidence(model_id, attempt_token, result_attempt_id)
