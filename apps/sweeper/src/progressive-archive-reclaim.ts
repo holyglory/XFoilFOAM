@@ -370,11 +370,45 @@ async function reclaimClaim(
   }
 }
 
+export async function reconcileCompletedProgressiveArchiveReclaims(
+  db: DB,
+): Promise<number> {
+  const rows = await db.execute(sql`
+    WITH completed AS (
+      SELECT reclaim.sim_job_id,reclaim.point_content_signature,canonical.reclaimed_at
+      FROM progressive_worker_archive_reclaims reclaim
+      JOIN progressive_worker_hub_receipts retained USING(sim_job_id,point_content_signature)
+      JOIN progressive_worker_archive_receipts custody USING(sim_job_id,point_content_signature)
+      JOIN result_attempts attempt ON attempt.id=retained.result_attempt_id
+        AND attempt.sim_job_id=reclaim.sim_job_id AND attempt.engine_job_id=reclaim.sim_job_id::text
+      JOIN sync_remote_hub_binding_receipts canonical ON canonical.result_attempt_id=attempt.id
+        AND canonical.result_id=attempt.result_id AND canonical.sim_job_id=reclaim.sim_job_id
+        AND canonical.brokered_upload_id=custody.brokered_upload_id
+      WHERE reclaim.completed_at IS NULL
+        AND (reclaim.claim_token IS NULL OR reclaim.claim_expires_at<=clock_timestamp())
+        AND canonical.reclaim_state='reclaimed' AND canonical.reclaimed_at IS NOT NULL
+        AND canonical.reclaimed_bytes>=0
+        AND canonical.promise_id::text=custody.receipt#>>'{receipt,source,promiseId}'
+        AND canonical.receipt->>'engineJobId'=reclaim.sim_job_id::text
+        AND canonical.receipt->'remote'=custody.receipt#>'{receipt,remote}'
+      ORDER BY canonical.reclaimed_at,reclaim.sim_job_id,reclaim.point_content_signature
+      LIMIT 128 FOR UPDATE OF reclaim SKIP LOCKED
+    )
+    UPDATE progressive_worker_archive_reclaims reclaim SET completed_at=completed.reclaimed_at,
+      reclaimed_bytes=0,claim_token=NULL,claim_expires_at=NULL,last_error=NULL
+    FROM completed WHERE reclaim.sim_job_id=completed.sim_job_id
+      AND reclaim.point_content_signature=completed.point_content_signature RETURNING reclaim.sim_job_id
+  `);
+  return rows.length;
+}
+
 export async function reclaimProgressiveArchives(
   db: DB,
   settings: Settings,
   limit = 8,
 ): Promise<number> {
+  const alreadyReclaimed =
+    await reconcileCompletedProgressiveArchiveReclaims(db);
   const claims: Claim[] = [];
   for (
     let index = 0;
@@ -388,5 +422,5 @@ export async function reclaimProgressiveArchives(
   const results = await Promise.all(
     claims.map((claim) => reclaimClaim(db, settings, claim)),
   );
-  return results.reduce((total, count) => total + count, 0);
+  return results.reduce((total, count) => total + count, alreadyReclaimed);
 }

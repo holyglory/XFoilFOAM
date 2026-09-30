@@ -8,9 +8,82 @@ import {
   progressiveArchiveSelectionSql,
 } from "../../../apps/sweeper/src/progressive-worker-archive-delivery";
 import type { DB } from "../src/client";
+import { reconcileCompletedProgressiveArchiveReclaims } from "../../../apps/sweeper/src/progressive-archive-reclaim";
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+it("recognizes exact completed canonical cleanup without deleting again or double-counting bytes", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE reclaim_cases ON COMMIT DROP AS
+      SELECT md5(variant)::uuid id,variant FROM unnest(ARRAY['exact','live-claim','pending','wrong-job','wrong-attempt-job',
+        'wrong-result','wrong-upload','wrong-promise','wrong-source','wrong-generation','missing-remote','already-complete']) variant`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_archive_reclaims ON COMMIT DROP AS
+      SELECT id AS sim_job_id,'signature'::text AS point_content_signature,
+        CASE WHEN variant='already-complete' THEN timestamptz '2026-01-01' END AS completed_at,
+        CASE WHEN variant='already-complete' THEN 123 ELSE 0 END::bigint AS reclaimed_bytes,
+        CASE WHEN variant='live-claim' THEN md5('claim')::uuid END AS claim_token,
+        CASE WHEN variant='live-claim' THEN clock_timestamp()+interval '1 day' END AS claim_expires_at,
+        'stale failure'::text AS last_error FROM reclaim_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_hub_receipts ON COMMIT DROP AS
+      SELECT id AS sim_job_id,'signature'::text AS point_content_signature,id AS result_attempt_id FROM reclaim_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
+      SELECT id,id AS result_id,CASE WHEN variant='wrong-attempt-job' THEN md5('foreign')::uuid ELSE id END AS sim_job_id,
+        id::text AS engine_job_id FROM reclaim_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_archive_receipts ON COMMIT DROP AS
+      SELECT id AS sim_job_id,'signature'::text AS point_content_signature,id AS brokered_upload_id,
+        jsonb_build_object('receipt',jsonb_build_object('source',jsonb_build_object('promiseId',id::text),
+          'remote',jsonb_build_object('generation','1','storedSha256','sha','storedByteSize',42))) AS receipt FROM reclaim_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_remote_hub_binding_receipts ON COMMIT DROP AS
+      SELECT id AS result_attempt_id,CASE WHEN variant='wrong-result' THEN md5('foreign')::uuid ELSE id END AS result_id,
+        CASE WHEN variant='wrong-job' THEN md5('foreign')::uuid ELSE id END AS sim_job_id,
+        CASE WHEN variant='wrong-upload' THEN md5('foreign')::uuid ELSE id END AS brokered_upload_id,
+        CASE WHEN variant='wrong-promise' THEN md5('foreign')::uuid ELSE id END AS promise_id,
+        CASE WHEN variant='pending' THEN 'pending' ELSE 'reclaimed' END AS reclaim_state,
+        timestamptz '2026-01-01' AS reclaimed_at,42::bigint AS reclaimed_bytes,
+        jsonb_build_object('engineJobId',CASE WHEN variant='wrong-source' THEN 'foreign' ELSE id::text END,
+          'remote',CASE WHEN variant='missing-remote' THEN NULL::jsonb ELSE
+          jsonb_build_object('generation',CASE WHEN variant='wrong-generation' THEN '2' ELSE '1' END,'storedSha256','sha','storedByteSize',42) END) AS receipt
+      FROM reclaim_cases`);
+    const before = await transaction.execute(
+      sql`SELECT to_jsonb(receipt) AS value FROM sync_remote_hub_binding_receipts receipt ORDER BY result_attempt_id`,
+    );
+    expect(
+      await reconcileCompletedProgressiveArchiveReclaims(
+        transaction as unknown as DB,
+      ),
+    ).toBe(1);
+    expect(
+      await reconcileCompletedProgressiveArchiveReclaims(
+        transaction as unknown as DB,
+      ),
+    ).toBe(0);
+    const [settled] =
+      await transaction.execute(sql`SELECT completed_at,reclaimed_bytes,claim_token,last_error
+      FROM progressive_worker_archive_reclaims WHERE sim_job_id=md5('exact')::uuid`);
+    expect(settled).toMatchObject({
+      reclaimed_bytes: "0",
+      claim_token: null,
+      last_error: null,
+    });
+    expect(new Date(String(settled.completed_at)).toISOString()).toBe(
+      "2026-01-01T00:00:00.000Z",
+    );
+    expect(
+      await transaction.execute(
+        sql`SELECT to_jsonb(receipt) AS value FROM sync_remote_hub_binding_receipts receipt ORDER BY result_attempt_id`,
+      ),
+    ).toEqual(before);
+    const [retained] = await transaction.execute(
+      sql`SELECT count(*)::int AS count FROM progressive_worker_archive_reclaims WHERE completed_at IS NULL`,
+    );
+    expect(retained.count).toBe(10);
+    const [original] = await transaction.execute(
+      sql`SELECT reclaimed_bytes FROM progressive_worker_archive_reclaims WHERE sim_job_id=md5('already-complete')::uuid`,
+    );
+    expect(String(original.reclaimed_bytes)).toBe("123");
+  });
+});
 
 it("settles fulfilled and active jobs fairly while expired work keeps arriving", async () => {
   await client.db.transaction(async (transaction) => {
