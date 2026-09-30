@@ -3661,7 +3661,11 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       remoteAdmissionConsumed: true,
       admissionStatus: { status: "solving", error: null },
     });
-    expect(forbiddenRansSubmit).not.toHaveBeenCalled();
+    expect(forbiddenRansSubmit).toHaveBeenCalledTimes(1);
+    expect(forbiddenRansSubmit.mock.calls[0]?.[0]).toMatchObject({
+      aoa: { angles: [aoa] },
+      solver: { urans_fidelity: "precalc" },
+    });
     expect(
       await db
         .select({ id: simJobs.id })
