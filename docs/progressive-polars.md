@@ -1351,10 +1351,12 @@ Completed campaigns reopen for the new numerical work; paused campaigns stay
 paused, and cancelled or archived campaigns are not changed. Normal catalog
 enrollment uses the successor conditions when later profiles arrive.
 
-The explicit `--defer-stopped-archives` option separates already-stopped remote
-execution from archive uploads still in progress. It requires paused admission,
+The explicit `--defer-stopped-evidence` option separates already-stopped
+execution from archive uploads or derived polar fitting still in progress. It requires paused admission,
 the exact recorded physical stop, immutable dispatch scope, fully applied report
-inventories and no active ingestion lease. It only supersedes scheduling scope;
+inventories and no active ingestion lease for remote archive waits. Already
+ingested terminal results may also hand off their unfinished fitting work after
+exact physical-stop proof. It only supersedes scheduling scope;
 it does not mark evidence complete, delete archives or change stored results.
 Normal obsolete-execution settlement releases the old jobs and promises while
 the existing stopped-storage path retains outstanding evidence. The new plan

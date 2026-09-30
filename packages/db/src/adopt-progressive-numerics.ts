@@ -7,11 +7,11 @@ if (
   !campaignId ||
   !sourcePlanId ||
   !["--dry-run", "--apply"].includes(mode) ||
-  (handoff !== undefined && handoff !== "--defer-stopped-archives") ||
+  (handoff !== undefined && handoff !== "--defer-stopped-evidence") ||
   process.argv.length > 6
 )
   throw new Error(
-    "Usage: adopt-progressive-numerics CAMPAIGN_UUID SOURCE_PLAN_UUID [--dry-run|--apply] [--defer-stopped-archives]",
+    "Usage: adopt-progressive-numerics CAMPAIGN_UUID SOURCE_PLAN_UUID [--dry-run|--apply] [--defer-stopped-evidence]",
   );
 const { db, sql } = createClient({ max: 1 });
 const rollback = new Error("reviewed numerical transition dry-run rollback");
@@ -23,7 +23,7 @@ try {
         transaction as unknown as typeof db,
         campaignId,
         sourcePlanId,
-        { deferStoppedArchives: handoff === "--defer-stopped-archives" },
+        { deferStoppedEvidence: handoff === "--defer-stopped-evidence" },
       );
       if (mode === "--dry-run") throw rollback;
     })

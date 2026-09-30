@@ -520,7 +520,7 @@ describe("durable progressive scope requests", () => {
     ).rejects.toThrow("physically stopped and settled");
     await db
       .update(simJobs)
-      .set({ status: "done", ingestedAt: new Date() })
+      .set({ status: "done", engineState: "completed", ingestedAt: new Date() })
       .where(eq(simJobs.id, fixture.composed.jobId));
     await expect(
       adoptProgressiveNumerics2(db, fixture.campaignId, plan),
@@ -533,6 +533,17 @@ describe("durable progressive scope requests", () => {
       adoptProgressiveNumerics2(db, fixture.campaignId, plan),
     ).rejects.toThrow("physically stopped and settled");
     const fit = (await fixture.acquire())!;
+    const retainedAttempts = await db.select().from(resultAttempts).where(eq(resultAttempts.simJobId,fixture.composed.jobId));
+    const rollback = new Error("isolated stopped fitting handoff rollback");
+    await expect(db.transaction(async transaction=>{
+      const connection=transaction as unknown as DB;
+      expect(await adoptProgressiveNumerics2(connection,fixture.campaignId,plan,{deferStoppedEvidence:true}))
+        .toMatchObject({kind:"adopted",stoppedEvidenceHandoffJobs:1});
+      expect(await settleProgressiveCfdExecution(connection,fixture.composed.jobId))
+        .toMatchObject({complete:0,cancelled:fixture.leases.length});
+      expect(await connection.select().from(resultAttempts).where(eq(resultAttempts.simJobId,fixture.composed.jobId))).toEqual(retainedAttempts);
+      throw rollback;
+    })).rejects.toBe(rollback);
     const request = buildProgressiveFitRequest(fit);
     await storeProgressivePolarFit(
       db,
@@ -3167,7 +3178,7 @@ describe("progressive CPU admission", () => {
           sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${scope.campaignId}::uuid`,
         );
         const plan = String(campaignRow.current_plan_revision_id);
-        const handoff = { deferStoppedArchives: true };
+        const handoff = { deferStoppedEvidence: true };
         await expect(
           adoptProgressiveNumerics2(db, scope.campaignId, plan, handoff),
         ).rejects.toThrow("Pause new solver admissions");
@@ -3219,7 +3230,7 @@ describe("progressive CPU admission", () => {
         );
         expect(adopted).toMatchObject({
           kind: "adopted",
-          stoppedArchiveHandoffJobs: 1,
+          stoppedEvidenceHandoffJobs: 1,
         });
         expect(await settleProgressiveRemoteJob(db, job.id)).toMatchObject({
           kind: "settled",
