@@ -3622,7 +3622,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
       .set({ status: "stale" })
       .where(eq(results.id, result.id));
 
-    const forbiddenRansSubmit = vi.fn(async () =>
+    const forbiddenRansSubmit = vi.fn(async (_request: PolarRequest) =>
       acceptedStatus("forbidden-replacement-rans"),
     );
     expect(

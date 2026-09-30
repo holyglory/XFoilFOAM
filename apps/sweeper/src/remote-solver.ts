@@ -7526,6 +7526,7 @@ export async function admitRemoteSolverTick(
         lastOutcome = `${outcome.kind}: ${outcome.reason}`;
       break;
     }
+    if (admitted) await setStatus(db, "solving", null);
     if (assignedCount || submittedCount || lastOutcome)
       console.log(
         JSON.stringify({
