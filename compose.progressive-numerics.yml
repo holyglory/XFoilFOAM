@@ -87,9 +87,27 @@ services:
   mach3-precise-pressure:
     <<: *saved-state-replay
     command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-precise-pressure", "--variant", "minmod-all", "--integrate", "--pressure-transient"]
+  mach3-pressure-updates:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-pressure-updates", "--variant", "minmod-all", "--integrate", "--pressure-transient", "--pressure-updates", "minimum"]
+  mach3-pressure-strict:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-pressure-strict", "--variant", "minmod-all", "--integrate", "--pressure-transient", "--pressure-updates", "strict"]
   mach3-all-minmod-guarded:
     <<: *saved-state-replay
     command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-all-minmod-guarded", "--variant", "minmod-all", "--integrate"]
+  mach3-precise-energy:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-precise-energy", "--variant", "minmod-all", "--integrate", "--energy-probe", "/canary-output/energy-probe-build-r1/bin/xfoilfoamEnergyProbe"]
+  mach3-precise-energy-small:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-precise-energy-small", "--variant", "minmod-all", "--integrate", "--energy-probe", "/canary-output/energy-probe-build-r1/bin/xfoilfoamEnergyProbe", "--maximum-courant", "0.05"]
+  mach3-diffusion-minimum:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-diffusion-minimum", "--variant", "minmod-all", "--integrate", "--diffusion", "minimum", "--energy-probe", "/canary-output/energy-probe-build-r1/bin/xfoilfoamEnergyProbe"]
+  mach3-diffusion-strict:
+    <<: *saved-state-replay
+    command: ["python", "-m", "scripts.materials.replay_precise_state", "--source", "/canary-output/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d", "--destination", "/canary-output/mach3-diffusion-strict", "--variant", "minmod-all", "--integrate", "--diffusion", "strict", "--energy-probe", "/canary-output/energy-probe-build-r1/bin/xfoilfoamEnergyProbe"]
   acoustic-probe-build:
     build:
       context: .
@@ -179,6 +197,12 @@ services:
   mach3-precise-cadence:
     <<: *precise-replay
     command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-cadence", "--precise-startup"]
+  mach3-precise-diffusion:
+    <<: *precise-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-diffusion", "--precise-startup"]
+  mach3-precise-bounded:
+    <<: *precise-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-bounded", "--precise-startup", "--bounded-reconstruction"]
   mach3-precise-initialized:
     <<: *precise-replay
     command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "04e24159cd6d79db3955a9a5f385e3e7159b4408c2d16d99e38b2a9c542953ed", "--destination", "/canary-output/mach3-precise-initialized", "--precise-startup", "--precise-local-initializer"]
@@ -215,6 +239,9 @@ services:
   mach3-fast-features:
     <<: *production-replay
     command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-fast-features"]
+  mach3-fast-diffusion:
+    <<: *production-replay
+    command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-fast-diffusion"]
   mach3-startup-tenth:
     <<: *production-replay
     command: ["python", "-m", "scripts.materials.replay_production_numerics", "--request", "/fixture/request.json", "--sha256", "cea9c7f3190b6246c782ce889b9d57e7b42e9d099202fa01a084a3ddcac2c420", "--destination", "/canary-output/mach3-startup-tenth", "--startup-courant", "0.1", "--early-fields"]

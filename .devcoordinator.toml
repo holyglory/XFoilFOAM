@@ -71,6 +71,20 @@ timeout_seconds = 900
 [test.acoustic-classification]
 timeout_seconds = 900
 
+[test.precise-diffusion]
+timeout_seconds = 900
+
+[[test.precise-diffusion.check]]
+name = "numerical-contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "tests/test_local_steady_startup.py", "tests/test_acoustic_startup.py", "tests/test_numerical_canary.py", "tests/test_mach3_failure_reproduction.py", "tests/test_mach3_startup_fields.py", "-q"]
+
+[[test.precise-diffusion.check]]
+name = "retained-energy-and-diffusion"
+tier = "development"
+command = [".venv/bin/python", "-m", "scripts.materials.inspect_cartesian_startup", "--destination", ".codex-artifacts/precise-diffusion-20260930", "--groups", "mach3-precise-energy", "mach3-precise-energy-small", "mach3-diffusion-minimum", "mach3-diffusion-strict", "mach3-pressure-updates", "mach3-pressure-strict", "mach3-precise-diffusion", "mach3-fast-diffusion", "mach3-precise-bounded", "--comparison-source", ".codex-artifacts/precise-native-repair-20260930/mach3-precise-initialized/7adafad1-74c2-4093-afa0-953f2432650d/report.json"]
+retained_artifacts = [{ name = "precise-diffusion", path = ".codex-artifacts/precise-diffusion-20260930", max_bytes = 1073741824 }]
+
 [[test.acoustic-classification.check]]
 name = "failure-routing-and-source-contracts"
 tier = "development"
@@ -3643,8 +3657,8 @@ timeout_seconds = 900
 type = "compose"
 env = { COMPOSE_PROGRESS = "quiet" }
 files = ["compose.progressive-numerics.yml"]
-services = ["artifacts", "mach3-classification"]
-finite_services = ["mach3-classification"]
+services = ["artifacts", "mach3-precise-bounded"]
+finite_services = ["mach3-precise-bounded"]
 build = false
 port = true
 route = true

@@ -170,7 +170,7 @@ class CompressibleCaseBuilder(CaseBuilder):
                                 f'"({variables})"': transport, f'"({variables})Final"': {**transport, "relTol": 0}}}
         if self.solver_family == "rhoCentralFoam":
             solution["solvers"]['"(rho|rhoU|rhoE)"'] = {"solver": "diagonal"}
-            diffusion = {"solver": "smoothSolver", "smoother": "symGaussSeidel", "nSweeps": 2, "tolerance": 1e-9, "relTol": 0.01}
+            diffusion = {"solver": "smoothSolver", "smoother": "symGaussSeidel", "nSweeps": 2, "minIter": 1, "tolerance": 1e-9, "relTol": 0.01}
             for variable in ["U", "e", "h"]:
                 solution["solvers"][variable] = diffusion.copy()
                 solution["solvers"][f"{variable}Final"] = {**diffusion, "relTol": 0}

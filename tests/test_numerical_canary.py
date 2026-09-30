@@ -11,7 +11,7 @@ from airfoilfoam.openfoam.dialects import OPENCFD_2606
 from airfoilfoam.openfoam.runner import DeterministicMeshError, InfrastructureError, RunResult, Runner
 from scripts.materials.build_energy_probe import instrument
 from scripts.materials.build_acoustic_probe import instrument as instrument_acoustic
-from scripts.materials.replay_precise_state import bounded_gradients
+from scripts.materials.replay_precise_state import bounded_gradients, diffusion_controls, pressure_controls
 
 
 ASPECT_ONLY = (
@@ -217,6 +217,29 @@ def test_saved_state_gradient_comparison_retains_original_transport_schemes():
     assert bounded_gradients(original, "minmod-all").replace("MinmodV", "vanLeerV").replace("Minmod", "vanLeer") == original
     with pytest.raises(ValueError, match="settings changed"):
         bounded_gradients(original.replace("default Gauss linear;", "default leastSquares;"), "density")
+
+
+def test_saved_state_diffusion_comparison_requires_each_original_numerical_block():
+    original = "\n".join(name + " { solver smoothSolver; nSweeps 2; tolerance 1e-9; relTol 0.01; }" for name in ("U", "UFinal", "e", "eFinal", "h", "hFinal"))
+    minimum = diffusion_controls(original, False)
+    assert minimum.replace("\n        minIter 1;", "") == original
+    strict = diffusion_controls(original, True)
+    assert strict.count("tolerance 1e-12;") == 6 and strict.count("relTol 0;") == 6
+    with pytest.raises(ValueError, match="blocks changed"):
+        diffusion_controls(original.replace("hFinal", "missing"), True)
+
+
+def test_pressure_comparison_preserves_diagonal_conservation_and_explicit_tolerances():
+    original = "solvers {\n" + "\n".join(name + " { solver GAMG; tolerance 1e-7; relTol 0.01; }" for name in ("p", "pFinal", "Phi"))
+    original += '\n"(U|e|h|k|omega)" { solver PBiCGStab; tolerance 1e-8; relTol 0.01; }\n"(U|e|h|k|omega)Final" { solver PBiCGStab; tolerance 1e-8; relTol 0; }\nrho { solver diagonal; }\n}'
+    minimum = pressure_controls(original, False)
+    assert minimum.count("minIter 1;") == 5
+    assert minimum.replace("\n        minIter 1;", "") == original
+    strict = pressure_controls(original, True)
+    assert strict.count("tolerance 1e-12;") == 5
+    assert "rho { solver diagonal; }" in strict
+    with pytest.raises(ValueError, match="blocks changed"):
+        pressure_controls(original.replace("solver GAMG;", "solver PCG;", 1), False)
 
 
 def test_energy_probe_execution_is_explicit_and_fingerprinted(tmp_path):

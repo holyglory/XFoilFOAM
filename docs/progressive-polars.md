@@ -1342,6 +1342,15 @@ do not certify the resulting flow. The retained precise Mach-3 cold-start and
 developed-initial-guess comparisons still fail their material or reconstructed
 density checks and remain diagnostic evidence, not accepted polar data.
 
+Density-based momentum and energy diffusion solvers require at least one
+iteration, while retaining their existing tolerances and sweep counts. A global
+residual below tolerance can otherwise skip a locally important update in very
+small wall cells. In the retained fine-mesh comparison, requiring the update
+removes the observed viscous-energy failure through the diagnostic budget, but
+does not complete the requested transient horizon. Cold-start and alternative
+reconstruction studies remain separate: this correction alone does not establish
+a stable precise Mach-3 polar.
+
 ### Frozen history-weighting transfer study
 
 The September 22 study freezes seven previously unused compressible profiles at

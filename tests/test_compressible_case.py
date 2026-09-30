@@ -88,6 +88,10 @@ def test_density_reconstruction_honors_requested_order(tmp_path, gas, state, tra
     for field in ["rho", "U", "T"]:
         expected = "upwind" if scheme == "upwind" else "vanLeerV" if field == "U" else "vanLeer"
         assert f"reconstruct({field}) {expected};" in dictionary
+    solution = " ".join((tmp_path / "system/fvSolution").read_text().split())
+    for variable in ("U", "e", "h", "UFinal", "eFinal", "hFinal"):
+        relative = "0" if variable.endswith("Final") else "0.01"
+        assert f"{variable} {{ solver smoothSolver; smoother symGaussSeidel; nSweeps 2; minIter 1; tolerance 1e-09; relTol {relative}; }}" in solution
 
 
 def test_pressure_initializer_metadata_changes_to_physical_time_without_rewriting_material(tmp_path, gas, state):

@@ -11,6 +11,7 @@ from unittest.mock import patch
 import airfoilfoam
 from airfoilfoam import pipeline
 from airfoilfoam.config import Settings
+from airfoilfoam.case.compressible import CompressibleCaseBuilder
 from airfoilfoam.jobs import execute_job
 from airfoilfoam.models import PolarRequest
 from airfoilfoam.meshing.base import register_mesher
@@ -28,6 +29,7 @@ from scripts.materials.reproduce_mach3_failure import (
     summarize_outcomes,
 )
 from scripts.materials.inspect_mach3_startup import preserve_early_frames
+from scripts.materials.replay_precise_state import bounded_gradients
 
 
 def replay_request(path, expected_sha256, *, anchor_zero=False, finite_edge_mesh=False, precise_startup=False):
@@ -147,11 +149,14 @@ def main():
     parser.add_argument("--startup-courant", type=float, choices=[0.1, 0.05])
     parser.add_argument("--precise-startup", action="store_true")
     parser.add_argument("--precise-local-initializer", action="store_true")
+    parser.add_argument("--bounded-reconstruction", action="store_true")
     arguments = parser.parse_args()
     if arguments.precise_startup and (arguments.quiescent_start or arguments.early_fields or arguments.startup_courant is not None):
         raise ValueError("Precise startup cannot use a fast-path numerical override")
     if arguments.precise_local_initializer and not arguments.precise_startup:
         raise ValueError("The local initial-guess study requires the precise startup recipe")
+    if arguments.bounded_reconstruction and not arguments.precise_startup:
+        raise ValueError("Bounded reconstruction comparison requires the precise recipe")
     source_job, original, request = replay_request(arguments.request, arguments.sha256, anchor_zero=arguments.anchor_zero,
                                                    finite_edge_mesh=arguments.finite_edge_mesh, precise_startup=arguments.precise_startup)
     if arguments.finite_edge_mesh:
@@ -196,10 +201,17 @@ def main():
     original_native_solver = LocalRunner.solver
     original_prepare = pipeline._prepare_transient_case
     original_transient_attempt = pipeline._run_transient_attempt
+    original_schemes = CompressibleCaseBuilder._write_fv_schemes
     captures = []
     capture_errors = []
     initializations = []
     pending_initializations = {}
+
+    def write_bounded_schemes(builder, turbulence):
+        original_schemes(builder, turbulence)
+        if builder.solver_family == "rhoCentralFoam" and builder.solver.momentum_scheme != "upwind":
+            schemes = builder._p("system", "fvSchemes")
+            schemes.write_text(bounded_gradients(schemes.read_text(), "minmod-all"))
 
     def prepare_with_local_initial_guess(directory, airfoil, resolved, spec, fluid, roughness, solver, runner, processes, timeout, **kwargs):
         mesh, patches = original_prepare(directory, airfoil, resolved, spec, fluid, roughness, solver, runner, processes, timeout, **kwargs)
@@ -259,6 +271,7 @@ def main():
     startup_control = patch.object(local_startup, "STARTUP_COURANT", arguments.startup_courant) if arguments.startup_courant is not None else nullcontext()
     precise_initialization = patch.object(pipeline, "_prepare_transient_case", prepare_with_local_initial_guess) if arguments.precise_local_initializer else nullcontext()
     precise_attempt = patch.object(pipeline, "_run_transient_attempt", attempt_with_local_initial_guess) if arguments.precise_local_initializer else nullcontext()
+    reconstruction = patch.object(CompressibleCaseBuilder, "_write_fv_schemes", write_bounded_schemes) if arguments.bounded_reconstruction else nullcontext()
     if arguments.quiescent_start:
         report["differences"].append("quiescent internal velocity initial guess only; physical boundaries, pressure and temperature unchanged")
     if arguments.early_fields:
@@ -267,8 +280,10 @@ def main():
         report["differences"].append(f"startup Courant{arguments.startup_courant} for the existing50updates; original continuation ceiling and full horizon retained")
     if arguments.precise_local_initializer:
         report["differences"].append("isolated same-mesh upwind local-steady initial guess for original iteration allocation, then original high-order physical-time solve; one shared diagnostic budget")
+    if arguments.bounded_reconstruction:
+        report["differences"].append("Minmod/MinmodV bounded higher-order reconstruction instead of vanLeer/vanLeerV; original equations, gradients and physical fields retained")
     try:
-        with initialization, output_capture, startup_control, precise_initialization, precise_attempt:
+        with initialization, output_capture, startup_control, precise_initialization, precise_attempt, reconstruction:
             result = execute_job(job_id, request, store=store, settings=settings)
         report.update(solver_state=result.state.value, solver_message=result.message,
                       case_outcomes=summarize_outcomes(result),
