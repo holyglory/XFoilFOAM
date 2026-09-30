@@ -77,7 +77,70 @@ def candidate_fit(prior, observations, policy, candidate):
                                "added_variance_multipliers": {method: value.tolist() for method,value in multipliers.items()},
                                "disagreement_scores_before": scores, "model_cutoff": cutoff,
                                "tail_probability_per_method_coefficient": MODEL_TAIL_PROBABILITY if "conservative" in candidate else None}
+    result["research_only"]["grouped_conflicts"] = grouped_conflict_diagnostics(prior, observations, policy)
     return result
+
+
+def grouped_conflict_diagnostics(prior, observations, policy):
+    prior_angles = np.asarray(prior.alpha, dtype=float)
+    prior_values = np.asarray(prior.coefficients, dtype=float)
+    groups = {}
+    for observation in observations:
+        if not observation.eligible:
+            continue
+        key = (observation.method, observation.lineage_id)
+        groups.setdefault(key, []).append(observation)
+    diagnostics = []
+    for (method, lineage_id), rows in sorted(groups.items()):
+        angles = np.asarray([row.alpha for row in rows], dtype=float)
+        values = np.asarray([row.coefficients for row in rows], dtype=float)
+        errors = np.asarray([row.standard_error for row in rows], dtype=float)
+        transformed = values.copy()
+        transformed[:, 1] = np.log(values[:, 1])
+        transformed_errors = errors.copy()
+        transformed_errors[:, 1] = np.sqrt(np.log1p((errors[:, 1] / values[:, 1]) ** 2))
+        center = float(np.mean(angles))
+        prior_center = np.array([np.interp(center, prior_angles, prior_values[:, index]) for index in range(3)])
+        prior_center[1] = math.log(prior_center[1])
+        residual = np.mean(transformed - prior_center, axis=0)
+        group_error = np.sqrt(np.mean(transformed_errors ** 2, axis=0))
+        standardized = residual / np.maximum(group_error, 1e-12)
+        diagnostics.append({
+            "method": method,
+            "lineage_id": lineage_id,
+            "window_count": len(rows),
+            "alpha_min": float(angles.min()),
+            "alpha_max": float(angles.max()),
+            "alpha_center": center,
+            "residual_transformed": residual.tolist(),
+            "group_error_transformed": group_error.tolist(),
+            "standardized_residual": standardized.tolist(),
+            "group_squared_score": float(np.mean(standardized ** 2)),
+        })
+    reversals = []
+    for method in sorted({row["method"] for row in diagnostics}):
+        method_groups = [row for row in diagnostics if row["method"] == method]
+        if len(method_groups) < 2:
+            continue
+        method_groups.sort(key=lambda row: row["alpha_center"])
+        left, right = method_groups[0], method_groups[-1]
+        observed_delta = (right["residual_transformed"][0] - left["residual_transformed"][0]
+                          + float(np.interp(right["alpha_center"], prior_angles, prior_values[:, 0]))
+                          - float(np.interp(left["alpha_center"], prior_angles, prior_values[:, 0])))
+        prior_left = float(np.interp(left["alpha_center"], prior_angles, prior_values[:, 0]))
+        prior_right = float(np.interp(right["alpha_center"], prior_angles, prior_values[:, 0]))
+        prior_delta = prior_right - prior_left
+        reversals.append({
+            "method": method,
+            "left_lineage_id": left["lineage_id"],
+            "right_lineage_id": right["lineage_id"],
+            "observed_cl_delta": float(observed_delta),
+            "prior_cl_delta": prior_delta,
+            "reversal": bool(prior_delta * observed_delta < 0 and abs(observed_delta) > 0.1),
+            "related_window_count": left["window_count"] + right["window_count"],
+        })
+    return {"groups": diagnostics, "reversals": reversals,
+            "interpretation": "diagnostic_only_related_windows_are_not_independent_confirmations"}
 
 
 def observations_without_reference(source, request, reference):
@@ -250,6 +313,7 @@ def run_study(sg_path, native_path, cohort_path, producer_path, destination):
             estimate = candidate_fit(request.prior, observations, request.policy, candidate)
             write_result(destination / f"{name}-{candidate}.json", estimate)
             diagnostics[name][candidate] = lift_summary(estimate)
+            diagnostics[name][candidate]["grouped_conflicts"] = estimate.get("research_only", {}).get("grouped_conflicts")
     measurements, failures = {candidate: [] for candidate in CANDIDATES}, []
     sources = cohort.get("sources", [])
     if cohort.get("kind") != "retained-polar-cohort-export-v1" or len(sources) != 8 or len({row["physical"]["airfoilId"] for row in sources}) != 8:

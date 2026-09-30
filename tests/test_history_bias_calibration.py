@@ -10,7 +10,7 @@ from test_progressive_polar import observation
 from scripts.materials.calibrate_history_bias import bias_observation, curve_measurement, measure_profile
 from scripts.materials import calibrate_history_bias as calibration
 from scripts.materials.measure_retained_polar import replay_source
-from scripts.materials.screen_sparse_polar_means import candidate_fit, measure_candidate_profile, verify_replay, producing_request_signature, manufactured_controls, assess_candidates, CANDIDATES, CONFLICT_CUTOFF
+from scripts.materials.screen_sparse_polar_means import candidate_fit, measure_candidate_profile, verify_replay, producing_request_signature, manufactured_controls, assess_candidates, grouped_conflict_diagnostics, CANDIDATES, CONFLICT_CUTOFF
 from test_progressive_polar import prior, policy
 
 
@@ -111,6 +111,18 @@ def test_model_tail_threshold_is_conservative_for_correlated_gaussian_controls(c
     samples=np.sqrt(correlation)*shared+np.sqrt(1-correlation)*independent
     scores=np.mean(samples**2,axis=1)
     assert np.mean(scores>CONFLICT_CUTOFF)<0.01
+
+
+def test_grouped_diagnostic_exposes_related_windows_without_dropping_them():
+    rows = [replace(observation(f"{alpha}-{window}", alpha=alpha, cl=cl),
+                    lineage_id=f"lineage-{alpha}", window=(float(window), float(window + 1)))
+            for alpha, cl in [(-2, 1.5), (2, -0.3)] for window in range(4)]
+    diagnostic = grouped_conflict_diagnostics(prior(), rows, policy())
+    assert [group["window_count"] for group in diagnostic["groups"]] == [4, 4]
+    assert diagnostic["reversals"][0]["reversal"] is True
+    assert diagnostic["reversals"][0]["related_window_count"] == 8
+    assert diagnostic["interpretation"].endswith("not_independent_confirmations")
+    assert len(rows) == 8
 
 
 def test_uncertified_bias_adds_transformed_variance_without_changing_values():

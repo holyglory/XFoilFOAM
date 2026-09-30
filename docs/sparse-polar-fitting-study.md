@@ -90,3 +90,12 @@ conflicts, without collapsing those histories in the final joint fit. It must
 catch both shared errors across related windows and disagreements within those
 windows, retain source identities, and preserve useful independent and precise
 evidence. Full-polar physical validation remains a separate requirement.
+
+The artifact also records a lineage-group diagnostic for every research fit. It
+reports window count, alpha span, transformed residual, model-conditional group
+score, and whether the group-to-group lift change reverses the prior. This
+diagnostic does not change weights or discard a history. In the SG6051
+counterfactual it flags a reversal even though each anchor is a separate
+lineage; in the repeated-window control it shows the two four-window lineages
+as related groups. That distinction is the required input to the next grouped
+covariance candidate.
