@@ -131,7 +131,6 @@ export async function observeProgressiveRemoteJob(
     } catch (error) {
       const terminalWithoutCases =
         status.completed_cases === 0 &&
-        status.total_cases === 0 &&
         ["failed", "cancelled"].includes(status.state);
       if (
         !(
