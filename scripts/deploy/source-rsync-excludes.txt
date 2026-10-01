@@ -22,4 +22,6 @@ postProcessing/
 .codex-artifacts/
 .codex-db-backups/
 .devcoordinator/
+.serena/
+**/.serena/
 test-results/

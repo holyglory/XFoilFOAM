@@ -40,6 +40,7 @@ EXCLUDED_DIRECTORY_NAMES = {
     ".codex-db-backups",
     ".devcoordinator",
     "test-results",
+    ".serena",
 }
 
 

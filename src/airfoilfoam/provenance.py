@@ -32,6 +32,8 @@ def application_source_files(project_root: Path) -> list[Path]:
             for path in source_root.rglob("*")
             if path.is_file()
             and "__pycache__" not in path.parts
+            and ".serena" not in path.parts
+            and not any(part.endswith(".egg-info") for part in path.parts)
             and path.suffix not in {".pyc", ".pyo"}
         )
     return sorted(paths, key=lambda path: path.relative_to(root).as_posix())
