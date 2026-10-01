@@ -14,6 +14,10 @@ export async function listProgressiveRemoteAssignments(
       dispatch.content_signature AS "contentSignature", dispatch.cpu_slots AS "cpuSlots"
     FROM progressive_remote_dispatches dispatch
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
+    JOIN sync_sweep_promises promise
+      ON promise.id = dispatch.promise_id
+      AND promise.status = 'active'
+      AND promise."expiresAt" > clock_timestamp()
     WHERE dispatch.solver_id = ${input.solverId}::uuid
       ${input.after ? sql`AND dispatch.sim_job_id > ${input.after}::uuid` : sql``}
       AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
