@@ -38,7 +38,7 @@ function queued(
   };
 }
 
-it("uses the existing RANS allowance for all96known two-angle jobs without lowering standby reserves", () => {
+it("uses the existing RANS allowance for all96known two-angle jobs and bounds empty standby reserve to one admission batch", () => {
   const exposure = diskAdmissionExposureForJobs(
     [],
     config,
@@ -55,7 +55,7 @@ it("uses the existing RANS allowance for all96known two-angle jobs without lower
   ).toMatchObject({ allowed: true, requiredFreeBytes: 80 * GIB });
   expect(
     diskAdmissionExposureForJobs([], config, 96).idleLocalReservedBytes,
-  ).toBe(2880 * GIB);
+  ).toBe(16 * 30 * GIB);
   expect(config.idleSlotReserveBytes).toBe(30 * GIB);
 });
 

@@ -1,6 +1,7 @@
 import type { DiskAdmissionConfig, LocalDiskJob } from "./disk-admission";
 
 export const MAX_FORECAST_QUEUE_JOBS = 4096;
+export const DEFAULT_DISK_ADMISSION_BATCH_SLOTS = 16;
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -78,8 +79,9 @@ export function queuedDiskExposure(
     throw new Error(
       "Queued disk forecast requires finite storage and capacity bounds",
     );
+  const standbySlots = Math.min(idleSlots, DEFAULT_DISK_ADMISSION_BATCH_SLOTS);
   const fallback = {
-    reservedBytes: idleSlots * config.idleSlotReserveBytes,
+    reservedBytes: standbySlots * config.idleSlotReserveBytes,
     queuedCpuSlots: 0,
   };
   if (jobs.length > MAX_FORECAST_QUEUE_JOBS) return fallback;
@@ -119,7 +121,9 @@ export function queuedDiskExposure(
     remaining -= slots;
     if (remaining === 0) break;
   }
-  reservedBytes += remaining * config.idleSlotReserveBytes;
+  reservedBytes +=
+    Math.min(remaining, DEFAULT_DISK_ADMISSION_BATCH_SLOTS) *
+    config.idleSlotReserveBytes;
   if (!Number.isSafeInteger(reservedBytes) || reservedBytes < 0)
     throw new Error("Queued disk forecast exceeds finite storage bounds");
   return { reservedBytes, queuedCpuSlots: idleSlots - remaining };

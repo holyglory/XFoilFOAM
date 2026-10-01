@@ -398,10 +398,10 @@ export async function cancelDisposableJobsForDiskPressure(
 
 /**
  * Reserve measured future growth of local engine work plus a calibrated
- * working-set envelope for every idle configured execution unit. Upstream
- * promises computed on another solver are intentionally absent: their durable
- * archive uploads directly to GCS, while the fixed system floor covers the
- * hub's bounded fresh-generation verification.
+ * working-set envelope for the bounded next admission batch. Upstream promises
+ * computed on another solver are intentionally absent: their durable archive
+ * uploads directly to GCS, while the fixed system floor covers the hub's
+ * bounded fresh-generation verification.
  */
 export function evaluateDiskAdmission(
   disk: EngineMaintenanceDiskResponse,
