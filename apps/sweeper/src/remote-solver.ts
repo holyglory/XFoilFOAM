@@ -4208,11 +4208,14 @@ async function completeMirroredPromiseIfReady(
   return true;
 }
 
-async function firstReadyMirroredPromiseId(
+const MAX_READY_PROMISE_COMPLETIONS_PER_TICK = 16;
+
+async function readyMirroredPromiseIds(
   db: DB,
   settings: Settings,
-): Promise<string | null> {
-  const [row] = (await db.execute(sql`
+  limit = MAX_READY_PROMISE_COMPLETIONS_PER_TICK,
+): Promise<string[]> {
+  const rows = (await db.execute(sql`
     SELECT remote_promise.id
     FROM sync_sweep_promises remote_promise
     WHERE remote_promise.status IN ('active', 'expired')
@@ -4232,9 +4235,9 @@ async function firstReadyMirroredPromiseId(
           AND promise_point.status NOT IN ('fulfilled', 'cancelled')
       )
     ORDER BY remote_promise."createdAt", remote_promise.id
-    LIMIT 1
-  `)) as unknown as Array<{ id: string }>;
-  return row?.id ?? null;
+    LIMIT ${Math.max(1, Math.min(Math.trunc(limit), MAX_READY_PROMISE_COMPLETIONS_PER_TICK))}
+    `)) as unknown as Array<{ id: string }>;
+  return rows.map((row) => row.id);
 }
 
 interface VerifiedCheckpointPointer {
@@ -7322,10 +7325,16 @@ export async function transferRemoteSolverTick(
       Boolean(releasedUnavailablePromises) ||
       Boolean(repairedCancelledJobs) ||
       transfer.processed;
-    const readyPromiseId = await firstReadyMirroredPromiseId(db, settings);
-    if (readyPromiseId) {
+    const readyPromiseIds = await readyMirroredPromiseIds(db, settings);
+    if (readyPromiseIds.length) {
       await setStatus(db, "pushing", null);
-      await completeMirroredPromiseIfReady(db, settings, readyPromiseId, null);
+      await runWithConcurrency(
+        readyPromiseIds,
+        activeReconcileConcurrency(),
+        async (promiseId) => {
+          await completeMirroredPromiseIfReady(db, settings, promiseId, null);
+        },
+      );
       await setStatus(db, "idle", null, {
         remoteSolverLastPushAt: new Date(),
       });
@@ -7346,7 +7355,7 @@ export async function transferRemoteSolverTick(
       );
     }
     return (
-      processedDurableDelivery || Boolean(readyPromiseId) || reusedEvidence
+      processedDurableDelivery || readyPromiseIds.length > 0 || reusedEvidence
     );
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));

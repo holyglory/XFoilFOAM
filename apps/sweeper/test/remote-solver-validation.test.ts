@@ -1128,9 +1128,8 @@ function requests(fetchMock: ReturnType<typeof vi.fn>, suffix: string) {
       });
       if (streamed)
         Object.defineProperty(call, "bodyByteLength", {
-          value: (
-            init as RequestInit & { __bodyByteLength?: number }
-          ).__bodyByteLength,
+          value: (init as RequestInit & { __bodyByteLength?: number })
+            .__bodyByteLength,
           enumerable: false,
         });
       return call;
@@ -4697,7 +4696,9 @@ describe("remote solver push validation regressions", () => {
       (await deliveriesForJob(job.id)).some(
         (delivery) =>
           delivery.state === "retry_wait" &&
-          delivery.lastError?.includes("remote polar push failed (500): chunk failed"),
+          delivery.lastError?.includes(
+            "remote polar push failed (500): chunk failed",
+          ),
       ),
     ).toBe(true);
 
@@ -4711,9 +4712,9 @@ describe("remote solver push validation regressions", () => {
     await remoteSolverTick(db, {} as never);
     await remoteSolverTick(db, {} as never);
 
-    expect(requests(retried.fetchMock, "/polars").length).toBeGreaterThanOrEqual(
-      1,
-    );
+    expect(
+      requests(retried.fetchMock, "/polars").length,
+    ).toBeGreaterThanOrEqual(1);
     expect(
       requests(
         retried.fetchMock,
@@ -5171,6 +5172,50 @@ describe("remote solver push validation regressions", () => {
       "fulfilled",
       "fulfilled",
     ]);
+  });
+
+  it("completes multiple ready promises in one transfer pass", async () => {
+    const firstPromiseId = randomUUID();
+    const secondPromiseId = randomUUID();
+    const firstJob = await seedDoneRemoteJob(
+      "batch-complete-first",
+      [1850.001],
+      2,
+      firstPromiseId,
+    );
+    await seedMirroredPromise(
+      "batch-complete-first",
+      [1850.001],
+      firstPromiseId,
+    );
+    const secondJob = await seedDoneRemoteJob(
+      "batch-complete-second",
+      [1851.001],
+      2,
+      secondPromiseId,
+    );
+    await seedMirroredPromise(
+      "batch-complete-second",
+      [1851.001],
+      secondPromiseId,
+    );
+    const transport = stubFetch();
+
+    await transferRemoteSolverTick(db, {} as unknown as EngineClient);
+
+    expect(
+      requests(transport.fetchMock, "/sweeps/").filter((request) =>
+        request.url.endsWith("/complete"),
+      ),
+    ).toHaveLength(2);
+    expect((await readPromise(firstPromiseId)).promise.status).toBe(
+      "fulfilled",
+    );
+    expect((await readPromise(secondPromiseId)).promise.status).toBe(
+      "fulfilled",
+    );
+    expect((await readJobPayload(firstJob.id)).remotePushedAt).toBeUndefined();
+    expect((await readJobPayload(secondJob.id)).remotePushedAt).toBeUndefined();
   });
 
   it("keeps a slow progressing upload alive past multiple stall windows and aborts a stalled upload", async () => {
