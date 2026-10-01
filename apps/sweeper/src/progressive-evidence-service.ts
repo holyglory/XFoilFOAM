@@ -42,7 +42,17 @@ export async function nextProgressiveEvidenceWakeAt(
         AND promise.source_base_url = settings.upstream_base_url
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
     )
-    SELECT min(wake_at) AS wake_at FROM (
+      SELECT min(wake_at) AS wake_at FROM (
+      (SELECT clock_timestamp() AS wake_at
+      FROM owned_reports owned
+      WHERE ${scope !== "delivery"}
+        AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
+          WHERE staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence)
+        AND NOT EXISTS (SELECT 1 FROM progressive_worker_staging_failures failure
+          WHERE failure.sim_job_id = owned.sim_job_id AND failure.sequence = owned.sequence
+            AND failure.retry_after > clock_timestamp())
+      LIMIT 1)
+      UNION ALL
       (SELECT clock_timestamp() AS wake_at
       FROM owned_reports owned
       JOIN progressive_worker_evidence_receipts staged

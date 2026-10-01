@@ -46,7 +46,9 @@ async function projectMeasuredCancellation(
     RETURNING id
   `);
   if (rows.length !== 1)
-    throw new Error("Measured cancellation report has a foreign engine identity");
+    throw new Error(
+      "Measured cancellation report has a foreign engine identity",
+    );
   return true;
 }
 
@@ -302,5 +304,8 @@ export async function acknowledgeProgressiveWorkerReport(
       throw new Error(
         "Worker report acknowledgement does not match the next durable delivery",
       );
+    await connection.execute(
+      sql`SELECT pg_notify('progressive_worker_evidence_changed', ${input.executionId})`,
+    );
   });
 }
