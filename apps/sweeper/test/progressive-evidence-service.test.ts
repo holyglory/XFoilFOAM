@@ -136,6 +136,9 @@ it("continues delivery while all four staging slots wait", async () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(4);
     expect(deliver).toHaveBeenCalledTimes(4);
+    expect(deliver.mock.calls.every(([preferActive]) => preferActive)).toBe(
+      true,
+    );
     channel.notify("progressive_worker_evidence_changed");
     await vi.advanceTimersByTimeAsync(0);
     expect(deliver).toHaveBeenCalledTimes(5);
