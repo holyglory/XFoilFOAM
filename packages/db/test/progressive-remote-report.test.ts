@@ -301,6 +301,43 @@ describe("remote progressive incremental report validation", () => {
     },
   );
 
+  it("retains a stopped cancelled infrastructure failure before any cases exist", () => {
+    const { assignment, report } = fixture();
+    report.status = {
+      ...report.status,
+      state: "cancelled",
+      total_cases: 0,
+      completed_cases: 0,
+      failure_disposition: "infrastructure",
+      solver_budget_progress: null,
+    };
+    report.result = null;
+    report.stopProof = {
+      version: 1,
+      job_id: report.executionId,
+      execution_stopped: true,
+      producer_stopped: true,
+      namespace_verified: true,
+      remaining: [],
+      observed_at: "2026-10-01T00:00:00Z",
+      error: null,
+      fence: "terminal_result",
+      ownership_basis: "recorded_execution_namespace",
+    };
+    expect(
+      validateProgressiveRemoteReport(report, assignment).report.status,
+    ).toMatchObject({
+      state: "cancelled",
+      total_cases: 0,
+      completed_cases: 0,
+      failure_disposition: "infrastructure",
+    });
+    report.stopProof.namespace_verified = false;
+    expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
+      "verified execution-stop proof",
+    );
+  });
+
   it("retains unpublished attempts and measured progress without making a valid polar claim", () => {
     const { assignment, report } = fixture();
     const validated = validateProgressiveRemoteReport(report, assignment);

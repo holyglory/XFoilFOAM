@@ -203,6 +203,23 @@ export function validateProgressiveRemoteReport(
       (record(value.result) &&
         Array.isArray(value.result.polars) &&
         value.result.polars.length === 0)) &&
+      (status.solver_budget_progress == null ||
+      (record(status.solver_budget_progress) &&
+        Array.isArray(status.solver_budget_progress.cases) &&
+        status.solver_budget_progress.cases.length === 0));
+  const cancelledBeforeCases =
+    record(status) &&
+    status.state === "cancelled" &&
+    status.total_cases === 0 &&
+    status.completed_cases === 0 &&
+    ["deterministic_mesh", "infrastructure"].includes(
+      String(status.failure_disposition),
+    ) &&
+    record(value.stopProof) &&
+    (value.result === null ||
+      (record(value.result) &&
+        Array.isArray(value.result.polars) &&
+        value.result.polars.length === 0)) &&
     (status.solver_budget_progress == null ||
       (record(status.solver_budget_progress) &&
         Array.isArray(status.solver_budget_progress.cases) &&
@@ -214,6 +231,7 @@ export function validateProgressiveRemoteReport(
     !states.includes(status.state) ||
     (status.total_cases !== envelope.scope.units.length &&
       !failedBeforeCases &&
+      !cancelledBeforeCases &&
       !(
         status.total_cases === 0 &&
         record(value.stopProof) &&
