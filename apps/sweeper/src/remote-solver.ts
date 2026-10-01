@@ -6801,9 +6801,9 @@ async function processRemoteResultDeliveries(
             )
         )
     `)) as unknown as Array<{ id: string }>;
-    const readyResultIds = new Set(readyRows.map((row) => row.id));
+    const readyResultIds = new Set(readyRows.map((row) => String(row.id)));
     for (const result of resultRows) {
-      if (!readyResultIds.has(result.id)) continue;
+      if (!readyResultIds.has(String(result.id))) continue;
       if (
         await pushOneRemoteResult(db, engine, settings, promiseId, job, result)
       ) {
