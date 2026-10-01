@@ -7205,11 +7205,13 @@ export async function reconcileRemoteSolverTick(
         );
       await registerSolver(db, settings);
     }
-    let intake: { seen: number; errors: Array<{ executionId: string; error: string }> };
+    let intake: {
+      seen: number;
+      errors: Array<{ executionId: string; error: string }>;
+    };
     try {
-      intake = await measureRemoteReconciliationStep(
-        "assignment_intake",
-        () => receiveProgressiveCampaignAssignments(db, engine),
+      intake = await measureRemoteReconciliationStep("assignment_intake", () =>
+        receiveProgressiveCampaignAssignments(db, engine),
       );
     } catch (error) {
       intake = {
@@ -7471,13 +7473,22 @@ export async function admitRemoteSolverTick(
     // polar remains serial internally (the promise composer guards that
     // promise), while independent promises fill every available token.
     const MAX_ADMISSIONS_PER_TICK = 16;
+    const MAX_ASSIGNMENT_INSPECTIONS_PER_TICK = Math.max(
+      MAX_ADMISSIONS_PER_TICK,
+      Math.min(remoteCap, 96),
+    );
     let admitted = false;
     let assignedCount = 0;
     let submittedCount = 0;
     let lastOutcome: string | null = null;
     const attemptedAssignments = new Set<string>();
-    for (let attempt = 0; attempt < MAX_ADMISSIONS_PER_TICK; attempt++) {
+    for (
+      let attempt = 0;
+      attempt < MAX_ASSIGNMENT_INSPECTIONS_PER_TICK;
+      attempt++
+    ) {
       if ((await remoteReservedCpuSlots(db, settings)) >= remoteCap) break;
+      if (submittedCount >= MAX_ADMISSIONS_PER_TICK) break;
       if (engineBackoffActive()) {
         await setStatus(
           db,
@@ -7503,7 +7514,7 @@ export async function admitRemoteSolverTick(
       }
       const concurrency = Math.min(
         activeReconcileConcurrency(),
-        MAX_ADMISSIONS_PER_TICK - attempt,
+        MAX_ASSIGNMENT_INSPECTIONS_PER_TICK - attempt,
       );
       const assigned = await db.execute(sql`
         SELECT job.id FROM sim_jobs job JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'

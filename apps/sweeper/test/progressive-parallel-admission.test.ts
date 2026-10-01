@@ -31,16 +31,16 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
-function fixture(reserved = 0) {
+function fixture(reserved = 0, cpuBudget = 4, jobCount = 4) {
   const settings = {
     id: 1,
     remoteSolverEnabled: true,
     upstreamBaseUrl: "https://hub.example/api/sync/v1",
     remoteSolverRegisteredId: randomUUID(),
     remoteSolverAuthToken: "fixture",
-    remoteSolverCpuBudget: 4,
+    remoteSolverCpuBudget: cpuBudget,
   };
-  const jobs = Array.from({ length: 4 }, () => ({ id: randomUUID() }));
+  const jobs = Array.from({ length: jobCount }, () => ({ id: randomUUID() }));
   const expectedIds = jobs.map((job) => job.id);
   const updates: Record<string, unknown>[] = [];
   const dialect = new PgDialect();
@@ -161,4 +161,23 @@ it("queues rejected starts without waiting for a blocked stop endpoint or claimi
     scope.updates.filter((update) => update.engineState === "cancelled"),
   ).toHaveLength(0);
   expect(new Set(hooks.submit.mock.calls.map((call) => call[2])).size).toBe(4);
+});
+
+it("continues past stale assignment cleanup to reach later fresh assignments", async () => {
+  const scope = fixture(0, 24, 24);
+  hooks.submit.mockImplementation(async () => ({
+    kind: hooks.submit.mock.calls.length <= 20 ? "stop_required" : "submitted",
+    reason: "expired exact authorization",
+  }));
+
+  expect(
+    await admitRemoteSolverTick(scope.db, scope.engine, {
+      kind: "allow",
+      meshRecoveryVersion: 1,
+    }),
+  ).toBe(true);
+  expect(hooks.submit).toHaveBeenCalledTimes(24);
+  expect(
+    scope.updates.filter((update) => update.engineState === "cancel_pending"),
+  ).toHaveLength(20);
 });
