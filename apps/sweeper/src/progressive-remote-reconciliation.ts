@@ -15,6 +15,44 @@ import {
   runWithConcurrency,
 } from "./reconcile";
 
+const configuredProgressiveRemoteStaleGraceMs = Number(
+  process.env.SWEEPER_PROGRESSIVE_REMOTE_STALE_GRACE_MS ?? 30 * 60 * 1000,
+);
+const PROGRESSIVE_REMOTE_STALE_GRACE_MS =
+  Number.isFinite(configuredProgressiveRemoteStaleGraceMs) &&
+  configuredProgressiveRemoteStaleGraceMs > 0
+    ? configuredProgressiveRemoteStaleGraceMs
+    : 30 * 60 * 1000;
+
+const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
+  SELECT 1
+  FROM progressive_remote_reports stale_report
+  WHERE stale_report.sim_job_id = ${jobId}
+    AND stale_report.report #>> '{status,state}' = 'running'
+    AND jsonb_array_length(
+      CASE
+        WHEN jsonb_typeof(stale_report.report #> '{status,active_pids}') = 'array'
+          THEN stale_report.report #> '{status,active_pids}'
+        ELSE '[]'::jsonb
+      END
+    ) = 0
+    AND (
+      CASE
+        WHEN COALESCE(stale_report.report #>> '{status,last_progress_at}', '') ~
+          '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+          THEN (stale_report.report #>> '{status,last_progress_at}')::timestamptz
+        ELSE stale_report.received_at
+      END
+    ) <= clock_timestamp() -
+      (${PROGRESSIVE_REMOTE_STALE_GRACE_MS}::double precision * interval '1 millisecond')
+    AND NOT EXISTS (
+      SELECT 1
+      FROM progressive_remote_reports newer_report
+      WHERE newer_report.sim_job_id = stale_report.sim_job_id
+        AND newer_report.sequence > stale_report.sequence
+    )
+)`;
+
 export async function reconcileProgressiveRemoteWorker(
   db: DB,
   engine: EngineClient,
@@ -85,7 +123,8 @@ export async function reconcileProgressiveRemoteWorker(
       settings.remote_solver_auth_token AS auth_token, settings.upstream_base_url,
       promise.source_base_url,
       (NOT settings.remote_solver_enabled OR job.status = 'cancelled'
-        OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp()) AS stop_required
+        OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp()
+        OR ${staleRemoteExecutionSql(sql`job.id`)}) AS stop_required
     FROM sim_jobs job LEFT JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
