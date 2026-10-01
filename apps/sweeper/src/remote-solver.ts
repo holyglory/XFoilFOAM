@@ -3371,6 +3371,8 @@ export interface DeliveryClaim {
    * otherwise reopen the original solver-work lease.
    */
   fulfilledReplay: boolean;
+  /** The surrounding promise is closed, so transfer may not renew solver work. */
+  promiseClosed: boolean;
 }
 
 export async function claimResultDelivery(
@@ -3470,6 +3472,11 @@ export async function claimResultDelivery(
     ) {
       return null;
     }
+    const [promiseState] = await tx
+      .select({ status: syncSweepPromises.status })
+      .from(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, promiseId))
+      .limit(1);
     const [fulfilledReplay] = job.simulationPresetRevisionId
       ? await tx
           .select({ id: syncSweepPromisePoints.id })
@@ -3519,7 +3526,14 @@ export async function claimResultDelivery(
         attemptCount: syncRemoteResultDeliveries.attemptCount,
       });
     return claimed
-      ? { ...claimed, token, fulfilledReplay: Boolean(fulfilledReplay) }
+      ? {
+          ...claimed,
+          token,
+          fulfilledReplay: Boolean(fulfilledReplay),
+          promiseClosed: ["fulfilled", "cancelled", "expired"].includes(
+            promiseState?.status ?? "",
+          ),
+        }
       : null;
   });
 }
@@ -5235,7 +5249,7 @@ async function pushOneRemoteResult(
         await renewResultDeliveryClaim(db, claim);
         await touchHeartbeat(db);
       },
-      { renewUpstreamPromise: !claim.fulfilledReplay },
+      { renewUpstreamPromise: !claim.promiseClosed },
     );
     let brokerResponse = (await fetch(
       `${syncBase(settings)}/evidence-uploads`,
@@ -6591,7 +6605,7 @@ export async function readyLegacyRemoteResultJobs(db: DB, settings: Settings) {
             AND remote_promise.source_base_url = ${syncBase(settings)}
             AND remote_promise.request_payload ->> 'remoteSolver' = 'true'
             AND ${remotePromiseOwnerSql(settings, "remote_promise")}
-            AND remote_promise.status IN ('active', 'expired')
+            AND remote_promise.status IN ('active', 'expired', 'fulfilled')
         )`,
         sql`NOT (
           ${simJobs.wave} = 1
@@ -6608,12 +6622,41 @@ export async function readyLegacyRemoteResultJobs(db: DB, settings: Settings) {
             AND promotion.revision_id = ${simJobs.simulationPresetRevisionId}
             AND promotion.sync_promise_id::text = ${simJobs.requestPayload} ->> 'syncPromiseId'
         )`,
-        sql`NOT EXISTS (
-          SELECT 1
-          FROM sync_remote_result_deliveries terminal_delivery
-          WHERE terminal_delivery.sim_job_id = ${simJobs.id}
-            AND terminal_delivery.result_id IS NULL
-            AND terminal_delivery.state IN ('delivered', 'superseded', 'blocked')
+        sql`(
+          NOT EXISTS (
+            SELECT 1
+            FROM sync_remote_result_deliveries terminal_delivery
+            WHERE terminal_delivery.sim_job_id = ${simJobs.id}
+              AND terminal_delivery.result_id IS NULL
+              AND terminal_delivery.state IN ('delivered', 'superseded', 'blocked')
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM results newer_result
+            JOIN result_attempts newer_attempt
+              ON newer_attempt.id = newer_result.current_result_attempt_id
+             AND newer_attempt.result_id = newer_result.id
+            JOIN result_classifications newer_classification
+              ON newer_classification.result_attempt_id = newer_attempt.id
+             AND newer_classification.state = 'accepted'
+            LEFT JOIN sync_remote_result_deliveries newer_delivery
+              ON newer_delivery.promise_id = (${simJobs.requestPayload} ->> 'syncPromiseId')::uuid
+             AND newer_delivery.result_id = newer_result.id
+            WHERE newer_result.sim_job_id = ${simJobs.id}
+              AND (
+                newer_delivery.id IS NULL
+                OR newer_delivery.generation_key IS DISTINCT FROM newer_attempt.id::text
+                OR newer_delivery.state = 'pending'
+                OR (
+                  newer_delivery.state = 'retry_wait'
+                  AND newer_delivery.next_attempt_at <= now()
+                )
+                OR (
+                  newer_delivery.state = 'pushing'
+                  AND newer_delivery.claim_expires_at <= now()
+                )
+              )
+          )
         )`,
         sql`(
           (
@@ -6807,6 +6850,58 @@ async function processRemoteResultDeliveries(
       if (
         await pushOneRemoteResult(db, engine, settings, promiseId, job, result)
       ) {
+        if (
+          ["done", "failed", "cancelled"].includes(job.status) &&
+          resultRows.length
+        ) {
+          const deliveries = await db
+            .select({
+              resultId: syncRemoteResultDeliveries.resultId,
+              generationKey: syncRemoteResultDeliveries.generationKey,
+              state: syncRemoteResultDeliveries.state,
+            })
+            .from(syncRemoteResultDeliveries)
+            .where(
+              and(
+                eq(syncRemoteResultDeliveries.promiseId, promiseId),
+                inArray(
+                  syncRemoteResultDeliveries.resultId,
+                  resultRows.map((row) => row.id),
+                ),
+              ),
+            );
+          const deliveredByResult = new Map(
+            deliveries.map((delivery) => [delivery.resultId, delivery]),
+          );
+          let allDelivered = true;
+          for (const deliveredResult of resultRows) {
+            if (!deliveredResult.currentResultAttemptId) {
+              allDelivered = false;
+              break;
+            }
+            const deliveredAttempt = await currentAttemptForResult(
+              db,
+              job,
+              deliveredResult,
+            );
+            const delivery = deliveredByResult.get(deliveredResult.id);
+            if (
+              delivery?.state !== "delivered" ||
+              delivery.generationKey !== deliveredAttempt.id
+            ) {
+              allDelivered = false;
+              break;
+            }
+          }
+          if (allDelivered) {
+            await markRemoteJobDeliveryTerminal(
+              db,
+              promiseId,
+              job.id,
+              "delivered",
+            );
+          }
+        }
         return true;
       }
     }

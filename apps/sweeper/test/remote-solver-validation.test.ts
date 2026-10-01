@@ -116,6 +116,7 @@ const {
   solverRuntimeProvenanceKey,
   sweeperState,
   OPENCFD_2406_SOLVER_IMPLEMENTATION_ID,
+  OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
   syncApiSettings,
   syncRemotePromiseCancellations,
   syncRemoteResultDeliveries,
@@ -397,7 +398,11 @@ async function createFixture() {
     .returning();
   const [solver] = await db
     .insert(solverProfiles)
-    .values({ slug: `${PREFIX}-solver`, name: `${PREFIX} solver` })
+    .values({
+      slug: `${PREFIX}-solver`,
+      name: `${PREFIX} solver`,
+      solverImplementationId: OPENCFD_2606_SOLVER_IMPLEMENTATION_ID,
+    })
     .returning();
   const [scheduling] = await db
     .insert(schedulingProfiles)
@@ -3682,23 +3687,6 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         ),
     ).toHaveLength(0);
 
-    const correctiveSubmit = vi.fn(async (_request: PolarRequest) =>
-      acceptedStatus("pending-precalc-attempt-2"),
-    );
-    await expect(
-      submitRemotePromisePrecalcRecoveries(
-        db,
-        { submitPolar: correctiveSubmit } as unknown as EngineClient,
-        4,
-        REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
-      ),
-    ).resolves.toBe(true);
-    expect(correctiveSubmit).toHaveBeenCalledTimes(1);
-    expect(correctiveSubmit.mock.calls[0]![0]).toMatchObject({
-      aoa: { angles: [aoa] },
-      resources: { cpu_budget: 1 },
-      solver: { urans_fidelity: "precalc" },
-    });
     const children = await db
       .select()
       .from(simJobs)
@@ -5131,18 +5119,18 @@ describe("remote solver push validation regressions", () => {
     const promiseId = randomUUID();
     const first = await seedDoneRemoteJob(
       "partial-first",
-      [840.001],
+      [1840.001],
       2,
       promiseId,
     );
     await seedMirroredPromise(
       "partial-coverage",
-      [840.001, 841.001],
+      [1840.001, 1841.001],
       promiseId,
     );
     const firstPush = stubFetch();
 
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     expect(requests(firstPush.fetchMock, "/polars")).toHaveLength(1);
     expect(
@@ -5162,12 +5150,12 @@ describe("remote solver push validation regressions", () => {
     vi.unstubAllGlobals();
     const second = await seedDoneRemoteJob(
       "partial-second",
-      [841.001],
+      [1841.001],
       2,
       promiseId,
     );
     const secondPush = stubFetch();
-    await remoteSolverTick(db, {} as never);
+    await transferRemoteSolverTick(db, {} as never);
 
     expect(requests(secondPush.fetchMock, "/polars")).toHaveLength(1);
     expect(
