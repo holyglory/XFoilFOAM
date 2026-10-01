@@ -24,6 +24,7 @@ from airfoilfoam.models import (
     SolverParams,
 )
 from airfoilfoam.pipeline import CaseOutcome
+from airfoilfoam.resources import CpuTokenPool as RealCpuTokenPool
 from airfoilfoam.storage import JobStore
 
 
@@ -32,12 +33,12 @@ class _Mesher:
     cache_version = "test-speed-resolved-v1"
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, *, worker_cpu_budget: int = 1) -> Settings:
     return Settings(
         data_dir=tmp_path / "data",
         cache_dir=tmp_path / "cache",
         cpu_token_state_path=tmp_path / "cpu-tokens.json",
-        worker_cpu_budget=1,
+        worker_cpu_budget=worker_cpu_budget,
         case_concurrency=1,
         solver_processes=1,
     )
@@ -133,6 +134,31 @@ def test_multi_speed_job_builds_one_mesh_per_distinct_speed_resolved_recipe(
         by_speed[30.0][0][0].first_cell_height_chords
         != by_speed[90.0][0][0].first_cell_height_chords
     )
+
+
+def test_mesh_builds_reserve_the_full_worker_budget(tmp_path, monkeypatch, naca0012_selig_text):
+    prepared: list[tuple[Path, MeshParams]] = []
+    solved: list[tuple[CaseSpec, MeshParams, Path]] = []
+    _wire_fake_engine(monkeypatch, prepared, solved)
+    requests: list[int] = []
+
+    class _RecordingCpuTokenPool(RealCpuTokenPool):
+        def acquire(self, tokens, *args, **kwargs):
+            requests.append(tokens)
+            return super().acquire(tokens, *args, **kwargs)
+
+    monkeypatch.setattr(jobs, "CpuTokenPool", _RecordingCpuTokenPool)
+    settings = _settings(tmp_path, worker_cpu_budget=4)
+
+    jobs.execute_job(
+        "full-mesh-budget",
+        _request(naca0012_selig_text, mesh=MeshParams()),
+        store=JobStore(settings),
+        settings=settings,
+    )
+
+    assert requests[:2] == [4, 4]
+    assert set(requests[2:]) == {1}
 
 
 def test_multi_speed_job_deduplicates_only_an_exactly_equal_resolved_recipe(

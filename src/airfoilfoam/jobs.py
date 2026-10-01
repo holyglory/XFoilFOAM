@@ -429,20 +429,21 @@ def execute_job(
                         # directory before cache authentication runs.
                         / f"recipe-{requested_recipe_key}"
                     )
+                    mesh_cpu_tokens = plan.worker_cpu_budget
                     wait_for_cpu(
-                        1,
+                        mesh_cpu_tokens,
                         f"waiting for CPU before meshing c={chord:g} m, U={speed:g} m/s",
                         case=qa_spec,
                     )
                     with cpu_tokens.acquire(
-                        1,
+                        mesh_cpu_tokens,
                         on_wait=lambda _snapshot, c=chord, s=speed, case=qa_spec: wait_for_cpu(
-                            1,
+                            mesh_cpu_tokens,
                             f"waiting for CPU before meshing c={c:g} m, U={s:g} m/s",
                             case=case,
                         ),
                         on_acquired=lambda _snapshot, c=chord, s=speed, case=qa_spec: cpu_acquired(
-                            1,
+                            mesh_cpu_tokens,
                             JobPhase.meshing,
                             f"meshing c={c:g} m, U={s:g} m/s",
                             case=case,
