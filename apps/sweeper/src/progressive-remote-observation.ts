@@ -129,12 +129,20 @@ export async function observeProgressiveRemoteJob(
     try {
       result = await engine.getResult(executionId, route);
     } catch (error) {
+      const terminalWithoutCases =
+        status.completed_cases === 0 &&
+        status.total_cases === 0 &&
+        ["failed", "cancelled"].includes(status.state);
       if (
         !(
           error instanceof EngineError &&
           (error.status === 404 ||
             (error.status === 409 && status.state === "running")) &&
           status.completed_cases === 0
+        ) && !(
+          error instanceof EngineError &&
+          error.status === 409 &&
+          terminalWithoutCases
         )
       )
         throw error;
