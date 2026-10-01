@@ -225,6 +225,9 @@ async function stageClaimedProgressiveWorkerEvidence(
         })
         .where(ingestLeaseOwnedWhere(executionId, claimed.token));
     });
+    await db.execute(
+      sql`SELECT pg_notify('progressive_worker_evidence_changed', ${executionId})`,
+    );
     return {
       kind: "staged" as const,
       executionId,
