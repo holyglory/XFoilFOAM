@@ -7,6 +7,7 @@ import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidenc
 import { runSweeperServices } from "./service-lifecycle";
 
 const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 8;
+const SERVICE_MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 32;
 const MAX_PARALLEL_EVIDENCE_STAGES = 4;
 
 export async function drainProgressiveWorkerEvidencePass(
@@ -136,7 +137,7 @@ export async function runProgressiveEvidenceService(
               : drainProgressiveWorkerEvidencePass(
                   deliver,
                   preference,
-                  MAX_SEQUENTIAL_EVIDENCE_DELIVERIES,
+                  SERVICE_MAX_SEQUENTIAL_EVIDENCE_DELIVERIES,
                   childSignal,
                 );
           },
