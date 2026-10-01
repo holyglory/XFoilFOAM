@@ -3528,7 +3528,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         db,
         { submitPolar } as unknown as EngineClient,
         4,
-        1,
+        REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
       ),
     ).resolves.toBe(true);
 
@@ -3690,7 +3690,7 @@ describe("remote-owned derived PRECALC lifecycle", () => {
         db,
         { submitPolar: correctiveSubmit } as unknown as EngineClient,
         4,
-        1,
+        REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
       ),
     ).resolves.toBe(true);
     expect(correctiveSubmit).toHaveBeenCalledTimes(1);

@@ -6554,7 +6554,7 @@ async function processFulfilledEvidenceUpgrades(
 }
 
 export async function readyLegacyRemoteResultJobs(db: DB, settings: Settings) {
-  return db
+  const jobs = await db
     .select(getTableColumns(simJobs))
     .from(simJobs)
     .innerJoin(
@@ -6721,6 +6721,7 @@ export async function readyLegacyRemoteResultJobs(db: DB, settings: Settings) {
       simJobs.id,
     )
     .limit(250);
+  return jobs;
 }
 
 async function processRemoteResultDeliveries(
@@ -7109,10 +7110,23 @@ export async function reconcileRemoteSolverTick(
         );
       await registerSolver(db, settings);
     }
-    const intake = await measureRemoteReconciliationStep(
-      "assignment_intake",
-      () => receiveProgressiveCampaignAssignments(db, engine),
-    );
+    let intake: { seen: number; errors: Array<{ executionId: string; error: string }> };
+    try {
+      intake = await measureRemoteReconciliationStep(
+        "assignment_intake",
+        () => receiveProgressiveCampaignAssignments(db, engine),
+      );
+    } catch (error) {
+      intake = {
+        seen: 0,
+        errors: [
+          {
+            executionId: "",
+            error: error instanceof Error ? error.message : String(error),
+          },
+        ],
+      };
+    }
     if (intake.seen || intake.errors.length)
       console.log(
         JSON.stringify({ component: "progressive-remote-intake", ...intake }),
