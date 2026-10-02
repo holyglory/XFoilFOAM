@@ -146,7 +146,9 @@ async function receiveAssignmentPage(
   };
   await runWithConcurrency(
     identities,
-    activeReconcileConcurrency(),
+    activeReconcileConcurrency(
+      process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_CONCURRENCY ?? "8",
+    ),
     async (identity) => {
       receipt.seen += 1;
       try {
