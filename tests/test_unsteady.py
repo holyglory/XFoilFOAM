@@ -29,6 +29,7 @@ from airfoilfoam.postprocess.unsteady import (
 )
 from airfoilfoam.postprocess.images import find_all_vtus, select_vtus
 from airfoilfoam.models import CaseSpec, FailureDisposition
+from airfoilfoam.openfoam.execution import CompressibleExecution
 from airfoilfoam.openfoam.runner import (
     DeterministicMeshError,
     HardSolverError,
@@ -48,6 +49,35 @@ from airfoilfoam.pipeline import (
     should_abort_rans_sweep_for_urans,
     solve_polar_marched,
 )
+from airfoilfoam.thermodynamics import GasThermodynamics, ThermodynamicState
+
+
+def test_high_mach_precise_startup_uses_conservative_courant_ceiling():
+    gas = GasThermodynamics(
+        gas_constant=287.05,
+        heat_capacity_cp=1005,
+        transport_model="constant",
+        reference_dynamic_viscosity=1.82e-5,
+        reference_temperature_k=288.15,
+        prandtl=0.71,
+        provenance="isolated startup policy fixture",
+    )
+    state = ThermodynamicState(temperature_k=288.15, pressure_pa=101325)
+    runner = SimpleNamespace(
+        flow_execution=CompressibleExecution("rhoCentralFoam", gas, state, 0.85)
+    )
+    precise = pipeline._urans_startup_max_courant(
+        pipeline.SolverParams(force_transient=True, transient_max_courant=4),
+        runner,
+        CaseSpec(chord=1.0, speed=3.0 * gas.speed_of_sound(state), aoa_deg=0.0),
+    )
+    subsonic = pipeline._urans_startup_max_courant(
+        pipeline.SolverParams(force_transient=True, transient_max_courant=4),
+        runner,
+        CaseSpec(chord=1.0, speed=0.9 * gas.speed_of_sound(state), aoa_deg=0.0),
+    )
+    assert precise == pytest.approx(pipeline.URANS_HIGH_MACH_STARTUP_MAX_COURANT)
+    assert subsonic == pytest.approx(pipeline.URANS_STARTUP_MAX_COURANT)
 
 
 def _held_rans_fixture(directory, outcome):

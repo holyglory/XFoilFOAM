@@ -440,10 +440,24 @@ URANS_RECOVERY_CHECKPOINT_DIR = "_urans_recovery_checkpoint_v2"
 STEADY_INITIALIZATION_EVIDENCE_DIR = "steady_initialization"
 URANS_NUMERICAL_RECOVERY_MAX_COURANT = 1.0
 URANS_NUMERICAL_RECOVERY_DELTA_T_FACTOR = 0.25
+URANS_HIGH_MACH_STARTUP_THRESHOLD = 2.0
+URANS_HIGH_MACH_STARTUP_MAX_COURANT = 0.1
 # A normal URANS chunk also starts at Co<=1 until the live force monitor proves
 # that the latest two physical periods repeat.  Unlike numerical recovery, the
 # configured ceiling is then restored in-place for production throughput.
 URANS_STARTUP_MAX_COURANT = 1.0
+
+
+def _urans_startup_max_courant(solver_params, runner, spec) -> float:
+    ceiling = min(float(solver_params.transient_max_courant), URANS_STARTUP_MAX_COURANT)
+    if not solver_params.force_transient or not is_density_based(runner):
+        return ceiling
+    context = runner.flow_execution
+    speed_of_sound = context.gas.speed_of_sound(context.state)
+    mach = spec.speed / speed_of_sound
+    if math.isfinite(mach) and mach >= URANS_HIGH_MACH_STARTUP_THRESHOLD:
+        return min(ceiling, URANS_HIGH_MACH_STARTUP_MAX_COURANT)
+    return ceiling
 
 
 def write_divergence_condemnation(case_dir: Path, reason: str) -> None:
@@ -5453,12 +5467,10 @@ def _run_transient_attempt(
             pass_failure,
         )
 
+    startup_max_courant = _urans_startup_max_courant(solver_params, runner, spec)
     startup_params = solver_params.model_copy(
         update={
-            "transient_max_courant": min(
-                float(solver_params.transient_max_courant),
-                URANS_STARTUP_MAX_COURANT,
-            )
+            "transient_max_courant": startup_max_courant
         }
     )
     try:
@@ -5502,7 +5514,7 @@ def _run_transient_attempt(
             update={
                 "momentum_scheme": "upwind",
                 "transient_max_courant": min(
-                    float(solver_params.transient_max_courant),
+                    startup_max_courant,
                     URANS_NUMERICAL_RECOVERY_MAX_COURANT,
                 ),
             }
