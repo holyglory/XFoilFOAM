@@ -378,14 +378,17 @@ and the selected report still passes full immutable-source verification. The
 ordering index avoids sorting the entire backlog; it does not discard history or
 sample a truncated candidate list.
 
-Four staging slots refill independently, alongside one serial delivery stream.
-Each slot alternates current-work and backlog priority; selection and acquisition
-of its durable import lease share a short transaction so slots claim different
-jobs. A free slot does not wait for another import or network delivery. Delivery
-can see only committed staging receipts and wakes on the evidence notification
-channel. Staging and delivery wait on their own retry deadlines, so a delivery
-backlog cannot make an idle staging slot spin. Failure in one operation does not
-cancel its safe siblings, and shutdown waits for all started operations.
+Four staging slots refill independently, alongside four delivery lanes.
+Each staging slot alternates current-work and backlog priority; selection and
+acquisition of its durable import lease share a short transaction so slots claim
+different jobs. Each delivery lane acquires a short-lived durable point claim in
+the same selection transaction, so lanes cannot send the same point concurrently
+and an abandoned claim becomes retryable after its expiry. A free slot does not
+wait for another import or network delivery. Delivery can see only committed
+staging receipts and wakes on the evidence notification channel. Staging and
+delivery wait on their own retry deadlines, so a delivery backlog cannot make an
+idle staging slot spin. Failure in one operation does not cancel its safe
+siblings, and shutdown waits for all started operations.
 Within each delivery priority lane, due retries precede untouched sources.
 Their existing retry deadlines still apply, and conflicts remain excluded;
 continuous new results cannot indefinitely postpone a recoverable transfer.
