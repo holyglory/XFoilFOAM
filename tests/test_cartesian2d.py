@@ -26,9 +26,11 @@ class _SequenceRunner:
     def __init__(self, *results: RunResult):
         self.results = list(results)
         self.commands: list[str] = []
+        self.environments: list[dict[str, str] | None] = []
 
     def application(self, _case_dir, command, *args, **kwargs):
         self.commands.append(command)
+        self.environments.append(kwargs.get("environment"))
         return self.results.pop(0)
 
 
@@ -136,8 +138,24 @@ def test_cartesian2d_run_records_real_cell_count_and_logs(tmp_path):
     result = mesher.run_mesh(tmp_path, MeshParams(), runner)
 
     assert runner.commands == ["cartesian2DMesh"]
+    assert runner.environments == [None]
     assert result.n_cells == 12345
     assert (tmp_path / "log.cartesian2DMesh").read_text() == "mesh generated\n"
+
+
+def test_cartesian2d_uses_the_bounded_mesh_thread_budget(tmp_path):
+    mesher = Cartesian2DExternalMesh()
+    runner = _SequenceRunner(RunResult("cartesian2DMesh", 0, "mesh generated\n"))
+    runner.settings = type(
+        "MeshSettings",
+        (),
+        {"resolved_mesh_cpu_budget": lambda _self: 4},
+    )()
+    _write_owner(tmp_path, [0, 1, 1, 12344, 12])
+
+    mesher.run_mesh(tmp_path, MeshParams(), runner)
+
+    assert runner.environments == [{"OMP_NUM_THREADS": "4"}]
 
 
 @pytest.mark.parametrize(

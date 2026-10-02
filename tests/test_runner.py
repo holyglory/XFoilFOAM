@@ -119,6 +119,14 @@ def test_serial_solver_does_not_invoke_mpi_or_decomposition(tmp_path):
     assert runner.commands == [(tmp_path, "simpleFoam", 42, None)]
 
 
+def test_application_prefixes_scoped_environment_assignments(tmp_path):
+    runner = RecordingRunner()
+
+    runner.application(tmp_path, "cartesian2DMesh", environment={"OMP_NUM_THREADS": "8"})
+
+    assert runner.commands == [(tmp_path, "env OMP_NUM_THREADS=8 cartesian2DMesh", 7200, None)]
+
+
 def test_parallel_solver_rejects_rank_count_above_declared_worker_capacity(tmp_path):
     runner = RecordingRunner()
     runner.settings = Settings(worker_cpu_budget=4)

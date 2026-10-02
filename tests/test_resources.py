@@ -41,6 +41,13 @@ def test_resource_resolver_clamps_case_concurrency_to_cpu_budget(tmp_path):
     assert resolved.resolved_case_concurrency == 2
 
 
+def test_mesh_cpu_budget_is_bounded_separately_from_worker_budget(tmp_path):
+    settings = _settings(tmp_path, worker_cpu_budget=96)
+    assert settings.resolved_mesh_cpu_budget() == 8
+    assert Settings(worker_cpu_budget=96, mesh_cpu_budget=12).resolved_mesh_cpu_budget() == 12
+    assert Settings(worker_cpu_budget=4, mesh_cpu_budget=12).resolved_mesh_cpu_budget() == 4
+
+
 def test_execution_units_keep_warm_aoas_serial_but_transient_cases_parallel():
     assert execution_unit_count(
         chord_count=1,

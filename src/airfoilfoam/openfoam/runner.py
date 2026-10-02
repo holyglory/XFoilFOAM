@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from ..config import Settings, get_settings
 from ..material_warning import MATERIAL_DOMAIN_WARNING
@@ -275,8 +275,16 @@ class Runner:
         args: str = "",
         timeout: int = 7200,
         monitor: RunMonitor | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> RunResult:
-        return self.run(case_dir, f"{app} {args}".strip(), timeout=timeout, monitor=monitor)
+        command = f"{app} {args}".strip()
+        if environment:
+            assignments = " ".join(
+                f"{shlex.quote(str(key))}={shlex.quote(str(value))}"
+                for key, value in environment.items()
+            )
+            command = f"env {assignments} {command}"
+        return self.run(case_dir, command, timeout=timeout, monitor=monitor)
 
     def solver(
         self,

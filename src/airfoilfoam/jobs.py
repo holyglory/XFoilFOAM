@@ -429,7 +429,7 @@ def execute_job(
                         # directory before cache authentication runs.
                         / f"recipe-{requested_recipe_key}"
                     )
-                    mesh_cpu_tokens = plan.worker_cpu_budget
+                    mesh_cpu_tokens = settings.resolved_mesh_cpu_budget()
                     wait_for_cpu(
                         mesh_cpu_tokens,
                         f"waiting for CPU before meshing c={chord:g} m, U={speed:g} m/s",

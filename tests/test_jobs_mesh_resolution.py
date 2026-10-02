@@ -136,7 +136,7 @@ def test_multi_speed_job_builds_one_mesh_per_distinct_speed_resolved_recipe(
     )
 
 
-def test_mesh_builds_reserve_the_full_worker_budget(tmp_path, monkeypatch, naca0012_selig_text):
+def test_mesh_builds_reserve_the_bounded_mesh_budget(tmp_path, monkeypatch, naca0012_selig_text):
     prepared: list[tuple[Path, MeshParams]] = []
     solved: list[tuple[CaseSpec, MeshParams, Path]] = []
     _wire_fake_engine(monkeypatch, prepared, solved)
@@ -149,6 +149,7 @@ def test_mesh_builds_reserve_the_full_worker_budget(tmp_path, monkeypatch, naca0
 
     monkeypatch.setattr(jobs, "CpuTokenPool", _RecordingCpuTokenPool)
     settings = _settings(tmp_path, worker_cpu_budget=4)
+    settings.mesh_cpu_budget = 2
 
     jobs.execute_job(
         "full-mesh-budget",
@@ -157,7 +158,7 @@ def test_mesh_builds_reserve_the_full_worker_budget(tmp_path, monkeypatch, naca0
         settings=settings,
     )
 
-    assert requests[:2] == [4, 4]
+    assert requests[:2] == [2, 2]
     assert set(requests[2:]) == {1}
 
 

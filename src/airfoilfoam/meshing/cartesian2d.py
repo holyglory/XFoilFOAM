@@ -313,7 +313,21 @@ class Cartesian2DExternalMesh(Mesher):
         runner: Runner,
     ) -> MeshResult:
         try:
-            result = runner.application(case_dir, "cartesian2DMesh")
+            settings = getattr(runner, "settings", None)
+            mesh_threads = (
+                settings.resolved_mesh_cpu_budget()
+                if settings is not None and hasattr(settings, "resolved_mesh_cpu_budget")
+                else None
+            )
+            result = runner.application(
+                case_dir,
+                "cartesian2DMesh",
+                environment=(
+                    {"OMP_NUM_THREADS": str(mesh_threads)}
+                    if mesh_threads is not None
+                    else None
+                ),
+            )
         except InfrastructureError:
             raise
         except Exception as exc:  # noqa: BLE001 - launcher/runtime plumbing

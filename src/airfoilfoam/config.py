@@ -173,6 +173,11 @@ class Settings(BaseSettings):
         ge=1,
         description="Shared worker-local CPU token budget. Defaults to Docker CPU quota or detected CPU count.",
     )
+    mesh_cpu_budget: int | None = Field(
+        default=None,
+        ge=1,
+        description="Bounded CPU budget for external meshers. Defaults to eight tokens or the worker budget, whichever is smaller.",
+    )
     cpu_token_state_path: Path = Field(
         default=Path("/tmp/airfoilfoam-cpu-tokens.json"),
         description="Small JSON file used by worker processes to coordinate CPU token leases.",
@@ -348,6 +353,12 @@ class Settings(BaseSettings):
         if quota is not None:
             return max(1, quota)
         return max(1, os.cpu_count() or 1)
+
+    def resolved_mesh_cpu_budget(self) -> int:
+        worker_budget = self.resolved_worker_cpu_budget()
+        if self.mesh_cpu_budget is not None:
+            return max(1, min(int(self.mesh_cpu_budget), worker_budget))
+        return min(8, worker_budget)
 
 
 def _docker_cpu_quota() -> int | None:
