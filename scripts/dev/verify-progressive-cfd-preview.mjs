@@ -30,22 +30,46 @@ try {
     });
     const viewer = page.getByTestId("progressive-polar-viewer");
     await expect(viewer).toHaveAttribute("aria-busy", "false");
-    const response = await page.request.get(`${origin}/api/airfoils/${slug}`);
-    assert(response.ok());
-    const detail = await response.json();
-    const series = detail.progressivePolars.find(
-      (item) =>
-        (!values.target || item.targetId === values.target) &&
-        item.curves.some((curve) => curve.method === "composite") &&
-        item.explanation.contributors?.some((entry) =>
-          Number.isFinite(entry.alpha),
-        ),
-    );
-    assert(
-      series,
-      "The preview must contain actual included CFD evidence, not just a cached prior",
-    );
-    await viewer.getByLabel("Polar condition").selectOption(series.targetId);
+    let detail;
+    let series;
+    let compareMethods;
+    for (let refresh = 0; refresh < 2; refresh += 1) {
+      const response = await page.request.get(`${origin}/api/airfoils/${slug}`);
+      assert(response.ok());
+      detail = await response.json();
+      series = detail.progressivePolars.find(
+        (item) =>
+          (!values.target || item.targetId === values.target) &&
+          item.curves.some((curve) => curve.method === "composite") &&
+          item.explanation.contributors?.some((entry) =>
+            Number.isFinite(entry.alpha),
+          ),
+      );
+      assert(
+        series,
+        "The preview must contain actual included CFD evidence, not just a cached prior",
+      );
+      const condition = viewer.getByLabel("Polar condition");
+      const availableTargets = await condition
+        .locator("option")
+        .evaluateAll((options) => options.map((option) => option.value));
+      if (!availableTargets.includes(series.targetId)) {
+        if (refresh === 1)
+          throw new Error("The rendered condition list is stale");
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await expect(viewer).toHaveAttribute("aria-busy", "false");
+        continue;
+      }
+      await condition.selectOption(series.targetId);
+      compareMethods = viewer.getByLabel("Compare methods");
+      if (await compareMethods.count()) break;
+      if (refresh === 1)
+        throw new Error("The rendered polar methods are stale");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await expect(viewer).toHaveAttribute("aria-busy", "false");
+    }
+    assert(series);
+    assert(compareMethods);
     await expect(viewer.getByTestId("progressive-polar-curve")).toHaveCount(1);
     await expect(viewer.getByTestId("prediction-sample")).toHaveCount(0);
     await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
@@ -53,7 +77,7 @@ try {
       await writeFile(`${evidenceDirectory}/${viewport.width}-series.json`,JSON.stringify(series));
       await viewer.screenshot({path:`${evidenceDirectory}/${viewport.width}-curve.png`});
     }
-    await viewer.getByLabel("Compare methods").check();
+    await compareMethods.check();
     await expect(viewer.getByTestId("progressive-polar-curve")).toHaveCount(
       series.curves.length,
     );
