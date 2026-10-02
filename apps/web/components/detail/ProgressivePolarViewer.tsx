@@ -75,7 +75,9 @@ export function ProgressivePolarViewer({
   const projected = useMemo(() => {
     if (!selected) return null;
     const primary =
-      selected.curves.find((curve) => curve.method === selected.primaryMethod) ??
+      selected.curves.find(
+        (curve) => curve.method === selected.primaryMethod,
+      ) ??
       selected.curves.find((curve) => curve.method === "composite") ??
       selected.curves.at(-1)!;
     const curves = (methodsVisible ? selected.curves : [primary]).map(
@@ -439,11 +441,14 @@ export function ProgressivePolarViewer({
           Why this curve
         </summary>
         <p>
-          {selected.kind === "estimate" && selected.primaryMethod === "neuralfoil"
-            ? "The displayed curve remains the stored NeuralFoil prediction because the available sparse fast-CFD anchors conflict with its low-angle lift trend. The CFD evidence remains available for comparison, but it is not used as the public primary curve until a matched full-polar reference is supplied."
+          {selected.kind === "estimate" &&
+          selected.primaryMethod === "neuralfoil"
+            ? "The displayed curve remains the stored NeuralFoil prediction because the available sparse fast-CFD anchors conflict with its low-angle lift trend. " +
+              "It is not a completed OpenFOAM calculation. The CFD evidence remains available for comparison, " +
+              "but it is not used as the public primary curve until a matched full-polar reference is supplied."
             : selected.kind === "estimate"
               ? `This curve combines the stored NeuralFoil prediction with ${selected.explanation.contributors?.length ?? 0} contributing CFD observations. History windows remain observations, not separate solver runs or automatically converged points.`
-            : "This is a NeuralFoil prediction from the stored profile coordinates and the selected flow condition, with AeroSandbox compressibility corrections. It is not a completed OpenFOAM calculation."}
+              : "This is a NeuralFoil prediction from the stored profile coordinates and the selected flow condition, with AeroSandbox compressibility corrections. It is not a completed OpenFOAM calculation."}
         </p>
         <p>
           {selected.explanation.calibration === "unvalidated"
