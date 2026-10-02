@@ -1,7 +1,10 @@
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
-import { progressivePublicationSelectionSql } from "../../../apps/sweeper/src/progressive-publication-selection";
+import {
+  progressivePublicationBatchSelectionSql,
+  progressivePublicationSelectionSql,
+} from "../../../apps/sweeper/src/progressive-publication-selection";
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
@@ -42,6 +45,8 @@ it("selects the oldest exact owned report without re-reading the whole pending b
     expect(index.indisvalid).toBe(true);
     const select = () =>
       transaction.execute(progressivePublicationSelectionSql());
+    const selectBatch = () =>
+      transaction.execute(progressivePublicationBatchSelectionSql(3));
     const legacy = () =>
       transaction.execute(sql`
       SELECT report.sim_job_id FROM progressive_worker_reports report
@@ -67,6 +72,11 @@ it("selects the oldest exact owned report without re-reading the whole pending b
     }
     expect(selectedJobs.size).toBe(3);
     expect(await select()).toEqual([]);
+    await transaction.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL
+      WHERE sim_job_id IN (md5('eligible')::uuid,md5('cancelled')::uuid,md5('expired')::uuid)`);
+    const batch = await selectBatch();
+    expect(batch).toHaveLength(3);
+    expect(new Set(batch.map((row) => row.sim_job_id)).size).toBe(3);
     await transaction.execute(
       sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL WHERE sim_job_id=md5('eligible')::uuid`,
     );

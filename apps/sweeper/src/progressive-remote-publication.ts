@@ -7,7 +7,10 @@ import {
   type DB,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
-import { progressivePublicationSelectionSql } from "./progressive-publication-selection";
+import {
+  progressivePublicationBatchSelectionSql,
+  progressivePublicationSelectionSql,
+} from "./progressive-publication-selection";
 
 export async function publishProgressiveWorkerReport(
   db: DB,
@@ -120,4 +123,34 @@ export async function publishNextProgressiveWorkerReport(
       )
     ).kind === "published"
   );
+}
+
+export async function publishProgressiveWorkerReports(
+  db: DB,
+  fetcher: typeof fetch = fetch,
+): Promise<boolean> {
+  const pending = await db.execute(progressivePublicationBatchSelectionSql());
+  if (!pending.length) return false;
+  const results = await Promise.allSettled(
+    pending.map((row) =>
+      publishProgressiveWorkerReport(db, String(row.sim_job_id), fetcher),
+    ),
+  );
+  const failures = results.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  const published = results.some(
+    (result) =>
+      result.status === "fulfilled" && result.value.kind === "published",
+  );
+  if (failures.length) {
+    const reason = failures[0].reason;
+    if (published)
+      throw new AggregateError(
+        failures.map((failure) => failure.reason),
+        `Progressive report batch had ${failures.length} publication failure(s)`,
+      );
+    throw reason;
+  }
+  return published;
 }

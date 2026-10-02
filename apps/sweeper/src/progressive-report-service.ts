@@ -1,5 +1,5 @@
 import type { DB, Sql } from "@aerodb/db";
-import { publishNextProgressiveWorkerReport } from "./progressive-remote-publication";
+import { publishProgressiveWorkerReports } from "./progressive-remote-publication";
 import { runNotificationDrain } from "./notification-drain";
 
 export async function runProgressiveReportService(
@@ -13,7 +13,7 @@ export async function runProgressiveReportService(
 ): Promise<void> {
   if (signal.aborted) return;
   const publish =
-    options.publish ?? (() => publishNextProgressiveWorkerReport(db));
+    options.publish ?? (() => publishProgressiveWorkerReports(db));
   const reportError =
     options.reportError ??
     ((error) =>
