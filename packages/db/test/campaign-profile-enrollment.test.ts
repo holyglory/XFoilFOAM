@@ -8736,6 +8736,45 @@ describe("durable progressive CFD units", () => {
     });
   });
 
+  it("prioritizes subsonic CFD targets, orders high Mach targets, and ignores leased work", async () => {
+    const id = await campaign(
+      "active",
+      [340.3 * 0.5, 340.3 * 2, 340.3 * 1.2],
+      [0],
+    );
+    await materializeProgressiveCampaignScope(db, id);
+    for (let index = 0; index < 3; index += 1) {
+      const baseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(
+        db,
+        baseline,
+        predictionFixture(baseline),
+      );
+    }
+    expect(await initializeProgressiveCfdWork(db)).toBe(3);
+
+    const first = (await claimCfd())!;
+    const second = (await claimCfd())!;
+    const third = (await claimCfd())!;
+
+    expect(first.physical.derived.mach).toBeCloseTo(0.5);
+    expect(second.physical.derived.mach).toBeCloseTo(1.2);
+    expect(third.physical.derived.mach).toBeCloseTo(2);
+    expect(second.id).not.toBe(first.id);
+    expect(second.targetId).not.toBe(first.targetId);
+    expect(
+      await db.execute(
+        sql`SELECT state, lease_owner, lease_token FROM progressive_cfd_units WHERE id = ${first.id}`,
+      ),
+    ).toEqual([
+      {
+        state: "leased",
+        lease_owner: "isolated-cfd",
+        lease_token: first.token,
+      },
+    ]);
+  });
+
   it("waits for complete cohort initialization before selecting a CFD candidate", async () => {
     const { generationId } = await fastCfdGeneration(true);
     expect(await initializeProgressiveCfdWork(db)).toBe(4);

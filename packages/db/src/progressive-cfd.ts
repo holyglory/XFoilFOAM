@@ -298,11 +298,17 @@ export async function claimProgressiveCfdUnit(
         )
     `)) as unknown as Array<{ id: string }>;
     if (!initializedGenerations.length) return null;
+    const targetMach = sql`CASE
+      WHEN jsonb_typeof(target.physical->'derived'->'mach') = 'number'
+      THEN (target.physical->'derived'->>'mach')::double precision
+      ELSE NULL
+    END`;
     const [unit] = (await connection.execute(sql`
       WITH ${previousExecutions}, selected AS MATERIALIZED (
       SELECT unit.id
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN polar_analysis_targets target ON target.id = work.target_id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.id IN (${sql.join(
           initializedGenerations.map((generation) => sql`${generation.id}`),
@@ -321,7 +327,9 @@ export async function claimProgressiveCfdUnit(
           WHERE sibling.generation_id = generation.id AND sibling.stage = work.stage
             AND initial.purpose = 'initial' AND initial.state NOT IN ('complete', 'gap')
         ))
-      ORDER BY generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
+      ORDER BY CASE WHEN ${targetMach} < 1.0 THEN 0 WHEN ${targetMach} >= 1.0 THEN 1 ELSE 2 END,
+        CASE WHEN ${targetMach} >= 1.0 THEN ${targetMach} END ASC NULLS LAST,
+        generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       )
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
