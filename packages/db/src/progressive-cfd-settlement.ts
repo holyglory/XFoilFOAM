@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
@@ -228,7 +229,7 @@ export async function settleProgressiveCfdExecution(
     const units = await connection.execute(sql`
       SELECT attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
         unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds, work.id AS work_id,
-        generation.stage = work.stage AND work.state IN ('pending', 'gap') AS recoverable_stage,
+        ${effectiveProgressiveStageSql()} = work.stage AND work.state IN ('pending', 'gap') AS recoverable_stage,
         NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
           AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
         ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts,

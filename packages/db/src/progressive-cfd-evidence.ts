@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import type { JobStatus } from "../../engine-client/src/types";
 import {
   resolveSolverCaseAllocations,
@@ -92,7 +93,7 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
     JOIN simulation_preset_revisions revision ON revision.id = recipe.execution_revision_id
     WHERE attempt.sim_job_id = ${simJobId} AND generation.epoch_id = ${epoch.id}
       AND generation.campaign_id = ${job.campaign_id} AND generation.plan_revision_id = ${campaign.current_plan_revision_id}
-      AND generation.status = 'active' AND generation.stage = work.stage
+      AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage
     ORDER BY unit.ordinal FOR UPDATE OF generation, work, unit, attempt
   `)) as unknown as BoundUnit[];
   const [count] = await db.execute(

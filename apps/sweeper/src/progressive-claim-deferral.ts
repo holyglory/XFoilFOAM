@@ -1,5 +1,6 @@
 import { type DB, type ProgressiveCfdLease } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 
 export class ProgressiveEvidenceCellOwned extends Error {
   constructor(readonly leases: readonly ProgressiveCfdLease[]) {
@@ -32,7 +33,7 @@ export async function deferProgressiveClaim(
     JOIN calculation_epochs epoch ON epoch.id=generation.epoch_id JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
     WHERE unit.work_id=work.id AND (${targets}) AND epoch.current AND generation.status='active'
       AND generation.plan_revision_id=campaign.current_plan_revision_id AND campaign.status IN ('active','attention')
-      AND generation.stage=work.stage AND work.state='pending' AND unit.state='pending' AND unit.lease_token IS NULL
+      AND ${effectiveProgressiveStageSql()}=work.stage AND work.state='pending' AND unit.state='pending' AND unit.lease_token IS NULL
       AND NOT EXISTS(SELECT 1 FROM progressive_cfd_attempts owner WHERE owner.unit_id=unit.id AND owner.outcome='running')
     RETURNING unit.id`);
   return rows.length;

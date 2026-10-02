@@ -7,6 +7,7 @@
 // generated in TS via @aerodb/core expandAngleGrid (never SQL generate_series).
 
 import { createHash } from "node:crypto";
+import { progressiveCampaignActiveStageSql } from "./progressive-execution-policy";
 
 import {
   AUTO_PRECALC_CONTINUATION_BUDGET_S,
@@ -2224,7 +2225,7 @@ async function campaignProgressiveSnapshot(
       COALESCE(sum(point_count) FILTER (WHERE fast_state NOT IN ('complete', 'gap')), 0)::int AS fast_open,
       COALESCE(sum(point_count) FILTER (WHERE precise_state NOT IN ('complete', 'gap')), 0)::int AS precise_open,
       COALESCE(sum(point_count) FILTER (WHERE neuralfoil_state = 'gap' OR fast_state = 'gap' OR precise_state = 'gap'), 0)::int AS gap_points,
-      (SELECT stage::int FROM current_generation) AS stage,
+      ${progressiveCampaignActiveStageSql(sql`${campaignId}::uuid`, sql`(SELECT stage::int FROM current_generation)`)} AS stage,
       (SELECT count(*)::int FROM sim_jobs job
         WHERE job.status IN ('pending', 'submitted', 'running', 'ingesting')
           AND job.campaign_id = ${campaignId}) AS active_jobs,

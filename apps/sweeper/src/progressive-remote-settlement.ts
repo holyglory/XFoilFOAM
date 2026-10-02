@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -211,7 +212,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       SELECT 1 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
       JOIN progressive_work work ON work.id = unit.work_id JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
-      WHERE attempt.sim_job_id = ${executionId}::uuid AND epoch.current AND generation.status = 'active' AND generation.stage = work.stage
+      WHERE attempt.sim_job_id = ${executionId}::uuid AND epoch.current AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage
         AND generation.plan_revision_id = campaign.current_plan_revision_id AND campaign.status IN ('active', 'attention', 'paused')
       ) AS current_scope`);
     if (!scope.current_scope) {

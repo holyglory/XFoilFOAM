@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import type { PolarRequest } from "../../engine-client/src/types";
 import type { DB } from "./client";
 import { progressiveSolverOwnerLock } from "./progressive-solver-lock";
@@ -151,7 +152,7 @@ export async function bindProgressiveRemoteDispatch(
         AND attempt.execution_recipe_id = ${envelope.scope.recipeId}
         AND unit.state = 'leased' AND unit.lease_until > clock_timestamp()
         AND generation.id = ${envelope.scope.generationId}::uuid AND epoch.id = ${envelope.scope.epochId}::uuid
-        AND generation.status = 'active' AND generation.stage = work.stage AND work.stage = ${envelope.scope.stage}
+        AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage AND work.stage = ${envelope.scope.stage}
         AND work.target_id = ${envelope.scope.targetId} AND work.state = 'pending'
         AND generation.plan_revision_id = campaign.current_plan_revision_id AND campaign.status IN ('active', 'attention')
       ORDER BY attempt.token FOR UPDATE OF generation, work, unit, attempt

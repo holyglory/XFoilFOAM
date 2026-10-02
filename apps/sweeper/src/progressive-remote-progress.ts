@@ -9,6 +9,7 @@ import {
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { indexProgressiveRemoteReport } from "@aerodb/db/progressive-remote-inventory";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
@@ -99,7 +100,7 @@ export async function applyProgressiveRemoteProgress(
       JOIN progressive_work work ON work.id = unit.work_id JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
       JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
-      WHERE attempt.sim_job_id = ${executionId}::uuid AND generation.status = 'active' AND work.stage = generation.stage
+      WHERE attempt.sim_job_id = ${executionId}::uuid AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()}
         AND generation.plan_revision_id = campaign.current_plan_revision_id AND campaign.status IN ('active', 'attention', 'paused')
         AND attempt.outcome = 'running' AND unit.state IN ('leased', 'blocked')) AS accepts_progress`);
     if (report.status.solver_budget_progress && scope.accepts_progress)

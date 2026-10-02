@@ -5,6 +5,12 @@ import { canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
 import { advanceGeneration } from "./progressive-campaigns";
 import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
+import {
+  effectiveProgressiveStageSql,
+  progressiveCfdAdmissionSql,
+  progressiveCohortReadinessSql,
+  progressiveInitialCoverageCompleteSql,
+} from "./progressive-execution-policy";
 
 async function finishCampaigns(db: DB, epochId: string): Promise<number> {
   const completed = await db.execute(sql`
@@ -34,17 +40,6 @@ async function finishCampaigns(db: DB, epochId: string): Promise<number> {
 }
 
 export async function advanceProgressiveCfdStages(db: DB) {
-  const initialCoverage = (epochId: string) => sql`initial_coverage AS MATERIALIZED (
-    SELECT generation.id FROM progressive_generations generation
-    WHERE generation.epoch_id = ${epochId} AND generation.status = 'active'
-      AND NOT EXISTS (
-        SELECT 1 FROM progressive_work sibling WHERE sibling.generation_id = generation.id AND sibling.stage = 2
-          AND sibling.state NOT IN ('complete', 'gap') AND (
-            NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial')
-            OR EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = sibling.id AND unit.purpose = 'initial' AND unit.state NOT IN ('complete', 'gap'))
-          )
-      )
-  )`;
   const hasEvidence = sql`EXISTS (
     SELECT 1 FROM progressive_cfd_evidence evidence JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
     JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
@@ -59,7 +54,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       WHERE unit.work_id = work.id AND (attempt.outcome = 'running'
         OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL))
     ) AND (work.stage = 3 OR (
-      generation.id IN (SELECT id FROM initial_coverage) AND NOT EXISTS (
+      ${progressiveInitialCoverageCompleteSql()} AND NOT EXISTS (
         SELECT 1 FROM progressive_work baseline JOIN progressive_prediction_links link ON link.work_id = baseline.id
         JOIN progressive_polar_fit_work fit ON fit.prediction_id = link.prediction_id
         WHERE baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1
@@ -80,13 +75,13 @@ export async function advanceProgressiveCfdStages(db: DB) {
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const [campaign] = await connection.execute(sql`
-      WITH ${initialCoverage(String(epoch.id))}
+      WITH ${progressiveCohortReadinessSql(String(epoch.id))}
       SELECT campaign.id FROM sim_campaigns campaign
       WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
         SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
         WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
           AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
-          AND generation.stage IN (2, 3) AND work.stage = generation.stage AND work.state = 'pending'
+          AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
           AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
           AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id AND unit.state NOT IN ('complete', 'gap'))
           AND ${ready}
@@ -100,7 +95,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       return receipt;
     }
     const scopes = await connection.execute(sql`
-      WITH ${initialCoverage(String(epoch.id))}
+      WITH ${progressiveCohortReadinessSql(String(epoch.id))}
       SELECT work.id, work.generation_id, work.target_id, work.stage, scope.angles,
         ${hasEvidence} AS has_cfd_evidence,
         EXISTS (
@@ -112,7 +107,8 @@ export async function advanceProgressiveCfdStages(db: DB) {
             AND baseline_prediction.epoch_id = generation.epoch_id
         ) AS has_neuralfoil_baseline,
         fit.state AS fit_state, model.id AS model_id, model.response,
-        generation.id IN (SELECT id FROM initial_coverage) AS initial_coverage_complete
+        ${progressiveInitialCoverageCompleteSql()} AS initial_coverage_complete,
+        ${progressiveCfdAdmissionSql()} AS admits_new_unit
       FROM progressive_work work JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
       LEFT JOIN progressive_work baseline ON baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1
@@ -123,7 +119,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       LEFT JOIN progressive_polar_models model ON model.id = verification.model_id AND fit.state = 'ready'
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
-        AND generation.status = 'active' AND generation.stage IN (2, 3) AND work.stage = generation.stage AND work.state = 'pending'
+        AND generation.status = 'active' AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
         AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id AND unit.state NOT IN ('complete', 'gap'))
         AND ${ready}
@@ -260,6 +256,10 @@ export async function advanceProgressiveCfdStages(db: DB) {
         );
       } else if (units.some((unit) => unit.state === "gap")) {
         reason = "precise_requested_grid_with_gaps";
+      }
+      if (alpha !== null && !scope.admits_new_unit) {
+        receipt.waiting += 1;
+        continue;
       }
       const ordinal =
         Math.max(...units.map((unit) => Number(unit.ordinal))) + 1;

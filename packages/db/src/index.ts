@@ -6,6 +6,7 @@ export * from "./polar-cache";
 export * from "./campaigns";
 export * from "./analysis-target";
 export * from "./progressive-campaigns";
+export * from "./progressive-execution-policy";
 export * from "./progressive-materialization";
 export * from "./progressive-recipe-adoption";
 export * from "./progressive-numerics-transition";

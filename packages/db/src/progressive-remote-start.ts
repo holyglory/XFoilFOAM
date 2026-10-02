@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { canonicalAnalysisJson } from "./analysis-target";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 
@@ -70,7 +71,7 @@ export async function authorizeProgressiveRemoteStart(
           "The assignment is stopped, expired or belongs to an obsolete calculation",
       };
     const [generation] = await connection.execute(sql`
-      SELECT generation.status, generation.stage, campaign.status AS campaign_status,
+      SELECT generation.status, ${effectiveProgressiveStageSql("generation", sql`${envelope.scope.targetId}`)} AS stage, campaign.status AS campaign_status,
         generation.plan_revision_id = campaign.current_plan_revision_id AS current_plan
       FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       WHERE generation.id = ${envelope.scope.generationId}::uuid AND generation.epoch_id = ${envelope.scope.epochId}::uuid

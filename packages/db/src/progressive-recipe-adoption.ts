@@ -119,7 +119,12 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
         AND epoch_id=${epoch.id} AND plan_revision_id=${campaign.current_plan_revision_id}
         AND status IN ('active','attention') ORDER BY id FOR UPDATE
     `);
-    if (generations.some((generation) => Number(generation.stage) >= 3))
+    const [preciseCohort] = await connection.execute(sql`SELECT EXISTS (
+      SELECT 1 FROM progressive_generation_cohorts cursor JOIN progressive_generations generation ON generation.id = cursor.generation_id
+      WHERE generation.campaign_id = ${campaignId}::uuid AND generation.epoch_id = ${epoch.id}
+        AND generation.plan_revision_id = ${campaign.current_plan_revision_id} AND generation.status IN ('active', 'attention') AND cursor.stage = 3
+    ) AS started`);
+    if (preciseCohort.started || generations.some((generation) => Number(generation.stage) >= 3))
       throw new Error(
         "A precise generation must not be restarted by preliminary recipe adoption",
       );

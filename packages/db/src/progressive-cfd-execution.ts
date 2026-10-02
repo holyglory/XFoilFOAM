@@ -11,6 +11,7 @@ import {
 } from "./analysis-target";
 import { legacyBoundaryValuesFromSnapshot } from "./campaigns";
 import type { DB } from "./client";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { localStepRecipeSql } from "./campaign-local-step-policy";
 import type { ProgressiveCfdLease } from "./progressive-cfd";
 import {
@@ -85,7 +86,7 @@ export async function lockProgressiveCfdExecution(
       AND unit.lease_until > clock_timestamp() AND attempt.outcome = 'running'
       AND generation.id = ${lease.generationId} AND generation.epoch_id = ${lease.epochId}
       AND generation.campaign_id = ${lease.campaignId} AND generation.plan_revision_id = ${campaign.current_plan_revision_id}
-      AND generation.status = 'active' AND generation.stage = work.stage AND work.stage = ${lease.stage}
+      AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage AND work.stage = ${lease.stage}
       AND work.state = 'pending' AND work.target_id = ${lease.targetId} AND scope.revision_id = ${lease.revisionId}
     FOR UPDATE OF generation, work, unit, attempt
   `);

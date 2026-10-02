@@ -36,6 +36,7 @@ import {
   URANS_RECOVERY_CAPABILITY_MISMATCH_CODE,
 } from "@aerodb/engine-client";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 
 import { configuredAdmissionFencePolicy } from "./config";
 
@@ -173,7 +174,7 @@ function pendingSubmitWhere(jobId: string, campaignId: string | null) {
         WHERE binding.sim_job_id = ${simJobs.id} AND (
           binding.outcome <> 'running' OR unit.state <> 'leased'
           OR unit.lease_token IS DISTINCT FROM binding.token OR unit.lease_until <= clock_timestamp()
-          OR generation.status <> 'active' OR generation.stage <> work.stage OR work.state <> 'pending'
+          OR generation.status <> 'active' OR ${effectiveProgressiveStageSql()} IS DISTINCT FROM work.stage OR work.state <> 'pending'
           OR NOT epoch.current OR generation.plan_revision_id IS DISTINCT FROM campaign.current_plan_revision_id
           OR campaign.status NOT IN ('active', 'attention')
           OR epoch.id::text IS DISTINCT FROM (${simJobs.requestPayload} -> 'progressive' ->> 'epochId')

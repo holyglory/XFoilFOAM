@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
 
 export async function recoverUnboundProgressiveCfdLeases(
@@ -19,7 +20,7 @@ export async function recoverUnboundProgressiveCfdLeases(
         JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
         WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
           AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
-          AND generation.stage = work.stage AND work.state = 'pending'
+          AND ${effectiveProgressiveStageSql()} = work.stage AND work.state = 'pending'
           AND unit.state = 'leased' AND unit.lease_until <= clock_timestamp()
           AND attempt.outcome = 'running' AND attempt.sim_job_id IS NULL
       ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -33,7 +34,7 @@ export async function recoverUnboundProgressiveCfdLeases(
       JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
-        AND generation.status = 'active' AND generation.stage = work.stage AND work.state = 'pending'
+        AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage AND work.state = 'pending'
         AND unit.state = 'leased' AND unit.lease_until <= clock_timestamp()
         AND attempt.outcome = 'running' AND attempt.sim_job_id IS NULL
       ORDER BY unit.lease_until, unit.id LIMIT 64 FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED

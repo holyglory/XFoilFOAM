@@ -10,6 +10,7 @@ import {
 } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
+import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { runProgressiveBaselineBatch } from "./progressive-baselines";
 import {
   PROGRESSIVE_FIT_POLICY_ID,
@@ -159,7 +160,7 @@ export async function runProgressiveBaselineService(
               JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
               JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
               WHERE unit.state = 'leased' AND attempt.outcome = 'running' AND attempt.sim_job_id IS NULL
-                AND generation.status = 'active' AND generation.stage = work.stage AND work.state = 'pending'
+                AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage AND work.state = 'pending'
                 AND generation.plan_revision_id = campaign.current_plan_revision_id
                 AND campaign.status IN ('active', 'attention', 'paused')
             ) expiry

@@ -1,4 +1,11 @@
 import { randomUUID } from "node:crypto";
+import {
+  advanceProgressiveGenerationCohorts,
+  effectiveProgressiveStageSql,
+  initializeProgressiveGenerationCohorts,
+  progressiveAdmissionFrontierSql,
+  progressiveCfdAdmissionSql,
+} from "./progressive-execution-policy";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { cancelObsoleteProgressiveCfdUnits } from "./progressive-cfd";
@@ -258,6 +265,7 @@ export async function sealProgressiveGeneration(
         CROSS JOIN generate_series(1, 3) stage
       `);
     }
+    await initializeProgressiveGenerationCohorts(connection, generation.id);
     if (campaign.status === "completed")
       await connection.execute(
         sql`UPDATE sim_campaigns SET status = 'active', "completedAt" = NULL WHERE id = ${campaign.id}`,
@@ -267,6 +275,7 @@ export async function sealProgressiveGeneration(
 }
 
 export async function advanceGeneration(db: DB, generationId: string) {
+  if (await advanceProgressiveGenerationCohorts(db, generationId)) return;
   const [generation] = await rows<{ stage: ProgressiveStage }>(
     db,
     sql`
@@ -346,6 +355,7 @@ export async function claimProgressiveWork(
     const [campaign] = await rows<{ id: string }>(
       connection,
       sql`
+      WITH ${progressiveAdmissionFrontierSql(epochId)}
       SELECT campaign.id FROM sim_campaigns campaign
       WHERE campaign.status IN ('active', 'attention')
         AND EXISTS (
@@ -353,7 +363,8 @@ export async function claimProgressiveWork(
           WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epochId}
             AND generation.plan_revision_id = campaign.current_plan_revision_id
             AND ${groupFilter}
-            AND generation.status = 'active' AND work.stage = generation.stage
+            AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()}
+            AND (work.stage = 1 OR ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)})
             AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
             AND work.stage IN (${sql.join(
               input.stages.map((stage) => sql`${stage}`),
@@ -378,6 +389,7 @@ export async function claimProgressiveWork(
     }>(
       connection,
       sql`
+      WITH ${progressiveAdmissionFrontierSql(epochId)}
       SELECT work.id, work.generation_id, work.target_id, work.stage, work.attempts,
         scope.angles, scope.recipes, scope.revision_id, target.physical
       FROM progressive_work work JOIN progressive_generations generation ON generation.id = work.generation_id
@@ -386,7 +398,8 @@ export async function claimProgressiveWork(
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epochId}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND ${groupFilter}
-        AND generation.status = 'active' AND work.stage = generation.stage
+        AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()}
+        AND (work.stage = 1 OR ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)})
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
         AND work.stage IN (${sql.join(
           input.stages.map((stage) => sql`${stage}`),
@@ -461,7 +474,7 @@ async function lockLease(db: DB, lease: ProgressiveLease) {
       AND work.stage = ${lease.stage} AND work.state = 'leased'
       AND work.lease_token = ${lease.token} AND work.lease_owner = ${lease.owner}
       AND work.lease_until > clock_timestamp() AND generation.epoch_id = ${lease.epochId}
-      AND generation.campaign_id = ${lease.campaignId} AND generation.stage = work.stage AND generation.status = 'active'
+      AND generation.campaign_id = ${lease.campaignId} AND ${effectiveProgressiveStageSql()} = work.stage AND generation.status = 'active'
       AND generation.plan_revision_id = ${campaign.current_plan_revision_id}
     FOR UPDATE OF generation, work
   `,

@@ -2243,8 +2243,8 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 [[test.progressive.check]]
 name = "cfd-cohort"
 tier = "development"
-requires = ["dependencies", "types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "durable progressive CFD units"]
+requires = ["dependencies", "types", "fixture-ownership"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "durable progressive CFD units|subsonic through precise priority"]
 
 [[test.progressive.check]]
 name = "history-startup"

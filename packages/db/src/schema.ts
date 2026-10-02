@@ -6980,6 +6980,50 @@ export const progressiveGenerations = pgTable(
   }),
 );
 
+export const campaignProgressiveExecutionPolicies = pgTable(
+  "campaign_progressive_execution_policies",
+  {
+    campaignId: uuid("campaign_id").primaryKey().references(() => simCampaigns.id, { onDelete: "cascade" }),
+    policy: text("policy").notNull(),
+    adoptedAt: timestamp("adopted_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    policyCheck: check("campaign_progressive_execution_policies_policy_check", sql`${table.policy} = 'subsonic-through-precise-v1'`),
+  }),
+);
+
+export const progressiveGenerationCohorts = pgTable(
+  "progressive_generation_cohorts",
+  {
+    generationId: uuid("generation_id").notNull().references(() => progressiveGenerations.id, { onDelete: "cascade" }),
+    cohort: text("cohort").notNull(),
+    stage: smallint("stage").notNull().default(1),
+    status: text("status").notNull().default("active"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.generationId, table.cohort] }),
+    cohortCheck: check("progressive_generation_cohorts_cohort_check", sql`${table.cohort} IN ('low', 'high')`),
+    stageCheck: check("progressive_generation_cohorts_stage_check", sql`${table.stage} IN (1, 2, 3)`),
+    statusCheck: check("progressive_generation_cohorts_status_check", sql`${table.status} IN ('active', 'complete', 'attention')`),
+  }),
+);
+
+export const progressiveGenerationCohortTargets = pgTable(
+  "progressive_generation_cohort_targets",
+  {
+    generationId: uuid("generation_id").notNull(),
+    targetId: text("target_id").notNull(),
+    cohort: text("cohort").notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.generationId, table.targetId] }),
+    scopeFk: foreignKey({ columns: [table.generationId, table.targetId], foreignColumns: [progressiveGenerationTargets.generationId, progressiveGenerationTargets.targetId] }).onDelete("cascade"),
+    cohortFk: foreignKey({ columns: [table.generationId, table.cohort], foreignColumns: [progressiveGenerationCohorts.generationId, progressiveGenerationCohorts.cohort] }).onDelete("cascade"),
+    cohortIdx: index("progressive_generation_cohort_targets_cohort_idx").on(table.generationId, table.cohort, table.targetId),
+  }),
+);
+
 export const progressiveRecipeAdoptions = pgTable(
   "progressive_recipe_adoptions",
   {

@@ -30,7 +30,7 @@ def test_reset_never_truncates_configuration_or_uses_cascade():
 def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
     assert not RESET["CONFIGURATION_TABLES"] & RESET["SOLVER_TABLES"]
     assert {"sim_campaign_airfoils", "sim_campaign_plan_revisions", "sim_campaign_conditions",
-            "registered_remote_solvers", "sync_api_settings"} <= RESET["CONFIGURATION_TABLES"]
+            "registered_remote_solvers", "sync_api_settings", "campaign_progressive_execution_policies"} <= RESET["CONFIGURATION_TABLES"]
     assert {"results", "result_attempts", "force_history", "sim_jobs",
             "sync_sweep_promises", "polar_fit_sets", "solver_evidence_incomplete_quarantines",
             "solver_evidence_orphan_quarantines", "progressive_cfd_units", "progressive_cfd_attempts",
@@ -38,7 +38,8 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
             "progressive_prediction_repairs", "progressive_prediction_repair_attempts", "progressive_recipe_adoptions",
             "progressive_publication_recoveries", "progressive_publication_recovery_claims",
             "progressive_worker_archive_reclaims", "progressive_polar_geometry_verifications",
-            "progressive_worker_evidence_delivery_claims"} <= RESET["SOLVER_TABLES"]
+            "progressive_worker_evidence_delivery_claims", "progressive_generation_cohorts",
+            "progressive_generation_cohort_targets"} <= RESET["SOLVER_TABLES"]
 
 
 def test_archive_reclaim_queue_is_disposable_without_widening_configuration_deletion():
@@ -56,11 +57,25 @@ def test_numerical_policy_survives_solver_reset_but_attempt_claims_do_not():
     configuration, solver = RESET["classify_tables"]([
         *recognized_tables(), {"schema": "public", "name": "campaign_local_step_policies"},
         {"schema": "public", "name": "progressive_cfd_local_step_claims"},
+        {"schema": "public", "name": "campaign_progressive_execution_policies"},
+        {"schema": "public", "name": "progressive_generation_cohorts"},
+        {"schema": "public", "name": "progressive_generation_cohort_targets"},
     ])
     assert "campaign_local_step_policies" in configuration
-    assert solver == ["progressive_cfd_local_step_claims"]
-    with pytest.raises(ValueError, match="explicit solver domain"):
-        RESET["truncate_statement"](["campaign_local_step_policies"])
+    assert "campaign_progressive_execution_policies" in configuration
+    assert solver == ["progressive_cfd_local_step_claims", "progressive_generation_cohort_targets", "progressive_generation_cohorts"]
+    for policy in ("campaign_local_step_policies", "campaign_progressive_execution_policies"):
+        with pytest.raises(ValueError, match="explicit solver domain"):
+            RESET["truncate_statement"]([policy])
+    statement = RESET["truncate_statement"](solver)
+    assert "campaign_progressive_execution_policies" not in statement
+    assert "progressive_generation_cohorts" in statement
+    assert "progressive_generation_cohort_targets" in statement
+    RESET["validate_foreign_keys"]([
+        {"source": "campaign_progressive_execution_policies", "target": "sim_campaigns"},
+        {"source": "progressive_generation_cohorts", "target": "progressive_generations"},
+        {"source": "progressive_generation_cohort_targets", "target": "progressive_generation_cohorts"},
+    ], configuration)
 
 
 def test_preserved_foreign_keys_cannot_retain_solver_dependencies():

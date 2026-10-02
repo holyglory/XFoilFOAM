@@ -109,9 +109,70 @@ accuracy certificate; unsuitable profiles remain unavailable.
 
 Every existing and new campaign first produces complete NeuralFoil prediction
 curves, then improves coverage with bounded fast OpenFOAM calculations, and finally
-resolves the original angle targets with precise OpenFOAM. These are strict stages
-within a sealed campaign execution generation, not overlapping per-polar ladders.
+resolves the original angle targets with precise OpenFOAM. By default these are
+strict stages within a sealed campaign execution generation. An explicitly
+adopted execution priority may instead advance its persisted cohorts as described
+below; it never changes the sealed target or numerical recipe.
 Campaign priority applies before stage, least-covered target and information gain.
+
+### Optional subsonic through precise priority
+
+Decision `subsonic-through-precise-priority-20261002` (`ncf57defef73ae0e3`) permits
+an existing campaign to adopt `subsonic-through-precise-v1`. NeuralFoil settles
+first for the entire generation. Its low cohort then advances through fast and
+precise CFD while higher-speed fast work may remain pending. Low means a finite,
+nonnegative Mach value below 1; exactly Mach 1, missing, malformed and negative
+Mach values belong to the high cohort and cannot be treated as subsonic.
+
+Every current generation's low precise work must close successfully before a
+new high CFD claim is issued. A fast gap can advance into precise recovery; a
+precise gap keeps the high cohort waiting. In-flight, locked, deferred or
+unsupported low work also holds high admission. Pending profile-enrollment scope
+requests hold high admission until their new immutable targets and inherited
+cohort cursors have been recorded. Cancelled generations and superseded plans
+do not create current obligations.
+
+The policy, cohort cursors and indexed target-to-cohort membership are execution
+metadata. Adoption does not replace generations, change target membership,
+physical identity, setup snapshots, recipes, budgets, attempts, results or the
+calculation epoch. The campaign row lock serializes adoption with new claims and
+enrollment; existing issued ownership remains valid. Local dispatch, runtime
+accounting, evidence ingestion, remote start and continuation, reports, settlement
+and recovery use the same effective cohort stage. Initial coverage and adaptive
+fast barriers apply to that cohort. Generation stage remains the earliest cohort
+stage and generation status remains the aggregate; the existing admin progress
+stage reports the active low stage while it has unfinished precise obligations.
+Campaigns without the policy retain their global stage ordering.
+
+Admission reads a materialized frontier from indexed cohort state, once per
+claim statement, without scanning target JSON or individual precise units for
+each candidate. Cohort initialization and coverage readiness are also materialized
+once per selection statement. No additional worker or admission capacity is added.
+
+After deploying the parent-reviewed coherent candidate and its migration on the
+hub, preview and then adopt the policy with the finite operator command:
+
+```sh
+pnpm --filter @aerodb/db exec tsx src/adopt-progressive-subsonic-priority.ts CAMPAIGN_UUID --dry-run
+pnpm --filter @aerodb/db exec tsx src/adopt-progressive-subsonic-priority.ts CAMPAIGN_UUID --apply
+```
+
+The default is a transactionally rolled-back dry run. Apply is idempotent and
+preserves a paused campaign and all active ownership. Lock waits are bounded at
+five seconds and individual statements at thirty seconds; timeout rolls back
+adoption. A worker restart or epoch reset is unnecessary. Verify new low fast
+then low precise claims on the hub and remote solver before treating production
+activation as complete. Deployment and activation are separate from source proof.
+An explicitly approved solver-domain reset preserves the campaign execution
+policy as configuration and discards cohort cursors and membership with the
+generations; their replacement generations inherit the retained priority.
+
+The governed `progressive` graph's `cfd-cohort` check extends the isolated
+campaign-profile-enrollment database journey with Mach 0.5, 1 and 2, stored
+prediction fixtures, exact attempt ownership, restart, concurrent claims, new
+profile enrollment, remote continuation and a bounded admission-frontier EXPLAIN.
+Accepted and rejected scheduling fixtures are confined to its disposable database;
+they are controller acceptance evidence, not newly calculated aerodynamic results.
 
 Public Detail and Compare put curves first. Points are opt-in. Method comparison
 and a "Why this curve" disclosure explain the actual prediction, contributing
