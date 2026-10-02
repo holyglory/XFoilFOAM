@@ -37,7 +37,8 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
             "progressive_cfd_execution_stops", "progressive_cfd_stage_decisions", "progressive_cfd_runtime_progress",
             "progressive_prediction_repairs", "progressive_prediction_repair_attempts", "progressive_recipe_adoptions",
             "progressive_publication_recoveries", "progressive_publication_recovery_claims",
-            "progressive_worker_archive_reclaims"} <= RESET["SOLVER_TABLES"]
+            "progressive_worker_archive_reclaims", "progressive_polar_geometry_verifications",
+            "progressive_worker_evidence_delivery_claims"} <= RESET["SOLVER_TABLES"]
 
 
 def test_archive_reclaim_queue_is_disposable_without_widening_configuration_deletion():

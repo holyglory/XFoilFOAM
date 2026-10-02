@@ -355,6 +355,9 @@ it("rehearses with complete rollback then restores requested points without chan
       (policy) => policy.planRevisionId === input.expectedPlanRevisionId,
     ),
   ).toBe(true);
+  await db.execute(
+    sql`UPDATE calculation_epochs SET current = false WHERE current`,
+  );
   const receipt = await prepareProgressiveReset(db, input);
   const [campaign] = await db
     .select()
@@ -365,6 +368,11 @@ it("rehearses with complete rollback then restores requested points without chan
     priority: 7,
     name: prefix,
   });
+  expect(receipt.calculationEpochId).toEqual(expect.any(String));
+  const [currentEpoch] = await db.execute(
+    sql`SELECT id FROM calculation_epochs WHERE current`,
+  );
+  expect(currentEpoch.id).toBe(receipt.calculationEpochId);
   const [plan] = await db
     .select()
     .from(simCampaignPlanRevisions)

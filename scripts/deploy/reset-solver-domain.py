@@ -86,6 +86,7 @@ progressive_remote_progress_receipts
 progressive_remote_evidence_receipts
 progressive_worker_evidence_attempts
 progressive_worker_evidence_receipts
+progressive_worker_evidence_delivery_claims
 progressive_worker_hub_receipts
 progressive_worker_archive_receipts
 progressive_worker_archive_reclaims
@@ -96,6 +97,7 @@ progressive_worker_reports
 progressive_worker_submission_intents
 progressive_worker_assignment_cursors
 progressive_polar_models progressive_polar_fit_work progressive_polar_model_evidence
+progressive_polar_geometry_verifications
 progressive_work_attempts
 """.split())
 

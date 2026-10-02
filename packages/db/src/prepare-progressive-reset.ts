@@ -307,6 +307,18 @@ export async function prepareProgressiveReset(
         })
         .where(eq(simCampaignConditions.id, condition.id));
     }
+    const [previousEpoch] = await connection.execute(
+      sql`SELECT id FROM calculation_epochs WHERE current FOR UPDATE`,
+    );
+    if (previousEpoch)
+      await connection.execute(
+        sql`UPDATE calculation_epochs SET current = false WHERE current`,
+      );
+    const [epoch] = await connection.execute(sql`
+      INSERT INTO calculation_epochs(reason)
+      VALUES (${`progressive-solver-domain-reset: ${input.sourceReference}`})
+      RETURNING id
+    `);
     const [revision] = await connection
       .insert(simCampaignPlanRevisions)
       .values({
@@ -346,6 +358,7 @@ export async function prepareProgressiveReset(
       campaignId: campaign.id,
       planRevisionId: revision.id,
       previousPlanRevisionId: plan.id,
+      calculationEpochId: epoch.id,
       conditions: active.length,
       ...counts,
       revisions,
