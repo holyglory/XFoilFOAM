@@ -378,7 +378,10 @@ and the selected report still passes full immutable-source verification. The
 ordering index avoids sorting the entire backlog; it does not discard history or
 sample a truncated candidate list.
 
-Four staging slots refill independently, alongside four delivery lanes.
+Evidence processing uses independently configurable staging and delivery lanes;
+the source default is four of each, while the production compose configuration
+sets eight of each for the remote solver. The lane count is bounded from one to
+32 so a deployment cannot create an unbounded evidence fan-out.
 Each staging slot alternates current-work and backlog priority; selection and
 acquisition of its durable import lease share a short transaction so slots claim
 different jobs. Each delivery lane acquires a short-lived durable point claim in
