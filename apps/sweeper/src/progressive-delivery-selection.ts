@@ -1,6 +1,9 @@
 import { sql } from "drizzle-orm";
 
-export function progressiveDeliverySelectionSql(preferActive: boolean) {
+export function progressiveDeliverySelectionSql(
+  preferActive: boolean,
+  claimToken?: string,
+) {
   const points = sql`SELECT source.sim_job_id, source.sequence, source.result_attempt_id,
       source.point_content_signature, report.created_at, attempt.aoa_deg,
       COALESCE(failure.state = 'retry', false) AS is_retry
@@ -12,7 +15,10 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
       AND delivered.point_content_signature = source.point_content_signature
     LEFT JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = source.sim_job_id
       AND failure.point_content_signature = source.point_content_signature
+    LEFT JOIN progressive_worker_evidence_delivery_claims claim ON claim.sim_job_id = source.sim_job_id
+      AND claim.point_content_signature = source.point_content_signature
     WHERE delivered.sim_job_id IS NULL AND report.acknowledged_at IS NOT NULL AND attempt.result_id IS NOT NULL
+      AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())
       AND (failure.sim_job_id IS NULL OR (failure.state = 'retry' AND failure.retry_after <= clock_timestamp()))
     ORDER BY CASE WHEN failure.state = 'retry' THEN 0 ELSE 1 END,
       report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id OFFSET 0`;
@@ -40,7 +46,7 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
         fallback AS (${candidate(false)} WHERE NOT EXISTS (SELECT 1 FROM active) ${order})
       SELECT * FROM active UNION ALL SELECT * FROM fallback`
     : sql`${candidate(false)} ${order}`;
-  return sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
+  const selectedCandidate = sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
       report.content_signature AS report_signature, report.report, attempt.result_id, attempt.aoa_deg,
       attempt.engine_case_slug, attempt.evidence_payload, selected.request_payload, selected.upstream_base_url,
       selected.remote_solver_auth_token, selected.remote_solver_registered_id, selected.instance_id, selected.instance_name,
@@ -48,4 +54,24 @@ export function progressiveDeliverySelectionSql(preferActive: boolean) {
     FROM (${selected}) selected
     JOIN progressive_worker_reports report ON report.sim_job_id = selected.sim_job_id AND report.sequence = selected.sequence
     JOIN result_attempts attempt ON attempt.id = selected.result_attempt_id`;
+  if (!claimToken) return selectedCandidate;
+  return sql`
+    WITH candidate AS MATERIALIZED (${selectedCandidate}), claimed AS (
+      INSERT INTO progressive_worker_evidence_delivery_claims
+        (sim_job_id, sequence, result_attempt_id, point_content_signature, claim_token, claim_expires_at)
+      SELECT candidate.sim_job_id, candidate.sequence, candidate.result_attempt_id,
+        candidate.point_content_signature, ${claimToken}::uuid,
+        clock_timestamp() + interval '120 seconds'
+      FROM candidate
+      ON CONFLICT (sim_job_id, point_content_signature) DO UPDATE SET
+        sequence = EXCLUDED.sequence,
+        result_attempt_id = EXCLUDED.result_attempt_id,
+        claim_token = EXCLUDED.claim_token,
+        claim_expires_at = EXCLUDED.claim_expires_at
+      WHERE progressive_worker_evidence_delivery_claims.claim_expires_at <= clock_timestamp()
+      RETURNING sim_job_id, point_content_signature
+    )
+    SELECT candidate.*
+    FROM candidate JOIN claimed USING (sim_job_id, point_content_signature)
+  `;
 }

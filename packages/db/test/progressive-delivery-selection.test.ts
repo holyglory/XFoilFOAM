@@ -277,6 +277,15 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
       SELECT fixture.id AS sim_job_id,sequence,md5(variant||angle||replay)::uuid AS result_attempt_id,
         md5('point'||variant||angle||replay)::text AS point_content_signature
       FROM fixture_jobs fixture CROSS JOIN generate_series(1,2) sequence CROSS JOIN unnest(ARRAY[-2,3]) angle CROSS JOIN generate_series(1,2) replay`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_delivery_claims (
+      sim_job_id uuid NOT NULL,
+      sequence bigint NOT NULL,
+      result_attempt_id uuid NOT NULL,
+      point_content_signature text NOT NULL,
+      claim_token uuid NOT NULL,
+      claim_expires_at timestamptz NOT NULL,
+      PRIMARY KEY (sim_job_id, point_content_signature)
+    ) ON COMMIT DROP`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_hub_receipts ON COMMIT DROP AS
       SELECT source.sim_job_id,source.point_content_signature FROM progressive_worker_evidence_attempts source
       JOIN fixture_jobs fixture ON fixture.id=source.sim_job_id WHERE fixture.variant='already-delivered' GROUP BY 1,2`);
@@ -331,6 +340,35 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         }),
       ).rejects.toBe(rollback);
     }
+    const claimRollback = new Error("Rollback isolated delivery claim");
+    await expect(
+      transaction.transaction(async (nested) => {
+        const first = await nested.execute(
+          progressiveDeliverySelectionSql(
+            true,
+            "11111111-1111-4111-8111-111111111111",
+          ),
+        );
+        expect(first).toHaveLength(1);
+        const [storedClaim] = await nested.execute(
+          sql`SELECT claim_token FROM progressive_worker_evidence_delivery_claims
+            WHERE sim_job_id=${first[0].sim_job_id}::uuid
+              AND point_content_signature=${first[0].point_content_signature}`,
+        );
+        expect(storedClaim.claim_token).toBe(
+          "11111111-1111-4111-8111-111111111111",
+        );
+        expect(
+          await nested.execute(
+            progressiveDeliverySelectionSql(
+              true,
+              "22222222-2222-4222-8222-222222222222",
+            ),
+          ),
+        ).toEqual([]);
+        throw claimRollback;
+      }),
+    ).rejects.toBe(claimRollback);
     const [due] = await transaction.execute(
       sql`SELECT id FROM fixture_jobs WHERE variant='due-retry'`,
     );

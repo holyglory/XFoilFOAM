@@ -89,7 +89,7 @@ it("refills a free staging slot while other imports and delivery remain pending"
   try {
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(4);
-    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver).toHaveBeenCalledTimes(4);
     imports[0].release();
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(5);
@@ -108,7 +108,7 @@ it("refills a free staging slot while other imports and delivery remain pending"
     network.release();
     await running;
   }
-  expect(channel.unlisten).toHaveBeenCalledTimes(5);
+  expect(channel.unlisten).toHaveBeenCalledTimes(8);
 });
 
 it("continues delivery while all four staging slots wait", async () => {
@@ -135,13 +135,13 @@ it("continues delivery while all four staging slots wait", async () => {
   try {
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(4);
-    expect(deliver).toHaveBeenCalledTimes(4);
+    expect(deliver).toHaveBeenCalledTimes(8);
     expect(deliver.mock.calls.every(([preferActive]) => preferActive)).toBe(
       true,
     );
     channel.notify("progressive_worker_evidence_changed");
     await vi.advanceTimersByTimeAsync(0);
-    expect(deliver).toHaveBeenCalledTimes(5);
+    expect(deliver).toHaveBeenCalledTimes(12);
     expect(stage).toHaveBeenCalledTimes(4);
   } finally {
     owner.abort();
@@ -171,12 +171,12 @@ it("keeps staging moving during delivery failures without bypassing delivery bac
   try {
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(8);
-    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(99);
-    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(1);
-    expect(deliver).toHaveBeenCalledTimes(2);
-    expect(reportError).toHaveBeenCalledTimes(2);
+    expect(deliver).toHaveBeenCalledTimes(8);
+    expect(reportError).toHaveBeenCalledTimes(8);
   } finally {
     owner.abort();
     await running;
@@ -206,17 +206,17 @@ it("keeps retry deadlines independent and wakes all slots for acknowledged evide
   try {
     await vi.advanceTimersByTimeAsync(1032);
     expect(stage).toHaveBeenCalledTimes(4);
-    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(1);
     expect(stage).toHaveBeenCalledTimes(4);
-    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliver).toHaveBeenCalledTimes(8);
     await vi.advanceTimersByTimeAsync(1024);
     expect(stage).toHaveBeenCalledTimes(8);
-    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliver).toHaveBeenCalledTimes(8);
     channel.notify("progressive_worker_evidence_changed");
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(12);
-    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(deliver).toHaveBeenCalledTimes(12);
     await vi.advanceTimersByTimeAsync(10000);
     expect(stage).toHaveBeenCalledTimes(12);
   } finally {
@@ -265,6 +265,6 @@ it("awaits every in-flight operation on shutdown and never restarts after abort"
     await running;
   }
   expect(finished).toBe(true);
-  expect(channel.unlisten).toHaveBeenCalledTimes(5);
-  expect(deliver).toHaveBeenCalledTimes(1);
+  expect(channel.unlisten).toHaveBeenCalledTimes(8);
+  expect(deliver).toHaveBeenCalledTimes(4);
 });

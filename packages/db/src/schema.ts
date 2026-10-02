@@ -8107,6 +8107,44 @@ export const progressiveWorkerEvidenceAttempts = pgTable(
   }),
 );
 
+export const progressiveWorkerEvidenceDeliveryClaims = pgTable(
+  "progressive_worker_evidence_delivery_claims",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    resultAttemptId: uuid("result_attempt_id").notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    claimToken: uuid("claim_token").notNull(),
+    claimExpiresAt: timestamp("claim_expires_at", {
+      withTimezone: true,
+    }).notNull(),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.simJobId, table.pointContentSignature],
+    }),
+    attempt: foreignKey({
+      columns: [table.simJobId, table.sequence, table.resultAttemptId],
+      foreignColumns: [
+        progressiveWorkerEvidenceAttempts.simJobId,
+        progressiveWorkerEvidenceAttempts.sequence,
+        progressiveWorkerEvidenceAttempts.resultAttemptId,
+      ],
+    }).onDelete("cascade"),
+    pointSignatureCheck: check(
+      "progressive_worker_evidence_delivery_claims_point_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    claimCheck: check(
+      "progressive_worker_evidence_delivery_claims_claim_check",
+      sql`${table.claimToken} IS NOT NULL AND ${table.claimExpiresAt} IS NOT NULL`,
+    ),
+    expiryIdx: index(
+      "progressive_worker_evidence_delivery_claims_expiry_idx",
+    ).on(table.claimExpiresAt),
+  }),
+);
+
 export const progressiveWorkerHubReceipts = pgTable(
   "progressive_worker_hub_receipts",
   {

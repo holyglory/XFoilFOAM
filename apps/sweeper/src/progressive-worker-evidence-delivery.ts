@@ -9,6 +9,7 @@ import {
   type ProgressiveRemoteEvidenceReference,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import { progressiveDeliverySelectionSql } from "./progressive-delivery-selection";
 import { recordInactiveStoppedPromise } from "./progressive-inactive-promise";
@@ -87,6 +88,11 @@ export async function recordProgressiveWorkerEvidenceReceipt(
       throw new Error("Hub changed its immutable progressive attempt receipt");
     await connection.execute(sql`DELETE FROM progressive_worker_delivery_failures
       WHERE sim_job_id=${expected.executionId}::uuid AND point_content_signature=${expected.pointContentSignature}`);
+    await connection.execute(sql`
+      DELETE FROM progressive_worker_evidence_delivery_claims
+      WHERE sim_job_id=${expected.executionId}::uuid
+        AND point_content_signature=${expected.pointContentSignature}
+    `);
   });
   return receipt;
 }
@@ -97,8 +103,12 @@ export async function deliverNextProgressiveWorkerEvidence(
   selection: { preferActive?: boolean } = {},
 ): Promise<boolean> {
   await requeueStoppedProgressiveStorage(db, { retryStoppedStorage: true });
+  const claimToken = randomUUID();
   const [pending] = await db.execute(
-    progressiveDeliverySelectionSql(selection.preferActive === true),
+    progressiveDeliverySelectionSql(
+      selection.preferActive === true,
+      claimToken,
+    ),
   );
   if (!pending) return false;
   const executionId = String(pending.sim_job_id);
@@ -254,6 +264,12 @@ export async function deliverNextProgressiveWorkerEvidence(
           ELSE clock_timestamp() + make_interval(secs => LEAST(60, power(2, LEAST(5, progressive_worker_delivery_failures.attempt_count + 1)))::double precision) END,
         last_http_status = excluded.last_http_status, last_error = excluded.last_error,
         remote_conflict_ids = excluded.remote_conflict_ids, updated_at = clock_timestamp()
+    `);
+    await db.execute(sql`
+      DELETE FROM progressive_worker_evidence_delivery_claims
+      WHERE sim_job_id=${executionId}::uuid
+        AND point_content_signature=${pending.point_content_signature}
+        AND claim_token=${claimToken}::uuid
     `);
     throw error;
   }

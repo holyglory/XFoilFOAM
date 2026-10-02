@@ -9,6 +9,7 @@ import { runSweeperServices } from "./service-lifecycle";
 const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 8;
 const SERVICE_MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 32;
 const MAX_PARALLEL_EVIDENCE_STAGES = 4;
+const MAX_PARALLEL_EVIDENCE_DELIVERIES = 4;
 
 export async function drainProgressiveWorkerEvidencePass(
   deliver: (preferActive: boolean) => Promise<boolean>,
@@ -160,6 +161,8 @@ export async function runProgressiveEvidenceService(
     ...Array.from({ length: MAX_PARALLEL_EVIDENCE_STAGES }, (_, lane) =>
       service("staging", lane),
     ),
-    service("delivery", 0),
+    ...Array.from({ length: MAX_PARALLEL_EVIDENCE_DELIVERIES }, (_, lane) =>
+      service("delivery", lane),
+    ),
   ]);
 }
