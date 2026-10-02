@@ -4,6 +4,29 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { expect, it, vi } from "vitest";
 import { renewIndependentPromises } from "../src/remote-promise-renewal";
 
+it("drains the full selected batch without exceeding the service cap", async () => {
+  let active = 0;
+  let maximum = 0;
+  const seen: number[] = [];
+  const summary = await renewIndependentPromises(
+    Array.from({ length: 100 }, (_, index) => index),
+    16,
+    new AbortController().signal,
+    async (item) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await nextTurn();
+      seen.push(item);
+      active -= 1;
+    },
+  );
+  expect(maximum).toBe(16);
+  expect(summary).toEqual({ processed: 100, deferred: 0 });
+  expect(seen.sort((left, right) => left - right)).toEqual(
+    Array.from({ length: 100 }, (_, index) => index),
+  );
+});
+
 it("renews independent promises concurrently within the existing caller capacity", async () => {
   const controller = new AbortController();
   let active = 0;
@@ -69,6 +92,34 @@ it("observes all safe siblings and preserves the first input-order failure", asy
   rejectFirst(first);
   expect(await running).toBe(first);
   expect(finished.sort()).toEqual([0, 1, 2]);
+});
+
+it("isolates one failed renewal while draining every other selected promise", async () => {
+  const failure = new Error("one promise failed");
+  let active = 0;
+  let maximum = 0;
+  let attempted = 0;
+  await expect(
+    renewIndependentPromises(
+      Array.from({ length: 100 }, (_, index) => index),
+      16,
+      new AbortController().signal,
+      async (item) => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        attempted += 1;
+        try {
+          await nextTurn();
+          if (item === 37) throw failure;
+        } finally {
+          active -= 1;
+        }
+      },
+    ),
+  ).rejects.toBe(failure);
+  expect(maximum).toBe(16);
+  expect(attempted).toBe(100);
+  expect(active).toBe(0);
 });
 
 it("aborts genuinely stalled HTTP responses and never starts queued renewals after expiry", async () => {

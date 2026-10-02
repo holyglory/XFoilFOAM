@@ -171,9 +171,22 @@ const REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS = Math.min(
   ),
 );
 const REMOTE_RECLAIM_MAX_CONCURRENCY = 8;
+const REMOTE_PROMISE_RENEWAL_DEFAULT_CONCURRENCY = 16;
+const REMOTE_PROMISE_RENEWAL_MAX_CONCURRENCY = 16;
 const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
   "xfoilfoam-hub-canonical-evidence-binding-v1\n";
 const BROKER_UPLOAD_IDEMPOTENCY_DOMAIN = "xfoilfoam:broker-upload:v1\0";
+
+function remotePromiseRenewalConcurrency(
+  raw = process.env.SWEEPER_REMOTE_PROMISE_RENEWAL_CONCURRENCY,
+): number {
+  if (raw == null || raw.trim() === "")
+    return REMOTE_PROMISE_RENEWAL_DEFAULT_CONCURRENCY;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1)
+    return REMOTE_PROMISE_RENEWAL_DEFAULT_CONCURRENCY;
+  return Math.min(parsed, REMOTE_PROMISE_RENEWAL_MAX_CONCURRENCY);
+}
 
 export function brokeredEvidenceIdempotencyKey(
   promiseId: string,
@@ -1856,7 +1869,7 @@ async function renewMirroredPromiseLeases(
     .orderBy(syncSweepPromises.expiresAt, syncSweepPromises.id)
     .limit(100);
   const started = performance.now();
-  const concurrency = activeReconcileConcurrency();
+  const concurrency = remotePromiseRenewalConcurrency();
   const renewal = await renewIndependentPromises(
     rows,
     concurrency,
