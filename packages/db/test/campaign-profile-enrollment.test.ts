@@ -3694,6 +3694,68 @@ describe("progressive CPU admission", () => {
     });
   }, 60_000);
 
+  it("does not reserve remote CPU for an unstarted dispatch after its case lease expires", async () => {
+    await ready(async () => {
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "remote-expired-admission-fixture",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+      });
+      const composed = await composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      const [job] = await db
+        .select()
+        .from(simJobs)
+        .where(eq(simJobs.id, composed.jobId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      await db.execute(sql`
+        INSERT INTO registered_remote_solvers (id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+        VALUES (${solverId}::uuid, ${randomUUID()}, 'isolated expired remote worker', 96, 96, 96)
+      `);
+      await db.execute(sql`
+        INSERT INTO sync_sweep_promises (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid,
+          ${leases.length}, clock_timestamp() + interval '1 hour')
+      `);
+      for (const lease of leases)
+        await db.execute(sql`
+          INSERT INTO sync_sweep_promise_points (promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
+          VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})
+        `);
+      try {
+        await bindProgressiveRemoteDispatch(db, {
+          simJobId: job.id,
+          solverId,
+          promiseId,
+        });
+        expect(await progressiveRemoteReservedSlots(db, solverId)).toBe(1);
+        await db.execute(sql`
+          UPDATE progressive_cfd_units
+          SET lease_until = clock_timestamp() - interval '1 second'
+          WHERE id IN (${sql.join(
+            leases.map((lease) => sql`${lease.id}::uuid`),
+            sql`, `,
+          )})
+        `);
+        expect(await progressiveRemoteReservedSlots(db, solverId)).toBe(0);
+      } finally {
+        await db.execute(
+          sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id = ${job.id}::uuid`,
+        );
+        await db.execute(
+          sql`DELETE FROM sync_sweep_promises WHERE id = ${promiseId}::uuid`,
+        );
+        await db.execute(
+          sql`DELETE FROM registered_remote_solvers WHERE id = ${solverId}::uuid`,
+        );
+      }
+    });
+  });
+
   it("progressive remote dispatch composes only after authenticated capabilities and rolls back incompatible work", async () => {
     await ready(async ({ generationId, poolId }) => {
       const solverId = randomUUID();

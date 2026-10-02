@@ -20,6 +20,26 @@ export async function progressiveRemoteReservedSlots(
     WHERE dispatch.solver_id = ${solverId}::uuid
       AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
         WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
+      AND NOT EXISTS (
+        SELECT 1 FROM sim_jobs job
+        WHERE job.id = dispatch.sim_job_id
+          AND job.status = 'pending'
+          AND job.engine_job_id IS NULL
+          AND job.engine_state IS NULL
+          AND EXISTS (
+            SELECT 1 FROM progressive_cfd_attempts attempt
+            WHERE attempt.sim_job_id = job.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM progressive_cfd_attempts attempt
+            JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+            WHERE attempt.sim_job_id = job.id
+              AND attempt.outcome = 'running'
+              AND unit.state = 'leased'
+              AND unit.lease_until > clock_timestamp()
+          )
+      )
   `);
   return Number(row.reserved);
 }
