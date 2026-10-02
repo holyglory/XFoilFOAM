@@ -358,14 +358,16 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         expect(storedClaim.claim_token).toBe(
           "11111111-1111-4111-8111-111111111111",
         );
-        expect(
-          await nested.execute(
-            progressiveDeliverySelectionSql(
-              true,
-              "22222222-2222-4222-8222-222222222222",
-            ),
+        const second = await nested.execute(
+          progressiveDeliverySelectionSql(
+            true,
+            "22222222-2222-4222-8222-222222222222",
           ),
-        ).toEqual([]);
+        );
+        expect(second).toHaveLength(1);
+        expect(second[0].point_content_signature).not.toBe(
+          first[0].point_content_signature,
+        );
         throw claimRollback;
       }),
     ).rejects.toBe(claimRollback);
