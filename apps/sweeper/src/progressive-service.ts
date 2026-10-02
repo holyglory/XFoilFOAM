@@ -16,6 +16,15 @@ import {
   runProgressiveFitBatch,
 } from "./progressive-fitting";
 
+function configuredNeuralFoilConcurrency(env: NodeJS.ProcessEnv = process.env) {
+  const raw =
+    env.AIRFOILFOAM_NEURALFOIL_CONCURRENCY ??
+    env.AIRFOILFOAM_WORKER_CPU_BUDGET ??
+    "1";
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : 1;
+}
+
 export async function runProgressiveBaselineService(
   db: DB,
   notifications: Pick<Sql, "listen">,
@@ -89,9 +98,22 @@ export async function runProgressiveBaselineService(
           if (invalidated)
             report({ component: "progressive-fit-policy", invalidated });
         }
-        const batch = await runProgressiveBaselineBatch(db, engine, owner, {
-          requireSweeperEnabled: true,
-        });
+        const baselineBatches = await Promise.all(
+          Array.from({ length: configuredNeuralFoilConcurrency() }, () =>
+            runProgressiveBaselineBatch(db, engine, owner, {
+              requireSweeperEnabled: true,
+            }),
+          ),
+        );
+        const batch = baselineBatches.reduce(
+          (summary, current) => ({
+            claimed: summary.claimed + current.claimed,
+            stored: summary.stored + current.stored,
+            reused: summary.reused + current.reused,
+            errors: [...summary.errors, ...current.errors],
+          }),
+          { claimed: 0, stored: 0, reused: 0, errors: [] as string[] },
+        );
         if (batch.claimed) {
           pending = true;
           report({ component: "progressive-baseline", ...batch });
