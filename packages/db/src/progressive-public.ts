@@ -36,21 +36,26 @@ type ProgressivePublicRecord = {
   };
 };
 
-function trend(samples: Array<{ alpha: number; cl: number }>): number | null {
-  const scoped = samples.filter((sample) => sample.alpha >= -5 && sample.alpha <= 10);
+function trend(
+  samples: Array<{ alpha: number; cl: number }>,
+  minimumAlpha = -5,
+  maximumAlpha = 10,
+): number | null {
+  const scoped = samples.filter(
+    (sample) => sample.alpha >= minimumAlpha && sample.alpha <= maximumAlpha,
+  );
   if (scoped.length < 2) return null;
   return scoped.at(-1)!.cl - scoped[0].cl;
 }
 
-function primaryMethod(record: ProgressivePublicRecord):
-  | "neuralfoil"
-  | "openfoam_fast"
-  | "openfoam_precise"
-  | "composite" {
-  const declared = record.estimate?.publication?.primary_method;
-  if (declared) return declared;
+function primaryMethod(
+  record: ProgressivePublicRecord,
+): "neuralfoil" | "openfoam_fast" | "openfoam_precise" | "composite" {
   const contributors = record.estimate?.contributors ?? [];
-  if (contributors.length && contributors.every((row) => row.method === "openfoam_fast")) {
+  if (
+    contributors.length &&
+    contributors.every((row) => row.method === "openfoam_fast")
+  ) {
     const neuralfoil = record.payload.alpha.map((alpha, index) => ({
       alpha,
       cl: record.payload.coefficients[index][0],
@@ -63,6 +68,23 @@ function primaryMethod(record: ProgressivePublicRecord):
       : [];
     const priorTrend = trend(neuralfoil);
     const fittedTrend = trend(composite);
+    const contributorAngles = contributors.map(
+      (row) => record.evidence_angles?.[row.attempt_id],
+    );
+    const hasExactContributorAngles = contributorAngles.every(
+      (alpha): alpha is number =>
+        typeof alpha === "number" && Number.isFinite(alpha),
+    );
+    const priorFullTrend = trend(neuralfoil, -5, 20);
+    const fittedFullTrend = trend(composite, -5, 20);
+    const sparseFullRangeConflict =
+      hasExactContributorAngles &&
+      new Set(contributorAngles).size <= 2 &&
+      priorFullTrend !== null &&
+      fittedFullTrend !== null &&
+      Math.abs(priorFullTrend) >= 0.2 &&
+      Math.abs(fittedFullTrend) >= 0.2 &&
+      priorFullTrend * fittedFullTrend < 0;
     if (
       priorTrend !== null &&
       fittedTrend !== null &&
@@ -71,7 +93,10 @@ function primaryMethod(record: ProgressivePublicRecord):
       priorTrend * fittedTrend < 0
     )
       return "neuralfoil";
+    if (sparseFullRangeConflict) return "neuralfoil";
   }
+  const declared = record.estimate?.publication?.primary_method;
+  if (declared) return declared;
   return record.estimate ? "composite" : "neuralfoil";
 }
 

@@ -105,6 +105,39 @@ def test_reversed_sparse_fast_anchors_keep_neuralfoil_primary_until_full_referen
     assert fitted["curves"]["openfoam_fast"]["coefficients"][0][0] > 1
 
 
+def test_sparse_fast_posterior_reversal_keeps_neuralfoil_primary():
+    angles = list(range(-5, 21))
+    coefficients = [
+        [
+            0.07 * (alpha + 5) - 0.002 * max(alpha - 10, 0) ** 2 - 0.08,
+            0.022 + 0.0003 * (alpha - 1) ** 2,
+            -0.05 + 0.001 * alpha,
+        ]
+        for alpha in angles
+    ]
+    wide_prior = PolarPrior(
+        "physical-target",
+        "wide-test-prediction",
+        "single",
+        angles,
+        coefficients,
+        [[0.3, 0.02, 0.1] for _ in angles],
+        {"fixture": True},
+    )
+    fitted = fit_progressive_polar(
+        wide_prior,
+        [observation("wide-left", -4, 0.25), observation("wide-right", 5, 0.1)],
+        policy(),
+    )
+    assert fitted["best_method"] == "neuralfoil"
+    assert fitted["publication"]["primary_method"] == "neuralfoil"
+    assert fitted["publication"]["reason"] == "conflicting_sparse_fast_cfd_trend"
+    assert fitted["publication"]["angle_scope"] == [-5.0, 20.0]
+    np.testing.assert_allclose(
+        fitted["curves"]["composite"]["coefficients"], wide_prior.coefficients,
+    )
+
+
 def test_precise_observation_does_not_relabel_fast_evidence():
     rows = [observation("fast", cl=0.25), observation("precise", cl=0.4, method="openfoam_precise")]
     fitted = fit_progressive_polar(prior(), rows, policy())

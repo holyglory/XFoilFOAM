@@ -43,9 +43,14 @@ function latestCatalogCurves(airfoilIds?: string[], groupId?: string) {
   return sql`
     SELECT DISTINCT ON (prediction.target_id)
       target.airfoil_id, target.condition_group_id, prediction.target_id,
-      CASE WHEN model.catalog_composite_present THEN model.id ELSE prediction.id END AS model_id,
-      CASE WHEN model.catalog_composite_present THEN 'estimate' ELSE 'prediction' END AS kind,
       CASE WHEN model.catalog_composite_present
+        AND coalesce(model.response->'estimate'->'publication'->>'primary_method', 'composite') <> 'neuralfoil'
+        THEN model.id ELSE prediction.id END AS model_id,
+      CASE WHEN model.catalog_composite_present
+        AND coalesce(model.response->'estimate'->'publication'->>'primary_method', 'composite') <> 'neuralfoil'
+        THEN 'estimate' ELSE 'prediction' END AS kind,
+      CASE WHEN model.catalog_composite_present
+        AND coalesce(model.response->'estimate'->'publication'->>'primary_method', 'composite') <> 'neuralfoil'
         THEN model.catalog_metrics_v1 ELSE prediction.catalog_metrics_v1 END AS metrics
     FROM neuralfoil_predictions prediction
     JOIN calculation_epochs epoch ON epoch.id = prediction.epoch_id AND epoch.current

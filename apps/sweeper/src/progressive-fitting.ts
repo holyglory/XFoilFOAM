@@ -20,7 +20,7 @@ import type {
 } from "@aerodb/engine-client";
 
 const ASSUMPTIONS = {
-  version: "progressive-fit-assumptions-v8",
+  version: "progressive-fit-assumptions-v9",
   sourceGeometryMeshVersion: SOURCE_GEOMETRY_MESH_VERSION,
   historyOrigin: "recorded-source-before-windowing-v1",
   informativeWindow: "post-startup-suffix-v1",

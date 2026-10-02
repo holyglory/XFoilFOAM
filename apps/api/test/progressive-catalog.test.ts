@@ -447,7 +447,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
         };
         const first = await makePrediction(profiles[0], 30, 1);
         await makePrediction(profiles[0], 90, 0.5);
-        await makePrediction(profiles[1], 30, 2);
+        const second = await makePrediction(profiles[1], 30, 2);
         const obsoleteEpoch = randomUUID();
         await connection.execute(
           sql`INSERT INTO calculation_epochs(id,current,reason) VALUES(${obsoleteEpoch},false,'isolated obsolete prediction')`,
@@ -590,6 +590,47 @@ async function verifyPublicCatalog(fullScale: boolean) {
           source: "estimate",
           modelId,
           targetId: first.targetId,
+        });
+        const fallbackModelId = signature();
+        const fallbackResponse = {
+          ...response,
+          estimate: {
+            ...response.estimate,
+            signature: fallbackModelId,
+            publication: {
+              primary_method: "neuralfoil",
+              status: "preliminary",
+              reason: "conflicting_sparse_fast_cfd_trend",
+              matched_full_polar_reference: false,
+            },
+          },
+        };
+        await connection.execute(
+          sql`INSERT INTO progressive_polar_models(id,prediction_id,source_signature,request,response) VALUES(${fallbackModelId},${second.predictionId},${fallbackModelId},'{}',${JSON.stringify(fallbackResponse)}::jsonb)`,
+        );
+        await connection.execute(
+          sql`INSERT INTO progressive_polar_geometry_verifications(model_id,source_geometry_compatible) VALUES(${fallbackModelId},true)`,
+        );
+        await connection.execute(
+          sql`INSERT INTO progressive_polar_fit_work(prediction_id,state,model_id) VALUES(${second.predictionId},'ready',${fallbackModelId})`,
+        );
+        const fallbackPublished = (
+          await publicProgressivePolars(connection, profiles[1])
+        ).find((polar) => polar.targetId === second.targetId)!;
+        expect(fallbackPublished.primaryMethod).toBe("neuralfoil");
+        expect(
+          (
+            await publicProgressiveCatalog(
+              connection,
+              profiles,
+              firstCondition.key,
+            )
+          ).metrics.get(profiles[1]),
+        ).toMatchObject({
+          ldmax: 200,
+          source: "prediction",
+          modelId: second.predictionId,
+          targetId: second.targetId,
         });
         const published = (
           await publicProgressivePolars(connection, profiles[0])

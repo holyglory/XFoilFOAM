@@ -261,6 +261,41 @@ def _sparse_low_angle_conflict(prior_angles, prior_mean, observations):
     }
 
 
+def _sparse_fit_trend_conflict(prior_angles, prior_mean, fit_angles, curves, observations):
+    if not observations or any(row.method == "openfoam_precise" for row in observations):
+        return None
+    if len({float(row.alpha) for row in observations}) > 2:
+        return None
+    fast_curve = curves.get("openfoam_fast")
+    if not isinstance(fast_curve, dict):
+        return None
+    coefficients = np.asarray(fast_curve.get("coefficients"), dtype=float)
+    if coefficients.shape != (len(fit_angles), 3) or not np.all(np.isfinite(coefficients)):
+        return None
+    low = float(fit_angles[0])
+    high = float(fit_angles[-1])
+    prior_trend = float(
+        np.interp(high, prior_angles, prior_mean[:, 0])
+        - np.interp(low, prior_angles, prior_mean[:, 0])
+    )
+    fitted_trend = float(coefficients[-1, 0] - coefficients[0, 0])
+    if (
+        abs(prior_trend) < 0.2
+        or abs(fitted_trend) < 0.2
+        or prior_trend * fitted_trend >= 0
+    ):
+        return None
+    return {
+        "primary_method": "neuralfoil",
+        "status": "preliminary",
+        "reason": "conflicting_sparse_fast_cfd_trend",
+        "matched_full_polar_reference": False,
+        "angle_scope": [low, high],
+        "prior_trend_cl": prior_trend,
+        "observed_trend_cl": fitted_trend,
+    }
+
+
 def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation], policy: PolarModelPolicy) -> dict:
     angles, coefficients, uncertainty, eligible, excluded = _validate(prior, observations, policy)
     prior_mean, prior_std = _transformed(coefficients, uncertainty)
@@ -389,6 +424,10 @@ def fit_progressive_polar(prior: PolarPrior, observations: list[PolarObservation
         "matched_full_polar_reference": False,
     }
     sparse_conflict = _sparse_low_angle_conflict(angles, prior_mean, eligible)
+    if sparse_conflict is None:
+        sparse_conflict = _sparse_fit_trend_conflict(
+            prior.alpha, prior_mean, angles, curves, eligible,
+        )
     if sparse_conflict is not None:
         publication.update(sparse_conflict)
         fallback = {
