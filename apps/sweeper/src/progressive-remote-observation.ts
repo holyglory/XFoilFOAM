@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   canonicalAnalysisJson,
   enqueueProgressiveWorkerReport,
+  validateProgressiveRemoteReport,
   validateProgressiveExecutionStopProof,
   verifyProgressiveRemoteExecution,
   type DB,
@@ -33,6 +34,18 @@ export async function observeProgressiveRemoteJob(
   const [owned] = await db.execute(sql`
     SELECT job.engine_job_id, job.request_payload,
       coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}') AS assignment_signature,
+      (SELECT report.report FROM progressive_worker_reports report
+        WHERE report.sim_job_id = job.id
+          AND report.acknowledged_at IS NOT NULL
+          AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')
+          AND report.stopped_engine_job_id = job.id::text
+        ORDER BY report.sequence DESC LIMIT 1) AS durable_final_report,
+      (SELECT report.content_signature FROM progressive_worker_reports report
+        WHERE report.sim_job_id = job.id
+          AND report.acknowledged_at IS NOT NULL
+          AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')
+          AND report.stopped_engine_job_id = job.id::text
+        ORDER BY report.sequence DESC LIMIT 1) AS durable_final_content_signature,
       promise.id AS promise_id, promise.registered_solver_id AS solver_id
     FROM sim_jobs job
     LEFT JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
@@ -68,6 +81,33 @@ export async function observeProgressiveRemoteJob(
     throw new Error(
       "Progressive observation differs from its immutable engine request",
     );
+  if (options.stop && owned.durable_final_report) {
+    const durable = validateProgressiveRemoteReport(
+      owned.durable_final_report,
+      envelope,
+    );
+    if (
+      durable.contentSignature !== String(owned.durable_final_content_signature)
+    )
+      throw new Error("Durable progressive stop report content changed");
+    if (!durable.report.stopProof)
+      throw new Error("Durable progressive stop report lacks its proof");
+    validateProgressiveExecutionStopProof(durable.report.stopProof);
+    const replay = await enqueueProgressiveWorkerReport(db, {
+      executionId,
+      solverId: envelope.solverId,
+      promiseId: envelope.promiseId,
+      assignmentSignature: envelope.contentSignature,
+      status: durable.report.status,
+      result: durable.report.result,
+      stopProof: durable.report.stopProof,
+    });
+    return {
+      ...replay,
+      stopped: true,
+      completedCases: durable.report.status.completed_cases,
+    };
+  }
   const route = {
     expectedEngine: envelope.request.expected_engine!,
     expectedExecutionPool: envelope.request.expected_execution_pool,
@@ -138,7 +178,8 @@ export async function observeProgressiveRemoteJob(
           (error.status === 404 ||
             (error.status === 409 && status.state === "running")) &&
           status.completed_cases === 0
-        ) && !(
+        ) &&
+        !(
           error instanceof EngineError &&
           error.status === 409 &&
           terminalWithoutCases

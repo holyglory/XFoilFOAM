@@ -535,6 +535,14 @@ export async function verifyProgressiveWorkerObservation(
     await observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
   ).toMatchObject({ stopped: true, replayed: true });
   expect(engine.cancelJob).not.toHaveBeenCalled();
+  engine.getExecutionStopProof.mockClear();
+  engine.getExecutionStopProof.mockRejectedValueOnce(
+    new EngineError("worker execution-stop inspection is unavailable", 503),
+  );
+  expect(
+    await observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
+  ).toMatchObject({ stopped: true, replayed: true });
+  expect(engine.getExecutionStopProof).not.toHaveBeenCalled();
   proof.observed_at = "2026-09-07T19:40:00Z";
   expect(
     await observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
