@@ -122,6 +122,15 @@ def test_runtime_cleanup_rejects_other_projects_and_database_volumes():
         RESET["runtime_volume_root"]("app", "results", "/data/airfoilfoam", [{**mounts[0], "Type": "bind"}], volume)
 
 
+def test_runtime_cleanup_recreates_nested_sync_import_mountpoint(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    RESET["initialize_nested_runtime_mountpoints"]({"results": results})
+    assert (results / "sync-imports").is_dir()
+    with pytest.raises(ValueError, match="Missing results"):
+        RESET["initialize_nested_runtime_mountpoints"]({})
+
+
 def test_deployment_lock_reuses_read_only_existing_file_and_excludes_other_writer(tmp_path):
     path = tmp_path / "deployment.lock"
     path.write_text("existing operator lock")

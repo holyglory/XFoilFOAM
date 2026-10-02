@@ -194,6 +194,14 @@ def runtime_volume_root(project: str, suffix: str, destination: str, mounts: lis
     return root
 
 
+def initialize_nested_runtime_mountpoints(runtime_roots: dict[str, Path]) -> None:
+    results_root = runtime_roots.get("results")
+    if results_root is None:
+        raise ValueError("Missing results runtime volume")
+    mountpoint = results_root / "sync-imports"
+    mountpoint.mkdir(mode=0o755, exist_ok=True)
+
+
 class Reset:
     def __init__(self, project: str, audit: Path, database: str = "aerodb") -> None:
         if project not in {"app", "hz-solver2"}:
@@ -418,7 +426,7 @@ class Reset:
             "engine_runtime": ("worker", "/data/airfoilfoam-runtime"),
             "sync_imports": ("node-api", "/data/airfoilfoam/sync-imports"),
         }
-        roots = []
+        roots = {}
         for suffix, (service, destination) in expected_mounts.items():
             volume_name = f"{self.project}_{suffix}"
             mounts = json.loads(self.command(
@@ -431,19 +439,27 @@ class Reset:
             root = runtime_volume_root(self.project, suffix, destination, mounts, volume)
             if root.resolve() != root or not root.is_dir():
                 raise ValueError(f"Unexpected runtime volume location: {volume_name}")
-            roots.append(root)
+            roots[suffix] = root
         self.quiesced()
-        for root in roots:
+        for root in roots.values():
             for child in root.iterdir():
                 if child.is_symlink() or not child.is_dir():
                     child.unlink()
                 else:
                     shutil.rmtree(child)
+        initialize_nested_runtime_mountpoints(roots)
         self.command(
             ["docker", "exec", f"{self.project}-redis-1", "redis-cli", "FLUSHALL", "SYNC"],
             stdout=subprocess.DEVNULL,
         )
-        if any(any(root.iterdir()) for root in roots):
+        allowed_results = {"sync-imports"}
+        if any(
+            any(child.name not in allowed_results for child in root.iterdir())
+            for suffix, root in roots.items()
+            if suffix == "results"
+        ) or any(
+            any(root.iterdir()) for suffix, root in roots.items() if suffix != "results"
+        ):
             raise ValueError("Solver runtime files reappeared during cleanup")
         keyspace = self.command(
             ["docker", "exec", f"{self.project}-redis-1", "redis-cli", "INFO", "keyspace"],
@@ -453,7 +469,8 @@ class Reset:
             raise ValueError("Redis work reappeared during cleanup")
         self.quiesced()
         receipt = {"project": self.project, "verified_at": datetime.now(timezone.utc).isoformat(),
-                   "runtime_volumes_empty": len(roots), "redis_empty": True, "admission": "disabled"}
+                   "runtime_volumes_empty": len(roots), "nested_mountpoints_initialized": True,
+                   "redis_empty": True, "admission": "disabled"}
         atomic_json(self.audit / "runtime-cleared.json", receipt)
         return receipt
 
