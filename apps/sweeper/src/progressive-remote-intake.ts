@@ -28,6 +28,15 @@ const pendingPages = new WeakMap<
   ReturnType<typeof receiveAssignmentPage>
 >();
 
+function progressiveAssignmentIntakeConcurrency(): number {
+  const configured = Number(
+    process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_CONCURRENCY ?? 16,
+  );
+  return Number.isInteger(configured) && configured > 0
+    ? Math.min(configured, 16)
+    : 16;
+}
+
 export async function receiveProgressiveAssignmentPage(
   ...args: Parameters<typeof receiveAssignmentPage>
 ) {
@@ -146,9 +155,7 @@ async function receiveAssignmentPage(
   };
   await runWithConcurrency(
     identities,
-    activeReconcileConcurrency(
-      process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_CONCURRENCY ?? "8",
-    ),
+    progressiveAssignmentIntakeConcurrency(),
     async (identity) => {
       receipt.seen += 1;
       try {
