@@ -8,8 +8,24 @@ import { runSweeperServices } from "./service-lifecycle";
 
 const MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 8;
 const SERVICE_MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 32;
-const MAX_PARALLEL_EVIDENCE_STAGES = 4;
-const MAX_PARALLEL_EVIDENCE_DELIVERIES = 4;
+const DEFAULT_PARALLEL_EVIDENCE_LANES = 4;
+const MAX_PARALLEL_EVIDENCE_LANES = 32;
+
+function configuredEvidenceLanes(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const value = Number(env[name] ?? DEFAULT_PARALLEL_EVIDENCE_LANES);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > MAX_PARALLEL_EVIDENCE_LANES
+  )
+    throw new Error(
+      `${name} must be an integer from 1 through ${MAX_PARALLEL_EVIDENCE_LANES}`,
+    );
+  return value;
+}
 
 export async function drainProgressiveWorkerEvidencePass(
   deliver: (preferActive: boolean) => Promise<boolean>,
@@ -113,6 +129,10 @@ export async function runProgressiveEvidenceService(
     reportError?: (error: unknown) => void;
   } = {},
 ): Promise<void> {
+  const stagingLanes = configuredEvidenceLanes("REMOTE_EVIDENCE_STAGE_LANES");
+  const deliveryLanes = configuredEvidenceLanes(
+    "REMOTE_EVIDENCE_DELIVERY_LANES",
+  );
   const stage =
     options.stage ??
     ((preferActive: boolean) =>
@@ -158,10 +178,10 @@ export async function runProgressiveEvidenceService(
     },
   });
   await runSweeperServices(signal, [
-    ...Array.from({ length: MAX_PARALLEL_EVIDENCE_STAGES }, (_, lane) =>
+    ...Array.from({ length: stagingLanes }, (_, lane) =>
       service("staging", lane),
     ),
-    ...Array.from({ length: MAX_PARALLEL_EVIDENCE_DELIVERIES }, (_, lane) =>
+    ...Array.from({ length: deliveryLanes }, (_, lane) =>
       service("delivery", lane),
     ),
   ]);

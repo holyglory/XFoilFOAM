@@ -111,6 +111,49 @@ it("refills a free staging slot while other imports and delivery remain pending"
   expect(channel.unlisten).toHaveBeenCalledTimes(8);
 });
 
+it("uses bounded configured staging and delivery lane counts", async () => {
+  vi.useFakeTimers();
+  const previousStageLanes = process.env.REMOTE_EVIDENCE_STAGE_LANES;
+  const previousDeliveryLanes = process.env.REMOTE_EVIDENCE_DELIVERY_LANES;
+  process.env.REMOTE_EVIDENCE_STAGE_LANES = "2";
+  process.env.REMOTE_EVIDENCE_DELIVERY_LANES = "3";
+  const channel = notifications();
+  const owner = new AbortController();
+  const imports = Array.from({ length: 2 }, gate);
+  const network = gate();
+  const stage = vi.fn(async () => {
+    await imports[0].pending;
+    return false;
+  });
+  const deliver = vi.fn(async () => {
+    await network.pending;
+    return false;
+  });
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt: async () => null },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(2);
+    expect(deliver).toHaveBeenCalledTimes(3);
+  } finally {
+    owner.abort();
+    imports.forEach((pending) => pending.release());
+    network.release();
+    await running;
+    if (previousStageLanes === undefined)
+      delete process.env.REMOTE_EVIDENCE_STAGE_LANES;
+    else process.env.REMOTE_EVIDENCE_STAGE_LANES = previousStageLanes;
+    if (previousDeliveryLanes === undefined)
+      delete process.env.REMOTE_EVIDENCE_DELIVERY_LANES;
+    else process.env.REMOTE_EVIDENCE_DELIVERY_LANES = previousDeliveryLanes;
+  }
+});
+
 it("continues delivery while all four staging slots wait", async () => {
   vi.useFakeTimers();
   const channel = notifications();
