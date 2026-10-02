@@ -7541,7 +7541,7 @@ export async function admitRemoteSolverTick(
                 )})`
               : sql``
           }
-        ORDER BY job."updatedAt", job.id LIMIT ${concurrency}
+        ORDER BY job."updatedAt" DESC, job.id DESC LIMIT ${concurrency}
       `);
       if (assigned.length) {
         assignedCount += assigned.length;
