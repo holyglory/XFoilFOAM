@@ -150,7 +150,10 @@ export async function acknowledgeProgressiveCfdExecutionStop(
 export async function settleProgressiveCfdExecution(
   db: DB,
   simJobId: string,
-  options: { recoverNeverStarted?: boolean } = {},
+  options: {
+    recoverNeverStarted?: boolean;
+    recoverStoredEvidence?: { resultAttemptIds: string[] };
+  } = {},
 ): Promise<{
   complete: number;
   retry: number;
@@ -177,6 +180,21 @@ export async function settleProgressiveCfdExecution(
     );
     if (!job || !["done", "failed", "cancelled"].includes(String(job.status)))
       return { ...counts, waiting: 1 };
+    const storedEvidenceIds = [
+      ...new Set(options.recoverStoredEvidence?.resultAttemptIds ?? []),
+    ];
+    if (storedEvidenceIds.length > 2048)
+      throw new Error(
+        "Progressive stored-evidence recovery exceeds its bounded case scope",
+      );
+    const historicalEvidence = storedEvidenceIds.length
+      ? sql`EXISTS (SELECT 1 FROM progressive_cfd_evidence historical_evidence
+          WHERE historical_evidence.attempt_token = attempt.token
+            AND historical_evidence.result_attempt_id IN (${sql.join(
+              storedEvidenceIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )}))`
+      : sql`false`;
     if (!job.ingestedAt) {
       const [current] = await connection.execute(sql`
       SELECT EXISTS (
@@ -203,7 +221,7 @@ export async function settleProgressiveCfdExecution(
       if (
         current?.value &&
         !(
-          job.status === 'ingesting' &&
+          job.status === "ingesting" &&
           current.stopped_pending &&
           current.no_active_running_lease
         )
@@ -228,7 +246,7 @@ export async function settleProgressiveCfdExecution(
       );
     const units = await connection.execute(sql`
       SELECT attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
-        unit.id, unit.state, unit.attempts, unit.active_seconds, unit.active_budget_seconds, work.id AS work_id,
+        unit.id, unit.state, unit.lease_token, unit.lease_until, unit.attempts, unit.active_seconds, unit.active_budget_seconds, work.id AS work_id,
         ${effectiveProgressiveStageSql()} = work.stage AND work.state IN ('pending', 'gap') AS recoverable_stage,
         NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
           AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
@@ -244,6 +262,7 @@ export async function settleProgressiveCfdExecution(
           WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token AND recovery.ordinal = 2) AS precise_verification,
         (unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
           AND ${progressiveCfdPreciseVerificationAvailableSql("unit", "attempt")}) AS unused_precise_verification,
+        ${historicalEvidence} AS historical_recovery,
         EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt,
           jsonb_array_elements(coalesce(fitted.response->'estimate'->'contributors', '[]'::jsonb)) contributor
           WHERE receipt.attempt_token = attempt.token AND receipt.result_attempt_id::text = contributor->>'attempt_id') AS informative
@@ -289,7 +308,26 @@ export async function settleProgressiveCfdExecution(
         unit.recoverable_stage === true &&
         unit.latest_attempt === true &&
         neverStarted;
-      if (unit.outcome !== "running" && !recovering) continue;
+      const recoveringStoredEvidence =
+        options.recoverStoredEvidence != null &&
+        unit.historical_recovery === true &&
+        job.ingestedAt != null &&
+        unit.current_scope === true &&
+        unit.latest_attempt === true &&
+        ["gap", "leased", "blocked"].includes(String(unit.state)) &&
+        (unit.state !== "leased"
+          ? unit.lease_token == null
+          : unit.lease_token === unit.token &&
+            (unit.lease_until == null ||
+              new Date(String(unit.lease_until)).getTime() <= Date.now())) &&
+        ["complete", "failed", "cancelled"].includes(String(unit.outcome));
+      const recoverableStoredEvidence = recoveringStoredEvidence;
+      if (
+        unit.outcome !== "running" &&
+        !recovering &&
+        !recoverableStoredEvidence
+      )
+        continue;
       if (!unit.current_scope || unit.state === "cancelled") {
         await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome = 'cancelled', finished_at = clock_timestamp(),
           error = 'obsolete execution physically stopped' WHERE token = ${unit.token}`);
@@ -298,7 +336,11 @@ export async function settleProgressiveCfdExecution(
         counts.cancelled += 1;
         continue;
       }
-      if (!recovering && !["leased", "blocked"].includes(String(unit.state)))
+      if (
+        !recovering &&
+        !recoverableStoredEvidence &&
+        !["leased", "blocked"].includes(String(unit.state))
+      )
         throw new Error(
           "Progressive CFD settlement has no exclusive current unit ownership",
         );

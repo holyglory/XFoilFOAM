@@ -11,6 +11,7 @@ export * from "./progressive-materialization";
 export * from "./progressive-recipe-adoption";
 export * from "./progressive-numerics-transition";
 export * from "./progressive-publication-recovery";
+export * from "./progressive-storage-evidence-recovery";
 export * from "./retained-solver-reports";
 export * from "./progressive-public";
 export * from "./progressive-catalog";

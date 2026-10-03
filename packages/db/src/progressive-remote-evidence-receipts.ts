@@ -3,6 +3,7 @@ import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
 import { resultAttempts } from "./schema";
 import { recordProgressiveCfdEvidence } from "./progressive-cfd-evidence";
+import type { ProgressiveStorageEvidenceRecoveryScope } from "./progressive-cfd-evidence";
 import {
   ProgressiveRemoteEvidenceConflict,
   resolveProgressiveRemoteEvidence,
@@ -84,6 +85,7 @@ export async function recordProgressiveRemoteEvidenceReceipt(
   input: ProgressiveRemoteEvidenceDelivery & {
     resultAttemptId: string;
     storageOnly?: boolean;
+    recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
   },
 ) {
   return db.transaction(async (transaction) => {
@@ -94,7 +96,7 @@ export async function recordProgressiveRemoteEvidenceReceipt(
         throw new Error(
           "Progressive receipt already binds another local attempt",
         );
-      return receipt;
+      if (!input.recoveryScope || !receipt.storageOnly) return receipt;
     }
     const [attempt] = await connection
       .select()
@@ -150,6 +152,30 @@ export async function recordProgressiveRemoteEvidenceReceipt(
       throw new Error(
         "Progressive local attempt differs from its reported source values",
       );
+    if (input.recoveryScope) {
+      const [cell] = await connection.execute(sql`
+        SELECT speed, chord, mach, reynolds FROM results
+        WHERE id = ${attempt.resultId}::uuid
+      `);
+      const sourceReynolds =
+        source.polar.reynolds == null
+          ? null
+          : Math.round(Number(source.polar.reynolds));
+      if (
+        !cell ||
+        cell.speed !== projection.speed ||
+        cell.chord !== projection.chord ||
+        (cell.mach == null
+          ? projection.mach !== null
+          : cell.mach !== projection.mach) ||
+        (cell.reynolds == null
+          ? sourceReynolds !== null
+          : Number(cell.reynolds) !== sourceReynolds)
+      )
+        throw new Error(
+          "Historical progressive evidence differs from the exact reported physical case",
+        );
+    }
     if (input.storageOnly)
       await assertStoppedProgressiveStorage(connection, input);
     else
@@ -157,6 +183,7 @@ export async function recordProgressiveRemoteEvidenceReceipt(
         simJobId: input.engineJobId,
         engineJobId: input.engineJobId,
         resultAttemptIds: [input.resultAttemptId],
+        recoveryScope: input.recoveryScope,
       });
     await connection.execute(sql`
       INSERT INTO progressive_remote_evidence_receipts

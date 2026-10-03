@@ -134,6 +134,10 @@ import {
   recordProgressiveCfdEvidence,
   recordProgressiveCfdRuntimeProgress,
 } from "../src/progressive-cfd-evidence";
+import { recoverProgressiveStorageOnlyEvidence } from "../src/progressive-storage-evidence-recovery";
+import { recordProgressiveRemoteEvidenceReceipt } from "../src/progressive-remote-evidence-receipts";
+import { progressiveRemotePointProjection } from "../src/progressive-remote-point-projection";
+import { resolveProgressiveReportedPoint } from "../src/progressive-remote-report";
 import {
   materializeProgressiveCampaignScope,
   reconcileProgressiveGenerationRequest,
@@ -7865,6 +7869,290 @@ describe("persistent progressive polar cache", () => {
 });
 
 describe("progressive CFD evidence accounting", () => {
++  it("republishes current-scope storage-only evidence append-only and remains idempotent", async () => {
+    const fixture = await cfdEvidenceFixture(32.173, 2, [], [0]);
+    const lease = fixture.leases[0];
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    const [campaignRow] = await db.execute(
+      sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${fixture.campaignId}::uuid`,
+    );
+    const solverId = randomUUID();
+    const promiseId = randomUUID();
+    try {
+      await db.execute(sql`
+        INSERT INTO registered_remote_solvers(id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+        VALUES (${solverId}::uuid, ${randomUUID()}, 'storage recovery fixture', 96, 96, 96)
+      `);
+      await db.execute(sql`
+        INSERT INTO sync_sweep_promises(id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, 1, clock_timestamp() + interval '1 hour')
+      `);
+      await db.execute(sql`
+        INSERT INTO sync_sweep_promise_points(promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
+        VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})
+      `);
+      const bound = await bindProgressiveRemoteDispatch(db, {
+        simJobId: job.id,
+        solverId,
+        promiseId,
+      });
+      const baseResult = progressiveRemoteEvidenceResult(bound.envelope) as any;
+      const basePolar = baseResult.polars[0];
+      const basePoint = basePolar.attempts[0];
+      const {
+        error: _error,
+        failure_disposition: _failure,
+        ...point
+      } = basePoint;
+      const physical = fixture.execution.snapshot;
+      const result = {
+        ...baseResult,
+        state: "completed",
+        polars: [
+          {
+            ...basePolar,
+            speed: physical.flowState.speedMps,
+            chord: physical.referenceGeometry.referenceLengthM,
+            reynolds: physical.derived.reynolds,
+            mach: physical.derived.mach,
+            attempts: [
+              {
+                ...point,
+                aoa_deg: lease.alpha,
+                converged: true,
+                error: undefined,
+              },
+            ],
+          },
+        ],
+      };
+      const report: ProgressiveRemoteReport = {
+        version: 1,
+        solverId,
+        promiseId,
+        executionId: job.id,
+        assignmentSignature: bound.envelope.contentSignature,
+        sequence: 1,
+        status: {
+          job_id: job.id,
+          state: "completed",
+          total_cases: 1,
+          completed_cases: 1,
+          engine: result.engine,
+        },
+        result,
+        stopProof: executionStopProof(job.id),
+      };
+      await storeProgressiveRemoteReport(db, {
+        solverId,
+        promiseId,
+        executionId: job.id,
+        report,
+      });
+      const source = resolveProgressiveReportedPoint(result, {
+        alpha: lease.alpha,
+        speed: physical.flowState.speedMps,
+        chord: physical.referenceGeometry.referenceLengthM,
+        caseSlug: "isolated-reported-case",
+      });
+      const projection = progressiveRemotePointProjection({
+        ...source,
+        envelope: bound.envelope,
+        report,
+      });
+      const [cell] = await db.execute(
+        sql`SELECT id, bc_id FROM results WHERE sim_job_id = ${job.id}::uuid AND aoa_deg = ${lease.alpha}`,
+      );
+      await db.execute(sql`
+        UPDATE results SET status='done', source='solved', regime='rans',
+          reynolds=${physical.derived.reynolds}, speed=${physical.flowState.speedMps},
+          chord=${physical.referenceGeometry.referenceLengthM}, mach=${physical.derived.mach},
+          cl=${projection.cl}, cd=${projection.cd}, cm=${projection.cm},
+          cl_cd=${projection.clCd}, converged=true, valid_for_polar=true
+        WHERE id=${cell.id}::uuid
+      `);
+      const [attempt] = await db
+        .insert(resultAttempts)
+        .values({
+          resultId: String(cell.id),
+          airfoilId: String(job.airfoilId),
+          bcId: String(cell.bc_id),
+          simulationPresetRevisionId: String(job.simulationPresetRevisionId),
+          simJobId: job.id,
+          engineJobId: job.id,
+          aoaDeg: projection.aoaDeg,
+          status: projection.status,
+          source: projection.source,
+          regime: projection.regime,
+          cl: projection.cl,
+          cd: projection.cd,
+          cm: projection.cm,
+          clCd: projection.clCd,
+          clStd: projection.clStd,
+          cdStd: projection.cdStd,
+          cmStd: projection.cmStd,
+          stalled: projection.stalled,
+          unsteady: projection.unsteady,
+          converged: projection.converged,
+          finalResidual: projection.finalResidual,
+          iterations: projection.iterations,
+          yPlusAvg: projection.yPlusAvg,
+          yPlusMax: projection.yPlusMax,
+          nCells: projection.nCells,
+          firstOrderFallback: projection.firstOrderFallback,
+          strouhal: projection.strouhal,
+          error: projection.error,
+          qualityWarnings: projection.qualityWarnings,
+          methodKey: projection.methodKey,
+          evidencePayload: projection.evidencePayload,
+          validForPolar: true,
+        })
+        .returning();
+      await db.execute(sql`
+        INSERT INTO result_classifications(result_attempt_id, airfoil_id, simulation_preset_revision_id,
+          aoa_deg, classifier_version, state, reasons)
+        VALUES (${attempt.id}::uuid, ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid,
+          ${projection.aoaDeg}, 'storage-recovery-fixture', 'accepted', '{}')
+      `);
+      await acknowledgeProgressiveCfdExecutionStop(db, {
+        simJobId: job.id,
+        proof: report.stopProof!,
+      });
+      await db.execute(sql`
+        UPDATE sim_jobs SET status='done', engine_job_id=id::text, engine_state='completed',
+          "ingestedAt"=clock_timestamp(), "finishedAt"=clock_timestamp(),
+          ingest_lease_token=NULL, ingest_lease_expires_at=NULL
+        WHERE id=${job.id}::uuid
+      `);
+      await db.execute(sql`
+        UPDATE progressive_cfd_attempts SET outcome='failed', finished_at=clock_timestamp()
+        WHERE sim_job_id=${job.id}::uuid
+      `);
+      await db.execute(sql`
+        UPDATE progressive_cfd_units SET state='gap', lease_token=NULL, lease_owner=NULL, lease_until=NULL
+        WHERE id=${lease.id}::uuid
+      `);
+      await db.execute(sql`
+        UPDATE sync_sweep_promises SET status='expired', "expiresAt"=clock_timestamp()-interval '1 second'
+        WHERE id=${promiseId}::uuid
+      `);
+      const delivery = {
+        solverId,
+        promiseId,
+        engineJobId: job.id,
+        aoaDeg: lease.alpha,
+        engineCaseSlug: "isolated-reported-case",
+        progressiveEvidence: {
+          sequence: 1,
+          reportContentSignature: (
+            await db.execute(
+              sql`SELECT content_signature FROM progressive_remote_reports WHERE sim_job_id=${job.id}::uuid AND sequence=1`,
+            )
+          )[0].content_signature as string,
+          pointContentSignature: source.contentSignature,
+        },
+        remoteResultId: randomUUID(),
+        remoteResultAttemptId: randomUUID(),
+      };
+      await recordProgressiveRemoteEvidenceReceipt(db, {
+        ...delivery,
+        resultAttemptId: attempt.id,
+        storageOnly: true,
+      });
+      const [receiptBefore] = await db.execute(
+        sql`SELECT * FROM progressive_remote_evidence_receipts WHERE sim_job_id=${job.id}::uuid`,
+      );
+      await db.execute(
+        sql`UPDATE result_attempts SET cl=cl+1 WHERE id=${attempt.id}::uuid`,
+      );
+      const rejected = await recoverProgressiveStorageOnlyEvidence(db, {
+        campaignId: fixture.campaignId,
+        epochId: lease.epochId,
+        generationId: lease.generationId,
+        planRevisionId: String(campaignRow.current_plan_revision_id),
+        stage: 2,
+      });
+      expect(rejected).toMatchObject({ selected: 1, linked: 0, errors: 1 });
+      await db.execute(
+        sql`UPDATE result_attempts SET cl=${projection.cl} WHERE id=${attempt.id}::uuid`,
+      );
+      const closedRollback = new Error("restore closed-scope fixture");
+      await expect(
+        db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(
+            sql`UPDATE progressive_generations SET status='cancelled' WHERE id=${lease.generationId}::uuid`,
+          );
+          expect(
+            await recoverProgressiveStorageOnlyEvidence(connection, {
+              campaignId: fixture.campaignId,
+              epochId: lease.epochId,
+              generationId: lease.generationId,
+              planRevisionId: String(campaignRow.current_plan_revision_id),
+              stage: 2,
+            }),
+          ).toMatchObject({ selected: 0, linked: 0 });
+          throw closedRollback;
+        }),
+      ).rejects.toBe(closedRollback);
+      const recovered = await recoverProgressiveStorageOnlyEvidence(
+        db,
+        {
+          campaignId: fixture.campaignId,
+          epochId: lease.epochId,
+          generationId: lease.generationId,
+          planRevisionId: String(campaignRow.current_plan_revision_id),
+          stage: 2,
+        },
+        { limit: 1 },
+      );
+      expect(recovered).toMatchObject({
+        selected: 1,
+        linked: 1,
+        errors: 0,
+        conflicts: 0,
+        settledJobs: 1,
+      });
+      const [receiptAfter] = await db.execute(
+        sql`SELECT * FROM progressive_remote_evidence_receipts WHERE sim_job_id=${job.id}::uuid`,
+      );
+      expect(receiptAfter).toEqual(receiptBefore);
+      expect(receiptAfter.storage_only).toBe(true);
+      expect(
+        await db.execute(
+          sql`SELECT count(*)::integer AS count FROM progressive_cfd_evidence WHERE result_attempt_id=${attempt.id}::uuid`,
+        ),
+      ).toEqual([{ count: 1 }]);
+      expect(
+        await db.execute(
+          sql`SELECT state FROM progressive_cfd_units WHERE id=${lease.id}::uuid`,
+        ),
+      ).toEqual([{ state: "complete" }]);
+      expect(
+        await recoverProgressiveStorageOnlyEvidence(db, {
+          campaignId: fixture.campaignId,
+          epochId: lease.epochId,
+          generationId: lease.generationId,
+          planRevisionId: String(campaignRow.current_plan_revision_id),
+          stage: 2,
+        }),
+      ).toMatchObject({ selected: 0, linked: 0, errors: 0 });
+    } finally {
+      await db.execute(
+        sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`,
+      );
+      await db.execute(
+        sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`,
+      );
+      await db.execute(
+        sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`,
+      );
+    }
+  }, 120_000);
   it("conserves rejected evidence and charges cumulative observations only once without completing work", async () => {
     const fixture = await cfdEvidenceFixture();
     const first = await fixture.save(50);

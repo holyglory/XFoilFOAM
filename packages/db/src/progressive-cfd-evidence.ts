@@ -29,6 +29,9 @@ interface BoundUnit {
   target_id: string;
   execution_recipe_id: string;
   stage: number;
+  lease_token: string | null;
+  lease_until: Date | string | null;
+  work_state: string;
   requested_budget_seconds?: number;
   snapshot: {
     flowState: { speedMps: number };
@@ -36,9 +39,26 @@ interface BoundUnit {
   };
 }
 
-async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
+export interface ProgressiveStorageEvidenceRecoveryScope {
+  campaignId: string;
+  epochId: string;
+  generationId: string;
+  planRevisionId: string;
+  stage: 2;
+}
+
+async function lockJobScope(
+  db: DB,
+  simJobId: string,
+  engineJobId: string,
+  options: {
+    recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+  } = {},
+) {
+  const recoveryScope = options.recoveryScope;
   const [job] = await db.execute(sql`
-    SELECT job.airfoil_id, job.engine_job_id, job.campaign_id, job.request_payload, job.request_payload->'progressive' AS progressive,
+    SELECT job.airfoil_id, job.engine_job_id, job.campaign_id, job.status, job."ingestedAt", job.ingest_lease_expires_at,
+      job.request_payload, job.request_payload->'progressive' AS progressive,
       job.request_payload->'engineRequest'->'resources' AS requested_resources,
       job.request_payload->'engineRequest'->'expected_solver_budget_version' AS requested_budget_version,
       EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt WHERE attempt.sim_job_id = job.id) AS bound
@@ -57,6 +77,18 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
     throw new ProgressiveCfdEvidenceScopeClosed(
       "Progressive CFD evidence has no exact engine/job ownership",
     );
+  if (
+    recoveryScope &&
+    (!recoveryScope.campaignId ||
+      job.campaign_id !== recoveryScope.campaignId ||
+      !["done", "failed", "cancelled"].includes(String(job.status)) ||
+      job.ingestedAt == null ||
+      (job.ingest_lease_expires_at != null &&
+        new Date(String(job.ingest_lease_expires_at)).getTime() > Date.now()))
+  )
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive evidence recovery requires a terminal, ingested execution with no active ingest lease",
+    );
   const metadata = job.progressive as Record<string, unknown>;
   assertProgressiveExecutionIdentity(
     simJobId,
@@ -66,7 +98,11 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
   const [epoch] = await db.execute(
     sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
   );
-  if (!epoch || metadata.epochId !== epoch.id)
+  if (
+    !epoch ||
+    metadata.epochId !== epoch.id ||
+    (recoveryScope && String(epoch.id) !== recoveryScope.epochId)
+  )
     throw new ProgressiveCfdEvidenceScopeClosed(
       "Obsolete CFD calculation epoch",
     );
@@ -80,9 +116,19 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
     throw new ProgressiveCfdEvidenceScopeClosed(
       "Campaign no longer accepts CFD evidence",
     );
+  if (
+    recoveryScope &&
+    (String(campaign.current_plan_revision_id) !==
+      recoveryScope.planRevisionId ||
+      String(job.campaign_id) !== recoveryScope.campaignId)
+  )
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive evidence recovery does not match the current campaign plan",
+    );
   const units = (await db.execute(sql`
     SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg, attempt.active_seconds, unit.active_seconds AS unit_seconds,
       unit.active_budget_seconds, unit.state, attempt.outcome, recipe.execution_revision_id,
+      unit.lease_token, unit.lease_until, work.state AS work_state,
       (EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt WHERE receipt.attempt_token = attempt.token
         AND receipt.budget_guard_exhausted) OR EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress runtime
         WHERE runtime.attempt_token = attempt.token AND runtime.engine_job_id = ${engineJobId})) AS budget_guard_confirmed,
@@ -108,8 +154,18 @@ async function lockJobScope(db: DB, simJobId: string, engineJobId: string) {
         unit.target_id !== metadata.targetId ||
         unit.execution_recipe_id !== metadata.recipeId ||
         unit.stage !== metadata.stage ||
-        unit.outcome !== "running" ||
-        !["leased", "blocked"].includes(unit.state),
+        (recoveryScope
+          ? !["running", "complete", "failed", "cancelled"].includes(
+              unit.outcome,
+            ) ||
+            !["leased", "blocked", "gap"].includes(unit.state) ||
+            unit.work_state !== "pending" ||
+            (unit.state === "leased" &&
+              (unit.lease_token !== unit.token ||
+                (unit.lease_until != null &&
+                  new Date(String(unit.lease_until)).getTime() > Date.now())))
+          : unit.outcome !== "running" ||
+            !["leased", "blocked"].includes(unit.state)),
     )
   )
     throw new ProgressiveCfdEvidenceScopeClosed(
@@ -314,7 +370,12 @@ export async function recordProgressiveCfdRuntimeProgress(
 
 export async function recordProgressiveCfdEvidence(
   db: DB,
-  input: { simJobId: string; engineJobId: string; resultAttemptIds: string[] },
+  input: {
+    simJobId: string;
+    engineJobId: string;
+    resultAttemptIds: string[];
+    recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+  },
 ): Promise<{ progressive: boolean; linked: number; stopRequired: boolean }> {
   const ids = [...new Set(input.resultAttemptIds)];
   if (ids.length > 2048)
@@ -325,6 +386,7 @@ export async function recordProgressiveCfdEvidence(
       connection,
       input.simJobId,
       input.engineJobId,
+      { recoveryScope: input.recoveryScope },
     );
     if (!scope) return { progressive: false, linked: 0, stopRequired: false };
     let linked = 0;
@@ -336,6 +398,7 @@ export async function recordProgressiveCfdEvidence(
     const evidence = ids.length
       ? await connection.execute(sql`
       SELECT attempt.id, attempt.airfoil_id, attempt.aoa_deg, attempt.simulation_preset_revision_id, attempt.evidence_payload,
+        cell.speed, cell.chord, cell.mach, cell.reynolds,
         cell.airfoil_id AS cell_airfoil_id, cell.aoa_deg AS cell_aoa_deg,
         cell.simulation_preset_revision_id AS cell_revision_id
       FROM result_attempts attempt JOIN results cell ON cell.id = attempt.result_id
@@ -364,6 +427,36 @@ export async function recordProgressiveCfdEvidence(
         throw new Error(
           "CFD evidence differs from the immutable physical/numerical scope",
         );
+      if (input.recoveryScope) {
+        const snapshot = unit.snapshot as unknown as {
+          flowState?: { speedMps?: number; mach?: number | null };
+          referenceGeometry?: { referenceLengthM?: number };
+          derived?: { mach?: number | null; reynolds?: number | null };
+        };
+        const expectedSpeed = snapshot.flowState?.speedMps;
+        const expectedChord = snapshot.referenceGeometry?.referenceLengthM;
+        const expectedMach =
+          snapshot.derived?.mach ?? snapshot.flowState?.mach ?? null;
+        const expectedReynolds =
+          snapshot.derived?.reynolds == null
+            ? null
+            : Math.round(snapshot.derived.reynolds);
+        if (
+          typeof expectedSpeed !== "number" ||
+          typeof expectedChord !== "number" ||
+          row.speed !== expectedSpeed ||
+          row.chord !== expectedChord ||
+          (row.mach == null
+            ? expectedMach !== null
+            : expectedMach !== row.mach) ||
+          (row.reynolds == null
+            ? expectedReynolds !== null
+            : expectedReynolds !== row.reynolds)
+        )
+          throw new Error(
+            "Historical progressive evidence differs from the immutable physical case",
+          );
+      }
       const payload = row.evidence_payload as Record<string, unknown> | null;
       const duration = payload?.solver_active_seconds;
       if (
