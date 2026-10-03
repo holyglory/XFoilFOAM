@@ -5,6 +5,7 @@ import {
   drainProgressiveWorkerEvidencePass,
   runProgressiveEvidenceService,
 } from "../src/progressive-evidence-service";
+import { withPeriodicIngestLeaseRenewal } from "../src/progressive-worker-evidence";
 
 function notifications() {
   const callbacks = new Map<string, Set<() => void>>();
@@ -38,6 +39,52 @@ function gate() {
 }
 
 afterEach(() => vi.useRealTimers());
+
+it("renews a delayed ingest without overlap and cleans up its timer", async () => {
+  vi.useFakeTimers();
+  const stagePointGate = gate();
+  const renewalGate = gate();
+  let activeRenewals = 0;
+  let peakRenewals = 0;
+  const stagePoint = vi.fn(async () => {
+    await stagePointGate.pending;
+  });
+  const renew = vi.fn(async () => {
+    activeRenewals += 1;
+    peakRenewals = Math.max(peakRenewals, activeRenewals);
+    try {
+      await renewalGate.pending;
+    } finally {
+      activeRenewals -= 1;
+    }
+  });
+  let settled = false;
+  const running = withPeriodicIngestLeaseRenewal(
+    async () => {
+      await stagePoint();
+      return "staged";
+    },
+    renew,
+  ).then((result) => {
+    settled = true;
+    return result;
+  });
+
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(stagePoint).toHaveBeenCalledTimes(1);
+  expect(renew).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(renew).toHaveBeenCalledTimes(1);
+  expect(peakRenewals).toBe(1);
+
+  stagePointGate.release();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(settled).toBe(false);
+  renewalGate.release();
+  await expect(running).resolves.toBe("staged");
+  expect(activeRenewals).toBe(0);
+  expect(vi.getTimerCount()).toBe(0);
+});
 
 it("bounds serial deliveries and stops when no eligible evidence remains", async () => {
   const deliver = vi

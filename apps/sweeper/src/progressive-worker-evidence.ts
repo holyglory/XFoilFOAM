@@ -21,6 +21,46 @@ import {
   renewIngestLeaseOrThrow,
 } from "./ingest-lease";
 
+const INGEST_LEASE_RENEW_INTERVAL_MS = 20_000;
+
+export async function withPeriodicIngestLeaseRenewal<T>(
+  operation: () => Promise<T>,
+  renew: () => Promise<void>,
+): Promise<T> {
+  let renewalInFlight: Promise<void> | null = null;
+  let renewalError: unknown;
+  let rejectRenewalFailure!: (reason: unknown) => void;
+  const renewalFailure = new Promise<never>((_resolve, reject) => {
+    rejectRenewalFailure = reject;
+  });
+  const renewOnce = () => {
+    if (renewalInFlight || renewalError) return;
+    renewalInFlight = Promise.resolve()
+      .then(renew)
+      .catch((error) => {
+        renewalError = error;
+        rejectRenewalFailure(error);
+        throw error;
+      })
+      .finally(() => {
+        renewalInFlight = null;
+      });
+    void renewalInFlight.catch(() => {});
+  };
+  const timer = setInterval(renewOnce, INGEST_LEASE_RENEW_INTERVAL_MS);
+  timer.unref?.();
+  try {
+    return await Promise.race([operation(), renewalFailure]);
+  } finally {
+    clearInterval(timer);
+    const pendingRenewal = renewalInFlight;
+    await Promise.resolve(pendingRenewal).catch((error: unknown) => {
+      renewalError ??= error;
+    });
+    if (renewalError) throw renewalError;
+  }
+}
+
 async function claimProgressiveWorkerEvidence(
   db: DB,
   executionId: string,
@@ -139,30 +179,34 @@ async function stageClaimedProgressiveWorkerEvidence(
     );
     const ingested = reused
       ? { resultAttemptIds: reused }
-      : await ingestResult({
-          db,
-          engine,
-          engineJobId: executionId,
-          simJobId: executionId,
-          airfoilId: claimed.job.airfoilId,
-          speedMap: [
-            {
-              speed: claimed.setup.flowState.speedMps,
-              bcId: claimed.setup.preset.legacyBoundaryConditionId!,
-              presetRevisionId: claimed.job.simulationPresetRevisionId,
-              mach: claimed.setup.flowState.mach,
-            },
-          ],
-          jobAoas: claimed.envelope.scope.units.map((unit) => unit.alpha),
-          uransFidelity:
-            claimed.job.wave === 2
-              ? claimed.envelope.request.solver?.urans_fidelity
-              : undefined,
-          result: claimed.result,
-          remoteProgressiveReportSequence: claimed.sequence,
-          ingestLeaseToken: claimed.token,
-          heartbeat: () => renewIngestLeaseOrThrow(db, lease),
-        });
+      : await withPeriodicIngestLeaseRenewal(
+          () =>
+            ingestResult({
+              db,
+              engine,
+              engineJobId: executionId,
+              simJobId: executionId,
+              airfoilId: claimed.job.airfoilId,
+              speedMap: [
+                {
+                  speed: claimed.setup.flowState.speedMps,
+                  bcId: claimed.setup.preset.legacyBoundaryConditionId!,
+                  presetRevisionId: claimed.job.simulationPresetRevisionId,
+                  mach: claimed.setup.flowState.mach,
+                },
+              ],
+              jobAoas: claimed.envelope.scope.units.map((unit) => unit.alpha),
+              uransFidelity:
+                claimed.job.wave === 2
+                  ? claimed.envelope.request.solver?.urans_fidelity
+                  : undefined,
+              result: claimed.result,
+              remoteProgressiveReportSequence: claimed.sequence,
+              ingestLeaseToken: claimed.token,
+              heartbeat: () => renewIngestLeaseOrThrow(db, lease),
+            }),
+          () => renewIngestLeaseOrThrow(db, lease),
+        );
     await hooks.afterEvidenceStaged?.();
     await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
