@@ -165,7 +165,7 @@ export async function recoverProgressiveStorageOnlyEvidence(
         AND job.status IN ('done', 'failed', 'cancelled')
         AND job."ingestedAt" IS NOT NULL
         AND (job.ingest_lease_expires_at IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-        AND progressive_attempt.outcome IN ('running', 'complete', 'failed', 'cancelled')
+        AND progressive_attempt.outcome IN ('complete', 'failed', 'cancelled')
         AND unit.state IN ('gap', 'leased', 'blocked')
         AND (unit.state <> 'leased' OR unit.lease_until IS NULL OR unit.lease_until <= clock_timestamp())
         AND NOT EXISTS (

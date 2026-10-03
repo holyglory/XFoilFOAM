@@ -8067,6 +8067,23 @@ describe("progressive CFD evidence accounting", () => {
         sql`SELECT * FROM progressive_remote_evidence_receipts WHERE sim_job_id=${job.id}::uuid`,
       );
       await db.execute(
+        sql`UPDATE progressive_cfd_attempts SET outcome='running', finished_at=NULL
+          WHERE sim_job_id=${job.id}::uuid`,
+      );
+      expect(
+        await recoverProgressiveStorageOnlyEvidence(db, {
+          campaignId: fixture.campaignId,
+          epochId: lease.epochId,
+          generationId: lease.generationId,
+          planRevisionId: String(campaignRow.current_plan_revision_id),
+          stage: 2,
+        }),
+      ).toMatchObject({ selected: 0, linked: 0, errors: 0 });
+      await db.execute(
+        sql`UPDATE progressive_cfd_attempts SET outcome='failed', finished_at=clock_timestamp()
+          WHERE sim_job_id=${job.id}::uuid`,
+      );
+      await db.execute(
         sql`UPDATE result_attempts SET cl=cl+1 WHERE id=${attempt.id}::uuid`,
       );
       const rejected = await recoverProgressiveStorageOnlyEvidence(db, {
