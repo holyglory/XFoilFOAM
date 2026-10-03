@@ -160,10 +160,11 @@ async function lockJobScope(
             ) ||
             !["leased", "blocked", "gap"].includes(unit.state) ||
             unit.work_state !== "pending" ||
-            (unit.state === "leased" &&
-              (unit.lease_token !== unit.token ||
-                (unit.lease_until != null &&
-                  new Date(String(unit.lease_until)).getTime() > Date.now())))
+            (unit.state === "leased"
+              ? unit.lease_token !== unit.token ||
+                unit.lease_until == null ||
+                new Date(String(unit.lease_until)).getTime() > Date.now()
+              : unit.lease_token != null || unit.lease_until != null)
           : unit.outcome !== "running" ||
             !["leased", "blocked"].includes(unit.state)),
     )

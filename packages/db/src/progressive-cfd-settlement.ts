@@ -316,10 +316,10 @@ export async function settleProgressiveCfdExecution(
         unit.latest_attempt === true &&
         ["gap", "leased", "blocked"].includes(String(unit.state)) &&
         (unit.state !== "leased"
-          ? unit.lease_token == null
+          ? unit.lease_token == null && unit.lease_until == null
           : unit.lease_token === unit.token &&
-            (unit.lease_until == null ||
-              new Date(String(unit.lease_until)).getTime() <= Date.now())) &&
+            unit.lease_until != null &&
+            new Date(String(unit.lease_until)).getTime() <= Date.now()) &&
         ["complete", "failed", "cancelled"].includes(String(unit.outcome));
       const recoverableStoredEvidence = recoveringStoredEvidence;
       if (

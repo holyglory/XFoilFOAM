@@ -140,6 +140,9 @@ export async function recoverProgressiveStorageOnlyEvidence(
       JOIN progressive_cfd_attempts progressive_attempt
         ON progressive_attempt.sim_job_id = receipt.sim_job_id
         AND progressive_attempt.execution_recipe_id = dispatch.envelope#>>'{scope,recipeId}'
+        AND progressive_attempt.token::text IN (
+          SELECT jsonb_array_elements_text(dispatch.envelope#>'{scope,tokens}')
+        )
       JOIN progressive_cfd_units unit
         ON unit.id = progressive_attempt.unit_id AND unit.aoa_deg = raw.aoa_deg
       JOIN progressive_work work ON work.id = unit.work_id
@@ -167,7 +170,12 @@ export async function recoverProgressiveStorageOnlyEvidence(
         AND (job.ingest_lease_expires_at IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
         AND progressive_attempt.outcome IN ('complete', 'failed', 'cancelled')
         AND unit.state IN ('gap', 'leased', 'blocked')
-        AND (unit.state <> 'leased' OR unit.lease_until IS NULL OR unit.lease_until <= clock_timestamp())
+        AND (
+          (unit.state IN ('gap', 'blocked') AND unit.lease_token IS NULL AND unit.lease_until IS NULL)
+          OR
+          (unit.state = 'leased' AND unit.lease_token = progressive_attempt.token
+            AND unit.lease_until <= clock_timestamp())
+        )
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_evidence evidence
           WHERE evidence.result_attempt_id = receipt.result_attempt_id

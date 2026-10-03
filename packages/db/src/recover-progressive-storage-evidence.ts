@@ -4,18 +4,22 @@ import { recoverProgressiveStorageOnlyEvidence } from "./progressive-storage-evi
 
 const [campaignId, epochId, generationId, planRevisionId, ...args] =
   process.argv.slice(2);
-const mode =
-  args.find((value) => value === "--dry-run" || value === "--apply") ??
-  "--dry-run";
-const limitArg = args.find((value) => value.startsWith("--limit="));
+const modes = args.filter(
+  (value) => value === "--dry-run" || value === "--apply",
+);
+const mode = modes[0] ?? "--dry-run";
+const limitArgs = args.filter((value) => value.startsWith("--limit="));
+const limitArg = limitArgs[0];
 const limit = limitArg ? Number(limitArg.slice("--limit=".length)) : 32;
 
 if (
-  process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver" ||
+  process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "hub" ||
   !campaignId ||
   !epochId ||
   !generationId ||
   !planRevisionId ||
+  modes.length > 1 ||
+  limitArgs.length > 1 ||
   !["--dry-run", "--apply"].includes(mode) ||
   !Number.isSafeInteger(limit) ||
   limit < 1 ||
