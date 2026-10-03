@@ -191,6 +191,43 @@ export async function verifyProgressivePolarImport(
         new Map(),
       ),
     ).rejects.toThrow("previously retained progressive source");
+    const currentScopeRollback = new Error(
+      "Rollback expired current-scope fixture",
+    );
+    try {
+      await db.transaction(async (transaction) => {
+        const scoped = transaction as unknown as DB;
+        isolated.connection = scoped;
+        await scoped.execute(
+          sql`UPDATE sync_sweep_promises SET status='expired', "expiresAt"=clock_timestamp()-interval '1 second'
+          WHERE id=${delivery.promiseId}::uuid`,
+        );
+        await scoped.execute(sql`UPDATE sim_jobs SET status='ingesting', "ingestedAt"=NULL,
+          engine_job_id=id::text, ingest_lease_token=NULL, ingest_lease_expires_at=NULL
+          WHERE id=${delivery.engineJobId}::uuid`);
+        await scoped.execute(sql`UPDATE progressive_cfd_attempts SET outcome='running'
+          WHERE sim_job_id=${delivery.engineJobId}::uuid`);
+        await scoped.execute(sql`UPDATE progressive_cfd_units SET state='blocked',
+          lease_token=NULL, lease_owner=NULL, lease_until=NULL
+          WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${delivery.engineJobId}::uuid)`);
+        const imported = await push(payload, new Map());
+        expect(imported.progressiveEvidenceReceipts).toMatchObject([
+          { storageOnly: false },
+        ]);
+        const [evidence] = await scoped.execute(sql`
+          SELECT count(*)::integer AS count
+          FROM progressive_cfd_evidence evidence
+          JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token
+          WHERE attempt.sim_job_id=${delivery.engineJobId}::uuid
+        `);
+        expect(evidence.count).toBe(1);
+        throw currentScopeRollback;
+      });
+    } catch (error) {
+      if (error !== currentScopeRollback) throw error;
+    } finally {
+      isolated.connection = db;
+    }
     const storageRollback = new Error(
       "Rollback isolated stopped storage import",
     );
@@ -560,9 +597,17 @@ export async function verifyProgressivePolarImport(
     await db.execute(
       sql`DELETE FROM progressive_remote_evidence_receipts WHERE sim_job_id = ${delivery.engineJobId}::uuid`,
     );
-    await expect(push(payload, new Map())).rejects.toThrow(
-      "Campaign no longer accepts CFD evidence",
-    );
+    const closedScope = await app.inject({
+      method: "POST",
+      url: "/api/sync/v1/polars",
+      headers: { "x-xfoilfoam-solver-token": token },
+      payload,
+    });
+    expect(closedScope.statusCode, closedScope.body).toBe(409);
+    expect(closedScope.json()).toMatchObject({
+      code: "progressive_scope_closed",
+      error: "Campaign no longer accepts CFD evidence",
+    });
     const [retained] = await db.execute(
       sql`SELECT count(*)::integer AS count FROM result_attempts WHERE sim_job_id = ${delivery.engineJobId}::uuid`,
     );

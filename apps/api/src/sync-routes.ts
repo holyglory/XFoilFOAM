@@ -8422,6 +8422,10 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           }
         }
         let conflictError: string | null = null;
+        let conflictCode:
+          | "promise_inactive"
+          | "progressive_scope_closed"
+          | null = null;
         let pendingError: string | null = null;
         let permissionError: string | null = null;
         let blobLocks: Awaited<ReturnType<typeof acquireSyncBlobLocks>> | null =
@@ -8472,13 +8476,20 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         } catch (error) {
           if (error instanceof ProgressiveCfdEvidenceScopePending) {
             pendingError = error.message;
+          } else if (error instanceof ProgressiveCfdEvidenceScopeClosed) {
+            conflictError = error.message;
+            conflictCode = "progressive_scope_closed";
           } else if (
             error instanceof PolarPromiseScopeError ||
             error instanceof PolarEvidenceBindingError ||
-            error instanceof ProgressiveRemoteEvidenceConflict ||
-            error instanceof ProgressiveCfdEvidenceScopeClosed
+            error instanceof ProgressiveRemoteEvidenceConflict
           ) {
             conflictError = error.message;
+            if (
+              error instanceof PolarPromiseScopeError &&
+              error.message === "promise is not active"
+            )
+              conflictCode = "promise_inactive";
           } else {
             throw error;
           }
@@ -8530,7 +8541,10 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             ),
           };
         }
-        return reply.code(409).send({ error: conflictError });
+        return reply.code(409).send({
+          error: conflictError,
+          ...(conflictCode ? { code: conflictCode } : {}),
+        });
       },
     );
 

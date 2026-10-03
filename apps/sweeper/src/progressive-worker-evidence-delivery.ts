@@ -157,46 +157,73 @@ export async function deliverNextProgressiveWorkerEvidence(
       throw new Error(
         "Worker evidence delivery differs from its immutable reported source",
       );
-    stoppedStorage = await progressiveStoppedStorageEligible(db, executionId);
-    const response = await fetcher(
-      `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/${stoppedStorage ? "retained-progressive-evidence" : "polars"}`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-xfoilfoam-solver-token": String(pending.remote_solver_auth_token),
+    const requestBody = JSON.stringify({
+      promiseId: pending.promise_id,
+      sourceInstanceId: pending.instance_id,
+      sourceInstanceName: pending.instance_name,
+      results: [
+        {
+          aoaDeg: source.point.aoa_deg,
+          engineJobId: executionId,
+          engineCaseSlug: source.point.case_slug ?? null,
+          remoteResultId: pending.result_id,
+          remoteResultAttemptId: pending.result_attempt_id,
+          progressiveEvidence: {
+            sequence,
+            reportContentSignature: pending.report_signature,
+            pointContentSignature: source.contentSignature,
+          },
         },
-        redirect: "error",
-        signal: AbortSignal.timeout(30000),
-        body: JSON.stringify({
-          promiseId: pending.promise_id,
-          sourceInstanceId: pending.instance_id,
-          sourceInstanceName: pending.instance_name,
-          results: [
-            {
-              aoaDeg: source.point.aoa_deg,
-              engineJobId: executionId,
-              engineCaseSlug: source.point.case_slug ?? null,
-              remoteResultId: pending.result_id,
-              remoteResultAttemptId: pending.result_attempt_id,
-              progressiveEvidence: {
-                sequence,
-                reportContentSignature: pending.report_signature,
-                pointContentSignature: source.contentSignature,
-              },
-            },
-          ],
-        }),
-      },
-    );
+      ],
+    });
+    const post = (route: "polars" | "retained-progressive-evidence") =>
+      fetcher(
+        `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/${route}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-xfoilfoam-solver-token": String(
+              pending.remote_solver_auth_token,
+            ),
+          },
+          redirect: "error",
+          signal: AbortSignal.timeout(30000),
+          body: requestBody,
+        },
+      );
+    let rejected: { code?: unknown; error?: unknown } | null = null;
+    let response = await post("polars");
     responseStatus = response.status;
     if (!response.ok) {
-      if (response.status === 409) {
-        const rejected = (await response.json().catch(() => null)) as {
-          error?: unknown;
-        } | null;
+      rejected = (await response.json().catch(() => null)) as {
+        code?: unknown;
+        error?: unknown;
+      } | null;
+      const closedScope =
+        rejected?.code === "promise_inactive" ||
+        rejected?.code === "progressive_scope_closed";
+      if (response.status === 409 && closedScope) {
+        stoppedStorage = await progressiveStoppedStorageEligible(
+          db,
+          executionId,
+        );
+        if (stoppedStorage) {
+          response = await post("retained-progressive-evidence");
+          responseStatus = response.status;
+          rejected = response.ok
+            ? null
+            : ((await response.json().catch(() => null)) as {
+                code?: unknown;
+                error?: unknown;
+              } | null);
+        }
+      }
+    }
+    if (!response.ok) {
+      if (response.status === 409 && !stoppedStorage) {
         retryStoppedStorage =
-          !stoppedStorage && rejected?.error === "promise is not active";
+          !stoppedStorage && rejected?.code === "promise_inactive";
         await recordInactiveStoppedPromise(
           db,
           {
@@ -213,30 +240,30 @@ export async function deliverNextProgressiveWorkerEvidence(
         `${stoppedStorage ? "Stopped progressive storage" : "Progressive evidence"} delivery failed (${response.status})`,
       );
     }
-    const body = (await response.json()) as {
+    const responseBody = (await response.json()) as {
       progressiveEvidenceReceipts?: unknown;
       conflictIds?: unknown;
     } | null;
-    if (body?.conflictIds !== undefined) {
+    if (responseBody?.conflictIds !== undefined) {
       const uuid =
         /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
       if (
-        !Array.isArray(body.conflictIds) ||
-        body.conflictIds.length > 128 ||
-        body.conflictIds.some(
+        !Array.isArray(responseBody.conflictIds) ||
+        responseBody.conflictIds.length > 128 ||
+        responseBody.conflictIds.some(
           (value) => typeof value !== "string" || !uuid.test(value),
         )
       )
         throw new Error(
           "Hub returned malformed progressive import conflict references",
         );
-      importConflictIds = [...new Set(body.conflictIds as string[])];
+      importConflictIds = [...new Set(responseBody.conflictIds as string[])];
       if (importConflictIds.length)
         throw new Error(
           "Progressive evidence delivery requires import conflict review",
         );
     }
-    const receipts = body?.progressiveEvidenceReceipts;
+    const receipts = responseBody?.progressiveEvidenceReceipts;
     const receipt =
       Array.isArray(receipts) && receipts.length === 1
         ? (receipts[0] as Record<string, unknown> | null)
