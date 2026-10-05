@@ -19,6 +19,8 @@ import { ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import { settleProgressiveCfdExecution } from "./progressive-cfd-settlement";
 import { assertProgressiveStorageEvidenceRecoveryHost } from "./progressive-storage-recovery-scope";
+import { readProgressiveRemoteRetention } from "./progressive-remote-retention";
+import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const DEFAULT_LIMIT = 32;
@@ -119,12 +121,25 @@ export async function recoverProgressiveStorageOnlyEvidence(
     await connection.execute(sql`SET LOCAL statement_timeout = '30s'`);
     await assertProgressiveStorageEvidenceRecoveryHost(connection);
     const receipt = result();
-    const rows = await connection.execute(sql`
+    const pageSize = Math.max(limit, 32);
+    const selectedRows: Array<Record<string, any>> = [];
+    const retentionCache = new Map<
+      string,
+      Awaited<ReturnType<typeof readProgressiveRemoteRetention>> | null
+    >();
+    const stoppedJobs = new Map<string, boolean>();
+    let offset = 0;
+    while (selectedRows.length < limit) {
+      const page = await connection.execute(sql`
       WITH archive_ready AS MATERIALIZED (
         SELECT DISTINCT upload.engine_job_id, upload.solver_id, upload.promise_id,
           upload.canonical_result_id, upload.canonical_result_attempt_id,
           upload.manifest_sha256, upload.manifest_byte_size
         FROM sync_brokered_evidence_uploads upload
+        JOIN progressive_remote_dispatches ready_dispatch
+          ON ready_dispatch.sim_job_id::text = upload.engine_job_id
+          AND ready_dispatch.solver_id = upload.solver_id
+          AND ready_dispatch.promise_id = upload.promise_id
         JOIN solver_evidence_archives archive
           ON archive.result_id = upload.canonical_result_id
           AND archive.result_attempt_id = upload.canonical_result_attempt_id
@@ -133,6 +148,9 @@ export async function recoverProgressiveStorageOnlyEvidence(
         JOIN solver_evidence_blobs blob ON blob.id = archive.blob_id
         JOIN solver_evidence_artifacts bundle ON bundle.id = archive.source_artifact_id
         WHERE upload.state = 'bound'
+          AND ready_dispatch.envelope#>>'{scope,generationId}' = ${scope.generationId}
+          AND ready_dispatch.envelope#>>'{scope,epochId}' = ${scope.epochId}
+          AND ready_dispatch.envelope#>>'{scope,stage}' = ${String(scope.stage)}
           AND upload.bound_at IS NOT NULL
           AND upload.verified_at IS NOT NULL
           AND upload.generation IS NOT NULL
@@ -157,7 +175,7 @@ export async function recoverProgressiveStorageOnlyEvidence(
           AND (
             SELECT count(*) FROM solver_evidence_artifact_members member
             WHERE member.archive_id = archive.id
-          ) = upload.bundled_file_count + 1
+          ) = upload.bundled_file_count::bigint + 1
           AND EXISTS (
             SELECT 1
             FROM solver_evidence_artifact_members member
@@ -176,8 +194,9 @@ export async function recoverProgressiveStorageOnlyEvidence(
               AND (
                 member_artifact.result_id IS DISTINCT FROM upload.canonical_result_id
                 OR member_artifact.result_attempt_id IS DISTINCT FROM upload.canonical_result_attempt_id
-                OR member_artifact.sha256 !~ '^[a-f0-9]{64}$'
+                OR member_artifact.sha256 !~* '^[a-f0-9]{64}$'
                 OR member_artifact.byte_size < 0
+                OR member_artifact.byte_size > 9007199254740991
               )
           )
       ), candidates AS MATERIALIZED (
@@ -273,15 +292,15 @@ export async function recoverProgressiveStorageOnlyEvidence(
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
           WHERE evidence.result_attempt_id = receipt.result_attempt_id
             AND progressive_attempt.finished_at >= evidence.created_at)
-        AND latest_report.report->'stopProof' IS NOT NULL
+        AND jsonb_typeof(latest_report.report->'stopProof') = 'object'
         AND latest_report.report->'status'->>'state' IN ('completed', 'failed', 'cancelled')
         AND (
           latest_report.report->'stopProof'->>'ownership_basis' = 'never_started_cancellation_fence'
           OR (
-            latest_report.report->'result' IS NULL
+            latest_report.report->'result' = 'null'::jsonb
             AND latest_report.report->'status'->>'state' = 'failed'
-            AND (latest_report.report->'status'->>'total_cases')::integer = 0
-            AND (latest_report.report->'status'->>'completed_cases')::integer = 0
+            AND latest_report.report->'status'->>'total_cases' = '0'
+            AND latest_report.report->'status'->>'completed_cases' = '0'
             AND latest_report.report->'status'->>'failure_disposition' IN ('deterministic_mesh', 'infrastructure')
           )
           OR latest_report.report->'result'->>'state' IN ('completed', 'failed', 'cancelled')
@@ -320,42 +339,6 @@ export async function recoverProgressiveStorageOnlyEvidence(
             AND source.sequence <= latest_report.sequence
             AND source_receipt.result_attempt_id IS NULL
         )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM progressive_remote_report_sources source
-          JOIN progressive_remote_evidence_receipts source_receipt
-            ON source_receipt.sim_job_id = source.sim_job_id
-            AND source_receipt.point_content_signature = source.point_content_signature
-          JOIN result_attempts source_attempt ON source_attempt.id = source_receipt.result_attempt_id
-          WHERE source.sim_job_id = receipt.sim_job_id
-            AND source.sequence <= latest_report.sequence
-            AND EXISTS (
-              SELECT 1
-              FROM jsonb_array_elements(CASE
-                WHEN jsonb_typeof(source_attempt.evidence_payload->'evidence_artifacts') = 'array'
-                  THEN source_attempt.evidence_payload->'evidence_artifacts'
-                ELSE '[]'::jsonb END) artifact
-              WHERE artifact->>'kind' = 'manifest'
-            )
-            AND NOT EXISTS (
-              SELECT 1
-              FROM archive_ready ready
-              WHERE ready.engine_job_id = source.sim_job_id::text
-                AND ready.solver_id = dispatch.solver_id
-                AND ready.promise_id = dispatch.promise_id
-                AND ready.canonical_result_attempt_id = source_receipt.result_attempt_id
-                AND EXISTS (
-                  SELECT 1
-                  FROM jsonb_array_elements(CASE
-                    WHEN jsonb_typeof(source_attempt.evidence_payload->'evidence_artifacts') = 'array'
-                      THEN source_attempt.evidence_payload->'evidence_artifacts'
-                    ELSE '[]'::jsonb END) artifact
-                  WHERE artifact->>'kind' = 'manifest'
-                    AND artifact->>'sha256' = ready.manifest_sha256
-                    AND artifact->>'byte_size' = ready.manifest_byte_size::text
-                )
-            )
-        )
         AND EXISTS (
           SELECT 1
           FROM jsonb_array_elements(CASE
@@ -378,15 +361,55 @@ export async function recoverProgressiveStorageOnlyEvidence(
                   THEN raw.evidence_payload->'evidence_artifacts'
                 ELSE '[]'::jsonb END) artifact
               WHERE artifact->>'kind' = 'manifest'
-                AND artifact->>'sha256' = ready.manifest_sha256
-                AND artifact->>'byte_size' = ready.manifest_byte_size::text
+                AND lower(artifact->>'sha256') = ready.manifest_sha256
+                AND artifact->'byte_size' = to_jsonb(ready.manifest_byte_size)
             )
         )
       )
       SELECT * FROM candidates
       ORDER BY sim_job_id, sequence, point_content_signature
-      LIMIT ${limit}
-    `);
+      LIMIT ${pageSize} OFFSET ${offset}
+      `);
+      if (!page.length) break;
+      offset += page.length;
+      for (const row of page as unknown as Array<Record<string, any>>) {
+        const jobId = String(row.sim_job_id);
+        let retained = retentionCache.get(jobId);
+        if (!retentionCache.has(jobId)) {
+          try {
+            retained = await readProgressiveRemoteRetention(connection, jobId);
+          } catch (error) {
+            if (error instanceof ProgressiveRemoteEvidenceConflict)
+              receipt.conflicts += 1;
+            else receipt.errors += 1;
+            rememberError(receipt, error);
+            retained = null;
+          }
+          retentionCache.set(jobId, retained);
+        }
+        if (retained?.kind !== "retained") continue;
+        const source = retained.sources.find(
+          (source) => source.resultAttemptId === String(row.result_attempt_id),
+        );
+        if (!source?.archived) continue;
+        if (!stoppedJobs.has(jobId)) {
+          try {
+            await assertStoppedProgressiveStorage(connection, source.delivery);
+            stoppedJobs.set(jobId, true);
+          } catch (error) {
+            if (error instanceof ProgressiveRemoteEvidenceConflict)
+              receipt.conflicts += 1;
+            else receipt.errors += 1;
+            rememberError(receipt, error);
+            stoppedJobs.set(jobId, false);
+          }
+        }
+        if (stoppedJobs.get(jobId)) selectedRows.push(row);
+        if (selectedRows.length >= limit) break;
+      }
+      if (page.length < pageSize) break;
+    }
+    const rows = selectedRows;
 
     const jobs = new Map<string, Array<Record<string, any>>>();
     for (const row of rows as unknown as Array<Record<string, any>>) {

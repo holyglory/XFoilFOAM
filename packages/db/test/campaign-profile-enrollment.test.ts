@@ -8588,6 +8588,21 @@ describe("progressive CFD evidence accounting", () => {
                   ),
               },
               {
+                name: "missing authenticated archive member",
+                mutate: (connection: DB) =>
+                  connection.execute(sql`
+                    DELETE FROM solver_evidence_artifact_members member
+                    WHERE member.archive_id IN (
+                      SELECT archive.id
+                      FROM solver_evidence_archives archive
+                      JOIN result_attempts attempt
+                        ON attempt.id = archive.result_attempt_id
+                      WHERE attempt.sim_job_id = ${job.id}::uuid
+                    )
+                    AND member.member_path = 'evidence_manifest.json'
+                  `),
+              },
+              {
                 name: "active ingest lease",
                 mutate: (connection: DB) =>
                   connection.execute(
@@ -8639,6 +8654,12 @@ describe("progressive CFD evidence accounting", () => {
                     scope,
                   );
                   expect(denied.linked, unsafe.name).toBe(0);
+                  if (
+                    unsafe.name === "missing stop proof" ||
+                    unsafe.name === "missing final inventory" ||
+                    unsafe.name === "missing authenticated archive member"
+                  )
+                    expect(denied.selected, unsafe.name).toBe(0);
                   expect(
                     await connection.execute(sql`SELECT count(*)::int AS count FROM progressive_cfd_evidence evidence
                   JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token WHERE attempt.sim_job_id=${job.id}::uuid`),
