@@ -7999,6 +7999,7 @@ describe("progressive CFD evidence accounting", () => {
     "accepted",
     "rejected",
     "missing-manifest",
+    "first-missing-manifest",
     "wrong-reynolds",
     "wrong-mach",
     "wrong-speed",
@@ -8135,7 +8136,9 @@ describe("progressive CFD evidence accounting", () => {
                     converged: scientificState === "accepted",
                     error: null,
                     evidence_artifacts:
-                      scientificState === "missing-manifest"
+                      scientificState === "missing-manifest" ||
+                      (scientificState === "first-missing-manifest" &&
+                        selected.alpha === fixture.leases[0].alpha)
                         ? []
                         : [
                             {
@@ -8151,6 +8154,42 @@ describe("progressive CFD evidence accounting", () => {
                 },
               ],
             };
+            if (scientificState === "first-missing-manifest") {
+              const attempts = result.polars[0].attempts!;
+              const manifestArtifacts = attempts.find(
+                (candidate) => candidate.evidence_artifacts?.length,
+              )!.evidence_artifacts!;
+              const signature = (candidate: (typeof attempts)[number]) =>
+                analysisContentHash({
+                  kind: "progressive-reported-point-v1",
+                  executionId: result.job_id,
+                  chord: result.polars[0].chord,
+                  speed: result.polars[0].speed,
+                  reynolds: result.polars[0].reynolds,
+                  mach: result.polars[0].mach ?? null,
+                  point: candidate,
+                });
+              const missingAlpha = fixture.leases.find((lease) =>
+                fixture.leases.every((candidate) => {
+                  for (const attempt of attempts)
+                    attempt.evidence_artifacts =
+                      attempt.aoa_deg === lease.alpha
+                        ? []
+                        : manifestArtifacts;
+                  const first = [...attempts].sort((left, right) =>
+                    signature(left).localeCompare(signature(right)),
+                  )[0];
+                  return first.aoa_deg === lease.alpha;
+                }),
+              )?.alpha;
+              if (missingAlpha === undefined)
+                throw new Error(
+                  "Storage recovery fixture could not place missing custody first",
+                );
+              for (const attempt of attempts)
+                attempt.evidence_artifacts =
+                  attempt.aoa_deg === missingAlpha ? [] : manifestArtifacts;
+            }
             const report: ProgressiveRemoteReport = {
               version: 1,
               solverId,
@@ -8328,11 +8367,113 @@ describe("progressive CFD evidence accounting", () => {
               scope,
             );
             expect(withoutCustody).toMatchObject({
-              selected: 2,
+              selected: 0,
               linked: 0,
-              settlementWaiting: 1,
+              settlementWaiting: 0,
               errors: 0,
             });
+            if (scientificState === "first-missing-manifest") {
+              const ordered = await db.execute(sql`
+                SELECT result_attempt_id
+                FROM progressive_remote_evidence_receipts
+                WHERE sim_job_id=${job.id}::uuid
+                ORDER BY sim_job_id, sequence, point_content_signature
+              `);
+              expect(ordered).toHaveLength(2);
+              const later = stored.find(
+                (item) => item.attempt.id === ordered[1].result_attempt_id,
+              )!;
+              const originalReceipts = await db.execute(sql`
+                SELECT * FROM progressive_remote_evidence_receipts
+                WHERE sim_job_id=${job.id}::uuid
+                ORDER BY sequence, point_content_signature
+              `);
+              const originalAttempts = await db.execute(sql`
+                SELECT * FROM result_attempts
+                WHERE sim_job_id=${job.id}::uuid
+                ORDER BY id
+              `);
+              const originalCells = await db.execute(sql`
+                SELECT id, current_result_attempt_id, current_result_interpretation_id,
+                  current_canonical_selection_id, speed, chord, mach, reynolds
+                FROM results WHERE sim_job_id=${job.id}::uuid ORDER BY id
+              `);
+              const [laterReceipt] = await db.execute(sql`
+                SELECT remote_result_id, remote_result_attempt_id
+                FROM progressive_remote_evidence_receipts
+                WHERE result_attempt_id=${later.attempt.id}::uuid
+              `);
+              const [reportRow] = await db.execute(sql`
+                SELECT content_signature
+                FROM progressive_remote_reports
+                WHERE sim_job_id=${job.id}::uuid AND sequence=1
+              `);
+              await retainStorageRecoveryArchive(db, {
+                solverId,
+                promiseId,
+                engineJobId: job.id,
+                aoaDeg: later.selected.alpha,
+                engineCaseSlug: "isolated-reported-case",
+                progressiveEvidence: {
+                  sequence: 1,
+                  reportContentSignature: String(reportRow.content_signature),
+                  pointContentSignature: later.source.contentSignature,
+                },
+                remoteResultId: String(laterReceipt.remote_result_id),
+                remoteResultAttemptId: String(
+                  laterReceipt.remote_result_attempt_id,
+                ),
+              });
+              const recovered = await recoverProgressiveStorageOnlyEvidence(
+                db,
+                scope,
+                { limit: 1 },
+              );
+              expect(recovered).toMatchObject({
+                selected: 1,
+                linked: 1,
+                errors: 0,
+                conflicts: 0,
+                settlementWaiting: 1,
+              });
+              expect(
+                await db.execute(sql`SELECT evidence.result_attempt_id
+                  FROM progressive_cfd_evidence evidence
+                  JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token
+                  WHERE attempt.sim_job_id=${job.id}::uuid`),
+              ).toEqual([{ result_attempt_id: ordered[1].result_attempt_id }]);
+              expect(
+                await db.execute(sql`
+                  SELECT * FROM progressive_remote_evidence_receipts
+                  WHERE sim_job_id=${job.id}::uuid
+                  ORDER BY sequence, point_content_signature
+                `),
+              ).toEqual(originalReceipts);
+              expect(
+                await db.execute(sql`
+                  SELECT * FROM result_attempts
+                  WHERE sim_job_id=${job.id}::uuid ORDER BY id
+                `),
+              ).toEqual(originalAttempts);
+              expect(
+                await db.execute(sql`
+                  SELECT id, current_result_attempt_id, current_result_interpretation_id,
+                    current_canonical_selection_id, speed, chord, mach, reynolds
+                  FROM results WHERE sim_job_id=${job.id}::uuid ORDER BY id
+                `),
+              ).toEqual(originalCells);
+              expect(
+                await recoverProgressiveStorageOnlyEvidence(db, scope, {
+                  limit: 1,
+                }),
+              ).toMatchObject({
+                selected: 0,
+                linked: 0,
+                replayed: 0,
+                errors: 0,
+              });
+              throw rollback;
+            }
             if (scientificState === "missing-manifest") {
               expect(
                 await db.execute(sql`SELECT count(*)::int AS count FROM progressive_cfd_evidence evidence

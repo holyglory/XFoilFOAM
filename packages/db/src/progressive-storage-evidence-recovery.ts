@@ -120,7 +120,68 @@ export async function recoverProgressiveStorageOnlyEvidence(
     await assertProgressiveStorageEvidenceRecoveryHost(connection);
     const receipt = result();
     const rows = await connection.execute(sql`
-      SELECT receipt.sim_job_id::text AS sim_job_id, receipt.sequence,
+      WITH archive_ready AS MATERIALIZED (
+        SELECT DISTINCT upload.engine_job_id, upload.solver_id, upload.promise_id,
+          upload.canonical_result_id, upload.canonical_result_attempt_id,
+          upload.manifest_sha256, upload.manifest_byte_size
+        FROM sync_brokered_evidence_uploads upload
+        JOIN solver_evidence_archives archive
+          ON archive.result_id = upload.canonical_result_id
+          AND archive.result_attempt_id = upload.canonical_result_attempt_id
+          AND archive.source_artifact_id = upload.canonical_artifact_id
+          AND archive.state = 'current'
+        JOIN solver_evidence_blobs blob ON blob.id = archive.blob_id
+        JOIN solver_evidence_artifacts bundle ON bundle.id = archive.source_artifact_id
+        WHERE upload.state = 'bound'
+          AND upload.bound_at IS NOT NULL
+          AND upload.verified_at IS NOT NULL
+          AND upload.generation IS NOT NULL
+          AND upload.crc32c IS NOT NULL
+          AND blob.backend = 'gcs'
+          AND blob.compression = 'zstd'
+          AND blob.mime_type = 'application/zstd'
+          AND blob.verified_at IS NOT NULL
+          AND blob.bucket = upload.bucket
+          AND blob.object_key = upload.object_key
+          AND blob.generation = upload.generation
+          AND blob.sha256 = upload.stored_sha256
+          AND blob.byte_size = upload.stored_byte_size
+          AND blob.crc32c = upload.crc32c
+          AND blob.uncompressed_tar_sha256 = upload.tar_sha256
+          AND blob.uncompressed_tar_byte_size = upload.tar_byte_size
+          AND bundle.kind = 'engine_bundle'
+          AND bundle.storage_key = upload.object_key
+          AND bundle.mime_type = 'application/zstd'
+          AND bundle.sha256 = upload.stored_sha256
+          AND bundle.byte_size = upload.stored_byte_size
+          AND (
+            SELECT count(*) FROM solver_evidence_artifact_members member
+            WHERE member.archive_id = archive.id
+          ) = upload.bundled_file_count + 1
+          AND EXISTS (
+            SELECT 1
+            FROM solver_evidence_artifact_members member
+            JOIN solver_evidence_artifacts manifest ON manifest.id = member.artifact_id
+            WHERE member.archive_id = archive.id
+              AND member.member_path = 'evidence_manifest.json'
+              AND manifest.kind = 'manifest'
+              AND manifest.sha256 = upload.manifest_sha256
+              AND manifest.byte_size = upload.manifest_byte_size
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM solver_evidence_artifact_members member
+            JOIN solver_evidence_artifacts member_artifact ON member_artifact.id = member.artifact_id
+            WHERE member.archive_id = archive.id
+              AND (
+                member_artifact.result_id IS DISTINCT FROM upload.canonical_result_id
+                OR member_artifact.result_attempt_id IS DISTINCT FROM upload.canonical_result_attempt_id
+                OR member_artifact.sha256 !~ '^[a-f0-9]{64}$'
+                OR member_artifact.byte_size < 0
+              )
+          )
+      ), candidates AS MATERIALIZED (
+        SELECT receipt.sim_job_id::text AS sim_job_id, receipt.sequence,
         receipt.point_content_signature, receipt.result_attempt_id::text AS result_attempt_id,
         receipt.remote_result_id::text AS remote_result_id,
         receipt.remote_result_attempt_id::text AS remote_result_attempt_id,
@@ -165,6 +226,13 @@ export async function recoverProgressiveStorageOnlyEvidence(
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id
       JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      JOIN LATERAL (
+        SELECT latest.report, latest.sequence
+        FROM progressive_remote_reports latest
+        WHERE latest.sim_job_id = receipt.sim_job_id
+        ORDER BY latest.sequence DESC
+        LIMIT 1
+      ) latest_report ON true
       WHERE receipt.storage_only = true
         AND receipt.result_attempt_id IS NOT NULL
         AND job.campaign_id = ${scope.campaignId}::uuid
@@ -205,7 +273,118 @@ export async function recoverProgressiveStorageOnlyEvidence(
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
           WHERE evidence.result_attempt_id = receipt.result_attempt_id
             AND progressive_attempt.finished_at >= evidence.created_at)
-      ORDER BY receipt.sim_job_id, receipt.sequence, receipt.point_content_signature
+        AND latest_report.report->'stopProof' IS NOT NULL
+        AND latest_report.report->'status'->>'state' IN ('completed', 'failed', 'cancelled')
+        AND (
+          latest_report.report->'stopProof'->>'ownership_basis' = 'never_started_cancellation_fence'
+          OR (
+            latest_report.report->'result' IS NULL
+            AND latest_report.report->'status'->>'state' = 'failed'
+            AND (latest_report.report->'status'->>'total_cases')::integer = 0
+            AND (latest_report.report->'status'->>'completed_cases')::integer = 0
+            AND latest_report.report->'status'->>'failure_disposition' IN ('deterministic_mesh', 'infrastructure')
+          )
+          OR latest_report.report->'result'->>'state' IN ('completed', 'failed', 'cancelled')
+        )
+        AND EXISTS (
+          SELECT 1 FROM progressive_remote_report_sources source
+          WHERE source.sim_job_id = receipt.sim_job_id
+            AND source.sequence = receipt.sequence
+            AND source.point_content_signature = receipt.point_content_signature
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_remote_reports retained_report
+          LEFT JOIN progressive_remote_report_inventories inventory
+            ON inventory.sim_job_id = retained_report.sim_job_id
+            AND inventory.sequence = retained_report.sequence
+          WHERE retained_report.sim_job_id = receipt.sim_job_id
+            AND retained_report.sequence <= latest_report.sequence
+            AND (
+              inventory.sequence IS NULL
+              OR inventory.report_content_signature <> retained_report.content_signature
+              OR inventory.source_count <> (
+                SELECT count(*) FROM progressive_remote_report_sources source
+                WHERE source.sim_job_id = retained_report.sim_job_id
+                  AND source.sequence = retained_report.sequence
+              )
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_remote_report_sources source
+          LEFT JOIN progressive_remote_evidence_receipts source_receipt
+            ON source_receipt.sim_job_id = source.sim_job_id
+            AND source_receipt.point_content_signature = source.point_content_signature
+          WHERE source.sim_job_id = receipt.sim_job_id
+            AND source.sequence <= latest_report.sequence
+            AND source_receipt.result_attempt_id IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_remote_report_sources source
+          JOIN progressive_remote_evidence_receipts source_receipt
+            ON source_receipt.sim_job_id = source.sim_job_id
+            AND source_receipt.point_content_signature = source.point_content_signature
+          JOIN result_attempts source_attempt ON source_attempt.id = source_receipt.result_attempt_id
+          WHERE source.sim_job_id = receipt.sim_job_id
+            AND source.sequence <= latest_report.sequence
+            AND EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(CASE
+                WHEN jsonb_typeof(source_attempt.evidence_payload->'evidence_artifacts') = 'array'
+                  THEN source_attempt.evidence_payload->'evidence_artifacts'
+                ELSE '[]'::jsonb END) artifact
+              WHERE artifact->>'kind' = 'manifest'
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM archive_ready ready
+              WHERE ready.engine_job_id = source.sim_job_id::text
+                AND ready.solver_id = dispatch.solver_id
+                AND ready.promise_id = dispatch.promise_id
+                AND ready.canonical_result_attempt_id = source_receipt.result_attempt_id
+                AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(CASE
+                    WHEN jsonb_typeof(source_attempt.evidence_payload->'evidence_artifacts') = 'array'
+                      THEN source_attempt.evidence_payload->'evidence_artifacts'
+                    ELSE '[]'::jsonb END) artifact
+                  WHERE artifact->>'kind' = 'manifest'
+                    AND artifact->>'sha256' = ready.manifest_sha256
+                    AND artifact->>'byte_size' = ready.manifest_byte_size::text
+                )
+            )
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(CASE
+            WHEN jsonb_typeof(raw.evidence_payload->'evidence_artifacts') = 'array'
+              THEN raw.evidence_payload->'evidence_artifacts'
+            ELSE '[]'::jsonb END) artifact
+          WHERE artifact->>'kind' = 'manifest'
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM archive_ready ready
+          WHERE ready.engine_job_id = receipt.sim_job_id::text
+            AND ready.solver_id = dispatch.solver_id
+            AND ready.promise_id = dispatch.promise_id
+            AND ready.canonical_result_attempt_id = receipt.result_attempt_id
+            AND EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(CASE
+                WHEN jsonb_typeof(raw.evidence_payload->'evidence_artifacts') = 'array'
+                  THEN raw.evidence_payload->'evidence_artifacts'
+                ELSE '[]'::jsonb END) artifact
+              WHERE artifact->>'kind' = 'manifest'
+                AND artifact->>'sha256' = ready.manifest_sha256
+                AND artifact->>'byte_size' = ready.manifest_byte_size::text
+            )
+        )
+      )
+      SELECT * FROM candidates
+      ORDER BY sim_job_id, sequence, point_content_signature
       LIMIT ${limit}
     `);
 
