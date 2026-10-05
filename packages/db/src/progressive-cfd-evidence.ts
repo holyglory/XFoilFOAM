@@ -8,10 +8,23 @@ import {
   solverBudgetCaseKey,
 } from "../../engine-client/src/solver-budget";
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
-
-export class ProgressiveCfdEvidenceScopeClosed extends Error {}
-
-export class ProgressiveCfdEvidenceScopePending extends Error {}
+import { readProgressiveRemoteRetention } from "./progressive-remote-retention";
+import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
+import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
+import {
+  assertProgressiveStorageEvidenceRecoveryHost,
+  assertProgressiveStorageEvidenceRecoveryRole,
+  lockProgressiveStorageRecoveryUnits,
+  ProgressiveCfdEvidenceScopeClosed,
+  ProgressiveCfdEvidenceScopePending,
+  type ProgressiveStorageEvidenceRecoveryScope,
+} from "./progressive-storage-recovery-scope";
+export {
+  assertProgressiveStorageEvidenceRecoveryRole,
+  ProgressiveCfdEvidenceScopeClosed,
+  ProgressiveCfdEvidenceScopePending,
+  type ProgressiveStorageEvidenceRecoveryScope,
+} from "./progressive-storage-recovery-scope";
 
 interface BoundUnit {
   token: string;
@@ -32,19 +45,12 @@ interface BoundUnit {
   lease_token: string | null;
   lease_until: Date | string | null;
   work_state: string;
+  latest_attempt: boolean;
   requested_budget_seconds?: number;
   snapshot: {
     flowState: { speedMps: number };
     referenceGeometry: { referenceLengthM: number };
   };
-}
-
-export interface ProgressiveStorageEvidenceRecoveryScope {
-  campaignId: string;
-  epochId: string;
-  generationId: string;
-  planRevisionId: string;
-  stage: 2;
 }
 
 async function lockJobScope(
@@ -56,6 +62,7 @@ async function lockJobScope(
   } = {},
 ) {
   const recoveryScope = options.recoveryScope;
+  if (recoveryScope) await assertProgressiveStorageEvidenceRecoveryHost(db);
   const [job] = await db.execute(sql`
     SELECT job.airfoil_id, job.engine_job_id, job.campaign_id, job.status, job."ingestedAt", job.ingest_lease_expires_at,
       job.request_payload, job.request_payload->'progressive' AS progressive,
@@ -81,6 +88,10 @@ async function lockJobScope(
     recoveryScope &&
     (!recoveryScope.campaignId ||
       job.campaign_id !== recoveryScope.campaignId ||
+      (job.progressive as Record<string, unknown>).generationId !==
+        recoveryScope.generationId ||
+      (job.progressive as Record<string, unknown>).stage !==
+        recoveryScope.stage ||
       !["done", "failed", "cancelled"].includes(String(job.status)) ||
       job.ingestedAt == null ||
       (job.ingest_lease_expires_at != null &&
@@ -125,10 +136,14 @@ async function lockJobScope(
     throw new ProgressiveCfdEvidenceScopeClosed(
       "Historical progressive evidence recovery does not match the current campaign plan",
     );
+  if (recoveryScope)
+    await lockProgressiveStorageRecoveryUnits(db, recoveryScope, simJobId);
   const units = (await db.execute(sql`
     SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg, attempt.active_seconds, unit.active_seconds AS unit_seconds,
       unit.active_budget_seconds, unit.state, attempt.outcome, recipe.execution_revision_id,
       unit.lease_token, unit.lease_until, work.state AS work_state,
+      NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
+        AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
       (EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt WHERE receipt.attempt_token = attempt.token
         AND receipt.budget_guard_exhausted) OR EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress runtime
         WHERE runtime.attempt_token = attempt.token AND runtime.engine_job_id = ${engineJobId})) AS budget_guard_confirmed,
@@ -140,7 +155,8 @@ async function lockJobScope(
     WHERE attempt.sim_job_id = ${simJobId} AND generation.epoch_id = ${epoch.id}
       AND generation.campaign_id = ${job.campaign_id} AND generation.plan_revision_id = ${campaign.current_plan_revision_id}
       AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage
-    ORDER BY unit.ordinal FOR UPDATE OF generation, work, unit, attempt
+    ORDER BY unit.ordinal, unit.id
+    ${recoveryScope ? sql`` : sql`FOR UPDATE OF generation, work, unit, attempt`}
   `)) as unknown as BoundUnit[];
   const [count] = await db.execute(
     sql`SELECT count(*)::integer AS count FROM progressive_cfd_attempts WHERE sim_job_id = ${simJobId}`,
@@ -155,10 +171,8 @@ async function lockJobScope(
         unit.execution_recipe_id !== metadata.recipeId ||
         unit.stage !== metadata.stage ||
         (recoveryScope
-          ? !["running", "complete", "failed", "cancelled"].includes(
-              unit.outcome,
-            ) ||
-            !["leased", "blocked", "gap"].includes(unit.state) ||
+          ? !["complete", "failed", "cancelled"].includes(unit.outcome) ||
+            !["leased", "blocked", "gap", "complete"].includes(unit.state) ||
             unit.work_state !== "pending" ||
             (unit.state === "leased"
               ? unit.lease_token !== unit.token ||
@@ -194,10 +208,130 @@ async function lockJobScope(
     unit.requested_budget_seconds = allocations.get(
       solverBudgetCaseKey(physicalCases[index]),
     );
+  if (recoveryScope) {
+    const [lockedJob] = await db.execute(sql`
+      SELECT engine_job_id, request_payload, status, "ingestedAt", ingest_lease_token, ingest_lease_expires_at
+      FROM sim_jobs WHERE id = ${simJobId} FOR UPDATE
+    `);
+    if (
+      !lockedJob ||
+      lockedJob.engine_job_id !== engineJobId ||
+      analysisContentHash(lockedJob.request_payload) !==
+        analysisContentHash(job.request_payload) ||
+      !["done", "failed", "cancelled"].includes(String(lockedJob.status)) ||
+      lockedJob.ingestedAt == null ||
+      (lockedJob.ingest_lease_token != null &&
+        (lockedJob.ingest_lease_expires_at == null ||
+          new Date(String(lockedJob.ingest_lease_expires_at)).getTime() >
+            Date.now()))
+    )
+      throw new ProgressiveCfdEvidenceScopeClosed(
+        "Historical progressive execution ownership changed or is still active",
+      );
+  }
   return {
     airfoilId: String(job.airfoil_id),
     units,
   };
+}
+
+export async function assertProgressiveStorageEvidenceRecoveryJob(
+  db: DB,
+  simJobId: string,
+  recoveryScope: ProgressiveStorageEvidenceRecoveryScope,
+  resultAttemptIds: string[],
+) {
+  assertProgressiveStorageEvidenceRecoveryRole();
+  if (
+    !recoveryScope ||
+    recoveryScope.stage !== 2 ||
+    [
+      recoveryScope.campaignId,
+      recoveryScope.epochId,
+      recoveryScope.generationId,
+      recoveryScope.planRevisionId,
+    ].some(
+      (id) =>
+        typeof id !== "string" ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id),
+    )
+  )
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive recovery requires the exact current stage-2 scope",
+    );
+  await db.execute(sql`SET LOCAL lock_timeout = '5s'`);
+  await db.execute(sql`SET LOCAL statement_timeout = '30s'`);
+  const scope = await lockJobScope(db, simJobId, simJobId, { recoveryScope });
+  if (!scope || !resultAttemptIds.length || resultAttemptIds.length > 2048)
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive recovery requires exact stored attempt identities",
+    );
+  const [dispatch] = await db.execute(sql`
+    SELECT solver_id, promise_id, envelope, content_signature FROM progressive_remote_dispatches
+    WHERE sim_job_id = ${simJobId}::uuid FOR SHARE
+  `);
+  if (!dispatch)
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive recovery has no original remote dispatch",
+    );
+  const envelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
+    solverId: String(dispatch.solver_id),
+    promiseId: String(dispatch.promise_id),
+    executionId: simJobId,
+    contentSignature: String(dispatch.content_signature),
+  });
+  if (
+    envelope.scope.epochId !== recoveryScope.epochId ||
+    envelope.scope.generationId !== recoveryScope.generationId ||
+    envelope.scope.stage !== recoveryScope.stage ||
+    scope.units.some(
+      (unit) =>
+        envelope.scope.targetId !== unit.target_id ||
+        envelope.scope.recipeId !== unit.execution_recipe_id ||
+        !envelope.scope.tokens.includes(unit.token),
+    )
+  )
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive recovery differs from its immutable remote scope",
+    );
+  const retained = await readProgressiveRemoteRetention(db, simJobId);
+  if (retained.kind !== "retained")
+    throw new ProgressiveCfdEvidenceScopePending(
+      `Historical progressive recovery is waiting for complete remote retention: ${retained.reason}`,
+    );
+  for (const resultAttemptId of resultAttemptIds) {
+    const source = retained.sources.find(
+      (item) => item.resultAttemptId === resultAttemptId,
+    );
+    const unit = scope.units.find(
+      (item) => item.aoa_deg === source?.delivery.aoaDeg,
+    );
+    if (!source || !unit || !unit.latest_attempt || unit.state === "complete")
+      throw new ProgressiveCfdEvidenceScopeClosed(
+        "Historical progressive evidence no longer owns the latest unsettled unit attempt",
+      );
+    if (!source.archived)
+      throw new ProgressiveCfdEvidenceScopePending(
+        "Historical progressive evidence is waiting for its manifest and archive custody",
+      );
+    const [receipt] = await db.execute(sql`
+      SELECT storage_only FROM progressive_remote_evidence_receipts
+      WHERE sim_job_id = ${simJobId}::uuid AND result_attempt_id = ${resultAttemptId}::uuid
+    `);
+    if (receipt?.storage_only !== true)
+      throw new ProgressiveCfdEvidenceScopeClosed(
+        "Historical progressive recovery requires an immutable storage-only receipt",
+      );
+    await assertStoppedProgressiveStorage(db, source.delivery);
+    const { assertProgressiveRemoteEvidenceAttempt } =
+      await import("./progressive-remote-evidence-receipts");
+    await assertProgressiveRemoteEvidenceAttempt(db, {
+      ...source.delivery,
+      resultAttemptId,
+      recoveryScope,
+    });
+  }
+  return scope;
 }
 
 export async function assertProgressiveCfdEvidenceJob(
@@ -383,12 +517,18 @@ export async function recordProgressiveCfdEvidence(
     throw new Error("CFD evidence batch exceeds its bounded case scope");
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    const scope = await lockJobScope(
-      connection,
-      input.simJobId,
-      input.engineJobId,
-      { recoveryScope: input.recoveryScope },
-    );
+    const scope = input.recoveryScope
+      ? await assertProgressiveStorageEvidenceRecoveryJob(
+          connection,
+          input.simJobId,
+          input.recoveryScope,
+          ids,
+        )
+      : await lockJobScope(connection, input.simJobId, input.engineJobId);
+    if (input.recoveryScope && input.engineJobId !== input.simJobId)
+      throw new ProgressiveCfdEvidenceScopeClosed(
+        "Historical progressive recovery requires exact engine ownership",
+      );
     if (!scope) return { progressive: false, linked: 0, stopRequired: false };
     let linked = 0;
     let stopRequired = scope.units.some(
@@ -452,7 +592,7 @@ export async function recordProgressiveCfdEvidence(
             : expectedMach !== row.mach) ||
           (row.reynolds == null
             ? expectedReynolds !== null
-            : expectedReynolds !== row.reynolds)
+            : expectedReynolds !== Number(row.reynolds))
         )
           throw new Error(
             "Historical progressive evidence differs from the immutable physical case",

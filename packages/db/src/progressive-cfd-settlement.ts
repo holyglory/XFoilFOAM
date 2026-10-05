@@ -152,7 +152,10 @@ export async function settleProgressiveCfdExecution(
   simJobId: string,
   options: {
     recoverNeverStarted?: boolean;
-    recoverStoredEvidence?: { resultAttemptIds: string[] };
+    recoverStoredEvidence?: {
+      resultAttemptIds: string[];
+      scope: import("./progressive-cfd-evidence").ProgressiveStorageEvidenceRecoveryScope;
+    };
   } = {},
 ): Promise<{
   complete: number;
@@ -164,6 +167,16 @@ export async function settleProgressiveCfdExecution(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const counts = { complete: 0, retry: 0, gaps: 0, cancelled: 0, waiting: 0 };
+    if (options.recoverStoredEvidence) {
+      const { assertProgressiveStorageEvidenceRecoveryJob } =
+        await import("./progressive-cfd-evidence");
+      await assertProgressiveStorageEvidenceRecoveryJob(
+        connection,
+        simJobId,
+        options.recoverStoredEvidence.scope,
+        options.recoverStoredEvidence.resultAttemptIds,
+      );
+    }
     const [stop] = await connection.execute(
       sql`SELECT proof FROM progressive_cfd_execution_stops WHERE sim_job_id = ${simJobId}`,
     );
@@ -195,6 +208,12 @@ export async function settleProgressiveCfdExecution(
               sql`, `,
             )}))`
       : sql`false`;
+    const selectedReceiptScope = options.recoverStoredEvidence
+      ? sql`AND receipt.result_attempt_id IN (${sql.join(
+          storedEvidenceIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )})`
+      : sql``;
     if (!job.ingestedAt) {
       const [current] = await connection.execute(sql`
       SELECT EXISTS (
@@ -231,7 +250,8 @@ export async function settleProgressiveCfdExecution(
     const sources = await connection.execute(sql`
       SELECT receipt.evidence_signature, raw.evidence_payload FROM progressive_cfd_attempts attempt
       JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = attempt.token
-      JOIN result_attempts raw ON raw.id = receipt.result_attempt_id WHERE attempt.sim_job_id = ${simJobId} LIMIT 2049
+      JOIN result_attempts raw ON raw.id = receipt.result_attempt_id WHERE attempt.sim_job_id = ${simJobId}
+        ${selectedReceiptScope} LIMIT 2049
     `);
     if (
       sources.length > 2048 ||
@@ -265,7 +285,8 @@ export async function settleProgressiveCfdExecution(
         ${historicalEvidence} AS historical_recovery,
         EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt,
           jsonb_array_elements(coalesce(fitted.response->'estimate'->'contributors', '[]'::jsonb)) contributor
-          WHERE receipt.attempt_token = attempt.token AND receipt.result_attempt_id::text = contributor->>'attempt_id') AS informative
+          WHERE receipt.attempt_token = attempt.token AND receipt.result_attempt_id::text = contributor->>'attempt_id'
+            ${selectedReceiptScope}) AS informative
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
@@ -280,7 +301,7 @@ export async function settleProgressiveCfdExecution(
           coalesce(bool_and(coalesce(raw.evidence_payload->>'failure_disposition', '') = 'infrastructure'), false) AS infrastructure_only
         FROM progressive_cfd_evidence receipt JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
         LEFT JOIN result_classifications classification ON classification.result_attempt_id = raw.id
-        WHERE receipt.attempt_token = attempt.token
+        WHERE receipt.attempt_token = attempt.token ${selectedReceiptScope}
       ) evidence ON true
       LEFT JOIN LATERAL (
         SELECT fit.state, model.response FROM neuralfoil_predictions prediction
@@ -294,6 +315,8 @@ export async function settleProgressiveCfdExecution(
       WHERE attempt.sim_job_id = ${simJobId} ORDER BY unit.ordinal, unit.id
     `);
     for (const unit of units) {
+      if (options.recoverStoredEvidence && unit.historical_recovery !== true)
+        continue;
       const neverStarted =
         (stop.proof as EngineExecutionStopProof).ownership_basis ===
           "never_started_cancellation_fence" &&
@@ -313,6 +336,7 @@ export async function settleProgressiveCfdExecution(
         unit.historical_recovery === true &&
         job.ingestedAt != null &&
         unit.current_scope === true &&
+        unit.recoverable_stage === true &&
         unit.latest_attempt === true &&
         ["gap", "leased", "blocked"].includes(String(unit.state)) &&
         (unit.state !== "leased"
@@ -349,7 +373,7 @@ export async function settleProgressiveCfdExecution(
         (unit.accepted === true ||
           (unit.stage === 2 && unit.informative === true));
       if (
-        !complete &&
+        (!complete || recoverableStoredEvidence) &&
         unit.numerical_recovery !== true &&
         unit.stage === 2 &&
         Number(unit.count) > 0 &&

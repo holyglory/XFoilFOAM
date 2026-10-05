@@ -1,6 +1,11 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
-import { ProgressiveCfdEvidenceScopeClosed } from "./progressive-cfd-evidence";
+import {
+  assertProgressiveStorageEvidenceRecoveryJob,
+  assertProgressiveStorageEvidenceRecoveryRole,
+  ProgressiveCfdEvidenceScopeClosed,
+  ProgressiveCfdEvidenceScopePending,
+} from "./progressive-cfd-evidence";
 import type { ProgressiveStorageEvidenceRecoveryScope } from "./progressive-cfd-evidence";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import {
@@ -10,6 +15,7 @@ import {
 import { ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import { settleProgressiveCfdExecution } from "./progressive-cfd-settlement";
+import { assertProgressiveStorageEvidenceRecoveryHost } from "./progressive-storage-recovery-scope";
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const DEFAULT_LIMIT = 32;
@@ -95,6 +101,7 @@ export async function recoverProgressiveStorageOnlyEvidence(
   scope: ProgressiveStorageEvidenceRecoveryScope,
   options: { limit?: number } = {},
 ): Promise<ProgressiveStorageEvidenceRecoveryResult> {
+  assertProgressiveStorageEvidenceRecoveryRole();
   assertScope(scope);
   const limit = options.limit ?? DEFAULT_LIMIT;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT)
@@ -104,12 +111,17 @@ export async function recoverProgressiveStorageOnlyEvidence(
 
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    await connection.execute(sql`SET LOCAL lock_timeout = '5s'`);
+    await connection.execute(sql`SET LOCAL statement_timeout = '30s'`);
+    await assertProgressiveStorageEvidenceRecoveryHost(connection);
     const receipt = result();
     const rows = await connection.execute(sql`
       SELECT receipt.sim_job_id::text AS sim_job_id, receipt.sequence,
         receipt.point_content_signature, receipt.result_attempt_id::text AS result_attempt_id,
         receipt.remote_result_id::text AS remote_result_id,
         receipt.remote_result_attempt_id::text AS remote_result_attempt_id,
+        EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
+          WHERE evidence.result_attempt_id = receipt.result_attempt_id) AS already_linked,
         dispatch.solver_id::text AS solver_id, dispatch.promise_id::text AS promise_id,
         dispatch.content_signature AS dispatch_signature, dispatch.envelope,
         report.content_signature AS report_signature,
@@ -176,65 +188,103 @@ export async function recoverProgressiveStorageOnlyEvidence(
           (unit.state = 'leased' AND unit.lease_token = progressive_attempt.token
             AND unit.lease_until <= clock_timestamp())
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_cfd_evidence evidence
+        AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer
+          WHERE newer.unit_id = unit.id
+            AND (newer.started_at, newer.token) > (progressive_attempt.started_at, progressive_attempt.token))
+        AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
           WHERE evidence.result_attempt_id = receipt.result_attempt_id
-        )
+            AND progressive_attempt.finished_at >= evidence.created_at)
       ORDER BY receipt.sim_job_id, receipt.sequence, receipt.point_content_signature
       LIMIT ${limit}
-      FOR UPDATE OF receipt, dispatch, report, job, raw, progressive_attempt, unit, work, generation
-      SKIP LOCKED
     `);
 
-    const settlementIds = new Map<string, string[]>();
+    const jobs = new Map<string, Array<Record<string, any>>>();
     for (const row of rows as unknown as Array<Record<string, any>>) {
       receipt.selected += 1;
-      const delivery: ProgressiveRemoteEvidenceDelivery = {
-        solverId: String(row.solver_id),
-        promiseId: String(row.promise_id),
-        engineJobId: String(row.sim_job_id),
-        aoaDeg: Number(row.aoa_deg),
-        engineCaseSlug:
-          row.engine_case_slug == null ? null : String(row.engine_case_slug),
-        progressiveEvidence: {
-          sequence: Number(row.sequence),
-          reportContentSignature: String(row.report_signature),
-          pointContentSignature: String(row.point_content_signature),
-        },
-        remoteResultId: String(row.remote_result_id),
-        remoteResultAttemptId: String(row.remote_result_attempt_id),
-      };
+      const jobId = String(row.sim_job_id);
+      const selected = jobs.get(jobId) ?? [];
+      selected.push(row);
+      jobs.set(jobId, selected);
+    }
+    for (const [jobId, selected] of jobs) {
       try {
-        const envelope = verifyProgressiveRemoteExecution(row.envelope, {
-          solverId: delivery.solverId,
-          promiseId: delivery.promiseId,
-          executionId: delivery.engineJobId,
-          contentSignature: String(row.dispatch_signature),
-        });
-        if (!scopeMatches(envelope, scope, row))
-          throw new ProgressiveRemoteEvidenceConflict(
-            "Historical progressive evidence envelope is outside the requested target and recipe scope",
+        const recovered = await connection.transaction(async (savepoint) => {
+          const jobConnection = savepoint as unknown as DB;
+          const resultAttemptIds = [
+            ...new Set(selected.map((row) => String(row.result_attempt_id))),
+          ];
+          await assertProgressiveStorageEvidenceRecoveryJob(
+            jobConnection,
+            jobId,
+            scope,
+            resultAttemptIds,
           );
-        const [promise] = await connection.execute(sql`
-          SELECT status FROM sync_sweep_promises
-          WHERE id = ${delivery.promiseId}::uuid
-            AND status IN ('expired', 'cancelled', 'fulfilled')
-          FOR SHARE
-        `);
-        if (!promise)
-          throw new ProgressiveRemoteEvidenceConflict(
-            "Historical progressive evidence requires a closed promise status",
+          let linked = 0;
+          let replayed = 0;
+          for (const row of selected) {
+            const delivery: ProgressiveRemoteEvidenceDelivery = {
+              solverId: String(row.solver_id),
+              promiseId: String(row.promise_id),
+              engineJobId: jobId,
+              aoaDeg: Number(row.aoa_deg),
+              engineCaseSlug:
+                row.engine_case_slug == null
+                  ? null
+                  : String(row.engine_case_slug),
+              progressiveEvidence: {
+                sequence: Number(row.sequence),
+                reportContentSignature: String(row.report_signature),
+                pointContentSignature: String(row.point_content_signature),
+              },
+              remoteResultId: String(row.remote_result_id),
+              remoteResultAttemptId: String(row.remote_result_attempt_id),
+            };
+            const envelope = verifyProgressiveRemoteExecution(row.envelope, {
+              solverId: delivery.solverId,
+              promiseId: delivery.promiseId,
+              executionId: jobId,
+              contentSignature: String(row.dispatch_signature),
+            });
+            if (!scopeMatches(envelope, scope, row))
+              throw new ProgressiveRemoteEvidenceConflict(
+                "Historical progressive evidence envelope is outside the requested target and recipe scope",
+              );
+            const [promise] = await jobConnection.execute(sql`
+              SELECT status FROM sync_sweep_promises
+              WHERE id = ${delivery.promiseId}::uuid
+                AND status IN ('expired', 'cancelled', 'fulfilled') FOR SHARE
+            `);
+            if (!promise)
+              throw new ProgressiveRemoteEvidenceConflict(
+                "Historical progressive evidence requires a closed promise status",
+              );
+            await recordProgressiveRemoteEvidenceReceipt(jobConnection, {
+              ...delivery,
+              resultAttemptId: String(row.result_attempt_id),
+              recoveryScope: scope,
+            });
+            if (row.already_linked) replayed += 1;
+            else linked += 1;
+          }
+          const settled = await settleProgressiveCfdExecution(
+            jobConnection,
+            jobId,
+            {
+              recoverStoredEvidence: { resultAttemptIds, scope },
+            },
           );
-        await recordProgressiveRemoteEvidenceReceipt(connection, {
-          ...delivery,
-          resultAttemptId: String(row.result_attempt_id),
-          storageOnly: false,
-          recoveryScope: scope,
+          const transitions =
+            settled.complete + settled.retry + settled.gaps + settled.cancelled;
+          if (!transitions && !settled.waiting)
+            throw new ProgressiveCfdEvidenceScopeClosed(
+              "Historical progressive evidence made no owned settlement transition",
+            );
+          return { linked, replayed, settled };
         });
-        receipt.linked += 1;
-        const ids = settlementIds.get(delivery.engineJobId) ?? [];
-        ids.push(String(row.result_attempt_id));
-        settlementIds.set(delivery.engineJobId, ids);
+        receipt.linked += recovered.linked;
+        receipt.replayed += recovered.replayed;
+        if (recovered.settled.waiting > 0) receipt.settlementWaiting += 1;
+        else receipt.settledJobs += 1;
       } catch (error) {
         if (
           error instanceof ProgressiveRemoteEvidenceConflict &&
@@ -243,6 +293,8 @@ export async function recoverProgressiveStorageOnlyEvidence(
           receipt.skippedPromiseStatus += 1;
         } else if (error instanceof ProgressiveCfdEvidenceScopeClosed) {
           receipt.skippedClosed += 1;
+        } else if (error instanceof ProgressiveCfdEvidenceScopePending) {
+          receipt.settlementWaiting += 1;
         } else if (
           error instanceof ProgressiveRemoteEvidenceConflict &&
           /in.?flight|active ingest|active lease|running/i.test(message(error))
@@ -257,20 +309,6 @@ export async function recoverProgressiveStorageOnlyEvidence(
       }
     }
 
-    for (const [jobId, resultAttemptIds] of settlementIds) {
-      try {
-        const settled = await settleProgressiveCfdExecution(connection, jobId, {
-          recoverStoredEvidence: {
-            resultAttemptIds: [...new Set(resultAttemptIds)],
-          },
-        });
-        if (settled.waiting > 0) receipt.settlementWaiting += 1;
-        else receipt.settledJobs += 1;
-      } catch (error) {
-        receipt.errors += 1;
-        rememberError(receipt, error);
-      }
-    }
     return receipt;
   });
 }

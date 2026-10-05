@@ -80,6 +80,94 @@ export async function readProgressiveRemoteEvidenceReceipt(
   return (await sourceAndReceipt(db, input)).receipt;
 }
 
+export async function assertProgressiveRemoteEvidenceAttempt(
+  db: DB,
+  input: ProgressiveRemoteEvidenceDelivery & {
+    resultAttemptId: string;
+    recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+  },
+) {
+  const { source } = await sourceAndReceipt(db, input);
+  const [attempt] = await db
+    .select()
+    .from(resultAttempts)
+    .where(eq(resultAttempts.id, input.resultAttemptId));
+  if (
+    !attempt ||
+    attempt.simJobId !== input.engineJobId ||
+    attempt.engineJobId !== input.engineJobId ||
+    !attempt.resultId
+  )
+    throw new Error(
+      "Progressive receipt requires exact owned local attempt evidence",
+    );
+  const projection = progressiveRemotePointProjection(source);
+  const sourceFields = [
+    "aoaDeg",
+    "status",
+    "source",
+    "regime",
+    "cl",
+    "cd",
+    "cm",
+    "clCd",
+    "clStd",
+    "cdStd",
+    "cmStd",
+    "stalled",
+    "unsteady",
+    "converged",
+    "finalResidual",
+    "iterations",
+    "yPlusAvg",
+    "yPlusMax",
+    "nCells",
+    "firstOrderFallback",
+    "strouhal",
+    "error",
+    "qualityWarnings",
+    "methodKey",
+    "engineJobId",
+    "engineCaseSlug",
+  ] as const;
+  if (
+    sourceFields.some(
+      (key) =>
+        analysisContentHash(attempt[key] ?? null) !==
+        analysisContentHash(projection[key] ?? null),
+    ) ||
+    analysisContentHash(attempt.evidencePayload) !==
+      analysisContentHash(projection.evidencePayload)
+  )
+    throw new Error(
+      "Progressive local attempt differs from its reported source values",
+    );
+  if (input.recoveryScope) {
+    const [cell] = await db.execute(sql`
+      SELECT speed, chord, mach, reynolds FROM results
+      WHERE id = ${attempt.resultId}::uuid
+    `);
+    const sourceReynolds =
+      source.polar.reynolds == null
+        ? null
+        : Math.round(Number(source.polar.reynolds));
+    if (
+      !cell ||
+      cell.speed !== projection.speed ||
+      cell.chord !== projection.chord ||
+      (cell.mach == null
+        ? projection.mach !== null
+        : cell.mach !== projection.mach) ||
+      (cell.reynolds == null
+        ? sourceReynolds !== null
+        : Number(cell.reynolds) !== sourceReynolds)
+    )
+      throw new Error(
+        "Historical progressive evidence differs from the exact reported physical case",
+      );
+  }
+}
+
 export async function recordProgressiveRemoteEvidenceReceipt(
   db: DB,
   input: ProgressiveRemoteEvidenceDelivery & {
@@ -88,6 +176,11 @@ export async function recordProgressiveRemoteEvidenceReceipt(
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
   },
 ) {
+  if (input.recoveryScope) {
+    const { assertProgressiveStorageEvidenceRecoveryRole } =
+      await import("./progressive-cfd-evidence");
+    assertProgressiveStorageEvidenceRecoveryRole();
+  }
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const { source, receipt } = await sourceAndReceipt(connection, input);
@@ -96,86 +189,13 @@ export async function recordProgressiveRemoteEvidenceReceipt(
         throw new Error(
           "Progressive receipt already binds another local attempt",
         );
-      if (!input.recoveryScope || !receipt.storageOnly) return receipt;
+      if (!input.recoveryScope) return receipt;
     }
-    const [attempt] = await connection
-      .select()
-      .from(resultAttempts)
-      .where(eq(resultAttempts.id, input.resultAttemptId));
-    if (
-      !attempt ||
-      attempt.simJobId !== input.engineJobId ||
-      attempt.engineJobId !== input.engineJobId ||
-      !attempt.resultId
-    )
-      throw new Error(
-        "Progressive receipt requires exact owned local attempt evidence",
+    if (input.recoveryScope && (!receipt?.storageOnly || input.storageOnly))
+      throw new ProgressiveRemoteEvidenceConflict(
+        "Historical recovery requires an existing immutable storage-only receipt",
       );
-    const projection = progressiveRemotePointProjection(source);
-    const sourceFields = [
-      "aoaDeg",
-      "status",
-      "source",
-      "regime",
-      "cl",
-      "cd",
-      "cm",
-      "clCd",
-      "clStd",
-      "cdStd",
-      "cmStd",
-      "stalled",
-      "unsteady",
-      "converged",
-      "finalResidual",
-      "iterations",
-      "yPlusAvg",
-      "yPlusMax",
-      "nCells",
-      "firstOrderFallback",
-      "strouhal",
-      "error",
-      "qualityWarnings",
-      "methodKey",
-      "engineJobId",
-      "engineCaseSlug",
-    ] as const;
-    if (
-      sourceFields.some(
-        (key) =>
-          analysisContentHash(attempt[key] ?? null) !==
-          analysisContentHash(projection[key] ?? null),
-      ) ||
-      analysisContentHash(attempt.evidencePayload) !==
-        analysisContentHash(projection.evidencePayload)
-    )
-      throw new Error(
-        "Progressive local attempt differs from its reported source values",
-      );
-    if (input.recoveryScope) {
-      const [cell] = await connection.execute(sql`
-        SELECT speed, chord, mach, reynolds FROM results
-        WHERE id = ${attempt.resultId}::uuid
-      `);
-      const sourceReynolds =
-        source.polar.reynolds == null
-          ? null
-          : Math.round(Number(source.polar.reynolds));
-      if (
-        !cell ||
-        cell.speed !== projection.speed ||
-        cell.chord !== projection.chord ||
-        (cell.mach == null
-          ? projection.mach !== null
-          : cell.mach !== projection.mach) ||
-        (cell.reynolds == null
-          ? sourceReynolds !== null
-          : Number(cell.reynolds) !== sourceReynolds)
-      )
-        throw new Error(
-          "Historical progressive evidence differs from the exact reported physical case",
-        );
-    }
+    await assertProgressiveRemoteEvidenceAttempt(connection, input);
     if (input.storageOnly)
       await assertStoppedProgressiveStorage(connection, input);
     else

@@ -428,6 +428,38 @@ reports to be staged. The selected sequence is passed through the claim boundary
 the stager must not rediscover an earlier deferred report. Successful staging
 clears only its own retry record.
 
+### Operator recovery of storage-only campaign evidence
+
+Recovery is an explicit hub operator action. Set
+`AIRFOILFOAM_DEPLOYMENT_ROLE=hub` and connect to the configured hub database;
+the operation also refuses a database configured as a remote solver. Supply the
+exact campaign, current epoch, selected generation and current plan-revision IDs,
+in that order. These four IDs pin the recovery scope; recheck them after a plan
+or epoch change rather than substituting a new identity into an old request.
+
+```bash
+AIRFOILFOAM_DEPLOYMENT_ROLE=hub corepack pnpm --filter @aerodb/db \
+  recover:progressive-storage-evidence CAMPAIGN_UUID EPOCH_UUID \
+  GENERATION_UUID PLAN_REVISION_UUID --dry-run --limit=32
+```
+
+Dry-run is the default and rolls back changes. The default limit is 32 receipts
+per invocation; `--limit=1..128` bounds each batch. Use `--apply` only after review
+of the dry-run and its exact evidence. Each job has its own rollback boundary.
+Original storage-only receipts, result payloads and canonical result pointers
+remain unchanged; closed promises are never reopened or fulfilled by recovery.
+
+Selection and link counts describe bookkeeping, not scientifically accepted CFD
+or a recoverable fraction of a previously measured backlog. Linking requires the
+exact local result-attempt identity, latest unit ownership, verified stop and final
+report, and the existing manifest/archive custody proof. Missing proof, live or
+newer ownership, closed scope, conflicts and waiting fits are not completion.
+The normal fitting trigger queues a refresh after a new link. Repeated invocation
+of the same scope resumes settlement of already-linked terminal attempts after
+fitting, including `--limit=1` continuation when another angle is already complete.
+Only selected recovery attempts may settle. Rejected evidence remains rejected;
+linking alone cannot make it accepted or complete.
+
 The staging selector uses ordered acknowledged-report metadata. Active-priority
 passes first select the newest eligible report from an unexpired active promise;
 only when none exists do they fall back to the earliest eligible retained report.
