@@ -446,6 +446,9 @@ AIRFOILFOAM_DEPLOYMENT_ROLE=hub corepack pnpm --filter @aerodb/db \
 Dry-run is the default and rolls back changes. The default limit is 32 receipts
 per invocation; `--limit=1..128` bounds each batch. Use `--apply` only after review
 of the dry-run and its exact evidence. Each job has its own rollback boundary.
+The CLI restricts both modes to pinned targets with Mach greater than or equal
+to zero and below one. High-Mach receipts stay retained outside that scope;
+their UUID ordering or recovery errors cannot consume the low-Mach batch limit.
 Original storage-only receipts, result payloads and canonical result pointers
 remain unchanged; closed promises are never reopened or fulfilled by recovery.
 
@@ -454,6 +457,10 @@ or a recoverable fraction of a previously measured backlog. Linking requires the
 exact local result-attempt identity, latest unit ownership, verified stop and final
 report, and the existing manifest/archive custody proof. Missing proof, live or
 newer ownership, closed scope, conflicts and waiting fits are not completion.
+Physical comparisons use the attempt's immutable execution revision, with the
+existing integer Reynolds representation. Optional reported Mach is checked
+when present; absent Mach comes from the pinned flow state. Nullable or shared
+display-cell values are not execution identity, and no tolerance is introduced.
 The normal fitting trigger queues a refresh after a new link. Repeated invocation
 of the same scope resumes settlement of already-linked terminal attempts after
 fitting, including `--limit=1` continuation when another angle is already complete.

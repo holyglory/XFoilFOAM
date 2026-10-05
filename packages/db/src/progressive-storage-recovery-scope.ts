@@ -11,6 +11,7 @@ export interface ProgressiveStorageEvidenceRecoveryScope {
   generationId: string;
   planRevisionId: string;
   stage: 2;
+  cohort?: "low";
 }
 
 export function assertProgressiveStorageEvidenceRecoveryRole() {

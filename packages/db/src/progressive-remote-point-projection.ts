@@ -91,3 +91,44 @@ export function progressiveRemotePointProjection(
       : undefined,
   };
 }
+
+export function assertProgressiveRemotePhysicalCase(
+  source: Parameters<typeof progressiveRemotePointProjection>[0],
+  snapshot: {
+    flowState?: { speedMps?: number; mach?: number | null };
+    referenceGeometry?: { referenceLengthM?: number };
+    derived?: { mach?: number | null; reynolds?: number | null };
+  },
+) {
+  const reported = progressiveRemotePointProjection(source);
+  const speed = snapshot.flowState?.speedMps;
+  const chord = snapshot.referenceGeometry?.referenceLengthM;
+  const mach = snapshot.derived?.mach ?? snapshot.flowState?.mach;
+  const reynolds = snapshot.derived?.reynolds;
+  if (
+    typeof speed !== "number" ||
+    !Number.isFinite(speed) ||
+    speed <= 0 ||
+    typeof chord !== "number" ||
+    !Number.isFinite(chord) ||
+    chord <= 0 ||
+    typeof mach !== "number" ||
+    !Number.isFinite(mach) ||
+    mach < 0 ||
+    mach > 3 ||
+    typeof reynolds !== "number" ||
+    !Number.isFinite(reynolds) ||
+    reynolds <= 0 ||
+    typeof reported.reynolds !== "number" ||
+    !Number.isFinite(reported.reynolds) ||
+    reported.reynolds <= 0 ||
+    reported.speed !== speed ||
+    reported.chord !== chord ||
+    (reported.mach != null && reported.mach !== mach) ||
+    !Number.isSafeInteger(Math.round(reynolds)) ||
+    Math.round(reported.reynolds) !== Math.round(reynolds)
+  )
+    throw new Error(
+      "Historical progressive evidence differs from the exact reported physical case",
+    );
+}

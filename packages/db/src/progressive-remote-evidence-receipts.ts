@@ -9,7 +9,10 @@ import {
   resolveProgressiveRemoteEvidence,
   type ProgressiveRemoteEvidenceReference,
 } from "./progressive-remote-evidence";
-import { progressiveRemotePointProjection } from "./progressive-remote-point-projection";
+import {
+  assertProgressiveRemotePhysicalCase,
+  progressiveRemotePointProjection,
+} from "./progressive-remote-point-projection";
 import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
 
 export interface ProgressiveRemoteEvidenceDelivery {
@@ -143,28 +146,20 @@ export async function assertProgressiveRemoteEvidenceAttempt(
       "Progressive local attempt differs from its reported source values",
     );
   if (input.recoveryScope) {
-    const [cell] = await db.execute(sql`
-      SELECT speed, chord, mach, reynolds FROM results
-      WHERE id = ${attempt.resultId}::uuid
+    const [revision] = await db.execute(sql`
+      SELECT snapshot FROM simulation_preset_revisions
+      WHERE id = ${attempt.simulationPresetRevisionId}::uuid
     `);
-    const sourceReynolds =
-      source.polar.reynolds == null
-        ? null
-        : Math.round(Number(source.polar.reynolds));
-    if (
-      !cell ||
-      cell.speed !== projection.speed ||
-      cell.chord !== projection.chord ||
-      (cell.mach == null
-        ? projection.mach !== null
-        : cell.mach !== projection.mach) ||
-      (cell.reynolds == null
-        ? sourceReynolds !== null
-        : Number(cell.reynolds) !== sourceReynolds)
-    )
+    if (!revision)
       throw new Error(
-        "Historical progressive evidence differs from the exact reported physical case",
+        "Historical progressive evidence has no immutable execution revision",
       );
+    assertProgressiveRemotePhysicalCase(
+      source,
+      revision.snapshot as Parameters<
+        typeof assertProgressiveRemotePhysicalCase
+      >[1],
+    );
   }
 }
 

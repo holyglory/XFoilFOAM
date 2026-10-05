@@ -50,6 +50,7 @@ interface BoundUnit {
   snapshot: {
     flowState: { speedMps: number };
     referenceGeometry: { referenceLengthM: number };
+    derived?: { mach?: number | null };
   };
 }
 
@@ -265,6 +266,21 @@ export async function assertProgressiveStorageEvidenceRecoveryJob(
   if (!scope || !resultAttemptIds.length || resultAttemptIds.length > 2048)
     throw new ProgressiveCfdEvidenceScopeClosed(
       "Historical progressive recovery requires exact stored attempt identities",
+    );
+  if (
+    recoveryScope.cohort === "low" &&
+    scope.units.some((unit) => {
+      const mach = unit.snapshot.derived?.mach;
+      return (
+        typeof mach !== "number" ||
+        !Number.isFinite(mach) ||
+        mach < 0 ||
+        mach >= 1
+      );
+    })
+  )
+    throw new ProgressiveCfdEvidenceScopeClosed(
+      "Historical progressive evidence is outside the requested low-Mach scope",
     );
   const [dispatch] = await db.execute(sql`
     SELECT solver_id, promise_id, envelope, content_signature FROM progressive_remote_dispatches
@@ -539,7 +555,6 @@ export async function recordProgressiveCfdEvidence(
     const evidence = ids.length
       ? await connection.execute(sql`
       SELECT attempt.id, attempt.airfoil_id, attempt.aoa_deg, attempt.simulation_preset_revision_id, attempt.evidence_payload,
-        cell.speed, cell.chord, cell.mach, cell.reynolds,
         cell.airfoil_id AS cell_airfoil_id, cell.aoa_deg AS cell_aoa_deg,
         cell.simulation_preset_revision_id AS cell_revision_id
       FROM result_attempts attempt JOIN results cell ON cell.id = attempt.result_id
@@ -568,36 +583,6 @@ export async function recordProgressiveCfdEvidence(
         throw new Error(
           "CFD evidence differs from the immutable physical/numerical scope",
         );
-      if (input.recoveryScope) {
-        const snapshot = unit.snapshot as unknown as {
-          flowState?: { speedMps?: number; mach?: number | null };
-          referenceGeometry?: { referenceLengthM?: number };
-          derived?: { mach?: number | null; reynolds?: number | null };
-        };
-        const expectedSpeed = snapshot.flowState?.speedMps;
-        const expectedChord = snapshot.referenceGeometry?.referenceLengthM;
-        const expectedMach =
-          snapshot.derived?.mach ?? snapshot.flowState?.mach ?? null;
-        const expectedReynolds =
-          snapshot.derived?.reynolds == null
-            ? null
-            : Math.round(snapshot.derived.reynolds);
-        if (
-          typeof expectedSpeed !== "number" ||
-          typeof expectedChord !== "number" ||
-          row.speed !== expectedSpeed ||
-          row.chord !== expectedChord ||
-          (row.mach == null
-            ? expectedMach !== null
-            : expectedMach !== row.mach) ||
-          (row.reynolds == null
-            ? expectedReynolds !== null
-            : expectedReynolds !== Number(row.reynolds))
-        )
-          throw new Error(
-            "Historical progressive evidence differs from the immutable physical case",
-          );
-      }
       const payload = row.evidence_payload as Record<string, unknown> | null;
       const duration = payload?.solver_active_seconds;
       if (

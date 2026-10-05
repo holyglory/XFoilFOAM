@@ -7,7 +7,10 @@ import {
   ProgressiveCfdEvidenceScopePending,
 } from "./progressive-cfd-evidence";
 import type { ProgressiveStorageEvidenceRecoveryScope } from "./progressive-cfd-evidence";
-import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
+import {
+  effectiveProgressiveStageSql,
+  progressiveTargetMachSql,
+} from "./progressive-execution-policy";
 import {
   recordProgressiveRemoteEvidenceReceipt,
   type ProgressiveRemoteEvidenceDelivery,
@@ -41,7 +44,8 @@ function assertScope(scope: ProgressiveStorageEvidenceRecoveryScope) {
     !UUID.test(scope.epochId) ||
     !UUID.test(scope.generationId) ||
     !UUID.test(scope.planRevisionId) ||
-    scope.stage !== 2
+    scope.stage !== 2 ||
+    (scope.cohort != null && scope.cohort !== "low")
   )
     throw new Error(
       "Progressive storage evidence recovery requires an exact campaign, epoch, generation, plan, and stage-2 scope",
@@ -176,6 +180,13 @@ export async function recoverProgressiveStorageOnlyEvidence(
         AND work.stage = ${scope.stage}
         AND ${effectiveProgressiveStageSql()} = ${scope.stage}
         AND work.state = 'pending'
+        ${
+          scope.cohort === "low"
+            ? sql`AND EXISTS (SELECT 1 FROM polar_analysis_targets target
+          WHERE target.id = work.target_id AND ${progressiveTargetMachSql()} >= 0
+            AND ${progressiveTargetMachSql()} < 1)`
+            : sql``
+        }
         AND job.engine_job_id = job.id::text
         AND job.status IN ('done', 'failed', 'cancelled')
         AND job."ingestedAt" IS NOT NULL

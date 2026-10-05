@@ -40,6 +40,7 @@ const scope: ProgressiveStorageEvidenceRecoveryScope = {
   generationId,
   planRevisionId,
   stage: 2,
+  cohort: "low",
 };
 const { db, sql } = createClient({ max: 1 });
 const rollback = new Error("Progressive storage evidence dry-run rollback");
