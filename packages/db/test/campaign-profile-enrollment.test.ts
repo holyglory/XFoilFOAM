@@ -2880,6 +2880,16 @@ describe("progressive live solver accounting", () => {
         scope.observation(60.5, "2026-09-07T00:00:00.000002Z"),
       ),
     ).toMatchObject({ updated: 1 });
+    const [renewed] = await db.execute(sql`SELECT unit.lease_until AS unit_lease,
+      attempt.lease_until AS attempt_lease FROM progressive_cfd_units unit
+      JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
+      WHERE unit.id = ${scope.leases[0].id}`);
+    expect(new Date(String(renewed.unit_lease)).getTime()).toBeGreaterThan(
+      Date.now() + 60_000,
+    );
+    expect(new Date(String(renewed.attempt_lease)).getTime()).toBeGreaterThan(
+      Date.now() + 60_000,
+    );
     expect(await scope.recordRuntime(scope.observation(500))).toMatchObject({
       stale: 1,
     });

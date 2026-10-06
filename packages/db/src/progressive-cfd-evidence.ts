@@ -501,14 +501,14 @@ export async function recordProgressiveCfdRuntimeProgress(
       const total =
         Number(unit.unit_seconds) + measured - Number(unit.active_seconds);
       const exhausted = total >= Number(unit.active_budget_seconds);
-      await connection.execute(
-        sql`UPDATE progressive_cfd_attempts SET active_seconds = ${measured} WHERE token = ${unit.token}`,
-      );
+      await connection.execute(sql`UPDATE progressive_cfd_attempts SET active_seconds = ${measured},
+        lease_until = CASE WHEN ${exhausted} THEN clock_timestamp() ELSE clock_timestamp() + interval '120 seconds' END
+        WHERE token = ${unit.token}`);
       await connection.execute(sql`UPDATE progressive_cfd_units SET active_seconds = ${total},
         state = CASE WHEN ${exhausted} THEN 'blocked' ELSE state END,
         lease_token = CASE WHEN ${exhausted} THEN NULL ELSE lease_token END,
         lease_owner = CASE WHEN ${exhausted} THEN NULL ELSE lease_owner END,
-        lease_until = CASE WHEN ${exhausted} THEN NULL ELSE lease_until END,
+        lease_until = CASE WHEN ${exhausted} THEN NULL ELSE clock_timestamp() + interval '120 seconds' END,
         error = CASE WHEN ${exhausted} THEN 'active compute budget exhausted; engine guard owns case stop' ELSE error END
         WHERE id = ${unit.unit_id}`);
       unit.active_seconds = measured;
