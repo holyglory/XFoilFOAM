@@ -1,10 +1,282 @@
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { createClient } from "../src/client";
+import { createClient, type DB } from "../src/client";
 import { progressiveStagingSelectionSql } from "../../../apps/sweeper/src/progressive-staging-selection";
+import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progressive-evidence-service";
+import {
+  progressiveEvidenceWakeSql,
+  type ProgressiveEvidenceWakeScope,
+} from "../../../apps/sweeper/src/progressive-evidence-wake";
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+async function withWakeFixture(
+  scope: ProgressiveEvidenceWakeScope,
+  run: (connection: DB) => Promise<void>,
+) {
+  await client.db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    await transaction.execute(sql`CREATE TEMP TABLE wake_cases ON COMMIT DROP AS
+      SELECT md5('wake-'||variant)::uuid id,variant FROM unnest(ARRAY[
+        'ready','future-retry','live-claim','retry-and-claim','retry-after-claim','expired-retry','expired-claim',
+        'null-claim-expiry','wrong-owner','wrong-upstream','wrong-job-upstream','not-remote',
+        'unacknowledged','null-result','already-finished','blocked','wrong-attempt-job','wrong-engine','missing-result-id']) variant`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_api_settings ON COMMIT DROP AS
+      SELECT 1 id,false remote_solver_transfer_paused,'fixture-token'::text remote_solver_auth_token,
+        'https://wake.invalid'::text upstream_base_url,md5('unselected')::uuid remote_solver_registered_id`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs (
+      id uuid PRIMARY KEY,request_payload jsonb,ingest_lease_token uuid,ingest_lease_expires_at timestamptz) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO sim_jobs
+      SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',variant<>'not-remote',
+        'upstreamBaseUrl',CASE WHEN variant='wrong-job-upstream' THEN 'https://foreign.invalid' ELSE 'https://wake.invalid' END),
+        CASE WHEN variant IN ('live-claim','expired-claim','retry-and-claim','retry-after-claim','null-claim-expiry') THEN id END,
+        CASE WHEN variant IN ('live-claim','retry-and-claim') THEN clock_timestamp()+interval '2 hours'
+          WHEN variant='retry-after-claim' THEN clock_timestamp()+interval '1 hour'
+          WHEN variant='expired-claim' THEN clock_timestamp()-interval '1 hour' END
+      FROM wake_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
+      SELECT id,CASE WHEN variant='wrong-owner' THEN md5('foreign')::uuid ELSE id END registered_solver_id,
+        CASE WHEN variant='wrong-upstream' THEN 'https://foreign.invalid' ELSE 'https://wake.invalid' END source_base_url
+      FROM wake_cases`);
+    await transaction.execute(
+      sql`CREATE UNIQUE INDEX wake_promise_identity_idx ON sync_sweep_promises((id::text))`,
+    );
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports (
+      sim_job_id uuid,sequence bigint,acknowledged_at timestamptz,report jsonb,created_at timestamptz,
+      PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_reports
+      SELECT id,1,CASE WHEN variant<>'unacknowledged' THEN clock_timestamp() END,
+        CASE WHEN variant='null-result' THEN '{"result":null}'::jsonb ELSE '{"result":{}}'::jsonb END,
+        timestamptz '2026-01-01' FROM wake_cases`);
+    await transaction.execute(sql`CREATE INDEX wake_report_source_idx ON progressive_worker_reports(created_at,sim_job_id,sequence)
+      WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_receipts (
+      sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_receipts
+      SELECT id,1 FROM wake_cases WHERE ${scope === "delivery"} OR variant='already-finished'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures (
+      sim_job_id uuid,sequence bigint,retry_after timestamptz,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_staging_failures
+      SELECT id,1,clock_timestamp()+CASE WHEN variant='expired-retry' THEN interval '-1 hour'
+        WHEN variant='retry-after-claim' THEN interval '3 hours' ELSE interval '1 hour' END
+      FROM wake_cases WHERE variant IN ('future-retry','retry-and-claim','retry-after-claim','expired-retry')`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_attempts (
+      id uuid PRIMARY KEY,sim_job_id uuid,engine_job_id text,result_id uuid) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO result_attempts
+      SELECT id,CASE WHEN variant='wrong-attempt-job' THEN md5('foreign')::uuid ELSE id END,
+        CASE WHEN variant='wrong-engine' THEN 'foreign' ELSE id::text END,
+        CASE WHEN variant<>'missing-result-id' THEN id END FROM wake_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_attempts (
+      sim_job_id uuid,sequence bigint,result_attempt_id uuid,point_content_signature text,
+      PRIMARY KEY(sim_job_id,sequence,result_attempt_id)) ON COMMIT DROP`);
+    await transaction.execute(
+      sql`INSERT INTO progressive_worker_evidence_attempts SELECT id,1,id,id::text FROM wake_cases`,
+    );
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_hub_receipts (
+      sim_job_id uuid,point_content_signature text,PRIMARY KEY(sim_job_id,point_content_signature)) ON COMMIT DROP`);
+    await transaction.execute(
+      sql`INSERT INTO progressive_worker_hub_receipts SELECT id,id::text FROM wake_cases WHERE variant='already-finished'`,
+    );
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_delivery_failures (
+      sim_job_id uuid,point_content_signature text,state text,retry_after timestamptz,
+      PRIMARY KEY(sim_job_id,point_content_signature)) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_delivery_failures
+      SELECT id,id::text,CASE WHEN variant='blocked' THEN 'blocked' ELSE 'retry' END,
+        clock_timestamp()+CASE WHEN variant IN ('expired-retry','blocked') THEN interval '-1 hour'
+          WHEN variant='retry-after-claim' THEN interval '3 hours' ELSE interval '1 hour' END
+      FROM wake_cases WHERE variant IN ('future-retry','retry-and-claim','retry-after-claim','expired-retry','blocked')`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_delivery_claims (
+      sim_job_id uuid,point_content_signature text,claim_token uuid,claim_expires_at timestamptz,
+      PRIMARY KEY(sim_job_id,point_content_signature)) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_delivery_claims
+      SELECT id,id::text,ingest_lease_token,ingest_lease_expires_at FROM sim_jobs WHERE ingest_lease_token IS NOT NULL`);
+    await run(connection);
+  });
+}
+
+it.each(["staging", "delivery"] as const)(
+  "wakes %s only for owned pending work after every claim and retry deadline",
+  async (scope) => {
+    await withWakeFixture(scope, async (connection) => {
+      const selectVariant = async (variant: string) => {
+        await connection.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=
+        (SELECT id FROM wake_cases WHERE variant=${variant})`);
+      };
+      for (const variant of ["ready", "expired-retry", "expired-claim"]) {
+        await selectVariant(variant);
+        const before = Date.now();
+        const wake = await nextProgressiveEvidenceWakeAt(connection, scope);
+        expect(wake?.getTime()).toBeGreaterThanOrEqual(before - 1000);
+        expect(wake?.getTime()).toBeLessThanOrEqual(Date.now() + 1000);
+      }
+      for (const variant of [
+        "future-retry",
+        "live-claim",
+        "retry-and-claim",
+        "retry-after-claim",
+      ]) {
+        await selectVariant(variant);
+        const [expected] = await connection.execute(
+          scope === "staging"
+            ? sql`SELECT greatest(failure.retry_after,job.ingest_lease_expires_at) deadline
+          FROM wake_cases fixture JOIN sim_jobs job ON job.id=fixture.id
+          LEFT JOIN progressive_worker_staging_failures failure ON failure.sim_job_id=fixture.id
+          WHERE fixture.variant=${variant}`
+            : sql`SELECT greatest(failure.retry_after,claim.claim_expires_at) deadline
+          FROM wake_cases fixture
+          LEFT JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id=fixture.id
+          LEFT JOIN progressive_worker_evidence_delivery_claims claim ON claim.sim_job_id=fixture.id
+          WHERE fixture.variant=${variant}`,
+        );
+        const deadline =
+          expected.deadline instanceof Date
+            ? expected.deadline
+            : new Date(String(expected.deadline));
+        expect(
+          (await nextProgressiveEvidenceWakeAt(connection, scope))?.getTime(),
+        ).toBe(deadline.getTime());
+      }
+      for (const variant of [
+        "wrong-owner",
+        "wrong-upstream",
+        "wrong-job-upstream",
+        "not-remote",
+        "unacknowledged",
+        "null-result",
+        "already-finished",
+        "null-claim-expiry",
+        ...(scope === "delivery"
+          ? [
+              "blocked",
+              "wrong-attempt-job",
+              "wrong-engine",
+              "missing-result-id",
+            ]
+          : []),
+      ]) {
+        await selectVariant(variant);
+        expect(
+          await nextProgressiveEvidenceWakeAt(connection, scope),
+          variant,
+        ).toBeNull();
+      }
+      await selectVariant("ready");
+      for (const statement of [
+        sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true`,
+        sql`UPDATE sync_api_settings SET remote_solver_auth_token=''`,
+        sql`UPDATE sync_api_settings SET upstream_base_url=NULL`,
+      ]) {
+        const rollback = new Error("restore wake settings");
+        await expect(
+          connection.transaction(async (transaction) => {
+            await transaction.execute(statement);
+            expect(
+              await nextProgressiveEvidenceWakeAt(
+                transaction as unknown as DB,
+                scope,
+              ),
+            ).toBeNull();
+            throw rollback;
+          }),
+        ).rejects.toBe(rollback);
+      }
+      await connection.execute(
+        sql`UPDATE sync_api_settings SET remote_solver_registered_id=md5('absent')::uuid`,
+      );
+      expect(await nextProgressiveEvidenceWakeAt(connection, scope)).toBeNull();
+    });
+  },
+);
+
+it.each(["staging", "delivery"] as const)(
+  "keeps %s ownership probes bounded with forty thousand retained reports",
+  async (scope) => {
+    await withWakeFixture(scope, async (connection) => {
+      await connection.execute(sql`CREATE TEMP TABLE retained_wake_jobs ON COMMIT DROP AS
+      SELECT md5('retained-wake-'||ordinal)::uuid id FROM generate_series(1,40000) ordinal`);
+      await connection.execute(sql`INSERT INTO sim_jobs SELECT id,jsonb_build_object(
+      'syncPromiseId',id::text,'remoteSolver',true,'upstreamBaseUrl','https://wake.invalid',
+      'retainedMetadata',repeat(md5(id::text),32)),NULL,NULL FROM retained_wake_jobs`);
+      await connection.execute(
+        sql`INSERT INTO sync_sweep_promises SELECT id,md5('wake-ready')::uuid,'https://wake.invalid' FROM retained_wake_jobs`,
+      );
+      await connection.execute(sql`INSERT INTO progressive_worker_reports SELECT id,1,clock_timestamp(),
+      jsonb_build_object('result',jsonb_build_object('retainedMetadata',repeat(md5(id::text),32))),timestamptz '2025-01-01' FROM retained_wake_jobs`);
+      await connection.execute(
+        sql`INSERT INTO progressive_worker_evidence_receipts SELECT id,1 FROM retained_wake_jobs`,
+      );
+      await connection.execute(
+        sql`INSERT INTO result_attempts SELECT id,id,id::text,id FROM retained_wake_jobs`,
+      );
+      await connection.execute(
+        sql`INSERT INTO progressive_worker_evidence_attempts SELECT id,1,id,id::text FROM retained_wake_jobs`,
+      );
+      await connection.execute(
+        sql`INSERT INTO progressive_worker_hub_receipts SELECT id,id::text FROM retained_wake_jobs`,
+      );
+      await connection.execute(sql`ANALYZE sim_jobs,sync_sweep_promises,progressive_worker_reports,progressive_worker_evidence_receipts,
+      progressive_worker_evidence_attempts,progressive_worker_hub_receipts,progressive_worker_delivery_failures,
+      progressive_worker_evidence_delivery_claims,progressive_worker_staging_failures,result_attempts,sync_api_settings`);
+      await connection.execute(
+        sql`UPDATE sync_api_settings SET remote_solver_registered_id=md5('wake-ready')::uuid`,
+      );
+      expect(
+        await nextProgressiveEvidenceWakeAt(connection, scope),
+      ).not.toBeNull();
+      for (const ready of [true, false]) {
+        const [measured] = await connection.execute(
+          sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${progressiveEvidenceWakeSql(scope, ready)}`,
+        );
+        const result = (
+          measured["QUERY PLAN"] as Array<Record<string, unknown>>
+        )[0];
+        const nodes: Array<Record<string, unknown>> = [];
+        const visit = (node: Record<string, unknown>) => {
+          nodes.push(node);
+          for (const child of (node.Plans ?? []) as Array<
+            Record<string, unknown>
+          >)
+            visit(child);
+        };
+        visit(result.Plan as Record<string, unknown>);
+        const ownership = nodes.filter(
+          (node) => node["Relation Name"] === "sim_jobs",
+        );
+        expect(
+          ownership.every((node) => node["Node Type"] !== "Seq Scan"),
+        ).toBe(true);
+        const probes = ownership.reduce(
+          (total, node) => total + Number(node["Actual Loops"]),
+          0,
+        );
+        expect(probes).toBeLessThanOrEqual(32);
+        expect(
+          nodes.some((node) => node["Subplan Name"] === "CTE owned_reports"),
+        ).toBe(false);
+        console.info(
+          JSON.stringify({
+            scope,
+            ready,
+            retainedReports: 40000,
+            ownershipProbes: probes,
+            executionMs: result["Execution Time"],
+          }),
+        );
+      }
+      await connection.execute(
+        sql`UPDATE sync_api_settings SET remote_solver_registered_id=md5('wake-live-claim')::uuid`,
+      );
+      expect(
+        (await nextProgressiveEvidenceWakeAt(connection, scope))!.getTime(),
+      ).toBeGreaterThan(Date.now() + 3600_000);
+      await connection.execute(
+        sql`UPDATE sync_api_settings SET remote_solver_registered_id=md5('wake-already-finished')::uuid`,
+      );
+      expect(await nextProgressiveEvidenceWakeAt(connection, scope)).toBeNull();
+    });
+  },
+);
 
 it("serves fresh active reports and FIFO backlog without changing eligibility", async () => {
   await client.db.transaction(async (transaction) => {

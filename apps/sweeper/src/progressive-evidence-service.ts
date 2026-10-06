@@ -1,6 +1,9 @@
 import type { DB, Sql } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
-import { sql } from "drizzle-orm";
+import {
+  progressiveEvidenceWakeSql,
+  type ProgressiveEvidenceWakeScope,
+} from "./progressive-evidence-wake";
 import { runNotificationDrain } from "./notification-drain";
 import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evidence-delivery";
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
@@ -45,76 +48,34 @@ export async function drainProgressiveWorkerEvidencePass(
 
 export async function nextProgressiveEvidenceWakeAt(
   db: DB,
-  scope: "staging" | "delivery" | "all" = "all",
+  scope: ProgressiveEvidenceWakeScope | "all" = "all",
 ): Promise<Date | null> {
-  const [pending] = await db.execute(sql`
-    WITH owned_reports AS (
-      SELECT report.sim_job_id, report.sequence, job.ingest_lease_expires_at
-      FROM progressive_worker_reports report JOIN sim_jobs job ON job.id = report.sim_job_id
-      JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
-      JOIN sync_api_settings settings ON settings.id = 1
-      WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
-        AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''
-        AND settings.upstream_base_url IS NOT NULL AND job.request_payload->>'remoteSolver' = 'true'
-        AND promise.registered_solver_id = settings.remote_solver_registered_id
-        AND promise.source_base_url = settings.upstream_base_url
-        AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
-    )
-      SELECT min(wake_at) AS wake_at FROM (
-      (SELECT clock_timestamp() AS wake_at
-      FROM owned_reports owned
-      WHERE ${scope !== "delivery"}
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
-          WHERE staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence)
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_staging_failures failure
-          WHERE failure.sim_job_id = owned.sim_job_id AND failure.sequence = owned.sequence
-            AND failure.retry_after > clock_timestamp())
-      LIMIT 1)
-      UNION ALL
-      (SELECT clock_timestamp() AS wake_at
-      FROM owned_reports owned
-      JOIN progressive_worker_evidence_receipts staged
-        ON staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence
-      JOIN progressive_worker_evidence_attempts association
-        ON association.sim_job_id = staged.sim_job_id AND association.sequence = staged.sequence
-      WHERE ${scope !== "staging"} AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
-        WHERE delivered.sim_job_id = association.sim_job_id
-          AND delivered.point_content_signature = association.point_content_signature)
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_delivery_failures failure
-          WHERE failure.sim_job_id = association.sim_job_id
-            AND failure.point_content_signature = association.point_content_signature)
-      LIMIT 1)
-      UNION ALL
-      SELECT owned.ingest_lease_expires_at AS wake_at FROM owned_reports owned
-      WHERE ${scope !== "delivery"} AND owned.ingest_lease_expires_at > clock_timestamp()
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
-          WHERE staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence)
-      UNION ALL
-      SELECT failure.retry_after FROM owned_reports owned
-      JOIN progressive_worker_staging_failures failure ON failure.sim_job_id = owned.sim_job_id AND failure.sequence = owned.sequence
-      WHERE ${scope !== "delivery"} AND failure.retry_after > clock_timestamp()
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
-          WHERE staged.sim_job_id = owned.sim_job_id AND staged.sequence = owned.sequence)
-      UNION ALL
-      SELECT failure.retry_after FROM owned_reports owned
-      JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = owned.sim_job_id AND failure.sequence = owned.sequence
-      WHERE ${scope !== "staging"} AND failure.state = 'retry' AND failure.retry_after > clock_timestamp()
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
-          WHERE delivered.sim_job_id = failure.sim_job_id AND delivered.point_content_signature = failure.point_content_signature)
-      UNION ALL
-      SELECT clock_timestamp() AS wake_at FROM owned_reports owned
-      JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = owned.sim_job_id
-        AND failure.sequence = owned.sequence
-      WHERE ${scope !== "staging"} AND failure.state = 'retry' AND failure.retry_after <= clock_timestamp()
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
-          WHERE delivered.sim_job_id = failure.sim_job_id AND delivered.point_content_signature = failure.point_content_signature)
-    ) pending
-  `);
-  return pending?.wake_at == null
-    ? null
-    : pending.wake_at instanceof Date
-      ? pending.wake_at
-      : new Date(String(pending.wake_at));
+  const scopes: ProgressiveEvidenceWakeScope[] =
+    scope === "all" ? ["staging", "delivery"] : [scope];
+  for (const selected of scopes) {
+    const [ready] = await db.execute(
+      progressiveEvidenceWakeSql(selected, true),
+    );
+    if (ready?.wake_at != null)
+      return ready.wake_at instanceof Date
+        ? ready.wake_at
+        : new Date(String(ready.wake_at));
+  }
+  const deadlines: Date[] = [];
+  for (const selected of scopes) {
+    const [pending] = await db.execute(
+      progressiveEvidenceWakeSql(selected, false),
+    );
+    if (pending?.wake_at != null)
+      deadlines.push(
+        pending.wake_at instanceof Date
+          ? pending.wake_at
+          : new Date(String(pending.wake_at)),
+      );
+  }
+  return deadlines.length
+    ? new Date(Math.min(...deadlines.map((deadline) => deadline.getTime())))
+    : null;
 }
 
 export async function runProgressiveEvidenceService(
@@ -141,6 +102,25 @@ export async function runProgressiveEvidenceService(
     options.deliver ??
     ((preferActive: boolean) =>
       deliverNextProgressiveWorkerEvidence(db, fetch, { preferActive }));
+  const pendingWakes = new Map<
+    ProgressiveEvidenceWakeScope,
+    Promise<Date | null>
+  >();
+  const nextWakeAt = (scope: ProgressiveEvidenceWakeScope) => {
+    const existing = pendingWakes.get(scope);
+    if (existing) return existing;
+    const pending = Promise.resolve()
+      .then(() =>
+        options.nextWakeAt
+          ? options.nextWakeAt(scope)
+          : nextProgressiveEvidenceWakeAt(db, scope),
+      )
+      .finally(() => {
+        if (pendingWakes.get(scope) === pending) pendingWakes.delete(scope);
+      });
+    pendingWakes.set(scope, pending);
+    return pending;
+  };
   const service = (scope: "staging" | "delivery", lane: number) => ({
     name: `progressive-evidence-${scope}-${lane}`,
     run: async (childSignal: AbortSignal) => {
@@ -162,10 +142,7 @@ export async function runProgressiveEvidenceService(
                   childSignal,
                 );
           },
-          nextWakeAt: () =>
-            options.nextWakeAt
-              ? options.nextWakeAt(scope)
-              : nextProgressiveEvidenceWakeAt(db, scope),
+          nextWakeAt: () => nextWakeAt(scope),
           reportError:
             options.reportError ??
             ((error) =>

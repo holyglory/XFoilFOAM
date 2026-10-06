@@ -358,3 +358,139 @@ it("awaits every in-flight operation on shutdown and never restarts after abort"
   expect(channel.unlisten).toHaveBeenCalledTimes(8);
   expect(deliver).toHaveBeenCalledTimes(4);
 });
+
+it("shares only pending wake lookups per scope and retains notifications received during lookup", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const staging = gate();
+  const delivery = gate();
+  const stage = vi.fn().mockResolvedValue(false);
+  const deliver = vi.fn().mockResolvedValue(false);
+  const nextWakeAt = vi.fn(async (scope: "staging" | "delivery") => {
+    await (scope === "staging" ? staging.pending : delivery.pending);
+    return null;
+  });
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(nextWakeAt.mock.calls).toEqual([["staging"], ["delivery"]]);
+    channel.notify("progressive_worker_evidence_changed");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(nextWakeAt).toHaveBeenCalledTimes(2);
+    staging.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stage).toHaveBeenCalledTimes(8);
+    expect(deliver).toHaveBeenCalledTimes(4);
+    expect(nextWakeAt.mock.calls).toEqual([
+      ["staging"],
+      ["delivery"],
+      ["staging"],
+    ]);
+    delivery.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deliver).toHaveBeenCalledTimes(8);
+    expect(nextWakeAt).toHaveBeenCalledTimes(4);
+    channel.notify("progressive_worker_evidence_changed");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(nextWakeAt).toHaveBeenCalledTimes(6);
+  } finally {
+    owner.abort();
+    staging.release();
+    delivery.release();
+    await running;
+  }
+  expect(channel.unlisten).toHaveBeenCalledTimes(8);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("clears rejected shared wake lookups and retries without retaining their failure", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const firstLookup = gate();
+  const reportError = vi.fn();
+  let stagingLookups = 0;
+  const nextWakeAt = vi.fn(async (scope: "staging" | "delivery") => {
+    if (scope === "staging" && stagingLookups++ === 0) {
+      await firstLookup.pending;
+      throw new Error("wake lookup failed");
+    }
+    return null;
+  });
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    {
+      stage: async () => false,
+      deliver: async () => false,
+      nextWakeAt,
+      reportError,
+    },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stagingLookups).toBe(1);
+    firstLookup.release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reportError).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(stagingLookups).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stagingLookups).toBeGreaterThan(1);
+    expect(reportError).toHaveBeenCalledTimes(4);
+    channel.notify("progressive_worker_evidence_changed");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reportError).toHaveBeenCalledTimes(4);
+  } finally {
+    owner.abort();
+    firstLookup.release();
+    await running;
+  }
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("waits for live claim deadlines without spinning or retaining an expired deadline", async () => {
+  vi.useFakeTimers();
+  const channel = notifications();
+  const owner = new AbortController();
+  const deadline = Date.now() + 60_000;
+  const stage = vi.fn().mockResolvedValue(false);
+  const deliver = vi.fn().mockResolvedValue(false);
+  const nextWakeAt = vi.fn(async () =>
+    Date.now() < deadline ? new Date(deadline) : null,
+  );
+  const running = runProgressiveEvidenceService(
+    {} as DB,
+    channel.connection,
+    {} as EngineClient,
+    owner.signal,
+    { stage, deliver, nextWakeAt },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(stage).toHaveBeenCalledTimes(4);
+    expect(deliver).toHaveBeenCalledTimes(4);
+    expect(nextWakeAt).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stage).toHaveBeenCalledTimes(8);
+    expect(deliver).toHaveBeenCalledTimes(8);
+    const settledLookups = nextWakeAt.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(stage).toHaveBeenCalledTimes(8);
+    expect(deliver).toHaveBeenCalledTimes(8);
+    expect(nextWakeAt).toHaveBeenCalledTimes(settledLookups);
+  } finally {
+    owner.abort();
+    await running;
+  }
+  expect(vi.getTimerCount()).toBe(0);
+});
