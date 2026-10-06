@@ -242,7 +242,7 @@ it("resumes due archive retries and expired claims before untouched work while p
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_archives ON COMMIT DROP AS
       SELECT md5(variant)::uuid id,variant,ordinal FROM unnest(ARRAY['ordinary','due-retry','expired-claim',
-        'unselected-accepted','selected-accepted','already-retained','future-retry','live-claim',
+        'unselected-accepted','selected-accepted','storage-only-accepted-current','storage-only-wrong-kind','already-retained','future-retry','live-claim',
         'wrong-solver','wrong-upstream','wrong-job-upstream','not-remote','not-progressive',
         'wrong-attempt-job','wrong-engine','missing-result','missing-manifest','malformed-manifest'])
         WITH ORDINALITY AS variants(variant,ordinal)`);
@@ -269,6 +269,8 @@ it("resumes due archive retries and expired claims before untouched work while p
       FROM fixture_archives`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_hub_receipts ON COMMIT DROP AS
       SELECT id sim_job_id,md5(variant)::text point_content_signature,md5('attempt'||variant)::uuid result_attempt_id,
+        CASE WHEN variant='storage-only-wrong-kind' THEN '{"kind":"other","storageOnly":true}'::jsonb
+          ELSE jsonb_build_object('kind','retained-progressive-attempt','storageOnly',variant='storage-only-accepted-current') END receipt,
         timestamptz '2026-01-01' + ordinal * interval '1 second' delivered_at FROM fixture_archives`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_archive_receipts ON COMMIT DROP AS
       SELECT id sim_job_id,md5(variant)::text point_content_signature FROM fixture_archives WHERE variant='already-retained'`);
@@ -283,15 +285,17 @@ it("resumes due archive retries and expired claims before untouched work while p
       FROM fixture_archives WHERE variant IN ('future-retry','due-retry','live-claim','expired-claim')`);
     await transaction.execute(sql`CREATE TEMP TABLE result_classifications ON COMMIT DROP AS
       SELECT md5('attempt'||variant)::uuid result_attempt_id,'accepted'::text state
-      FROM fixture_archives WHERE variant IN ('selected-accepted','unselected-accepted')`);
+      FROM fixture_archives WHERE variant IN ('selected-accepted','unselected-accepted','storage-only-accepted-current','storage-only-wrong-kind')`);
     await transaction.execute(sql`CREATE TEMP TABLE results ON COMMIT DROP AS
-      SELECT md5('attempt'||variant)::uuid current_result_attempt_id FROM fixture_archives WHERE variant='selected-accepted'`);
+      SELECT md5('attempt'||variant)::uuid current_result_attempt_id FROM fixture_archives
+      WHERE variant IN ('selected-accepted','storage-only-accepted-current','storage-only-wrong-kind')`);
     const connection = transaction as unknown as DB;
     for (const variant of [
       "expired-claim",
       "due-retry",
       "ordinary",
       "unselected-accepted",
+      "storage-only-accepted-current",
     ]) {
       const selected = await transaction.execute(
         progressiveArchiveSelectionSql(),

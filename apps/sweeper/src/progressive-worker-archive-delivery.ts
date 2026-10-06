@@ -19,9 +19,15 @@ function archiveCandidates(waiting: boolean) {
           : sql`(delivery.claim_expires_at IS NULL OR delivery.claim_expires_at <= clock_timestamp())
           AND (delivery.retry_after IS NULL OR delivery.retry_after <= clock_timestamp())`
       }
-      AND NOT EXISTS (SELECT 1 FROM result_classifications classification
-        JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
-        WHERE classification.result_attempt_id = retained.result_attempt_id AND classification.state = 'accepted')
+      AND (
+        (
+          retained.receipt->>'kind' = 'retained-progressive-attempt'
+          AND retained.receipt->>'storageOnly' = 'true'
+        )
+        OR NOT EXISTS (SELECT 1 FROM result_classifications classification
+          JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
+          WHERE classification.result_attempt_id = retained.result_attempt_id AND classification.state = 'accepted')
+      )
     ORDER BY transfer_priority, due_at, retained.delivered_at, retained.sim_job_id, retained.point_content_signature OFFSET 0`;
 }
 
