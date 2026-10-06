@@ -27,15 +27,22 @@ async function settleInactiveUndeliveredExecution(
   const authoritativeLeaseLoss =
     (promise?.response_payload as Record<string, unknown> | null | undefined)
       ?.authoritativeLeaseLoss === true;
-  if (
-    !promise ||
-    promise.status !== "cancelled" &&
-      !(promise.status === "expired" && authoritativeLeaseLoss)
-  )
-    return null;
   const [stopped] =
     await db.execute(sql`SELECT proof FROM progressive_cfd_execution_stops
     WHERE sim_job_id = ${executionId}::uuid`);
+  const [job] = await db.execute(sql`SELECT status, engine_state FROM sim_jobs
+    WHERE id = ${executionId}::uuid`);
+  const terminalExpiredPromise =
+    promise?.status === "expired" &&
+    ["ingesting", "failed", "cancelled"].includes(String(job?.status)) &&
+    ["completed", "failed", "cancelled"].includes(String(job?.engine_state));
+  if (
+    !promise ||
+    promise.status !== "cancelled" &&
+      !(promise.status === "expired" &&
+        (authoritativeLeaseLoss || terminalExpiredPromise))
+  )
+    return null;
   if (!stopped) return null;
   await acknowledgeProgressiveCfdExecutionStop(db, {
     simJobId: executionId,
