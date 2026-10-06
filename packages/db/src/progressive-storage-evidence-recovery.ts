@@ -158,7 +158,7 @@ export async function recoverProgressiveStorageOnlyEvidence(
           AND blob.backend = 'gcs'
           AND blob.compression = 'zstd'
           AND blob.mime_type = 'application/zstd'
-          AND blob.verified_at IS NOT NULL
+          AND blob."verifiedAt" IS NOT NULL
           AND blob.bucket = upload.bucket
           AND blob.object_key = upload.object_key
           AND blob.generation = upload.generation
