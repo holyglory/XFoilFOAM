@@ -7995,6 +7995,183 @@ describe("progressive CFD evidence accounting", () => {
     ).toMatchObject({ canonical: { resultAttemptId: attempt.id } });
   }
 
+  async function prepareStorageRecoveryProbeFixture(
+    connection: DB,
+    fixture: Awaited<ReturnType<typeof cfdEvidenceFixture>>,
+    solverId: string,
+  ) {
+    const lease = fixture.leases[0];
+    const [job] = await connection
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    const promiseId = randomUUID();
+    await connection.execute(sql`
+        UPDATE sim_jobs SET status='pending', engine_job_id=NULL, engine_state=NULL
+        WHERE id=${job.id}::uuid
+      `);
+    await connection.execute(sql`
+        INSERT INTO sync_sweep_promises(id, registered_solver_id, airfoil_id,
+          simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, 1, clock_timestamp()+interval '1 hour')
+      `);
+    await connection.execute(sql`
+        INSERT INTO sync_sweep_promise_points(promise_id, airfoil_id,
+          simulation_preset_revision_id, aoa_deg)
+        VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})
+      `);
+    const bound = await bindProgressiveRemoteDispatch(connection, {
+      simJobId: job.id,
+      solverId,
+      promiseId,
+    });
+    const result = progressiveRemoteEvidenceResult(bound.envelope);
+    result.state = "completed";
+    const polar = result.polars[0];
+    polar.reynolds = fixture.execution.snapshot.derived.reynolds;
+    polar.mach = fixture.execution.snapshot.derived.mach;
+    const point = polar.attempts![0];
+    point.error = null;
+    delete point.failure_disposition;
+    point.evidence_artifacts = [
+      {
+        kind: "manifest",
+        path: "evidence_manifest.json",
+        mime_type: "application/json",
+        sha256: progressiveArchiveManifestSha256,
+        byte_size: progressiveArchiveManifestBytes.byteLength,
+      },
+    ];
+    const report: ProgressiveRemoteReport = {
+      version: 1,
+      solverId,
+      promiseId,
+      executionId: job.id,
+      assignmentSignature: bound.envelope.contentSignature,
+      sequence: 1,
+      status: {
+        job_id: job.id,
+        state: "completed",
+        total_cases: 1,
+        completed_cases: 1,
+        engine: result.engine,
+      },
+      result,
+      stopProof: executionStopProof(job.id),
+    };
+    const reported = await storeProgressiveRemoteReport(connection, {
+      solverId,
+      promiseId,
+      executionId: job.id,
+      report,
+    });
+    const source = resolveProgressiveReportedPoint(result, {
+      alpha: lease.alpha,
+      speed: polar.speed,
+      chord: polar.chord,
+      caseSlug: "isolated-reported-case",
+    });
+    const projection = progressiveRemotePointProjection({
+      ...source,
+      envelope: bound.envelope,
+      report,
+    });
+    const [cell] = await connection.execute(sql`
+        SELECT id, bc_id FROM results
+        WHERE sim_job_id=${job.id}::uuid AND aoa_deg=${lease.alpha}
+      `);
+    const [attempt] = await connection
+      .insert(resultAttempts)
+      .values({
+        resultId: String(cell.id),
+        airfoilId: job.airfoilId,
+        bcId: String(cell.bc_id),
+        simulationPresetRevisionId: job.simulationPresetRevisionId,
+        simJobId: job.id,
+        engineJobId: job.id,
+        engineCaseSlug: projection.engineCaseSlug,
+        aoaDeg: projection.aoaDeg,
+        status: projection.status,
+        source: projection.source,
+        regime: projection.regime,
+        cl: projection.cl,
+        cd: projection.cd,
+        cm: projection.cm,
+        clCd: projection.clCd,
+        clStd: projection.clStd,
+        cdStd: projection.cdStd,
+        cmStd: projection.cmStd,
+        stalled: projection.stalled,
+        unsteady: projection.unsteady,
+        converged: projection.converged,
+        finalResidual: projection.finalResidual,
+        iterations: projection.iterations,
+        yPlusAvg: projection.yPlusAvg,
+        yPlusMax: projection.yPlusMax,
+        nCells: projection.nCells,
+        firstOrderFallback: projection.firstOrderFallback,
+        strouhal: projection.strouhal,
+        error: projection.error,
+        qualityWarnings: projection.qualityWarnings,
+        methodKey: projection.methodKey,
+        evidencePayload: projection.evidencePayload,
+        validForPolar: false,
+      })
+      .returning();
+    await connection.execute(sql`
+        INSERT INTO result_classifications(result_attempt_id, airfoil_id,
+          simulation_preset_revision_id, aoa_deg, classifier_version, state, reasons)
+        VALUES (${attempt.id}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, ${lease.alpha},
+          'storage-probe-fixture', 'rejected', '{}')
+      `);
+    await connection.execute(sql`
+        UPDATE sim_jobs SET status='done', engine_job_id=id::text, engine_state='completed',
+          "ingestedAt"=clock_timestamp(), "finishedAt"=clock_timestamp(),
+          ingest_lease_token=NULL, ingest_lease_expires_at=NULL
+        WHERE id=${job.id}::uuid
+      `);
+    await acknowledgeProgressiveCfdExecutionStop(connection, {
+      simJobId: job.id,
+      proof: report.stopProof!,
+    });
+    await connection.execute(sql`
+        UPDATE progressive_cfd_attempts SET outcome='failed', finished_at=clock_timestamp()
+        WHERE sim_job_id=${job.id}::uuid
+      `);
+    await connection.execute(sql`
+        UPDATE progressive_cfd_units SET state='gap', lease_token=NULL, lease_owner=NULL,
+          lease_until=NULL WHERE id=${lease.id}::uuid
+      `);
+    await connection.execute(sql`
+        UPDATE sync_sweep_promises SET status='expired', "expiresAt"=clock_timestamp()-interval '1 second'
+        WHERE id=${promiseId}::uuid
+      `);
+    const delivery = {
+      solverId,
+      promiseId,
+      engineJobId: job.id,
+      aoaDeg: lease.alpha,
+      engineCaseSlug: "isolated-reported-case",
+      progressiveEvidence: {
+        sequence: 1,
+        reportContentSignature: reported.contentSignature,
+        pointContentSignature: source.contentSignature,
+      },
+      remoteResultId: randomUUID(),
+      remoteResultAttemptId: randomUUID(),
+      resultAttemptId: attempt.id,
+    };
+    await recordProgressiveRemoteEvidenceReceipt(connection, {
+      ...delivery,
+      storageOnly: true,
+    });
+    await retainStorageRecoveryArchive(connection, delivery);
+    return { jobId: job.id, promiseId, resultAttemptId: attempt.id };
+  }
+
   it.each([
     "accepted",
     "rejected",
@@ -8154,49 +8331,13 @@ describe("progressive CFD evidence accounting", () => {
                 },
               ],
             };
-            if (scientificState === "first-missing-manifest") {
-              const attempts = result.polars[0].attempts!;
-              const manifestArtifacts = attempts.find(
-                (candidate) => candidate.evidence_artifacts?.length,
-              )!.evidence_artifacts!;
-              const signature = (candidate: (typeof attempts)[number]) =>
-                analysisContentHash({
-                  kind: "progressive-reported-point-v1",
-                  executionId: result.job_id,
-                  chord: result.polars[0].chord,
-                  speed: result.polars[0].speed,
-                  reynolds: result.polars[0].reynolds,
-                  mach: result.polars[0].mach ?? null,
-                  point: candidate,
-                });
-              const missingAlpha = fixture.leases.find((lease) =>
-                fixture.leases.every((candidate) => {
-                  for (const attempt of attempts)
-                    attempt.evidence_artifacts =
-                      attempt.aoa_deg === lease.alpha
-                        ? []
-                        : manifestArtifacts;
-                  const first = [...attempts].sort((left, right) =>
-                    signature(left).localeCompare(signature(right)),
-                  )[0];
-                  return first.aoa_deg === lease.alpha;
-                }),
-              )?.alpha;
-              if (missingAlpha === undefined)
-                throw new Error(
-                  "Storage recovery fixture could not place missing custody first",
-                );
-              for (const attempt of attempts)
-                attempt.evidence_artifacts =
-                  attempt.aoa_deg === missingAlpha ? [] : manifestArtifacts;
-            }
             const report: ProgressiveRemoteReport = {
               version: 1,
               solverId,
               promiseId,
               executionId: job.id,
               assignmentSignature: bound.envelope.contentSignature,
-              sequence: 1,
+              sequence: scientificState === "first-missing-manifest" ? 2 : 1,
               status: {
                 job_id: job.id,
                 state: "completed",
@@ -8229,6 +8370,33 @@ describe("progressive CFD evidence accounting", () => {
                   WHERE attempt.sim_job_id=${job.id}::uuid`),
               ).toEqual([{ count: 0 }]);
               throw rollback;
+            }
+            if (scientificState === "first-missing-manifest") {
+              await storeProgressiveRemoteReport(db, {
+                solverId,
+                promiseId,
+                executionId: job.id,
+                report: {
+                  ...report,
+                  sequence: 1,
+                  status: {
+                    ...report.status,
+                    state: "running",
+                    completed_cases: 1,
+                  },
+                  result: {
+                    ...result,
+                    state: "running",
+                    polars: [
+                      {
+                        ...result.polars[0],
+                        attempts: [result.polars[0].attempts[0]],
+                      },
+                    ],
+                  },
+                  stopProof: null,
+                },
+              });
             }
             await storeProgressiveRemoteReport(db, {
               solverId,
@@ -8330,6 +8498,11 @@ describe("progressive CFD evidence accounting", () => {
               WHERE id=${promiseId}::uuid
             `);
             for (const { selected, source, attempt } of stored) {
+              const sequence =
+                scientificState === "first-missing-manifest" &&
+                selected.alpha === fixture.leases[0].alpha
+                  ? 1
+                  : report.sequence;
               const delivery = {
                 solverId,
                 promiseId,
@@ -8337,10 +8510,10 @@ describe("progressive CFD evidence accounting", () => {
                 aoaDeg: selected.alpha,
                 engineCaseSlug: "isolated-reported-case",
                 progressiveEvidence: {
-                  sequence: 1,
+                  sequence,
                   reportContentSignature: (
                     await db.execute(
-                      sql`SELECT content_signature FROM progressive_remote_reports WHERE sim_job_id=${job.id}::uuid AND sequence=1`,
+                      sql`SELECT content_signature FROM progressive_remote_reports WHERE sim_job_id=${job.id}::uuid AND sequence=${sequence}`,
                     )
                   )[0].content_signature as string,
                   pointContentSignature: source.contentSignature,
@@ -8383,6 +8556,12 @@ describe("progressive CFD evidence accounting", () => {
               const later = stored.find(
                 (item) => item.attempt.id === ordered[1].result_attempt_id,
               )!;
+              expect(later.source.point.evidence_artifacts).toHaveLength(1);
+              expect(
+                stored.find(
+                  (item) => item.attempt.id === ordered[0].result_attempt_id,
+                )!.source.point.evidence_artifacts,
+              ).toEqual([]);
               const originalReceipts = await db.execute(sql`
                 SELECT * FROM progressive_remote_evidence_receipts
                 WHERE sim_job_id=${job.id}::uuid
@@ -8406,7 +8585,7 @@ describe("progressive CFD evidence accounting", () => {
               const [reportRow] = await db.execute(sql`
                 SELECT content_signature
                 FROM progressive_remote_reports
-                WHERE sim_job_id=${job.id}::uuid AND sequence=1
+                WHERE sim_job_id=${job.id}::uuid AND sequence=${report.sequence}
               `);
               await retainStorageRecoveryArchive(db, {
                 solverId,
@@ -8415,7 +8594,7 @@ describe("progressive CFD evidence accounting", () => {
                 aoaDeg: later.selected.alpha,
                 engineCaseSlug: "isolated-reported-case",
                 progressiveEvidence: {
-                  sequence: 1,
+                  sequence: report.sequence,
                   reportContentSignature: String(reportRow.content_signature),
                   pointContentSignature: later.source.contentSignature,
                 },
@@ -8423,6 +8602,7 @@ describe("progressive CFD evidence accounting", () => {
                 remoteResultAttemptId: String(
                   laterReceipt.remote_result_attempt_id,
                 ),
+                resultAttemptId: later.attempt.id,
               });
               const recovered = await recoverProgressiveStorageOnlyEvidence(
                 db,
@@ -8458,10 +8638,93 @@ describe("progressive CFD evidence accounting", () => {
               expect(
                 await db.execute(sql`
                   SELECT id, current_result_attempt_id, current_result_interpretation_id,
+                  current_canonical_selection_id, speed, chord, mach, reynolds
+                  FROM results WHERE sim_job_id=${job.id}::uuid ORDER BY id
+                `),
+              ).toEqual(originalCells);
+              const evidenceBeforeReplay = await db.execute(sql`
+                SELECT evidence.* FROM progressive_cfd_evidence evidence
+                JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token
+                WHERE attempt.sim_job_id=${job.id}::uuid ORDER BY evidence.result_attempt_id
+              `);
+              expect(
+                await recoverProgressiveStorageOnlyEvidence(db, scope, {
+                  limit: 1,
+                }),
+              ).toMatchObject({
+                selected: 1,
+                linked: 0,
+                replayed: 1,
+                errors: 0,
+                settlementWaiting: 1,
+              });
+              expect(
+                await db.execute(sql`
+                  SELECT evidence.* FROM progressive_cfd_evidence evidence
+                  JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token
+                  WHERE attempt.sim_job_id=${job.id}::uuid ORDER BY evidence.result_attempt_id
+                `),
+              ).toEqual(evidenceBeforeReplay);
+              const [prediction] = await db.execute(sql`
+                SELECT id FROM neuralfoil_predictions
+                WHERE target_id=${lease.targetId} AND epoch_id=${lease.epochId}::uuid
+                ORDER BY created_at DESC, id DESC LIMIT 1
+              `);
+              const fitting = await claimProgressivePolarFit(db, {
+                predictionId: String(prediction.id),
+                owner: "storage-recovery-missing-manifest-fit",
+                leaseSeconds: 120,
+              });
+              expect(fitting).not.toBeNull();
+              const fitRequest = buildProgressiveFitRequest(fitting!);
+              await storeProgressivePolarFit(
+                db,
+                fitting!,
+                fitRequest,
+                await fitUsingPython(fitRequest),
+              );
+              expect(
+                await recoverProgressiveStorageOnlyEvidence(db, scope, {
+                  limit: 1,
+                }),
+              ).toMatchObject({
+                selected: 1,
+                linked: 0,
+                replayed: 1,
+                errors: 0,
+                settledJobs: 1,
+                settlementWaiting: 0,
+              });
+              expect(
+                await db.execute(sql`
+                  SELECT * FROM result_attempts
+                  WHERE sim_job_id=${job.id}::uuid ORDER BY id
+                `),
+              ).toEqual(originalAttempts);
+              expect(
+                await db.execute(sql`
+                  SELECT * FROM progressive_remote_evidence_receipts
+                  WHERE sim_job_id=${job.id}::uuid
+                  ORDER BY sequence, point_content_signature
+                `),
+              ).toEqual(originalReceipts);
+              expect(
+                await db.execute(sql`
+                  SELECT id, current_result_attempt_id, current_result_interpretation_id,
                     current_canonical_selection_id, speed, chord, mach, reynolds
                   FROM results WHERE sim_job_id=${job.id}::uuid ORDER BY id
                 `),
               ).toEqual(originalCells);
+              expect(
+                await db.execute(sql`
+                  SELECT classification.state, raw.valid_for_polar
+                  FROM result_classifications classification
+                  JOIN result_attempts raw ON raw.id=classification.result_attempt_id
+                  WHERE raw.sim_job_id=${job.id}::uuid ORDER BY raw.id
+                `),
+              ).toEqual(
+                stored.map(() => ({ state: "rejected", valid_for_polar: false })),
+              );
               expect(
                 await recoverProgressiveStorageOnlyEvidence(db, scope, {
                   limit: 1,
@@ -9046,6 +9309,343 @@ describe("progressive CFD evidence accounting", () => {
     },
     120_000,
   );
+  it("republishes current-scope storage-only evidence append-only and remains idempotent (probe lock isolation)", async () => {
+    const previousRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+    const parentDatabasePath = targetUrl.pathname;
+    const parentCampaignCount = campaignIds.length;
+    const probeDatabaseName = `enrollment_probe_${randomUUID().replaceAll("-", "")}`;
+    let probeDatabaseCreated = false;
+    let observer!: ReturnType<typeof createClient>;
+    const solverId = randomUUID();
+    const jobIds: string[] = [];
+    try {
+      await client.sql.end();
+      await admin.unsafe(
+        `CREATE DATABASE "${probeDatabaseName}" TEMPLATE "${DATABASE}"`,
+      );
+      probeDatabaseCreated = true;
+      targetUrl.pathname = `/${probeDatabaseName}`;
+      client = createClient({ url: targetUrl.toString(), max: 4 });
+      db = client.db;
+      observer = createClient({ url: targetUrl.toString(), max: 1 });
+      const [observerConfiguration] = await observer.db.execute(sql`
+        SELECT pg_size_bytes(current_setting('track_activity_query_size'))::int AS query_bytes
+      `);
+      console.info(
+        JSON.stringify({
+          storageRecoveryProbeActivityQueryBytes: observerConfiguration.query_bytes,
+        }),
+      );
+      const [syncRole] = await db.execute(
+        sql`SELECT id FROM sync_api_settings LIMIT 1`,
+      );
+      const campaignId = await campaign("active", [32.173], [-2, 0], {
+        chordM: 0.0726036,
+      });
+      await materializeProgressiveCampaignScope(db, campaignId);
+      const baseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+      await initializeProgressiveCfdWork(db);
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "storage-probe-fixture",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+        localTimeStepVersion: 1,
+      });
+      expect(leases).toHaveLength(2);
+      const firstFixture = await cfdEvidenceFixture(32.173, 2, [], [-2], false, {
+        campaignId,
+        leases: [leases[0]],
+      });
+      const secondFixture = await cfdEvidenceFixture(32.173, 2, [], [0], false, {
+        campaignId,
+        leases: [leases[1]],
+      });
+      jobIds.push(firstFixture.composed.jobId, secondFixture.composed.jobId);
+      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+      const fixtures = await db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        await connection.execute(sql`
+              UPDATE sweeper_state SET enabled=true, admission_fence_active=false,
+                disk_admission_blocked=false WHERE id=1
+            `);
+        await connection.execute(sql`
+              UPDATE sync_api_settings SET remote_solver_enabled=false WHERE id=${syncRole.id}
+            `);
+        await connection.execute(sql`
+              INSERT INTO registered_remote_solvers(id, instance_id, instance_name,
+                cpu_capacity, cpu_budget, max_active_polar_promises, auth_token_hash)
+              VALUES (${solverId}::uuid, ${randomUUID()}, 'storage probe fixture',
+                96, 96, 96, ${analysisContentHash(randomUUID())})
+            `);
+        return [
+          await prepareStorageRecoveryProbeFixture(
+            connection,
+            firstFixture,
+            solverId,
+          ),
+          await prepareStorageRecoveryProbeFixture(
+            connection,
+            secondFixture,
+            solverId,
+          ),
+        ].sort((left, right) => left.jobId.localeCompare(right.jobId));
+      });
+      const [campaignRow] = await db.execute(sql`
+            SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${campaignId}::uuid
+          `);
+      const scope = {
+        campaignId,
+        epochId: leases[0].epochId,
+        generationId: leases[0].generationId,
+        planRevisionId: String(campaignRow.current_plan_revision_id),
+        stage: 2 as const,
+      };
+      const jobList = sql.join(
+        jobIds.map((jobId) => sql`${jobId}::uuid`),
+        sql`, `,
+      );
+      const originals = await db.execute(sql`
+            SELECT * FROM result_attempts WHERE sim_job_id IN (${jobList}) ORDER BY id
+          `);
+      const originalReceipts = await db.execute(sql`
+            SELECT * FROM progressive_remote_evidence_receipts
+            WHERE sim_job_id IN (${jobList}) ORDER BY sim_job_id, sequence, point_content_signature
+          `);
+      async function withHeldRows(
+        statements: Array<Parameters<DB["execute"]>[0]>,
+        exercise: (ownerPid: number, releaseLocks: () => void) => Promise<void>,
+      ) {
+        const owner = createClient({ url: targetUrl.toString(), max: 1 });
+        let release!: () => void;
+        let signalLocked!: (ownerPid: number) => void;
+        const released = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const locked = new Promise<number>((resolve) => {
+          signalLocked = resolve;
+        });
+        const holding = owner.db.transaction(async (transaction) => {
+          await transaction.execute(sql`SET LOCAL lock_timeout='1s'`);
+          for (const statement of statements)
+            await transaction.execute(statement);
+          const [backend] = await transaction.execute(
+            sql`SELECT pg_backend_pid() AS pid`,
+          );
+          signalLocked(Number(backend.pid));
+          await released;
+        });
+        try {
+          const ownerPid = await Promise.race([
+            locked,
+            holding.then(() => {
+              throw new Error("Fixture owner exited before lock acquisition");
+            }),
+          ]);
+          await exercise(ownerPid, release);
+        } finally {
+          release();
+          try {
+            await holding;
+          } finally {
+            await owner.sql.end();
+          }
+        }
+      }
+      await withHeldRows(
+        [
+          sql`SELECT id FROM sim_jobs WHERE id=${fixtures[0].jobId}::uuid FOR UPDATE`,
+          sql`SELECT id FROM sync_sweep_promises WHERE id=${fixtures[0].promiseId}::uuid FOR UPDATE`,
+        ],
+        async () => {
+          const recoveryStartedAt = performance.now();
+          const recovering = recoverProgressiveStorageOnlyEvidence(db, scope, {
+            limit: 1,
+          }).then(
+            (receipt) => ({ receipt, error: null }),
+            (error: unknown) => ({ receipt: null, error }),
+          );
+          try {
+            const outcome = await recovering;
+            expect(performance.now() - recoveryStartedAt)
+              .toBeGreaterThanOrEqual(5_000);
+            expect(outcome.error).toBeNull();
+            expect(outcome.receipt).toMatchObject({
+              selected: 1,
+              linked: 1,
+              replayed: 0,
+              errors: 1,
+              conflicts: 0,
+              settlementWaiting: 1,
+            });
+            expect(outcome.receipt!.errorSamples).toEqual([
+              expect.stringContaining("lock timeout"),
+            ]);
+            expect(
+              await db.execute(sql`
+                SELECT result_attempt_id FROM progressive_cfd_evidence
+                WHERE result_attempt_id IN (${sql.join(
+                  fixtures.map(
+                    (fixture) => sql`${fixture.resultAttemptId}::uuid`,
+                  ),
+                  sql`, `,
+                )})
+              `),
+            ).toEqual([{ result_attempt_id: fixtures[1].resultAttemptId }]);
+          } finally {
+            await recovering;
+          }
+        },
+      );
+      await withHeldRows(
+        [
+          sql`SELECT id FROM sim_campaigns WHERE id=${campaignId}::uuid FOR UPDATE`,
+        ],
+        async (ownerPid, releaseLocks) => {
+          const recovering = recoverProgressiveStorageOnlyEvidence(db, scope, {
+            limit: 2,
+          }).then(
+            (receipt) => ({ receipt, error: null }),
+            (error: unknown) => ({ receipt: null, error }),
+          );
+          try {
+            await expect
+              .poll(
+                async () => {
+                  const [waiting] = await observer.db.execute(sql`
+                  SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname=current_database() AND ${ownerPid}::integer=ANY(pg_blocking_pids(pid))
+                      AND query LIKE '%FROM sim_campaigns%' AND query LIKE '%FOR UPDATE%') AS blocked
+                `);
+                  return waiting.blocked;
+                },
+                { timeout: 5_000, interval: 25 },
+              )
+              .toBe(true);
+            await expect(
+              observer.db.transaction(async (transaction) => {
+                await transaction.execute(sql`
+                  SELECT id FROM sim_campaigns WHERE id=${campaignId}::uuid FOR UPDATE NOWAIT
+                `);
+              }),
+            ).rejects.toMatchObject({ code: "55P03" });
+            await observer.db.transaction(async (transaction) => {
+              expect(
+                await transaction.execute(sql`
+                  SELECT id FROM sim_jobs WHERE id IN (${jobList}) ORDER BY id FOR UPDATE NOWAIT
+                `),
+              ).toHaveLength(2);
+              expect(
+                await transaction.execute(sql`
+                  SELECT id FROM sync_sweep_promises WHERE registered_solver_id=${solverId}::uuid
+                  ORDER BY id FOR UPDATE NOWAIT
+                `),
+              ).toHaveLength(2);
+            });
+          } finally {
+            releaseLocks();
+            const outcome = await recovering;
+            expect(outcome.error).toBeNull();
+            expect(outcome.receipt).toMatchObject({
+              selected: 2,
+              linked: 1,
+              replayed: 1,
+              errors: 0,
+              conflicts: 0,
+              settlementWaiting: 2,
+            });
+          }
+        },
+      );
+      expect(
+        await recoverProgressiveStorageOnlyEvidence(db, scope, { limit: 2 }),
+      ).toMatchObject({
+        selected: 2,
+        linked: 0,
+        replayed: 2,
+        errors: 0,
+        conflicts: 0,
+        settlementWaiting: 2,
+      });
+      const evidenceBeforeReplay = await db.execute(sql`
+            SELECT evidence.* FROM progressive_cfd_evidence evidence
+            JOIN result_attempts raw ON raw.id=evidence.result_attempt_id
+            WHERE raw.sim_job_id IN (${jobList}) ORDER BY evidence.result_attempt_id
+          `);
+      expect(
+        await recoverProgressiveStorageOnlyEvidence(db, scope, { limit: 2 }),
+      ).toMatchObject({
+        selected: 2,
+        linked: 0,
+        replayed: 2,
+        errors: 0,
+        settlementWaiting: 2,
+      });
+      expect(
+        await db.execute(sql`
+            SELECT evidence.* FROM progressive_cfd_evidence evidence
+            JOIN result_attempts raw ON raw.id=evidence.result_attempt_id
+            WHERE raw.sim_job_id IN (${jobList}) ORDER BY evidence.result_attempt_id
+          `),
+      ).toEqual(evidenceBeforeReplay);
+      expect(
+        await db.execute(
+          sql`SELECT * FROM result_attempts WHERE sim_job_id IN (${jobList}) ORDER BY id`,
+        ),
+      ).toEqual(originals);
+      expect(
+        await db.execute(sql`
+            SELECT * FROM progressive_remote_evidence_receipts
+            WHERE sim_job_id IN (${jobList}) ORDER BY sim_job_id, sequence, point_content_signature
+          `),
+      ).toEqual(originalReceipts);
+      expect(
+        await db.execute(sql`
+            SELECT classification.state, raw.valid_for_polar FROM result_classifications classification
+            JOIN result_attempts raw ON raw.id=classification.result_attempt_id
+            WHERE raw.sim_job_id IN (${jobList}) ORDER BY raw.id
+          `),
+      ).toEqual([
+        { state: "rejected", valid_for_polar: false },
+        { state: "rejected", valid_for_polar: false },
+      ]);
+      await expect(
+        db.execute(sql`
+          DELETE FROM sync_brokered_evidence_uploads WHERE solver_id=${solverId}::uuid
+        `),
+      ).rejects.toThrow(
+        "bound brokered evidence upload audit ownership is immutable",
+      );
+      await expect(
+        cleanupCampaignFixtures(db, {
+          campaignIds: [campaignId],
+          presetSlugPrefix: `campaign-${PREFIX}`,
+        }),
+      ).rejects.toThrow("sync_brokered_evidence_uploads_attempt_fk");
+    } finally {
+      try {
+        await observer?.sql.end();
+        await client.sql.end();
+        if (probeDatabaseCreated) {
+          await admin.unsafe(`DROP DATABASE "${probeDatabaseName}"`);
+          expect(
+            await admin`
+              SELECT count(*)::int AS count FROM pg_database WHERE datname=${probeDatabaseName}
+            `,
+          ).toEqual([{ count: 0 }]);
+        }
+      } finally {
+        targetUrl.pathname = parentDatabasePath;
+        client = createClient({ url: targetUrl.toString(), max: 4 });
+        db = client.db;
+        campaignIds.splice(parentCampaignCount);
+        if (previousRole === undefined)
+          delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+        else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = previousRole;
+      }
+    }
+  }, 60_000);
+
   it("conserves rejected evidence and charges cumulative observations only once without completing work", async () => {
     const fixture = await cfdEvidenceFixture();
     const first = await fixture.save(50);

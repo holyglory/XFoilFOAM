@@ -82,6 +82,28 @@ function rememberError(
     receipt.errorSamples.push(message(error));
 }
 
+async function probeProgressiveStorageReadiness(db: DB, jobId: string) {
+  const ready = new Set<string>();
+  const rollback = new Error("rollback progressive storage readiness probe");
+  try {
+    await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const retained = await readProgressiveRemoteRetention(connection, jobId);
+      if (retained.kind === "retained") {
+        const archived = retained.sources.filter((source) => source.archived);
+        if (archived.length) {
+          await assertStoppedProgressiveStorage(connection, archived[0].delivery);
+          for (const source of archived) ready.add(source.resultAttemptId);
+        }
+      }
+      throw rollback;
+    });
+  } catch (error) {
+    if (error !== rollback) throw error;
+  }
+  return ready;
+}
+
 function scopeMatches(
   envelope: ReturnType<typeof verifyProgressiveRemoteExecution>,
   scope: ProgressiveStorageEvidenceRecoveryScope,
@@ -123,11 +145,7 @@ export async function recoverProgressiveStorageOnlyEvidence(
     const receipt = result();
     const pageSize = Math.max(limit, 32);
     const selectedRows: Array<Record<string, any>> = [];
-    const retentionCache = new Map<
-      string,
-      Awaited<ReturnType<typeof readProgressiveRemoteRetention>> | null
-    >();
-    const stoppedJobs = new Map<string, boolean>();
+    const readiness = new Map<string, Set<string>>();
     let offset = 0;
     while (selectedRows.length < limit) {
       const page = await connection.execute(sql`
@@ -246,37 +264,20 @@ export async function recoverProgressiveStorageOnlyEvidence(
       offset += page.length;
       for (const row of page as unknown as Array<Record<string, any>>) {
         const jobId = String(row.sim_job_id);
-        let retained = retentionCache.get(jobId);
-        if (!retentionCache.has(jobId)) {
+        let ready = readiness.get(jobId);
+        if (!ready) {
           try {
-            retained = await readProgressiveRemoteRetention(connection, jobId);
+            ready = await probeProgressiveStorageReadiness(connection, jobId);
           } catch (error) {
             if (error instanceof ProgressiveRemoteEvidenceConflict)
               receipt.conflicts += 1;
             else receipt.errors += 1;
             rememberError(receipt, error);
-            retained = null;
+            ready = new Set();
           }
-          retentionCache.set(jobId, retained);
+          readiness.set(jobId, ready);
         }
-        if (retained?.kind !== "retained") continue;
-        const source = retained.sources.find(
-          (source) => source.resultAttemptId === String(row.result_attempt_id),
-        );
-        if (!source?.archived) continue;
-        if (!stoppedJobs.has(jobId)) {
-          try {
-            await assertStoppedProgressiveStorage(connection, source.delivery);
-            stoppedJobs.set(jobId, true);
-          } catch (error) {
-            if (error instanceof ProgressiveRemoteEvidenceConflict)
-              receipt.conflicts += 1;
-            else receipt.errors += 1;
-            rememberError(receipt, error);
-            stoppedJobs.set(jobId, false);
-          }
-        }
-        if (stoppedJobs.get(jobId)) selectedRows.push(row);
+        if (ready.has(String(row.result_attempt_id))) selectedRows.push(row);
         if (selectedRows.length >= limit) break;
       }
       if (page.length < pageSize) break;
