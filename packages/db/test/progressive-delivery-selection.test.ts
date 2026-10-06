@@ -2,7 +2,10 @@ import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
 import { progressiveDeliverySelectionSql } from "../../../apps/sweeper/src/progressive-delivery-selection";
-import { progressiveSettlementJobsSql } from "../../../apps/sweeper/src/progressive-progress-selection";
+import {
+  progressiveReportJobsSql,
+  progressiveSettlementJobsSql,
+} from "../../../apps/sweeper/src/progressive-progress-selection";
 import {
   nextProgressiveArchiveWakeAt,
   progressiveArchiveSelectionSql,
@@ -88,51 +91,132 @@ it("recognizes exact completed canonical cleanup without deleting again or doubl
 it("settles fulfilled and active jobs fairly while expired work keeps arriving", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_settlement_jobs ON COMMIT DROP AS
-      SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['fulfilled','active','unapplied','unindexed','executing','not-dispatched']) variant
-      UNION ALL SELECT md5('expired-'||ordinal)::uuid,'expired-'||ordinal FROM generate_series(1,36) ordinal`);
+      SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['fulfilled','active','unapplied','unindexed','executing','not-dispatched',
+        'stopped-running','stopped-terminal','done-active','done-closed']) variant
+      UNION ALL SELECT md5('expired-'||ordinal)::uuid,'expired-'||ordinal FROM generate_series(1,160) ordinal
+      UNION ALL SELECT md5('report-unapplied-'||ordinal)::uuid,'report-unapplied-'||ordinal FROM generate_series(1,24) ordinal
+      UNION ALL SELECT md5('report-unindexed-'||ordinal)::uuid,'report-unindexed-'||ordinal FROM generate_series(1,24) ordinal`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_campaigns ON COMMIT DROP AS
       SELECT md5('campaign')::uuid AS id,'active'::text AS status`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT id,md5('campaign')::uuid AS campaign_id,
-        CASE WHEN variant='executing' THEN 'running' ELSE 'ingesting' END AS status,
-        CASE WHEN variant='executing' THEN 'running' ELSE 'completed' END AS engine_state,
+        CASE WHEN variant IN ('executing','stopped-running') THEN 'running'
+          WHEN variant IN ('stopped-terminal','done-active','done-closed') THEN 'done' ELSE 'ingesting' END AS status,
+        CASE WHEN variant IN ('executing','stopped-running') THEN 'running' ELSE 'completed' END AS engine_state,
         clock_timestamp()-interval '2 days' AS "updatedAt",
-        clock_timestamp()-CASE WHEN variant='fulfilled' THEN interval '1 day' ELSE interval '1 hour' END AS "polledAt"
+        CASE WHEN variant<>'report-unapplied-1' THEN clock_timestamp()-CASE WHEN variant='fulfilled' THEN interval '1 day' ELSE interval '1 hour' END END AS "polledAt"
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
       SELECT id AS sim_job_id,id AS promise_id FROM fixture_settlement_jobs WHERE variant<>'not-dispatched'`);
     await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
-      SELECT id,CASE WHEN variant LIKE 'expired-%' THEN 'expired' WHEN variant='fulfilled' THEN 'fulfilled' ELSE 'active' END AS status
+      SELECT id,CASE WHEN variant LIKE 'expired-%' THEN 'expired'
+        WHEN variant IN ('fulfilled','stopped-terminal','done-closed') THEN 'fulfilled' ELSE 'active' END AS status
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
       SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts ON COMMIT DROP AS
-      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs WHERE variant<>'unapplied'`);
+      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs
+      WHERE variant NOT IN ('unapplied','not-dispatched') AND variant NOT LIKE 'report-unapplied-%'`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories ON COMMIT DROP AS
-      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs WHERE variant<>'unindexed'`);
+      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs
+      WHERE variant<>'unindexed' AND variant NOT LIKE 'report-unindexed-%'`);
     await transaction.execute(
       sql`CREATE TEMP TABLE progressive_cfd_execution_stops (sim_job_id uuid) ON COMMIT DROP`,
     );
     await transaction.execute(
       sql`CREATE TEMP TABLE progressive_cfd_attempts (sim_job_id uuid,outcome text) ON COMMIT DROP`,
     );
+    await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+      SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal')`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
+      SELECT id,CASE WHEN variant='stopped-terminal' THEN 'complete' ELSE 'running' END FROM fixture_settlement_jobs
+      WHERE variant IN ('executing','stopped-running','stopped-terminal')`);
+    const expectedReports = () =>
+      transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
+        FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
+        WHERE fixture.variant IN ('unapplied','unindexed') OR fixture.variant LIKE 'report-%'
+        ORDER BY coalesce(job."polledAt",job."updatedAt"),job.id`);
+    const expectedSettlements = () =>
+      transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
+        FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
+        WHERE fixture.variant IN ('fulfilled','active','stopped-running','done-active') OR fixture.variant LIKE 'expired-%'
+        ORDER BY CASE WHEN fixture.variant IN ('stopped-running','done-active') THEN 1 ELSE 0 END,
+          coalesce(job."polledAt",job."updatedAt"),job.id`);
+    const jobStates = await transaction.execute(
+      sql`SELECT id,status,engine_state FROM sim_jobs ORDER BY id`,
+    );
     const [fulfilled] = await transaction.execute(
       sql`SELECT id FROM fixture_settlement_jobs WHERE variant='fulfilled'`,
     );
+    const allReports = await expectedReports();
+    const allSettlements = await expectedSettlements();
+    expect(allReports).toHaveLength(50);
+    expect(allSettlements).toHaveLength(164);
+    const reports = await transaction.execute(progressiveReportJobsSql());
+    expect(reports).toHaveLength(32);
+    expect(reports).toEqual(allReports.slice(0, 32));
+    const [oldestReport] = await transaction.execute(
+      sql`SELECT id FROM fixture_settlement_jobs WHERE variant='report-unapplied-1'`,
+    );
+    expect(reports[0].sim_job_id).toBe(oldestReport.id);
     const first = await transaction.execute(progressiveSettlementJobsSql());
-    expect(first).toHaveLength(32);
+    expect(first).toHaveLength(128);
+    expect(first).toEqual(allSettlements.slice(0, 128));
     expect(first[0].sim_job_id).toBe(fulfilled.id);
-    for (const row of first) {
-      await transaction.execute(
-        sql`UPDATE sim_jobs SET "polledAt"=clock_timestamp() WHERE id=${row.sim_job_id}::uuid`,
+    expect(
+      first.some((row) =>
+        reports.some((report) => report.sim_job_id === row.sim_job_id),
+      ),
+    ).toBe(false);
+    const explicitRows =
+      await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
+      WHERE variant IN ('fulfilled','unapplied','unindexed','executing','not-dispatched',
+        'stopped-running','stopped-terminal','done-active','done-closed') ORDER BY id`);
+    const explicitIds = explicitRows.map((row) => String(row.id));
+    for (const [selector, eligible] of [
+      [progressiveReportJobsSql, allReports],
+      [progressiveSettlementJobsSql, allSettlements],
+    ] as const) {
+      expect(await transaction.execute(selector(explicitIds))).toEqual(
+        eligible.filter((row) => explicitIds.includes(String(row.sim_job_id))),
       );
+      expect(await transaction.execute(selector([]))).toEqual([]);
+      expect(
+        await transaction.execute(
+          selector(["00000000-0000-4000-8000-000000000001"]),
+        ),
+      ).toEqual([]);
     }
+    for (const selected of [first, reports])
+      await transaction.execute(sql`UPDATE sim_jobs SET "polledAt"=clock_timestamp()
+        WHERE id IN (${sql.join(
+          selected.map((row) => sql`${row.sim_job_id}::uuid`),
+          sql`,`,
+        )})`);
     const second = await transaction.execute(progressiveSettlementJobsSql());
+    expect(second).toHaveLength(128);
+    expect(second).toEqual((await expectedSettlements()).slice(0, 128));
     const visited = new Set([...first, ...second].map((row) => row.sim_job_id));
-    expect(visited.size).toBe(38);
+    const terminalRows =
+      await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
+      WHERE variant IN ('fulfilled','active') OR variant LIKE 'expired-%'`);
+    expect([...visited].sort()).toEqual(
+      terminalRows.map((row) => row.id).sort(),
+    );
+    expect(visited.size).toBe(162);
+    const nextReports = await transaction.execute(progressiveReportJobsSql());
+    expect(nextReports).toHaveLength(32);
+    expect(nextReports).toEqual((await expectedReports()).slice(0, 32));
+    const visitedReports = new Set(
+      [...reports, ...nextReports].map((row) => row.sim_job_id),
+    );
+    expect([...visitedReports].sort()).toEqual(
+      allReports.map((row) => row.sim_job_id).sort(),
+    );
     const excluded =
       await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
-      WHERE variant IN ('unapplied','unindexed','executing','not-dispatched')`);
+      WHERE variant IN ('unapplied','unindexed','executing','not-dispatched','stopped-terminal','done-closed')
+        OR variant LIKE 'report-%'`);
     for (const row of excluded) expect(visited.has(row.id)).toBe(false);
     expect(
       await transaction.execute(
@@ -141,6 +225,16 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     ).toEqual([
       { sim_job_id: fulfilled.id, campaign_id: first[0].campaign_id },
     ]);
+    expect(
+      await transaction.execute(
+        progressiveReportJobsSql([String(fulfilled.id)]),
+      ),
+    ).toEqual([]);
+    expect(
+      await transaction.execute(
+        sql`SELECT id,status,engine_state FROM sim_jobs ORDER BY id`,
+      ),
+    ).toEqual(jobStates);
   });
 });
 
