@@ -1017,6 +1017,36 @@ async function registerSolver(db: DB, settings: Settings): Promise<string> {
   return payload.solver.id;
 }
 
+type RemoteSolverHeartbeatResult = "ok" | "not_found" | "transient_failure";
+
+async function clearStaleRemoteSolverRegistration(
+  db: DB,
+  settings: Settings,
+): Promise<boolean> {
+  const registeredId = settings.remoteSolverRegisteredId;
+  const authToken = settings.remoteSolverAuthToken;
+  if (!registeredId || !authToken) return false;
+  const [cleared] = await db
+    .update(syncApiSettings)
+    .set({
+      remoteSolverRegisteredId: null,
+      remoteSolverAuthToken: "",
+      remoteSolverLastStatus: "error",
+      remoteSolverLastError:
+        "remote solver registration was not found; re-registration pending",
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(syncApiSettings.id, 1),
+        eq(syncApiSettings.remoteSolverRegisteredId, registeredId),
+        eq(syncApiSettings.remoteSolverAuthToken, authToken),
+      ),
+    )
+    .returning({ id: syncApiSettings.id });
+  return Boolean(cleared);
+}
+
 async function heartbeat(
   settings: Settings,
   status: Settings["remoteSolverLastStatus"],
@@ -1056,29 +1086,35 @@ async function heartbeat(
   solvedCount?: number,
   pushedCount?: number,
   progressiveMetadata?: ReturnType<typeof progressiveWorkerCapabilityMetadata>,
-): Promise<boolean> {
-  if (!settings.remoteSolverRegisteredId) return false;
-  const response = await fetch(
-    `${syncBase(settings)}/solvers/${settings.remoteSolverRegisteredId}/heartbeat`,
-    {
-      method: "POST",
-      signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
-      headers: headers(settings),
-      body: JSON.stringify({
-        status,
-        activePromiseCount,
-        activeAoaCount,
-        cpuCapacity: remoteWorkerCpuCapacity(settings),
-        cpuBudget: settings.remoteSolverCpuBudget,
-        buildVersion: configuredBuildVersion(),
-        ...(solvedCount == null ? {} : { solvedCount }),
-        ...(pushedCount == null ? {} : { pushedCount }),
-        health: telemetry,
-        ...(progressiveMetadata ? { metadata: progressiveMetadata } : {}),
-      }),
-    },
-  ).catch(() => null);
-  return response?.ok === true;
+): Promise<RemoteSolverHeartbeatResult> {
+  if (!settings.remoteSolverRegisteredId) return "transient_failure";
+  let response: Response;
+  try {
+    response = await fetch(
+      `${syncBase(settings)}/solvers/${settings.remoteSolverRegisteredId}/heartbeat`,
+      {
+        method: "POST",
+        signal: AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+        headers: headers(settings),
+        body: JSON.stringify({
+          status,
+          activePromiseCount,
+          activeAoaCount,
+          cpuCapacity: remoteWorkerCpuCapacity(settings),
+          cpuBudget: settings.remoteSolverCpuBudget,
+          buildVersion: configuredBuildVersion(),
+          ...(solvedCount == null ? {} : { solvedCount }),
+          ...(pushedCount == null ? {} : { pushedCount }),
+          health: telemetry,
+          ...(progressiveMetadata ? { metadata: progressiveMetadata } : {}),
+        }),
+      },
+    );
+  } catch {
+    return "transient_failure";
+  }
+  if (response.status === 404) return "not_found";
+  return response.ok ? "ok" : "transient_failure";
 }
 
 function percent(used: number, total: number): number {
@@ -1159,7 +1195,11 @@ async function reportRemoteSolverFleetHeartbeat(
   db: DB,
   settings: Settings,
   options: { includeOutcomeCounters: boolean },
-): Promise<{ remoteCap: number; reservedCpuSlots: number }> {
+): Promise<{
+  remoteCap: number;
+  reservedCpuSlots: number;
+  heartbeatResult: RemoteSolverHeartbeatResult;
+}> {
   const [active, reservedCpuSlots] = await Promise.all([
     activeRemoteJobs(db, settings),
     remoteReservedCpuSlots(db, settings),
@@ -1172,7 +1212,7 @@ async function reportRemoteSolverFleetHeartbeat(
       ? remoteOutcomeCounters(db, settings)
       : Promise.resolve(null),
   ]);
-  await heartbeat(
+  const heartbeatResult = await heartbeat(
     settings,
     active.length ? "solving" : "idle",
     active.length,
@@ -1182,7 +1222,7 @@ async function reportRemoteSolverFleetHeartbeat(
     counters?.pushedCount,
     progressiveWorkerCapabilityMetadata(db),
   );
-  return { remoteCap, reservedCpuSlots };
+  return { remoteCap, reservedCpuSlots, heartbeatResult };
 }
 
 /**
@@ -1206,9 +1246,11 @@ export async function sendRemoteSolverFleetHeartbeat(db: DB): Promise<void> {
     return;
   assertRemoteSolverHubUrlContract(settings.upstreamBaseUrl);
   assertRemoteSolverNodeEvidenceContract(settings.remoteSolverEnabled);
-  await reportRemoteSolverFleetHeartbeat(db, settings, {
+  const report = await reportRemoteSolverFleetHeartbeat(db, settings, {
     includeOutcomeCounters: false,
   });
+  if (report.heartbeatResult === "not_found")
+    await clearStaleRemoteSolverRegistration(db, settings);
 }
 
 /** Independent single-flight fleet reporter. A held request cannot stack
@@ -7253,12 +7295,16 @@ export async function reconcileRemoteSolverTick(
     await measureRemoteReconciliationStep("rejected_results", () =>
       releaseUnacceptedPromiseResults(db, settings),
     );
-    const { remoteCap, reservedCpuSlots } =
+    const { remoteCap, reservedCpuSlots, heartbeatResult } =
       await measureRemoteReconciliationStep("fleet_heartbeat", () =>
         reportRemoteSolverFleetHeartbeat(db, settings, {
           includeOutcomeCounters: true,
         }),
       );
+    if (heartbeatResult === "not_found") {
+      await clearStaleRemoteSolverRegistration(db, settings);
+      return false;
+    }
     return remoteCap > 0 && reservedCpuSlots < remoteCap;
   } catch (e) {
     await setStatus(db, "error", e instanceof Error ? e.message : String(e));

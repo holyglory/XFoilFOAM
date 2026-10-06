@@ -1658,6 +1658,274 @@ afterAll(async () => {
 });
 
 describe("remote solver submit lifecycle", () => {
+  it("clears a missing hub registration and retries without changing owners", async () => {
+    await db
+      .update(syncApiSettings)
+      .set({ upstreamSecret: SECRET, updatedAt: new Date() })
+      .where(eq(syncApiSettings.id, 1));
+    const promise = await seedMirroredPromise(
+      "registration-recovery",
+      [900.401],
+    );
+    const [settingsBefore] = await db
+      .select({
+        instanceId: syncApiSettings.instanceId,
+        instanceName: syncApiSettings.instanceName,
+        upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
+        upstreamSecret: syncApiSettings.upstreamSecret,
+        remoteSolverEnabled: syncApiSettings.remoteSolverEnabled,
+        remoteSolverCpuBudget: syncApiSettings.remoteSolverCpuBudget,
+        remoteSolverClaimSize: syncApiSettings.remoteSolverClaimSize,
+        remoteSolverHeartbeatIntervalSeconds:
+          syncApiSettings.remoteSolverHeartbeatIntervalSeconds,
+        remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+        remoteSolverAuthToken: syncApiSettings.remoteSolverAuthToken,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    if (!settingsBefore?.remoteSolverRegisteredId)
+      throw new Error("registered remote solver fixture required");
+    const oldSolverId = settingsBefore.remoteSolverRegisteredId;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        jobKind: "targeted",
+        status: "running",
+        totalCases: 1,
+        engineJobId: `${PREFIX}-registration-recovery`,
+        engineState: "running",
+        requestPayload: {
+          remoteSolver: true,
+          syncPromiseId: promise.id,
+          solverId: oldSolverId,
+          upstreamBaseUrl: UPSTREAM,
+        },
+      })
+      .returning({
+        id: simJobs.id,
+        status: simJobs.status,
+        engineJobId: simJobs.engineJobId,
+        requestPayload: simJobs.requestPayload,
+      });
+    const [promiseBefore] = await db
+      .select({
+        status: syncSweepPromises.status,
+        registeredSolverId: syncSweepPromises.registeredSolverId,
+        requestPayload: syncSweepPromises.requestPayload,
+      })
+      .from(syncSweepPromises)
+      .where(eq(syncSweepPromises.id, promise.id))
+      .limit(1);
+    const baseFetch = stubFetch().fetchMock;
+    let registrationLost = true;
+    const fetchMock = vi.fn(
+      async (input: string | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input);
+        if (url.includes("/solvers/") && url.endsWith("/heartbeat")) {
+          if (registrationLost) {
+            registrationLost = false;
+            return Response.json(
+              { error: "registered solver not found" },
+              { status: 404 },
+            );
+          }
+        }
+        return baseFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const engine = {
+      submitPolar: vi.fn(),
+      cancelJob: vi.fn(),
+    } as unknown as EngineClient;
+    expect(await reconcileRemoteSolverTick(db, engine)).toBe(false);
+    const [afterNotFound] = await db
+      .select({
+        instanceId: syncApiSettings.instanceId,
+        instanceName: syncApiSettings.instanceName,
+        upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
+        upstreamSecret: syncApiSettings.upstreamSecret,
+        remoteSolverEnabled: syncApiSettings.remoteSolverEnabled,
+        remoteSolverCpuBudget: syncApiSettings.remoteSolverCpuBudget,
+        remoteSolverClaimSize: syncApiSettings.remoteSolverClaimSize,
+        remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+        remoteSolverAuthToken: syncApiSettings.remoteSolverAuthToken,
+        remoteSolverLastStatus: syncApiSettings.remoteSolverLastStatus,
+        remoteSolverLastError: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    expect(afterNotFound).toMatchObject({
+      instanceId: settingsBefore.instanceId,
+      instanceName: settingsBefore.instanceName,
+      upstreamBaseUrl: settingsBefore.upstreamBaseUrl,
+      upstreamSecret: settingsBefore.upstreamSecret,
+      remoteSolverEnabled: settingsBefore.remoteSolverEnabled,
+      remoteSolverCpuBudget: settingsBefore.remoteSolverCpuBudget,
+      remoteSolverClaimSize: settingsBefore.remoteSolverClaimSize,
+      remoteSolverRegisteredId: null,
+      remoteSolverAuthToken: "",
+      remoteSolverLastStatus: "error",
+      remoteSolverLastError: expect.stringContaining("re-registration pending"),
+    });
+    expect(
+      await db
+        .select({ id: registeredRemoteSolvers.id })
+        .from(registeredRemoteSolvers)
+        .where(eq(registeredRemoteSolvers.id, oldSolverId)),
+    ).toHaveLength(1);
+    expect(promiseBefore).toBeTruthy();
+    expect(
+      await db
+        .select({
+          status: syncSweepPromises.status,
+          registeredSolverId: syncSweepPromises.registeredSolverId,
+          requestPayload: syncSweepPromises.requestPayload,
+        })
+        .from(syncSweepPromises)
+        .where(eq(syncSweepPromises.id, promise.id))
+        .limit(1),
+    ).toEqual([promiseBefore]);
+    expect(
+      await db
+        .select({
+          id: simJobs.id,
+          status: simJobs.status,
+          engineJobId: simJobs.engineJobId,
+          requestPayload: simJobs.requestPayload,
+        })
+        .from(simJobs)
+        .where(eq(simJobs.id, job!.id)),
+    ).toEqual([job]);
+    expect(engine.submitPolar).not.toHaveBeenCalled();
+    expect(engine.cancelJob).not.toHaveBeenCalled();
+
+    expect(await reconcileRemoteSolverTick(db, engine)).toBe(true);
+    const [afterRetry] = await db
+      .select({
+        instanceId: syncApiSettings.instanceId,
+        instanceName: syncApiSettings.instanceName,
+        upstreamBaseUrl: syncApiSettings.upstreamBaseUrl,
+        upstreamSecret: syncApiSettings.upstreamSecret,
+        remoteSolverEnabled: syncApiSettings.remoteSolverEnabled,
+        remoteSolverCpuBudget: syncApiSettings.remoteSolverCpuBudget,
+        remoteSolverClaimSize: syncApiSettings.remoteSolverClaimSize,
+        remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+        remoteSolverAuthToken: syncApiSettings.remoteSolverAuthToken,
+        remoteSolverLastStatus: syncApiSettings.remoteSolverLastStatus,
+        remoteSolverLastError: syncApiSettings.remoteSolverLastError,
+      })
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    expect(afterRetry).toMatchObject({
+      instanceId: settingsBefore.instanceId,
+      instanceName: settingsBefore.instanceName,
+      upstreamBaseUrl: settingsBefore.upstreamBaseUrl,
+      upstreamSecret: settingsBefore.upstreamSecret,
+      remoteSolverEnabled: settingsBefore.remoteSolverEnabled,
+      remoteSolverCpuBudget: settingsBefore.remoteSolverCpuBudget,
+      remoteSolverClaimSize: settingsBefore.remoteSolverClaimSize,
+      remoteSolverRegisteredId: expect.any(String),
+      remoteSolverAuthToken: `${PREFIX}-registered-solver-token`,
+      remoteSolverLastStatus: "idle",
+      remoteSolverLastError: null,
+    });
+    expect(afterRetry?.remoteSolverRegisteredId).not.toBe(oldSolverId);
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).endsWith("/solvers/register"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input]) =>
+          String(input).includes("/solvers/") &&
+          String(input).endsWith("/heartbeat"),
+      ),
+    ).toHaveLength(2);
+    expect(
+      await db
+        .select({
+          status: syncSweepPromises.status,
+          registeredSolverId: syncSweepPromises.registeredSolverId,
+          requestPayload: syncSweepPromises.requestPayload,
+        })
+        .from(syncSweepPromises)
+        .where(eq(syncSweepPromises.id, promise.id))
+        .limit(1),
+    ).toEqual([promiseBefore]);
+    expect(
+      await db
+        .select({
+          id: simJobs.id,
+          status: simJobs.status,
+          engineJobId: simJobs.engineJobId,
+          requestPayload: simJobs.requestPayload,
+        })
+        .from(simJobs)
+        .where(eq(simJobs.id, job!.id)),
+    ).toEqual([job]);
+  });
+
+  it.each(["http-500", "network"] as const)(
+    "preserves registration credentials after a %s fleet heartbeat failure",
+    async (failure) => {
+      const [settingsBefore] = await db
+        .select({
+          remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+          remoteSolverAuthToken: syncApiSettings.remoteSolverAuthToken,
+          remoteSolverLastStatus: syncApiSettings.remoteSolverLastStatus,
+          remoteSolverLastError: syncApiSettings.remoteSolverLastError,
+        })
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1))
+        .limit(1);
+      const baseFetch = stubFetch().fetchMock;
+      const fetchMock = vi.fn(
+        async (input: string | URL, init?: RequestInit): Promise<Response> => {
+          const url = String(input);
+          if (url.includes("/solvers/") && url.endsWith("/heartbeat")) {
+            if (failure === "network") throw new Error("ECONNRESET");
+            return Response.json(
+              { error: "temporary hub failure" },
+              { status: 500 },
+            );
+          }
+          return baseFetch(input, init);
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      expect(await reconcileRemoteSolverTick(db, {} as EngineClient)).toBe(
+        true,
+      );
+      const [settingsAfter] = await db
+        .select({
+          remoteSolverRegisteredId: syncApiSettings.remoteSolverRegisteredId,
+          remoteSolverAuthToken: syncApiSettings.remoteSolverAuthToken,
+          remoteSolverLastStatus: syncApiSettings.remoteSolverLastStatus,
+          remoteSolverLastError: syncApiSettings.remoteSolverLastError,
+        })
+        .from(syncApiSettings)
+        .where(eq(syncApiSettings.id, 1))
+        .limit(1);
+      expect(settingsAfter).toEqual(settingsBefore);
+      expect(
+        fetchMock.mock.calls.filter(([input]) =>
+          String(input).endsWith("/solvers/register"),
+        ),
+      ).toHaveLength(0);
+    },
+  );
+
   it("MUST-CATCH: reports fleet liveness while a promise renewal holds the scheduler tick", async () => {
     const promise = await seedMirroredPromise("held-lease-renewal", [900.451]);
     await db
