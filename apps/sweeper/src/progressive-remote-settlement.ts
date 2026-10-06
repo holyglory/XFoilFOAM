@@ -269,6 +269,34 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       )
       .map((source) => source.resultAttemptId);
     if (finalAttemptIds.length) {
+      await connection.execute(sql`
+        UPDATE results result SET current_result_attempt_id = raw.id,
+          status = raw.status, source = raw.source, regime = raw.regime,
+          method_key = raw.method_key, solver_implementation_id = raw.solver_implementation_id,
+          solver_runtime_build_id = raw.solver_runtime_build_id, cl = raw.cl, cd = raw.cd,
+          cm = raw.cm, cl_cd = raw.cl_cd, cl_std = raw.cl_std, cd_std = raw.cd_std,
+          cm_std = raw.cm_std, stalled = raw.stalled, unsteady = raw.unsteady,
+          converged = raw.converged, final_residual = raw.final_residual,
+          iterations = raw.iterations, y_plus_avg = raw.y_plus_avg, y_plus_max = raw.y_plus_max,
+          n_cells = raw.n_cells, first_order_fallback = raw.first_order_fallback,
+          strouhal = raw.strouhal, error = raw.error, quality_warnings = raw.quality_warnings,
+          frame_track = coalesce(raw.evidence_payload->'frame_track', raw.evidence_payload->'frameTrack'),
+          fidelity = coalesce(raw.evidence_payload->>'fidelity', raw.evidence_payload->>'fidelity'),
+          steady_history = coalesce(raw.evidence_payload->'steady_history', raw.evidence_payload->'steadyHistory'),
+          engine_job_id = raw.engine_job_id, engine_case_slug = raw.engine_case_slug,
+          sim_job_id = raw.sim_job_id, "solvedAt" = raw."solvedAt", priority = 0,
+          "updatedAt" = clock_timestamp()
+        FROM result_attempts raw
+        JOIN result_classifications classification ON classification.result_attempt_id = raw.id
+        WHERE raw.id IN (${sql.join(
+          finalAttemptIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )})
+          AND raw.result_id = result.id
+          AND raw.status = 'done' AND raw.valid_for_polar
+          AND classification.state = 'accepted'
+          AND result.current_result_attempt_id IS NULL
+      `);
       const unpublished =
         await connection.execute(sql`SELECT raw.id, raw.regime, raw.evidence_payload->>'fidelity' AS fidelity,
           selected.regime AS selected_regime, selected.evidence_payload->>'fidelity' AS selected_fidelity,
