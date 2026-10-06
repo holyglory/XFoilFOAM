@@ -70,6 +70,7 @@ export async function readProgressiveRemoteRetention(
     delivery: ProgressiveRemoteEvidenceDelivery;
     resultAttemptId: string;
     archived: boolean;
+    storageOnly: boolean;
   }> = [];
   let pendingArchives = 0;
   for (const source of sources) {
@@ -126,6 +127,7 @@ export async function readProgressiveRemoteRetention(
       delivery,
       resultAttemptId: String(source.result_attempt_id),
       archived: hasManifest,
+      storageOnly: source.storage_only === true,
     });
   }
   if (pendingArchives)

@@ -331,8 +331,8 @@ async function exerciseProgressiveArchiveCustody(
     expect(retention).toMatchObject({
       kind: "retained",
       report: terminal,
-      sources: [{ resultAttemptId, archived: true, delivery: source }],
-    });
+    sources: [{ resultAttemptId, archived: true, storageOnly: false, delivery: source }],
+  });
     const rollbackInventory = new Error(
       "Rollback isolated missing source inventory",
     );

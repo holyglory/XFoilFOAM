@@ -253,10 +253,12 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         : [],
     );
     const finalAttemptIds = retained.sources
-      .filter((source) =>
-        finalPoints.has(
-          source.delivery.progressiveEvidence.pointContentSignature,
-        ),
+      .filter(
+        (source) =>
+          !source.storageOnly &&
+          finalPoints.has(
+            source.delivery.progressiveEvidence.pointContentSignature,
+          ),
       )
       .map((source) => source.resultAttemptId);
     if (finalAttemptIds.length) {
