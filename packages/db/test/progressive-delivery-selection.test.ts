@@ -124,12 +124,29 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       sql`CREATE TEMP TABLE progressive_cfd_execution_stops (sim_job_id uuid) ON COMMIT DROP`,
     );
     await transaction.execute(
-      sql`CREATE TEMP TABLE progressive_cfd_attempts (sim_job_id uuid,outcome text) ON COMMIT DROP`,
+      sql`CREATE TEMP TABLE progressive_cfd_units (id uuid,work_id uuid) ON COMMIT DROP`,
     );
+    await transaction.execute(
+      sql`CREATE TEMP TABLE progressive_work (id uuid,generation_id uuid,target_id uuid) ON COMMIT DROP`,
+    );
+    await transaction.execute(
+      sql`CREATE TEMP TABLE progressive_generation_cohort_targets (generation_id uuid,target_id uuid,cohort text) ON COMMIT DROP`,
+    );
+    await transaction.execute(
+      sql`CREATE TEMP TABLE progressive_cfd_attempts (sim_job_id uuid,outcome text,unit_id uuid) ON COMMIT DROP`,
+    );
+    await transaction.execute(sql`INSERT INTO progressive_cfd_units
+      SELECT id,id FROM fixture_settlement_jobs`);
+    await transaction.execute(sql`INSERT INTO progressive_work
+      SELECT id,md5('generation')::uuid,id FROM fixture_settlement_jobs`);
+    await transaction.execute(sql`INSERT INTO progressive_generation_cohort_targets
+      SELECT md5('generation')::uuid,id,
+        'high'
+      FROM fixture_settlement_jobs`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
       SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal')`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
-      SELECT id,CASE WHEN variant='stopped-terminal' THEN 'complete' ELSE 'running' END FROM fixture_settlement_jobs
+      SELECT id,CASE WHEN variant='stopped-terminal' THEN 'complete' ELSE 'running' END,id FROM fixture_settlement_jobs
       WHERE variant IN ('executing','stopped-running','stopped-terminal')`);
     const expectedReports = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
@@ -139,8 +156,18 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const expectedSettlements = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
         FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
+        LEFT JOIN LATERAL (
+          SELECT CASE WHEN bool_or(member.cohort = 'low') THEN 0 ELSE 1 END AS priority
+          FROM progressive_cfd_attempts attempt
+          JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+          JOIN progressive_work work ON work.id = unit.work_id
+          JOIN progressive_generation_cohort_targets member
+            ON member.generation_id = work.generation_id AND member.target_id = work.target_id
+          WHERE attempt.sim_job_id = job.id
+        ) cohort_priority ON true
         WHERE fixture.variant IN ('fulfilled','active','stopped-running','done-active') OR fixture.variant LIKE 'expired-%'
-        ORDER BY CASE WHEN fixture.variant IN ('stopped-running','done-active') THEN 1 ELSE 0 END,
+        ORDER BY coalesce(cohort_priority.priority, 1),
+          CASE WHEN fixture.variant IN ('stopped-running','done-active') THEN 1 ELSE 0 END,
           coalesce(job."polledAt",job."updatedAt"),job.id`);
     const jobStates = await transaction.execute(
       sql`SELECT id,status,engine_state FROM sim_jobs ORDER BY id`,

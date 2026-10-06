@@ -36,6 +36,15 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
     LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
     LEFT JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+    LEFT JOIN LATERAL (
+      SELECT CASE WHEN bool_or(member.cohort = 'low') THEN 0 ELSE 1 END AS priority
+      FROM progressive_cfd_attempts attempt
+      JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generation_cohort_targets member
+        ON member.generation_id = work.generation_id AND member.target_id = work.target_id
+      WHERE attempt.sim_job_id = job.id
+    ) cohort_priority ON true
     WHERE ${executionScope(jobIds)} AND NOT ${unappliedReports}
       AND (
         (job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled'))
@@ -45,7 +54,8 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active')))
-    ORDER BY CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
+    ORDER BY coalesce(cohort_priority.priority, 1),
+      CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
       CASE WHEN job.status = 'ingesting'
       AND job.engine_state IN ('completed', 'failed', 'cancelled')
       THEN 0 ELSE 1 END,
