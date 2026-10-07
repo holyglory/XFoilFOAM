@@ -84,11 +84,7 @@ export async function reconcileProgressiveExecutions(
     waiting: 0,
     errors: [] as Array<{ jobId: string; error: string }>,
   };
-  const [role] = await db.execute(
-    sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
-  );
-  if (role?.remote_solver_enabled || options.jobIds?.length === 0)
-    return receipt;
+  if (options.jobIds?.length === 0) return receipt;
   const filter = options.jobIds
     ? sql`AND job.id IN (${sql.join(
         options.jobIds.map((id) => sql`${id}::uuid`),
