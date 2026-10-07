@@ -188,7 +188,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
         AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id AND unit.state NOT IN ('complete', 'gap'))
         AND ${ready}
-      ORDER BY generation.created_at, generation.id, work.target_id LIMIT 32 FOR UPDATE OF generation, work SKIP LOCKED
+      ORDER BY generation.created_at, generation.id, work.target_id LIMIT 128 FOR UPDATE OF generation, work SKIP LOCKED
     `);
     for (const scope of scopes) {
       const units = await connection.execute(sql`
