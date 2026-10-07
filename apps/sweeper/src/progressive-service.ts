@@ -135,7 +135,19 @@ export async function runProgressiveBaselineService(
           pending = true;
           report({ component: "progressive-fitting", ...fitting });
         }
-        const stages = await advanceProgressiveCfdStages(db);
+        const [adaptive] = await db.execute(sql`
+          SELECT EXISTS (
+            SELECT 1 FROM progressive_cfd_units unit
+            JOIN progressive_work work ON work.id = unit.work_id
+            JOIN progressive_generations generation ON generation.id = work.generation_id
+            JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+            WHERE generation.status = 'active' AND work.stage = 2
+              AND unit.purpose = 'adaptive' AND unit.state = 'pending'
+          ) AS pending
+        `);
+        const stages = adaptive?.pending
+          ? { admitted: 0, closed: 0, waiting: 1, campaignsCompleted: 0 }
+          : await advanceProgressiveCfdStages(db);
         if (stages.admitted || stages.closed || stages.campaignsCompleted) {
           pending = true;
           report({ component: "progressive-cfd-stages", ...stages });
