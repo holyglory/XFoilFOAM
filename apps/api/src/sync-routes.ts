@@ -244,6 +244,12 @@ export async function expireStaleRemotePromiseLeases(
       AND promise."expiresAt" > now()
       AND promise."createdAt" <= now() - interval '15 minutes'
       AND NOT EXISTS (
+        SELECT 1
+        FROM progressive_remote_dispatches dispatch
+        WHERE dispatch.promise_id = promise.id
+          AND dispatch.solver_id = promise.registered_solver_id
+      )
+      AND NOT EXISTS (
         SELECT 1 FROM sim_jobs job
         WHERE job.request_payload ->> 'syncPromiseId' = promise.id::text
           AND (job.status IN ('pending', 'submitted', 'running', 'ingesting')

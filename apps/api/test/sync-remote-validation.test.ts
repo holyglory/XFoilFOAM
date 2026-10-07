@@ -70,6 +70,7 @@ const {
   meshProfiles,
   outputProfiles,
   polarFitSets,
+  progressiveRemoteDispatches,
   referenceGeometryProfiles,
   registeredRemoteSolvers,
   remoteAssetReferences,
@@ -1023,7 +1024,9 @@ describe("remote solver sync validation regressions", () => {
     const solverId = randomUUID();
     const stalePromiseId = randomUUID();
     const livePromiseId = randomUUID();
+    const progressivePromiseId = randomUUID();
     let liveJobId: string | null = null;
+    let progressiveJobId: string | null = null;
     await db.insert(registeredRemoteSolvers).values({
       id: solverId,
       instanceId: `${PREFIX}-stale-promise-solver`,
@@ -1061,6 +1064,21 @@ describe("remote solver sync validation regressions", () => {
           lastHeartbeatAt: new Date(),
           requestPayload: { remoteSolver: true },
         },
+        {
+          id: progressivePromiseId,
+          sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+          sourceInstanceName: `${PREFIX} stale promise solver`,
+          sourceBaseUrl: `${PREFIX}-hub`,
+          registeredSolverId: solverId,
+          status: "active",
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaCount: 1,
+          expiresAt: new Date(Date.now() + 3_600_000),
+          createdAt: new Date(Date.now() - 20 * 60_000),
+          lastHeartbeatAt: new Date(),
+          requestPayload: { remoteSolver: true, progressive: true },
+        },
       ]);
       await db.insert(syncSweepPromisePoints).values([
         {
@@ -1077,6 +1095,13 @@ describe("remote solver sync validation regressions", () => {
           aoaDeg: 733.002,
           status: "active",
         },
+        {
+          promiseId: progressivePromiseId,
+          airfoilId,
+          simulationPresetRevisionId: revisionId,
+          aoaDeg: 733.003,
+          status: "active",
+        },
       ]);
       [{ id: liveJobId }] = await db
         .insert(simJobs)
@@ -1089,12 +1114,58 @@ describe("remote solver sync validation regressions", () => {
           requestPayload: { syncPromiseId: livePromiseId },
         })
         .returning({ id: simJobs.id });
+      progressiveJobId = randomUUID();
+      const progressiveSignature = "a".repeat(64);
+      const progressiveEnvelope = {
+        version: 1,
+        solverId,
+        promiseId: progressivePromiseId,
+        contentSignature: progressiveSignature,
+        scope: { executionId: progressiveJobId },
+        request: { execution_id: progressiveJobId },
+      };
+      await db.insert(simJobs).values({
+        id: progressiveJobId,
+        airfoilId,
+        bcIds: [legacyBcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: CHORD,
+        engineJobId: progressiveJobId,
+        status: "done",
+        requestPayload: { remoteProgressiveExecution: progressiveEnvelope },
+      });
+      await db.insert(progressiveRemoteDispatches).values({
+        simJobId: progressiveJobId,
+        promiseId: progressivePromiseId,
+        solverId,
+        cpuSlots: 1,
+        contentSignature: progressiveSignature,
+        envelope: progressiveEnvelope,
+      });
 
       expect(await expireStaleRemotePromiseLeases(db, solverId)).toBe(1);
       const rows = await db
         .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
         .from(syncSweepPromises)
-        .where(inArray(syncSweepPromises.id, [stalePromiseId, livePromiseId]));
+        .where(
+          inArray(syncSweepPromises.id, [
+            stalePromiseId,
+            livePromiseId,
+            progressivePromiseId,
+          ]),
+        );
+      const progressive = await db
+        .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
+        .from(syncSweepPromises)
+        .where(eq(syncSweepPromises.id, progressivePromiseId));
+      expect(progressive).toEqual([
+        { id: progressivePromiseId, status: "active" },
+      ]);
+      await db
+        .delete(progressiveRemoteDispatches)
+        .where(eq(progressiveRemoteDispatches.simJobId, progressiveJobId));
+      if (progressiveJobId)
+        await db.delete(simJobs).where(eq(simJobs.id, progressiveJobId));
       expect(rows).toEqual(
         expect.arrayContaining([
           { id: stalePromiseId, status: "expired" },
@@ -1111,19 +1182,33 @@ describe("remote solver sync validation regressions", () => {
           inArray(syncSweepPromisePoints.promiseId, [
             stalePromiseId,
             livePromiseId,
+            progressivePromiseId,
           ]),
         );
       expect(points).toEqual(
         expect.arrayContaining([
           { promiseId: stalePromiseId, status: "expired" },
           { promiseId: livePromiseId, status: "active" },
+          { promiseId: progressivePromiseId, status: "active" },
         ]),
       );
     } finally {
       if (liveJobId) await db.delete(simJobs).where(eq(simJobs.id, liveJobId));
+      if (progressiveJobId) {
+        await db
+          .delete(progressiveRemoteDispatches)
+          .where(eq(progressiveRemoteDispatches.simJobId, progressiveJobId));
+        await db.delete(simJobs).where(eq(simJobs.id, progressiveJobId));
+      }
       await db
         .delete(syncSweepPromises)
-        .where(inArray(syncSweepPromises.id, [stalePromiseId, livePromiseId]));
+        .where(
+          inArray(syncSweepPromises.id, [
+            stalePromiseId,
+            livePromiseId,
+            progressivePromiseId,
+          ]),
+        );
       await db
         .delete(registeredRemoteSolvers)
         .where(eq(registeredRemoteSolvers.id, solverId));
