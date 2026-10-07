@@ -124,6 +124,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       JOIN candidate_campaigns candidate ON candidate.id = campaign.id
       WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
         SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
+        LEFT JOIN progressive_stage_evidence_targets evidence_target ON evidence_target.target_id = work.target_id
         WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
           AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
           AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
