@@ -188,6 +188,15 @@ function remotePromiseRenewalConcurrency(
   return Math.min(parsed, REMOTE_PROMISE_RENEWAL_MAX_CONCURRENCY);
 }
 
+function remoteAdmissionsPerTick(
+  raw = process.env.SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK,
+): number {
+  if (raw == null || raw.trim() === "") return 16;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return 16;
+  return Math.min(parsed, 32);
+}
+
 export function brokeredEvidenceIdempotencyKey(
   promiseId: string,
   resultAttemptId: string,
@@ -7540,9 +7549,9 @@ export async function admitRemoteSolverTick(
     // A node cap is a weighted token budget, not a singleton-job switch. One
     // polar remains serial internally (the promise composer guards that
     // promise), while independent promises fill every available token.
-    const MAX_ADMISSIONS_PER_TICK = 16;
+    const maxAdmissionsPerTick = remoteAdmissionsPerTick();
     const MAX_ASSIGNMENT_INSPECTIONS_PER_TICK = Math.max(
-      MAX_ADMISSIONS_PER_TICK,
+      maxAdmissionsPerTick,
       Math.min(remoteCap, 96),
     );
     let admitted = false;
@@ -7556,7 +7565,7 @@ export async function admitRemoteSolverTick(
       attempt++
     ) {
       if ((await remoteReservedCpuSlots(db, settings)) >= remoteCap) break;
-      if (submittedCount >= MAX_ADMISSIONS_PER_TICK) break;
+      if (submittedCount >= maxAdmissionsPerTick) break;
       if (engineBackoffActive()) {
         await setStatus(
           db,
