@@ -383,9 +383,17 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       proof: retained.report.stopProof!,
     });
     let recoveryWarning: string | null = null;
-    let promotions: ProgressiveRansPromotion[] = [];
     try {
-      promotions = await recoveryPromotions(connection, envelope, retained);
+      const promotions = await recoveryPromotions(
+        connection,
+        envelope,
+        retained,
+      );
+      await recordProgressiveCfdRecoveryPlans(
+        connection,
+        executionId,
+        promotions,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (
@@ -396,11 +404,6 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         throw error;
       recoveryWarning = message;
     }
-    await recordProgressiveCfdRecoveryPlans(
-      connection,
-      executionId,
-      promotions,
-    );
     const status = retained.report.status;
     await connection.execute(sql`UPDATE sim_jobs SET status = CASE WHEN status = 'cancelled' THEN status
         ELSE ${status.state === "completed" ? "done" : status.state === "cancelled" ? "cancelled" : "failed"}::sim_job_status END,
