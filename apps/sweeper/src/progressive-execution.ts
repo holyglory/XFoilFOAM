@@ -1,5 +1,10 @@
 import { eq, sql } from "drizzle-orm";
 import {
+  EngineError,
+  type EngineExecutionStopProof,
+  type EngineClient,
+} from "@aerodb/engine-client";
+import {
   acknowledgeProgressiveCfdExecutionStop,
   assertProgressiveExecutionIdentity,
   settleProgressiveCfdExecution,
@@ -7,7 +12,6 @@ import {
   solverLocalExecutionSql,
   type DB,
 } from "@aerodb/db";
-import type { EngineClient } from "@aerodb/engine-client";
 import {
   expectedEngineForJob,
   expectedExecutionPoolForJob,
@@ -112,10 +116,36 @@ export async function reconcileProgressiveExecutions(
             );
           receipt.stopRequests += 1;
         }
-        const proof = await engine.getExecutionStopProof(
-          job.engineJobId,
-          route,
-        );
+        let proof: EngineExecutionStopProof;
+        try {
+          proof = await engine.getExecutionStopProof(job.engineJobId, route);
+        } catch (error) {
+          if (!(error instanceof EngineError && error.status === 404))
+            throw error;
+          const [unstarted] = await db.execute(sql`
+            SELECT NOT EXISTS (SELECT 1 FROM result_attempts
+              WHERE sim_job_id = ${jobId}::uuid)
+              AND NOT EXISTS (SELECT 1
+                FROM progressive_cfd_runtime_progress runtime
+                JOIN progressive_cfd_attempts attempt
+                  ON attempt.token = runtime.attempt_token
+                WHERE attempt.sim_job_id = ${jobId}::uuid
+                  AND runtime.active_seconds > 0) AS value
+          `);
+          if (unstarted?.value !== true) throw error;
+          proof = {
+            version: 1,
+            job_id: job.engineJobId,
+            execution_stopped: true,
+            producer_stopped: true,
+            namespace_verified: true,
+            remaining: [],
+            observed_at: new Date().toISOString(),
+            error: null,
+            fence: "cancel_marker",
+            ownership_basis: "never_started_cancellation_fence",
+          };
+        }
         if (proof.job_id !== job.engineJobId)
           throw new Error("Execution-stop proof belongs to another engine job");
         if (!proof.execution_stopped) {
@@ -138,6 +168,24 @@ export async function reconcileProgressiveExecutions(
           { simJobId: jobId, proof },
         );
         if (!acknowledgement.replayed) receipt.acknowledged += 1;
+      }
+      if (job.status === "cancelled" && job.engineState === "cancelled") {
+        const [finished] = await db.execute(sql`
+          UPDATE sim_jobs SET "ingestedAt" = coalesce("ingestedAt", clock_timestamp()),
+            "finishedAt" = coalesce("finishedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
+          WHERE id = ${jobId}::uuid AND status = 'cancelled'
+            AND (ingest_lease_expires_at IS NULL OR ingest_lease_expires_at <= clock_timestamp())
+          RETURNING id
+        `);
+        if (finished) {
+          const settled = await settleProgressiveCfdExecution(db, jobId);
+          receipt.complete += settled.complete;
+          receipt.retry += settled.retry;
+          receipt.gaps += settled.gaps;
+          receipt.cancelled += settled.cancelled;
+          receipt.waiting += settled.waiting;
+          continue;
+        }
       }
       const settled = await settleProgressiveCfdExecution(db, jobId);
       for (const key of [
