@@ -1,10 +1,24 @@
 import type { DB, Sql } from "@aerodb/db";
+import { sql } from "drizzle-orm";
 import { acknowledgeProgressiveRemoteStops } from "./progressive-remote-stop-receipt";
 import { reconcileProgressiveRemoteProgress } from "./progressive-remote-progress";
 import { runNotificationDrain } from "./notification-drain";
 import { prepareProgressiveRemoteFleet } from "./progressive-remote-admission";
 import { advanceProgressiveCfdStages } from "@aerodb/db";
-import { sql } from "drizzle-orm";
+
+async function adaptiveWorkPending(db: DB): Promise<boolean> {
+  const [row] = await db.execute(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+      WHERE generation.status = 'active' AND work.stage = 2
+        AND unit.purpose = 'adaptive' AND unit.state = 'pending'
+    ) AS pending
+  `);
+  return row?.pending === true;
+}
 
 export async function runProgressiveHubProgressService(
   db: DB,
@@ -24,7 +38,9 @@ export async function runProgressiveHubProgressService(
         )) as unknown as Array<{ remote_solver_enabled: boolean }>;
         const stages = role?.remote_solver_enabled
           ? { admitted: 0, closed: 0, waiting: 0, campaignsCompleted: 0 }
-          : await advanceProgressiveCfdStages(db);
+          : (await adaptiveWorkPending(db))
+            ? { admitted: 0, closed: 0, waiting: 1, campaignsCompleted: 0 }
+            : await advanceProgressiveCfdStages(db);
         const admission = signal.aborted
           ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
           : await prepareProgressiveRemoteFleet(db);
