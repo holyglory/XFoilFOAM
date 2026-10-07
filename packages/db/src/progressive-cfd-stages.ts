@@ -92,6 +92,8 @@ export async function advanceProgressiveCfdStages(db: DB) {
             ON scope.generation_id = generation.id
           JOIN progressive_work work
             ON work.generation_id = generation.id AND work.target_id = scope.target_id
+          LEFT JOIN progressive_stage_evidence_targets evidence_target
+            ON evidence_target.target_id = work.target_id
           WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
             AND generation.plan_revision_id = campaign.current_plan_revision_id
             AND generation.status = 'active'
