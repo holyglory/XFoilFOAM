@@ -199,18 +199,26 @@ export async function claimProgressivePolarFit(
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const [work] = await connection.execute(sql`
-      ${input.requireCfdEvidence || input.currentCampaignEvidenceOnly ? sql`WITH evidence_targets AS MATERIALIZED (
+      ${
+        input.requireCfdEvidence || input.currentCampaignEvidenceOnly
+          ? sql`WITH evidence_targets AS MATERIALIZED (
         SELECT DISTINCT source_work.target_id FROM progressive_cfd_evidence receipt
         JOIN progressive_cfd_attempts attempt ON attempt.token=receipt.attempt_token
         JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
         JOIN progressive_work source_work ON source_work.id=unit.work_id
         JOIN progressive_generations generation ON generation.id=source_work.generation_id
-        ${input.currentCampaignEvidenceOnly ? sql`JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
+        ${
+          input.currentCampaignEvidenceOnly
+            ? sql`JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
           AND campaign.current_plan_revision_id=generation.plan_revision_id
-          AND campaign.status IN ('active','attention','paused','completed')` : sql``}
+          AND campaign.status IN ('active','attention','paused','completed')`
+            : sql``
+        }
         WHERE generation.epoch_id=${epoch.id}
           ${input.currentCampaignEvidenceOnly ? sql`AND generation.status<>'cancelled'` : sql``}
-      )` : sql``}
+      )`
+          : sql``
+      }
       SELECT work.prediction_id, work.source_version, work.attempts FROM progressive_polar_fit_work work
       JOIN neuralfoil_predictions prediction ON prediction.id = work.prediction_id
       ${input.requireCfdEvidence || input.currentCampaignEvidenceOnly ? sql`JOIN evidence_targets ON evidence_targets.target_id=prediction.target_id` : sql``}
@@ -221,7 +229,9 @@ export async function claimProgressivePolarFit(
         AND ${input.predictionId ? sql`prediction.id = ${input.predictionId}` : sql`true`}
         AND EXISTS (SELECT 1 FROM progressive_generation_targets scope JOIN progressive_generations generation ON generation.id = scope.generation_id
           WHERE scope.target_id = prediction.target_id AND generation.epoch_id = prediction.epoch_id)
-        AND (work.state = 'pending' OR (work.state = 'leased' AND work.lease_until <= clock_timestamp()))
+        AND (work.state = 'pending'
+          OR (work.state = 'leased' AND work.lease_until <= clock_timestamp())
+          OR (work.state = 'ready' AND work.model_id IS NULL))
       ORDER BY work.updated_at, work.prediction_id LIMIT 1 FOR UPDATE OF work SKIP LOCKED
     `);
     if (!work) return null;
@@ -421,8 +431,8 @@ function validateFitOutput(
       (request.policy.lineage_conflict_probability != null
         ? "progressive-polar-gp-v4"
         : request.policy.uncertified_fast_bias_std == null
-        ? "progressive-polar-gp-v2"
-        : "progressive-polar-gp-v3") ||
+          ? "progressive-polar-gp-v2"
+          : "progressive-polar-gp-v3") ||
     estimate.kind !== "estimate" ||
     estimate.target_signature !== request.prior.target_signature ||
     estimate.branch !== request.prior.branch ||
