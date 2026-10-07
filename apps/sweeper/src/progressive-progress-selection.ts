@@ -53,7 +53,25 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
             WHERE attempt.sim_job_id = job.id AND attempt.outcome = 'running'))
         OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-          WHERE dispatch.sim_job_id = job.id AND promise.status = 'active')))
+          WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'))
+        OR (job.status IN ('done', 'failed', 'cancelled')
+          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = job.id)
+          AND EXISTS (SELECT 1
+            FROM results result
+            JOIN result_attempts raw ON raw.result_id = result.id
+            JOIN result_classifications classification
+              ON classification.result_attempt_id = raw.id
+            WHERE raw.sim_job_id = job.id
+              AND raw.status = 'done'
+              AND raw.valid_for_polar
+              AND classification.state = 'accepted'
+              AND result.current_result_attempt_id IS NULL
+              AND coalesce((SELECT review.verdict::text
+                FROM result_review_verdicts review
+                WHERE review.result_id = result.id AND review."revokedAt" IS NULL
+                ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '')
+                NOT IN ('exclude', 'defer'))))
     ORDER BY coalesce(cohort_priority.priority, 1),
       CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
       CASE WHEN job.status = 'ingesting'

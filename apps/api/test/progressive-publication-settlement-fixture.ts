@@ -71,4 +71,29 @@ export async function verifyProgressivePublicationPrecedence(
       }),
     ).rejects.toBe(rollback);
   }
+  const rollback = new Error("Rollback ingested pointer repair");
+  await expect(
+    db.transaction(async (raw) => {
+      const connection = raw as unknown as DB;
+      await connection.execute(sql`UPDATE results
+        SET current_result_attempt_id = NULL
+        WHERE id = ${attempt.resultId}::uuid`);
+      await connection.execute(sql`UPDATE sim_jobs
+        SET status = 'done', engine_state = 'completed',
+          "ingestedAt" = clock_timestamp(), "finishedAt" = clock_timestamp()
+        WHERE id = ${executionId}::uuid`);
+      await connection.execute(sql`UPDATE sync_sweep_promises
+        SET status = 'expired'
+        WHERE id = (SELECT promise_id FROM progressive_remote_dispatches
+          WHERE sim_job_id = ${executionId}::uuid)`);
+      expect(
+        await settleProgressiveRemoteJob(connection, executionId),
+      ).toMatchObject({ kind: "settled" });
+      const [selected] = await connection.execute(
+        sql`SELECT current_result_attempt_id FROM results WHERE id = ${attempt.resultId}::uuid`,
+      );
+      expect(selected.current_result_attempt_id).toBe(resultAttemptId);
+      throw rollback;
+    }),
+  ).rejects.toBe(rollback);
 }

@@ -92,7 +92,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_settlement_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['fulfilled','active','unapplied','unindexed','executing','not-dispatched',
-        'stopped-running','stopped-terminal','done-active','done-closed']) variant
+        'stopped-running','stopped-terminal','done-active','done-closed','done-closed-pointer-gap']) variant
       UNION ALL SELECT md5('expired-'||ordinal)::uuid,'expired-'||ordinal FROM generate_series(1,160) ordinal
       UNION ALL SELECT md5('report-unapplied-'||ordinal)::uuid,'report-unapplied-'||ordinal FROM generate_series(1,24) ordinal
       UNION ALL SELECT md5('report-unindexed-'||ordinal)::uuid,'report-unindexed-'||ordinal FROM generate_series(1,24) ordinal`);
@@ -101,16 +101,30 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT id,md5('campaign')::uuid AS campaign_id,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running'
-          WHEN variant IN ('stopped-terminal','done-active','done-closed') THEN 'done' ELSE 'ingesting' END AS status,
+          WHEN variant IN ('stopped-terminal','done-active','done-closed','done-closed-pointer-gap') THEN 'done' ELSE 'ingesting' END AS status,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running' ELSE 'completed' END AS engine_state,
         clock_timestamp()-interval '2 days' AS "updatedAt",
         CASE WHEN variant<>'report-unapplied-1' THEN clock_timestamp()-CASE WHEN variant='fulfilled' THEN interval '1 day' ELSE interval '1 hour' END END AS "polledAt"
       FROM fixture_settlement_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE results ON COMMIT DROP AS
+      SELECT md5('result-'||variant)::uuid AS id,NULL::uuid AS current_result_attempt_id
+      FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
+      SELECT md5('attempt-'||variant)::uuid AS id,md5('result-'||variant)::uuid AS result_id,
+        id AS sim_job_id,'done'::text AS status,true AS valid_for_polar
+      FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_classifications ON COMMIT DROP AS
+      SELECT md5('attempt-'||variant)::uuid AS result_attempt_id,'accepted'::text AS state
+      FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_review_verdicts (
+      id uuid, result_id uuid, verdict text, "revokedAt" timestamptz, "createdAt" timestamptz
+    ) ON COMMIT DROP`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
       SELECT id AS sim_job_id,id AS promise_id FROM fixture_settlement_jobs WHERE variant<>'not-dispatched'`);
     await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
       SELECT id,CASE WHEN variant LIKE 'expired-%' THEN 'expired'
-        WHEN variant IN ('fulfilled','stopped-terminal','done-closed') THEN 'fulfilled' ELSE 'active' END AS status
+        WHEN variant IN ('fulfilled','stopped-terminal','done-closed') THEN 'fulfilled'
+        WHEN variant='done-closed-pointer-gap' THEN 'expired' ELSE 'active' END AS status
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
       SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs`);
@@ -144,7 +158,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
         'high'
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
-      SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal')`);
+      SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal','done-closed-pointer-gap')`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
       SELECT id,CASE WHEN variant='stopped-terminal' THEN 'complete' ELSE 'running' END,id FROM fixture_settlement_jobs
       WHERE variant IN ('executing','stopped-running','stopped-terminal')`);
@@ -165,9 +179,9 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
             ON member.generation_id = work.generation_id AND member.target_id = work.target_id
           WHERE attempt.sim_job_id = job.id
         ) cohort_priority ON true
-        WHERE fixture.variant IN ('fulfilled','active','stopped-running','done-active') OR fixture.variant LIKE 'expired-%'
+        WHERE fixture.variant IN ('fulfilled','active','stopped-running','done-active','done-closed-pointer-gap') OR fixture.variant LIKE 'expired-%'
         ORDER BY coalesce(cohort_priority.priority, 1),
-          CASE WHEN fixture.variant IN ('stopped-running','done-active') THEN 1 ELSE 0 END,
+          CASE WHEN fixture.variant IN ('stopped-running','done-active','done-closed-pointer-gap') THEN 1 ELSE 0 END,
           coalesce(job."polledAt",job."updatedAt"),job.id`);
     const jobStates = await transaction.execute(
       sql`SELECT id,status,engine_state FROM sim_jobs ORDER BY id`,
@@ -178,7 +192,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const allReports = await expectedReports();
     const allSettlements = await expectedSettlements();
     expect(allReports).toHaveLength(50);
-    expect(allSettlements).toHaveLength(164);
+    expect(allSettlements).toHaveLength(165);
     const reports = await transaction.execute(progressiveReportJobsSql());
     expect(reports).toHaveLength(32);
     expect(reports).toEqual(allReports.slice(0, 32));
@@ -198,7 +212,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const explicitRows =
       await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
       WHERE variant IN ('fulfilled','unapplied','unindexed','executing','not-dispatched',
-        'stopped-running','stopped-terminal','done-active','done-closed') ORDER BY id`);
+        'stopped-running','stopped-terminal','done-active','done-closed','done-closed-pointer-gap') ORDER BY id`);
     const explicitIds = explicitRows.map((row) => String(row.id));
     for (const [selector, eligible] of [
       [progressiveReportJobsSql, allReports],

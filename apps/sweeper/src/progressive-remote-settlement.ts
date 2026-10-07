@@ -22,7 +22,8 @@ async function settleInactiveUndeliveredExecution(
   executionId: string,
   promiseId: string,
 ) {
-  const [promise] = await db.execute(sql`SELECT status, response_payload FROM sync_sweep_promises
+  const [promise] =
+    await db.execute(sql`SELECT status, response_payload FROM sync_sweep_promises
     WHERE id = ${promiseId}::uuid FOR UPDATE`);
   const authoritativeLeaseLoss =
     (promise?.response_payload as Record<string, unknown> | null | undefined)
@@ -38,9 +39,11 @@ async function settleInactiveUndeliveredExecution(
     ["completed", "failed", "cancelled"].includes(String(job?.engine_state));
   if (
     !promise ||
-    promise.status !== "cancelled" &&
-      !(promise.status === "expired" &&
-        (authoritativeLeaseLoss || terminalExpiredPromise))
+    (promise.status !== "cancelled" &&
+      !(
+        promise.status === "expired" &&
+        (authoritativeLeaseLoss || terminalExpiredPromise)
+      ))
   )
     return null;
   if (!stopped) return null;
@@ -92,6 +95,70 @@ async function settleInactiveUndeliveredExecution(
     evidencePending: true,
   };
 }
+
+async function publishAcceptedProgressiveAttempts(
+  db: DB,
+  executionId: string,
+  attemptIds?: readonly string[],
+) {
+  const attemptScope = attemptIds
+    ? sql`raw.id IN (${sql.join(
+        attemptIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )})`
+    : sql`raw.sim_job_id = ${executionId}::uuid`;
+  return db.execute(sql`
+    WITH candidates AS (
+      SELECT DISTINCT ON (raw.result_id) raw.id AS attempt_id
+      FROM result_attempts raw
+      JOIN result_classifications classification
+        ON classification.result_attempt_id = raw.id
+      JOIN results result ON result.id = raw.result_id
+      WHERE raw.sim_job_id = ${executionId}::uuid
+        AND ${attemptScope}
+        AND raw.status = 'done'
+        AND raw.valid_for_polar
+        AND classification.state = 'accepted'
+        AND result.current_result_attempt_id IS NULL
+        AND coalesce((SELECT review.verdict::text
+          FROM result_review_verdicts review
+          WHERE review.result_id = result.id AND review."revokedAt" IS NULL
+          ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '')
+          NOT IN ('exclude', 'defer')
+      ORDER BY raw.result_id,
+        CASE
+          WHEN raw.evidence_payload->>'fidelity' = 'urans_full' THEN 230
+          WHEN raw.evidence_payload->>'fidelity' = 'urans_precalc'
+            OR raw.regime = 'urans' THEN 220
+          ELSE 210
+        END DESC,
+        raw."solvedAt" DESC NULLS LAST,
+        raw.id
+    )
+    UPDATE results result SET current_result_attempt_id = raw.id,
+      status = raw.status, source = raw.source, regime = raw.regime,
+      method_key = raw.method_key, solver_implementation_id = raw.solver_implementation_id,
+      solver_runtime_build_id = raw.solver_runtime_build_id, cl = raw.cl, cd = raw.cd,
+      cm = raw.cm, cl_cd = raw.cl_cd, cl_std = raw.cl_std, cd_std = raw.cd_std,
+      cm_std = raw.cm_std, stalled = raw.stalled, unsteady = raw.unsteady,
+      converged = raw.converged, final_residual = raw.final_residual,
+      iterations = raw.iterations, y_plus_avg = raw.y_plus_avg, y_plus_max = raw.y_plus_max,
+      n_cells = raw.n_cells, first_order_fallback = raw.first_order_fallback,
+      strouhal = raw.strouhal, error = raw.error, quality_warnings = raw.quality_warnings,
+      frame_track = coalesce(raw.evidence_payload->'frame_track', raw.evidence_payload->'frameTrack'),
+      fidelity = raw.evidence_payload->>'fidelity',
+      steady_history = coalesce(raw.evidence_payload->'steady_history', raw.evidence_payload->'steadyHistory'),
+      engine_job_id = raw.engine_job_id, engine_case_slug = raw.engine_case_slug,
+      sim_job_id = raw.sim_job_id, "solvedAt" = raw."solvedAt", priority = 0,
+      "updatedAt" = clock_timestamp()
+    FROM candidates candidate
+    JOIN result_attempts raw ON raw.id = candidate.attempt_id
+    WHERE result.id = raw.result_id
+      AND result.current_result_attempt_id IS NULL
+    RETURNING result.id
+  `);
+}
+
 import { validateRansPrecalcPromotionSignal } from "./ingest";
 
 type RetainedExecution = Extract<
@@ -209,6 +276,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     );
     if (!stop) return { kind: "waiting" as const, reason: "physical_stop" };
     if (job.ingestedAt) {
+      await publishAcceptedProgressiveAttempts(connection, executionId);
       await retireSettledProgressivePromise(connection, executionId);
       return {
         kind: "settled" as const,
@@ -269,34 +337,6 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       )
       .map((source) => source.resultAttemptId);
     if (finalAttemptIds.length) {
-      await connection.execute(sql`
-        UPDATE results result SET current_result_attempt_id = raw.id,
-          status = raw.status, source = raw.source, regime = raw.regime,
-          method_key = raw.method_key, solver_implementation_id = raw.solver_implementation_id,
-          solver_runtime_build_id = raw.solver_runtime_build_id, cl = raw.cl, cd = raw.cd,
-          cm = raw.cm, cl_cd = raw.cl_cd, cl_std = raw.cl_std, cd_std = raw.cd_std,
-          cm_std = raw.cm_std, stalled = raw.stalled, unsteady = raw.unsteady,
-          converged = raw.converged, final_residual = raw.final_residual,
-          iterations = raw.iterations, y_plus_avg = raw.y_plus_avg, y_plus_max = raw.y_plus_max,
-          n_cells = raw.n_cells, first_order_fallback = raw.first_order_fallback,
-          strouhal = raw.strouhal, error = raw.error, quality_warnings = raw.quality_warnings,
-          frame_track = coalesce(raw.evidence_payload->'frame_track', raw.evidence_payload->'frameTrack'),
-          fidelity = coalesce(raw.evidence_payload->>'fidelity', raw.evidence_payload->>'fidelity'),
-          steady_history = coalesce(raw.evidence_payload->'steady_history', raw.evidence_payload->'steadyHistory'),
-          engine_job_id = raw.engine_job_id, engine_case_slug = raw.engine_case_slug,
-          sim_job_id = raw.sim_job_id, "solvedAt" = raw."solvedAt", priority = 0,
-          "updatedAt" = clock_timestamp()
-        FROM result_attempts raw
-        JOIN result_classifications classification ON classification.result_attempt_id = raw.id
-        WHERE raw.id IN (${sql.join(
-          finalAttemptIds.map((id) => sql`${id}::uuid`),
-          sql`, `,
-        )})
-          AND raw.result_id = result.id
-          AND raw.status = 'done' AND raw.valid_for_polar
-          AND classification.state = 'accepted'
-          AND result.current_result_attempt_id IS NULL
-      `);
       const unpublished =
         await connection.execute(sql`SELECT raw.id, raw.regime, raw.evidence_payload->>'fidelity' AS fidelity,
           selected.regime AS selected_regime, selected.evidence_payload->>'fidelity' AS selected_fidelity,
@@ -339,17 +379,31 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       simJobId: executionId,
       proof: retained.report.stopProof!,
     });
+    let recoveryWarning: string | null = null;
+    let promotions: ProgressiveRansPromotion[] = [];
+    try {
+      promotions = await recoveryPromotions(connection, envelope, retained);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        !message.includes(
+          "Numerical recovery changed the exact original RANS promotion scope",
+        )
+      )
+        throw error;
+      recoveryWarning = message;
+    }
     await recordProgressiveCfdRecoveryPlans(
       connection,
       executionId,
-      await recoveryPromotions(connection, envelope, retained),
+      promotions,
     );
     const status = retained.report.status;
     await connection.execute(sql`UPDATE sim_jobs SET status = CASE WHEN status = 'cancelled' THEN status
         ELSE ${status.state === "completed" ? "done" : status.state === "cancelled" ? "cancelled" : "failed"}::sim_job_status END,
       engine_state = ${status.state}, completed_cases = ${status.completed_cases}, total_cases = ${status.total_cases},
       "ingestedAt" = clock_timestamp(), "finishedAt" = clock_timestamp(), "updatedAt" = clock_timestamp(),
-      error = ${status.state === "completed" ? null : (status.message ?? "Remote execution stopped")},
+      error = ${recoveryWarning ?? (status.state === "completed" ? null : (status.message ?? "Remote execution stopped"))},
       ingest_lease_token = NULL, ingest_lease_claimed_at = NULL, ingest_lease_expires_at = NULL
       WHERE id = ${executionId}::uuid`);
     await releaseResultClaimsForJob(connection, executionId, [
