@@ -142,10 +142,10 @@ export async function runProgressiveBaselineService(
             JOIN progressive_generations generation ON generation.id = work.generation_id
             JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
             WHERE generation.status = 'active' AND work.stage = 2
-              AND unit.purpose = 'adaptive' AND unit.state = 'pending'
-          ) AS pending
+              AND unit.purpose = 'adaptive' AND unit.state NOT IN ('complete', 'gap', 'cancelled')
+          ) AS active
         `);
-        const stages = adaptive?.pending
+        const stages = adaptive?.active
           ? { admitted: 0, closed: 0, waiting: 1, campaignsCompleted: 0 }
           : await advanceProgressiveCfdStages(db);
         if (stages.admitted || stages.closed || stages.campaignsCompleted) {

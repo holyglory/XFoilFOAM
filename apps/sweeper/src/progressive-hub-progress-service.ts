@@ -6,7 +6,7 @@ import { runNotificationDrain } from "./notification-drain";
 import { prepareProgressiveRemoteFleet } from "./progressive-remote-admission";
 import { advanceProgressiveCfdStages } from "@aerodb/db";
 
-async function adaptiveWorkPending(db: DB): Promise<boolean> {
+async function adaptiveWorkActive(db: DB): Promise<boolean> {
   const [row] = await db.execute(sql`
     SELECT EXISTS (
       SELECT 1 FROM progressive_cfd_units unit
@@ -14,10 +14,10 @@ async function adaptiveWorkPending(db: DB): Promise<boolean> {
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
       WHERE generation.status = 'active' AND work.stage = 2
-        AND unit.purpose = 'adaptive' AND unit.state = 'pending'
-    ) AS pending
+        AND unit.purpose = 'adaptive' AND unit.state NOT IN ('complete', 'gap', 'cancelled')
+    ) AS active
   `);
-  return row?.pending === true;
+  return row?.active === true;
 }
 
 export async function runProgressiveHubProgressService(
@@ -38,7 +38,7 @@ export async function runProgressiveHubProgressService(
         )) as unknown as Array<{ remote_solver_enabled: boolean }>;
         const stages = role?.remote_solver_enabled
           ? { admitted: 0, closed: 0, waiting: 0, campaignsCompleted: 0 }
-          : (await adaptiveWorkPending(db))
+          : (await adaptiveWorkActive(db))
             ? { admitted: 0, closed: 0, waiting: 1, campaignsCompleted: 0 }
             : await advanceProgressiveCfdStages(db);
         const admission = signal.aborted

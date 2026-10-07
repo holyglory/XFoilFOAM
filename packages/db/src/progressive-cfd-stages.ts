@@ -40,19 +40,12 @@ async function finishCampaigns(db: DB, epochId: string): Promise<number> {
 }
 
 export async function advanceProgressiveCfdStages(db: DB) {
-  const hasEvidence = sql`EXISTS (
-    SELECT 1 FROM progressive_cfd_evidence evidence JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
-    JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
-    JOIN progressive_work source_work ON source_work.id = source_unit.work_id
-    JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
-    WHERE source_work.target_id = work.target_id AND source_generation.epoch_id = generation.epoch_id
-  )`;
+  const hasEvidence = sql`evidence_target.target_id IS NOT NULL`;
   const ready = sql`
     NOT EXISTS (
-      SELECT 1 FROM progressive_cfd_units unit JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
-      LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
-      WHERE unit.work_id = work.id AND (attempt.outcome = 'running'
-        OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL))
+      SELECT 1 FROM progressive_cfd_units unit
+      JOIN progressive_stage_unsettled_units unsettled ON unsettled.unit_id = unit.id
+      WHERE unit.work_id = work.id
     ) AND (work.stage = 3 OR (
       ${progressiveInitialCoverageCompleteSql()} AND NOT EXISTS (
         SELECT 1 FROM progressive_work baseline JOIN progressive_prediction_links link ON link.work_id = baseline.id
@@ -75,8 +68,58 @@ export async function advanceProgressiveCfdStages(db: DB) {
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const [campaign] = await connection.execute(sql`
-      WITH ${progressiveCohortReadinessSql(String(epoch.id))}
+      WITH progressive_stage_unsettled_units AS MATERIALIZED (
+        SELECT DISTINCT attempt.unit_id
+        FROM progressive_cfd_attempts attempt
+        LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
+        WHERE attempt.outcome = 'running'
+          OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL)
+      ), progressive_stage_evidence_targets AS MATERIALIZED (
+        SELECT DISTINCT source_work.target_id
+        FROM progressive_cfd_evidence evidence
+        JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
+        JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
+        JOIN progressive_work source_work ON source_work.id = source_unit.work_id
+        JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
+        WHERE source_generation.epoch_id = ${epoch.id}
+      ), candidate_campaigns AS MATERIALIZED (
+        SELECT campaign.id, campaign.priority, campaign."createdAt"
+        FROM sim_campaigns campaign
+        WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
+          SELECT 1
+          FROM progressive_generations generation
+          JOIN progressive_generation_targets scope
+            ON scope.generation_id = generation.id
+          JOIN progressive_work work
+            ON work.generation_id = generation.id AND work.target_id = scope.target_id
+          WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
+            AND generation.plan_revision_id = campaign.current_plan_revision_id
+            AND generation.status = 'active'
+            AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()}
+            AND work.state = 'pending'
+            AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM progressive_cfd_units unit
+              WHERE unit.work_id = work.id AND unit.state NOT IN ('complete', 'gap')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM progressive_cfd_units unit
+              JOIN progressive_stage_unsettled_units unsettled ON unsettled.unit_id = unit.id
+              WHERE unit.work_id = work.id
+            )
+        )
+        ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id
+        LIMIT 16
+      ), ${progressiveCohortReadinessSql(
+        String(epoch.id),
+        sql`EXISTS (
+          SELECT 1 FROM candidate_campaigns candidate
+          WHERE candidate.id = generation.campaign_id
+        )`,
+        false,
+      )}
       SELECT campaign.id FROM sim_campaigns campaign
+      JOIN candidate_campaigns candidate ON candidate.id = campaign.id
       WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
         SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
         WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
@@ -95,7 +138,25 @@ export async function advanceProgressiveCfdStages(db: DB) {
       return receipt;
     }
     const scopes = await connection.execute(sql`
-      WITH ${progressiveCohortReadinessSql(String(epoch.id))}
+      WITH progressive_stage_unsettled_units AS MATERIALIZED (
+        SELECT DISTINCT attempt.unit_id
+        FROM progressive_cfd_attempts attempt
+        LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
+        WHERE attempt.outcome = 'running'
+          OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL)
+      ), progressive_stage_evidence_targets AS MATERIALIZED (
+        SELECT DISTINCT source_work.target_id
+        FROM progressive_cfd_evidence evidence
+        JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
+        JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
+        JOIN progressive_work source_work ON source_work.id = source_unit.work_id
+        JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
+        WHERE source_generation.epoch_id = ${epoch.id}
+      ), ${progressiveCohortReadinessSql(
+        String(epoch.id),
+        sql`generation.campaign_id = ${campaign.id}`,
+        false,
+      )}
       SELECT work.id, work.generation_id, work.target_id, work.stage, scope.angles,
         ${hasEvidence} AS has_cfd_evidence,
         EXISTS (
@@ -117,6 +178,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       LEFT JOIN progressive_polar_geometry_verifications verification ON verification.model_id = fit.model_id
         AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION} AND verification.source_geometry_compatible
       LEFT JOIN progressive_polar_models model ON model.id = verification.model_id AND fit.state = 'ready'
+      LEFT JOIN progressive_stage_evidence_targets evidence_target ON evidence_target.target_id = work.target_id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'

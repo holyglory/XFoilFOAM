@@ -59,16 +59,22 @@ function progressiveCohortReadySql(field: "initialized" | "initial_coverage_comp
         WHERE member.generation_id = generation.id AND member.target_id = work.target_id AND member.cohort = readiness.cohort)))`;
 }
 
-export function progressiveCohortReadinessSql(epochId: string) {
+export function progressiveCohortReadinessSql(
+  epochId: string,
+  generationFilter: SQL = sql`TRUE`,
+  includeInitialized = true,
+) {
   return sql`progressive_cohort_readiness AS MATERIALIZED (
     SELECT generation.id AS generation_id, active.cohort, active.stage,
-      NOT EXISTS (
+      ${includeInitialized
+        ? sql`NOT EXISTS (
         SELECT 1 FROM progressive_work sibling
         LEFT JOIN progressive_generation_cohort_targets member ON member.generation_id = sibling.generation_id AND member.target_id = sibling.target_id
         WHERE sibling.generation_id = generation.id AND sibling.stage = active.stage
           AND (active.cohort IS NULL OR member.cohort = active.cohort) AND sibling.state = 'pending'
           AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units initialized WHERE initialized.work_id = sibling.id)
-      ) AS initialized,
+      ) AS initialized,`
+        : sql``}
       NOT EXISTS (
         SELECT 1 FROM progressive_work sibling
         LEFT JOIN progressive_generation_cohort_targets member ON member.generation_id = sibling.generation_id AND member.target_id = sibling.target_id
@@ -87,6 +93,7 @@ export function progressiveCohortReadinessSql(epochId: string) {
     ) active
     WHERE generation.epoch_id = ${epochId}::uuid AND generation.status = 'active'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
+      AND ${generationFilter}
   )`;
 }
 
