@@ -347,11 +347,11 @@ export async function advanceProgressiveCfdStages(db: DB) {
         `);
         receipt.admitted += 1;
       } else {
-          const gap =
-            units.some((unit) => unit.state === "gap") ||
-            reason.startsWith("fast_model_unavailable") ||
-            reason === "fast_evidence_uninformative" ||
-            reason === "fast_prior_unavailable_with_gaps";
+        const gap =
+          units.some((unit) => unit.state === "gap") ||
+          reason.startsWith("fast_model_unavailable") ||
+          reason === "fast_evidence_uninformative" ||
+          reason === "fast_prior_unavailable_with_gaps";
         await connection.execute(sql`
           UPDATE progressive_work SET state = ${gap ? "gap" : "complete"}, error = ${gap ? reason : null}, completed_at = clock_timestamp()
           WHERE id = ${scope.id}

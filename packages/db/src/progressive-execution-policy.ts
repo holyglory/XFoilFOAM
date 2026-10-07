@@ -66,15 +66,17 @@ export function progressiveCohortReadinessSql(
 ) {
   return sql`progressive_cohort_readiness AS MATERIALIZED (
     SELECT generation.id AS generation_id, active.cohort, active.stage,
-      ${includeInitialized
-        ? sql`NOT EXISTS (
+      ${
+        includeInitialized
+          ? sql`NOT EXISTS (
         SELECT 1 FROM progressive_work sibling
         LEFT JOIN progressive_generation_cohort_targets member ON member.generation_id = sibling.generation_id AND member.target_id = sibling.target_id
         WHERE sibling.generation_id = generation.id AND sibling.stage = active.stage
           AND (active.cohort IS NULL OR member.cohort = active.cohort) AND sibling.state = 'pending'
           AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units initialized WHERE initialized.work_id = sibling.id)
       ) AS initialized,`
-        : sql``}
+          : sql``
+      }
       NOT EXISTS (
         SELECT 1 FROM progressive_work sibling
         LEFT JOIN progressive_generation_cohort_targets member ON member.generation_id = sibling.generation_id AND member.target_id = sibling.target_id
