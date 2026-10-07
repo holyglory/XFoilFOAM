@@ -52,6 +52,7 @@ const { ensureSimulationPresetRevision } =
   await import("@aerodb/db/simulation-setup");
 const { advisoryLockSql, db, sql } = await import("../src/db");
 const { buildServer } = await import("../src/server");
+const { createProgressiveReportFixture } = await import("./progressive-report-fixture");
 const {
   assertMultipartDiskReserveAvailableBytes,
   expireStaleRemotePromiseLeases,
@@ -70,7 +71,6 @@ const {
   meshProfiles,
   outputProfiles,
   polarFitSets,
-  progressiveRemoteDispatches,
   referenceGeometryProfiles,
   registeredRemoteSolvers,
   remoteAssetReferences,
@@ -1020,18 +1020,21 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
-  it("expires stale remote promises before cap counting but preserves a live job", async () => {
+  it.each(["pending", "running", "ingesting", "done", "failed", "cancelled"] as const)("expires stale remote promises before cap counting but preserves a live job and a %s progressive dispatch", async (progressiveStatus) => {
     const solverId = randomUUID();
+    const solverToken = `${PREFIX}-stale-promise-token`;
     const stalePromiseId = randomUUID();
     const livePromiseId = randomUUID();
     const progressivePromiseId = randomUUID();
     let liveJobId: string | null = null;
-    let progressiveJobId: string | null = null;
+    let progressiveFixture: Awaited<ReturnType<typeof createProgressiveReportFixture>> | null = null;
     await db.insert(registeredRemoteSolvers).values({
       id: solverId,
       instanceId: `${PREFIX}-stale-promise-solver`,
       instanceName: `${PREFIX} stale promise solver`,
-      maxActivePolarPromises: 2,
+      maxActivePolarPromises: 0,
+      authTokenHash: sha256(Buffer.from(solverToken)),
+      credentialVersion: 1,
     });
     try {
       await db.insert(syncSweepPromises).values([
@@ -1048,7 +1051,11 @@ describe("remote solver sync validation regressions", () => {
           expiresAt: new Date(Date.now() + 3_600_000),
           createdAt: new Date(Date.now() - 20 * 60_000),
           lastHeartbeatAt: new Date(Date.now() - 20 * 60_000),
-          requestPayload: { remoteSolver: true },
+          requestPayload: {
+            remoteSolver: true,
+            executionContract: "progressive-cfd-v1",
+            progressiveExecutionId: randomUUID(),
+          },
         },
         {
           id: livePromiseId,
@@ -1061,6 +1068,7 @@ describe("remote solver sync validation regressions", () => {
           simulationPresetRevisionId: revisionId,
           aoaCount: 1,
           expiresAt: new Date(Date.now() + 3_600_000),
+          createdAt: new Date(Date.now() - 20 * 60_000),
           lastHeartbeatAt: new Date(),
           requestPayload: { remoteSolver: true },
         },
@@ -1114,36 +1122,24 @@ describe("remote solver sync validation regressions", () => {
           requestPayload: { syncPromiseId: livePromiseId },
         })
         .returning({ id: simJobs.id });
-      progressiveJobId = randomUUID();
-      const progressiveSignature = "a".repeat(64);
-      const progressiveEnvelope = {
-        version: 1,
+      progressiveFixture = await createProgressiveReportFixture({
         solverId,
         promiseId: progressivePromiseId,
-        contentSignature: progressiveSignature,
-        scope: { executionId: progressiveJobId },
-        request: { execution_id: progressiveJobId },
-      };
-      await db.insert(simJobs).values({
-        id: progressiveJobId,
         airfoilId,
-        bcIds: [legacyBcId],
-        simulationPresetRevisionId: revisionId,
-        referenceChordM: CHORD,
-        engineJobId: progressiveJobId,
-        status: "done",
-        requestPayload: { remoteProgressiveExecution: progressiveEnvelope },
+        revisionId,
+        bcId: legacyBcId,
+        alpha: 733.003,
       });
-      await db.insert(progressiveRemoteDispatches).values({
-        simJobId: progressiveJobId,
-        promiseId: progressivePromiseId,
-        solverId,
-        cpuSlots: 1,
-        contentSignature: progressiveSignature,
-        envelope: progressiveEnvelope,
+      await db.update(simJobs).set({ status: progressiveStatus }).where(eq(simJobs.id, progressiveFixture.executionId));
+      const claim = () => app.inject({
+        method: "POST",
+        url: "/api/sync/v1/sweeps/claim",
+        headers: { "x-xfoilfoam-solver-token": solverToken },
+        payload: { solverId, limit: 1 },
       });
-
-      expect(await expireStaleRemotePromiseLeases(db, solverId)).toBe(1);
+      const claimed = await claim();
+      expect(claimed.statusCode, claimed.body).toBe(200);
+      expect(await expireStaleRemotePromiseLeases(db, solverId)).toBe(0);
       const rows = await db
         .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
         .from(syncSweepPromises)
@@ -1161,11 +1157,6 @@ describe("remote solver sync validation regressions", () => {
       expect(progressive).toEqual([
         { id: progressivePromiseId, status: "active" },
       ]);
-      await db
-        .delete(progressiveRemoteDispatches)
-        .where(eq(progressiveRemoteDispatches.simJobId, progressiveJobId));
-      if (progressiveJobId)
-        await db.delete(simJobs).where(eq(simJobs.id, progressiveJobId));
       expect(rows).toEqual(
         expect.arrayContaining([
           { id: stalePromiseId, status: "expired" },
@@ -1192,14 +1183,17 @@ describe("remote solver sync validation regressions", () => {
           { promiseId: progressivePromiseId, status: "active" },
         ]),
       );
+      await db.update(syncSweepPromises).set({ expiresAt: new Date(Date.now() - 1_000) }).where(eq(syncSweepPromises.id, progressivePromiseId));
+      const expiredClaim = await claim();
+      expect(expiredClaim.statusCode, expiredClaim.body).toBe(200);
+      const expired = await readPromise(progressivePromiseId);
+      expect(expired.promise.status).toBe("expired");
+      expect(expired.promise.expiredAt).not.toBeNull();
+      expect(expired.points).toHaveLength(1);
+      expect(expired.points[0].status).toBe("expired");
     } finally {
       if (liveJobId) await db.delete(simJobs).where(eq(simJobs.id, liveJobId));
-      if (progressiveJobId) {
-        await db
-          .delete(progressiveRemoteDispatches)
-          .where(eq(progressiveRemoteDispatches.simJobId, progressiveJobId));
-        await db.delete(simJobs).where(eq(simJobs.id, progressiveJobId));
-      }
+      await progressiveFixture?.cleanup();
       await db
         .delete(syncSweepPromises)
         .where(
