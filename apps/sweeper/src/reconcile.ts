@@ -179,7 +179,7 @@ const activeJobStatuses: Array<"submitted" | "running" | "ingesting"> = [
 export const DEFAULT_ACTIVE_RECONCILE_JOB_LIMIT = 8;
 export const MAX_ACTIVE_RECONCILE_JOB_LIMIT = 64;
 export const DEFAULT_ACTIVE_RECONCILE_CONCURRENCY = 4;
-const MAX_ACTIVE_RECONCILE_CONCURRENCY = 8;
+const MAX_ACTIVE_RECONCILE_CONCURRENCY = 16;
 
 /** Bound one foreground scheduler pass so partial-result ingestion at high
  * concurrency cannot postpone CPU refill until every active polar has been
