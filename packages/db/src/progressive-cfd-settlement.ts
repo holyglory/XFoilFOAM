@@ -353,6 +353,24 @@ export async function settleProgressiveCfdExecution(
             new Date(String(unit.lease_until)).getTime() <= Date.now()) &&
         ["complete", "failed", "cancelled"].includes(String(unit.outcome));
       const recoverableStoredEvidence = recoveringStoredEvidence;
+      const staleTerminalUnit =
+        unit.latest_attempt === true &&
+        unit.outcome !== "running" &&
+        ((unit.state === "leased" &&
+          unit.lease_token === unit.token &&
+          unit.lease_until != null &&
+          new Date(String(unit.lease_until)).getTime() <= Date.now()) ||
+          (unit.state === "blocked" &&
+            unit.lease_token == null &&
+            unit.lease_until == null));
+      if (staleTerminalUnit) {
+        await connection.execute(sql`UPDATE progressive_cfd_units SET state = 'gap',
+          lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+          error = 'Terminal progressive execution released a stale unit lease'
+          WHERE id = ${unit.id}`);
+        counts.gaps += 1;
+        continue;
+      }
       if (
         unit.outcome !== "running" &&
         !recovering &&

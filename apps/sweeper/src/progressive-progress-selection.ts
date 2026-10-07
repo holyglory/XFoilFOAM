@@ -51,6 +51,20 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
           AND EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
             WHERE attempt.sim_job_id = job.id AND attempt.outcome = 'running'))
+        OR (job.status IN ('done', 'failed', 'cancelled')
+          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = job.id)
+          AND EXISTS (SELECT 1
+            FROM progressive_cfd_attempts attempt
+            JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+            WHERE attempt.sim_job_id = job.id
+              AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer
+                WHERE newer.unit_id = unit.id
+                  AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token))
+              AND ((unit.state = 'leased' AND unit.lease_token = attempt.token
+                AND unit.lease_until <= clock_timestamp())
+                OR (unit.state = 'blocked' AND unit.lease_token IS NULL
+                  AND unit.lease_until IS NULL))))
         OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'))

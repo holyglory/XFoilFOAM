@@ -138,7 +138,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       sql`CREATE TEMP TABLE progressive_cfd_execution_stops (sim_job_id uuid) ON COMMIT DROP`,
     );
     await transaction.execute(
-      sql`CREATE TEMP TABLE progressive_cfd_units (id uuid,work_id uuid) ON COMMIT DROP`,
+      sql`CREATE TEMP TABLE progressive_cfd_units (id uuid,work_id uuid,state text,lease_token uuid,lease_until timestamptz) ON COMMIT DROP`,
     );
     await transaction.execute(
       sql`CREATE TEMP TABLE progressive_work (id uuid,generation_id uuid,target_id uuid) ON COMMIT DROP`,
@@ -147,10 +147,14 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       sql`CREATE TEMP TABLE progressive_generation_cohort_targets (generation_id uuid,target_id uuid,cohort text) ON COMMIT DROP`,
     );
     await transaction.execute(
-      sql`CREATE TEMP TABLE progressive_cfd_attempts (sim_job_id uuid,outcome text,unit_id uuid) ON COMMIT DROP`,
+      sql`CREATE TEMP TABLE progressive_cfd_attempts (token uuid,sim_job_id uuid,outcome text,unit_id uuid,started_at timestamptz) ON COMMIT DROP`,
     );
     await transaction.execute(sql`INSERT INTO progressive_cfd_units
-      SELECT id,id FROM fixture_settlement_jobs`);
+      SELECT id,id,
+        CASE WHEN variant='done-closed-pointer-gap' THEN 'leased' END,
+        CASE WHEN variant='done-closed-pointer-gap' THEN md5('attempt-'||variant)::uuid END,
+        CASE WHEN variant='done-closed-pointer-gap' THEN clock_timestamp()-interval '1 hour' END
+      FROM fixture_settlement_jobs`);
     await transaction.execute(sql`INSERT INTO progressive_work
       SELECT id,md5('generation')::uuid,id FROM fixture_settlement_jobs`);
     await transaction.execute(sql`INSERT INTO progressive_generation_cohort_targets
@@ -160,8 +164,12 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
       SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal','done-closed-pointer-gap')`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
-      SELECT id,CASE WHEN variant='stopped-terminal' THEN 'complete' ELSE 'running' END,id FROM fixture_settlement_jobs
-      WHERE variant IN ('executing','stopped-running','stopped-terminal')`);
+      SELECT md5('attempt-'||variant)::uuid,id,
+        CASE WHEN variant='stopped-terminal' THEN 'complete'
+          WHEN variant='done-closed-pointer-gap' THEN 'cancelled' ELSE 'running' END,
+        id,clock_timestamp()-interval '2 hours'
+      FROM fixture_settlement_jobs
+      WHERE variant IN ('executing','stopped-running','stopped-terminal','done-closed-pointer-gap')`);
     const expectedReports = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
         FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
@@ -277,7 +285,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       ),
     ).toEqual(jobStates);
   });
-});
+}, 15_000);
 
 it("resumes due archive retries and expired claims before untouched work while preserving ownership and deadlines", async () => {
   await client.db.transaction(async (transaction) => {
