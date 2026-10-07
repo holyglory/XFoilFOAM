@@ -63,6 +63,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       waiting: 0,
       campaignsCompleted: 0,
     };
+    const generationsToAdvance = new Set<string>();
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -359,10 +360,12 @@ export async function advanceProgressiveCfdStages(db: DB) {
           UPDATE progressive_work SET state = ${gap ? "gap" : "complete"}, error = ${gap ? reason : null}, completed_at = clock_timestamp()
           WHERE id = ${scope.id}
         `);
-        await advanceGeneration(connection, String(scope.generation_id));
+        generationsToAdvance.add(String(scope.generation_id));
         receipt.closed += 1;
       }
     }
+    for (const generationId of generationsToAdvance)
+      await advanceGeneration(connection, generationId);
     receipt.campaignsCompleted = await finishCampaigns(
       connection,
       String(epoch.id),

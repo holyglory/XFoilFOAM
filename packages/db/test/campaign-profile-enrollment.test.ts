@@ -39,6 +39,7 @@ import { buildPolarRequest } from "../../../apps/sweeper/src/build-request";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import * as progressiveCampaigns from "../src/progressive-campaigns";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
 import {
@@ -2616,12 +2617,18 @@ describe("progressive durable stage transitions", () => {
     expect(generation.stage).toBe(3);
   }, 120_000);
 
-  it("closes settled fast anchors without a NeuralFoil prior and opens precise work", async () => {
-    const campaignId = await campaign();
+  it.each([false, true])("closes settled fast anchors without a NeuralFoil prior and opens precise work with one generation recount (cohorts: %s)", async (cohorts) => {
+    const campaignId = await campaign("active", [32.173, 42.173, 62.173]);
     await materializeProgressiveCampaignScope(db, campaignId);
+    if (cohorts) await adoptProgressiveSubsonicPriority(db, campaignId);
     const baseline = (await claim([1]))!;
     await failProgressiveWork(db, baseline, "geometry fit unavailable", false);
-    expect(await initializeProgressiveCfdWork(db)).toBe(2);
+    for (let index = 0; index < 2; index += 1) {
+      const remaining = (await claim([1]))!;
+      expect(remaining.generationId).toBe(baseline.generationId);
+      await failProgressiveWork(db, remaining, "geometry fit unavailable", false);
+    }
+    expect(await initializeProgressiveCfdWork(db)).toBe(6);
     await db.execute(sql`
       UPDATE progressive_cfd_units unit
       SET state = 'complete', lease_token = NULL, lease_owner = NULL, lease_until = NULL
@@ -2629,30 +2636,36 @@ describe("progressive durable stage transitions", () => {
       WHERE unit.work_id = work.id AND work.generation_id = ${baseline.generationId}
     `);
 
-    expect(await advanceProgressiveCfdStages(db)).toMatchObject({
-      admitted: 0,
-      closed: 1,
-    });
-    const [fast] = await db.execute(sql`
+    const recount = vi.spyOn(progressiveCampaigns, "advanceGeneration");
+    let recounts: unknown[][];
+    try {
+      expect(await advanceProgressiveCfdStages(db)).toMatchObject({
+        admitted: 0,
+        closed: 3,
+      });
+      recounts = [...recount.mock.calls];
+    } finally {
+      recount.mockRestore();
+    }
+    const fast = await db.execute(sql`
       SELECT id, state, error FROM progressive_work
       WHERE generation_id = ${baseline.generationId} AND stage = 2
     `);
-    expect(fast).toMatchObject({
-      state: "complete",
-      error: null,
-    });
-    const [decision] = await db.execute(sql`
+    expect(fast).toHaveLength(3);
+    expect(fast.every((work) => work.state === "complete" && work.error === null)).toBe(true);
+    const decisions = await db.execute(sql`
       SELECT reason FROM progressive_cfd_stage_decisions
-      WHERE work_id = ${fast.id}
+      WHERE work_id IN (SELECT id FROM progressive_work WHERE generation_id = ${baseline.generationId} AND stage = 2)
     `);
-    expect(decision).toMatchObject({
-      reason: "fast_prior_unavailable_after_initial_coverage",
-    });
+    expect(decisions).toHaveLength(3);
+    expect(decisions.every((decision) => decision.reason === "fast_prior_unavailable_after_initial_coverage")).toBe(true);
     const [generation] = await db.execute(sql`
       SELECT stage FROM progressive_generations WHERE id = ${baseline.generationId}
     `);
     expect(generation.stage).toBe(3);
-    expect(await initializeProgressiveCfdWork(db)).toBe(3);
+    expect(await initializeProgressiveCfdWork(db)).toBe(9);
+    expect(recounts).toHaveLength(1);
+    expect(recounts[0][1]).toBe(baseline.generationId);
   }, 120_000);
 
   it("never advances evidence from a previous calculation epoch", async () => {

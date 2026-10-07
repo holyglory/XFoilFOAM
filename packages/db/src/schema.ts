@@ -7419,6 +7419,11 @@ export const progressiveCfdAttempts = pgTable(
     unstartedIdx: index("progressive_cfd_attempts_unstarted_idx")
       .on(table.unitId)
       .where(sql`${table.outcome} = 'cancelled' AND ${table.activeSeconds} = 0`),
+    unitLookupIdx: index("progressive_cfd_attempts_unit_lookup_idx").on(
+      table.unitId,
+      table.outcome,
+      table.simJobId,
+    ),
     outcomeCheck: check(
       "progressive_cfd_attempts_outcome_check",
       sql`${table.outcome} IN ('running', 'complete', 'failed', 'expired', 'cancelled')`,
