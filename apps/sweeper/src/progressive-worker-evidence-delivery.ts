@@ -17,6 +17,7 @@ import {
   progressiveStoppedStorageEligible,
   requeueStoppedProgressiveStorage,
 } from "./progressive-stopped-storage";
+import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 export async function recordProgressiveWorkerEvidenceReceipt(
   db: DB,
@@ -177,7 +178,8 @@ export async function deliverNextProgressiveWorkerEvidence(
       ],
     });
     const post = (route: "polars" | "retained-progressive-evidence") =>
-      fetcher(
+      fetchProgressiveRemote(
+        fetcher,
         `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/${route}`,
         {
           method: "POST",

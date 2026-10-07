@@ -11,6 +11,7 @@ import type { EngineClient, JobStatus } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
 import { withGlobalAdmissionPermit } from "./submit-lifecycle";
+import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 type StartAuthorization = {
   kind: "authorized";
@@ -105,7 +106,8 @@ export async function submitProgressiveRemoteJob(
       reason: "The local worker or promise does not admit this exact execution",
     };
   const requestedAt = performance.now();
-  const response = await fetcher(
+  const response = await fetchProgressiveRemote(
+    fetcher,
     `${baseUrl}/progressive-executions/${executionId}/start`,
     {
       method: "POST",

@@ -11,6 +11,7 @@ import {
   progressivePublicationBatchSelectionSql,
   progressivePublicationSelectionSql,
 } from "./progressive-publication-selection";
+import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 export async function publishProgressiveWorkerReport(
   db: DB,
@@ -64,7 +65,8 @@ export async function publishProgressiveWorkerReport(
     throw new Error(
       "Stored report bytes differ from their publication signature",
     );
-  const response = await fetcher(
+  const response = await fetchProgressiveRemote(
+    fetcher,
     `${baseUrl}/progressive-executions/${executionId}/reports`,
     {
       method: "POST",

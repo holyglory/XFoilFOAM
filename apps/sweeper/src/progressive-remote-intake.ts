@@ -6,6 +6,7 @@ import {
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
+import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 export interface ProgressiveAssignmentDocument extends Record<string, unknown> {
   envelope: ProgressiveRemoteExecutionEnvelope;
@@ -90,11 +91,15 @@ async function receiveAssignmentPage(
       ? null
       : String(cursor.after_execution_id);
   const request = async (path: string) => {
-    const response = await fetcher(`${baseUrl}${path}`, {
-      headers: { "x-xfoilfoam-solver-token": String(settings.auth_token) },
-      redirect: "error",
-      signal: AbortSignal.timeout(10000),
-    });
+    const response = await fetchProgressiveRemote(
+      fetcher,
+      `${baseUrl}${path}`,
+      {
+        headers: { "x-xfoilfoam-solver-token": String(settings.auth_token) },
+        redirect: "error",
+        signal: AbortSignal.timeout(10000),
+      },
+    );
     if (!response.ok)
       throw new Error(
         `Progressive assignment intake failed (${response.status})`,

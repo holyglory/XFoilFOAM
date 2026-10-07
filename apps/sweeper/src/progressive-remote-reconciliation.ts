@@ -14,6 +14,7 @@ import {
   activeReconcileConcurrency,
   runWithConcurrency,
 } from "./reconcile";
+import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 const configuredProgressiveRemoteStaleGraceMs = Number(
   process.env.SWEEPER_PROGRESSIVE_REMOTE_STALE_GRACE_MS ?? 30 * 60 * 1000,
@@ -185,7 +186,8 @@ export async function reconcileProgressiveRemoteWorker(
               throw new Error(
                 "The registered worker credential is unavailable",
               );
-            const response = await (options.fetcher ?? fetch)(
+            const response = await fetchProgressiveRemote(
+              options.fetcher ?? fetch,
               `${baseUrl}/progressive-executions/${executionId}/control`,
               {
                 headers: {
