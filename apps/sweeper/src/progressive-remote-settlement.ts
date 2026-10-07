@@ -308,7 +308,10 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       executionId,
     );
     if (retained.kind === "waiting") {
-      if (retained.reason === "raw_evidence") {
+      if (
+        retained.reason === "raw_evidence" ||
+        retained.reason === "archives"
+      ) {
         const inactive = await settleInactiveUndeliveredExecution(
           connection,
           executionId,

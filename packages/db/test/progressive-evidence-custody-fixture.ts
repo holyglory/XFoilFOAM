@@ -153,6 +153,20 @@ async function exerciseProgressiveArchiveCustody(
     WHERE id = ${source.promiseId}::uuid`);
   await db.execute(sql`UPDATE sync_sweep_promise_points SET status = ${status}::sync_promise_status
     WHERE promise_id = ${source.promiseId}::uuid AND aoa_deg = ${source.aoaDeg}`);
+  if (status === "expired") {
+    const rollback = new Error("Rollback expired archive-custody settlement");
+    await expect(
+      db.transaction(async (nested) => {
+        expect(
+          await settleProgressiveRemoteJob(
+            nested as unknown as DB,
+            source.engineJobId,
+          ),
+        ).toMatchObject({ kind: "settled", evidencePending: true });
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+  }
   if (status === "fulfilled") {
     const otherAttemptId = randomUUID();
     await db.insert(resultAttempts).values({
@@ -331,8 +345,15 @@ async function exerciseProgressiveArchiveCustody(
     expect(retention).toMatchObject({
       kind: "retained",
       report: terminal,
-    sources: [{ resultAttemptId, archived: true, storageOnly: false, delivery: source }],
-  });
+      sources: [
+        {
+          resultAttemptId,
+          archived: true,
+          storageOnly: false,
+          delivery: source,
+        },
+      ],
+    });
     const rollbackInventory = new Error(
       "Rollback isolated missing source inventory",
     );
