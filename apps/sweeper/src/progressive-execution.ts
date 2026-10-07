@@ -1,9 +1,5 @@
 import { eq, sql } from "drizzle-orm";
-import {
-  EngineError,
-  type EngineExecutionStopProof,
-  type EngineClient,
-} from "@aerodb/engine-client";
+import { EngineError, type EngineClient } from "@aerodb/engine-client";
 import {
   acknowledgeProgressiveCfdExecutionStop,
   assertProgressiveExecutionIdentity,
@@ -12,12 +8,55 @@ import {
   solverLocalExecutionSql,
   type DB,
 } from "@aerodb/db";
+import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import {
   expectedEngineForJob,
   expectedExecutionPoolForJob,
 } from "./engine-routing";
 
 type StopEngine = Pick<EngineClient, "cancelJob" | "getExecutionStopProof">;
+
+async function releaseMissingCancelledExecution(db: DB, jobId: string) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [job] = await connection.execute(sql`
+      SELECT status, engine_state FROM sim_jobs WHERE id = ${jobId}::uuid FOR UPDATE
+    `);
+    if (job?.status !== "cancelled" || job.engine_state !== "cancelled")
+      return 0;
+    const [evidence] = await connection.execute(sql`
+      SELECT EXISTS (SELECT 1 FROM result_attempts WHERE sim_job_id = ${jobId}::uuid)
+        OR EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
+          JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
+          WHERE attempt.sim_job_id = ${jobId}::uuid) AS present
+    `);
+    if (evidence?.present === true) return 0;
+    const units = await connection.execute(sql`
+      SELECT attempt.token, unit.id
+      FROM progressive_cfd_attempts attempt
+      JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+      WHERE attempt.sim_job_id = ${jobId}::uuid AND attempt.outcome = 'running'
+      FOR UPDATE OF attempt, unit
+    `);
+    if (!units.length) return 0;
+    for (const unit of units) {
+      await connection.execute(sql`UPDATE progressive_cfd_attempts
+        SET outcome = 'cancelled', finished_at = clock_timestamp(),
+          error = 'Engine execution disappeared after cancellation without stored solver evidence'
+        WHERE token = ${unit.token}::uuid`);
+      await connection.execute(sql`UPDATE progressive_cfd_units
+        SET state = 'gap', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+          error = 'Engine execution disappeared after cancellation without stored solver evidence'
+        WHERE id = ${unit.id}::uuid`);
+    }
+    await connection.execute(sql`UPDATE sim_jobs SET "ingestedAt" = coalesce("ingestedAt", clock_timestamp()),
+      "finishedAt" = coalesce("finishedAt", clock_timestamp()), "updatedAt" = clock_timestamp(),
+      error = 'Engine execution disappeared after cancellation without stored solver evidence'
+      WHERE id = ${jobId}::uuid`);
+    await releaseResultClaimsForJob(connection, jobId, ["queued", "running"]);
+    return units.length;
+  });
+}
 
 export async function reconcileProgressiveExecutions(
   db: DB,
@@ -116,35 +155,16 @@ export async function reconcileProgressiveExecutions(
             );
           receipt.stopRequests += 1;
         }
-        let proof: EngineExecutionStopProof;
+        let proof;
         try {
           proof = await engine.getExecutionStopProof(job.engineJobId, route);
         } catch (error) {
           if (!(error instanceof EngineError && error.status === 404))
             throw error;
-          const [unstarted] = await db.execute(sql`
-            SELECT NOT EXISTS (SELECT 1 FROM result_attempts
-              WHERE sim_job_id = ${jobId}::uuid)
-              AND NOT EXISTS (SELECT 1
-                FROM progressive_cfd_runtime_progress runtime
-                JOIN progressive_cfd_attempts attempt
-                  ON attempt.token = runtime.attempt_token
-                WHERE attempt.sim_job_id = ${jobId}::uuid
-                  AND runtime.active_seconds > 0) AS value
-          `);
-          if (unstarted?.value !== true) throw error;
-          proof = {
-            version: 1,
-            job_id: job.engineJobId,
-            execution_stopped: true,
-            producer_stopped: true,
-            namespace_verified: true,
-            remaining: [],
-            observed_at: new Date().toISOString(),
-            error: null,
-            fence: "cancel_marker",
-            ownership_basis: "never_started_cancellation_fence",
-          };
+          const released = await releaseMissingCancelledExecution(db, jobId);
+          if (!released) throw error;
+          receipt.gaps += released;
+          continue;
         }
         if (proof.job_id !== job.engineJobId)
           throw new Error("Execution-stop proof belongs to another engine job");
