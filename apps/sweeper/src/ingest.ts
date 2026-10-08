@@ -1,5 +1,7 @@
 import {
+  acquireEvidenceArtifactKeyLock,
   acquireResultEvidenceLock,
+  acquireResultEvidenceLocks,
   assertProgressiveCfdEvidenceJob,
   recordProgressiveCfdEvidence,
   airfoils,
@@ -59,7 +61,7 @@ import {
   type RenderedDefaultMedia,
   type UransFidelity,
 } from "@aerodb/engine-client";
-import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { constants, createReadStream } from "node:fs";
 import { access, readFile, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -1867,6 +1869,7 @@ export async function registerEvidenceArtifacts(opts: {
   point: PolarPoint;
   artifact: EngineEvidenceArtifact;
   runtime?: ResolvedEngineRuntime | null;
+  transaction?: DB;
 }): Promise<PendingRemoteEvidenceCleanup | null> {
   const {
     db,
@@ -1879,6 +1882,7 @@ export async function registerEvidenceArtifacts(opts: {
     point,
     artifact,
     runtime,
+    transaction,
   } = opts;
   const urlPath = artifact.url ?? artifact.path;
   if (!urlPath) return null;
@@ -2160,6 +2164,7 @@ export async function registerEvidenceArtifacts(opts: {
     }
     return null;
   };
+  if (transaction) return write(transaction);
   return withEvidenceArtifactWriteLocks(
     db,
     {
@@ -2171,10 +2176,13 @@ export async function registerEvidenceArtifacts(opts: {
   );
 }
 
-const EVIDENCE_ARTIFACT_REGISTRATION_CONCURRENCY = 8;
+const EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE = 64;
 
 async function registerEvidenceArtifactsBatch(
-  base: Omit<Parameters<typeof registerEvidenceArtifacts>[0], "artifact">,
+  base: Omit<
+    Parameters<typeof registerEvidenceArtifacts>[0],
+    "artifact" | "transaction"
+  >,
   artifacts: readonly EngineEvidenceArtifact[],
 ): Promise<PendingRemoteEvidenceCleanup[]> {
   const structural = artifacts.filter((artifact) =>
@@ -2184,23 +2192,85 @@ async function registerEvidenceArtifactsBatch(
     (artifact) =>
       !["manifest", "engine_bundle", "openfoam_bundle"].includes(artifact.kind),
   );
+  const ordered = [...structural, ...bulk];
   const cleanups: PendingRemoteEvidenceCleanup[] = [];
-  const register = async (artifact: EngineEvidenceArtifact) => {
-    const cleanup = await registerEvidenceArtifacts({ ...base, artifact });
-    if (cleanup) cleanups.push(cleanup);
-  };
-
-  for (const artifact of structural) await register(artifact);
   for (
     let offset = 0;
-    offset < bulk.length;
-    offset += EVIDENCE_ARTIFACT_REGISTRATION_CONCURRENCY
+    offset < ordered.length;
+    offset += EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE
   ) {
-    await Promise.all(
-      bulk
-        .slice(offset, offset + EVIDENCE_ARTIFACT_REGISTRATION_CONCURRENCY)
-        .map(register),
+    const batch = ordered.slice(
+      offset,
+      offset + EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE,
     );
+    const batchCleanups = await base.db.transaction(async (rawTransaction) => {
+      const transaction = rawTransaction as unknown as DB;
+      const lockKeys = [
+        ...new Map(
+          batch
+            .map((artifact) => {
+              const urlPath = artifact.url ?? artifact.path;
+              return urlPath
+                ? [
+                    `${storageKeyOf(urlPath)}\0${artifact.sha256}`,
+                    {
+                      storageKey: storageKeyOf(urlPath),
+                      sha256: artifact.sha256,
+                    },
+                  ]
+                : null;
+            })
+            .filter(
+              (
+                value,
+              ): value is [string, { storageKey: string; sha256: string }] =>
+                value !== null,
+            ),
+        ).values(),
+      ].sort((left, right) =>
+        `${left.storageKey}\0${left.sha256}`.localeCompare(
+          `${right.storageKey}\0${right.sha256}`,
+        ),
+      );
+      for (const key of lockKeys)
+        await acquireEvidenceArtifactKeyLock(
+          transaction,
+          key.storageKey,
+          key.sha256,
+        );
+      if (lockKeys.length) {
+        const existing = await transaction
+          .select({ resultId: solverEvidenceArtifacts.resultId })
+          .from(solverEvidenceArtifacts)
+          .where(
+            or(
+              ...lockKeys.map((key) =>
+                and(
+                  eq(solverEvidenceArtifacts.storageKey, key.storageKey),
+                  eq(solverEvidenceArtifacts.sha256, key.sha256),
+                ),
+              ),
+            ),
+          );
+        await acquireResultEvidenceLocks(transaction, [
+          ...existing.map((row) => row.resultId),
+          base.resultId,
+        ]);
+      } else {
+        await acquireResultEvidenceLocks(transaction, [base.resultId]);
+      }
+      const registered: PendingRemoteEvidenceCleanup[] = [];
+      for (const artifact of batch) {
+        const cleanup = await registerEvidenceArtifacts({
+          ...base,
+          artifact,
+          transaction,
+        });
+        if (cleanup) registered.push(cleanup);
+      }
+      return registered;
+    });
+    cleanups.push(...batchCleanups);
   }
   return cleanups;
 }
