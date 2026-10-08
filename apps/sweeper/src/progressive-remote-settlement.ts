@@ -106,6 +106,7 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
     JOIN progressive_cfd_execution_stops stopped
       ON stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id
     WHERE job.id = ${executionId}::uuid AND job.engine_job_id = job.id::text
+      AND job.status <> 'cancelled'
       AND EXISTS (
         SELECT 1 FROM result_attempts raw
         JOIN results result ON result.id = raw.result_id
