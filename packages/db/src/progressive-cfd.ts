@@ -305,7 +305,7 @@ export async function claimProgressiveCfdUnit(
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN polar_analysis_targets target ON target.id = work.target_id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
-        AND ${progressiveCohortInitializedSql()}
+        AND (work.stage = 3 OR ${progressiveCohortInitializedSql()})
         AND ${targetFilter}
         AND ${familyFilter}
         AND ${recoveryOwner}
