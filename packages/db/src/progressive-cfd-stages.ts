@@ -204,11 +204,33 @@ export async function advanceProgressiveCfdStages(db: DB) {
       const units = await connection.execute(sql`
         SELECT unit.id, unit.aoa_deg, unit.ordinal, unit.recipe, unit.state,
           EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
+            WHERE attempt.unit_id = unit.id) AS has_attempt,
+          EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
             LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
             WHERE attempt.unit_id = unit.id AND (attempt.outcome = 'running' OR
               (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL))) AS unsettled
         FROM progressive_cfd_units unit WHERE unit.work_id = ${scope.id} ORDER BY unit.ordinal FOR UPDATE OF unit
       `);
+      for (const unit of units) {
+        const hasAttempt =
+          unit.has_attempt === true ||
+          String(unit.has_attempt) === "true" ||
+          String(unit.has_attempt) === "t";
+        const unsettled =
+          unit.unsettled === true ||
+          String(unit.unsettled) === "true" ||
+          String(unit.unsettled) === "t";
+        if (String(unit.state) === "blocked" && !hasAttempt && !unsettled) {
+          await connection.execute(sql`
+            UPDATE progressive_cfd_units
+            SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+              lease_until = NULL,
+              error = 'Blocked unit has no retained execution attempt'
+            WHERE id = ${unit.id} AND state = 'blocked'
+          `);
+          unit.state = "gap";
+        }
+      }
       if (
         !units.length ||
         units.some(
