@@ -27,6 +27,7 @@ function fixture() {
     prepared: 0,
     deferred: 0,
     waiting: 1,
+    waitingReasons: [],
     errors: [],
   });
   let notify = () => {};
@@ -60,7 +61,13 @@ it("releases exact stop receipts before replay and drains available ordered repo
   const order: string[] = [];
   vi.mocked(prepareProgressiveRemoteFleet).mockImplementation(async () => {
     order.push("admission");
-    return { prepared: 0, deferred: 0, waiting: 1, errors: [] };
+    return {
+      prepared: 0,
+      deferred: 0,
+      waiting: 1,
+      waitingReasons: [],
+      errors: [],
+    };
   });
   vi.mocked(acknowledgeProgressiveRemoteStops).mockImplementation(async () => {
     order.push("stop");
@@ -168,6 +175,7 @@ it("keeps filling available assignments without waiting for another controller t
     prepared: 2,
     deferred: 0,
     waiting: 1,
+    waitingReasons: [],
     errors: [],
   });
   const owner = new AbortController();
@@ -190,6 +198,7 @@ it("continues after deferring an owned target, then sleeps when no further progr
     prepared: 0,
     deferred: 2,
     waiting: 0,
+    waitingReasons: [],
     errors: [],
   });
   const owner = new AbortController();

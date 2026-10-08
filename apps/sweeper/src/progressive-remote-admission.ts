@@ -249,6 +249,7 @@ export async function prepareProgressiveRemoteFleet(db: DB) {
     prepared: 0,
     deferred: 0,
     waiting: 0,
+    waitingReasons: [] as Array<{ solverId: string; reason: string }>,
     errors: [] as Array<{ solverId: string; reason: string }>,
   };
   for (const solver of solvers) {
@@ -265,6 +266,7 @@ export async function prepareProgressiveRemoteFleet(db: DB) {
         }
         if (result.kind === "waiting") {
           receipt.waiting += 1;
+          receipt.waitingReasons.push({ solverId, reason: result.reason });
           break;
         }
         receipt.prepared += 1;
