@@ -4,7 +4,7 @@ import {
   bindProgressiveRemoteDispatch,
   canonicalAnalysisJson,
   claimProgressiveCfdBatch,
-  progressiveRemoteReservedSlots,
+  progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteActivePromiseCount,
   progressiveSolverOwnerLock,
   type DB,
@@ -160,7 +160,8 @@ export async function prepareProgressiveRemoteDispatch(
           ? Math.min(Number(solver.cpu_budget), Number(solver.cpu_capacity))
           : Number(solver.cpu_capacity);
       const available =
-        capacity - (await progressiveRemoteReservedSlots(connection, solverId));
+        capacity -
+        (await progressiveRemoteAdmissionReservedSlots(connection, solverId));
       if (!Number.isSafeInteger(available) || available < 1)
         throw new RemoteProgressiveAdmissionWait(
           "The worker has no unreserved CPU slots",

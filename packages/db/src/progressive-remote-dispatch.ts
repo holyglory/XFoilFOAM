@@ -44,6 +44,20 @@ export async function progressiveRemoteReservedSlots(
   return Number(row.reserved);
 }
 
+export async function progressiveRemoteAdmissionReservedSlots(
+  db: DB,
+  solverId: string,
+): Promise<number> {
+  const [row] = await db.execute(sql`
+    SELECT coalesce(sum(dispatch.cpu_slots), 0)::integer AS reserved
+    FROM progressive_remote_dispatches dispatch
+    WHERE dispatch.solver_id = ${solverId}::uuid
+      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+        WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
+  `);
+  return Number(row.reserved);
+}
+
 export function progressiveRemoteActivePromiseIdsSql(solverId: string) {
   return sql`
     SELECT promise.id FROM sync_sweep_promises promise
@@ -214,7 +228,10 @@ export async function bindProgressiveRemoteDispatch(
       !Number.isSafeInteger(capacity) ||
       capacity < 1 ||
       slots +
-        (await progressiveRemoteReservedSlots(connection, input.solverId)) >
+        (await progressiveRemoteAdmissionReservedSlots(
+          connection,
+          input.solverId,
+        )) >
         capacity
     )
       throw new Error(
