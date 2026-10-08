@@ -10,6 +10,7 @@ import {
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { analysisContentHash } from "../src/analysis-target";
+import { acknowledgeProgressiveWorkerReport } from "../src/progressive-worker-reports";
 import { observeProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-observation";
 import { solverQueuePressure } from "../../../apps/sweeper/src/submit-lifecycle";
 import { reconcileProgressiveRemoteWorker } from "../../../apps/sweeper/src/progressive-remote-reconciliation";
@@ -539,10 +540,46 @@ export async function verifyProgressiveWorkerObservation(
   engine.getExecutionStopProof.mockRejectedValueOnce(
     new EngineError("worker execution-stop inspection is unavailable", 503),
   );
-  expect(
-    await observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
-  ).toMatchObject({ stopped: true, replayed: true });
-  expect(engine.getExecutionStopProof).not.toHaveBeenCalled();
+  await expect(
+    observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
+  ).rejects.toThrow("worker execution-stop inspection is unavailable");
+  expect(engine.getExecutionStopProof).toHaveBeenCalledOnce();
+  const replayRollback = new Error("Restore unacknowledged observer reports");
+  try {
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        const reports =
+          await connection.execute(sql`SELECT sequence, content_signature
+        FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid ORDER BY sequence`);
+        for (const report of reports)
+          await acknowledgeProgressiveWorkerReport(connection, {
+            executionId,
+            solverId: envelope.solverId,
+            sequence: Number(report.sequence),
+            contentSignature: String(report.content_signature),
+          });
+        engine.getExecutionStopProof.mockClear();
+        engine.getExecutionStopProof.mockRejectedValueOnce(
+          new EngineError(
+            "worker execution-stop inspection is unavailable",
+            503,
+          ),
+        );
+        expect(
+          await observeProgressiveRemoteJob(connection, engine, executionId, {
+            stop: true,
+          }),
+        ).toMatchObject({ stopped: true, replayed: true });
+        expect(engine.getExecutionStopProof).not.toHaveBeenCalled();
+        throw replayRollback;
+      }),
+    ).rejects.toBe(replayRollback);
+  } finally {
+    engine.getExecutionStopProof
+      .mockReset()
+      .mockImplementation(async () => structuredClone(proof));
+  }
   proof.observed_at = "2026-09-07T19:40:00Z";
   expect(
     await observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),

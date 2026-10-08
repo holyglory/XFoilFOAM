@@ -202,7 +202,7 @@ export async function verifyProgressiveRemoteReportInventory(
             const evidenceBefore =
               await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports
               WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
-            if (status !== "cancelled") {
+            if (status === "active" || status === "fulfilled") {
               expect(
                 await settleProgressiveRemoteJob(scoped, executionId),
               ).toMatchObject({ kind: "waiting", reason: "raw_evidence" });
@@ -321,7 +321,8 @@ export async function verifyProgressiveRemoteReportInventory(
                 sql`SELECT count(*)::integer AS count FROM result_attempts WHERE sim_job_id=${executionId}::uuid`,
               );
               expect(rows.count).toBe(0);
-              await verifyPublicationRecovery(scoped, executionId);
+              if (status === "cancelled")
+                await verifyPublicationRecovery(scoped, executionId);
             }
             expect(
               await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports

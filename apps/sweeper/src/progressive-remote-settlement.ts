@@ -3,6 +3,7 @@ import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-p
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
   acknowledgeProgressiveCfdExecutionStop,
+  assertProgressiveCfdEvidenceJob,
   canonicalAnalysisJson,
   recordProgressiveCfdRecoveryPlans,
   settleProgressiveCfdExecution,
@@ -14,6 +15,7 @@ import {
   type ProgressiveRansPromotion,
 } from "@aerodb/db";
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
+import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 
@@ -96,18 +98,72 @@ async function settleInactiveUndeliveredExecution(
   };
 }
 
-async function publishAcceptedProgressiveAttempts(
-  db: DB,
-  executionId: string,
-  attemptIds?: readonly string[],
-) {
-  const attemptScope = attemptIds
-    ? sql`raw.id IN (${sql.join(
-        attemptIds.map((id) => sql`${id}::uuid`),
-        sql`, `,
-      )})`
-    : sql`raw.sim_job_id = ${executionId}::uuid`;
-  return db.execute(sql`
+async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
+  const [candidate] = await db.execute(sql`
+    SELECT job.airfoil_id, job.simulation_preset_revision_id, job.campaign_id
+    FROM sim_jobs job
+    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
+    JOIN progressive_cfd_execution_stops stopped
+      ON stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id
+    WHERE job.id = ${executionId}::uuid AND job.engine_job_id = job.id::text
+      AND EXISTS (
+        SELECT 1 FROM result_attempts raw
+        JOIN results result ON result.id = raw.result_id
+        JOIN result_classifications classification ON classification.result_attempt_id = raw.id
+        WHERE raw.sim_job_id = job.id AND raw.status = 'done' AND raw.valid_for_polar
+          AND classification.state = 'accepted' AND result.current_result_attempt_id IS NULL)
+  `);
+  if (!candidate) return;
+  const retained = await readProgressiveRemoteRetention(db, executionId);
+  if (retained.kind !== "retained") return;
+  const result = retained.report.result;
+  const finalPoints = new Set(
+    result
+      ? progressiveReportedPointSources({
+          ...result,
+          polars: result.polars.map((polar) => ({ ...polar, attempts: [] })),
+        }).map((source) => source.contentSignature)
+      : [],
+  );
+  const attemptIds = retained.sources
+    .filter(
+      (source) =>
+        source.archived &&
+        !source.storageOnly &&
+        finalPoints.has(
+          source.delivery.progressiveEvidence.pointContentSignature,
+        ),
+    )
+    .map((source) => source.resultAttemptId);
+  if (!attemptIds.length) return;
+  await refreshPolarCacheForRevision(
+    db,
+    String(candidate.airfoil_id),
+    String(candidate.simulation_preset_revision_id),
+    {
+      afterAttemptClassifications: async (connection) => {
+        const [current] = await connection.execute(sql`
+          SELECT job."ingestedAt", job.ingest_lease_expires_at > clock_timestamp() AS ingestion_owned
+          FROM sim_jobs job
+          JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
+          JOIN progressive_generations generation
+            ON generation.id::text = job.request_payload->'progressive'->>'generationId'
+            AND generation.campaign_id = campaign.id
+          JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+          WHERE job.id = ${executionId}::uuid AND job.engine_job_id = job.id::text
+            AND generation.status <> 'cancelled'
+            AND generation.plan_revision_id = campaign.current_plan_revision_id
+            AND campaign.status IN ('active', 'attention', 'paused', 'completed')
+          FOR SHARE OF epoch FOR UPDATE OF campaign, job
+        `);
+        if (!current || current.ingestion_owned) return;
+        if (!current.ingestedAt)
+          await assertProgressiveCfdEvidenceJob(
+            connection,
+            executionId,
+            executionId,
+          );
+        await connection.execute(sql`
     WITH candidates AS (
       SELECT DISTINCT ON (raw.result_id) raw.id AS attempt_id
       FROM result_attempts raw
@@ -115,7 +171,12 @@ async function publishAcceptedProgressiveAttempts(
         ON classification.result_attempt_id = raw.id
       JOIN results result ON result.id = raw.result_id
       WHERE raw.sim_job_id = ${executionId}::uuid
-        AND ${attemptScope}
+        AND raw.id IN (${sql.join(
+          attemptIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )})
+        AND raw.airfoil_id = ${candidate.airfoil_id}::uuid
+        AND raw.simulation_preset_revision_id = ${candidate.simulation_preset_revision_id}::uuid
         AND raw.status = 'done'
         AND raw.valid_for_polar
         AND classification.state = 'accepted'
@@ -156,7 +217,10 @@ async function publishAcceptedProgressiveAttempts(
     WHERE result.id = raw.result_id
       AND result.current_result_attempt_id IS NULL
     RETURNING result.id
-  `);
+        `);
+      },
+    },
+  );
 }
 
 import { validateRansPrecalcPromotionSignal } from "./ingest";
@@ -230,6 +294,7 @@ async function recoveryPromotions(
 }
 
 export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
+  await publishAcceptedProgressiveAttempts(db, executionId);
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [dispatch] =
@@ -276,7 +341,6 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     );
     if (!stop) return { kind: "waiting" as const, reason: "physical_stop" };
     if (job.ingestedAt) {
-      await publishAcceptedProgressiveAttempts(connection, executionId);
       await retireSettledProgressivePromise(connection, executionId);
       return {
         kind: "settled" as const,
@@ -322,7 +386,6 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       }
       return retained;
     }
-    await publishAcceptedProgressiveAttempts(connection, executionId);
     const result = retained.report.result;
     const finalPoints = new Set(
       result

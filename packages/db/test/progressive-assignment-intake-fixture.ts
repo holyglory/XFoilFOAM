@@ -296,7 +296,12 @@ export async function verifyProgressiveAssignmentIntake(
         await db.execute(
           sql`UPDATE progressive_worker_assignment_cursors SET after_execution_id = ${futureCursor}::uuid WHERE settings_id = 1`,
         );
-        return Response.json({ items: [], nextCursor: null });
+        return Response.json({
+          items: [],
+          cycleStartedAt: new Date(Date.UTC(2026, 0, 1, 0, 1)).toISOString(),
+          nextCursor: null,
+          nextCreatedAt: null,
+        });
       },
     );
     expect(changed.cursorAdvanced).toBe(false);

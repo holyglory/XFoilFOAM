@@ -393,6 +393,13 @@ idempotent retries but neither fulfills a promise nor authorizes local cleanup.
 Unconverged evidence remains distinct from accepted points. The full archive path
 carries the same source proof; a prior compact receipt must not suppress later
 publication when the complete evidence passes the still-current execution gates.
+Remote settlement can recover an empty canonical point selection only from the
+exact final-report point, a non-storage-only receipt, and authenticated archive
+custody after physical stopping. It rechecks classification and review under the
+normal revision/compatibility cache locks, then selects the point and refreshes
+its CFD curves in the same transaction. Existing selections remain unchanged.
+This publication step precedes campaign/job settlement locks so it follows the
+same lock order as the import path; repeating it cannot duplicate solver evidence.
 Existing receipts may replay after cancellation without reopening that execution.
 New compact evidence from a closed assignment uses the separate registered-worker
 `retained-progressive-evidence` endpoint. It requires the exact immutable dispatch

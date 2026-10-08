@@ -252,15 +252,6 @@ export async function verifyProgressivePolarArchiveImport(input: {
                   input.delivery.engineJobId,
                 ),
               ).toMatchObject({ kind: "applied", sequence });
-            expect(
-              await settleProgressiveRemoteJob(
-                connection,
-                input.delivery.engineJobId,
-              ),
-            ).toMatchObject({
-              kind: "waiting",
-              reason: "accepted_point_publication",
-            });
             await verifyProgressivePublicationPrecedence(
               connection,
               input.delivery.engineJobId,

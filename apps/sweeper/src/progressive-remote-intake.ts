@@ -254,10 +254,9 @@ async function receiveAssignmentPage(
       after_execution_id = EXCLUDED.after_execution_id, updated_at = clock_timestamp()
     WHERE progressive_worker_assignment_cursors.solver_id <> ${solverId}::uuid
       OR progressive_worker_assignment_cursors.upstream_base_url <> ${baseUrl}
-      OR progressive_worker_assignment_cursors.cycle_started_at IS NULL
       OR progressive_worker_assignment_cursors.cycle_started_at IS NOT DISTINCT FROM ${cycleStartedAt}::timestamptz
-        AND progressive_worker_assignment_cursors.after_created_at IS NOT DISTINCT FROM ${afterCreatedAt}::timestamptz
-        AND progressive_worker_assignment_cursors.after_execution_id IS NOT DISTINCT FROM ${after}::uuid
+        AND progressive_worker_assignment_cursors.after_created_at IS NOT DISTINCT FROM ${databaseTimestamp(cursor?.after_created_at)}::timestamptz
+        AND progressive_worker_assignment_cursors.after_execution_id IS NOT DISTINCT FROM ${cursor?.after_execution_id ?? null}::uuid
     RETURNING settings_id
   `);
   receipt.cursorAdvanced = Boolean(advanced);
