@@ -113,7 +113,10 @@ import {
   type ProgressiveRemoteExecutionEnvelope,
 } from "../src/progressive-remote-execution";
 import { advanceProgressiveCfdStages } from "../src/progressive-cfd-stages";
-import { recoverUnboundProgressiveCfdLeases } from "../src/progressive-cfd-recovery";
+import {
+  recoverInactiveProgressiveRemoteGaps,
+  recoverUnboundProgressiveCfdLeases,
+} from "../src/progressive-cfd-recovery";
 import {
   buildProgressiveFitRequest,
   PROGRESSIVE_FIT_POLICY_ID,
@@ -2383,6 +2386,46 @@ describe("progressive durable stage transitions", () => {
         leaseSeconds: 120,
       }),
     ).toHaveLength(0);
+  });
+
+  it("requeues only bounded inactive remote delivery gaps", async () => {
+    const campaignId = await campaign();
+    await materializeProgressiveCampaignScope(db, campaignId);
+    const baseline = (await claim([1]))!;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await initializeProgressiveCfdWork(db);
+    const leases = await claimProgressiveCfdBatch(db, {
+      owner: "inactive-remote-gap-recovery",
+      leaseSeconds: 120,
+    });
+    expect(leases.length).toBeGreaterThanOrEqual(2);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+        attempts = CASE WHEN id = ${leases[1].id}::uuid THEN 2 ELSE 1 END,
+        active_seconds = 1,
+        error = 'Inactive remote delivery has unresolved evidence'
+      WHERE id IN (${leases[0].id}::uuid, ${leases[1].id}::uuid)
+    `);
+    expect(await recoverInactiveProgressiveRemoteGaps(db)).toBe(1);
+    const rows = await db.execute(sql`
+      SELECT id, state, attempts, error FROM progressive_cfd_units
+      WHERE id IN (${leases[0].id}::uuid, ${leases[1].id}::uuid)
+      ORDER BY id
+    `);
+    expect(rows).toHaveLength(2);
+    const recovered = rows.find((row) => row.id === leases[0].id)!;
+    const exhausted = rows.find((row) => row.id === leases[1].id)!;
+    expect(recovered).toMatchObject({
+      state: "pending",
+      attempts: 1,
+      error: "Retrying after inactive remote delivery",
+    });
+    expect(exhausted).toMatchObject({
+      state: "gap",
+      attempts: 2,
+      error: "Inactive remote delivery has unresolved evidence",
+    });
   });
 
   it.each(["paused", "cancelled"])(
