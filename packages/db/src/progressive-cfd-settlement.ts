@@ -198,7 +198,10 @@ export async function settleProgressiveCfdExecution(
     const [job] = await connection.execute(
       sql`SELECT status, "ingestedAt" FROM sim_jobs WHERE id = ${simJobId}`,
     );
-    if (!job || !["done", "failed", "cancelled"].includes(String(job.status)))
+    if (
+      !job ||
+      !["done", "failed", "cancelled", "ingesting"].includes(String(job.status))
+    )
       return { ...counts, waiting: 1 };
     const storedEvidenceIds = [
       ...new Set(options.recoverStoredEvidence?.resultAttemptIds ?? []),
