@@ -1193,7 +1193,7 @@ name = "capability-pure"
 tier = "development"
 requires = ["types"]
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-capabilities.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-capabilities.test.ts", "test/progressive-remote-admission.test.ts"]
 
 [test.progressive-archive-reclaim]
 timeout_seconds = 900
