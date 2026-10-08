@@ -155,7 +155,10 @@ export async function reconcileProgressiveRemoteProgress(
     (options.jobIds.length > 32 ||
       new Set(options.jobIds).size !== options.jobIds.length ||
       options.jobIds.some(
-        (id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id),
+        (id) =>
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+            id,
+          ),
       ))
   )
     throw new Error("Invalid bounded progressive progress scope");
@@ -198,59 +201,50 @@ export async function reconcileProgressiveRemoteProgress(
         waiting: 0,
         errors: [] as Array<{ executionId: string; reason: string }>,
       };
-      try {
-        await db.transaction(async (transaction) => {
-          const connection = transaction as unknown as DB;
-          for (const job of campaignJobs) {
-            const executionId = String(job.sim_job_id);
-            try {
-              for (
-                let reportPass = 0;
-                reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
-                reportPass += 1
-              ) {
-                const result = await applyProgressiveRemoteProgress(
-                  connection,
-                  executionId,
-                );
-                if (result.kind === "indexed") campaignReceipt.indexed += 1;
-                if (result.kind === "applied") {
-                  campaignReceipt.applied += 1;
-                  if (result.stopped) campaignReceipt.stopped += 1;
-                }
-                if (result.kind === "idle") {
-                  const terminal = await settleProgressiveRemoteJob(
-                    connection,
-                    executionId,
-                  );
-                  if (terminal.kind === "settled") campaignReceipt.settled += 1;
-                  else campaignReceipt.waiting += 1;
-                  break;
-                }
-              }
-            } catch (error) {
-              campaignReceipt.errors.push({
+      for (const job of campaignJobs) {
+        const executionId = String(job.sim_job_id);
+        try {
+          for (
+            let reportPass = 0;
+            reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
+            reportPass += 1
+          ) {
+            const result = await applyProgressiveRemoteProgress(
+              db,
+              executionId,
+            );
+            if (result.kind === "indexed") campaignReceipt.indexed += 1;
+            if (result.kind === "applied") {
+              campaignReceipt.applied += 1;
+              if (result.stopped) campaignReceipt.stopped += 1;
+            }
+            if (result.kind === "idle") {
+              const terminal = await settleProgressiveRemoteJob(
+                db,
                 executionId,
-                reason: error instanceof Error ? error.message : String(error),
-              });
-            } finally {
-              await connection.execute(
-                sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
               );
+              if (terminal.kind === "settled") campaignReceipt.settled += 1;
+              else campaignReceipt.waiting += 1;
+              break;
             }
           }
-        });
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        campaignReceipt.errors = campaignJobs.map((job) => ({
-          executionId: String(job.sim_job_id),
-          reason,
-        }));
-        campaignReceipt.applied = 0;
-        campaignReceipt.indexed = 0;
-        campaignReceipt.stopped = 0;
-        campaignReceipt.settled = 0;
-        campaignReceipt.waiting = 0;
+        } catch (error) {
+          campaignReceipt.errors.push({
+            executionId,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          try {
+            await db.execute(
+              sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+            );
+          } catch (error) {
+            campaignReceipt.errors.push({
+              executionId,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       }
       receipt.applied += campaignReceipt.applied;
       receipt.indexed += campaignReceipt.indexed;
