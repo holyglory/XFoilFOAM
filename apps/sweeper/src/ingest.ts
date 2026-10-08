@@ -2171,6 +2171,40 @@ export async function registerEvidenceArtifacts(opts: {
   );
 }
 
+const EVIDENCE_ARTIFACT_REGISTRATION_CONCURRENCY = 8;
+
+async function registerEvidenceArtifactsBatch(
+  base: Omit<Parameters<typeof registerEvidenceArtifacts>[0], "artifact">,
+  artifacts: readonly EngineEvidenceArtifact[],
+): Promise<PendingRemoteEvidenceCleanup[]> {
+  const structural = artifacts.filter((artifact) =>
+    ["manifest", "engine_bundle", "openfoam_bundle"].includes(artifact.kind),
+  );
+  const bulk = artifacts.filter(
+    (artifact) =>
+      !["manifest", "engine_bundle", "openfoam_bundle"].includes(artifact.kind),
+  );
+  const cleanups: PendingRemoteEvidenceCleanup[] = [];
+  const register = async (artifact: EngineEvidenceArtifact) => {
+    const cleanup = await registerEvidenceArtifacts({ ...base, artifact });
+    if (cleanup) cleanups.push(cleanup);
+  };
+
+  for (const artifact of structural) await register(artifact);
+  for (
+    let offset = 0;
+    offset < bulk.length;
+    offset += EVIDENCE_ARTIFACT_REGISTRATION_CONCURRENCY
+  ) {
+    await Promise.all(
+      bulk
+        .slice(offset, offset + EVIDENCE_ARTIFACT_REGISTRATION_CONCURRENCY)
+        .map(register),
+    );
+  }
+  return cleanups;
+}
+
 type ScaleGroupKey = `${string}:${string}:${ImageFieldName}`;
 
 interface ScaleGroup {
@@ -5890,8 +5924,8 @@ export async function ingestResult(opts: {
     // Exact immutable evidence is complete before any canonical projection or
     // current pointer can change. Every row carries both owner ids, enforced
     // by the 0053 composite foreign keys.
-    for (const artifact of p.evidence_artifacts ?? []) {
-      const cleanup = await registerEvidenceArtifacts({
+    const cleanups = await registerEvidenceArtifactsBatch(
+      {
         db,
         engine,
         resultId: cell.id,
@@ -5900,12 +5934,12 @@ export async function ingestResult(opts: {
         simJobId,
         engineJobId,
         point: p,
-        artifact,
         runtime,
-      });
-      if (cleanup) {
-        mergePendingRemoteEvidenceCleanup(remoteEvidenceCleanups, cleanup);
-      }
+      },
+      p.evidence_artifacts ?? [],
+    );
+    for (const cleanup of cleanups) {
+      mergePendingRemoteEvidenceCleanup(remoteEvidenceCleanups, cleanup);
     }
     if (!failed) {
       media += await registerShippedMedia(
