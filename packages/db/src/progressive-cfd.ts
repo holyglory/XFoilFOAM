@@ -96,7 +96,7 @@ export async function initializeProgressiveCfdWork(db: DB): Promise<number> {
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
-      ORDER BY generation.created_at, generation.id, work.target_id LIMIT 64 FOR UPDATE OF generation, work SKIP LOCKED
+        ORDER BY generation.created_at, generation.id, work.target_id LIMIT 256 FOR UPDATE OF generation, work SKIP LOCKED
     `)) as unknown as WorkScope[];
     let inserted = 0;
     for (const scope of scopes) {
