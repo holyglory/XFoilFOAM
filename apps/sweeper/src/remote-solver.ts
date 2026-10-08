@@ -5066,6 +5066,7 @@ export async function deliverNextProgressiveWorkerArchive(
             AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
           ]),
           headers: headers(settings),
+          body: "{}",
         },
       );
       const custodyBody = (await custodyResponse.json().catch(() => null)) as {
