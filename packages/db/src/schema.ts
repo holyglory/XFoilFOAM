@@ -6923,6 +6923,10 @@ export const polarAnalysisTargets = pgTable(
       .notNull()
       .references(() => airfoils.id, { onDelete: "cascade" }),
     physical: jsonb("physical").$type<Record<string, unknown>>().notNull(),
+    mach: doublePrecision("mach").generatedAlwaysAs(
+      sql`CASE WHEN jsonb_typeof(physical->'derived'->'mach') = 'number'
+        THEN (physical->'derived'->>'mach')::double precision ELSE NULL END`,
+    ),
     conditionGroupId: text("condition_group_id").generatedAlwaysAs(
       sql`encode(sha256(jsonb_send(physical - 'airfoilId' - 'geometry')), 'hex')`,
     ),
@@ -6932,6 +6936,10 @@ export const polarAnalysisTargets = pgTable(
   },
   (table) => ({
     airfoilIdx: index("polar_analysis_targets_airfoil_idx").on(table.airfoilId),
+    machIdIdx: index("polar_analysis_targets_mach_id_idx").on(
+      table.mach,
+      table.id,
+    ),
     identityCheck: check(
       "polar_analysis_targets_id_check",
       sql`${table.id} ~ '^[a-f0-9]{64}$'`,

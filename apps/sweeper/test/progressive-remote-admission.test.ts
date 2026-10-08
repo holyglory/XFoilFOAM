@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OPENCFD_2606_ENGINE, type EngineClient } from "@aerodb/engine-client";
+import {
+  ENGINE_IDENTITY_MISMATCH_CODE,
+  EngineError,
+  OPENCFD_2606_ENGINE,
+  type EngineClient,
+} from "@aerodb/engine-client";
 import type { DB } from "@aerodb/db";
 import { parseProgressiveRemoteCapabilities } from "../src/progressive-remote-admission";
 import {
@@ -162,6 +167,9 @@ it("bounds a slow observation, shares concurrent refreshes and ignores a late re
   vi.spyOn(performance, "now").mockImplementation(() => Date.now());
   const fixture = serviceFixture();
   await refreshProgressiveWorkerCapabilities(fixture.db, fixture.engine);
+  const sampledAt = progressiveWorkerCapabilityMetadata(
+    fixture.db,
+  ).progressiveExecutionObservedAt;
   await vi.advanceTimersByTimeAsync(30001);
   let release: (value: unknown) => void = () => {};
   fixture.healthDetails.mockImplementationOnce(
@@ -185,6 +193,16 @@ it("bounds a slow observation, shares concurrent refreshes and ignores a late re
   ).not.toBeNull();
   await vi.advanceTimersByTimeAsync(1);
   await Promise.all([first, second]);
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
+  ).not.toBeNull();
+  expect(
+    progressiveWorkerCapabilityMetadata(fixture.db)
+      .progressiveExecutionObservedAt,
+  ).toBe(sampledAt);
+  await refreshProgressiveWorkerCapabilities(fixture.db, fixture.engine);
+  expect(fixture.healthDetails).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(24999);
   expect(
     progressiveWorkerCapabilityMetadata(fixture.db).progressiveExecution,
   ).toBeNull();
@@ -317,6 +335,62 @@ describe("remote progressive capability admission", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+
+  it.each([
+    ["incompatible response", { status: "degraded" }],
+    [
+      "malformed identity response",
+      {
+        status: "ok",
+        solver_budget_version: 2,
+        mesh_recovery_version: 1,
+        urans_recovery_version: 14,
+        supported_engines: [{ version: "not-an-engine" }],
+      },
+    ],
+  ])(
+    "invalidates a previously valid observation after an answered %s",
+    async (_label, healthPatch) => {
+      const db = {} as DB;
+      let now = 1000;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+      const fixture = serviceFixture();
+      await refreshProgressiveWorkerCapabilities(db, fixture.engine);
+      now += 30001;
+      fixture.healthDetails.mockResolvedValueOnce(healthPatch);
+      await refreshProgressiveWorkerCapabilities(db, fixture.engine);
+      expect(progressiveWorkerCapabilityMetadata(db)).toEqual({
+        progressiveExecution: null,
+        progressiveExecutionObservedAt: null,
+      });
+      now += 1;
+      await refreshProgressiveWorkerCapabilities(db, fixture.engine);
+      expect(fixture.healthDetails).toHaveBeenCalledTimes(2);
+      clock.mockRestore();
+    },
+  );
+
+  it("invalidates an explicit engine identity mismatch without treating it as transport failure", async () => {
+    const db = {} as DB;
+    let now = 1000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    const fixture = serviceFixture();
+    await refreshProgressiveWorkerCapabilities(db, fixture.engine);
+    now += 30001;
+    fixture.healthDetails.mockRejectedValueOnce(
+      new EngineError(
+        "engine identity mismatch",
+        undefined,
+        ENGINE_IDENTITY_MISMATCH_CODE,
+      ),
+    );
+    await refreshProgressiveWorkerCapabilities(db, fixture.engine);
+    expect(progressiveWorkerCapabilityMetadata(db)).toEqual({
+      progressiveExecution: null,
+      progressiveExecutionObservedAt: null,
+    });
+    clock.mockRestore();
   });
   it("retains exact advertised capabilities without fabricating unsteady support", () => {
     const source = capabilities();

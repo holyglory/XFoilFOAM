@@ -6,7 +6,6 @@ import {
   progressiveCohortInitializedSql,
   progressiveCohortReadinessSql,
   progressiveInitialCoverageCompleteSql,
-  progressiveTargetMachSql,
 } from "./progressive-execution-policy";
 import {
   initialFastAnchors,
@@ -279,8 +278,8 @@ export async function claimProgressiveCfdUnit(
     }
     const [campaign] = await connection.execute(sql`
       WITH ${previousExecutions}, ${progressiveAdmissionFrontierSql(String(epoch.id))}
-      SELECT campaign.id FROM sim_campaigns campaign WHERE campaign.status IN ('active', 'attention')
-        AND EXISTS (
+      SELECT campaign.id,
+        NOT EXISTS (
           SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
           JOIN progressive_cfd_units unit ON unit.work_id = work.id
           WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
@@ -289,23 +288,75 @@ export async function claimProgressiveCfdUnit(
             AND ${recoveryOwner}
             AND ${previousExecutionStopped}
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
-            AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+            AND work.stage = 2 AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
             AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
             AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
-        ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
+        ) AS all_stage3
+      FROM sim_campaigns campaign
+      WHERE campaign.status IN ('active', 'attention') AND EXISTS (
+        SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
+        JOIN progressive_cfd_units unit ON unit.work_id = work.id
+        WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
+          AND ${targetFilter}
+          AND ${familyFilter}
+          AND ${recoveryOwner}
+          AND ${previousExecutionStopped}
+          AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
+          AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+          AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
+          AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+          AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
+      )
+      ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
     `);
     if (!campaign) return null;
-    const targetMach = progressiveTargetMachSql();
-    const [unit] = (await connection.execute(sql`
-      WITH ${previousExecutions}, ${progressiveAdmissionFrontierSql(String(epoch.id))},
-        ${progressiveCohortReadinessSql(String(epoch.id))}, selected AS MATERIALIZED (
+    const cohortReadiness = campaign.all_stage3
+      ? sql``
+      : sql`, ${progressiveCohortReadinessSql(String(epoch.id))}`;
+    const cohortInitialized = campaign.all_stage3
+      ? sql`true`
+      : progressiveCohortInitializedSql();
+    const initialCoverageComplete = campaign.all_stage3
+      ? sql`true`
+      : progressiveInitialCoverageCompleteSql();
+    const selected = campaign.all_stage3
+      ? sql`selected AS MATERIALIZED (
+      SELECT unit.id
+      FROM progressive_generations generation
+      JOIN progressive_work work ON work.generation_id = generation.id
+      JOIN polar_analysis_targets target ON target.id = work.target_id
+      JOIN LATERAL (
+        SELECT unit.id
+        FROM progressive_cfd_units unit
+        WHERE unit.work_id = work.id
+          AND ${targetFilter}
+          AND ${familyFilter}
+          AND ${recoveryOwner}
+          AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+          AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
+          AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
+        ORDER BY CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END, unit.ordinal, unit.id
+        LIMIT 1
+      ) first_unit ON true
+      JOIN progressive_cfd_units unit ON unit.id = first_unit.id
+      WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+        AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
+        AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+        AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
+        AND ${previousExecutionStopped}
+      ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
+        CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
+        generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
+        unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
+      )`
+      : sql`selected AS MATERIALIZED (
       SELECT unit.id
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN polar_analysis_targets target ON target.id = work.target_id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
-        AND (work.stage = 3 OR ${progressiveCohortInitializedSql()})
+        AND (work.stage = 3 OR ${cohortInitialized})
         AND ${targetFilter}
         AND ${familyFilter}
         AND ${recoveryOwner}
@@ -315,12 +366,14 @@ export async function claimProgressiveCfdUnit(
         AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
-        AND (unit.purpose <> 'adaptive' OR ${progressiveInitialCoverageCompleteSql()})
-      ORDER BY CASE WHEN ${targetMach} < 1.0 THEN 0 WHEN ${targetMach} >= 1.0 THEN 1 ELSE 2 END,
-        CASE WHEN ${targetMach} >= 1.0 THEN ${targetMach} END ASC NULLS LAST,
+        AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
+      ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
+        CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
         generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
-      )
+      )`;
+    const [unit] = (await connection.execute(sql`
+      WITH ${previousExecutions}, ${progressiveAdmissionFrontierSql(String(epoch.id))}${cohortReadiness}, ${selected}
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
         work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,

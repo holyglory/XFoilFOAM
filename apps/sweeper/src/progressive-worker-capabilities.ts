@@ -4,6 +4,8 @@ import { sql } from "drizzle-orm";
 import { canonicalAnalysisJson } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import {
+  ENGINE_IDENTITY_MISMATCH_CODE,
+  EngineError,
   isEngineIdentity,
   isEngineCapabilityDescriptor,
 } from "@aerodb/engine-client";
@@ -16,6 +18,7 @@ interface Observation {
   checkedAt: number;
   sampledAt: string;
   capabilities: ProgressiveRemoteCapabilities | null;
+  attemptedAt: number;
 }
 
 const observations = new WeakMap<DB, Observation>();
@@ -27,7 +30,7 @@ export function progressiveWorkerCapabilityMetadata(
 ) {
   const observation = observations.get(db);
   const fresh =
-    observation &&
+    !!observation?.capabilities &&
     now >= observation.checkedAt &&
     now - observation.checkedAt < 60000;
   return {
@@ -41,7 +44,13 @@ export async function refreshProgressiveWorkerCapabilities(
   engine: EngineClient,
 ): Promise<void> {
   const previous = observations.get(db);
-  if (previous && performance.now() - previous.checkedAt < 30000) return;
+  const now = performance.now();
+  if (
+    previous &&
+    now >= previous.attemptedAt &&
+    now - previous.attemptedAt < 30000
+  )
+    return;
   const running = pending.get(db);
   if (running) return running;
   const refresh = async () => {
@@ -49,6 +58,7 @@ export async function refreshProgressiveWorkerCapabilities(
     const sampledAt = new Date().toISOString();
     let capabilities: ProgressiveRemoteCapabilities | null = null;
     let observationCompleted = false;
+    let contractMismatch = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const [health, inventory] = await Promise.race([
@@ -100,13 +110,23 @@ export async function refreshProgressiveWorkerCapabilities(
           executionPools: routes.map((route) => route.routing_key),
         });
       }
-    } catch {
+    } catch (error) {
       capabilities = null;
+      contractMismatch =
+        error instanceof EngineError &&
+        error.code === ENGINE_IDENTITY_MISMATCH_CODE;
     } finally {
       if (timeout) clearTimeout(timeout);
     }
-    if (observationCompleted || !previous?.capabilities) {
-      observations.set(db, { checkedAt, sampledAt, capabilities });
+    if (observationCompleted || contractMismatch || !previous?.capabilities) {
+      observations.set(db, {
+        checkedAt,
+        sampledAt,
+        capabilities,
+        attemptedAt: checkedAt,
+      });
+    } else {
+      observations.set(db, { ...previous, attemptedAt: checkedAt });
     }
   };
   const operation = refresh();
