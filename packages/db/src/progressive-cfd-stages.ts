@@ -233,8 +233,12 @@ export async function advanceProgressiveCfdStages(db: DB) {
         costEvidenceId: string;
       }> = [];
       if (Number(scope.stage) === 2) {
-        if (
+        const adaptiveFastDeferred =
           scope.adaptive_fast_deferred === true ||
+          String(scope.adaptive_fast_deferred) === "true" ||
+          String(scope.adaptive_fast_deferred) === "t";
+        if (
+          adaptiveFastDeferred ||
           scope.work_error === ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR
         ) {
           reason = "adaptive_fast_refinement_deferred";
