@@ -4,6 +4,7 @@ import { expect } from "vitest";
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { authorizeProgressiveRemoteStart } from "../src/progressive-remote-start";
+import { PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS } from "../src/progressive-remote-start";
 import { readProgressiveRemoteContinuation } from "../src/progressive-remote-continuation";
 
 export async function verifyProgressiveRemoteStart(
@@ -82,7 +83,7 @@ export async function verifyProgressiveRemoteStart(
     expect(
       Date.parse(authorization.expiresAt) -
         Date.parse(authorization.authorizedAt),
-    ).toBeLessThanOrEqual(120000);
+    ).toBeLessThanOrEqual(PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS);
     const [unchanged] = await db.execute(sql`
       SELECT status, engine_job_id, request_payload FROM sim_jobs WHERE id = ${input.executionId}::uuid
     `);
@@ -110,10 +111,14 @@ export async function verifyProgressiveRemoteStart(
     const olderAuthorization = {
       ...authorization,
       authorizedAt: new Date(
-        Date.parse(authorization.authorizedAt) - 180000,
+        Date.parse(authorization.authorizedAt) -
+          PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS -
+          60000,
       ).toISOString(),
       expiresAt: new Date(
-        Date.parse(authorization.expiresAt) - 180000,
+        Date.parse(authorization.expiresAt) -
+          PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS -
+          60000,
       ).toISOString(),
     };
     await db.execute(sql`UPDATE sim_jobs SET request_payload = jsonb_set(request_payload, '{remoteStartAuthorization}',

@@ -4,6 +4,10 @@ import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { canonicalAnalysisJson } from "./analysis-target";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 
+export const PROGRESSIVE_REMOTE_START_LEASE_SECONDS = 900;
+export const PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS =
+  PROGRESSIVE_REMOTE_START_LEASE_SECONDS * 1000;
+
 export type ProgressiveRemoteStartDecision =
   | {
       kind: "authorized";
@@ -173,7 +177,7 @@ export async function authorizeProgressiveRemoteStart(
         Date.parse(authorization.authorizedAt) > now.getTime() ||
         Date.parse(authorization.expiresAt) -
           Date.parse(authorization.authorizedAt) >
-          120_000 ||
+          PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS ||
         !(Date.parse(authorization.expiresAt) > now.getTime())
       )
         return {
@@ -195,7 +199,7 @@ export async function authorizeProgressiveRemoteStart(
       authorizedAt: now.toISOString(),
       expiresAt: new Date(
         Math.min(
-          now.getTime() + 120_000,
+          now.getTime() + PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
           new Date(promise.expires_at as string | Date).getTime(),
           ...units.map((unit) =>
             new Date(unit.lease_until as string | Date).getTime(),

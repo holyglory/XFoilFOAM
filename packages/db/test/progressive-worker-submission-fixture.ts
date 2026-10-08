@@ -16,6 +16,7 @@ import {
   queuedDiskJobScope,
 } from "../../../apps/sweeper/src/disk-admission";
 import { submitProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-submission";
+import { PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS } from "../src/progressive-remote-start";
 import { admitRemoteSolverTick } from "../../../apps/sweeper/src/remote-solver";
 
 export async function verifyProgressiveWorkerSubmission(
@@ -65,7 +66,9 @@ export async function verifyProgressiveWorkerSubmission(
         executionId,
         contentSignature: envelope.contentSignature,
         authorizedAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + 120000).toISOString(),
+        expiresAt: new Date(
+          now + PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
+        ).toISOString(),
       },
     });
   };
@@ -101,10 +104,13 @@ export async function verifyProgressiveWorkerSubmission(
       const response = await authorization(url, options);
       const body = await response.json();
       body.decision.authorizedAt = new Date(
-        Date.parse(body.checkedAt) - 120001,
+        Date.parse(body.checkedAt) -
+          PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS -
+          1,
       ).toISOString();
       body.decision.expiresAt = new Date(
-        Date.parse(body.decision.authorizedAt) + 120000,
+        Date.parse(body.decision.authorizedAt) +
+          PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
       ).toISOString();
       return Response.json(body);
     };

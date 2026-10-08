@@ -7,6 +7,7 @@ import {
   progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteActivePromiseCount,
   progressiveSolverOwnerLock,
+  PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
@@ -169,7 +170,7 @@ export async function prepareProgressiveRemoteDispatch(
       const leases = await claimProgressiveCfdBatch(connection, {
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
-        leaseSeconds: 120,
+        leaseSeconds: PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
         requireSweeperEnabled: true,
         solverBudgetVersion: 2,
         localTimeStepVersion: capabilities.localTimeStepVersion,

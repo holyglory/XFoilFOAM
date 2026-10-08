@@ -3,6 +3,7 @@ import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { canonicalAnalysisJson } from "./analysis-target";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
+import { PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS } from "./progressive-remote-start";
 
 export async function readProgressiveRemoteContinuation(
   db: DB,
@@ -90,7 +91,7 @@ export async function readProgressiveRemoteContinuation(
         !Number.isFinite(expiresAt) ||
         authorizedAt > new Date(epoch.checked_at as string | Date).getTime() ||
         expiresAt <= authorizedAt ||
-        expiresAt - authorizedAt > 120000 ||
+        expiresAt - authorizedAt > PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS ||
         canonicalAnalysisJson(payload.engineRequest) !==
           canonicalAnalysisJson(envelope.request) ||
         canonicalAnalysisJson(payload.progressive) !==

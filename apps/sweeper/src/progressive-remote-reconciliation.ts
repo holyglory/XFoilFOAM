@@ -1,6 +1,10 @@
 import { sql } from "drizzle-orm";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
-import { settleProgressiveWorkerFinalReport, type DB } from "@aerodb/db";
+import {
+  PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
+  settleProgressiveWorkerFinalReport,
+  type DB,
+} from "@aerodb/db";
 import {
   ENGINE_SUBMIT_TIMEOUT_MS,
   type EngineClient,
@@ -140,7 +144,7 @@ export async function reconcileProgressiveRemoteWorker(
     WHERE job.request_payload->>'remoteSolver' = 'true' AND NOT settings.remote_solver_transfer_paused
       AND job.request_payload ? 'remoteProgressiveExecution'
       AND promise.registered_solver_id = settings.remote_solver_registered_id
-      AND (job.engine_job_id IS NOT NULL OR intent.created_at <= clock_timestamp() - ${120000 + ENGINE_SUBMIT_TIMEOUT_MS} * interval '1 millisecond'
+      AND (job.engine_job_id IS NOT NULL OR intent.created_at <= clock_timestamp() - ${PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS + ENGINE_SUBMIT_TIMEOUT_MS} * interval '1 millisecond'
         OR NOT settings.remote_solver_enabled OR job.status IN ('done', 'failed', 'cancelled')
         OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp())
       AND ((job.engine_job_id IS NOT NULL AND job.engine_job_id <> job.id::text) OR NOT EXISTS (

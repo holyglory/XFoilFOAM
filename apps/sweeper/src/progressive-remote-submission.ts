@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   canonicalAnalysisJson,
+  PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
   verifyProgressiveRemoteExecution,
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
@@ -150,7 +151,11 @@ export async function submitProgressiveRemoteJob(
     throw new Error("The hub did not authorize the exact assigned execution");
   const duration =
     Date.parse(decision.expiresAt) - Date.parse(decision.authorizedAt);
-  if (!Number.isFinite(duration) || duration <= 0 || duration > 120_000)
+  if (
+    !Number.isFinite(duration) ||
+    duration <= 0 ||
+    duration > PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS
+  )
     throw new Error("The hub returned an invalid bounded start authorization");
   const checkedAt =
     typeof body?.checkedAt === "string" ? Date.parse(body.checkedAt) : NaN;
