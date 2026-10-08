@@ -71,6 +71,28 @@ export async function advanceProgressiveCfdStages(db: DB) {
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
+    await connection.execute(sql`
+      UPDATE progressive_cfd_units unit
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+        lease_until = NULL,
+        error = 'Blocked unit has no retained execution attempt'
+      FROM progressive_work work
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      WHERE unit.work_id = work.id
+        AND generation.epoch_id = ${epoch.id}
+        AND generation.status = 'active'
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND campaign.status IN ('active', 'attention', 'paused')
+        AND work.stage IN (2, 3)
+        AND unit.state = 'blocked'
+        AND unit.lease_token IS NULL
+        AND unit.lease_until IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts attempt
+          WHERE attempt.unit_id = unit.id
+        )
+    `);
     const [campaign] = await connection.execute(sql`
       WITH progressive_stage_unsettled_units AS MATERIALIZED (
         SELECT DISTINCT attempt.unit_id
