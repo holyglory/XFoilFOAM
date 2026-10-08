@@ -17,6 +17,7 @@ import {
   PROGRESSIVE_FIT_POLICY_ID,
   runProgressiveFitBatch,
 } from "./progressive-fitting";
+import { runProgressiveFitBatches } from "./progressive-fit-concurrency";
 
 function configuredNeuralFoilConcurrency(env: NodeJS.ProcessEnv = process.env) {
   const raw =
@@ -25,6 +26,19 @@ function configuredNeuralFoilConcurrency(env: NodeJS.ProcessEnv = process.env) {
     "1";
   const value = Number(raw);
   return Number.isSafeInteger(value) && value > 0 ? value : 1;
+}
+
+function configuredProgressiveFitConcurrency(
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const raw =
+    env.AIRFOILFOAM_PROGRESSIVE_FIT_CONCURRENCY ??
+    env.AIRFOILFOAM_WORKER_CPU_BUDGET ??
+    "1";
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, 16)
+    : 1;
 }
 
 export async function runProgressiveBaselineService(
@@ -130,16 +144,24 @@ export async function runProgressiveBaselineService(
           report({ component: "progressive-baseline", ...batch });
         }
         if (signal.aborted) break;
-        let fitting = await runProgressiveFitBatch(db, engine, owner, {
-          requireCfdEvidence: cfdFitTurn,
-          currentCampaignEvidenceOnly: cfdFitTurn,
-          requireSweeperEnabled: true,
-        });
+        let fitting = await runProgressiveFitBatches(
+          configuredProgressiveFitConcurrency(),
+          () =>
+            runProgressiveFitBatch(db, engine, owner, {
+              requireCfdEvidence: cfdFitTurn,
+              currentCampaignEvidenceOnly: cfdFitTurn,
+              requireSweeperEnabled: true,
+            }),
+        );
         if (!fitting.claimed && cfdFitTurn && !signal.aborted)
-          fitting = await runProgressiveFitBatch(db, engine, owner, {
-            requireCfdEvidence: false,
-            requireSweeperEnabled: true,
-          });
+          fitting = await runProgressiveFitBatches(
+            configuredProgressiveFitConcurrency(),
+            () =>
+              runProgressiveFitBatch(db, engine, owner, {
+                requireCfdEvidence: false,
+                requireSweeperEnabled: true,
+              }),
+          );
         if (fitting.claimed) {
           cfdFitTurn = !cfdFitTurn;
           pending = true;

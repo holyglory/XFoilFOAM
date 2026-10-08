@@ -56,7 +56,9 @@ with an unrestricted oldest-first turn. Evidence from a cancelled or superseded
 plan cannot take the priority turn; it may still be processed normally by the
 oldest-first path. An empty priority turn falls back immediately, without
 waiting for another solver report. The global stop and remote-worker role gates
-remain unchanged, and no additional fitting worker is started.
+remain unchanged. Fit requests run as a bounded concurrent batch in the existing
+service process; `AIRFOILFOAM_PROGRESSIVE_FIT_CONCURRENCY` overrides the batch
+size, otherwise the worker CPU budget is used, capped at 16.
 
 This is publication ordering, not a change to the campaign stage barrier or
 scientific acceptance. Fast RANS iteration histories and unsteady histories can
