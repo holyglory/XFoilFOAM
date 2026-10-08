@@ -32,12 +32,12 @@ export async function listProgressiveRemoteAssignments(
       AND dispatch.created_at <= ${cycleStartedAt}::timestamptz
       ${
         input.after && input.afterCreatedAt
-          ? sql`AND (dispatch.created_at, dispatch.sim_job_id) < (${input.afterCreatedAt}::timestamptz, ${input.after}::uuid)`
+          ? sql`AND (dispatch.created_at, dispatch.sim_job_id) > (${input.afterCreatedAt}::timestamptz, ${input.after}::uuid)`
           : sql``
       }
       AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
         WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
-    ORDER BY dispatch.created_at DESC, dispatch.sim_job_id DESC LIMIT ${limit + 1}
+    ORDER BY dispatch.created_at ASC, dispatch.sim_job_id ASC LIMIT ${limit + 1}
   `);
   const items = rows.slice(0, limit).map((row) => ({
     executionId: String(row.executionId),

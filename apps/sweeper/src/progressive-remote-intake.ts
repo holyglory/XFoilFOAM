@@ -132,10 +132,9 @@ async function receiveAssignmentPage(
     !(page.nextCreatedAt === null || timestamp(page.nextCreatedAt))
   )
     throw new Error("The hub returned an invalid assignment page");
-  const cycleBoundary = Date.parse(String(page.cycleStartedAt));
   let previousCreatedAt = afterCreatedAt
     ? Date.parse(afterCreatedAt)
-    : cycleBoundary;
+    : Number.NEGATIVE_INFINITY;
   let previous = after;
   const identities: Array<{
     executionId: string;
@@ -157,10 +156,10 @@ async function receiveAssignmentPage(
       );
     const itemCreatedAt = Date.parse(item.createdAt);
     if (
-      itemCreatedAt > previousCreatedAt ||
+      itemCreatedAt < previousCreatedAt ||
       (itemCreatedAt === previousCreatedAt &&
         previous !== null &&
-        item.executionId >= previous)
+        item.executionId <= previous)
     )
       throw new Error(
         "The hub returned unordered or malformed assignment identities",

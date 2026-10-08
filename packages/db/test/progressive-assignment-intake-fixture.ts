@@ -62,17 +62,15 @@ export async function verifyProgressiveAssignmentIntake(
         if (createdAt > cycleStartedAt) return false;
         if (after === null || afterCreatedAt === null) return true;
         return (
-          createdAt < afterCreatedAt ||
-          (createdAt === afterCreatedAt && item.scope.executionId < after)
+          createdAt > afterCreatedAt ||
+          (createdAt === afterCreatedAt && item.scope.executionId > after)
         );
       });
       const page = remaining
         .sort((left, right) => {
-          const createdAt = createdAtByExecutionId.get(
-            right.scope.executionId,
-          )!;
+          const createdAt = createdAtByExecutionId.get(left.scope.executionId)!;
           const otherCreatedAt = createdAtByExecutionId.get(
-            left.scope.executionId,
+            right.scope.executionId,
           )!;
           return createdAt.localeCompare(otherCreatedAt);
         })
