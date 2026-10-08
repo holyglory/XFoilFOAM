@@ -322,6 +322,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       }
       return retained;
     }
+    await publishAcceptedProgressiveAttempts(connection, executionId);
     const result = retained.report.result;
     const finalPoints = new Set(
       result
