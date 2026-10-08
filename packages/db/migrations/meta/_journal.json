@@ -1191,6 +1191,13 @@
       "when": 1792368000063,
       "tag": "0169_progressive_assignment_cursor_order",
       "breakpoints": true
+    },
+    {
+      "idx": 170,
+      "version": "7",
+      "when": 1792368000064,
+      "tag": "0170_progressive_adaptive_deferral",
+      "breakpoints": true
     }
   ]
 }
