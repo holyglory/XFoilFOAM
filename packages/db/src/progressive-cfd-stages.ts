@@ -12,6 +12,9 @@ import {
   progressiveInitialCoverageCompleteSql,
 } from "./progressive-execution-policy";
 
+export const ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR =
+  "adaptive fast refinement deferred before precise low-Mach stage";
+
 async function finishCampaigns(db: DB, epochId: string): Promise<number> {
   const completed = await db.execute(sql`
     WITH settled AS (
@@ -161,7 +164,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
         sql`generation.campaign_id = ${campaign.id}`,
         false,
       )}
-      SELECT work.id, work.generation_id, work.target_id, work.stage, scope.angles,
+      SELECT work.id, work.generation_id, work.target_id, work.stage, work.error AS work_error, scope.angles,
         ${hasEvidence} AS has_cfd_evidence,
         EXISTS (
           SELECT 1
@@ -224,7 +227,9 @@ export async function advanceProgressiveCfdStages(db: DB) {
         costEvidenceId: string;
       }> = [];
       if (Number(scope.stage) === 2) {
-        if (!scope.initial_coverage_complete) {
+        if (scope.work_error === ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR) {
+          reason = "adaptive_fast_refinement_deferred";
+        } else if (!scope.initial_coverage_complete) {
           receipt.waiting += 1;
           continue;
         }
@@ -353,6 +358,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       } else {
         const gap =
           units.some((unit) => unit.state === "gap") ||
+          reason === "adaptive_fast_refinement_deferred" ||
           reason.startsWith("fast_model_unavailable") ||
           reason === "fast_evidence_uninformative" ||
           reason === "fast_prior_unavailable_with_gaps";

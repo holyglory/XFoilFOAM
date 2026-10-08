@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR } from "./progressive-cfd-stages";
 import { SUBSONIC_THROUGH_PRECISE_POLICY } from "./progressive-execution-policy";
 
 export async function deferProgressiveAdaptiveFastUnits(
@@ -52,7 +53,7 @@ export async function deferProgressiveAdaptiveFastUnits(
       const rows = await connection.execute(sql`
         UPDATE progressive_cfd_units unit SET state = 'gap',
           lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-          error = 'adaptive fast refinement deferred before precise low-Mach stage'
+          error = ${ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR}
         FROM progressive_work work
         JOIN progressive_generation_cohort_targets member
           ON member.generation_id = work.generation_id AND member.target_id = work.target_id
@@ -67,9 +68,21 @@ export async function deferProgressiveAdaptiveFastUnits(
               AND (attempt.outcome = 'running'
                 OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL))
           )
-        RETURNING unit.id
+        RETURNING unit.id, unit.work_id
       `);
       if (rows.length) {
+        const workIds = [
+          ...new Set(rows.map((row) => String(row.work_id ?? ""))),
+        ].filter(Boolean);
+        if (workIds.length)
+          await connection.execute(sql`
+            UPDATE progressive_work SET error = ${ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR}
+            WHERE id IN (${sql.join(
+              workIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )})
+              AND state = 'pending'
+          `);
         deferred += rows.length;
         generationIds.push(String(generation.id));
       }
