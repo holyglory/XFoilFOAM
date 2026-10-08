@@ -240,7 +240,7 @@ function capabilities() {
 }
 
 describe("remote progressive capability admission", () => {
-  it("advertises only fresh observed gateway capabilities and clears them after a failed refresh", async () => {
+  it("retains a valid capability observation across a transient refresh failure", async () => {
     const db = {} as DB;
     let now = 1000;
     const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
@@ -299,8 +299,12 @@ describe("remote progressive capability admission", () => {
       await refreshProgressiveWorkerCapabilities(db, engine);
       expect(
         progressiveWorkerCapabilityMetadata(db).progressiveExecution,
+      ).not.toBeNull();
+      now += 30000;
+      expect(
+        progressiveWorkerCapabilityMetadata(db).progressiveExecution,
       ).toBeNull();
-      now += 30001;
+      now += 1;
       await refreshProgressiveWorkerCapabilities(db, engine);
       expect(
         progressiveWorkerCapabilityMetadata(db).progressiveExecution,

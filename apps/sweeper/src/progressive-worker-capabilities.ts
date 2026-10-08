@@ -48,6 +48,7 @@ export async function refreshProgressiveWorkerCapabilities(
     const checkedAt = performance.now();
     const sampledAt = new Date().toISOString();
     let capabilities: ProgressiveRemoteCapabilities | null = null;
+    let observationCompleted = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const [health, inventory] = await Promise.race([
@@ -62,6 +63,7 @@ export async function refreshProgressiveWorkerCapabilities(
           );
         }),
       ]);
+      observationCompleted = true;
       const identity = inventory.default_engine;
       if (
         health.status === "ok" &&
@@ -103,7 +105,9 @@ export async function refreshProgressiveWorkerCapabilities(
     } finally {
       if (timeout) clearTimeout(timeout);
     }
-    observations.set(db, { checkedAt, sampledAt, capabilities });
+    if (observationCompleted || !previous?.capabilities) {
+      observations.set(db, { checkedAt, sampledAt, capabilities });
+    }
   };
   const operation = refresh();
   pending.set(db, operation);
