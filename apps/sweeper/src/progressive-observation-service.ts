@@ -4,6 +4,15 @@ import type { EngineClient } from "@aerodb/engine-client";
 import { reconcileProgressiveRemoteWorker } from "./progressive-remote-reconciliation";
 import { MAX_ACTIVE_RECONCILE_JOB_LIMIT } from "./reconcile";
 
+function progressiveObservationConcurrency(
+  raw = process.env.SWEEPER_PROGRESSIVE_OBSERVATION_CONCURRENCY,
+): number {
+  if (raw == null || raw.trim() === "") return 8;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return 8;
+  return Math.min(parsed, 16);
+}
+
 export async function runProgressiveRemoteObservationService(
   db: DB,
   engine: EngineClient,
@@ -13,6 +22,7 @@ export async function runProgressiveRemoteObservationService(
     try {
       const receipt = await reconcileProgressiveRemoteWorker(db, engine, {
         limit: MAX_ACTIVE_RECONCILE_JOB_LIMIT,
+        concurrency: progressiveObservationConcurrency(),
       });
       if (receipt.inspected || receipt.errors.length)
         console.log(

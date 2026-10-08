@@ -57,7 +57,12 @@ const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
 export async function reconcileProgressiveRemoteWorker(
   db: DB,
   engine: EngineClient,
-  options: { jobIds?: string[]; limit?: number; fetcher?: typeof fetch } = {},
+  options: {
+    jobIds?: string[];
+    limit?: number;
+    concurrency?: number;
+    fetcher?: typeof fetch;
+  } = {},
 ) {
   const limit = options.limit ?? activeReconcileJobLimit();
   if (
@@ -69,6 +74,9 @@ export async function reconcileProgressiveRemoteWorker(
         new Set(options.jobIds).size !== options.jobIds.length))
   )
     throw new Error("Invalid progressive remote reconciliation scope");
+  const concurrency = options.concurrency ?? activeReconcileConcurrency();
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 16)
+    throw new Error("Invalid progressive remote reconciliation concurrency");
   const receipt = {
     inspected: 0,
     reported: 0,
@@ -102,7 +110,7 @@ export async function reconcileProgressiveRemoteWorker(
   `);
   await runWithConcurrency(
     finalMirrors,
-    activeReconcileConcurrency(),
+    concurrency,
     async (job) => {
       const executionId = String(job.id);
       try {
@@ -156,7 +164,7 @@ export async function reconcileProgressiveRemoteWorker(
   `);
   await runWithConcurrency(
     candidates,
-    activeReconcileConcurrency(),
+    concurrency,
     async (candidate) => {
       const executionId = String(candidate.id);
       receipt.inspected += 1;

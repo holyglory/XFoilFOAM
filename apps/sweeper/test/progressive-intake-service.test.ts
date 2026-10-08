@@ -68,6 +68,7 @@ it("observes obsolete execution independently and drains its active proof before
   expect(observe).toHaveBeenCalledOnce();
   expect(observe.mock.calls[0][2]).toEqual({
     limit: MAX_ACTIVE_RECONCILE_JOB_LIMIT,
+    concurrency: 8,
   });
   expect(MAX_ACTIVE_RECONCILE_JOB_LIMIT).toBe(64);
   expect(activeReconcileJobLimit("")).toBe(8);
