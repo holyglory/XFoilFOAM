@@ -165,6 +165,7 @@ export async function claimProgressiveCfdUnit(
     solverBudgetVersion?: number | null;
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
+    campaignLockMode?: "skip" | "wait";
     sameTarget?: {
       generationId: string;
       targetId: string;
@@ -292,7 +293,7 @@ export async function claimProgressiveCfdUnit(
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
             AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
             AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
-        ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
+        ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
     `);
     if (!campaign) return null;
     const targetMach = progressiveTargetMachSql();
@@ -406,6 +407,7 @@ export async function claimProgressiveCfdBatch(
     solverBudgetVersion?: number | null;
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
+    campaignLockMode?: "skip" | "wait";
   },
 ): Promise<ProgressiveCfdLease[]> {
   const maximum = input.maximumUnits ?? 64;
