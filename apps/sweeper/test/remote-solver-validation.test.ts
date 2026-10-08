@@ -45,6 +45,7 @@ const { ensureSimulationPresetRevision } =
 const {
   admitRemoteSolverTick,
   brokeredEvidenceIdempotencyKey,
+  brokeredEvidenceArchiveRecoveryIdempotencyKey,
   claimResultDelivery,
   settleForeignProgressiveDeliveries,
   createProgressAwareAbort,
@@ -4253,12 +4254,23 @@ describe("remote solver push validation regressions", () => {
       secondPromiseId,
       attemptId,
     );
+    const archiveRecovery = brokeredEvidenceArchiveRecoveryIdempotencyKey(
+      firstPromiseId,
+      attemptId,
+    );
 
     expect(first).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(retry).toBe(first);
     expect(reusedEvidence).not.toBe(first);
+    expect(archiveRecovery).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(archiveRecovery).not.toBe(first);
+    expect(archiveRecovery).toBe(
+      brokeredEvidenceArchiveRecoveryIdempotencyKey(firstPromiseId, attemptId),
+    );
   });
 
   it("MUST-CATCH: brokers a rejected restartable PRECALC checkpoint without fulfilling the remote point", async () => {

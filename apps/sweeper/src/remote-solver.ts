@@ -176,6 +176,7 @@ const REMOTE_PROMISE_RENEWAL_MAX_CONCURRENCY = 16;
 const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
   "xfoilfoam-hub-canonical-evidence-binding-v1\n";
 const BROKER_UPLOAD_IDEMPOTENCY_DOMAIN = "xfoilfoam:broker-upload:v1\0";
+const BROKER_ARCHIVE_RECOVERY_DOMAIN = "xfoilfoam:broker-archive-recovery:v1\0";
 
 function remotePromiseRenewalConcurrency(
   raw = process.env.SWEEPER_REMOTE_PROMISE_RENEWAL_CONCURRENCY,
@@ -203,6 +204,23 @@ export function brokeredEvidenceIdempotencyKey(
 ): string {
   const bytes = createHash("sha256")
     .update(BROKER_UPLOAD_IDEMPOTENCY_DOMAIN)
+    .update(promiseId)
+    .update("\0")
+    .update(resultAttemptId)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x80;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function brokeredEvidenceArchiveRecoveryIdempotencyKey(
+  promiseId: string,
+  resultAttemptId: string,
+): string {
+  const bytes = createHash("sha256")
+    .update(BROKER_ARCHIVE_RECOVERY_DOMAIN)
     .update(promiseId)
     .update("\0")
     .update(resultAttemptId)
@@ -4912,17 +4930,39 @@ export async function deliverNextProgressiveWorkerArchive(
         string,
         unknown
       > | null;
-      if (!response.ok || !body)
+      if (!response.ok || !body) {
+        const detail = typeof body?.error === "string" ? `: ${body.error}` : "";
         throw new Error(
-          `Progressive archive broker ${path} failed (${response.status})`,
+          `Progressive archive broker ${path} failed (${response.status})${detail}`,
         );
+      }
       return body;
     };
-    let broker = await request(
-      "/evidence-uploads",
-      brokerRequest,
-      REMOTE_POLL_TIMEOUT_MS,
-    );
+    let broker: Record<string, unknown>;
+    try {
+      broker = await request(
+        "/evidence-uploads",
+        brokerRequest,
+        REMOTE_POLL_TIMEOUT_MS,
+      );
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !error.message.includes("brokered evidence upload is revoked")
+      )
+        throw error;
+      broker = await request(
+        "/evidence-uploads",
+        {
+          ...brokerRequest,
+          idempotencyKey: brokeredEvidenceArchiveRecoveryIdempotencyKey(
+            promiseId,
+            attempt.id,
+          ),
+        },
+        REMOTE_POLL_TIMEOUT_MS,
+      );
+    }
     if (broker.state === "issued") {
       if (
         typeof broker.id !== "string" ||
@@ -5050,23 +5090,39 @@ export async function deliverNextProgressiveWorkerArchive(
     } finally {
       uploadAbort.dispose();
     }
-    if (
-      body?.conflictIds?.length ||
-      body?.progressiveArchiveReceipts?.length !== 1
-    )
+    let custodyReceipt =
+      body?.progressiveArchiveReceipts?.length === 1
+        ? body.progressiveArchiveReceipts[0]
+        : null;
+    if (!custodyReceipt) {
+      const custodyResponse = await fetch(
+        `${syncBase(settings)}/evidence-uploads/${broker.id}/custody`,
+        {
+          method: "POST",
+          signal: AbortSignal.any([
+            transferLease.signal,
+            AbortSignal.timeout(REMOTE_POLL_TIMEOUT_MS),
+          ]),
+          headers: headers(settings),
+        },
+      );
+      const custodyBody = (await custodyResponse.json().catch(() => null)) as {
+        progressiveArchiveReceipt?: unknown;
+        error?: unknown;
+      } | null;
+      if (custodyResponse.ok && custodyBody?.progressiveArchiveReceipt)
+        custodyReceipt = custodyBody.progressiveArchiveReceipt;
+    }
+    if (!custodyReceipt)
       throw new Error(
         "Progressive archive import did not return exact custody",
       );
     transferLease.throwIfFailed();
-    await recordProgressiveWorkerArchiveCustody(
-      db,
-      body.progressiveArchiveReceipts[0],
-      {
-        source,
-        brokeredUploadId: broker.id,
-        remote,
-      },
-    );
+    await recordProgressiveWorkerArchiveCustody(db, custodyReceipt, {
+      source,
+      brokeredUploadId: broker.id,
+      remote,
+    });
     await settleProgressiveWorkerArchiveClaim(db, claim);
     return true;
   } catch (error) {

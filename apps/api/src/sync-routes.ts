@@ -4681,7 +4681,11 @@ export async function importPolarPush(
         }
       : attemptValues;
     if (progressivePoint) incomingResult.simJobId = importedEngineJobId;
-    const insertAttemptForResult = async (tx: DB, resultId: string) => {
+    const insertAttemptForResult = async (
+      tx: DB,
+      resultId: string,
+      archiveOnlyReplay = false,
+    ) => {
       const [existingAttempt] = await tx
         .select()
         .from(resultAttempts)
@@ -4702,16 +4706,17 @@ export async function importPolarPush(
           return { kind: "conflict" as const, attempt: existingAttempt };
         }
         if (
+          !archiveOnlyReplay &&
           stableHash(
             comparableRemoteAttempt(
               existingAttempt as unknown as Record<string, unknown>,
             ),
           ) !==
-          stableHash(
-            comparableRemoteAttempt(
-              ownedAttemptValues as Record<string, unknown>,
-            ),
-          )
+            stableHash(
+              comparableRemoteAttempt(
+                ownedAttemptValues as Record<string, unknown>,
+              ),
+            )
         ) {
           return { kind: "conflict" as const, attempt: existingAttempt };
         }
@@ -5055,7 +5060,11 @@ export async function importPolarPush(
             kind: "existing" as const,
             attempt: { id: exactReplayAttempt!.id },
           } as const)
-        : await insertAttemptForResult(tx, existing.id);
+        : await insertAttemptForResult(
+            tx,
+            existing.id,
+            transportedPoint.progressiveArchiveOnly === true,
+          );
       if (attemptResolution.kind === "conflict") {
         return { kind: "conflict" as const, existing };
       }
@@ -7490,6 +7499,73 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           error instanceof Error
             ? error.message
             : "evidence verification failed",
+      });
+    }
+  });
+
+  app.post("/api/sync/v1/evidence-uploads/:id/custody", async (req, reply) => {
+    const solver = await requireRegisteredRemoteSolver(req, reply);
+    if (!solver) return;
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const token = remoteSolverToken(req);
+    if (!token)
+      return reply
+        .code(401)
+        .send({ error: "remote solver credential required" });
+    try {
+      const [row] = await db.execute(sql`
+        SELECT upload.promise_id, upload.engine_job_id, upload.engine_case_slug,
+          upload.aoa_deg, upload.remote_result_id, upload.remote_result_attempt_id,
+          receipt.sequence, receipt.point_content_signature,
+          report.content_signature AS report_content_signature
+        FROM sync_brokered_evidence_uploads upload
+        JOIN progressive_remote_evidence_receipts receipt
+          ON receipt.sim_job_id = upload.engine_job_id::uuid
+         AND receipt.remote_result_attempt_id = upload.remote_result_attempt_id
+        JOIN progressive_remote_reports report
+          ON report.sim_job_id = receipt.sim_job_id
+         AND report.sequence = receipt.sequence
+        WHERE upload.id = ${params.id}::uuid
+          AND upload.solver_id = ${solver.id}::uuid
+        ORDER BY receipt.received_at DESC
+        LIMIT 1
+      `);
+      if (!row)
+        return reply
+          .code(409)
+          .send({ error: "exact bound progressive custody is unavailable" });
+      const receipt = await readProgressiveEvidenceCustodyReceipt(
+        db,
+        {
+          solverId: solver.id,
+          promiseId: String(row.promise_id),
+          engineJobId: String(row.engine_job_id),
+          aoaDeg: Number(row.aoa_deg),
+          engineCaseSlug: row.engine_case_slug
+            ? String(row.engine_case_slug)
+            : null,
+          remoteResultId: String(row.remote_result_id),
+          remoteResultAttemptId: String(row.remote_result_attempt_id),
+          progressiveEvidence: {
+            sequence: Number(row.sequence),
+            reportContentSignature: String(row.report_content_signature),
+            pointContentSignature: String(row.point_content_signature),
+          },
+        },
+        params.id,
+      );
+      return {
+        progressiveArchiveReceipt: signProgressiveEvidenceCustodyReceipt(
+          receipt,
+          token,
+        ),
+      };
+    } catch (error) {
+      return reply.code(409).send({
+        error:
+          error instanceof Error
+            ? error.message
+            : "exact bound progressive custody is unavailable",
       });
     }
   });
