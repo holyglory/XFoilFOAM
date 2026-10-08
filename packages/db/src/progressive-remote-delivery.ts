@@ -4,14 +4,24 @@ import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution
 
 export async function listProgressiveRemoteAssignments(
   db: DB,
-  input: { solverId: string; after?: string; limit?: number },
+  input: {
+    solverId: string;
+    beforeCreatedAt?: string;
+    afterCreatedAt?: string;
+    after?: string;
+    limit?: number;
+  },
 ) {
   const limit = input.limit ?? 25;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50)
     throw new Error("Remote assignment page size must be between 1 and 50");
+  if (Boolean(input.afterCreatedAt) !== Boolean(input.after))
+    throw new Error("Remote assignment cursor requires created time and id");
+  const cycleStartedAt = input.beforeCreatedAt ?? new Date().toISOString();
   const rows = await db.execute(sql`
     SELECT dispatch.sim_job_id AS "executionId", dispatch.promise_id AS "promiseId",
-      dispatch.content_signature AS "contentSignature", dispatch.cpu_slots AS "cpuSlots"
+      dispatch.content_signature AS "contentSignature", dispatch.cpu_slots AS "cpuSlots",
+      dispatch.created_at AS "createdAt"
     FROM progressive_remote_dispatches dispatch
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
     JOIN sync_sweep_promises promise
@@ -19,20 +29,28 @@ export async function listProgressiveRemoteAssignments(
       AND promise.status = 'active'
       AND promise."expiresAt" > clock_timestamp()
     WHERE dispatch.solver_id = ${input.solverId}::uuid
-      ${input.after ? sql`AND dispatch.sim_job_id > ${input.after}::uuid` : sql``}
+      AND dispatch.created_at <= ${cycleStartedAt}::timestamptz
+      ${
+        input.after && input.afterCreatedAt
+          ? sql`AND (dispatch.created_at, dispatch.sim_job_id) < (${input.afterCreatedAt}::timestamptz, ${input.after}::uuid)`
+          : sql``
+      }
       AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
         WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
-    ORDER BY dispatch.sim_job_id LIMIT ${limit + 1}
+    ORDER BY dispatch.created_at DESC, dispatch.sim_job_id DESC LIMIT ${limit + 1}
   `);
   const items = rows.slice(0, limit).map((row) => ({
     executionId: String(row.executionId),
     promiseId: String(row.promiseId),
     contentSignature: String(row.contentSignature),
     cpuSlots: Number(row.cpuSlots),
+    createdAt: new Date(row.createdAt as string | Date).toISOString(),
   }));
   return {
     items,
+    cycleStartedAt,
     nextCursor: rows.length > limit ? items.at(-1)!.executionId : null,
+    nextCreatedAt: rows.length > limit ? items.at(-1)!.createdAt : null,
   };
 }
 

@@ -24,6 +24,16 @@ function uuid(value: unknown): value is string {
   );
 }
 
+function timestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function databaseTimestamp(value: unknown): string | null {
+  if (value instanceof Date && Number.isFinite(value.getTime()))
+    return value.toISOString();
+  return timestamp(value) ? new Date(value).toISOString() : null;
+}
+
 const pendingPages = new WeakMap<
   DB,
   ReturnType<typeof receiveAssignmentPage>
@@ -84,12 +94,16 @@ async function receiveAssignmentPage(
   const solverId = String(settings.solver_id);
   const baseUrl = canonicalRemoteHubBaseUrl(String(settings.upstream_base_url));
   const [cursor] =
-    await db.execute(sql`SELECT after_execution_id FROM progressive_worker_assignment_cursors
+    await db.execute(sql`SELECT cycle_started_at, after_created_at, after_execution_id FROM progressive_worker_assignment_cursors
     WHERE settings_id = 1 AND solver_id = ${solverId}::uuid AND upstream_base_url = ${baseUrl}`);
+  const cycleStartedAt = databaseTimestamp(cursor?.cycle_started_at);
+  const afterCreatedAt = cycleStartedAt
+    ? databaseTimestamp(cursor?.after_created_at)
+    : null;
   const after =
-    cursor?.after_execution_id == null
-      ? null
-      : String(cursor.after_execution_id);
+    afterCreatedAt && cursor?.after_execution_id != null
+      ? String(cursor.after_execution_id)
+      : null;
   const request = async (path: string) => {
     const response = await fetchProgressiveRemote(
       fetcher,
@@ -107,21 +121,28 @@ async function receiveAssignmentPage(
     return response.json() as Promise<unknown>;
   };
   const page = await request(
-    `/progressive-executions?limit=50${after ? `&after=${encodeURIComponent(after)}` : ""}`,
+    `/progressive-executions?limit=50${cycleStartedAt ? `&beforeCreatedAt=${encodeURIComponent(cycleStartedAt)}` : ""}${after && afterCreatedAt ? `&afterCreatedAt=${encodeURIComponent(afterCreatedAt)}&after=${encodeURIComponent(after)}` : ""}`,
   );
   if (
     !record(page) ||
     !Array.isArray(page.items) ||
     page.items.length > 50 ||
-    !(page.nextCursor === null || uuid(page.nextCursor))
+    !timestamp(page.cycleStartedAt) ||
+    !(page.nextCursor === null || uuid(page.nextCursor)) ||
+    !(page.nextCreatedAt === null || timestamp(page.nextCreatedAt))
   )
     throw new Error("The hub returned an invalid assignment page");
+  const cycleBoundary = Date.parse(String(page.cycleStartedAt));
+  let previousCreatedAt = afterCreatedAt
+    ? Date.parse(afterCreatedAt)
+    : cycleBoundary;
+  let previous = after;
   const identities: Array<{
     executionId: string;
     promiseId: string;
     contentSignature: string;
+    createdAt: string;
   }> = [];
-  let previous = after;
   for (const item of page.items) {
     if (
       !record(item) ||
@@ -129,7 +150,17 @@ async function receiveAssignmentPage(
       !uuid(item.promiseId) ||
       typeof item.contentSignature !== "string" ||
       !/^[a-f0-9]{64}$/.test(item.contentSignature) ||
-      (previous !== null && item.executionId <= previous)
+      !timestamp(item.createdAt)
+    )
+      throw new Error(
+        "The hub returned unordered or malformed assignment identities",
+      );
+    const itemCreatedAt = Date.parse(item.createdAt);
+    if (
+      itemCreatedAt > previousCreatedAt ||
+      (itemCreatedAt === previousCreatedAt &&
+        previous !== null &&
+        item.executionId >= previous)
     )
       throw new Error(
         "The hub returned unordered or malformed assignment identities",
@@ -138,16 +169,21 @@ async function receiveAssignmentPage(
       executionId: item.executionId,
       promiseId: item.promiseId,
       contentSignature: item.contentSignature,
+      createdAt: new Date(itemCreatedAt).toISOString(),
     });
+    previousCreatedAt = itemCreatedAt;
     previous = item.executionId;
   }
   if (
     page.nextCursor !== null &&
-    page.nextCursor !== identities.at(-1)?.executionId
+    (page.nextCursor !== identities.at(-1)?.executionId ||
+      page.nextCreatedAt !== identities.at(-1)?.createdAt)
   )
     throw new Error(
       "The hub assignment cursor would skip unreceived executions",
     );
+  if (page.nextCursor === null && page.nextCreatedAt !== null)
+    throw new Error("The hub returned an invalid terminal assignment cursor");
   const mirrored = async (identity: (typeof identities)[number]) => {
     const [job] = await db.execute(sql`SELECT job.id FROM sim_jobs job
       JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
@@ -207,15 +243,21 @@ async function receiveAssignmentPage(
     },
   );
   const [advanced] = await db.execute(sql`
-    INSERT INTO progressive_worker_assignment_cursors (settings_id, solver_id, upstream_base_url, after_execution_id)
-    SELECT 1, ${solverId}::uuid, ${baseUrl}, ${page.nextCursor}::uuid FROM sync_api_settings settings
+    INSERT INTO progressive_worker_assignment_cursors (settings_id, solver_id, upstream_base_url, cycle_started_at, after_created_at, after_execution_id)
+    SELECT 1, ${solverId}::uuid, ${baseUrl},
+      ${page.nextCursor === null ? null : page.cycleStartedAt}::timestamptz,
+      ${page.nextCreatedAt}::timestamptz, ${page.nextCursor}::uuid FROM sync_api_settings settings
     WHERE settings.id = 1 AND settings.remote_solver_registered_id = ${solverId}::uuid
       AND settings.upstream_base_url = ${settings.upstream_base_url}
     ON CONFLICT (settings_id) DO UPDATE SET solver_id = EXCLUDED.solver_id, upstream_base_url = EXCLUDED.upstream_base_url,
+      cycle_started_at = EXCLUDED.cycle_started_at,
+      after_created_at = EXCLUDED.after_created_at,
       after_execution_id = EXCLUDED.after_execution_id, updated_at = clock_timestamp()
     WHERE progressive_worker_assignment_cursors.solver_id <> ${solverId}::uuid
       OR progressive_worker_assignment_cursors.upstream_base_url <> ${baseUrl}
-      OR progressive_worker_assignment_cursors.after_execution_id IS NOT DISTINCT FROM ${after}::uuid
+      OR progressive_worker_assignment_cursors.cycle_started_at IS NOT DISTINCT FROM ${cycleStartedAt}::timestamptz
+        AND progressive_worker_assignment_cursors.after_created_at IS NOT DISTINCT FROM ${afterCreatedAt}::timestamptz
+        AND progressive_worker_assignment_cursors.after_execution_id IS NOT DISTINCT FROM ${after}::uuid
     RETURNING settings_id
   `);
   receipt.cursorAdvanced = Boolean(advanced);

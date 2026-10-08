@@ -36,6 +36,12 @@ export async function verifyProgressiveAssignmentIntake(
   ].sort((left, right) =>
     left.scope.executionId < right.scope.executionId ? -1 : 1,
   );
+  const createdAtByExecutionId = new Map(
+    assignments.map((item, index) => [
+      item.scope.executionId,
+      new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    ]),
+  );
   const fullReads: string[] = [];
   const importedExecutionId = randomUUID();
   const importedPromiseId = randomUUID();
@@ -46,20 +52,46 @@ export async function verifyProgressiveAssignmentIntake(
     if (url.pathname.endsWith("/progressive-executions")) {
       expect(url.searchParams.get("limit")).toBe("50");
       expect(url.searchParams.has("currentCampaignOnly")).toBe(false);
+      const beforeCreatedAt = url.searchParams.get("beforeCreatedAt");
       const after = url.searchParams.get("after");
-      const remaining = assignments.filter(
-        (item) => after === null || item.scope.executionId > after,
-      );
-      const page = remaining.slice(0, 50);
+      const afterCreatedAt = url.searchParams.get("afterCreatedAt");
+      const cycleStartedAt =
+        beforeCreatedAt ?? new Date(Date.UTC(2026, 0, 1, 0, 1)).toISOString();
+      const remaining = assignments.filter((item) => {
+        const createdAt = createdAtByExecutionId.get(item.scope.executionId)!;
+        if (createdAt > cycleStartedAt) return false;
+        if (after === null || afterCreatedAt === null) return true;
+        return (
+          createdAt < afterCreatedAt ||
+          (createdAt === afterCreatedAt && item.scope.executionId < after)
+        );
+      });
+      const page = remaining
+        .sort((left, right) => {
+          const createdAt = createdAtByExecutionId.get(
+            right.scope.executionId,
+          )!;
+          const otherCreatedAt = createdAtByExecutionId.get(
+            left.scope.executionId,
+          )!;
+          return createdAt.localeCompare(otherCreatedAt);
+        })
+        .slice(0, 50);
       return Response.json({
+        cycleStartedAt,
         items: page.map((item) => ({
           executionId: item.scope.executionId,
           promiseId: item.promiseId,
           contentSignature: item.contentSignature,
           cpuSlots: item.request.resources?.solver_processes ?? 1,
+          createdAt: createdAtByExecutionId.get(item.scope.executionId),
         })),
         nextCursor:
           remaining.length > 50 ? page.at(-1)!.scope.executionId : null,
+        nextCreatedAt:
+          remaining.length > 50
+            ? createdAtByExecutionId.get(page.at(-1)!.scope.executionId)
+            : null,
       });
     }
     const assignedId = url.pathname.split("/").at(-1)!;
@@ -131,25 +163,31 @@ export async function verifyProgressiveAssignmentIntake(
     expect(repeated.reduce((total, item) => total + item.existing, 0)).toBe(1);
     expect(receive).toHaveBeenCalledTimes(1);
     expect(fullReads.filter((id) => id === executionId)).toHaveLength(1);
-    const readCursor = () => db.execute(sql`SELECT * FROM progressive_worker_assignment_cursors
+    const readCursor = () =>
+      db.execute(sql`SELECT * FROM progressive_worker_assignment_cursors
       WHERE settings_id = 1`);
     const pageItems = assignments.slice(0, 2).map((item) => ({
       executionId: item.scope.executionId,
       promiseId: item.promiseId,
       contentSignature: item.contentSignature,
+      createdAt: createdAtByExecutionId.get(item.scope.executionId),
     }));
     for (const malformed of [
       { items: pageItems.toReversed(), nextCursor: null },
       { items: [pageItems[0], pageItems[0]], nextCursor: null },
       { items: [], nextCursor: 123 },
       { items: [] },
-      { items: Array.from({ length: 51 }, () => pageItems[0]), nextCursor: null },
+      {
+        items: Array.from({ length: 51 }, () => pageItems[0]),
+        nextCursor: null,
+      },
     ]) {
       const beforeCursor = await readCursor();
       const received = receive.mock.calls.length;
       const fetchPage = vi.fn(async () => Response.json(malformed));
-      await expect(receiveProgressiveAssignmentPage(db, receive, fetchPage))
-        .rejects.toThrow(/invalid assignment page|unordered or malformed/);
+      await expect(
+        receiveProgressiveAssignmentPage(db, receive, fetchPage),
+      ).rejects.toThrow(/invalid assignment page|unordered or malformed/);
       expect(fetchPage).toHaveBeenCalledOnce();
       expect(receive).toHaveBeenCalledTimes(received);
       expect(await readCursor()).toEqual(beforeCursor);
@@ -196,9 +234,12 @@ export async function verifyProgressiveAssignmentIntake(
                 executionId: importedExecutionId,
                 promiseId: importedPromiseId,
                 contentSignature: importedEnvelope.contentSignature,
+                createdAt: new Date(Date.UTC(2026, 0, 1)).toISOString(),
               },
             ],
+            cycleStartedAt: new Date(Date.UTC(2026, 0, 1, 0, 1)).toISOString(),
             nextCursor: null,
+            nextCreatedAt: null,
           });
         return Response.json({
           assignment: {
@@ -241,7 +282,12 @@ export async function verifyProgressiveAssignmentIntake(
     expect(noExecution).toEqual({ points: 0, intents: 0, reports: 1 });
     await expect(
       receiveProgressiveAssignmentPage(db, receive, async () =>
-        Response.json({ items: [], nextCursor: randomUUID() }),
+        Response.json({
+          items: [],
+          cycleStartedAt: new Date(Date.UTC(2026, 0, 1, 0, 1)).toISOString(),
+          nextCursor: randomUUID(),
+          nextCreatedAt: new Date(Date.UTC(2026, 0, 1)).toISOString(),
+        }),
       ),
     ).rejects.toThrow("cursor would skip");
     const futureCursor = "ffffffff-ffff-ffff-ffff-ffffffffffff";
@@ -277,7 +323,11 @@ export async function verifyProgressiveAssignmentIntake(
     );
     if (originalCursor)
       await db.execute(sql`INSERT INTO progressive_worker_assignment_cursors
-      (settings_id, solver_id, upstream_base_url, after_execution_id, updated_at) VALUES
-      (1, ${originalCursor.solver_id}::uuid, ${originalCursor.upstream_base_url}, ${originalCursor.after_execution_id}::uuid, ${originalCursor.updated_at}::timestamptz)`);
+      (settings_id, solver_id, upstream_base_url, cycle_started_at, after_created_at, after_execution_id, updated_at) VALUES
+      (1, ${originalCursor.solver_id}::uuid, ${originalCursor.upstream_base_url},
+        ${originalCursor.cycle_started_at}::timestamptz,
+        ${originalCursor.after_created_at}::timestamptz,
+        ${originalCursor.after_execution_id}::uuid,
+        ${originalCursor.updated_at}::timestamptz)`);
   }
 }

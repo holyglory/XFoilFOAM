@@ -6981,6 +6981,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     const query = z
       .object({
         after: z.string().uuid().optional(),
+        afterCreatedAt: z.string().datetime().optional(),
+        beforeCreatedAt: z.string().datetime().optional(),
         limit: z.coerce.number().int().min(1).max(50).optional(),
       })
       .strict()

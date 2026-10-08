@@ -7806,6 +7806,9 @@ export const progressiveRemoteDispatches = pgTable(
     solverIdx: index("progressive_remote_dispatches_solver_idx").on(
       table.solverId,
     ),
+    solverCreatedIdx: index(
+      "progressive_remote_dispatches_solver_created_idx",
+    ).on(table.solverId, table.createdAt, table.simJobId),
     slotsCheck: check(
       "progressive_remote_dispatches_cpu_slots_check",
       sql`${table.cpuSlots} > 0`,
@@ -8438,6 +8441,8 @@ export const progressiveWorkerAssignmentCursors = pgTable(
       .references(() => syncApiSettings.id, { onDelete: "cascade" }),
     solverId: uuid("solver_id").notNull(),
     upstreamBaseUrl: text("upstream_base_url").notNull(),
+    cycleStartedAt: timestamp("cycle_started_at", { withTimezone: true }),
+    afterCreatedAt: timestamp("after_created_at", { withTimezone: true }),
     afterExecutionId: uuid("after_execution_id"),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
