@@ -1,10 +1,8 @@
 import type { DB, Sql } from "@aerodb/db";
-import { sql } from "drizzle-orm";
 import { acknowledgeProgressiveRemoteStops } from "./progressive-remote-stop-receipt";
 import { reconcileProgressiveRemoteProgress } from "./progressive-remote-progress";
 import { runNotificationDrain } from "./notification-drain";
 import { prepareProgressiveRemoteFleet } from "./progressive-remote-admission";
-import { advanceProgressiveCfdStages } from "@aerodb/db";
 
 export async function runProgressiveHubProgressService(
   db: DB,
@@ -19,15 +17,15 @@ export async function runProgressiveHubProgressService(
       drain: async () => {
         const stops = await acknowledgeProgressiveRemoteStops(db);
         const progress = await reconcileProgressiveRemoteProgress(db);
-        const [role] = (await db.execute(
-          sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
-        )) as unknown as Array<{ remote_solver_enabled: boolean }>;
-        const stages = role?.remote_solver_enabled
-          ? { admitted: 0, closed: 0, waiting: 0, campaignsCompleted: 0 }
-          : await advanceProgressiveCfdStages(db);
         const admission = signal.aborted
           ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
           : await prepareProgressiveRemoteFleet(db);
+        const stages = {
+          admitted: 0,
+          closed: 0,
+          waiting: 0,
+          campaignsCompleted: 0,
+        };
         if (
           stops.acknowledged ||
           stops.errors.length ||
