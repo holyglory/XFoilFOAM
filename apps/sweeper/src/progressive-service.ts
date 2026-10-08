@@ -36,9 +36,7 @@ function configuredProgressiveFitConcurrency(
     env.AIRFOILFOAM_WORKER_CPU_BUDGET ??
     "1";
   const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0
-    ? Math.min(value, 16)
-    : 1;
+  return Number.isSafeInteger(value) && value > 0 ? Math.min(value, 16) : 1;
 }
 
 export async function runProgressiveBaselineService(
@@ -84,7 +82,6 @@ export async function runProgressiveBaselineService(
           SELECT state.enabled, coalesce((SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1), false) AS remote
           FROM sweeper_state state WHERE state.id = 1
         `)) as unknown as Array<{ enabled: boolean; remote: boolean }>;
-        if (settings?.remote) continue;
         const scope = await reconcileProgressiveGenerationRequest(db);
         if (scope) {
           pending = true;
@@ -112,6 +109,7 @@ export async function runProgressiveBaselineService(
             retried: inactiveRemoteGaps,
           });
         }
+        if (settings?.remote) continue;
         if (!settings?.enabled || signal.aborted) continue;
         if (!policyReconciled) {
           const invalidated = await invalidateProgressiveFitPolicy(
