@@ -242,45 +242,46 @@ export async function advanceProgressiveCfdStages(db: DB) {
           scope.work_error === ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR
         ) {
           reason = "adaptive_fast_refinement_deferred";
-        } else if (!scope.initial_coverage_complete) {
-          receipt.waiting += 1;
-          continue;
-        }
-        if (
-          scope.has_cfd_evidence &&
-          ["pending", "leased"].includes(String(scope.fit_state))
-        ) {
-          receipt.waiting += 1;
-          continue;
-        }
-        const model = (
-          scope.response as { estimate?: ProgressivePolarEstimate } | null
-        )?.estimate;
-        if (
-          !model ||
-          model.version !== "progressive-polar-gp-v2" ||
-          model.target_signature !== scope.target_id ||
-          model.acquisition?.version !== "fixed-posterior-coverage-v1"
-        ) {
-          if (!scope.has_neuralfoil_baseline) {
-            reason = units.some((unit) => unit.state === "gap")
-              ? "fast_prior_unavailable_with_gaps"
-              : "fast_prior_unavailable_after_initial_coverage";
-          } else if (
-            scope.fit_state === "gap" ||
-            units.every((unit) => unit.state === "gap")
-          )
-            reason = "fast_model_unavailable_after_bounded_work";
-          else {
+        } else {
+          if (!scope.initial_coverage_complete) {
             receipt.waiting += 1;
             continue;
           }
-        } else if (!model.contributors.length) {
-          reason = "fast_evidence_uninformative";
-          modelId = String(scope.model_id);
-        } else {
-          modelId = String(scope.model_id);
-          const costs = await connection.execute(sql`
+          if (
+            scope.has_cfd_evidence &&
+            ["pending", "leased"].includes(String(scope.fit_state))
+          ) {
+            receipt.waiting += 1;
+            continue;
+          }
+          const model = (
+            scope.response as { estimate?: ProgressivePolarEstimate } | null
+          )?.estimate;
+          if (
+            !model ||
+            model.version !== "progressive-polar-gp-v2" ||
+            model.target_signature !== scope.target_id ||
+            model.acquisition?.version !== "fixed-posterior-coverage-v1"
+          ) {
+            if (!scope.has_neuralfoil_baseline) {
+              reason = units.some((unit) => unit.state === "gap")
+                ? "fast_prior_unavailable_with_gaps"
+                : "fast_prior_unavailable_after_initial_coverage";
+            } else if (
+              scope.fit_state === "gap" ||
+              units.every((unit) => unit.state === "gap")
+            )
+              reason = "fast_model_unavailable_after_bounded_work";
+            else {
+              receipt.waiting += 1;
+              continue;
+            }
+          } else if (!model.contributors.length) {
+            reason = "fast_evidence_uninformative";
+            modelId = String(scope.model_id);
+          } else {
+            modelId = String(scope.model_id);
+            const costs = await connection.execute(sql`
             SELECT measured.result_attempt_id, measured.solver_active_seconds FROM (
             SELECT DISTINCT ON (attempt.token) evidence.result_attempt_id, evidence.solver_active_seconds FROM progressive_cfd_evidence evidence
             JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
@@ -290,45 +291,50 @@ export async function advanceProgressiveCfdStages(db: DB) {
             ORDER BY attempt.token, evidence.solver_active_seconds DESC, evidence.result_attempt_id
             ) measured ORDER BY measured.solver_active_seconds, measured.result_attempt_id
           `);
-          if (costs.length) {
-            const cost = costs[Math.floor(costs.length / 2)];
-            costId = String(cost.result_attempt_id);
-            costSeconds = Number(cost.solver_active_seconds);
-            candidates = model.acquisition.candidates
-              .filter((candidate) => requestedAngles.includes(candidate.alpha))
-              .map((candidate) => ({
-                alpha: candidate.alpha,
-                integratedVarianceReductionFraction:
-                  candidate.integrated_variance_reduction_fraction,
-                expectedActiveSeconds: costSeconds!,
-                modelId: modelId!,
-                costEvidenceId: costId!,
-              }));
-          }
-          const decision = nextFastAnchor({
-            requestedAngles,
-            attemptedAngles: units.map((unit) => Number(unit.aoa_deg)),
-            initialCoverageComplete: true,
-            candidates,
-          });
-          if (decision.reason === "no_measured_candidate") {
-            const unobserved = new Set(
-              model.acquisition.candidates.map((candidate) => candidate.alpha),
-            );
-            if (
-              requestedAngles.every(
-                (angle) =>
-                  model.alpha.includes(angle) && !unobserved.has(angle),
-              )
-            )
-              reason = "requested_grid_already_observed";
-            else {
-              receipt.waiting += 1;
-              continue;
+            if (costs.length) {
+              const cost = costs[Math.floor(costs.length / 2)];
+              costId = String(cost.result_attempt_id);
+              costSeconds = Number(cost.solver_active_seconds);
+              candidates = model.acquisition.candidates
+                .filter((candidate) =>
+                  requestedAngles.includes(candidate.alpha),
+                )
+                .map((candidate) => ({
+                  alpha: candidate.alpha,
+                  integratedVarianceReductionFraction:
+                    candidate.integrated_variance_reduction_fraction,
+                  expectedActiveSeconds: costSeconds!,
+                  modelId: modelId!,
+                  costEvidenceId: costId!,
+                }));
             }
-          } else {
-            alpha = decision.alpha;
-            reason = decision.reason;
+            const decision = nextFastAnchor({
+              requestedAngles,
+              attemptedAngles: units.map((unit) => Number(unit.aoa_deg)),
+              initialCoverageComplete: true,
+              candidates,
+            });
+            if (decision.reason === "no_measured_candidate") {
+              const unobserved = new Set(
+                model.acquisition.candidates.map(
+                  (candidate) => candidate.alpha,
+                ),
+              );
+              if (
+                requestedAngles.every(
+                  (angle) =>
+                    model.alpha.includes(angle) && !unobserved.has(angle),
+                )
+              )
+                reason = "requested_grid_already_observed";
+              else {
+                receipt.waiting += 1;
+                continue;
+              }
+            } else {
+              alpha = decision.alpha;
+              reason = decision.reason;
+            }
           }
         }
       } else if (
