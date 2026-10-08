@@ -4,6 +4,7 @@ import {
   initializeProgressiveCfdWork,
   advanceProgressiveCfdStages,
   recoverUnboundProgressiveCfdLeases,
+  recoverInactiveProgressiveRemoteGaps,
   invalidateProgressiveFitPolicy,
   type DB,
   type Sql,
@@ -86,6 +87,15 @@ export async function runProgressiveBaselineService(
           report({
             component: "progressive-cfd-unbound-recovery",
             ...recovery,
+          });
+        }
+        const inactiveRemoteGaps =
+          await recoverInactiveProgressiveRemoteGaps(db);
+        if (inactiveRemoteGaps) {
+          pending = true;
+          report({
+            component: "progressive-inactive-remote-recovery",
+            retried: inactiveRemoteGaps,
           });
         }
         if (!settings?.enabled || signal.aborted) continue;

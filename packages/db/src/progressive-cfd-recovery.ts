@@ -60,3 +60,45 @@ export async function recoverUnboundProgressiveCfdLeases(
     return receipt;
   });
 }
+
+export async function recoverInactiveProgressiveRemoteGaps(
+  db: DB,
+): Promise<number> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [epoch] = await connection.execute(
+      sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+    );
+    if (!epoch) throw new Error("Calculation epoch is missing");
+    const units = await connection.execute(sql`
+      SELECT unit.id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      WHERE generation.epoch_id = ${epoch.id}
+        AND generation.status = 'active'
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND ${effectiveProgressiveStageSql()} = work.stage
+        AND work.state = 'pending'
+        AND campaign.status IN ('active', 'attention', 'paused')
+        AND unit.state = 'gap'
+        AND unit.error = 'Inactive remote delivery has unresolved evidence'
+        AND unit.attempts < 2
+        AND unit.active_seconds < unit.active_budget_seconds
+      ORDER BY unit.id
+      LIMIT 64
+      FOR UPDATE OF generation, work, unit SKIP LOCKED
+    `);
+    for (const unit of units) {
+      await connection.execute(sql`
+        UPDATE progressive_cfd_units
+        SET state = 'pending', lease_token = NULL, lease_owner = NULL,
+          lease_until = NULL, retry_after = NULL,
+          error = 'Retrying after inactive remote delivery'
+        WHERE id = ${unit.id}::uuid
+      `);
+    }
+    return units.length;
+  });
+}
