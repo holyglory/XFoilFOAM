@@ -528,6 +528,7 @@ export async function requestBrokeredEvidenceUpload(
     throw new Error("GCS evidence bucket is not configured on the hub");
   const claimedOrExisting = await database.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
+    let lateArchiveRecovery = false;
     // Serialize the per-solver quota and idempotency decision across every API
     // process. The engine call happens only after this transaction commits.
     await tx.execute(
@@ -611,8 +612,20 @@ export async function requestBrokeredEvidenceUpload(
       }
       if (["issuing", "verifying"].includes(existing.state))
         throw new Error("brokered evidence upload is already being processed");
-      if (existing.state === "revoked")
-        throw new Error("brokered evidence upload is revoked");
+      if (existing.state === "revoked") {
+        const [eligible] = await tx.execute(sql`
+          SELECT is_exact_retained_progressive_archive(upload) AS eligible
+          FROM sync_brokered_evidence_uploads upload
+          WHERE upload.id = ${existing.id}
+        `);
+        lateArchiveRecovery =
+          existing.sessionCancellationAcknowledgedAt !== null &&
+          existing.uploadUrl === null &&
+          existing.uploadExpiresAt === null &&
+          eligible?.eligible === true;
+        if (!lateArchiveRecovery)
+          throw new Error("brokered evidence upload is revoked");
+      }
       if (
         existing.state === "expired" &&
         existing.sessionCancellationAcknowledgedAt === null
@@ -796,6 +809,15 @@ export async function requestBrokeredEvidenceUpload(
               ),
               isNull(syncBrokeredEvidenceUploads.uploadUrl),
               isNull(syncBrokeredEvidenceUploads.uploadExpiresAt),
+            ),
+            and(
+              eq(syncBrokeredEvidenceUploads.state, "revoked"),
+              isNotNull(
+                syncBrokeredEvidenceUploads.sessionCancellationAcknowledgedAt,
+              ),
+              isNull(syncBrokeredEvidenceUploads.uploadUrl),
+              isNull(syncBrokeredEvidenceUploads.uploadExpiresAt),
+              sql`is_exact_retained_progressive_archive(${syncBrokeredEvidenceUploads})`,
             ),
           ),
         ),

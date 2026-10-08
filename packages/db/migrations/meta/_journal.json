@@ -1198,6 +1198,13 @@
       "when": 1792368000064,
       "tag": "0170_progressive_adaptive_deferral",
       "breakpoints": true
+    },
+    {
+      "idx": 171,
+      "version": "7",
+      "when": 1792368000065,
+      "tag": "0171_progressive_late_archive_revoked_retry",
+      "breakpoints": true
     }
   ]
 }
