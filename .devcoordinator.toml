@@ -1145,6 +1145,56 @@ tier = "development"
 requires = ["seed", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/admission-predicate-transitions.test.ts", "test/admission-circuit-breaker.test.ts"]
 
+[[test.reservation-accounting.check]]
+name = "expired-unstarted-remote-reservation"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "does not reserve remote CPU for an unstarted dispatch after its case lease expires"]
+
+[test.precise-admission]
+timeout_seconds = 900
+
+[test.precise-admission.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.precise-admission.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.precise-admission.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.precise-admission.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.precise-admission.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.precise-admission.check]]
+name = "precise-admission"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "subsonic through precise priority|keeps prior-generation stop safety|claims multiple precise units in order"]
+
+[[test.precise-admission.check]]
+name = "capability-pure"
+tier = "development"
+requires = ["types"]
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-capabilities.test.ts"]
+
 [test.progressive-archive-reclaim]
 timeout_seconds = 900
 

@@ -10978,6 +10978,133 @@ describe("subsonic through precise priority", () => {
     expect(await claimCfd()).toBeNull();
   }, 120_000);
 
+  it("claims multiple precise units in order, skips unavailable heads, and keeps high work closed until accepted low precise closure", async () => {
+    const fallback = await scope();
+    await initializeProgressiveCfdWork(db);
+    expect(
+      await claimProgressiveCfdUnit(db, {
+        owner: "default-stage-fallback",
+        leaseSeconds: 120,
+      }),
+    ).toMatchObject({ stage: 2 });
+    await db
+      .update(simCampaigns)
+      .set({ status: "paused" })
+      .where(eq(simCampaigns.id, fallback.campaignId));
+
+    const fixture = await scope(false, [-4, -2, 0, 2]);
+    const machTargets = await db.execute(sql`
+      SELECT target.id AS target_id, target.mach,
+        target.physical->'derived'->>'mach' AS physical_mach
+      FROM progressive_generation_targets scope
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      WHERE scope.generation_id = ${fixture.generationId}
+      ORDER BY target.mach, target.id
+    `);
+    expect(machTargets.map((target) => Number(target.mach))).toEqual([
+      0.5,
+      1,
+      2,
+    ]);
+    for (const target of machTargets)
+      expect(Number(target.mach)).toBe(Number(target.physical_mach));
+
+    const lowTarget = machTargets[0];
+    const lowMach = Number(lowTarget.mach);
+    await adoptProgressiveSubsonicPriority(db, fixture.campaignId);
+    expect(await initializeProgressiveCfdWork(db)).toBe(6);
+    const fastLeases = [(await claimCfd())!, (await claimCfd())!];
+    expect(fastLeases.every((lease) => lease.stage === 2)).toBe(true);
+    expect(fastLeases.every((lease) => lease.targetId === lowTarget.target_id)).toBe(true);
+    for (const lease of fastLeases) await finish(lease);
+    expect(await advanceProgressiveCfdStages(db)).toMatchObject({ closed: 1 });
+    expect(await initializeProgressiveCfdWork(db)).toBe(4);
+
+    const preciseUnits = await db.execute(sql`
+      SELECT unit.id, unit.ordinal, unit.aoa_deg, unit.active_budget_seconds
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      WHERE work.generation_id = ${fixture.generationId}
+        AND work.target_id = ${lowTarget.target_id} AND work.stage = 3
+      ORDER BY unit.ordinal
+    `);
+    expect(preciseUnits).toHaveLength(4);
+    const [leasedHead, deferredHead, exhaustedHead] = preciseUnits;
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'leased', lease_token = ${randomUUID()}::uuid,
+        lease_owner = 'foreign-precise-owner',
+        lease_until = clock_timestamp() + interval '1 hour'
+      WHERE id = ${leasedHead.id}
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET retry_after = clock_timestamp() + interval '1 hour'
+      WHERE id = ${deferredHead.id}
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET active_seconds = active_budget_seconds
+      WHERE id = ${exhaustedHead.id}
+    `);
+
+    expect(
+      await claimProgressiveCfdUnit(db, {
+        owner: "ineligible-precise-capability",
+        leaseSeconds: 120,
+        allowedSolverFamilies: ["simpleFoam"],
+      }),
+    ).toBeNull();
+    const [highPending] = await db.execute(sql`
+      SELECT count(*)::integer AS count
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generation_targets scope ON scope.generation_id = work.generation_id
+        AND scope.target_id = work.target_id
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      WHERE work.generation_id = ${fixture.generationId}
+        AND work.stage = 2 AND target.mach >= 1 AND unit.state = 'pending'
+    `);
+    expect(Number(highPending.count)).toBeGreaterThan(0);
+
+    const precise = (await claimCfd())!;
+    expect(precise).toMatchObject({
+      id: preciseUnits[3].id,
+      stage: 3,
+      targetId: lowTarget.target_id,
+      alpha: Number(preciseUnits[3].aoa_deg),
+    });
+    expect(precise.physical.derived.mach).toBe(lowMach);
+    expect(await claimCfd()).toBeNull();
+    await finish(precise, true);
+
+    for (const unit of preciseUnits.slice(0, 3))
+      await db.execute(sql`
+        UPDATE progressive_cfd_units
+        SET state = 'pending', retry_after = NULL, active_seconds = 0,
+          lease_token = NULL, lease_owner = NULL, lease_until = NULL
+        WHERE id = ${unit.id}
+      `);
+    const remainingAlphas: number[] = [];
+    for (const expected of preciseUnits.slice(0, 3)) {
+      const lease = (await claimCfd())!;
+      remainingAlphas.push(lease.alpha);
+      expect(lease).toMatchObject({
+        id: expected.id,
+        stage: 3,
+        targetId: lowTarget.target_id,
+      });
+      expect(lease.physical.derived.mach).toBe(lowMach);
+      await finish(lease, true);
+    }
+    expect(remainingAlphas).toEqual(
+      preciseUnits.slice(0, 3).map((unit) => Number(unit.aoa_deg)),
+    );
+    expect(await claimCfd()).toBeNull();
+    expect(await advanceProgressiveCfdStages(db)).toMatchObject({ closed: 1 });
+    expect((await claimCfd())?.physical.derived.mach).toBe(1);
+  }, 120_000);
+
   it("inherits priority on new-profile enrollment and holds old high work for low obligations in every current generation", async () => {
     const fixture = await scope();
     const low = await precise(fixture);

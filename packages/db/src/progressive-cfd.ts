@@ -13,7 +13,7 @@ import {
   selectProgressiveSolver,
   type ProgressiveSolverFamily,
 } from "@aerodb/core";
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import {
   canonicalAnalysisJson,
   type AnalysisPhysical,
@@ -320,37 +320,67 @@ export async function claimProgressiveCfdUnit(
     const initialCoverageComplete = campaign.all_stage3
       ? sql`true`
       : progressiveInitialCoverageCompleteSql();
-    const selected = campaign.all_stage3
-      ? sql`selected AS MATERIALIZED (
-      SELECT unit.id
-      FROM progressive_generations generation
-      JOIN progressive_work work ON work.generation_id = generation.id
-      JOIN polar_analysis_targets target ON target.id = work.target_id
-      JOIN LATERAL (
-        SELECT unit.id
-        FROM progressive_cfd_units unit
-        WHERE unit.work_id = work.id
-          AND ${targetFilter}
-          AND ${familyFilter}
-          AND ${recoveryOwner}
-          AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
-          AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
-          AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
-        ORDER BY CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END, unit.ordinal, unit.id
-        LIMIT 1
-      ) first_unit ON true
-      JOIN progressive_cfd_units unit ON unit.id = first_unit.id
-      WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
-        AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
-        AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
-        AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
-        AND ${previousExecutionStopped}
-      ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
-        CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
-        generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
-        unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
-      )`
-      : sql`selected AS MATERIALIZED (
+    let selected: SQL;
+    if (campaign.all_stage3) {
+      const selectStage3Candidate = async (
+        machPredicate: SQL,
+        orderBy: SQL,
+      ) => {
+        const selectWithAttemptPredicate = async (attemptPredicate: SQL) => {
+          const [candidate] = await connection.execute(sql`
+            WITH ${previousExecutions}, ${progressiveAdmissionFrontierSql(String(epoch.id))}
+            SELECT unit.id
+            FROM polar_analysis_targets target
+            JOIN progressive_generation_targets scope ON scope.target_id = target.id
+            JOIN progressive_work work ON work.generation_id = scope.generation_id AND work.target_id = scope.target_id
+              AND work.stage = 3 AND work.state = 'pending'
+            JOIN progressive_generations generation ON generation.id = scope.generation_id
+            JOIN LATERAL (
+              SELECT unit.id
+              FROM progressive_cfd_units unit
+              WHERE unit.work_id = work.id
+                AND ${targetFilter}
+                AND ${familyFilter}
+                AND ${recoveryOwner}
+                AND unit.state = 'pending' AND ${attemptPredicate} AND unit.active_seconds < unit.active_budget_seconds
+                AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
+                AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
+              ORDER BY CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END, unit.ordinal, unit.id
+              LIMIT 1
+            ) first_unit ON true
+            JOIN progressive_cfd_units unit ON unit.id = first_unit.id
+            WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+              AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
+              AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+              AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
+              AND ${machPredicate}
+              AND ${previousExecutionStopped}
+            ORDER BY ${orderBy} LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
+          `);
+          return candidate?.id ? String(candidate.id) : null;
+        };
+        const fastCandidate = await selectWithAttemptPredicate(
+          sql`unit.attempts < 2`,
+        );
+        return fastCandidate ?? selectWithAttemptPredicate(attemptAvailable);
+      };
+      let selectedId = await selectStage3Candidate(
+        sql`target.mach < 1.0`,
+        sql`generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
+          unit.ordinal, work.target_id`,
+      );
+      if (!selectedId)
+        selectedId = await selectStage3Candidate(
+          sql`target.mach >= 1.0`,
+          sql`target.mach, generation.created_at, generation.id,
+            CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END, unit.ordinal, work.target_id`,
+        );
+      if (!selectedId) return null;
+      selected = sql`selected AS MATERIALIZED (
+        SELECT ${selectedId}::uuid AS id
+      )`;
+    } else {
+      selected = sql`selected AS MATERIALIZED (
       SELECT unit.id
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
@@ -372,6 +402,7 @@ export async function claimProgressiveCfdUnit(
         generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       )`;
+    }
     const [unit] = (await connection.execute(sql`
       WITH ${previousExecutions}, ${progressiveAdmissionFrontierSql(String(epoch.id))}${cohortReadiness}, ${selected}
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
