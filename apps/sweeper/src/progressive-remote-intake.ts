@@ -41,11 +41,11 @@ const pendingPages = new WeakMap<
 
 function progressiveAssignmentIntakeConcurrency(): number {
   const configured = Number(
-    process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_CONCURRENCY ?? 16,
+    process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_CONCURRENCY ?? 32,
   );
   return Number.isInteger(configured) && configured > 0
-    ? Math.min(configured, 16)
-    : 16;
+    ? Math.min(configured, 32)
+    : 32;
 }
 
 export async function receiveProgressiveAssignmentPage(
