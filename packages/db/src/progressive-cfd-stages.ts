@@ -164,7 +164,13 @@ export async function advanceProgressiveCfdStages(db: DB) {
         sql`generation.campaign_id = ${campaign.id}`,
         false,
       )}
-      SELECT work.id, work.generation_id, work.target_id, work.stage, work.error AS work_error, scope.angles,
+      SELECT work.id, work.generation_id, work.target_id, work.stage, work.error AS work_error,
+        EXISTS (
+          SELECT 1 FROM progressive_generation_cohorts deferred
+          WHERE deferred.generation_id = generation.id AND deferred.cohort = 'low'
+            AND deferred.adaptive_fast_deferred
+        ) AS adaptive_fast_deferred,
+        scope.angles,
         ${hasEvidence} AS has_cfd_evidence,
         EXISTS (
           SELECT 1
@@ -227,7 +233,10 @@ export async function advanceProgressiveCfdStages(db: DB) {
         costEvidenceId: string;
       }> = [];
       if (Number(scope.stage) === 2) {
-        if (scope.work_error === ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR) {
+        if (
+          scope.adaptive_fast_deferred === true ||
+          scope.work_error === ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR
+        ) {
           reason = "adaptive_fast_refinement_deferred";
         } else if (!scope.initial_coverage_complete) {
           receipt.waiting += 1;

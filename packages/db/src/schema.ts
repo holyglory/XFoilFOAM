@@ -1,4 +1,8 @@
-import { DEFAULT_TRANSIENT_MAX_COURANT, type GasThermodynamicModel, type Point } from "@aerodb/core";
+import {
+  DEFAULT_TRANSIENT_MAX_COURANT,
+  type GasThermodynamicModel,
+  type Point,
+} from "@aerodb/core";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -338,38 +342,43 @@ export const airfoilHashtags = pgTable(
 // 3. Mediums — density + a discriminated viscosity model. The resolved
 //    dynamic/kinematic viscosity scalars are what feed Reynolds and the solver.
 // ---------------------------------------------------------------------------
-export const mediums = pgTable("mediums", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  slug: text("slug").notNull().unique(),
-  name: text("name").notNull(),
-  phase: phaseEnum("phase").notNull(),
-  density: doublePrecision("density").notNull(),
-  refTemperatureK: doublePrecision("ref_temperature_k")
-    .notNull()
-    .default(288.15),
-  refPressurePa: doublePrecision("ref_pressure_pa").notNull().default(101325),
-  viscosityModel: text("viscosity_model").notNull(), // constant | sutherland | table
-  constantDynamicViscosity: doublePrecision("constant_dynamic_viscosity"),
-  sutherlandMuRef: doublePrecision("sutherland_mu_ref"),
-  sutherlandTRef: doublePrecision("sutherland_t_ref"),
-  sutherlandS: doublePrecision("sutherland_s"),
-  dynamicViscosity: doublePrecision("dynamic_viscosity").notNull(),
-  kinematicViscosity: doublePrecision("kinematic_viscosity").notNull(),
-  speedOfSound: doublePrecision("speed_of_sound"),
-  gasThermodynamics: jsonb("gas_thermodynamics").$type<GasThermodynamicModel>(),
-  notes: text("notes"),
-  isSeeded: boolean("is_seeded").notNull().default(false),
-  createdAt: ts().notNull().defaultNow(),
-  updatedAt: ts()
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-}, (table) => ({
-  gasThermodynamicsPhase: check(
-    "mediums_gas_thermodynamics_phase_check",
-    sql`${table.gasThermodynamics} IS NULL OR (${table.phase} = 'gas' AND jsonb_typeof(${table.gasThermodynamics}) = 'object')`,
-  ),
-}));
+export const mediums = pgTable(
+  "mediums",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slug: text("slug").notNull().unique(),
+    name: text("name").notNull(),
+    phase: phaseEnum("phase").notNull(),
+    density: doublePrecision("density").notNull(),
+    refTemperatureK: doublePrecision("ref_temperature_k")
+      .notNull()
+      .default(288.15),
+    refPressurePa: doublePrecision("ref_pressure_pa").notNull().default(101325),
+    viscosityModel: text("viscosity_model").notNull(), // constant | sutherland | table
+    constantDynamicViscosity: doublePrecision("constant_dynamic_viscosity"),
+    sutherlandMuRef: doublePrecision("sutherland_mu_ref"),
+    sutherlandTRef: doublePrecision("sutherland_t_ref"),
+    sutherlandS: doublePrecision("sutherland_s"),
+    dynamicViscosity: doublePrecision("dynamic_viscosity").notNull(),
+    kinematicViscosity: doublePrecision("kinematic_viscosity").notNull(),
+    speedOfSound: doublePrecision("speed_of_sound"),
+    gasThermodynamics:
+      jsonb("gas_thermodynamics").$type<GasThermodynamicModel>(),
+    notes: text("notes"),
+    isSeeded: boolean("is_seeded").notNull().default(false),
+    createdAt: ts().notNull().defaultNow(),
+    updatedAt: ts()
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => ({
+    gasThermodynamicsPhase: check(
+      "mediums_gas_thermodynamics_phase_check",
+      sql`${table.gasThermodynamics} IS NULL OR (${table.phase} = 'gas' AND jsonb_typeof(${table.gasThermodynamics}) = 'object')`,
+    ),
+  }),
+);
 
 export const mediumViscosityTablePoints = pgTable(
   "medium_viscosity_table_points",
@@ -4135,9 +4144,12 @@ export const simJobs = pgTable(
       sql`${t.ingestLeasePreviousStatus} IS NULL OR ${t.ingestLeasePreviousStatus} <> 'ingesting'`,
     ),
     engineJobIdx: index("sim_jobs_engine_job_idx").on(t.engineJobId),
-    directTerminalRetentionIdx: index("sim_jobs_direct_terminal_retention_idx")
-      .on(sql`COALESCE(${t.finishedAt}, ${t.ingestedAt}, ${t.updatedAt}, ${t.createdAt})`, t.id)
-      .where(sql`${t.status} IN ('done', 'failed', 'cancelled')
+    directTerminalRetentionIdx: index(
+      "sim_jobs_direct_terminal_retention_idx",
+    ).on(
+      sql`COALESCE(${t.finishedAt}, ${t.ingestedAt}, ${t.updatedAt}, ${t.createdAt})`,
+      t.id,
+    ).where(sql`${t.status} IN ('done', 'failed', 'cancelled')
         AND ${t.engineJobId} IS NOT NULL
         AND NOT coalesce(${t.requestPayload} ? 'remoteProgressiveExecution', false)`),
     solverImplementationIdx: index("sim_jobs_solver_implementation_idx").on(
@@ -6119,7 +6131,9 @@ export const syncSweepPromises = pgTable(
   },
   (t) => ({
     statusIdx: index("sync_sweep_promises_status_idx").on(t.status),
-    textIdentityIdx: index("sync_sweep_promises_text_identity_idx").on(sql`(${t.id}::text)`),
+    textIdentityIdx: index("sync_sweep_promises_text_identity_idx").on(
+      sql`(${t.id}::text)`,
+    ),
     expiresIdx: index("sync_sweep_promises_expires_idx").on(t.expiresAt),
     scopeIdx: index("sync_sweep_promises_scope_idx").on(
       t.airfoilId,
@@ -6983,29 +6997,52 @@ export const progressiveGenerations = pgTable(
 export const campaignProgressiveExecutionPolicies = pgTable(
   "campaign_progressive_execution_policies",
   {
-    campaignId: uuid("campaign_id").primaryKey().references(() => simCampaigns.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id")
+      .primaryKey()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
     policy: text("policy").notNull(),
-    adoptedAt: timestamp("adopted_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+    adoptedAt: timestamp("adopted_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
   },
   (table) => ({
-    policyCheck: check("campaign_progressive_execution_policies_policy_check", sql`${table.policy} = 'subsonic-through-precise-v1'`),
+    policyCheck: check(
+      "campaign_progressive_execution_policies_policy_check",
+      sql`${table.policy} = 'subsonic-through-precise-v1'`,
+    ),
   }),
 );
 
 export const progressiveGenerationCohorts = pgTable(
   "progressive_generation_cohorts",
   {
-    generationId: uuid("generation_id").notNull().references(() => progressiveGenerations.id, { onDelete: "cascade" }),
+    generationId: uuid("generation_id")
+      .notNull()
+      .references(() => progressiveGenerations.id, { onDelete: "cascade" }),
     cohort: text("cohort").notNull(),
     stage: smallint("stage").notNull().default(1),
     status: text("status").notNull().default("active"),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+    adaptiveFastDeferred: boolean("adaptive_fast_deferred")
+      .notNull()
+      .default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
   },
   (table) => ({
     pk: primaryKey({ columns: [table.generationId, table.cohort] }),
-    cohortCheck: check("progressive_generation_cohorts_cohort_check", sql`${table.cohort} IN ('low', 'high')`),
-    stageCheck: check("progressive_generation_cohorts_stage_check", sql`${table.stage} IN (1, 2, 3)`),
-    statusCheck: check("progressive_generation_cohorts_status_check", sql`${table.status} IN ('active', 'complete', 'attention')`),
+    cohortCheck: check(
+      "progressive_generation_cohorts_cohort_check",
+      sql`${table.cohort} IN ('low', 'high')`,
+    ),
+    stageCheck: check(
+      "progressive_generation_cohorts_stage_check",
+      sql`${table.stage} IN (1, 2, 3)`,
+    ),
+    statusCheck: check(
+      "progressive_generation_cohorts_status_check",
+      sql`${table.status} IN ('active', 'complete', 'attention')`,
+    ),
   }),
 );
 
@@ -7018,9 +7055,25 @@ export const progressiveGenerationCohortTargets = pgTable(
   },
   (table) => ({
     pk: primaryKey({ columns: [table.generationId, table.targetId] }),
-    scopeFk: foreignKey({ columns: [table.generationId, table.targetId], foreignColumns: [progressiveGenerationTargets.generationId, progressiveGenerationTargets.targetId] }).onDelete("cascade"),
-    cohortFk: foreignKey({ columns: [table.generationId, table.cohort], foreignColumns: [progressiveGenerationCohorts.generationId, progressiveGenerationCohorts.cohort] }).onDelete("cascade"),
-    cohortIdx: index("progressive_generation_cohort_targets_cohort_idx").on(table.generationId, table.cohort, table.targetId),
+    scopeFk: foreignKey({
+      columns: [table.generationId, table.targetId],
+      foreignColumns: [
+        progressiveGenerationTargets.generationId,
+        progressiveGenerationTargets.targetId,
+      ],
+    }).onDelete("cascade"),
+    cohortFk: foreignKey({
+      columns: [table.generationId, table.cohort],
+      foreignColumns: [
+        progressiveGenerationCohorts.generationId,
+        progressiveGenerationCohorts.cohort,
+      ],
+    }).onDelete("cascade"),
+    cohortIdx: index("progressive_generation_cohort_targets_cohort_idx").on(
+      table.generationId,
+      table.cohort,
+      table.targetId,
+    ),
   }),
 );
 
@@ -7418,7 +7471,9 @@ export const progressiveCfdAttempts = pgTable(
       .where(sql`${table.simJobId} IS NOT NULL`),
     unstartedIdx: index("progressive_cfd_attempts_unstarted_idx")
       .on(table.unitId)
-      .where(sql`${table.outcome} = 'cancelled' AND ${table.activeSeconds} = 0`),
+      .where(
+        sql`${table.outcome} = 'cancelled' AND ${table.activeSeconds} = 0`,
+      ),
     unitLookupIdx: index("progressive_cfd_attempts_unit_lookup_idx").on(
       table.unitId,
       table.outcome,
@@ -7607,27 +7662,54 @@ export const campaignLocalStepPolicies = pgTable(
   "campaign_local_step_policies",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    sequence: bigint("sequence", { mode: "number" }).generatedAlwaysAsIdentity().notNull().unique(),
-    campaignId: uuid("campaign_id").notNull().references(() => simCampaigns.id, { onDelete: "cascade" }),
-    planRevisionId: uuid("plan_revision_id").notNull().references(() => simCampaignPlanRevisions.id, { onDelete: "cascade" }),
+    sequence: bigint("sequence", { mode: "number" })
+      .generatedAlwaysAsIdentity()
+      .notNull()
+      .unique(),
+    campaignId: uuid("campaign_id")
+      .notNull()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    planRevisionId: uuid("plan_revision_id")
+      .notNull()
+      .references(() => simCampaignPlanRevisions.id, { onDelete: "cascade" }),
     smoothing: doublePrecision("smoothing").notNull(),
     source: text("source").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
   },
   (table) => ({
-    currentIdx: index("campaign_local_step_policies_current_idx").on(table.campaignId, table.planRevisionId, table.sequence.desc()),
-    smoothingCheck: check("campaign_local_step_policies_smoothing_check", sql`${table.smoothing} BETWEEN 0 AND 1`),
-    sourceCheck: check("campaign_local_step_policies_source_check", sql`${table.source} IN ('default','adopted','inherited')`),
+    currentIdx: index("campaign_local_step_policies_current_idx").on(
+      table.campaignId,
+      table.planRevisionId,
+      table.sequence.desc(),
+    ),
+    smoothingCheck: check(
+      "campaign_local_step_policies_smoothing_check",
+      sql`${table.smoothing} BETWEEN 0 AND 1`,
+    ),
+    sourceCheck: check(
+      "campaign_local_step_policies_source_check",
+      sql`${table.source} IN ('default','adopted','inherited')`,
+    ),
   }),
 );
 
 export const progressiveCfdLocalStepClaims = pgTable(
   "progressive_cfd_local_step_claims",
   {
-    attemptToken: uuid("attempt_token").primaryKey().references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
-    policyId: uuid("policy_id").notNull().references(() => campaignLocalStepPolicies.id),
+    attemptToken: uuid("attempt_token")
+      .primaryKey()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    policyId: uuid("policy_id")
+      .notNull()
+      .references(() => campaignLocalStepPolicies.id),
   },
-  (table) => ({ policyIdx: index("progressive_cfd_local_step_claims_policy_idx").on(table.policyId) }),
+  (table) => ({
+    policyIdx: index("progressive_cfd_local_step_claims_policy_idx").on(
+      table.policyId,
+    ),
+  }),
 );
 
 export const progressiveCfdRuntimeProgress = pgTable(
@@ -7995,25 +8077,43 @@ export const progressiveWorkerReports = pgTable(
   (table) => ({
     stagingOrderIdx: index("progressive_worker_reports_staging_order_idx")
       .on(table.createdAt, table.simJobId, table.sequence)
-      .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
-    terminalStagingOrderIdx: index("progressive_worker_reports_terminal_staging_order_idx")
+      .where(
+        sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`,
+      ),
+    terminalStagingOrderIdx: index(
+      "progressive_worker_reports_terminal_staging_order_idx",
+    )
       .on(table.createdAt, table.simJobId, table.sequence)
-      .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object' AND ${table.stoppedEngineJobId} IS NOT NULL`),
-    stagingCandidateIdx: index("progressive_worker_reports_staging_candidate_idx")
+      .where(
+        sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object' AND ${table.stoppedEngineJobId} IS NOT NULL`,
+      ),
+    stagingCandidateIdx: index(
+      "progressive_worker_reports_staging_candidate_idx",
+    )
       .on(table.simJobId, table.sequence, table.createdAt)
-      .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
+      .where(
+        sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`,
+      ),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NULL`),
-    publicationOrderIdx: index("progressive_worker_reports_publication_order_idx")
-      .on(sql`${table.report}->>'solverId'`, table.createdAt, table.simJobId, table.sequence)
+    publicationOrderIdx: index(
+      "progressive_worker_reports_publication_order_idx",
+    )
+      .on(
+        sql`${table.report}->>'solverId'`,
+        table.createdAt,
+        table.simJobId,
+        table.sequence,
+      )
       .where(sql`${table.acknowledgedAt} IS NULL`),
     stopIdentityIdx: index("progressive_worker_reports_stop_identity_idx")
       .on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
       .where(sql`${table.stoppedEngineJobId} IS NOT NULL`),
-    finalStopIdentityIdx: index("progressive_worker_reports_final_stop_identity_idx")
-      .on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
+    finalStopIdentityIdx: index(
+      "progressive_worker_reports_final_stop_identity_idx",
+    ).on(table.simJobId, table.assignmentSignature, table.stoppedEngineJobId)
       .where(sql`${table.stoppedEngineJobId} IS NOT NULL AND (
         ${table.report}#>>'{stopProof,ownership_basis}' = 'never_started_cancellation_fence'
         OR ${table.report}#>>'{result,state}' IN ('completed', 'failed', 'cancelled')

@@ -46,10 +46,15 @@ export async function deferProgressiveAdaptiveFastUnits(
     const generationIds: string[] = [];
     for (const generation of generations) {
       const [cursor] = await connection.execute(sql`
-        SELECT stage, status FROM progressive_generation_cohorts
+        SELECT stage, status, adaptive_fast_deferred FROM progressive_generation_cohorts
         WHERE generation_id = ${generation.id} AND cohort = 'low' FOR UPDATE
       `);
       if (!cursor || Number(cursor.stage) !== 2) continue;
+      await connection.execute(sql`
+        UPDATE progressive_generation_cohorts
+        SET adaptive_fast_deferred = true, updated_at = clock_timestamp()
+        WHERE generation_id = ${generation.id} AND cohort = 'low'
+      `);
       const rows = await connection.execute(sql`
         UPDATE progressive_cfd_units unit SET state = 'gap',
           lease_token = NULL, lease_owner = NULL, lease_until = NULL,
