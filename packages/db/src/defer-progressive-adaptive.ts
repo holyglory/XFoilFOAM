@@ -1,3 +1,4 @@
+import { sql as dsql } from "drizzle-orm";
 import { createClient } from "./client";
 import { deferProgressiveAdaptiveFastUnits } from "./progressive-adaptive-deferral";
 
@@ -16,10 +17,19 @@ let result!: Awaited<ReturnType<typeof deferProgressiveAdaptiveFastUnits>>;
 try {
   await db
     .transaction(async (transaction) => {
-      result = await deferProgressiveAdaptiveFastUnits(
-        transaction as unknown as typeof db,
-        campaignId,
+      const connection = transaction as unknown as typeof db;
+      const [sweeper] = await connection.execute(
+        dsql`SELECT enabled FROM sweeper_state WHERE id = 1 FOR UPDATE`,
       );
+      if (mode === "--apply")
+        await connection.execute(
+          dsql`UPDATE sweeper_state SET enabled = false WHERE id = 1`,
+        );
+      result = await deferProgressiveAdaptiveFastUnits(connection, campaignId);
+      if (mode === "--apply")
+        await connection.execute(
+          dsql`UPDATE sweeper_state SET enabled = ${sweeper?.enabled === true} WHERE id = 1`,
+        );
       if (mode === "--dry-run") throw rollback;
     })
     .catch((error) => {
