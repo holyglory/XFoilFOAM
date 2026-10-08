@@ -29,12 +29,8 @@ function archiveCandidates(waiting: boolean) {
           AND retained.receipt->>'storageOnly' = 'false'
           AND EXISTS (SELECT 1 FROM result_classifications classification
             JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
-            JOIN sim_jobs retained_job ON retained_job.id = retained.sim_job_id
-            JOIN sync_sweep_promises retained_promise
-              ON retained_promise.id::text = retained_job.request_payload->>'syncPromiseId'
             WHERE classification.result_attempt_id = retained.result_attempt_id
-              AND classification.state = 'accepted'
-              AND retained_promise.status IN ('expired', 'cancelled'))
+              AND classification.state = 'accepted')
         )
         OR NOT EXISTS (SELECT 1 FROM result_classifications classification
           JOIN results selected ON selected.current_result_attempt_id = classification.result_attempt_id
