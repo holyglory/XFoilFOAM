@@ -1870,6 +1870,10 @@ export async function registerEvidenceArtifacts(opts: {
   artifact: EngineEvidenceArtifact;
   runtime?: ResolvedEngineRuntime | null;
   transaction?: DB;
+  archiveContext?: {
+    archive: StoredEvidenceArchive;
+    evidenceBase: string;
+  } | null;
 }): Promise<PendingRemoteEvidenceCleanup | null> {
   const {
     db,
@@ -1883,6 +1887,7 @@ export async function registerEvidenceArtifacts(opts: {
     artifact,
     runtime,
     transaction,
+    archiveContext,
   } = opts;
   const urlPath = artifact.url ?? artifact.path;
   if (!urlPath) return null;
@@ -2014,13 +2019,15 @@ export async function registerEvidenceArtifacts(opts: {
           );
         }
         const currentArchive =
-          resultId && resultAttemptId
-            ? await currentArchiveWithEvidenceBase(
-                writeDb,
-                resultId,
-                resultAttemptId,
-              )
-            : null;
+          archiveContext !== undefined
+            ? archiveContext
+            : resultId && resultAttemptId
+              ? await currentArchiveWithEvidenceBase(
+                  writeDb,
+                  resultId,
+                  resultAttemptId,
+                )
+              : null;
         if (currentArchive) {
           await registerArchiveMember({
             db: writeDb,
@@ -2147,11 +2154,14 @@ export async function registerEvidenceArtifacts(opts: {
       resultAttemptId &&
       ARCHIVED_EVIDENCE_MEMBER_KINDS.has(storedArtifact.kind)
     ) {
-      const currentArchive = await currentArchiveWithEvidenceBase(
-        writeDb,
-        resultId,
-        resultAttemptId,
-      );
+      const currentArchive =
+        archiveContext !== undefined
+          ? archiveContext
+          : await currentArchiveWithEvidenceBase(
+              writeDb,
+              resultId,
+              resultAttemptId,
+            );
       if (currentArchive) {
         await registerArchiveMember({
           db: writeDb,
@@ -2192,17 +2202,23 @@ async function registerEvidenceArtifactsBatch(
     (artifact) =>
       !["manifest", "engine_bundle", "openfoam_bundle"].includes(artifact.kind),
   );
-  const ordered = [...structural, ...bulk];
+  const batches = [
+    ...(structural.length ? [structural] : []),
+    ...Array.from(
+      {
+        length: Math.ceil(
+          bulk.length / EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE,
+        ),
+      },
+      (_, index) =>
+        bulk.slice(
+          index * EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE,
+          (index + 1) * EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE,
+        ),
+    ),
+  ];
   const cleanups: PendingRemoteEvidenceCleanup[] = [];
-  for (
-    let offset = 0;
-    offset < ordered.length;
-    offset += EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE
-  ) {
-    const batch = ordered.slice(
-      offset,
-      offset + EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE,
-    );
+  for (const batch of batches) {
     const batchCleanups = await base.db.transaction(async (rawTransaction) => {
       const transaction = rawTransaction as unknown as DB;
       const lockKeys = [
@@ -2259,12 +2275,22 @@ async function registerEvidenceArtifactsBatch(
       } else {
         await acquireResultEvidenceLocks(transaction, [base.resultId]);
       }
+      const archiveContext = structural.includes(batch[0]!)
+        ? undefined
+        : base.resultId && base.resultAttemptId
+          ? await currentArchiveWithEvidenceBase(
+              transaction,
+              base.resultId,
+              base.resultAttemptId,
+            )
+          : null;
       const registered: PendingRemoteEvidenceCleanup[] = [];
       for (const artifact of batch) {
         const cleanup = await registerEvidenceArtifacts({
           ...base,
           artifact,
           transaction,
+          archiveContext,
         });
         if (cleanup) registered.push(cleanup);
       }
