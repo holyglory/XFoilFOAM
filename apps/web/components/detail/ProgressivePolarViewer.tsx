@@ -521,7 +521,6 @@ export function ProgressivePolarViewer({
                             contributors,
                           })
                         }
-                        onMouseLeave={() => setSampleFocus(null)}
                         onFocus={() =>
                           setSampleFocus({
                             method: curve.method,
@@ -529,7 +528,6 @@ export function ProgressivePolarViewer({
                             contributors,
                           })
                         }
-                        onBlur={() => setSampleFocus(null)}
                         onClick={() => {
                           activateSample(curve.method, value.sample);
                         }}
