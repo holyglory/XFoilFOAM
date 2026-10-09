@@ -1965,11 +1965,25 @@ describe("progressive durable stage transitions", () => {
     expect(legacyProgressRows.every((row) => Number(row.requested) === 3)).toBe(
       true,
     );
+    const expectedCoverage = {
+      requested: 3,
+      preliminary: 3,
+      cfdEvidence: 0,
+      fastComplete: 0,
+      preciseComplete: 0,
+    };
+    const beforeDeletion = await campaignSummary(db, fixture.campaignId);
+    expect(beforeDeletion.conditions.map((condition) => condition.progressive))
+      .toEqual([expectedCoverage, expectedCoverage]);
     await db.execute(
       sql`DELETE FROM sim_campaign_progress WHERE campaign_id=${fixture.campaignId}`,
     );
 
     const summary = await campaignSummary(db, fixture.campaignId);
+    expect(summary.conditions.map((condition) => condition.progressive)).toEqual([
+      expectedCoverage,
+      expectedCoverage,
+    ]);
     expect(summary.conditions[0]?.progressive).toMatchObject({
       requested: 3,
       preliminary: 3,
