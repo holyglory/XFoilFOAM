@@ -29,10 +29,13 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_staging_failures failure
         WHERE failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
           AND failure.retry_after > clock_timestamp())
+      AND report.stopped_engine_job_id = report.sim_job_id::text
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
     ORDER BY report.created_at, report.sim_job_id, report.sequence OFFSET 0`;
-  const owned = (active: boolean) => sql`SELECT job.id, promise.status AS promise_status
+  const owned = (
+    active: boolean,
+  ) => sql`SELECT job.id, promise.status AS promise_status
     FROM sim_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
@@ -64,7 +67,8 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-    ORDER BY report.created_at DESC, report.sim_job_id DESC, report.sequence DESC
+    ORDER BY CASE WHEN report.stopped_engine_job_id = report.sim_job_id::text THEN 0 ELSE 1 END,
+      report.created_at DESC, report.sim_job_id DESC, report.sequence DESC
     LIMIT 1`;
   const candidate = (
     active: boolean,
@@ -74,7 +78,6 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
   const terminalCandidate = sql`SELECT report.sim_job_id, report.sequence, report.created_at
     FROM (${terminalReports}) report
     JOIN LATERAL (${owned(false)}) owned ON true
-    WHERE owned.promise_status IN ('expired', 'cancelled', 'fulfilled')
     ORDER BY report.created_at, report.sim_job_id, report.sequence LIMIT 1`;
   const terminal = sql`SELECT sim_job_id, sequence, created_at
     FROM (${terminalCandidate}) report`;

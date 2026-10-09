@@ -11105,6 +11105,149 @@ describe("subsonic through precise priority", () => {
     expect((await claimCfd())?.physical.derived.mach).toBe(1);
   }, 120_000);
 
+  it("claims multiple precise units in order: an eligible earlier retry past a locked head without fabricating later work or admitting high", async () => {
+    const fixture = await scope(false, [-4, -2, 0, 2]);
+    await adoptProgressiveSubsonicPriority(db, fixture.campaignId);
+    expect(await initializeProgressiveCfdWork(db)).toBe(6);
+    const fastLeases = [(await claimCfd())!, (await claimCfd())!];
+    for (const lease of fastLeases) await finish(lease);
+    expect(await advanceProgressiveCfdStages(db)).toMatchObject({ closed: 1 });
+    expect(await initializeProgressiveCfdWork(db)).toBe(4);
+
+    const preciseUnits = await db.execute(sql`
+      SELECT unit.id, unit.ordinal, unit.aoa_deg, work.target_id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      WHERE work.generation_id = ${fixture.generationId}
+        AND work.stage = 3
+      ORDER BY unit.ordinal
+    `);
+    expect(preciseUnits).toHaveLength(4);
+    const [head, retryCandidate, laterFresh] = preciseUnits;
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET retry_after = clock_timestamp() + interval '1 hour'
+      WHERE id = ${head.id}
+    `);
+
+    const allocatedRetry = (await claimCfd())!;
+    expect(allocatedRetry).toMatchObject({
+      id: retryCandidate.id,
+      stage: 3,
+      targetId: head.target_id,
+    });
+    expect((await finish(allocatedRetry, false, true)).settlement).toMatchObject({
+      retry: 1,
+      gaps: 0,
+    });
+    const beforeCancellation = (await claimCfd())!;
+    expect(beforeCancellation.id).toBe(retryCandidate.id);
+    const cancelled = await cfdEvidenceFixture(undefined, 2, [], [0], false, {
+      campaignId: fixture.campaignId,
+      leases: [beforeCancellation],
+    });
+    expect(
+      await claimSimJobCancellation(
+        db,
+        cancelled.composed.jobId,
+        "isolated precise retry setup",
+      ),
+    ).toMatchObject({ kind: "cancelled" });
+    await db
+      .update(simJobs)
+      .set({ status: "cancelled", ingestedAt: new Date() })
+      .where(eq(simJobs.id, cancelled.composed.jobId));
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: cancelled.composed.jobId,
+      proof: {
+        ...executionStopProof(cancelled.engineJobId),
+        fence: "cancel_marker",
+        ownership_basis: "never_started_cancellation_fence",
+      },
+    });
+    expect(
+      await settleProgressiveCfdExecution(db, cancelled.composed.jobId),
+    ).toMatchObject({ retry: 1, gaps: 0 });
+    expect(
+      await db.execute(
+        sql`SELECT id FROM result_attempts WHERE sim_job_id = ${cancelled.composed.jobId}`,
+      ),
+    ).toEqual([]);
+    expect(await db.execute(sql`
+      SELECT unit.state, unit.attempts, unit.active_seconds,
+        count(attempt.token)::integer AS recorded_attempts,
+        count(attempt.token) FILTER (WHERE attempt.outcome = 'cancelled'
+          AND attempt.active_seconds = 0)::integer AS zero_work_cancellations
+      FROM progressive_cfd_units unit
+      JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
+      WHERE unit.id = ${retryCandidate.id}
+      GROUP BY unit.id
+    `)).toEqual([{
+      state: "pending", attempts: 2, active_seconds: 25,
+      recorded_attempts: 2, zero_work_cancellations: 1,
+    }]);
+    const retryRollback = new Error("restore precise retry priority claim");
+    await expect(db.transaction(async (transaction) => {
+      const claimed = await claimProgressiveCfdUnit(transaction as unknown as DB, {
+        owner: "earlier-precise-retry", leaseSeconds: 120, localTimeStepVersion: 1,
+      });
+      expect(claimed).toMatchObject({
+        id: retryCandidate.id, stage: 3,
+        targetId: head.target_id, alpha: Number(retryCandidate.aoa_deg),
+      });
+      throw retryRollback;
+    })).rejects.toThrow(retryRollback);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET retry_after = NULL
+      WHERE id = ${head.id}
+    `);
+
+    await db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`SELECT id FROM progressive_cfd_units WHERE id = ${head.id} FOR UPDATE`,
+      );
+      const claimed = await claimCfd();
+      expect(claimed).toMatchObject({
+        id: retryCandidate.id,
+        stage: 3,
+        targetId: head.target_id,
+        alpha: Number(retryCandidate.aoa_deg),
+      });
+    });
+    const untouched = await db.execute(sql`
+      SELECT unit.id, unit.state, unit.attempts, unit.active_seconds,
+        (SELECT count(*)::integer FROM progressive_cfd_attempts attempt
+          WHERE attempt.unit_id = unit.id) AS recorded_attempts,
+        (SELECT count(*)::integer FROM progressive_cfd_attempts attempt
+          JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = attempt.token
+          WHERE attempt.unit_id = unit.id) AS evidence_count
+      FROM progressive_cfd_units unit
+      WHERE unit.id IN (${head.id}, ${laterFresh.id}, ${preciseUnits[3].id})
+      ORDER BY unit.ordinal
+    `);
+    expect(untouched).toEqual([
+      { id: head.id, state: "pending", attempts: 0, active_seconds: 0, recorded_attempts: 0, evidence_count: 0 },
+      { id: laterFresh.id, state: "pending", attempts: 0, active_seconds: 0, recorded_attempts: 0, evidence_count: 0 },
+      { id: preciseUnits[3].id, state: "pending", attempts: 0, active_seconds: 0, recorded_attempts: 0, evidence_count: 0 },
+    ]);
+    expect(await claimProgressiveCfdUnit(db, {
+      owner: "high-cannot-bypass-precise-retry", leaseSeconds: 120,
+      localTimeStepVersion: 1, allowedSolverFamilies: ["rhoCentralFoam"],
+    })).toBeNull();
+    const [highPending] = await db.execute(sql`
+      SELECT count(*)::integer AS count
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generation_targets scope ON scope.generation_id = work.generation_id
+        AND scope.target_id = work.target_id
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      WHERE work.generation_id = ${fixture.generationId}
+        AND work.stage = 2 AND target.mach >= 1 AND unit.state = 'pending'
+    `);
+    expect(Number(highPending.count)).toBeGreaterThan(0);
+  }, 120_000);
+
   it("inherits priority on new-profile enrollment and holds old high work for low obligations in every current generation", async () => {
     const fixture = await scope();
     const low = await precise(fixture);

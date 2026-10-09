@@ -347,6 +347,25 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     expect(fresh[0].sequence).toBe(2);
     expect(oldest[0].sequence).toBe(1);
     expect(fresh).not.toEqual(oldest);
+    const terminalPriorityRollback = new Error(
+      "Restore active terminal staging priority fixture",
+    );
+    await expect(
+      transaction.transaction(async (nested) => {
+        await nested.execute(sql`UPDATE progressive_worker_reports
+          SET stopped_engine_job_id=sim_job_id::text,
+            created_at=timestamptz '2024-01-01T00:00:00Z'
+          WHERE sim_job_id=${fresh[0].sim_job_id} AND sequence=1`);
+        const [selected] = await nested.execute(
+          progressiveStagingSelectionSql(true),
+        );
+        expect(selected).toMatchObject({
+          sim_job_id: fresh[0].sim_job_id,
+          sequence: 1,
+        });
+        throw terminalPriorityRollback;
+      }),
+    ).rejects.toBe(terminalPriorityRollback);
     await transaction.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,acknowledged_at,report,created_at)
       SELECT id,sequence,clock_timestamp(),'{"result":{}}'::jsonb,
         timestamptz '2025-01-01T00:00:00Z' + sequence * interval '1 second'
@@ -401,28 +420,38 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     );
     expect(await select(true)).toEqual(await select(false));
     const retryRollback = new Error("Restore terminal retry fixture");
-    await expect(transaction.transaction(async (nested) => {
-      await nested.execute(sql`UPDATE progressive_worker_reports
+    await expect(
+      transaction.transaction(async (nested) => {
+        await nested.execute(sql`UPDATE progressive_worker_reports
         SET stopped_engine_job_id=sim_job_id::text,created_at=timestamptz '2024-01-01T00:00:00Z'
         WHERE sim_job_id=md5('future-retry')::uuid`);
-      for (const active of [true, false]) {
-        const [selected] = await nested.execute(progressiveStagingSelectionSql(active));
-        expect(selected.sim_job_id).not.toBe(
-          (await nested.execute(sql`SELECT md5('future-retry')::uuid AS id`))[0].id,
-        );
-      }
-      await nested.execute(sql`UPDATE progressive_worker_staging_failures
+        for (const active of [true, false]) {
+          const [selected] = await nested.execute(
+            progressiveStagingSelectionSql(active),
+          );
+          expect(selected.sim_job_id).not.toBe(
+            (
+              await nested.execute(sql`SELECT md5('future-retry')::uuid AS id`)
+            )[0].id,
+          );
+        }
+        await nested.execute(sql`UPDATE progressive_worker_staging_failures
         SET retry_after=clock_timestamp()-interval '1 second'
         WHERE sim_job_id=md5('future-retry')::uuid AND sequence=2`);
-      for (const active of [true, false]) {
-        const [selected] = await nested.execute(progressiveStagingSelectionSql(active));
-        expect(selected.sequence).toBe(2);
-        expect(selected.sim_job_id).toBe(
-          (await nested.execute(sql`SELECT md5('future-retry')::uuid AS id`))[0].id,
-        );
-      }
-      throw retryRollback;
-    })).rejects.toBe(retryRollback);
+        for (const active of [true, false]) {
+          const [selected] = await nested.execute(
+            progressiveStagingSelectionSql(active),
+          );
+          expect(selected.sequence).toBe(2);
+          expect(selected.sim_job_id).toBe(
+            (
+              await nested.execute(sql`SELECT md5('future-retry')::uuid AS id`)
+            )[0].id,
+          );
+        }
+        throw retryRollback;
+      }),
+    ).rejects.toBe(retryRollback);
     for (const statement of [
       sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true`,
       sql`UPDATE sync_api_settings SET remote_solver_auth_token=''`,
@@ -452,5 +481,96 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     );
     expect(await select(true)).toEqual([]);
     expect(await select(false)).toEqual([]);
+  });
+});
+
+it("prioritizes active terminal reports and keeps invalid reports in the fallback queue", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE fixture_jobs ON COMMIT DROP AS
+      SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY[
+        'active-terminal','active-non-terminal','active-invalid-terminal','ordinary']) variant`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_api_settings ON COMMIT DROP AS
+      SELECT 1 AS id,false AS remote_solver_transfer_paused,'fixture-token'::text AS remote_solver_auth_token,
+        'https://fixture.invalid'::text AS upstream_base_url,md5('solver')::uuid AS remote_solver_registered_id`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',true,
+        'upstreamBaseUrl','https://fixture.invalid') AS request_payload,
+        NULL::uuid AS ingest_lease_token,NULL::timestamptz AS ingest_lease_expires_at
+      FROM fixture_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
+      SELECT id,'active'::text AS status,clock_timestamp()+interval '1 day' AS "expiresAt",
+        md5('solver')::uuid AS registered_solver_id,'https://fixture.invalid'::text AS source_base_url
+      FROM fixture_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
+      SELECT id AS sim_job_id,1::bigint AS sequence,clock_timestamp() AS acknowledged_at,
+        CASE
+          WHEN variant='active-terminal' THEN jsonb_build_object('result',jsonb_build_object(),
+            'stopProof',jsonb_build_object('execution_stopped',true,'job_id',id::text))
+          WHEN variant='active-invalid-terminal' THEN jsonb_build_object('result',jsonb_build_object(),
+            'stopProof',jsonb_build_object('execution_stopped',true,'job_id',md5('foreign-stop')::text))
+          ELSE '{"result":{}}'::jsonb
+        END AS report,
+        CASE WHEN variant='active-terminal' THEN id::text
+          WHEN variant='active-invalid-terminal' THEN md5('foreign-stop')::text END AS stopped_engine_job_id,
+        timestamptz '2026-01-01T00:00:00Z' + CASE
+          WHEN variant='active-non-terminal' THEN interval '1 second'
+          WHEN variant='active-invalid-terminal' THEN interval '2 seconds'
+          WHEN variant='active-terminal' THEN interval '3 seconds'
+          ELSE interval '4 seconds' END AS created_at
+      FROM fixture_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures(
+      sim_job_id uuid,sequence bigint,retry_after timestamptz) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_receipts(
+      sim_job_id uuid,sequence bigint) ON COMMIT DROP`);
+    await transaction.execute(
+      sql`CREATE UNIQUE INDEX fixture_job_idx ON sim_jobs(id)`,
+    );
+    await transaction.execute(
+      sql`CREATE UNIQUE INDEX fixture_promise_idx ON sync_sweep_promises(id)`,
+    );
+    await transaction.execute(sql`CREATE UNIQUE INDEX fixture_report_idx
+      ON progressive_worker_reports(sim_job_id,sequence)`);
+    await transaction.execute(sql`CREATE UNIQUE INDEX fixture_receipt_idx
+      ON progressive_worker_evidence_receipts(sim_job_id,sequence)`);
+
+    const [activeTerminal] = await transaction.execute(
+      sql`SELECT id FROM fixture_jobs WHERE variant='active-terminal'`,
+    );
+    const [activeNonTerminal] = await transaction.execute(
+      sql`SELECT id FROM fixture_jobs WHERE variant='active-non-terminal'`,
+    );
+    const [ordinary] = await transaction.execute(
+      sql`SELECT id FROM fixture_jobs WHERE variant='ordinary'`,
+    );
+    const [invalidTerminal] = await transaction.execute(
+      sql`SELECT id FROM fixture_jobs WHERE variant='active-invalid-terminal'`,
+    );
+
+    for (const preferActive of [false, true]) {
+      const [selectedTerminal] = await transaction.execute(
+        progressiveStagingSelectionSql(preferActive),
+      );
+      expect(selectedTerminal).toMatchObject({
+        sim_job_id: activeTerminal.id,
+        sequence: "1",
+      });
+    }
+
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_receipts
+      VALUES (${activeTerminal.id}::uuid,1)`);
+    const expectedFallback = new Map([
+      [false, activeNonTerminal.id],
+      [true, ordinary.id],
+    ]);
+    for (const preferActive of [false, true]) {
+      const [selectedFallback] = await transaction.execute(
+        progressiveStagingSelectionSql(preferActive),
+      );
+      expect(selectedFallback).toMatchObject({
+        sim_job_id: expectedFallback.get(preferActive),
+        sequence: "1",
+      });
+      expect(selectedFallback.sim_job_id).not.toBe(invalidTerminal.id);
+    }
   });
 });
