@@ -188,6 +188,10 @@ export function ProgressivePolarViewer({
     selected.curves.find((curve) => curve.method === "composite") ??
     selected.curves.at(-1)!;
   const metrics = primaryCurve.metrics;
+  const contributorCountFor = (method: ProgressiveCurveMethod) =>
+    selected.explanation.contributors?.filter(
+      (entry) => entry.method === method,
+    ).length ?? 0;
   const metricRows = metrics
     ? ([
         ["Maximum lift / drag", metrics.liftToDragMaximum],
@@ -318,6 +322,17 @@ export function ProgressivePolarViewer({
           <span
             key={curve.method}
             data-polar-method={curve.method}
+            aria-label={[
+              METHODS[curve.method],
+              contributorCountFor(curve.method) > 0
+                ? contributorCountFor(curve.method) +
+                  " CFD anchors and " +
+                  curve.samples.length +
+                  " estimated samples"
+                : null,
+            ]
+              .filter(Boolean)
+              .join(", ")}
             style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
           >
             <span
@@ -341,10 +356,31 @@ export function ProgressivePolarViewer({
                 }}
               />
             </span>
-            {METHODS[curve.method]}
+            <span>{METHODS[curve.method]}</span>
+            {contributorCountFor(curve.method) > 0 && (
+              <span style={{ color: C.muted, fontSize: 10 }}>
+                {contributorCountFor(curve.method)} anchors ·{" "}
+                {curve.samples.length} samples
+              </span>
+            )}
           </span>
         ))}
       </div>
+      {methodsVisible &&
+      selected.kind === "estimate" &&
+      selected.explanation.contributors?.length ? (
+        <p
+          style={{
+            margin: "-2px 0 10px",
+            color: C.text2,
+            fontSize: 12,
+            lineHeight: 1.45,
+          }}
+        >
+          CFD anchors are stored solver evidence. The remaining samples on a
+          method curve are fitted estimates between and beyond those anchors.
+        </p>
+      ) : null}
       <div
         ref={root}
         style={{ width: "100%", minWidth: 0, overflowAnchor: "none" }}
@@ -442,56 +478,63 @@ export function ProgressivePolarViewer({
                   strokeWidth={2.2}
                 />
                 {samplesVisible &&
-                  curve.values.map((value) => (
-                    <circle
-                      key={value.sample.alpha}
-                      data-testid="prediction-sample"
-                      cx={projected.x(value.x)}
-                      cy={projected.y(value.y)}
-                      r={3}
-                      fill={COLORS[curve.method]}
-                      tabIndex={0}
-                      role="button"
-                      aria-label={`${METHODS[curve.method]} sample at alpha ${number(value.sample.alpha)} degrees`}
-                      style={{ cursor: "pointer" }}
-                      onMouseEnter={() =>
-                        setSampleFocus({
-                          method: curve.method,
-                          sample: value.sample,
-                          contributor: contributorFor(
-                            curve.method,
-                            value.sample.alpha,
-                          ),
-                        })
-                      }
-                      onMouseLeave={() => setSampleFocus(null)}
-                      onFocus={() =>
-                        setSampleFocus({
-                          method: curve.method,
-                          sample: value.sample,
-                          contributor: contributorFor(
-                            curve.method,
-                            value.sample.alpha,
-                          ),
-                        })
-                      }
-                      onBlur={() => setSampleFocus(null)}
-                      onClick={() => {
-                        activateSample(curve.method, value.sample);
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key !== "Enter" && event.key !== " ") return;
-                        event.preventDefault();
-                        activateSample(curve.method, value.sample);
-                      }}
-                    >
-                      <title>
-                        {METHODS[curve.method]}: α {number(value.sample.alpha)}
-                        °, Cl {number(value.sample.cl)}, Cd{" "}
-                        {number(value.sample.cd)}, Cm {number(value.sample.cm)}
-                      </title>
-                    </circle>
-                  ))}
+                  curve.values.map((value) => {
+                    const contributor = contributorFor(
+                      curve.method,
+                      value.sample.alpha,
+                    );
+                    return (
+                      <circle
+                        key={value.sample.alpha}
+                        data-testid="prediction-sample"
+                        data-cfd-anchor={contributor ? "true" : "false"}
+                        cx={projected.x(value.x)}
+                        cy={projected.y(value.y)}
+                        r={contributor ? 4.5 : 2.75}
+                        fill={COLORS[curve.method]}
+                        fillOpacity={contributor ? 1 : 0.62}
+                        stroke={contributor ? C.text : "none"}
+                        strokeWidth={contributor ? 1 : 0}
+                        tabIndex={0}
+                        role="button"
+                        aria-label={`${METHODS[curve.method]} sample at alpha ${number(value.sample.alpha)} degrees`}
+                        style={{ cursor: "pointer" }}
+                        onMouseEnter={() =>
+                          setSampleFocus({
+                            method: curve.method,
+                            sample: value.sample,
+                            contributor,
+                          })
+                        }
+                        onMouseLeave={() => setSampleFocus(null)}
+                        onFocus={() =>
+                          setSampleFocus({
+                            method: curve.method,
+                            sample: value.sample,
+                            contributor,
+                          })
+                        }
+                        onBlur={() => setSampleFocus(null)}
+                        onClick={() => {
+                          activateSample(curve.method, value.sample);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter" && event.key !== " ")
+                            return;
+                          event.preventDefault();
+                          activateSample(curve.method, value.sample);
+                        }}
+                      >
+                        <title>
+                          {METHODS[curve.method]}: α{" "}
+                          {number(value.sample.alpha)}
+                          °, Cl {number(value.sample.cl)}, Cd{" "}
+                          {number(value.sample.cd)}, Cm{" "}
+                          {number(value.sample.cm)}
+                        </title>
+                      </circle>
+                    );
+                  })}
               </g>
             ))}
           </g>
