@@ -237,6 +237,7 @@ for (const polar of native.polars) {
       (item) => contributor?.attemptId === item.result_attempt_id,
     );
     assert(contributor?.resultId && contributor.attemptId && receipt);
+    assert.equal(receipt.sim_job_id, native.job_id);
     points.push({
       aoaDeg: point.aoa_deg,
       status: "done",
@@ -254,7 +255,7 @@ for (const polar of native.polars) {
       clStd: point.cl_std,
       cdStd: point.cd_std,
       cmStd: point.cm_std,
-      stalled: false,
+      ...(typeof point.stalled === "boolean" ? { stalled: point.stalled } : {}),
       unsteady: point.unsteady,
       converged: point.converged,
       finalResidual: point.final_residual,
@@ -279,6 +280,14 @@ for (const polar of native.polars) {
         mesh_recovery_version: native.mesh_recovery_version,
         native_source_receipt: receipt ?? null,
         native_run_id: "t20261002T213447Z-aa1e9a",
+        native_job_id: native.job_id,
+        native_result_id: contributor.resultId,
+        native_result_attempt_id: contributor.attemptId,
+        native_original_point: point,
+        source_field_availability: {
+          stalled:
+            typeof point.stalled === "boolean" ? "reported" : "not_reported",
+        },
       },
       fieldExtents: [],
       evidenceArtifacts,
@@ -446,6 +455,7 @@ assert.deepEqual(
 );
 const deadline = Date.now() + 120000;
 let series;
+let bindings = [];
 let waitMs = 250;
 while (Date.now() < deadline) {
   const response = await fetch(`${origin}/api/airfoils/ag24`, {
@@ -453,13 +463,62 @@ while (Date.now() < deadline) {
   });
   assert(response.ok);
   const detail = await response.json();
-  series = detail.progressivePolars?.find(
-    (item) =>
-      item.curves.some((curve) => curve.method === "composite") &&
-      item.explanation?.contributors?.some(
-        (item) => item.resultId && item.attemptId,
-      ),
-  );
+  const candidates =
+    detail.progressivePolars?.filter(
+      (item) =>
+        item.curves.some((curve) => curve.method === "composite") &&
+        item.explanation?.contributors?.some(
+          (item) => item.resultId && item.attemptId,
+        ),
+    ) ?? [];
+  for (const candidate of candidates) {
+    const candidateBindings = [];
+    for (const contributor of candidate.explanation.contributors) {
+      if (!contributor.resultId || !contributor.attemptId) continue;
+      const query = new URLSearchParams({
+        resultId: contributor.resultId,
+        resultAttemptId: contributor.attemptId,
+      });
+      const response = await fetch(`${origin}/api/airfoils/ag24/sim?${query}`, {
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) continue;
+      const stored = await response.json();
+      const manifest = stored.evidenceArtifacts?.find(
+        (item) => item.kind === "manifest",
+      );
+      const sourcePoint = native.polars[0].points.find((point) =>
+        point.evidence_artifacts.some(
+          (item) =>
+            item.kind === "manifest" && item.sha256 === manifest?.sha256,
+        ),
+      );
+      if (!sourcePoint) continue;
+      assert.equal(stored.resultId, contributor.resultId);
+      assert.equal(stored.resultAttemptId, contributor.attemptId);
+      assert.equal(stored.cl, sourcePoint.cl);
+      assert.equal(stored.cd, sourcePoint.cd);
+      assert.equal(stored.cm, sourcePoint.cm);
+      const sourceContributor = report.refined[0].explanation.contributors.find(
+        (item) => item.alpha === sourcePoint.aoa_deg,
+      );
+      candidateBindings.push({
+        resultId: contributor.resultId,
+        attemptId: contributor.attemptId,
+        sourceResultId: sourceContributor.resultId,
+        sourceAttemptId: sourceContributor.attemptId,
+        manifestSha256: manifest.sha256,
+      });
+    }
+    if (
+      new Set(candidateBindings.map((item) => item.manifestSha256)).size ===
+      native.polars[0].points.length
+    ) {
+      series = candidate;
+      bindings = candidateBindings;
+      break;
+    }
+  }
   if (series) break;
   await delay(Math.min(waitMs, deadline - Date.now()));
   waitMs = Math.min(waitMs * 2, 5000);
@@ -477,7 +536,23 @@ const receipt = {
   originalCampaignPreserved: true,
   fixtureCampaignId,
   revisionId,
-  sourceCompatibilityHash: originalCompatibility,
+  retainedRequestCompatibilityHash: originalCompatibility,
+  currentDefaultNumericalIdentityClaimed: false,
+  bindings,
+  sourceTransforms: {
+    labelChanges: [
+      "flowState.mediumSlug",
+      "flowState.mediumName",
+      "preset.name",
+    ],
+    stateMapping: { nativeResultState: native.state, transportStatus: "done" },
+    coefficientsChanged: false,
+    stalled: native.polars[0].points.map((point) => ({
+      aoaDeg: point.aoa_deg,
+      sourceReported: typeof point.stalled === "boolean",
+      sourceValue: point.stalled ?? null,
+    })),
+  },
   targetId: series.targetId,
   imported: imported.imported,
   attempts: imported.attempts,
