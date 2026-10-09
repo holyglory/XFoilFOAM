@@ -2170,6 +2170,8 @@ export async function recomputeCampaignProgress(
 interface CampaignProgressSnapshot {
   totals: CampaignProgressTotals;
   remediation: CampaignRemediationSummary;
+  progressiveConditionRows: ProgressiveConditionCoverageRow[];
+  progressiveOverlayUsed: boolean;
 }
 
 export interface CampaignProgressiveSnapshot {
@@ -2357,7 +2359,12 @@ async function campaignProgressSnapshot(
       `campaign ${campaignId} blocked remediation counters do not conserve the headline total`,
     );
   }
-  return { totals: normalizedTotals, remediation };
+  return {
+    totals: normalizedTotals,
+    remediation,
+    progressiveConditionRows: progressiveOverlay,
+    progressiveOverlayUsed: useProgressiveOverlay,
+  };
 }
 
 export async function campaignProgressTotals(
@@ -7943,10 +7950,9 @@ export async function campaignSummary(
       AND cc.generation = ${campaign.currentConditionGeneration}
     ORDER BY cc.ord ASC
   `) as unknown as Promise<Array<Record<string, unknown>>>;
-  const progressiveConditionRowsPromise = campaignProgressiveConditionRows(
-    db,
-    campaignId,
-  );
+  const progressiveConditionRowsPromise = progress.progressiveOverlayUsed
+    ? Promise.resolve(progress.progressiveConditionRows)
+    : campaignProgressiveConditionRows(db, campaignId);
   const laneRowsPromise = db.execute(sql`
     SELECT lane.objective, lane.state, count(*)::int AS n
     FROM sim_campaign_lanes lane
@@ -7974,7 +7980,7 @@ export async function campaignSummary(
     scopeRowsPromise,
     lifecycleRowsPromise,
     conditionRowsPromise,
-    progressiveConditionRowsPromise,
+    progress.progressiveConditionRows,
     laneRowsPromise,
     progressivePromise,
   ]);
@@ -8201,15 +8207,13 @@ function campaignProgressiveCoverageCtes(
        AND condition.status IN ('active', 'kept')
       WHERE ${targetFilter}
       ORDER BY condition.id, target.airfoil_id, generation.created_at DESC, generation.id DESC
-    ), progressive_stats AS MATERIALIZED (
+    ), completed_unit_stats AS MATERIALIZED (
       SELECT target_cells.target_id,
-        count(DISTINCT evidence.result_attempt_id)::int AS cfd_evidence,
         count(DISTINCT unit.id) FILTER (
-          WHERE work.stage = 2 AND unit.state = 'complete'
+          WHERE work.stage = 2
         )::int AS fast_complete,
         count(DISTINCT unit.id) FILTER (
           WHERE work.stage = 3
-            AND unit.state = 'complete'
             AND EXISTS (
               SELECT 1
               FROM progressive_cfd_evidence accepted_evidence
@@ -8237,16 +8241,38 @@ function campaignProgressiveCoverageCtes(
             )
         )::int AS precise_complete
       FROM target_cells
-      LEFT JOIN progressive_work work
+      JOIN progressive_work work
         ON work.target_id = target_cells.target_id
        AND work.generation_id = target_cells.generation_id
        AND work.stage IN (2, 3)
-      LEFT JOIN progressive_cfd_units unit ON unit.work_id = work.id
+      JOIN progressive_cfd_units unit ON unit.work_id = work.id
       LEFT JOIN progressive_cfd_attempts attempt
         ON attempt.unit_id = unit.id
-      LEFT JOIN progressive_cfd_evidence evidence
-        ON evidence.attempt_token = attempt.token
+      WHERE unit.state = 'complete'
       GROUP BY target_cells.target_id
+    ), evidence_stats AS MATERIALIZED (
+      SELECT target_cells.target_id,
+        count(DISTINCT evidence.result_attempt_id)::int AS cfd_evidence
+      FROM progressive_cfd_evidence evidence
+      JOIN progressive_cfd_attempts attempt
+        ON attempt.token = evidence.attempt_token
+      JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN target_cells
+        ON target_cells.target_id = work.target_id
+       AND target_cells.generation_id = work.generation_id
+      WHERE work.stage IN (2, 3)
+      GROUP BY target_cells.target_id
+    ), progressive_stats AS MATERIALIZED (
+      SELECT target_scope.target_id,
+        coalesce(evidence_stats.cfd_evidence, 0)::int AS cfd_evidence,
+        coalesce(completed_unit_stats.fast_complete, 0)::int AS fast_complete,
+        coalesce(completed_unit_stats.precise_complete, 0)::int AS precise_complete
+      FROM (SELECT DISTINCT target_id FROM target_cells) target_scope
+      LEFT JOIN evidence_stats
+        ON evidence_stats.target_id = target_scope.target_id
+      LEFT JOIN completed_unit_stats
+        ON completed_unit_stats.target_id = target_scope.target_id
     ), coverage AS MATERIALIZED (
       SELECT target_cells.airfoil_id, target_cells.condition_id,
         target_cells.requested,

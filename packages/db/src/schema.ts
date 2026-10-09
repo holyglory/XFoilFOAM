@@ -7356,6 +7356,9 @@ export const progressiveCfdUnits = pgTable(
     pendingIdx: index("progressive_cfd_units_pending_idx")
       .on(table.workId, table.ordinal)
       .where(sql`${table.state} = 'pending'`),
+    completeIdx: index("progressive_cfd_units_complete_idx")
+      .on(table.workId)
+      .where(sql`${table.state} = 'complete'`),
     alphaCheck: check(
       "progressive_cfd_units_aoa_deg_check",
       sql`${table.aoaDeg} BETWEEN -180 AND 180`,

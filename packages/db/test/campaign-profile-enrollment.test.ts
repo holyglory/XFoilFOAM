@@ -169,6 +169,7 @@ import { databaseUrl } from "../src/env";
 import {
   campaignAirfoilRows,
   campaignSummary,
+  listCampaigns,
   materializeCampaignLaunch,
   reconcileCampaignProfileEnrollment,
 } from "../src/campaigns";
@@ -1949,7 +1950,27 @@ describe("progressive durable stage transitions", () => {
     );
 
     const summary = await campaignSummary(db, fixture.campaignId);
-    expect(summary.conditions[0]?.progressive).toMatchObject({ requested: 3 });
+    expect(summary.conditions[0]?.progressive).toMatchObject({
+      requested: 3,
+      preliminary: 3,
+      cfdEvidence: 0,
+      fastComplete: 0,
+      preciseComplete: 0,
+    });
+    expect(summary.conditions[0]?.counters).toMatchObject({
+      requested: 3,
+      solved: 0,
+      remaining: 3,
+    });
+    const listed = await listCampaigns(db, {
+      statuses: ["active"],
+      limit: 100,
+    });
+    expect(listed.items.find((item) => item.id === fixture.campaignId)?.totals).toMatchObject({
+      requested: 6,
+      solved: 0,
+      remaining: 6,
+    });
     const page = await campaignAirfoilRows(db, fixture.campaignId);
     const row = page.items.find((item) => item.airfoilId === originalId)!;
     const [condition] = await db.execute(
