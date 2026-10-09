@@ -7528,6 +7528,7 @@ export async function listCampaigns(
       COALESCE(pr.blocked_precalc_exhausted, 0)::int AS blocked_precalc_exhausted,
       COALESCE(pr.blocked_engine_submit, 0)::int AS blocked_engine_submit,
       COALESCE(pr.blocked_other, 0)::int AS blocked_other,
+      pr.campaign_id IS NOT NULL AS has_legacy_progress,
       (
         SELECT count(*)::int
         FROM (
@@ -7595,6 +7596,36 @@ export async function listCampaigns(
     ORDER BY (c.status = 'attention') DESC, c."updatedAt" DESC
     LIMIT ${limit} OFFSET ${offset}
   `)) as unknown as Array<Record<string, unknown>>;
+  const progressiveTotalsByCampaign = new Map<string, CampaignProgressTotals>();
+  const progressiveRowsByCampaign = await Promise.all(
+    rows
+      .filter((r) => !Boolean(r.has_legacy_progress))
+      .map(async (r) => {
+        const progressiveRows = await campaignProgressiveConditionRows(
+          db,
+          String(r.id),
+        );
+        const progressive = progressiveRows.reduce<ProgressiveCoverageCell>(
+          (totals, row) => ({
+            ...totals,
+            requested: totals.requested + Number(row.requested),
+            preciseComplete:
+              totals.preciseComplete + Number(row.precise_complete),
+          }),
+          {
+            requested: 0,
+            preliminary: 0,
+            cfdEvidence: 0,
+            fastComplete: 0,
+            preciseComplete: 0,
+          },
+        );
+        return [String(r.id), progressiveCoverageTotals(progressive)] as const;
+      }),
+  );
+  for (const [campaignId, totals] of progressiveRowsByCampaign) {
+    progressiveTotalsByCampaign.set(campaignId, totals);
+  }
   const total = Number(rows[0]?.total ?? 0);
   const reviewBuckets = await reviewBucketsByCampaign(
     db,
@@ -7633,25 +7664,26 @@ export async function listCampaigns(
       conditionCount: Number(r.condition_count),
       airfoilCount: Number(r.airfoil_count),
       excludedAirfoilCount: Number(r.excluded_airfoil_count),
-      totals: {
-        requested: Number(r.requested),
-        solved: Number(r.solved),
-        failed: Number(r.failed),
-        running: Number(r.running),
-        superseded: Number(r.superseded),
-        derived: Number(r.derived),
-        rejected: Number(r.rejected),
-        blocked: Number(r.blocked),
-        remaining: Math.max(
-          0,
-          Number(r.requested) -
-            Number(r.solved) -
-            Number(r.derived) -
-            Number(r.failed) -
-            Number(r.rejected) -
-            Number(r.blocked),
-        ),
-      },
+      totals:
+        progressiveTotalsByCampaign.get(String(r.id)) ?? {
+          requested: Number(r.requested),
+          solved: Number(r.solved),
+          failed: Number(r.failed),
+          running: Number(r.running),
+          superseded: Number(r.superseded),
+          derived: Number(r.derived),
+          rejected: Number(r.rejected),
+          blocked: Number(r.blocked),
+          remaining: Math.max(
+            0,
+            Number(r.requested) -
+              Number(r.solved) -
+              Number(r.derived) -
+              Number(r.failed) -
+              Number(r.rejected) -
+              Number(r.blocked),
+          ),
+        },
       remediation: buildCampaignRemediationSummary({
         precalcMeshRepairing: Number(r.precalc_mesh_repairing),
         blockedMeshQuality: Number(r.blocked_mesh_quality),
