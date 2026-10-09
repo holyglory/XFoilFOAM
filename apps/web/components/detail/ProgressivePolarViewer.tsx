@@ -31,6 +31,11 @@ type ProgressiveSample =
 type ProgressiveContributor = NonNullable<
   ProgressivePolarSeries["explanation"]["contributors"]
 >[number];
+type ProgressiveSampleFocus = {
+  method: ProgressiveCurveMethod;
+  sample: ProgressiveSample;
+  contributors: ProgressiveContributor[];
+};
 
 export function ProgressivePolarViewer({
   series,
@@ -55,26 +60,25 @@ export function ProgressivePolarViewer({
   const [chart, setChart] = useState<Chart>("cl");
   const [samplesVisible, setSamplesVisible] = useState(false);
   const [methodsVisible, setMethodsVisible] = useState(false);
-  const [sampleFocus, setSampleFocus] = useState<{
-    method: ProgressiveCurveMethod;
-    sample: ProgressiveSample;
-    contributor?: ProgressiveContributor;
-  } | null>(null);
+  const [sampleFocus, setSampleFocus] = useState<ProgressiveSampleFocus | null>(
+    null,
+  );
   const [interactive, setInteractive] = useState(false);
   const [width, setWidth] = useState(320);
   const root = useRef<HTMLDivElement>(null);
   const clipId = `progressive-${useId().replaceAll(":", "")}`;
   const selected = series.find((item) => item.targetId === selectedId);
-  const contributorFor = (method: ProgressiveCurveMethod, alpha: number) =>
-    selected?.explanation.contributors?.find(
+  const contributorsFor = (method: ProgressiveCurveMethod, alpha: number) =>
+    selected?.explanation.contributors?.filter(
       (entry) => entry.method === method && entry.alpha === alpha,
-    );
+    ) ?? [];
   const activateSample = (
     method: ProgressiveCurveMethod,
     sample: ProgressiveSample,
   ) => {
-    const contributor = contributorFor(method, sample.alpha);
-    setSampleFocus({ method, sample, contributor });
+    const contributors = contributorsFor(method, sample.alpha);
+    setSampleFocus({ method, sample, contributors });
+    const contributor = contributors[0];
     if (contributor && onOpenResult && selected)
       onOpenResult({
         re: selected.re,
@@ -83,6 +87,17 @@ export function ProgressivePolarViewer({
         resultAttemptId: contributor.attemptId,
       });
   };
+  const selectionFingerprint = series
+    .map((item) => item.conditionKey + ":" + item.targetId)
+    .join("|");
+  useEffect(() => {
+    const nextId = initialConditionKey
+      ? (series.find((item) => item.conditionKey === initialConditionKey)
+          ?.targetId ?? "")
+      : (series[0]?.targetId ?? "");
+    setSelectedId(nextId);
+    setSampleFocus(null);
+  }, [initialConditionKey, selectionFingerprint]);
   useEffect(() => {
     let disposed = false;
     let observer: ResizeObserver | undefined;
@@ -387,7 +402,7 @@ export function ProgressivePolarViewer({
       >
         <svg
           data-ui-continuation-anchor
-          role="img"
+          role="group"
           aria-label={`${CHARTS[chart]} polar at Reynolds ${selected.re}, Mach ${selected.mach}`}
           width="100%"
           height={height}
@@ -479,7 +494,7 @@ export function ProgressivePolarViewer({
                 />
                 {samplesVisible &&
                   curve.values.map((value) => {
-                    const contributor = contributorFor(
+                    const contributors = contributorsFor(
                       curve.method,
                       value.sample.alpha,
                     );
@@ -487,14 +502,14 @@ export function ProgressivePolarViewer({
                       <circle
                         key={value.sample.alpha}
                         data-testid="prediction-sample"
-                        data-cfd-anchor={contributor ? "true" : "false"}
+                        data-cfd-anchor={contributors.length ? "true" : "false"}
                         cx={projected.x(value.x)}
                         cy={projected.y(value.y)}
-                        r={contributor ? 4.5 : 2.75}
+                        r={contributors.length ? 4.5 : 2.75}
                         fill={COLORS[curve.method]}
-                        fillOpacity={contributor ? 1 : 0.62}
-                        stroke={contributor ? C.text : "none"}
-                        strokeWidth={contributor ? 1 : 0}
+                        fillOpacity={contributors.length ? 1 : 0.62}
+                        stroke={contributors.length ? C.text : "none"}
+                        strokeWidth={contributors.length ? 1 : 0}
                         tabIndex={0}
                         role="button"
                         aria-label={`${METHODS[curve.method]} sample at alpha ${number(value.sample.alpha)} degrees`}
@@ -503,7 +518,7 @@ export function ProgressivePolarViewer({
                           setSampleFocus({
                             method: curve.method,
                             sample: value.sample,
-                            contributor,
+                            contributors,
                           })
                         }
                         onMouseLeave={() => setSampleFocus(null)}
@@ -511,7 +526,7 @@ export function ProgressivePolarViewer({
                           setSampleFocus({
                             method: curve.method,
                             sample: value.sample,
-                            contributor,
+                            contributors,
                           })
                         }
                         onBlur={() => setSampleFocus(null)}
@@ -543,7 +558,8 @@ export function ProgressivePolarViewer({
       {sampleFocus && (
         <div
           data-testid="progressive-sample-inspector"
-          role="status"
+          role="group"
+          aria-label="Selected polar sample details"
           style={{
             display: "flex",
             flexWrap: "wrap",
@@ -567,37 +583,47 @@ export function ProgressivePolarViewer({
             {number(sampleFocus.sample.cd)} · Cm {number(sampleFocus.sample.cm)}{" "}
             · L/D {number(sampleFocus.sample.cl / sampleFocus.sample.cd)}
           </span>
-          <span style={{ color: sampleFocus.contributor ? C.amber : C.muted }}>
-            {sampleFocus.contributor
-              ? "stored CFD evidence anchor"
-              : "curve sample only · not a stored CFD result"}
+          <span
+            style={{
+              color: sampleFocus.contributors.length ? C.amber : C.muted,
+            }}
+          >
+            {sampleFocus.contributors.length
+              ? "fitted curve estimate at a CFD-anchored angle"
+              : "fitted curve sample · no stored CFD result at this angle"}
           </span>
-          {sampleFocus.contributor && onOpenResult && (
-            <button
-              type="button"
-              onClick={() =>
-                onOpenResult({
-                  re: selected.re,
-                  aoa: sampleFocus.sample.alpha,
-                  resultId: sampleFocus.contributor!.resultId,
-                  resultAttemptId: sampleFocus.contributor!.attemptId,
-                })
-              }
-              style={{
-                marginLeft: "auto",
-                border: `1px solid ${C.tealBorder}`,
-                borderRadius: 6,
-                padding: "4px 8px",
-                background: C.tealFill,
-                color: C.teal,
-                fontFamily: MONO,
-                fontSize: 10,
-                cursor: "pointer",
-              }}
-            >
-              Open stored evidence
-            </button>
-          )}
+          {sampleFocus.contributors.length > 0 &&
+            onOpenResult &&
+            sampleFocus.contributors.map((contributor, index) => (
+              <button
+                key={contributor.attemptId}
+                type="button"
+                onClick={() =>
+                  onOpenResult({
+                    re: selected.re,
+                    aoa: sampleFocus.sample.alpha,
+                    resultId: contributor.resultId,
+                    resultAttemptId: contributor.attemptId,
+                  })
+                }
+                style={{
+                  marginLeft: index === 0 ? "auto" : undefined,
+                  border: "1px solid " + C.tealBorder,
+                  borderRadius: 6,
+                  padding: "4px 8px",
+                  background: C.tealFill,
+                  color: C.teal,
+                  fontFamily: MONO,
+                  fontSize: 10,
+                  cursor: "pointer",
+                }}
+              >
+                {"Open CFD evidence" +
+                  (sampleFocus.contributors.length > 1
+                    ? " #" + (index + 1)
+                    : "")}
+              </button>
+            ))}
         </div>
       )}
       <details
