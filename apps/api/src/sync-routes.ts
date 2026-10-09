@@ -593,6 +593,44 @@ type PolarPushPayload = z.infer<typeof polarPushSchema>;
 class PolarPromiseScopeError extends Error {}
 class PolarEvidenceBindingError extends Error {}
 
+function canonicalEvidenceArtifactKind(value: unknown): {
+  originalKind: string;
+  normalizedKind:
+    | "manifest"
+    | "engine_bundle"
+    | "openfoam_bundle"
+    | "vtk_window"
+    | "time_directory"
+    | "log"
+    | "force_coefficients"
+    | "mesh"
+    | "dictionary"
+    | "field_data"
+    | "frame_image";
+} {
+  const originalKind = nullableText(value) ?? "field_data";
+  const normalizedKind =
+    originalKind === "mesh_evidence" ? "mesh" : originalKind;
+  switch (normalizedKind) {
+    case "manifest":
+    case "engine_bundle":
+    case "openfoam_bundle":
+    case "vtk_window":
+    case "time_directory":
+    case "log":
+    case "force_coefficients":
+    case "mesh":
+    case "dictionary":
+    case "field_data":
+    case "frame_image":
+      return { originalKind, normalizedKind };
+    default:
+      throw new PolarEvidenceBindingError(
+        `unsupported evidence artifact kind: ${originalKind}`,
+      );
+  }
+}
+
 function syncIdentityToken(value: string, label: string): string {
   const token = value.trim();
   if (!/^[A-Za-z0-9._-]{1,200}$/.test(token)) {
@@ -5072,32 +5110,40 @@ export async function importPolarPush(
       const artifactAssociationFor = ({
         artifact,
         stored,
-      }: (typeof preparedArtifacts)[number]) => ({
-        resultId: existing.id,
-        resultAttemptId: attempt.id,
-        airfoilId,
-        simJobId: progressivePoint ? importedEngineJobId : null,
-        engineJobId: importedEngineJobId,
-        engineCaseSlug: point.engineCaseSlug ?? null,
-        methodKey: point.methodKey ?? null,
-        solverImplementationId: runtime?.solverImplementationId ?? null,
-        solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
-        aoaDeg: point.aoaDeg,
-        kind: (nullableText(artifact.kind) ?? "field_data") as never,
-        field: nullableText(artifact.field),
-        role: nullableText(artifact.role),
-        storageKey: stored.storageKey,
-        mimeType: nullableText(artifact.mimeType) ?? stored.mimeType,
-        sha256: stored.sha256,
-        byteSize: stored.byteSize,
-        metadata: {
-          ...jsonObject(artifact.metadata),
-          sourceInstanceId,
-          ...(stored.brokeredUploadId
-            ? { remoteEvidenceUploadId: stored.brokeredUploadId }
-            : {}),
-        },
-      });
+      }: (typeof preparedArtifacts)[number]) => {
+        const { originalKind, normalizedKind } = canonicalEvidenceArtifactKind(
+          artifact.kind,
+        );
+        return {
+          resultId: existing.id,
+          resultAttemptId: attempt.id,
+          airfoilId,
+          simJobId: progressivePoint ? importedEngineJobId : null,
+          engineJobId: importedEngineJobId,
+          engineCaseSlug: point.engineCaseSlug ?? null,
+          methodKey: point.methodKey ?? null,
+          solverImplementationId: runtime?.solverImplementationId ?? null,
+          solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
+          aoaDeg: point.aoaDeg,
+          kind: normalizedKind,
+          field: nullableText(artifact.field),
+          role: nullableText(artifact.role),
+          storageKey: stored.storageKey,
+          mimeType: nullableText(artifact.mimeType) ?? stored.mimeType,
+          sha256: stored.sha256,
+          byteSize: stored.byteSize,
+          metadata: {
+            ...jsonObject(artifact.metadata),
+            ...(originalKind !== normalizedKind
+              ? { engineArtifactKind: originalKind }
+              : {}),
+            sourceInstanceId,
+            ...(stored.brokeredUploadId
+              ? { remoteEvidenceUploadId: stored.brokeredUploadId }
+              : {}),
+          },
+        };
+      };
       let replayedExistingManifest = false;
       let replayedExistingManifestArtifactId: string | null = null;
       if (attemptResolution.kind === "existing") {

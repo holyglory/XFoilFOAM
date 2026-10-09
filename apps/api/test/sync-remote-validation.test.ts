@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2479,6 +2485,68 @@ describe("remote solver sync validation regressions", () => {
       contentBase64: `[stripped ${media.contentBase64.length} base64 chars]`,
       sha256: media.sha256,
       field: media.field,
+    });
+  });
+
+  it("normalizes mesh_evidence artifacts while retaining engine kind provenance and bytes", async () => {
+    const aoaDeg = 703.051;
+    const meshBytes = Buffer.from(`${PREFIX}:mesh-evidence-import`);
+    const meshArtifact = {
+      kind: "mesh_evidence",
+      role: "mesh_evidence",
+      filename: "mesh-evidence.bin",
+      metadata: { label: "mesh-evidence-import" },
+      contentBase64: meshBytes.toString("base64"),
+      sha256: sha256(meshBytes),
+      byteSize: meshBytes.byteLength,
+      mimeType: "application/octet-stream",
+    };
+    const pushed = await postPolars(
+      polarPayload([
+        makePoint(aoaDeg, {
+          evidenceArtifacts: [
+            artifactItem("mesh-evidence-manifest"),
+            meshArtifact,
+          ],
+        }),
+      ]),
+    );
+    expect(pushed.statusCode, pushed.body).toBe(200);
+    const row = await resultAt(aoaDeg);
+    expect(row?.currentResultAttemptId).toBeTruthy();
+    const [stored] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(
+        and(
+          eq(
+            solverEvidenceArtifacts.resultAttemptId,
+            row!.currentResultAttemptId!,
+          ),
+          eq(solverEvidenceArtifacts.sha256, meshArtifact.sha256),
+        ),
+      )
+      .limit(1);
+    expect(stored).toMatchObject({
+      kind: "mesh",
+      role: "mesh_evidence",
+      metadata: {
+        label: "mesh-evidence-import",
+        engineArtifactKind: "mesh_evidence",
+      },
+    });
+    expect(readFileSync(join(MEDIA_DIR, stored.storageKey))).toEqual(
+      meshBytes,
+    );
+    const [attempt] = await db
+      .select({ evidencePayload: resultAttempts.evidencePayload })
+      .from(resultAttempts)
+      .where(eq(resultAttempts.id, row!.currentResultAttemptId!))
+      .limit(1);
+    expect(attempt?.evidencePayload).toMatchObject({
+      evidenceArtifacts: expect.arrayContaining([
+        expect.objectContaining({ kind: "mesh_evidence" }),
+      ]),
     });
   });
 
