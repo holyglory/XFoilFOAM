@@ -25,6 +25,12 @@ const COLORS = {
   composite: "#e6f0fa",
 };
 const number = (value: number) => Number(value.toPrecision(4)).toString();
+type ProgressiveCurveMethod = keyof typeof METHODS;
+type ProgressiveSample =
+  ProgressivePolarSeries["curves"][number]["samples"][number];
+type ProgressiveContributor = NonNullable<
+  ProgressivePolarSeries["explanation"]["contributors"]
+>[number];
 
 export function ProgressivePolarViewer({
   series,
@@ -49,11 +55,34 @@ export function ProgressivePolarViewer({
   const [chart, setChart] = useState<Chart>("cl");
   const [samplesVisible, setSamplesVisible] = useState(false);
   const [methodsVisible, setMethodsVisible] = useState(false);
+  const [sampleFocus, setSampleFocus] = useState<{
+    method: ProgressiveCurveMethod;
+    sample: ProgressiveSample;
+    contributor?: ProgressiveContributor;
+  } | null>(null);
   const [interactive, setInteractive] = useState(false);
   const [width, setWidth] = useState(320);
   const root = useRef<HTMLDivElement>(null);
   const clipId = `progressive-${useId().replaceAll(":", "")}`;
   const selected = series.find((item) => item.targetId === selectedId);
+  const contributorFor = (method: ProgressiveCurveMethod, alpha: number) =>
+    selected?.explanation.contributors?.find(
+      (entry) => entry.method === method && entry.alpha === alpha,
+    );
+  const activateSample = (
+    method: ProgressiveCurveMethod,
+    sample: ProgressiveSample,
+  ) => {
+    const contributor = contributorFor(method, sample.alpha);
+    setSampleFocus({ method, sample, contributor });
+    if (contributor && onOpenResult && selected)
+      onOpenResult({
+        re: selected.re,
+        aoa: sample.alpha,
+        resultId: contributor.resultId,
+        resultAttemptId: contributor.attemptId,
+      });
+  };
   useEffect(() => {
     let disposed = false;
     let observer: ResizeObserver | undefined;
@@ -421,6 +450,40 @@ export function ProgressivePolarViewer({
                       cy={projected.y(value.y)}
                       r={3}
                       fill={COLORS[curve.method]}
+                      tabIndex={0}
+                      role="button"
+                      aria-label={`${METHODS[curve.method]} sample at alpha ${number(value.sample.alpha)} degrees`}
+                      style={{ cursor: "pointer" }}
+                      onMouseEnter={() =>
+                        setSampleFocus({
+                          method: curve.method,
+                          sample: value.sample,
+                          contributor: contributorFor(
+                            curve.method,
+                            value.sample.alpha,
+                          ),
+                        })
+                      }
+                      onMouseLeave={() => setSampleFocus(null)}
+                      onFocus={() =>
+                        setSampleFocus({
+                          method: curve.method,
+                          sample: value.sample,
+                          contributor: contributorFor(
+                            curve.method,
+                            value.sample.alpha,
+                          ),
+                        })
+                      }
+                      onBlur={() => setSampleFocus(null)}
+                      onClick={() => {
+                        activateSample(curve.method, value.sample);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        activateSample(curve.method, value.sample);
+                      }}
                     >
                       <title>
                         {METHODS[curve.method]}: α {number(value.sample.alpha)}
@@ -434,6 +497,66 @@ export function ProgressivePolarViewer({
           </g>
         </svg>
       </div>
+      {sampleFocus && (
+        <div
+          data-testid="progressive-sample-inspector"
+          role="status"
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            gap: 8,
+            marginTop: 8,
+            padding: "8px 10px",
+            border: `1px solid ${C.border}`,
+            borderRadius: 8,
+            fontFamily: MONO,
+            fontSize: 11,
+            color: C.text2,
+          }}
+        >
+          <strong style={{ color: COLORS[sampleFocus.method] }}>
+            {METHODS[sampleFocus.method]} · α {number(sampleFocus.sample.alpha)}
+            °
+          </strong>
+          <span>
+            Cl {number(sampleFocus.sample.cl)} · Cd{" "}
+            {number(sampleFocus.sample.cd)} · Cm {number(sampleFocus.sample.cm)}{" "}
+            · L/D {number(sampleFocus.sample.cl / sampleFocus.sample.cd)}
+          </span>
+          <span style={{ color: sampleFocus.contributor ? C.amber : C.muted }}>
+            {sampleFocus.contributor
+              ? "stored CFD evidence anchor"
+              : "curve sample only · not a stored CFD result"}
+          </span>
+          {sampleFocus.contributor && onOpenResult && (
+            <button
+              type="button"
+              onClick={() =>
+                onOpenResult({
+                  re: selected.re,
+                  aoa: sampleFocus.sample.alpha,
+                  resultId: sampleFocus.contributor!.resultId,
+                  resultAttemptId: sampleFocus.contributor!.attemptId,
+                })
+              }
+              style={{
+                marginLeft: "auto",
+                border: `1px solid ${C.tealBorder}`,
+                borderRadius: 6,
+                padding: "4px 8px",
+                background: C.tealFill,
+                color: C.teal,
+                fontFamily: MONO,
+                fontSize: 10,
+                cursor: "pointer",
+              }}
+            >
+              Open stored evidence
+            </button>
+          )}
+        </div>
+      )}
       <details
         style={{ marginTop: 14, color: C.text2, fontSize: 13, lineHeight: 1.6 }}
       >

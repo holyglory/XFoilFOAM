@@ -823,11 +823,15 @@ export function CellSidePanel({
               <>
                 <span style={chip(C.violet, C.violetBorder)}>
                   {fCount(counters.progressive.preliminary)}/
-                  {fCount(counters.progressive.requested)} curve angles
+                  {fCount(counters.progressive.requested)} curve samples
                 </span>
                 {counters.progressive.cfdEvidence > 0 && (
-                  <span style={chip(C.amber, "rgba(245,158,11,0.45)")}>
+                  <span
+                    title="Stored OpenFOAM evidence anchors used to inform the displayed curve; the remaining samples are curve estimates."
+                    style={chip(C.amber, "rgba(245,158,11,0.45)")}
+                  >
                     {fCount(counters.progressive.cfdEvidence)} CFD evidence
+                    anchors
                   </span>
                 )}
               </>
