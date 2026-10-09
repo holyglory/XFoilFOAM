@@ -150,6 +150,8 @@ Admission reads a materialized frontier from indexed cohort state, once per
 claim statement, without scanning target JSON or individual precise units for
 each candidate. Cohort initialization and coverage readiness are also materialized
 once per selection statement. No additional worker or admission capacity is added.
+CFD claims reuse that frontier to skip forbidden high-speed fallback scans, while
+campaigns without this policy retain their low-before-high fallback.
 
 After deploying the parent-reviewed coherent candidate and its migration on the
 hub, preview and then adopt the policy with the finite operator command:
@@ -329,11 +331,14 @@ exact namespace-backed stop-proof requirements remain unchanged. The isolated
 `control-rpc` check exercises concurrent cancellation and independent health
 requests against Redis, then inspects and cancels a genuinely busy CFD case.
 
-After acknowledgement, evidence staging alternates between the freshest eligible
-report for an active promise and the oldest eligible report overall. New histories
-can therefore reach polar refinement without waiting for the entire historical
-backlog, while older reports continue to make progress. Report publication order,
-ownership checks, retry delays and live import leases are unchanged. Identical
+After acknowledgement, evidence staging alternates active-priority and backlog
+passes. Active passes choose the newest eligible exact terminal report from an
+unexpired active promise, then the newest eligible ordinary active report. The
+fallback chooses the oldest eligible exact terminal report, including reports
+from active promises, then follows FIFO order for the remaining backlog. New
+histories can reach polar refinement while older reports continue to make
+progress. Report publication order, ownership checks, retry delays and live
+import leases are unchanged. Identical
 evidence may be reused from another acknowledged report in either sequence
 direction only after its exact content, projected fields and execution identity
 match; changed evidence still requires its own import and immutable attempt.
@@ -477,15 +482,17 @@ Only selected recovery attempts may settle. Rejected evidence remains rejected;
 linking alone cannot make it accepted or complete.
 
 The staging selector uses ordered acknowledged-report metadata. Active-priority
-passes first select the newest eligible report from an unexpired active promise;
-only when none exists do they fall back to the earliest eligible retained report.
-That fallback first releases terminal reports from expired, cancelled or fulfilled
-promises when they carry an exact stop proof, then retains chronological order for
-the remaining backlog. Both paths share the same
+passes first select the newest eligible exact terminal report from an unexpired
+active promise, then the newest eligible ordinary active report. If no active
+candidate exists, or during a backlog pass, the fallback chooses the oldest
+eligible exact terminal report, including reports from active, expired, cancelled
+or fulfilled promises, then follows FIFO order for the remaining backlog.
+Both paths share the same
 source ownership, transfer-pause, acknowledgement, retry and ingest-lease checks,
-and the selected report still passes full immutable-source verification. The
-ordering index avoids sorting the entire backlog; it does not discard history or
-sample a truncated candidate list.
+and the selected report still passes full immutable-source verification.
+Selection uses indexed acknowledged-report and exact terminal metadata; active
+terminal-first ordering may still sort eligible active candidates. The selector
+preserves history and does not sample a truncated candidate list.
 
 Evidence processing uses independently configurable staging and delivery lanes;
 the source default is four of each, while the production compose configuration
@@ -1083,8 +1090,10 @@ services, never the legacy accepted-result publisher. A terminal worker report
 may precede local point staging; that temporary absence is not an empty solve and
 must not cancel the promise or create a legacy blocked-delivery receipt.
 Compact evidence publication alternates a current, unexpired-promise priority
-pass with an oldest-first pass, so current curves do not wait behind retained
-cancelled work and historical evidence still advances. Each pass attempts both
+pass with a backlog pass. Staging chooses the newest eligible exact terminal
+report before the newest ordinary active report; its fallback chooses the oldest
+eligible exact terminal report, including active promises, before the remaining
+FIFO backlog. Each pass attempts both
 staging and delivery even if one fails; existing retry deadlines, exact-report
 ownership and conflict checks remain unchanged. This is publication order, not
 permission to accept a cancelled promise or change campaign-stage priorities.

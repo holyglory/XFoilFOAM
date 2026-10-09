@@ -279,6 +279,8 @@ export async function claimProgressiveCfdUnit(
     const [campaign] = await connection.execute(sql`
       WITH ${previousExecutions}, ${progressiveAdmissionFrontierSql(String(epoch.id))}
       SELECT campaign.id,
+        coalesce((SELECT high_allowed FROM progressive_admission_frontier frontier
+          WHERE frontier.campaign_id = campaign.id), true) AS high_allowed,
         NOT EXISTS (
           SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
           JOIN progressive_cfd_units unit ON unit.work_id = work.id
@@ -357,7 +359,7 @@ export async function claimProgressiveCfdUnit(
         sql`generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
           unit.ordinal, work.target_id`,
       );
-      if (!selectedId)
+      if (!selectedId && campaign.high_allowed)
         selectedId = await selectStage3Candidate(
           sql`target.mach >= 1.0 OR target.mach IS NULL`,
           sql`target.mach, generation.created_at, generation.id,

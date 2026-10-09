@@ -39,6 +39,7 @@ import { buildPolarRequest } from "../../../apps/sweeper/src/build-request";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import * as progressiveCampaigns from "../src/progressive-campaigns";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
@@ -10979,14 +10980,71 @@ describe("subsonic through precise priority", () => {
   }, 120_000);
 
   it("claims multiple precise units in order, skips unavailable heads, and keeps high work closed until accepted low precise closure", async () => {
-    const fallback = await scope();
+    const dialect = new PgDialect();
+    async function capturedClaim() {
+      const statements: string[] = [];
+      const capturedDb = {
+        transaction: (
+          callback: (transaction: DB) => Promise<ProgressiveCfdLease | null>,
+        ) =>
+          db.transaction(async (transaction) => {
+            const execute = vi.spyOn(transaction, "execute");
+            try {
+              return await callback(transaction as unknown as DB);
+            } finally {
+              for (const [statement] of execute.mock.calls)
+                statements.push(
+                  typeof statement === "string"
+                    ? statement
+                    : dialect.sqlToQuery(statement.getSQL()).sql,
+                );
+              execute.mockRestore();
+            }
+          }),
+      } as unknown as DB;
+      const lease = await claimProgressiveCfdUnit(capturedDb, {
+        owner: "captured-precise-admission",
+        leaseSeconds: 120,
+        localTimeStepVersion: 1,
+      });
+      return { lease, statements };
+    }
+
+    const fallback = await scope(false, [-8]);
     await initializeProgressiveCfdWork(db);
-    expect(
+    const fallbackFast = (
       await claimProgressiveCfdUnit(db, {
         owner: "default-stage-fallback",
         leaseSeconds: 120,
-      }),
-    ).toMatchObject({ stage: 2 });
+      })
+    )!;
+    expect(fallbackFast).toMatchObject({ stage: 2 });
+    for (const lease of [fallbackFast, (await claimCfd())!, (await claimCfd())!])
+      await finish(lease);
+    expect(await advanceProgressiveCfdStages(db)).toMatchObject({ closed: 3 });
+    expect(await initializeProgressiveCfdWork(db)).toBe(3);
+    const [fallbackLow] = await db.execute(sql`
+      SELECT unit.id FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN polar_analysis_targets target ON target.id = work.target_id
+      WHERE work.generation_id = ${fallback.generationId}
+        AND work.stage = 3 AND target.mach < 1.0
+    `);
+    await db.transaction(async (transaction) => {
+      await transaction.execute(sql`SELECT id FROM progressive_cfd_units
+        WHERE id = ${fallbackLow.id} FOR UPDATE`);
+      const captured = await capturedClaim();
+      expect(captured.lease).toMatchObject({ stage: 3 });
+      expect(captured.lease?.physical.derived.mach).toBe(1);
+      const lowSelector = captured.statements.findIndex((statement) =>
+        statement.includes("target.mach < 1.0"),
+      );
+      const highSelector = captured.statements.findIndex((statement) =>
+        statement.includes("target.mach >= 1.0 OR target.mach IS NULL"),
+      );
+      expect(lowSelector).toBeGreaterThanOrEqual(0);
+      expect(highSelector).toBeGreaterThan(lowSelector);
+    });
     await db
       .update(simCampaigns)
       .set({ status: "paused" })
@@ -11066,6 +11124,29 @@ describe("subsonic through precise priority", () => {
         AND work.stage = 2 AND target.mach >= 1 AND unit.state = 'pending'
     `);
     expect(Number(highPending.count)).toBeGreaterThan(0);
+
+    await db.transaction(async (transaction) => {
+      await transaction.execute(sql`SELECT id FROM progressive_cfd_units
+        WHERE id = ${preciseUnits[3].id} FOR UPDATE`);
+      const captured = await capturedClaim();
+      expect(captured.lease).toBeNull();
+      expect(
+        captured.statements.filter((statement) =>
+          statement.includes("target.mach < 1.0"),
+        ),
+      ).toHaveLength(1);
+      expect(
+        captured.statements.some((statement) =>
+          statement.includes("target.mach >= 1.0 OR target.mach IS NULL"),
+        ),
+      ).toBe(false);
+      const campaignSelector = captured.statements.find((statement) =>
+        statement.includes("AS all_stage3"),
+      );
+      expect(campaignSelector).toMatch(
+        /coalesce\(\(SELECT high_allowed FROM progressive_admission_frontier frontier\s+WHERE frontier.campaign_id = campaign.id\), true\) AS high_allowed/,
+      );
+    });
 
     const precise = (await claimCfd())!;
     expect(precise).toMatchObject({
