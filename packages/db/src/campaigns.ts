@@ -2320,11 +2320,15 @@ async function campaignProgressSnapshot(
     (sum, condition) => sum + Number(condition.precise_complete),
     0,
   );
+  const normalizedRequested = useProgressiveOverlay
+    ? progressiveRequested
+    : Number(totals.requested);
+  const normalizedSolved = useProgressiveOverlay
+    ? progressiveSolved
+    : Number(totals.solved);
   const normalizedTotals: CampaignProgressTotals = {
-    requested: useProgressiveOverlay
-      ? progressiveRequested
-      : Number(totals.requested),
-    solved: useProgressiveOverlay ? progressiveSolved : Number(totals.solved),
+    requested: normalizedRequested,
+    solved: normalizedSolved,
     failed: Number(totals.failed),
     running: Number(totals.running),
     superseded: Number(totals.superseded),
@@ -2333,8 +2337,8 @@ async function campaignProgressSnapshot(
     blocked: Number(totals.blocked),
     remaining: Math.max(
       0,
-      Number(totals.requested) -
-        Number(totals.solved) -
+      normalizedRequested -
+        normalizedSolved -
         Number(totals.derived) -
         Number(totals.failed) -
         Number(totals.rejected) -
