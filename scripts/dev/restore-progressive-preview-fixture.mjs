@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   methodCompatibilityHashForSnapshot,
   simulationSetupSignature,
@@ -39,38 +39,175 @@ const artifactRoot = new URL(
   "../../.codex-artifacts/preview-ag24-recovery-20261002-a6ce8ae2/",
   import.meta.url,
 );
+const nativeReportPath = process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
+  ? resolve(root, process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT)
+  : null;
 const report = JSON.parse(
   await readFile(
-    process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
-      ? resolve(root, process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT)
-      : new URL("native-report.json", artifactRoot),
+    nativeReportPath ?? new URL("native-report.json", artifactRoot),
     "utf8",
   ),
 );
-const native = process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
-  ? await fetch(
-      new URL(`/jobs/${report.jobs[0].engineJobId}/result`, engineOrigin),
-      { signal: AbortSignal.timeout(15000), redirect: "error" },
-    ).then(async (response) => {
-      assert(response.ok);
-      return response.json();
-    })
-  : JSON.parse(
-      await readFile(new URL("new-job-result.json", artifactRoot), "utf8"),
+const retainedHandoff = nativeReportPath !== null;
+const handoffRoot = nativeReportPath ? dirname(nativeReportPath) : null;
+const hashBytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const assertSha256 = (value, label) => {
+  assert.match(value, /^[0-9a-f]{64}$/, `${label} is not a SHA-256 digest`);
+};
+const assertEngineIdentity = (actual, expected, label) => {
+  assert(actual && expected, `${label} is missing`);
+  for (const field of [
+    "family",
+    "distribution",
+    "version",
+    "numerics_revision",
+    "adapter_contract_version",
+  ]) {
+    assert.equal(actual[field], expected[field], `${label}.${field} changed`);
+  }
+};
+const readRetainedFile = async (path, expected, label) => {
+  assert(handoffRoot && typeof path === "string" && path.length > 0);
+  assert(Number.isSafeInteger(expected.byteSize) && expected.byteSize >= 0);
+  assertSha256(expected.sha256, label);
+  assert(!path.split(/[\\/]/).includes(".."), `${label} path is invalid`);
+  const absolute = resolve(handoffRoot, path);
+  const withinRoot = relative(handoffRoot, absolute);
+  assert(
+    withinRoot && !withinRoot.startsWith("..") && !isAbsolute(withinRoot),
+    `${label} escaped its retained handoff directory`,
+  );
+  const bytes = await readFile(absolute);
+  assert.equal(bytes.length, expected.byteSize, `${label} byte size changed`);
+  assert.equal(hashBytes(bytes), expected.sha256, `${label} bytes changed`);
+  return { bytes, sha256: expected.sha256, byteSize: bytes.length };
+};
+let handoff;
+let handoffJob;
+let sourceJob;
+let native;
+if (retainedHandoff) {
+  assert.equal(report.nativeEvidence?.kind, "native-engine-evidence-handoff");
+  assert.equal(report.nativeEvidence?.version, 2);
+  assert.equal(report.nativeEvidence?.retainedBeforeExecutionStops, true);
+  assert(report.nativeEvidence?.manifestPath);
+  const manifestPath = resolve(handoffRoot, "native-evidence-manifest.json");
+  assert.equal(resolve(root, report.nativeEvidence.manifestPath), manifestPath);
+  const manifestBytes = await readFile(manifestPath);
+  assert.equal(
+    manifestBytes.length,
+    report.nativeEvidence.manifestByteSize,
+    "Retained handoff manifest byte size changed",
+  );
+  assert.equal(
+    hashBytes(manifestBytes),
+    report.nativeEvidence.manifestSha256,
+    "Retained handoff manifest bytes changed",
+  );
+  assertSha256(
+    report.nativeEvidence.manifestSha256,
+    "Retained handoff manifest",
+  );
+  handoff = JSON.parse(manifestBytes.toString("utf8"));
+  assert.equal(handoff.kind, "native-engine-evidence-handoff");
+  assert.equal(handoff.version, 2);
+  assert.equal(handoff.sourceRunId, report.sourceRunId);
+  assert.deepEqual(handoff.source.expectedEngine, report.engineIdentity);
+  assert.equal(handoff.source.instanceId, report.engineDeploymentId);
+  assert.equal(handoff.source.deployment, report.engineDeployment);
+  assert.equal(
+    handoff.source.expectedSolverSource,
+    report.expectedSolverSource,
+  );
+  assert.equal(handoff.retainedBeforeExecutionStops, true);
+  assert.equal(handoff.jobs.length, 1);
+  [handoffJob] = handoff.jobs;
+  assert.equal(handoffJob.resultPath, "native-result.json");
+  assert(Array.isArray(handoff.artifacts));
+  assertEngineIdentity(
+    handoff.source.expectedEngine,
+    report.engineIdentity,
+    "Retained expected engine",
+  );
+  for (const artifact of handoff.artifacts) {
+    assert.equal(artifact.jobId, handoffJob.jobId);
+    assert(typeof artifact.originalPath === "string" && artifact.originalPath);
+    assert(typeof artifact.retainedPath === "string" && artifact.retainedPath);
+    assert(
+      Array.isArray(artifact.references) && artifact.references.length > 0,
     );
+    assertSha256(artifact.sha256, `Retained ${artifact.originalPath}`);
+    for (const reference of artifact.references) {
+      assert.equal(reference.simJobId, handoffJob.simJobId);
+    }
+  }
+  sourceJob = report.jobs.find((job) => job.id === handoffJob.simJobId);
+  assert(sourceJob, "Retained handoff lost its source database job");
+  assert.equal(sourceJob.engineJobId, handoffJob.jobId);
+  assert.equal(sourceJob.airfoilId, handoffJob.airfoilId);
+  assert.equal(
+    sourceJob.simulationPresetRevisionId,
+    handoffJob.simulationPresetRevisionId,
+  );
+  assert.deepEqual(sourceJob.requestPayload, handoffJob.requestPayload);
+  const requestBytes = Buffer.from(
+    `${JSON.stringify(sourceJob.requestPayload ?? null)}\n`,
+  );
+  assert.equal(
+    hashBytes(requestBytes),
+    handoffJob.requestPayloadSha256,
+    "Retained source request bytes changed",
+  );
+  const result = await readRetainedFile(
+    handoffJob.resultPath,
+    {
+      byteSize: handoffJob.resultByteSize,
+      sha256: handoffJob.resultSha256,
+    },
+    "Retained native result",
+  );
+  native = JSON.parse(result.bytes.toString("utf8"));
+} else {
+  native = JSON.parse(
+    await readFile(new URL("new-job-result.json", artifactRoot), "utf8"),
+  );
+  sourceJob = report.jobs[0];
+}
 assert.equal(native.state, "completed");
-assert.equal(native.job_id, report.jobs[0].engineJobId);
+assert.equal(native.job_id, sourceJob.engineJobId);
 assert.equal(native.engine.numerics_revision, "2");
 assert.equal(native.mesh_recovery_version, 3);
 assert.equal(
   native.engine.application_source_sha256,
   report.expectedSolverSource,
 );
-const sourceRunId = process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
-  ? (process.env.DEVCOORDINATOR_RUN_ID ?? null)
+if (retainedHandoff) {
+  assertEngineIdentity(
+    handoffJob.sourceEngine,
+    handoff.source.expectedEngine,
+    "Retained source engine",
+  );
+  assertEngineIdentity(
+    native.engine,
+    handoff.source.expectedEngine,
+    "Retained result engine",
+  );
+  assert.deepEqual(native.engine, handoffJob.sourceEngine);
+  assert.deepEqual(native.requested_engine, handoffJob.requestedEngine);
+  assert.equal(
+    native.requested_execution_pool,
+    handoffJob.requestedExecutionPool,
+  );
+  assert.equal(native.execution_pool, handoffJob.executionPool);
+  assert.equal(native.job_id, handoffJob.jobId);
+  assert.equal(handoffJob.resultState, native.state);
+}
+const sourceRunId = retainedHandoff
+  ? handoff.sourceRunId
   : "t20261002T213447Z-aa1e9a";
 const originalCampaignId = "35c2dc35-7fbd-411f-a7f7-452c1e1d3b0f";
-const snapshot = structuredClone(report.jobs[0].requestPayload.setupSnapshot);
+assert(sourceJob?.requestPayload?.setupSnapshot);
+const snapshot = structuredClone(sourceJob.requestPayload.setupSnapshot);
 const originalCompatibility = methodCompatibilityHashForSnapshot(snapshot);
 snapshot.flowState.mediumSlug = `preview-retained-ag24-${native.job_id.slice(0, 8)}-air`;
 snapshot.flowState.mediumName = "Air — retained AG24 preview";
@@ -81,7 +218,9 @@ assert.equal(
 );
 const signatureHash = simulationSetupSignature(snapshot);
 const source = {
-  sourceInstanceId: engine.data.deployment_id,
+  sourceInstanceId: retainedHandoff
+    ? handoff.source.instanceId
+    : engine.data.deployment_id,
   sourceInstanceName: `Private progressive engine; native job ${native.job_id}`,
 };
 const secret = randomBytes(32).toString("hex");
@@ -166,6 +305,10 @@ const originalCampaign = campaignIdentity(
 );
 const downloads = [];
 const download = async (path, expected = null) => {
+  assert(
+    !retainedHandoff,
+    "Fresh native imports must use retained local files",
+  );
   const url = new URL(path, engineOrigin);
   assert.equal(url.origin, engineOrigin);
   assert(url.pathname.startsWith(`/jobs/${native.job_id}/files/`));
@@ -182,10 +325,102 @@ const download = async (path, expected = null) => {
   }
   return { bytes, sha256, byteSize: bytes.length };
 };
+const canonicalArtifactPath = (jobId, value) => {
+  const raw = String(value);
+  assert(!raw.includes("://"), "Native artifact path must be local to the job");
+  const text = raw.replace(/^\/+/, "");
+  const prefix = `jobs/${jobId}/files/`;
+  if (text.startsWith("jobs/")) {
+    assert(
+      text.startsWith(prefix),
+      "Native artifact path belongs to another job",
+    );
+    return text.slice(prefix.length);
+  }
+  assert(!text.split("/").includes(".."));
+  return text;
+};
+const samePoint = (left, right) =>
+  left.simJobId === right.simJobId &&
+  left.polarIndex === right.polarIndex &&
+  left.pointIndex === right.pointIndex &&
+  left.pointCollection === right.pointCollection &&
+  left.aoaDeg === right.aoaDeg &&
+  left.caseSlug === right.caseSlug &&
+  left.resultId === right.resultId &&
+  left.attemptId === right.attemptId;
+const retainedPointReference = (polarIndex, pointIndex, point) => {
+  assert(retainedHandoff);
+  const caseSlug = point.case_slug ?? null;
+  const references = handoff.artifacts.flatMap(
+    (entry) => entry.references ?? [],
+  );
+  const matches = references.filter(
+    (reference) =>
+      reference.simJobId === handoffJob.simJobId &&
+      reference.polarIndex === polarIndex &&
+      reference.pointIndex === pointIndex &&
+      reference.pointCollection === "points" &&
+      reference.aoaDeg === point.aoa_deg &&
+      reference.caseSlug === caseSlug,
+  );
+  assert(matches.length > 0, "Retained native point identity is missing");
+  const reference = matches[0];
+  assert(
+    matches.every((candidate) => samePoint(candidate, reference)),
+    "Retained native point identity is inconsistent",
+  );
+  assert(reference.resultId && reference.attemptId);
+  assert.equal(reference.caseSlug, caseSlug);
+  assert.deepEqual(reference.coefficients, {
+    cl: point.cl ?? null,
+    cd: point.cd ?? null,
+    cm: point.cm ?? null,
+    clCd: point.cl_cd ?? null,
+  });
+  return reference;
+};
+const readRetainedArtifact = async (
+  pointReference,
+  sourceType,
+  originalPath,
+  descriptor,
+) => {
+  assert(retainedHandoff);
+  const matches = handoff.artifacts.filter(
+    (entry) =>
+      entry.jobId === handoffJob.jobId &&
+      entry.sourceType === sourceType &&
+      entry.originalPath === originalPath &&
+      (entry.references ?? []).some((reference) =>
+        samePoint(reference, pointReference),
+      ),
+  );
+  assert.equal(
+    matches.length,
+    1,
+    "Retained native artifact identity is ambiguous",
+  );
+  const entry = matches[0];
+  if (descriptor) {
+    assert.equal(entry.kind, descriptor.kind);
+    assert.equal(entry.field, descriptor.field ?? null);
+    assert.equal(entry.role, descriptor.role ?? null);
+    assert.equal(entry.mimeType, descriptor.mime_type);
+    assert.equal(entry.byteSize, descriptor.byte_size);
+    assert.equal(entry.sha256, descriptor.sha256);
+  }
+  const stored = await readRetainedFile(
+    entry.retainedPath,
+    { byteSize: entry.byteSize, sha256: entry.sha256 },
+    `Retained ${sourceType} ${originalPath}`,
+  );
+  return { ...stored, entry };
+};
 const multipart = new FormData();
 const points = [];
-for (const polar of native.polars) {
-  for (const point of polar.points) {
+for (const [polarIndex, polar] of native.polars.entries()) {
+  for (const [pointIndex, point] of polar.points.entries()) {
     assert(point.converged && !point.error && point.fidelity === "rans");
     const manifest = point.evidence_artifacts.find(
       (item) => item.kind === "manifest",
@@ -196,8 +431,19 @@ for (const polar of native.polars) {
     );
     const evidenceArtifacts = [];
     const media = [];
+    const pointReference = retainedHandoff
+      ? retainedPointReference(polarIndex, pointIndex, point)
+      : null;
     for (const artifact of point.evidence_artifacts) {
-      const stored = await download(artifact.url, artifact);
+      const originalPath = canonicalArtifactPath(native.job_id, artifact.path);
+      const stored = retainedHandoff
+        ? await readRetainedArtifact(
+            pointReference,
+            "evidence_artifact",
+            originalPath,
+            artifact,
+          )
+        : await download(artifact.url, artifact);
       const uploadField = `artifact-${downloads.length}`;
       multipart.append(
         uploadField,
@@ -222,7 +468,22 @@ for (const polar of native.polars) {
       });
     }
     for (const [field, path] of Object.entries(point.images ?? {})) {
-      const stored = await download(path);
+      const originalPath = canonicalArtifactPath(native.job_id, path);
+      const retained = retainedHandoff
+        ? await readRetainedArtifact(
+            pointReference,
+            "image",
+            originalPath,
+            null,
+          )
+        : null;
+      if (retained) {
+        assert.equal(retained.entry.kind, "image");
+        assert.equal(retained.entry.field, field);
+        assert.equal(retained.entry.role, "instantaneous");
+        assert.equal(retained.entry.mimeType, "image/png");
+      }
+      const stored = retained ?? (await download(path));
       assert.equal(stored.bytes.subarray(1, 4).toString(), "PNG");
       const uploadField = `media-${downloads.length}`;
       multipart.append(
@@ -255,10 +516,18 @@ for (const polar of native.polars) {
       (item) => item.alpha === point.aoa_deg || item.aoa === point.aoa_deg,
     );
     const receipt = report.sourceReceipts.find(
-      (item) => contributor?.attemptId === item.result_attempt_id,
+      (item) =>
+        contributor?.attemptId === item.result_attempt_id &&
+        item.sim_job_id === sourceJob.id,
     );
     assert(contributor?.resultId && contributor.attemptId && receipt);
-    assert.equal(receipt.sim_job_id, native.job_id);
+    assert.equal(receipt.sim_job_id, sourceJob.id);
+    assert.equal(native.job_id, sourceJob.engineJobId);
+    if (retainedHandoff) {
+      assert.equal(pointReference.resultId, contributor.resultId);
+      assert.equal(pointReference.attemptId, contributor.attemptId);
+      assert.equal(pointReference.caseSlug, point.case_slug ?? null);
+    }
     points.push({
       aoaDeg: point.aoa_deg,
       status: "done",
@@ -301,7 +570,19 @@ for (const polar of native.polars) {
         mesh_recovery_version: native.mesh_recovery_version,
         native_source_receipt: receipt ?? null,
         native_run_id: sourceRunId,
+        native_source_job_id: sourceJob.id,
         native_job_id: native.job_id,
+        native_request_payload_sha256: retainedHandoff
+          ? handoffJob.requestPayloadSha256
+          : null,
+        native_engine_identity: native.engine,
+        native_requested_engine: native.requested_engine ?? null,
+        native_coefficients: {
+          cl: point.cl ?? null,
+          cd: point.cd ?? null,
+          cm: point.cm ?? null,
+          clCd: point.cl_cd ?? null,
+        },
         native_result_id: contributor.resultId,
         native_result_attempt_id: contributor.attemptId,
         native_original_point: point,
@@ -380,7 +661,7 @@ try {
           type: "simulation_setup",
           data: {
             kind: "simulation_preset_revision",
-            id: report.jobs[0].simulationPresetRevisionId,
+            id: sourceJob.simulationPresetRevisionId,
             snapshot,
             signatureHash,
           },

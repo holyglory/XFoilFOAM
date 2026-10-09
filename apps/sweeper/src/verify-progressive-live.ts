@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { deriveGeometry, parseCoordinates } from "@aerodb/core";
@@ -31,6 +31,8 @@ import {
   EngineClient,
   engineIdentityKey,
   type EngineIdentity,
+  type JobResult,
+  type PolarPoint,
 } from "@aerodb/engine-client";
 import { and, eq, sql } from "drizzle-orm";
 import {
@@ -92,6 +94,11 @@ assert(
     databaseUrl.pathname === `/${process.env.PGDATABASE}` &&
     !process.env.DC2_COMPONENT,
   "Refusing a database outside the governed ephemeral check",
+);
+const coordinatorRunId = process.env.DEVCOORDINATOR_RUN_ID;
+assert(
+  coordinatorRunId,
+  "A governed run identity is required for native evidence handoff",
 );
 const deployment = JSON.parse(
   execFileSync(
@@ -222,11 +229,13 @@ let controllerLog = "";
 const timeline: Record<string, unknown>[] = [];
 const report: Record<string, unknown> = {
   kind: "real-progressive-fast-journey",
+  sourceRunId: coordinatorRunId,
   startedAt: new Date().toISOString(),
   physicalAerodynamicAccuracyValidated: false,
   productionDeployed: false,
   engineIdentity: health.default_engine,
   engineDeployment,
+  engineDeploymentId: deployment.data.deployment_id,
   buildId: health.build_id,
   requestedSpeedMps,
   requestedMomentumScheme,
@@ -237,6 +246,365 @@ const report: Record<string, unknown> = {
   workerRuntime: worker,
   expectedSolverSource,
   deploymentPendingApply: deployment.data.readiness.pending_apply,
+};
+
+type RetainedPointReference = {
+  simJobId: string;
+  polarIndex: number;
+  pointIndex: number;
+  pointCollection: "points" | "attempts";
+  aoaDeg: number;
+  caseSlug: string | null;
+  resultId: string | null;
+  attemptId: string | null;
+  coefficients: {
+    cl: number | null;
+    cd: number | null;
+    cm: number | null;
+    clCd: number | null;
+  };
+};
+
+type RetainedArtifactEntry = {
+  jobId: string;
+  sourceType: "evidence_artifact" | "image";
+  polarIndex: number;
+  pointIndex: number;
+  pointCollection: "points" | "attempts";
+  kind: string;
+  field: string | null;
+  role: string | null;
+  originalPath: string;
+  mimeType: string;
+  byteSize: number;
+  sha256: string;
+  retainedPath: string;
+  metadata?: Record<string, unknown>;
+  references: RetainedPointReference[];
+};
+
+type RetainedNativeJob = {
+  simJobId: string;
+  airfoilId: string;
+  simulationPresetRevisionId: string | null;
+  requestPayload: unknown;
+  requestPayloadSha256: string;
+  jobId: string;
+  resultPath: string;
+  resultByteSize: number;
+  resultSha256: string;
+  resultState: JobResult["state"];
+  sourceEngine: JobResult["engine"];
+  requestedEngine: JobResult["requested_engine"];
+  requestedExecutionPool: string | null;
+  executionPool: string | null;
+};
+
+type RetainedNativeEvidenceSummary = {
+  kind: "native-engine-evidence-handoff";
+  version: 2;
+  sourceRunId: string;
+  sourceInstanceId: string;
+  engineDeployment: string;
+  expectedSolverSource: string;
+  expectedEngine: EngineIdentity;
+  expectedExecutionPool: string;
+  retainedBeforeExecutionStops: true;
+  manifestPath: string;
+  manifestByteSize: number;
+  manifestSha256: string;
+  jobs: RetainedNativeJob[];
+  artifactCount: number;
+  artifactBytes: number;
+};
+
+type RetainedSourceJob = {
+  id: string;
+  airfoilId: string;
+  engineJobId: string | null;
+  simulationPresetRevisionId: string | null;
+  requestPayload: unknown;
+};
+
+const retainNativeEngineEvidence = async (options: {
+  engine: EngineClient;
+  jobs: RetainedSourceJob[];
+  directory: string;
+  report: Record<string, unknown>;
+  expectedEngine: EngineIdentity;
+  expectedExecutionPool: string;
+  sourceRunId: string;
+  sourceInstanceId: string;
+  engineDeployment: string;
+  expectedSolverSource: string;
+}): Promise<RetainedNativeEvidenceSummary> => {
+  const jobs = options.jobs.filter(
+    (job): job is RetainedSourceJob & { engineJobId: string } =>
+      Boolean(job.engineJobId),
+  );
+  assert(
+    jobs.length > 0,
+    "No engine execution identity was available to retain",
+  );
+  const sourceReceipts = Array.isArray(options.report.sourceReceipts)
+    ? (options.report.sourceReceipts as Array<{
+        result_attempt_id?: string;
+        sim_job_id?: string;
+      }>)
+    : [];
+  const contributors = Array.isArray(options.report.refined)
+    ? (
+        options.report.refined as Array<{
+          explanation?: {
+            contributors?: Array<{
+              alpha?: number;
+              aoa?: number;
+              resultId?: string;
+              attemptId?: string;
+            }>;
+          };
+        }>
+      ).flatMap((curve) => curve.explanation?.contributors ?? [])
+    : [];
+  const artifacts = new Map<string, RetainedArtifactEntry>();
+  const retainedJobs: RetainedNativeJob[] = [];
+  let artifactOrdinal = 0;
+
+  const canonicalFilePath = (jobId: string, value: string): string => {
+    const base = new URL(options.engine.fileUrl(jobId, ""));
+    const url = new URL(value, base);
+    assert.equal(url.origin, base.origin);
+    assert(url.pathname.startsWith(base.pathname));
+    const path = url.pathname.slice(base.pathname.length);
+    assert(path && !path.split("/").includes(".."));
+    return path;
+  };
+
+  const storeArtifact = async (input: {
+    jobId: string;
+    sourceType: "evidence_artifact" | "image";
+    polarIndex: number;
+    pointIndex: number;
+    pointCollection: "points" | "attempts";
+    pointReference: RetainedPointReference;
+    kind: string;
+    field: string | null;
+    role: string | null;
+    originalPath: string;
+    mimeType: string;
+    expectedSha256: string | null;
+    expectedByteSize: number | null;
+    metadata?: Record<string, unknown>;
+  }): Promise<void> => {
+    const response = await fetch(
+      options.engine.fileUrl(input.jobId, input.originalPath),
+      { signal: AbortSignal.timeout(30_000), redirect: "error" },
+    );
+    assert(
+      response.ok,
+      `Native artifact download returned ${response.status} for ${input.originalPath}`,
+    );
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (input.expectedByteSize !== null)
+      assert.equal(bytes.length, input.expectedByteSize);
+    if (input.expectedSha256 !== null)
+      assert.equal(sha256, input.expectedSha256);
+    const key = `${input.jobId}\0${input.sourceType}\0${input.originalPath}\0${sha256}`;
+    const existing = artifacts.get(key);
+    if (existing) {
+      existing.references.push(input.pointReference);
+      return;
+    }
+    const retainedPath = `engine-evidence/${input.jobId}/${String(
+      artifactOrdinal++,
+    ).padStart(4, "0")}-${sha256}`;
+    const destination = resolve(options.directory, retainedPath);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, bytes, { mode: 0o600 });
+    artifacts.set(key, {
+      jobId: input.jobId,
+      sourceType: input.sourceType,
+      polarIndex: input.polarIndex,
+      pointIndex: input.pointIndex,
+      pointCollection: input.pointCollection,
+      kind: input.kind,
+      field: input.field,
+      role: input.role,
+      originalPath: input.originalPath,
+      mimeType: input.mimeType,
+      byteSize: bytes.length,
+      sha256,
+      retainedPath,
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+      references: [input.pointReference],
+    });
+  };
+
+  for (const [jobIndex, job] of jobs.entries()) {
+    const jobId = job.engineJobId;
+    const requestBytes = Buffer.from(
+      `${JSON.stringify(job.requestPayload ?? null)}\n`,
+    );
+    const native = await options.engine.getResult(jobId, {
+      timeoutMs: 120_000,
+      expectedEngine: options.expectedEngine,
+      expectedExecutionPool: options.expectedExecutionPool,
+    });
+    assert.equal(native.job_id, jobId);
+    assert(
+      native.engine,
+      "Native result is missing its runtime source identity",
+    );
+    const resultPath =
+      jobIndex === 0 ? "native-result.json" : `native-results/${jobId}.json`;
+    const resultBytes = Buffer.from(`${JSON.stringify(native, null, 2)}\n`);
+    const resultDestination = resolve(options.directory, resultPath);
+    mkdirSync(dirname(resultDestination), { recursive: true });
+    writeFileSync(resultDestination, resultBytes, { mode: 0o600 });
+    for (const [polarIndex, polar] of native.polars.entries()) {
+      const pointCollections: Array<{
+        name: "points" | "attempts";
+        points: PolarPoint[];
+      }> = [
+        { name: "points", points: polar.points },
+        ...(polar.attempts
+          ? [{ name: "attempts" as const, points: polar.attempts }]
+          : []),
+      ];
+      for (const pointCollection of pointCollections) {
+        for (const [pointIndex, point] of pointCollection.points.entries()) {
+          const contributor = contributors.find(
+            (candidate) =>
+              (candidate.alpha ?? candidate.aoa) === point.aoa_deg &&
+              sourceReceipts.some(
+                (receipt) =>
+                  receipt.sim_job_id === job.id &&
+                  receipt.result_attempt_id === candidate.attemptId,
+              ),
+          );
+          const pointReference: RetainedPointReference = {
+            simJobId: job.id,
+            polarIndex,
+            pointIndex,
+            pointCollection: pointCollection.name,
+            aoaDeg: point.aoa_deg,
+            caseSlug: point.case_slug ?? null,
+            resultId: contributor?.resultId ?? null,
+            attemptId: contributor?.attemptId ?? null,
+            coefficients: {
+              cl: point.cl ?? null,
+              cd: point.cd ?? null,
+              cm: point.cm ?? null,
+              clCd: point.cl_cd ?? null,
+            },
+          };
+          for (const artifact of point.evidence_artifacts ?? []) {
+            const originalPath = canonicalFilePath(jobId, artifact.path);
+            await storeArtifact({
+              jobId,
+              sourceType: "evidence_artifact",
+              polarIndex,
+              pointIndex,
+              pointCollection: pointCollection.name,
+              pointReference,
+              kind: artifact.kind,
+              field: artifact.field ?? null,
+              role: artifact.role ?? null,
+              originalPath,
+              mimeType: artifact.mime_type,
+              expectedSha256: artifact.sha256,
+              expectedByteSize: artifact.byte_size,
+              metadata: artifact.metadata,
+            });
+          }
+          for (const [field, path] of Object.entries(point.images ?? {})) {
+            const originalPath = canonicalFilePath(jobId, path);
+            await storeArtifact({
+              jobId,
+              sourceType: "image",
+              polarIndex,
+              pointIndex,
+              pointCollection: pointCollection.name,
+              pointReference,
+              kind: "image",
+              field,
+              role: "instantaneous",
+              originalPath,
+              mimeType: "image/png",
+              expectedSha256: null,
+              expectedByteSize: null,
+            });
+          }
+        }
+      }
+    }
+    retainedJobs.push({
+      simJobId: job.id,
+      airfoilId: job.airfoilId,
+      simulationPresetRevisionId: job.simulationPresetRevisionId,
+      requestPayload: job.requestPayload,
+      requestPayloadSha256: createHash("sha256")
+        .update(requestBytes)
+        .digest("hex"),
+      jobId,
+      resultPath,
+      resultByteSize: resultBytes.length,
+      resultSha256: createHash("sha256").update(resultBytes).digest("hex"),
+      resultState: native.state,
+      sourceEngine: native.engine,
+      requestedEngine: native.requested_engine ?? null,
+      requestedExecutionPool: native.requested_execution_pool ?? null,
+      executionPool: native.execution_pool ?? null,
+    });
+  }
+
+  const manifestPath = "native-evidence-manifest.json";
+  const manifest = {
+    kind: "native-engine-evidence-handoff",
+    version: 2,
+    sourceRunId: options.sourceRunId,
+    source: {
+      instanceId: options.sourceInstanceId,
+      deployment: options.engineDeployment,
+      expectedSolverSource: options.expectedSolverSource,
+      expectedEngine: options.expectedEngine,
+      expectedExecutionPool: options.expectedExecutionPool,
+    },
+    retainedBeforeExecutionStops: true,
+    jobs: retainedJobs,
+    artifacts: [...artifacts.values()],
+  };
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  const manifestDestination = resolve(options.directory, manifestPath);
+  writeFileSync(`${manifestDestination}.partial`, manifestBytes, {
+    mode: 0o600,
+  });
+  renameSync(`${manifestDestination}.partial`, manifestDestination);
+  const manifestSha256 = createHash("sha256")
+    .update(manifestBytes)
+    .digest("hex");
+  const artifactBytes = [...artifacts.values()].reduce(
+    (total, artifact) => total + artifact.byteSize,
+    0,
+  );
+  return {
+    kind: "native-engine-evidence-handoff",
+    version: 2,
+    sourceRunId: options.sourceRunId,
+    sourceInstanceId: options.sourceInstanceId,
+    engineDeployment: options.engineDeployment,
+    expectedSolverSource: options.expectedSolverSource,
+    expectedEngine: options.expectedEngine,
+    expectedExecutionPool: options.expectedExecutionPool,
+    retainedBeforeExecutionStops: true,
+    manifestPath: relative(root, manifestDestination),
+    manifestByteSize: manifestBytes.length,
+    manifestSha256,
+    jobs: retainedJobs,
+    artifactCount: artifacts.size,
+    artifactBytes,
+  };
 };
 
 try {
@@ -695,6 +1063,18 @@ try {
         await db.execute(sql`SELECT receipt.*, attempt.sim_job_id
         FROM progressive_cfd_evidence receipt
         JOIN progressive_cfd_attempts attempt ON attempt.token = receipt.attempt_token`);
+      report.nativeEvidence = await retainNativeEngineEvidence({
+        engine,
+        jobs,
+        directory,
+        report,
+        expectedEngine: health.default_engine,
+        expectedExecutionPool: worker.execution_pool,
+        sourceRunId: coordinatorRunId,
+        sourceInstanceId: String(deployment.data.deployment_id),
+        engineDeployment,
+        expectedSolverSource,
+      });
       const stops = [];
       for (const job of jobs) {
         if (!job.engineJobId) continue;
