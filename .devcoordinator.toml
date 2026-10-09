@@ -3891,7 +3891,32 @@ health = { path = "/health", timeout_seconds = 120 }
 timeout_seconds = 900
 
 [test.progressive-preview-recovery]
-timeout_seconds = 1200
+timeout_seconds = 2700
+
+[test.progressive-preview-recovery.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-preview-recovery.check]]
+name = "native-schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.progressive-preview-recovery.check]]
+name = "native-seed"
+tier = "development"
+requires = ["native-schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.progressive-preview-recovery.check]]
+name = "native-ag24"
+tier = "development"
+requires = ["native-seed", "preview-ready"]
+timeout_seconds = 2100
+env = { PROGRESSIVE_LIVE_SPEED_MPS = "30", PROGRESSIVE_LIVE_ENGINE_DEPLOYMENT = "progressive-engine" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "node", "--import", "tsx", "src/verify-progressive-live.ts"]
+retained_artifacts = [{ name = "real-native-ag24", path = ".codex-artifacts/progressive-live-30", max_bytes = 10485760 }]
 
 [[test.progressive-preview-recovery.check]]
 name = "preview-origin"
@@ -3907,8 +3932,9 @@ command = ["node", "scripts/dev/verify-progressive-preview-ready.mjs"]
 [[test.progressive-preview-recovery.check]]
 name = "fixture-import"
 tier = "development"
-requires = ["preview-ready"]
+requires = ["preview-ready", "native-ag24"]
 timeout_seconds = 600
+env = { PROGRESSIVE_PREVIEW_NATIVE_REPORT = ".codex-artifacts/progressive-live-30/report.json" }
 command = ["node", "--import", "tsx", "scripts/dev/restore-progressive-preview-fixture.mjs"]
 retained_artifacts = [{ name = "native-fixture-recovery", path = ".codex-artifacts/preview-fixture-recovery", max_bytes = 1048576 }]
 

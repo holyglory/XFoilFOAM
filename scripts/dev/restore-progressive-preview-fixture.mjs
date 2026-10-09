@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
+import { resolve } from "node:path";
 import {
   methodCompatibilityHashForSnapshot,
   simulationSetupSignature,
@@ -39,19 +40,39 @@ const artifactRoot = new URL(
   import.meta.url,
 );
 const report = JSON.parse(
-  await readFile(new URL("native-report.json", artifactRoot), "utf8"),
+  await readFile(
+    process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
+      ? resolve(root, process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT)
+      : new URL("native-report.json", artifactRoot),
+    "utf8",
+  ),
 );
-const native = JSON.parse(
-  await readFile(new URL("new-job-result.json", artifactRoot), "utf8"),
-);
+const native = process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
+  ? await fetch(
+      new URL(`/jobs/${report.jobs[0].engineJobId}/result`, engineOrigin),
+      { signal: AbortSignal.timeout(15000), redirect: "error" },
+    ).then(async (response) => {
+      assert(response.ok);
+      return response.json();
+    })
+  : JSON.parse(
+      await readFile(new URL("new-job-result.json", artifactRoot), "utf8"),
+    );
 assert.equal(native.state, "completed");
-assert.equal(native.job_id, "a6ce8ae2-cddb-490e-9e0a-b2deeee0b64f");
+assert.equal(native.job_id, report.jobs[0].engineJobId);
 assert.equal(native.engine.numerics_revision, "2");
 assert.equal(native.mesh_recovery_version, 3);
+assert.equal(
+  native.engine.application_source_sha256,
+  report.expectedSolverSource,
+);
+const sourceRunId = process.env.PROGRESSIVE_PREVIEW_NATIVE_REPORT
+  ? (process.env.DEVCOORDINATOR_RUN_ID ?? null)
+  : "t20261002T213447Z-aa1e9a";
 const originalCampaignId = "35c2dc35-7fbd-411f-a7f7-452c1e1d3b0f";
 const snapshot = structuredClone(report.jobs[0].requestPayload.setupSnapshot);
 const originalCompatibility = methodCompatibilityHashForSnapshot(snapshot);
-snapshot.flowState.mediumSlug = "preview-retained-ag24-a6ce8ae2-air";
+snapshot.flowState.mediumSlug = `preview-retained-ag24-${native.job_id.slice(0, 8)}-air`;
 snapshot.flowState.mediumName = "Air — retained AG24 preview";
 snapshot.preset.name = "Retained AG24 native evidence";
 assert.equal(
@@ -61,7 +82,7 @@ assert.equal(
 const signatureHash = simulationSetupSignature(snapshot);
 const source = {
   sourceInstanceId: engine.data.deployment_id,
-  sourceInstanceName: `Private progressive engine; native run ${report.nativeRun ?? "t20261002T213447Z-aa1e9a"}`,
+  sourceInstanceName: `Private progressive engine; native job ${native.job_id}`,
 };
 const secret = randomBytes(32).toString("hex");
 let syncEnabled = false;
@@ -279,7 +300,7 @@ for (const polar of native.polars) {
         ...point,
         mesh_recovery_version: native.mesh_recovery_version,
         native_source_receipt: receipt ?? null,
-        native_run_id: "t20261002T213447Z-aa1e9a",
+        native_run_id: sourceRunId,
         native_job_id: native.job_id,
         native_result_id: contributor.resultId,
         native_result_attempt_id: contributor.attemptId,
@@ -400,7 +421,7 @@ try {
     name: "Retained AG24 native evidence preview",
     notes: `Derived preview of real native job ${native.job_id}; original campaign ${originalCampaignId} remains preserved.`,
     priority: 0,
-    idempotencyKey: "preview-retained-ag24-a6ce8ae2-v1",
+    idempotencyKey: `preview-retained-ag24-${native.job_id}-v1`,
     airfoilIds: [airfoil.id],
     plan: {
       mediumId: flow.mediumId,
@@ -530,7 +551,7 @@ assert(
 const receipt = {
   kind: "retained-native-preview-recovery",
   sourceJobId: native.job_id,
-  sourceRunId: "t20261002T213447Z-aa1e9a",
+  sourceRunId,
   sourceProviderId: source.sourceInstanceId,
   originalCampaign,
   originalCampaignPreserved: true,
@@ -564,6 +585,16 @@ const receipt = {
   checkedAt: new Date().toISOString(),
 };
 await mkdir(destination, { recursive: true });
+await writeFile(
+  new URL("native-result.json", destination),
+  `${JSON.stringify(native)}\n`,
+  { mode: 0o600 },
+);
+await writeFile(
+  new URL("native-report.json", destination),
+  `${JSON.stringify(report)}\n`,
+  { mode: 0o600 },
+);
 await writeFile(
   new URL("recovery.json", destination),
   `${JSON.stringify(receipt)}\n`,
