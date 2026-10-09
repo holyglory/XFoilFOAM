@@ -1457,6 +1457,16 @@ beforeAll(async () => {
       "../migrations",
     ),
   });
+  const completeUnitIndexes = await db.execute(sql`
+    SELECT indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'progressive_cfd_units'
+      AND indexname = 'progressive_cfd_units_complete_idx'
+  `);
+  expect(completeUnitIndexes).toEqual([
+    { indexname: "progressive_cfd_units_complete_idx" },
+  ]);
   const [category] = await db
     .insert(categories)
     .values({ slug: PREFIX, name: PREFIX, path: PREFIX, depth: 0 })
@@ -1945,6 +1955,16 @@ describe("progressive durable stage transitions", () => {
   it("keeps progressive coverage visible without legacy progress rows", async () => {
     const fixture = await cfdEvidenceFixture(32.713, 2, [42.713]);
     const source = fixture.leases[0];
+    const legacyProgressRows = await db.execute(sql`
+      SELECT condition_id, requested::int AS requested
+      FROM sim_campaign_progress
+      WHERE campaign_id = ${fixture.campaignId}
+      ORDER BY condition_id
+    `);
+    expect(legacyProgressRows).toHaveLength(2);
+    expect(legacyProgressRows.every((row) => Number(row.requested) === 3)).toBe(
+      true,
+    );
     await db.execute(
       sql`DELETE FROM sim_campaign_progress WHERE campaign_id=${fixture.campaignId}`,
     );

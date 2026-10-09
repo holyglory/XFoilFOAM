@@ -7980,7 +7980,7 @@ export async function campaignSummary(
     scopeRowsPromise,
     lifecycleRowsPromise,
     conditionRowsPromise,
-    progress.progressiveConditionRows,
+    progressiveConditionRowsPromise,
     laneRowsPromise,
     progressivePromise,
   ]);
