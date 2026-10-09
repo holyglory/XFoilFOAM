@@ -3890,6 +3890,66 @@ health = { path = "/health", timeout_seconds = 120 }
 [test.progressive-ui]
 timeout_seconds = 900
 
+[test.progressive-preview-recovery]
+timeout_seconds = 1200
+
+[[test.progressive-preview-recovery.check]]
+name = "preview-origin"
+tier = "development"
+command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs", "scripts/dev/prepare-progressive-tsconfig.test.mjs", "scripts/dev/verify-progressive-web-delivery.test.mjs"]
+
+[[test.progressive-preview-recovery.check]]
+name = "preview-ready"
+tier = "development"
+requires = ["preview-origin"]
+command = ["node", "scripts/dev/verify-progressive-preview-ready.mjs"]
+
+[[test.progressive-preview-recovery.check]]
+name = "fixture-import"
+tier = "development"
+requires = ["preview-ready"]
+timeout_seconds = 600
+command = ["node", "--import", "tsx", "scripts/dev/restore-progressive-preview-fixture.mjs"]
+retained_artifacts = [{ name = "native-fixture-recovery", path = ".codex-artifacts/preview-fixture-recovery", max_bytes = 1048576 }]
+
+[[test.progressive-preview-recovery.check]]
+name = "restore-sync"
+tier = "development"
+after = ["fixture-import"]
+requires = ["preview-ready"]
+command = ["node", "--import", "tsx", "scripts/dev/restore-progressive-preview-fixture.mjs", "--restore-access-only"]
+
+[[test.progressive-preview-recovery.check]]
+name = "interactions"
+tier = "development"
+requires = ["fixture-import", "restore-sync"]
+command = ["node", "scripts/dev/verify-progressive-preview.mjs"]
+
+[[test.progressive-preview-recovery.check]]
+name = "comparison-interactions"
+tier = "development"
+requires = ["fixture-import", "restore-sync"]
+command = ["node", "scripts/dev/verify-progressive-comparison.mjs"]
+
+[[test.progressive-preview-recovery.check]]
+name = "real-cfd-evidence"
+tier = "development"
+requires = ["fixture-import", "restore-sync"]
+command = ["node", "scripts/dev/verify-progressive-cfd-preview.mjs"]
+
+[[test.progressive-preview-recovery.check]]
+name = "deferred-cfd-points"
+tier = "development"
+requires = ["fixture-import", "restore-sync"]
+command = ["node", "scripts/dev/verify-deferred-cfd-points.mjs"]
+
+[[test.progressive-preview-recovery.check]]
+name = "web-delivery-proof"
+tier = "development"
+requires = ["interactions", "comparison-interactions", "real-cfd-evidence", "deferred-cfd-points"]
+command = ["node", "scripts/dev/verify-progressive-web-delivery.mjs"]
+retained_artifacts = [{ name = "verified-web-route", path = ".codex-artifacts/progressive-web-delivery", max_bytes = 8388608 }]
+
 [test.cfd-curve-display]
 timeout_seconds = 300
 

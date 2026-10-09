@@ -113,7 +113,8 @@ async function main() {
         id: "curve-first-public-polars",
         scope: "product",
         state: "real_e2e",
-        expected_result: "Detail and Compare render cached curves before optional solver points.",
+        expected_result:
+          "Detail and Compare render cached curves before optional solver points.",
         evidence_refs: ["journey/progressive-ui/curve-first"],
         enabled_control: false,
       },
@@ -121,7 +122,8 @@ async function main() {
         id: "method-and-history-disclosure",
         scope: "product",
         state: "real_e2e",
-        expected_result: "Users can opt into curve samples and see contributing methods and history context.",
+        expected_result:
+          "Users can opt into curve samples and see contributing methods and history context.",
         evidence_refs: ["journey/progressive-ui/method-disclosure"],
         enabled_control: true,
         rendered_evidence_refs: ["journey/progressive-ui/method-disclosure"],
@@ -130,7 +132,8 @@ async function main() {
         id: "deferred-cfd-evidence",
         scope: "product",
         state: "real_e2e",
-        expected_result: "CFD points load on demand with retry, cancellation, and exact evidence navigation.",
+        expected_result:
+          "CFD points load on demand with retry, cancellation, and exact evidence navigation.",
         evidence_refs: ["journey/progressive-ui/deferred-cfd"],
         enabled_control: true,
         rendered_evidence_refs: ["journey/progressive-ui/deferred-cfd"],
@@ -139,7 +142,8 @@ async function main() {
         id: "full-progressive-campaign-completion",
         scope: "product",
         state: "deferred",
-        expected_result: "All current campaign fast and precise stages finish and publish accepted evidence.",
+        expected_result:
+          "All current campaign fast and precise stages finish and publish accepted evidence.",
         task_id: "p3e2cb79d3dadab81",
         evidence_refs: [],
       },
@@ -147,7 +151,8 @@ async function main() {
         id: "mach3-physical-validation",
         scope: "product",
         state: "deferred",
-        expected_result: "Representative Mach-3 CFD results are physically validated against reference evidence.",
+        expected_result:
+          "Representative Mach-3 CFD results are physically validated against reference evidence.",
         task_id: "p1bb83717aa444085",
         evidence_refs: [],
       },
@@ -155,8 +160,36 @@ async function main() {
         id: "uncertainty-calibration",
         scope: "product",
         state: "deferred",
-        expected_result: "Composite polar uncertainty is calibrated on held-out profiles and conditions.",
+        expected_result:
+          "Composite polar uncertainty is calibrated on held-out profiles and conditions.",
         task_id: "p0c8f80510d7808af",
+        evidence_refs: [],
+      },
+      {
+        id: "historical-preview-campaign-stop-settlement",
+        scope: "product",
+        state: "external_blocked",
+        expected_result:
+          "The preserved original preview campaign has exact execution-stop proof and settled historical attempts.",
+        task_id: "p8829c29b1ba7ee70",
+        evidence_refs: [],
+      },
+      {
+        id: "public-polar-paint-budget",
+        scope: "product",
+        state: "deferred",
+        expected_result:
+          "Public polar pages meet the agreed paint-time budget across the required themes and widths.",
+        task_id: "p68518e3c0b911ba6",
+        evidence_refs: [],
+      },
+      {
+        id: "public-interface-final-review",
+        scope: "product",
+        state: "deferred",
+        expected_result:
+          "The selected public interface passes its remaining formal and visual readiness reviews.",
+        task_id: "p599d0d537d6e4ef5",
         evidence_refs: [],
       },
     ],
@@ -166,9 +199,13 @@ async function main() {
     `${JSON.stringify(completion)}\n`,
     { mode: 0o600 },
   );
-  await writeFile(join(destination, "delivery.json"), `${JSON.stringify(proof)}\n`, {
-    mode: 0o600,
-  });
+  await writeFile(
+    join(destination, "delivery.json"),
+    `${JSON.stringify(proof)}\n`,
+    {
+      mode: 0o600,
+    },
+  );
   await writeFile(
     join(destination, "verification.json"),
     `${JSON.stringify(proof)}\n`,
