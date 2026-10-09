@@ -1941,6 +1941,28 @@ describe("progressive durable stage transitions", () => {
     expect((await read()).progressive).toBeUndefined();
   }, 120_000);
 
+  it("keeps progressive coverage visible without legacy progress rows", async () => {
+    const fixture = await cfdEvidenceFixture(32.713, 2, [42.713]);
+    const source = fixture.leases[0];
+    await db.execute(
+      sql`DELETE FROM sim_campaign_progress WHERE campaign_id=${fixture.campaignId}`,
+    );
+
+    const summary = await campaignSummary(db, fixture.campaignId);
+    expect(summary.conditions[0]?.progressive).toMatchObject({ requested: 3 });
+    const page = await campaignAirfoilRows(db, fixture.campaignId);
+    const row = page.items.find((item) => item.airfoilId === originalId)!;
+    const [condition] = await db.execute(
+      sql`SELECT id FROM sim_campaign_conditions
+      WHERE campaign_id=${fixture.campaignId} AND simulation_preset_revision_id=${source.revisionId}`,
+    );
+    const cell = row.perCondition.find(
+      (item) => item.conditionId === condition.id,
+    )!;
+    expect(cell.progressive).toMatchObject({ requested: 3 });
+    expect(cell.solved).toBe(0);
+  }, 120_000);
+
   it.skipIf(process.env.PROGRESSIVE_PREDICTION_REPAIR_LIVE !== "1")(
     "repairs real old-engine geometry gaps through the new prediction engine without CFD replay",
     async () => {

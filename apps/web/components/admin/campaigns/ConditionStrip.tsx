@@ -102,6 +102,7 @@ export function ConditionStrip({
         const blocked = c.counters.blocked ?? 0;
         const dimmed = state === "released";
         const solvedish = c.counters.solved + c.counters.derived;
+        const progressive = c.progressive;
         const frac =
           c.counters.requested > 0 ? solvedish / c.counters.requested : 0;
         const busy = busyConditionId === c.id;
@@ -243,8 +244,27 @@ export function ConditionStrip({
               }}
             >
               <span>
-                {fCount(solvedish)}/{fCount(c.counters.requested)}
+                {fCount(solvedish)}/{fCount(c.counters.requested)} accepted
               </span>
+              {progressive && (
+                <>
+                  <span
+                    style={{ color: C.violet }}
+                    title="Preliminary curve points from the first solver stage; they are not accepted CFD results."
+                  >
+                    curve {fCount(progressive.preliminary)}/
+                    {fCount(progressive.requested)}
+                  </span>
+                  {progressive.cfdEvidence > 0 && (
+                    <span
+                      style={{ color: C.amber }}
+                      title="Stored CFD evidence points; acceptance is shown separately."
+                    >
+                      CFD {fCount(progressive.cfdEvidence)}
+                    </span>
+                  )}
+                </>
+              )}
               {c.counters.derived > 0 && (
                 <span style={{ color: C.dim }} title="derived by symmetry">
                   ◌ {fCount(c.counters.derived)}

@@ -23,7 +23,7 @@ import {
   expandAngleGrid,
   type MediumStateInput,
 } from "@aerodb/core";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 
 import {
   recomputeProgressForCampaign,
@@ -2274,7 +2274,8 @@ async function campaignProgressSnapshot(
       COALESCE(sum(blocked_mesh_quality), 0)::int AS blocked_mesh_quality,
       COALESCE(sum(blocked_precalc_exhausted), 0)::int AS blocked_precalc_exhausted,
       COALESCE(sum(blocked_engine_submit), 0)::int AS blocked_engine_submit,
-      COALESCE(sum(blocked_other), 0)::int AS blocked_other
+      COALESCE(sum(blocked_other), 0)::int AS blocked_other,
+      count(progress.condition_id)::int AS legacy_progress_rows
     FROM sim_campaign_progress progress
     JOIN sim_campaign_conditions condition ON condition.id = progress.condition_id
     JOIN sim_campaigns campaign ON campaign.id = progress.campaign_id
@@ -2287,6 +2288,7 @@ async function campaignProgressSnapshot(
       blocked_precalc_exhausted: number;
       blocked_engine_submit: number;
       blocked_other: number;
+      legacy_progress_rows: number;
     }
   >;
   const totals = row ?? {
@@ -2303,10 +2305,26 @@ async function campaignProgressSnapshot(
     blocked_precalc_exhausted: 0,
     blocked_engine_submit: 0,
     blocked_other: 0,
+    legacy_progress_rows: 0,
   };
+  const progressiveOverlay =
+    Number(totals.legacy_progress_rows) === 0
+      ? await campaignProgressiveConditionRows(db, campaignId)
+      : [];
+  const useProgressiveOverlay = Number(totals.legacy_progress_rows) === 0;
+  const progressiveRequested = progressiveOverlay.reduce(
+    (sum, condition) => sum + Number(condition.requested),
+    0,
+  );
+  const progressiveSolved = progressiveOverlay.reduce(
+    (sum, condition) => sum + Number(condition.precise_complete),
+    0,
+  );
   const normalizedTotals: CampaignProgressTotals = {
-    requested: Number(totals.requested),
-    solved: Number(totals.solved),
+    requested: useProgressiveOverlay
+      ? progressiveRequested
+      : Number(totals.requested),
+    solved: useProgressiveOverlay ? progressiveSolved : Number(totals.solved),
     failed: Number(totals.failed),
     running: Number(totals.running),
     superseded: Number(totals.superseded),
@@ -7670,6 +7688,7 @@ export interface CampaignConditionSummary {
   drift: boolean;
   gainedEvidenceAfterRelease: boolean;
   counters: CampaignProgressTotals;
+  progressive?: ProgressiveCoverageCell;
   /** Per-condition rolling-compatibility ladder split; see CampaignListItem. */
   reviewBuckets: CampaignReviewBuckets;
 }
@@ -7872,20 +7891,26 @@ export async function campaignSummary(
       COALESCE(pr.superseded, 0)::int AS superseded,
       COALESCE(pr.derived, 0)::int AS derived,
       COALESCE(pr.rejected, 0)::int AS rejected,
-      COALESCE(pr.blocked, 0)::int AS blocked
+      COALESCE(pr.blocked, 0)::int AS blocked,
+      COALESCE(pr.has_rows, false) AS has_legacy_progress
     FROM sim_campaign_conditions cc
     JOIN simulation_presets p ON p.id = cc.preset_id
     JOIN simulation_preset_revisions rev ON rev.id = cc.simulation_preset_revision_id
     LEFT JOIN (
       SELECT condition_id, sum(requested) AS requested, sum(solved) AS solved, sum(failed) AS failed,
              sum(running) AS running, sum(superseded) AS superseded, sum(derived) AS derived,
-             sum(rejected) AS rejected, sum(blocked) AS blocked
+             sum(rejected) AS rejected, sum(blocked) AS blocked,
+             count(*) > 0 AS has_rows
       FROM sim_campaign_progress WHERE campaign_id = ${campaignId} GROUP BY condition_id
     ) pr ON pr.condition_id = cc.id
     WHERE cc.campaign_id = ${campaignId}
       AND cc.generation = ${campaign.currentConditionGeneration}
     ORDER BY cc.ord ASC
   `) as unknown as Promise<Array<Record<string, unknown>>>;
+  const progressiveConditionRowsPromise = campaignProgressiveConditionRows(
+    db,
+    campaignId,
+  );
   const laneRowsPromise = db.execute(sql`
     SELECT lane.objective, lane.state, count(*)::int AS n
     FROM sim_campaign_lanes lane
@@ -7903,6 +7928,7 @@ export async function campaignSummary(
     scopeRows,
     lifecycleRows,
     conditionRows,
+    progressiveConditionRows,
     laneRows,
     progressive,
   ] = await Promise.all([
@@ -7912,6 +7938,7 @@ export async function campaignSummary(
     scopeRowsPromise,
     lifecycleRowsPromise,
     conditionRowsPromise,
+    progressiveConditionRowsPromise,
     laneRowsPromise,
     progressivePromise,
   ]);
@@ -7932,6 +7959,16 @@ export async function campaignSummary(
     reviewByCondition.set(row.conditionId, {
       awaitingUrans: prev.awaitingUrans + row.awaitingUrans,
       needsReview: prev.needsReview + row.needsReview,
+    });
+  }
+  const progressiveByCondition = new Map<string, ProgressiveCoverageCell>();
+  for (const row of progressiveConditionRows) {
+    progressiveByCondition.set(String(row.condition_id), {
+      requested: Number(row.requested),
+      preliminary: Number(row.preliminary),
+      cfdEvidence: Number(row.cfd_evidence),
+      fastComplete: Number(row.fast_complete),
+      preciseComplete: Number(row.precise_complete),
     });
   }
   const scopeRow = scopeRows[0];
@@ -8011,25 +8048,29 @@ export async function campaignSummary(
       chordM: r.chord_m == null ? null : Number(r.chord_m),
       drift: Boolean(r.drift),
       gainedEvidenceAfterRelease: Boolean(r.gained_evidence),
-      counters: {
-        requested: Number(r.requested),
-        solved: Number(r.solved),
-        failed: Number(r.failed),
-        running: Number(r.running),
-        superseded: Number(r.superseded),
-        derived: Number(r.derived),
-        rejected: Number(r.rejected),
-        blocked: Number(r.blocked),
-        remaining: Math.max(
-          0,
-          Number(r.requested) -
-            Number(r.solved) -
-            Number(r.derived) -
-            Number(r.failed) -
-            Number(r.rejected) -
-            Number(r.blocked),
-        ),
-      },
+      counters:
+        !r.has_legacy_progress && progressiveByCondition.has(String(r.id))
+          ? progressiveCoverageTotals(progressiveByCondition.get(String(r.id))!)
+          : {
+              requested: Number(r.requested),
+              solved: Number(r.solved),
+              failed: Number(r.failed),
+              running: Number(r.running),
+              superseded: Number(r.superseded),
+              derived: Number(r.derived),
+              rejected: Number(r.rejected),
+              blocked: Number(r.blocked),
+              remaining: Math.max(
+                0,
+                Number(r.requested) -
+                  Number(r.solved) -
+                  Number(r.derived) -
+                  Number(r.failed) -
+                  Number(r.rejected) -
+                  Number(r.blocked),
+              ),
+            },
+      progressive: progressiveByCondition.get(String(r.id)),
       reviewBuckets: reviewByCondition.get(String(r.id)) ?? {
         awaitingUrans: 0,
         needsReview: 0,
@@ -8059,6 +8100,167 @@ export interface ProgressiveCoverageCell {
   cfdEvidence: number;
   fastComplete: number;
   preciseComplete: number;
+}
+
+function progressiveCoverageTotals(
+  progressive: ProgressiveCoverageCell,
+): CampaignProgressTotals {
+  return {
+    requested: progressive.requested,
+    solved: progressive.preciseComplete,
+    failed: 0,
+    running: 0,
+    superseded: 0,
+    derived: 0,
+    rejected: 0,
+    blocked: 0,
+    remaining: Math.max(0, progressive.requested - progressive.preciseComplete),
+  };
+}
+
+interface ProgressiveCoverageRow {
+  airfoil_id: string;
+  condition_id: string;
+  requested: number;
+  preliminary: number;
+  cfd_evidence: number;
+  fast_complete: number;
+  precise_complete: number;
+}
+
+type ProgressiveConditionCoverageRow = Omit<
+  ProgressiveCoverageRow,
+  "airfoil_id"
+>;
+
+function campaignProgressiveCoverageCtes(
+  campaignId: string,
+  targetFilter: SQL = sql`TRUE`,
+) {
+  return sql`
+    WITH current_generations AS MATERIALIZED (
+      SELECT generation.id, generation.epoch_id, generation.created_at,
+             campaign.current_condition_generation
+      FROM progressive_generations generation
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      JOIN calculation_epochs epoch
+        ON epoch.id = generation.epoch_id AND epoch.current
+      WHERE generation.campaign_id = ${campaignId}
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND generation.status IN ('active', 'complete', 'attention')
+    ), target_cells AS MATERIALIZED (
+      SELECT DISTINCT ON (condition.id, target.airfoil_id)
+        target.id AS target_id, target.airfoil_id, generation.id AS generation_id,
+        generation.epoch_id, scope.angles,
+        condition.id AS condition_id,
+        cardinality(scope.angles)::int AS requested
+      FROM current_generations generation
+      JOIN progressive_generation_targets scope
+        ON scope.generation_id = generation.id
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      JOIN sim_campaign_conditions condition
+        ON condition.campaign_id = ${campaignId}
+       AND condition.generation = generation.current_condition_generation
+       AND condition.simulation_preset_revision_id = scope.revision_id
+       AND condition.status IN ('active', 'kept')
+      WHERE ${targetFilter}
+      ORDER BY condition.id, target.airfoil_id, generation.created_at DESC, generation.id DESC
+    ), progressive_stats AS MATERIALIZED (
+      SELECT target_cells.target_id,
+        count(DISTINCT evidence.result_attempt_id)::int AS cfd_evidence,
+        count(DISTINCT unit.id) FILTER (
+          WHERE work.stage = 2 AND unit.state = 'complete'
+        )::int AS fast_complete,
+        count(DISTINCT unit.id) FILTER (
+          WHERE work.stage = 3
+            AND unit.state = 'complete'
+            AND EXISTS (
+              SELECT 1
+              FROM progressive_cfd_evidence accepted_evidence
+              JOIN result_attempts raw
+                ON raw.id = accepted_evidence.result_attempt_id
+              JOIN result_classifications classification
+                ON classification.result_attempt_id = raw.id
+              LEFT JOIN LATERAL (
+                SELECT verdict.verdict
+                FROM result_review_verdicts verdict
+                WHERE verdict.result_id = raw.result_id
+                  AND verdict."revokedAt" IS NULL
+                ORDER BY verdict."createdAt" DESC, verdict.id DESC
+                LIMIT 1
+              ) review ON true
+              WHERE accepted_evidence.attempt_token = attempt.token
+                AND raw.status = 'done'
+                AND raw.valid_for_polar
+                AND classification.state = 'accepted'
+                AND (
+                  raw.regime = 'rans'
+                  OR raw.evidence_payload->>'fidelity' = 'urans_full'
+                )
+                AND COALESCE(review.verdict, 'waive') NOT IN ('exclude', 'defer')
+            )
+        )::int AS precise_complete
+      FROM target_cells
+      LEFT JOIN progressive_work work
+        ON work.target_id = target_cells.target_id
+       AND work.generation_id = target_cells.generation_id
+       AND work.stage IN (2, 3)
+      LEFT JOIN progressive_cfd_units unit ON unit.work_id = work.id
+      LEFT JOIN progressive_cfd_attempts attempt
+        ON attempt.unit_id = unit.id
+      LEFT JOIN progressive_cfd_evidence evidence
+        ON evidence.attempt_token = attempt.token
+      GROUP BY target_cells.target_id
+    ), coverage AS MATERIALIZED (
+      SELECT target_cells.airfoil_id, target_cells.condition_id,
+        target_cells.requested,
+        (SELECT count(*)::int FROM unnest(target_cells.angles) requested(alpha)
+          WHERE prediction.payload->'alpha' @> to_jsonb(requested.alpha)) AS preliminary,
+        coalesce(progressive_stats.cfd_evidence, 0)::int AS cfd_evidence,
+        coalesce(progressive_stats.fast_complete, 0)::int AS fast_complete,
+        coalesce(progressive_stats.precise_complete, 0)::int AS precise_complete
+      FROM target_cells
+      LEFT JOIN LATERAL (
+        SELECT prediction.payload FROM neuralfoil_predictions prediction
+        WHERE prediction.target_id = target_cells.target_id
+          AND prediction.epoch_id = target_cells.epoch_id
+          AND prediction.catalog_metrics_v1 IS NOT NULL
+        ORDER BY prediction.created_at DESC, prediction.id LIMIT 1
+      ) prediction ON true
+      LEFT JOIN progressive_stats
+        ON progressive_stats.target_id = target_cells.target_id
+    )
+  `;
+}
+
+async function campaignProgressiveCoverageRows(
+  db: DbTx,
+  campaignId: string,
+  targetFilter: SQL = sql`TRUE`,
+): Promise<ProgressiveCoverageRow[]> {
+  return (await asDb(db).execute(sql`
+    ${campaignProgressiveCoverageCtes(campaignId, targetFilter)}
+    SELECT airfoil_id, condition_id, requested, preliminary,
+      cfd_evidence, fast_complete, precise_complete
+    FROM coverage
+  `)) as unknown as ProgressiveCoverageRow[];
+}
+
+async function campaignProgressiveConditionRows(
+  db: DbTx,
+  campaignId: string,
+): Promise<ProgressiveConditionCoverageRow[]> {
+  return (await asDb(db).execute(sql`
+    ${campaignProgressiveCoverageCtes(campaignId)}
+    SELECT condition_id,
+      sum(requested)::int AS requested,
+      sum(preliminary)::int AS preliminary,
+      sum(cfd_evidence)::int AS cfd_evidence,
+      sum(fast_complete)::int AS fast_complete,
+      sum(precise_complete)::int AS precise_complete
+    FROM coverage
+    GROUP BY condition_id
+  `)) as unknown as ProgressiveConditionCoverageRow[];
 }
 
 /** Keyset matrix rows by airfoil slug (spec §10, cursor = last slug). */
@@ -8159,83 +8361,14 @@ export async function campaignAirfoilRows(
         inArray(simCampaignProgress.conditionId, currentConditionIds),
       ),
     );
-  const progressiveRows = (await db.execute(sql`
-    WITH current_generations AS MATERIALIZED (
-      SELECT generation.id, generation.epoch_id, generation.created_at
-      FROM progressive_generations generation
-      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
-      JOIN calculation_epochs epoch
-        ON epoch.id = generation.epoch_id AND epoch.current
-      WHERE generation.campaign_id = ${campaignId}
-        AND generation.plan_revision_id = campaign.current_plan_revision_id
-        AND generation.status IN ('active', 'complete', 'attention')
-    ), target_cells AS MATERIALIZED (
-      SELECT DISTINCT ON (condition.id, target.airfoil_id)
-        target.id AS target_id, target.airfoil_id, generation.id AS generation_id,
-        generation.epoch_id, scope.angles,
-        condition.id AS condition_id,
-        cardinality(scope.angles)::int AS requested
-      FROM current_generations generation
-      JOIN progressive_generation_targets scope
-        ON scope.generation_id = generation.id
-      JOIN polar_analysis_targets target ON target.id = scope.target_id
-      JOIN sim_campaign_conditions condition
-        ON condition.campaign_id = ${campaignId}
-       AND condition.generation = ${campaign.currentConditionGeneration}
-       AND condition.simulation_preset_revision_id = scope.revision_id
-       AND condition.status IN ('active', 'kept')
-      WHERE target.airfoil_id IN (${sql.join(
-        ids.map((id) => sql`${id}::uuid`),
-        sql`,`,
-      )})
-      ORDER BY condition.id, target.airfoil_id, generation.created_at DESC, generation.id DESC
-    ), progressive_stats AS MATERIALIZED (
-      SELECT target_cells.target_id,
-        count(DISTINCT evidence.result_attempt_id)::int AS cfd_evidence,
-        count(DISTINCT unit.id) FILTER (
-          WHERE work.stage = 2 AND unit.state = 'complete'
-        )::int AS fast_complete,
-        count(DISTINCT unit.id) FILTER (
-          WHERE work.stage = 3 AND unit.state = 'complete'
-        )::int AS precise_complete
-      FROM target_cells
-      LEFT JOIN progressive_work work
-        ON work.target_id = target_cells.target_id
-       AND work.generation_id = target_cells.generation_id
-       AND work.stage IN (2, 3)
-      LEFT JOIN progressive_cfd_units unit ON unit.work_id = work.id
-      LEFT JOIN progressive_cfd_attempts attempt
-        ON attempt.unit_id = unit.id
-      LEFT JOIN progressive_cfd_evidence evidence
-        ON evidence.attempt_token = attempt.token
-      GROUP BY target_cells.target_id
-    )
-    SELECT target_cells.target_id, target_cells.airfoil_id,
-      target_cells.condition_id, target_cells.requested,
-      (SELECT count(*)::int FROM unnest(target_cells.angles) requested(alpha)
-        WHERE prediction.payload->'alpha' @> to_jsonb(requested.alpha)) AS preliminary,
-      coalesce(progressive_stats.cfd_evidence, 0)::int AS cfd_evidence,
-      coalesce(progressive_stats.fast_complete, 0)::int AS fast_complete,
-      coalesce(progressive_stats.precise_complete, 0)::int AS precise_complete
-    FROM target_cells
-    LEFT JOIN LATERAL (
-      SELECT prediction.payload FROM neuralfoil_predictions prediction
-      WHERE prediction.target_id = target_cells.target_id
-        AND prediction.epoch_id = target_cells.epoch_id
-        AND prediction.catalog_metrics_v1 IS NOT NULL
-      ORDER BY prediction.created_at DESC, prediction.id LIMIT 1
-    ) prediction ON true
-    LEFT JOIN progressive_stats
-      ON progressive_stats.target_id = target_cells.target_id
-  `)) as unknown as Array<{
-    airfoil_id: string;
-    condition_id: string;
-    requested: number;
-    preliminary: number;
-    cfd_evidence: number;
-    fast_complete: number;
-    precise_complete: number;
-  }>;
+  const progressiveRows = await campaignProgressiveCoverageRows(
+    db,
+    campaignId,
+    sql`target.airfoil_id IN (${sql.join(
+      ids.map((id) => sql`${id}::uuid`),
+      sql`,`,
+    )})`,
+  );
   const progressiveByCell = new Map<string, ProgressiveCoverageCell>();
   for (const row of progressiveRows) {
     progressiveByCell.set(`${row.airfoil_id}:${row.condition_id}`, {
@@ -8258,10 +8391,13 @@ export async function campaignAirfoilRows(
       needsReview: row.needsReview,
     });
   }
+  const legacyCells = new Set<string>();
   const byAirfoil = new Map<string, CampaignAirfoilRow["perCondition"]>();
   for (const row of progressRows) {
+    const key = `${row.airfoilId}:${row.conditionId}`;
+    legacyCells.add(key);
     const bucket = byAirfoil.get(row.airfoilId) ?? [];
-    const review = reviewByCell.get(`${row.airfoilId}:${row.conditionId}`) ?? {
+    const review = reviewByCell.get(key) ?? {
       awaitingUrans: 0,
       needsReview: 0,
     };
@@ -8286,9 +8422,22 @@ export async function campaignAirfoilRows(
       ),
       awaitingUrans: review.awaitingUrans,
       needsReview: review.needsReview,
-      progressive: progressiveByCell.get(`${row.airfoilId}:${row.conditionId}`),
+      progressive: progressiveByCell.get(key),
     });
     byAirfoil.set(row.airfoilId, bucket);
+  }
+  for (const row of progressiveRows) {
+    const key = `${row.airfoil_id}:${row.condition_id}`;
+    if (legacyCells.has(key)) continue;
+    const progressive = progressiveByCell.get(key)!;
+    const bucket = byAirfoil.get(row.airfoil_id) ?? [];
+    bucket.push({
+      conditionId: row.condition_id,
+      ...progressiveCoverageTotals(progressive),
+      ...(reviewByCell.get(key) ?? { awaitingUrans: 0, needsReview: 0 }),
+      progressive,
+    });
+    byAirfoil.set(row.airfoil_id, bucket);
   }
   return {
     items: page.map((r) => ({

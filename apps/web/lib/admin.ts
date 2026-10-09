@@ -1902,6 +1902,7 @@ export interface AdminCampaignConditionSummary {
   drift: boolean;
   gainedEvidenceAfterRelease: boolean;
   counters: CampaignProgressTotals;
+  progressive?: CampaignProgressiveCoverageCell;
   reviewBuckets?: CampaignReviewBuckets;
 }
 
