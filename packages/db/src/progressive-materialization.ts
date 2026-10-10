@@ -54,6 +54,7 @@ export function progressiveRecipes(
     mesh.targetYPlus,
     maximumConcaveCurvature,
   );
+  const usesWallFunction = wallSpacing.selection === "wall_function";
   return {
     neuralfoil: {
       recipe_id: "neuralfoil-prior-v1",
@@ -67,7 +68,9 @@ export function progressiveRecipes(
         ? localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
           ? "openfoam-fast-density-local-v2"
           : "openfoam-fast-density-local-v1"
-        : "openfoam-fast-wall-v2",
+        : usesWallFunction
+          ? "openfoam-fast-wall-v2"
+          : "openfoam-fast-v1",
       ...(!localDensity ? { wallSpacing } : {}),
       ...(localDensity
         ? { timeCoordinate: "local_pseudo_time_iterations" }
@@ -98,7 +101,19 @@ export function progressiveRecipes(
         convergenceTolerance: Math.max(solver.convergenceTolerance, 1e-4),
       },
     },
-    precise: { ...common, recipe_id: "openfoam-precise-v1", mesh, solver },
+    precise: {
+      ...common,
+      recipe_id:
+        !localDensity && usesWallFunction
+          ? "openfoam-precise-wall-v2"
+          : "openfoam-precise-v1",
+      ...(!localDensity ? { wallSpacing } : {}),
+      mesh: {
+        ...mesh,
+        ...(!localDensity ? { targetYPlus: wallSpacing.targetYPlus } : {}),
+      },
+      solver,
+    },
   };
 }
 
@@ -205,7 +220,7 @@ export async function materializeProgressiveCampaignScope(
       campaignId,
       planRevisionId: intent.revisionId,
       scopeKey: analysisContentHash({
-        fastWallSpacingPolicy: FAST_WALL_SPACING_POLICY,
+        subsonicWallSpacingPolicy: FAST_WALL_SPACING_POLICY,
         plan: intent.revisionId,
         profiles: profiles.map((profile) => profile.id),
         ...(requestVersion ? { requestVersion } : {}),

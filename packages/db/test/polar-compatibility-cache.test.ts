@@ -289,16 +289,42 @@ describe("physics compatibility hash contract", () => {
         mesh: { targetYPlus: 1 },
         wallSpacing: { selection: "requested" },
       });
-    expect(normal.precise).toEqual(concave.precise);
     expect(normal.precise).toMatchObject({
+      mesh: { targetYPlus: 40 },
+      recipe_id: "openfoam-precise-wall-v2",
+      wallSpacing: { selection: "wall_function", targetYPlus: 40 },
+    });
+    expect(concave.precise).toMatchObject({
       mesh: { targetYPlus: 1 },
       recipe_id: "openfoam-precise-v1",
+      wallSpacing: { selection: "requested", targetYPlus: 1 },
     });
     expect(normal.neuralfoil).toEqual(unknown.neuralfoil);
     expect(snapshot).toEqual(original);
+    const threshold = {
+      ...snapshot,
+      derived: { ...snapshot.derived, mach: 1.199 },
+    };
+    expect(progressiveRecipes(threshold, 0.2).precise.mesh).toMatchObject({
+      targetYPlus: 40,
+    });
     const density = { ...snapshot, derived: { ...snapshot.derived, mach: 2 } };
     expect(progressiveRecipes(density, 0.2)).toEqual(
       progressiveRecipes(density, 4.9),
+    );
+    expect(progressiveRecipes(density, 0.2).precise).toMatchObject({
+      recipe_id: "openfoam-precise-v1",
+      mesh: { targetYPlus: 1 },
+    });
+    expect(progressiveRecipes(density, 0.2).precise).not.toHaveProperty(
+      "wallSpacing",
+    );
+    const thresholdDensity = {
+      ...snapshot,
+      derived: { ...snapshot.derived, mach: 1.2 },
+    };
+    expect(progressiveRecipes(thresholdDensity, 0.2).precise.mesh).toMatchObject(
+      { targetYPlus: 1 },
     );
   });
   it("preserves legacy hashes for absent initialization and separates explicit limits", () => {

@@ -1264,30 +1264,34 @@ both export paths, pressure/velocity rendering, and unchanged original-file
 hashes. Its synthetic two-cell fixture is never campaign evidence. A passing
 fixture does not replace guarded engine rollout and real-case verification.
 
-New pressure-based fast recipes use curvature-guarded wall-function spacing.
+New pressure-based fast and precise subsonic recipes use curvature-guarded wall-function spacing.
 The original profile coordinates are aligned and normalized using the same
 geometry convention as the native solver. A maximum concave curvature no greater
 than 2.5 per chord, measured over a 0.025-chord arc window, permits a wall target
 of yPlus 40. Strongly concave or unmeasurable profiles retain the requested
-spacing. The measured selection is stored in the immutable fast recipe; precise
-recipes and the density-based fast recipe are unchanged. This preliminary
-throughput policy remains unvalidated for aerodynamic accuracy. Existing sealed
+spacing. The measured selection is stored in each immutable pressure-based
+recipe, with distinct recipe IDs and the actual mesh target. Density-based
+recipes at Mach 1.2 and above remain unchanged. This preliminary throughput
+policy remains unvalidated for aerodynamic accuracy. Existing sealed
 generations are not rewritten by this change and require explicit adoption.
 
-For an active campaign still in stage 1 or 2, pause new admissions and let its
-bound jobs stop and settle through the normal controller. Run
+For an active campaign at any progressive stage, pause the campaign and global
+new solver admission, then let its bound jobs stop and settle through the
+normal controller. Resume the campaign while global admission remains paused.
+Run
 `pnpm --filter @aerodb/db exec node --import tsx src/adopt-progressive-wall-policy.ts CAMPAIGN_UUID --dry-run`
 to rehearse the transactional upgrade, then use `--apply` for the same campaign.
 The default is a rollback-only dry run. Restore the previous admission state
 afterward. The operation retains the campaign plan, predictions, results and
-old sealed recipes, appends a stage-1 successor, and records an idempotent
+old sealed recipes, appends a successor generation, and records an idempotent
 adoption receipt. Compatible existing NeuralFoil predictions are linked after
 exact content and setup validation, without inventing a new solver attempt;
 only missing baselines require calculation before the fast stage can begin.
-It refuses paused, cancelled or archived campaigns and any
-generation that has already reached the precise stage. Completed campaigns
-adopt new defaults when new profiles are enrolled; this command does not restart
-their finished work.
+It refuses paused, cancelled or archived campaigns and any old execution that
+has not been physically stopped and settled. A settled precise-stage generation
+may be replaced by the append-only successor as well; no old generation is
+changed in place. Completed campaigns adopt new defaults when new profiles are
+enrolled; this command does not restart their finished work.
 
 Windowed URANS histories carry `source_start_time`, the first recorded source
 coefficient time before startup discard or period selection. The retained `t`

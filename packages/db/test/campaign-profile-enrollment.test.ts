@@ -906,7 +906,11 @@ describe("durable progressive scope requests", () => {
         mesh: { targetYPlus: 40 },
         wallSpacing: { selection: "wall_function" },
       },
-      precise: { mesh: { targetYPlus: 1 } },
+      precise: {
+        mesh: { targetYPlus: 40 },
+        recipe_id: "openfoam-precise-wall-v2",
+        wallSpacing: { selection: "wall_function" },
+      },
     });
     expect(
       targets.find((row) => row.airfoil_id === concave)?.recipes,
@@ -915,7 +919,11 @@ describe("durable progressive scope requests", () => {
         mesh: { targetYPlus: 1 },
         wallSpacing: { selection: "requested" },
       },
-      precise: { mesh: { targetYPlus: 1 } },
+      precise: {
+        mesh: { targetYPlus: 1 },
+        recipe_id: "openfoam-precise-v1",
+        wallSpacing: { selection: "requested" },
+      },
     });
     expect(
       await db.execute(
@@ -945,8 +953,9 @@ describe("durable progressive scope requests", () => {
     const recipes = structuredClone(
       scope.recipes,
     ) as SealedPolarTarget["recipes"];
-    delete recipes.fast.wallSpacing;
-    recipes.fast.recipe_id = "openfoam-fast-v1";
+    delete recipes.precise.wallSpacing;
+    recipes.precise.recipe_id = "openfoam-precise-v1";
+    (recipes.precise.mesh as Record<string, unknown>).targetYPlus = 1;
     const legacy = await sealProgressiveGeneration(db, {
       campaignId: id,
       planRevisionId: String(plan.current_plan_revision_id),
@@ -983,9 +992,18 @@ describe("durable progressive scope requests", () => {
     await db.execute(
       sql`UPDATE progressive_generations SET stage=3 WHERE id=${legacy.id}`,
     );
-    await expect(adoptProgressiveWallPolicy(db, id)).rejects.toThrow(
-      "precise generation",
+    const preciseAdoptionRollback = new Error(
+      "isolated-precise-adoption-dry-run",
     );
+    await expect(
+      db.transaction(async (transaction) => {
+        expect(
+          (await adoptProgressiveWallPolicy(transaction as unknown as DB, id))
+            .kind,
+        ).toBe("adopted");
+        throw preciseAdoptionRollback;
+      }),
+    ).rejects.toBe(preciseAdoptionRollback);
     await db.execute(
       sql`UPDATE progressive_generations SET stage=1 WHERE id=${legacy.id}`,
     );

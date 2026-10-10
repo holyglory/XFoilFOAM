@@ -119,15 +119,6 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
         AND epoch_id=${epoch.id} AND plan_revision_id=${campaign.current_plan_revision_id}
         AND status IN ('active','attention') ORDER BY id FOR UPDATE
     `);
-    const [preciseCohort] = await connection.execute(sql`SELECT EXISTS (
-      SELECT 1 FROM progressive_generation_cohorts cursor JOIN progressive_generations generation ON generation.id = cursor.generation_id
-      WHERE generation.campaign_id = ${campaignId}::uuid AND generation.epoch_id = ${epoch.id}
-        AND generation.plan_revision_id = ${campaign.current_plan_revision_id} AND generation.status IN ('active', 'attention') AND cursor.stage = 3
-    ) AS started`);
-    if (preciseCohort.started || generations.some((generation) => Number(generation.stage) >= 3))
-      throw new Error(
-        "A precise generation must not be restarted by preliminary recipe adoption",
-      );
     if (!generations.length)
       return { kind: "not_required" as const, campaignId };
     const generationIds = generations.map((generation) =>
@@ -138,9 +129,17 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
       sql`, `,
     );
     const [outdated] = await connection.execute(sql`
-      SELECT EXISTS(SELECT 1 FROM progressive_generation_targets WHERE generation_id IN (${ids})
-        AND recipes#>>'{fast,recipe_id}' <> 'openfoam-fast-density-local-v1'
-        AND recipes#>>'{fast,wallSpacing,policy}' IS DISTINCT FROM ${FAST_WALL_SPACING_POLICY}) AS present
+      SELECT EXISTS(
+        SELECT 1
+        FROM progressive_generation_targets scope
+        JOIN polar_analysis_targets target ON target.id = scope.target_id
+        WHERE scope.generation_id IN (${ids})
+          AND target.mach < 1.2
+          AND (
+            scope.recipes#>>'{fast,wallSpacing,policy}' IS DISTINCT FROM ${FAST_WALL_SPACING_POLICY}
+            OR scope.recipes#>>'{precise,wallSpacing,policy}' IS DISTINCT FROM ${FAST_WALL_SPACING_POLICY}
+          )
+      ) AS present
     `);
     if (!outdated?.present)
       return { kind: "not_required" as const, campaignId };
