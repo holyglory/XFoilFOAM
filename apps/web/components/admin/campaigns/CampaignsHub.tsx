@@ -838,7 +838,7 @@ export function CampaignsHub({
                   )}
                   <span style={{ marginLeft: "auto", color: C.dimmest }}>
                     {item.activityAt
-                      ? `activity ${ago(item.activityAt)}`
+                      ? `last solver activity ${ago(item.activityAt)}`
                       : `updated ${ago(item.updatedAt)}`}
                   </span>
                 </div>

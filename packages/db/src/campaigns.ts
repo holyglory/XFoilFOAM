@@ -7483,6 +7483,9 @@ export interface CampaignListItem {
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Persisted sim_jobs lifecycle activity across direct and shared owners.
+   * Progressive report/receipt activity is not included because it has no
+   * campaign activity projection here. */
   activityAt?: string | null;
   conditionCount: number;
   airfoilCount: number;
@@ -7517,6 +7520,89 @@ export async function listCampaigns(
       ? sql`WHERE c.status = ANY(${pgTextArray(opts.statuses)}::text[])`
       : sql``;
   const rows = (await db.execute(sql`
+    WITH job_activity_candidates AS MATERIALIZED (
+      SELECT
+        job.campaign_id,
+        CASE
+          WHEN job.request_payload ->> 'uransRequestId' ~
+               '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          THEN (job.request_payload ->> 'uransRequestId')::uuid
+          ELSE NULL
+        END AS urans_request_id,
+        CASE
+          WHEN job.request_payload ->> 'verifyQueueItemId' ~
+               '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          THEN (job.request_payload ->> 'verifyQueueItemId')::uuid
+          ELSE NULL
+        END AS verify_queue_id,
+        job.request_payload -> 'precalcObligationIds' AS precalc_obligation_ids,
+        GREATEST(
+          job."updatedAt",
+          COALESCE(job."polledAt", job."updatedAt"),
+          COALESCE(job."submittedAt", job."updatedAt"),
+          COALESCE(job."ingestedAt", job."updatedAt"),
+          COALESCE(job."finishedAt", job."updatedAt")
+        ) AS activity_at
+      FROM sim_jobs job
+      WHERE job.campaign_id IS NOT NULL
+         OR job.request_payload ->> 'uransRequestId' ~
+            '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+         OR job.request_payload ->> 'verifyQueueItemId' ~
+            '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+         OR jsonb_typeof(job.request_payload -> 'precalcObligationIds') = 'array'
+    ), job_activity_owners AS (
+      SELECT candidate.campaign_id, candidate.activity_at
+      FROM job_activity_candidates candidate
+      WHERE candidate.campaign_id IS NOT NULL
+
+      UNION ALL
+
+      SELECT ownership.campaign_id, candidate.activity_at
+      FROM job_activity_candidates candidate
+      JOIN sim_urans_request_campaigns ownership
+        ON ownership.request_id = candidate.urans_request_id
+       AND ownership.state = 'active'
+      WHERE candidate.urans_request_id IS NOT NULL
+
+      UNION ALL
+
+      SELECT ownership.campaign_id, candidate.activity_at
+      FROM job_activity_candidates candidate
+      JOIN sim_urans_verify_queue_campaigns ownership
+        ON ownership.queue_id = candidate.verify_queue_id
+       AND ownership.state = 'active'
+      WHERE candidate.verify_queue_id IS NOT NULL
+
+      UNION ALL
+
+      SELECT ownership.campaign_id, candidate.activity_at
+      FROM job_activity_candidates candidate
+      JOIN sim_urans_verify_queue_requests coverage
+        ON coverage.queue_id = candidate.verify_queue_id
+      JOIN sim_urans_request_campaigns ownership
+        ON ownership.request_id = coverage.request_id
+       AND ownership.state = 'active'
+      WHERE candidate.verify_queue_id IS NOT NULL
+
+      UNION ALL
+
+      SELECT ownership.campaign_id, candidate.activity_at
+      FROM job_activity_candidates candidate
+      CROSS JOIN LATERAL jsonb_array_elements_text(
+        CASE
+          WHEN jsonb_typeof(candidate.precalc_obligation_ids) = 'array'
+          THEN candidate.precalc_obligation_ids
+          ELSE '[]'::jsonb
+        END
+      ) payload_obligation(id)
+      JOIN sim_precalc_obligation_campaigns ownership
+        ON ownership.obligation_id = payload_obligation.id::uuid
+       AND ownership.state = 'active'
+    ), job_activity AS (
+      SELECT campaign_id, max(activity_at) AS activity_at
+      FROM job_activity_owners
+      GROUP BY campaign_id
+    )
     SELECT
       c.id, c.slug, c.name, c.status, c.priority, c.notes,
       c.closed_with_failed_count, c.closed_with_rejected_count, c."completedAt" AS completed_at, c."createdAt" AS created_at, c."updatedAt" AS updated_at,
@@ -7598,19 +7684,7 @@ export async function listCampaigns(
       WHERE condition.generation = progress_campaign.current_condition_generation
       GROUP BY progress.campaign_id
     ) pr ON pr.campaign_id = c.id
-    LEFT JOIN (
-      SELECT job.campaign_id,
-        max(GREATEST(
-          job."updatedAt",
-          COALESCE(job."polledAt", job."updatedAt"),
-          COALESCE(job."submittedAt", job."updatedAt"),
-          COALESCE(job."ingestedAt", job."updatedAt"),
-          COALESCE(job."finishedAt", job."updatedAt")
-        )) AS activity_at
-      FROM sim_jobs job
-      WHERE job.campaign_id IS NOT NULL
-      GROUP BY job.campaign_id
-    ) job_activity ON job_activity.campaign_id = c.id
+    LEFT JOIN job_activity ON job_activity.campaign_id = c.id
     LEFT JOIN LATERAL (
       SELECT event.action, event.actor, event.reason, event."createdAt"
       FROM sim_campaign_lifecycle_events event

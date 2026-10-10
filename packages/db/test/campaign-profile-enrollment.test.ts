@@ -2041,6 +2041,60 @@ describe("progressive durable stage transitions", () => {
     expect(new Date(listedCampaign!.activityAt!).toISOString()).toBe(
       jobActivityAt.toISOString(),
     );
+    const sharedRequestId = randomUUID();
+    await db.execute(sql`
+      INSERT INTO sim_urans_requests
+        (id, airfoil_id, revision_id, aoa_deg, fidelity, state)
+      VALUES
+        (${sharedRequestId}, ${originalId}, ${source.revisionId}, 0, 'precalc', 'running')
+    `);
+    await db.execute(sql`
+      INSERT INTO sim_urans_request_campaigns (request_id, campaign_id, state)
+      VALUES (${sharedRequestId}, ${fixture.campaignId}, 'active')
+    `);
+    const sharedActivityAt = new Date("2023-01-01T00:00:00.000Z");
+    const [sharedJob] = await db
+      .insert(simJobs)
+      .values({
+        engineJobId: `${PREFIX}-shared-activity`,
+        airfoilId: originalId,
+        bcIds: [fixture.execution.snapshot.preset.legacyBoundaryConditionId!],
+        simulationPresetRevisionId: source.revisionId,
+        jobKind: "targeted",
+        referenceChordM:
+          fixture.execution.snapshot.referenceGeometry.referenceLengthM,
+        wave: 1,
+        status: "running",
+        totalCases: 1,
+        completedCases: 0,
+        requestPayload: { uransRequestId: sharedRequestId },
+        updatedAt: sharedActivityAt,
+        polledAt: sharedActivityAt,
+      })
+      .returning({ id: simJobs.id });
+    await db.execute(sql`
+      UPDATE sim_urans_requests
+      SET sim_job_id = ${sharedJob.id}
+      WHERE id = ${sharedRequestId}
+    `);
+    try {
+      const withSharedActivity = await listCampaigns(db, {
+        statuses: ["active"],
+        limit: 100,
+      });
+      const campaignWithSharedActivity = withSharedActivity.items.find(
+        (item) => item.id === fixture.campaignId,
+      );
+      expect(campaignWithSharedActivity?.activityAt).toBeDefined();
+      expect(
+        new Date(campaignWithSharedActivity!.activityAt!).toISOString(),
+      ).toBe(sharedActivityAt.toISOString());
+    } finally {
+      await db.delete(simJobs).where(eq(simJobs.id, sharedJob.id));
+      await db.execute(
+        sql`DELETE FROM sim_urans_requests WHERE id = ${sharedRequestId}`,
+      );
+    }
     const page = await campaignAirfoilRows(db, fixture.campaignId);
     const row = page.items.find((item) => item.airfoilId === originalId)!;
     const [condition] = await db.execute(
