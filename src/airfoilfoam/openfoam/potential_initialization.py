@@ -16,6 +16,7 @@ from .runner import InfrastructureError
 
 
 PRESSURE_INITIALIZATION_DIR = "pressure_initialization"
+QUIESCENT_INITIALIZATION_DIR = "quiescent-initialization"
 
 
 def velocity_internal_entry(content):
@@ -244,3 +245,90 @@ def initialize_compressible_velocity(case_dir: Path, runner, patches, command: s
         os.replace(staged_receipt, case_dir / "pressure-initialization.json")
         shutil.rmtree(work_dir)
     return result
+
+
+def initialize_quiescent_velocity(case_dir: Path) -> dict:
+    """Replace only a uniform internal velocity with rest for a transient canary."""
+    case_dir = Path(case_dir)
+    velocity_path = case_dir / "0/U"
+    original_velocity = velocity_path.read_bytes()
+    original_sha256 = hashlib.sha256(original_velocity).hexdigest()
+    protected = {
+        name: (case_dir / name).read_bytes()
+        for name in ("0/p", "0/T", "constant/thermophysicalProperties")
+        if (case_dir / name).is_file()
+    }
+    evidence_root = case_dir / "system" / QUIESCENT_INITIALIZATION_DIR
+    for receipt_path in sorted(evidence_root.glob("attempt-*/receipt.json")):
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise InfrastructureError(
+                f"Cannot verify quiescent initialization receipt: {receipt_path}"
+            ) from error
+        if (
+            receipt.get("version") == 1
+            and receipt.get("kind") == "quiescent-initial-velocity"
+            and receipt.get("applied_sha256") == original_sha256
+        ):
+            expected_protected = receipt.get("protected_sha256")
+            if expected_protected != {
+                name: hashlib.sha256(content).hexdigest()
+                for name, content in protected.items()
+            }:
+                raise InfrastructureError("Quiescent initialization protected fields changed")
+            return receipt
+
+    original_text, original_entry = velocity_internal_entry(original_velocity)
+    if original_entry.group(1) != "uniform":
+        raise InfrastructureError("Quiescent initialization requires a uniform internal velocity")
+    if internal_velocity_squared(original_velocity, require_uniform=True) == 0:
+        raise InfrastructureError("Zero internal velocity has no matching quiescent receipt")
+
+    updated_velocity = (
+        original_text[: original_entry.start()]
+        + "internalField uniform (0 0 0);"
+        + original_text[original_entry.end() :]
+    ).encode()
+    attempt_name = f"attempt-{uuid4().hex}"
+    attempt_dir = evidence_root / attempt_name
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    (attempt_dir / "U.original").write_bytes(original_velocity)
+    (attempt_dir / "U.applied").write_bytes(updated_velocity)
+    for name, content in protected.items():
+        retained = attempt_dir / "original" / name
+        retained.parent.mkdir(parents=True, exist_ok=True)
+        retained.write_bytes(content)
+
+    staged = velocity_path.parent / f".U-{attempt_name}"
+    try:
+        staged.write_bytes(updated_velocity)
+        os.replace(staged, velocity_path)
+        if any((case_dir / name).read_bytes() != content for name, content in protected.items()):
+            raise InfrastructureError("Quiescent initialization changed a protected physical field")
+        applied_velocity = velocity_path.read_bytes()
+        receipt = {
+            "version": 1,
+            "kind": "quiescent-initial-velocity",
+            "attempt_directory": attempt_name,
+            "aerodynamic_evidence": False,
+            "applied": True,
+            "original_sha256": original_sha256,
+            "applied_sha256": hashlib.sha256(applied_velocity).hexdigest(),
+            "protected_sha256": {
+                name: hashlib.sha256(content).hexdigest()
+                for name, content in protected.items()
+            },
+        }
+        (attempt_dir / "receipt.json").write_text(
+            json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
+        return receipt
+    except BaseException:
+        if staged.exists():
+            staged.unlink()
+        restore = velocity_path.parent / f".U-restore-{attempt_name}"
+        restore.write_bytes(original_velocity)
+        os.replace(restore, velocity_path)
+        shutil.rmtree(attempt_dir, ignore_errors=True)
+        raise

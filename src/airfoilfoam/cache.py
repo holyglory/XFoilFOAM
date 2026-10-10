@@ -183,6 +183,7 @@ class EngineCache:
             {
                 "steadyRansMarcher": STEADY_RANS_MARCHER_SEED_VERSION,
                 "flowSolverFamily": solver_params.flow_solver_family,
+                "quiescentInitialVelocity": solver_params.quiescent_initial_velocity,
                 "turbulentPrandtl": solver_params.turbulent_prandtl,
                 "turbulence": {
                     "model": solver_params.turbulence.model.value,

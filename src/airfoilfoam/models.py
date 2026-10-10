@@ -447,6 +447,10 @@ class SolverParams(BaseModel):
         "still be used as initialisation, but the steady RANS coefficients are not accepted as the "
         "reported polar result.",
     )
+    quiescent_initial_velocity: bool = Field(
+        default=False,
+        description="For explicitly versioned compressible force-transient diagnostics, replace only the uniform internal U field with zero while preserving physical boundary fields.",
+    )
     urans_quality_recovery: bool = Field(
         default=False,
         description="Start a controller-selected repeated preliminary-URANS attempt on the "
@@ -828,6 +832,15 @@ class PolarRequest(BaseModel):
             if self.expected_local_time_step_version is None:
                 raise ValueError("Explicit local time-step smoothing requires expected_local_time_step_version")
         compressible = family is not None and family.startswith("rho")
+        if self.solver.quiescent_initial_velocity and (
+            not compressible
+            or family != "rhoPimpleFoam"
+            or not self.solver.force_transient
+            or self.expected_urans_initialization_version is None
+        ):
+            raise ValueError(
+                "quiescent_initial_velocity requires a versioned compressible rhoPimpleFoam force-transient request"
+            )
         if compressible:
             gas, state = self.fluid.gas, self.flow_state
             if gas is None or state is None or self.solver.turbulent_prandtl is None:

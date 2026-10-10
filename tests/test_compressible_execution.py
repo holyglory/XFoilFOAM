@@ -121,6 +121,22 @@ def test_local_density_request_preserves_steady_mode_and_refuses_implicit_urans(
         PolarRequest.model_validate(request_payload)
 
 
+def test_quiescent_initial_velocity_requires_versioned_pressure_transient(request_payload):
+    request_payload["solver"].update(
+        flow_solver_family="rhoPimpleFoam",
+        force_transient=True,
+        quiescent_initial_velocity=True,
+    )
+    with pytest.raises(ValidationError, match="versioned compressible rhoPimpleFoam"):
+        PolarRequest.model_validate(request_payload)
+    request_payload["expected_urans_initialization_version"] = 1
+    request = PolarRequest.model_validate(request_payload)
+    assert request.solver.quiescent_initial_velocity is True
+    request_payload["solver"]["flow_solver_family"] = "rhoSimpleFoam"
+    with pytest.raises(ValidationError, match="versioned compressible rhoPimpleFoam"):
+        PolarRequest.model_validate(request_payload)
+
+
 @pytest.mark.parametrize("seeded", [False, True])
 def test_local_density_keeps_iteration_clock_separate_from_physical_startup(
     request_payload, monkeypatch, tmp_path, seeded

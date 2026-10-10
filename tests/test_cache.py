@@ -273,6 +273,9 @@ def test_solver_signature_tracks_bc_relevant_fields(monkeypatch):
     # cache entry can be byte-perfect yet come from the alternate A18 branch.
     monkeypatch.setattr(cache_module, "STEADY_RANS_MARCHER_SEED_VERSION", "legacy-march")
     assert EngineCache.solver_signature(SolverParams(), RoughnessParams()) != base
+    assert EngineCache.solver_signature(
+        SolverParams(quiescent_initial_velocity=True), RoughnessParams()
+    ) != base
 
 
 # --------------------------------------------------------------------------- #

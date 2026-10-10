@@ -90,7 +90,11 @@ from .models import (
 from .openfoam.budget import begin_case_budget, case_solver_seconds, case_solver_budget
 from .openfoam.execution import is_compressible, is_density_based
 from .openfoam.acoustic_startup import acoustic_startup_step
-from .openfoam.potential_initialization import PRESSURE_INITIALIZATION_DIR, initialize_compressible_velocity
+from .openfoam.potential_initialization import (
+    PRESSURE_INITIALIZATION_DIR,
+    initialize_compressible_velocity,
+    initialize_quiescent_velocity,
+)
 from .openfoam.runner import (
     CommandTimeoutError,
     DeterministicMeshError,
@@ -6642,6 +6646,12 @@ def _run_transient(
             urans_mesh=urans_mesh,
             urans_precalc_mesh=urans_precalc_mesh,
         )
+        if solver_params.quiescent_initial_velocity:
+            if resume is not None or not is_compressible(runner) or solver_params.flow_solver_family != "rhoPimpleFoam":
+                raise InfrastructureError(
+                    "Quiescent initial velocity is only valid for a fresh compressible rhoPimpleFoam case"
+                )
+            initialize_quiescent_velocity(tcase)
 
         initial_run_time = _fresh_transient_cycles(solver_params) * initial_period
         transient_start = _latest_time(tcase)
