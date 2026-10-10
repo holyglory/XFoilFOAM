@@ -1952,6 +1952,23 @@ describe("progressive durable stage transitions", () => {
     expect((await read()).progressive).toBeUndefined();
   }, 120_000);
 
+  it("counts the sealed NeuralFoil scope when its prediction exists and none when absent", async () => {
+    const fixture = await cfdEvidenceFixture(32.913);
+    const source = fixture.leases[0];
+    const read = async () => {
+      const page = await campaignAirfoilRows(db, fixture.campaignId);
+      const row = page.items.find((item) => item.airfoilId === originalId)!;
+      const [condition] = await db.execute(sql`SELECT id FROM sim_campaign_conditions
+        WHERE campaign_id=${fixture.campaignId} AND simulation_preset_revision_id=${source.revisionId}`);
+      return row.perCondition.find((cell) => cell.conditionId === condition.id)!.progressive;
+    };
+
+    expect(await read()).toMatchObject({ requested: 3, preliminary: 3 });
+    await db.execute(sql`DELETE FROM neuralfoil_predictions
+      WHERE target_id=${source.targetId} AND epoch_id=${source.epochId}`);
+    expect(await read()).toMatchObject({ requested: 3, preliminary: 0 });
+  }, 120_000);
+
   it("keeps progressive coverage visible without legacy progress rows", async () => {
     const fixture = await cfdEvidenceFixture(32.713, 2, [42.713]);
     const source = fixture.leases[0];

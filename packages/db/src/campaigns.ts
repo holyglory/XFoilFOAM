@@ -8276,14 +8276,13 @@ function campaignProgressiveCoverageCtes(
     ), coverage AS MATERIALIZED (
       SELECT target_cells.airfoil_id, target_cells.condition_id,
         target_cells.requested,
-        (SELECT count(*)::int FROM unnest(target_cells.angles) requested(alpha)
-          WHERE prediction.payload->'alpha' @> to_jsonb(requested.alpha)) AS preliminary,
+        CASE WHEN prediction.id IS NULL THEN 0 ELSE target_cells.requested END AS preliminary,
         coalesce(progressive_stats.cfd_evidence, 0)::int AS cfd_evidence,
         coalesce(progressive_stats.fast_complete, 0)::int AS fast_complete,
         coalesce(progressive_stats.precise_complete, 0)::int AS precise_complete
       FROM target_cells
       LEFT JOIN LATERAL (
-        SELECT prediction.payload FROM neuralfoil_predictions prediction
+        SELECT prediction.id FROM neuralfoil_predictions prediction
         WHERE prediction.target_id = target_cells.target_id
           AND prediction.epoch_id = target_cells.epoch_id
           AND prediction.catalog_metrics_v1 IS NOT NULL
