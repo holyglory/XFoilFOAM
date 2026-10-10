@@ -266,7 +266,8 @@ export function CampaignsHub({
     return [...items].sort(
       (a, b) =>
         Number(b.status === "attention") - Number(a.status === "attention") ||
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+        new Date(b.activityAt ?? b.updatedAt).getTime() -
+          new Date(a.activityAt ?? a.updatedAt).getTime(),
     );
   }, [items]);
 
@@ -836,7 +837,9 @@ export function CampaignsHub({
                     <span>+{reValues.length - 6} more</span>
                   )}
                   <span style={{ marginLeft: "auto", color: C.dimmest }}>
-                    updated {ago(item.updatedAt)}
+                    {item.activityAt
+                      ? `activity ${ago(item.activityAt)}`
+                      : `updated ${ago(item.updatedAt)}`}
                   </span>
                 </div>
               </div>

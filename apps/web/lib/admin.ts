@@ -1866,6 +1866,7 @@ export interface AdminCampaignListItem {
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  activityAt?: string | null;
   conditionCount: number;
   airfoilCount: number;
   excludedAirfoilCount: number;
