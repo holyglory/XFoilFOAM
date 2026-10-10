@@ -160,6 +160,7 @@ import {
   initializeProgressiveCfdWork,
   claimProgressiveCfdUnit,
   claimProgressiveCfdBatch,
+  progressiveCfdBatchMaximum,
   heartbeatProgressiveCfdUnit,
   type ProgressiveCfdLease,
 } from "../src/progressive-cfd";
@@ -10940,6 +10941,12 @@ describe("durable progressive CFD units", () => {
 });
 
 describe("subsonic through precise priority", () => {
+  it("keeps precise CFD batches short while preserving larger fast batches", () => {
+    expect(progressiveCfdBatchMaximum(1)).toBe(64);
+    expect(progressiveCfdBatchMaximum(2)).toBe(64);
+    expect(progressiveCfdBatchMaximum(3)).toBe(8);
+  });
+
   async function scope(policyBeforeBaselines = false, angles = [0]) {
     const campaignId = await campaign("active", [340.3 * 0.5, 340.3, 340.3 * 2], angles);
     await reconcileProgressiveGenerationRequest(db);

@@ -64,6 +64,12 @@ export interface ProgressiveCfdLease {
   localStepPolicyId?: string | null;
 }
 
+export const MAX_PRECISE_CFD_BATCH_UNITS = 8;
+
+export function progressiveCfdBatchMaximum(stage: number): number {
+  return stage === 3 ? MAX_PRECISE_CFD_BATCH_UNITS : 64;
+}
+
 export async function initializeProgressiveCfdWork(db: DB): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
@@ -484,13 +490,13 @@ export async function claimProgressiveCfdBatch(
     campaignLockMode?: "skip" | "wait";
   },
 ): Promise<ProgressiveCfdLease[]> {
-  const maximum = input.maximumUnits ?? 64;
-  if (!Number.isInteger(maximum) || maximum < 1 || maximum > 512)
-    throw new Error("Invalid bounded CFD batch size");
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const first = await claimProgressiveCfdUnit(connection, input);
     if (!first) return [];
+    const maximum = input.maximumUnits ?? progressiveCfdBatchMaximum(first.stage);
+    if (!Number.isInteger(maximum) || maximum < 1 || maximum > 512)
+      throw new Error("Invalid bounded CFD batch size");
     const batch = [first];
     while (batch.length < maximum) {
       const next = await claimProgressiveCfdUnit(connection, {
