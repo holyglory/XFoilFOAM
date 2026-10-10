@@ -29,12 +29,31 @@ try {
     },
   ]);
   const page = await context.newPage();
-  await page.goto(`https://airfoils.pro/admin?campaign=${campaignId}`, {
-    waitUntil: "domcontentloaded",
+  const campaignResponses = [];
+  page.on("response", (response) => {
+    if (response.url().includes("/api/admin/campaigns/"))
+      campaignResponses.push({
+        url: response.url(),
+        status: response.status(),
+      });
   });
+  await page.goto(
+    `https://airfoils.pro/admin?section=simulations&campaign=${campaignId}`,
+    {
+      waitUntil: "domcontentloaded",
+    },
+  );
+  assert(page.url().includes(`campaign=${campaignId}`));
+  console.log(JSON.stringify({ pageUrl: page.url(), campaignResponses }));
   await expect(page.getByTestId("campaign-detail")).toBeVisible({
     timeout: 30000,
   });
+  const conditionStrip = page.getByTestId("campaign-condition-strip");
+  await expect(conditionStrip).toContainText("accepted");
+  await expect(conditionStrip).toContainText(/curve [\d,]+\/[\d,]+/);
+  await expect(page.getByTestId("campaign-instrument-hero")).toContainText(
+    /of [1-9][0-9,]+/,
+  );
   await expect(page.getByTestId("matrix-scroll")).toBeVisible({
     timeout: 30000,
   });
