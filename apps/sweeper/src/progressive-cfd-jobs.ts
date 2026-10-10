@@ -177,10 +177,7 @@ export async function composeProgressiveCfdJob(
     request.solver = { ...request.solver, warm_start: true };
     request.resources = {
       ...request.resources,
-      case_concurrency: (() => {
-        const parsed = Number(process.env.PROGRESSIVE_CFD_CASE_CONCURRENCY);
-        return Math.max(1, Math.min(Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : 1, input.cpuSlots));
-      })(),
+      case_concurrency: 1,
       ...(mixedBudgets
         ? {
             case_solver_allocations: leases
