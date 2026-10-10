@@ -2013,15 +2013,33 @@ describe("progressive durable stage transitions", () => {
       solved: 0,
       remaining: 3,
     });
+    const campaignUpdatedAt = new Date("2020-01-01T00:00:00.000Z");
+    const jobUpdatedAt = new Date("2021-01-01T00:00:00.000Z");
+    const jobActivityAt = new Date("2022-01-01T00:00:00.000Z");
+    await db
+      .update(simCampaigns)
+      .set({ updatedAt: campaignUpdatedAt })
+      .where(eq(simCampaigns.id, fixture.campaignId));
+    await db
+      .update(simJobs)
+      .set({ updatedAt: jobUpdatedAt, polledAt: jobActivityAt })
+      .where(eq(simJobs.id, fixture.composed.jobId));
     const listed = await listCampaigns(db, {
       statuses: ["active"],
       limit: 100,
     });
-    expect(listed.items.find((item) => item.id === fixture.campaignId)?.totals).toMatchObject({
+    const listedCampaign = listed.items.find(
+      (item) => item.id === fixture.campaignId,
+    );
+    expect(listedCampaign?.totals).toMatchObject({
       requested: 6,
       solved: 0,
       remaining: 6,
     });
+    expect(listedCampaign?.activityAt).toBeDefined();
+    expect(new Date(listedCampaign!.activityAt!).toISOString()).toBe(
+      jobActivityAt.toISOString(),
+    );
     const page = await campaignAirfoilRows(db, fixture.campaignId);
     const row = page.items.find((item) => item.airfoilId === originalId)!;
     const [condition] = await db.execute(

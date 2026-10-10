@@ -7483,6 +7483,7 @@ export interface CampaignListItem {
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  activityAt?: string | null;
   conditionCount: number;
   airfoilCount: number;
   excludedAirfoilCount: number;
@@ -7519,6 +7520,7 @@ export async function listCampaigns(
     SELECT
       c.id, c.slug, c.name, c.status, c.priority, c.notes,
       c.closed_with_failed_count, c.closed_with_rejected_count, c."completedAt" AS completed_at, c."createdAt" AS created_at, c."updatedAt" AS updated_at,
+      job_activity.activity_at,
       lifecycle.action AS lifecycle_action,
       lifecycle.actor AS lifecycle_actor,
       lifecycle.reason AS lifecycle_reason,
@@ -7596,6 +7598,19 @@ export async function listCampaigns(
       WHERE condition.generation = progress_campaign.current_condition_generation
       GROUP BY progress.campaign_id
     ) pr ON pr.campaign_id = c.id
+    LEFT JOIN (
+      SELECT job.campaign_id,
+        max(GREATEST(
+          job."updatedAt",
+          COALESCE(job."polledAt", job."updatedAt"),
+          COALESCE(job."submittedAt", job."updatedAt"),
+          COALESCE(job."ingestedAt", job."updatedAt"),
+          COALESCE(job."finishedAt", job."updatedAt")
+        )) AS activity_at
+      FROM sim_jobs job
+      WHERE job.campaign_id IS NOT NULL
+      GROUP BY job.campaign_id
+    ) job_activity ON job_activity.campaign_id = c.id
     LEFT JOIN LATERAL (
       SELECT event.action, event.actor, event.reason, event."createdAt"
       FROM sim_campaign_lifecycle_events event
@@ -7662,6 +7677,7 @@ export async function listCampaigns(
       completedAt: isoOf(r.completed_at as Date | string | null),
       createdAt: isoOf(r.created_at as Date | string | null)!,
       updatedAt: isoOf(r.updated_at as Date | string | null)!,
+      activityAt: isoOf(r.activity_at as Date | string | null),
       automaticPrecalcOpen: Number(r.automatic_precalc_open ?? 0),
       latestLifecycleEvent:
         r.lifecycle_action == null || r.lifecycle_created_at == null
