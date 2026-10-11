@@ -307,10 +307,17 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       FROM sync_sweep_promises
       WHERE id = ${dispatch.promise_id}::uuid
     `);
+    const responsePayload = promise?.response_payload as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const remoteCancellation =
+      responsePayload?.remoteCancellation as Record<string, unknown> | undefined;
     const authoritativeLeaseLoss =
       promise?.status === "cancelled" &&
-      (promise.response_payload as Record<string, unknown> | null | undefined)
-        ?.authoritativeLeaseLoss === true;
+      (responsePayload?.authoritativeLeaseLoss === true ||
+        remoteCancellation?.disposition === "operator_release" ||
+        remoteCancellation?.disposition === "terminal_local_state");
     const envelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
       executionId,
       solverId: String(dispatch.solver_id),
