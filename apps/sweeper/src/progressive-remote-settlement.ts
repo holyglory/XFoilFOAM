@@ -302,6 +302,15 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       await connection.execute(sql`SELECT envelope, solver_id, promise_id, content_signature
       FROM progressive_remote_dispatches WHERE sim_job_id = ${executionId}::uuid`);
     if (!dispatch) throw new Error("Remote settlement has no exact dispatch");
+    const [promise] = await connection.execute(sql`
+      SELECT status, response_payload
+      FROM sync_sweep_promises
+      WHERE id = ${dispatch.promise_id}::uuid
+    `);
+    const authoritativeLeaseLoss =
+      promise?.status === "cancelled" &&
+      (promise.response_payload as Record<string, unknown> | null | undefined)
+        ?.authoritativeLeaseLoss === true;
     const envelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
       executionId,
       solverId: String(dispatch.solver_id),
@@ -436,13 +445,22 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
                 "accepted",
                 source.fidelity as string | null,
                 source.regime as "rans" | "urans" | null,
-              ),
+            ),
         )
-      )
+      ) {
+        if (authoritativeLeaseLoss) {
+          const inactive = await settleInactiveUndeliveredExecution(
+            connection,
+            executionId,
+            String(dispatch.promise_id),
+          );
+          if (inactive) return inactive;
+        }
         return {
           kind: "waiting" as const,
           reason: "accepted_point_publication",
         };
+      }
     }
     await acknowledgeProgressiveCfdExecutionStop(connection, {
       simJobId: executionId,

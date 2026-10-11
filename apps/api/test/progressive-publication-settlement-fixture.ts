@@ -154,4 +154,40 @@ export async function verifyProgressivePublicationPrecedence(
       }),
     ).rejects.toBe(rollback);
   }
+  const rollback = new Error("Rollback cancelled remote publication gap");
+  await expect(
+    db.transaction(async (raw) => {
+      const connection = raw as unknown as DB;
+      const selectedId = randomUUID();
+      await connection.insert(resultAttempts).values({
+        ...attempt,
+        id: selectedId,
+        simJobId: null,
+        engineJobId: `isolated-cancelled-publication-${selectedId}`,
+      });
+      await connection.insert(resultClassifications).values({
+        ...classification,
+        id: randomUUID(),
+        resultId: null,
+        resultAttemptId: selectedId,
+        state: "accepted",
+      });
+      await connection.execute(sql`UPDATE results
+        SET current_result_attempt_id = ${selectedId}::uuid
+        WHERE id = ${attempt.resultId}::uuid`);
+      await connection.execute(sql`UPDATE sync_sweep_promises
+        SET status = 'cancelled', response_payload = jsonb_build_object('authoritativeLeaseLoss', true)
+        WHERE id = (SELECT promise_id FROM progressive_remote_dispatches
+          WHERE sim_job_id = ${executionId}::uuid)`);
+      expect(
+        await settleProgressiveRemoteJob(connection, executionId),
+      ).toMatchObject({ kind: "settled" });
+      expect(
+        await connection.execute(
+          sql`SELECT current_result_attempt_id FROM results WHERE id = ${attempt.resultId}::uuid`,
+        ),
+      ).toEqual([{ current_result_attempt_id: selectedId }]);
+      throw rollback;
+    }),
+  ).rejects.toBe(rollback);
 }
