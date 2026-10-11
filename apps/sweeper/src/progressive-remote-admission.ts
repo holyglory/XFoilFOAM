@@ -234,7 +234,16 @@ export async function prepareProgressiveRemoteDispatch(
   }
 }
 
-export async function prepareProgressiveRemoteFleet(db: DB) {
+function remoteAdmissionsPerTick(
+  raw = process.env.SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK,
+): number {
+  if (raw == null || raw.trim() === "") return 16;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return 16;
+  return Math.min(parsed, 32);
+}
+
+async function prepareProgressiveRemoteFleetRun(db: DB) {
   const solvers = await db.execute(sql`
     SELECT solver.id, least(solver.cpu_capacity, CASE WHEN solver.cpu_budget > 0 THEN solver.cpu_budget ELSE solver.cpu_capacity END)::integer AS capacity
     FROM registered_remote_solvers solver JOIN sync_api_settings settings ON settings.id = 1
@@ -253,11 +262,16 @@ export async function prepareProgressiveRemoteFleet(db: DB) {
     waitingReasons: [] as Array<{ solverId: string; reason: string }>,
     errors: [] as Array<{ solverId: string; reason: string }>,
   };
+  const maxAdmissionsPerTick = remoteAdmissionsPerTick();
   for (const solver of solvers) {
     const solverId = String(solver.id);
     const capacity = Number(solver.capacity);
     if (!Number.isSafeInteger(capacity) || capacity < 1) continue;
-    for (let admitted = 0; admitted < capacity; admitted += 1) {
+    for (
+      let admitted = 0;
+      admitted < Math.min(capacity, maxAdmissionsPerTick);
+      admitted += 1
+    ) {
       try {
         const result = await prepareProgressiveRemoteDispatch(db, solverId);
         if (result.kind === "waiting" && result.deferredUnits !== undefined) {
@@ -281,4 +295,24 @@ export async function prepareProgressiveRemoteFleet(db: DB) {
     }
   }
   return receipt;
+}
+
+const pendingProgressiveRemoteFleets = new WeakMap<
+  DB,
+  ReturnType<typeof prepareProgressiveRemoteFleetRun>
+>();
+
+export function prepareProgressiveRemoteFleet(
+  db: DB,
+): ReturnType<typeof prepareProgressiveRemoteFleetRun> {
+  const existing = pendingProgressiveRemoteFleets.get(db);
+  if (existing) return existing;
+  const operation = prepareProgressiveRemoteFleetRun(db);
+  pendingProgressiveRemoteFleets.set(db, operation);
+  const clear = () => {
+    if (pendingProgressiveRemoteFleets.get(db) === operation)
+      pendingProgressiveRemoteFleets.delete(db);
+  };
+  void operation.then(clear, clear);
+  return operation;
 }
