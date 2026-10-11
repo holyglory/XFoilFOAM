@@ -1226,6 +1226,13 @@
       "when": 1792368000068,
       "tag": "0174_reassert_revision_scoped_result_claims",
       "breakpoints": true
+    },
+    {
+      "idx": 175,
+      "version": "7",
+      "when": 1792368000069,
+      "tag": "0175_progressive_cfd_evidence_reuse",
+      "breakpoints": true
     }
   ]
 }

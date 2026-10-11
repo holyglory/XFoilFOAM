@@ -7712,6 +7712,43 @@ export const progressiveCfdEvidence = pgTable(
   }),
 );
 
+export const progressiveCfdEvidenceReuses = pgTable(
+  "progressive_cfd_evidence_reuses",
+  {
+    successorUnitId: uuid("successor_unit_id")
+      .primaryKey()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    sourceAttemptToken: uuid("source_attempt_token")
+      .notNull()
+      .references(() => progressiveCfdAttempts.token),
+    sourceResultAttemptId: uuid("source_result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id),
+    sourceEvidenceSignature: text("source_evidence_signature").notNull(),
+    sourceGenerationId: uuid("source_generation_id")
+      .notNull()
+      .references(() => progressiveGenerations.id),
+    sourceExecutionRecipeId: text("source_execution_recipe_id")
+      .notNull()
+      .references(() => progressiveCfdExecutionRecipes.id),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    sourceAttemptIdx: index("progressive_cfd_evidence_reuses_source_attempt_idx").on(
+      table.sourceAttemptToken,
+    ),
+    sourceResultIdx: index("progressive_cfd_evidence_reuses_source_result_idx").on(
+      table.sourceResultAttemptId,
+    ),
+    signatureCheck: check(
+      "progressive_cfd_evidence_reuses_signature_check",
+      sql`${table.sourceEvidenceSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
 export const progressiveCfdStageDecisions = pgTable(
   "progressive_cfd_stage_decisions",
   {
