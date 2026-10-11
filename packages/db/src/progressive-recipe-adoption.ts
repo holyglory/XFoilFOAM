@@ -150,7 +150,7 @@ export async function reuseAcceptedProgressiveCfdEvidence(
       AND stopped.epoch_id=${epochId}::uuid
     LEFT JOIN progressive_cfd_evidence_reuses reuse
       ON reuse.successor_unit_id=successor.id
-    WHERE successor.generation_id=${generationId}::uuid
+    WHERE successor_work.generation_id=${generationId}::uuid
       AND successor_work.state='pending'
       AND successor.state='pending'
       AND successor_work.stage IN (2,3)
