@@ -147,7 +147,8 @@ export async function bindProgressiveRemoteDispatch(
       );
     const [promise] = await connection.execute(sql`
       SELECT promise.id, promise.aoa_count FROM sync_sweep_promises promise
-      WHERE promise.id = ${input.promiseId}::uuid AND promise.registered_solver_id = ${input.solverId}::uuid
+      WHERE promise.id = ${input.promiseId}::uuid
+        AND (promise.registered_solver_id IS NULL OR promise.registered_solver_id = ${input.solverId}::uuid)
         AND promise.airfoil_id = ${job.airfoil_id}::uuid
         AND promise.simulation_preset_revision_id = ${job.simulation_preset_revision_id}::uuid
         AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
@@ -157,6 +158,20 @@ export async function bindProgressiveRemoteDispatch(
       throw new Error(
         "Remote dispatch promise does not own the exact active execution scope",
       );
+    const [assignedPromise] = await connection.execute(sql`
+      UPDATE sync_sweep_promises SET registered_solver_id = ${input.solverId}::uuid
+      WHERE id = ${input.promiseId}::uuid AND registered_solver_id IS NULL
+      RETURNING id
+    `);
+    if (!assignedPromise) {
+      const [owner] = await connection.execute(sql`
+        SELECT registered_solver_id FROM sync_sweep_promises WHERE id = ${input.promiseId}::uuid
+      `);
+      if (owner?.registered_solver_id !== input.solverId)
+        throw new Error(
+          "Remote dispatch promise belongs to another execution owner",
+        );
+    }
     const promised = await connection.execute(sql`
       SELECT aoa_deg FROM sync_sweep_promise_points WHERE promise_id = ${input.promiseId}::uuid
         AND airfoil_id = ${job.airfoil_id}::uuid AND simulation_preset_revision_id = ${job.simulation_preset_revision_id}::uuid

@@ -204,7 +204,7 @@ export async function prepareProgressiveRemoteDispatch(
       await connection.execute(sql`
         INSERT INTO sync_sweep_promises (id, registered_solver_id, source_instance_id, source_instance_name, source_base_url,
           airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt", request_payload)
-        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${solver.instance_id}, ${solver.instance_name}, ${solver.public_endpoint},
+        VALUES (${promiseId}::uuid, NULL, ${solver.instance_id}, ${solver.instance_name}, ${solver.public_endpoint},
           ${job.airfoil_id}::uuid, ${job.simulation_preset_revision_id}::uuid, ${leases.length}, clock_timestamp() + interval '1 hour',
           ${JSON.stringify({ solverId, progressiveExecutionId: composed.jobId, executionContract: "progressive-cfd-v1" })}::jsonb)
       `);
