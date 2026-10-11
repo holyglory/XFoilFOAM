@@ -33,31 +33,79 @@ export async function authorizeProgressiveRemoteStart(
     const [settings] = await connection.execute(sql`
       SELECT enabled, remote_solver_enabled FROM sync_api_settings WHERE id = 1
     `);
-    const [solver] = await connection.execute(sql`
-      SELECT id, last_heartbeat_at > clock_timestamp() - interval '2 minutes' AS recent
-      FROM registered_remote_solvers WHERE id = ${input.solverId}::uuid AND revoked_at IS NULL FOR UPDATE
-    `);
     const [dispatch] = await connection.execute(sql`
-      SELECT envelope, promise_id, content_signature FROM progressive_remote_dispatches
-      WHERE sim_job_id = ${input.executionId}::uuid AND solver_id = ${input.solverId}::uuid FOR UPDATE
+      SELECT envelope, content_signature, promise_id FROM progressive_remote_dispatches
+      WHERE sim_job_id = ${input.executionId}::uuid AND solver_id = ${input.solverId}::uuid
     `);
-    if (!solver || !dispatch)
+    if (!dispatch)
       return {
         kind: "stop",
         reason: "The worker does not own this assignment",
       };
-    const envelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
+    const initialEnvelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
       ...input,
       promiseId: String(dispatch.promise_id),
     });
+    const [generation] = await connection.execute(sql`
+      SELECT generation.status, ${effectiveProgressiveStageSql("generation", sql`${initialEnvelope.scope.targetId}`)} AS stage, campaign.status AS campaign_status,
+        generation.plan_revision_id = campaign.current_plan_revision_id AS current_plan
+      FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      WHERE generation.id = ${initialEnvelope.scope.generationId}::uuid AND generation.epoch_id = ${initialEnvelope.scope.epochId}::uuid
+      FOR UPDATE OF campaign, generation
+    `);
+    if (
+      !generation ||
+      generation.status !== "active" ||
+      !generation.current_plan ||
+      Number(generation.stage) !== initialEnvelope.scope.stage ||
+      !["active", "attention", "paused"].includes(
+        String(generation.campaign_status),
+      )
+    )
+      return {
+        kind: "stop",
+        reason: "The campaign no longer owns this execution stage",
+      };
+    const [solver] = await connection.execute(sql`
+      SELECT id, last_heartbeat_at > clock_timestamp() - interval '2 minutes' AS recent
+      FROM registered_remote_solvers WHERE id = ${input.solverId}::uuid AND revoked_at IS NULL FOR UPDATE
+    `);
+    const [lockedDispatch] = await connection.execute(sql`
+      SELECT envelope, content_signature, promise_id FROM progressive_remote_dispatches
+      WHERE sim_job_id = ${input.executionId}::uuid AND solver_id = ${input.solverId}::uuid FOR UPDATE
+    `);
     const [job] = await connection.execute(sql`
       SELECT status, engine_job_id, request_payload, request_payload->'remoteStartAuthorization' AS authorization
       FROM sim_jobs WHERE id = ${input.executionId}::uuid FOR UPDATE
     `);
     const [promise] = await connection.execute(sql`
       SELECT status, "expiresAt" > clock_timestamp() AS active, "expiresAt" AS expires_at
-      FROM sync_sweep_promises WHERE id = ${envelope.promiseId}::uuid FOR UPDATE
+      FROM sync_sweep_promises WHERE id = ${initialEnvelope.promiseId}::uuid FOR UPDATE
     `);
+    if (
+      !solver ||
+      !lockedDispatch ||
+      String(dispatch.content_signature) !== input.contentSignature ||
+      String(lockedDispatch.content_signature) !==
+        String(dispatch.content_signature) ||
+      String(lockedDispatch.promise_id) !== String(dispatch.promise_id)
+    )
+      return {
+        kind: "stop",
+        reason: "The worker does not own this assignment",
+      };
+    const envelope = verifyProgressiveRemoteExecution(lockedDispatch.envelope, {
+      ...input,
+      promiseId: String(lockedDispatch.promise_id),
+    });
+    if (
+      canonicalAnalysisJson(envelope.scope) !==
+      canonicalAnalysisJson(initialEnvelope.scope)
+    )
+      return {
+        kind: "stop",
+        reason: "The registered request differs from the immutable assignment",
+      };
     const [stopped] = await connection.execute(sql`
       SELECT sim_job_id FROM progressive_cfd_execution_stops WHERE sim_job_id = ${input.executionId}::uuid
     `);
@@ -73,26 +121,6 @@ export async function authorizeProgressiveRemoteStart(
         kind: "stop",
         reason:
           "The assignment is stopped, expired or belongs to an obsolete calculation",
-      };
-    const [generation] = await connection.execute(sql`
-      SELECT generation.status, ${effectiveProgressiveStageSql("generation", sql`${envelope.scope.targetId}`)} AS stage, campaign.status AS campaign_status,
-        generation.plan_revision_id = campaign.current_plan_revision_id AS current_plan
-      FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
-      WHERE generation.id = ${envelope.scope.generationId}::uuid AND generation.epoch_id = ${envelope.scope.epochId}::uuid
-      FOR UPDATE OF campaign, generation
-    `);
-    if (
-      !generation ||
-      generation.status !== "active" ||
-      !generation.current_plan ||
-      Number(generation.stage) !== envelope.scope.stage ||
-      !["active", "attention", "paused"].includes(
-        String(generation.campaign_status),
-      )
-    )
-      return {
-        kind: "stop",
-        reason: "The campaign no longer owns this execution stage",
       };
     const units = await connection.execute(sql`
       SELECT attempt.token, unit.id, unit.aoa_deg, unit.lease_until,
