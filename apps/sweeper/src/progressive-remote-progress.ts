@@ -48,7 +48,8 @@ export async function applyProgressiveRemoteProgress(
     await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
       WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
     const [job] = await connection.execute(
-      sql`SELECT engine_job_id, request_payload FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`,
+      sql`SELECT engine_job_id, status, engine_state, completed_cases, request_payload
+      FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`,
     );
     if (
       !job ||
@@ -63,16 +64,30 @@ export async function applyProgressiveRemoteProgress(
       throw new Error(
         "Remote progress conflicts with immutable hub execution ownership",
       );
-    const [stored] =
+    let [stored] =
       await connection.execute(sql`SELECT report.sequence, report.content_signature, report.report,
         EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
-          WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence) AS progress_applied
+          WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence) AS progress_applied,
+        EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+          WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence) AS progress_indexed
       FROM progressive_remote_reports report
       WHERE report.sim_job_id = ${executionId}::uuid AND (NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
         OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
           WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence))
       ORDER BY report.sequence LIMIT 1`);
+    if (!stored && job.engine_job_id === null && job.status === "pending") {
+      [stored] =
+        await connection.execute(sql`SELECT report.sequence, report.content_signature, report.report,
+        TRUE AS progress_applied, TRUE AS progress_indexed
+      FROM progressive_remote_reports report
+      WHERE report.sim_job_id = ${executionId}::uuid
+        AND EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+          WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+        AND EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+          WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
+      ORDER BY report.sequence DESC LIMIT 1`);
+    }
     if (!stored) return { kind: "idle" as const };
     const validated = validateProgressiveRemoteReport(stored.report, envelope);
     if (validated.contentSignature !== stored.content_signature)
@@ -80,11 +95,17 @@ export async function applyProgressiveRemoteProgress(
         "Remote progress bytes differ from their immutable receipt",
       );
     const report = validated.report;
-    await indexProgressiveRemoteReport(connection, {
-      report,
-      reportContentSignature: validated.contentSignature,
-    });
-    if (stored.progress_applied)
+    if (!stored.progress_indexed)
+      await indexProgressiveRemoteReport(connection, {
+        report,
+        reportContentSignature: validated.contentSignature,
+      });
+    const jobReflectsReport =
+      job.engine_job_id === executionId &&
+      job.engine_state !== null &&
+      job.status !== "pending" &&
+      Number(job.completed_cases) >= report.status.completed_cases;
+    if (stored.progress_applied && jobReflectsReport)
       return { kind: "indexed" as const, sequence: report.sequence };
     await connection.execute(sql`UPDATE sim_jobs SET engine_job_id = ${executionId}, engine_state = ${report.status.state},
       completed_cases = ${report.status.completed_cases},
@@ -135,8 +156,9 @@ export async function applyProgressiveRemoteProgress(
       ]);
       settled = await settleProgressiveCfdExecution(connection, executionId);
     }
-    await connection.execute(sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id, sequence, content_signature)
-      VALUES (${executionId}::uuid, ${report.sequence}, ${validated.contentSignature})`);
+    if (!stored.progress_applied)
+      await connection.execute(sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id, sequence, content_signature)
+        VALUES (${executionId}::uuid, ${report.sequence}, ${validated.contentSignature})`);
     return {
       kind: "applied" as const,
       sequence: report.sequence,

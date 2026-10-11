@@ -11,6 +11,14 @@ const unappliedReports = sql`EXISTS (
     OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
       WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)))`;
 
+const indexedReports = sql`EXISTS (
+  SELECT 1 FROM progressive_remote_reports report
+  WHERE report.sim_job_id = job.id
+    AND EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+      WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+    AND EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+      WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence))`;
+
 function executionScope(jobIds?: string[]) {
   return jobIds
     ? jobIds.length
@@ -25,7 +33,10 @@ function executionScope(jobIds?: string[]) {
 export function progressiveReportJobsSql(jobIds?: string[]) {
   return sql`SELECT job.id AS sim_job_id, job.campaign_id
     FROM sim_jobs job
-    WHERE ${executionScope(jobIds)} AND ${unappliedReports}
+    WHERE ${executionScope(jobIds)} AND (
+      ${unappliedReports}
+      OR (job.engine_job_id IS NULL AND job.status = 'pending' AND ${indexedReports})
+    )
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
     ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }

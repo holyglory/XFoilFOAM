@@ -8,7 +8,10 @@ import {
   indexProgressiveRemoteReport,
   progressiveRemoteReportInventory,
 } from "../src/progressive-remote-inventory";
-import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
+import {
+  applyProgressiveRemoteProgress,
+  reconcileProgressiveRemoteProgress,
+} from "../../../apps/sweeper/src/progressive-remote-progress";
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
 import { verifyPublicationRecovery } from "./progressive-publication-recovery-fixture";
 import { verifyRetainedReports } from "./retained-report-fixture";
@@ -63,6 +66,51 @@ export async function verifyProgressiveRemoteReportInventory(
         FROM sim_jobs WHERE id = ${executionId}::uuid`)),
       ];
       const before = await readJob();
+      const staleProjectionRollback = new Error(
+        "Rollback stale remote progress projection fixture",
+      );
+      await expect(
+        connection.transaction(async (raw) => {
+          const scoped = raw as unknown as DB;
+          const reportsBefore =
+            await scoped.execute(sql`SELECT sequence, content_signature
+            FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+          const inventoriesBefore =
+            await scoped.execute(sql`SELECT sequence, report_content_signature, inventory_signature, source_count
+            FROM progressive_remote_report_inventories WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+          const receiptsBefore =
+            await scoped.execute(sql`SELECT sequence, content_signature
+            FROM progressive_remote_progress_receipts WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+          await scoped.execute(sql`UPDATE sim_jobs SET engine_job_id=NULL, engine_state=NULL,
+            status='pending', completed_cases=0 WHERE id=${executionId}::uuid`);
+          expect(
+            await reconcileProgressiveRemoteProgress(scoped, {
+              jobIds: [executionId],
+            }),
+          ).toMatchObject({ applied: 1, indexed: 0, errors: [] });
+          const [projected] =
+            await scoped.execute(sql`SELECT engine_job_id, engine_state, completed_cases
+            FROM sim_jobs WHERE id=${executionId}::uuid`);
+          expect(projected).toMatchObject({
+            engine_job_id: executionId,
+            engine_state: terminal.status.state,
+            completed_cases: terminal.status.completed_cases,
+          });
+          expect(
+            await scoped.execute(sql`SELECT sequence, content_signature
+              FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`),
+          ).toEqual(reportsBefore);
+          expect(
+            await scoped.execute(sql`SELECT sequence, report_content_signature, inventory_signature, source_count
+              FROM progressive_remote_report_inventories WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`),
+          ).toEqual(inventoriesBefore);
+          expect(
+            await scoped.execute(sql`SELECT sequence, content_signature
+              FROM progressive_remote_progress_receipts WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`),
+          ).toEqual(receiptsBefore);
+          throw staleProjectionRollback;
+        }),
+      ).rejects.toBe(staleProjectionRollback);
       await connection.execute(
         sql`DELETE FROM progressive_remote_report_inventories WHERE sim_job_id = ${executionId}::uuid AND sequence = 2`,
       );
