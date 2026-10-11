@@ -90,7 +90,7 @@ export async function bindProgressiveRemoteDispatch(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [state] = await connection.execute(sql`
-      SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1 FOR UPDATE
+      SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1
     `);
     const [role] = await connection.execute(
       sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
@@ -258,6 +258,18 @@ export async function bindProgressiveRemoteDispatch(
     );
     if (active > Number(solver.max_active_polar_promises))
       throw new Error("Remote execution exceeds the registered promise policy");
+    const [finalState] = await connection.execute(sql`
+      SELECT enabled, admission_fence_active, disk_admission_blocked
+      FROM sweeper_state WHERE id = 1
+    `);
+    if (
+      !finalState?.enabled ||
+      finalState.admission_fence_active ||
+      finalState.disk_admission_blocked
+    )
+      throw new Error(
+        "The hub stopped remote campaign dispatch during exact binding",
+      );
     await connection.execute(sql`
       INSERT INTO progressive_remote_dispatches (sim_job_id, promise_id, solver_id, cpu_slots, content_signature, envelope)
       VALUES (${input.simJobId}::uuid, ${input.promiseId}::uuid, ${input.solverId}::uuid, ${slots},
