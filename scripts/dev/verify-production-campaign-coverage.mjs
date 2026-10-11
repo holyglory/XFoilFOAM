@@ -29,22 +29,117 @@ try {
     },
   ]);
   const page = await context.newPage();
-  const campaignResponses = [];
-  page.on("response", (response) => {
-    if (response.url().includes("/api/admin/campaigns/"))
-      campaignResponses.push({
-        url: response.url(),
-        status: response.status(),
-      });
+  const listRequestStartedAt = new WeakMap();
+  const listResponsePromises = [];
+  const campaignListResponses = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.method() === "GET" && url.pathname === "/api/admin/campaigns") {
+      listRequestStartedAt.set(request, Date.now());
+    }
   });
+  page.on("response", (response) => {
+    const url = new URL(response.url());
+    if (
+      response.request().method() === "GET" &&
+      url.pathname === "/api/admin/campaigns"
+    ) {
+      const requestStartedAt = listRequestStartedAt.get(response.request()) ?? null;
+      const responseReceivedAt = Date.now();
+      listResponsePromises.push(
+        (async () => {
+          try {
+            const body = await response.json();
+            const item = body.items?.find((entry) => entry.id === campaignId);
+            campaignListResponses.push({
+              url: response.url(),
+              status: response.status(),
+              requestStartedAt,
+              responseReceivedAt,
+              item: item
+                ? {
+                    id: item.id,
+                    updatedAt: item.updatedAt,
+                    activityAt: item.activityAt ?? null,
+                  }
+                : null,
+            });
+          } catch (error) {
+            campaignListResponses.push({
+              url: response.url(),
+              status: response.status(),
+              requestStartedAt,
+              responseReceivedAt,
+              bodyError: String(error),
+            });
+          }
+        })(),
+      );
+    }
+  });
+  const listRouteStartedAt = Date.now();
   await page.goto(
-    `https://airfoils.pro/admin?section=simulations&campaign=${campaignId}`,
+    "https://airfoils.pro/admin",
     {
       waitUntil: "domcontentloaded",
     },
   );
+  assert(!new URL(page.url()).searchParams.has("campaign"));
+  await expect(page.getByTestId("campaigns-hub")).toBeVisible({
+    timeout: 30000,
+  });
+  const targetRow = page
+    .locator('[data-testid^="campaign-row-"]')
+    .filter({ hasText: "All seeded airfoils — standard air sweep (2026-07-12)" });
+  const cardWaitStartedAt = Date.now();
+  await expect(targetRow).toHaveCount(1, { timeout: 30000 });
+  await Promise.all(listResponsePromises);
+  const cardRenderedAt = Date.now();
+  const renderedTargetCardText = await targetRow.innerText();
+  const listResponse = campaignListResponses.find(
+    (entry) => entry.status === 200 && entry.item?.id === campaignId,
+  );
+  console.log(
+    JSON.stringify({
+      route: "/admin",
+      api: listResponse ?? null,
+      renderedTargetCardText,
+      loadingDurationMs: {
+        routeToCard: cardRenderedAt - listRouteStartedAt,
+        cardWait: cardRenderedAt - cardWaitStartedAt,
+        requestToCard:
+          listResponse?.requestStartedAt == null
+            ? null
+            : cardRenderedAt - listResponse.requestStartedAt,
+        requestToResponse:
+          listResponse?.requestStartedAt == null
+            ? null
+            : listResponse.responseReceivedAt - listResponse.requestStartedAt,
+        responseToCard:
+          listResponse == null
+            ? null
+            : cardRenderedAt - listResponse.responseReceivedAt,
+      },
+    }),
+  );
+  assert(listResponse, "Authenticated campaign list response was not captured");
+  assert.equal(listResponse.item?.id, campaignId);
+  assert(listResponse.item?.updatedAt, "Campaign list response omitted updatedAt");
+  assert(listResponse.item?.activityAt, "Campaign list response omitted activityAt");
+  assert.match(
+    renderedTargetCardText,
+    /last solver activity/,
+    "Target card did not render the activity timestamp",
+  );
+
+  const targetRowTestId = await targetRow.getAttribute("data-testid");
+  assert.match(targetRowTestId ?? "", /^campaign-row-/);
+  const targetSlug = targetRowTestId.slice("campaign-row-".length);
+  await targetRow.getByTestId(`campaign-open-${targetSlug}`).click();
+  await expect(page.getByTestId("campaign-detail")).toBeVisible({
+    timeout: 30000,
+  });
   assert(page.url().includes(`campaign=${campaignId}`));
-  console.log(JSON.stringify({ pageUrl: page.url(), campaignResponses }));
   await expect(page.getByTestId("campaign-detail")).toBeVisible({
     timeout: 30000,
   });
