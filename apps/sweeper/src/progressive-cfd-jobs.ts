@@ -260,12 +260,11 @@ export async function composeProgressiveCfdJob(
       jobId,
       leases,
     );
-    if (
-      canonicalAnalysisJson(
-        [...claimed].sort((left, right) => left - right),
-      ) !== canonicalAnalysisJson(angles)
-    )
-      throw new ProgressiveEvidenceCellOwned(leases);
+    const unclaimedLeases = leases.filter(
+      (lease) => !claimed.includes(lease.alpha),
+    );
+    if (unclaimedLeases.length)
+      throw new ProgressiveEvidenceCellOwned(unclaimedLeases);
     for (const lease of leases)
       await connection
         .update(progressiveCfdAttempts)

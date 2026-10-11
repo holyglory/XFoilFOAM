@@ -70,7 +70,10 @@ export function progressiveCfdBatchMaximum(stage: number): number {
   return stage === 3 ? MAX_PRECISE_CFD_BATCH_UNITS : 64;
 }
 
-export async function initializeProgressiveCfdWork(db: DB): Promise<number> {
+export async function initializeProgressiveCfdWork(
+  db: DB,
+  campaignId?: string,
+): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [epoch] = await connection.execute(
@@ -79,6 +82,7 @@ export async function initializeProgressiveCfdWork(db: DB): Promise<number> {
     if (!epoch) throw new Error("Calculation epoch is missing");
     const [campaign] = await connection.execute(sql`
       SELECT campaign.id FROM sim_campaigns campaign WHERE campaign.status IN ('active', 'attention', 'paused')
+        ${campaignId ? sql`AND campaign.id = ${campaignId}::uuid` : sql``}
         AND EXISTS (
           SELECT 1 FROM progressive_generations generation JOIN progressive_work work ON work.generation_id = generation.id
           WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
@@ -363,13 +367,14 @@ export async function claimProgressiveCfdUnit(
       let selectedId = await selectStage3Candidate(
         sql`target.mach < 1.0`,
         sql`generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
-          unit.ordinal, work.target_id`,
+          unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id`,
       );
       if (!selectedId && campaign.high_allowed)
         selectedId = await selectStage3Candidate(
           sql`target.mach >= 1.0 OR target.mach IS NULL`,
           sql`target.mach, generation.created_at, generation.id,
-            CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END, unit.ordinal, work.target_id`,
+            CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
+            unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id`,
         );
       if (!selectedId) return null;
       selected = sql`selected AS MATERIALIZED (
@@ -396,7 +401,7 @@ export async function claimProgressiveCfdUnit(
       ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
         generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
-        unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
+        unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       )`;
     }
     const [unit] = (await connection.execute(sql`
