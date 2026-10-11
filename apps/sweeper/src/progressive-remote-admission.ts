@@ -6,7 +6,6 @@ import {
   claimProgressiveCfdBatch,
   progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteActivePromiseCount,
-  progressiveSolverOwnerLock,
   PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
@@ -122,7 +121,6 @@ export async function prepareProgressiveRemoteDispatch(
         FROM registered_remote_solvers WHERE id = ${solverId}::uuid AND revoked_at IS NULL
           AND auth_token_hash IS NOT NULL AND credential_version > 0
           AND last_heartbeat_at > clock_timestamp() - interval '2 minutes'
-        ${progressiveSolverOwnerLock}
       `);
       if (!solver)
         throw new RemoteProgressiveAdmissionWait(

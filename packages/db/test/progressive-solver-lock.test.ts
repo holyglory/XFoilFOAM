@@ -85,3 +85,68 @@ it("permits archive foreign keys while preserving admission, revocation and capa
     await owner.db.execute(sql`DROP TABLE ${parent}`);
   }
 }, 30_000);
+
+it("leaves the solver heartbeat free during candidate scans and serializes final binding", async () => {
+  const suffix = randomUUID().replaceAll("-", "");
+  const parent = sql.identifier(`solver_heartbeat_${suffix}`);
+  const identity = randomUUID();
+  await owner.db.execute(
+    sql`CREATE TABLE ${parent}(id uuid PRIMARY KEY,budget integer NOT NULL)`,
+  );
+  await owner.db.execute(
+    sql`INSERT INTO ${parent}(id,budget) VALUES(${identity}::uuid,96)`,
+  );
+  let releaseScan: () => void = () => {};
+  let releaseFinal: () => void = () => {};
+  let scanReady: () => void = () => {};
+  let finalReady: () => void = () => {};
+  const scanReleased = new Promise<void>((resolve) => {
+    releaseScan = resolve;
+  });
+  const finalReleased = new Promise<void>((resolve) => {
+    releaseFinal = resolve;
+  });
+  const scanStarted = new Promise<void>((resolve) => {
+    scanReady = resolve;
+  });
+  const finalStarted = new Promise<void>((resolve) => {
+    finalReady = resolve;
+  });
+  const admission = owner.db.transaction(async (transaction) => {
+    await transaction.execute(
+      sql`SELECT id FROM ${parent} WHERE id=${identity}::uuid`,
+    );
+    scanReady();
+    await scanReleased;
+    await transaction.execute(
+      sql`SELECT id FROM ${parent} WHERE id=${identity}::uuid ${progressiveSolverOwnerLock}`,
+    );
+    finalReady();
+    await finalReleased;
+  });
+  try {
+    await scanStarted;
+    await observer.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`UPDATE ${parent} SET budget=95 WHERE id=${identity}::uuid`,
+      );
+    });
+    releaseScan();
+    await finalStarted;
+    await expect(
+      observer.db.transaction(async (transaction) => {
+        await transaction.execute(sql`SET LOCAL lock_timeout='100ms'`);
+        await transaction.execute(
+          sql`UPDATE ${parent} SET budget=94 WHERE id=${identity}::uuid`,
+        );
+      }),
+    ).rejects.toMatchObject({ code: "55P03" });
+    releaseFinal();
+    await admission;
+  } finally {
+    releaseScan();
+    releaseFinal();
+    await admission;
+    await owner.db.execute(sql`DROP TABLE ${parent}`);
+  }
+});
