@@ -199,7 +199,7 @@ export async function reuseAcceptedProgressiveCfdEvidence(
     const [completed] = await db.execute(sql`
       UPDATE progressive_cfd_units
       SET state='complete',lease_token=NULL,lease_owner=NULL,lease_until=NULL,
-        completed_at=clock_timestamp(),error=NULL
+        error=NULL
       WHERE id=${successorUnitId}::uuid AND state='pending'
       RETURNING id
     `);
