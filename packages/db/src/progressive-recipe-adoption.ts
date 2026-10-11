@@ -151,7 +151,9 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
         LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
         WHERE work.generation_id IN (${ids}) AND (attempt.outcome='running'
           OR job.status IN ('pending','submitted','running','ingesting')
-          OR (job.engine_job_id IS NOT NULL AND (stopped.engine_job_id IS DISTINCT FROM job.engine_job_id OR stopped.epoch_id IS DISTINCT FROM ${epoch.id}::uuid))))
+          OR (attempt.outcome = 'running' AND job.engine_job_id IS NOT NULL
+            AND (stopped.engine_job_id IS DISTINCT FROM job.engine_job_id
+              OR stopped.epoch_id IS DISTINCT FROM ${epoch.id}::uuid))))
         OR EXISTS(SELECT 1 FROM progressive_work WHERE generation_id IN (${ids}) AND state='leased') AS present
     `);
     if (busy?.present)
