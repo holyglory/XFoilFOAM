@@ -278,7 +278,7 @@ export async function claimProgressiveCfdUnit(
     )`;
     if (input.requireSweeperEnabled) {
       const [state] = await connection.execute(
-        sql`SELECT enabled FROM sweeper_state WHERE id = 1 FOR SHARE`,
+        sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
       );
       if (!state?.enabled) return null;
     }
@@ -430,12 +430,17 @@ export async function claimProgressiveCfdUnit(
     }>;
     if (!unit) return null;
     const token = randomUUID();
-    await connection.execute(sql`
+    const enabledGuard = input.requireSweeperEnabled
+      ? sql`AND EXISTS (SELECT 1 FROM sweeper_state WHERE id = 1 AND enabled)`
+      : sql``;
+    const [leased] = await connection.execute(sql`
       UPDATE progressive_cfd_units SET state = 'leased', lease_token = ${token}, lease_owner = ${input.owner},
         lease_until = clock_timestamp() + ${input.leaseSeconds} * interval '1 second', attempts = attempts + 1,
         error = CASE WHEN retry_after IS NOT NULL THEN NULL ELSE error END, retry_after = NULL
-      WHERE id = ${unit.id}
+      WHERE id = ${unit.id} ${enabledGuard}
+      RETURNING id
     `);
+    if (!leased) return null;
     await connection.execute(sql`
       INSERT INTO progressive_cfd_attempts (token, unit_id, owner, lease_until)
       SELECT ${token}, id, lease_owner, lease_until FROM progressive_cfd_units WHERE id = ${unit.id}
@@ -494,7 +499,8 @@ export async function claimProgressiveCfdBatch(
     const connection = transaction as unknown as DB;
     const first = await claimProgressiveCfdUnit(connection, input);
     if (!first) return [];
-    const maximum = input.maximumUnits ?? progressiveCfdBatchMaximum(first.stage);
+    const maximum =
+      input.maximumUnits ?? progressiveCfdBatchMaximum(first.stage);
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 512)
       throw new Error("Invalid bounded CFD batch size");
     const batch = [first];

@@ -737,6 +737,7 @@ export async function tick(
   db: DB,
   engine: EngineClient,
   reconcileOptions?: Parameters<typeof reconcile>[2],
+  retentionDb: DB = db,
 ): Promise<void> {
   const state = await getState(db);
   // Tick PROGRESS stamp (liveness/progress split, migration 0033): started
@@ -774,7 +775,7 @@ export async function tick(
       // The engine may need a short interval to release its execution lock.
       // This immediate pass reclaims every already-stopped directory; the
       // ordinary retention call at the next tick retries any 409 refusal.
-      await retentionTick(db, engine, { stripMaxPerTick: cancelled });
+      await retentionTick(retentionDb, engine, { stripMaxPerTick: cancelled });
       diskAdmission = await refreshDiskAdmission(db, engine);
     }
   }
@@ -893,11 +894,12 @@ export async function runLoop(
   db: DB,
   engine: EngineClient,
   signal: AbortSignal,
+  retentionDb: DB = db,
 ): Promise<void> {
   await resetOrphans(db);
   while (!signal.aborted) {
     try {
-      await tick(db, engine);
+      await tick(db, engine, undefined, retentionDb);
     } catch (e) {
       console.error("[sweeper] tick error:", e);
     }

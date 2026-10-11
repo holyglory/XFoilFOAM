@@ -97,3 +97,7 @@ export function makeContext() {
   );
   return { db, sql, engine };
 }
+
+export function makeIsolatedDatabase(max = 1) {
+  return createClient({ max });
+}

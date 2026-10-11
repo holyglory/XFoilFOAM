@@ -95,7 +95,7 @@ export async function composeProgressiveCfdJob(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     const [state] = await connection.execute(
-      sql`SELECT enabled FROM sweeper_state WHERE id = 1 FOR SHARE`,
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
     );
     if (!state?.enabled) throw new Error("CFD admission is paused");
     const bindings = [];
@@ -193,6 +193,10 @@ export async function composeProgressiveCfdJob(
     };
     if (input.solverBudgetVersion === 2)
       request.expected_solver_budget_version = 2;
+    const [admission] = await connection.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
+    );
+    if (!admission?.enabled) throw new Error("CFD admission is paused");
     const jobId = randomUUID();
     request.execution_id = jobId;
     const progressive = validateProgressiveExecutionScope(request, {

@@ -4,6 +4,7 @@ import {
   assertRemoteSolverHubUrlContract,
   assertRemoteSolverNodeEvidenceContract,
   makeContext,
+  makeIsolatedDatabase,
 } from "./config";
 import { startHeartbeatTimer } from "./heartbeat";
 import { runLoop } from "./loop";
@@ -21,6 +22,8 @@ import { runSweeperServices } from "./service-lifecycle";
 import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 
 const { db, sql, engine } = makeContext();
+const critical = makeIsolatedDatabase(2);
+const retention = makeIsolatedDatabase(1);
 try {
   const [syncSettings] = await db
     .select({
@@ -34,7 +37,7 @@ try {
     syncSettings?.remoteSolverEnabled ?? false,
   );
 } catch (error) {
-  await sql.end();
+  await Promise.all([sql.end(), critical.sql.end(), retention.sql.end()]);
   throw error;
 }
 const ac = new AbortController();
@@ -48,11 +51,16 @@ console.log(
 // tick work starved the in-tick heartbeat >90 s and the web read a live
 // process as "PROCESS NOT RUNNING"). Tick progress is stamped separately by
 // the loop (lastTickStartedAt/lastTickCompletedAt).
-const stopHeartbeat = startHeartbeatTimer(db);
-const stopRemoteFleetHeartbeat = startRemoteSolverFleetHeartbeatTimer(db);
+const stopHeartbeat = startHeartbeatTimer(critical.db);
+const stopRemoteFleetHeartbeat = startRemoteSolverFleetHeartbeatTimer(
+  critical.db,
+);
 try {
   await runSweeperServices(ac.signal, [
-    { name: "controller", run: (signal) => runLoop(db, engine, signal) },
+    {
+      name: "controller",
+      run: (signal) => runLoop(db, engine, signal, retention.db),
+    },
     {
       name: "progressive-hub-progress",
       run: (signal) => runProgressiveHubProgressService(db, sql, signal),
@@ -69,7 +77,7 @@ try {
     },
     {
       name: "retention",
-      run: (signal) => runRetentionService(db, engine, signal),
+      run: (signal) => runRetentionService(retention.db, engine, signal),
     },
     {
       name: "progressive-capabilities",
@@ -100,6 +108,6 @@ try {
 } finally {
   stopRemoteFleetHeartbeat();
   stopHeartbeat();
-  await sql.end();
+  await Promise.all([sql.end(), critical.sql.end(), retention.sql.end()]);
 }
 console.log("[sweeper] stopped");

@@ -81,6 +81,9 @@ it("authenticates exact worker ownership and requests only checkpoint stripping"
     { timeoutMs: 30000 },
   );
   const dialect = new PgDialect();
+  expect(dialect.sqlToQuery(state.execute.mock.calls[0][0]).sql).not.toContain(
+    "FOR UPDATE",
+  );
   const selected = dialect.sqlToQuery(state.execute.mock.calls[1][0]).sql;
   for (const guard of [
     "FOR UPDATE",

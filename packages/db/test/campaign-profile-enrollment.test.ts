@@ -10102,6 +10102,78 @@ describe("progressive CFD evidence accounting", () => {
 });
 
 describe("durable progressive CFD units", () => {
+  it("does not hold the sweeper state lock while candidate selection waits", async () => {
+    const generation = await fastCfdGeneration();
+    await initializeProgressiveCfdWork(db);
+    const [before] = await db.execute(
+      sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
+    );
+    await db.execute(sql`UPDATE sweeper_state SET enabled = true WHERE id = 1`);
+    const locker = createClient({ url: databaseUrl(), max: 1 });
+    let release!: () => void;
+    let locked!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const campaignLocked = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const holding = locker.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`SELECT id FROM sim_campaigns WHERE id = ${generation.campaignId}::uuid FOR UPDATE`,
+      );
+      locked();
+      await released;
+    });
+    const claiming = async () =>
+      claimProgressiveCfdUnit(db, {
+        owner: "lock-scope-regression",
+        leaseSeconds: 120,
+        requireSweeperEnabled: true,
+        campaignLockMode: "wait",
+        localTimeStepVersion: 1,
+      });
+    let pending: ReturnType<typeof claiming> | undefined;
+    try {
+      await campaignLocked;
+      pending = claiming();
+      await expect
+        .poll(
+          async () => {
+            const [row] = await db.execute(sql`
+              SELECT EXISTS (
+                SELECT 1 FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND wait_event_type = 'Lock'
+                  AND query LIKE '%FROM sim_campaigns%'
+                  AND query LIKE '%FOR UPDATE%'
+              ) AS waiting
+            `);
+            return row.waiting;
+          },
+          { timeout: 5_000, interval: 25 },
+        )
+        .toBe(true);
+      await db.transaction(async (transaction) => {
+        await transaction.execute(sql`SET LOCAL lock_timeout = '300ms'`);
+        await transaction.execute(
+          sql`UPDATE sweeper_state SET "heartbeatAt" = clock_timestamp() WHERE id = 1`,
+        );
+      });
+      release();
+      await holding;
+      await pending;
+    } finally {
+      release();
+      await holding.catch(() => undefined);
+      await pending?.catch(() => undefined);
+      await locker.sql.end();
+      await db.execute(
+        sql`UPDATE sweeper_state SET enabled = ${before?.enabled ?? false} WHERE id = 1`,
+      );
+    }
+  }, 30_000);
+
   it("keeps prior-generation stop safety scoped to the exact target and execution", async () => {
     const fixture = await cfdEvidenceFixture();
     const originalLease = fixture.leases[0];

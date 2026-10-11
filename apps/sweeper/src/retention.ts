@@ -30,6 +30,7 @@ export const DEFAULT_SYNC_IMPORT_BLOB_MIN_AGE_MS = 48 * 60 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_GC_MAX_PER_SWEEP = 20_000;
 export const DEFAULT_SYNC_IMPORT_GC_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_GC_DELETE_BATCH_SIZE = 250;
+export const DEFAULT_RETENTION_QUERY_TIMEOUT_MS = 10_000;
 
 const LIVE_URANS_REQUEST_STATES = [
   "pending",
@@ -155,8 +156,58 @@ export async function stripTerminalJobs(
   const requireDurableMediaBinding =
     options.requireDurableMediaBinding ??
     Boolean(process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim());
-  const candidates = (await db.execute(sql`
-    WITH candidates AS (
+  const queryTimeoutMs = Math.max(
+    1_000,
+    Math.floor(
+      envNumber(
+        "SWEEPER_RETENTION_QUERY_TIMEOUT_MS",
+        DEFAULT_RETENTION_QUERY_TIMEOUT_MS,
+      ),
+    ),
+  );
+  const candidateScanLimit = Math.min(
+    1_024,
+    Math.max(32, config.stripMaxPerTick * 16),
+  );
+  const candidates = (await db.transaction(async (rawTransaction) => {
+    const transaction = rawTransaction as unknown as DB;
+    await transaction.execute(
+      sql`SET LOCAL statement_timeout = ${sql.raw(String(queryTimeoutMs))}`,
+    );
+    return transaction.execute(sql`
+    WITH candidate_jobs AS MATERIALIZED (
+      SELECT j.id
+      FROM sim_jobs j
+      WHERE j.status IN ('done', 'failed', 'cancelled')
+        AND ${solverDirectLifecycleSql("j")}
+        AND j.engine_job_id IS NOT NULL
+        AND (
+          j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
+          OR (
+            (
+              NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
+              OR EXISTS (
+                SELECT 1
+                FROM sync_remote_result_deliveries remote_delivery
+                WHERE remote_delivery.sim_job_id = j.id
+                  AND remote_delivery.result_id IS NULL
+                  AND remote_delivery.state IN ('delivered', 'superseded')
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sync_sweep_promises closed_promise
+                WHERE closed_promise.id::text =
+                    COALESCE(j.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
+                  AND closed_promise.status = 'cancelled'
+              )
+            )
+            AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
+              ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
+          )
+        )
+      ORDER BY COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt"), j.id
+      LIMIT ${candidateScanLimit}
+    ), candidates AS (
       SELECT
         j.id,
         j.engine_job_id,
@@ -341,6 +392,7 @@ export async function stripTerminalJobs(
           )
         ) AS delete_job_dir
       FROM sim_jobs j
+      JOIN candidate_jobs selected ON selected.id = j.id
       WHERE j.status IN ('done', 'failed', 'cancelled')
         AND ${solverDirectLifecycleSql("j")}
         AND j.engine_job_id IS NOT NULL
@@ -434,7 +486,8 @@ export async function stripTerminalJobs(
       )
     ORDER BY terminal_at ASC, id ASC
     LIMIT ${config.stripMaxPerTick}
-  `)) as unknown as StripCandidate[];
+  `);
+  })) as unknown as StripCandidate[];
 
   let stripped = 0;
   for (const candidate of candidates) {

@@ -21,7 +21,7 @@ export async function reclaimProgressiveRestartState(
     const connection = transaction as unknown as DB;
     const [state] =
       await connection.execute(sql`SELECT disk_admission_blocked,set_config('statement_timeout','10000',true) FROM sweeper_state
-      WHERE id=1 FOR UPDATE`);
+      WHERE id=1`);
     if (state?.disk_admission_blocked !== true)
       return { stripped: 0, bytesFreed: 0 };
     const candidates = await connection.execute(sql`

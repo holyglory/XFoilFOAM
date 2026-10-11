@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { DB } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
+import type { SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import * as retention from "../src/retention";
 import { runRetentionService } from "../src/retention-service";
@@ -149,4 +150,28 @@ it("uses the existing cleanup batch and stops when pressure reclamation is exhau
     owner.abort();
     await running;
   }
+});
+
+it("bounds the terminal cleanup query before evaluating evidence guards", async () => {
+  const dialect = new PgDialect();
+  const statements: string[] = [];
+  const execute = vi.fn(async (query: Parameters<DB["execute"]>[0]) => {
+    statements.push(dialect.sqlToQuery(query as SQL<unknown>).sql);
+    return [];
+  });
+  const db = {
+    execute,
+    transaction: async (run: (transaction: DB) => Promise<unknown>) =>
+      run({ execute } as unknown as DB),
+  } as unknown as DB;
+
+  await retention.stripTerminalJobs(db, {} as EngineClient, {
+    stripMaxPerTick: 1,
+    now: new Date(0),
+  });
+
+  expect(statements[0]).toContain("SET LOCAL statement_timeout");
+  expect(statements[1]).toContain("candidate_jobs AS MATERIALIZED");
+  expect(statements[1]).toContain("LIMIT 32");
+  expect(statements[1]).toContain("JOIN candidate_jobs selected");
 });

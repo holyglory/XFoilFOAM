@@ -98,7 +98,7 @@ export async function prepareProgressiveRemoteDispatch(
           "No current campaign calculation epoch",
         );
       const [state] = await connection.execute(sql`
-        SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1 FOR UPDATE
+        SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1
       `);
       const [settings] = await connection.execute(sql`
         SELECT enabled, remote_solver_enabled FROM sync_api_settings WHERE id = 1

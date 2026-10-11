@@ -56,7 +56,7 @@ export async function admitProgressiveCfdBatch(
       if (!epoch) throw new Error("Progressive calculation epoch is missing");
       const [state] =
         await connection.execute(sql`SELECT enabled, cpu_slots, max_concurrent_jobs,
-        admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1 FOR UPDATE`);
+        admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1`);
       if (
         !state?.enabled ||
         state.admission_fence_active ||

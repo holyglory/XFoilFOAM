@@ -1143,6 +1143,63 @@ describe("sweeper: gap → claim → ingest", () => {
       );
   }, 60000);
 
+  it("claims a revision-scoped cell beside legacy unpinned evidence", async () => {
+    const aoaDeg = 90.777;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [testBcId()],
+        simulationPresetRevisionId: testPresetRevisionId,
+        referenceChordM: 1,
+        wave: 1,
+        status: "pending",
+      })
+      .returning({ id: simJobs.id });
+    cleanupJobIds.add(job.id);
+    const [legacy] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId: testBcId(),
+        simulationPresetRevisionId: null,
+        aoaDeg,
+        status: "done",
+        source: "solved",
+        converged: true,
+      })
+      .returning({ id: results.id });
+    cleanupResultIds.add(legacy.id);
+
+    expect(
+      await claimAoas(
+        db,
+        airfoilId,
+        testBcId(),
+        testPresetRevisionId,
+        [aoaDeg],
+        job.id,
+      ),
+    ).toEqual([aoaDeg]);
+    const rows = await db
+      .select({
+        id: results.id,
+        revisionId: results.simulationPresetRevisionId,
+        status: results.status,
+        source: results.source,
+      })
+      .from(results)
+      .where(and(eq(results.airfoilId, airfoilId), eq(results.aoaDeg, aoaDeg)));
+    const claimed = rows.find((row) => row.revisionId === testPresetRevisionId);
+    expect(claimed).toMatchObject({ status: "queued", source: "queued" });
+    cleanupResultIds.add(claimed!.id);
+    expect(rows.find((row) => row.id === legacy.id)).toMatchObject({
+      revisionId: null,
+      status: "done",
+      source: "solved",
+    });
+  }, 60000);
+
   it("refuses ledger-owned cells at the continuous and campaign claim boundaries", async () => {
     const batch = await testBatch(500);
     expect(batch).not.toBeNull();
