@@ -7813,6 +7813,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
     const claimResult = await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       let owner = registeredSolver;
+      if (!first) return { promise: null };
+      const aoas = await lockAndFilterRemoteClaimAoas(
+        tx,
+        first.airfoil_id,
+        first.revision_id,
+        candidateAoas,
+      );
+      if (!aoas.length) return { promise: null };
       if (body.solverId) {
         const [locked] = await tx
           .select()
@@ -7873,15 +7881,6 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           };
         }
       }
-
-      if (!first) return { promise: null };
-      const aoas = await lockAndFilterRemoteClaimAoas(
-        tx,
-        first.airfoil_id,
-        first.revision_id,
-        candidateAoas,
-      );
-      if (!aoas.length) return { promise: null };
 
       const [promise] = await tx
         .insert(syncSweepPromises)
