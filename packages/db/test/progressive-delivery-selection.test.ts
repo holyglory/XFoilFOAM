@@ -244,7 +244,15 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
               OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
                 WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence))
         ) oldest ON true
-        WHERE fixture.variant IN ('unapplied','unindexed') OR fixture.variant LIKE 'report-%'
+        WHERE (fixture.variant IN ('unapplied','unindexed') OR fixture.variant LIKE 'report-%')
+          AND (oldest.received_at IS NOT NULL OR (
+            job.engine_job_id IS NULL AND job.status = 'pending'
+            AND EXISTS (SELECT 1 FROM progressive_remote_reports indexed_report
+              WHERE indexed_report.sim_job_id=job.id
+                AND EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+                  WHERE receipt.sim_job_id=indexed_report.sim_job_id AND receipt.sequence=indexed_report.sequence)
+                AND EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+                  WHERE inventory.sim_job_id=indexed_report.sim_job_id AND inventory.sequence=indexed_report.sequence))))
         ORDER BY oldest.received_at NULLS LAST, coalesce(job."polledAt",job."updatedAt"),job.id`);
     const expectedSettlements = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
@@ -313,6 +321,22 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
           selected.map((row) => sql`${row.sim_job_id}::uuid`),
           sql`,`,
         )})`);
+    for (const reportJob of reports) {
+      await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id,sequence)
+        SELECT report.sim_job_id,report.sequence
+        FROM progressive_remote_reports report
+        WHERE report.sim_job_id=${reportJob.sim_job_id}::uuid
+          AND report.sequence <= 4
+          AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+            WHERE receipt.sim_job_id=report.sim_job_id AND receipt.sequence=report.sequence)`);
+      await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories(sim_job_id,sequence)
+        SELECT report.sim_job_id,report.sequence
+        FROM progressive_remote_reports report
+        WHERE report.sim_job_id=${reportJob.sim_job_id}::uuid
+          AND report.sequence <= 4
+          AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+            WHERE inventory.sim_job_id=report.sim_job_id AND inventory.sequence=report.sequence)`);
+    }
     const second = await transaction.execute(progressiveSettlementJobsSql());
     expect(second).toHaveLength(128);
     expect(second).toEqual((await expectedSettlements()).slice(0, 128));
@@ -325,8 +349,8 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     );
     expect(visited.size).toBe(162);
     const nextReports = await transaction.execute(progressiveReportJobsSql());
-    expect(nextReports).toHaveLength(32);
-    expect(nextReports).toEqual((await expectedReports()).slice(0, 32));
+    expect(nextReports).toHaveLength(allReports.length - reports.length);
+    expect(nextReports).toEqual(await expectedReports());
     const visitedReports = new Set(
       [...reports, ...nextReports].map((row) => row.sim_job_id),
     );
