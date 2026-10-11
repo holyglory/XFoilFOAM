@@ -19,6 +19,18 @@ const indexedReports = sql`EXISTS (
     AND EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
       WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence))`;
 
+const oldestUnappliedReport = sql`(
+  SELECT min(report.received_at)
+  FROM progressive_remote_reports report
+  WHERE report.sim_job_id = job.id
+    AND (
+      NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+      OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+        WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
+    )
+)`;
+
 function executionScope(jobIds?: string[]) {
   return jobIds
     ? jobIds.length
@@ -38,7 +50,8 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
       OR (job.engine_job_id IS NULL AND job.status = 'pending' AND ${indexedReports})
     )
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-    ORDER BY coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
+    ORDER BY ${oldestUnappliedReport} NULLS LAST,
+      coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }
 
 export function progressiveSettlementJobsSql(jobIds?: string[]) {

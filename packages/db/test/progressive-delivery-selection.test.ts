@@ -88,6 +88,63 @@ it("recognizes exact completed canonical cleanup without deleting again or doubl
   });
 });
 
+it("keeps the oldest multi-report backlog selected after a bounded pass", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT md5('old-backlog')::uuid AS id,md5('campaign')::uuid AS campaign_id,
+        NULL::text AS engine_job_id,'running'::text AS status,
+        timestamptz '2026-10-01T02:00:00Z' AS "updatedAt",
+        timestamptz '2026-10-01T01:00:00Z' AS "polledAt"
+      UNION ALL
+      SELECT md5('new-arrival-'||ordinal)::uuid,md5('campaign')::uuid,
+        NULL::text,'running'::text,
+        timestamptz '2026-10-01T02:00:00Z',timestamptz '2026-10-01T01:00:00Z'
+      FROM generate_series(1,32) ordinal`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id AS sim_job_id FROM sim_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT md5('old-backlog')::uuid AS sim_job_id,sequence,
+        timestamptz '2026-10-01T00:00:00Z' + sequence * interval '1 second' AS received_at
+      FROM generate_series(1,6) sequence
+      UNION ALL
+      SELECT md5('new-arrival-'||ordinal)::uuid,1,
+        timestamptz '2026-10-02T00:00:00Z' + ordinal * interval '1 second'
+      FROM generate_series(1,32) ordinal`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
+      sim_job_id uuid,sequence bigint
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
+      sim_job_id uuid,sequence bigint
+    ) ON COMMIT DROP`);
+    const [oldJob] = await transaction.execute(
+      sql`SELECT id FROM sim_jobs WHERE id=md5('old-backlog')::uuid`,
+    );
+    const first = await transaction.execute(progressiveReportJobsSql());
+    expect(first).toHaveLength(32);
+    expect(first[0].sim_job_id).toBe(oldJob.id);
+
+    await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
+      SELECT md5('old-backlog')::uuid,sequence FROM generate_series(1,4) sequence`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
+      SELECT md5('old-backlog')::uuid,sequence FROM generate_series(1,4) sequence`);
+    await transaction.execute(sql`UPDATE sim_jobs SET "polledAt"=clock_timestamp()
+      WHERE id=md5('old-backlog')::uuid`);
+
+    const second = await transaction.execute(progressiveReportJobsSql());
+    expect(second).toHaveLength(32);
+    expect(second[0].sim_job_id).toBe(oldJob.id);
+    expect(
+      await transaction.execute(sql`SELECT min(received_at) AS received_at
+        FROM progressive_remote_reports report
+        WHERE report.sim_job_id=md5('old-backlog')::uuid
+          AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+            WHERE receipt.sim_job_id=report.sim_job_id AND receipt.sequence=report.sequence)
+          AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+            WHERE inventory.sim_job_id=report.sim_job_id AND inventory.sequence=report.sequence)`),
+    ).toEqual([{ received_at: "2026-10-01 00:00:05+00" }]);
+  });
+});
+
 it("settles fulfilled and active jobs fairly while expired work keeps arriving", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_settlement_jobs ON COMMIT DROP AS
@@ -100,6 +157,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       SELECT md5('campaign')::uuid AS id,'active'::text AS status`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT id,md5('campaign')::uuid AS campaign_id,
+        NULL::text AS engine_job_id,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running'
           WHEN variant IN ('stopped-terminal','done-active','done-closed','done-closed-pointer-gap') THEN 'done' ELSE 'ingesting' END AS status,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running' ELSE 'completed' END AS engine_state,
@@ -127,7 +185,11 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
         WHEN variant='done-closed-pointer-gap' THEN 'expired' ELSE 'active' END AS status
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
-      SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs`);
+      SELECT id AS sim_job_id,1 AS sequence,
+        CASE WHEN variant='report-unapplied-1' THEN timestamptz '2026-01-01T00:00:00Z'
+          WHEN variant LIKE 'report-unapplied-%' THEN timestamptz '2026-01-02T00:00:00Z'
+          ELSE timestamptz '2026-01-03T00:00:00Z' END AS received_at
+      FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts ON COMMIT DROP AS
       SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs
       WHERE variant NOT IN ('unapplied','not-dispatched') AND variant NOT LIKE 'report-unapplied-%'`);
@@ -173,8 +235,17 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const expectedReports = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
         FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
+        LEFT JOIN LATERAL (
+          SELECT min(report.received_at) AS received_at
+          FROM progressive_remote_reports report
+          WHERE report.sim_job_id = job.id
+            AND (NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+              WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+              OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+                WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence))
+        ) oldest ON true
         WHERE fixture.variant IN ('unapplied','unindexed') OR fixture.variant LIKE 'report-%'
-        ORDER BY coalesce(job."polledAt",job."updatedAt"),job.id`);
+        ORDER BY oldest.received_at NULLS LAST, coalesce(job."polledAt",job."updatedAt"),job.id`);
     const expectedSettlements = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
         FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
