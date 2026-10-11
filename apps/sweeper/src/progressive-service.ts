@@ -12,6 +12,7 @@ import {
 import type { EngineClient } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
+import { reconcileAcceptedProgressiveCfdEvidence } from "@aerodb/db/progressive-cfd-reuse";
 import { runProgressiveBaselineBatch } from "./progressive-baselines";
 import {
   PROGRESSIVE_FIT_POLICY_ID,
@@ -91,6 +92,11 @@ export async function runProgressiveBaselineService(
         if (cfdUnits) {
           pending = true;
           report({ component: "progressive-cfd-scope", units: cfdUnits });
+        }
+        const reusedCfd = await reconcileAcceptedProgressiveCfdEvidence(db);
+        if (reusedCfd) {
+          pending = true;
+          report({ component: "progressive-cfd-reuse", reused: reusedCfd });
         }
         const recovery = await recoverUnboundProgressiveCfdLeases(db);
         if (recovery.retried || recovery.gaps) {
