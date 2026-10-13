@@ -1420,6 +1420,7 @@ export const results = pgTable(
     ),
     statusIdx: index("results_status_idx").on(t.status),
     simJobIdx: index("results_sim_job_idx").on(t.simJobId),
+    engineJobIdx: index("results_engine_job_idx").on(t.engineJobId),
     catalogMetricsIdx: index("results_catalog_metrics_idx").on(
       t.airfoilId,
       t.simulationPresetRevisionId,
