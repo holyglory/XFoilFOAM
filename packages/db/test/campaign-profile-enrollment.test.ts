@@ -164,7 +164,10 @@ import {
   heartbeatProgressiveCfdUnit,
   type ProgressiveCfdLease,
 } from "../src/progressive-cfd";
-import { admitProgressiveCfdBudgetExtension } from "../src/progressive-cfd-budget-extension";
+import {
+  admitProgressiveCfdBudgetExtension,
+  recoverProgressiveFastBudgetExtensions,
+} from "../src/progressive-cfd-budget-extension";
 
 import { createClient, type DB } from "../src/client";
 import { databaseUrl } from "../src/env";
@@ -4985,6 +4988,105 @@ describe("progressive execution stop and settlement", () => {
       ),
     ).toEqual([
       { state: "claimed", claim_attempt_token: claimed!.token },
+    ]);
+  });
+
+  it("reopens only settled FAST budget gaps with matching immutable URANS evidence", async () => {
+    const fixture = await fitFixture(2, false, [-1, 0, 1]);
+    const eligible = fixture.leases[0];
+    const noninformative = fixture.leases[1];
+    const eligibleResult = await fixture.save(900, "urans", eligible.alpha, {
+      fidelity: "urans_precalc",
+      force_history: { t: [0, 1], cl: [0, 0], cd: [0.02, 0.02], cm: [0, 0] },
+    });
+    const noninformativeResult = await fixture.save(
+      900,
+      "urans",
+      noninformative.alpha,
+      {
+        fidelity: "urans_precalc",
+        force_history: { t: [0, 1], cl: [0, 0], cd: [0.02, 0.02], cm: [0, 0] },
+      },
+    );
+    for (const [resultAttemptId, lease] of [
+      [eligibleResult, eligible],
+      [noninformativeResult, noninformative],
+    ] as const) {
+      await db
+        .update(resultAttempts)
+        .set({
+          engineJobId: fixture.engineJobId,
+          engineCaseSlug: `c0p1_u30/a${lease.alpha}`,
+          error: "URANS integration stopped by the wall-clock budget guard",
+          qualityWarnings: ["stopped by the wall-clock budget guard"],
+        })
+        .where(eq(resultAttempts.id, resultAttemptId));
+    }
+    await fixture.record([eligibleResult, noninformativeResult]);
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', active_seconds = 900, finished_at = clock_timestamp(),
+        error = 'active compute budget exhausted'
+      WHERE token IN (${eligible.token}::uuid, ${noninformative.token}::uuid)
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET attempts = 2, active_seconds = 900, lease_token = NULL,
+        lease_owner = NULL, lease_until = NULL, state = CASE
+          WHEN id = ${eligible.id}::uuid THEN 'gap'
+          WHEN id = ${noninformative.id}::uuid THEN 'gap'
+        END,
+        error = CASE
+          WHEN id = ${eligible.id}::uuid THEN 'active compute budget exhausted'
+          WHEN id = ${noninformative.id}::uuid THEN 'fast pass has no informative accepted evidence'
+        END
+      WHERE id IN (${eligible.id}::uuid, ${noninformative.id}::uuid)
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
+      WHERE id = ${eligible.workId}::uuid
+    `);
+
+    const recovered = await recoverProgressiveFastBudgetExtensions(db, {
+      campaignId: fixture.campaignId,
+      expectedCount: 1,
+    });
+    expect(recovered).toMatchObject({
+      candidateCount: 1,
+      reopenedUnitIds: [eligible.id],
+      sourceAttemptTokens: [eligible.token],
+      sourceResultAttemptIds: [eligibleResult],
+    });
+    expect(
+      await db.execute(sql`
+        SELECT id, state, error FROM progressive_cfd_units
+        WHERE id IN (${eligible.id}::uuid, ${noninformative.id}::uuid)
+        ORDER BY id
+      `),
+    ).toEqual([
+      {
+        id: eligible.id,
+        state: "pending",
+        error: "bounded URANS budget continuation admitted",
+      },
+      {
+        id: noninformative.id,
+        state: "gap",
+        error: "fast pass has no informative accepted evidence",
+      },
+    ].sort((left, right) => left.id.localeCompare(right.id)));
+    expect(
+      await db.execute(sql`
+        SELECT unit_id, source_attempt_token, source_result_attempt_id, state
+        FROM progressive_cfd_budget_extensions
+      `),
+    ).toEqual([
+      {
+        unit_id: eligible.id,
+        source_attempt_token: eligible.token,
+        source_result_attempt_id: eligibleResult,
+        state: "pending",
+      },
     ]);
   });
 

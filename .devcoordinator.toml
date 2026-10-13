@@ -59,6 +59,18 @@ tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "admits one exact saved-case FAST continuation"]
 
+[[test.cfd-source-geometry.check]]
+name = "progressive-fast-budget-recovery"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reopens only settled FAST budget gaps"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-fast-budget-types"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
 [test.mach3-cartesian-diagnosis]
 timeout_seconds = 300
 
