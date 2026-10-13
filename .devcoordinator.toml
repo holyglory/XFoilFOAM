@@ -2171,6 +2171,12 @@ requires = ["types", "execution-contract"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-execution.test.ts", "test/progressive-remote-report.test.ts"]
 
 [[test.progressive.check]]
+name = "remote-storage-role-contract"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-storage-contract.test.ts"]
+
+[[test.progressive.check]]
 name = "point-evidence-contract"
 tier = "development"
 requires = ["types"]

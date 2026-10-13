@@ -4,11 +4,13 @@ import {
   assertRemoteSolverHubUrlContract,
   assertRemoteSolverNodeEvidenceContract,
   configuredBuildVersion,
+  configuredDeploymentRole,
 } from "../src/config";
 
 const savedBucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET;
 const savedRemoteOnly = process.env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY;
 const savedControlPlaneToken = process.env.ENGINE_CONTROL_PLANE_TOKEN;
+const savedDeploymentRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
 
 afterEach(() => {
   if (savedBucket === undefined) delete process.env.AIRFOILFOAM_EVIDENCE_BUCKET;
@@ -19,10 +21,14 @@ afterEach(() => {
   if (savedControlPlaneToken === undefined)
     delete process.env.ENGINE_CONTROL_PLANE_TOKEN;
   else process.env.ENGINE_CONTROL_PLANE_TOKEN = savedControlPlaneToken;
+  if (savedDeploymentRole === undefined)
+    delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+  else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = savedDeploymentRole;
 });
 
 describe("credentialless remote-solver evidence storage contract", () => {
   it("accepts local tar.zst retention for hub-brokered upload", () => {
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "remote-solver";
     process.env.AIRFOILFOAM_EVIDENCE_BUCKET = "";
     process.env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY = "false";
     process.env.ENGINE_CONTROL_PLANE_TOKEN =
@@ -38,6 +44,7 @@ describe("credentialless remote-solver evidence storage contract", () => {
   ])(
     "fails closed when remote mode has engine bucket %j and remote-only %j",
     (bucket, remoteOnly) => {
+      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "remote-solver";
       process.env.AIRFOILFOAM_EVIDENCE_BUCKET = bucket;
       process.env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY = remoteOnly;
 
@@ -47,11 +54,18 @@ describe("credentialless remote-solver evidence storage contract", () => {
     },
   );
 
-  it("does not impose the remote-node contract on a hub/local solver", () => {
+  it("keeps the hub GCS contract when the hub enables remote solvers", () => {
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
     process.env.AIRFOILFOAM_EVIDENCE_BUCKET = "airfoils-pro-storage-bucket";
     process.env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY = "true";
 
-    expect(() => assertRemoteSolverNodeEvidenceContract(false)).not.toThrow();
+    expect(() => assertRemoteSolverNodeEvidenceContract(true)).not.toThrow();
+  });
+
+  it("rejects an invalid deployment role instead of guessing its evidence mode", () => {
+    expect(() =>
+      configuredDeploymentRole({ AIRFOILFOAM_DEPLOYMENT_ROLE: "worker" }),
+    ).toThrow(/must be hub or remote-solver/);
   });
 });
 

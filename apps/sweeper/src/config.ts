@@ -26,6 +26,18 @@ export function configuredBuildVersion(
   return packageVersion || null;
 }
 
+export function configuredDeploymentRole(
+  env: NodeJS.ProcessEnv = process.env,
+): "hub" | "remote-solver" {
+  const role = env.AIRFOILFOAM_DEPLOYMENT_ROLE?.trim() || "hub";
+  if (role !== "hub" && role !== "remote-solver") {
+    throw new Error(
+      "AIRFOILFOAM_DEPLOYMENT_ROLE must be hub or remote-solver",
+    );
+  }
+  return role;
+}
+
 export function configuredEngineIdentity() {
   return openFoamEngineIdentityFromConfig({
     distribution:
@@ -58,18 +70,23 @@ export function configuredControlPlaneToken(): string | undefined {
  */
 export function assertRemoteSolverNodeEvidenceContract(
   remoteSolverEnabled: boolean,
+  env: NodeJS.ProcessEnv = process.env,
 ): void {
-  if (!remoteSolverEnabled) return;
-  const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim() ?? "";
+  if (
+    !remoteSolverEnabled ||
+    configuredDeploymentRole(env) !== "remote-solver"
+  )
+    return;
+  const bucket = env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim() ?? "";
   const remoteOnly = /^(?:1|true|yes|on)$/i.test(
-    process.env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY?.trim() ?? "",
+    env.AIRFOILFOAM_EVIDENCE_REMOTE_ONLY?.trim() ?? "",
   );
   if (bucket || remoteOnly) {
     throw new Error(
       "remote solver evidence configuration is unsafe: credentialless remote nodes require AIRFOILFOAM_EVIDENCE_BUCKET empty and AIRFOILFOAM_EVIDENCE_REMOTE_ONLY=false so the local tar.zst survives for hub-brokered upload",
     );
   }
-  const controlToken = process.env.ENGINE_CONTROL_PLANE_TOKEN?.trim();
+  const controlToken = env.ENGINE_CONTROL_PLANE_TOKEN?.trim();
   if (!controlToken || controlToken.length < 32) {
     throw new Error(
       "remote solver evidence configuration is incomplete: ENGINE_CONTROL_PLANE_TOKEN (at least 32 characters) is required for authenticated crash-safe local reclaim",
