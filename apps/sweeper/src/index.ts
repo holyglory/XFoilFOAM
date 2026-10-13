@@ -54,6 +54,8 @@ console.log(
 const stopHeartbeat = startHeartbeatTimer(critical.db);
 const stopRemoteFleetHeartbeat = startRemoteSolverFleetHeartbeatTimer(
   critical.db,
+  undefined,
+  db,
 );
 try {
   await runSweeperServices(ac.signal, [

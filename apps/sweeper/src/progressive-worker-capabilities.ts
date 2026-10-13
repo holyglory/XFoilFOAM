@@ -26,9 +26,10 @@ const pending = new WeakMap<DB, Promise<void>>();
 
 export function progressiveWorkerCapabilityMetadata(
   db: DB,
+  observationDb: DB = db,
   now = performance.now(),
 ) {
-  const observation = observations.get(db);
+  const observation = observations.get(observationDb);
   const fresh =
     !!observation?.capabilities &&
     now >= observation.checkedAt &&

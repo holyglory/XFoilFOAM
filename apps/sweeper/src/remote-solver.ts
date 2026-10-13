@@ -1204,6 +1204,7 @@ async function reportRemoteSolverFleetHeartbeat(
   db: DB,
   settings: Settings,
   options: { includeOutcomeCounters: boolean },
+  capabilityDb: DB = db,
 ): Promise<{
   remoteCap: number;
   reservedCpuSlots: number;
@@ -1229,7 +1230,7 @@ async function reportRemoteSolverFleetHeartbeat(
     telemetry,
     counters?.solvedCount,
     counters?.pushedCount,
-    progressiveWorkerCapabilityMetadata(db),
+    progressiveWorkerCapabilityMetadata(db, capabilityDb),
   );
   return { remoteCap, reservedCpuSlots, heartbeatResult };
 }
@@ -1240,7 +1241,10 @@ async function reportRemoteSolverFleetHeartbeat(
  * or run transfer work, so slow CFD/reconciliation cannot make a live node
  * disappear from the hub's Health view.
  */
-export async function sendRemoteSolverFleetHeartbeat(db: DB): Promise<void> {
+export async function sendRemoteSolverFleetHeartbeat(
+  db: DB,
+  capabilityDb: DB = db,
+): Promise<void> {
   const [settings] = await db
     .select()
     .from(syncApiSettings)
@@ -1257,7 +1261,7 @@ export async function sendRemoteSolverFleetHeartbeat(db: DB): Promise<void> {
   assertRemoteSolverNodeEvidenceContract(settings.remoteSolverEnabled);
   const report = await reportRemoteSolverFleetHeartbeat(db, settings, {
     includeOutcomeCounters: false,
-  });
+  }, capabilityDb);
   if (report.heartbeatResult === "not_found")
     await clearStaleRemoteSolverRegistration(db, settings);
 }
@@ -1267,12 +1271,13 @@ export async function sendRemoteSolverFleetHeartbeat(db: DB): Promise<void> {
 export function startRemoteSolverFleetHeartbeatTimer(
   db: DB,
   intervalMs: number = REMOTE_FLEET_HEARTBEAT_INTERVAL_MS,
+  capabilityDb: DB = db,
 ): () => void {
   let inFlight = false;
   const beat = () => {
     if (inFlight) return;
     inFlight = true;
-    sendRemoteSolverFleetHeartbeat(db)
+    sendRemoteSolverFleetHeartbeat(db, capabilityDb)
       .catch((error) => {
         console.error(
           "[sweeper] remote fleet heartbeat failed:",
