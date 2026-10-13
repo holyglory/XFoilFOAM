@@ -836,8 +836,6 @@ export async function tick(
       meshRecoveryVersion,
       uransRecoveryVersion,
     });
-    await markTickCompleted(db);
-    return;
   }
   if (uransRecoveryVersion != null)
     await submitPendingPointCorrectionFastRequest(

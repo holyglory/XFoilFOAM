@@ -164,16 +164,23 @@ describe("progressive controller tick", () => {
     expect(hooks.admission).not.toHaveBeenCalled();
     expect(scope.health).not.toHaveBeenCalled();
   });
-  it("admits assigned remote work through the existing capacity gates without local replanning", async () => {
+  it("attempts assigned remote and local work through the existing capacity gates", async () => {
     hooks.remoteReconcile.mockResolvedValue(true);
     const scope = fixture();
     await tick(scope.db, scope.engine);
     expect(hooks.remoteAdmit).toHaveBeenCalledWith(scope.db, scope.engine, {
       kind: "allow",
       meshRecoveryVersion: 1,
+      uransRecoveryVersion: 14,
     });
-    expect(hooks.admission).not.toHaveBeenCalled();
-    expect(hooks.correction).not.toHaveBeenCalled();
+    expect(hooks.admission).toHaveBeenCalled();
+    expect(hooks.correction).toHaveBeenCalledWith(
+      scope.db,
+      scope.engine,
+      3,
+      1,
+      14,
+    );
     expect(hooks.tickCompleted).toHaveBeenCalledTimes(1);
   });
   it("preserves an explicit point correction without restoring automatic legacy campaign work", async () => {
