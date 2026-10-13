@@ -109,17 +109,6 @@ it.each([
   },
 );
 
-it("reads the capability observation through an independent heartbeat database handle", async () => {
-  const primaryDb = {} as DB;
-  const heartbeatDb = {} as DB;
-  const fixture = serviceFixture();
-  await refreshProgressiveWorkerCapabilities(primaryDb, fixture.engine);
-  expect(
-    progressiveWorkerCapabilityMetadata(heartbeatDb, primaryDb)
-      .progressiveExecution,
-  ).toEqual(capabilities());
-});
-
 it("refreshes remote eligibility beyond sixty seconds without a controller tick and stops cleanly", async () => {
   vi.useFakeTimers();
   vi.spyOn(performance, "now").mockImplementation(() => Date.now());

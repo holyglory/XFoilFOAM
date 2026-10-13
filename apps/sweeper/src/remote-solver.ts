@@ -1230,7 +1230,7 @@ async function reportRemoteSolverFleetHeartbeat(
     telemetry,
     counters?.solvedCount,
     counters?.pushedCount,
-    progressiveWorkerCapabilityMetadata(db, capabilityDb),
+    progressiveWorkerCapabilityMetadata(capabilityDb),
   );
   return { remoteCap, reservedCpuSlots, heartbeatResult };
 }
@@ -1259,9 +1259,12 @@ export async function sendRemoteSolverFleetHeartbeat(
     return;
   assertRemoteSolverHubUrlContract(settings.upstreamBaseUrl);
   assertRemoteSolverNodeEvidenceContract(settings.remoteSolverEnabled);
-  const report = await reportRemoteSolverFleetHeartbeat(db, settings, {
-    includeOutcomeCounters: false,
-  }, capabilityDb);
+  const report = await reportRemoteSolverFleetHeartbeat(
+    db,
+    settings,
+    { includeOutcomeCounters: false },
+    capabilityDb,
+  );
   if (report.heartbeatResult === "not_found")
     await clearStaleRemoteSolverRegistration(db, settings);
 }

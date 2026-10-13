@@ -24,6 +24,7 @@ import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 const { db, sql, engine } = makeContext();
 const critical = makeIsolatedDatabase(2);
 const retention = makeIsolatedDatabase(1);
+const evidence = makeIsolatedDatabase(4);
 try {
   const [syncSettings] = await db
     .select({
@@ -37,7 +38,12 @@ try {
     syncSettings?.remoteSolverEnabled ?? false,
   );
 } catch (error) {
-  await Promise.all([sql.end(), critical.sql.end(), retention.sql.end()]);
+  await Promise.all([
+    sql.end(),
+    critical.sql.end(),
+    retention.sql.end(),
+    evidence.sql.end(),
+  ]);
   throw error;
 }
 const ac = new AbortController();
@@ -92,24 +98,38 @@ try {
     },
     {
       name: "progressive-report-delivery",
-      run: (signal) => runProgressiveReportService(db, sql, signal),
+      run: (signal) =>
+        runProgressiveReportService(evidence.db, evidence.sql, signal),
     },
     {
       name: "progressive-compact-evidence",
-      run: (signal) => runProgressiveEvidenceService(db, sql, engine, signal),
+      run: (signal) =>
+        runProgressiveEvidenceService(
+          evidence.db,
+          evidence.sql,
+          engine,
+          signal,
+        ),
     },
     {
       name: "progressive-archive-delivery",
-      run: (signal) => runProgressiveArchiveService(db, sql, engine, signal),
+      run: (signal) =>
+        runProgressiveArchiveService(evidence.db, evidence.sql, engine, signal),
     },
     {
       name: "archive-reclamation",
-      run: (signal) => runArchiveReclaimService(db, sql, engine, signal),
+      run: (signal) =>
+        runArchiveReclaimService(evidence.db, evidence.sql, engine, signal),
     },
   ]);
 } finally {
   stopRemoteFleetHeartbeat();
   stopHeartbeat();
-  await Promise.all([sql.end(), critical.sql.end(), retention.sql.end()]);
+  await Promise.all([
+    sql.end(),
+    critical.sql.end(),
+    retention.sql.end(),
+    evidence.sql.end(),
+  ]);
 }
 console.log("[sweeper] stopped");

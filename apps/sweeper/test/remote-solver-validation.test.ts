@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 
 import {
   EngineError,
+  OPENCFD_2606_NUMERICS2_ENGINE,
   type EngineClient,
   type JobStatus,
   type PolarRequest,
@@ -64,6 +65,8 @@ const { registerEvidenceArtifacts } = await import("../src/ingest");
 const { backfillLegacyBrokeredEvidence } =
   await import("../src/legacy-brokered-evidence-backfill");
 const { resetEngineBackoffForTests } = await import("../src/engine-backoff");
+const { refreshProgressiveWorkerCapabilities } =
+  await import("../src/progressive-worker-capabilities");
 const { submitPendingJobWithLifecycleGuard } =
   await import("../src/submit-lifecycle");
 const { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } =
@@ -1960,7 +1963,37 @@ describe("remote solver submit lifecycle", () => {
         break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    const stop = startRemoteSolverFleetHeartbeatTimer(db, 20);
+    const capabilityDb = {} as typeof db;
+    await refreshProgressiveWorkerCapabilities(capabilityDb, {
+      healthDetails: async () => ({
+        status: "ok",
+        solver_budget_version: 2,
+        mesh_recovery_version: 3,
+        urans_recovery_version: 14,
+        supported_engines: [OPENCFD_2606_NUMERICS2_ENGINE],
+      }),
+      capabilities: async () => ({
+        solver_budget_version: 2,
+        default_engine: OPENCFD_2606_NUMERICS2_ENGINE,
+        engines: [
+          {
+            engine: OPENCFD_2606_NUMERICS2_ENGINE,
+            routing_key: "openfoam-opencfd-2606-numerics-2",
+            analysis_methods: ["rans", "urans"],
+            steady: true,
+            transient: true,
+            mesh_evidence: true,
+            volume_fields: true,
+            stored_media: true,
+            custom_field_rendering: true,
+            multi_element_geometry: false,
+            supported_turbulence_models: ["kOmegaSST"],
+            supported_image_fields: ["pressure"],
+          },
+        ],
+      }),
+    } as unknown as EngineClient);
+    const stop = startRemoteSolverFleetHeartbeatTimer(db, 20, capabilityDb);
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
       expect(
@@ -1970,6 +2003,24 @@ describe("remote solver submit lifecycle", () => {
             String(input).endsWith("/heartbeat"),
         ).length,
       ).toBeGreaterThanOrEqual(2);
+      const heartbeats = fetchMock.mock.calls.filter(
+        ([input]) =>
+          String(input).includes("/solvers/") &&
+          String(input).endsWith("/heartbeat"),
+      );
+      for (const [, init] of heartbeats) {
+        const payload = JSON.parse(String(init?.body));
+        expect(payload.metadata.progressiveExecution).toMatchObject({
+          solverBudgetVersion: 2,
+          engine: OPENCFD_2606_NUMERICS2_ENGINE,
+          executionPools: ["openfoam-opencfd-2606-numerics-2"],
+        });
+        expect(
+          Number.isFinite(
+            Date.parse(payload.metadata.progressiveExecutionObservedAt),
+          ),
+        ).toBe(true);
+      }
     } finally {
       stop();
       releaseRenewal(
