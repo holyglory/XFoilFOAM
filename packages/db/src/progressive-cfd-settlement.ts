@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
@@ -460,4 +461,135 @@ export async function settleProgressiveCfdExecution(
     }
     return counts;
   });
+}
+
+export type OperatorStaleRemoteDispatch = {
+  jobId: string;
+  promiseId: string;
+};
+
+export async function recoverOperatorVerifiedStaleRemoteDispatches(
+  db: DB,
+  input: {
+    solverId: string;
+    dispatches: readonly OperatorStaleRemoteDispatch[];
+    expectedCount: number;
+    operator: string;
+    crossHostAbsenceConfirmed: true;
+  },
+): Promise<{ recoveredJobs: number; settledUnits: number }> {
+  const uuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (
+    !uuid.test(input.solverId) ||
+    !input.operator.trim() ||
+    input.crossHostAbsenceConfirmed !== true ||
+    !Number.isSafeInteger(input.expectedCount) ||
+    input.expectedCount < 1 ||
+    input.expectedCount > 256 ||
+    input.dispatches.length !== input.expectedCount ||
+    new Set(input.dispatches.map((item) => item.jobId)).size !== input.expectedCount ||
+    new Set(input.dispatches.map((item) => item.promiseId)).size !== input.expectedCount ||
+    input.dispatches.some((item) => !uuid.test(item.jobId) || !uuid.test(item.promiseId))
+  )
+    throw new Error("Invalid bounded stale remote dispatch recovery scope");
+  const batchId = randomUUID();
+  let recoveredJobs = 0;
+  let settledUnits = 0;
+  for (const dispatch of input.dispatches) {
+    const counts = await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const [owned] = await connection.execute(sql`
+        SELECT job.id, job.campaign_id, job.engine_job_id, job.status,
+          job.request_payload, promise.status AS promise_status,
+          campaign.status AS campaign_status
+        FROM progressive_remote_dispatches remote_dispatch
+        JOIN sync_sweep_promises promise ON promise.id = remote_dispatch.promise_id
+        JOIN sim_jobs job ON job.id = remote_dispatch.sim_job_id
+        JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
+        WHERE remote_dispatch.sim_job_id = ${dispatch.jobId}::uuid
+          AND remote_dispatch.promise_id = ${dispatch.promiseId}::uuid
+          AND remote_dispatch.solver_id = ${input.solverId}::uuid
+          AND promise.registered_solver_id = remote_dispatch.solver_id
+          AND promise.status IN ('expired', 'cancelled')
+          AND job.status = 'pending' AND job.engine_job_id IS NULL
+          AND job.engine_state IS NULL
+          AND campaign.status IN ('active', 'attention', 'paused')
+        FOR UPDATE OF promise, job, campaign
+      `);
+      if (
+        !owned ||
+        !["expired", "cancelled"].includes(String(owned.promise_status)) ||
+        owned.status !== "pending" ||
+        owned.engine_job_id !== null
+      )
+        throw new Error(`Stale remote recovery ownership changed for ${dispatch.jobId}`);
+      const attempts = await connection.execute(sql`
+        SELECT token, outcome, active_seconds FROM progressive_cfd_attempts
+        WHERE sim_job_id = ${dispatch.jobId}::uuid FOR UPDATE
+      `);
+      const [evidence] = await connection.execute(sql`
+        SELECT
+          EXISTS (SELECT 1 FROM progressive_remote_reports WHERE sim_job_id = ${dispatch.jobId}::uuid) AS reports,
+          EXISTS (SELECT 1 FROM result_attempts WHERE sim_job_id = ${dispatch.jobId}::uuid) AS results,
+          EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress runtime
+            JOIN progressive_cfd_attempts attempt ON attempt.token = runtime.attempt_token
+            WHERE attempt.sim_job_id = ${dispatch.jobId}::uuid) AS runtime,
+          EXISTS (SELECT 1 FROM progressive_cfd_execution_stops WHERE sim_job_id = ${dispatch.jobId}::uuid) AS stops
+      `);
+      if (
+        !attempts.length ||
+        attempts.some((attempt) => attempt.outcome !== "running" || Number(attempt.active_seconds) !== 0) ||
+        evidence?.reports || evidence?.results || evidence?.runtime || evidence?.stops
+      )
+        throw new Error(`Stale remote recovery evidence guard failed for ${dispatch.jobId}`);
+      const marker = {
+        kind: "expired-remote-never-started",
+        operator: input.operator,
+        batchId,
+        expectedCount: input.expectedCount,
+        crossHostAbsenceConfirmed: true,
+        dispatches: input.dispatches,
+        markedAt: new Date().toISOString(),
+      };
+      await connection.execute(sql`
+        UPDATE sync_sweep_promises SET status = 'cancelled',
+          "cancelledAt" = coalesce("cancelledAt", clock_timestamp()),
+          response_payload = coalesce(response_payload, '{}'::jsonb) ||
+            jsonb_build_object('operatorRecovery', ${JSON.stringify(marker)}::jsonb),
+          "updatedAt" = clock_timestamp()
+        WHERE id = ${dispatch.promiseId}::uuid AND status IN ('expired', 'cancelled')
+      `);
+      await connection.execute(sql`
+        UPDATE sync_sweep_promise_points SET status = 'cancelled', "updatedAt" = clock_timestamp()
+        WHERE promise_id = ${dispatch.promiseId}::uuid AND status IN ('active', 'expired')
+      `);
+      await connection.execute(sql`
+        UPDATE sim_jobs SET engine_job_id = ${dispatch.jobId}::uuid, status = 'cancelled',
+          engine_state = 'cancelled', "ingestedAt" = clock_timestamp(), "finishedAt" = clock_timestamp(),
+          "updatedAt" = clock_timestamp(),
+          error = 'Operator-verified expired remote execution never started; no remote mirror or evidence'
+        WHERE id = ${dispatch.jobId}::uuid AND status = 'pending' AND engine_job_id IS NULL
+      `);
+      await acknowledgeProgressiveCfdExecutionStop(connection, {
+        simJobId: dispatch.jobId,
+        proof: {
+          version: 1,
+          job_id: dispatch.jobId,
+          execution_stopped: true,
+          producer_stopped: true,
+          namespace_verified: true,
+          remaining: [],
+          observed_at: new Date().toISOString(),
+          error: null,
+          fence: "cancel_marker",
+          ownership_basis: "never_started_cancellation_fence",
+        },
+      });
+      return settleProgressiveCfdExecution(connection, dispatch.jobId);
+    });
+    recoveredJobs += 1;
+    settledUnits += Number(counts.complete ?? 0) + Number(counts.retry ?? 0) + Number(counts.gaps ?? 0) + Number(counts.cancelled ?? 0);
+  }
+  return { recoveredJobs, settledUnits };
 }
