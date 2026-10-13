@@ -249,6 +249,39 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
       sql`SELECT * FROM progressive_worker_hub_receipts WHERE sim_job_id = ${executionId}::uuid`,
     );
     expect(noReceipt).toHaveLength(0);
+    await db.execute(
+      sql`DELETE FROM progressive_worker_delivery_failures WHERE sim_job_id = ${executionId}::uuid`,
+    );
+    const permanent503 = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ code: "upstream_unavailable" }), {
+          status: 503,
+          headers: { "retry-after": "0" },
+        }),
+    );
+    await expect(
+      deliverNextProgressiveWorkerEvidence(db, permanent503),
+    ).rejects.toThrow("503");
+    expect(permanent503).toHaveBeenCalledTimes(3);
+    const [permanentFailure] = await db.execute(sql`
+      SELECT state, attempt_count, last_http_status,
+        retry_after > clock_timestamp() AS delayed
+      FROM progressive_worker_delivery_failures
+      WHERE sim_job_id = ${executionId}::uuid
+    `);
+    expect(permanentFailure).toMatchObject({
+      state: "retry",
+      attempt_count: 1,
+      last_http_status: 503,
+      delayed: true,
+    });
+    expect(
+      await db.execute(sql`SELECT 1 FROM progressive_worker_evidence_delivery_claims
+        WHERE sim_job_id = ${executionId}::uuid`),
+    ).toHaveLength(0);
+    await db.execute(
+      sql`DELETE FROM progressive_worker_delivery_failures WHERE sim_job_id = ${executionId}::uuid`,
+    );
     const expected = {
       executionId,
       pointContentSignature: String(source.point_content_signature),
@@ -264,8 +297,10 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
         ),
       ).rejects.toThrow("exact progressive source attempt");
     }
+    let deliveredCalls = 0;
     const delivered = vi.fn(
       async (_url: string | URL | Request, init?: RequestInit) => {
+        deliveredCalls += 1;
         expect(String(_url)).toMatch(/\/polars$/);
         expect(init?.redirect).toBe("error");
         expect(init?.headers).toMatchObject({
@@ -286,6 +321,15 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
             },
           },
         ]);
+        if (deliveredCalls === 1)
+          return new Response(
+            JSON.stringify({
+              code: "progressive_cfd_evidence_scope_pending",
+              error:
+                "Progressive CFD execution ownership is awaiting report processing",
+            }),
+            { status: 503, headers: { "retry-after": "0" } },
+          );
         return new Response(
           JSON.stringify({
             progressiveEvidenceReceipts: [receipt],
@@ -297,6 +341,7 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     expect(await deliverNextProgressiveWorkerEvidence(db, delivered)).toBe(
       true,
     );
+    expect(delivered).toHaveBeenCalledTimes(2);
     expect(await deliverNextProgressiveWorkerEvidence(db, unused)).toBe(false);
     expect(unused).not.toHaveBeenCalled();
     const [stored] = await db.execute(

@@ -8637,10 +8637,10 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         if (permissionError)
           return reply.code(403).send({ error: permissionError });
         if (pendingError)
-          return reply
-            .header("retry-after", "2")
-            .code(503)
-            .send({ error: pendingError });
+          return reply.header("retry-after", "2").code(503).send({
+            code: "progressive_cfd_evidence_scope_pending",
+            error: pendingError,
+          });
         if (response) {
           // A later exact delivery can make an earlier replay conflict obsolete.
           // Reconcile on the successful ingest boundary so the admin review

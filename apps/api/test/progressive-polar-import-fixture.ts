@@ -161,6 +161,11 @@ export async function verifyProgressivePolarImport(
     });
     expect(pendingOwnership.statusCode, pendingOwnership.body).toBe(503);
     expect(pendingOwnership.headers["retry-after"]).toBe("2");
+    expect(pendingOwnership.json()).toMatchObject({
+      code: "progressive_cfd_evidence_scope_pending",
+      error:
+        "Progressive CFD execution ownership is awaiting report processing",
+    });
     await db.execute(
       sql`UPDATE sim_jobs SET engine_job_id = id::text WHERE id = ${delivery.engineJobId}::uuid`,
     );
