@@ -22,12 +22,11 @@ import {
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 4;
 
-export async function applyProgressiveRemoteProgress(
+async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
   executionId: string,
 ) {
-  return db.transaction(async (transaction) => {
-    const connection = transaction as unknown as DB;
+  const connection = db;
     const [dispatch] =
       await connection.execute(sql`SELECT envelope, content_signature, solver_id, promise_id
       FROM progressive_remote_dispatches WHERE sim_job_id = ${executionId}::uuid`);
@@ -159,12 +158,69 @@ export async function applyProgressiveRemoteProgress(
     if (!stored.progress_applied)
       await connection.execute(sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id, sequence, content_signature)
         VALUES (${executionId}::uuid, ${report.sequence}, ${validated.contentSignature})`);
-    return {
-      kind: "applied" as const,
-      sequence: report.sequence,
-      stopped: report.stopProof !== null,
-      settled,
+  return {
+    kind: "applied" as const,
+    sequence: report.sequence,
+    stopped: report.stopProof !== null,
+    settled,
+  };
+}
+
+export async function applyProgressiveRemoteProgress(
+  db: DB,
+  executionId: string,
+) {
+  return db.transaction(async (transaction) =>
+    applyProgressiveRemoteProgressInTransaction(
+      transaction as unknown as DB,
+      executionId,
+    ),
+  );
+}
+
+async function applyProgressiveRemoteProgressBatch(
+  db: DB,
+  executionId: string,
+) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const batchReceipt = {
+      applied: 0,
+      indexed: 0,
+      stopped: 0,
+      idle: false,
+      errors: [] as Array<{ executionId: string; reason: string }>,
     };
+    for (
+      let reportPass = 0;
+      reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
+      reportPass += 1
+    ) {
+      try {
+        const result = await connection.transaction(async (savepoint) =>
+          applyProgressiveRemoteProgressInTransaction(
+            savepoint as unknown as DB,
+            executionId,
+          ),
+        );
+        if (result.kind === "indexed") batchReceipt.indexed += 1;
+        if (result.kind === "applied") {
+          batchReceipt.applied += 1;
+          if (result.stopped) batchReceipt.stopped += 1;
+        }
+        if (result.kind === "idle") {
+          batchReceipt.idle = true;
+          break;
+        }
+      } catch (error) {
+        batchReceipt.errors.push({
+          executionId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        break;
+      }
+    }
+    return batchReceipt;
   });
 }
 
@@ -226,29 +282,21 @@ export async function reconcileProgressiveRemoteProgress(
       for (const job of campaignJobs) {
         const executionId = String(job.sim_job_id);
         try {
-          for (
-            let reportPass = 0;
-            reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
-            reportPass += 1
-          ) {
-            const result = await applyProgressiveRemoteProgress(
+          const batch = await applyProgressiveRemoteProgressBatch(
+            db,
+            executionId,
+          );
+          campaignReceipt.applied += batch.applied;
+          campaignReceipt.indexed += batch.indexed;
+          campaignReceipt.stopped += batch.stopped;
+          campaignReceipt.errors.push(...batch.errors);
+          if (batch.idle && batch.errors.length === 0) {
+            const terminal = await settleProgressiveRemoteJob(
               db,
               executionId,
             );
-            if (result.kind === "indexed") campaignReceipt.indexed += 1;
-            if (result.kind === "applied") {
-              campaignReceipt.applied += 1;
-              if (result.stopped) campaignReceipt.stopped += 1;
-            }
-            if (result.kind === "idle") {
-              const terminal = await settleProgressiveRemoteJob(
-                db,
-                executionId,
-              );
-              if (terminal.kind === "settled") campaignReceipt.settled += 1;
-              else campaignReceipt.waiting += 1;
-              break;
-            }
+            if (terminal.kind === "settled") campaignReceipt.settled += 1;
+            else campaignReceipt.waiting += 1;
           }
         } catch (error) {
           campaignReceipt.errors.push({
@@ -257,9 +305,11 @@ export async function reconcileProgressiveRemoteProgress(
           });
         } finally {
           try {
-            await db.execute(
-              sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-            );
+            await db.transaction(async (transaction) => {
+              await transaction.execute(
+                sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+              );
+            });
           } catch (error) {
             campaignReceipt.errors.push({
               executionId,
