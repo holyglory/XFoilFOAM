@@ -27,6 +27,10 @@ import {
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
+import {
+  progressiveCfdBudgetExtensionPendingSql,
+  progressiveCfdEffectiveBudgetSql,
+} from "./progressive-cfd-budget-extension";
 import type { SealedPolarTarget } from "./progressive-campaigns";
 
 interface WorkScope {
@@ -62,6 +66,13 @@ export interface ProgressiveCfdLease {
   recoveryPlanId?: string | null;
   recoveryParentJobId?: string | null;
   localStepPolicyId?: string | null;
+  budgetExtension?: {
+    id: string;
+    sourceResultAttemptId: string;
+    engineJobId: string;
+    engineCaseSlug: string;
+    extensionSeconds: number;
+  } | null;
 }
 
 export const MAX_PRECISE_CFD_BATCH_UNITS = 8;
@@ -223,6 +234,8 @@ export async function claimProgressiveCfdUnit(
     const localStepPolicy = currentLocalStepPolicySql();
     const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
       (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
+    const effectiveBudget = progressiveCfdEffectiveBudgetSql(sql`unit`);
+    const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(sql`unit`);
     const recoveryParent = sql`(SELECT recovery.parent_job_id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1)`;
     const remoteOwner = input.remoteSolverId
       ? sql`EXISTS (SELECT 1 FROM registered_remote_solvers solver
@@ -245,7 +258,8 @@ export async function claimProgressiveCfdUnit(
     const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
     const attemptAvailable = sql`(${ordinaryAttempts} < 2 OR ${publicationRecovery} OR (${ordinaryAttempts} = 2
       AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
-      AND ${progressiveCfdPreciseVerificationAvailableSql()}))`;
+      AND ${progressiveCfdPreciseVerificationAvailableSql()}) OR (${ordinaryAttempts} = 2
+      AND work.stage = 2 AND unit.purpose = 'initial' AND ${pendingBudgetExtension}))`;
     const targetFilter = input.sameTarget
       ? sql`generation.id = ${input.sameTarget.generationId} AND work.target_id = ${input.sameTarget.targetId}
           AND ${effectiveRecipe} = ${JSON.stringify(input.sameTarget.recipe)}::jsonb
@@ -300,7 +314,7 @@ export async function claimProgressiveCfdUnit(
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
             AND work.stage = 2 AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
-            AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+            AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
             AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         ) AS all_stage3
       FROM sim_campaigns campaign
@@ -315,7 +329,7 @@ export async function claimProgressiveCfdUnit(
           AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
           AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
           AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
-          AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+          AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
           AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
       )
       ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
@@ -355,7 +369,7 @@ export async function claimProgressiveCfdUnit(
             AND ${previousExecutionStopped}
             AND unit.state = 'pending'
             AND CASE WHEN unit.attempts < 2 THEN true ELSE ${attemptAvailable} END
-            AND unit.active_seconds < unit.active_budget_seconds
+            AND unit.active_seconds < ${effectiveBudget}
             AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
             AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
           ORDER BY ${orderBy} LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
@@ -393,12 +407,13 @@ export async function claimProgressiveCfdUnit(
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
         AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
-        AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < unit.active_budget_seconds
+        AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
       ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
-        generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
+        generation.created_at, generation.id, CASE WHEN ${pendingBudgetExtension} THEN 0 ELSE 1 END,
+        CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       )`;
     }
@@ -409,7 +424,17 @@ export async function claimProgressiveCfdUnit(
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
         (${localStepPolicy}) AS local_step_policy_id,
         ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
-        unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
+        ${effectiveBudget} - unit.active_seconds AS remaining_active_seconds,
+        (SELECT extension.unit_id FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id AND extension.state = 'pending' LIMIT 1) AS budget_extension_id,
+        (SELECT extension.source_result_attempt_id FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id AND extension.state = 'pending' LIMIT 1) AS budget_extension_result_attempt_id,
+        (SELECT extension.source_engine_job_id FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id AND extension.state = 'pending' LIMIT 1) AS budget_extension_engine_job_id,
+        (SELECT extension.source_engine_case_slug FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id AND extension.state = 'pending' LIMIT 1) AS budget_extension_case_slug,
+        (SELECT extension.extension_seconds FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id AND extension.state = 'pending' LIMIT 1) AS budget_extension_seconds
       FROM selected JOIN progressive_cfd_units unit ON unit.id = selected.id
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
@@ -430,6 +455,11 @@ export async function claimProgressiveCfdUnit(
       local_step_policy_id: string | null;
       recovery_parent_job_id: string | null;
       publication_recovery: boolean;
+      budget_extension_id: string | null;
+      budget_extension_result_attempt_id: string | null;
+      budget_extension_engine_job_id: string | null;
+      budget_extension_case_slug: string | null;
+      budget_extension_seconds: number | null;
     }>;
     if (!unit) return null;
     const token = randomUUID();
@@ -448,6 +478,16 @@ export async function claimProgressiveCfdUnit(
       INSERT INTO progressive_cfd_attempts (token, unit_id, owner, lease_until)
       SELECT ${token}, id, lease_owner, lease_until FROM progressive_cfd_units WHERE id = ${unit.id}
     `);
+    if (unit.budget_extension_id) {
+      const [claimedExtension] = await connection.execute(sql`
+        UPDATE progressive_cfd_budget_extensions
+        SET state = 'claimed', claim_attempt_token = ${token}::uuid, claimed_at = clock_timestamp()
+        WHERE unit_id = ${unit.id}::uuid AND state = 'pending'
+        RETURNING unit_id
+      `);
+      if (!claimedExtension)
+        throw new Error("Progressive budget extension was claimed by another attempt");
+    }
     if (unit.recovery_plan_id)
       await connection.execute(sql`
         INSERT INTO progressive_cfd_recovery_claims (attempt_token, recovery_plan_id)
@@ -479,6 +519,15 @@ export async function claimProgressiveCfdUnit(
       recoveryPlanId: unit.recovery_plan_id,
       recoveryParentJobId: unit.recovery_parent_job_id,
       localStepPolicyId: unit.local_step_policy_id,
+      budgetExtension: unit.budget_extension_id
+        ? {
+            id: unit.budget_extension_id,
+            sourceResultAttemptId: unit.budget_extension_result_attempt_id!,
+            engineJobId: unit.budget_extension_engine_job_id!,
+            engineCaseSlug: unit.budget_extension_case_slug!,
+            extensionSeconds: Number(unit.budget_extension_seconds),
+          }
+        : null,
     };
   });
 }
@@ -507,6 +556,7 @@ export async function claimProgressiveCfdBatch(
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 512)
       throw new Error("Invalid bounded CFD batch size");
     const batch = [first];
+    if (first.budgetExtension) return batch;
     while (batch.length < maximum) {
       const next = await claimProgressiveCfdUnit(connection, {
         ...input,
@@ -520,6 +570,7 @@ export async function claimProgressiveCfdBatch(
       });
       if (!next) break;
       batch.push(next);
+      if (next.budgetExtension) break;
     }
     return batch.sort((left, right) => left.alpha - right.alpha);
   });
@@ -579,7 +630,8 @@ export async function heartbeatProgressiveCfdUnit(
     )
       throw new Error("Campaign no longer accepts CFD progress");
     const [unit] = await connection.execute(sql`
-      SELECT unit.active_budget_seconds, unit.active_seconds, attempt.active_seconds AS attempt_seconds
+      SELECT unit.active_seconds, attempt.active_seconds AS attempt_seconds,
+        ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AS effective_budget_seconds
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
@@ -598,7 +650,7 @@ export async function heartbeatProgressiveCfdUnit(
       throw new Error("Measured active solver time cannot decrease");
     const total =
       Number(unit.active_seconds) + input.attemptActiveSeconds - previous;
-    const remaining = Math.max(0, Number(unit.active_budget_seconds) - total);
+    const remaining = Math.max(0, Number(unit.effective_budget_seconds) - total);
     await connection.execute(sql`
       UPDATE progressive_cfd_attempts SET active_seconds = ${input.attemptActiveSeconds},
         lease_until = clock_timestamp() + ${input.leaseSeconds} * interval '1 second' WHERE token = ${lease.token}

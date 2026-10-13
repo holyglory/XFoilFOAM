@@ -64,6 +64,90 @@ describe("shared progressive execution ownership", () => {
     expect(request).toEqual(before);
   });
 
+  it("accepts one exact saved preliminary-URANS continuation allocation", () => {
+    const { request, scope } = fixture();
+    const sourceResultAttemptId = randomUUID();
+    const sourceJobId = randomUUID();
+    const extensionId = randomUUID();
+    const unit = scope.units[0];
+    scope.units = [unit];
+    scope.tokens = [unit.token];
+    scope.continuation = {
+      extensionId,
+      sourceResultAttemptId,
+      engineJobId: sourceJobId,
+      engineCaseSlug: "c0p1_u30/a0",
+      extensionSeconds: 740,
+    };
+    request.aoa = { angles: [unit.alpha] };
+    request.resources = {
+      ...request.resources,
+      case_solver_allocations: [
+        { chord: 0.1, speed: 30, aoa_deg: unit.alpha, limit_seconds: 740 },
+      ],
+    };
+    request.solver = {
+      ...request.solver,
+      flow_solver_family: "rhoPimpleFoam",
+      force_transient: true,
+      urans_fidelity: "precalc",
+    };
+    request.expected_urans_recovery_version = 14;
+    request.continue_from = {
+      engine_job_id: sourceJobId,
+      case_slug: "c0p1_u30/a0",
+    };
+    request.budget_override_s = 740;
+    expect(validateProgressiveExecutionScope(request, scope)).toMatchObject({
+      continuation: {
+        extensionId,
+        sourceResultAttemptId,
+        engineJobId: sourceJobId,
+        extensionSeconds: 740,
+      },
+      units: [{ activeBudgetSeconds: 740 }],
+    });
+  });
+
+  it("rejects a continuation without the durable URANS recovery capability", () => {
+    const { request, scope } = fixture();
+    const sourceResultAttemptId = randomUUID();
+    const sourceJobId = randomUUID();
+    const extensionId = randomUUID();
+    const unit = scope.units[0];
+    scope.units = [unit];
+    scope.tokens = [unit.token];
+    scope.continuation = {
+      extensionId,
+      sourceResultAttemptId,
+      engineJobId: sourceJobId,
+      engineCaseSlug: "c0p1_u30/a0",
+      extensionSeconds: 740,
+    };
+    request.aoa = { angles: [unit.alpha] };
+    request.resources = {
+      ...request.resources,
+      case_solver_allocations: [
+        { chord: 0.1, speed: 30, aoa_deg: unit.alpha, limit_seconds: 740 },
+      ],
+    };
+    request.solver = {
+      ...request.solver,
+      flow_solver_family: "rhoPimpleFoam",
+      force_transient: true,
+      urans_fidelity: "precalc",
+    };
+    request.expected_urans_recovery_version = 1;
+    request.continue_from = {
+      engine_job_id: sourceJobId,
+      case_slug: "c0p1_u30/a0",
+    };
+    request.budget_override_s = 740;
+    expect(() => validateProgressiveExecutionScope(request, scope)).toThrow(
+      "Progressive continuation is not bound to its exact saved URANS case",
+    );
+  });
+
   it("preserves uniform precise allocations and all supported pressure conventions", () => {
     for (const family of [
       "simpleFoam",

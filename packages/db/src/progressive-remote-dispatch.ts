@@ -4,6 +4,7 @@ import type { PolarRequest } from "../../engine-client/src/types";
 import type { DB } from "./client";
 import { progressiveSolverOwnerLock } from "./progressive-solver-lock";
 import { canonicalAnalysisJson } from "./analysis-target";
+import { progressiveCfdEffectiveBudgetSql } from "./progressive-cfd-budget-extension";
 import {
   sealProgressiveRemoteExecution,
   verifyProgressiveRemoteExecution,
@@ -190,7 +191,7 @@ export async function bindProgressiveRemoteDispatch(
       );
     const current = await connection.execute(sql`
       SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg,
-        unit.active_budget_seconds - unit.active_seconds AS remaining_seconds
+        ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds AS remaining_seconds
       FROM progressive_cfd_attempts attempt
       JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id AND unit.lease_token = attempt.token
       JOIN progressive_work work ON work.id = unit.work_id

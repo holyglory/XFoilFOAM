@@ -53,6 +53,12 @@ tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "requires source-preserving CFD|conserves rejected evidence and charges cumulative"]
 
+[[test.cfd-source-geometry.check]]
+name = "progressive-fast-budget-continuation"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "admits one exact saved-case FAST continuation"]
+
 [test.mach3-cartesian-diagnosis]
 timeout_seconds = 300
 

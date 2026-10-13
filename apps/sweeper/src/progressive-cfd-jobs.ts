@@ -30,6 +30,7 @@ export async function composeProgressiveCfdJob(
   input: {
     cpuSlots: number;
     meshRecoveryVersion: number;
+    uransRecoveryVersion?: number | null;
     solverBudgetVersion?: number | null;
     localTimeStepVersion?: number | null;
   },
@@ -44,6 +45,15 @@ export async function composeProgressiveCfdJob(
   )
     throw new Error("Invalid CFD batch composition");
   const first = leases[0];
+  const continuation = first.budgetExtension ?? null;
+  if (
+    leases.some((lease) => Boolean(lease.budgetExtension) !== Boolean(continuation)) ||
+    (continuation != null &&
+      (leases.length !== 1 ||
+        !Number.isSafeInteger(input.uransRecoveryVersion) ||
+        (input.uransRecoveryVersion ?? -1) < 2))
+  )
+    throw new Error("Progressive continuation must be one exact capable case");
   if (
     leases.some(
       (lease) =>
@@ -175,6 +185,16 @@ export async function composeProgressiveCfdJob(
     request.expected_execution_pool = pool.routingKey;
     request.expected_mesh_recovery_version = input.meshRecoveryVersion;
     request.solver = { ...request.solver, warm_start: true };
+    if (continuation) {
+      if (!transient || fidelity !== "precalc")
+        throw new Error("Progressive continuation requires preliminary URANS");
+      request.continue_from = {
+        engine_job_id: continuation.engineJobId,
+        case_slug: continuation.engineCaseSlug,
+      };
+      request.budget_override_s = continuation.extensionSeconds;
+      request.expected_urans_recovery_version = input.uransRecoveryVersion!;
+    }
     request.resources = {
       ...request.resources,
       case_concurrency: 1,
@@ -214,6 +234,17 @@ export async function composeProgressiveCfdJob(
         token: lease.token,
         activeBudgetSeconds: lease.remainingActiveSeconds,
       })),
+      ...(continuation
+        ? {
+            continuation: {
+              extensionId: continuation.id,
+              sourceResultAttemptId: continuation.sourceResultAttemptId,
+              engineJobId: continuation.engineJobId,
+              engineCaseSlug: continuation.engineCaseSlug,
+              extensionSeconds: continuation.extensionSeconds,
+            },
+          }
+        : {}),
     });
     const boundaryId = execution.snapshot.preset.legacyBoundaryConditionId!;
     await connection.insert(simJobs).values({
@@ -227,7 +258,8 @@ export async function composeProgressiveCfdJob(
       solverExecutionPoolId: pool.id,
       methodKey: transient ? "openfoam.urans" : "openfoam.rans",
       campaignId: first.campaignId,
-      parentJobId: first.recoveryParentJobId ?? null,
+      parentJobId:
+        continuation?.engineJobId ?? first.recoveryParentJobId ?? null,
       jobKind: angles.length > 1 ? "sweep" : "targeted",
       referenceChordM: execution.snapshot.referenceGeometry.referenceLengthM,
       wave: transient ? 2 : 1,
