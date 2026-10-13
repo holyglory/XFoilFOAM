@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
+import { progressiveCfdEffectiveBudgetSql } from "./progressive-cfd-budget-extension";
 import type { JobStatus } from "../../engine-client/src/types";
 import {
   resolveSolverCaseAllocations,
@@ -33,6 +34,7 @@ interface BoundUnit {
   active_seconds: number;
   unit_seconds: number;
   active_budget_seconds: number;
+  effective_budget_seconds: number;
   budget_guard_confirmed: boolean;
   state: string;
   outcome: string;
@@ -141,7 +143,8 @@ async function lockJobScope(
     await lockProgressiveStorageRecoveryUnits(db, recoveryScope, simJobId);
   const units = (await db.execute(sql`
     SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg, attempt.active_seconds, unit.active_seconds AS unit_seconds,
-      unit.active_budget_seconds, unit.state, attempt.outcome, recipe.execution_revision_id,
+      unit.active_budget_seconds, ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AS effective_budget_seconds,
+      unit.state, attempt.outcome, recipe.execution_revision_id,
       unit.lease_token, unit.lease_until, work.state AS work_state,
       NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
         AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
@@ -445,7 +448,7 @@ export async function recordProgressiveCfdRuntimeProgress(
         observed.limit_seconds > 43200 ||
         observed.limit_seconds !== unit.requested_budget_seconds ||
         observed.limit_seconds >
-          Number(unit.active_budget_seconds) -
+        Number(unit.effective_budget_seconds) -
             (Number(unit.unit_seconds) - Number(unit.active_seconds)) ||
         typeof observed.solver_running !== "boolean"
       )
@@ -500,7 +503,7 @@ export async function recordProgressiveCfdRuntimeProgress(
       );
       const total =
         Number(unit.unit_seconds) + measured - Number(unit.active_seconds);
-      const exhausted = total >= Number(unit.active_budget_seconds);
+      const exhausted = total >= Number(unit.effective_budget_seconds);
       await connection.execute(sql`UPDATE progressive_cfd_attempts SET active_seconds = ${measured},
         lease_until = CASE WHEN ${exhausted} THEN clock_timestamp() ELSE clock_timestamp() + interval '120 seconds' END
         WHERE token = ${unit.token}`);
@@ -549,7 +552,7 @@ export async function recordProgressiveCfdEvidence(
     let linked = 0;
     let stopRequired = scope.units.some(
       (unit) =>
-        Number(unit.unit_seconds) >= Number(unit.active_budget_seconds) &&
+        Number(unit.unit_seconds) >= Number(unit.effective_budget_seconds) &&
         !unit.budget_guard_confirmed,
     );
     const evidence = ids.length
@@ -613,7 +616,7 @@ export async function recordProgressiveCfdEvidence(
           typeof guard.exhausted !== "boolean" ||
           guard.exhausted !== duration >= guard.limit_seconds ||
           guard.limit_seconds >
-            Number(unit.active_budget_seconds) -
+            Number(unit.effective_budget_seconds) -
               (Number(unit.unit_seconds) - Number(unit.active_seconds))
         )
           throw new Error(
@@ -641,7 +644,7 @@ export async function recordProgressiveCfdEvidence(
       const measured = Math.max(Number(unit.active_seconds), duration);
       const total =
         Number(unit.unit_seconds) + measured - Number(unit.active_seconds);
-      const exhausted = total >= Number(unit.active_budget_seconds);
+      const exhausted = total >= Number(unit.effective_budget_seconds);
       await connection.execute(
         sql`UPDATE progressive_cfd_attempts SET active_seconds = ${measured} WHERE token = ${unit.token}`,
       );
@@ -660,7 +663,7 @@ export async function recordProgressiveCfdEvidence(
     }
     stopRequired = scope.units.some(
       (unit) =>
-        Number(unit.unit_seconds) >= Number(unit.active_budget_seconds) &&
+        Number(unit.unit_seconds) >= Number(unit.effective_budget_seconds) &&
         !unit.budget_guard_confirmed,
     );
     return { progressive: true, linked, stopRequired };

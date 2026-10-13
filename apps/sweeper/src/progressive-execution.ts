@@ -4,6 +4,7 @@ import {
   acknowledgeProgressiveCfdExecutionStop,
   assertProgressiveExecutionIdentity,
   settleProgressiveCfdExecution,
+  progressiveCfdEffectiveBudgetSql,
   simJobs,
   solverLocalExecutionSql,
   type DB,
@@ -95,7 +96,7 @@ export async function reconcileProgressiveExecutions(
     SELECT job.id FROM sim_jobs job
     JOIN LATERAL (
       SELECT bool_or(attempt.outcome = 'running') AS unsettled,
-        bool_or((unit.active_seconds >= unit.active_budget_seconds AND NOT EXISTS (
+        bool_or((unit.active_seconds >= ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_evidence receipt WHERE receipt.attempt_token = attempt.token AND receipt.budget_guard_exhausted
         ) AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_runtime_progress runtime WHERE runtime.attempt_token = attempt.token AND runtime.engine_job_id = job.engine_job_id

@@ -7448,6 +7448,60 @@ export const progressiveCfdAttempts = pgTable(
   }),
 );
 
+export const progressiveCfdBudgetExtensions = pgTable(
+  "progressive_cfd_budget_extensions",
+  {
+    unitId: uuid("unit_id")
+      .primaryKey()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    sourceAttemptToken: uuid("source_attempt_token")
+      .notNull()
+      .unique()
+      .references(() => progressiveCfdAttempts.token),
+    sourceResultAttemptId: uuid("source_result_attempt_id")
+      .notNull()
+      .unique()
+      .references(() => resultAttempts.id),
+    sourceEvidenceSignature: text("source_evidence_signature").notNull(),
+    sourceEngineJobId: text("source_engine_job_id").notNull(),
+    sourceEngineCaseSlug: text("source_engine_case_slug").notNull(),
+    extensionSeconds: doublePrecision("extension_seconds").notNull(),
+    policyVersion: text("policy_version").notNull(),
+    state: text("state").notNull().default("pending"),
+    claimAttemptToken: uuid("claim_attempt_token")
+      .unique()
+      .references(() => progressiveCfdAttempts.token),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  },
+  (table) => ({
+    pendingIdx: index("progressive_cfd_budget_extensions_pending_idx")
+      .on(table.state, table.createdAt)
+      .where(sql`${table.state} = 'pending'`),
+    signatureCheck: check(
+      "progressive_cfd_budget_extensions_signature_check",
+      sql`${table.sourceEvidenceSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+    secondsCheck: check(
+      "progressive_cfd_budget_extensions_seconds_check",
+      sql`${table.extensionSeconds} > 0 AND ${table.extensionSeconds} <= 43200`,
+    ),
+    stateCheck: check(
+      "progressive_cfd_budget_extensions_state_check",
+      sql`${table.state} IN ('pending', 'claimed', 'consumed', 'exhausted')`,
+    ),
+    claimCheck: check(
+      "progressive_cfd_budget_extensions_claim_check",
+      sql`(${table.state} = 'pending' AND ${table.claimAttemptToken} IS NULL AND ${table.claimedAt} IS NULL AND ${table.consumedAt} IS NULL)
+        OR (${table.state} = 'claimed' AND ${table.claimAttemptToken} IS NOT NULL AND ${table.claimedAt} IS NOT NULL AND ${table.consumedAt} IS NULL)
+        OR (${table.state} IN ('consumed', 'exhausted') AND ${table.claimAttemptToken} IS NOT NULL AND ${table.claimedAt} IS NOT NULL AND ${table.consumedAt} IS NOT NULL)`,
+    ),
+  }),
+);
+
 export const progressivePublicationRecoveries = pgTable(
   "progressive_publication_recoveries",
   {

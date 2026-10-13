@@ -948,7 +948,13 @@ to the requested grid. Additional anchors maximize normalized integrated
 uncertainty reduction per measured compute cost. Initial defaults are at most
 eight angles, a five-percent marginal-gain stopping threshold, and fifteen minutes
 of active solver time per anchor across an initial attempt and one diagnosed retry.
-Bounded failures close the fast pass with explicit gaps, allowing precise work.
+One additional fifteen-minute same-case continuation may be admitted only when a
+preliminary URANS attempt stopped at the wall budget with an exact saved case and
+force history. The continuation is a separate immutable attempt, uses the live
+URANS recovery capability, and remains subject to the existing certification and
+informative-history gates. Flat, material-domain, numerical-recovery-exhausted,
+and no-case evidence never receives this extension. Bounded failures close the
+fast pass with explicit gaps, allowing precise work.
 
 The engine's `case_solver_budget_seconds` limits cumulative solver-command wall
 time for one chord/speed/angle within a job, including initialization and retries.

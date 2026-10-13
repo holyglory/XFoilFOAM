@@ -12,6 +12,11 @@ import {
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
+import {
+  admitProgressiveCfdBudgetExtension,
+  PROGRESSIVE_FAST_BUDGET_EXTENSION_SECONDS,
+  progressiveCfdEffectiveBudgetSql,
+} from "./progressive-cfd-budget-extension";
 
 export function validateProgressiveExecutionStopProof(
   proof: EngineExecutionStopProof,
@@ -277,7 +282,12 @@ export async function settleProgressiveCfdExecution(
       );
     const units = await connection.execute(sql`
       SELECT attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
-        unit.id, unit.state, unit.lease_token, unit.lease_until, unit.attempts, unit.active_seconds, unit.active_budget_seconds, work.id AS work_id,
+        unit.id, unit.state, unit.lease_token, unit.lease_until, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AS effective_budget_seconds, work.id AS work_id,
+        (SELECT extension.state FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id LIMIT 1) AS budget_extension_state,
+        (SELECT extension.claim_attempt_token FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id LIMIT 1) AS budget_extension_claim_attempt_token,
         ${effectiveProgressiveStageSql()} = work.stage AND work.state IN ('pending', 'gap') AS recoverable_stage,
         NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
           AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
@@ -411,12 +421,33 @@ export async function settleProgressiveCfdExecution(
         counts.waiting += 1;
         continue;
       }
+      const budgetExtensionAdmitted =
+        !complete &&
+        unit.stage === 2 &&
+        unit.latest_attempt === true &&
+        Number(unit.attempts) === 2 &&
+        (await admitProgressiveCfdBudgetExtension(connection, {
+          unitId: String(unit.id),
+          attemptToken: String(unit.token),
+        }));
+      const effectiveBudget =
+        Number(unit.effective_budget_seconds) +
+        (budgetExtensionAdmitted ? PROGRESSIVE_FAST_BUDGET_EXTENSION_SECONDS : 0);
+      const budgetExtensionPending =
+        budgetExtensionAdmitted || unit.budget_extension_state === "pending";
       const exhausted =
-        Number(unit.active_seconds) >= Number(unit.active_budget_seconds);
+        Number(unit.active_seconds) >= effectiveBudget;
       const ordinaryAttempts =
         Number(unit.ordinary_attempts) - (neverStarted ? 1 : 0);
-      const retry =
+      const budgetExtensionRetry =
         !complete &&
+        budgetExtensionPending &&
+        unit.stage === 2 &&
+        ordinaryAttempts === 2 &&
+        Number(unit.active_seconds) < effectiveBudget;
+      const retry =
+        budgetExtensionRetry ||
+        (!complete &&
         !exhausted &&
         (!neverStarted ||
           (Number(unit.never_started_attempts) < 1 &&
@@ -428,9 +459,11 @@ export async function settleProgressiveCfdExecution(
               (neverStarted && unit.unused_precise_verification === true)))) &&
         (unit.numerical_recovery === true ||
           neverStarted ||
-          (Number(unit.count) > 0 && unit.infrastructure_only === true));
+          (Number(unit.count) > 0 && unit.infrastructure_only === true)));
       const reason = complete
         ? null
+        : budgetExtensionRetry
+          ? "bounded URANS budget continuation admitted"
         : retry
           ? unit.numerical_recovery === true
             ? unit.precise_verification === true
@@ -452,7 +485,14 @@ export async function settleProgressiveCfdExecution(
         finished_at = clock_timestamp(), error = ${reason} WHERE token = ${unit.token}`);
       await connection.execute(sql`UPDATE progressive_cfd_units SET state = ${complete ? "complete" : retry ? "pending" : "gap"},
         lease_token = NULL, lease_owner = NULL, lease_until = NULL, error = ${reason} WHERE id = ${unit.id}`);
-      if (recovering && retry)
+      if (unit.budget_extension_state === "claimed" &&
+          unit.budget_extension_claim_attempt_token === unit.token) {
+        await connection.execute(sql`UPDATE progressive_cfd_budget_extensions
+          SET state = ${complete ? "consumed" : "exhausted"}, consumed_at = clock_timestamp()
+          WHERE unit_id = ${unit.id} AND state = 'claimed'
+            AND claim_attempt_token = ${unit.token}::uuid`);
+      }
+      if ((recovering || budgetExtensionRetry) && retry)
         await connection.execute(sql`UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
           WHERE id = ${unit.work_id} AND state = 'gap'`);
       if (complete) counts.complete += 1;

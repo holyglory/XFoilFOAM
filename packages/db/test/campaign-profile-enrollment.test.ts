@@ -164,6 +164,7 @@ import {
   heartbeatProgressiveCfdUnit,
   type ProgressiveCfdLease,
 } from "../src/progressive-cfd";
+import { admitProgressiveCfdBudgetExtension } from "../src/progressive-cfd-budget-extension";
 
 import { createClient, type DB } from "../src/client";
 import { databaseUrl } from "../src/env";
@@ -4930,6 +4931,63 @@ describe("progressive submission recovery", () => {
 });
 
 describe("progressive execution stop and settlement", () => {
+  it("admits one exact saved-case FAST continuation and binds it to a new attempt", async () => {
+    const fixture = await fitFixture(2, false, [0]);
+    const lease = fixture.leases[0];
+    const resultAttemptId = await fixture.save(900, "urans", lease.alpha, {
+      fidelity: "urans_precalc",
+      force_history: { t: [0, 1], cl: [0, 0], cd: [0.02, 0.02], cm: [0, 0] },
+    });
+    await db
+      .update(resultAttempts)
+      .set({
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        error: "URANS integration stopped by the wall-clock budget guard",
+        qualityWarnings: ["stopped by the wall-clock budget guard"],
+      })
+      .where(eq(resultAttempts.id, resultAttemptId));
+    await fixture.record([resultAttemptId]);
+    await db.execute(sql`UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', active_seconds = 900, finished_at = clock_timestamp(),
+        error = 'active compute budget exhausted'
+      WHERE token = ${lease.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units
+      SET attempts = 2, active_seconds = 900, state = 'pending',
+        lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      WHERE id = ${lease.id}`);
+    await db.execute(sql`UPDATE progressive_work SET state = 'pending'
+      WHERE id = ${lease.workId}`);
+    const admitted = await admitProgressiveCfdBudgetExtension(db, {
+      unitId: lease.id,
+      attemptToken: lease.token,
+    });
+    expect(admitted).toBe(true);
+    const claimed = await claimProgressiveCfdUnit(db, {
+      owner: "fast-continuation-test",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+    expect(claimed).toMatchObject({
+      id: lease.id,
+      remainingActiveSeconds: 900,
+      budgetExtension: {
+        sourceResultAttemptId: resultAttemptId,
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        extensionSeconds: 900,
+      },
+    });
+    expect(
+      await db.execute(
+        sql`SELECT state, claim_attempt_token FROM progressive_cfd_budget_extensions WHERE unit_id = ${lease.id}`,
+      ),
+    ).toEqual([
+      { state: "claimed", claim_attempt_token: claimed!.token },
+    ]);
+  });
+
   it("quarantines conflicting execution identities without touching the foreign engine job", async () => {
     const fixture = await fitFixture();
     const jobId = fixture.composed.jobId;

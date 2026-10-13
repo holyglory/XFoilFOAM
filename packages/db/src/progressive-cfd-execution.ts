@@ -13,6 +13,7 @@ import { legacyBoundaryValuesFromSnapshot } from "./campaigns";
 import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { localStepRecipeSql } from "./campaign-local-step-policy";
+import { progressiveCfdEffectiveBudgetSql } from "./progressive-cfd-budget-extension";
 import type { ProgressiveCfdLease } from "./progressive-cfd";
 import {
   boundaryConditions,
@@ -70,7 +71,11 @@ export async function lockProgressiveCfdExecution(
       THEN ${localStepRecipeSql(sql`unit.recipe`, sql`local_policy.smoothing`)} END, unit.recipe) AS recipe,
       local_policy.id AS local_step_policy_id, recovery.id AS recovery_plan_id,
       recovery.parent_job_id AS recovery_parent_job_id, target.physical, scope.revision_id, attempt.sim_job_id, attempt.execution_recipe_id,
-      unit.active_budget_seconds - unit.active_seconds AS remaining_active_seconds
+      ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds AS remaining_active_seconds,
+      extension.unit_id AS budget_extension_id, extension.source_result_attempt_id AS budget_extension_result_attempt_id,
+      extension.source_engine_job_id AS budget_extension_engine_job_id,
+      extension.source_engine_case_slug AS budget_extension_case_slug,
+      extension.extension_seconds AS budget_extension_seconds
     FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
     JOIN progressive_generations generation ON generation.id = work.generation_id
     JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
@@ -78,6 +83,8 @@ export async function lockProgressiveCfdExecution(
     JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
     LEFT JOIN progressive_cfd_recovery_claims recovery_claim ON recovery_claim.attempt_token = attempt.token
     LEFT JOIN progressive_cfd_recovery_plans recovery ON recovery.id = recovery_claim.recovery_plan_id AND recovery.unit_id = unit.id
+    LEFT JOIN progressive_cfd_budget_extensions extension
+      ON extension.unit_id = unit.id AND extension.state = 'claimed' AND extension.claim_attempt_token = attempt.token
     LEFT JOIN progressive_cfd_local_step_claims local_claim ON local_claim.attempt_token=attempt.token
     LEFT JOIN campaign_local_step_policies local_policy ON local_policy.id=local_claim.policy_id
       AND local_policy.campaign_id=generation.campaign_id AND local_policy.plan_revision_id=generation.plan_revision_id
@@ -107,6 +114,17 @@ export async function lockProgressiveCfdExecution(
       canonicalAnalysisJson(lease.physical)
   )
     throw new Error("CFD lease payload differs from its sealed scope");
+  const extension = lease.budgetExtension;
+  if (
+    Boolean(extension) !== Boolean(unit.budget_extension_id) ||
+    (extension != null &&
+      (extension.id !== unit.budget_extension_id ||
+        extension.sourceResultAttemptId !== unit.budget_extension_result_attempt_id ||
+        extension.engineJobId !== unit.budget_extension_engine_job_id ||
+        extension.engineCaseSlug !== unit.budget_extension_case_slug ||
+        Number(extension.extensionSeconds) !== Number(unit.budget_extension_seconds)))
+  )
+    throw new Error("CFD lease budget extension differs from its sealed scope");
   return unit;
 }
 

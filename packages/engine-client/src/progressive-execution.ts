@@ -12,6 +12,14 @@ export interface ProgressiveExecutionUnit {
   activeBudgetSeconds: number;
 }
 
+export interface ProgressiveExecutionContinuation {
+  extensionId: string;
+  sourceResultAttemptId: string;
+  engineJobId: string;
+  engineCaseSlug: string;
+  extensionSeconds: number;
+}
+
 export interface ProgressiveExecutionScope {
   executionContract: "progressive-cfd-v1";
   executionId: string;
@@ -22,6 +30,7 @@ export interface ProgressiveExecutionScope {
   recipeId: string;
   tokens: string[];
   units: ProgressiveExecutionUnit[];
+  continuation?: ProgressiveExecutionContinuation;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -46,6 +55,7 @@ export function validateProgressiveExecutionScope(
   request: PolarRequest,
   value: unknown,
 ): ProgressiveExecutionScope {
+  const hasContinuation = record(value) && Object.hasOwn(value, "continuation");
   if (
     !record(value) ||
     !exactKeys(value, [
@@ -58,6 +68,7 @@ export function validateProgressiveExecutionScope(
       "recipeId",
       "tokens",
       "units",
+      ...(hasContinuation ? ["continuation"] : []),
     ]) ||
     value.executionContract !== "progressive-cfd-v1" ||
     !identifier(value.executionId, UUID) ||
@@ -87,14 +98,58 @@ export function validateProgressiveExecutionScope(
     throw new Error(
       "Progressive request requires an explicit engine, pool and mesh capability",
     );
-  if (
+  let continuation: ProgressiveExecutionContinuation | undefined;
+  if (hasContinuation) {
+    const candidate = value.continuation;
+    if (
+      !record(candidate) ||
+      !exactKeys(candidate, [
+        "extensionId",
+        "sourceResultAttemptId",
+        "engineJobId",
+        "engineCaseSlug",
+        "extensionSeconds",
+      ]) ||
+      !identifier(candidate.extensionId, UUID) ||
+      !identifier(candidate.sourceResultAttemptId, UUID) ||
+      !identifier(candidate.engineJobId, UUID) ||
+      typeof candidate.engineCaseSlug !== "string" ||
+      !candidate.engineCaseSlug.trim() ||
+      candidate.engineCaseSlug.length > 512 ||
+      typeof candidate.extensionSeconds !== "number" ||
+      !Number.isFinite(candidate.extensionSeconds) ||
+      candidate.extensionSeconds <= 0 ||
+      candidate.extensionSeconds > 43200 ||
+      value.stage !== 2 ||
+      request.continue_from == null ||
+      request.continue_from.engine_job_id !== candidate.engineJobId ||
+      request.continue_from.case_slug !== candidate.engineCaseSlug ||
+      request.budget_override_s !== candidate.extensionSeconds ||
+      request.corrective_tail_periods != null ||
+      request.solver?.force_transient !== true ||
+      request.solver?.urans_fidelity !== "precalc" ||
+      !Number.isSafeInteger(request.expected_urans_recovery_version) ||
+      (request.expected_urans_recovery_version ?? -1) < 2
+    )
+      throw new Error(
+        "Progressive continuation is not bound to its exact saved URANS case",
+      );
+    continuation = {
+      extensionId: candidate.extensionId,
+      sourceResultAttemptId: candidate.sourceResultAttemptId,
+      engineJobId: candidate.engineJobId,
+      engineCaseSlug: candidate.engineCaseSlug,
+      extensionSeconds: candidate.extensionSeconds,
+    };
+  } else if (
     request.continue_from != null ||
     request.budget_override_s != null ||
     request.corrective_tail_periods != null
-  )
+  ) {
     throw new Error(
       "Progressive execution cannot override its immutable case allocations",
     );
+  }
   if (
     request.resources?.case_concurrency !== 1 ||
     request.solver?.warm_start !== true
@@ -106,6 +161,7 @@ export function validateProgressiveExecutionScope(
     !Array.isArray(value.units) ||
     value.units.length < 1 ||
     value.units.length > 512 ||
+    (continuation != null && value.units.length !== 1) ||
     !Array.isArray(value.tokens) ||
     value.tokens.length !== value.units.length
   )
@@ -191,5 +247,6 @@ export function validateProgressiveExecutionScope(
     recipeId: value.recipeId,
     tokens: [...value.tokens] as string[],
     units,
+    ...(continuation ? { continuation } : {}),
   };
 }

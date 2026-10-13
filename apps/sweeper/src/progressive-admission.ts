@@ -83,6 +83,7 @@ export async function admitProgressiveCfdBatch(
       const composed = await composeProgressiveCfdJob(connection, leases, {
         cpuSlots: available,
         meshRecoveryVersion: input.meshRecoveryVersion,
+        uransRecoveryVersion: input.uransRecoveryVersion,
         solverBudgetVersion: input.solverBudgetVersion,
         localTimeStepVersion: input.localTimeStepVersion,
       });

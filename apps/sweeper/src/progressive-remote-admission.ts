@@ -184,6 +184,7 @@ export async function prepareProgressiveRemoteDispatch(
       const composed = await composeProgressiveCfdJob(connection, leases, {
         cpuSlots: available,
         meshRecoveryVersion: capabilities.meshRecoveryVersion,
+        uransRecoveryVersion: capabilities.uransRecoveryVersion,
         solverBudgetVersion: 2,
         localTimeStepVersion: capabilities.localTimeStepVersion,
       });
