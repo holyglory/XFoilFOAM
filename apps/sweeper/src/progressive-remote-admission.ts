@@ -18,6 +18,8 @@ import {
 } from "./progressive-claim-deferral";
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 
+const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 10_000;
+
 export interface ProgressiveRemoteCapabilities {
   localTimeStepVersion?: number | null;
   version: 1;
@@ -263,6 +265,26 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
     waitingReasons: [] as Array<{ solverId: string; reason: string }>,
     errors: [] as Array<{ solverId: string; reason: string }>,
   };
+  const unappliedReports = await db.execute(sql`
+    SELECT report.sim_job_id, report.sequence
+    FROM progressive_remote_reports report
+    LEFT JOIN progressive_remote_progress_receipts receipt
+      ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
+    LEFT JOIN progressive_remote_report_inventories inventory
+      ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
+    WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
+    LIMIT ${PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT}
+  `);
+  if (unappliedReports.length >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT) {
+    for (const solver of solvers) {
+      receipt.waiting += 1;
+      receipt.waitingReasons.push({
+        solverId: String(solver.id),
+        reason: "Remote report reconciliation backlog is throttling new admissions",
+      });
+    }
+    return receipt;
+  }
   const maxAdmissionsPerTick = remoteAdmissionsPerTick();
   for (const solver of solvers) {
     const solverId = String(solver.id);
