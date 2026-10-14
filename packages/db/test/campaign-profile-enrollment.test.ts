@@ -186,6 +186,7 @@ import {
 import { simCampaignConditions } from "../src/schema";
 import {
   bindProgressiveRemoteDispatch,
+  clearHubWorkerPayloadFields,
   progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteReservedSlots,
 } from "../src/progressive-remote-dispatch";
@@ -3637,6 +3638,21 @@ describe("progressive CPU admission", () => {
           FROM sim_jobs WHERE id = ${job.id}::uuid
         `);
         expect(hubPayload).toEqual({
+          remote_solver: false,
+          remote_execution: false,
+        });
+        await db.execute(sql`
+          UPDATE sim_jobs SET request_payload = request_payload ||
+            '{"remoteSolver":true,"solverId":"fixture","syncPromiseId":"fixture","upstreamBaseUrl":"https://fixture.invalid/api/sync/v1","remoteProgressiveExecution":{}}'::jsonb
+          WHERE id = ${job.id}::uuid
+        `);
+        expect(await clearHubWorkerPayloadFields(db)).toBe(1);
+        const [cleanedHubPayload] = await db.execute(sql`
+          SELECT request_payload ? 'remoteSolver' AS remote_solver,
+            request_payload ? 'remoteProgressiveExecution' AS remote_execution
+          FROM sim_jobs WHERE id = ${job.id}::uuid
+        `);
+        expect(cleanedHubPayload).toEqual({
           remote_solver: false,
           remote_execution: false,
         });

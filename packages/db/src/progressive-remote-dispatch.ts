@@ -91,6 +91,44 @@ export async function progressiveRemoteActivePromiseCount(
   return Number(row.count);
 }
 
+export async function clearHubWorkerPayloadFields(
+  db: DB,
+  limit = 512,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 2_000)
+    throw new Error("Invalid hub dispatch payload cleanup limit");
+  const rows = await db.execute(sql`
+    WITH candidates AS MATERIALIZED (
+      SELECT job.id
+      FROM sim_jobs job
+      JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
+      JOIN sync_api_settings settings ON settings.id = 1
+      WHERE NOT settings.remote_solver_enabled
+        AND (
+          job.request_payload ? 'remoteSolver'
+          OR job.request_payload ? 'solverId'
+          OR job.request_payload ? 'syncPromiseId'
+          OR job.request_payload ? 'upstreamBaseUrl'
+          OR job.request_payload ? 'remoteProgressiveExecution'
+        )
+      ORDER BY job."updatedAt", job.id
+      LIMIT ${limit}
+    )
+    UPDATE sim_jobs job
+    SET request_payload = request_payload
+      - 'remoteSolver'
+      - 'solverId'
+      - 'syncPromiseId'
+      - 'upstreamBaseUrl'
+      - 'remoteProgressiveExecution',
+      "updatedAt" = clock_timestamp()
+    FROM candidates
+    WHERE job.id = candidates.id
+    RETURNING job.id
+  `);
+  return rows.length;
+}
+
 export async function bindProgressiveRemoteDispatch(
   db: DB,
   input: { simJobId: string; promiseId: string; solverId: string },
