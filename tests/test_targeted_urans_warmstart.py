@@ -481,6 +481,60 @@ def test_freestream_fallback_skips_init_and_starts_pimple_from_time_zero(
     assert any("skipping in-case short simpleFoam init" in message for message in caplog.messages)
 
 
+def test_fresh_low_mach_transient_survives_postprocess_handoff(tmp_path, monkeypatch):
+    """A fresh low-Mach progressive case keeps its transient through postprocess."""
+    observed: dict[str, Path] = {}
+
+    def fake_run_transient(case_dir, *_args, **_kwargs):
+        return _successful_no_shedding_transient(Path(case_dir) / "transient")
+
+    def fake_archive(_case_dir, post_dir, *_args, **_kwargs):
+        observed["post_dir"] = Path(post_dir)
+        assert observed["post_dir"].is_dir()
+
+    class PostprocessRunner:
+        def application(self, postprocess_case_dir, _command, *args, **kwargs):
+            assert Path(postprocess_case_dir) == case_dir / "transient"
+            return SimpleNamespace(ok=True, stdout="", check=lambda: None)
+
+    monkeypatch.setattr(pipeline, "_run_transient", fake_run_transient)
+    monkeypatch.setattr(pipeline, "_archive_case_evidence", fake_archive)
+    monkeypatch.setattr(
+        pipeline,
+        "dialect_for_runner",
+        lambda _runner: SimpleNamespace(y_plus_command="postProcess -func yPlus"),
+    )
+
+    case_dir = tmp_path / "case"
+    outcome = CaseOutcome(
+        spec=CaseSpec(chord=0.5, speed=50.0, aoa_deg=8.0),
+        reynolds=250_000,
+    )
+    _finalize_outcome(
+        case_dir,
+        outcome,
+        airfoil=SimpleNamespace(name="naca0012", contour=[]),
+        resolved=MeshParams(),
+        spec=outcome.spec,
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(
+            flow_solver_family="pimpleFoam",
+            force_transient=True,
+            urans_fidelity="precalc",
+            write_images=[],
+        ),
+        runner=PostprocessRunner(),
+        n_proc=1,
+        render_images=False,
+        solver_timeout=60,
+    )
+
+    assert outcome.error is None
+    assert observed["post_dir"] == case_dir / "transient"
+    assert observed["post_dir"].is_dir()
+
+
 def test_converged_full_steady_field_still_warm_starts_transient(tmp_path, monkeypatch):
     """False-positive guard: a full steady stage with residual convergence is
     still the preferred URANS initial field."""

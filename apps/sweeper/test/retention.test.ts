@@ -909,6 +909,64 @@ describe("terminal strip reaper", () => {
     });
   });
 
+  it("MUST-CATCH: keeps a failed HZ case until terminal result ingestion stamps the job", async () => {
+    const [promise] = await db
+      .insert(syncSweepPromises)
+      .values({
+        sourceInstanceId: `${PREFIX}-hz-source`,
+        sourceInstanceName: `${PREFIX} hz source`,
+        sourceBaseUrl: "https://hz.invalid/api/sync/v1",
+        airfoilId,
+        simulationPresetRevisionId: revisionId,
+        aoaCount: 1,
+        expiresAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+        lastHeartbeatAt: NOW,
+        requestPayload: { fixture: PREFIX },
+      })
+      .returning({ id: syncSweepPromises.id });
+    const job = await insertTerminalJob(`${PREFIX}-hz-failed-uningested`, {
+      status: "failed",
+      engineState: "failed",
+      error: "FileNotFoundError: [Errno 2] No such file or directory: /data/airfoilfoam/jobs/hz/cases/a0/transient",
+      requestPayload: { syncPromiseId: promise.id, remoteSolver: true },
+      ingestedAt: null,
+      finishedAt: OLD,
+    });
+    await db.insert(syncRemoteResultDeliveries).values({
+      promiseId: promise.id,
+      simJobId: job.id,
+      generationKey: `${PREFIX}-hz-failed-generation`,
+      state: "delivered",
+      deliveredAt: NOW,
+      nextAttemptAt: OLD,
+    });
+    const engine = fakeEngine();
+
+    await stripTerminalJobs(db, engine, {
+      now: NOW,
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.stripCalls)).toEqual([]);
+    expect(own(engine.deleteCalls)).toEqual([]);
+    expect((await readJob(job.id)).strippedAt).toBeNull();
+
+    await db
+      .update(simJobs)
+      .set({ ingestedAt: OLD })
+      .where(eq(simJobs.id, job.id));
+    await stripTerminalJobs(db, engine, {
+      now: new Date(NOW.getTime() + 60_000),
+      stripMinAgeMs: THIRTY_MIN,
+      stripMaxPerTick: 500,
+    });
+
+    expect(own(engine.deleteCalls)).toEqual([job.engineJobId]);
+    await db.delete(syncRemoteResultDeliveries).where(eq(syncRemoteResultDeliveries.simJobId, job.id));
+    await db.delete(syncSweepPromises).where(eq(syncSweepPromises.id, promise.id));
+  });
+
   it("keeps remote-solver source bytes until acknowledgement, then deletes the whole disposable job directory", async () => {
     const [promise] = await db
       .insert(syncSweepPromises)

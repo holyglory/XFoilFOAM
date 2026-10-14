@@ -184,7 +184,8 @@ export async function stripTerminalJobs(
         AND (
           j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
           OR (
-            (
+            j."ingestedAt" IS NOT NULL
+            AND (
               NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
               OR EXISTS (
                 SELECT 1
@@ -203,7 +204,7 @@ export async function stripTerminalJobs(
             )
             AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
               ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
-          )
+            )
         )
       ORDER BY COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt"), j.id
       LIMIT ${candidateScanLimit}

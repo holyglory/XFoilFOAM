@@ -951,6 +951,119 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     ).toBe(false);
   });
 
+  it("MUST-CATCH: released-cell quarantine preserves an incoming infrastructure error on the immutable attempt", async () => {
+    await cleanCell();
+    const infrastructureError =
+      "FileNotFoundError: [Errno 2] No such file or directory: /data/airfoilfoam/jobs/hz/cases/a0/transient";
+    const previousEngineJobId = `${PREFIX}-released-infrastructure-previous`;
+    const incomingEngineJobId = `${PREFIX}-released-infrastructure-incoming`;
+    const [previousJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "failed",
+        engineJobId: previousEngineJobId,
+        totalCases: 1,
+        requestPayload: {
+          speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+          aoas: [GATE_AOA],
+          uransFidelity: "precalc",
+        },
+      })
+      .returning();
+    const [shell] = await db
+      .insert(results)
+      .values({
+        airfoilId,
+        bcId,
+        simulationPresetRevisionId: revisionId,
+        aoaDeg: GATE_AOA,
+        status: "failed",
+        source: "queued",
+        error: "previous infrastructure failure",
+        simJobId: previousJob.id,
+        engineJobId: previousEngineJobId,
+        engineCaseSlug: "a0",
+        regime: "urans",
+        reynolds,
+        speed: SPEED,
+        chord: CHORD,
+        mach,
+      })
+      .returning({ id: results.id });
+    const [incomingJob] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "running",
+        engineJobId: incomingEngineJobId,
+        totalCases: 1,
+        requestPayload: {
+          speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+          aoas: [GATE_AOA],
+          uransFidelity: "precalc",
+        },
+      })
+      .returning();
+
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId: incomingEngineJobId,
+      simJobId: incomingJob.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      uransFidelity: "precalc",
+      result: jobResult(incomingEngineJobId, {
+        case_slug: "a0",
+        aoa_deg: GATE_AOA,
+        unsteady: true,
+        converged: false,
+        first_order_fallback: false,
+        images: {},
+        error: infrastructureError,
+        fidelity: "urans_precalc",
+        failure_disposition: "infrastructure",
+      } as PolarPoint),
+    });
+
+    const [attempt] = await db
+      .select({ error: resultAttempts.error, qualityWarnings: resultAttempts.qualityWarnings })
+      .from(resultAttempts)
+      .where(
+        and(
+          eq(resultAttempts.simJobId, incomingJob.id),
+          eq(resultAttempts.resultId, shell.id),
+        ),
+      )
+      .limit(1);
+    expect(attempt.error).toBe(infrastructureError);
+    expect(
+      attempt.qualityWarnings?.some((warning) =>
+        warning.startsWith("released-cell failure quarantined:"),
+      ),
+    ).toBe(true);
+    const [canonical] = await db
+      .select({ status: results.status, simJobId: results.simJobId, error: results.error })
+      .from(results)
+      .where(eq(results.id, shell.id));
+    expect(canonical).toEqual({
+      status: "failed",
+      simJobId: previousJob.id,
+      error: "previous infrastructure failure",
+    });
+  });
+
   it("MUST-CATCH: accepted PRECALC replaces a stale parent RANS generation owned by the exact running obligation", async () => {
     await cleanCell();
     const keptId = await seedAcceptedRansCell();

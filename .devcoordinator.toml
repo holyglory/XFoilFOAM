@@ -4247,3 +4247,59 @@ name = "layout"
 tier = "development"
 requires = ["verifier-self-test", "preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-layout.mjs"]
+
+[test.hz-transient-lifecycle]
+timeout_seconds = 1800
+
+[test.hz-transient-lifecycle.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.hz-transient-lifecycle.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+env = { CI = "true" }
+
+[[test.hz-transient-lifecycle.check]]
+name = "python-dependencies"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "sync", "--frozen", "--extra", "dev", "--python", "/usr/bin/python3"]
+
+[[test.hz-transient-lifecycle.check]]
+name = "worker-transient-handoff"
+tier = "development"
+requires = ["python-dependencies"]
+command = ["/home/holyglory/.local/bin/uv", "run", "--no-sync", "-m", "pytest", "tests/test_targeted_urans_warmstart.py", "-q"]
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.hz-transient-lifecycle.check]]
+name = "sweeper-types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.hz-transient-lifecycle.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "src/migrate.ts"]
+
+[[test.hz-transient-lifecycle.check]]
+name = "seed"
+tier = "development"
+requires = ["schema", "workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.hz-transient-lifecycle.check]]
+name = "retention-hz-fence"
+tier = "development"
+requires = ["seed", "sweeper-types", "workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/retention.test.ts", "-t", "MUST-CATCH: keeps a failed HZ"]
+
+[[test.hz-transient-lifecycle.check]]
+name = "quarantine-origin"
+tier = "development"
+requires = ["seed", "sweeper-types", "workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/replace-guard.test.ts", "-t", "released-cell quarantine preserves"]
