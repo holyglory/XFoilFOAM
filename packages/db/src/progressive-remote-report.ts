@@ -162,6 +162,17 @@ function hasPermanentContinuationFailure(value: unknown): boolean {
   );
 }
 
+function hasNoSolverProgress(value: unknown): boolean {
+  if (value == null) return true;
+  if (!record(value) || !Array.isArray(value.cases)) return false;
+  return value.cases.every(
+    (item) =>
+      record(item) &&
+      item.solver_running === false &&
+      Number(item.solver_active_seconds) === 0,
+  );
+}
+
 export function validateProgressiveRemoteReport(
   value: unknown,
   assignment: ProgressiveRemoteExecutionEnvelope,
@@ -212,10 +223,7 @@ export function validateProgressiveRemoteReport(
       (record(value.result) &&
         Array.isArray(value.result.polars) &&
         value.result.polars.length === 0)) &&
-      (status.solver_budget_progress == null ||
-      (record(status.solver_budget_progress) &&
-        Array.isArray(status.solver_budget_progress.cases) &&
-        status.solver_budget_progress.cases.length === 0));
+      hasNoSolverProgress(status.solver_budget_progress);
   const cancelledBeforeCases =
     record(status) &&
     status.state === "cancelled" &&
@@ -229,10 +237,7 @@ export function validateProgressiveRemoteReport(
       (record(value.result) &&
         Array.isArray(value.result.polars) &&
         value.result.polars.length === 0)) &&
-      (status.solver_budget_progress == null ||
-      (record(status.solver_budget_progress) &&
-        Array.isArray(status.solver_budget_progress.cases) &&
-        status.solver_budget_progress.cases.length === 0));
+      hasNoSolverProgress(status.solver_budget_progress);
   const permanentContinuationBeforeCases =
     record(status) &&
     status.state === "failed" &&
@@ -244,10 +249,7 @@ export function validateProgressiveRemoteReport(
       (record(value.result) &&
         Array.isArray(value.result.polars) &&
         value.result.polars.length === 0)) &&
-    (status.solver_budget_progress == null ||
-      (record(status.solver_budget_progress) &&
-        Array.isArray(status.solver_budget_progress.cases) &&
-        status.solver_budget_progress.cases.length === 0));
+    hasNoSolverProgress(status.solver_budget_progress);
   if (
     !record(status) ||
     status.job_id !== envelope.scope.executionId ||
@@ -256,6 +258,7 @@ export function validateProgressiveRemoteReport(
     (status.total_cases !== envelope.scope.units.length &&
       !failedBeforeCases &&
       !cancelledBeforeCases &&
+      !permanentContinuationBeforeCases &&
       !permanentContinuationBeforeCases &&
       !(
         status.total_cases === 0 &&

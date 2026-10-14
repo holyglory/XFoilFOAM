@@ -332,6 +332,21 @@ describe("remote progressive incremental report validation", () => {
       ...report.status,
       continuation_failure_kind: null,
       message: "continuation_source_permanent: saved transient is unavailable",
+      solver_budget_progress: {
+        version: 1,
+        job_id: report.executionId,
+        observed_at: "2026-09-09T00:00:00Z",
+        cases: [
+          {
+            chord: 1,
+            speed: 30,
+            aoa_deg: 0,
+            solver_active_seconds: 0,
+            limit_seconds: 900,
+            solver_running: false,
+          },
+        ],
+      },
     };
     expect(validateProgressiveRemoteReport(report, assignment).report).toEqual(
       report,
