@@ -309,3 +309,66 @@ export async function acknowledgeProgressiveWorkerReport(
     );
   });
 }
+
+export async function quarantineProgressiveWorkerReportConflict(
+  db: DB,
+  input: {
+    executionId: string;
+    solverId: string;
+    sequence: number;
+    contentSignature: string;
+    reason: string;
+  },
+): Promise<boolean> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    await connection.execute(
+      sql`SELECT id FROM sim_jobs WHERE id = ${input.executionId}::uuid FOR UPDATE`,
+    );
+    const [row] = await connection.execute(sql`
+      SELECT report, content_signature
+      FROM progressive_worker_reports
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND sequence = ${input.sequence}
+        AND content_signature = ${input.contentSignature}
+        AND report->>'solverId' = ${input.solverId}
+        AND acknowledged_at IS NULL
+    `);
+    if (
+      !row ||
+      !isFinalProgressiveRemoteReport(
+        row.report as unknown as ProgressiveRemoteReport,
+      )
+    )
+      return false;
+    await connection.execute(sql`
+      INSERT INTO progressive_worker_report_conflicts
+        (sim_job_id, sequence, content_signature, report, reason)
+      VALUES
+        (${input.executionId}::uuid, ${input.sequence}, ${input.contentSignature},
+         ${JSON.stringify(row.report)}::jsonb, ${input.reason})
+      ON CONFLICT (sim_job_id, sequence) DO NOTHING
+    `);
+    const [acknowledged] = await connection.execute(sql`
+      UPDATE progressive_worker_reports
+      SET acknowledged_at = coalesce(acknowledged_at, clock_timestamp())
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND sequence = ${input.sequence}
+        AND content_signature = ${input.contentSignature}
+        AND report->>'solverId' = ${input.solverId}
+        AND acknowledged_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_worker_reports previous
+          WHERE previous.sim_job_id = progressive_worker_reports.sim_job_id
+            AND previous.sequence < progressive_worker_reports.sequence
+            AND previous.acknowledged_at IS NULL
+        )
+      RETURNING sequence
+    `);
+    if (!acknowledged) return false;
+    await connection.execute(
+      sql`SELECT pg_notify('progressive_worker_evidence_changed', ${input.executionId})`,
+    );
+    return true;
+  });
+}

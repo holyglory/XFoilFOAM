@@ -8147,6 +8147,29 @@ export const progressiveWorkerReports = pgTable(
   }),
 );
 
+export const progressiveWorkerReportConflicts = pgTable(
+  "progressive_worker_report_conflicts",
+  {
+    simJobId: uuid("sim_job_id")
+      .notNull()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    contentSignature: text("content_signature").notNull(),
+    report: jsonb("report").$type<Record<string, unknown>>().notNull(),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    signatureCheck: check(
+      "progressive_worker_report_conflicts_content_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
+    ),
+  }),
+);
+
 export const progressiveRemoteProgressReceipts = pgTable(
   "progressive_remote_progress_receipts",
   {

@@ -1,9 +1,11 @@
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   acknowledgeProgressiveWorkerReport,
+  quarantineProgressiveWorkerReportConflict,
   readPendingProgressiveWorkerReport,
   validateProgressiveRemoteReport,
   verifyProgressiveRemoteExecution,
+  isFinalProgressiveRemoteReport,
   type DB,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
@@ -18,7 +20,8 @@ export async function publishProgressiveWorkerReport(
   executionId: string,
   fetcher: typeof fetch = fetch,
 ): Promise<
-  { kind: "idle" | "paused" } | { kind: "published"; sequence: number }
+  | { kind: "idle" | "paused" }
+  | { kind: "published" | "quarantined"; sequence: number }
 > {
   const [owned] = await db.execute(sql`
     SELECT settings.remote_solver_registered_id AS solver_id, settings.remote_solver_auth_token AS auth_token,
@@ -82,6 +85,23 @@ export async function publishProgressiveWorkerReport(
       }),
     },
   );
+  if (response.status === 409) {
+    const body = (await response.json().catch(() => null)) as {
+      error?: unknown;
+    } | null;
+    if (
+      body?.error === "Remote report replay changed immutable content" &&
+      isFinalProgressiveRemoteReport(pending.report) &&
+      (await quarantineProgressiveWorkerReportConflict(db, {
+        executionId,
+        solverId: String(owned.solver_id),
+        sequence: pending.sequence,
+        contentSignature: pending.contentSignature,
+        reason: String(body.error),
+      }))
+    )
+      return { kind: "quarantined", sequence: pending.sequence };
+  }
   if (!response.ok)
     throw new Error(`Remote report publication failed (${response.status})`);
   const body = (await response.json()) as {
@@ -143,7 +163,8 @@ export async function publishProgressiveWorkerReports(
   );
   const published = results.some(
     (result) =>
-      result.status === "fulfilled" && result.value.kind === "published",
+      result.status === "fulfilled" &&
+      ["published", "quarantined"].includes(result.value.kind),
   );
   if (failures.length) {
     const reason = failures[0].reason;

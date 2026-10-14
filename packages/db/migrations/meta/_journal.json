@@ -1261,6 +1261,13 @@
       "when": 1792368000073,
       "tag": "0179_progressive_legacy_continuation_final_stop",
       "breakpoints": true
+    },
+    {
+      "idx": 180,
+      "version": "7",
+      "when": 1792368000074,
+      "tag": "0180_progressive_worker_report_conflicts",
+      "breakpoints": true
     }
   ]
 }
