@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from airfoilfoam.models import CaseSpec, PolarRequest, ResourceParams, SolverCaseAllocation
-from airfoilfoam.openfoam.budget import BudgetedRunner, begin_case_budget, case_solver_seconds, case_solver_budget
+from airfoilfoam.openfoam.budget import BudgetedRunner, begin_case_budget, case_solver_seconds, case_solver_budget, register_case_budget
 from airfoilfoam.openfoam.runner import InfrastructureError, InsufficientMpiSlotsError, RunResult, Runner
 
 
@@ -142,6 +142,21 @@ def test_live_measurement_does_not_wait_for_the_active_solver(monkeypatch, tmp_p
         assert solver.result(timeout=2).ok
     assert runner.snapshot()[0] == {**observed[0], "solver_running": False}
     assert runner.consumed(case()) == 4.25
+
+
+def test_register_case_publishes_budget_without_claiming_solver_thread(budget, tmp_path):
+    runner, _inner = budget
+    register_case_budget(runner, case())
+    assert runner.snapshot() == [{
+        "chord": 1.0,
+        "speed": 30.0,
+        "aoa_deg": 0.0,
+        "solver_active_seconds": 0.0,
+        "limit_seconds": 10.0,
+        "solver_running": False,
+    }]
+    with pytest.raises(InfrastructureError, match="ownership"):
+        runner.solver(tmp_path, "simpleFoam", 1)
 
 
 def test_mpi_only_charges_solver_not_mesh_decomposition_or_reconstruction(budget, tmp_path):

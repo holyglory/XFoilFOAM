@@ -53,6 +53,9 @@ class BudgetedRunner(Runner):
 
     def begin_case(self, spec) -> None:
         self._thread.current = None
+        self._thread.current = self.register_case(spec)
+
+    def register_case(self, spec) -> _CaseBudget:
         key = (float(spec.chord), float(spec.speed), float(spec.aoa_deg))
         if not all(math.isfinite(value) for value in key):
             raise ValueError("Solver budget identity requires a finite physical case")
@@ -60,7 +63,7 @@ class BudgetedRunner(Runner):
         if limit is None:
             raise InfrastructureError("Physical case has no exact solver budget allocation")
         with self._cases_lock:
-            self._thread.current = self._cases.setdefault(key, _CaseBudget(limit_seconds=limit))
+            return self._cases.setdefault(key, _CaseBudget(limit_seconds=limit))
 
     def limit(self, spec) -> float | None:
         key = (float(spec.chord), float(spec.speed), float(spec.aoa_deg))
@@ -145,6 +148,11 @@ class BudgetedRunner(Runner):
 def begin_case_budget(runner, spec) -> None:
     if isinstance(runner, BudgetedRunner):
         runner.begin_case(spec)
+
+
+def register_case_budget(runner, spec) -> None:
+    if isinstance(runner, BudgetedRunner):
+        runner.register_case(spec)
 
 
 def case_solver_seconds(runner, spec) -> float | None:

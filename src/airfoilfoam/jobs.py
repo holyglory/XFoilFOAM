@@ -47,6 +47,7 @@ from .pipeline import (
 )
 from .resources import CpuTokenPool, execution_unit_count, resolve_resources
 from .storage import JobStore
+from .openfoam.budget import BudgetedRunner, begin_case_budget, register_case_budget
 
 logger = logging.getLogger(__name__)
 
@@ -229,11 +230,13 @@ def execute_job(
     from .openfoam.execution import configure_flow_execution
     configure_flow_execution(runner, request)
     if request.resources.case_solver_budget_seconds is not None or request.resources.case_solver_allocations is not None:
-        from .openfoam.budget import BudgetedRunner
         runner = BudgetedRunner(runner, request.resources.case_solver_budget_seconds,
                                 case_allocations=request.resources.case_solver_allocations)
         if budget_started is not None:
             budget_started(runner)
+    if isinstance(runner, BudgetedRunner):
+        for budget_case in request.cases():
+            register_case_budget(runner, budget_case)
     aoas = request.aoa.expand()
     chords, speeds = request.chord_lengths, request.speeds
     total = len(chords) * len(speeds) * len(aoas)

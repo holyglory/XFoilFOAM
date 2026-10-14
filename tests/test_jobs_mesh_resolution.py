@@ -61,12 +61,14 @@ def _request(naca0012_selig_text: str, *, mesh: MeshParams) -> PolarRequest:
     )
 
 
-def _wire_fake_engine(monkeypatch, prepared, solved):
+def _wire_fake_engine(monkeypatch, prepared, solved, observed_progress=None):
     mesher = _Mesher()
 
     def fake_prepare(mesh_dir, _airfoil, resolved, _chord, _mesher, _runner, **_kwargs):
         mesh_dir.mkdir(parents=True, exist_ok=True)
         prepared.append((mesh_dir, resolved))
+        if observed_progress is not None:
+            observed_progress.append(_runner.progress("budget-prep").cases)
         return SimpleNamespace(n_cells=321), resolved, False
 
     def fake_run_case(
@@ -98,6 +100,45 @@ def _wire_fake_engine(monkeypatch, prepared, solved):
     monkeypatch.setattr(jobs, "get_mesher", lambda _name: mesher)
     monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", fake_prepare)
     monkeypatch.setattr(jobs, "run_case", fake_run_case)
+
+
+def test_budget_progress_covers_all_cases_before_shared_mesh_preparation(
+    tmp_path, monkeypatch, naca0012_selig_text
+):
+    prepared: list[tuple[Path, MeshParams]] = []
+    solved: list[tuple[CaseSpec, MeshParams, Path]] = []
+    observed_progress = []
+    _wire_fake_engine(monkeypatch, prepared, solved, observed_progress)
+    request = _request(naca0012_selig_text, mesh=MeshParams()).model_copy(
+        update={
+            "resources": ResourceParams(
+                policy="case_parallel",
+                cpu_budget=1,
+                case_concurrency=1,
+                solver_processes=1,
+                case_solver_budget_seconds=900,
+            ),
+            "expected_solver_budget_version": 2,
+        }
+    )
+
+    jobs.execute_job(
+        "budget-heartbeat-before-mesh",
+        request,
+        store=JobStore(_settings(tmp_path)),
+        settings=_settings(tmp_path),
+    )
+
+    assert len(observed_progress) == 2
+    for cases in observed_progress:
+        assert {(case.chord, case.speed, case.aoa_deg) for case in cases} == {
+            (1.0, 30.0, 0.0),
+            (1.0, 30.0, 2.0),
+            (1.0, 90.0, 0.0),
+            (1.0, 90.0, 2.0),
+        }
+        assert all(case.solver_active_seconds == 0.0 for case in cases)
+        assert all(case.solver_running is False for case in cases)
 
 
 def test_multi_speed_job_builds_one_mesh_per_distinct_speed_resolved_recipe(
