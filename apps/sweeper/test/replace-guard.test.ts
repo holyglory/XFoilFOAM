@@ -3541,6 +3541,74 @@ describe("ingest replace guard (gate incident 2026-07-07)", () => {
     ).toHaveLength(2);
   }, 60000);
 
+  it("keeps a late infrastructure transient-missing failure as quarantined history", async () => {
+    await cleanCell();
+    const keptId = await seedAcceptedRansCell();
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId);
+    const [before] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, keptId));
+    const engineJobId = `${PREFIX}-late-transient-missing`;
+    const [job] = await db
+      .insert(simJobs)
+      .values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        solverImplementationId,
+        jobKind: "targeted",
+        referenceChordM: CHORD,
+        wave: 2,
+        status: "running",
+        engineJobId,
+        totalCases: 1,
+        completedCases: 1,
+      })
+      .returning();
+    const failed = rejectedPrecalcPoint();
+    failed.error =
+      "FileNotFoundError: [Errno 2] No such file or directory: /data/airfoilfoam/jobs/late/cases/a0/transient";
+    failed.failure_disposition = "infrastructure";
+    failed.quality_warnings = [failed.error];
+    const errorSpy = vi.spyOn(console, "error");
+
+    await ingestResult({
+      db,
+      engine: stubEngine(),
+      engineJobId,
+      simJobId: job.id,
+      airfoilId,
+      speedMap: [{ speed: SPEED, bcId, presetRevisionId: revisionId, mach }],
+      uransFidelity: "precalc",
+      result: jobResult(engineJobId, failed),
+    });
+
+    const [after] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, keptId));
+    expect(after.currentResultAttemptId).toBe(before.currentResultAttemptId);
+    expect(after.status).toBe("done");
+    expect(after.engineJobId).toBe(`${PREFIX}-seed-accepted`);
+    expect(
+      errorSpy.mock.calls.some((call) =>
+        String(call[0]).includes("RELEASED-CELL GUARD"),
+      ),
+    ).toBe(true);
+    const attempts = await db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.resultId, keptId));
+    expect(attempts).toHaveLength(2);
+    expect(attempts.at(-1)?.qualityWarnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("FileNotFoundError"),
+        expect.stringContaining("released-cell failure quarantined"),
+      ]),
+    );
+  }, 60000);
+
   it("fences a stale concurrent correction so projection and pointer stay one generation", async () => {
     await cleanCell();
     const seeded = await seedAcceptedPrecalcCell("concurrent-correction");
