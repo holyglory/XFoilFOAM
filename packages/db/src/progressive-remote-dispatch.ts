@@ -100,33 +100,66 @@ export async function repairProgressiveRemoteDispatchPayloads(
 ): Promise<number> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000)
     throw new Error("Invalid progressive remote payload repair limit");
-  const rows = await db.execute(sql`
-    WITH candidates AS MATERIALIZED (
-      SELECT dispatch.sim_job_id, dispatch.promise_id, dispatch.envelope,
-        promise.source_base_url
-      FROM progressive_remote_dispatches dispatch
-      JOIN sim_jobs job ON job.id = dispatch.sim_job_id
-      JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-      WHERE job.request_payload -> 'remoteProgressiveExecution' IS NULL
-        AND job.request_payload -> 'syncPromiseId' IS NULL
-        AND promise.source_base_url IS NOT NULL
-      ORDER BY dispatch.created_at, dispatch.sim_job_id
-      LIMIT ${limit}
-    )
-    UPDATE sim_jobs job
-    SET request_payload = job.request_payload || jsonb_build_object(
-      'remoteSolver', true,
-      'syncPromiseId', candidates.promise_id::text,
-      'upstreamBaseUrl', candidates.source_base_url,
-      'remoteProgressiveExecution', candidates.envelope
-    ), "updatedAt" = clock_timestamp()
-    FROM candidates
-    WHERE job.id = candidates.sim_job_id
-      AND job.request_payload -> 'remoteProgressiveExecution' IS NULL
-      AND job.request_payload -> 'syncPromiseId' IS NULL
-    RETURNING job.id
-  `);
-  return rows.length;
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    await connection.execute(sql`
+      WITH candidates AS MATERIALIZED (
+        SELECT promise.id, settings.upstream_base_url
+        FROM progressive_remote_dispatches dispatch
+        JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+        JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+        JOIN sync_api_settings settings ON settings.id = 1
+        WHERE promise.source_base_url IS NULL
+          AND promise.registered_solver_id = settings.remote_solver_registered_id
+          AND settings.upstream_base_url IS NOT NULL
+          AND (job.status IN ('pending', 'submitted', 'running', 'ingesting')
+            OR job.engine_state IN ('submitting', 'cancelling', 'cancel_pending'))
+        ORDER BY dispatch.created_at, dispatch.sim_job_id
+        LIMIT ${limit}
+      )
+      UPDATE sync_sweep_promises promise
+      SET source_base_url = candidates.upstream_base_url,
+        "updatedAt" = clock_timestamp()
+      FROM candidates
+      WHERE promise.id = candidates.id
+    `);
+    const rows = await connection.execute(sql`
+      WITH candidates AS MATERIALIZED (
+        SELECT dispatch.sim_job_id, promise.id AS promise_id, dispatch.envelope,
+          coalesce(promise.source_base_url, settings.upstream_base_url) AS source_base_url
+        FROM progressive_remote_dispatches dispatch
+        JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+        JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+        JOIN sync_api_settings settings ON settings.id = 1
+        WHERE coalesce(promise.source_base_url, settings.upstream_base_url) IS NOT NULL
+          AND promise.registered_solver_id = settings.remote_solver_registered_id
+          AND (job.status IN ('pending', 'submitted', 'running', 'ingesting')
+            OR job.engine_state IN ('submitting', 'cancelling', 'cancel_pending'))
+          AND (
+            job.request_payload -> 'remoteProgressiveExecution' IS NULL
+            OR job.request_payload ->> 'syncPromiseId' IS NULL
+            OR job.request_payload ->> 'upstreamBaseUrl' IS NULL
+          )
+        ORDER BY dispatch.created_at, dispatch.sim_job_id
+        LIMIT ${limit}
+      )
+      UPDATE sim_jobs job
+      SET request_payload = job.request_payload
+        || jsonb_build_object(
+          'remoteSolver', true,
+          'syncPromiseId', candidates.promise_id::text,
+          'upstreamBaseUrl', candidates.source_base_url
+        )
+        || CASE WHEN job.request_payload -> 'remoteProgressiveExecution' IS NULL
+          THEN jsonb_build_object('remoteProgressiveExecution', candidates.envelope)
+          ELSE '{}'::jsonb END,
+        "updatedAt" = clock_timestamp()
+      FROM candidates
+      WHERE job.id = candidates.sim_job_id
+      RETURNING job.id
+    `);
+    return rows.length;
+  });
 }
 
 export async function bindProgressiveRemoteDispatch(
@@ -142,7 +175,7 @@ export async function bindProgressiveRemoteDispatch(
       SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1
     `);
     const [role] = await connection.execute(
-      sql`SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1`,
+      sql`SELECT remote_solver_enabled, upstream_base_url FROM sync_api_settings LIMIT 1`,
     );
     if (
       !state?.enabled ||
@@ -237,6 +270,16 @@ export async function bindProgressiveRemoteDispatch(
       throw new Error(
         "Remote dispatch promise changes the exact owned angle list",
       );
+    const upstreamBaseUrl =
+      promise.source_base_url ?? role?.upstream_base_url ?? null;
+    if (!upstreamBaseUrl)
+      throw new Error("Remote dispatch has no authenticated upstream base URL");
+    if (!promise.source_base_url)
+      await connection.execute(sql`
+        UPDATE sync_sweep_promises
+        SET source_base_url = ${upstreamBaseUrl}::text, "updatedAt" = clock_timestamp()
+        WHERE id = ${input.promiseId}::uuid AND source_base_url IS NULL
+      `);
     const current = await connection.execute(sql`
       SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg,
         ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds AS remaining_seconds
@@ -324,7 +367,7 @@ export async function bindProgressiveRemoteDispatch(
       SET request_payload = request_payload || jsonb_build_object(
         'remoteSolver', true,
         'syncPromiseId', ${input.promiseId}::text,
-        'upstreamBaseUrl', ${promise.source_base_url}::text,
+        'upstreamBaseUrl', ${upstreamBaseUrl}::text,
         'remoteProgressiveExecution', ${JSON.stringify(envelope)}::jsonb
       ), "updatedAt" = clock_timestamp()
       WHERE id = ${input.simJobId}::uuid

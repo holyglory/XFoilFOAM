@@ -102,7 +102,8 @@ export async function prepareProgressiveRemoteDispatch(
         SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1
       `);
       const [settings] = await connection.execute(sql`
-        SELECT enabled, remote_solver_enabled FROM sync_api_settings WHERE id = 1
+        SELECT enabled, remote_solver_enabled, upstream_base_url
+        FROM sync_api_settings WHERE id = 1
       `);
       const [permission] = await connection.execute(
         sql`SELECT can_fetch FROM sync_api_permissions WHERE data_type = 'sweeps'`,
@@ -207,7 +208,7 @@ export async function prepareProgressiveRemoteDispatch(
       await connection.execute(sql`
         INSERT INTO sync_sweep_promises (id, registered_solver_id, source_instance_id, source_instance_name, source_base_url,
           airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt", request_payload)
-        VALUES (${promiseId}::uuid, NULL, ${solver.instance_id}, ${solver.instance_name}, ${solver.public_endpoint},
+        VALUES (${promiseId}::uuid, NULL, ${solver.instance_id}, ${solver.instance_name}, ${settings.upstream_base_url},
           ${job.airfoil_id}::uuid, ${job.simulation_preset_revision_id}::uuid, ${leases.length}, clock_timestamp() + interval '1 hour',
           ${JSON.stringify({ solverId, progressiveExecutionId: composed.jobId, executionContract: "progressive-cfd-v1" })}::jsonb)
       `);
