@@ -31,6 +31,11 @@ const oldestUnappliedReport = sql`(
     )
 )`;
 
+const pendingUnsubmittedReport = sql`CASE
+  WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 0
+  ELSE 1
+END`;
+
 function executionScope(jobIds?: string[]) {
   return jobIds
     ? jobIds.length
@@ -50,7 +55,8 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
       OR (job.engine_job_id IS NULL AND job.status = 'pending' AND ${indexedReports})
     )
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-    ORDER BY ${oldestUnappliedReport} NULLS LAST,
+    ORDER BY ${pendingUnsubmittedReport},
+      ${oldestUnappliedReport} NULLS LAST,
       coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }
 
