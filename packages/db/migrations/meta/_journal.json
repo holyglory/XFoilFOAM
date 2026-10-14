@@ -1247,6 +1247,13 @@
       "when": 1792368000071,
       "tag": "0177_progressive_fast_budget_extensions",
       "breakpoints": true
+    },
+    {
+      "idx": 178,
+      "version": "7",
+      "when": 1792368000072,
+      "tag": "0178_progressive_permanent_continuation_final_stop",
+      "breakpoints": true
     }
   ]
 }

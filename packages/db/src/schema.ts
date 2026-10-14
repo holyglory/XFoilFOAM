@@ -8125,7 +8125,8 @@ export const progressiveWorkerReports = pgTable(
           AND ${table.report}#>>'{status,state}' = 'failed'
           AND ${table.report}#>>'{status,total_cases}' = '0'
           AND ${table.report}#>>'{status,completed_cases}' = '0'
-          AND ${table.report}#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure'))
+          AND (${table.report}#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure')
+            OR ${table.report}#>>'{status,continuation_failure_kind}' = 'permanent'))
       )`),
     sequenceCheck: check(
       "progressive_worker_reports_sequence_check",
