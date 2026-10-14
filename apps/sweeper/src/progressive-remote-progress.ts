@@ -44,9 +44,8 @@ async function applyProgressiveRemoteProgressInTransaction(
     await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE id = ${envelope.scope.epochId}::uuid FOR SHARE`,
     );
-    const [campaign] = await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
-      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign SKIP LOCKED`);
-    if (!campaign) return { kind: "deferred" as const };
+    await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
+      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
     const [job] = await connection.execute(
       sql`SELECT engine_job_id, status, engine_state, completed_cases, request_payload
       FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`,
@@ -190,7 +189,6 @@ async function applyProgressiveRemoteProgressBatch(
       indexed: 0,
       stopped: 0,
       idle: false,
-      deferred: 0,
       errors: [] as Array<{ executionId: string; reason: string }>,
     };
     for (
@@ -212,10 +210,6 @@ async function applyProgressiveRemoteProgressBatch(
         }
         if (result.kind === "idle") {
           batchReceipt.idle = true;
-          break;
-        }
-        if (result.kind === "deferred") {
-          batchReceipt.deferred += 1;
           break;
         }
       } catch (error) {
@@ -296,7 +290,6 @@ export async function reconcileProgressiveRemoteProgress(
           campaignReceipt.indexed += batch.indexed;
           campaignReceipt.stopped += batch.stopped;
           campaignReceipt.errors.push(...batch.errors);
-          campaignReceipt.waiting += batch.deferred;
           if (batch.idle && batch.errors.length === 0) {
             const terminal = await settleProgressiveRemoteJob(
               db,
