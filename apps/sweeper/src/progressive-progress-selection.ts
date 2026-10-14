@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
 
 const PROGRESSIVE_REPORT_JOB_LIMIT = 32;
-const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 128;
+const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 4;
 
 const unappliedReports = sql`EXISTS (
   SELECT 1 FROM progressive_remote_reports report
