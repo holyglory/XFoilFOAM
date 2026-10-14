@@ -35,7 +35,8 @@ export async function verifyProgressiveWorkerReportDelivery(
         OR (report.report->'result'='null'::jsonb AND report.report#>>'{status,state}'='failed'
           AND report.report#>>'{status,total_cases}'='0' AND report.report#>>'{status,completed_cases}'='0'
           AND (report.report#>>'{status,failure_disposition}' IN ('deterministic_mesh','infrastructure')
-            OR report.report#>>'{status,continuation_failure_kind}'='permanent')))`;
+            OR report.report#>>'{status,continuation_failure_kind}'='permanent'
+            OR report.report#>>'{status,message}' LIKE '%continuation_source_permanent:%')))`;
   const [finalIndex] = await db.execute(sql`SELECT indisvalid FROM pg_index
     WHERE indexrelid='progressive_worker_reports_final_stop_identity_idx'::regclass`);
   expect(finalIndex.indisvalid).toBe(true);

@@ -328,6 +328,14 @@ describe("remote progressive incremental report validation", () => {
       report,
     );
     expect(isFinalProgressiveRemoteReport(report)).toBe(true);
+    report.status = {
+      ...report.status,
+      continuation_failure_kind: null,
+      message: "continuation_source_permanent: saved transient is unavailable",
+    };
+    expect(validateProgressiveRemoteReport(report, assignment).report).toEqual(
+      report,
+    );
   });
 
   it("retains a stopped cancelled infrastructure failure before any cases exist", () => {

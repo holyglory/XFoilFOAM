@@ -252,7 +252,8 @@ export async function recoverProgressiveStorageOnlyEvidence(
             AND latest_report.report->'status'->>'total_cases' = '0'
             AND latest_report.report->'status'->>'completed_cases' = '0'
             AND (latest_report.report->'status'->>'failure_disposition' IN ('deterministic_mesh', 'infrastructure')
-              OR latest_report.report->'status'->>'continuation_failure_kind' = 'permanent')
+              OR latest_report.report->'status'->>'continuation_failure_kind' = 'permanent'
+              OR latest_report.report->'status'->>'message' LIKE '%continuation_source_permanent:%')
           )
           OR latest_report.report->'result'->>'state' IN ('completed', 'failed', 'cancelled')
         )

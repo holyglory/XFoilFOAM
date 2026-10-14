@@ -99,7 +99,7 @@ export function isFinalProgressiveRemoteReport(
         report.status.completed_cases === 0 &&
         (["deterministic_mesh", "infrastructure"].includes(
           String(report.status.failure_disposition),
-        ) || report.status.continuation_failure_kind === "permanent")) ||
+        ) || hasPermanentContinuationFailure(report.status))) ||
       (report.result !== null &&
         ["completed", "failed", "cancelled"].includes(report.result.state)))
   );
@@ -151,6 +151,15 @@ export function validateProgressiveRemoteReportOrder(
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasPermanentContinuationFailure(value: unknown): boolean {
+  return (
+    record(value) &&
+    (value.continuation_failure_kind === "permanent" ||
+      (typeof value.message === "string" &&
+        value.message.includes("continuation_source_permanent:")))
+  );
 }
 
 export function validateProgressiveRemoteReport(
@@ -229,7 +238,7 @@ export function validateProgressiveRemoteReport(
     status.state === "failed" &&
     status.total_cases === 0 &&
     status.completed_cases === 0 &&
-    status.continuation_failure_kind === "permanent" &&
+    hasPermanentContinuationFailure(status) &&
     record(value.stopProof) &&
     (value.result === null ||
       (record(value.result) &&
