@@ -31,6 +31,7 @@ export const DEFAULT_SYNC_IMPORT_GC_MAX_PER_SWEEP = 20_000;
 export const DEFAULT_SYNC_IMPORT_GC_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_SYNC_IMPORT_GC_DELETE_BATCH_SIZE = 250;
 export const DEFAULT_RETENTION_QUERY_TIMEOUT_MS = 10_000;
+export const DEFAULT_STRIP_INTERVAL_MS = 60_000;
 
 const LIVE_URANS_REQUEST_STATES = [
   "pending",
@@ -65,6 +66,7 @@ interface StripCandidate {
 
 let lastOrphanSweepAtMs = 0;
 let lastSyncImportGcAtMs = 0;
+let lastStripAtMs = -Infinity;
 
 export interface SyncImportGcOptions {
   now?: Date;
@@ -111,6 +113,7 @@ export function retentionConfigFromEnv(
 export function resetRetentionMemory(): void {
   lastOrphanSweepAtMs = 0;
   lastSyncImportGcAtMs = 0;
+  lastStripAtMs = -Infinity;
 }
 
 function mb(bytes: number): string {
@@ -808,16 +811,28 @@ async function runRetentionPass(
   engine: EngineClient,
   options: RetentionTickOptions = {},
 ): Promise<void> {
-  try {
-    await stripTerminalJobs(db, engine, options);
-  } catch (error) {
-    console.error(
-      `[sweeper] RETENTION: strip reaper failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
   const config = retentionConfigFromEnv(options);
   const nowMs = (options.now ?? new Date()).getTime();
+  const stripIntervalMs = Math.max(
+    1_000,
+    Math.floor(
+      envNumber("SWEEPER_STRIP_INTERVAL_MS", DEFAULT_STRIP_INTERVAL_MS),
+    ),
+  );
+  if (
+    options.reclaimOptionalCaseState ||
+    nowMs - lastStripAtMs >= stripIntervalMs
+  ) {
+    lastStripAtMs = nowMs;
+    try {
+      await stripTerminalJobs(db, engine, options);
+    } catch (error) {
+      console.error(
+        `[sweeper] RETENTION: strip reaper failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   if (
     options.forceOrphanSweep ||
     nowMs - lastOrphanSweepAtMs >= config.orphanSweepMs
