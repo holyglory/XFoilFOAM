@@ -1,6 +1,5 @@
 type Step =
   | "capabilities"
-  | "dispatch_payload_repair"
   | "assignment_intake"
   | "lease_renewal"
   | "promise_expiry"

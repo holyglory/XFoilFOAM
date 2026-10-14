@@ -7,7 +7,6 @@ import {
   progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteActivePromiseCount,
   PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
-  repairProgressiveRemoteDispatchPayloads,
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
@@ -249,15 +248,6 @@ function remoteAdmissionsPerTick(
 }
 
 async function prepareProgressiveRemoteFleetRun(db: DB) {
-  const repairedDispatchPayloads =
-    await repairProgressiveRemoteDispatchPayloads(db);
-  if (repairedDispatchPayloads)
-    console.log(
-      JSON.stringify({
-        component: "progressive-remote-dispatch-repair",
-        repaired: repairedDispatchPayloads,
-      }),
-    );
   const solvers = await db.execute(sql`
     SELECT solver.id, least(solver.cpu_capacity, CASE WHEN solver.cpu_budget > 0 THEN solver.cpu_budget ELSE solver.cpu_capacity END)::integer AS capacity
     FROM registered_remote_solvers solver JOIN sync_api_settings settings ON settings.id = 1

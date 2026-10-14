@@ -40,7 +40,6 @@ import {
   solverCpuReservationSql,
   solverCpuReservedJobIdsSql,
   settleProgressiveWorkerFinalReport,
-  repairProgressiveRemoteDispatchPayloads,
   sweeperState,
   syncApiSettings,
   syncRemoteHubBindingReceipts,
@@ -7300,18 +7299,6 @@ export async function reconcileRemoteSolverTick(
         );
       await registerSolver(db, settings);
     }
-    const repairedDispatchPayloads =
-      await measureRemoteReconciliationStep(
-        "dispatch_payload_repair",
-        () => repairProgressiveRemoteDispatchPayloads(db),
-      );
-    if (repairedDispatchPayloads)
-      console.log(
-        JSON.stringify({
-          component: "progressive-remote-dispatch-repair",
-          repaired: repairedDispatchPayloads,
-        }),
-      );
     let intake: {
       seen: number;
       errors: Array<{ executionId: string; error: string }>;
