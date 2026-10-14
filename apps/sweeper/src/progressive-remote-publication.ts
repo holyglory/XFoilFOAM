@@ -89,13 +89,16 @@ export async function publishProgressiveWorkerReport(
       error?: unknown;
     } | null;
     if (
-      body?.error === "Remote report replay changed immutable content" &&
+      [
+        "Remote report replay changed immutable content",
+        "Final remote execution evidence cannot change after its stop fence",
+      ].includes(String(body?.error)) &&
       (await quarantineProgressiveWorkerReportConflict(db, {
         executionId,
         solverId: String(owned.solver_id),
         sequence: pending.sequence,
         contentSignature: pending.contentSignature,
-        reason: String(body.error),
+        reason: String(body?.error),
       }))
     )
       return { kind: "quarantined", sequence: pending.sequence };
