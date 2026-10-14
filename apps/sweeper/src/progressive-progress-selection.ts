@@ -11,31 +11,6 @@ const unappliedReports = sql`EXISTS (
     OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
       WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)))`;
 
-const indexedReports = sql`EXISTS (
-  SELECT 1 FROM progressive_remote_reports report
-  WHERE report.sim_job_id = job.id
-    AND EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
-      WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-    AND EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
-      WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence))`;
-
-const oldestUnappliedReport = sql`(
-  SELECT min(report.received_at)
-  FROM progressive_remote_reports report
-  WHERE report.sim_job_id = job.id
-    AND (
-      NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
-        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-      OR NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
-        WHERE inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence)
-    )
-)`;
-
-const pendingUnsubmittedReport = sql`CASE
-  WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 0
-  ELSE 1
-END`;
-
 function executionScope(jobIds?: string[]) {
   return jobIds
     ? jobIds.length
@@ -48,15 +23,30 @@ function executionScope(jobIds?: string[]) {
 }
 
 export function progressiveReportJobsSql(jobIds?: string[]) {
-  return sql`SELECT job.id AS sim_job_id, job.campaign_id
-    FROM sim_jobs job
-    WHERE ${executionScope(jobIds)} AND (
-      ${unappliedReports}
-      OR (job.engine_job_id IS NULL AND job.status = 'pending' AND ${indexedReports})
+  return sql`WITH report_state AS MATERIALIZED (
+      SELECT report.sim_job_id,
+        min(report.received_at) FILTER (
+          WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
+        ) AS oldest_unapplied_report,
+        bool_or(receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL) AS has_unapplied,
+        bool_or(receipt.sim_job_id IS NOT NULL AND inventory.sim_job_id IS NOT NULL) AS has_indexed
+      FROM progressive_remote_reports report
+      LEFT JOIN progressive_remote_progress_receipts receipt
+        ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
+      LEFT JOIN progressive_remote_report_inventories inventory
+        ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
+      GROUP BY report.sim_job_id
     )
+    SELECT job.id AS sim_job_id, job.campaign_id
+    FROM report_state state
+    JOIN sim_jobs job ON job.id = state.sim_job_id
+    WHERE ${executionScope(jobIds)}
+      AND (state.has_unapplied OR (
+        job.engine_job_id IS NULL AND job.status = 'pending' AND state.has_indexed
+      ))
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-    ORDER BY ${pendingUnsubmittedReport},
-      ${oldestUnappliedReport} NULLS LAST,
+    ORDER BY CASE WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 0 ELSE 1 END,
+      state.oldest_unapplied_report NULLS LAST,
       coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }
 
