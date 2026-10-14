@@ -5,7 +5,6 @@ import {
   readPendingProgressiveWorkerReport,
   validateProgressiveRemoteReport,
   verifyProgressiveRemoteExecution,
-  isFinalProgressiveRemoteReport,
   type DB,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
@@ -91,7 +90,6 @@ export async function publishProgressiveWorkerReport(
     } | null;
     if (
       body?.error === "Remote report replay changed immutable content" &&
-      isFinalProgressiveRemoteReport(pending.report) &&
       (await quarantineProgressiveWorkerReportConflict(db, {
         executionId,
         solverId: String(owned.solver_id),

@@ -334,13 +334,7 @@ export async function quarantineProgressiveWorkerReportConflict(
         AND report->>'solverId' = ${input.solverId}
         AND acknowledged_at IS NULL
     `);
-    if (
-      !row ||
-      !isFinalProgressiveRemoteReport(
-        row.report as unknown as ProgressiveRemoteReport,
-      )
-    )
-      return false;
+    if (!row) return false;
     await connection.execute(sql`
       INSERT INTO progressive_worker_report_conflicts
         (sim_job_id, sequence, content_signature, report, reason)
