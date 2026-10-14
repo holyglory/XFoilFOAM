@@ -202,6 +202,26 @@ restore_sweeper_on_error() {
   exit "$exit_code"
 }
 
+ensure_postgres_shared_memory() {
+  local current_size required_size
+  required_size=1073741824
+  current_size="$(docker inspect --format '{{.HostConfig.ShmSize}}' "${COMPOSE_PROJECT_NAME}-postgres-1" 2>/dev/null || printf '0')"
+  if [[ "$current_size" =~ ^[0-9]+$ ]] && (( current_size >= required_size )); then
+    echo "Postgres shared memory is already ${current_size} bytes."
+    return 0
+  fi
+  echo "Recreating postgres with ${required_size}-byte shared memory; the pgdata volume is preserved."
+  compose up -d --no-deps --force-recreate postgres
+  for _ in {1..60}; do
+    if compose exec -T postgres pg_isready -U "$(read_deploy_env_var POSTGRES_USER || printf aerodb)" -d "$(read_deploy_env_var POSTGRES_DB || printf aerodb)" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Postgres did not become ready after the shared-memory recreation." >&2
+  return 12
+}
+
 known_engine_worker_services() {
   compose --profile '*' config --services | awk '$0 == "worker" || $0 ~ /^worker-/'
 }
@@ -355,6 +375,8 @@ main() {
   else
     echo "media-repair is not configured in this deployment source; no writer to stop."
   fi
+
+  ensure_postgres_shared_memory
 
   # `node-api` mounts `results` read-only and `sync_imports` at a nested
   # path. Fresh result volumes therefore need the nested mountpoint created
