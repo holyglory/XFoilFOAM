@@ -7,6 +7,7 @@ import {
   sealProgressiveRemoteExecution,
   verifyProgressiveRemoteExecution,
 } from "../src/progressive-remote-execution";
+import { preciseProgressiveSolverSelection } from "../src/progressive-cfd";
 
 function fixture() {
   const token = randomUUID();
@@ -60,6 +61,27 @@ function fixture() {
 }
 
 describe("immutable remote progressive execution envelope", () => {
+  it("uses transient pressure refinement for precise subsonic selections", () => {
+    expect(
+      preciseProgressiveSolverSelection({
+        solver: "simpleFoam",
+        pressureKind: "kinematic",
+      }),
+    ).toMatchObject({ solver: "pimpleFoam", reason: "precise_transient_refinement" });
+    expect(
+      preciseProgressiveSolverSelection({
+        solver: "rhoSimpleFoam",
+        pressureKind: "absolute",
+      }),
+    ).toMatchObject({
+      solver: "rhoPimpleFoam",
+      reason: "precise_compressible_transient_refinement",
+    });
+    expect(
+      preciseProgressiveSolverSelection({ solver: "rhoCentralFoam" }),
+    ).toEqual({ solver: "rhoCentralFoam" });
+  });
+
   it("round-trips the exact hub request without local numerical recomposition", () => {
     const { envelope, expected, request, scope } = fixture();
     const received = verifyProgressiveRemoteExecution(

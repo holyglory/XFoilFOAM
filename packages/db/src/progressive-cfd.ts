@@ -77,6 +77,25 @@ export interface ProgressiveCfdLease {
 
 export const MAX_PRECISE_CFD_BATCH_UNITS = 8;
 
+export function preciseProgressiveSolverSelection(
+  selection: Record<string, unknown>,
+): Record<string, unknown> {
+  const family = selection.solver;
+  if (family === "simpleFoam")
+    return {
+      ...selection,
+      solver: "pimpleFoam",
+      reason: "precise_transient_refinement",
+    };
+  if (family === "rhoSimpleFoam")
+    return {
+      ...selection,
+      solver: "rhoPimpleFoam",
+      reason: "precise_compressible_transient_refinement",
+    };
+  return { ...selection };
+}
+
 export function progressiveCfdBatchMaximum(stage: number): number {
   return stage === 3 ? MAX_PRECISE_CFD_BATCH_UNITS : 64;
 }
@@ -148,7 +167,10 @@ export async function initializeProgressiveCfdWork(
       });
       const recipe = {
         ...(scope.stage === 2 ? scope.recipes.fast : scope.recipes.precise),
-        selection,
+        selection:
+          scope.stage === 2
+            ? selection
+            : preciseProgressiveSolverSelection(selection),
         turbulentPrandtl:
           selection.pressureKind === "absolute"
             ? PROGRESSIVE_COMPUTE_POLICY.turbulentPrandtl
