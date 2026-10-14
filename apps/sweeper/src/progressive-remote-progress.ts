@@ -20,7 +20,7 @@ import {
   progressiveSettlementJobsSql,
 } from "./progressive-progress-selection";
 
-const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 32;
+const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 64;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
