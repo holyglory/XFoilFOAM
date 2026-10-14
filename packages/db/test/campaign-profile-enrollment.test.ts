@@ -188,6 +188,7 @@ import {
   bindProgressiveRemoteDispatch,
   progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteReservedSlots,
+  repairProgressiveRemoteDispatchPayloads,
 } from "../src/progressive-remote-dispatch";
 import {
   createAnalysisTarget,
@@ -3573,8 +3574,9 @@ describe("progressive CPU admission", () => {
         VALUES (${solverId}::uuid, ${randomUUID()}, 'isolated remote worker', 96, 96, 96)
       `);
       await db.execute(sql`
-        INSERT INTO sync_sweep_promises (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
-        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid,
+        INSERT INTO sync_sweep_promises (id, registered_solver_id, source_base_url, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES (${promiseId}::uuid, ${solverId}::uuid, 'https://upstream.invalid/api/sync/v1',
+          ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid,
           ${leases.length}, clock_timestamp() + interval '1 hour')
       `);
       for (const lease of leases)
@@ -3631,6 +3633,34 @@ describe("progressive CPU admission", () => {
         expect(bound.envelope.request).toEqual(
           JSON.parse(JSON.stringify(composed.request)),
         );
+        const [remotePayload] = await db.execute(sql`
+          SELECT request_payload->>'remoteSolver' AS remote_solver,
+            request_payload->>'syncPromiseId' AS sync_promise_id,
+            request_payload->>'upstreamBaseUrl' AS upstream_base_url,
+            request_payload->'remoteProgressiveExecution' AS envelope
+          FROM sim_jobs WHERE id = ${job.id}::uuid
+        `);
+        expect(remotePayload).toEqual({
+          remote_solver: "true",
+          sync_promise_id: promiseId,
+          upstream_base_url: "https://upstream.invalid/api/sync/v1",
+          envelope: bound.envelope,
+        });
+        await db.execute(sql`
+          UPDATE sim_jobs
+          SET request_payload = request_payload - 'remoteSolver' - 'syncPromiseId'
+            - 'upstreamBaseUrl' - 'remoteProgressiveExecution'
+          WHERE id = ${job.id}::uuid
+        `);
+        expect(await repairProgressiveRemoteDispatchPayloads(db)).toBe(1);
+        const [repairedPayload] = await db.execute(sql`
+          SELECT request_payload->>'remoteSolver' AS remote_solver,
+            request_payload->>'syncPromiseId' AS sync_promise_id,
+            request_payload->>'upstreamBaseUrl' AS upstream_base_url,
+            request_payload->'remoteProgressiveExecution' AS envelope
+          FROM sim_jobs WHERE id = ${job.id}::uuid
+        `);
+        expect(repairedPayload).toEqual(remotePayload);
         const forecastRollback = new Error(
           "isolated disk attribution rollback",
         );

@@ -91,6 +91,44 @@ export async function progressiveRemoteActivePromiseCount(
   return Number(row.count);
 }
 
+/** Restore remote provenance for dispatches created before binding persisted it
+ * on the job payload. The dispatch row and its sealed envelope are the
+ * immutable source of truth for this bounded repair. */
+export async function repairProgressiveRemoteDispatchPayloads(
+  db: DB,
+  limit = 256,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000)
+    throw new Error("Invalid progressive remote payload repair limit");
+  const rows = await db.execute(sql`
+    WITH candidates AS MATERIALIZED (
+      SELECT dispatch.sim_job_id, dispatch.promise_id, dispatch.envelope,
+        promise.source_base_url
+      FROM progressive_remote_dispatches dispatch
+      JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+      JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+      WHERE job.request_payload -> 'remoteProgressiveExecution' IS NULL
+        AND job.request_payload -> 'syncPromiseId' IS NULL
+        AND promise.source_base_url IS NOT NULL
+      ORDER BY dispatch.created_at, dispatch.sim_job_id
+      LIMIT ${limit}
+    )
+    UPDATE sim_jobs job
+    SET request_payload = job.request_payload || jsonb_build_object(
+      'remoteSolver', true,
+      'syncPromiseId', candidates.promise_id::text,
+      'upstreamBaseUrl', candidates.source_base_url,
+      'remoteProgressiveExecution', candidates.envelope
+    ), "updatedAt" = clock_timestamp()
+    FROM candidates
+    WHERE job.id = candidates.sim_job_id
+      AND job.request_payload -> 'remoteProgressiveExecution' IS NULL
+      AND job.request_payload -> 'syncPromiseId' IS NULL
+    RETURNING job.id
+  `);
+  return rows.length;
+}
+
 export async function bindProgressiveRemoteDispatch(
   db: DB,
   input: { simJobId: string; promiseId: string; solverId: string },
@@ -157,7 +195,7 @@ export async function bindProgressiveRemoteDispatch(
         "Remote dispatch cannot replace the hub execution identity",
       );
     const [promise] = await connection.execute(sql`
-      SELECT promise.id, promise.aoa_count FROM sync_sweep_promises promise
+      SELECT promise.id, promise.aoa_count, promise.source_base_url FROM sync_sweep_promises promise
       WHERE promise.id = ${input.promiseId}::uuid
         AND (promise.registered_solver_id IS NULL OR promise.registered_solver_id = ${input.solverId}::uuid)
         AND promise.airfoil_id = ${job.airfoil_id}::uuid
@@ -281,6 +319,16 @@ export async function bindProgressiveRemoteDispatch(
       throw new Error(
         "The hub stopped remote campaign dispatch during exact binding",
       );
+    await connection.execute(sql`
+      UPDATE sim_jobs
+      SET request_payload = request_payload || jsonb_build_object(
+        'remoteSolver', true,
+        'syncPromiseId', ${input.promiseId}::text,
+        'upstreamBaseUrl', ${promise.source_base_url}::text,
+        'remoteProgressiveExecution', ${JSON.stringify(envelope)}::jsonb
+      ), "updatedAt" = clock_timestamp()
+      WHERE id = ${input.simJobId}::uuid
+    `);
     await connection.execute(sql`
       INSERT INTO progressive_remote_dispatches (sim_job_id, promise_id, solver_id, cpu_slots, content_signature, envelope)
       VALUES (${input.simJobId}::uuid, ${input.promiseId}::uuid, ${input.solverId}::uuid, ${slots},
