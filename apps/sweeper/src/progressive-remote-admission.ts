@@ -240,9 +240,9 @@ export async function prepareProgressiveRemoteDispatch(
 function remoteAdmissionsPerTick(
   raw = process.env.SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK,
 ): number {
-  if (raw == null || raw.trim() === "") return 8;
+  if (raw == null || raw.trim() === "") return 16;
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 1) return 8;
+  if (!Number.isInteger(parsed) || parsed < 1) return 16;
   return Math.min(parsed, 32);
 }
 
