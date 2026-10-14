@@ -55,6 +55,16 @@ export async function progressiveRemoteAdmissionReservedSlots(
     WHERE dispatch.solver_id = ${solverId}::uuid
       AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
         WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM sim_jobs job
+        JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+        WHERE job.id = dispatch.sim_job_id
+          AND job.status = 'pending'
+          AND job.engine_job_id IS NULL
+          AND job.engine_state IS NULL
+          AND (promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp())
+      )
   `);
   return Number(row.reserved);
 }

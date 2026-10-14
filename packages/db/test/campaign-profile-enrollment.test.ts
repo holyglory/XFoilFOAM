@@ -186,6 +186,7 @@ import {
 import { simCampaignConditions } from "../src/schema";
 import {
   bindProgressiveRemoteDispatch,
+  progressiveRemoteAdmissionReservedSlots,
   progressiveRemoteReservedSlots,
 } from "../src/progressive-remote-dispatch";
 import {
@@ -4003,6 +4004,18 @@ describe("progressive CPU admission", () => {
           promiseId,
         });
         expect(await progressiveRemoteReservedSlots(db, solverId)).toBe(1);
+        expect(await progressiveRemoteAdmissionReservedSlots(db, solverId)).toBe(
+          1,
+        );
+        await db.execute(sql`
+          UPDATE sync_sweep_promises
+          SET status = 'expired', "expiresAt" = clock_timestamp() - interval '1 second'
+          WHERE id = ${promiseId}::uuid
+        `);
+        expect(await progressiveRemoteReservedSlots(db, solverId)).toBe(1);
+        expect(await progressiveRemoteAdmissionReservedSlots(db, solverId)).toBe(
+          0,
+        );
         await db.execute(sql`
           UPDATE progressive_cfd_units
           SET lease_until = clock_timestamp() - interval '1 second'
