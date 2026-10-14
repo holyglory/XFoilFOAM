@@ -301,6 +301,35 @@ describe("remote progressive incremental report validation", () => {
     },
   );
 
+  it("accepts a stopped permanent continuation failure before any cases exist", () => {
+    const { assignment, report } = fixture();
+    report.status = {
+      ...report.status,
+      state: "failed",
+      total_cases: 0,
+      completed_cases: 0,
+      continuation_failure_kind: "permanent",
+      solver_budget_progress: null,
+    };
+    report.result = null;
+    report.stopProof = {
+      version: 1,
+      job_id: report.executionId,
+      execution_stopped: true,
+      producer_stopped: true,
+      namespace_verified: true,
+      remaining: [],
+      observed_at: "2026-09-09T00:00:00Z",
+      error: null,
+      fence: "terminal_result",
+      ownership_basis: "recorded_execution_namespace",
+    };
+    expect(validateProgressiveRemoteReport(report, assignment).report).toEqual(
+      report,
+    );
+    expect(isFinalProgressiveRemoteReport(report)).toBe(true);
+  });
+
   it("retains a stopped cancelled infrastructure failure before any cases exist", () => {
     const { assignment, report } = fixture();
     report.status = {
