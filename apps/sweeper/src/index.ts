@@ -24,7 +24,7 @@ import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 const { db, sql, engine } = makeContext();
 const critical = makeIsolatedDatabase(2);
 const retention = makeIsolatedDatabase(1);
-const evidence = makeIsolatedDatabase(4);
+const evidence = makeIsolatedDatabase(32);
 try {
   const [syncSettings] = await db
     .select({
