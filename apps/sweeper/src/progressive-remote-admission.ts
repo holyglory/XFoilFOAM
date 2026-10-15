@@ -294,6 +294,7 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
     LEFT JOIN progressive_remote_report_inventories inventory
       ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
     WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
+    ORDER BY report.received_at, report.sim_job_id, report.sequence
     LIMIT ${PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT}
   `);
   if (unappliedReports.length >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT) {

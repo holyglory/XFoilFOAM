@@ -7968,6 +7968,8 @@ export const progressiveRemoteReports = pgTable(
     stopCandidateIdx: index("progressive_remote_reports_stop_candidate_idx")
       .on(table.simJobId)
       .where(sql`${table.report}#>>'{stopProof,execution_stopped}'='true'`),
+    receivedOrderIdx: index("progressive_remote_reports_received_order_idx")
+      .on(table.receivedAt, table.simJobId, table.sequence),
     sequenceCheck: check(
       "progressive_remote_reports_sequence_check",
       sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
