@@ -7,7 +7,6 @@ import {
   recoverInactiveProgressiveRemoteGaps,
   recoverTerminalProgressiveNoEvidenceGaps,
   invalidateProgressiveFitPolicy,
-  progressiveRemoteAdmissionReservedSlots,
   type DB,
   type Sql,
 } from "@aerodb/db";
@@ -21,6 +20,8 @@ import {
   runProgressiveFitBatch,
 } from "./progressive-fitting";
 import { runProgressiveFitBatches } from "./progressive-fit-concurrency";
+
+const PROGRESSIVE_MAINTENANCE_INTERVAL_MS = 30_000;
 
 function configuredNeuralFoilConcurrency(env: NodeJS.ProcessEnv = process.env) {
   const raw =
@@ -56,9 +57,20 @@ export async function runProgressiveBaselineService(
   let cfdFitTurn = true;
   let wake: (() => void) | null = null;
   let deadline: ReturnType<typeof setTimeout> | null = null;
+  let maintenanceTimer: ReturnType<typeof setTimeout> | null = null;
+  let maintenanceDue = true;
   const notify = () => {
     pending = true;
     wake?.();
+  };
+  const scheduleMaintenance = () => {
+    if (signal.aborted || maintenanceTimer) return;
+    maintenanceTimer = setTimeout(() => {
+      maintenanceTimer = null;
+      maintenanceDue = true;
+      notify();
+    }, PROGRESSIVE_MAINTENANCE_INTERVAL_MS);
+    maintenanceTimer.unref?.();
   };
   signal.addEventListener("abort", notify);
   let unlisten: (() => Promise<void>) | null = null;
@@ -81,55 +93,35 @@ export async function runProgressiveBaselineService(
       deadline = null;
       if (signal.aborted) break;
       try {
+        let runMaintenance = maintenanceDue;
+        maintenanceDue = false;
         const [settings] = (await db.execute(sql`
           SELECT state.enabled, coalesce((SELECT remote_solver_enabled FROM sync_api_settings LIMIT 1), false) AS remote
           FROM sweeper_state state WHERE state.id = 1
         `)) as unknown as Array<{ enabled: boolean; remote: boolean }>;
-        const [remoteSolver] = await db.execute(sql`
-          SELECT solver.id,
-            least(solver.cpu_capacity, CASE WHEN solver.cpu_budget > 0 THEN solver.cpu_budget ELSE solver.cpu_capacity END)::integer AS capacity
-          FROM registered_remote_solvers solver
-          JOIN sync_api_settings settings ON settings.id = 1
-          JOIN sweeper_state remote_state ON remote_state.id = 1
-          WHERE settings.enabled AND NOT settings.remote_solver_enabled
-            AND remote_state.enabled AND NOT remote_state.admission_fence_active
-            AND NOT remote_state.disk_admission_blocked
-            AND solver.revoked_at IS NULL AND solver.auth_token_hash IS NOT NULL
-            AND solver.credential_version > 0
-            AND solver.last_heartbeat_at > clock_timestamp() - interval '2 minutes'
-            AND solver.metadata->'progressiveExecution' IS NOT NULL
-          ORDER BY solver.last_heartbeat_at, solver.id LIMIT 1
-        `);
-        const remoteHasCapacity = remoteSolver
-          ? Number(remoteSolver.capacity) -
-              (await progressiveRemoteAdmissionReservedSlots(
-                db,
-                String(remoteSolver.id),
-              )) >
-            0
-          : false;
         const scope = await reconcileProgressiveGenerationRequest(db);
         if (scope) {
           pending = true;
+          runMaintenance = true;
           report({ component: "progressive-scope", ...scope });
         }
-        const cfdUnits = remoteHasCapacity
-          ? 0
-          : await initializeProgressiveCfdWork(db);
+        const cfdUnits = runMaintenance
+          ? await initializeProgressiveCfdWork(db)
+          : 0;
         if (cfdUnits) {
           pending = true;
           report({ component: "progressive-cfd-scope", units: cfdUnits });
         }
-        const reusedCfd = remoteHasCapacity
-          ? 0
-          : await reconcileAcceptedProgressiveCfdEvidence(db);
+        const reusedCfd = runMaintenance
+          ? await reconcileAcceptedProgressiveCfdEvidence(db)
+          : 0;
         if (reusedCfd) {
           pending = true;
           report({ component: "progressive-cfd-reuse", reused: reusedCfd });
         }
-        const recovery = remoteHasCapacity
-          ? { retried: 0, gaps: 0 }
-          : await recoverUnboundProgressiveCfdLeases(db);
+        const recovery = runMaintenance
+          ? await recoverUnboundProgressiveCfdLeases(db)
+          : { retried: 0, gaps: 0 };
         if (recovery.retried || recovery.gaps) {
           pending = true;
           report({
@@ -137,9 +129,9 @@ export async function runProgressiveBaselineService(
             ...recovery,
           });
         }
-        const inactiveRemoteGaps = remoteHasCapacity
-          ? 0
-          : await recoverInactiveProgressiveRemoteGaps(db);
+        const inactiveRemoteGaps = runMaintenance
+          ? await recoverInactiveProgressiveRemoteGaps(db)
+          : 0;
         if (inactiveRemoteGaps) {
           pending = true;
           report({
@@ -147,9 +139,9 @@ export async function runProgressiveBaselineService(
             retried: inactiveRemoteGaps,
           });
         }
-        const terminalNoEvidenceGaps = remoteHasCapacity
-          ? 0
-          : await recoverTerminalProgressiveNoEvidenceGaps(db);
+        const terminalNoEvidenceGaps = runMaintenance
+          ? await recoverTerminalProgressiveNoEvidenceGaps(db)
+          : 0;
         if (terminalNoEvidenceGaps) {
           pending = true;
           report({
@@ -213,14 +205,9 @@ export async function runProgressiveBaselineService(
           pending = true;
           report({ component: "progressive-fitting", ...fitting });
         }
-        const stages = remoteHasCapacity
-          ? {
-              admitted: 0,
-              closed: 0,
-              waiting: 0,
-              campaignsCompleted: 0,
-            }
-          : await advanceProgressiveCfdStages(db);
+        const stages = runMaintenance
+          ? await advanceProgressiveCfdStages(db)
+          : { admitted: 0, closed: 0, waiting: 0, campaignsCompleted: 0 };
         if (stages.admitted || stages.closed || stages.campaignsCompleted) {
           pending = true;
           report({ component: "progressive-cfd-stages", ...stages });
@@ -256,13 +243,16 @@ export async function runProgressiveBaselineService(
               Math.max(0, new Date(expiry.at).getTime() - Date.now()),
             );
         }
+        scheduleMaintenance();
       } catch (error) {
         report({ component: "progressive-baseline", error: String(error) });
+        scheduleMaintenance();
       }
     }
   } finally {
     signal.removeEventListener("abort", notify);
     if (deadline) clearTimeout(deadline);
+    if (maintenanceTimer) clearTimeout(maintenanceTimer);
     await unlisten?.();
   }
 }
