@@ -13,6 +13,8 @@ export function progressiveEvidenceWakeSql(
         LEFT JOIN progressive_worker_staging_failures failure
           ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
         WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
+          AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+            WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
           AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
             WHERE staged.sim_job_id = report.sim_job_id AND staged.sequence = report.sequence)
           ${ready ? sql`AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())` : sql``}
@@ -31,6 +33,8 @@ export function progressiveEvidenceWakeSql(
         LEFT JOIN progressive_worker_evidence_delivery_claims claim
           ON claim.sim_job_id = association.sim_job_id AND claim.point_content_signature = association.point_content_signature
         WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
+          AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+            WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
           AND attempt.result_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
             WHERE delivered.sim_job_id = association.sim_job_id

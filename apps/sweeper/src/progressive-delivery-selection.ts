@@ -18,6 +18,8 @@ export function progressiveDeliverySelectionSql(
     LEFT JOIN progressive_worker_evidence_delivery_claims claim ON claim.sim_job_id = source.sim_job_id
       AND claim.point_content_signature = source.point_content_signature
     WHERE delivered.sim_job_id IS NULL AND report.acknowledged_at IS NOT NULL AND attempt.result_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+        WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())
       AND (failure.sim_job_id IS NULL OR (failure.state = 'retry' AND failure.retry_after <= clock_timestamp()))
     ORDER BY CASE WHEN failure.state = 'retry' THEN 0 ELSE 1 END,

@@ -45,6 +45,8 @@ async function withWakeFixture(
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports (
       sim_job_id uuid,sequence bigint,acknowledged_at timestamptz,report jsonb,created_at timestamptz,
       PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts (
+      sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
     await transaction.execute(sql`INSERT INTO progressive_worker_reports
       SELECT id,1,CASE WHEN variant<>'unacknowledged' THEN clock_timestamp() END,
         CASE WHEN variant='null-result' THEN '{"result":null}'::jsonb ELSE '{"result":{}}'::jsonb END,
@@ -306,6 +308,10 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
         CASE WHEN variant='eligible-expired' THEN id::text END AS stopped_engine_job_id,
         timestamptz '2026-01-01T00:00:00Z' + CASE WHEN variant='eligible-cancelled' THEN interval '0 seconds' ELSE interval '1 second' END AS created_at
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts ON COMMIT DROP AS
+      SELECT id AS sim_job_id,sequence FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence WHERE false`);
+    await transaction.execute(sql`CREATE UNIQUE INDEX fixture_report_conflicts_idx
+      ON progressive_worker_report_conflicts(sim_job_id,sequence)`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures ON COMMIT DROP AS
       SELECT id AS sim_job_id,sequence,clock_timestamp()+interval '1 day' AS retry_after
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence WHERE variant='future-retry'`);
@@ -347,6 +353,11 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     expect(fresh[0].sequence).toBe(2);
     expect(oldest[0].sequence).toBe(1);
     expect(fresh).not.toEqual(oldest);
+    await transaction.execute(sql`INSERT INTO progressive_worker_report_conflicts
+      (sim_job_id,sequence) VALUES (${fresh[0].sim_job_id}::uuid,${fresh[0].sequence})`);
+    expect(await select(true)).not.toEqual(fresh);
+    await transaction.execute(sql`DELETE FROM progressive_worker_report_conflicts
+      WHERE sim_job_id=${fresh[0].sim_job_id}::uuid AND sequence=${fresh[0].sequence}`);
     const terminalPriorityRollback = new Error(
       "Restore active terminal staging priority fixture",
     );
@@ -370,7 +381,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       SELECT id,sequence,clock_timestamp(),'{"result":{}}'::jsonb,
         timestamptz '2025-01-01T00:00:00Z' + sequence * interval '1 second'
       FROM fixture_jobs CROSS JOIN generate_series(3,15002) sequence WHERE variant='eligible-active'`);
-    await transaction.execute(sql`ANALYZE progressive_worker_reports,progressive_worker_evidence_receipts,
+    await transaction.execute(sql`ANALYZE progressive_worker_reports,progressive_worker_report_conflicts,progressive_worker_evidence_receipts,
       sim_jobs,sync_sweep_promises,progressive_worker_staging_failures,sync_api_settings`);
     expect(await select(true)).toEqual(fresh);
     const backlogHead = await select(false);
@@ -518,6 +529,8 @@ it("prioritizes active terminal reports and keeps invalid reports in the fallbac
           WHEN variant='active-terminal' THEN interval '3 seconds'
           ELSE interval '4 seconds' END AS created_at
       FROM fixture_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts(
+      sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures(
       sim_job_id uuid,sequence bigint,retry_after timestamptz) ON COMMIT DROP`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_receipts(

@@ -16,6 +16,8 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
     FROM progressive_worker_reports report
     LEFT JOIN progressive_worker_staging_failures failure ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
     WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+        WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
@@ -25,6 +27,8 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
     FROM progressive_worker_reports report
     WHERE report.acknowledged_at IS NOT NULL
       AND jsonb_typeof(report.report->'result') = 'object'
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+        WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND report.stopped_engine_job_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_staging_failures failure
         WHERE failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
@@ -64,6 +68,8 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
     WHERE report.acknowledged_at IS NOT NULL
       AND jsonb_typeof(report.report->'result') = 'object'
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+        WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)

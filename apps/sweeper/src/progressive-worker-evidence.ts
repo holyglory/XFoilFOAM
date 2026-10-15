@@ -75,6 +75,8 @@ async function claimProgressiveWorkerEvidence(
       WHERE job.id = ${executionId}::uuid AND NOT settings.remote_solver_transfer_paused
         AND (${reportSequence ?? null}::bigint IS NULL OR report.sequence = ${reportSequence ?? null}::bigint)
         AND report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
+        AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+          WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
           WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
         AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())

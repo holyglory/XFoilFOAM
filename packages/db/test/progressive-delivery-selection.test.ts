@@ -548,6 +548,8 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         '{"result":{}}'::jsonb AS report,md5(variant||sequence)::text AS content_signature,
         timestamptz '2026-01-01T00:00:00Z' + CASE WHEN variant='eligible-cancelled' THEN interval '0 seconds' ELSE interval '1 second' END AS created_at
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts ON COMMIT DROP AS
+      SELECT id AS sim_job_id,sequence FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence WHERE false`);
     await transaction.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
       SELECT md5(variant||angle||replay)::uuid AS id,
         CASE WHEN variant='wrong-attempt-job' THEN md5('foreign')::uuid ELSE id END AS sim_job_id,
