@@ -207,7 +207,14 @@ export async function runProgressiveBaselineService(
           pending = true;
           report({ component: "progressive-fitting", ...fitting });
         }
-        const stages = await advanceProgressiveCfdStages(db);
+        const stages = remoteHasCapacity
+          ? {
+              admitted: 0,
+              closed: 0,
+              waiting: 0,
+              campaignsCompleted: 0,
+            }
+          : await advanceProgressiveCfdStages(db);
         if (stages.admitted || stages.closed || stages.campaignsCompleted) {
           pending = true;
           report({ component: "progressive-cfd-stages", ...stages });
