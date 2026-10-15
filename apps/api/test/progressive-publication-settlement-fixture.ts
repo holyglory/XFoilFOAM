@@ -14,10 +14,21 @@ export async function verifyProgressivePublicationPrecedence(
     .select()
     .from(resultAttempts)
     .where(eq(resultAttempts.id, resultAttemptId));
-  const [classification] = await db
+  let [classification] = await db
     .select()
     .from(resultClassifications)
     .where(eq(resultClassifications.resultAttemptId, resultAttemptId));
+  if (!classification) {
+    await refreshPolarCacheForRevision(
+      db,
+      String(attempt.airfoilId),
+      String(attempt.simulationPresetRevisionId),
+    );
+    [classification] = await db
+      .select()
+      .from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, resultAttemptId));
+  }
   expect(attempt.regime).toBe("rans");
   expect(classification.state).toBe("accepted");
   const expectedCache = async (connection: DB, count: number) => {
@@ -107,7 +118,10 @@ export async function verifyProgressivePublicationPrecedence(
         WHERE result_attempt_id = ${resultAttemptId}::uuid`);
       expect(
         await settleProgressiveRemoteJob(connection, executionId),
-      ).toMatchObject({ kind: "settled" });
+      ).toMatchObject({
+        kind: "waiting",
+        reason: "accepted_point_publication",
+      });
       const [published] = await connection.execute(sql`
         SELECT result.current_result_attempt_id, classification.state
         FROM results result
@@ -116,7 +130,7 @@ export async function verifyProgressivePublicationPrecedence(
         WHERE result.id = ${attempt.resultId}::uuid
       `);
       expect(published).toEqual({
-        current_result_attempt_id: resultAttemptId,
+        current_result_attempt_id: selectedId,
         state: "accepted",
       });
       throw unclassifiedRollback;
