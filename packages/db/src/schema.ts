@@ -7097,6 +7097,9 @@ export const progressiveGenerationTargets = pgTable(
   },
   (table) => ({
     pk: primaryKey({ columns: [table.generationId, table.targetId] }),
+    targetGenerationIdx: index(
+      "progressive_generation_targets_target_generation_idx",
+    ).on(table.targetId, table.generationId),
     anglesCheck: check(
       "progressive_generation_targets_angles_check",
       sql`cardinality(${table.angles}) > 0`,
