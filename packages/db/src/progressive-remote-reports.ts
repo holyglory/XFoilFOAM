@@ -32,7 +32,6 @@ export async function storeProgressiveRemoteReport(
       WHERE dispatch.sim_job_id = ${input.executionId}::uuid
         AND dispatch.solver_id = ${input.solverId}::uuid AND dispatch.promise_id = ${input.promiseId}::uuid
         AND solver.revoked_at IS NULL
-      FOR UPDATE OF dispatch
     `);
     if (!dispatch)
       throw new ProgressiveRemoteReportConflict(
@@ -57,11 +56,12 @@ export async function storeProgressiveRemoteReport(
       sequence: report.sequence,
       contentSignature,
     };
-    const [existing] = await connection.execute(sql`
-      SELECT content_signature FROM progressive_remote_reports
-      WHERE sim_job_id = ${input.executionId}::uuid AND sequence = ${report.sequence}
-    `);
-    if (existing) {
+    const replayExisting = async () => {
+      const [existing] = await connection.execute(sql`
+        SELECT content_signature FROM progressive_remote_reports
+        WHERE sim_job_id = ${input.executionId}::uuid AND sequence = ${report.sequence}
+      `);
+      if (!existing) return null;
       if (existing.content_signature !== contentSignature)
         throw new ProgressiveRemoteReportConflict(
           "Remote report replay changed immutable content",
@@ -70,8 +70,24 @@ export async function storeProgressiveRemoteReport(
         report,
         reportContentSignature: contentSignature,
       });
-      return { ...receipt, replayed: true };
-    }
+      return { ...receipt, replayed: true as const };
+    };
+    const replayed = await replayExisting();
+    if (replayed) return replayed;
+    const [lockedDispatch] = await connection.execute(sql`
+      SELECT dispatch.sim_job_id FROM progressive_remote_dispatches dispatch
+      JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id
+      WHERE dispatch.sim_job_id = ${input.executionId}::uuid
+        AND dispatch.solver_id = ${input.solverId}::uuid AND dispatch.promise_id = ${input.promiseId}::uuid
+        AND solver.revoked_at IS NULL
+      FOR UPDATE OF dispatch
+    `);
+    if (!lockedDispatch)
+      throw new ProgressiveRemoteReportConflict(
+        "Remote report sender does not own the immutable dispatch",
+      );
+    const replayedAfterLock = await replayExisting();
+    if (replayedAfterLock) return replayedAfterLock;
     const [latest] = await connection.execute(sql`
       SELECT sequence, report FROM progressive_remote_reports WHERE sim_job_id = ${input.executionId}::uuid
       ORDER BY sequence DESC LIMIT 1
