@@ -22,7 +22,7 @@ export function progressivePublicationSelectionSql() {
   `;
 }
 
-export function progressivePublicationBatchSelectionSql(limit = 8) {
+export function progressivePublicationBatchSelectionSql(limit = 32) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32)
     throw new Error("Progressive publication batch limit is out of range");
   return sql`
