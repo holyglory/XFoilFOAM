@@ -320,7 +320,15 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
         const result = await prepareProgressiveRemoteDispatch(db, solverId);
         if (result.kind === "waiting" && result.deferredUnits !== undefined) {
           receipt.deferred += result.deferredUnits;
-          if (!result.deferredUnits) break;
+          if (!result.deferredUnits) {
+            receipt.waiting += 1;
+            receipt.waitingReasons.push({
+              solverId,
+              reason:
+                "Remote claim lost all exact result-cell ownership during dispatch binding",
+            });
+            break;
+          }
           continue;
         }
         if (result.kind === "waiting") {
