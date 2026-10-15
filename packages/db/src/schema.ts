@@ -4094,6 +4094,15 @@ export const simJobs = pgTable(
     syncPromiseIdentityIdx: index("sim_jobs_sync_promise_identity_idx").on(
       sql`(${t.requestPayload}->>'syncPromiseId')`,
     ),
+    remotePayloadCleanupIdx: index("sim_jobs_remote_payload_cleanup_idx")
+      .on(t.updatedAt, t.id)
+      .where(sql`(
+        ${t.requestPayload} ? 'remoteSolver'
+        OR ${t.requestPayload} ? 'solverId'
+        OR ${t.requestPayload} ? 'syncPromiseId'
+        OR ${t.requestPayload} ? 'upstreamBaseUrl'
+        OR ${t.requestPayload} ? 'remoteProgressiveExecution'
+      )`),
     runtimeBuildOwnerFk: foreignKey({
       columns: [t.solverRuntimeBuildId, t.solverImplementationId],
       foreignColumns: [

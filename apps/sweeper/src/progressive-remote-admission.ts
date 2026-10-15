@@ -92,6 +92,7 @@ export async function prepareProgressiveRemoteDispatch(
   try {
     return await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
+      await connection.execute(sql`SET LOCAL lock_timeout = '2s'`);
       const [epoch] = await connection.execute(
         sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
       );
@@ -179,7 +180,7 @@ export async function prepareProgressiveRemoteDispatch(
         allowPhysicalTime:
           capabilities.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
-        campaignLockMode: "skip",
+        campaignLockMode: "wait",
       });
       if (!leases.length)
         throw new RemoteProgressiveAdmissionWait(
@@ -235,6 +236,14 @@ export async function prepareProgressiveRemoteDispatch(
       };
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
+    if (
+      (error as { code?: unknown }).code === "55P03" ||
+      (error instanceof Error && /lock timeout/i.test(error.message))
+    )
+      return {
+        kind: "waiting",
+        reason: "Campaign admission is waiting for a short-lived database lock",
+      };
     throw error;
   }
 }
