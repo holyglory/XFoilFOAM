@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { claimProgressiveCfdBatch, type DB } from "@aerodb/db";
+import {
+  claimProgressiveCfdBatch,
+  progressiveRemoteAdmissionReservedSlots,
+  type DB,
+} from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import {
   admissionCpuSlotsForRequest,
@@ -63,6 +67,28 @@ export async function admitProgressiveCfdBatch(
         state.disk_admission_blocked
       )
         return null;
+      const [remoteSolver] = await connection.execute(sql`
+        SELECT solver.id,
+          least(solver.cpu_capacity, CASE WHEN solver.cpu_budget > 0 THEN solver.cpu_budget ELSE solver.cpu_capacity END)::integer AS capacity
+        FROM registered_remote_solvers solver
+        JOIN sync_api_settings settings ON settings.id = 1
+        JOIN sweeper_state remote_state ON remote_state.id = 1
+        WHERE settings.enabled AND NOT settings.remote_solver_enabled
+          AND remote_state.enabled AND NOT remote_state.admission_fence_active
+          AND NOT remote_state.disk_admission_blocked
+          AND solver.revoked_at IS NULL AND solver.auth_token_hash IS NOT NULL
+          AND solver.credential_version > 0
+          AND solver.last_heartbeat_at > clock_timestamp() - interval '2 minutes'
+          AND solver.metadata->'progressiveExecution' IS NOT NULL
+        ORDER BY solver.last_heartbeat_at, solver.id LIMIT 1
+      `);
+      if (remoteSolver) {
+        const reserved = await progressiveRemoteAdmissionReservedSlots(
+          connection,
+          String(remoteSolver.id),
+        );
+        if (Number(remoteSolver.capacity) - reserved > 0) return null;
+      }
       const capacity = effectiveMaxConcurrentJobs(
         Number(state.max_concurrent_jobs),
         Number(state.cpu_slots),
