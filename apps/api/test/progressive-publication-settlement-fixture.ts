@@ -80,6 +80,48 @@ export async function verifyProgressivePublicationPrecedence(
       }),
     ).rejects.toBe(rollback);
   }
+  const unclassifiedRollback = new Error(
+    "Rollback unclassified progressive publication",
+  );
+  await expect(
+    db.transaction(async (raw) => {
+      const connection = raw as unknown as DB;
+      const selectedId = randomUUID();
+      await connection.insert(resultAttempts).values({
+        ...attempt,
+        id: selectedId,
+        simJobId: null,
+        engineJobId: `isolated-unclassified-publication-${selectedId}`,
+      });
+      await connection.insert(resultClassifications).values({
+        ...classification,
+        id: randomUUID(),
+        resultId: null,
+        resultAttemptId: selectedId,
+        state: "accepted",
+      });
+      await connection.execute(sql`UPDATE results
+        SET current_result_attempt_id = ${selectedId}::uuid
+        WHERE id = ${attempt.resultId}::uuid`);
+      await connection.execute(sql`DELETE FROM result_classifications
+        WHERE result_attempt_id = ${resultAttemptId}::uuid`);
+      expect(
+        await settleProgressiveRemoteJob(connection, executionId),
+      ).toMatchObject({ kind: "settled" });
+      const [published] = await connection.execute(sql`
+        SELECT result.current_result_attempt_id, classification.state
+        FROM results result
+        JOIN result_classifications classification
+          ON classification.result_attempt_id = ${resultAttemptId}::uuid
+        WHERE result.id = ${attempt.resultId}::uuid
+      `);
+      expect(published).toEqual({
+        current_result_attempt_id: resultAttemptId,
+        state: "accepted",
+      });
+      throw unclassifiedRollback;
+    }),
+  ).rejects.toBe(unclassifiedRollback);
   for (const ingested of [false, true]) {
     const rollback = new Error("Rollback exact accepted publication");
     await expect(

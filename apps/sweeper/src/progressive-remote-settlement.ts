@@ -16,7 +16,7 @@ import {
   progressiveCfdEffectiveBudgetSql,
 } from "@aerodb/db";
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
-import { refreshPolarCacheForRevision } from "@aerodb/db/polar-cache";
+import { refreshPolarClassificationsForJob } from "@aerodb/db/polar-cache";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 
@@ -69,7 +69,8 @@ async function settleInactiveUndeliveredExecution(
           (unit.state === "leased" && unit.lease_token === unit.token) ||
           (unit.state === "blocked" &&
             unit.lease_token === null &&
-            Number(unit.active_seconds) >= Number(unit.effective_budget_seconds))
+            Number(unit.active_seconds) >=
+              Number(unit.effective_budget_seconds))
         ),
     )
   )
@@ -100,6 +101,140 @@ async function settleInactiveUndeliveredExecution(
   };
 }
 
+async function promoteRetainedProgressiveAttempts(
+  db: DB,
+  input: {
+    executionId: string;
+    airfoilId: string;
+    simulationPresetRevisionId: string;
+    attemptIds: readonly string[];
+  },
+) {
+  if (!input.attemptIds.length) return false;
+  const promoted = await db.execute(sql`
+    WITH candidates AS (
+      SELECT DISTINCT ON (raw.result_id)
+        raw.id AS attempt_id,
+        raw.result_id,
+        result.current_result_attempt_id AS observed_current_attempt_id,
+        classification.state AS incoming_state,
+        raw.regime AS incoming_regime,
+        raw.evidence_payload AS incoming_evidence_payload,
+        current_attempt.regime AS current_regime,
+        current_attempt.evidence_payload AS current_evidence_payload,
+        current_classification.state AS current_state
+      FROM result_attempts raw
+      JOIN result_classifications classification
+        ON classification.result_attempt_id = raw.id
+        AND classification.state IN ('accepted', 'needs_urans')
+      JOIN results result ON result.id = raw.result_id
+      LEFT JOIN result_attempts current_attempt
+        ON current_attempt.id = result.current_result_attempt_id
+        AND current_attempt.result_id = result.id
+      LEFT JOIN result_classifications current_classification
+        ON current_classification.result_attempt_id = current_attempt.id
+      WHERE raw.id IN (${sql.join(
+        input.attemptIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )})
+        AND raw.sim_job_id = ${input.executionId}::uuid
+        AND raw.airfoil_id = ${input.airfoilId}::uuid
+        AND raw.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
+        AND raw.status = 'done'
+        AND raw.valid_for_polar
+        AND result.current_result_attempt_id IS DISTINCT FROM raw.id
+        AND coalesce((SELECT review.verdict::text
+          FROM result_review_verdicts review
+          WHERE review.result_id = result.id AND review."revokedAt" IS NULL
+          ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '')
+          NOT IN ('exclude', 'defer')
+        AND (
+          SELECT count(*) = 1
+            AND count(*) FILTER (
+              WHERE manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+                AND manifest.byte_size > 0
+                AND length(trim(manifest.storage_key)) > 0
+                AND length(trim(manifest.mime_type)) > 0
+            ) = 1
+          FROM solver_evidence_artifacts manifest
+          WHERE manifest.result_id = raw.result_id
+            AND manifest.result_attempt_id = raw.id
+            AND manifest.kind = 'manifest'
+        )
+      ORDER BY raw.result_id,
+        CASE classification.state WHEN 'accepted' THEN 200 ELSE 100 END +
+        CASE
+          WHEN raw.evidence_payload->>'fidelity' = 'urans_full' THEN 30
+          WHEN raw.evidence_payload->>'fidelity' = 'urans_precalc'
+            OR raw.regime = 'urans' THEN 20
+          ELSE 10
+        END DESC,
+        raw."solvedAt" DESC NULLS LAST,
+        raw.id
+    ), eligible AS (
+      SELECT candidates.*,
+        CASE incoming_state WHEN 'accepted' THEN 200 ELSE 100 END +
+        CASE
+          WHEN incoming_evidence_payload->>'fidelity' = 'urans_full' THEN 30
+          WHEN incoming_evidence_payload->>'fidelity' = 'urans_precalc'
+            OR incoming_regime = 'urans' THEN 20
+          ELSE 10
+        END AS incoming_rank,
+        coalesce(
+          CASE current_state
+            WHEN 'accepted' THEN 200
+            WHEN 'needs_urans' THEN 100
+            ELSE NULL
+          END +
+          CASE
+            WHEN current_evidence_payload->>'fidelity' = 'urans_full' THEN 30
+            WHEN current_evidence_payload->>'fidelity' = 'urans_precalc'
+              OR current_regime = 'urans' THEN 20
+            ELSE 10
+          END,
+          -1
+        ) AS current_rank
+      FROM candidates
+    )
+    UPDATE results result SET current_result_attempt_id = eligible.attempt_id,
+      status = raw.status, source = raw.source, regime = raw.regime,
+      method_key = raw.method_key, solver_implementation_id = raw.solver_implementation_id,
+      solver_runtime_build_id = raw.solver_runtime_build_id, cl = raw.cl, cd = raw.cd,
+      cm = raw.cm, cl_cd = raw.cl_cd, cl_std = raw.cl_std, cd_std = raw.cd_std,
+      cm_std = raw.cm_std, stalled = raw.stalled, unsteady = raw.unsteady,
+      converged = raw.converged, final_residual = raw.final_residual,
+      iterations = raw.iterations, y_plus_avg = raw.y_plus_avg, y_plus_max = raw.y_plus_max,
+      n_cells = raw.n_cells, first_order_fallback = raw.first_order_fallback,
+      strouhal = raw.strouhal, error = raw.error, quality_warnings = raw.quality_warnings,
+      frame_track = coalesce(raw.evidence_payload->'frame_track', raw.evidence_payload->'frameTrack'),
+      fidelity = raw.evidence_payload->>'fidelity',
+      steady_history = coalesce(raw.evidence_payload->'steady_history', raw.evidence_payload->'steadyHistory'),
+      engine_job_id = raw.engine_job_id, engine_case_slug = raw.engine_case_slug,
+      sim_job_id = raw.sim_job_id, "solvedAt" = raw."solvedAt", priority = 0,
+      "updatedAt" = clock_timestamp()
+    FROM eligible
+    JOIN result_attempts raw ON raw.id = eligible.attempt_id
+    WHERE result.id = eligible.result_id
+      AND eligible.incoming_rank >= eligible.current_rank
+      AND result.current_result_attempt_id IS NOT DISTINCT FROM eligible.observed_current_attempt_id
+    RETURNING result.id
+  `);
+  if (!promoted.length) return false;
+  await db.execute(sql`
+    UPDATE polar_compatibility_fit_sets fit
+    SET is_current = false, "updatedAt" = now()
+    WHERE fit.is_current = true
+      AND fit.airfoil_id = ${input.airfoilId}::uuid
+      AND EXISTS (
+        SELECT 1
+        FROM polar_compatibility_fit_members member
+        WHERE member.fit_set_id = fit.id
+          AND member.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
+      )
+  `);
+  return true;
+}
+
 async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
   const [candidate] = await db.execute(sql`
     SELECT job.airfoil_id, job.simulation_preset_revision_id, job.campaign_id
@@ -112,9 +247,35 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
       AND job."ingestedAt" IS NULL
       AND EXISTS (
         SELECT 1 FROM result_attempts raw
+        JOIN progressive_cfd_evidence evidence ON evidence.result_attempt_id = raw.id
         JOIN results result ON result.id = raw.result_id
+        LEFT JOIN result_classifications classification
+          ON classification.result_attempt_id = raw.id
         WHERE raw.sim_job_id = job.id AND raw.status = 'done' AND raw.valid_for_polar
-          AND result.current_result_attempt_id IS NULL)
+          AND (
+            classification.id IS NULL
+            OR (
+              classification.state IN ('accepted', 'needs_urans')
+              AND result.current_result_attempt_id IS DISTINCT FROM raw.id
+              AND EXISTS (
+                SELECT 1 FROM solver_evidence_archives archive
+                WHERE archive.result_attempt_id = raw.id AND archive.state = 'current'
+              )
+              AND (
+                SELECT count(*) = 1
+                  AND count(*) FILTER (
+                    WHERE manifest.sha256 ~ '^[0-9a-fA-F]{64}$'
+                      AND manifest.byte_size > 0
+                      AND length(trim(manifest.storage_key)) > 0
+                      AND length(trim(manifest.mime_type)) > 0
+                  ) = 1
+                FROM solver_evidence_artifacts manifest
+                WHERE manifest.result_id = raw.result_id
+                  AND manifest.result_attempt_id = raw.id
+                  AND manifest.kind = 'manifest'
+              )
+            )
+          ))
   `);
   if (!candidate) return;
   const retained = await readProgressiveRemoteRetention(db, executionId);
@@ -139,91 +300,35 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
     )
     .map((source) => source.resultAttemptId);
   if (!attemptIds.length) return;
-  await refreshPolarCacheForRevision(
+  const [current] = await db.execute(sql`
+    SELECT job."ingestedAt", job.ingest_lease_expires_at > clock_timestamp() AS ingestion_owned
+    FROM sim_jobs job
+    JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
+    JOIN progressive_generations generation
+      ON generation.id::text = job.request_payload->'progressive'->>'generationId'
+      AND generation.campaign_id = campaign.id
+    JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+    WHERE job.id = ${executionId}::uuid AND job.engine_job_id = job.id::text
+      AND generation.status <> 'cancelled'
+      AND generation.plan_revision_id = campaign.current_plan_revision_id
+      AND campaign.status IN ('active', 'attention', 'paused', 'completed')
+    FOR SHARE OF epoch FOR UPDATE OF campaign, job
+  `);
+  if (!current || current.ingestion_owned) return;
+  if (!current.ingestedAt)
+    await assertProgressiveCfdEvidenceJob(db, executionId, executionId);
+  await refreshPolarClassificationsForJob(
     db,
     String(candidate.airfoil_id),
     String(candidate.simulation_preset_revision_id),
-    {
-      afterAttemptClassifications: async (connection) => {
-        const [current] = await connection.execute(sql`
-          SELECT job."ingestedAt", job.ingest_lease_expires_at > clock_timestamp() AS ingestion_owned
-          FROM sim_jobs job
-          JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
-          JOIN progressive_generations generation
-            ON generation.id::text = job.request_payload->'progressive'->>'generationId'
-            AND generation.campaign_id = campaign.id
-          JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
-          WHERE job.id = ${executionId}::uuid AND job.engine_job_id = job.id::text
-            AND generation.status <> 'cancelled'
-            AND generation.plan_revision_id = campaign.current_plan_revision_id
-            AND campaign.status IN ('active', 'attention', 'paused', 'completed')
-          FOR SHARE OF epoch FOR UPDATE OF campaign, job
-        `);
-        if (!current || current.ingestion_owned) return;
-        if (!current.ingestedAt)
-          await assertProgressiveCfdEvidenceJob(
-            connection,
-            executionId,
-            executionId,
-          );
-        await connection.execute(sql`
-    WITH candidates AS (
-      SELECT DISTINCT ON (raw.result_id) raw.id AS attempt_id
-      FROM result_attempts raw
-      JOIN result_classifications classification
-        ON classification.result_attempt_id = raw.id
-      JOIN results result ON result.id = raw.result_id
-      WHERE raw.sim_job_id = ${executionId}::uuid
-        AND raw.id IN (${sql.join(
-          attemptIds.map((id) => sql`${id}::uuid`),
-          sql`, `,
-        )})
-        AND raw.airfoil_id = ${candidate.airfoil_id}::uuid
-        AND raw.simulation_preset_revision_id = ${candidate.simulation_preset_revision_id}::uuid
-        AND raw.status = 'done'
-        AND raw.valid_for_polar
-        AND classification.state = 'accepted'
-        AND result.current_result_attempt_id IS NULL
-        AND coalesce((SELECT review.verdict::text
-          FROM result_review_verdicts review
-          WHERE review.result_id = result.id AND review."revokedAt" IS NULL
-          ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '')
-          NOT IN ('exclude', 'defer')
-      ORDER BY raw.result_id,
-        CASE
-          WHEN raw.evidence_payload->>'fidelity' = 'urans_full' THEN 230
-          WHEN raw.evidence_payload->>'fidelity' = 'urans_precalc'
-            OR raw.regime = 'urans' THEN 220
-          ELSE 210
-        END DESC,
-        raw."solvedAt" DESC NULLS LAST,
-        raw.id
-    )
-    UPDATE results result SET current_result_attempt_id = raw.id,
-      status = raw.status, source = raw.source, regime = raw.regime,
-      method_key = raw.method_key, solver_implementation_id = raw.solver_implementation_id,
-      solver_runtime_build_id = raw.solver_runtime_build_id, cl = raw.cl, cd = raw.cd,
-      cm = raw.cm, cl_cd = raw.cl_cd, cl_std = raw.cl_std, cd_std = raw.cd_std,
-      cm_std = raw.cm_std, stalled = raw.stalled, unsteady = raw.unsteady,
-      converged = raw.converged, final_residual = raw.final_residual,
-      iterations = raw.iterations, y_plus_avg = raw.y_plus_avg, y_plus_max = raw.y_plus_max,
-      n_cells = raw.n_cells, first_order_fallback = raw.first_order_fallback,
-      strouhal = raw.strouhal, error = raw.error, quality_warnings = raw.quality_warnings,
-      frame_track = coalesce(raw.evidence_payload->'frame_track', raw.evidence_payload->'frameTrack'),
-      fidelity = raw.evidence_payload->>'fidelity',
-      steady_history = coalesce(raw.evidence_payload->'steady_history', raw.evidence_payload->'steadyHistory'),
-      engine_job_id = raw.engine_job_id, engine_case_slug = raw.engine_case_slug,
-      sim_job_id = raw.sim_job_id, "solvedAt" = raw."solvedAt", priority = 0,
-      "updatedAt" = clock_timestamp()
-    FROM candidates candidate
-    JOIN result_attempts raw ON raw.id = candidate.attempt_id
-    WHERE result.id = raw.result_id
-      AND result.current_result_attempt_id IS NULL
-    RETURNING result.id
-        `);
-      },
-    },
+    executionId,
   );
+  await promoteRetainedProgressiveAttempts(db, {
+    executionId,
+    airfoilId: String(candidate.airfoil_id),
+    simulationPresetRevisionId: String(candidate.simulation_preset_revision_id),
+    attemptIds,
+  });
 }
 
 import { validateRansPrecalcPromotionSignal } from "./ingest";
@@ -313,8 +418,9 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       | Record<string, unknown>
       | null
       | undefined;
-    const remoteCancellation =
-      responsePayload?.remoteCancellation as Record<string, unknown> | undefined;
+    const remoteCancellation = responsePayload?.remoteCancellation as
+      | Record<string, unknown>
+      | undefined;
     const authoritativeLeaseLoss =
       promise?.status === "cancelled" &&
       (responsePayload?.authoritativeLeaseLoss === true ||
@@ -454,7 +560,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
                 "accepted",
                 source.fidelity as string | null,
                 source.regime as "rans" | "urans" | null,
-            ),
+              ),
         )
       ) {
         if (authoritativeLeaseLoss) {

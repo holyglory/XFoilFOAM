@@ -165,12 +165,9 @@ export async function verifyProgressivePolarArchiveImport(input: {
               "refreshPolarCacheForRevision",
             );
             try {
-              refresh.mockRejectedValueOnce(
-                new Error("isolated interruption after archive binding"),
-              );
-              const interrupted = await post();
-              expect(interrupted.statusCode, interrupted.body).toBe(500);
-              expect(refresh).toHaveBeenCalledOnce();
+              const deferred = await post();
+              expect(deferred.statusCode, deferred.body).toBe(200);
+              expect(refresh).not.toHaveBeenCalled();
               const [bound] =
                 await connection.execute(sql`SELECT upload.state, result.current_result_attempt_id
                 FROM sync_brokered_evidence_uploads upload JOIN results result ON result.id = upload.canonical_result_id

@@ -576,6 +576,7 @@ async function loadAttemptEvidence(
   airfoilId: string,
   simulationPresetRevisionId: string,
   points: readonly Point[],
+  simJobId?: string,
 ): Promise<EvidenceWithDbIds[]> {
   const exactAttemptForce = hasAttemptForceHistory(
     sql.raw('"result_attempts"."evidence_payload"'),
@@ -676,9 +677,42 @@ async function loadAttemptEvidence(
           resultAttempts.simulationPresetRevisionId,
           simulationPresetRevisionId,
         ),
+        simJobId ? eq(resultAttempts.simJobId, simJobId) : undefined,
       ),
     );
   return sourceAwareEvidence(db, airfoilId, points, rows);
+}
+
+export async function refreshPolarClassificationsForJob(
+  db: DB,
+  airfoilId: string,
+  simulationPresetRevisionId: string,
+  simJobId: string,
+): Promise<PolarEvidenceClassification[]> {
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as DB;
+    const [airfoil] = await tx
+      .select({ points: airfoils.points })
+      .from(airfoils)
+      .where(eq(airfoils.id, airfoilId))
+      .limit(1);
+    const evidence = await loadAttemptEvidence(
+      tx,
+      airfoilId,
+      simulationPresetRevisionId,
+      airfoil?.points ?? [],
+      simJobId,
+    );
+    const classified = classifyPolarEvidence(evidence);
+    for (const classification of classified.classifications)
+      await upsertClassification(
+        tx,
+        classification,
+        airfoilId,
+        simulationPresetRevisionId,
+      );
+    return classified.classifications;
+  });
 }
 
 async function upsertClassification(
