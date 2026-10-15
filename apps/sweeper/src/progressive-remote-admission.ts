@@ -95,7 +95,7 @@ export async function prepareProgressiveRemoteDispatch(
       const connection = transaction as unknown as DB;
       admissionPhase = "transaction setup";
       await connection.execute(
-        sql`SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '3s'`,
+        sql`SET LOCAL lock_timeout = '10s'; SET LOCAL statement_timeout = '15s'`,
       );
       const [epoch] = await connection.execute(
         sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
