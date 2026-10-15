@@ -14,6 +14,12 @@ import {
 } from "./progressive-publication-selection";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
 
+const immutableReportConflictReasons = new Set([
+  "Remote report replay changed immutable content",
+  "Final remote execution evidence cannot change after its stop fence",
+  "An acknowledged stopped remote execution cannot resume",
+]);
+
 export async function publishProgressiveWorkerReport(
   db: DB,
   executionId: string,
@@ -90,7 +96,7 @@ export async function publishProgressiveWorkerReport(
     } | null;
     const conflictReason = String(body?.error ?? "");
     if (
-      conflictReason &&
+      immutableReportConflictReasons.has(conflictReason) &&
       (await quarantineProgressiveWorkerReportConflict(db, {
         executionId,
         solverId: String(owned.solver_id),
