@@ -5636,6 +5636,43 @@ describe("progressive execution stop and settlement", () => {
     ).toHaveLength(1);
   });
 
+  it("finalizes a cancelled progressive job when the engine has no result snapshot", async () => {
+    const fixture = await fitFixture();
+    const engine = new EngineClient("http://unused.invalid");
+    vi.spyOn(engine, "getJob").mockResolvedValue({
+      job_id: fixture.engineJobId,
+      state: "cancelled",
+      total_cases: fixture.leases.length,
+      completed_cases: 0,
+    });
+    vi.spyOn(engine, "getExecutionStopProof").mockResolvedValue(
+      executionStopProof(fixture.engineJobId),
+    );
+    vi.spyOn(engine, "getResult").mockRejectedValue(
+      new EngineError("Result not ready (state=cancelled)", 409),
+    );
+
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    await reconcileProgressiveCfdJob(db, engine, job);
+
+    const [finished] = await db
+      .select({
+        status: simJobs.status,
+        engineState: simJobs.engineState,
+        ingestedAt: simJobs.ingestedAt,
+      })
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    expect(finished).toMatchObject({
+      status: "cancelled",
+      engineState: "cancelled",
+    });
+    expect(finished.ingestedAt).toBeInstanceOf(Date);
+  });
+
   it("reconciles budget stops without releasing work before physical proof and terminal ingestion", async () => {
     const fixture = await fitFixture();
     const options = { jobIds: [fixture.composed.jobId] };

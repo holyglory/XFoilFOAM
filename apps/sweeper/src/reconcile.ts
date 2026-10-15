@@ -505,6 +505,10 @@ function isNotFound(e: unknown): boolean {
   return e instanceof EngineError && e.status === 404;
 }
 
+function isTerminalResultNotReady(e: unknown): boolean {
+  return e instanceof EngineError && e.status === 409;
+}
+
 function queueListsJob(queue: EngineQueueState, engineJobId: string): boolean {
   return (
     queue.job_ids.includes(engineJobId) ||
@@ -4184,7 +4188,11 @@ export async function reconcileProgressiveCfdJob(
     try {
       result = await engine.getResult(job.engineJobId, route);
     } catch (error) {
-      if (!terminal || status.state === "completed" || !isNotFound(error))
+      if (
+        !terminal ||
+        status.state === "completed" ||
+        (!isNotFound(error) && !isTerminalResultNotReady(error))
+      )
         throw error;
       result = null;
     }
