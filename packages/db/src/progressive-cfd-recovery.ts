@@ -92,6 +92,22 @@ export async function recoverInactiveProgressiveRemoteGaps(
     `);
     for (const unit of units) {
       await connection.execute(sql`
+        UPDATE results result
+        SET status = 'pending', source = 'queued', sim_job_id = NULL,
+          engine_job_id = NULL, error = NULL, "updatedAt" = clock_timestamp()
+        FROM progressive_cfd_attempts attempt
+        JOIN result_attempts raw ON raw.sim_job_id = attempt.sim_job_id
+          AND raw.result_id = result.id
+        WHERE attempt.unit_id = ${unit.id}::uuid
+          AND attempt.sim_job_id IS NOT NULL
+          AND result.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1 FROM result_classifications classification
+            WHERE classification.result_id = result.id
+              AND classification.state = 'accepted'
+          )
+      `);
+      await connection.execute(sql`
         UPDATE progressive_cfd_units
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL,
