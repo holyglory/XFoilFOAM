@@ -278,8 +278,13 @@ export async function deliverNextProgressiveWorkerEvidence(
     });
     return true;
   } catch (error) {
+    const transientTransportFailure =
+      error instanceof Error &&
+      (error.name === "AbortError" ||
+        /aborted|timeout|timed out/i.test(error.message));
     const conflict =
-      (responseStatus === 409 && !retryStoppedStorage) ||
+      ((responseStatus === 409 && !retryStoppedStorage) &&
+        !transientTransportFailure) ||
       importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures

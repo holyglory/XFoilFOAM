@@ -4,9 +4,18 @@ export function progressiveDeliverySelectionSql(
   preferActive: boolean,
   claimToken?: string,
 ) {
+  const retryableFailure = sql`(
+    failure.state = 'retry'
+    OR (
+      failure.state = 'conflict'
+      AND failure.last_error ILIKE ANY (ARRAY[
+        '%aborted%', '%timeout%', '%timed out%'
+      ])
+    )
+  )`;
   const points = sql`SELECT source.sim_job_id, source.sequence, source.result_attempt_id,
       source.point_content_signature, report.created_at, attempt.aoa_deg,
-      COALESCE(failure.state = 'retry', false) AS is_retry
+      COALESCE(${retryableFailure}, false) AS is_retry
     FROM progressive_worker_reports report
     JOIN progressive_worker_evidence_attempts source ON source.sim_job_id = report.sim_job_id AND source.sequence = report.sequence
     JOIN result_attempts attempt ON attempt.id = source.result_attempt_id AND attempt.sim_job_id = source.sim_job_id
@@ -21,8 +30,9 @@ export function progressiveDeliverySelectionSql(
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
         WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())
-      AND (failure.sim_job_id IS NULL OR (failure.state = 'retry' AND failure.retry_after <= clock_timestamp()))
-    ORDER BY CASE WHEN failure.state = 'retry' THEN 0 ELSE 1 END,
+      AND (failure.sim_job_id IS NULL OR (${retryableFailure}
+        AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))
+    ORDER BY CASE WHEN ${retryableFailure} THEN 0 ELSE 1 END,
       report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id OFFSET 0`;
   const owned = (
     active: boolean,
