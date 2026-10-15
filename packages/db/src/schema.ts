@@ -7141,6 +7141,9 @@ export const progressiveWork = pgTable(
       table.stage,
       table.state,
     ),
+    pendingTargetIdx: index("progressive_work_pending_target_idx")
+      .on(table.generationId, table.stage, table.targetId, table.id)
+      .where(sql`${table.state} = 'pending'`),
     stageCheck: check(
       "progressive_work_stage_check",
       sql`${table.stage} IN (1, 2, 3)`,
