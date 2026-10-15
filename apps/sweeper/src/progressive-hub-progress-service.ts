@@ -9,6 +9,7 @@ export async function runProgressiveHubProgressService(
   notifications: Pick<Sql, "listen">,
   signal: AbortSignal,
 ) {
+  let lastAdmissionWaitReason: string | null = null;
   const progressDrain = runNotificationDrain(
     notifications,
     "progressive_remote_report_changed",
@@ -55,8 +56,29 @@ export async function runProgressiveHubProgressService(
     {
       drain: async () => {
         const admission = signal.aborted
-          ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
+          ? {
+              prepared: 0,
+              deferred: 0,
+              waiting: 0,
+              waitingReasons: [],
+              errors: [],
+            }
           : await prepareProgressiveRemoteFleet(db);
+        const waitReason = admission.waitingReasons
+          .map((entry) => `${entry.solverId}:${entry.reason}`)
+          .join("|");
+        if (waitReason && waitReason !== lastAdmissionWaitReason) {
+          lastAdmissionWaitReason = waitReason;
+          console.log(
+            JSON.stringify({
+              component: "progressive-remote-admission-wait",
+              waiting: admission.waiting,
+              waitingReasons: admission.waitingReasons,
+            }),
+          );
+        } else if (!waitReason) {
+          lastAdmissionWaitReason = null;
+        }
         if (admission.prepared || admission.deferred || admission.errors.length)
           console.log(
             JSON.stringify({
