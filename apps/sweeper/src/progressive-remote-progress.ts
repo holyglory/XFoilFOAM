@@ -182,46 +182,43 @@ async function applyProgressiveRemoteProgressBatch(
   db: DB,
   executionId: string,
 ) {
-  return db.transaction(async (transaction) => {
-    const connection = transaction as unknown as DB;
-    const batchReceipt = {
-      applied: 0,
-      indexed: 0,
-      stopped: 0,
-      idle: false,
-      errors: [] as Array<{ executionId: string; reason: string }>,
-    };
-    for (
-      let reportPass = 0;
-      reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
-      reportPass += 1
-    ) {
-      try {
-        const result = await connection.transaction(async (savepoint) =>
-          applyProgressiveRemoteProgressInTransaction(
-            savepoint as unknown as DB,
-            executionId,
-          ),
-        );
-        if (result.kind === "indexed") batchReceipt.indexed += 1;
-        if (result.kind === "applied") {
-          batchReceipt.applied += 1;
-          if (result.stopped) batchReceipt.stopped += 1;
-        }
-        if (result.kind === "idle") {
-          batchReceipt.idle = true;
-          break;
-        }
-      } catch (error) {
-        batchReceipt.errors.push({
+  const batchReceipt = {
+    applied: 0,
+    indexed: 0,
+    stopped: 0,
+    idle: false,
+    errors: [] as Array<{ executionId: string; reason: string }>,
+  };
+  for (
+    let reportPass = 0;
+    reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
+    reportPass += 1
+  ) {
+    try {
+      const result = await db.transaction(async (transaction) =>
+        applyProgressiveRemoteProgressInTransaction(
+          transaction as unknown as DB,
           executionId,
-          reason: error instanceof Error ? error.message : String(error),
-        });
+        ),
+      );
+      if (result.kind === "indexed") batchReceipt.indexed += 1;
+      if (result.kind === "applied") {
+        batchReceipt.applied += 1;
+        if (result.stopped) batchReceipt.stopped += 1;
+      }
+      if (result.kind === "idle") {
+        batchReceipt.idle = true;
         break;
       }
+    } catch (error) {
+      batchReceipt.errors.push({
+        executionId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      break;
     }
-    return batchReceipt;
-  });
+  }
+  return batchReceipt;
 }
 
 export async function reconcileProgressiveRemoteProgress(
