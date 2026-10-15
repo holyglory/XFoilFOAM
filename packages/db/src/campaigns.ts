@@ -2228,23 +2228,21 @@ async function campaignProgressiveSnapshot(
       COALESCE(sum(point_count) FILTER (WHERE precise_state NOT IN ('complete', 'gap')), 0)::int AS precise_open,
       COALESCE(sum(point_count) FILTER (WHERE neuralfoil_state = 'gap' OR fast_state = 'gap' OR precise_state = 'gap'), 0)::int AS gap_points,
       ${progressiveCampaignActiveStageSql(sql`${campaignId}::uuid`, sql`(SELECT stage::int FROM current_generation)`)} AS stage,
-      (SELECT count(*)::int FROM sim_jobs job
-        WHERE job.status IN ('pending', 'submitted', 'running', 'ingesting')
-          AND job.campaign_id = ${campaignId}) AS active_jobs,
       (SELECT count(DISTINCT unit.id)::int
         FROM progressive_cfd_units unit
         JOIN progressive_work work ON work.id = unit.work_id
         JOIN current_generation generation ON generation.id = work.generation_id
-        WHERE EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
+      WHERE EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
           JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
           WHERE attempt.unit_id = unit.id)) AS cfd_evidence_points
     FROM targets
   `)) as unknown as Array<Record<string, unknown>>;
+  const activeJobs = await campaignActiveJobCount(asDb(db), campaignId);
   return {
     requestedPoints: Number(row?.requested_points ?? 0),
     preliminaryPoints: Number(row?.preliminary_points ?? 0),
     cfdEvidencePoints: Number(row?.cfd_evidence_points ?? 0),
-    activeJobs: Number(row?.active_jobs ?? 0),
+    activeJobs,
     stage:
       row?.stage === 1 || row?.stage === 2 || row?.stage === 3
         ? row.stage
