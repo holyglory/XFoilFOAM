@@ -3,6 +3,7 @@ import type { ProgressivePolarEstimate } from "../../engine-client/src/progressi
 import { sql } from "drizzle-orm";
 import { canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import { advanceGeneration } from "./progressive-campaigns";
 import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 import {
@@ -66,6 +67,8 @@ export async function advanceProgressiveCfdStages(db: DB) {
       waiting: 0,
       campaignsCompleted: 0,
     };
+    if (!(await tryProgressiveAdmissionLock(connection)))
+      return receipt;
     const generationsToAdvance = new Set<string>();
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,

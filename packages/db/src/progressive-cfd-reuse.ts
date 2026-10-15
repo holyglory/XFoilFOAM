@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 
 export const MAX_PROGRESSIVE_CFD_REUSE_UNITS = 256;
 
@@ -27,6 +28,7 @@ export async function reuseAcceptedProgressiveCfdEvidence(
   if (!previousIds.length) return 0;
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );

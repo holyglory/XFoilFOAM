@@ -19,6 +19,7 @@ import {
   type AnalysisPhysical,
 } from "./analysis-target";
 import type { DB } from "./client";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import {
   currentLocalStepPolicySql,
   localStepRecipeSql,
@@ -106,6 +107,7 @@ export async function initializeProgressiveCfdWork(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -578,6 +580,7 @@ export async function claimProgressiveCfdBatch(
 ): Promise<ProgressiveCfdLease[]> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (!(await tryProgressiveAdmissionLock(connection))) return [];
     const first = await claimProgressiveCfdUnit(connection, input);
     if (!first) return [];
     const maximum =

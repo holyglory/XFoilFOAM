@@ -2,12 +2,15 @@ import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
 ): Promise<{ retried: number; gaps: number }> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (!(await tryProgressiveAdmissionLock(connection)))
+      return { retried: 0, gaps: 0 };
     const receipt = { retried: 0, gaps: 0 };
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
@@ -66,6 +69,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -129,6 +133,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
