@@ -102,3 +102,55 @@ export async function recoverInactiveProgressiveRemoteGaps(
     return units.length;
   });
 }
+
+export async function recoverTerminalProgressiveNoEvidenceGaps(
+  db: DB,
+): Promise<number> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [epoch] = await connection.execute(
+      sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+    );
+    if (!epoch) throw new Error("Calculation epoch is missing");
+    const units = await connection.execute(sql`
+      SELECT unit.id, unit.work_id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
+      JOIN progressive_cfd_execution_stops stopped
+        ON stopped.sim_job_id = attempt.sim_job_id
+        AND stopped.engine_job_id = attempt.sim_job_id::text
+      WHERE generation.epoch_id = ${epoch.id}
+        AND generation.status = 'active'
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND ${effectiveProgressiveStageSql()} = work.stage
+        AND work.state = 'gap'
+        AND campaign.status IN ('active', 'attention', 'paused')
+        AND unit.state = 'gap'
+        AND unit.error = 'terminal execution has no measured case evidence'
+        AND unit.attempts < 2
+        AND unit.active_seconds < unit.active_budget_seconds
+        AND attempt.outcome = 'failed'
+      ORDER BY unit.id
+      LIMIT 64
+      FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED
+    `);
+    for (const unit of units) {
+      await connection.execute(sql`
+        UPDATE progressive_cfd_units
+        SET state = 'pending', lease_token = NULL, lease_owner = NULL,
+          lease_until = NULL, retry_after = NULL,
+          error = 'Retrying after terminal execution without measurable case evidence'
+        WHERE id = ${unit.id}::uuid AND state = 'gap'
+      `);
+      await connection.execute(sql`
+        UPDATE progressive_work
+        SET state = 'pending', error = NULL, completed_at = NULL
+        WHERE id = ${unit.work_id}::uuid AND state = 'gap'
+      `);
+    }
+    return units.length;
+  });
+}

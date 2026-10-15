@@ -5,6 +5,7 @@ import {
   advanceProgressiveCfdStages,
   recoverUnboundProgressiveCfdLeases,
   recoverInactiveProgressiveRemoteGaps,
+  recoverTerminalProgressiveNoEvidenceGaps,
   invalidateProgressiveFitPolicy,
   type DB,
   type Sql,
@@ -113,6 +114,15 @@ export async function runProgressiveBaselineService(
           report({
             component: "progressive-inactive-remote-recovery",
             retried: inactiveRemoteGaps,
+          });
+        }
+        const terminalNoEvidenceGaps =
+          await recoverTerminalProgressiveNoEvidenceGaps(db);
+        if (terminalNoEvidenceGaps) {
+          pending = true;
+          report({
+            component: "progressive-terminal-no-evidence-recovery",
+            retried: terminalNoEvidenceGaps,
           });
         }
         if (settings?.remote) continue;

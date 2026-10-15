@@ -2249,6 +2249,12 @@ requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-hub-progress-service.test.ts"]
 
 [[test.progressive.check]]
+name = "terminal-no-evidence-recovery"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "requeues only stopped terminal executions with no measurable evidence"]
+
+[[test.progressive.check]]
 name = "remote-stage-barrier"
 tier = "development"
 requires = ["dependencies", "types"]
