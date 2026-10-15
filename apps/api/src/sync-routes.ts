@@ -755,7 +755,6 @@ async function ensureSyncRows(): Promise<void> {
 }
 
 async function getSettings() {
-  await ensureSyncRows();
   const [settings] = await db
     .select()
     .from(syncApiSettings)
@@ -7065,6 +7064,7 @@ async function runUpstreamSync(
 }
 
 export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
+  await ensureSyncRows();
   app.get("/api/sync/v1/progressive-executions", async (req, reply) => {
     const solver = await requireRegisteredRemoteSolver(req, reply);
     if (!solver) return;
