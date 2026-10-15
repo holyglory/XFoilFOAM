@@ -32,7 +32,7 @@ def configure_flow_execution(runner, request: PolarRequest) -> None:
     source_fitted = gas.transport_model == "polynomial"
     steady = (
         "xfoilfoamRhoSimpleFoam"
-        if family == "rhoSimpleFoam"
+        if family in {"rhoSimpleFoam", "rhoPimpleFoam"}
         and source_fitted
         else "rhoCentralFoam" if family == "rhoCentralFoam" else "rhoSimpleFoam"
     )

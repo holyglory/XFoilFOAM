@@ -51,7 +51,7 @@ class CompressibleCaseBuilder(CaseBuilder):
         )
         steady_command = (
             "xfoilfoamRhoSimpleFoam"
-            if solver_family == "rhoSimpleFoam"
+            if solver_family in {"rhoSimpleFoam", "rhoPimpleFoam"}
             and gas.transport_model == "polynomial"
             else solver_family
         )
