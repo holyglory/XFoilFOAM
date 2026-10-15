@@ -271,6 +271,12 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
       AND solver.metadata->'progressiveExecution' IS NOT NULL
     ORDER BY solver.last_heartbeat_at, solver.id
   `);
+  console.log(
+    JSON.stringify({
+      component: "progressive-remote-admission-cycle",
+      solvers: solvers.length,
+    }),
+  );
   const receipt = {
     prepared: 0,
     deferred: 0,
@@ -340,6 +346,15 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
         cleaned: cleanedHubPayloads,
       }),
     );
+  console.log(
+    JSON.stringify({
+      component: "progressive-remote-admission-cycle-result",
+      prepared: receipt.prepared,
+      deferred: receipt.deferred,
+      waiting: receipt.waiting,
+      errors: receipt.errors.length,
+    }),
+  );
   return receipt;
 }
 
