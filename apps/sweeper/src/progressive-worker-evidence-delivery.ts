@@ -19,6 +19,10 @@ import {
 } from "./progressive-stopped-storage";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
 
+const REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS = Number(
+  process.env.REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS ?? 120_000,
+);
+
 export async function recordProgressiveWorkerEvidenceReceipt(
   db: DB,
   supplied: unknown,
@@ -191,7 +195,7 @@ export async function deliverNextProgressiveWorkerEvidence(
             ),
           },
           redirect: "error",
-          signal: AbortSignal.timeout(30000),
+          signal: AbortSignal.timeout(REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS),
           body: requestBody,
         },
       );
