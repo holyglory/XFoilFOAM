@@ -109,12 +109,12 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
       ON stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id
     WHERE job.id = ${executionId}::uuid AND job.engine_job_id = job.id::text
       AND job.status <> 'cancelled'
+      AND job."ingestedAt" IS NULL
       AND EXISTS (
         SELECT 1 FROM result_attempts raw
         JOIN results result ON result.id = raw.result_id
-        JOIN result_classifications classification ON classification.result_attempt_id = raw.id
         WHERE raw.sim_job_id = job.id AND raw.status = 'done' AND raw.valid_for_polar
-          AND classification.state = 'accepted' AND result.current_result_attempt_id IS NULL)
+          AND result.current_result_attempt_id IS NULL)
   `);
   if (!candidate) return;
   const retained = await readProgressiveRemoteRetention(db, executionId);
