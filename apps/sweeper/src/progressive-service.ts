@@ -21,7 +21,7 @@ import {
 } from "./progressive-fitting";
 import { runProgressiveFitBatches } from "./progressive-fit-concurrency";
 
-const PROGRESSIVE_MAINTENANCE_INTERVAL_MS = 30_000;
+const PROGRESSIVE_MAINTENANCE_INTERVAL_MS = 120_000;
 
 function configuredNeuralFoilConcurrency(env: NodeJS.ProcessEnv = process.env) {
   const raw =

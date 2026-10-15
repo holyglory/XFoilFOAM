@@ -93,7 +93,7 @@ it("runs stage maintenance again without a solver notification and cleans its wa
   expect(mocks.initialize).toHaveBeenCalledOnce();
   expect(mocks.stages).toHaveBeenCalledOnce();
 
-  await vi.advanceTimersByTimeAsync(30_000);
+  await vi.advanceTimersByTimeAsync(120_000);
   expect(mocks.initialize).toHaveBeenCalledTimes(2);
   expect(mocks.stages).toHaveBeenCalledTimes(2);
 
