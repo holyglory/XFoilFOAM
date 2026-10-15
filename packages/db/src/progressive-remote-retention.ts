@@ -9,6 +9,26 @@ import {
   validateProgressiveRemoteReport,
 } from "./progressive-remote-report";
 import type { ProgressiveRemoteExecutionEnvelope } from "./progressive-remote-execution";
+import type { ProgressiveRemoteReport } from "./progressive-remote-report";
+
+export function terminalReportHasNoPhysicalEvidence(
+  report: ProgressiveRemoteReport,
+): boolean {
+  if (!report.result || !["failed", "cancelled"].includes(report.result.state))
+    return false;
+  const polars = report.result.polars ?? [];
+  const points = polars.flatMap((polar) => polar.points ?? []);
+  const attempts = polars.flatMap((polar) => polar.attempts ?? []);
+  return (
+    points.length === 0 &&
+    attempts.length > 0 &&
+    attempts.every(
+      (attempt) =>
+        (!attempt.evidence_artifacts || attempt.evidence_artifacts.length === 0) &&
+        (attempt.failure_disposition != null || attempt.error != null),
+    )
+  );
+}
 
 export async function readProgressiveRemoteRetention(
   db: DB,
@@ -59,7 +79,7 @@ export async function readProgressiveRemoteRetention(
   const missingEvidence = sources.filter(
     (source) => source.result_attempt_id == null,
   ).length;
-  if (missingEvidence)
+  if (missingEvidence && !terminalReportHasNoPhysicalEvidence(report))
     return {
       kind: "waiting" as const,
       reason: "raw_evidence" as const,

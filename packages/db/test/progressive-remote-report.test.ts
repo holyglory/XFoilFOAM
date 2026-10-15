@@ -5,6 +5,7 @@ import type { ProgressiveExecutionScope } from "../../engine-client/src/progress
 import type { PolarRequest } from "../../engine-client/src/types";
 import { sealProgressiveRemoteExecution } from "../src/progressive-remote-execution";
 import { progressiveRemoteReportInventory } from "../src/progressive-remote-inventory";
+import { terminalReportHasNoPhysicalEvidence } from "../src/progressive-remote-retention";
 import {
   isFinalProgressiveRemoteReport,
   validateProgressiveRemoteReportOrder,
@@ -123,6 +124,18 @@ function fixture() {
   };
   return { assignment, report };
 }
+
+it("recognizes terminal infrastructure reports with no physical evidence", () => {
+  const input = fixture();
+  input.report.status.state = "failed";
+  input.report.result!.state = "failed";
+  expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(true);
+
+  input.report.result!.polars[0].attempts![0].evidence_artifacts = [
+    { kind: "log" },
+  ];
+  expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
+});
 
 describe("remote progressive incremental report validation", () => {
   it("inventories all exact raw generations without inventing evidence for empty reports", () => {
