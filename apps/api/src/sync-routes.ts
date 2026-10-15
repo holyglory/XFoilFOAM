@@ -5671,19 +5671,10 @@ export async function importPolarPush(
     }
     return publishableProgressive;
   };
-  const progressiveEvidenceOnly =
-    !options.stoppedStorageOnly &&
-    progressive.size === payload.results.length &&
-    payload.results.every(
-      (point) =>
-        point.progressiveEvidence &&
-        point.evidenceArtifacts.length === 0 &&
-        point.media.length === 0 &&
-        point.fieldExtents.length === 0 &&
-        !point.forceHistory,
-    );
+  const deferProgressivePolarRefresh =
+    progressive.size === payload.results.length;
 
-  if (progressiveEvidenceOnly) {
+  if (deferProgressivePolarRefresh) {
     await db.transaction(async (rawTx) => {
       await recordProgressiveEvidenceReceipts(rawTx as unknown as DB);
     });
