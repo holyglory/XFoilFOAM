@@ -1380,72 +1380,102 @@ export async function lockAndFilterRemoteClaimAoas(
 export async function reconcileObsoleteExactPolarConflicts(
   database: DB = db,
 ): Promise<number> {
-  const rows = (await database.execute(sql`
-    UPDATE sync_import_conflicts conflict
-    SET
-      status = 'archived',
-      resolution_note =
-        'automatically cleared: exact promised generation was subsequently accepted',
-      "resolvedAt" = now(),
-      "updatedAt" = now()
-    FROM sync_sweep_promises promise,
-         sync_sweep_promise_points promised_point,
-         results result,
-         result_attempts attempt
-    WHERE conflict.status = 'pending'
-      AND conflict.data_type = 'polars'
-      AND conflict.artifact_manifest ->> 'promiseId' = promise.id::text
-      AND promised_point.promise_id = promise.id
-      AND promised_point.status = 'fulfilled'
-      AND promised_point.result_id = result.id
-      AND promised_point.result_attempt_id = attempt.id
-      AND result.current_result_attempt_id = attempt.id
-      AND attempt.result_id = result.id
-      AND attempt.status = 'done'
-      AND conflict.incoming_payload ->> 'engineJobId' IS NOT NULL
-      AND promised_point.aoa_deg = CASE
-        WHEN conflict.incoming_payload ->> 'aoaDeg'
-          ~ '^-?[0-9]+([.][0-9]+)?$'
-        THEN (conflict.incoming_payload ->> 'aoaDeg')::float8
-        ELSE NULL
-      END
-      AND attempt.engine_job_id IN (
-        conflict.incoming_payload ->> 'engineJobId',
-        concat(
-          'sync:',
-          COALESCE(conflict.source_instance_id, promise.source_instance_id),
-          ':',
-          conflict.incoming_payload ->> 'engineJobId'
+  try {
+    return await database.transaction(async (rawTransaction) => {
+      const transaction = rawTransaction as unknown as DB;
+      const [lock] = await transaction.execute(sql`
+        SELECT pg_try_advisory_xact_lock(
+          hashtextextended('sync-import-conflict-reconcile', 0)
+        ) AS acquired
+      `);
+      if (!lock?.acquired) return 0;
+      await transaction.execute(sql`SET LOCAL lock_timeout = '250ms'`);
+      await transaction.execute(sql`SET LOCAL statement_timeout = '3000ms'`);
+      const rows = (await transaction.execute(sql`
+        WITH candidates AS MATERIALIZED (
+          SELECT DISTINCT conflict.id
+          FROM sync_import_conflicts conflict,
+               sync_sweep_promises promise,
+               sync_sweep_promise_points promised_point,
+               results result,
+               result_attempts attempt
+          WHERE conflict.status = 'pending'
+            AND conflict.data_type = 'polars'
+            AND conflict.artifact_manifest ->> 'promiseId' = promise.id::text
+            AND promised_point.promise_id = promise.id
+            AND promised_point.status = 'fulfilled'
+            AND promised_point.result_id = result.id
+            AND promised_point.result_attempt_id = attempt.id
+            AND result.current_result_attempt_id = attempt.id
+            AND attempt.result_id = result.id
+            AND attempt.status = 'done'
+            AND conflict.incoming_payload ->> 'engineJobId' IS NOT NULL
+            AND promised_point.aoa_deg = CASE
+              WHEN conflict.incoming_payload ->> 'aoaDeg'
+                ~ '^-?[0-9]+([.][0-9]+)?$'
+              THEN (conflict.incoming_payload ->> 'aoaDeg')::float8
+              ELSE NULL
+            END
+            AND attempt.engine_job_id IN (
+              conflict.incoming_payload ->> 'engineJobId',
+              concat(
+                'sync:',
+                COALESCE(conflict.source_instance_id, promise.source_instance_id),
+                ':',
+                conflict.incoming_payload ->> 'engineJobId'
+              )
+            )
+            AND attempt.engine_case_slug IS NOT DISTINCT FROM
+              NULLIF(conflict.incoming_payload ->> 'engineCaseSlug', '')
+            AND result.fidelity::text IS NOT DISTINCT FROM
+              (conflict.incoming_payload ->> 'fidelity')
+            AND attempt.cl IS NOT DISTINCT FROM CASE
+              WHEN jsonb_typeof(conflict.incoming_payload -> 'cl') = 'number'
+              THEN (conflict.incoming_payload ->> 'cl')::float8
+              ELSE NULL
+            END
+            AND attempt.cd IS NOT DISTINCT FROM CASE
+              WHEN jsonb_typeof(conflict.incoming_payload -> 'cd') = 'number'
+              THEN (conflict.incoming_payload ->> 'cd')::float8
+              ELSE NULL
+            END
+            AND attempt.cm IS NOT DISTINCT FROM CASE
+              WHEN jsonb_typeof(conflict.incoming_payload -> 'cm') = 'number'
+              THEN (conflict.incoming_payload ->> 'cm')::float8
+              ELSE NULL
+            END
+            AND EXISTS (
+              SELECT 1
+              FROM result_classifications classification
+              WHERE classification.result_attempt_id = attempt.id
+                AND classification.state = 'accepted'
+            )
+          ORDER BY conflict.id
+          LIMIT 128
         )
-      )
-      AND attempt.engine_case_slug IS NOT DISTINCT FROM
-        NULLIF(conflict.incoming_payload ->> 'engineCaseSlug', '')
-      AND result.fidelity::text IS NOT DISTINCT FROM
-        (conflict.incoming_payload ->> 'fidelity')
-      AND attempt.cl IS NOT DISTINCT FROM CASE
-        WHEN jsonb_typeof(conflict.incoming_payload -> 'cl') = 'number'
-        THEN (conflict.incoming_payload ->> 'cl')::float8
-        ELSE NULL
-      END
-      AND attempt.cd IS NOT DISTINCT FROM CASE
-        WHEN jsonb_typeof(conflict.incoming_payload -> 'cd') = 'number'
-        THEN (conflict.incoming_payload ->> 'cd')::float8
-        ELSE NULL
-      END
-      AND attempt.cm IS NOT DISTINCT FROM CASE
-        WHEN jsonb_typeof(conflict.incoming_payload -> 'cm') = 'number'
-        THEN (conflict.incoming_payload ->> 'cm')::float8
-        ELSE NULL
-      END
-      AND EXISTS (
-        SELECT 1
-        FROM result_classifications classification
-        WHERE classification.result_attempt_id = attempt.id
-          AND classification.state = 'accepted'
-      )
-    RETURNING conflict.id
-  `)) as unknown as Array<{ id: string }>;
-  return rows.length;
+        UPDATE sync_import_conflicts conflict
+        SET status = 'archived',
+          resolution_note =
+            'automatically cleared: exact promised generation was subsequently accepted',
+          "resolvedAt" = now(),
+          "updatedAt" = now()
+        FROM candidates
+        WHERE conflict.id = candidates.id
+        RETURNING conflict.id
+      `)) as unknown as Array<{ id: string }>;
+      return rows.length;
+    });
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (
+      code === '57014' ||
+      code === '55P03' ||
+      (error instanceof Error &&
+        /statement timeout|lock timeout/i.test(error.message))
+    )
+      return 0;
+    throw error;
+  }
 }
 
 function conflictReviewNumber(
