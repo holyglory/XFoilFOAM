@@ -242,10 +242,10 @@ export async function prepareProgressiveRemoteDispatch(
 function remoteAdmissionsPerTick(
   raw = process.env.SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK,
 ): number {
-  if (raw == null || raw.trim() === "") return 32;
+  if (raw == null || raw.trim() === "") return 64;
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 1) return 32;
-  return Math.min(parsed, 32);
+  if (!Number.isInteger(parsed) || parsed < 1) return 64;
+  return Math.min(parsed, 64);
 }
 
 async function prepareProgressiveRemoteFleetRun(db: DB) {

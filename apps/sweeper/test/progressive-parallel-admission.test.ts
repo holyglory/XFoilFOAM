@@ -228,7 +228,7 @@ it("continues past stale assignment cleanup to reach later fresh assignments", a
 });
 
 it("applies the default per-tick admission bound across assignment batches", async () => {
-  const scope = fixture(0, 64, 40);
+  const scope = fixture(0, 96, 72);
   hooks.submit.mockResolvedValue({ kind: "submitted" });
 
   expect(
@@ -237,10 +237,10 @@ it("applies the default per-tick admission bound across assignment batches", asy
       meshRecoveryVersion: 1,
     }),
   ).toBe(true);
-  expect(scope.assignmentLimits).toEqual(Array(8).fill(4));
-  expect(hooks.submit).toHaveBeenCalledTimes(32);
+  expect(scope.assignmentLimits).toEqual(Array(16).fill(4));
+  expect(hooks.submit).toHaveBeenCalledTimes(64);
   expect(hooks.submit.mock.calls.map((call) => call[2])).toEqual(
-    scope.expectedIds.slice(0, 32),
+    scope.expectedIds.slice(0, 64),
   );
-  expect(Math.max(...scope.reservedSnapshots)).toBeLessThanOrEqual(64);
+  expect(Math.max(...scope.reservedSnapshots)).toBeLessThanOrEqual(96);
 });
