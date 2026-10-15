@@ -2222,7 +2222,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "remote-capabilities"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts", "test/progressive-parallel-admission.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts", "test/progressive-remote-admission-lock.test.ts", "test/progressive-parallel-admission.test.ts"]
 
 [[test.progressive.check]]
 name = "remote-archive-broker"

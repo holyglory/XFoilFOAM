@@ -173,6 +173,7 @@ export async function prepareProgressiveRemoteDispatch(
       const leases = await claimProgressiveCfdBatch(connection, {
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
+        maximumUnits: 16,
         leaseSeconds: PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
         requireSweeperEnabled: true,
         solverBudgetVersion: 2,
