@@ -1413,6 +1413,7 @@ async function refreshPolarCachesForJob(
   job: SimJobRow,
   heartbeat: () => Promise<void> = () => touchHeartbeat(db),
 ): Promise<void> {
+  if (requestPayload(job).remoteProgressiveExecution) return;
   const conditionMap = conditionMapForJob(job);
   if (conditionMap) {
     for (const revisionId of new Set(
