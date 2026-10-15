@@ -113,7 +113,9 @@ export async function runProgressiveBaselineService(
           pending = true;
           report({ component: "progressive-scope", ...scope });
         }
-        const cfdUnits = await initializeProgressiveCfdWork(db);
+        const cfdUnits = remoteHasCapacity
+          ? 0
+          : await initializeProgressiveCfdWork(db);
         if (cfdUnits) {
           pending = true;
           report({ component: "progressive-cfd-scope", units: cfdUnits });
