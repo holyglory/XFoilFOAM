@@ -5,6 +5,7 @@ import {
   configuredMediaRepairConcurrency,
   MEDIA_REPAIR_ACTIVE_DELAY_MS,
   MEDIA_REPAIR_IDLE_DELAY_MS,
+  MEDIA_REPAIR_MAINTENANCE_DELAY_MS,
   nextMediaRepairDelayMs,
   runUntilAborted,
 } from "../src/media-repair-worker-policy";
@@ -56,6 +57,10 @@ describe("durable media repair worker policy", () => {
     expect(nextMediaRepairDelayMs({ claimedCount: 0 })).toBe(
       MEDIA_REPAIR_IDLE_DELAY_MS,
     );
+  });
+
+  it("keeps broad discovery scans on a background cadence", () => {
+    expect(MEDIA_REPAIR_MAINTENANCE_DELAY_MS).toBe(120_000);
   });
 
   it("accepts only the bounded production concurrency range", () => {

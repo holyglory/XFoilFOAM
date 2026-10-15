@@ -4,7 +4,7 @@ export const DEFAULT_MEDIA_REPAIR_CONCURRENCY = 2;
 export const MAX_MEDIA_REPAIR_CONCURRENCY = 4;
 export const MEDIA_REPAIR_ACTIVE_DELAY_MS = 100;
 export const MEDIA_REPAIR_IDLE_DELAY_MS = 5_000;
-export const MEDIA_REPAIR_MAINTENANCE_DELAY_MS = 30_000;
+export const MEDIA_REPAIR_MAINTENANCE_DELAY_MS = 120_000;
 
 export function configuredMediaRepairConcurrency(
   raw = process.env.AIRFOILFOAM_MEDIA_REPAIR_CONCURRENCY,

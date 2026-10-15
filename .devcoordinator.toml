@@ -2097,6 +2097,12 @@ requires = ["workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-service.test.ts"]
 
 [[test.progressive.check]]
+name = "media-repair-policy"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/media-repair-worker-policy.test.ts"]
+
+[[test.progressive.check]]
 name = "restart-retention"
 tier = "development"
 requires = ["types"]
