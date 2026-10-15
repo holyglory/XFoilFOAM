@@ -29,6 +29,10 @@ const PROGRESSIVE_REMOTE_STALE_GRACE_MS =
     ? configuredProgressiveRemoteStaleGraceMs
     : 30 * 60 * 1000;
 
+const PROGRESSIVE_REMOTE_CONTROL_TIMEOUT_MS = Number(
+  process.env.SWEEPER_PROGRESSIVE_REMOTE_CONTROL_TIMEOUT_MS ?? 30_000,
+);
+
 const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
   SELECT 1
   FROM progressive_remote_reports stale_report
@@ -112,24 +116,20 @@ export async function reconcileProgressiveRemoteWorker(
       }
     ORDER BY job."updatedAt", job.id LIMIT ${limit}
   `);
-  await runWithConcurrency(
-    finalMirrors,
-    concurrency,
-    async (job) => {
-      const executionId = String(job.id);
-      try {
-        if (await settleProgressiveWorkerFinalReport(db, executionId)) {
-          receipt.inspected += 1;
-          receipt.stopped += 1;
-        }
-      } catch (error) {
-        receipt.errors.push({
-          executionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
+  await runWithConcurrency(finalMirrors, concurrency, async (job) => {
+    const executionId = String(job.id);
+    try {
+      if (await settleProgressiveWorkerFinalReport(db, executionId)) {
+        receipt.inspected += 1;
+        receipt.stopped += 1;
       }
-    },
-  );
+    } catch (error) {
+      receipt.errors.push({
+        executionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
   const candidates = await db.execute(sql`
     SELECT job.id, job.engine_job_id, job.request_payload,
       coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}') AS assignment_signature,
@@ -168,111 +168,67 @@ export async function reconcileProgressiveRemoteWorker(
       }
     ORDER BY job."updatedAt", job.id LIMIT ${limit}
   `);
-  await runWithConcurrency(
-    candidates,
-    concurrency,
-    async (candidate) => {
-      const executionId = String(candidate.id);
-      receipt.inspected += 1;
-      try {
-        if (
-          candidate.engine_job_id !== null &&
-          candidate.engine_job_id !== executionId
-        )
-          throw new Error(
-            "Foreign engine identity requires explicit reconciliation; CPU ownership is retained",
-          );
-        const payload = candidate.request_payload as Record<string, unknown>;
-        const baseUrl = canonicalRemoteHubBaseUrl(
-          String(candidate.upstream_base_url ?? ""),
+  await runWithConcurrency(candidates, concurrency, async (candidate) => {
+    const executionId = String(candidate.id);
+    receipt.inspected += 1;
+    try {
+      if (
+        candidate.engine_job_id !== null &&
+        candidate.engine_job_id !== executionId
+      )
+        throw new Error(
+          "Foreign engine identity requires explicit reconciliation; CPU ownership is retained",
         );
-        if (
-          baseUrl !== candidate.source_base_url ||
-          baseUrl !== payload.upstreamBaseUrl
-        )
-          throw new Error(
-            "Progressive observation upstream differs from the registered assignment",
-          );
-        let stop = Boolean(candidate.stop_required);
-        if (!stop) {
-          try {
-            if (!candidate.auth_token)
-              throw new Error(
-                "The registered worker credential is unavailable",
-              );
-            const response = await fetchProgressiveRemote(
-              options.fetcher ?? fetch,
-              `${baseUrl}/progressive-executions/${executionId}/control`,
-              {
-                headers: {
-                  "x-xfoilfoam-solver-token": String(candidate.auth_token),
-                },
-                redirect: "error",
-                signal: AbortSignal.timeout(10000),
+      const payload = candidate.request_payload as Record<string, unknown>;
+      const baseUrl = canonicalRemoteHubBaseUrl(
+        String(candidate.upstream_base_url ?? ""),
+      );
+      if (
+        baseUrl !== candidate.source_base_url ||
+        baseUrl !== payload.upstreamBaseUrl
+      )
+        throw new Error(
+          "Progressive observation upstream differs from the registered assignment",
+        );
+      let stop = Boolean(candidate.stop_required);
+      if (!stop) {
+        try {
+          if (!candidate.auth_token)
+            throw new Error("The registered worker credential is unavailable");
+          const response = await fetchProgressiveRemote(
+            options.fetcher ?? fetch,
+            `${baseUrl}/progressive-executions/${executionId}/control`,
+            {
+              headers: {
+                "x-xfoilfoam-solver-token": String(candidate.auth_token),
               },
-            );
-            if ([401, 403, 404].includes(response.status)) stop = true;
-            else {
-              if (!response.ok)
-                throw new Error(
-                  `Progressive continuation control failed (${response.status})`,
-                );
-              const body = (await response.json()) as {
-                executionId?: unknown;
-                contentSignature?: unknown;
-                continuation?: { kind?: unknown };
-              } | null;
-              if (
-                body?.executionId !== executionId ||
-                body.contentSignature !== candidate.assignment_signature ||
-                !["continue", "stop"].includes(String(body.continuation?.kind))
-              )
-                throw new Error(
-                  "The hub returned invalid exact-execution continuation control",
-                );
-              stop = body.continuation?.kind === "stop";
-            }
-          } catch (error) {
-            receipt.errors.push({
-              executionId,
-              error: error instanceof Error ? error.message : String(error),
-            });
+              redirect: "error",
+              signal: AbortSignal.timeout(
+                PROGRESSIVE_REMOTE_CONTROL_TIMEOUT_MS,
+              ),
+            },
+          );
+          if ([401, 403, 404].includes(response.status)) stop = true;
+          else {
+            if (!response.ok)
+              throw new Error(
+                `Progressive continuation control failed (${response.status})`,
+              );
+            const body = (await response.json()) as {
+              executionId?: unknown;
+              contentSignature?: unknown;
+              continuation?: { kind?: unknown };
+            } | null;
+            if (
+              body?.executionId !== executionId ||
+              body.contentSignature !== candidate.assignment_signature ||
+              !["continue", "stop"].includes(String(body.continuation?.kind))
+            )
+              throw new Error(
+                "The hub returned invalid exact-execution continuation control",
+              );
+            stop = body.continuation?.kind === "stop";
           }
-        }
-        let observed;
-        try {
-          observed = await observeProgressiveRemoteJob(
-            db,
-            engine,
-            executionId,
-            {
-              stop,
-            },
-          );
-        } catch (error) {
-          if (stop || !(error instanceof ProgressiveRemoteJobMissingError))
-            throw error;
-          observed = await observeProgressiveRemoteJob(
-            db,
-            engine,
-            executionId,
-            {
-              stop: true,
-            },
-          );
-        }
-        if (!observed.replayed) receipt.reported += 1;
-        if (observed.stopped) receipt.stopped += 1;
-      } catch (error) {
-        receipt.errors.push({
-          executionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      } finally {
-        try {
-          await db.execute(
-            sql`UPDATE sim_jobs SET "updatedAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-          );
         } catch (error) {
           receipt.errors.push({
             executionId,
@@ -280,7 +236,37 @@ export async function reconcileProgressiveRemoteWorker(
           });
         }
       }
-    },
-  );
+      let observed;
+      try {
+        observed = await observeProgressiveRemoteJob(db, engine, executionId, {
+          stop,
+        });
+      } catch (error) {
+        if (stop || !(error instanceof ProgressiveRemoteJobMissingError))
+          throw error;
+        observed = await observeProgressiveRemoteJob(db, engine, executionId, {
+          stop: true,
+        });
+      }
+      if (!observed.replayed) receipt.reported += 1;
+      if (observed.stopped) receipt.stopped += 1;
+    } catch (error) {
+      receipt.errors.push({
+        executionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      try {
+        await db.execute(
+          sql`UPDATE sim_jobs SET "updatedAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+        );
+      } catch (error) {
+        receipt.errors.push({
+          executionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  });
   return receipt;
 }

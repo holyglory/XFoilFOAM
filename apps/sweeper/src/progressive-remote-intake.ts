@@ -39,6 +39,10 @@ const pendingPages = new WeakMap<
   ReturnType<typeof receiveAssignmentPage>
 >();
 
+const PROGRESSIVE_ASSIGNMENT_INTAKE_TIMEOUT_MS = Number(
+  process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_TIMEOUT_MS ?? 30_000,
+);
+
 function progressiveAssignmentIntakeConcurrency(): number {
   const configured = Number(
     process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_CONCURRENCY ?? 32,
@@ -111,7 +115,7 @@ async function receiveAssignmentPage(
       {
         headers: { "x-xfoilfoam-solver-token": String(settings.auth_token) },
         redirect: "error",
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(PROGRESSIVE_ASSIGNMENT_INTAKE_TIMEOUT_MS),
       },
     );
     if (!response.ok)
