@@ -79,7 +79,9 @@ export async function readProgressiveRemoteRetention(
   const missingEvidence = sources.filter(
     (source) => source.result_attempt_id == null,
   ).length;
-  if (missingEvidence && !terminalReportHasNoPhysicalEvidence(report))
+  if (missingEvidence && terminalReportHasNoPhysicalEvidence(report))
+    return { kind: "retained" as const, report, sources: [] };
+  if (missingEvidence)
     return {
       kind: "waiting" as const,
       reason: "raw_evidence" as const,
