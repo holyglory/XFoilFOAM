@@ -37,15 +37,14 @@ export async function reuseAcceptedProgressiveCfdEvidence(
       FROM sim_campaigns campaign
       JOIN progressive_generations generation ON generation.campaign_id = campaign.id
       WHERE generation.id = ${generationId}::uuid
-      FOR UPDATE OF campaign
+      FOR UPDATE OF campaign SKIP LOCKED
     `);
     const [generation] = await connection.execute(sql`
       SELECT id, epoch_id, status, plan_revision_id
-      FROM progressive_generations WHERE id = ${generationId}::uuid FOR UPDATE
+      FROM progressive_generations WHERE id = ${generationId}::uuid FOR UPDATE SKIP LOCKED
     `);
+    if (!campaign || !generation) return 0;
     if (
-      !campaign ||
-      !generation ||
       generation.epoch_id !== epochId ||
       generation.status !== "active" ||
       generation.plan_revision_id !== campaign.current_plan_revision_id ||
