@@ -92,7 +92,9 @@ export async function prepareProgressiveRemoteDispatch(
   try {
     return await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
-      await connection.execute(sql`SET LOCAL lock_timeout = '2s'`);
+      await connection.execute(
+        sql`SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '3s'`,
+      );
       const [epoch] = await connection.execute(
         sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
       );
@@ -237,7 +239,7 @@ export async function prepareProgressiveRemoteDispatch(
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
     if (
-      (error as { code?: unknown }).code === "55P03" ||
+      ["55P03", "57014"].includes(String((error as { code?: unknown }).code)) ||
       (error instanceof Error && /lock timeout/i.test(error.message))
     )
       return {
