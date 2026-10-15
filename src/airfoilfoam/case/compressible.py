@@ -49,12 +49,18 @@ class CompressibleCaseBuilder(CaseBuilder):
         self.local_time_step_smoothing = (
             0.02 if self.solver.local_time_step_smoothing is None else self.solver.local_time_step_smoothing
         )
+        steady_command = (
+            "xfoilfoamRhoSimpleFoam"
+            if solver_family == "rhoSimpleFoam"
+            and gas.transport_model == "polynomial"
+            else solver_family
+        )
         self.dialect = replace(
-            self.dialect, steady_solver_command=solver_family,
+            self.dialect, steady_solver_command=steady_command,
             transient_solver_command="rhoCentralFoam" if solver_family == "rhoCentralFoam" else "rhoPimpleFoam",
-            control_solver_value_steady=solver_family,
+            control_solver_value_steady=steady_command,
             control_solver_value_transient="rhoCentralFoam" if solver_family == "rhoCentralFoam" else "rhoPimpleFoam",
-            y_plus_command=f"{solver_family} -postProcess -func yPlus -latestTime",
+            y_plus_command=f"{steady_command} -postProcess -func yPlus -latestTime",
         )
 
     def _write_constant(self, turb) -> None:

@@ -196,9 +196,9 @@ def _case_builder(runner, airfoil, patches, resolved, spec, fluid, roughness, so
     from .thermodynamics import CompressibleTimeWindow
 
     context = runner.flow_execution
-    family = "rhoCentralFoam" if is_density_based(runner) else "rhoSimpleFoam"
+    family = context.family
     window = None
-    if family == "rhoCentralFoam":
+    if family in {"rhoCentralFoam", "rhoPimpleFoam"}:
         duration = spec.chord / spec.speed
         acoustic_step = 0.001 * spec.chord / (spec.speed + context.gas.speed_of_sound(context.state))
         window = CompressibleTimeWindow(
