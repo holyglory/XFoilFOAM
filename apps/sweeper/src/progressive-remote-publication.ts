@@ -92,6 +92,7 @@ export async function publishProgressiveWorkerReport(
       [
         "Remote report replay changed immutable content",
         "Final remote execution evidence cannot change after its stop fence",
+        "An acknowledged stopped remote execution cannot resume",
       ].includes(String(body?.error)) &&
       (await quarantineProgressiveWorkerReportConflict(db, {
         executionId,
