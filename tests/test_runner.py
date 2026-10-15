@@ -83,6 +83,20 @@ def test_docker_cleanup_allows_confirmed_absence_after_allocation_failure(monkey
     DockerRunner(Settings())._remove_command_container("airfoilfoam-command-test-owned")
 
 
+def test_docker_cleanup_accepts_inspect_proof_after_listing_failure(monkeypatch):
+    from airfoilfoam.openfoam import runner as module
+
+    def cleanup(args, **kwargs):
+        if args[1] == "rm":
+            return SimpleNamespace(returncode=1, stdout="", stderr="container disappeared")
+        if args[2] == "ls":
+            return SimpleNamespace(returncode=1, stdout="", stderr="temporary listing failure")
+        return SimpleNamespace(returncode=1, stdout="", stderr="Error: no such container")
+
+    monkeypatch.setattr(module.subprocess, "run", cleanup)
+    DockerRunner(Settings())._remove_command_container("airfoilfoam-command-test-owned")
+
+
 def test_parallel_solver_uses_bounded_logical_cpu_slots(tmp_path):
     runner = RecordingRunner()
 

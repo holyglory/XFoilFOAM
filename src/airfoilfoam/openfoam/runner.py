@@ -404,8 +404,38 @@ class DockerRunner(Runner):
                  "--filter", f"name=^/{container_name}$"],
                 capture_output=True, text=True, timeout=30,
             )
-            if remaining.returncode != 0 or remaining.stdout.strip():
-                raise InfrastructureError(f"Cannot confirm removal of owned OpenFOAM container {container_name}")
+            if remaining.returncode == 0 and not remaining.stdout.strip():
+                return
+            inspected = subprocess.run(
+                [self.settings.docker_binary, "container", "inspect", container_name],
+                capture_output=True, text=True, timeout=30,
+            )
+            inspection_error = " ".join(
+                value.strip()
+                for value in (
+                    getattr(inspected, "stderr", ""),
+                    getattr(inspected, "stdout", ""),
+                )
+                if value and value.strip()
+            )
+            if inspected.returncode != 0 and any(
+                marker in inspection_error.lower()
+                for marker in ("no such object", "no such container", "not found")
+            ):
+                return
+            details = " ".join(
+                value.strip()
+                for value in (
+                    getattr(removed, "stderr", ""),
+                    getattr(remaining, "stderr", ""),
+                    inspection_error,
+                )
+                if value and value.strip()
+            )
+            suffix = f": {details}" if details else ""
+            raise InfrastructureError(
+                f"Cannot confirm removal of owned OpenFOAM container {container_name}{suffix}"
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise InfrastructureError(f"Cannot confirm removal of owned OpenFOAM container {container_name}: {type(exc).__name__}") from exc
 
