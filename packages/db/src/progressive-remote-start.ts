@@ -28,7 +28,7 @@ export async function authorizeProgressiveRemoteStart(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     const [state] = await connection.execute(sql`
-      SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1 FOR UPDATE
+      SELECT enabled, admission_fence_active, disk_admission_blocked FROM sweeper_state WHERE id = 1 FOR SHARE
     `);
     const [settings] = await connection.execute(sql`
       SELECT enabled, remote_solver_enabled FROM sync_api_settings WHERE id = 1
@@ -51,7 +51,7 @@ export async function authorizeProgressiveRemoteStart(
         generation.plan_revision_id = campaign.current_plan_revision_id AS current_plan
       FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       WHERE generation.id = ${initialEnvelope.scope.generationId}::uuid AND generation.epoch_id = ${initialEnvelope.scope.epochId}::uuid
-      FOR UPDATE OF campaign, generation
+      FOR SHARE OF campaign, generation
     `);
     if (
       !generation ||
@@ -68,7 +68,7 @@ export async function authorizeProgressiveRemoteStart(
       };
     const [solver] = await connection.execute(sql`
       SELECT id, last_heartbeat_at > clock_timestamp() - interval '2 minutes' AS recent
-      FROM registered_remote_solvers WHERE id = ${input.solverId}::uuid AND revoked_at IS NULL FOR UPDATE
+      FROM registered_remote_solvers WHERE id = ${input.solverId}::uuid AND revoked_at IS NULL FOR SHARE
     `);
     const [lockedDispatch] = await connection.execute(sql`
       SELECT envelope, content_signature, promise_id FROM progressive_remote_dispatches
