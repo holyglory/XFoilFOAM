@@ -5,7 +5,10 @@ import {
   drainProgressiveWorkerEvidencePass,
   runProgressiveEvidenceService,
 } from "../src/progressive-evidence-service";
-import { withPeriodicIngestLeaseRenewal } from "../src/progressive-worker-evidence";
+import {
+  stageNextProgressiveWorkerEvidence,
+  withPeriodicIngestLeaseRenewal,
+} from "../src/progressive-worker-evidence";
 
 function notifications() {
   const callbacks = new Map<string, Set<() => void>>();
@@ -39,6 +42,20 @@ function gate() {
 }
 
 afterEach(() => vi.useRealTimers());
+
+it("does not wait on a staging lane already holding the admission lock", async () => {
+  const execute = vi.fn(async () => [{ acquired: false }]);
+  const db = {
+    execute,
+    transaction: async (run: (connection: DB) => Promise<unknown>) =>
+      run({ execute } as unknown as DB),
+  } as unknown as DB;
+
+  await expect(
+    stageNextProgressiveWorkerEvidence(db, {} as EngineClient),
+  ).resolves.toBe(false);
+  expect(execute).toHaveBeenCalledOnce();
+});
 
 it("renews a delayed ingest without overlap and cleans up its timer", async () => {
   vi.useFakeTimers();
