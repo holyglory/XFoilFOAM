@@ -127,7 +127,9 @@ export async function runProgressiveBaselineService(
           pending = true;
           report({ component: "progressive-cfd-reuse", reused: reusedCfd });
         }
-        const recovery = await recoverUnboundProgressiveCfdLeases(db);
+        const recovery = remoteHasCapacity
+          ? { retried: 0, gaps: 0 }
+          : await recoverUnboundProgressiveCfdLeases(db);
         if (recovery.retried || recovery.gaps) {
           pending = true;
           report({
@@ -135,8 +137,9 @@ export async function runProgressiveBaselineService(
             ...recovery,
           });
         }
-        const inactiveRemoteGaps =
-          await recoverInactiveProgressiveRemoteGaps(db);
+        const inactiveRemoteGaps = remoteHasCapacity
+          ? 0
+          : await recoverInactiveProgressiveRemoteGaps(db);
         if (inactiveRemoteGaps) {
           pending = true;
           report({
@@ -144,8 +147,9 @@ export async function runProgressiveBaselineService(
             retried: inactiveRemoteGaps,
           });
         }
-        const terminalNoEvidenceGaps =
-          await recoverTerminalProgressiveNoEvidenceGaps(db);
+        const terminalNoEvidenceGaps = remoteHasCapacity
+          ? 0
+          : await recoverTerminalProgressiveNoEvidenceGaps(db);
         if (terminalNoEvidenceGaps) {
           pending = true;
           report({
